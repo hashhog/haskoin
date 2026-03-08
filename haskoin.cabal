@@ -1,0 +1,29 @@
+cabal-version: 3.0
+name:          haskoin
+version:       0.1.0.0
+synopsis:      Bitcoin full node in Haskell
+build-type:    Simple
+
+library
+  exposed-modules: Haskoin.Types
+  hs-source-dirs:  src
+  build-depends:   base >= 4.14 && < 5
+                 , bytestring
+                 , binary
+  default-language: Haskell2010
+
+executable haskoin
+  main-is:       Main.hs
+  hs-source-dirs: app
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+  default-language: Haskell2010
+
+test-suite haskoin-test
+  type:          exitcode-stdio-1.0
+  main-is:       Spec.hs
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+  default-language: Haskell2010
