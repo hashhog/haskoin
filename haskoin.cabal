@@ -9,8 +9,11 @@ library
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
                  , bytestring
-                 , binary
+                 , cereal
+                 , hashable
+                 , deepseq
   default-language: Haskell2010
+  ghc-options:     -Wall
 
 executable haskoin
   main-is:       Main.hs
@@ -18,6 +21,7 @@ executable haskoin
   build-depends: base >= 4.14 && < 5
                , haskoin
   default-language: Haskell2010
+  ghc-options:     -Wall
 
 test-suite haskoin-test
   type:          exitcode-stdio-1.0
@@ -26,4 +30,8 @@ test-suite haskoin-test
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
+               , bytestring
+               , cereal
+               , QuickCheck
   default-language: Haskell2010
+  ghc-options:     -Wall
