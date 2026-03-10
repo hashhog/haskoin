@@ -96,6 +96,10 @@ system to make invalid states unrepresentable.
 - [x] Transaction selection by ancestor fee rate
 - [x] Block assembly from template and nonce
 - [x] Block submission with validation and broadcast
+- [x] JSON-RPC server (Bitcoin Core compatible)
+- [x] RPC endpoints: blockchain, transactions, mempool, network, mining
+- [x] HTTP Basic authentication
+- [x] Fee estimation RPC
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -122,6 +126,7 @@ haskoin/
       Mempool.hs       -- transaction pool, fee tracking, RBF
       FeeEstimator.hs  -- fee rate estimation from confirmation times
       BlockTemplate.hs -- block template construction for mining
+      Rpc.hs           -- json-rpc server (bitcoin core compatible)
   app/
     Main.hs         -- executable entry point
   test/
