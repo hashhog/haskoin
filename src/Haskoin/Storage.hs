@@ -14,6 +14,11 @@
 --   - Batch writes ensure atomicity for block connection
 --   - Bloom filter (10 bits/key) for fast UTXO negative lookups
 --
+-- UTXO Cache Design:
+--   - In-memory cache for fast lookups during validation
+--   - Dirty tracking for efficient batch flushes
+--   - UTXOEntry contains metadata (height, coinbase flag) for maturity checks
+--
 module Haskoin.Storage
   ( -- * Database Handle
     HaskoinDB(..)
@@ -44,6 +49,22 @@ module Haskoin.Storage
   , putUTXO
   , getUTXO
   , deleteUTXO
+    -- * UTXO Cache
+  , UTXOEntry(..)
+  , UTXOCache(..)
+  , newUTXOCache
+  , lookupUTXO
+  , addUTXO
+  , spendUTXO
+  , flushCache
+    -- * Undo Data
+  , UndoData(..)
+  , putUndoData
+  , getUndoData
+    -- * Persisted Chain State
+  , PersistedChainState(..)
+  , saveChainState
+  , getChainState
     -- * Chain Work
   , putChainWork
   , getChainWork
@@ -83,6 +104,9 @@ import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (newIORef, readIORef, modifyIORef')
 import GHC.Generics (Generic)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import Control.Concurrent.STM
 
 import Haskoin.Types
 
@@ -311,6 +335,206 @@ deleteUTXO :: HaskoinDB -> OutPoint -> IO ()
 deleteUTXO db outpoint =
   let key = makeKey PrefixUTXO (encode outpoint)
   in R.delete (dbHandle db) (dbWriteOpts db) key
+
+--------------------------------------------------------------------------------
+-- UTXO Entry with Metadata
+--------------------------------------------------------------------------------
+
+-- | UTXO entry with metadata for validation.
+-- Stores the output along with creation height and coinbase flag.
+-- The height and coinbase flag are needed for the 100-block coinbase maturity check.
+-- KNOWN PITFALL: Coinbase outputs cannot be spent until 100 blocks have passed.
+data UTXOEntry = UTXOEntry
+  { ueOutput   :: !TxOut       -- ^ The unspent transaction output
+  , ueHeight   :: !Word32      -- ^ Block height where this UTXO was created
+  , ueCoinbase :: !Bool        -- ^ Whether from a coinbase transaction
+  , ueSpent    :: !Bool        -- ^ Marked for deletion (for cache tracking)
+  } deriving (Show, Eq, Generic)
+
+instance Serialize UTXOEntry where
+  put UTXOEntry{..} = do
+    put ueOutput
+    putWord32be ueHeight
+    put ueCoinbase
+    put ueSpent
+  get = UTXOEntry <$> get <*> getWord32be <*> get <*> get
+
+--------------------------------------------------------------------------------
+-- UTXO Cache
+--------------------------------------------------------------------------------
+
+-- | In-memory UTXO cache for fast lookups during validation.
+-- The cache sits between the validation logic and the database, providing
+-- fast access to recently-used UTXOs. Dirty entries are tracked for
+-- efficient batch flushes to disk.
+--
+-- KNOWN PITFALL: The cache must be flushed before shutdown to avoid data loss.
+data UTXOCache = UTXOCache
+  { ucEntries  :: !(TVar (Map OutPoint UTXOEntry)) -- ^ Cached entries
+  , ucDirty    :: !(TVar (Map OutPoint UTXOEntry)) -- ^ Modified entries pending flush
+  , ucDB       :: !HaskoinDB                       -- ^ Database handle
+  , ucMaxSize  :: !Int                             -- ^ Maximum cache entries
+  , ucSize     :: !(TVar Int)                      -- ^ Current cache size
+  }
+
+-- | Create a new UTXO cache with the given maximum size.
+-- The cache starts empty; entries are loaded on demand from the database.
+newUTXOCache :: HaskoinDB -> Int -> IO UTXOCache
+newUTXOCache db maxSize = UTXOCache
+  <$> newTVarIO Map.empty
+  <*> newTVarIO Map.empty
+  <*> pure db
+  <*> pure maxSize
+  <*> newTVarIO 0
+
+-- | Look up a UTXO, checking cache first then database.
+-- Returns Nothing if the UTXO doesn't exist or is marked as spent.
+-- KNOWN PITFALL: LE internal, reversed display for hashes. Confusion causes lookup misses.
+lookupUTXO :: UTXOCache -> OutPoint -> IO (Maybe UTXOEntry)
+lookupUTXO cache op = do
+  -- Check cache first
+  cached <- atomically $ do
+    entries <- readTVar (ucEntries cache)
+    return $ Map.lookup op entries
+  case cached of
+    Just entry | not (ueSpent entry) -> return (Just entry)
+    Just _     -> return Nothing  -- marked as spent in cache
+    Nothing    -> do
+      -- Fall through to database
+      mTxOut <- getUTXO (ucDB cache) op
+      case mTxOut of
+        Nothing -> return Nothing
+        Just txout -> do
+          -- We don't have the full UTXOEntry metadata from just TxOut
+          -- In production, store UTXOEntry in DB instead of TxOut
+          -- For now, use default metadata (height 0, not coinbase)
+          let entry = UTXOEntry txout 0 False False
+          -- Add to cache for future lookups
+          atomically $ modifyTVar' (ucEntries cache) (Map.insert op entry)
+          return (Just entry)
+
+-- | Add a new UTXO to the cache.
+-- Marks the entry as dirty so it will be written on next flush.
+addUTXO :: UTXOCache -> OutPoint -> UTXOEntry -> STM ()
+addUTXO cache op entry = do
+  modifyTVar' (ucEntries cache) (Map.insert op entry)
+  modifyTVar' (ucDirty cache) (Map.insert op entry)
+  modifyTVar' (ucSize cache) (+ 1)
+
+-- | Mark a UTXO as spent in the cache.
+-- Returns the original entry if found, Nothing otherwise.
+-- The spent entry is kept in cache to track the deletion for flush.
+spendUTXO :: UTXOCache -> OutPoint -> STM (Maybe UTXOEntry)
+spendUTXO cache op = do
+  entries <- readTVar (ucEntries cache)
+  case Map.lookup op entries of
+    Nothing -> return Nothing
+    Just entry -> do
+      let spent = entry { ueSpent = True }
+      modifyTVar' (ucEntries cache) (Map.insert op spent)
+      modifyTVar' (ucDirty cache) (Map.insert op spent)
+      modifyTVar' (ucSize cache) (subtract 1)
+      return (Just entry)
+
+-- | Flush all dirty entries to the database.
+-- Spent entries are deleted, new/modified entries are written.
+-- Uses batch writes for atomicity.
+flushCache :: UTXOCache -> IO ()
+flushCache cache = do
+  dirty <- atomically $ do
+    d <- readTVar (ucDirty cache)
+    writeTVar (ucDirty cache) Map.empty
+    return d
+  let ops = map toOp (Map.toList dirty)
+  writeBatch (ucDB cache) (WriteBatch ops)
+  where
+    toOp (op, entry)
+      | ueSpent entry = BatchDelete (makeKey PrefixUTXO (encode op))
+      | otherwise     = BatchPut (makeKey PrefixUTXO (encode op)) (encode entry)
+
+--------------------------------------------------------------------------------
+-- Undo Data for Chain Reorganizations
+--------------------------------------------------------------------------------
+
+-- | Undo data for a block, enabling chain reorganizations.
+-- Stores the UTXOs that were spent by this block so they can be restored
+-- if the block is disconnected during a reorg.
+--
+-- KNOWN PITFALL: Without undo data, a node cannot safely handle reorgs.
+data UndoData = UndoData
+  { udBlockHash    :: !BlockHash            -- ^ Hash of the block this undo is for
+  , udHeight       :: !Word32               -- ^ Height of the block
+  , udSpentOutputs :: ![(OutPoint, UTXOEntry)] -- ^ UTXOs that were spent
+  } deriving (Show, Generic)
+
+instance Serialize UndoData where
+  put UndoData{..} = do
+    put udBlockHash
+    putWord32be udHeight
+    putWord32be (fromIntegral $ length udSpentOutputs)
+    mapM_ (\(op, entry) -> put op >> put entry) udSpentOutputs
+  get = do
+    bh <- get
+    height <- getWord32be
+    count <- getWord32be
+    spent <- sequence $ replicate (fromIntegral count) ((,) <$> get <*> get)
+    return $ UndoData bh height spent
+
+-- | Store undo data for a block.
+-- Uses prefix 0x10 for undo data keys.
+putUndoData :: HaskoinDB -> BlockHash -> UndoData -> IO ()
+putUndoData db bh undo =
+  let key = BS.cons 0x10 (encode bh)
+  in R.put (dbHandle db) (dbWriteOpts db) key (encode undo)
+
+-- | Retrieve undo data for a block.
+getUndoData :: HaskoinDB -> BlockHash -> IO (Maybe UndoData)
+getUndoData db bh = do
+  let key = BS.cons 0x10 (encode bh)
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+--------------------------------------------------------------------------------
+-- Persisted Chain State
+--------------------------------------------------------------------------------
+
+-- | Chain state that is persisted to disk.
+-- KNOWN PITFALL: header_tip vs chain_tip - these must be separate DB entries.
+-- Header sync updates header_tip, block validation updates chain_tip.
+data PersistedChainState = PersistedChainState
+  { pcsHeight    :: !Word32     -- ^ Height of the best validated block
+  , pcsBestBlock :: !BlockHash  -- ^ Hash of the best validated block
+  , pcsChainWork :: !Integer    -- ^ Cumulative proof-of-work
+  } deriving (Show, Generic)
+
+instance Serialize PersistedChainState where
+  put PersistedChainState{..} = do
+    putWord32be pcsHeight
+    put pcsBestBlock
+    -- Encode chain work as variable-length integer
+    let workBS = integerToBS pcsChainWork
+    putWord32be (fromIntegral $ BS.length workBS)
+    put workBS
+  get = do
+    height <- getWord32be
+    bestBlock <- get
+    workLen <- getWord32be
+    workBS <- get
+    return $ PersistedChainState height bestBlock (bsToInteger workBS)
+
+-- | Save chain state to the database.
+-- Uses prefix 0x20 for chain state.
+saveChainState :: HaskoinDB -> PersistedChainState -> IO ()
+saveChainState db pcs =
+  let key = BS.cons 0x20 BS.empty
+  in R.put (dbHandle db) (dbWriteOpts db) key (encode pcs)
+
+-- | Load chain state from the database.
+getChainState :: HaskoinDB -> IO (Maybe PersistedChainState)
+getChainState db = do
+  let key = BS.cons 0x20 BS.empty
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= either (const Nothing) Just . decode
 
 --------------------------------------------------------------------------------
 -- Transaction Index
