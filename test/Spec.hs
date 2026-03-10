@@ -30,6 +30,7 @@ import Haskoin.Sync
 import Haskoin.Mempool
 import Haskoin.FeeEstimator
 import Haskoin.Wallet
+import Haskoin.Performance
 import qualified Data.Map.Strict as Map
 import Control.Concurrent.STM
 
@@ -2984,3 +2985,146 @@ main = hspec $ do
           cs = CoinSelection inputs outputs Nothing 1000 (FeeRate 10)
           tx = createTransaction cs
       length (txOutputs tx) `shouldBe` 1
+
+  -- Performance module tests
+  describe "LRU Cache" $ do
+    it "stores and retrieves values" $ do
+      cache <- newLRUCache 100
+      lruInsert cache ("key1" :: String) (42 :: Int)
+      result <- lruLookup cache "key1"
+      result `shouldBe` Just 42
+
+    it "returns Nothing for missing keys" $ do
+      cache <- newLRUCache 100
+      result <- lruLookup cache ("missing" :: String)
+      (result :: Maybe Int) `shouldBe` Nothing
+
+    it "updates existing keys" $ do
+      cache <- newLRUCache 100
+      lruInsert cache ("key1" :: String) (42 :: Int)
+      lruInsert cache "key1" 99
+      result <- lruLookup cache "key1"
+      result `shouldBe` Just 99
+
+    it "evicts when at capacity" $ do
+      cache <- newLRUCache 3
+      lruInsert cache (1 :: Int) ("one" :: String)
+      lruInsert cache 2 "two"
+      lruInsert cache 3 "three"
+      -- Access 1 and 3 to make 2 the LRU
+      _ <- lruLookup cache 1
+      _ <- lruLookup cache 3
+      -- Insert 4, should evict 2
+      lruInsert cache 4 "four"
+      size <- lruSize cache
+      size `shouldBe` 3
+      result <- lruLookup cache 2
+      result `shouldBe` Nothing
+
+    it "tracks cache size correctly" $ do
+      cache <- newLRUCache 100
+      lruInsert cache (1 :: Int) ("one" :: String)
+      lruInsert cache 2 "two"
+      lruInsert cache 3 "three"
+      size <- lruSize cache
+      size `shouldBe` 3
+
+    it "hit rate starts at zero" $ do
+      cache <- newLRUCache 100
+      rate <- lruHitRate cache
+      rate `shouldBe` 0
+
+    it "hit rate is 100% when all lookups hit" $ do
+      cache <- newLRUCache 100
+      lruInsert cache ("key1" :: String) (42 :: Int)
+      _ <- lruLookup cache "key1"
+      _ <- lruLookup cache "key1"
+      rate <- lruHitRate cache
+      rate `shouldBe` 100.0
+
+  describe "Node Metrics" $ do
+    it "creates metrics with zero counters" $ do
+      metrics <- newNodeMetrics
+      snapshot <- getMetricSnapshot metrics
+      msBlocksProcessed snapshot `shouldBe` 0
+      msTxsValidated snapshot `shouldBe` 0
+
+    it "incrementMetric increases counter" $ do
+      metrics <- newNodeMetrics
+      incrementMetric (nmBlocksProcessed metrics)
+      incrementMetric (nmBlocksProcessed metrics)
+      incrementMetric (nmBlocksProcessed metrics)
+      snapshot <- getMetricSnapshot metrics
+      msBlocksProcessed snapshot `shouldBe` 3
+
+    it "addToMetric adds to counter" $ do
+      metrics <- newNodeMetrics
+      addToMetric (nmBytesReceived metrics) 1000
+      addToMetric (nmBytesReceived metrics) 500
+      snapshot <- getMetricSnapshot metrics
+      msBytesReceived snapshot `shouldBe` 1500
+
+    it "tracks uptime" $ do
+      metrics <- newNodeMetrics
+      snapshot <- getMetricSnapshot metrics
+      msUptimeSeconds snapshot `shouldSatisfy` (>= 0)
+
+  describe "Strict Processing" $ do
+    it "computeTxFeeStrict computes fee correctly" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          outpoint = OutPoint txid 0
+          prevOutput = TxOut 1000000 ""
+          utxoMap = Map.singleton outpoint prevOutput
+          txin = TxIn outpoint "" 0xffffffff
+          txout = TxOut 900000 ""
+          tx = Tx 1 [txin] [txout] [[]] 0
+      case computeTxFeeStrict utxoMap tx of
+        Right fee -> fee `shouldBe` 100000
+        Left err -> expectationFailure $ "Expected success, got: " ++ err
+
+    it "computeTxFeeStrict rejects missing UTXO" $ do
+      let utxoMap = Map.empty :: Map.Map OutPoint TxOut
+          txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          txin = TxIn (OutPoint txid 0) "" 0xffffffff
+          txout = TxOut 100000 ""
+          tx = Tx 1 [txin] [txout] [[]] 0
+      case computeTxFeeStrict utxoMap tx of
+        Left _ -> return ()  -- Expected
+        Right _ -> expectationFailure "Expected missing UTXO error"
+
+    it "computeTxFeeStrict rejects overspend" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          outpoint = OutPoint txid 0
+          prevOutput = TxOut 100000 ""  -- Only 100k sats available
+          utxoMap = Map.singleton outpoint prevOutput
+          txin = TxIn outpoint "" 0xffffffff
+          txout = TxOut 200000 ""  -- Trying to spend 200k sats
+          tx = Tx 1 [txin] [txout] [[]] 0
+      case computeTxFeeStrict utxoMap tx of
+        Left err -> err `shouldBe` "Outputs exceed inputs"
+        Right _ -> expectationFailure "Expected overspend error"
+
+  describe "Parallel Validation" $ do
+    it "verifyBlockScriptsParallel succeeds on empty block" $ do
+      let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0))) (Hash256 (BS.replicate 32 0)) 0 0 0
+          coinbase = Tx 1 [] [TxOut 5000000000 ""] [[]] 0
+          block = Block header [coinbase]
+          utxoMap = Map.empty
+          flags = ConsensusFlags False False False False False False
+      verifyBlockScriptsParallel block utxoMap flags `shouldBe` Right ()
+
+    it "parallelMap preserves order" $ do
+      let result = parallelMap (*2) [1, 2, 3, 4, 5 :: Int]
+      result `shouldBe` [2, 4, 6, 8, 10]
+
+  describe "Database Tuning" $ do
+    it "ibdDBConfig returns valid configuration" $ do
+      let (path, createIfMissing, maxFiles, writeBuffer, blockCache, bloomBits, compression) =
+            ibdDBConfig "/tmp/test"
+      path `shouldBe` "/tmp/test"
+      createIfMissing `shouldBe` True
+      maxFiles `shouldBe` 1000
+      writeBuffer `shouldBe` 256 * 1024 * 1024  -- 256 MB
+      blockCache `shouldBe` 512 * 1024 * 1024   -- 512 MB
+      bloomBits `shouldBe` 10
+      compression `shouldBe` True
