@@ -7,6 +7,7 @@ build-type:    Simple
 library
   exposed-modules: Haskoin.Types
                  , Haskoin.Crypto
+                 , Haskoin.Script
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
                  , bytestring
@@ -16,6 +17,7 @@ library
                  , cryptonite
                  , memory
                  , text
+                 , transformers
   default-language: Haskell2010
   ghc-options:     -Wall
 
