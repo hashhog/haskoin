@@ -63,6 +63,12 @@ system to make invalid states unrepresentable.
 - [x] Ping/pong monitoring with stale peer disconnection
 - [x] Block locator building for getheaders/getblocks
 - [x] Addr message handling for peer discovery
+- [x] Header chain with cumulative proof-of-work tracking
+- [x] Median time past calculation (BIP-113)
+- [x] Difficulty adjustment (retarget every 2016 blocks)
+- [x] Header validation (PoW, timestamp, difficulty)
+- [x] Headers-first sync controller
+- [x] Fork point detection and ancestor lookup
 - [ ] ECDSA signing/verification (requires secp256k1)
 - [ ] Block download and IBD
 - [ ] Mempool management
@@ -84,7 +90,7 @@ haskoin/
       Types.hs      -- core data types and serialization
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
       Script.hs     -- script parsing, classification, interpreter
-      Consensus.hs  -- network config, constants, block/tx validation
+      Consensus.hs  -- network config, validation, header sync
       Storage.hs    -- rocksdb persistence layer
       Network.hs    -- p2p messages, peer connection, peer manager
   app/
