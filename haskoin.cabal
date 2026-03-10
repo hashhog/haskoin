@@ -12,6 +12,7 @@ library
                  , Haskoin.Storage
                  , Haskoin.Network
                  , Haskoin.Sync
+                 , Haskoin.Mempool
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
                  , bytestring
