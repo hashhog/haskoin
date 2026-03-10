@@ -11,7 +11,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.Text as T
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import Data.Int (Int64)
 
 import Haskoin.Types
@@ -26,6 +26,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          UTXOEntry(..), UndoData(..), PersistedChainState(..))
 import Haskoin.Network
 import Haskoin.Sync
+import Haskoin.Mempool
 import qualified Data.Map.Strict as Map
 import Control.Concurrent.STM
 
@@ -2097,10 +2098,10 @@ main = hspec $ do
           retried = req { brRetries = brRetries req + 1 }
       brRetries retried `shouldBe` 1
 
-  describe "flushTBQueue" $ do
+  describe "flushTBQueueN" $ do
     it "returns empty list from empty queue" $ do
       q <- atomically $ newTBQueue 10
-      result <- atomically $ flushTBQueue q 5
+      result <- atomically $ flushTBQueueN q 5
       result `shouldBe` ([] :: [Int])
 
     it "returns all items when fewer than limit" $ do
@@ -2109,7 +2110,7 @@ main = hspec $ do
         writeTBQueue q (1 :: Int)
         writeTBQueue q 2
         writeTBQueue q 3
-      result <- atomically $ flushTBQueue q 10
+      result <- atomically $ flushTBQueueN q 10
       result `shouldBe` [1, 2, 3]
 
     it "returns only up to limit items" $ do
@@ -2120,16 +2121,16 @@ main = hspec $ do
         writeTBQueue q 3
         writeTBQueue q 4
         writeTBQueue q 5
-      result <- atomically $ flushTBQueue q 3
+      result <- atomically $ flushTBQueueN q 3
       result `shouldBe` [1, 2, 3]
       -- Remaining items should still be in queue
-      remaining <- atomically $ flushTBQueue q 10
+      remaining <- atomically $ flushTBQueueN q 10
       remaining `shouldBe` [4, 5]
 
     it "handles zero limit" $ do
       q <- atomically $ newTBQueue 10
       atomically $ writeTBQueue q (1 :: Int)
-      result <- atomically $ flushTBQueue q 0
+      result <- atomically $ flushTBQueueN q 0
       result `shouldBe` []
 
   -- Phase 14: UTXO Set & Chain State tests
@@ -2299,3 +2300,119 @@ main = hspec $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
           pcs = PersistedChainState 100 bh 999999
       pcsChainWork pcs `shouldBe` 999999
+
+  --------------------------------------------------------------------------------
+  -- Mempool Tests
+  --------------------------------------------------------------------------------
+
+  describe "Mempool" $ do
+    describe "FeeRate" $ do
+      it "creates fee rate from satoshis per vbyte" $ do
+        let rate = FeeRate 10
+        getFeeRate rate `shouldBe` 10
+
+      it "compares fee rates correctly" $ do
+        let low = FeeRate 1
+            high = FeeRate 10
+        (low < high) `shouldBe` True
+        (high > low) `shouldBe` True
+
+    describe "MempoolConfig" $ do
+      it "has sensible defaults" $ do
+        let cfg = defaultMempoolConfig
+        mpcMaxSize cfg `shouldBe` 300 * 1024 * 1024  -- 300 MB
+        mpcMinFeeRate cfg `shouldBe` FeeRate 1        -- 1 sat/vB
+        mpcRBFEnabled cfg `shouldBe` True
+        mpcMaxAncestors cfg `shouldBe` 25
+        mpcMaxDescendants cfg `shouldBe` 25
+
+      it "allows custom configuration" $ do
+        let cfg = defaultMempoolConfig
+              { mpcMaxSize = 100 * 1024 * 1024  -- 100 MB
+              , mpcMinFeeRate = FeeRate 5       -- 5 sat/vB
+              , mpcRBFEnabled = False
+              }
+        mpcMaxSize cfg `shouldBe` 100 * 1024 * 1024
+        mpcMinFeeRate cfg `shouldBe` FeeRate 5
+        mpcRBFEnabled cfg `shouldBe` False
+
+    describe "MempoolEntry" $ do
+      it "stores transaction metadata" $ do
+        -- Create a simple transaction
+        let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+            prevOutpoint = OutPoint txid 0
+            txIn = TxIn prevOutpoint "" 0xffffffff
+            txOut = TxOut 1000 ""
+            tx = Tx 1 [txIn] [txOut] [[]] 0
+        -- Create mempool entry
+        let entry = MempoolEntry
+              { meTransaction = tx
+              , meTxId = computeTxId tx
+              , meFee = 100
+              , meFeeRate = FeeRate 10
+              , meSize = 150
+              , meTime = 1234567890
+              , meHeight = 500
+              , meAncestorCount = 0
+              , meAncestorSize = 150
+              , meAncestorFees = 100
+              , meDescendantCount = 0
+              , meDescendantSize = 0
+              , meDescendantFees = 0
+              , meRBFOptIn = False
+              }
+        meFee entry `shouldBe` 100
+        meFeeRate entry `shouldBe` FeeRate 10
+        meSize entry `shouldBe` 150
+        meHeight entry `shouldBe` 500
+        meRBFOptIn entry `shouldBe` False
+
+    describe "MempoolError" $ do
+      it "represents different error types" $ do
+        let err1 = ErrAlreadyInMempool
+            err2 = ErrValidationFailed "test error"
+            err3 = ErrFeeBelowMinimum (FeeRate 1) (FeeRate 5)
+            err4 = ErrTooManyAncestors 30 25
+        show err1 `shouldBe` "ErrAlreadyInMempool"
+        show err2 `shouldBe` "ErrValidationFailed \"test error\""
+        show err3 `shouldBe` "ErrFeeBelowMinimum (FeeRate {getFeeRate = 1}) (FeeRate {getFeeRate = 5})"
+        show err4 `shouldBe` "ErrTooManyAncestors 30 25"
+
+    describe "RBF signaling" $ do
+      it "detects RBF opt-in when sequence < 0xfffffffe" $ do
+        -- Transaction with RBF signaled
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            op = OutPoint txid 0
+            -- Sequence 0xfffffffd signals RBF
+            rbfTxIn = TxIn op "" 0xfffffffd
+            rbfOptIn = txInSequence rbfTxIn < 0xfffffffe
+        rbfOptIn `shouldBe` True
+
+      it "does not signal RBF when sequence >= 0xfffffffe" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            op = OutPoint txid 0
+            -- Sequence 0xffffffff does not signal RBF
+            finalTxIn = TxIn op "" 0xffffffff
+            rbfOptIn = txInSequence finalTxIn < 0xfffffffe
+        rbfOptIn `shouldBe` False
+
+      it "sequence 0xfffffffe does not signal RBF" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            op = OutPoint txid 0
+            txIn = TxIn op "" 0xfffffffe
+            rbfOptIn = txInSequence txIn < 0xfffffffe
+        rbfOptIn `shouldBe` False
+
+    describe "Ancestor fee rate calculation" $ do
+      it "calculates ancestor fee rate for CPFP" $ do
+        -- Parent tx: 100 sat fee, 200 vB
+        -- Child tx: 500 sat fee, 150 vB
+        -- Ancestor fee rate = (100 + 500) * 1000 / (200 + 150) = 1714 msat/vB
+        let parentFee = 100 :: Word64
+            parentSize = 200 :: Int
+            childFee = 500 :: Word64
+            childSize = 150 :: Int
+            totalFees = parentFee + childFee
+            totalSize = parentSize + childSize
+            ancestorFeeRate = (totalFees * 1000) `div` fromIntegral totalSize
+        ancestorFeeRate `shouldBe` 1714
