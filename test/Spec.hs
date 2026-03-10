@@ -1,18 +1,27 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main where
 
 import Test.Hspec
 import Test.QuickCheck
-import Data.Serialize (encode, decode, runPut, runGet)
+import Data.Serialize (encode, decode)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.Text as T
 import Data.Word (Word64)
+import Data.Int (Int64)
 
 import Haskoin.Types
 import Haskoin.Crypto
+import Haskoin.Script
+
+-- Helper for hex decoding that works with Either-based API
+hexDecode :: ByteString -> ByteString
+hexDecode bs = case B16.decode bs of
+  Right x -> x
+  Left _ -> error "invalid hex"
 
 main :: IO ()
 main = hspec $ do
@@ -107,8 +116,8 @@ main = hspec $ do
       let txid = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint txid 0) "" 0xffffffff
           txout = TxOut 100000 "scriptpubkey"
-          witness = ["sig", "pubkey"]
-          tx = Tx 2 [txin] [txout] [witness] 0
+          wit = ["sig", "pubkey"]
+          tx = Tx 2 [txin] [txout] [wit] 0
       decode (encode tx) `shouldBe` Right tx
 
   describe "Block" $ do
@@ -146,12 +155,12 @@ main = hspec $ do
   describe "SHA256" $ do
     it "computes correct hash for empty string" $ do
       -- SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-      let expected = fst $ B16.decode "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      let expected = hexDecode "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       sha256 "" `shouldBe` expected
 
     it "computes correct hash for 'abc'" $ do
       -- SHA256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-      let expected = fst $ B16.decode "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      let expected = hexDecode "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
       sha256 "abc" `shouldBe` expected
 
   describe "doubleSHA256" $ do
@@ -164,12 +173,12 @@ main = hspec $ do
   describe "RIPEMD160" $ do
     it "computes correct hash for empty string" $ do
       -- RIPEMD160("") = 9c1185a5c5e9fc54612808977ee8f548b2258d31
-      let expected = fst $ B16.decode "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+      let expected = hexDecode "9c1185a5c5e9fc54612808977ee8f548b2258d31"
       ripemd160 "" `shouldBe` expected
 
     it "computes correct hash for 'abc'" $ do
       -- RIPEMD160("abc") = 8eb208f7e05d987a9b044a8e98c6b087f15a0bfc
-      let expected = fst $ B16.decode "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"
+      let expected = hexDecode "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"
       ripemd160 "abc" `shouldBe` expected
 
   describe "hash160" $ do
@@ -272,13 +281,13 @@ main = hspec $ do
       T.head addr `shouldBe` '3'
 
     it "roundtrips P2PKH address" $ do
-      let hash = Hash160 (fst $ B16.decode "89abcdefabbaabbaabbaabbaabbaabbaabbaabba")
+      let hash = Hash160 (hexDecode "89abcdefabbaabbaabbaabbaabbaabbaabbaabba")
           addr = PubKeyAddress hash
           encoded = addressToText addr
       textToAddress encoded `shouldBe` Just addr
 
     it "roundtrips P2SH address" $ do
-      let hash = Hash160 (fst $ B16.decode "0011223344556677889900aabbccddeeff001122")
+      let hash = Hash160 (hexDecode "0011223344556677889900aabbccddeeff001122")
           addr = ScriptAddress hash
           encoded = addressToText addr
       textToAddress encoded `shouldBe` Just addr
@@ -287,7 +296,7 @@ main = hspec $ do
       -- 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2 is a well-known address
       -- Its hash160 is: 77bff20c60e522dfaa3350c39b030a5d004e839a
       let knownAddr = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"
-          expectedHash = fst $ B16.decode "77bff20c60e522dfaa3350c39b030a5d004e839a"
+          expectedHash = hexDecode "77bff20c60e522dfaa3350c39b030a5d004e839a"
       case textToAddress knownAddr of
         Just (PubKeyAddress (Hash160 h)) -> h `shouldBe` expectedHash
         _ -> expectationFailure "Failed to decode known address"
@@ -310,13 +319,13 @@ main = hspec $ do
       T.take 4 addr `shouldBe` "bc1q"
 
     it "roundtrips P2WPKH address" $ do
-      let hash = Hash160 (fst $ B16.decode "751e76e8199196d454941c45d1b3a323f1433bd6")
+      let hash = Hash160 (hexDecode "751e76e8199196d454941c45d1b3a323f1433bd6")
           addr = WitnessPubKeyAddress hash
           encoded = addressToText addr
       textToAddress encoded `shouldBe` Just addr
 
     it "roundtrips P2WSH address" $ do
-      let hash = Hash256 (fst $ B16.decode "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+      let hash = Hash256 (hexDecode "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
           addr = WitnessScriptAddress hash
           encoded = addressToText addr
       textToAddress encoded `shouldBe` Just addr
@@ -325,7 +334,7 @@ main = hspec $ do
       -- bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4 corresponds to
       -- hash160: 751e76e8199196d454941c45d1b3a323f1433bd6
       let knownAddr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
-          expectedHash = fst $ B16.decode "751e76e8199196d454941c45d1b3a323f1433bd6"
+          expectedHash = hexDecode "751e76e8199196d454941c45d1b3a323f1433bd6"
       case textToAddress knownAddr of
         Just (WitnessPubKeyAddress (Hash160 h)) -> h `shouldBe` expectedHash
         _ -> expectationFailure "Failed to decode known bech32 address"
@@ -338,7 +347,7 @@ main = hspec $ do
       T.take 4 addr `shouldBe` "bc1p"
 
     it "roundtrips Taproot address" $ do
-      let hash = Hash256 (fst $ B16.decode "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+      let hash = Hash256 (hexDecode "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
           addr = TaprootAddress hash
           encoded = addressToText addr
       textToAddress encoded `shouldBe` Just addr
@@ -379,3 +388,527 @@ main = hspec $ do
       case addr of
         WitnessScriptAddress _ -> return ()
         _ -> expectationFailure "Expected P2WSH address"
+
+  -- Script module tests
+  describe "Script parsing" $ do
+    it "decodes OP_0" $ do
+      let bytes = BS.pack [0x00]
+      case decodeScript bytes of
+        Right (Script [OP_0]) -> return ()
+        _ -> expectationFailure "Expected OP_0"
+
+    it "decodes push data (direct push)" $ do
+      let bytes = BS.pack [0x03, 0xaa, 0xbb, 0xcc]
+      case decodeScript bytes of
+        Right (Script [OP_PUSHDATA bs OPCODE])
+          | bs == BS.pack [0xaa, 0xbb, 0xcc] -> return ()
+        _ -> expectationFailure "Expected 3-byte push"
+
+    it "decodes OP_PUSHDATA1" $ do
+      let bytes = BS.pack [0x4c, 0x03, 0xaa, 0xbb, 0xcc]
+      case decodeScript bytes of
+        Right (Script [OP_PUSHDATA bs OPDATA1])
+          | bs == BS.pack [0xaa, 0xbb, 0xcc] -> return ()
+        _ -> expectationFailure "Expected PUSHDATA1"
+
+    it "decodes small numbers (OP_1 through OP_16)" $ do
+      let bytes = BS.pack [0x51, 0x52, 0x60]  -- OP_1, OP_2, OP_16
+      case decodeScript bytes of
+        Right (Script [OP_1, OP_2, OP_16]) -> return ()
+        _ -> expectationFailure "Expected OP_1, OP_2, OP_16"
+
+    it "decodes P2PKH script" $ do
+      let hash20 = BS.replicate 20 0xab
+          bytes = BS.pack [0x76, 0xa9, 0x14] <> hash20 <> BS.pack [0x88, 0xac]
+      case decodeScript bytes of
+        Right (Script [OP_DUP, OP_HASH160, OP_PUSHDATA h OPCODE, OP_EQUALVERIFY, OP_CHECKSIG])
+          | h == hash20 -> return ()
+        _ -> expectationFailure "Expected P2PKH script"
+
+    it "roundtrips arbitrary script" $ do
+      let ops = [OP_1, OP_2, OP_ADD, OP_3, OP_EQUAL]
+          script = Script ops
+          encoded = encodeScript script
+      decodeScript encoded `shouldBe` Right script
+
+  describe "Script encoding" $ do
+    it "encodes OP_0 correctly" $ do
+      encodeScript (Script [OP_0]) `shouldBe` BS.pack [0x00]
+
+    it "encodes push data correctly" $ do
+      let bs = BS.pack [0xab, 0xcd]
+      encodeScript (Script [OP_PUSHDATA bs OPCODE]) `shouldBe` BS.pack [0x02, 0xab, 0xcd]
+
+    it "encodes small numbers correctly" $ do
+      encodeScript (Script [OP_1, OP_16]) `shouldBe` BS.pack [0x51, 0x60]
+
+  describe "Script classification" $ do
+    it "classifies P2PKH" $ do
+      let hash = Hash160 (BS.replicate 20 0xab)
+          script = encodeP2PKH hash
+      classifyOutput script `shouldBe` P2PKH hash
+
+    it "classifies P2SH" $ do
+      let hash = Hash160 (BS.replicate 20 0xcd)
+          script = encodeP2SH hash
+      classifyOutput script `shouldBe` P2SH hash
+
+    it "classifies P2WPKH" $ do
+      let hash = Hash160 (BS.replicate 20 0xef)
+          script = encodeP2WPKH hash
+      classifyOutput script `shouldBe` P2WPKH hash
+
+    it "classifies P2WSH" $ do
+      let hash = Hash256 (BS.replicate 32 0x12)
+          script = encodeP2WSH hash
+      classifyOutput script `shouldBe` P2WSH hash
+
+    it "classifies P2PK (compressed)" $ do
+      let pubkey = BS.cons 0x02 (BS.replicate 32 0xaa)
+          script = Script [OP_PUSHDATA pubkey OPCODE, OP_CHECKSIG]
+      classifyOutput script `shouldBe` P2PK pubkey
+
+    it "classifies P2PK (uncompressed)" $ do
+      let pubkey = BS.cons 0x04 (BS.replicate 64 0xbb)
+          script = Script [OP_PUSHDATA pubkey OPCODE, OP_CHECKSIG]
+      classifyOutput script `shouldBe` P2PK pubkey
+
+    it "classifies OP_RETURN" $ do
+      let script = encodeOpReturn (BS.pack [0x01, 0x02, 0x03])
+      case classifyOutput script of
+        OpReturn _ -> return ()
+        _ -> expectationFailure "Expected OP_RETURN"
+
+    it "classifies multisig" $ do
+      let pk1 = BS.cons 0x02 (BS.replicate 32 0xaa)
+          pk2 = BS.cons 0x02 (BS.replicate 32 0xbb)
+          script = encodeMultisig 1 [pk1, pk2]
+      case classifyOutput script of
+        P2MultiSig m pks | m == 1 && length pks == 2 -> return ()
+        _ -> expectationFailure "Expected 1-of-2 multisig"
+
+    it "classifies non-standard" $ do
+      let script = Script [OP_NOP, OP_NOP]
+      classifyOutput script `shouldBe` NonStandard
+
+  describe "Standard script constructors" $ do
+    it "encodeP2PKH creates valid P2PKH" $ do
+      let hash = Hash160 (BS.replicate 20 0x00)
+          Script ops = encodeP2PKH hash
+      length ops `shouldBe` 5
+      head ops `shouldBe` OP_DUP
+      ops !! 1 `shouldBe` OP_HASH160
+      ops !! 3 `shouldBe` OP_EQUALVERIFY
+      ops !! 4 `shouldBe` OP_CHECKSIG
+
+    it "encodeP2SH creates valid P2SH" $ do
+      let hash = Hash160 (BS.replicate 20 0x00)
+          Script ops = encodeP2SH hash
+      length ops `shouldBe` 3
+      head ops `shouldBe` OP_HASH160
+      ops !! 2 `shouldBe` OP_EQUAL
+
+    it "encodeP2WPKH creates valid P2WPKH" $ do
+      let hash = Hash160 (BS.replicate 20 0x00)
+          Script ops = encodeP2WPKH hash
+      length ops `shouldBe` 2
+      head ops `shouldBe` OP_0
+
+    it "encodeP2WSH creates valid P2WSH" $ do
+      let hash = Hash256 (BS.replicate 32 0x00)
+          Script ops = encodeP2WSH hash
+      length ops `shouldBe` 2
+      head ops `shouldBe` OP_0
+
+    it "encodeMultisig creates valid multisig" $ do
+      let pk1 = BS.cons 0x02 (BS.replicate 32 0xaa)
+          pk2 = BS.cons 0x02 (BS.replicate 32 0xbb)
+          pk3 = BS.cons 0x02 (BS.replicate 32 0xcc)
+          Script ops = encodeMultisig 2 [pk1, pk2, pk3]
+      head ops `shouldBe` OP_2
+      last ops `shouldBe` OP_CHECKMULTISIG
+      ops !! 4 `shouldBe` OP_3
+
+  describe "Script number encoding" $ do
+    it "encodes zero as empty" $ do
+      encodeScriptNum 0 `shouldBe` BS.empty
+
+    it "encodes positive numbers" $ do
+      encodeScriptNum 1 `shouldBe` BS.pack [0x01]
+      encodeScriptNum 127 `shouldBe` BS.pack [0x7f]
+      encodeScriptNum 128 `shouldBe` BS.pack [0x80, 0x00]  -- needs extra byte for sign
+      encodeScriptNum 255 `shouldBe` BS.pack [0xff, 0x00]
+      encodeScriptNum 256 `shouldBe` BS.pack [0x00, 0x01]
+
+    it "encodes negative numbers" $ do
+      encodeScriptNum (-1) `shouldBe` BS.pack [0x81]
+      encodeScriptNum (-127) `shouldBe` BS.pack [0xff]
+      encodeScriptNum (-128) `shouldBe` BS.pack [0x80, 0x80]
+
+    it "roundtrips script numbers" $ property $ \(n :: Int) ->
+      let n64 = fromIntegral n :: Int64
+          -- Limit to 4-byte range
+          clamped = max (-2147483647) (min 2147483647 n64)
+      in decodeScriptNum (encodeScriptNum clamped) == Right clamped
+
+  describe "Script number decoding" $ do
+    it "decodes empty as zero" $ do
+      decodeScriptNum BS.empty `shouldBe` Right 0
+
+    it "decodes positive numbers" $ do
+      decodeScriptNum (BS.pack [0x01]) `shouldBe` Right 1
+      decodeScriptNum (BS.pack [0x7f]) `shouldBe` Right 127
+      decodeScriptNum (BS.pack [0x80, 0x00]) `shouldBe` Right 128
+
+    it "decodes negative numbers" $ do
+      decodeScriptNum (BS.pack [0x81]) `shouldBe` Right (-1)
+      decodeScriptNum (BS.pack [0xff]) `shouldBe` Right (-127)
+
+    it "rejects overflow (> 4 bytes)" $ do
+      case decodeScriptNum (BS.pack [0x01, 0x02, 0x03, 0x04, 0x05]) of
+        Left _ -> return ()
+        Right _ -> expectationFailure "Should reject > 4 bytes"
+
+  describe "isTrue" $ do
+    it "empty is false" $ do
+      isTrue BS.empty `shouldBe` False
+
+    it "zero is false" $ do
+      isTrue (BS.pack [0x00]) `shouldBe` False
+      isTrue (BS.pack [0x00, 0x00]) `shouldBe` False
+
+    it "negative zero is false" $ do
+      isTrue (BS.pack [0x80]) `shouldBe` False
+
+    it "non-zero is true" $ do
+      isTrue (BS.pack [0x01]) `shouldBe` True
+      isTrue (BS.pack [0xff]) `shouldBe` True
+      isTrue (BS.pack [0x00, 0x01]) `shouldBe` True
+
+  describe "opN" $ do
+    it "returns correct opcodes" $ do
+      opN 0 `shouldBe` OP_0
+      opN 1 `shouldBe` OP_1
+      opN 16 `shouldBe` OP_16
+
+    it "returns OP_0 for out of range" $ do
+      opN 17 `shouldBe` OP_0
+      opN (-1) `shouldBe` OP_0
+
+  describe "Script evaluation (basic ops)" $ do
+    it "evaluates OP_1 OP_1 OP_ADD OP_2 OP_EQUAL" $ do
+      let scriptSig = Script []
+          scriptPubKey = Script [OP_1, OP_1, OP_ADD, OP_2, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "evaluates OP_1 OP_2 OP_ADD OP_4 OP_EQUAL (false)" $ do
+      let scriptSig = Script []
+          scriptPubKey = Script [OP_1, OP_2, OP_ADD, OP_4, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right False
+
+    it "evaluates OP_DUP" $ do
+      let scriptSig = Script [OP_1]
+          scriptPubKey = Script [OP_DUP, OP_ADD, OP_2, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "evaluates OP_SWAP" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_SWAP, OP_SUB, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "evaluates OP_IF/OP_ELSE/OP_ENDIF (true branch)" $ do
+      let scriptSig = Script [OP_1]
+          scriptPubKey = Script [OP_IF, OP_2, OP_ELSE, OP_3, OP_ENDIF]
+          dummyTx = Tx 1 [] [] [] 0
+      -- Stack should have 2 on top (true branch), which is truthy
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "evaluates OP_IF/OP_ELSE/OP_ENDIF (false branch)" $ do
+      let scriptSig = Script [OP_0]
+          scriptPubKey = Script [OP_IF, OP_0, OP_ELSE, OP_1, OP_ENDIF]
+          dummyTx = Tx 1 [] [] [] 0
+      -- Stack should have 1 on top (false branch), which is truthy
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "evaluates OP_HASH160" $ do
+      let scriptSig = Script [OP_PUSHDATA (BS.pack [0x01, 0x02, 0x03]) OPCODE]
+          expectedHash = hash160 (BS.pack [0x01, 0x02, 0x03])
+          scriptPubKey = Script [OP_HASH160, OP_PUSHDATA (getHash160 expectedHash) OPCODE, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "rejects OP_RETURN" $ do
+      let scriptSig = Script []
+          scriptPubKey = Script [OP_RETURN]
+          dummyTx = Tx 1 [] [] [] 0
+      case evalScript dummyTx 0 0 scriptSig scriptPubKey of
+        Left _ -> return ()
+        Right _ -> expectationFailure "Should reject OP_RETURN"
+
+    it "rejects disabled opcodes (OP_CAT)" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_CAT]
+          dummyTx = Tx 1 [] [] [] 0
+      case evalScript dummyTx 0 0 scriptSig scriptPubKey of
+        Left msg | "disabled" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject OP_CAT"
+
+    it "rejects stack underflow" $ do
+      let scriptSig = Script []
+          scriptPubKey = Script [OP_DUP]
+          dummyTx = Tx 1 [] [] [] 0
+      case evalScript dummyTx 0 0 scriptSig scriptPubKey of
+        Left _ -> return ()
+        Right _ -> expectationFailure "Should reject stack underflow"
+
+  describe "OP_RETURN in non-executing branch" $ do
+    it "does not terminate script in false IF branch" $ do
+      let scriptSig = Script [OP_0]  -- false
+          scriptPubKey = Script [OP_IF, OP_RETURN, OP_ELSE, OP_1, OP_ENDIF]
+          dummyTx = Tx 1 [] [] [] 0
+      -- Should skip OP_RETURN and execute ELSE branch
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  describe "Arithmetic operations" $ do
+    it "OP_1ADD increments" $ do
+      let scriptSig = Script [OP_5]
+          scriptPubKey = Script [OP_1ADD, OP_6, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_1SUB decrements" $ do
+      let scriptSig = Script [OP_5]
+          scriptPubKey = Script [OP_1SUB, OP_4, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_NEGATE negates" $ do
+      let scriptSig = Script [OP_5]
+          scriptPubKey = Script [OP_NEGATE, OP_PUSHDATA (encodeScriptNum (-5)) OPCODE, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_ABS takes absolute value" $ do
+      let scriptSig = Script [OP_PUSHDATA (encodeScriptNum (-5)) OPCODE]
+          scriptPubKey = Script [OP_ABS, OP_5, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_NOT returns 1 for 0" $ do
+      let scriptSig = Script [OP_0]
+          scriptPubKey = Script [OP_NOT, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_NOT returns 0 for non-zero" $ do
+      let scriptSig = Script [OP_5]
+          scriptPubKey = Script [OP_NOT, OP_0, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_BOOLAND works correctly" $ do
+      let scriptSig = Script [OP_1, OP_1]
+          scriptPubKey = Script [OP_BOOLAND]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_BOOLOR works correctly" $ do
+      let scriptSig = Script [OP_0, OP_1]
+          scriptPubKey = Script [OP_BOOLOR]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_LESSTHAN compares correctly" $ do
+      let scriptSig = Script [OP_3, OP_5]
+          scriptPubKey = Script [OP_LESSTHAN]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_WITHIN checks range" $ do
+      let scriptSig = Script [OP_5, OP_3, OP_7]  -- x=5, min=3, max=7, so 3 <= 5 < 7
+          scriptPubKey = Script [OP_WITHIN]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_MIN returns minimum" $ do
+      let scriptSig = Script [OP_3, OP_7]
+          scriptPubKey = Script [OP_MIN, OP_3, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_MAX returns maximum" $ do
+      let scriptSig = Script [OP_3, OP_7]
+          scriptPubKey = Script [OP_MAX, OP_7, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  describe "Stack operations" $ do
+    it "OP_DEPTH returns stack size" $ do
+      let scriptSig = Script [OP_1, OP_2, OP_3]
+          scriptPubKey = Script [OP_DEPTH, OP_3, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_DROP removes top element" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_DROP, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_NIP removes second element" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_NIP, OP_2, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_OVER copies second element" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_OVER, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_ROT rotates top 3" $ do
+      let scriptSig = Script [OP_1, OP_2, OP_3]
+          scriptPubKey = Script [OP_ROT, OP_1, OP_EQUAL]  -- 3,1,2 -> top is 1
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_TUCK copies top behind second" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_TUCK, OP_DEPTH, OP_3, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_2DUP duplicates top 2" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_2DUP, OP_DEPTH, OP_4, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_3DUP duplicates top 3" $ do
+      let scriptSig = Script [OP_1, OP_2, OP_3]
+          scriptPubKey = Script [OP_3DUP, OP_DEPTH, OP_6, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_SIZE pushes element size" $ do
+      let scriptSig = Script [OP_PUSHDATA (BS.pack [0x01, 0x02, 0x03]) OPCODE]
+          scriptPubKey = Script [OP_SIZE, OP_3, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_IFDUP duplicates if true" $ do
+      let scriptSig = Script [OP_1]
+          scriptPubKey = Script [OP_IFDUP, OP_DEPTH, OP_2, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_IFDUP does not duplicate if false" $ do
+      let scriptSig = Script [OP_0]
+          scriptPubKey = Script [OP_IFDUP, OP_DEPTH, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  describe "Crypto operations" $ do
+    it "OP_SHA256 computes SHA256" $ do
+      let input = BS.pack [0x01, 0x02, 0x03]
+          expected = sha256 input
+          scriptSig = Script [OP_PUSHDATA input OPCODE]
+          scriptPubKey = Script [OP_SHA256, OP_PUSHDATA expected OPCODE, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_HASH256 computes double SHA256" $ do
+      let input = BS.pack [0x01, 0x02, 0x03]
+          Hash256 expected = doubleSHA256 input
+          scriptSig = Script [OP_PUSHDATA input OPCODE]
+          scriptPubKey = Script [OP_HASH256, OP_PUSHDATA expected OPCODE, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_RIPEMD160 computes RIPEMD160" $ do
+      let input = BS.pack [0x01, 0x02, 0x03]
+          expected = ripemd160 input
+          scriptSig = Script [OP_PUSHDATA input OPCODE]
+          scriptPubKey = Script [OP_RIPEMD160, OP_PUSHDATA expected OPCODE, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  describe "EQUALVERIFY" $ do
+    it "passes when equal" $ do
+      let scriptSig = Script [OP_1, OP_1]
+          scriptPubKey = Script [OP_EQUALVERIFY, OP_1]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "fails when not equal" $ do
+      let scriptSig = Script [OP_1, OP_2]
+          scriptPubKey = Script [OP_EQUALVERIFY, OP_1]
+          dummyTx = Tx 1 [] [] [] 0
+      case evalScript dummyTx 0 0 scriptSig scriptPubKey of
+        Left _ -> return ()
+        Right _ -> expectationFailure "Should fail on unequal EQUALVERIFY"
+
+  describe "Nested IF" $ do
+    it "handles nested IF correctly" $ do
+      let scriptSig = Script [OP_1, OP_1]
+          -- if (1) { if (1) { 5 } else { 6 } } else { 7 }
+          scriptPubKey = Script
+            [ OP_IF
+            ,   OP_IF
+            ,     OP_5
+            ,   OP_ELSE
+            ,     OP_6
+            ,   OP_ENDIF
+            , OP_ELSE
+            ,   OP_7
+            , OP_ENDIF
+            ]
+          dummyTx = Tx 1 [] [] [] 0
+      -- Inner if is true, so result should be 5
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  describe "OP_NOTIF" $ do
+    it "executes on false" $ do
+      let scriptSig = Script [OP_0]
+          scriptPubKey = Script [OP_NOTIF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "skips on true" $ do
+      let scriptSig = Script [OP_1]
+          scriptPubKey = Script [OP_NOTIF, OP_0, OP_ELSE, OP_1, OP_ENDIF]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  describe "OP_VERIFY" $ do
+    it "passes on true" $ do
+      let scriptSig = Script [OP_1]
+          scriptPubKey = Script [OP_VERIFY, OP_1]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "fails on false" $ do
+      let scriptSig = Script [OP_0]
+          scriptPubKey = Script [OP_VERIFY, OP_1]
+          dummyTx = Tx 1 [] [] [] 0
+      case evalScript dummyTx 0 0 scriptSig scriptPubKey of
+        Left _ -> return ()
+        Right _ -> expectationFailure "Should fail on false VERIFY"
+
+  describe "OP_PICK and OP_ROLL" $ do
+    it "OP_PICK copies nth element" $ do
+      let scriptSig = Script [OP_1, OP_2, OP_3, OP_2]  -- pick index 2 (0-indexed)
+          scriptPubKey = Script [OP_PICK, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+    it "OP_ROLL moves nth element to top" $ do
+      let scriptSig = Script [OP_1, OP_2, OP_3, OP_2]
+          scriptPubKey = Script [OP_ROLL, OP_1, OP_EQUAL]
+          dummyTx = Tx 1 [] [] [] 0
+      evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
