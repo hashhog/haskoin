@@ -7,9 +7,11 @@ import Test.QuickCheck
 import Data.Serialize (encode, decode, runPut, runGet)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import Data.Word (Word64)
 
 import Haskoin.Types
+import Haskoin.Crypto
 
 main :: IO ()
 main = hspec $ do
@@ -138,3 +140,116 @@ main = hspec $ do
     it "roundtrips correctly" $ do
       let ws = WitnessStack ["item1", "item2", "item3"]
       decode (encode ws) `shouldBe` Right ws
+
+  -- Crypto module tests
+  describe "SHA256" $ do
+    it "computes correct hash for empty string" $ do
+      -- SHA256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+      let expected = fst $ B16.decode "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      sha256 "" `shouldBe` expected
+
+    it "computes correct hash for 'abc'" $ do
+      -- SHA256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+      let expected = fst $ B16.decode "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+      sha256 "abc" `shouldBe` expected
+
+  describe "doubleSHA256" $ do
+    it "computes correct double hash" $ do
+      -- doubleSHA256("abc") = SHA256(SHA256("abc"))
+      let Hash256 result = doubleSHA256 "abc"
+          expected = sha256 (sha256 "abc")
+      result `shouldBe` expected
+
+  describe "RIPEMD160" $ do
+    it "computes correct hash for empty string" $ do
+      -- RIPEMD160("") = 9c1185a5c5e9fc54612808977ee8f548b2258d31
+      let expected = fst $ B16.decode "9c1185a5c5e9fc54612808977ee8f548b2258d31"
+      ripemd160 "" `shouldBe` expected
+
+    it "computes correct hash for 'abc'" $ do
+      -- RIPEMD160("abc") = 8eb208f7e05d987a9b044a8e98c6b087f15a0bfc
+      let expected = fst $ B16.decode "8eb208f7e05d987a9b044a8e98c6b087f15a0bfc"
+      ripemd160 "abc" `shouldBe` expected
+
+  describe "hash160" $ do
+    it "computes RIPEMD160(SHA256(data))" $ do
+      let Hash160 result = hash160 "abc"
+          expected = ripemd160 (sha256 "abc")
+      result `shouldBe` expected
+
+  describe "parsePubKey" $ do
+    it "parses compressed public key (0x02 prefix)" $ do
+      let pk = BS.cons 0x02 (BS.replicate 32 0xab)
+      parsePubKey pk `shouldBe` Just (PubKeyCompressed pk)
+
+    it "parses compressed public key (0x03 prefix)" $ do
+      let pk = BS.cons 0x03 (BS.replicate 32 0xcd)
+      parsePubKey pk `shouldBe` Just (PubKeyCompressed pk)
+
+    it "parses uncompressed public key (0x04 prefix)" $ do
+      let pk = BS.cons 0x04 (BS.replicate 64 0xef)
+      parsePubKey pk `shouldBe` Just (PubKeyUncompressed pk)
+
+    it "rejects invalid prefix" $ do
+      let pk = BS.cons 0x05 (BS.replicate 32 0x00)
+      parsePubKey pk `shouldBe` Nothing
+
+    it "rejects wrong length" $ do
+      let pk = BS.cons 0x02 (BS.replicate 31 0x00)  -- too short
+      parsePubKey pk `shouldBe` Nothing
+
+  describe "serializePubKeyCompressed" $ do
+    it "returns compressed key unchanged" $ do
+      let pk = BS.cons 0x02 (BS.replicate 32 0xab)
+      serializePubKeyCompressed (PubKeyCompressed pk) `shouldBe` pk
+
+    it "compresses uncompressed key based on y parity" $ do
+      -- y ends with odd byte -> 0x03 prefix
+      let x = BS.replicate 32 0xaa
+          yOdd = BS.replicate 31 0x00 `BS.append` BS.singleton 0x01
+          uncompressed = BS.concat [BS.singleton 0x04, x, yOdd]
+      serializePubKeyCompressed (PubKeyUncompressed uncompressed) `shouldBe` BS.cons 0x03 x
+
+  describe "parseSigDER" $ do
+    it "parses valid DER signature" $ do
+      -- Minimal valid DER: 0x30 0x06 0x02 0x01 0x01 0x02 0x01 0x01
+      let sig = BS.pack [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]
+      parseSigDER sig `shouldBe` Just (Sig sig)
+
+    it "rejects non-DER data" $ do
+      let notDer = BS.pack [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+      parseSigDER notDer `shouldBe` Nothing
+
+  describe "SigHashType" $ do
+    it "sigHashAll encodes to 0x01" $ do
+      sigHashTypeToWord32 sigHashAll `shouldBe` 0x01
+
+    it "sigHashNone encodes to 0x02" $ do
+      sigHashTypeToWord32 sigHashNone `shouldBe` 0x02
+
+    it "sigHashSingle encodes to 0x03" $ do
+      sigHashTypeToWord32 sigHashSingle `shouldBe` 0x03
+
+    it "ANYONECANPAY sets 0x80 flag" $ do
+      sigHashTypeToWord32 (sigHashAnyoneCanPay sigHashAll) `shouldBe` 0x81
+      sigHashTypeToWord32 (sigHashAnyoneCanPay sigHashNone) `shouldBe` 0x82
+      sigHashTypeToWord32 (sigHashAnyoneCanPay sigHashSingle) `shouldBe` 0x83
+
+  describe "computeTxId" $ do
+    it "computes txid from non-witness data" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0x00))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          txout = TxOut 100000 "scriptpubkey"
+          tx = Tx 1 [txin] [txout] [[]] 0
+          TxId (Hash256 computed) = computeTxId tx
+      -- TxId should be 32 bytes (double SHA256)
+      BS.length computed `shouldBe` 32
+
+  describe "computeBlockHash" $ do
+    it "computes block hash from header" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          merkle = Hash256 (BS.replicate 32 0x00)
+          header = BlockHeader 1 prevHash merkle 0 0 0
+          BlockHash (Hash256 computed) = computeBlockHash header
+      -- Block hash should be 32 bytes
+      BS.length computed `shouldBe` 32
