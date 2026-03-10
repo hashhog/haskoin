@@ -20,7 +20,9 @@ import Haskoin.Script
 import Haskoin.Consensus
 import Haskoin.Storage
 import Haskoin.Network
+import Haskoin.Sync
 import qualified Data.Map.Strict as Map
+import Control.Concurrent.STM
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
@@ -2051,3 +2053,76 @@ main = hspec $ do
       tip <- getChainTip hc
       ancestor <- getAncestor hc (ceHash tip) 100
       ancestor `shouldBe` Nothing
+
+  -- Phase 13: Block Download & IBD tests
+  describe "IBDState" $ do
+    it "IBDNotStarted is distinct from other states" $ do
+      IBDNotStarted `shouldBe` IBDNotStarted
+      IBDNotStarted `shouldNotBe` IBDComplete
+
+    it "IBDDownloading contains current and target height" $ do
+      let state = IBDDownloading 100 500
+      state `shouldBe` IBDDownloading 100 500
+      state `shouldNotBe` IBDDownloading 200 500
+
+    it "IBDComplete is distinct" $ do
+      IBDComplete `shouldBe` IBDComplete
+      IBDComplete `shouldNotBe` IBDNotStarted
+
+  describe "BlockRequest" $ do
+    it "stores all required fields" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xab))
+          req = BlockRequest bh 100 Nothing 1234567890 False 0
+      brHash req `shouldBe` bh
+      brHeight req `shouldBe` 100
+      brPeer req `shouldBe` Nothing
+      brRequested req `shouldBe` 1234567890
+      brReceived req `shouldBe` False
+      brRetries req `shouldBe` 0
+
+    it "can mark block as received" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xcd))
+          req = BlockRequest bh 200 Nothing 1234567890 False 0
+          received = req { brReceived = True }
+      brReceived received `shouldBe` True
+
+    it "can increment retries" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xef))
+          req = BlockRequest bh 300 Nothing 1234567890 False 0
+          retried = req { brRetries = brRetries req + 1 }
+      brRetries retried `shouldBe` 1
+
+  describe "flushTBQueue" $ do
+    it "returns empty list from empty queue" $ do
+      q <- atomically $ newTBQueue 10
+      result <- atomically $ flushTBQueue q 5
+      result `shouldBe` ([] :: [Int])
+
+    it "returns all items when fewer than limit" $ do
+      q <- atomically $ newTBQueue 10
+      atomically $ do
+        writeTBQueue q (1 :: Int)
+        writeTBQueue q 2
+        writeTBQueue q 3
+      result <- atomically $ flushTBQueue q 10
+      result `shouldBe` [1, 2, 3]
+
+    it "returns only up to limit items" $ do
+      q <- atomically $ newTBQueue 10
+      atomically $ do
+        writeTBQueue q (1 :: Int)
+        writeTBQueue q 2
+        writeTBQueue q 3
+        writeTBQueue q 4
+        writeTBQueue q 5
+      result <- atomically $ flushTBQueue q 3
+      result `shouldBe` [1, 2, 3]
+      -- Remaining items should still be in queue
+      remaining <- atomically $ flushTBQueue q 10
+      remaining `shouldBe` [4, 5]
+
+    it "handles zero limit" $ do
+      q <- atomically $ newTBQueue 10
+      atomically $ writeTBQueue q (1 :: Int)
+      result <- atomically $ flushTBQueue q 0
+      result `shouldBe` []
