@@ -75,6 +75,12 @@ system to make invalid states unrepresentable.
 - [x] Adaptive stall detection and re-request
 - [x] Batch GetData messages for efficiency
 - [x] Block validation and chain connection during IBD
+- [x] In-memory UTXO cache with dirty tracking
+- [x] UTXOEntry with metadata (height, coinbase flag)
+- [x] Undo data generation for chain reorganizations
+- [x] Chain state persistence (height, best block, chain work)
+- [x] Coinbase maturity validation (100 block rule)
+- [x] Chain reorganization support (disconnect/reconnect)
 - [ ] ECDSA signing/verification (requires secp256k1)
 - [ ] Mempool management
 
@@ -95,8 +101,8 @@ haskoin/
       Types.hs      -- core data types and serialization
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
       Script.hs     -- script parsing, classification, interpreter
-      Consensus.hs  -- network config, validation, header sync
-      Storage.hs    -- rocksdb persistence layer
+      Consensus.hs  -- network config, validation, header sync, reorgs
+      Storage.hs    -- rocksdb persistence, UTXO cache, undo data
       Network.hs    -- p2p messages, peer connection, peer manager
       Sync.hs       -- block download, IBD pipeline
   app/
