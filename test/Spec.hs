@@ -28,6 +28,7 @@ import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
 import Haskoin.FeeEstimator
+import Haskoin.Wallet
 import qualified Data.Map.Strict as Map
 import Control.Concurrent.STM
 
@@ -2617,3 +2618,264 @@ main = hspec $ do
         length (fbConfirmations bucket) `shouldBe` 48
         fbTotalTxs bucket `shouldBe` 100
         fbInMempool bucket `shouldBe` 5
+
+  -- Wallet module tests
+  describe "BIP-39 Mnemonic" $ do
+    it "bip39WordList has exactly 2048 words" $ do
+      length bip39WordList `shouldBe` 2048
+
+    it "bip39WordList first word is 'abandon'" $ do
+      head bip39WordList `shouldBe` "abandon"
+
+    it "bip39WordList last word is 'zoo'" $ do
+      last bip39WordList `shouldBe` "zoo"
+
+    it "generateMnemonic produces 24 words for 256-bit strength" $ do
+      mnemonic <- generateMnemonic 256
+      length (getMnemonicWords mnemonic) `shouldBe` 24
+
+    it "generateMnemonic produces 12 words for 128-bit strength" $ do
+      mnemonic <- generateMnemonic 128
+      length (getMnemonicWords mnemonic) `shouldBe` 12
+
+    it "generated mnemonic words are in dictionary" $ do
+      mnemonic <- generateMnemonic 256
+      let words' = getMnemonicWords mnemonic
+      all (`elem` bip39WordList) words' `shouldBe` True
+
+    it "validateMnemonic accepts valid mnemonic" $ do
+      mnemonic <- generateMnemonic 256
+      validateMnemonic mnemonic `shouldBe` True
+
+    it "validateMnemonic rejects mnemonic with wrong word count" $ do
+      let badMnemonic = Mnemonic (replicate 11 "abandon")
+      validateMnemonic badMnemonic `shouldBe` False
+
+    it "validateMnemonic rejects mnemonic with invalid words" $ do
+      let badMnemonic = Mnemonic (replicate 12 "notaword")
+      validateMnemonic badMnemonic `shouldBe` False
+
+    it "mnemonicToSeed produces 64-byte seed" $ do
+      mnemonic <- generateMnemonic 256
+      let seed = mnemonicToSeed mnemonic ""
+      BS.length seed `shouldBe` 64
+
+    it "mnemonicToSeed is deterministic" $ do
+      mnemonic <- generateMnemonic 256
+      let seed1 = mnemonicToSeed mnemonic "password"
+          seed2 = mnemonicToSeed mnemonic "password"
+      seed1 `shouldBe` seed2
+
+    it "mnemonicToSeed differs with different passphrase" $ do
+      mnemonic <- generateMnemonic 256
+      let seed1 = mnemonicToSeed mnemonic "password1"
+          seed2 = mnemonicToSeed mnemonic "password2"
+      seed1 `shouldNotBe` seed2
+
+  describe "BIP-32 Key Derivation" $ do
+    it "masterKey produces ExtendedKey from seed" $ do
+      let seed = BS.replicate 64 0xab
+          master = masterKey seed
+      BS.length (ekChainCode master) `shouldBe` 32
+      ekDepth master `shouldBe` 0
+      ekParentFP master `shouldBe` 0
+      ekIndex master `shouldBe` 0
+
+    it "derivePrivate increases depth" $ do
+      let seed = BS.replicate 64 0xab
+          master = masterKey seed
+          child = derivePrivate master 0
+      ekDepth child `shouldBe` 1
+
+    it "derivePrivate sets correct index" $ do
+      let seed = BS.replicate 64 0xab
+          master = masterKey seed
+          child = derivePrivate master 42
+      ekIndex child `shouldBe` 42
+
+    it "deriveHardened sets hardened index bit" $ do
+      let seed = BS.replicate 64 0xab
+          master = masterKey seed
+          child = deriveHardened master 0
+      (ekIndex child >= 0x80000000) `shouldBe` True
+
+    it "derivePath follows multiple indices" $ do
+      let seed = BS.replicate 64 0xab
+          master = masterKey seed
+          path = [0x80000000 .|. 84, 0x80000000 .|. 0, 0x80000000 .|. 0]
+          derived = derivePath master path
+      ekDepth derived `shouldBe` 3
+
+    it "toExtendedPubKey converts to public key" $ do
+      let seed = BS.replicate 64 0xab
+          master = masterKey seed
+          pubKey = toExtendedPubKey master
+      epkDepth pubKey `shouldBe` 0
+      epkChainCode pubKey `shouldBe` ekChainCode master
+
+  describe "BIP-44/84 Paths" $ do
+    it "bip44Path produces correct path" $ do
+      let path = bip44Path 0
+      length path `shouldBe` 3
+      path !! 0 `shouldBe` (0x80000000 .|. 44)  -- 44'
+      path !! 1 `shouldBe` (0x80000000 .|. 0)   -- 0' (Bitcoin)
+      path !! 2 `shouldBe` (0x80000000 .|. 0)   -- 0' (account 0)
+
+    it "bip84Path produces correct path" $ do
+      let path = bip84Path 0
+      length path `shouldBe` 3
+      path !! 0 `shouldBe` (0x80000000 .|. 84)  -- 84'
+      path !! 1 `shouldBe` (0x80000000 .|. 0)   -- 0' (Bitcoin)
+      path !! 2 `shouldBe` (0x80000000 .|. 0)   -- 0' (account 0)
+
+    it "defaultDerivationPath is bip84Path 0" $ do
+      defaultDerivationPath `shouldBe` bip84Path 0
+
+    it "parseDerivationPath parses m/84'/0'/0'" $ do
+      let path = parseDerivationPath "m/84'/0'/0'"
+      path `shouldBe` Just [0x80000000 .|. 84, 0x80000000 .|. 0, 0x80000000 .|. 0]
+
+    it "parseDerivationPath parses non-hardened path" $ do
+      let path = parseDerivationPath "m/0/1/2"
+      path `shouldBe` Just [0, 1, 2]
+
+  describe "Wallet" $ do
+    it "createWallet generates new mnemonic and wallet" $ do
+      let config = WalletConfig mainnet 20 ""
+      (mnemonic, wallet) <- createWallet config
+      length (getMnemonicWords mnemonic) `shouldBe` 24
+      walletGapLimit wallet `shouldBe` 20
+
+    it "loadWallet creates wallet from mnemonic" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      walletGapLimit wallet `shouldBe` 20
+
+    it "getReceiveAddress returns unique addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      addr1 <- getReceiveAddress wallet
+      addr2 <- getReceiveAddress wallet
+      addr1 `shouldNotBe` addr2
+
+    it "getReceiveAddressAt is deterministic" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet1 <- loadWallet config mnemonic
+      wallet2 <- loadWallet config mnemonic
+      addr1 <- getReceiveAddressAt wallet1 0
+      addr2 <- getReceiveAddressAt wallet2 0
+      addr1 `shouldBe` addr2
+
+    it "isOurAddress returns True for generated addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      addr <- getReceiveAddress wallet
+      isOurs <- isOurAddress wallet addr
+      isOurs `shouldBe` True
+
+    it "isOurAddress returns False for unknown addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      let unknownAddr = WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xff))
+      isOurs <- isOurAddress wallet unknownAddr
+      isOurs `shouldBe` False
+
+    it "getBalance starts at zero" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      balance <- getBalance wallet
+      balance `shouldBe` 0
+
+    it "addWalletUTXO increases balance" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+          txout = TxOut 100000 ""
+      addWalletUTXO wallet op txout 6
+      balance <- getBalance wallet
+      balance `shouldBe` 100000
+
+    it "removeWalletUTXO decreases balance" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+          txout = TxOut 100000 ""
+      addWalletUTXO wallet op txout 6
+      removeWalletUTXO wallet op
+      balance <- getBalance wallet
+      balance `shouldBe` 0
+
+  describe "Coin Selection" $ do
+    it "selectCoins returns error for insufficient funds" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      let outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xaa))) 100000]
+      result <- selectCoins wallet outputs (FeeRate 10)
+      case result of
+        Left _ -> return ()  -- Expected
+        Right _ -> expectationFailure "Expected insufficient funds error"
+
+    it "selectCoins succeeds with sufficient funds" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      -- Add some UTXOs
+      let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+          txout = TxOut 1000000 ""  -- 0.01 BTC
+      addWalletUTXO wallet op txout 6
+      let outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 100000]
+      result <- selectCoins wallet outputs (FeeRate 10)
+      case result of
+        Left err -> expectationFailure $ "Expected success, got: " ++ err
+        Right cs -> do
+          length (csInputs cs) `shouldBe` 1
+          csFee cs `shouldSatisfy` (> 0)
+
+    it "selectCoins includes change output when appropriate" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+          txout = TxOut 1000000 ""  -- 0.01 BTC
+      addWalletUTXO wallet op txout 6
+      let outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 100000]
+      result <- selectCoins wallet outputs (FeeRate 10)
+      case result of
+        Right cs -> csChange cs `shouldSatisfy` (/= Nothing)
+        Left err -> expectationFailure $ "Expected success, got: " ++ err
+
+  describe "Transaction Creation" $ do
+    it "createTransaction builds valid transaction structure" $ do
+      let inputs = [(OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0, TxOut 1000000 "")]
+          outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 100000]
+          change = Just (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xcc)), 800000)
+          cs = CoinSelection inputs outputs change 100000 (FeeRate 10)
+          tx = createTransaction cs
+      length (txInputs tx) `shouldBe` 1
+      length (txOutputs tx) `shouldBe` 2  -- 1 output + 1 change
+      txVersion tx `shouldBe` 2
+
+    it "createTransaction sets correct output values" $ do
+      let inputs = [(OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0, TxOut 1000000 "")]
+          outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 500000]
+          change = Just (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xcc)), 400000)
+          cs = CoinSelection inputs outputs change 100000 (FeeRate 10)
+          tx = createTransaction cs
+      txOutValue (txOutputs tx !! 0) `shouldBe` 500000
+      txOutValue (txOutputs tx !! 1) `shouldBe` 400000
+
+    it "createTransaction handles no change" $ do
+      let inputs = [(OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0, TxOut 100000 "")]
+          outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 99000]
+          cs = CoinSelection inputs outputs Nothing 1000 (FeeRate 10)
+          tx = createTransaction cs
+      length (txOutputs tx) `shouldBe` 1
