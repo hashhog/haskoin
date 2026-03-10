@@ -19,6 +19,7 @@ import Haskoin.Crypto
 import Haskoin.Script
 import Haskoin.Consensus
 import Haskoin.Storage
+import qualified Data.Map.Strict as Map
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
@@ -1274,3 +1275,270 @@ main = hspec $ do
       BS.head key `shouldBe` prefixByte PrefixBlockHeight
       -- Rest of key should be big-endian height
       BS.take 4 (BS.drop 1 key) `shouldBe` toBE32 100
+
+  -- Phase 8: Block & Transaction Validation tests
+  describe "Coinbase detection" $ do
+    it "isCoinbase returns True for coinbase transaction" $ do
+      let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint (BS.replicate 10 0x04) 0xffffffff
+          tx = Tx 1 [txin] [TxOut 5000000000 "script"] [[]] 0
+      isCoinbase tx `shouldBe` True
+
+    it "isCoinbase returns False for regular transaction" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          tx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
+      isCoinbase tx `shouldBe` False
+
+    it "isCoinbase returns False when index is not 0xffffffff" $ do
+      let nullHash = TxId (Hash256 (BS.replicate 32 0))
+          txin = TxIn (OutPoint nullHash 0) "scriptsig" 0xffffffff  -- index is 0, not 0xffffffff
+          tx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
+      isCoinbase tx `shouldBe` False
+
+    it "isCoinbase returns False when hash is not all zeros" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          txin = TxIn (OutPoint txid 0xffffffff) "scriptsig" 0xffffffff
+          tx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
+      isCoinbase tx `shouldBe` False
+
+  describe "BIP-34 coinbase height" $ do
+    it "coinbaseHeight extracts 1-byte height" $ do
+      -- Height 1 encoded as: 0x01 0x01 (push 1 byte, value 1)
+      let script = BS.pack [0x01, 0x01]
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint script 0xffffffff
+          tx = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
+      coinbaseHeight tx `shouldBe` Just 1
+
+    it "coinbaseHeight extracts 2-byte height" $ do
+      -- Height 256 = 0x0100 little-endian encoded as: 0x02 0x00 0x01
+      let script = BS.pack [0x02, 0x00, 0x01]
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint script 0xffffffff
+          tx = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
+      coinbaseHeight tx `shouldBe` Just 256
+
+    it "coinbaseHeight extracts 3-byte height" $ do
+      -- Height 500000 = 0x07A120 little-endian: 0x20 0xA1 0x07
+      let script = BS.pack [0x03, 0x20, 0xa1, 0x07]
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint script 0xffffffff
+          tx = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
+      coinbaseHeight tx `shouldBe` Just 500000
+
+    it "coinbaseHeight returns Nothing for non-coinbase" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          tx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
+      coinbaseHeight tx `shouldBe` Nothing
+
+    it "coinbaseHeight returns Nothing for empty script" $ do
+      let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint BS.empty 0xffffffff
+          tx = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
+      coinbaseHeight tx `shouldBe` Nothing
+
+  describe "Block weight (BIP-141)" $ do
+    it "calculates weight for block without witness data" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          header = BlockHeader 1 prevHash merkle 0 0 0
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint (BS.replicate 10 0x04) 0xffffffff
+          txout = TxOut 5000000000 (BS.replicate 25 0xac)
+          coinbase = Tx 1 [txin] [txout] [[]] 0
+          block = Block header [coinbase]
+      -- For non-witness block: weight = base_size * 4
+      -- Since there's no witness, base_size = total_size
+      let weight = blockWeight block
+      weight `shouldBe` blockBaseSize block * 4
+
+    it "calculates weight for block with witness data" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          header = BlockHeader 1 prevHash merkle 0 0 0
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          coinbaseIn = TxIn nullOutpoint (BS.replicate 10 0x04) 0xffffffff
+          -- Add a witness item to coinbase
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"]
+                        [[BS.replicate 32 0x00]] 0
+          block = Block header [coinbase]
+      -- With witness: weight = base_size * 3 + total_size
+      let weight = blockWeight block
+          base = blockBaseSize block
+          total = blockTotalSize block
+      weight `shouldBe` (base * 3 + total)
+
+    it "checkBlockWeight accepts valid block" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          header = BlockHeader 1 prevHash merkle 0 0 0
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint (BS.replicate 10 0x04) 0xffffffff
+          coinbase = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
+          block = Block header [coinbase]
+      checkBlockWeight block `shouldBe` True
+
+  describe "Consensus flags" $ do
+    it "all flags disabled at height 0 on mainnet" $ do
+      let flags = consensusFlagsAtHeight mainnet 0
+      flagBIP34 flags `shouldBe` False
+      flagBIP65 flags `shouldBe` False
+      flagBIP66 flags `shouldBe` False
+      flagSegWit flags `shouldBe` False
+      flagTaproot flags `shouldBe` False
+
+    it "BIP-34 active at mainnet height 227931" $ do
+      let flags = consensusFlagsAtHeight mainnet 227931
+      flagBIP34 flags `shouldBe` True
+      flagBIP65 flags `shouldBe` False
+      flagBIP66 flags `shouldBe` False
+
+    it "BIP-66 active at mainnet height 363725" $ do
+      let flags = consensusFlagsAtHeight mainnet 363725
+      flagBIP34 flags `shouldBe` True
+      flagBIP66 flags `shouldBe` True
+      flagBIP65 flags `shouldBe` False
+
+    it "BIP-65 active at mainnet height 388381" $ do
+      let flags = consensusFlagsAtHeight mainnet 388381
+      flagBIP34 flags `shouldBe` True
+      flagBIP66 flags `shouldBe` True
+      flagBIP65 flags `shouldBe` True
+      flagSegWit flags `shouldBe` False
+
+    it "SegWit active at mainnet height 481824" $ do
+      let flags = consensusFlagsAtHeight mainnet 481824
+      flagSegWit flags `shouldBe` True
+      flagNullDummy flags `shouldBe` True
+      flagTaproot flags `shouldBe` False
+
+    it "Taproot active at mainnet height 709632" $ do
+      let flags = consensusFlagsAtHeight mainnet 709632
+      flagTaproot flags `shouldBe` True
+      flagSegWit flags `shouldBe` True
+
+    it "all flags active from genesis on regtest" $ do
+      let flags = consensusFlagsAtHeight regtest 0
+      flagSegWit flags `shouldBe` True
+      flagTaproot flags `shouldBe` True
+
+  describe "Full block validation" $ do
+    it "rejects block with no transactions" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          block = Block header []
+          cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
+      case validateFullBlock regtest cs block Map.empty of
+        Left msg | "no transactions" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject block with no transactions"
+
+    it "rejects block when first transaction is not coinbase" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          regularTx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
+          block = Block header [regularTx]
+          cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
+      case validateFullBlock regtest cs block Map.empty of
+        Left msg | "not coinbase" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject when first tx is not coinbase"
+
+    it "rejects block with multiple coinbase transactions" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          coinbaseIn = TxIn nullOutpoint (BS.pack [0x01, 0x01]) 0xffffffff
+          coinbase1 = Tx 1 [coinbaseIn] [TxOut 5000000000 "out1"] [[]] 0
+          coinbase2 = Tx 1 [coinbaseIn] [TxOut 1000000000 "out2"] [[]] 0
+          block = Block header [coinbase1, coinbase2]
+          cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
+      case validateFullBlock regtest cs block Map.empty of
+        Left msg | "Multiple coinbase" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject block with multiple coinbase"
+
+    it "rejects block with mismatched merkle root" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          wrongMerkle = Hash256 (BS.replicate 32 0xff)  -- Wrong merkle root
+          header = BlockHeader 1 prevHash wrongMerkle 0 0x207fffff 0
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          coinbaseIn = TxIn nullOutpoint (BS.pack [0x01, 0x01]) 0xffffffff
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          block = Block header [coinbase]
+          cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
+      case validateFullBlock regtest cs block Map.empty of
+        Left msg | "Merkle root" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject block with wrong merkle root"
+
+    it "rejects block when coinbase height mismatches (BIP-34)" $ do
+      -- Height will be 501 (500 + 1), but coinbase says height 1
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          -- Encode height 1 in coinbase, but we're at height 501
+          coinbaseScript = BS.pack [0x01, 0x01]
+          coinbaseIn = TxIn nullOutpoint coinbaseScript 0xffffffff
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid = computeTxId coinbase
+          merkle = computeMerkleRoot [txid]
+          header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          block = Block header [coinbase]
+          -- Chain state at height 500 (BIP-34 active on regtest at 500)
+          cs = ChainState 500 prevHash 0 0 (consensusFlagsAtHeight regtest 501)
+      case validateFullBlock regtest cs block Map.empty of
+        Left msg | "height" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject block with wrong coinbase height"
+
+  describe "Sigop counting" $ do
+    it "counts OP_CHECKSIG as 1 sigop" $ do
+      let script = Script [OP_CHECKSIG]
+      countScriptSigops script False `shouldBe` 1
+
+    it "counts OP_CHECKSIGVERIFY as 1 sigop" $ do
+      let script = Script [OP_CHECKSIGVERIFY]
+      countScriptSigops script False `shouldBe` 1
+
+    it "counts OP_CHECKMULTISIG as 20 sigops (inaccurate)" $ do
+      let script = Script [OP_CHECKMULTISIG]
+      countScriptSigops script False `shouldBe` 20
+
+    it "counts 2-of-3 multisig as 3 sigops (accurate)" $ do
+      let script = Script [OP_2, OP_PUSHDATA "pk1" OPCODE,
+                           OP_PUSHDATA "pk2" OPCODE, OP_PUSHDATA "pk3" OPCODE,
+                           OP_3, OP_CHECKMULTISIG]
+      countScriptSigops script True `shouldBe` 3
+
+    it "counts P2PKH script correctly" $ do
+      let hash = Hash160 (BS.replicate 20 0xab)
+          script = encodeP2PKH hash
+      -- P2PKH has 1 OP_CHECKSIG
+      countScriptSigops script False `shouldBe` 1
+
+  describe "ChainState" $ do
+    it "can be constructed" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0))
+          flags = consensusFlagsAtHeight mainnet 0
+          cs = ChainState 0 bh 0 0 flags
+      csHeight cs `shouldBe` 0
+      csBestBlock cs `shouldBe` bh
+      csChainWork cs `shouldBe` 0
+
+  describe "VarInt size calculation" $ do
+    it "returns 1 for values < 0xfd" $ do
+      varIntSize 0 `shouldBe` 1
+      varIntSize 252 `shouldBe` 1
+
+    it "returns 3 for values 0xfd to 0xffff" $ do
+      varIntSize 253 `shouldBe` 3
+      varIntSize 0xffff `shouldBe` 3
+
+    it "returns 5 for values 0x10000 to 0xffffffff" $ do
+      varIntSize 0x10000 `shouldBe` 5
+      varIntSize 0xffffffff `shouldBe` 5
+
+    it "returns 9 for values > 0xffffffff" $ do
+      varIntSize 0x100000000 `shouldBe` 9
