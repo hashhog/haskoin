@@ -65,6 +65,22 @@ module Haskoin.Network
     -- * Peer Threads
   , startPeerThreads
   , queueMessage
+      -- * Peer Manager Types
+  , PeerManager(..)
+  , PeerManagerConfig(..)
+  , defaultPeerManagerConfig
+    -- * Peer Manager Operations
+  , startPeerManager
+  , stopPeerManager
+  , discoverPeers
+  , broadcastMessage
+  , requestFromPeer
+  , getPeerCount
+  , getConnectedPeers
+  , banPeer
+  , addBanScore
+  , handleAddrMessage
+  , buildBlockLocator
   ) where
 
 import Data.ByteString (ByteString)
@@ -74,21 +90,26 @@ import Data.Serialize
 import Data.Word
 import Data.Int (Int32, Int64)
 import Data.Bits ((.&.), (.|.))
-import Control.Monad (replicateM, forM_, when, forever)
+import Control.Monad (replicateM, forM_, forM, when, forever, unless, void)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import qualified Data.Set as Set
+import Data.Maybe (mapMaybe)
+import Control.Concurrent (threadDelay)
 
 import Network.Socket (Socket, SockAddr(..), AddrInfo(..), getAddrInfo,
                        socket, connect, close, defaultHints, addrFamily,
                        addrSocketType, addrProtocol, addrAddress,
-                       SocketType(..))
+                       SocketType(..), PortNumber)
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch, mask_)
+import Control.Exception (try, SomeException, catch, mask_, IOException)
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256)
@@ -998,3 +1019,309 @@ startPeerThreads pc handler = do
 -- | Queue a message to be sent by the send thread
 queueMessage :: PeerConnection -> Message -> STM ()
 queueMessage pc msg = writeTBQueue (pcSendQueue pc) msg
+
+--------------------------------------------------------------------------------
+-- Peer Manager
+--------------------------------------------------------------------------------
+
+-- | Peer manager for maintaining multiple peer connections
+-- Handles peer discovery, connection management, and message routing
+data PeerManager = PeerManager
+  { pmPeers          :: !(TVar (Map SockAddr PeerConnection))
+  , pmKnownAddrs     :: !(TVar (Set.Set SockAddr))
+  , pmBannedAddrs    :: !(TVar (Map SockAddr Int64))
+  , pmConfig         :: !PeerManagerConfig
+  , pmNetwork        :: !Network
+  , pmBestHeight     :: !(TVar Int32)
+  , pmManagerThread  :: !(TVar (Maybe ThreadId))
+  , pmMessageHandler :: !(SockAddr -> Message -> IO ())
+  }
+
+-- | Configuration for the peer manager
+data PeerManagerConfig = PeerManagerConfig
+  { pmcMaxOutbound    :: !Int        -- ^ Maximum outbound connections (default 8)
+  , pmcMaxInbound     :: !Int        -- ^ Maximum inbound connections (default 117)
+  , pmcMaxTotal       :: !Int        -- ^ Maximum total connections (default 125)
+  , pmcBanDuration    :: !Int64      -- ^ Ban duration in seconds (default 86400 = 24h)
+  , pmcBanThreshold   :: !Int        -- ^ Ban score threshold (default 100)
+  , pmcPingInterval   :: !Int        -- ^ Ping interval in seconds (default 120)
+  , pmcConnectTimeout :: !Int        -- ^ Connection timeout in seconds (default 5)
+  } deriving (Show)
+
+-- | Default peer manager configuration (matches Bitcoin Core defaults)
+defaultPeerManagerConfig :: PeerManagerConfig
+defaultPeerManagerConfig = PeerManagerConfig
+  { pmcMaxOutbound    = 8
+  , pmcMaxInbound     = 117
+  , pmcMaxTotal       = 125
+  , pmcBanDuration    = 86400    -- 24 hours
+  , pmcBanThreshold   = 100
+  , pmcPingInterval   = 120      -- 2 minutes
+  , pmcConnectTimeout = 5
+  }
+
+--------------------------------------------------------------------------------
+-- DNS Seed Discovery
+--------------------------------------------------------------------------------
+
+-- | Hardcoded fallback peer addresses for when DNS seeds fail
+-- KNOWN PITFALL: DNS seeds unreliable for testnet4, use fallback addresses
+fallbackMainnetPeers :: [SockAddr]
+fallbackMainnetPeers =
+  [ SockAddrInet 8333 0x0a000001  -- placeholder IPs
+  ]
+
+fallbackTestnetPeers :: [SockAddr]
+fallbackTestnetPeers =
+  [ SockAddrInet 18333 0x0a000001
+  ]
+
+-- | Discover peers via DNS seeds with fallback to hardcoded addresses
+discoverPeers :: Network -> IO [SockAddr]
+discoverPeers net = do
+  results <- forM (netDNSSeeds net) $ \seed -> do
+    result <- try @SomeException $ do
+      addrInfos <- getAddrInfo Nothing (Just seed) (Just (show (netDefaultPort net)))
+      return $ map addrAddress addrInfos
+    case result of
+      Left _     -> return []
+      Right addrs -> return addrs
+  let discovered = concat results
+  -- Fall back to hardcoded addresses if DNS resolution fails
+  if null discovered
+    then return $ if netDefaultPort net == 8333
+                  then fallbackMainnetPeers
+                  else fallbackTestnetPeers
+    else return discovered
+
+--------------------------------------------------------------------------------
+-- Peer Manager Operations
+--------------------------------------------------------------------------------
+
+-- | Start the peer manager background thread
+startPeerManager :: Network -> PeerManagerConfig
+                 -> (SockAddr -> Message -> IO ()) -> IO PeerManager
+startPeerManager net config handler = do
+  pm <- PeerManager
+    <$> newTVarIO Map.empty
+    <*> newTVarIO Set.empty
+    <*> newTVarIO Map.empty
+    <*> pure config
+    <*> pure net
+    <*> newTVarIO 0
+    <*> newTVarIO Nothing
+    <*> pure handler
+  tid <- forkIO $ peerManagerLoop pm
+  atomically $ writeTVar (pmManagerThread pm) (Just tid)
+  return pm
+
+-- | Stop the peer manager and disconnect all peers
+stopPeerManager :: PeerManager -> IO ()
+stopPeerManager pm = do
+  mTid <- readTVarIO (pmManagerThread pm)
+  mapM_ killThread mTid
+  peers <- readTVarIO (pmPeers pm)
+  mapM_ disconnectPeer (Map.elems peers)
+
+-- | Main peer manager loop - maintains connections and handles timeouts
+peerManagerLoop :: PeerManager -> IO ()
+peerManagerLoop pm = forever $ do
+  -- Maintain target outbound connections
+  peers <- readTVarIO (pmPeers pm)
+  let outboundCount = Map.size peers  -- simplified: count all as outbound
+      target = pmcMaxOutbound (pmConfig pm)
+
+  when (outboundCount < target) $ do
+    known <- readTVarIO (pmKnownAddrs pm)
+    banned <- readTVarIO (pmBannedAddrs pm)
+    now <- round <$> getPOSIXTime
+
+    -- Filter out expired bans
+    let activeBans = Map.filter (> now) banned
+        connected = Map.keysSet peers
+        candidates = Set.toList $
+          Set.difference known (Set.union connected (Map.keysSet activeBans))
+
+    -- If no known addresses, discover via DNS
+    candidates' <- if null candidates
+      then discoverPeers (pmNetwork pm)
+      else return candidates
+
+    -- Connect to candidates
+    let toConnect = take (target - outboundCount) candidates'
+    mapM_ (void . forkIO . tryConnect pm) toConnect
+
+  -- Ping peers and disconnect stale ones
+  now <- round <$> getPOSIXTime
+  peers' <- readTVarIO (pmPeers pm)
+
+  forM_ (Map.toList peers') $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    when (piState info == PeerConnected) $ do
+      -- Send ping if no recent activity
+      when (now - piLastSeen info > fromIntegral (pmcPingInterval (pmConfig pm))) $ do
+        nonce <- randomIO
+        atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
+        sendMessage pc (MPing (Ping nonce)) `catch` (\(_ :: IOException) -> return ())
+
+      -- Disconnect if no response for 5 minutes
+      -- KNOWN PITFALL: Re-queue in-flight blocks immediately on disconnect
+      when (now - piLastSeen info > 300) $ do
+        disconnectPeer pc
+        atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
+  -- Check ban scores and disconnect misbehaving peers
+  forM_ (Map.toList peers') $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    when (piBanScore info >= pmcBanThreshold (pmConfig pm)) $ do
+      banPeer pm addr
+      disconnectPeer pc
+      atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
+  -- Sleep before next iteration
+  threadDelay (10 * 1000000)  -- 10 seconds
+
+-- | Try to connect to a peer address
+tryConnect :: PeerManager -> SockAddr -> IO ()
+tryConnect pm addr = do
+  let net = pmNetwork pm
+      config = PeerConfig
+        { pcfgNetwork     = net
+        , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
+        , pcfgBestHeight  = 0
+        , pcfgUserAgent   = userAgent
+        , pcfgRelay       = True
+        , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
+        , pcfgQueueSize   = 100
+        }
+      -- Extract host and port from SockAddr
+      (host, port) = sockAddrToHostPort addr (netDefaultPort net)
+
+  result <- connectPeer config host port
+  case result of
+    Left _ -> return ()
+    Right pc -> do
+      hsResult <- performHandshake config pc
+      case hsResult of
+        Left _ -> disconnectPeer pc
+        Right ver -> do
+          -- Verify peer supports required services
+          unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+
+          -- Add to peer map
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+
+          -- Start peer threads with message handler
+          pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+
+          -- Request addresses from peer
+          sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+
+-- | Convert SockAddr to host string and port
+sockAddrToHostPort :: SockAddr -> Int -> (String, Int)
+sockAddrToHostPort addr defaultPort = case addr of
+  SockAddrInet port hostAddr ->
+    let a = fromIntegral hostAddr :: Word32
+        b1 = a .&. 0xff
+        b2 = (a `div` 0x100) .&. 0xff
+        b3 = (a `div` 0x10000) .&. 0xff
+        b4 = (a `div` 0x1000000) .&. 0xff
+    in (show b1 ++ "." ++ show b2 ++ "." ++ show b3 ++ "." ++ show b4,
+        fromIntegral port)
+  _ -> ("127.0.0.1", defaultPort)  -- Fallback for IPv6, etc.
+
+--------------------------------------------------------------------------------
+-- Peer Manager API
+--------------------------------------------------------------------------------
+
+-- | Broadcast a message to all connected peers
+broadcastMessage :: PeerManager -> Message -> IO ()
+broadcastMessage pm msg = do
+  peers <- readTVarIO (pmPeers pm)
+  forM_ (Map.elems peers) $ \pc -> do
+    info <- readTVarIO (pcInfo pc)
+    when (piState info == PeerConnected) $
+      sendMessage pc msg `catch` (\(_ :: IOException) -> return ())
+
+-- | Send a message to a specific peer
+requestFromPeer :: PeerManager -> SockAddr -> Message -> IO ()
+requestFromPeer pm addr msg = do
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return ()
+    Just pc -> sendMessage pc msg `catch` (\(_ :: IOException) -> return ())
+
+-- | Get the number of connected peers
+getPeerCount :: PeerManager -> IO Int
+getPeerCount pm = Map.size <$> readTVarIO (pmPeers pm)
+
+-- | Get information about all connected peers
+getConnectedPeers :: PeerManager -> IO [(SockAddr, PeerInfo)]
+getConnectedPeers pm = do
+  peers <- readTVarIO (pmPeers pm)
+  forM (Map.toList peers) $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    return (addr, info)
+
+-- | Ban a peer for the configured duration
+banPeer :: PeerManager -> SockAddr -> IO ()
+banPeer pm addr = do
+  now <- round <$> getPOSIXTime
+  let expiry = now + pmcBanDuration (pmConfig pm)
+  atomically $ modifyTVar' (pmBannedAddrs pm) (Map.insert addr expiry)
+
+-- | Add to a peer's ban score for misbehavior
+-- Invalid messages typically add 10-100 points
+addBanScore :: PeerManager -> SockAddr -> Int -> String -> IO ()
+addBanScore pm addr score _reason = do
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return ()
+    Just pc -> atomically $ modifyTVar' (pcInfo pc) $ \i ->
+      i { piBanScore = piBanScore i + score }
+
+--------------------------------------------------------------------------------
+-- Addr Message Handling
+--------------------------------------------------------------------------------
+
+-- | Handle an addr message by adding addresses to the known pool
+handleAddrMessage :: PeerManager -> Addr -> IO ()
+handleAddrMessage pm (Addr entries) = do
+  let addrs = mapMaybe (addrToSockAddr . aeAddress) entries
+  atomically $ modifyTVar' (pmKnownAddrs pm) $
+    Set.union (Set.fromList addrs)
+  where
+    -- Convert NetworkAddress to SockAddr
+    addrToSockAddr :: NetworkAddress -> Maybe SockAddr
+    addrToSockAddr na =
+      let port = fromIntegral (naPort na) :: PortNumber
+          -- Extract IPv4 address from IPv6-mapped format (last 4 bytes)
+          addrBytes = naAddress na
+          ipv4Bytes = BS.drop 12 addrBytes
+      in if BS.length ipv4Bytes == 4
+         then let [b1, b2, b3, b4] = BS.unpack ipv4Bytes
+                  hostAddr = fromIntegral b1
+                           + fromIntegral b2 * 0x100
+                           + fromIntegral b3 * 0x10000
+                           + fromIntegral b4 * 0x1000000
+              in Just $ SockAddrInet port hostAddr
+         else Nothing
+
+--------------------------------------------------------------------------------
+-- Block Locator
+--------------------------------------------------------------------------------
+
+-- | Build a block locator from a chain of (height, hash) pairs
+-- Uses exponentially-spaced block hashes to efficiently find fork points
+-- Input should be sorted newest-first (highest height first)
+buildBlockLocator :: [(Word32, BlockHash)] -> [BlockHash]
+buildBlockLocator chain =
+  let -- We need oldest-first for processing, so reverse
+      reversed = reverse chain
+      go :: [(Word32, BlockHash)] -> Int -> Int -> [BlockHash]
+      go [] _ _ = []
+      go ((_, bh):rest) idx gap
+        | idx < 10  = bh : go rest (idx + 1) 1
+        | otherwise = bh : go (drop (gap - 1) rest) (idx + 1) (gap * 2)
+  in go reversed (0 :: Int) (1 :: Int)
