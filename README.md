@@ -106,14 +106,28 @@ system to make invalid states unrepresentable.
 - [x] Address generation with gap limit
 - [x] UTXO tracking and balance queries
 - [x] Coin selection and transaction creation
+- [x] CLI with node, wallet, and utility subcommands
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
 
 ```bash
 cabal build
-cabal test
-cabal run haskoin
+cabal run haskoin -- --help
+cabal run haskoin -- node --help
+cabal run haskoin -- wallet --help
+cabal run haskoin -- util --help
+```
+
+Run the full node:
+```bash
+cabal run haskoin -- node --rpcport 8332
+```
+
+Utility commands:
+```bash
+cabal run haskoin -- util validateaddress bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+cabal run haskoin -- util decodetx <hex>
 ```
 
 ## Project structure
@@ -137,7 +151,7 @@ haskoin/
   resources/
     bip39-english.txt  -- bip-39 mnemonic wordlist
   app/
-    Main.hs         -- executable entry point
+    Main.hs         -- CLI entry point with optparse-applicative
   test/
     Spec.hs         -- comprehensive test suite
 ```
