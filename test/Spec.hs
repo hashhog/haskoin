@@ -19,6 +19,7 @@ import Haskoin.Crypto
 import Haskoin.Script
 import Haskoin.Consensus
 import Haskoin.Storage
+import Haskoin.Network
 import qualified Data.Map.Strict as Map
 
 -- Helper for hex decoding that works with Either-based API
@@ -1542,3 +1543,325 @@ main = hspec $ do
 
     it "returns 9 for values > 0xffffffff" $ do
       varIntSize 0x100000000 `shouldBe` 9
+
+  -- Network module tests (Phase 9)
+  describe "MessageHeader" $ do
+    it "serializes to exactly 24 bytes" $ do
+      let header = MessageHeader 0xD9B4BEF9 "version" 100 0x12345678
+      BS.length (encode header) `shouldBe` 24
+
+    it "roundtrips correctly" $ do
+      let header = MessageHeader 0xD9B4BEF9 "ping" 8 0xABCDEF01
+      decode (encode header) `shouldBe` Right header
+
+    it "pads command to 12 bytes" $ do
+      let header = MessageHeader 0xD9B4BEF9 "tx" 0 0
+          encoded = encode header
+          -- Bytes 4-15 should be: "tx" + 10 null bytes
+      BS.index encoded 4 `shouldBe` 0x74  -- 't'
+      BS.index encoded 5 `shouldBe` 0x78  -- 'x'
+      BS.index encoded 6 `shouldBe` 0x00  -- null
+      BS.index encoded 15 `shouldBe` 0x00 -- null
+
+    it "decodes command stripping null bytes" $ do
+      let header = MessageHeader 0xD9B4BEF9 "inv" 36 0
+      case decode (encode header) of
+        Right h -> mhCommand h `shouldBe` "inv"
+        Left e -> expectationFailure e
+
+  describe "ServiceFlag" $ do
+    it "nodeNetwork is 1" $ do
+      getServiceFlag nodeNetwork `shouldBe` 1
+
+    it "nodeWitness is 8" $ do
+      getServiceFlag nodeWitness `shouldBe` 8
+
+    it "nodeBloom is 4" $ do
+      getServiceFlag nodeBloom `shouldBe` 4
+
+    it "nodeNetworkLimited is 1024" $ do
+      getServiceFlag nodeNetworkLimited `shouldBe` 1024
+
+    it "combineServices combines flags with OR" $ do
+      combineServices [nodeNetwork, nodeWitness] `shouldBe` 9
+      combineServices [nodeNetwork, nodeBloom, nodeWitness] `shouldBe` 13
+
+    it "hasService checks flag presence" $ do
+      let flags = combineServices [nodeNetwork, nodeWitness]
+      hasService flags nodeNetwork `shouldBe` True
+      hasService flags nodeWitness `shouldBe` True
+      hasService flags nodeBloom `shouldBe` False
+
+  describe "Ping/Pong" $ do
+    it "Ping roundtrips correctly" $ do
+      let ping = Ping 0x123456789ABCDEF0
+      decode (encode ping) `shouldBe` Right ping
+
+    it "Pong roundtrips correctly" $ do
+      let pong = Pong 0xFEDCBA9876543210
+      decode (encode pong) `shouldBe` Right pong
+
+    it "Ping serializes to 8 bytes" $ do
+      BS.length (encode (Ping 0)) `shouldBe` 8
+
+  describe "InvType" $ do
+    it "converts to correct wire values" $ do
+      invTypeToWord32 InvError `shouldBe` 0
+      invTypeToWord32 InvTx `shouldBe` 1
+      invTypeToWord32 InvBlock `shouldBe` 2
+      invTypeToWord32 InvFilteredBlock `shouldBe` 3
+      invTypeToWord32 InvCompactBlock `shouldBe` 4
+      invTypeToWord32 InvWitnessTx `shouldBe` 0x40000001
+      invTypeToWord32 InvWitnessBlock `shouldBe` 0x40000002
+
+    it "parses wire values correctly" $ do
+      word32ToInvType 0 `shouldBe` InvError
+      word32ToInvType 1 `shouldBe` InvTx
+      word32ToInvType 2 `shouldBe` InvBlock
+      word32ToInvType 0x40000001 `shouldBe` InvWitnessTx
+      word32ToInvType 0x40000002 `shouldBe` InvWitnessBlock
+
+    it "unknown values map to InvError" $ do
+      word32ToInvType 999 `shouldBe` InvError
+
+  describe "InvVector" $ do
+    it "serializes to 36 bytes (4 type + 32 hash)" $ do
+      let iv = InvVector InvTx (Hash256 (BS.replicate 32 0xab))
+      BS.length (encode iv) `shouldBe` 36
+
+    it "roundtrips correctly" $ do
+      let iv = InvVector InvBlock (Hash256 (BS.replicate 32 0xcd))
+      decode (encode iv) `shouldBe` Right iv
+
+  describe "Inv" $ do
+    it "roundtrips empty list" $ do
+      let inv = Inv []
+      decode (encode inv) `shouldBe` Right inv
+
+    it "roundtrips with multiple vectors" $ do
+      let iv1 = InvVector InvTx (Hash256 (BS.replicate 32 0x01))
+          iv2 = InvVector InvBlock (Hash256 (BS.replicate 32 0x02))
+          inv = Inv [iv1, iv2]
+      decode (encode inv) `shouldBe` Right inv
+
+  describe "GetData" $ do
+    it "roundtrips correctly" $ do
+      let iv = InvVector InvTx (Hash256 (BS.replicate 32 0xef))
+          gd = GetData [iv]
+      decode (encode gd) `shouldBe` Right gd
+
+  describe "NotFound" $ do
+    it "roundtrips correctly" $ do
+      let iv = InvVector InvBlock (Hash256 (BS.replicate 32 0xaa))
+          nf = NotFound [iv]
+      decode (encode nf) `shouldBe` Right nf
+
+  describe "GetBlocks" $ do
+    it "roundtrips correctly" $ do
+      let locator1 = BlockHash (Hash256 (BS.replicate 32 0x11))
+          locator2 = BlockHash (Hash256 (BS.replicate 32 0x22))
+          hashStop = BlockHash (Hash256 (BS.replicate 32 0))
+          gb = GetBlocks 70016 [locator1, locator2] hashStop
+      decode (encode gb) `shouldBe` Right gb
+
+    it "serializes version as first 4 bytes" $ do
+      let gb = GetBlocks 70016 [] (BlockHash (Hash256 (BS.replicate 32 0)))
+          encoded = encode gb
+      -- Version 70016 = 0x00011180 in little-endian
+      BS.take 4 encoded `shouldBe` BS.pack [0x80, 0x11, 0x01, 0x00]
+
+  describe "GetHeaders" $ do
+    it "roundtrips correctly" $ do
+      let locator = BlockHash (Hash256 (BS.replicate 32 0xaa))
+          hashStop = BlockHash (Hash256 (BS.replicate 32 0))
+          gh = GetHeaders 70016 [locator] hashStop
+      decode (encode gh) `shouldBe` Right gh
+
+  describe "Headers" $ do
+    it "roundtrips empty list" $ do
+      let hdrs = Headers []
+      decode (encode hdrs) `shouldBe` Right hdrs
+
+    it "roundtrips with headers" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0x11))
+          merkle = Hash256 (BS.replicate 32 0x22)
+          hdr = BlockHeader 1 prevHash merkle 1234567890 0x1d00ffff 12345
+          hdrs = Headers [hdr]
+      decode (encode hdrs) `shouldBe` Right hdrs
+
+    it "includes varint tx_count (0) after each header" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          merkle = Hash256 (BS.replicate 32 0)
+          hdr = BlockHeader 1 prevHash merkle 0 0 0
+          hdrs = Headers [hdr]
+          encoded = encode hdrs
+      -- 1 (count varint) + 80 (header) + 1 (tx_count varint 0) = 82 bytes
+      BS.length encoded `shouldBe` 82
+
+  describe "AddrEntry" $ do
+    it "serializes to 30 bytes (4 timestamp + 26 NetworkAddress)" $ do
+      let addr = NetworkAddress 1 (BS.replicate 16 0) 8333
+          entry = AddrEntry 1234567890 addr
+      BS.length (encode entry) `shouldBe` 30
+
+    it "roundtrips correctly" $ do
+      let addr = NetworkAddress 0x409 (BS.replicate 16 0xff) 8333
+          entry = AddrEntry 1609459200 addr
+      decode (encode entry) `shouldBe` Right entry
+
+  describe "Addr" $ do
+    it "roundtrips empty list" $ do
+      let addr = Addr []
+      decode (encode addr) `shouldBe` Right addr
+
+    it "roundtrips with entries" $ do
+      let na = NetworkAddress 1 (BS.replicate 16 0) 8333
+          entry = AddrEntry 1234567890 na
+          addr = Addr [entry]
+      decode (encode addr) `shouldBe` Right addr
+
+  describe "SendHeaders" $ do
+    it "serializes to 0 bytes (empty payload)" $ do
+      BS.length (encode SendHeaders) `shouldBe` 0
+
+    it "roundtrips correctly" $ do
+      decode (encode SendHeaders) `shouldBe` Right SendHeaders
+
+  describe "SendCmpct" $ do
+    it "serializes to 9 bytes" $ do
+      let sc = SendCmpct True 1
+      BS.length (encode sc) `shouldBe` 9
+
+    it "roundtrips correctly" $ do
+      let sc = SendCmpct False 2
+      decode (encode sc) `shouldBe` Right sc
+
+    it "encodes announce flag as byte" $ do
+      let sc1 = SendCmpct True 1
+          sc2 = SendCmpct False 1
+      BS.head (encode sc1) `shouldBe` 1
+      BS.head (encode sc2) `shouldBe` 0
+
+  describe "FeeFilter" $ do
+    it "serializes to 8 bytes" $ do
+      BS.length (encode (FeeFilter 1000)) `shouldBe` 8
+
+    it "roundtrips correctly" $ do
+      let ff = FeeFilter 12345
+      decode (encode ff) `shouldBe` Right ff
+
+  describe "Version message" $ do
+    it "roundtrips correctly" $ do
+      let recvAddr = NetworkAddress 1 (BS.replicate 16 0) 8333
+          sendAddr = NetworkAddress 1 (BS.replicate 16 0) 0
+          ver = Version
+            { vVersion = 70016
+            , vServices = 1
+            , vTimestamp = 1609459200
+            , vAddrRecv = recvAddr
+            , vAddrSend = sendAddr
+            , vNonce = 0x123456789ABCDEF0
+            , vUserAgent = VarString "/Haskoin:0.1.0/"
+            , vStartHeight = 650000
+            , vRelay = True
+            }
+      decode (encode ver) `shouldBe` Right ver
+
+    it "encodes relay flag" $ do
+      let recvAddr = NetworkAddress 0 (BS.replicate 16 0) 0
+          sendAddr = NetworkAddress 0 (BS.replicate 16 0) 0
+          ver = Version 70016 0 0 recvAddr sendAddr 0 (VarString "") 0 False
+          encoded = encode ver
+      -- Last byte should be relay flag (0)
+      BS.last encoded `shouldBe` 0
+
+  describe "Message encoding" $ do
+    it "encodeMessage produces correct header + payload" $ do
+      let msg = MPing (Ping 0x123456789ABCDEF0)
+          magic = 0xD9B4BEF9
+          encoded = encodeMessage magic msg
+      -- Header is 24 bytes, ping payload is 8 bytes
+      BS.length encoded `shouldBe` 32
+
+    it "encodeMessage uses correct magic" $ do
+      let msg = MVerAck
+          magic = 0xD9B4BEF9
+          encoded = encodeMessage magic msg
+      -- First 4 bytes should be magic (little-endian)
+      BS.take 4 encoded `shouldBe` BS.pack [0xF9, 0xBE, 0xB4, 0xD9]
+
+    it "encodeMessage calculates correct checksum" $ do
+      let msg = MVerAck
+          magic = 0xD9B4BEF9
+          encoded = encodeMessage magic msg
+      -- VerAck has empty payload, checksum is first 4 bytes of double-SHA256("")
+      -- SHA256(SHA256("")) checksum = 0x5df6e0e2
+      let checksumBytes = BS.take 4 (BS.drop 20 encoded)
+      checksumBytes `shouldBe` BS.pack [0x5d, 0xf6, 0xe0, 0xe2]
+
+  describe "Message decoding" $ do
+    it "decodes version message" $ do
+      let recvAddr = NetworkAddress 1 (BS.replicate 16 0) 8333
+          sendAddr = NetworkAddress 1 (BS.replicate 16 0) 0
+          ver = Version 70016 1 1609459200 recvAddr sendAddr 0 (VarString "") 0 True
+          payload = encode ver
+      decodeMessage "version" payload `shouldBe` Right (MVersion ver)
+
+    it "decodes verack message" $ do
+      decodeMessage "verack" BS.empty `shouldBe` Right MVerAck
+
+    it "decodes ping message" $ do
+      let ping = Ping 0x123456789ABCDEF0
+          payload = encode ping
+      decodeMessage "ping" payload `shouldBe` Right (MPing ping)
+
+    it "decodes pong message" $ do
+      let pong = Pong 0xFEDCBA9876543210
+          payload = encode pong
+      decodeMessage "pong" payload `shouldBe` Right (MPong pong)
+
+    it "decodes getaddr message" $ do
+      decodeMessage "getaddr" BS.empty `shouldBe` Right MGetAddr
+
+    it "decodes mempool message" $ do
+      decodeMessage "mempool" BS.empty `shouldBe` Right MMemPool
+
+    it "decodes sendheaders message" $ do
+      decodeMessage "sendheaders" BS.empty `shouldBe` Right MSendHeaders
+
+    it "returns error for unknown command" $ do
+      case decodeMessage "unknown" BS.empty of
+        Left _ -> return ()
+        Right _ -> expectationFailure "Should reject unknown command"
+
+  describe "commandName" $ do
+    it "returns correct names for all message types" $ do
+      commandName (MVersion undefined) `shouldBe` "version"
+      commandName MVerAck `shouldBe` "verack"
+      commandName (MPing undefined) `shouldBe` "ping"
+      commandName (MPong undefined) `shouldBe` "pong"
+      commandName (MAddr undefined) `shouldBe` "addr"
+      commandName (MInv undefined) `shouldBe` "inv"
+      commandName (MGetData undefined) `shouldBe` "getdata"
+      commandName (MNotFound undefined) `shouldBe` "notfound"
+      commandName (MGetBlocks undefined) `shouldBe` "getblocks"
+      commandName (MGetHeaders undefined) `shouldBe` "getheaders"
+      commandName (MHeaders undefined) `shouldBe` "headers"
+      commandName (MTx undefined) `shouldBe` "tx"
+      commandName (MBlock undefined) `shouldBe` "block"
+      commandName (MReject undefined) `shouldBe` "reject"
+      commandName MSendHeaders `shouldBe` "sendheaders"
+      commandName (MSendCmpct undefined) `shouldBe` "sendcmpct"
+      commandName (MFeeFilter undefined) `shouldBe` "feefilter"
+      commandName MGetAddr `shouldBe` "getaddr"
+      commandName MMemPool `shouldBe` "mempool"
+
+  describe "Protocol constants" $ do
+    it "protocolVersion is 70016" $ do
+      protocolVersion `shouldBe` 70016
+
+    it "minProtocolVersion is 70015" $ do
+      minProtocolVersion `shouldBe` 70015
+
+    it "userAgent contains Haskoin" $ do
+      userAgent `shouldBe` "/Haskoin:0.1.0/"
