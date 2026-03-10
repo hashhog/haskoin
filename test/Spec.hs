@@ -18,7 +18,12 @@ import Haskoin.Types
 import Haskoin.Crypto
 import Haskoin.Script
 import Haskoin.Consensus
-import Haskoin.Storage
+import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
+                         integerToBS, bsToInteger, TxLocation(..), BlockStatus(..),
+                         WriteBatch(..), getBatchOps, BatchOp(..),
+                         batchPutBlockHeader, batchPutUTXO, batchDeleteUTXO,
+                         batchPutBestBlock, batchPutBlockHeight,
+                         UTXOEntry(..), UndoData(..), PersistedChainState(..))
 import Haskoin.Network
 import Haskoin.Sync
 import qualified Data.Map.Strict as Map
@@ -2126,3 +2131,171 @@ main = hspec $ do
       atomically $ writeTBQueue q (1 :: Int)
       result <- atomically $ flushTBQueue q 0
       result `shouldBe` []
+
+  -- Phase 14: UTXO Set & Chain State tests
+  describe "UTXOEntry serialization" $ do
+    it "roundtrips correctly" $ do
+      let txout = TxOut 5000000000 "scriptpubkey"
+          entry = UTXOEntry txout 100 True False
+      decode (encode entry) `shouldBe` Right entry
+
+    it "preserves all metadata fields" $ do
+      let txout = TxOut 12345 "script"
+          entry = UTXOEntry txout 42 False True
+      decode (encode entry) `shouldBe` Right entry
+      ueHeight entry `shouldBe` 42
+      ueCoinbase entry `shouldBe` False
+      ueSpent entry `shouldBe` True
+
+    it "serializes coinbase flag correctly" $ do
+      let txout = TxOut 1000 "script"
+          coinbaseEntry = UTXOEntry txout 100 True False
+          regularEntry = UTXOEntry txout 100 False False
+      -- They should be different when serialized
+      encode coinbaseEntry `shouldNotBe` encode regularEntry
+
+  describe "UndoData serialization" $ do
+    it "roundtrips with empty spent outputs" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xaa))
+          undo = UndoData bh 100 []
+      decode (encode undo) `shouldBe` Right undo
+
+    it "roundtrips with spent outputs" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xbb))
+          txid = TxId (Hash256 (BS.replicate 32 0xcc))
+          op = OutPoint txid 0
+          txout = TxOut 5000000000 "script"
+          entry = UTXOEntry txout 50 True False
+          undo = UndoData bh 100 [(op, entry)]
+      decode (encode undo) `shouldBe` Right undo
+
+    it "roundtrips with multiple spent outputs" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xdd))
+          txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+          txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+          op1 = OutPoint txid1 0
+          op2 = OutPoint txid2 1
+          entry1 = UTXOEntry (TxOut 1000 "s1") 10 False False
+          entry2 = UTXOEntry (TxOut 2000 "s2") 20 True False
+          undo = UndoData bh 100 [(op1, entry1), (op2, entry2)]
+      decode (encode undo) `shouldBe` Right undo
+
+    it "preserves block hash and height" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xee))
+          undo = UndoData bh 12345 []
+      case decode (encode undo) of
+        Right decoded -> do
+          udBlockHash decoded `shouldBe` bh
+          udHeight decoded `shouldBe` 12345
+        Left err -> expectationFailure $ "Decode failed: " ++ err
+
+  describe "PersistedChainState serialization" $ do
+    it "roundtrips correctly" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xff))
+          pcs = PersistedChainState 100 bh 12345678
+      decode (encode pcs) `shouldBe` Right pcs
+
+    it "handles zero chain work" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
+          pcs = PersistedChainState 0 bh 0
+      decode (encode pcs) `shouldBe` Right pcs
+
+    it "handles large chain work" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xab))
+          largeWork = 2 ^ (200 :: Integer)  -- Very large number
+          pcs = PersistedChainState 500000 bh largeWork
+      decode (encode pcs) `shouldBe` Right pcs
+
+    it "preserves all fields" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xcd))
+          pcs = PersistedChainState 999 bh 42
+      case decode (encode pcs) of
+        Right decoded -> do
+          pcsHeight decoded `shouldBe` 999
+          pcsBestBlock decoded `shouldBe` bh
+          pcsChainWork decoded `shouldBe` 42
+        Left err -> expectationFailure $ "Decode failed: " ++ err
+
+  describe "UTXOEntry metadata" $ do
+    it "tracks creation height" $ do
+      let txout = TxOut 1000 "script"
+          entry = UTXOEntry txout 500 False False
+      ueHeight entry `shouldBe` 500
+
+    it "tracks coinbase status" $ do
+      let txout = TxOut 5000000000 "script"
+          coinbaseEntry = UTXOEntry txout 100 True False
+          regularEntry = UTXOEntry txout 100 False False
+      ueCoinbase coinbaseEntry `shouldBe` True
+      ueCoinbase regularEntry `shouldBe` False
+
+    it "tracks spent status" $ do
+      let txout = TxOut 1000 "script"
+          entry = UTXOEntry txout 100 False False
+          spent = entry { ueSpent = True }
+      ueSpent entry `shouldBe` False
+      ueSpent spent `shouldBe` True
+
+  describe "Coinbase maturity check logic" $ do
+    it "immature coinbase at same height" $ do
+      -- A coinbase created at height 100, trying to spend at height 100
+      let currentHeight = 100 :: Word32
+          creationHeight = 100 :: Word32
+          maturity = 100 :: Int
+      (currentHeight - creationHeight < fromIntegral maturity) `shouldBe` True
+
+    it "immature coinbase within 100 blocks" $ do
+      -- A coinbase created at height 100, trying to spend at height 150
+      let currentHeight = 150 :: Word32
+          creationHeight = 100 :: Word32
+          maturity = 100 :: Int
+      (currentHeight - creationHeight < fromIntegral maturity) `shouldBe` True
+
+    it "mature coinbase at exactly 100 blocks" $ do
+      -- A coinbase created at height 100, trying to spend at height 200
+      let currentHeight = 200 :: Word32
+          creationHeight = 100 :: Word32
+          maturity = 100 :: Int
+      (currentHeight - creationHeight < fromIntegral maturity) `shouldBe` False
+
+    it "mature coinbase after 100 blocks" $ do
+      -- A coinbase created at height 100, trying to spend at height 250
+      let currentHeight = 250 :: Word32
+          creationHeight = 100 :: Word32
+          maturity = 100 :: Int
+      (currentHeight - creationHeight < fromIntegral maturity) `shouldBe` False
+
+  describe "UndoData structure" $ do
+    it "stores block hash" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x12))
+          undo = UndoData bh 100 []
+      udBlockHash undo `shouldBe` bh
+
+    it "stores height" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
+          undo = UndoData bh 12345 []
+      udHeight undo `shouldBe` 12345
+
+    it "stores spent outputs list" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
+          txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          op = OutPoint txid 0
+          entry = UTXOEntry (TxOut 1000 "s") 50 False False
+          undo = UndoData bh 100 [(op, entry)]
+      length (udSpentOutputs undo) `shouldBe` 1
+
+  describe "Chain state fields" $ do
+    it "PersistedChainState tracks height" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
+          pcs = PersistedChainState 500 bh 1000
+      pcsHeight pcs `shouldBe` 500
+
+    it "PersistedChainState tracks best block" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xab))
+          pcs = PersistedChainState 100 bh 500
+      pcsBestBlock pcs `shouldBe` bh
+
+    it "PersistedChainState tracks chain work" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
+          pcs = PersistedChainState 100 bh 999999
+      pcsChainWork pcs `shouldBe` 999999
