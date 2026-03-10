@@ -81,8 +81,12 @@ system to make invalid states unrepresentable.
 - [x] Chain state persistence (height, best block, chain work)
 - [x] Coinbase maturity validation (100 block rule)
 - [x] Chain reorganization support (disconnect/reconnect)
+- [x] Transaction mempool with fee rate tracking
+- [x] BIP-125 Replace-By-Fee (RBF) support
+- [x] Ancestor/descendant limits (CPFP-aware)
+- [x] Transaction selection for block templates
+- [x] Mempool eviction by fee rate
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] Mempool management
 
 ## Quick start
 
@@ -105,6 +109,7 @@ haskoin/
       Storage.hs    -- rocksdb persistence, UTXO cache, undo data
       Network.hs    -- p2p messages, peer connection, peer manager
       Sync.hs       -- block download, IBD pipeline
+      Mempool.hs    -- transaction pool, fee tracking, RBF
   app/
     Main.hs         -- executable entry point
   test/
