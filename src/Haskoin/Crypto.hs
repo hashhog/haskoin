@@ -34,6 +34,20 @@ module Haskoin.Crypto
     -- * Transaction/Block hashing
   , computeTxId
   , computeBlockHash
+    -- * Addresses
+  , Address(..)
+  , addressToText
+  , textToAddress
+  , pubKeyToP2PKH
+  , pubKeyToP2WPKH
+  , scriptToP2SH
+  , scriptToP2WSH
+    -- * Address encoding
+  , base58Check
+  , base58CheckDecode
+  , bech32Encode
+  , bech32Decode
+  , bech32mEncode
   ) where
 
 import qualified Crypto.Hash as H
@@ -43,8 +57,13 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Serialize (Serialize(..), Put, runPut, putWord32le, putWord64le,
                        putByteString, encode)
-import Data.Word (Word32, Word64)
-import Data.Bits ((.|.), testBit)
+import Data.Word (Word8, Word32, Word64)
+import Data.Bits ((.&.), (.|.), xor, shiftL, shiftR, testBit)
+import Data.Char (ord, toLower)
+import Data.List (elemIndex)
+import Data.Maybe (fromMaybe, mapMaybe)
+import qualified Data.Text as T
+import Data.Text (Text)
 import GHC.Generics (Generic)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
@@ -314,3 +333,276 @@ putOutPoint :: OutPoint -> Put
 putOutPoint OutPoint{..} = do
   putByteString (getHash256 $ getTxIdHash outPointHash)
   putWord32le outPointIndex
+
+--------------------------------------------------------------------------------
+-- Address Types
+--------------------------------------------------------------------------------
+
+-- | Bitcoin address types
+data Address
+  = PubKeyAddress !Hash160          -- ^ P2PKH: Base58Check with version 0x00
+  | ScriptAddress !Hash160          -- ^ P2SH:  Base58Check with version 0x05
+  | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
+  | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
+  | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  deriving (Show, Eq, Generic)
+
+--------------------------------------------------------------------------------
+-- Address Construction
+--------------------------------------------------------------------------------
+
+-- | Create a P2PKH address from a public key
+pubKeyToP2PKH :: PubKey -> Address
+pubKeyToP2PKH pk = PubKeyAddress (hash160 (serializePubKeyCompressed pk))
+
+-- | Create a P2WPKH address from a public key
+pubKeyToP2WPKH :: PubKey -> Address
+pubKeyToP2WPKH pk = WitnessPubKeyAddress (hash160 (serializePubKeyCompressed pk))
+
+-- | Create a P2SH address from a script
+scriptToP2SH :: ByteString -> Address
+scriptToP2SH script = ScriptAddress (hash160 script)
+
+-- | Create a P2WSH address from a script
+-- P2WSH uses single SHA-256 (not double)
+scriptToP2WSH :: ByteString -> Address
+scriptToP2WSH script = WitnessScriptAddress (Hash256 (sha256 script))
+
+--------------------------------------------------------------------------------
+-- Base58Check Encoding
+--------------------------------------------------------------------------------
+
+-- | Base58 alphabet (no 0, O, I, l to avoid ambiguity)
+base58Alphabet :: String
+base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+-- | Encode a ByteString to Base58
+encodeBase58 :: ByteString -> Text
+encodeBase58 bs
+  | BS.null bs = T.empty
+  | bsToInteger bs == 0 = T.empty
+  | otherwise = T.pack $ reverse $ go (bsToInteger bs)
+  where
+    go 0 = []
+    go n = let (q, r) = n `divMod` 58
+           in (base58Alphabet !! fromIntegral r) : go q
+
+-- | Decode a Base58 text to ByteString
+decodeBase58 :: Text -> ByteString
+decodeBase58 txt
+  | T.null txt = BS.empty
+  | otherwise = integerToBS $ T.foldl' step 0 txt
+  where
+    step acc c = acc * 58 + fromIntegral (fromMaybe 0 (elemIndex c base58Alphabet))
+
+-- | Convert a ByteString to Integer (big-endian)
+bsToInteger :: ByteString -> Integer
+bsToInteger = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0
+
+-- | Convert an Integer to ByteString (big-endian)
+integerToBS :: Integer -> ByteString
+integerToBS 0 = BS.empty
+integerToBS n = BS.pack $ reverse $ go n
+  where
+    go 0 = []
+    go x = fromIntegral (x `mod` 256) : go (x `div` 256)
+
+-- | Encode data with Base58Check (version byte + payload + 4-byte checksum)
+base58Check :: Word8 -> ByteString -> Text
+base58Check version payload =
+  let versionedPayload = BS.cons version payload
+      checksum = BS.take 4 $ getHash256 $ doubleSHA256 versionedPayload
+      fullPayload = BS.append versionedPayload checksum
+      -- Count leading zero bytes
+      leadingZeros = BS.length $ BS.takeWhile (== 0) fullPayload
+      -- Convert to base58 by treating fullPayload as a big-endian integer
+      encoded = encodeBase58 fullPayload
+      -- Prepend '1' for each leading zero byte
+      prefix = T.replicate leadingZeros (T.singleton '1')
+  in T.append prefix encoded
+
+-- | Decode a Base58Check-encoded text
+base58CheckDecode :: Text -> Maybe (Word8, ByteString)
+base58CheckDecode txt
+  | T.null txt = Nothing
+  | otherwise =
+      let -- Strip leading '1's, count them as zero bytes
+          (ones, rest) = T.span (== '1') txt
+          leadingZeros = T.length ones
+          decoded = decodeBase58 rest
+          withZeros = BS.append (BS.replicate leadingZeros 0) decoded
+      in if BS.length withZeros < 5
+         then Nothing
+         else let payloadLen = BS.length withZeros - 4
+                  payload = BS.take payloadLen withZeros
+                  checkBytesGot = BS.drop payloadLen withZeros
+                  checkBytesExpected = BS.take 4 $ getHash256 $ doubleSHA256 payload
+              in if checkBytesGot == checkBytesExpected
+                 then Just (BS.head payload, BS.tail payload)
+                 else Nothing
+
+--------------------------------------------------------------------------------
+-- Bech32/Bech32m Encoding (BIP-173, BIP-350)
+--------------------------------------------------------------------------------
+
+-- | Bech32 character set
+bech32Charset :: String
+bech32Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+-- | Bech32 polymod for checksum calculation
+bech32Polymod :: [Int] -> Int
+bech32Polymod values = foldl step 1 values
+  where
+    generators :: [Int]
+    generators = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+
+    step chk v =
+      let b = chk `shiftR` 25
+          chk' = ((chk .&. 0x1ffffff) `shiftL` 5) `xor` v
+      in foldl (\c (i, g) -> if testBit b i then c `xor` g else c) chk'
+           (zip [0..] generators)
+
+-- | Expand HRP for checksum
+bech32HrpExpand :: String -> [Int]
+bech32HrpExpand hrp =
+  map (\c -> ord c `shiftR` 5) hrp ++ [0] ++ map (\c -> ord c .&. 31) hrp
+
+-- | Create Bech32 checksum
+-- Bech32 uses constant 1, Bech32m uses constant 0x2bc830a3
+bech32CreateChecksum :: String -> [Int] -> Int -> [Int]
+bech32CreateChecksum hrp datapart spec =
+  let values = bech32HrpExpand hrp ++ datapart ++ [0,0,0,0,0,0]
+      polymod = bech32Polymod values `xor` spec
+  in map (\i -> (polymod `shiftR` (5 * (5 - i))) .&. 31) [0..5]
+
+-- | Verify Bech32 checksum
+bech32VerifyChecksum :: String -> [Int] -> Int -> Bool
+bech32VerifyChecksum hrp datapart spec =
+  bech32Polymod (bech32HrpExpand hrp ++ datapart) == spec
+
+-- | Convert between bit groups (e.g., 8-bit to 5-bit)
+convertBits :: Int -> Int -> Bool -> [Word8] -> [Int]
+convertBits fromBits toBits pad input = go 0 0 input []
+  where
+    maxV = (1 `shiftL` toBits) - 1
+
+    go acc bits [] result
+      | pad && bits > 0 = reverse ((acc `shiftL` (toBits - bits)) .&. maxV : result)
+      | not pad && bits >= fromBits = reverse result
+      | otherwise = reverse result
+
+    go acc bits (x:xs) result =
+      let acc' = (acc `shiftL` fromBits) .|. fromIntegral x
+          bits' = bits + fromBits
+      in extractBits acc' bits' xs result
+
+    extractBits acc bits xs result
+      | bits >= toBits =
+          let bits' = bits - toBits
+          in extractBits acc bits' xs ((acc `shiftR` bits') .&. maxV : result)
+      | otherwise = go acc bits xs result
+
+-- | Convert 5-bit groups back to 8-bit bytes
+convertBitsBack :: Int -> Int -> Bool -> [Int] -> Maybe [Word8]
+convertBitsBack fromBits toBits pad input = go 0 0 input []
+  where
+    maxV = (1 `shiftL` toBits) - 1
+
+    go acc bits [] result
+      | pad && bits > 0 = Just $ reverse (fromIntegral ((acc `shiftL` (toBits - bits)) .&. maxV) : result)
+      | bits >= fromBits = Nothing  -- Invalid padding
+      | (acc `shiftL` (toBits - bits)) .&. maxV /= 0 = Nothing  -- Non-zero padding
+      | otherwise = Just $ reverse result
+
+    go acc bits (x:xs) result
+      | x < 0 || x >= (1 `shiftL` fromBits) = Nothing  -- Invalid value
+      | otherwise =
+          let acc' = (acc `shiftL` fromBits) .|. x
+              bits' = bits + fromBits
+          in extractBits acc' bits' xs result
+
+    extractBits acc bits xs result
+      | bits >= toBits =
+          let bits' = bits - toBits
+          in extractBits acc bits' xs (fromIntegral ((acc `shiftR` bits') .&. maxV) : result)
+      | otherwise = go acc bits xs result
+
+-- | Encode a SegWit address in Bech32 format (witness version 0)
+bech32Encode :: String -> Int -> ByteString -> Text
+bech32Encode hrp witVer witProg =
+  let dat = witVer : convertBits 8 5 True (BS.unpack witProg)
+      checksum = bech32CreateChecksum hrp dat 1  -- Bech32 constant
+      encoded = map (\i -> bech32Charset !! i) (dat ++ checksum)
+  in T.pack (hrp ++ "1" ++ encoded)
+
+-- | Encode a Taproot address in Bech32m format (witness version 1+)
+bech32mEncode :: String -> Int -> ByteString -> Text
+bech32mEncode hrp witVer witProg =
+  let dat = witVer : convertBits 8 5 True (BS.unpack witProg)
+      checksum = bech32CreateChecksum hrp dat 0x2bc830a3  -- Bech32m constant
+      encoded = map (\i -> bech32Charset !! i) (dat ++ checksum)
+  in T.pack (hrp ++ "1" ++ encoded)
+
+-- | Decode a Bech32/Bech32m address
+-- Returns (hrp, witness version, witness program)
+bech32Decode :: Text -> Maybe (String, Int, ByteString)
+bech32Decode addr =
+  let str = map toLower $ T.unpack addr
+  in case break (== '1') (reverse str) of
+       (_, []) -> Nothing  -- No separator found
+       (rDataPart, '1':rHrp) ->
+         let hrp = reverse rHrp
+             dataPart = reverse rDataPart
+         in if null hrp || length dataPart < 6
+            then Nothing
+            else case mapMaybe (`elemIndex` bech32Charset) dataPart of
+              decoded
+                | length decoded /= length dataPart -> Nothing
+                | otherwise ->
+                    let dataWithCheck = decoded
+                        dataOnly = take (length dataWithCheck - 6) dataWithCheck
+                        -- Try both Bech32 and Bech32m
+                        validBech32 = bech32VerifyChecksum hrp dataWithCheck 1
+                        validBech32m = bech32VerifyChecksum hrp dataWithCheck 0x2bc830a3
+                    in if not (validBech32 || validBech32m) || null dataOnly
+                       then Nothing
+                       else let witVer = head dataOnly
+                                witProgData = tail dataOnly
+                            in case convertBitsBack 5 8 False witProgData of
+                                 Nothing -> Nothing
+                                 Just prog -> Just (hrp, witVer, BS.pack prog)
+       _ -> Nothing
+
+--------------------------------------------------------------------------------
+-- Address Encoding/Decoding
+--------------------------------------------------------------------------------
+
+-- | Convert an Address to its text representation
+addressToText :: Address -> Text
+addressToText (PubKeyAddress h) = base58Check 0x00 (getHash160 h)
+addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
+addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
+addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
+addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+
+-- | Parse an address from text
+textToAddress :: Text -> Maybe Address
+textToAddress txt
+  | T.isPrefixOf "bc1q" txtLower || T.isPrefixOf "BC1Q" txt = -- Bech32 P2WPKH/P2WSH
+      case bech32Decode txt of
+        Just (_, 0, prog)
+          | BS.length prog == 20 -> Just $ WitnessPubKeyAddress (Hash160 prog)
+          | BS.length prog == 32 -> Just $ WitnessScriptAddress (Hash256 prog)
+        _ -> Nothing
+  | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt = -- Bech32m P2TR
+      case bech32Decode txt of
+        Just (_, 1, prog)
+          | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
+        _ -> Nothing
+  | otherwise = -- Base58Check
+      case base58CheckDecode txt of
+        Just (0x00, h) | BS.length h == 20 -> Just $ PubKeyAddress (Hash160 h)
+        Just (0x05, h) | BS.length h == 20 -> Just $ ScriptAddress (Hash160 h)
+        _ -> Nothing
+  where
+    txtLower = T.toLower txt
