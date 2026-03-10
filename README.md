@@ -17,7 +17,12 @@ system to make invalid states unrepresentable.
 - [x] Transaction types with SegWit support
 - [x] Block and BlockHeader types
 - [x] Network address type
-- [ ] Cryptographic hashing (SHA256d, RIPEMD160)
+- [x] Cryptographic hashing (SHA256, doubleSHA256, RIPEMD160, HASH160)
+- [x] HMAC-SHA512 for key derivation
+- [x] Public key parsing and serialization
+- [x] DER signature parsing
+- [x] Sighash computation (legacy and BIP-143 SegWit)
+- [ ] ECDSA signing/verification (requires secp256k1)
 - [ ] Script parsing and execution
 - [ ] Transaction validation
 - [ ] Block validation
@@ -39,10 +44,11 @@ haskoin/
   src/
     Haskoin/
       Types.hs      -- core data types and serialization
+      Crypto.hs     -- hashing, keys, signatures, sighash
   app/
     Main.hs         -- executable entry point
   test/
-    Spec.hs         -- serialization tests
+    Spec.hs         -- serialization and crypto tests
 ```
 
 ## Running tests
