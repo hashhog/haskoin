@@ -14,6 +14,7 @@ library
                  , Haskoin.Sync
                  , Haskoin.Mempool
                  , Haskoin.FeeEstimator
+                 , Haskoin.BlockTemplate
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
                  , bytestring
