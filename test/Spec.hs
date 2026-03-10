@@ -1836,23 +1836,42 @@ main = hspec $ do
 
   describe "commandName" $ do
     it "returns correct names for all message types" $ do
-      commandName (MVersion undefined) `shouldBe` "version"
+      let dummyVersion = Version 70016 0 0 (NetworkAddress 0 (BS.replicate 16 0) 0)
+                                        (NetworkAddress 0 (BS.replicate 16 0) 0)
+                                        0 (VarString "") 0 True
+          dummyPing = Ping 0
+          dummyPong = Pong 0
+          dummyAddr = Addr []
+          dummyInv = Inv []
+          dummyGetData = GetData []
+          dummyNotFound = NotFound []
+          dummyBlockHash = BlockHash (Hash256 (BS.replicate 32 0))
+          dummyGetBlocks = GetBlocks 70016 [] dummyBlockHash
+          dummyGetHeaders = GetHeaders 70016 [] dummyBlockHash
+          dummyHeaders = Headers []
+          dummyTx = Tx 1 [] [] [] 0
+          dummyBlockHeader = BlockHeader 1 dummyBlockHash (Hash256 (BS.replicate 32 0)) 0 0 0
+          dummyBlock = Block dummyBlockHeader []
+          dummyReject = Reject (VarString "tx") RejectInvalid (VarString "bad") ""
+          dummySendCmpct = SendCmpct False 2
+          dummyFeeFilter = FeeFilter 1000
+      commandName (MVersion dummyVersion) `shouldBe` "version"
       commandName MVerAck `shouldBe` "verack"
-      commandName (MPing undefined) `shouldBe` "ping"
-      commandName (MPong undefined) `shouldBe` "pong"
-      commandName (MAddr undefined) `shouldBe` "addr"
-      commandName (MInv undefined) `shouldBe` "inv"
-      commandName (MGetData undefined) `shouldBe` "getdata"
-      commandName (MNotFound undefined) `shouldBe` "notfound"
-      commandName (MGetBlocks undefined) `shouldBe` "getblocks"
-      commandName (MGetHeaders undefined) `shouldBe` "getheaders"
-      commandName (MHeaders undefined) `shouldBe` "headers"
-      commandName (MTx undefined) `shouldBe` "tx"
-      commandName (MBlock undefined) `shouldBe` "block"
-      commandName (MReject undefined) `shouldBe` "reject"
+      commandName (MPing dummyPing) `shouldBe` "ping"
+      commandName (MPong dummyPong) `shouldBe` "pong"
+      commandName (MAddr dummyAddr) `shouldBe` "addr"
+      commandName (MInv dummyInv) `shouldBe` "inv"
+      commandName (MGetData dummyGetData) `shouldBe` "getdata"
+      commandName (MNotFound dummyNotFound) `shouldBe` "notfound"
+      commandName (MGetBlocks dummyGetBlocks) `shouldBe` "getblocks"
+      commandName (MGetHeaders dummyGetHeaders) `shouldBe` "getheaders"
+      commandName (MHeaders dummyHeaders) `shouldBe` "headers"
+      commandName (MTx dummyTx) `shouldBe` "tx"
+      commandName (MBlock dummyBlock) `shouldBe` "block"
+      commandName (MReject dummyReject) `shouldBe` "reject"
       commandName MSendHeaders `shouldBe` "sendheaders"
-      commandName (MSendCmpct undefined) `shouldBe` "sendcmpct"
-      commandName (MFeeFilter undefined) `shouldBe` "feefilter"
+      commandName (MSendCmpct dummySendCmpct) `shouldBe` "sendcmpct"
+      commandName (MFeeFilter dummyFeeFilter) `shouldBe` "feefilter"
       commandName MGetAddr `shouldBe` "getaddr"
       commandName MMemPool `shouldBe` "mempool"
 
