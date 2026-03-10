@@ -32,6 +32,8 @@ module Haskoin.Script
   , encodeScriptNum
   , decodeScriptNum
   , isTrue
+    -- * Sigop Counting
+  , countScriptSigops
   ) where
 
 import Data.ByteString (ByteString)
@@ -1630,3 +1632,57 @@ verifySegWitScript tx idx prevScriptPubKey amount = do
     P2WPKH h -> verifyP2WPKH tx idx h amount
     P2WSH h -> verifyP2WSH tx idx h amount
     _ -> Left "Not a witness output"
+
+--------------------------------------------------------------------------------
+-- Sigop Counting
+--------------------------------------------------------------------------------
+
+-- | Count signature operations in a script.
+-- The accurate parameter indicates whether to count accurate sigops (P2SH/witness)
+-- or use the simple legacy counting.
+--
+-- For P2SH and witness scripts, the sigops are counted in the redeemed/witness script
+-- rather than the scriptPubKey. The 'accurate' flag indicates we're counting from
+-- a scriptSig/witness where we know the redeemed script.
+countScriptSigops :: Script -> Bool -> Int
+countScriptSigops (Script ops) accurate = go ops 0 Nothing
+  where
+    go [] acc _ = acc
+    go (op:rest) acc lastOp = case op of
+      OP_CHECKSIG -> go rest (acc + 1) (Just op)
+      OP_CHECKSIGVERIFY -> go rest (acc + 1) (Just op)
+      OP_CHECKMULTISIG ->
+        -- If accurate and last push was a small number, use that for key count
+        -- Otherwise assume worst case of 20 keys
+        let keyCount = if accurate
+                       then maybe 20 getPushNum lastOp
+                       else 20
+        in go rest (acc + keyCount) (Just op)
+      OP_CHECKMULTISIGVERIFY ->
+        let keyCount = if accurate
+                       then maybe 20 getPushNum lastOp
+                       else 20
+        in go rest (acc + keyCount) (Just op)
+      _ -> go rest acc (Just op)
+
+    -- Get the numeric value from a small number opcode for accurate multisig counting
+    getPushNum :: ScriptOp -> Int
+    getPushNum op = case op of
+      OP_0  -> 0
+      OP_1  -> 1
+      OP_2  -> 2
+      OP_3  -> 3
+      OP_4  -> 4
+      OP_5  -> 5
+      OP_6  -> 6
+      OP_7  -> 7
+      OP_8  -> 8
+      OP_9  -> 9
+      OP_10 -> 10
+      OP_11 -> 11
+      OP_12 -> 12
+      OP_13 -> 13
+      OP_14 -> 14
+      OP_15 -> 15
+      OP_16 -> 16
+      _     -> 20  -- Default to worst case
