@@ -22,6 +22,9 @@ system to make invalid states unrepresentable.
 - [x] Public key parsing and serialization
 - [x] DER signature parsing
 - [x] Sighash computation (legacy and BIP-143 SegWit)
+- [x] Address encoding (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
+- [x] Base58Check encoding/decoding
+- [x] Bech32/Bech32m encoding/decoding (BIP-173, BIP-350)
 - [ ] ECDSA signing/verification (requires secp256k1)
 - [ ] Script parsing and execution
 - [ ] Transaction validation
@@ -44,11 +47,11 @@ haskoin/
   src/
     Haskoin/
       Types.hs      -- core data types and serialization
-      Crypto.hs     -- hashing, keys, signatures, sighash
+      Crypto.hs     -- hashing, keys, signatures, sighash, addresses
   app/
     Main.hs         -- executable entry point
   test/
-    Spec.hs         -- serialization and crypto tests
+    Spec.hs         -- serialization, crypto, and address tests
 ```
 
 ## Running tests
