@@ -89,6 +89,7 @@ module Haskoin.Consensus
   , findForkPoint
   , getAncestor
   , buildLocatorHeights
+  , buildBlockLocatorFromChain
   , startHeaderSync
   , handleHeaders
     -- * Utilities
@@ -108,6 +109,7 @@ import Data.Serialize (encode, runPut, putWord32le, putWord64le, putByteString)
 import GHC.Generics (Generic)
 import Control.Concurrent.STM
 import Control.Concurrent (forkIO, threadDelay)
+import Network.Socket (SockAddr)
 
 import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
@@ -1339,10 +1341,10 @@ buildLocatorHeights tip = go tip 1 (0 :: Int)
 -- | Header sync controller state.
 -- Manages the headers-first synchronization process.
 data HeaderSync = HeaderSync
-  { hsChain    :: !HeaderChain        -- ^ The header chain being built
-  , hsNetwork  :: !Network            -- ^ Network configuration
-  , hsSyncing  :: !(TVar Bool)        -- ^ Whether sync is in progress
-  , hsSyncPeer :: !(TVar (Maybe Int)) -- ^ Peer ID we're syncing from (placeholder)
+  { hsChain    :: !HeaderChain              -- ^ The header chain being built
+  , hsNetwork  :: !Network                  -- ^ Network configuration
+  , hsSyncing  :: !(TVar Bool)              -- ^ Whether sync is in progress
+  , hsSyncPeer :: !(TVar (Maybe SockAddr))  -- ^ Peer address we're syncing from
   }
 
 -- | Start the header sync controller.
@@ -1395,3 +1397,18 @@ handleHeaders hs hdrs = do
     return ()
 
   return (successes, failures)
+
+--------------------------------------------------------------------------------
+-- Block Locator Building
+--------------------------------------------------------------------------------
+
+-- | Build a block locator from the current header chain.
+-- Returns a list of block hashes that can be used in getheaders messages.
+-- Uses exponentially-spaced heights to efficiently find fork points.
+buildBlockLocatorFromChain :: HeaderChain -> IO [BlockHash]
+buildBlockLocatorFromChain hc = do
+  tipHeight <- readTVarIO (hcHeight hc)
+  heightMap <- readTVarIO (hcByHeight hc)
+  let locHeights = buildLocatorHeights tipHeight
+      locHashes = [h | height <- locHeights, Just h <- [Map.lookup height heightMap]]
+  return locHashes
