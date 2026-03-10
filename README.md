@@ -57,6 +57,12 @@ system to make invalid states unrepresentable.
 - [x] Version handshake protocol (BIP handshake sequence)
 - [x] Feature negotiation (sendheaders BIP-130, sendcmpct BIP-152)
 - [x] Async send/receive threads with STM queues
+- [x] Peer manager with multi-peer connection handling
+- [x] DNS seed discovery with fallback addresses
+- [x] Peer scoring and banning (misbehavior threshold, 24h ban)
+- [x] Ping/pong monitoring with stale peer disconnection
+- [x] Block locator building for getheaders/getblocks
+- [x] Addr message handling for peer discovery
 - [ ] ECDSA signing/verification (requires secp256k1)
 - [ ] Block download and IBD
 - [ ] Mempool management
@@ -80,7 +86,7 @@ haskoin/
       Script.hs     -- script parsing, classification, interpreter
       Consensus.hs  -- network config, constants, block/tx validation
       Storage.hs    -- rocksdb persistence layer
-      Network.hs    -- p2p messages, peer connection, handshake
+      Network.hs    -- p2p messages, peer connection, peer manager
   app/
     Main.hs         -- executable entry point
   test/
