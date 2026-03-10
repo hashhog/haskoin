@@ -465,7 +465,7 @@ data UndoData = UndoData
   { udBlockHash    :: !BlockHash            -- ^ Hash of the block this undo is for
   , udHeight       :: !Word32               -- ^ Height of the block
   , udSpentOutputs :: ![(OutPoint, UTXOEntry)] -- ^ UTXOs that were spent
-  } deriving (Show, Generic)
+  } deriving (Show, Eq, Generic)
 
 instance Serialize UndoData where
   put UndoData{..} = do
@@ -505,7 +505,7 @@ data PersistedChainState = PersistedChainState
   { pcsHeight    :: !Word32     -- ^ Height of the best validated block
   , pcsBestBlock :: !BlockHash  -- ^ Hash of the best validated block
   , pcsChainWork :: !Integer    -- ^ Cumulative proof-of-work
-  } deriving (Show, Generic)
+  } deriving (Show, Eq, Generic)
 
 instance Serialize PersistedChainState where
   put PersistedChainState{..} = do
