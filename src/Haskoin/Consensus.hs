@@ -75,6 +75,22 @@ module Haskoin.Consensus
   , disconnectBlock
     -- * Block Status (re-exported from Storage)
   , BlockStatus(..)
+    -- * Header Synchronization
+  , ChainEntry(..)
+  , HeaderChain(..)
+  , HeaderSync(..)
+  , initHeaderChain
+  , headerWork
+  , cumulativeWork
+  , medianTimePast
+  , difficultyAdjustment
+  , addHeader
+  , getChainTip
+  , findForkPoint
+  , getAncestor
+  , buildLocatorHeights
+  , startHeaderSync
+  , handleHeaders
     -- * Utilities
   , hexToBS
   , hashFromHex
@@ -84,14 +100,16 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word8, Word32, Word64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.List (nub, foldl')
-import Control.Monad (when, unless, forM, foldM)
+import Data.List (nub, sort)
+import Control.Monad (when, unless, forM, foldM, forever, void)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Serialize (encode, runPut, putWord32le, putWord64le, putByteString)
 import GHC.Generics (Generic)
+import Control.Concurrent.STM
+import Control.Concurrent (forkIO, threadDelay)
 
-import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
+import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
                       Block(..), putVarInt, putVarBytes)
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
@@ -638,10 +656,10 @@ validateTransaction tx = do
 
   -- Coinbase checks
   let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
-      isCoinbase = length (txInputs tx) == 1
-                && txInPrevOutput (head $ txInputs tx) == nullOutpoint
+      txIsCoinbase = length (txInputs tx) == 1
+                  && txInPrevOutput (head $ txInputs tx) == nullOutpoint
 
-  when isCoinbase $ do
+  when txIsCoinbase $ do
     let scriptLen = BS.length $ txInScript $ head $ txInputs tx
     -- Coinbase scriptSig must be 2-100 bytes (BIP-34 encodes height)
     -- KNOWN PITFALL: CScriptNum sign-magnitude means thresholds are 0x7f/0x7fff
@@ -650,7 +668,7 @@ validateTransaction tx = do
       Left "Coinbase scriptSig size out of range (must be 2-100 bytes)"
 
   -- Non-coinbase checks
-  unless isCoinbase $ do
+  unless txIsCoinbase $ do
     -- No null prevouts in non-coinbase
     let hasNullPrevout = any (\inp ->
           txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
@@ -1057,3 +1075,323 @@ disconnectBlock db block prevHash = do
           [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
         ]
   writeBatch db (WriteBatch ops)
+
+--------------------------------------------------------------------------------
+-- Header Chain Types
+--------------------------------------------------------------------------------
+
+-- | An entry in the header chain with computed metadata.
+-- KNOWN PITFALL: header_tip vs chain_tip - track separately in DB.
+-- Headers can be far ahead of validated blocks. Same DB key = data corruption.
+data ChainEntry = ChainEntry
+  { ceHeader     :: !BlockHeader     -- ^ The raw 80-byte header
+  , ceHash       :: !BlockHash       -- ^ Block hash (computed from header)
+  , ceHeight     :: !Word32          -- ^ Height in the chain
+  , ceChainWork  :: !Integer         -- ^ Cumulative proof-of-work
+  , cePrev       :: !(Maybe BlockHash) -- ^ Previous block hash (for genesis: Nothing)
+  , ceStatus     :: !BlockStatus     -- ^ Validation status
+  , ceMedianTime :: !Word32          -- ^ Median time past for this block
+  } deriving (Show, Generic)
+
+-- | In-memory header chain with concurrent access support.
+-- Uses TVars for thread-safe access from multiple threads.
+data HeaderChain = HeaderChain
+  { hcEntries  :: !(TVar (Map BlockHash ChainEntry)) -- ^ All known entries by hash
+  , hcTip      :: !(TVar ChainEntry)                 -- ^ Current best tip
+  , hcHeight   :: !(TVar Word32)                     -- ^ Height of current tip
+  , hcByHeight :: !(TVar (Map Word32 BlockHash))     -- ^ Height -> hash index
+  }
+
+--------------------------------------------------------------------------------
+-- Chain Work Calculation
+--------------------------------------------------------------------------------
+
+-- | Calculate the work for a single header.
+-- Work = 2^256 / (target + 1), representing the expected number of hashes
+-- needed to find a block at this difficulty.
+headerWork :: BlockHeader -> Integer
+headerWork header =
+  let target = bitsToTarget (bhBits header)
+  in if target <= 0 then 0
+     else (2 ^ (256 :: Integer)) `div` (target + 1)
+
+-- | Calculate cumulative chain work by adding header work to previous work.
+cumulativeWork :: Integer -> BlockHeader -> Integer
+cumulativeWork prevWork header = prevWork + headerWork header
+
+--------------------------------------------------------------------------------
+-- Median Time Past (BIP-113)
+--------------------------------------------------------------------------------
+
+-- | Calculate the median time past for a block.
+-- MTP is the median of the previous 11 block timestamps.
+-- Used for locktime validation (BIP-113).
+medianTimePast :: Map BlockHash ChainEntry -> BlockHash -> Word32
+medianTimePast entries blockHash =
+  let timestamps = collectTimestamps entries blockHash 11
+      sorted = sort timestamps
+  in if null sorted then 0 else sorted !! (length sorted `div` 2)
+  where
+    collectTimestamps :: Map BlockHash ChainEntry -> BlockHash -> Int -> [Word32]
+    collectTimestamps _ _ 0 = []
+    collectTimestamps ents hash n =
+      case Map.lookup hash ents of
+        Nothing -> []
+        Just ce -> bhTimestamp (ceHeader ce)
+          : maybe [] (\p -> collectTimestamps ents p (n-1)) (cePrev ce)
+
+--------------------------------------------------------------------------------
+-- Difficulty Adjustment
+--------------------------------------------------------------------------------
+
+-- | Calculate the expected difficulty bits for the next block.
+-- Difficulty adjusts every 2016 blocks on mainnet.
+-- The adjustment clamps the timespan to [1/4, 4x] of the target (2 weeks).
+difficultyAdjustment :: Network -> Map BlockHash ChainEntry -> ChainEntry -> Word32
+difficultyAdjustment net entries entry =
+  let height = ceHeight entry + 1
+  in if height `mod` netRetargetInterval net /= 0
+     then bhBits (ceHeader entry)  -- No adjustment
+     else
+       -- Find the first block in this 2016-block period
+       let firstHash = walkBack entries (ceHash entry) (netRetargetInterval net - 1)
+       in case firstHash >>= (`Map.lookup` entries) of
+            Nothing -> bhBits (ceHeader entry)  -- Fallback if not found
+            Just firstEntry ->
+              let actualTime = bhTimestamp (ceHeader entry)
+                             - bhTimestamp (ceHeader firstEntry)
+                  -- Clamp to [targetTimespan/4, targetTimespan*4]
+                  minTime = netPowTargetTimespan net `div` 4
+                  maxTime = netPowTargetTimespan net * 4
+                  clampedTime = max minTime (min maxTime actualTime)
+                  oldTarget = bitsToTarget (bhBits (ceHeader entry))
+                  -- New target = old_target * actual_time / target_time
+                  newTarget = min (netPowLimit net) $
+                    (oldTarget * fromIntegral clampedTime)
+                    `div` fromIntegral (netPowTargetTimespan net)
+              in targetToBits newTarget
+  where
+    walkBack :: Map BlockHash ChainEntry -> BlockHash -> Word32 -> Maybe BlockHash
+    walkBack _ hash 0 = Just hash
+    walkBack ents hash n = case Map.lookup hash ents of
+      Nothing -> Nothing
+      Just ce -> cePrev ce >>= \p -> walkBack ents p (n-1)
+
+--------------------------------------------------------------------------------
+-- Header Chain Initialization
+--------------------------------------------------------------------------------
+
+-- | Initialize a header chain with the genesis block.
+initHeaderChain :: Network -> IO HeaderChain
+initHeaderChain net = do
+  let genesis = blockHeader (netGenesisBlock net)
+      genesisHash = computeBlockHash genesis
+      work = headerWork genesis
+      genesisEntry = ChainEntry
+        { ceHeader = genesis
+        , ceHash = genesisHash
+        , ceHeight = 0
+        , ceChainWork = work
+        , cePrev = Nothing
+        , ceStatus = StatusValid
+        , ceMedianTime = bhTimestamp genesis
+        }
+  entriesVar <- newTVarIO (Map.singleton genesisHash genesisEntry)
+  tipVar <- newTVarIO genesisEntry
+  heightVar <- newTVarIO 0
+  byHeightVar <- newTVarIO (Map.singleton 0 genesisHash)
+  return HeaderChain
+    { hcEntries = entriesVar
+    , hcTip = tipVar
+    , hcHeight = heightVar
+    , hcByHeight = byHeightVar
+    }
+
+--------------------------------------------------------------------------------
+-- Header Validation and Insertion
+--------------------------------------------------------------------------------
+
+-- | Add a header to the chain after validation.
+-- Returns Left with error message on failure, Right with entry on success.
+addHeader :: Network -> HeaderChain -> BlockHeader -> IO (Either String ChainEntry)
+addHeader net hc header = do
+  let hash = computeBlockHash header
+      prevHash = bhPrevBlock header
+  entries <- readTVarIO (hcEntries hc)
+
+  -- Check if already known
+  case Map.lookup hash entries of
+    Just existing -> return $ Right existing
+    Nothing -> case Map.lookup prevHash entries of
+      Nothing -> return $ Left "Unknown previous block"
+      Just parent -> do
+        let height = ceHeight parent + 1
+
+        -- Validate proof of work
+        if not (checkProofOfWork header (netPowLimit net))
+          then return $ Left "Proof of work check failed"
+          else do
+            -- Validate timestamp > MTP
+            let mtp = medianTimePast entries prevHash
+            if bhTimestamp header <= mtp
+              then return $ Left "Timestamp not after median time past"
+              else do
+                -- Validate difficulty (skip on testnet if min-diff blocks allowed)
+                let expectedBits = difficultyAdjustment net entries parent
+                    difficultyOk = bhBits header == expectedBits
+                                || netAllowMinDiffBlocks net
+
+                if not difficultyOk
+                  then return $ Left "Incorrect difficulty target"
+                  else do
+                    -- Compute metadata
+                    let work = cumulativeWork (ceChainWork parent) header
+                        entry = ChainEntry
+                          { ceHeader = header
+                          , ceHash = hash
+                          , ceHeight = height
+                          , ceChainWork = work
+                          , cePrev = Just prevHash
+                          , ceStatus = StatusHeaderValid
+                          , ceMedianTime = mtp
+                          }
+
+                    -- Insert and potentially update tip atomically
+                    atomically $ do
+                      modifyTVar' (hcEntries hc) (Map.insert hash entry)
+                      modifyTVar' (hcByHeight hc) (Map.insert height hash)
+                      currentTip <- readTVar (hcTip hc)
+                      when (work > ceChainWork currentTip) $ do
+                        writeTVar (hcTip hc) entry
+                        writeTVar (hcHeight hc) height
+
+                    return $ Right entry
+
+-- | Get the current chain tip.
+getChainTip :: HeaderChain -> IO ChainEntry
+getChainTip hc = readTVarIO (hcTip hc)
+
+--------------------------------------------------------------------------------
+-- Chain Navigation
+--------------------------------------------------------------------------------
+
+-- | Find the common ancestor (fork point) of two blocks.
+-- Works by walking both chains back until they meet.
+findForkPoint :: HeaderChain -> BlockHash -> BlockHash -> IO (Maybe ChainEntry)
+findForkPoint hc h1 h2 = do
+  entries <- readTVarIO (hcEntries hc)
+  let e1 = Map.lookup h1 entries
+      e2 = Map.lookup h2 entries
+  case (e1, e2) of
+    (Just a, Just b) -> return $ go entries a b
+    _ -> return Nothing
+  where
+    go :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Maybe ChainEntry
+    go ents a b
+      | ceHash a == ceHash b = Just a
+      | ceHeight a > ceHeight b =
+          cePrev a >>= (`Map.lookup` ents) >>= \p -> go ents p b
+      | ceHeight a < ceHeight b =
+          cePrev b >>= (`Map.lookup` ents) >>= \p -> go ents a p
+      | otherwise = do
+          -- Same height, both need to step back
+          p1 <- cePrev a >>= (`Map.lookup` ents)
+          p2 <- cePrev b >>= (`Map.lookup` ents)
+          go ents p1 p2
+
+-- | Get the ancestor at a specific height.
+-- Returns Nothing if the target height is higher than the block's height
+-- or if the chain is incomplete.
+getAncestor :: HeaderChain -> BlockHash -> Word32 -> IO (Maybe ChainEntry)
+getAncestor hc hash target = do
+  entries <- readTVarIO (hcEntries hc)
+  return $ walk entries hash
+  where
+    walk :: Map BlockHash ChainEntry -> BlockHash -> Maybe ChainEntry
+    walk ents h = case Map.lookup h ents of
+      Nothing -> Nothing
+      Just ce
+        | ceHeight ce == target -> Just ce
+        | ceHeight ce < target  -> Nothing  -- Target is higher
+        | otherwise -> cePrev ce >>= walk ents
+
+--------------------------------------------------------------------------------
+-- Block Locator
+--------------------------------------------------------------------------------
+
+-- | Build block locator heights using exponential backoff.
+-- Returns heights: tip, tip-1, tip-2, ..., tip-9, tip-11, tip-15, tip-23, ...
+-- This allows efficiently finding the fork point with minimal data.
+buildLocatorHeights :: Word32 -> [Word32]
+buildLocatorHeights tip = go tip 1 (0 :: Int)
+  where
+    go :: Word32 -> Word32 -> Int -> [Word32]
+    go h step count
+      | h == 0    = [0]
+      | count < 10 = h : go (h - 1) 1 (count + 1)
+      | h <= step = h : [0]  -- Avoid underflow, end at genesis
+      | otherwise = h : go (h - step) (step * 2) (count + 1)
+
+--------------------------------------------------------------------------------
+-- Header Sync Controller
+--------------------------------------------------------------------------------
+
+-- | Header sync controller state.
+-- Manages the headers-first synchronization process.
+data HeaderSync = HeaderSync
+  { hsChain    :: !HeaderChain        -- ^ The header chain being built
+  , hsNetwork  :: !Network            -- ^ Network configuration
+  , hsSyncing  :: !(TVar Bool)        -- ^ Whether sync is in progress
+  , hsSyncPeer :: !(TVar (Maybe Int)) -- ^ Peer ID we're syncing from (placeholder)
+  }
+
+-- | Start the header sync controller.
+-- Returns a HeaderSync that can be used to control synchronization.
+startHeaderSync :: Network -> HeaderChain -> IO HeaderSync
+startHeaderSync net hc = do
+  syncingVar <- newTVarIO False
+  peerVar <- newTVarIO Nothing
+  let hs = HeaderSync
+        { hsChain = hc
+        , hsNetwork = net
+        , hsSyncing = syncingVar
+        , hsSyncPeer = peerVar
+        }
+  -- Start the sync loop in a background thread
+  void $ forkIO $ headerSyncLoop hs
+  return hs
+
+-- | Main header sync loop.
+-- Periodically checks if we need to sync and initiates sync if needed.
+headerSyncLoop :: HeaderSync -> IO ()
+headerSyncLoop hs = forever $ do
+  syncing <- readTVarIO (hsSyncing hs)
+  unless syncing $ do
+    -- Check if we need to sync (placeholder - in real implementation
+    -- this would check peer heights and initiate getheaders)
+    return ()
+  threadDelay 1000000  -- 1 second
+
+-- | Handle incoming headers message.
+-- Validates and adds each header, potentially triggering more requests.
+-- Returns the number of successfully added headers.
+handleHeaders :: HeaderSync -> [BlockHeader] -> IO (Int, [String])
+handleHeaders hs hdrs = do
+  results <- mapM (addHeader (hsNetwork hs) (hsChain hs)) hdrs
+  let successes = length [() | Right _ <- results]
+      failures = [e | Left e <- results]
+
+  -- If we got 2000 headers, there may be more
+  when (length hdrs == 2000 && null failures) $ do
+    -- In a real implementation, we'd request more headers
+    -- starting from the last received header
+    return ()
+
+  -- If we got fewer than 2000 or had failures, sync is complete
+  when (length hdrs < 2000 || not (null failures)) $ do
+    atomically $ writeTVar (hsSyncing hs) False
+    _ <- getChainTip (hsChain hs)  -- Could be used for logging
+    -- Log completion (placeholder)
+    return ()
+
+  return (successes, failures)
