@@ -86,6 +86,10 @@ system to make invalid states unrepresentable.
 - [x] Ancestor/descendant limits (CPFP-aware)
 - [x] Transaction selection for block templates
 - [x] Mempool eviction by fee rate
+- [x] Fee estimation with confirmation time tracking
+- [x] Logarithmic fee rate buckets (128 buckets, 1-10000 sat/vB)
+- [x] Exponential decay for recent data weighting
+- [x] Conservative and economical estimation modes
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -105,11 +109,12 @@ haskoin/
       Types.hs      -- core data types and serialization
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
       Script.hs     -- script parsing, classification, interpreter
-      Consensus.hs  -- network config, validation, header sync, reorgs
-      Storage.hs    -- rocksdb persistence, UTXO cache, undo data
-      Network.hs    -- p2p messages, peer connection, peer manager
-      Sync.hs       -- block download, IBD pipeline
-      Mempool.hs    -- transaction pool, fee tracking, RBF
+      Consensus.hs     -- network config, validation, header sync, reorgs
+      Storage.hs       -- rocksdb persistence, UTXO cache, undo data
+      Network.hs       -- p2p messages, peer connection, peer manager
+      Sync.hs          -- block download, IBD pipeline
+      Mempool.hs       -- transaction pool, fee tracking, RBF
+      FeeEstimator.hs  -- fee rate estimation from confirmation times
   app/
     Main.hs         -- executable entry point
   test/
