@@ -18,6 +18,7 @@ import Haskoin.Types
 import Haskoin.Crypto
 import Haskoin.Script
 import Haskoin.Consensus
+import Haskoin.Storage
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
@@ -1138,3 +1139,138 @@ main = hspec $ do
             }
       -- Any real hash will be above target 1
       checkProofOfWork header powLimit `shouldBe` False
+
+  -- Storage module tests
+  describe "Storage key utilities" $ do
+    it "toBE32 encodes zero" $ do
+      toBE32 0 `shouldBe` BS.pack [0x00, 0x00, 0x00, 0x00]
+
+    it "toBE32 encodes small values" $ do
+      toBE32 1 `shouldBe` BS.pack [0x00, 0x00, 0x00, 0x01]
+      toBE32 255 `shouldBe` BS.pack [0x00, 0x00, 0x00, 0xff]
+      toBE32 256 `shouldBe` BS.pack [0x00, 0x00, 0x01, 0x00]
+
+    it "toBE32 encodes large values" $ do
+      toBE32 0xDEADBEEF `shouldBe` BS.pack [0xde, 0xad, 0xbe, 0xef]
+      toBE32 0xFFFFFFFF `shouldBe` BS.pack [0xff, 0xff, 0xff, 0xff]
+
+    it "fromBE32 decodes correctly" $ do
+      fromBE32 (BS.pack [0x00, 0x00, 0x00, 0x01]) `shouldBe` Just 1
+      fromBE32 (BS.pack [0xde, 0xad, 0xbe, 0xef]) `shouldBe` Just 0xDEADBEEF
+
+    it "fromBE32 rejects wrong length" $ do
+      fromBE32 (BS.pack [0x00, 0x00, 0x00]) `shouldBe` Nothing
+      fromBE32 (BS.pack [0x00, 0x00, 0x00, 0x00, 0x00]) `shouldBe` Nothing
+
+    it "toBE32/fromBE32 roundtrip" $ property $ \w ->
+      fromBE32 (toBE32 w) == Just w
+
+  describe "Storage integer encoding" $ do
+    it "integerToBS encodes zero" $ do
+      integerToBS 0 `shouldBe` BS.singleton 0
+
+    it "integerToBS encodes small values" $ do
+      integerToBS 1 `shouldBe` BS.singleton 1
+      integerToBS 127 `shouldBe` BS.singleton 127
+      integerToBS 255 `shouldBe` BS.singleton 255
+      integerToBS 256 `shouldBe` BS.pack [0x01, 0x00]
+
+    it "integerToBS encodes large values" $ do
+      integerToBS 0x123456 `shouldBe` BS.pack [0x12, 0x34, 0x56]
+      integerToBS 0xDEADBEEF `shouldBe` BS.pack [0xde, 0xad, 0xbe, 0xef]
+
+    it "bsToInteger decodes correctly" $ do
+      bsToInteger (BS.singleton 0) `shouldBe` 0
+      bsToInteger (BS.singleton 1) `shouldBe` 1
+      bsToInteger (BS.pack [0x01, 0x00]) `shouldBe` 256
+      bsToInteger (BS.pack [0xde, 0xad, 0xbe, 0xef]) `shouldBe` 0xDEADBEEF
+
+    it "integerToBS/bsToInteger roundtrip" $ property $ \(n :: Word64) ->
+      bsToInteger (integerToBS (fromIntegral n)) == fromIntegral n
+
+  describe "Storage key prefixes" $ do
+    it "prefixByte returns correct values" $ do
+      prefixByte PrefixBlockHeader `shouldBe` 0x01
+      prefixByte PrefixBlockData `shouldBe` 0x02
+      prefixByte PrefixBlockHeight `shouldBe` 0x03
+      prefixByte PrefixTxIndex `shouldBe` 0x04
+      prefixByte PrefixUTXO `shouldBe` 0x05
+      prefixByte PrefixBestBlock `shouldBe` 0x06
+      prefixByte PrefixChainWork `shouldBe` 0x07
+      prefixByte PrefixBlockStatus `shouldBe` 0x08
+
+    it "makeKey prepends prefix byte" $ do
+      makeKey PrefixBlockHeader (BS.pack [0xaa, 0xbb]) `shouldBe`
+        BS.pack [0x01, 0xaa, 0xbb]
+      makeKey PrefixUTXO BS.empty `shouldBe` BS.singleton 0x05
+
+    it "makeKey with encoded BlockHash" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xab))
+          key = makeKey PrefixBlockHeader (encode bh)
+      BS.head key `shouldBe` 0x01
+      BS.length key `shouldBe` 33  -- 1 prefix + 32 hash
+
+  describe "TxLocation serialization" $ do
+    it "roundtrips correctly" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xcd))
+          loc = TxLocation bh 42
+      decode (encode loc) `shouldBe` Right loc
+
+    it "has correct size" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
+          loc = TxLocation bh 0
+      -- 32 bytes for BlockHash + 4 bytes for Word32
+      BS.length (encode loc) `shouldBe` 36
+
+  describe "BlockStatus serialization" $ do
+    it "roundtrips all status values" $ do
+      decode (encode StatusUnknown) `shouldBe` Right StatusUnknown
+      decode (encode StatusHeaderValid) `shouldBe` Right StatusHeaderValid
+      decode (encode StatusDataReceived) `shouldBe` Right StatusDataReceived
+      decode (encode StatusValid) `shouldBe` Right StatusValid
+      decode (encode StatusInvalid) `shouldBe` Right StatusInvalid
+
+  describe "WriteBatch operations" $ do
+    it "mempty creates empty batch" $ do
+      getBatchOps mempty `shouldBe` []
+
+    it "monoid append combines batches" $ do
+      let batch1 = WriteBatch [BatchPut "k1" "v1"]
+          batch2 = WriteBatch [BatchPut "k2" "v2"]
+          combined = batch1 <> batch2
+      length (getBatchOps combined) `shouldBe` 2
+
+    it "batchPutBlockHeader creates correct operation" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xaa))
+          header = BlockHeader 1 bh (Hash256 (BS.replicate 32 0)) 0 0 0
+          BatchPut key val = batchPutBlockHeader bh header
+      -- Key should start with block header prefix
+      BS.head key `shouldBe` prefixByte PrefixBlockHeader
+
+    it "batchPutUTXO creates correct operation" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xbb))
+          outpoint = OutPoint txid 0
+          txout = TxOut 1000 "script"
+          BatchPut key val = batchPutUTXO outpoint txout
+      -- Key should start with UTXO prefix
+      BS.head key `shouldBe` prefixByte PrefixUTXO
+
+    it "batchDeleteUTXO creates correct operation" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xcc))
+          outpoint = OutPoint txid 1
+          BatchDelete key = batchDeleteUTXO outpoint
+      BS.head key `shouldBe` prefixByte PrefixUTXO
+
+    it "batchPutBestBlock creates correct operation" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xdd))
+          BatchPut key val = batchPutBestBlock bh
+      -- Key should start with best block prefix, then empty payload
+      key `shouldBe` makeKey PrefixBestBlock BS.empty
+
+    it "batchPutBlockHeight creates correct operation" $ do
+      let bh = BlockHash (Hash256 (BS.replicate 32 0xee))
+          BatchPut key val = batchPutBlockHeight 100 bh
+      -- Key should start with block height prefix
+      BS.head key `shouldBe` prefixByte PrefixBlockHeight
+      -- Rest of key should be big-endian height
+      BS.take 4 (BS.drop 1 key) `shouldBe` toBE32 100
