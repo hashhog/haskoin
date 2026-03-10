@@ -13,101 +13,21 @@ system to make invalid states unrepresentable.
 
 - [x] Core data types (Hash256, TxId, BlockHash, etc.)
 - [x] Binary serialization via cereal
-- [x] VarInt encoding
-- [x] Transaction types with SegWit support
-- [x] Block and BlockHeader types
-- [x] Network address type
+- [x] VarInt encoding and SegWit transaction support
 - [x] Cryptographic hashing (SHA256, doubleSHA256, RIPEMD160, HASH160)
-- [x] HMAC-SHA512 for key derivation
-- [x] Public key parsing and serialization
-- [x] DER signature parsing
-- [x] Sighash computation (legacy and BIP-143 SegWit)
 - [x] Address encoding (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- [x] Base58Check encoding/decoding
-- [x] Bech32/Bech32m encoding/decoding (BIP-173, BIP-350)
-- [x] Script parsing and encoding
-- [x] Script classification (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, multisig)
-- [x] Script interpreter with all standard opcodes
-- [x] P2SH script verification (BIP-16)
-- [x] SegWit script verification (P2WPKH, P2WSH)
-- [x] Flow control (IF/ELSE/ENDIF), arithmetic, stack ops
-- [x] CHECKLOCKTIMEVERIFY (BIP-65), CHECKSEQUENCEVERIFY (BIP-112)
-- [x] Consensus parameters (block limits, script limits, weight)
-- [x] Difficulty target conversion (compact bits format)
-- [x] Block reward schedule with halving
-- [x] Merkle root computation
-- [x] Network configs (mainnet, testnet3, regtest)
-- [x] Genesis blocks for all networks
-- [x] Basic block header validation
-- [x] Basic transaction validation
-- [x] RocksDB storage layer (block headers, UTXOs, tx index)
-- [x] Prefix-based key schema with batch writes
-- [x] Full block validation with consensus rules
-- [x] Transaction validation against UTXO set
-- [x] Coinbase detection and BIP-34 height extraction
-- [x] Block weight calculation (BIP-141)
-- [x] Sigop counting with witness discount
-- [x] Witness commitment validation
-- [x] Block connection/disconnection for chain state
-- [x] Intra-block UTXO spending support
-- [x] P2P message serialization (version, inv, getdata, headers, etc.)
-- [x] Service flags (NODE_NETWORK, NODE_WITNESS, etc.)
-- [x] Protocol version negotiation support
-- [x] TCP peer connection with buffered reads
-- [x] Version handshake protocol (BIP handshake sequence)
-- [x] Feature negotiation (sendheaders BIP-130, sendcmpct BIP-152)
-- [x] Async send/receive threads with STM queues
-- [x] Peer manager with multi-peer connection handling
-- [x] DNS seed discovery with fallback addresses
-- [x] Peer scoring and banning (misbehavior threshold, 24h ban)
-- [x] Ping/pong monitoring with stale peer disconnection
-- [x] Block locator building for getheaders/getblocks
-- [x] Addr message handling for peer discovery
-- [x] Header chain with cumulative proof-of-work tracking
-- [x] Median time past calculation (BIP-113)
-- [x] Difficulty adjustment (retarget every 2016 blocks)
-- [x] Header validation (PoW, timestamp, difficulty)
-- [x] Headers-first sync controller
-- [x] Fork point detection and ancestor lookup
-- [x] Block download pipeline (IBD)
-- [x] Pipelined block downloads (up to 128 in-flight)
-- [x] Per-peer download throttling (~16 blocks/peer)
-- [x] Adaptive stall detection and re-request
-- [x] Batch GetData messages for efficiency
-- [x] Block validation and chain connection during IBD
-- [x] In-memory UTXO cache with dirty tracking
-- [x] UTXOEntry with metadata (height, coinbase flag)
-- [x] Undo data generation for chain reorganizations
-- [x] Chain state persistence (height, best block, chain work)
-- [x] Coinbase maturity validation (100 block rule)
-- [x] Chain reorganization support (disconnect/reconnect)
-- [x] Transaction mempool with fee rate tracking
-- [x] BIP-125 Replace-By-Fee (RBF) support
-- [x] Ancestor/descendant limits (CPFP-aware)
-- [x] Transaction selection for block templates
-- [x] Mempool eviction by fee rate
-- [x] Fee estimation with confirmation time tracking
-- [x] Logarithmic fee rate buckets (128 buckets, 1-10000 sat/vB)
-- [x] Exponential decay for recent data weighting
-- [x] Conservative and economical estimation modes
+- [x] Script parsing, classification, and interpreter
+- [x] Full consensus validation with all BIP rules
+- [x] RocksDB storage layer with UTXO cache
+- [x] P2P networking with peer manager
+- [x] Headers-first sync and IBD pipeline
+- [x] Transaction mempool with RBF support
+- [x] Fee estimation with confirmation tracking
 - [x] Block template construction for mining
-- [x] Coinbase transaction with BIP-34 height encoding
-- [x] Witness commitment (BIP-141)
-- [x] Transaction selection by ancestor fee rate
-- [x] Block assembly from template and nonce
-- [x] Block submission with validation and broadcast
-- [x] JSON-RPC server (Bitcoin Core compatible)
-- [x] RPC endpoints: blockchain, transactions, mempool, network, mining
-- [x] HTTP Basic authentication
-- [x] Fee estimation RPC
-- [x] HD wallet with BIP-32/39/44/84 support
-- [x] Mnemonic generation and seed derivation
-- [x] Extended key derivation (hardened and normal)
-- [x] Address generation with gap limit
-- [x] UTXO tracking and balance queries
-- [x] Coin selection and transaction creation
-- [x] CLI with node, wallet, and utility subcommands
-- [x] Comprehensive test suite (HSpec + QuickCheck)
+- [x] Bitcoin Core compatible JSON-RPC server
+- [x] HD wallet (BIP-32/39/44/84)
+- [x] CLI with node, wallet, and utility commands
+- [x] Performance optimizations (parallel validation, LRU cache, metrics)
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -115,46 +35,41 @@ system to make invalid states unrepresentable.
 ```bash
 cabal build
 cabal run haskoin -- --help
-cabal run haskoin -- node --help
-cabal run haskoin -- wallet --help
-cabal run haskoin -- util --help
+cabal run haskoin -- node --network Regtest --rpcport 18443
+cabal test
 ```
 
-Run the full node:
-```bash
-cabal run haskoin -- node --rpcport 8332
-```
+For optimized builds with RTS tuning:
 
-Utility commands:
 ```bash
-cabal run haskoin -- util validateaddress bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
-cabal run haskoin -- util decodetx <hex>
+cabal build -O2
+cabal run haskoin -- +RTS -N -A64m -H2G -I0 -RTS node --network mainnet
 ```
 
 ## Project structure
 
 ```
 haskoin/
-  src/
-    Haskoin/
-      Types.hs         -- core data types and serialization
-      Crypto.hs        -- hashing, keys, signatures, sighash, addresses
-      Script.hs        -- script parsing, classification, interpreter
-      Consensus.hs     -- network config, validation, header sync, reorgs
-      Storage.hs       -- rocksdb persistence, UTXO cache, undo data
-      Network.hs       -- p2p messages, peer connection, peer manager
-      Sync.hs          -- block download, IBD pipeline
-      Mempool.hs       -- transaction pool, fee tracking, RBF
-      FeeEstimator.hs  -- fee rate estimation from confirmation times
-      BlockTemplate.hs -- block template construction for mining
-      Rpc.hs           -- json-rpc server (bitcoin core compatible)
-      Wallet.hs        -- hd wallet (bip-32/39/44/84)
-  resources/
-    bip39-english.txt  -- bip-39 mnemonic wordlist
+  src/Haskoin/
+    Types.hs         -- core data types and serialization
+    Crypto.hs        -- hashing, keys, signatures, addresses
+    Script.hs        -- script parsing and interpreter
+    Consensus.hs     -- validation, header sync, reorgs
+    Storage.hs       -- rocksdb persistence, UTXO cache
+    Network.hs       -- p2p messages, peer connection
+    Sync.hs          -- block download, IBD pipeline
+    Mempool.hs       -- transaction pool, RBF
+    FeeEstimator.hs  -- fee rate estimation
+    BlockTemplate.hs -- block template for mining
+    Rpc.hs           -- json-rpc server
+    Wallet.hs        -- hd wallet (bip-32/39/44/84)
+    Performance.hs   -- parallel validation, LRU cache, metrics
+  bench/
+    Bench.hs         -- criterion benchmarks
   app/
-    Main.hs         -- CLI entry point with optparse-applicative
+    Main.hs          -- CLI entry point
   test/
-    Spec.hs         -- comprehensive test suite
+    Spec.hs          -- test suite
 ```
 
 ## Running tests
@@ -163,6 +78,8 @@ haskoin/
 cabal test --test-show-details=direct
 ```
 
-The test suite covers serialization round-trips, cryptographic operations,
-script execution, consensus validation, address encoding, P2P messages,
-wallet operations, and fee estimation.
+## Running benchmarks
+
+```bash
+cabal bench --benchmark-options='-o report.html'
+```
