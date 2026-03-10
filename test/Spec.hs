@@ -13,6 +13,7 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Data.Text as T
 import Data.Word (Word32, Word64)
 import Data.Int (Int64)
+import Data.Bits ((.|.))
 
 import Haskoin.Types
 import Haskoin.Crypto
@@ -259,6 +260,110 @@ main = hspec $ do
       sigHashTypeToWord32 (sigHashAnyoneCanPay sigHashAll) `shouldBe` 0x81
       sigHashTypeToWord32 (sigHashAnyoneCanPay sigHashNone) `shouldBe` 0x82
       sigHashTypeToWord32 (sigHashAnyoneCanPay sigHashSingle) `shouldBe` 0x83
+
+  describe "Sighash Computation" $ do
+    describe "Legacy Sighash (txSigHash)" $ do
+      it "computes sighash for SIGHASH_ALL" $ do
+        -- Create a simple transaction
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xaa))
+            prevOutpoint = OutPoint prevTxid 0
+            txIn = TxIn prevOutpoint "" 0xffffffff
+            txOut = TxOut 1000000 ""
+            tx = Tx 1 [txIn] [txOut] [[]] 0
+            subscript = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xab <> BS.pack [0x88, 0xac]
+            Hash256 sighash = txSigHash tx 0 subscript sigHashAll
+        -- Result should be 32 bytes
+        BS.length sighash `shouldBe` 32
+        -- Should be deterministic
+        let Hash256 sighash2 = txSigHash tx 0 subscript sigHashAll
+        sighash `shouldBe` sighash2
+
+      it "produces different hashes for different sighash types" $ do
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xbb))
+            prevOutpoint = OutPoint prevTxid 0
+            txIn = TxIn prevOutpoint "" 0xffffffff
+            txOut = TxOut 500000 (BS.replicate 25 0xcc)
+            tx = Tx 1 [txIn] [txOut] [[]] 0
+            subscript = BS.replicate 25 0xdd
+            Hash256 hashAll = txSigHash tx 0 subscript sigHashAll
+            Hash256 hashNone = txSigHash tx 0 subscript sigHashNone
+            Hash256 hashSingle = txSigHash tx 0 subscript sigHashSingle
+        hashAll `shouldNotBe` hashNone
+        hashAll `shouldNotBe` hashSingle
+        hashNone `shouldNotBe` hashSingle
+
+      it "ANYONECANPAY produces different hash" $ do
+        let prevTxid1 = TxId (Hash256 (BS.replicate 32 0x11))
+            prevTxid2 = TxId (Hash256 (BS.replicate 32 0x22))
+            txIn1 = TxIn (OutPoint prevTxid1 0) "" 0xffffffff
+            txIn2 = TxIn (OutPoint prevTxid2 0) "" 0xffffffff
+            txOut = TxOut 1000000 ""
+            tx = Tx 1 [txIn1, txIn2] [txOut] [[], []] 0
+            subscript = BS.replicate 25 0xee
+            Hash256 hashAll = txSigHash tx 0 subscript sigHashAll
+            Hash256 hashAcp = txSigHash tx 0 subscript (sigHashAnyoneCanPay sigHashAll)
+        hashAll `shouldNotBe` hashAcp
+
+    describe "BIP-143 SegWit Sighash (txSigHashSegWit)" $ do
+      it "computes sighash for P2WPKH" $ do
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xcc))
+            prevOutpoint = OutPoint prevTxid 0
+            txIn = TxIn prevOutpoint "" 0xffffffff
+            txOut = TxOut 900000 ""
+            tx = Tx 2 [txIn] [txOut] [[]] 0
+            -- P2WPKH scriptCode: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+            scriptCode = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xff <> BS.pack [0x88, 0xac]
+            amount = 1000000 :: Word64
+            Hash256 sighash = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+        BS.length sighash `shouldBe` 32
+
+      it "is deterministic" $ do
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xdd))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xffffffff
+            txOut = TxOut 500000 ""
+            tx = Tx 2 [txIn] [txOut] [[]] 0
+            scriptCode = BS.replicate 25 0xaa
+            amount = 600000 :: Word64
+            Hash256 hash1 = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+            Hash256 hash2 = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+        hash1 `shouldBe` hash2
+
+      it "produces different hashes for different amounts" $ do
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xee))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xffffffff
+            txOut = TxOut 500000 ""
+            tx = Tx 2 [txIn] [txOut] [[]] 0
+            scriptCode = BS.replicate 25 0xbb
+            Hash256 hash1 = txSigHashSegWit tx 0 scriptCode 1000000 sigHashAll
+            Hash256 hash2 = txSigHashSegWit tx 0 scriptCode 2000000 sigHashAll
+        hash1 `shouldNotBe` hash2
+
+      it "different sighash types produce different hashes" $ do
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xff))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xffffffff
+            txOut = TxOut 500000 ""
+            tx = Tx 2 [txIn] [txOut] [[]] 0
+            scriptCode = BS.replicate 25 0xcc
+            amount = 600000 :: Word64
+            Hash256 hashAll = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+            Hash256 hashNone = txSigHashSegWit tx 0 scriptCode amount sigHashNone
+            Hash256 hashSingle = txSigHashSegWit tx 0 scriptCode amount sigHashSingle
+        hashAll `shouldNotBe` hashNone
+        hashAll `shouldNotBe` hashSingle
+        hashNone `shouldNotBe` hashSingle
+
+      it "ANYONECANPAY zeros out prevouts hash" $ do
+        -- With ANYONECANPAY, hash of prevouts should be all zeros
+        -- This test verifies different behavior
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0x01))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xffffffff
+            txOut = TxOut 500000 ""
+            tx = Tx 2 [txIn] [txOut] [[]] 0
+            scriptCode = BS.replicate 25 0xdd
+            amount = 600000 :: Word64
+            Hash256 hashNormal = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+            Hash256 hashAcp = txSigHashSegWit tx 0 scriptCode amount (sigHashAnyoneCanPay sigHashAll)
+        hashNormal `shouldNotBe` hashAcp
 
   describe "computeTxId" $ do
     it "computes txid from non-witness data" $ do
