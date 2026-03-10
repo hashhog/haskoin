@@ -25,8 +25,14 @@ system to make invalid states unrepresentable.
 - [x] Address encoding (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Base58Check encoding/decoding
 - [x] Bech32/Bech32m encoding/decoding (BIP-173, BIP-350)
+- [x] Script parsing and encoding
+- [x] Script classification (P2PKH, P2SH, P2WPKH, P2WSH, P2TR, multisig)
+- [x] Script interpreter with all standard opcodes
+- [x] P2SH script verification (BIP-16)
+- [x] SegWit script verification (P2WPKH, P2WSH)
+- [x] Flow control (IF/ELSE/ENDIF), arithmetic, stack ops
+- [x] CHECKLOCKTIMEVERIFY (BIP-65), CHECKSEQUENCEVERIFY (BIP-112)
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] Script parsing and execution
 - [ ] Transaction validation
 - [ ] Block validation
 - [ ] P2P networking
@@ -48,10 +54,11 @@ haskoin/
     Haskoin/
       Types.hs      -- core data types and serialization
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
+      Script.hs     -- script parsing, classification, interpreter
   app/
     Main.hs         -- executable entry point
   test/
-    Spec.hs         -- serialization, crypto, and address tests
+    Spec.hs         -- serialization, crypto, address, and script tests
 ```
 
 ## Running tests
