@@ -81,6 +81,8 @@ module Haskoin.Network
   , addBanScore
   , handleAddrMessage
   , buildBlockLocator
+    -- * Re-exports from Network.Socket
+  , SockAddr(..)
   ) where
 
 import Data.ByteString (ByteString)
