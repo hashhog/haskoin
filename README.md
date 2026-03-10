@@ -50,8 +50,11 @@ system to make invalid states unrepresentable.
 - [x] Witness commitment validation
 - [x] Block connection/disconnection for chain state
 - [x] Intra-block UTXO spending support
+- [x] P2P message serialization (version, inv, getdata, headers, etc.)
+- [x] Service flags (NODE_NETWORK, NODE_WITNESS, etc.)
+- [x] Protocol version negotiation support
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] P2P networking
+- [ ] P2P connection management
 - [ ] Mempool management
 
 ## Quick start
@@ -73,6 +76,7 @@ haskoin/
       Script.hs     -- script parsing, classification, interpreter
       Consensus.hs  -- network config, constants, block/tx validation
       Storage.hs    -- rocksdb persistence layer
+      Network.hs    -- p2p protocol message types and serialization
   app/
     Main.hs         -- executable entry point
   test/
