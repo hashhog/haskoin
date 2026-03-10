@@ -99,6 +99,8 @@ instance Serialize VarInt where
 newtype VarString = VarString { getVarString :: ByteString }
   deriving stock (Show, Eq, Generic)
 
+instance NFData VarString
+
 instance Serialize VarString where
   put (VarString bs) = putVarBytes bs
   get = VarString <$> getVarBytes
