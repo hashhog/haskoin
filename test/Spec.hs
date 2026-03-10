@@ -27,6 +27,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
 import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
+import Haskoin.FeeEstimator
 import qualified Data.Map.Strict as Map
 import Control.Concurrent.STM
 
@@ -2416,3 +2417,203 @@ main = hspec $ do
             totalSize = parentSize + childSize
             ancestorFeeRate = (totalFees * 1000) `div` fromIntegral totalSize
         ancestorFeeRate `shouldBe` 1714
+
+  --------------------------------------------------------------------------------
+  -- Fee Estimator Tests (Phase 16)
+  --------------------------------------------------------------------------------
+
+  describe "FeeEstimator" $ do
+    describe "Fee bucket functions" $ do
+      it "bucketFeeRate calculates correct rates" $ do
+        -- First bucket: 1 sat/vB (1.05^0)
+        bucketFeeRate 0 `shouldBe` 1
+        -- Higher buckets grow exponentially
+        bucketFeeRate 10 `shouldSatisfy` (> bucketFeeRate 0)
+        bucketFeeRate 50 `shouldSatisfy` (> bucketFeeRate 10)
+        bucketFeeRate 100 `shouldSatisfy` (> bucketFeeRate 50)
+
+      it "bucketFeeRate is monotonically increasing" $ do
+        let rates = map bucketFeeRate [0..numBuckets-1]
+        rates `shouldSatisfy` (\rs -> and $ zipWith (<=) rs (tail rs))
+
+      it "feeRateToBucket is inverse of bucketFeeRate" $ do
+        -- Low fee rates go to low buckets
+        feeRateToBucket 1 `shouldBe` 0
+        -- Medium fee rates go to medium buckets
+        feeRateToBucket 10 `shouldSatisfy` (> 0)
+        -- High fee rates go to high buckets
+        feeRateToBucket 100 `shouldSatisfy` (> feeRateToBucket 10)
+
+      it "feeRateToBucket clamps to valid range" $ do
+        -- Very low rate clamps to 0
+        feeRateToBucket 0 `shouldBe` 0
+        -- Very high rate clamps to max bucket
+        feeRateToBucket 100000 `shouldBe` (numBuckets - 1)
+
+      it "numBuckets is 128" $ do
+        numBuckets `shouldBe` 128
+
+      it "maxConfirmBlocks is 48" $ do
+        maxConfirmBlocks `shouldBe` 48
+
+    describe "FeeEstimator creation" $ do
+      it "newFeeEstimator creates empty estimator" $ do
+        fe <- newFeeEstimator
+        -- Check that pending is empty
+        pending <- readTVarIO (feePending fe)
+        Map.size pending `shouldBe` 0
+        -- Check that height is 0
+        height <- readTVarIO (feeBestHeight fe)
+        height `shouldBe` 0
+        -- Check decay factor is set
+        feeDecay fe `shouldBe` 0.998
+
+      it "newFeeEstimator initializes all buckets" $ do
+        fe <- newFeeEstimator
+        buckets <- readTVarIO (feeBuckets fe)
+        Map.size buckets `shouldBe` numBuckets
+
+      it "empty buckets have zero counts" $ do
+        fe <- newFeeEstimator
+        buckets <- readTVarIO (feeBuckets fe)
+        forM_ (Map.elems buckets) $ \bucket -> do
+          fbTotalTxs bucket `shouldBe` 0
+          fbInMempool bucket `shouldBe` 0
+          all (== 0) (fbConfirmations bucket) `shouldBe` True
+
+    describe "FeeBucket structure" $ do
+      it "has correct fee rate ranges" $ do
+        fe <- newFeeEstimator
+        buckets <- readTVarIO (feeBuckets fe)
+        case Map.lookup 0 buckets of
+          Just bucket -> do
+            fbMinFeeRate bucket `shouldBe` 1
+            fbMaxFeeRate bucket `shouldSatisfy` (>= 1)
+          Nothing -> expectationFailure "Bucket 0 not found"
+
+      it "buckets have correct confirmation slots" $ do
+        fe <- newFeeEstimator
+        buckets <- readTVarIO (feeBuckets fe)
+        case Map.lookup 0 buckets of
+          Just bucket -> do
+            length (fbConfirmations bucket) `shouldBe` maxConfirmBlocks
+          Nothing -> expectationFailure "Bucket 0 not found"
+
+    describe "FeeEstimateMode" $ do
+      it "FeeConservative and FeeEconomical are distinct" $ do
+        FeeConservative `shouldNotBe` FeeEconomical
+
+      it "modes have correct behavior descriptions" $ do
+        show FeeConservative `shouldBe` "FeeConservative"
+        show FeeEconomical `shouldBe` "FeeEconomical"
+
+    describe "Transaction tracking" $ do
+      it "trackTransaction adds pending transaction" $ do
+        fe <- newFeeEstimator
+        let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+        trackTransaction fe txid 50 100  -- 50 sat/vB at height 100
+        pending <- readTVarIO (feePending fe)
+        Map.member txid pending `shouldBe` True
+
+      it "trackTransaction records correct info" $ do
+        fe <- newFeeEstimator
+        let txid = TxId (Hash256 (BS.replicate 32 0xbb))
+        trackTransaction fe txid 25 200  -- 25 sat/vB at height 200
+        pending <- readTVarIO (feePending fe)
+        case Map.lookup txid pending of
+          Just info -> do
+            ptFeeRate info `shouldBe` 25
+            ptEntryHeight info `shouldBe` 200
+          Nothing -> expectationFailure "Transaction not tracked"
+
+      it "trackTransaction updates bucket mempool count" $ do
+        fe <- newFeeEstimator
+        let txid = TxId (Hash256 (BS.replicate 32 0xcc))
+            feeRate = 50 :: Word64
+            bucketIdx = feeRateToBucket feeRate
+        trackTransaction fe txid feeRate 100
+        buckets <- readTVarIO (feeBuckets fe)
+        case Map.lookup bucketIdx buckets of
+          Just bucket -> fbInMempool bucket `shouldBe` 1
+          Nothing -> expectationFailure "Bucket not found"
+
+      it "trackTransaction increments total count" $ do
+        fe <- newFeeEstimator
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+        trackTransaction fe txid1 10 100
+        trackTransaction fe txid2 20 100
+        total <- readTVarIO (feeTotalTxs fe)
+        total `shouldBe` 2
+
+    describe "Confirmation recording" $ do
+      it "recordConfirmation removes pending transaction" $ do
+        fe <- newFeeEstimator
+        let txid = TxId (Hash256 (BS.replicate 32 0xdd))
+        trackTransaction fe txid 50 100
+        recordConfirmation fe 101 [txid]
+        pending <- readTVarIO (feePending fe)
+        Map.member txid pending `shouldBe` False
+
+      it "recordConfirmation updates best height" $ do
+        fe <- newFeeEstimator
+        recordConfirmation fe 500 []
+        height <- readTVarIO (feeBestHeight fe)
+        height `shouldBe` 500
+
+      it "recordConfirmation applies decay to buckets" $ do
+        fe <- newFeeEstimator
+        let txid = TxId (Hash256 (BS.replicate 32 0xee))
+        trackTransaction fe txid 50 100
+        -- Record confirmation, which applies decay
+        recordConfirmation fe 101 [txid]
+        buckets <- readTVarIO (feeBuckets fe)
+        let bucketIdx = feeRateToBucket 50
+        case Map.lookup bucketIdx buckets of
+          Just bucket ->
+            -- After tracking (1) and decay (0.998), should be ~0.998
+            fbInMempool bucket `shouldSatisfy` (< 1)
+          Nothing -> expectationFailure "Bucket not found"
+
+    describe "Fee estimation" $ do
+      it "estimateFee returns Nothing with no data" $ do
+        fe <- newFeeEstimator
+        result <- estimateFee fe 6
+        result `shouldBe` Nothing
+
+      it "estimateSmartFee returns fallback with no data" $ do
+        fe <- newFeeEstimator
+        (rate, blocks) <- estimateSmartFee fe 6 FeeEconomical
+        rate `shouldBe` 1000  -- Fallback rate
+        blocks `shouldBe` maxConfirmBlocks
+
+      it "estimateSmartFee conservative adds 10% buffer" $ do
+        -- The conservative mode should return higher fees
+        fe <- newFeeEstimator
+        (conservRate, _) <- estimateSmartFee fe 6 FeeConservative
+        (econRate, _) <- estimateSmartFee fe 6 FeeEconomical
+        -- With no data both return fallback, but conservative adds 10%
+        conservRate `shouldBe` 1100  -- 1000 + 10%
+        econRate `shouldBe` 1000
+
+    describe "PendingTxInfo" $ do
+      it "stores all transaction info" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0xff))
+            info = PendingTxInfo txid 100 10 500
+        ptTxId info `shouldBe` txid
+        ptFeeRate info `shouldBe` 100
+        ptBucketIdx info `shouldBe` 10
+        ptEntryHeight info `shouldBe` 500
+
+    describe "FeeBucket" $ do
+      it "stores fee rate range" $ do
+        let bucket = FeeBucket 10 19 (replicate 48 0) 0 0
+        fbMinFeeRate bucket `shouldBe` 10
+        fbMaxFeeRate bucket `shouldBe` 19
+
+      it "stores confirmation counts" $ do
+        let confs = [1..48] :: [Double]
+            bucket = FeeBucket 1 10 confs 100 5
+        length (fbConfirmations bucket) `shouldBe` 48
+        fbTotalTxs bucket `shouldBe` 100
+        fbInMempool bucket `shouldBe` 5
