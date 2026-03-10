@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DeriveGeneric #-}
 
 module Haskoin.Consensus
   ( -- * Network
@@ -45,6 +46,35 @@ module Haskoin.Consensus
   , validateBlockHeader
   , validateTransaction
   , computeMerkleRoot
+    -- * Full Block Validation
+  , validateFullBlock
+  , validateBlockTransactions
+  , ChainState(..)
+  , ConsensusFlags(..)
+  , consensusFlagsAtHeight
+    -- * Coinbase
+  , isCoinbase
+  , coinbaseHeight
+    -- * Block Metrics
+  , blockWeight
+  , blockBaseSize
+  , blockTotalSize
+  , txBaseSize
+  , txTotalSize
+  , varIntSize
+  , checkBlockWeight
+    -- * Sigop Counting
+  , countBlockSigops
+  , countTxSigops
+  , countScriptSigops
+    -- * Witness Commitment
+  , validateWitnessCommitment
+  , computeWtxId
+    -- * Block Connection
+  , connectBlock
+  , disconnectBlock
+    -- * Block Status (re-exported from Storage)
+  , BlockStatus(..)
     -- * Utilities
   , hexToBS
   , hashFromHex
@@ -53,13 +83,22 @@ module Haskoin.Consensus
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word8, Word32, Word64)
--- import Data.Int (Int32)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Data.List (nub)
-import Control.Monad (when, unless)
+import Data.List (nub, foldl')
+import Control.Monad (when, unless, forM, foldM)
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
+import Data.Serialize (encode, runPut, putWord32le, putWord64le, putByteString)
+import GHC.Generics (Generic)
 
-import Haskoin.Types
-import Haskoin.Crypto
+import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
+                      OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
+                      Block(..), putVarInt, putVarBytes)
+import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
+import Haskoin.Script (decodeScript, countScriptSigops)
+import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
+                        makeKey, KeyPrefix(..), toBE32, TxLocation(..),
+                        BlockStatus(..))
 
 --------------------------------------------------------------------------------
 -- Network Configuration
@@ -648,3 +687,373 @@ hexToHash256 hex = Hash256 (hexToBS hex)
 -- | Create BlockHash from hex string (reverses bytes for display format)
 hashFromHex :: String -> BlockHash
 hashFromHex hex = BlockHash (Hash256 (BS.reverse $ hexToBS hex))
+
+--------------------------------------------------------------------------------
+-- Chain State and Consensus Flags
+--------------------------------------------------------------------------------
+
+-- | Current chain state for block validation
+data ChainState = ChainState
+  { csHeight        :: !Word32
+  , csBestBlock     :: !BlockHash
+  , csChainWork     :: !Integer
+  , csMedianTime    :: !Word32
+  , csFlags         :: !ConsensusFlags
+  } deriving (Show, Generic)
+
+-- | Consensus flags indicating which BIPs are active
+data ConsensusFlags = ConsensusFlags
+  { flagBIP34       :: !Bool    -- ^ Block height in coinbase
+  , flagBIP65       :: !Bool    -- ^ OP_CHECKLOCKTIMEVERIFY
+  , flagBIP66       :: !Bool    -- ^ Strict DER signatures
+  , flagSegWit      :: !Bool    -- ^ Segregated Witness
+  , flagTaproot     :: !Bool    -- ^ Taproot
+  , flagNullDummy   :: !Bool    -- ^ NULLDUMMY (BIP-147)
+  } deriving (Show, Generic)
+
+-- | Compute consensus flags for a given height based on network rules
+consensusFlagsAtHeight :: Network -> Word32 -> ConsensusFlags
+consensusFlagsAtHeight net h = ConsensusFlags
+  { flagBIP34   = h >= netBIP34Height net
+  , flagBIP65   = h >= netBIP65Height net
+  , flagBIP66   = h >= netBIP66Height net
+  , flagSegWit  = h >= netSegwitHeight net
+  , flagNullDummy = h >= netSegwitHeight net
+  , flagTaproot = h >= netTaprootHeight net
+  }
+
+--------------------------------------------------------------------------------
+-- Coinbase Detection and BIP-34
+--------------------------------------------------------------------------------
+
+-- | Check if a transaction is a coinbase transaction.
+-- A coinbase tx has exactly one input with null prevout hash and index 0xffffffff.
+isCoinbase :: Tx -> Bool
+isCoinbase tx =
+  length (txInputs tx) == 1
+  && outPointHash (txInPrevOutput (head (txInputs tx)))
+     == TxId (Hash256 (BS.replicate 32 0))
+  && outPointIndex (txInPrevOutput (head (txInputs tx))) == 0xffffffff
+
+-- | Extract the block height from a coinbase transaction (BIP-34).
+-- Returns Nothing if not a coinbase or if height encoding is invalid.
+-- The height is encoded as a CScriptNum at the start of the scriptSig.
+coinbaseHeight :: Tx -> Maybe Word32
+coinbaseHeight tx
+  | not (isCoinbase tx) = Nothing
+  | BS.null script = Nothing
+  | otherwise =
+      let len = fromIntegral (BS.head script)
+      in if len > 0 && len <= 4 && BS.length script > len
+         then Just $ decodeLittleEndian (BS.take len (BS.drop 1 script))
+         else Nothing
+  where
+    script = txInScript (head (txInputs tx))
+    -- Decode little-endian bytes to Word32
+    decodeLittleEndian :: ByteString -> Word32
+    decodeLittleEndian bs =
+      let bytes = BS.unpack bs
+          withIndex = zip [0..] bytes
+      in foldr (\(i, b) acc -> acc .|. (fromIntegral b `shiftL` (8 * i))) 0 withIndex
+
+--------------------------------------------------------------------------------
+-- Block Weight Calculation (BIP-141)
+--------------------------------------------------------------------------------
+
+-- | Calculate block weight.
+-- KNOWN PITFALL: weight = (non_witness_bytes * 3) + total_bytes
+-- This is equivalent to: base_size * 3 + total_size
+-- Or: base_size * (witnessScaleFactor - 1) + total_size
+blockWeight :: Block -> Int
+blockWeight block =
+  let baseSize = blockBaseSize block
+      totalSize = blockTotalSize block
+  -- weight = base_size * 3 + total_size
+  -- Which equals base_size * 4 when there's no witness data
+  in baseSize * (witnessScaleFactor - 1) + totalSize
+
+-- | Calculate the base size of a block (without witness data).
+-- This is the size as if the block had no witness data at all.
+blockBaseSize :: Block -> Int
+blockBaseSize block =
+  80  -- header size
+  + varIntSize (length $ blockTxns block)
+  + sum (map txBaseSize (blockTxns block))
+
+-- | Calculate the total size of a block (with witness data).
+blockTotalSize :: Block -> Int
+blockTotalSize block =
+  80  -- header size
+  + varIntSize (length $ blockTxns block)
+  + sum (map txTotalSize (blockTxns block))
+
+-- | Calculate the base size of a transaction (without witness data).
+txBaseSize :: Tx -> Int
+txBaseSize tx = BS.length $ runPut $ do
+  putWord32le (fromIntegral $ txVersion tx)
+  putVarInt (fromIntegral $ length $ txInputs tx)
+  mapM_ putTxInNoWitness (txInputs tx)
+  putVarInt (fromIntegral $ length $ txOutputs tx)
+  mapM_ putTxOutBinary (txOutputs tx)
+  putWord32le (txLockTime tx)
+  where
+    putTxInNoWitness inp = do
+      putByteString (encode $ txInPrevOutput inp)
+      putVarBytes (txInScript inp)
+      putWord32le (txInSequence inp)
+    putTxOutBinary out = do
+      putWord64le (txOutValue out)
+      putVarBytes (txOutScript out)
+
+-- | Calculate the total size of a transaction (with witness data).
+txTotalSize :: Tx -> Int
+txTotalSize tx = BS.length (encode tx)
+
+-- | Calculate the size needed to encode an integer as a VarInt.
+varIntSize :: Int -> Int
+varIntSize n
+  | n < 0xfd      = 1
+  | n <= 0xffff   = 3
+  | n <= 0xffffffff = 5
+  | otherwise      = 9
+
+-- | Check if a block's weight is within the consensus limit.
+-- Returns True if the block weight is valid, False otherwise.
+-- BIP-141 defines maxBlockWeight = 4,000,000 weight units.
+checkBlockWeight :: Block -> Bool
+checkBlockWeight block = blockWeight block <= maxBlockWeight
+
+--------------------------------------------------------------------------------
+-- Sigop Counting
+--------------------------------------------------------------------------------
+
+-- | Count signature operations in a block.
+-- For accurate counting, we need the UTXO map to look up previous outputs.
+countBlockSigops :: Block -> Map OutPoint TxOut -> Int
+countBlockSigops block utxoMap =
+  sum $ map (countTxSigops utxoMap) (blockTxns block)
+
+-- | Count signature operations in a transaction.
+-- Includes sigops from outputs (scriptPubKey) and inputs (scriptSig + redeemed script).
+countTxSigops :: Map OutPoint TxOut -> Tx -> Int
+countTxSigops utxoMap tx =
+  let outputSigops = sum $ map (scriptSigopsFromBytes . txOutScript) (txOutputs tx)
+      inputSigops = if isCoinbase tx then 0
+                    else sum $ map (inputSigopCount utxoMap) (txInputs tx)
+  in outputSigops + inputSigops
+  where
+    scriptSigopsFromBytes script =
+      case decodeScript script of
+        Right s -> countScriptSigops s False
+        Left _  -> 0
+    inputSigopCount utxos inp =
+      case Map.lookup (txInPrevOutput inp) utxos of
+        Nothing -> 0
+        Just prevOut ->
+          case decodeScript (txOutScript prevOut) of
+            Right s -> countScriptSigops s True
+            Left _  -> 0
+
+--------------------------------------------------------------------------------
+-- Full Block Validation
+--------------------------------------------------------------------------------
+
+-- | Validate a full block against consensus rules.
+-- Requires the UTXO map for input validation and sigop counting.
+validateFullBlock :: Network -> ChainState -> Block -> Map OutPoint TxOut
+                 -> Either String ()
+validateFullBlock net cs block utxoMap = do
+  let height = csHeight cs + 1
+      flags = consensusFlagsAtHeight net height
+      header = blockHeader block
+      txns = blockTxns block
+
+  -- 1. Block must have at least one transaction (coinbase)
+  when (null txns) $ Left "Block has no transactions"
+
+  -- 2. First transaction must be coinbase, no others
+  unless (isCoinbase (head txns)) $ Left "First transaction is not coinbase"
+  when (any isCoinbase (tail txns)) $ Left "Multiple coinbase transactions"
+
+  -- 3. Verify merkle root
+  let computedRoot = computeMerkleRoot (map computeTxId txns)
+  unless (computedRoot == bhMerkleRoot header) $ Left "Merkle root mismatch"
+
+  -- 4. Check block weight (only after SegWit activation)
+  when (flagSegWit flags && blockWeight block > maxBlockWeight) $
+    Left "Block exceeds maximum weight"
+
+  -- 5. BIP-34: coinbase must contain height
+  when (flagBIP34 flags) $
+    case coinbaseHeight (head txns) of
+      Nothing -> Left "Coinbase missing height (BIP-34)"
+      Just h  -> unless (h == height) $ Left "Coinbase height mismatch"
+
+  -- 6. Validate all transactions and compute total fees
+  -- KNOWN PITFALL: Intra-block spending - txs can spend outputs from earlier txs
+  -- We update UTXO set during validation, not after
+  totalFees <- validateBlockTransactions flags txns utxoMap
+
+  -- 7. Coinbase value must not exceed reward + fees
+  let maxCoinbase = blockReward height + totalFees
+      coinbaseValue = sum $ map txOutValue (txOutputs (head txns))
+  when (coinbaseValue > maxCoinbase) $
+    Left "Coinbase value exceeds allowed amount"
+
+  -- 8. Check sigops limit
+  when (countBlockSigops block utxoMap > maxBlockSigops) $
+    Left "Block exceeds sigop limit"
+
+  -- 9. SegWit witness commitment validation
+  when (flagSegWit flags) $ validateWitnessCommitment block
+
+  Right ()
+
+-- | Validate all non-coinbase transactions in a block.
+-- Returns the total fees collected.
+-- KNOWN PITFALL: Handles intra-block spending by updating UTXO map as we go.
+validateBlockTransactions :: ConsensusFlags -> [Tx] -> Map OutPoint TxOut
+                         -> Either String Word64
+validateBlockTransactions flags txns initialUtxoMap = do
+  -- Process transactions sequentially, updating UTXO map for intra-block spending
+  let go :: (Word64, Map OutPoint TxOut) -> Tx -> Either String (Word64, Map OutPoint TxOut)
+      go (accFees, utxoMap) tx = do
+        fee <- validateSingleTx flags utxoMap tx
+        -- Add outputs from this tx to UTXO map for subsequent txs in block
+        let txid = computeTxId tx
+            newUtxos = Map.fromList
+              [ (OutPoint txid (fromIntegral i), txout)
+              | (i, txout) <- zip [0..] (txOutputs tx)
+              ]
+            -- Remove spent outputs
+            spentOutpoints = map txInPrevOutput (txInputs tx)
+            utxoMap' = foldr Map.delete (Map.union newUtxos utxoMap) spentOutpoints
+        return (accFees + fee, utxoMap')
+
+  (totalFees, _) <- foldM go (0, initialUtxoMap) (tail txns)  -- Skip coinbase
+  return totalFees
+
+-- | Validate a single non-coinbase transaction.
+-- Returns the fee (inputs - outputs) on success.
+validateSingleTx :: ConsensusFlags -> Map OutPoint TxOut -> Tx
+                 -> Either String Word64
+validateSingleTx _flags utxoMap tx = do
+  -- First, run context-free validation
+  validateTransaction tx
+
+  -- Then validate inputs exist in UTXO set and compute values
+  inputValues <- forM (txInputs tx) $ \inp ->
+    case Map.lookup (txInPrevOutput inp) utxoMap of
+      Nothing -> Left $ "Missing UTXO: " ++ show (txInPrevOutput inp)
+      Just prevOut -> Right (txOutValue prevOut)
+
+  let totalIn  = sum inputValues
+      totalOut = sum $ map txOutValue (txOutputs tx)
+
+  -- Inputs must cover outputs
+  when (totalIn < totalOut) $ Left "Outputs exceed inputs"
+
+  -- Script verification would go here
+  -- For now, we skip actual signature verification as it requires secp256k1
+
+  return (totalIn - totalOut)
+
+--------------------------------------------------------------------------------
+-- Witness Commitment Validation
+--------------------------------------------------------------------------------
+
+-- | Validate the witness commitment in a SegWit block.
+-- The commitment is in a coinbase output with prefix 0x6a24aa21a9ed.
+validateWitnessCommitment :: Block -> Either String ()
+validateWitnessCommitment block = do
+  let coinbase = head (blockTxns block)
+      commitPrefix = BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+      -- Find outputs with witness commitment pattern
+      commitOutputs = filter (\txo ->
+        BS.length (txOutScript txo) >= 38
+        && BS.isPrefixOf commitPrefix (txOutScript txo)
+        ) (txOutputs coinbase)
+
+  -- If no commitment outputs, that's valid (pre-SegWit style or no witness txs)
+  case commitOutputs of
+    [] -> Right ()
+    _ -> do
+      -- Use the last commitment output (as per BIP-141)
+      let commitOut = last commitOutputs
+          commitment = BS.take 32 (BS.drop 6 (txOutScript commitOut))
+          -- Witness nonce is in the coinbase witness
+          witnessNonce = case txWitness coinbase of
+            (stack:_) | not (null stack) && BS.length (head stack) == 32 -> head stack
+            _ -> BS.replicate 32 0
+          -- Compute witness root from wtxids
+          wtxids = TxId (Hash256 (BS.replicate 32 0))  -- coinbase wtxid is all zeros
+                   : map computeWtxId (tail (blockTxns block))
+          witnessRoot = computeMerkleRoot wtxids
+          -- Expected commitment = SHA256d(witness_root || witness_nonce)
+          expected = doubleSHA256 (BS.append (getHash256 witnessRoot) witnessNonce)
+
+      unless (Hash256 commitment == expected) $
+        Left "Witness commitment mismatch"
+
+-- | Compute the witness transaction ID (wtxid).
+-- For coinbase, wtxid is all zeros.
+-- For other transactions, it's the hash of the full serialization including witness.
+computeWtxId :: Tx -> TxId
+computeWtxId tx = TxId (doubleSHA256 (encode tx))
+
+--------------------------------------------------------------------------------
+-- Block Connection and Disconnection
+--------------------------------------------------------------------------------
+
+-- | Connect a block to the chain state, updating UTXO set and indexes.
+-- Must be called atomically via batch writes.
+connectBlock :: HaskoinDB -> Network -> Block -> Word32 -> IO ()
+connectBlock db _net block height = do
+  let bh = computeBlockHash (blockHeader block)
+      txns = blockTxns block
+      txids = map computeTxId txns
+      ops = concat
+        [ -- Add new UTXOs from all transactions
+          [ BatchPut (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
+                     (encode txout)
+          | (txid, tx) <- zip txids txns
+          , (i, txout) <- zip [0..] (txOutputs tx)
+          ]
+        , -- Remove spent UTXOs (skip coinbase as it has no real inputs)
+          [ BatchDelete (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
+          | tx <- tail txns
+          , inp <- txInputs tx
+          ]
+        , -- Transaction index entries
+          [ BatchPut (makeKey PrefixTxIndex (encode txid))
+                     (encode (TxLocation bh (fromIntegral i)))
+          | (i, txid) <- zip [0..] txids
+          ]
+        , -- Update chain state
+          [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
+          , BatchPut (makeKey PrefixBlockHeader (encode bh))
+                     (encode (blockHeader block))
+          , BatchPut (makeKey PrefixBlockHeight (encode (toBE32 height)))
+                     (encode bh)
+          ]
+        ]
+  writeBatch db (WriteBatch ops)
+
+-- | Disconnect a block from the chain state (for reorgs).
+-- Note: Full undo requires storing spent UTXO values when connecting.
+disconnectBlock :: HaskoinDB -> Block -> BlockHash -> IO ()
+disconnectBlock db block prevHash = do
+  let txns = blockTxns block
+      txids = map computeTxId txns
+      ops = concat
+        [ -- Remove outputs created by this block
+          [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
+          | (txid, tx) <- zip txids txns
+          , (i, _) <- zip [0..] (txOutputs tx)
+          ]
+        -- Note: Restoring spent UTXOs would require undo data
+        -- In production, store undo data when connecting blocks
+        , -- Update best block to previous
+          [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
+        ]
+  writeBatch db (WriteBatch ops)
