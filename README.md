@@ -53,8 +53,12 @@ system to make invalid states unrepresentable.
 - [x] P2P message serialization (version, inv, getdata, headers, etc.)
 - [x] Service flags (NODE_NETWORK, NODE_WITNESS, etc.)
 - [x] Protocol version negotiation support
+- [x] TCP peer connection with buffered reads
+- [x] Version handshake protocol (BIP handshake sequence)
+- [x] Feature negotiation (sendheaders BIP-130, sendcmpct BIP-152)
+- [x] Async send/receive threads with STM queues
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] P2P connection management
+- [ ] Block download and IBD
 - [ ] Mempool management
 
 ## Quick start
@@ -76,7 +80,7 @@ haskoin/
       Script.hs     -- script parsing, classification, interpreter
       Consensus.hs  -- network config, constants, block/tx validation
       Storage.hs    -- rocksdb persistence layer
-      Network.hs    -- p2p protocol message types and serialization
+      Network.hs    -- p2p messages, peer connection, handshake
   app/
     Main.hs         -- executable entry point
   test/
