@@ -40,6 +40,8 @@ system to make invalid states unrepresentable.
 - [x] Genesis blocks for all networks
 - [x] Basic block header validation
 - [x] Basic transaction validation
+- [x] RocksDB storage layer (block headers, UTXOs, tx index)
+- [x] Prefix-based key schema with batch writes
 - [ ] ECDSA signing/verification (requires secp256k1)
 - [ ] Full transaction validation with UTXOs
 - [ ] P2P networking
@@ -63,6 +65,7 @@ haskoin/
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
       Script.hs     -- script parsing, classification, interpreter
       Consensus.hs  -- network config, constants, validation
+      Storage.hs    -- rocksdb persistence layer
   app/
     Main.hs         -- executable entry point
   test/
