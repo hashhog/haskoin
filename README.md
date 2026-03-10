@@ -100,6 +100,12 @@ system to make invalid states unrepresentable.
 - [x] RPC endpoints: blockchain, transactions, mempool, network, mining
 - [x] HTTP Basic authentication
 - [x] Fee estimation RPC
+- [x] HD wallet with BIP-32/39/44/84 support
+- [x] Mnemonic generation and seed derivation
+- [x] Extended key derivation (hardened and normal)
+- [x] Address generation with gap limit
+- [x] UTXO tracking and balance queries
+- [x] Coin selection and transaction creation
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -127,6 +133,9 @@ haskoin/
       FeeEstimator.hs  -- fee rate estimation from confirmation times
       BlockTemplate.hs -- block template construction for mining
       Rpc.hs           -- json-rpc server (bitcoin core compatible)
+      Wallet.hs        -- hd wallet (bip-32/39/44/84)
+  resources/
+    bip39-english.txt  -- bip-39 mnemonic wordlist
   app/
     Main.hs         -- executable entry point
   test/
