@@ -2017,3 +2017,37 @@ main = hspec $ do
       ceMedianTime entry `shouldBe` 12000
       bhTimestamp (ceHeader entry) `shouldBe` 12345
       bhNonce (ceHeader entry) `shouldBe` 42
+
+  describe "Header Chain IO Operations" $ do
+    it "initializes header chain with genesis block" $ do
+      hc <- initHeaderChain regtest
+      tip <- getChainTip hc
+      ceHeight tip `shouldBe` 0
+      ceChainWork tip `shouldSatisfy` (> 0)
+
+    it "builds block locator from chain" $ do
+      hc <- initHeaderChain regtest
+      locator <- buildBlockLocatorFromChain hc
+      tip <- getChainTip hc
+      length locator `shouldBe` 1  -- Just genesis
+      head locator `shouldBe` ceHash tip
+
+    it "finds fork point between same hash" $ do
+      hc <- initHeaderChain regtest
+      tip <- getChainTip hc
+      fork <- findForkPoint hc (ceHash tip) (ceHash tip)
+      fork `shouldBe` Just tip
+
+    it "gets ancestor at height 0 (genesis)" $ do
+      hc <- initHeaderChain regtest
+      tip <- getChainTip hc
+      ancestor <- getAncestor hc (ceHash tip) 0
+      case ancestor of
+        Just a -> ceHeight a `shouldBe` 0
+        Nothing -> expectationFailure "Expected to find genesis"
+
+    it "returns Nothing for ancestor above current height" $ do
+      hc <- initHeaderChain regtest
+      tip <- getChainTip hc
+      ancestor <- getAncestor hc (ceHash tip) 100
+      ancestor `shouldBe` Nothing
