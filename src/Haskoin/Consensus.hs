@@ -70,9 +70,16 @@ module Haskoin.Consensus
     -- * Witness Commitment
   , validateWitnessCommitment
   , computeWtxId
-    -- * Block Connection
+    -- * Block Connection (Legacy)
   , connectBlock
   , disconnectBlock
+    -- * UTXO Cache Block Operations
+  , applyBlock
+  , unapplyBlock
+    -- * Chain Reorganization
+  , performReorg
+  , disconnectChain
+  , connectChain
     -- * Block Status (re-exported from Storage)
   , BlockStatus(..)
     -- * Header Synchronization
@@ -118,7 +125,9 @@ import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
 import Haskoin.Script (decodeScript, countScriptSigops)
 import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         makeKey, KeyPrefix(..), toBE32, TxLocation(..),
-                        BlockStatus(..))
+                        BlockStatus(..), UTXOCache(..), UTXOEntry(..),
+                        UndoData(..), lookupUTXO, addUTXO, spendUTXO,
+                        putUndoData, getUndoData, getBlock)
 
 --------------------------------------------------------------------------------
 -- Network Configuration
@@ -1412,3 +1421,160 @@ buildBlockLocatorFromChain hc = do
   let locHeights = buildLocatorHeights tipHeight
       locHashes = [h | height <- locHeights, Just h <- [Map.lookup height heightMap]]
   return locHashes
+
+--------------------------------------------------------------------------------
+-- UTXO Cache Block Application
+--------------------------------------------------------------------------------
+
+-- | Apply a block to the UTXO cache, generating undo data.
+-- This function:
+--   1. For each transaction, spends inputs and creates outputs
+--   2. Validates coinbase maturity (100 blocks)
+--   3. Returns undo data for potential chain reorganizations
+--
+-- KNOWN PITFALL: Coinbase outputs cannot be spent until 100 blocks later.
+applyBlock :: UTXOCache -> Network -> Block -> Word32 -> IO (Either String UndoData)
+applyBlock cache net block height = do
+  let txns = blockTxns block
+      bh = computeBlockHash (blockHeader block)
+
+  -- Collect spent outputs for undo data
+  spentOutputsRef <- newTVarIO []
+
+  -- Process each transaction
+  results <- forM (zip [0..] txns) $ \(txIdx :: Int, tx) -> do
+    if isCoinbase tx
+      then do
+        -- Coinbase: only create outputs, no inputs to spend
+        atomically $ forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, txout) -> do
+          let op = OutPoint (computeTxId tx) (fromIntegral outIdx)
+              entry = UTXOEntry txout height True False
+          addUTXO cache op entry
+        return (Right ())
+      else do
+        -- Regular transaction: spend inputs, create outputs
+        -- Spend inputs first
+        inputResults <- forM (txInputs tx) $ \inp -> do
+          let op = txInPrevOutput inp
+          mEntry <- lookupUTXO cache op
+          case mEntry of
+            Nothing -> return $ Left $ "Missing UTXO: " ++ show op
+            Just entry -> do
+              -- Check coinbase maturity (100 block rule)
+              if ueCoinbase entry && height - ueHeight entry < fromIntegral (netCoinbaseMaturity net)
+                then return $ Left "Coinbase not yet mature"
+                else do
+                  atomically $ do
+                    void $ spendUTXO cache op
+                    modifyTVar' spentOutputsRef ((op, entry) :)
+                  return (Right ())
+
+        case sequence inputResults of
+          Left err -> return (Left err)
+          Right _ -> do
+            -- Create outputs
+            atomically $ forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, txout) -> do
+              let op = OutPoint (computeTxId tx) (fromIntegral outIdx)
+                  entry = UTXOEntry txout height False False
+              addUTXO cache op entry
+            return (Right ())
+
+  case sequence results of
+    Left err -> return (Left err)
+    Right _ -> do
+      spent <- readTVarIO spentOutputsRef
+      return $ Right UndoData
+        { udBlockHash = bh
+        , udHeight = height
+        , udSpentOutputs = spent
+        }
+
+-- | Unapply a block using undo data (for reorgs).
+-- Restores the UTXO set to its state before this block was applied.
+-- This removes outputs created by the block and restores spent outputs.
+unapplyBlock :: UTXOCache -> Block -> UndoData -> IO ()
+unapplyBlock cache block undo = atomically $ do
+  let txns = blockTxns block
+  -- Remove outputs created by this block (process in reverse order)
+  forM_ (reverse txns) $ \tx -> do
+    forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, _) -> do
+      let op = OutPoint (computeTxId tx) (fromIntegral outIdx)
+      void $ spendUTXO cache op
+
+  -- Restore spent outputs
+  forM_ (udSpentOutputs undo) $ \(op, entry) ->
+    addUTXO cache op (entry { ueSpent = False })
+
+--------------------------------------------------------------------------------
+-- Chain Reorganization
+--------------------------------------------------------------------------------
+
+-- | Perform a chain reorganization from old tip to new tip.
+-- This finds the fork point, disconnects blocks from old tip to fork,
+-- then connects blocks from fork to new tip.
+--
+-- KNOWN PITFALL: Reorgs require undo data for all blocks being disconnected.
+-- If undo data is missing, the reorg will fail.
+performReorg :: UTXOCache -> HaskoinDB -> HeaderChain
+             -> BlockHash -> BlockHash -> IO (Either String ())
+performReorg cache db hc oldTip newTip = do
+  -- Find the fork point
+  mFork <- findForkPoint hc oldTip newTip
+  case mFork of
+    Nothing -> return $ Left "Cannot find fork point"
+    Just forkEntry -> do
+      -- Disconnect blocks from old tip to fork
+      disconnectResult <- disconnectChain cache db hc oldTip (ceHash forkEntry)
+      case disconnectResult of
+        Left err -> return $ Left err
+        Right () -> do
+          -- Connect blocks from fork to new tip
+          connectChain cache db hc (ceHash forkEntry) newTip
+
+-- | Disconnect blocks from current hash back to target hash.
+-- Uses undo data to restore spent UTXOs at each step.
+disconnectChain :: UTXOCache -> HaskoinDB -> HeaderChain
+                -> BlockHash -> BlockHash -> IO (Either String ())
+disconnectChain cache db _hc currentHash targetHash
+  | currentHash == targetHash = return (Right ())
+  | otherwise = do
+      mBlock <- getBlock db currentHash
+      mUndo <- getUndoData db currentHash
+      case (mBlock, mUndo) of
+        (Just block, Just undo) -> do
+          unapplyBlock cache block undo
+          let prevHash = bhPrevBlock (blockHeader block)
+          disconnectChain cache db _hc prevHash targetHash
+        (Nothing, _) -> return $ Left $ "Missing block data for disconnect: " ++ show currentHash
+        (_, Nothing) -> return $ Left $ "Missing undo data for disconnect: " ++ show currentHash
+
+-- | Connect blocks from fork point to new tip.
+-- Applies each block in order, generating undo data.
+connectChain :: UTXOCache -> HaskoinDB -> HeaderChain
+             -> BlockHash -> BlockHash -> IO (Either String ())
+connectChain cache db hc fromHash toHash = do
+  -- Build list of blocks to connect (from fork to new tip)
+  entries <- readTVarIO (hcEntries hc)
+  let path = buildPath entries toHash fromHash []
+  results <- forM path $ \ce -> do
+    mBlock <- getBlock db (ceHash ce)
+    case mBlock of
+      Nothing -> return $ Left $ "Missing block data for reconnect: " ++ show (ceHash ce)
+      Just block -> do
+        result <- applyBlock cache mainnet block (ceHeight ce)
+        case result of
+          Left err -> return $ Left err
+          Right undo -> do
+            putUndoData db (ceHash ce) undo
+            return (Right ())
+  return $ sequence_ results
+  where
+    -- Build the path from toHash back to fromHash, then reverse
+    buildPath :: Map BlockHash ChainEntry -> BlockHash -> BlockHash -> [ChainEntry] -> [ChainEntry]
+    buildPath ents hash target acc
+      | hash == target = acc
+      | otherwise = case Map.lookup hash ents of
+          Nothing -> acc  -- Should not happen in a valid chain
+          Just ce -> case cePrev ce of
+            Nothing -> acc  -- Reached genesis
+            Just prevH -> buildPath ents prevH target (ce : acc)
