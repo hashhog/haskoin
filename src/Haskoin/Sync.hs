@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Block Download & Initial Block Download (IBD)
 --
@@ -31,7 +32,7 @@ module Haskoin.Sync
   , downloadWorker
   , blockProcessor
   , buildUTXOMap
-  , flushTBQueue
+  , flushTBQueueN
   ) where
 
 import Data.ByteString (ByteString)
@@ -271,7 +272,7 @@ downloadWorker bd addr = forever $ do
     when (peerInFlight < bdPerPeerMax bd) $ do
       -- Get batch of blocks to download (up to batchSize or perPeerMax - peerInFlight)
       let maxToGet = min (bdBatchSize bd) (bdPerPeerMax bd - peerInFlight)
-      hashes <- atomically $ flushTBQueue (bdDownloadQueue bd) maxToGet
+      hashes <- atomically $ flushTBQueueN (bdDownloadQueue bd) maxToGet
 
       unless (null hashes) $ do
         -- Mark as assigned to this peer
@@ -290,13 +291,13 @@ downloadWorker bd addr = forever $ do
   threadDelay (100 * 1000)  -- 100ms between checks
 
 -- | Read up to n items from a TBQueue without blocking
-flushTBQueue :: TBQueue a -> Int -> STM [a]
-flushTBQueue _ 0 = return []
-flushTBQueue q n = do
+flushTBQueueN :: TBQueue a -> Int -> STM [a]
+flushTBQueueN _ 0 = return []
+flushTBQueueN q n = do
   mItem <- tryReadTBQueue q
   case mItem of
     Nothing -> return []
-    Just item -> (item :) <$> flushTBQueue q (n - 1)
+    Just item -> (item :) <$> flushTBQueueN q (n - 1)
 
 --------------------------------------------------------------------------------
 -- Block Processor

@@ -1,6 +1,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Haskoin.Consensus
   ( -- * Network
@@ -109,7 +110,7 @@ import qualified Data.ByteString as BS
 import Data.Word (Word8, Word32, Word64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.List (nub, sort)
-import Control.Monad (when, unless, forM, foldM, forever, void)
+import Control.Monad (when, unless, forM, forM_, foldM, forever, void)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Serialize (encode, runPut, putWord32le, putWord64le, putByteString)
@@ -1102,7 +1103,7 @@ data ChainEntry = ChainEntry
   , cePrev       :: !(Maybe BlockHash) -- ^ Previous block hash (for genesis: Nothing)
   , ceStatus     :: !BlockStatus     -- ^ Validation status
   , ceMedianTime :: !Word32          -- ^ Median time past for this block
-  } deriving (Show, Generic)
+  } deriving (Show, Eq, Generic)
 
 -- | In-memory header chain with concurrent access support.
 -- Uses TVars for thread-safe access from multiple threads.
