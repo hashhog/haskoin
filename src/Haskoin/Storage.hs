@@ -79,6 +79,8 @@ import Data.Word (Word8, Word32)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Control.Exception (bracket)
 import Control.Monad (when)
+import Control.Monad.Trans.Resource (runResourceT)
+import Control.Monad.IO.Class (liftIO)
 import Data.IORef (newIORef, readIORef, modifyIORef')
 import GHC.Generics (Generic)
 
@@ -175,7 +177,7 @@ openDB :: DBConfig -> IO HaskoinDB
 openDB DBConfig{..} = do
   let opts = R.defaultOptions
         { R.createIfMissing = dbCreateIfMissing
-        , R.maxOpenFiles    = Just dbMaxOpenFiles
+        , R.maxOpenFiles    = dbMaxOpenFiles
         , R.writeBufferSize = dbWriteBufferSize
         }
   db <- R.open dbPath opts
@@ -261,7 +263,11 @@ fromBE32 :: ByteString -> Maybe Word32
 fromBE32 bs
   | BS.length bs /= 4 = Nothing
   | otherwise =
-      let [b0, b1, b2, b3] = BS.unpack bs
+      let bytes = BS.unpack bs
+          b0 = bytes !! 0
+          b1 = bytes !! 1
+          b2 = bytes !! 2
+          b3 = bytes !! 3
       in Just $ (fromIntegral b0 `shiftL` 24)
             .|. (fromIntegral b1 `shiftL` 16)
             .|. (fromIntegral b2 `shiftL` 8)
@@ -475,18 +481,24 @@ batchPutBlockHeight height bh =
 -- Keys are visited in sorted order.
 iterateWithPrefix :: HaskoinDB -> KeyPrefix
                   -> (ByteString -> ByteString -> IO Bool) -> IO ()
-iterateWithPrefix db prefix callback = do
+iterateWithPrefix db prefix callback = runResourceT $ do
   let prefixBS = BS.singleton (prefixByte prefix)
   R.withIterator (dbHandle db) (dbReadOpts db) $ \iter -> do
     R.iterSeek iter prefixBS
     let loop = do
           valid <- R.iterValid iter
           when valid $ do
-            key <- R.iterKey iter
-            when (BS.isPrefixOf prefixBS key) $ do
-              val <- R.iterValue iter
-              continue <- callback key val
-              when continue $ R.iterNext iter >> loop
+            mkey <- R.iterKey iter
+            case mkey of
+              Nothing -> return ()
+              Just key ->
+                when (BS.isPrefixOf prefixBS key) $ do
+                  mval <- R.iterValue iter
+                  case mval of
+                    Nothing -> return ()
+                    Just val -> do
+                      continue <- liftIO $ callback key val
+                      when continue $ R.iterNext iter >> loop
     loop
 
 -- | Get count of UTXOs in the database.
