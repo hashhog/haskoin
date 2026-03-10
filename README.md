@@ -42,10 +42,17 @@ system to make invalid states unrepresentable.
 - [x] Basic transaction validation
 - [x] RocksDB storage layer (block headers, UTXOs, tx index)
 - [x] Prefix-based key schema with batch writes
+- [x] Full block validation with consensus rules
+- [x] Transaction validation against UTXO set
+- [x] Coinbase detection and BIP-34 height extraction
+- [x] Block weight calculation (BIP-141)
+- [x] Sigop counting with witness discount
+- [x] Witness commitment validation
+- [x] Block connection/disconnection for chain state
+- [x] Intra-block UTXO spending support
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] Full transaction validation with UTXOs
 - [ ] P2P networking
-- [ ] Chain state management
+- [ ] Mempool management
 
 ## Quick start
 
@@ -64,7 +71,7 @@ haskoin/
       Types.hs      -- core data types and serialization
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
       Script.hs     -- script parsing, classification, interpreter
-      Consensus.hs  -- network config, constants, validation
+      Consensus.hs  -- network config, constants, block/tx validation
       Storage.hs    -- rocksdb persistence layer
   app/
     Main.hs         -- executable entry point
