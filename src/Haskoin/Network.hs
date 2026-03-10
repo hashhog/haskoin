@@ -3,6 +3,8 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Haskoin.Network
   ( -- * Message Envelope
@@ -47,6 +49,22 @@ module Haskoin.Network
   , word32ToInvType
     -- * Message command names
   , commandName
+    -- * Peer Connection Types
+  , PeerState(..)
+  , PeerInfo(..)
+  , PeerConnection(..)
+  , PeerConfig(..)
+    -- * Peer Connection Management
+  , connectPeer
+  , disconnectPeer
+    -- * Message I/O
+  , sendMessage
+  , receiveMessage
+    -- * Handshake
+  , performHandshake
+    -- * Peer Threads
+  , startPeerThreads
+  , queueMessage
   ) where
 
 import Data.ByteString (ByteString)
@@ -56,12 +74,25 @@ import Data.Serialize
 import Data.Word
 import Data.Int (Int32, Int64)
 import Data.Bits ((.&.), (.|.))
-import Control.Monad (replicateM, forM_)
+import Control.Monad (replicateM, forM_, when, forever)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
 
+import Network.Socket (Socket, SockAddr(..), AddrInfo(..), getAddrInfo,
+                       socket, connect, close, defaultHints, addrFamily,
+                       addrSocketType, addrProtocol, addrAddress,
+                       SocketType(..))
+import Network.Socket.ByteString (recv, sendAll)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Time.Clock.POSIX (getPOSIXTime)
+import System.Random (randomIO)
+import Control.Concurrent (ThreadId, forkIO, killThread)
+import Control.Concurrent.STM
+import Control.Exception (try, SomeException, catch, mask_)
+
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256)
+import Haskoin.Consensus (Network(..))
 
 --------------------------------------------------------------------------------
 -- Protocol Constants
@@ -634,3 +665,336 @@ decodeMessage cmd payload = case cmd of
   "getaddr"     -> Right MGetAddr
   "mempool"     -> Right MMemPool
   _             -> Left $ "Unknown command: " ++ C8.unpack cmd
+
+--------------------------------------------------------------------------------
+-- Peer State Types
+--------------------------------------------------------------------------------
+
+-- | State of a peer connection
+data PeerState
+  = PeerConnecting      -- ^ TCP connection in progress
+  | PeerHandshaking     -- ^ Version handshake in progress
+  | PeerConnected       -- ^ Fully connected and ready
+  | PeerDisconnecting   -- ^ Disconnect in progress
+  | PeerDisconnected    -- ^ Connection closed
+  | PeerBanned          -- ^ Peer is banned
+  deriving (Show, Eq, Ord, Generic)
+
+instance NFData PeerState
+
+-- | Information about a connected peer
+data PeerInfo = PeerInfo
+  { piAddress       :: !SockAddr          -- ^ Peer's network address
+  , piVersion       :: !(Maybe Version)   -- ^ Their version message
+  , piState         :: !PeerState         -- ^ Current connection state
+  , piServices      :: !Word64            -- ^ Services advertised by peer
+  , piStartHeight   :: !Int32             -- ^ Best block height at connect
+  , piRelay         :: !Bool              -- ^ Whether peer relays transactions
+  , piLastSeen      :: !Int64             -- ^ Unix timestamp of last message
+  , piLastPing      :: !(Maybe Word64)    -- ^ Nonce of last ping sent
+  , piPingLatency   :: !(Maybe Double)    -- ^ Round-trip time in seconds
+  , piBanScore      :: !Int               -- ^ Misbehavior score
+  , piBytesSent     :: !Word64            -- ^ Total bytes sent
+  , piBytesRecv     :: !Word64            -- ^ Total bytes received
+  , piMsgsSent      :: !Word64            -- ^ Total messages sent
+  , piMsgsRecv      :: !Word64            -- ^ Total messages received
+  , piConnectedAt   :: !Int64             -- ^ Unix timestamp of connection
+  , piInbound       :: !Bool              -- ^ True if peer connected to us
+  } deriving (Show, Generic)
+
+instance NFData PeerInfo
+
+-- | A live peer connection with socket and threads
+data PeerConnection = PeerConnection
+  { pcSocket      :: !Socket              -- ^ TCP socket
+  , pcInfo        :: !(TVar PeerInfo)     -- ^ Peer info (mutable)
+  , pcSendQueue   :: !(TBQueue Message)   -- ^ Outbound message queue
+  , pcRecvQueue   :: !(TBQueue Message)   -- ^ Inbound message queue
+  , pcSendThread  :: !(Maybe ThreadId)    -- ^ Send thread ID
+  , pcRecvThread  :: !(Maybe ThreadId)    -- ^ Receive thread ID
+  , pcNetwork     :: !Network             -- ^ Network configuration
+  , pcReadBuffer  :: !(IORef ByteString)  -- ^ Buffered partial reads
+  }
+
+-- | Configuration for establishing peer connections
+data PeerConfig = PeerConfig
+  { pcfgNetwork      :: !Network      -- ^ Network (mainnet/testnet/regtest)
+  , pcfgServices     :: !Word64       -- ^ Services we advertise
+  , pcfgBestHeight   :: !Int32        -- ^ Our best block height
+  , pcfgUserAgent    :: !ByteString   -- ^ Our user agent string
+  , pcfgRelay        :: !Bool         -- ^ Whether we want tx relay
+  , pcfgConnTimeout  :: !Int          -- ^ Connection timeout in seconds
+  , pcfgQueueSize    :: !Int          -- ^ Max queued messages
+  } deriving (Show)
+
+-- | Default peer configuration
+defaultPeerConfig :: Network -> PeerConfig
+defaultPeerConfig net = PeerConfig
+  { pcfgNetwork      = net
+  , pcfgServices     = combineServices [nodeNetwork, nodeWitness]
+  , pcfgBestHeight   = 0
+  , pcfgUserAgent    = userAgent
+  , pcfgRelay        = True
+  , pcfgConnTimeout  = 30
+  , pcfgQueueSize    = 100
+  }
+
+--------------------------------------------------------------------------------
+-- TCP Connection Management
+--------------------------------------------------------------------------------
+
+-- | Establish a TCP connection to a peer
+connectPeer :: PeerConfig -> String -> Int -> IO (Either String PeerConnection)
+connectPeer config host port = do
+  result <- try @SomeException $ do
+    let hints = defaultHints { addrSocketType = Stream }
+    addrs <- getAddrInfo (Just hints) (Just host) (Just (show port))
+    case addrs of
+      [] -> fail $ "Cannot resolve: " ++ host
+      (addr:_) -> do
+        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+        connect sock (addrAddress addr)
+        now <- round <$> getPOSIXTime
+        let info = PeerInfo
+              { piAddress       = addrAddress addr
+              , piVersion       = Nothing
+              , piState         = PeerConnecting
+              , piServices      = 0
+              , piStartHeight   = 0
+              , piRelay         = True
+              , piLastSeen      = now
+              , piLastPing      = Nothing
+              , piPingLatency   = Nothing
+              , piBanScore      = 0
+              , piBytesSent     = 0
+              , piBytesRecv     = 0
+              , piMsgsSent      = 0
+              , piMsgsRecv      = 0
+              , piConnectedAt   = now
+              , piInbound       = False
+              }
+        infoVar <- newTVarIO info
+        sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
+        recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
+        bufRef <- newIORef BS.empty
+        return PeerConnection
+          { pcSocket      = sock
+          , pcInfo        = infoVar
+          , pcSendQueue   = sendQ
+          , pcRecvQueue   = recvQ
+          , pcSendThread  = Nothing
+          , pcRecvThread  = Nothing
+          , pcNetwork     = pcfgNetwork config
+          , pcReadBuffer  = bufRef
+          }
+  case result of
+    Left e   -> return $ Left (show e)
+    Right pc -> return $ Right pc
+
+-- | Disconnect from a peer, cleaning up threads and socket
+disconnectPeer :: PeerConnection -> IO ()
+disconnectPeer pc = do
+  atomically $ modifyTVar' (pcInfo pc) (\i -> i { piState = PeerDisconnected })
+  -- Kill threads if they exist
+  mapM_ killThread (pcSendThread pc)
+  mapM_ killThread (pcRecvThread pc)
+  -- Close socket
+  close (pcSocket pc)
+
+--------------------------------------------------------------------------------
+-- Message I/O with Buffered Reads
+--------------------------------------------------------------------------------
+
+-- | Send a message to a peer
+sendMessage :: PeerConnection -> Message -> IO ()
+sendMessage pc msg = do
+  let magic = netMagic (pcNetwork pc)
+      encoded = encodeMessage magic msg
+  sendAll (pcSocket pc) encoded
+  atomically $ modifyTVar' (pcInfo pc) $ \i ->
+    i { piBytesSent = piBytesSent i + fromIntegral (BS.length encoded)
+      , piMsgsSent = piMsgsSent i + 1
+      }
+
+-- | Receive exactly n bytes from the socket, buffering partial reads
+-- KNOWN PITFALL: Uses mask_ to prevent async exceptions from desyncing TCP stream
+recvExact :: PeerConnection -> Int -> IO (Maybe ByteString)
+recvExact pc n = mask_ $ do
+  buf <- readIORef (pcReadBuffer pc)
+  if BS.length buf >= n
+    then do
+      let (result, rest) = BS.splitAt n buf
+      writeIORef (pcReadBuffer pc) rest
+      return (Just result)
+    else do
+      -- Need more data
+      chunk <- recv (pcSocket pc) (max 4096 (n - BS.length buf))
+      if BS.null chunk
+        then return Nothing  -- Connection closed
+        else do
+          writeIORef (pcReadBuffer pc) (BS.append buf chunk)
+          recvExact pc n
+
+-- | Receive a complete message from a peer
+-- Returns Left on error, Right on success
+receiveMessage :: PeerConnection -> IO (Either String Message)
+receiveMessage pc = do
+  -- Read 24-byte header
+  mHeader <- recvExact pc 24
+  case mHeader of
+    Nothing -> return $ Left "Connection closed"
+    Just headerBytes ->
+      case decodeMessageHeader headerBytes of
+        Left err -> return $ Left $ "Header parse error: " ++ err
+        Right header
+          -- Verify network magic
+          | mhMagic header /= netMagic (pcNetwork pc) ->
+              return $ Left "Wrong network magic"
+          -- Check payload size limit (32 MB)
+          | mhLength header > 32 * 1024 * 1024 ->
+              return $ Left "Payload too large"
+          | otherwise -> do
+              -- Read payload
+              let payloadLen = fromIntegral (mhLength header)
+              mPayload <- recvExact pc payloadLen
+              case mPayload of
+                Nothing -> return $ Left "Connection closed during payload"
+                Just payload -> do
+                  -- Verify checksum
+                  let checkBytes = BS.take 4 $ getHash256 $ doubleSHA256 payload
+                      checksumOk = either (const False) (== mhChecksum header)
+                                     (runGet getWord32le checkBytes)
+                  if not checksumOk
+                    then return $ Left "Checksum mismatch"
+                    else do
+                      -- Update stats
+                      atomically $ modifyTVar' (pcInfo pc) $ \i ->
+                        i { piBytesRecv = piBytesRecv i + fromIntegral (24 + payloadLen)
+                          , piMsgsRecv = piMsgsRecv i + 1
+                          }
+                      return $ decodeMessage (mhCommand header) payload
+
+--------------------------------------------------------------------------------
+-- Version Handshake
+--------------------------------------------------------------------------------
+
+-- | Perform the Bitcoin version handshake
+-- Protocol: we send version -> they send version -> both send verack
+-- Returns their version message on success
+performHandshake :: PeerConfig -> PeerConnection -> IO (Either String Version)
+performHandshake config pc = do
+  -- Update state to handshaking
+  atomically $ modifyTVar' (pcInfo pc) (\i -> i { piState = PeerHandshaking })
+
+  -- Build our version message
+  now <- round <$> getPOSIXTime
+  nonce <- randomIO
+
+  let ourVersion = Version
+        { vVersion     = protocolVersion
+        , vServices    = pcfgServices config
+        , vTimestamp   = now
+        , vAddrRecv    = NetworkAddress 0 (BS.replicate 16 0) 0
+        , vAddrSend    = NetworkAddress (pcfgServices config) (BS.replicate 16 0) 0
+        , vNonce       = nonce
+        , vUserAgent   = VarString (pcfgUserAgent config)
+        , vStartHeight = pcfgBestHeight config
+        , vRelay       = pcfgRelay config
+        }
+
+  -- Send our version
+  sendMessage pc (MVersion ourVersion)
+
+  -- Receive their version
+  r1 <- receiveMessage pc
+  case r1 of
+    Left err -> return $ Left $ "Handshake failed: " ++ err
+    Right (MVersion theirVersion)
+      -- Validate their version
+      | vVersion theirVersion < minProtocolVersion ->
+          return $ Left "Protocol version too low"
+      -- Check for self-connection
+      | vNonce theirVersion == nonce ->
+          return $ Left "Self-connection detected"
+      | otherwise -> do
+          -- Send verack
+          sendMessage pc MVerAck
+
+          -- Receive verack
+          r2 <- receiveMessage pc
+          case r2 of
+            Right MVerAck -> do
+              -- Update peer info with their version data
+              atomically $ modifyTVar' (pcInfo pc) $ \i ->
+                i { piState       = PeerConnected
+                  , piVersion     = Just theirVersion
+                  , piServices    = vServices theirVersion
+                  , piStartHeight = vStartHeight theirVersion
+                  , piRelay       = vRelay theirVersion
+                  }
+
+              -- Send post-handshake feature negotiation messages
+              sendMessage pc MSendHeaders
+              sendMessage pc (MSendCmpct (SendCmpct False 2))
+
+              return $ Right theirVersion
+
+            Right other -> return $ Left $ "Expected verack, got: " ++ msgTypeName other
+            Left err -> return $ Left $ "Verack failed: " ++ err
+
+    Right other -> return $ Left $ "Expected version, got: " ++ msgTypeName other
+
+-- | Get a descriptive name for a message type (for error messages)
+msgTypeName :: Message -> String
+msgTypeName (MVersion _)    = "version"
+msgTypeName MVerAck         = "verack"
+msgTypeName (MPing _)       = "ping"
+msgTypeName (MPong _)       = "pong"
+msgTypeName (MAddr _)       = "addr"
+msgTypeName (MInv _)        = "inv"
+msgTypeName (MGetData _)    = "getdata"
+msgTypeName (MNotFound _)   = "notfound"
+msgTypeName (MGetBlocks _)  = "getblocks"
+msgTypeName (MGetHeaders _) = "getheaders"
+msgTypeName (MHeaders _)    = "headers"
+msgTypeName (MTx _)         = "tx"
+msgTypeName (MBlock _)      = "block"
+msgTypeName (MReject _)     = "reject"
+msgTypeName MSendHeaders    = "sendheaders"
+msgTypeName (MSendCmpct _)  = "sendcmpct"
+msgTypeName (MFeeFilter _)  = "feefilter"
+msgTypeName MGetAddr        = "getaddr"
+msgTypeName MMemPool        = "mempool"
+
+--------------------------------------------------------------------------------
+-- Send/Receive Threads
+--------------------------------------------------------------------------------
+
+-- | Start send and receive threads for a peer connection
+-- The handler function is called for each received message
+startPeerThreads :: PeerConnection -> (Message -> IO ()) -> IO PeerConnection
+startPeerThreads pc handler = do
+  -- Send thread: reads from queue and sends to socket
+  sendTid <- forkIO $ forever $ do
+    msg <- atomically $ readTBQueue (pcSendQueue pc)
+    sendMessage pc msg `catch` (\(_ :: SomeException) -> disconnectPeer pc)
+
+  -- Receive thread: reads from socket and calls handler
+  recvTid <- forkIO $ forever $ do
+    result <- receiveMessage pc
+    case result of
+      Right msg -> do
+        -- Update last seen timestamp
+        now <- round <$> getPOSIXTime
+        atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastSeen = now })
+        -- Also put in receive queue for async processing
+        atomically $ writeTBQueue (pcRecvQueue pc) msg
+        -- Call handler
+        handler msg
+      Left _ -> disconnectPeer pc
+
+  return pc { pcSendThread = Just sendTid, pcRecvThread = Just recvTid }
+
+-- | Queue a message to be sent by the send thread
+queueMessage :: PeerConnection -> Message -> STM ()
+queueMessage pc msg = writeTBQueue (pcSendQueue pc) msg
