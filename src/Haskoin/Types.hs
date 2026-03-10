@@ -26,9 +26,6 @@ module Haskoin.Types
   , getVarInt'
   , putVarBytes
   , getVarBytes
-  , doubleSHA256
-  , txId
-  , blockHash
   ) where
 
 import Data.ByteString (ByteString)
@@ -330,18 +327,3 @@ instance Serialize NetworkAddress where
     putWord16be naPort       -- port is big-endian in Bitcoin protocol
   get = NetworkAddress <$> getWord64le <*> getBytes 16 <*> getWord16be
 
---------------------------------------------------------------------------------
--- Hashing Functions (placeholders)
---------------------------------------------------------------------------------
-
--- | Double SHA256 hash (SHA256(SHA256(data)))
-doubleSHA256 :: ByteString -> Hash256
-doubleSHA256 = error "Implemented in Phase 3"
-
--- | Compute the transaction ID (hash of non-witness serialization)
-txId :: Tx -> TxId
-txId = error "Implemented in Phase 3"
-
--- | Compute the block hash (hash of header)
-blockHash :: BlockHeader -> BlockHash
-blockHash = error "Implemented in Phase 3"
