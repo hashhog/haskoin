@@ -107,6 +107,7 @@ system to make invalid states unrepresentable.
 - [x] UTXO tracking and balance queries
 - [x] Coin selection and transaction creation
 - [x] CLI with node, wallet, and utility subcommands
+- [x] Comprehensive test suite (HSpec + QuickCheck)
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -159,5 +160,9 @@ haskoin/
 ## Running tests
 
 ```bash
-cabal test
+cabal test --test-show-details=direct
 ```
+
+The test suite covers serialization round-trips, cryptographic operations,
+script execution, consensus validation, address encoding, P2P messages,
+wallet operations, and fee estimation.
