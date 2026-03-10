@@ -1884,3 +1884,136 @@ main = hspec $ do
 
     it "userAgent contains Haskoin" $ do
       userAgent `shouldBe` "/Haskoin:0.1.0/"
+
+  -- Header synchronization tests
+  describe "Header Chain Work" $ do
+    it "computes header work from bits" $ do
+      let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                              (Hash256 (BS.replicate 32 0))
+                              0 0x1d00ffff 0  -- difficulty 1
+          work = headerWork header
+      work `shouldSatisfy` (> 0)
+
+    it "cumulative work adds up" $ do
+      let header1 = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                               (Hash256 (BS.replicate 32 0))
+                               0 0x1d00ffff 0
+          work1 = headerWork header1
+          work2 = cumulativeWork work1 header1
+      work2 `shouldBe` (2 * work1)
+
+    it "work is proportional to difficulty" $ do
+      -- Lower bits value (harder difficulty) should give more work
+      let easyHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                   (Hash256 (BS.replicate 32 0))
+                                   0 0x1d00ffff 0  -- difficulty 1
+          hardHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                   (Hash256 (BS.replicate 32 0))
+                                   0 0x1c00ffff 0  -- difficulty 256
+          easyWork = headerWork easyHeader
+          hardWork = headerWork hardHeader
+      hardWork `shouldSatisfy` (> easyWork)
+
+  describe "Block Locator Heights" $ do
+    it "builds locator heights from tip" $ do
+      let heights = buildLocatorHeights 100
+      -- Should start with tip
+      head heights `shouldBe` 100
+      -- Should include genesis
+      last heights `shouldBe` 0
+
+    it "uses exponential backoff" $ do
+      let heights = buildLocatorHeights 1000
+      -- First 10 should be consecutive
+      take 10 heights `shouldBe` [1000, 999, 998, 997, 996, 995, 994, 993, 992, 991]
+      -- Later ones should be spaced out
+      length heights `shouldSatisfy` (< 50)  -- not too many
+
+    it "handles small heights" $ do
+      let heights = buildLocatorHeights 5
+      -- Should include all heights for small chains
+      length heights `shouldSatisfy` (<= 6)
+      head heights `shouldBe` 5
+      last heights `shouldBe` 0
+
+    it "handles zero height" $ do
+      let heights = buildLocatorHeights 0
+      heights `shouldBe` [0]
+
+  describe "Median Time Past" $ do
+    it "returns timestamp for single block" $ do
+      let entry = ChainEntry
+            { ceHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                      (Hash256 (BS.replicate 32 0))
+                                      1000 0x207fffff 0
+            , ceHash = BlockHash (Hash256 (BS.replicate 32 0x01))
+            , ceHeight = 0
+            , ceChainWork = 1
+            , cePrev = Nothing
+            , ceStatus = StatusHeaderValid
+            , ceMedianTime = 1000
+            }
+          entries = Map.singleton (ceHash entry) entry
+          mtp = medianTimePast entries (ceHash entry)
+      mtp `shouldBe` 1000
+
+    it "returns median of multiple timestamps" $ do
+      -- Create a chain of 3 blocks with timestamps 100, 200, 300
+      let hash1 = BlockHash (Hash256 (BS.replicate 32 0x01))
+          hash2 = BlockHash (Hash256 (BS.replicate 32 0x02))
+          hash3 = BlockHash (Hash256 (BS.replicate 32 0x03))
+          entry1 = ChainEntry
+            { ceHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                      (Hash256 (BS.replicate 32 0)) 100 0x207fffff 0
+            , ceHash = hash1, ceHeight = 0, ceChainWork = 1
+            , cePrev = Nothing, ceStatus = StatusHeaderValid, ceMedianTime = 100 }
+          entry2 = ChainEntry
+            { ceHeader = BlockHeader 1 hash1 (Hash256 (BS.replicate 32 0)) 200 0x207fffff 0
+            , ceHash = hash2, ceHeight = 1, ceChainWork = 2
+            , cePrev = Just hash1, ceStatus = StatusHeaderValid, ceMedianTime = 100 }
+          entry3 = ChainEntry
+            { ceHeader = BlockHeader 1 hash2 (Hash256 (BS.replicate 32 0)) 300 0x207fffff 0
+            , ceHash = hash3, ceHeight = 2, ceChainWork = 3
+            , cePrev = Just hash2, ceStatus = StatusHeaderValid, ceMedianTime = 150 }
+          entries = Map.fromList [(hash1, entry1), (hash2, entry2), (hash3, entry3)]
+          mtp = medianTimePast entries hash3
+      -- Median of [100, 200, 300] = 200
+      mtp `shouldBe` 200
+
+  describe "Difficulty Adjustment" $ do
+    it "returns same bits when not at retarget interval" $ do
+      let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                              (Hash256 (BS.replicate 32 0))
+                              1000 0x207fffff 0
+          entry = ChainEntry
+            { ceHeader = header
+            , ceHash = BlockHash (Hash256 (BS.replicate 32 0x01))
+            , ceHeight = 100  -- Not at 150 (regtest retarget interval)
+            , ceChainWork = 1
+            , cePrev = Nothing
+            , ceStatus = StatusHeaderValid
+            , ceMedianTime = 1000
+            }
+          entries = Map.singleton (ceHash entry) entry
+          expectedBits = difficultyAdjustment regtest entries entry
+      expectedBits `shouldBe` 0x207fffff
+
+  describe "ChainEntry" $ do
+    it "stores all required fields" $ do
+      let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                              (Hash256 (BS.replicate 32 0xaa))
+                              12345 0x207fffff 42
+          entry = ChainEntry
+            { ceHeader = header
+            , ceHash = BlockHash (Hash256 (BS.replicate 32 0x01))
+            , ceHeight = 100
+            , ceChainWork = 12345678
+            , cePrev = Just (BlockHash (Hash256 (BS.replicate 32 0)))
+            , ceStatus = StatusHeaderValid
+            , ceMedianTime = 12000
+            }
+      ceHeight entry `shouldBe` 100
+      ceChainWork entry `shouldBe` 12345678
+      ceMedianTime entry `shouldBe` 12000
+      bhTimestamp (ceHeader entry) `shouldBe` 12345
+      bhNonce (ceHeader entry) `shouldBe` 42
