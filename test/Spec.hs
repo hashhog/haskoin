@@ -5,6 +5,7 @@ module Main where
 
 import Test.Hspec
 import Test.QuickCheck
+import Control.Monad (forM_)
 import Data.Serialize (encode, decode)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -16,6 +17,7 @@ import Data.Int (Int64)
 import Haskoin.Types
 import Haskoin.Crypto
 import Haskoin.Script
+import Haskoin.Consensus
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
@@ -912,3 +914,227 @@ main = hspec $ do
           scriptPubKey = Script [OP_ROLL, OP_1, OP_EQUAL]
           dummyTx = Tx 1 [] [] [] 0
       evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+  -- Consensus module tests
+  describe "Consensus constants" $ do
+    it "maxMoney is 21 million BTC in satoshis" $ do
+      maxMoney `shouldBe` 2100000000000000
+
+    it "maxBlockSize is 1 MB" $ do
+      maxBlockSize `shouldBe` 1000000
+
+    it "maxBlockWeight is 4 million weight units" $ do
+      maxBlockWeight `shouldBe` 4000000
+
+    it "coinbaseMaturity is 100" $ do
+      coinbaseMaturity `shouldBe` 100
+
+    it "difficultyAdjustmentInterval is 2016" $ do
+      difficultyAdjustmentInterval `shouldBe` 2016
+
+    it "halvingInterval is 210000" $ do
+      halvingInterval `shouldBe` 210000
+
+  describe "Block reward" $ do
+    it "initial block reward is 50 BTC" $ do
+      blockReward 0 `shouldBe` 5000000000
+
+    it "reward at block 209999 is still 50 BTC" $ do
+      blockReward 209999 `shouldBe` 5000000000
+
+    it "reward at block 210000 is 25 BTC (first halving)" $ do
+      blockReward 210000 `shouldBe` 2500000000
+
+    it "reward at block 420000 is 12.5 BTC (second halving)" $ do
+      blockReward 420000 `shouldBe` 1250000000
+
+    it "reward at block 630000 is 6.25 BTC (third halving)" $ do
+      blockReward 630000 `shouldBe` 625000000
+
+    it "reward at block 840000 is 3.125 BTC (fourth halving)" $ do
+      blockReward 840000 `shouldBe` 312500000
+
+    it "reward becomes 0 after 64 halvings" $ do
+      -- 64 * 210000 = 13,440,000
+      blockReward 13440000 `shouldBe` 0
+
+  describe "Difficulty target conversion" $ do
+    it "bitsToTarget converts difficulty 1 correctly" $ do
+      -- 0x1d00ffff is the "difficulty 1" target
+      let target = bitsToTarget 0x1d00ffff
+      target `shouldBe` 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+
+    it "bitsToTarget handles small exponents" $ do
+      -- Exponent = 3, mantissa = 0x7fffff
+      let target = bitsToTarget 0x037fffff
+      target `shouldBe` 0x7fffff
+
+    it "targetToBits roundtrips difficulty 1" $ do
+      let bits = 0x1d00ffff
+          target = bitsToTarget bits
+          bits' = targetToBits target
+      bits' `shouldBe` bits
+
+    it "targetToBits roundtrips various values" $ do
+      let testBits = [0x1b0404cb, 0x1c0d3142, 0x1d00ffff]
+      forM_ testBits $ \bits -> do
+        let target = bitsToTarget bits
+            bits' = targetToBits target
+        bits' `shouldBe` bits
+
+  describe "Merkle root computation" $ do
+    it "single txid returns same hash" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xab))
+          root = computeMerkleRoot [txid]
+      root `shouldBe` getTxIdHash txid
+
+    it "empty list returns zero hash" $ do
+      let root = computeMerkleRoot []
+      root `shouldBe` Hash256 (BS.replicate 32 0)
+
+    it "two txids are hashed together" $ do
+      let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+          txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+          root = computeMerkleRoot [txid1, txid2]
+          expected = doubleSHA256 (BS.append (BS.replicate 32 0x01) (BS.replicate 32 0x02))
+      root `shouldBe` expected
+
+    it "odd number of txids duplicates last" $ do
+      -- With 3 txids: hash(hash(tx1,tx2), hash(tx3,tx3))
+      let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+          txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+          txid3 = TxId (Hash256 (BS.replicate 32 0x03))
+          root = computeMerkleRoot [txid1, txid2, txid3]
+          h12 = doubleSHA256 (BS.append (BS.replicate 32 0x01) (BS.replicate 32 0x02))
+          h33 = doubleSHA256 (BS.append (BS.replicate 32 0x03) (BS.replicate 32 0x03))
+          expected = doubleSHA256 (BS.append (getHash256 h12) (getHash256 h33))
+      root `shouldBe` expected
+
+  describe "Network configuration" $ do
+    it "mainnet has correct magic bytes" $ do
+      netMagic mainnet `shouldBe` 0xD9B4BEF9
+
+    it "mainnet has correct port" $ do
+      netDefaultPort mainnet `shouldBe` 8333
+
+    it "mainnet has correct bech32 prefix" $ do
+      netBech32Prefix mainnet `shouldBe` "bc"
+
+    it "testnet3 has correct port" $ do
+      netDefaultPort testnet3 `shouldBe` 18333
+
+    it "testnet3 has correct bech32 prefix" $ do
+      netBech32Prefix testnet3 `shouldBe` "tb"
+
+    it "regtest has correct bech32 prefix" $ do
+      netBech32Prefix regtest `shouldBe` "bcrt"
+
+    it "regtest has shorter halving interval" $ do
+      netHalvingInterval regtest `shouldBe` 150
+
+  describe "Genesis block" $ do
+    it "mainnet genesis has correct timestamp" $ do
+      bhTimestamp genesisBlockHeader `shouldBe` 1231006505
+
+    it "mainnet genesis has correct nonce" $ do
+      bhNonce genesisBlockHeader `shouldBe` 2083236893
+
+    it "mainnet genesis has difficulty 1" $ do
+      bhBits genesisBlockHeader `shouldBe` 0x1d00ffff
+
+    it "mainnet genesis block has one transaction" $ do
+      length (blockTxns genesisBlock) `shouldBe` 1
+
+    it "mainnet genesis coinbase has 50 BTC output" $ do
+      let coinbase = head (blockTxns genesisBlock)
+          genesisTxOut = head (txOutputs coinbase)
+      txOutValue genesisTxOut `shouldBe` 5000000000
+
+  describe "Transaction validation" $ do
+    it "rejects transaction with no inputs" $ do
+      let tx = Tx 1 [] [TxOut 1000 "script"] [[]] 0
+      case validateTransaction tx of
+        Left msg | "no inputs" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject tx with no inputs"
+
+    it "rejects transaction with no outputs" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          tx = Tx 1 [txin] [] [[]] 0
+      case validateTransaction tx of
+        Left msg | "no outputs" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject tx with no outputs"
+
+    it "rejects transaction with duplicate inputs" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xbb))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          tx = Tx 1 [txin, txin] [TxOut 1000 "script"] [[], []] 0
+      case validateTransaction tx of
+        Left msg | "Duplicate" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject tx with duplicate inputs"
+
+    it "rejects transaction with outputs exceeding max money" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xcc))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          tx = Tx 1 [txin] [TxOut (maxMoney + 1) "script"] [[]] 0
+      case validateTransaction tx of
+        Left msg | "max money" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject tx exceeding max money"
+
+    it "accepts valid coinbase transaction" $ do
+      let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint (BS.replicate 10 0x04) 0xffffffff
+          tx = Tx 1 [txin] [TxOut 5000000000 "script"] [[]] 0
+      validateTransaction tx `shouldBe` Right ()
+
+    it "rejects coinbase with too short script" $ do
+      let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          txin = TxIn nullOutpoint (BS.singleton 0x04) 0xffffffff  -- 1 byte, too short
+          tx = Tx 1 [txin] [TxOut 5000000000 "script"] [[]] 0
+      case validateTransaction tx of
+        Left msg | "size" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Should reject coinbase with short script"
+
+  describe "Hex utilities" $ do
+    it "hexToBS converts hex string to bytes" $ do
+      hexToBS "deadbeef" `shouldBe` BS.pack [0xde, 0xad, 0xbe, 0xef]
+
+    it "hexToBS handles empty string" $ do
+      hexToBS "" `shouldBe` BS.empty
+
+    it "hexToBS handles uppercase" $ do
+      hexToBS "DEADBEEF" `shouldBe` BS.pack [0xde, 0xad, 0xbe, 0xef]
+
+  describe "Proof of work" $ do
+    it "mainnet powLimit is correct" $ do
+      powLimit `shouldBe` 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+
+    -- Note: checkProofOfWork validates that hash <= target
+    -- We test with a simple constructed header
+    it "accepts hash below target" $ do
+      -- Create a header with a very easy target (high bits value)
+      let header = BlockHeader
+            { bhVersion = 1
+            , bhPrevBlock = BlockHash (Hash256 (BS.replicate 32 0))
+            , bhMerkleRoot = Hash256 (BS.replicate 32 0)
+            , bhTimestamp = 0
+            , bhBits = 0x207fffff  -- Very easy target (regtest)
+            , bhNonce = 0
+            }
+          -- Regtest powLimit allows very easy targets
+          regtestPowLimit = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+      -- The hash should be below this very easy target
+      checkProofOfWork header regtestPowLimit `shouldBe` True
+
+    it "rejects hash above target" $ do
+      -- Create a header with an impossible target (0)
+      let header = BlockHeader
+            { bhVersion = 1
+            , bhPrevBlock = BlockHash (Hash256 (BS.replicate 32 0))
+            , bhMerkleRoot = Hash256 (BS.replicate 32 0)
+            , bhTimestamp = 0
+            , bhBits = 0x03000001  -- Very low target (essentially 1)
+            , bhNonce = 0
+            }
+      -- Any real hash will be above target 1
+      checkProofOfWork header powLimit `shouldBe` False
