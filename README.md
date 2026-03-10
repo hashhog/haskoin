@@ -32,9 +32,16 @@ system to make invalid states unrepresentable.
 - [x] SegWit script verification (P2WPKH, P2WSH)
 - [x] Flow control (IF/ELSE/ENDIF), arithmetic, stack ops
 - [x] CHECKLOCKTIMEVERIFY (BIP-65), CHECKSEQUENCEVERIFY (BIP-112)
+- [x] Consensus parameters (block limits, script limits, weight)
+- [x] Difficulty target conversion (compact bits format)
+- [x] Block reward schedule with halving
+- [x] Merkle root computation
+- [x] Network configs (mainnet, testnet3, regtest)
+- [x] Genesis blocks for all networks
+- [x] Basic block header validation
+- [x] Basic transaction validation
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] Transaction validation
-- [ ] Block validation
+- [ ] Full transaction validation with UTXOs
 - [ ] P2P networking
 - [ ] Chain state management
 
@@ -55,10 +62,11 @@ haskoin/
       Types.hs      -- core data types and serialization
       Crypto.hs     -- hashing, keys, signatures, sighash, addresses
       Script.hs     -- script parsing, classification, interpreter
+      Consensus.hs  -- network config, constants, validation
   app/
     Main.hs         -- executable entry point
   test/
-    Spec.hs         -- serialization, crypto, address, and script tests
+    Spec.hs         -- comprehensive test suite
 ```
 
 ## Running tests
