@@ -69,8 +69,13 @@ system to make invalid states unrepresentable.
 - [x] Header validation (PoW, timestamp, difficulty)
 - [x] Headers-first sync controller
 - [x] Fork point detection and ancestor lookup
+- [x] Block download pipeline (IBD)
+- [x] Pipelined block downloads (up to 128 in-flight)
+- [x] Per-peer download throttling (~16 blocks/peer)
+- [x] Adaptive stall detection and re-request
+- [x] Batch GetData messages for efficiency
+- [x] Block validation and chain connection during IBD
 - [ ] ECDSA signing/verification (requires secp256k1)
-- [ ] Block download and IBD
 - [ ] Mempool management
 
 ## Quick start
@@ -93,6 +98,7 @@ haskoin/
       Consensus.hs  -- network config, validation, header sync
       Storage.hs    -- rocksdb persistence layer
       Network.hs    -- p2p messages, peer connection, peer manager
+      Sync.hs       -- block download, IBD pipeline
   app/
     Main.hs         -- executable entry point
   test/
