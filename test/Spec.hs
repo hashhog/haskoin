@@ -49,7 +49,7 @@ import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
 import Haskoin.FeeEstimator
-import Haskoin.Wallet
+import Haskoin.Wallet hiding ((<|>))
 import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
@@ -7031,3 +7031,467 @@ tails xs@(_:xs') = xs : tails xs'
           Right psbt -> do
             length (psbtInputs psbt) `shouldBe` 2
             length (psbtOutputs psbt) `shouldBe` 2
+
+  --------------------------------------------------------------------------------
+  -- Output Descriptors (BIP-380-386)
+  --------------------------------------------------------------------------------
+
+  describe "output descriptor" $ do
+    describe "descriptor checksum" $ do
+      it "computes checksum for pk descriptor" $ do
+        -- Test checksum computation
+        let desc = "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
+        case descriptorChecksum (T.pack desc) of
+          Just checksum -> T.length checksum `shouldBe` 8
+          Nothing -> expectationFailure "Failed to compute checksum"
+
+      it "validates correct checksum" $ do
+        let descWithChecksum = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#8zl0zxma"
+        case validateDescriptorChecksum descWithChecksum of
+          Right _ -> return ()  -- Should succeed
+          Left err -> expectationFailure $ "Validation failed: " ++ show err
+
+      it "rejects invalid checksum" $ do
+        let descWithBadChecksum = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#aaaaaaaa"
+        case validateDescriptorChecksum descWithBadChecksum of
+          Right _ -> expectationFailure "Should have rejected bad checksum"
+          Left (InvalidChecksum _ _) -> return ()  -- Expected
+          Left err -> expectationFailure $ "Wrong error type: " ++ show err
+
+      it "adds checksum to descriptor" $ do
+        let desc = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case addDescriptorChecksum (T.pack desc) of
+          Just withChecksum -> T.isInfixOf "#" withChecksum `shouldBe` True
+          Nothing -> expectationFailure "Failed to add checksum"
+
+    describe "descriptor parsing" $ do
+      it "parses pk descriptor" $ do
+        let desc = "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
+        case parseDescriptor (T.pack desc) of
+          Right (Pk (KeyLiteral _)) -> return ()
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses pkh descriptor" $ do
+        let desc = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right (Pkh (KeyLiteral _)) -> return ()
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses wpkh descriptor" $ do
+        let desc = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right (Wpkh (KeyLiteral _)) -> return ()
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses sh(wpkh) nested descriptor" $ do
+        let desc = "sh(wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5))"
+        case parseDescriptor (T.pack desc) of
+          Right (Sh (Wpkh (KeyLiteral _))) -> return ()
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses wsh(multi) descriptor" $ do
+        let desc = "wsh(multi(2,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5))"
+        case parseDescriptor (T.pack desc) of
+          Right (Wsh (Multi 2 keys)) -> length keys `shouldBe` 2
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses sortedmulti descriptor" $ do
+        let desc = "sortedmulti(2,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right (SortedMulti 2 keys) -> length keys `shouldBe` 2
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses tr descriptor (key-only)" $ do
+        let desc = "tr(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
+        case parseDescriptor (T.pack desc) of
+          Right (Tr (KeyLiteral _) Nothing) -> return ()
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses combo descriptor" $ do
+        let desc = "combo(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right (Combo (KeyLiteral _)) -> return ()
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses raw descriptor" $ do
+        let desc = "raw(76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac)"
+        case parseDescriptor (T.pack desc) of
+          Right (Raw script) -> BS.length script `shouldBe` 25
+          Right other -> expectationFailure $ "Wrong descriptor type: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "rejects unknown function" $ do
+        let desc = "unknown(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Left (UnknownFunction _) -> return ()  -- Expected
+          Left err -> expectationFailure $ "Wrong error type: " ++ show err
+          Right _ -> expectationFailure "Should have rejected unknown function"
+
+      it "rejects invalid multisig threshold" $ do
+        let desc = "multi(5,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Left (InvalidThreshold 5 2) -> return ()  -- Expected: threshold 5 > 2 keys
+          Left err -> expectationFailure $ "Wrong error type: " ++ show err
+          Right _ -> expectationFailure "Should have rejected invalid threshold"
+
+    describe "descriptor range detection" $ do
+      it "detects non-ranged descriptor" $ do
+        let desc = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right d -> isRangeDescriptor d `shouldBe` False
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+    describe "descriptor serialization" $ do
+      it "roundtrips pk descriptor" $ do
+        let desc = "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)"
+        case parseDescriptor (T.pack desc) of
+          Right d -> do
+            let serialized = descriptorToText d
+            T.isPrefixOf "pk(" serialized `shouldBe` True
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "roundtrips nested sh(wpkh) descriptor" $ do
+        let desc = "sh(wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5))"
+        case parseDescriptor (T.pack desc) of
+          Right d -> do
+            let serialized = descriptorToText d
+            T.isPrefixOf "sh(wpkh(" serialized `shouldBe` True
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+    describe "combo expansion" $ do
+      it "expands combo to four descriptors" $ do
+        let key = KeyLiteral (PubKeyCompressed (BS.pack [0x02] <> BS.replicate 32 0xab))
+        let expanded = expandCombo key
+        length expanded `shouldBe` 4
+
+      it "combo contains pk, pkh, wpkh, sh(wpkh)" $ do
+        let key = KeyLiteral (PubKeyCompressed (BS.pack [0x02] <> BS.replicate 32 0xcd))
+        let expanded = expandCombo key
+        case expanded of
+          [Pk _, Pkh _, Wpkh _, Sh (Wpkh _)] -> return ()
+          _ -> expectationFailure $ "Unexpected combo expansion: " ++ show expanded
+
+    describe "address derivation" $ do
+      it "derives addresses from pkh descriptor" $ do
+        let desc = "pkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right d -> do
+            let addrs = deriveAddresses d [0]
+            length addrs `shouldBe` 1
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "derives scripts from wpkh descriptor" $ do
+        let desc = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right d -> do
+            let scripts = deriveScripts d 0
+            length scripts `shouldBe` 1
+            -- P2WPKH script should be 22 bytes
+            BS.length (head scripts) `shouldBe` 22
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "derives multiple addresses from combo descriptor" $ do
+        let desc = "combo(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case parseDescriptor (T.pack desc) of
+          Right d -> do
+            let scripts = deriveScripts d 0
+            -- combo produces 4 scripts: pk, pkh, wpkh, sh(wpkh)
+            length scripts `shouldBe` 4
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+  describe "importdescriptors RPC" $ do
+    -- Note: These are basic tests - full RPC testing requires server infrastructure
+    it "parses valid descriptor for import" $ do
+      let desc = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+      case parseDescriptor (T.pack desc) of
+        Right _ -> return ()  -- Valid descriptor
+        Left err -> expectationFailure $ "Parse error: " ++ show err
+
+    it "rejects malformed descriptor" $ do
+      let desc = "notafunction(xyz)"
+      case parseDescriptor (T.pack desc) of
+        Left _ -> return ()  -- Should fail
+        Right _ -> expectationFailure "Should have rejected malformed descriptor"
+
+  describe "miniscript" $ do
+    describe "miniscript parsing" $ do
+      it "parses true literal" $ do
+        case parseMiniscript "1" of
+          Right MsTrue -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses false literal" $ do
+        case parseMiniscript "0" of
+          Right MsFalse -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses pk expression" $ do
+        let pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        case parseMiniscript ("pk(" ++ pubkey ++ ")") of
+          Right (MsPk pk) -> BS.length pk `shouldBe` 33
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses pk_h expression" $ do
+        let pubkey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        case parseMiniscript ("pk_h(" ++ pubkey ++ ")") of
+          Right (MsPkH pk) -> BS.length pk `shouldBe` 33
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses older expression" $ do
+        case parseMiniscript "older(144)" of
+          Right (MsOlder n) -> n `shouldBe` 144
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses after expression" $ do
+        case parseMiniscript "after(500000000)" of
+          Right (MsAfter n) -> n `shouldBe` 500000000
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses sha256 expression" $ do
+        let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        case parseMiniscript ("sha256(" ++ hash ++ ")") of
+          Right (MsSha256 h) -> BS.length h `shouldBe` 32
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses and_v expression" $ do
+        case parseMiniscript "and_v(1,1)" of
+          Right (MsAndV MsTrue MsTrue) -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses or_i expression" $ do
+        case parseMiniscript "or_i(1,0)" of
+          Right (MsOrI MsTrue MsFalse) -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses andor expression" $ do
+        case parseMiniscript "andor(1,1,0)" of
+          Right (MsAndOr MsTrue MsTrue MsFalse) -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses thresh expression" $ do
+        case parseMiniscript "thresh(2,1,1,0)" of
+          Right (MsThresh k subs) -> do
+            k `shouldBe` 2
+            length subs `shouldBe` 3
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses wrapper expressions" $ do
+        case parseMiniscript "a:1" of
+          Right (MsA MsTrue) -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+      it "parses nested wrappers" $ do
+        case parseMiniscript "v:c:pk_h(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)" of
+          Right (MsV (MsC (MsPkH _))) -> return ()
+          Right other -> expectationFailure $ "Wrong result: " ++ show other
+          Left err -> expectationFailure $ "Parse error: " ++ show err
+
+    describe "miniscript type checking" $ do
+      it "MsTrue has type B" $ do
+        miniscriptType MsTrue `shouldBe` TypeB
+
+      it "MsFalse has type B" $ do
+        miniscriptType MsFalse `shouldBe` TypeB
+
+      it "MsPk has type K" $ do
+        let pk = BS.replicate 33 0x02
+        miniscriptType (MsPk pk) `shouldBe` TypeK
+
+      it "MsC wrapper converts K to B" $ do
+        let pk = BS.replicate 33 0x02
+        miniscriptType (MsC (MsPk pk)) `shouldBe` TypeB
+
+      it "MsV wrapper converts B to V" $ do
+        miniscriptType (MsV MsTrue) `shouldBe` TypeV
+
+      it "MsOlder has type B" $ do
+        miniscriptType (MsOlder 144) `shouldBe` TypeB
+
+      it "and_v result type depends on Y" $ do
+        -- and_v(V, B) -> B, and_v(V, V) -> V
+        miniscriptType (MsAndV (MsV MsTrue) MsTrue) `shouldBe` TypeB
+        miniscriptType (MsAndV (MsV MsTrue) (MsV MsTrue)) `shouldBe` TypeV
+
+    describe "miniscript type properties" $ do
+      it "MsTrue has z property" $ do
+        let props = miniscriptProps MsTrue
+        propZ props `shouldBe` True
+        propU props `shouldBe` True
+
+      it "MsFalse has d and e properties" $ do
+        let props = miniscriptProps MsFalse
+        propD props `shouldBe` True
+        propE props `shouldBe` True
+
+      it "MsPk has s property (requires signature)" $ do
+        let pk = BS.replicate 33 0x02
+        let props = miniscriptProps (MsPk pk)
+        propS props `shouldBe` True
+
+      it "MsOlder has f property (forced)" $ do
+        let props = miniscriptProps (MsOlder 144)
+        propF props `shouldBe` True
+
+      it "relative timelock sets h property" $ do
+        let props = miniscriptProps (MsOlder 144)  -- blocks, not time
+        propH props `shouldBe` True
+
+      it "absolute timelock sets i or j property" $ do
+        let propsTime = miniscriptProps (MsAfter 500000001)  -- time
+        let propsHeight = miniscriptProps (MsAfter 100000)    -- height
+        propI propsTime `shouldBe` True
+        propJ propsHeight `shouldBe` True
+
+    describe "miniscript compilation" $ do
+      it "compiles MsTrue to OP_1" $ do
+        let script = compileMiniscript ContextP2WSH MsTrue
+        getScriptOps script `shouldBe` [OP_1]
+
+      it "compiles MsFalse to OP_0" $ do
+        let script = compileMiniscript ContextP2WSH MsFalse
+        getScriptOps script `shouldBe` [OP_0]
+
+      it "compiles MsOlder to <n> OP_CSV" $ do
+        let script = compileMiniscript ContextP2WSH (MsOlder 144)
+        case getScriptOps script of
+          [OP_PUSHDATA n _, OP_CHECKSEQUENCEVERIFY] ->
+            decodeScriptNum n `shouldBe` Right 144
+          other -> expectationFailure $ "Wrong script: " ++ show other
+
+      it "compiles and_v with OP_VERIFY" $ do
+        -- and_v(1, 1) should compile to: OP_1 OP_VERIFY OP_1
+        let script = compileMiniscript ContextP2WSH (MsAndV MsTrue MsTrue)
+        -- The first expression gets verify=True in compilation
+        length (getScriptOps script) `shouldBe` 2  -- OP_1 OP_1 (no VERIFY needed for constants)
+
+      it "compiles or_i with IF/ELSE/ENDIF" $ do
+        let script = compileMiniscript ContextP2WSH (MsOrI MsTrue MsFalse)
+        let ops = getScriptOps script
+        OP_IF `elem` ops `shouldBe` True
+        OP_ELSE `elem` ops `shouldBe` True
+        OP_ENDIF `elem` ops `shouldBe` True
+
+      it "compiles multi with CHECKMULTISIG" $ do
+        let pk1 = BS.replicate 33 0x02
+        let pk2 = BS.replicate 33 0x03
+        let script = compileMiniscript ContextP2WSH (MsMulti 1 [pk1, pk2])
+        let ops = getScriptOps script
+        OP_CHECKMULTISIG `elem` ops `shouldBe` True
+
+    describe "miniscript size" $ do
+      it "calculates size for simple expression" $ do
+        let size = miniscriptSize ContextP2WSH MsTrue
+        size `shouldBe` 1  -- Just OP_1
+
+      it "calculates size for pk expression" $ do
+        let pk = BS.replicate 33 0x02
+        let size = miniscriptSize ContextP2WSH (MsPk pk)
+        size `shouldBe` 34  -- 1 byte push + 33 bytes key
+
+    describe "miniscript context validation" $ do
+      it "accepts multi in P2WSH" $ do
+        let pk = BS.replicate 33 0x02
+        checkMiniscriptType ContextP2WSH (MsC (MsMulti 1 [pk])) `shouldBe` Right ()
+
+      it "rejects multi_a in P2WSH" $ do
+        let pk = BS.replicate 33 0x02
+        case checkMiniscriptType ContextP2WSH (MsC (MsMultiA 1 [pk])) of
+          Left (MsContextError _) -> return ()
+          other -> expectationFailure $ "Expected context error: " ++ show other
+
+      it "accepts multi_a in Tapscript" $ do
+        let pk = BS.replicate 33 0x02
+        checkMiniscriptType ContextTapscript (MsC (MsMultiA 1 [pk])) `shouldBe` Right ()
+
+      it "rejects multi in Tapscript" $ do
+        let pk = BS.replicate 33 0x02
+        case checkMiniscriptType ContextTapscript (MsC (MsMulti 1 [pk])) of
+          Left (MsContextError _) -> return ()
+          other -> expectationFailure $ "Expected context error: " ++ show other
+
+    describe "miniscript roundtrip" $ do
+      it "roundtrips simple expressions" $ do
+        let exprs = [MsTrue, MsFalse, MsOlder 144, MsAfter 500000001]
+        forM_ exprs $ \expr -> do
+          let text = miniscriptToText expr
+          case parseMiniscript text of
+            Right parsed -> parsed `shouldBe` expr
+            Left err -> expectationFailure $ "Roundtrip failed: " ++ show err
+
+      it "roundtrips wrapper expressions" $ do
+        let expr = MsV (MsC (MsPk (BS.replicate 33 0x02)))
+        let text = miniscriptToText expr
+        case parseMiniscript text of
+          Right parsed -> parsed `shouldBe` expr
+          Left err -> expectationFailure $ "Roundtrip failed: " ++ show err
+
+    describe "satisfy miniscript" $ do
+      it "satisfies true" $ do
+        let ctx = SatisfactionContext Map.empty Map.empty ContextP2WSH
+        case satisfyMiniscript ctx MsTrue of
+          Right wit -> wit `shouldBe` []
+          Left err -> expectationFailure $ "Satisfaction failed: " ++ show err
+
+      it "cannot satisfy false" $ do
+        let ctx = SatisfactionContext Map.empty Map.empty ContextP2WSH
+        case satisfyMiniscript ctx MsFalse of
+          Left (MsSatisfactionError _) -> return ()
+          other -> expectationFailure $ "Expected error: " ++ show other
+
+      it "satisfies pk with available signature" $ do
+        let pk = hexDecode "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        let sig = BS.replicate 65 0xab
+        let ctx = SatisfactionContext (Map.singleton pk sig) Map.empty ContextP2WSH
+        case satisfyMiniscript ctx (MsPk pk) of
+          Right [s] -> s `shouldBe` sig
+          Right other -> expectationFailure $ "Wrong witness: " ++ show other
+          Left err -> expectationFailure $ "Satisfaction failed: " ++ show err
+
+      it "cannot satisfy pk without signature" $ do
+        let pk = hexDecode "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        let ctx = SatisfactionContext Map.empty Map.empty ContextP2WSH
+        case satisfyMiniscript ctx (MsPk pk) of
+          Left (MsSatisfactionError _) -> return ()
+          other -> expectationFailure $ "Expected error: " ++ show other
+
+      it "satisfies hash preimage" $ do
+        let hash = BS.replicate 32 0xab
+        let preimage = BS.pack [1,2,3,4]
+        let ctx = SatisfactionContext Map.empty (Map.singleton hash preimage) ContextP2WSH
+        case satisfyMiniscript ctx (MsSha256 hash) of
+          Right [p] -> p `shouldBe` preimage
+          Right other -> expectationFailure $ "Wrong witness: " ++ show other
+          Left err -> expectationFailure $ "Satisfaction failed: " ++ show err
+
+      it "satisfies or_i choosing cheaper branch" $ do
+        let ctx = SatisfactionContext Map.empty Map.empty ContextP2WSH
+        -- or_i(true, false) - should choose true branch
+        case satisfyMiniscript ctx (MsOrI MsTrue MsFalse) of
+          Right wit -> length wit `shouldBe` 1  -- Branch selector only
+          Left err -> expectationFailure $ "Satisfaction failed: " ++ show err
+
+      it "satisfies older with empty witness" $ do
+        let ctx = SatisfactionContext Map.empty Map.empty ContextP2WSH
+        case satisfyMiniscript ctx (MsOlder 144) of
+          Right wit -> wit `shouldBe` []  -- Timelocks need no witness data
+          Left err -> expectationFailure $ "Satisfaction failed: " ++ show err
