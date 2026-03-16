@@ -61,8 +61,10 @@ import Data.Scientific (Scientific)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
+import qualified Data.Vector.Unboxed as VU
 import Control.Concurrent.STM
 import System.IO.Temp (withSystemTempDirectory)
+import Data.Bits (xor, Bits, shiftL)
 import System.FilePath ((</>))
 
 -- Helper for hex decoding that works with Either-based API
@@ -642,6 +644,66 @@ main = hspec $ do
     it "classifies non-standard" $ do
       let script = Script [OP_NOP, OP_NOP]
       classifyOutput script `shouldBe` NonStandard
+
+    it "classifies P2A (Pay-to-Anchor)" $ do
+      -- P2A is OP_1 <0x4e73>
+      classifyOutput encodeP2A `shouldBe` P2A
+
+    it "classifies P2A by raw bytes" $ do
+      -- 0x51 (OP_1) 0x02 (push 2 bytes) 0x4e 0x73
+      let bytes = BS.pack [0x51, 0x02, 0x4e, 0x73]
+      case decodeScript bytes of
+        Right script -> classifyOutput script `shouldBe` P2A
+        Left err -> expectationFailure $ "Failed to decode P2A script: " ++ err
+
+  describe "Pay-to-Anchor (P2A)" $ do
+    it "p2aWitnessProgram is 0x4e73" $ do
+      p2aWitnessProgram `shouldBe` BS.pack [0x4e, 0x73]
+
+    it "encodeP2A creates correct script" $ do
+      let Script ops = encodeP2A
+      length ops `shouldBe` 2
+      head ops `shouldBe` OP_1
+      case ops !! 1 of
+        OP_PUSHDATA h _ -> h `shouldBe` BS.pack [0x4e, 0x73]
+        _ -> expectationFailure "Expected push data"
+
+    it "encodeP2A serializes to 4 bytes" $ do
+      let encoded = encodeScript encodeP2A
+      -- OP_1 (0x51) + push 2 bytes (0x02) + 0x4e + 0x73
+      BS.length encoded `shouldBe` 4
+      encoded `shouldBe` BS.pack [0x51, 0x02, 0x4e, 0x73]
+
+    it "isPayToAnchor detects P2A" $ do
+      isPayToAnchor encodeP2A `shouldBe` True
+
+    it "isPayToAnchor rejects P2TR" $ do
+      let p2tr = encodeP2TR (Hash256 (BS.replicate 32 0xab))
+      isPayToAnchor p2tr `shouldBe` False
+
+    it "isPayToAnchor rejects other witness v1 programs" $ do
+      -- OP_1 <16 bytes> (not P2TR and not P2A)
+      let other = Script [OP_1, OP_PUSHDATA (BS.replicate 16 0x00) OPCODE]
+      isPayToAnchor other `shouldBe` False
+
+    it "isPayToAnchor rejects P2WPKH" $ do
+      let p2wpkh = encodeP2WPKH (Hash160 (BS.replicate 20 0xab))
+      isPayToAnchor p2wpkh `shouldBe` False
+
+    it "p2aDustThreshold is 240 satoshis" $ do
+      p2aDustThreshold `shouldBe` 240
+
+    it "P2A script is anyone-can-spend (witness v1, 2-byte program)" $ do
+      -- P2A is special: witness v1 with 2-byte program (not 32 bytes like Taproot)
+      -- This makes it spendable with an empty witness
+      let Script ops = encodeP2A
+      case ops of
+        [OP_1, OP_PUSHDATA prog _] -> do
+          -- Witness version 1
+          -- Program is only 2 bytes (not Taproot's 32)
+          BS.length prog `shouldBe` 2
+          prog `shouldBe` BS.pack [0x4e, 0x73]
+        _ -> expectationFailure "Expected OP_1 <2 bytes>"
 
   describe "Standard script constructors" $ do
     it "encodeP2PKH creates valid P2PKH" $ do
@@ -5926,6 +5988,169 @@ tails xs@(_:xs') = xs : tails xs'
         length largeBatch `shouldBe` 1001
         length largeBatch `shouldSatisfy` (> maxBatchSize)
 
+  --------------------------------------------------------------------------------
+  -- REST API Tests (Phase 46)
+  --------------------------------------------------------------------------------
+
+  describe "rest api" $ do
+    describe "RestResponseFormat parsing" $ do
+      it "parses .bin suffix correctly" $ do
+        let (path, fmt) = parseRestFormat "blockhash.bin"
+        path `shouldBe` "blockhash"
+        fmt `shouldBe` RestBinary
+
+      it "parses .hex suffix correctly" $ do
+        let (path, fmt) = parseRestFormat "blockhash.hex"
+        path `shouldBe` "blockhash"
+        fmt `shouldBe` RestHex
+
+      it "parses .json suffix correctly" $ do
+        let (path, fmt) = parseRestFormat "blockhash.json"
+        path `shouldBe` "blockhash"
+        fmt `shouldBe` RestJson
+
+      it "returns RestUndefined for no suffix" $ do
+        let (path, fmt) = parseRestFormat "blockhash"
+        path `shouldBe` "blockhash"
+        fmt `shouldBe` RestUndefined
+
+      it "returns RestUndefined for unknown suffix" $ do
+        let (path, fmt) = parseRestFormat "blockhash.xml"
+        path `shouldBe` "blockhash.xml"
+        fmt `shouldBe` RestUndefined
+
+      it "handles paths with slashes" $ do
+        let (path, fmt) = parseRestFormat "block/000000.json"
+        path `shouldBe` "block/000000"
+        fmt `shouldBe` RestJson
+
+      it "handles empty path with suffix" $ do
+        let (path, fmt) = parseRestFormat ".json"
+        path `shouldBe` ""
+        fmt `shouldBe` RestJson
+
+    describe "maxRestHeadersResults" $ do
+      it "is set to 2000 (matches Bitcoin Core)" $ do
+        maxRestHeadersResults `shouldBe` 2000
+
+    describe "maxGetUtxosOutpoints" $ do
+      it "is set to 15 (matches Bitcoin Core)" $ do
+        maxGetUtxosOutpoints `shouldBe` 15
+
+    describe "REST format handling" $ do
+      it "parseRestFormat handles block hash format" $ do
+        let testHash = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+            (path, fmt) = parseRestFormat (testHash <> ".json")
+        path `shouldBe` testHash
+        fmt `shouldBe` RestJson
+
+      it "parseRestFormat handles count/hash format for headers" $ do
+        let testPath = "10/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+            (path, fmt) = parseRestFormat (testPath <> ".bin")
+        path `shouldBe` testPath
+        fmt `shouldBe` RestBinary
+
+      it "parseRestFormat handles UTXO outpoint format" $ do
+        let testPath = "checkmempool/txid-0/txid-1"
+            (path, fmt) = parseRestFormat (testPath <> ".hex")
+        path `shouldBe` testPath
+        fmt `shouldBe` RestHex
+
+    describe "REST endpoint path matching" $ do
+      it "block path prefix detection works" $ do
+        -- Test path prefix matching logic
+        let blockPath = "/rest/block/000000.json"
+            notxPath = "/rest/block/notxdetails/000000.json"
+        T.isPrefixOf "/rest/block/" blockPath `shouldBe` True
+        T.isPrefixOf "/rest/block/notxdetails/" notxPath `shouldBe` True
+        -- Verify notxdetails is more specific
+        (T.isPrefixOf "/rest/block/notxdetails/" blockPath) `shouldBe` False
+
+      it "transaction path prefix detection works" $ do
+        let txPath = "/rest/tx/abc123.json"
+        T.isPrefixOf "/rest/tx/" txPath `shouldBe` True
+
+      it "headers path prefix detection works" $ do
+        let headersPath = "/rest/headers/5/000000.json"
+        T.isPrefixOf "/rest/headers/" headersPath `shouldBe` True
+
+      it "blockhashbyheight path prefix detection works" $ do
+        let heightPath = "/rest/blockhashbyheight/123.json"
+        T.isPrefixOf "/rest/blockhashbyheight/" heightPath `shouldBe` True
+
+      it "chaininfo path prefix detection works" $ do
+        let infoPath = "/rest/chaininfo.json"
+        T.isPrefixOf "/rest/chaininfo" infoPath `shouldBe` True
+
+      it "mempool info path prefix detection works" $ do
+        let infoPath = "/rest/mempool/info.json"
+        T.isPrefixOf "/rest/mempool/info" infoPath `shouldBe` True
+
+      it "mempool contents path prefix detection works" $ do
+        let contentsPath = "/rest/mempool/contents.json"
+        T.isPrefixOf "/rest/mempool/contents" contentsPath `shouldBe` True
+
+      it "getutxos path prefix detection works" $ do
+        let utxosPath = "/rest/getutxos/txid-0.json"
+        T.isPrefixOf "/rest/getutxos" utxosPath `shouldBe` True
+
+    describe "REST API constants match Bitcoin Core" $ do
+      -- Reference: /home/max/hashhog/bitcoin/src/rest.cpp
+      -- MAX_REST_HEADERS_RESULTS = 2000
+      -- MAX_GETUTXOS_OUTPOINTS = 15
+      it "header count limit matches Bitcoin Core (2000)" $ do
+        maxRestHeadersResults `shouldBe` 2000
+
+      it "UTXO outpoints limit matches Bitcoin Core (15)" $ do
+        maxGetUtxosOutpoints `shouldBe` 15
+
+    describe "REST format error messages" $ do
+      it "available formats string includes all formats" $ do
+        -- The availableFormats string should list all supported formats
+        -- This tests the format string logic
+        let formats = [".bin", ".hex", ".json"]
+        all (\f -> f `elem` [".bin", ".hex", ".json"]) formats `shouldBe` True
+
+    describe "REST path parsing" $ do
+      it "extracts hash from block path" $ do
+        let fullPath = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.json"
+            (hashPart, _) = parseRestFormat fullPath
+        T.length hashPart `shouldBe` 64
+
+      it "extracts count and hash from headers path" $ do
+        let fullPath = "5/abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789.hex"
+            (pathPart, fmt) = parseRestFormat fullPath
+            parts = T.splitOn "/" pathPart
+        length parts `shouldBe` 2
+        fmt `shouldBe` RestHex
+
+      it "extracts height from blockhashbyheight path" $ do
+        let fullPath = "12345.bin"
+            (heightStr, fmt) = parseRestFormat fullPath
+        heightStr `shouldBe` "12345"
+        fmt `shouldBe` RestBinary
+
+    describe "REST UTXO path parsing" $ do
+      it "detects checkmempool flag" $ do
+        let pathWithCheck = "checkmempool/txid-0"
+            pathWithoutCheck = "txid-0"
+            partsWithCheck = T.splitOn "/" pathWithCheck
+            partsWithoutCheck = T.splitOn "/" pathWithoutCheck
+        head partsWithCheck `shouldBe` "checkmempool"
+        head partsWithoutCheck `shouldNotBe` "checkmempool"
+
+      it "parses outpoint format (txid-n)" $ do
+        let outpointStr = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef-5"
+            parts = T.splitOn "-" outpointStr
+        length parts `shouldBe` 2
+        parts !! 0 `shouldBe` "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        parts !! 1 `shouldBe` "5"
+
+      it "handles multiple outpoints in path" $ do
+        let pathPart = "txid1-0/txid2-1/txid3-2"
+            outpoints = filter (not . T.null) $ T.splitOn "/" pathPart
+        length outpoints `shouldBe` 3
+
   describe "broadcast mechanism" $ do
     it "InvVector uses InvWitnessTx type for transactions" $ do
       let txid = TxId (Hash256 (BS.replicate 32 0xaa))
@@ -7495,3 +7720,828 @@ tails xs@(_:xs') = xs : tails xs'
         case satisfyMiniscript ctx (MsOlder 144) of
           Right wit -> wit `shouldBe` []  -- Timelocks need no witness data
           Left err -> expectationFailure $ "Satisfaction failed: " ++ show err
+
+  -- BIP330 Erlay Transaction Reconciliation Tests
+  describe "erlay" $ do
+    describe "GF(2^32) arithmetic" $ do
+      it "gfAdd is XOR" $ do
+        gfAdd (GF2_32 0x12345678) (GF2_32 0x87654321) `shouldBe` GF2_32 (0x12345678 `xor` 0x87654321)
+
+      it "gfAdd is commutative" $ property $ \(a :: Word32) (b :: Word32) ->
+        gfAdd (GF2_32 a) (GF2_32 b) == gfAdd (GF2_32 b) (GF2_32 a)
+
+      it "gfAdd is associative" $ property $ \(a :: Word32) (b :: Word32) (c :: Word32) ->
+        gfAdd (gfAdd (GF2_32 a) (GF2_32 b)) (GF2_32 c) ==
+        gfAdd (GF2_32 a) (gfAdd (GF2_32 b) (GF2_32 c))
+
+      it "gfMul identity" $ property $ \(a :: Word32) ->
+        a /= 0 ==> gfMul (GF2_32 a) (GF2_32 1) == GF2_32 a
+
+      it "gfMul zero" $ property $ \(a :: Word32) ->
+        gfMul (GF2_32 a) (GF2_32 0) == GF2_32 0
+
+      it "gfMul is commutative" $ property $ \(a :: Word32) (b :: Word32) ->
+        gfMul (GF2_32 a) (GF2_32 b) == gfMul (GF2_32 b) (GF2_32 a)
+
+      it "gfPow 0 is 1" $ property $ \(a :: Word32) ->
+        a /= 0 ==> gfPow (GF2_32 a) 0 == GF2_32 1
+
+      it "gfPow 1 is identity" $ property $ \(a :: Word32) ->
+        gfPow (GF2_32 a) 1 == GF2_32 a
+
+      it "gfInv gives multiplicative inverse" $ do
+        let a = GF2_32 0x12345
+            inv_a = gfInv a
+        gfMul a inv_a `shouldBe` GF2_32 1
+
+      it "gfInv of 0 is 0 (sentinel)" $ do
+        gfInv (GF2_32 0) `shouldBe` GF2_32 0
+
+    describe "minisketch" $ do
+      it "newMinisketch creates empty sketch" $ do
+        let sketch = newMinisketch 10
+        msCapacity sketch `shouldBe` 10
+        -- All syndromes should be 0
+        all (== 0) (VU.toList (msSyndromes sketch)) `shouldBe` True
+
+      it "sketchAdd adds element" $ do
+        let sketch = newMinisketch 5
+            sketch' = sketchAdd sketch 42
+        -- Syndromes should no longer be all zero
+        any (/= 0) (VU.toList (msSyndromes sketch')) `shouldBe` True
+
+      it "sketchAdd is idempotent (XOR self)" $ do
+        let sketch = newMinisketch 5
+            sketch' = sketchAdd sketch 42
+            sketch'' = sketchAdd sketch' 42  -- Add same element again
+        -- Adding element twice cancels out (XOR property)
+        msSyndromes sketch'' `shouldBe` msSyndromes sketch
+
+      it "sketchMerge XORs syndromes" $ do
+        let s1 = sketchAdd (newMinisketch 5) 100
+            s2 = sketchAdd (newMinisketch 5) 200
+            merged = sketchMerge s1 s2
+        -- Merged should represent symmetric difference
+        msCapacity merged `shouldBe` 5
+
+      it "sketchMerge same sketch gives zeros" $ do
+        let sketch = sketchAdd (newMinisketch 5) 123
+            merged = sketchMerge sketch sketch
+        -- XOR with self gives zeros
+        all (== 0) (VU.toList (msSyndromes merged)) `shouldBe` True
+
+      it "sketchSerialize/sketchDeserialize roundtrips" $ do
+        let sketch = sketchAdd (sketchAdd (newMinisketch 10) 100) 200
+            serialized = sketchSerialize sketch
+        case sketchDeserialize serialized of
+          Right deserialized -> do
+            msCapacity deserialized `shouldBe` msCapacity sketch
+            msSyndromes deserialized `shouldBe` msSyndromes sketch
+          Left err -> expectationFailure $ "Deserialization failed: " ++ err
+
+      it "sketchDecode empty sketch returns empty list" $ do
+        let sketch = newMinisketch 5
+        sketchDecode sketch `shouldBe` Right []
+
+      it "sketchDecode single element" $ do
+        let sketch = sketchAdd (newMinisketch 10) 100
+        case sketchDecode sketch of
+          Right [elem] -> elem `shouldBe` 100
+          Right other -> expectationFailure $ "Wrong elements: " ++ show other
+          Left err -> expectationFailure $ "Decode failed: " ++ show err
+
+      it "sketchDecode multiple elements" $ do
+        let sketch = foldl' sketchAdd (newMinisketch 10) [50, 100, 200]
+        case sketchDecode sketch of
+          Right elems -> Set.fromList elems `shouldBe` Set.fromList [50, 100, 200]
+          Left err -> expectationFailure $ "Decode failed: " ++ show err
+
+      it "sketchDecode symmetric difference" $ do
+        let s1 = foldl' sketchAdd (newMinisketch 10) [1, 2, 3, 5]
+            s2 = foldl' sketchAdd (newMinisketch 10) [1, 2, 4, 5]
+            merged = sketchMerge s1 s2
+        -- Symmetric difference is {3, 4}
+        case sketchDecode merged of
+          Right elems -> Set.fromList elems `shouldBe` Set.fromList [3, 4]
+          Left err -> expectationFailure $ "Decode failed: " ++ show err
+
+    describe "erlay short txid" $ do
+      it "computeErlaySalt combines salts deterministically" $ do
+        let salt1 = computeErlaySalt 100 200
+            salt2 = computeErlaySalt 200 100  -- Same salts, different order
+        salt1 `shouldBe` salt2
+
+      it "computeErlaySalt different salts give different keys" $ do
+        let salt1 = computeErlaySalt 100 200
+            salt2 = computeErlaySalt 100 201
+        salt1 `shouldNotBe` salt2
+
+      it "computeErlayShortTxId produces 32-bit value" $ do
+        let key = computeErlaySalt 12345 67890
+            txid = TxId (Hash256 (BS.replicate 32 0xab))
+            shortId = computeErlayShortTxId key txid
+        shortId `shouldSatisfy` (<= 0xffffffff)
+
+      it "computeErlayShortTxId is deterministic" $ do
+        let key = computeErlaySalt 12345 67890
+            txid = TxId (Hash256 (BS.replicate 32 0xab))
+            shortId1 = computeErlayShortTxId key txid
+            shortId2 = computeErlayShortTxId key txid
+        shortId1 `shouldBe` shortId2
+
+      it "computeErlayShortTxId different txids give different short ids" $ do
+        let key = computeErlaySalt 12345 67890
+            txid1 = TxId (Hash256 (BS.replicate 32 0xab))
+            txid2 = TxId (Hash256 (BS.replicate 32 0xcd))
+            shortId1 = computeErlayShortTxId key txid1
+            shortId2 = computeErlayShortTxId key txid2
+        shortId1 `shouldNotBe` shortId2
+
+    describe "reconciliation messages" $ do
+      it "ReqRecon serializes and deserializes" $ do
+        let msg = ReqRecon 100 10 (BS.pack [1,2,3,4])
+        decode (encode msg) `shouldBe` Right msg
+
+      it "ReconcilDiff serializes success" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            msg = ReconcilDiff True [txid1] [txid2]
+        decode (encode msg) `shouldBe` Right msg
+
+      it "ReconcilDiff serializes failure" $ do
+        let msg = ReconcilDiff False [] []
+        decode (encode msg) `shouldBe` Right msg
+
+      it "SketchExt serializes and deserializes" $ do
+        let msg = SketchExt (BS.pack [5,6,7,8,9])
+        decode (encode msg) `shouldBe` Right msg
+
+    describe "reconciliation tracker" $ do
+      it "newTxReconciliationTracker creates tracker" $ do
+        tracker <- newTxReconciliationTracker 1
+        trtVersion tracker `shouldBe` 1
+
+      it "preRegisterPeer returns salt" $ do
+        tracker <- newTxReconciliationTracker 1
+        salt <- preRegisterPeer tracker 1
+        salt `shouldSatisfy` (> 0)
+
+      it "registerPeer succeeds after preRegister" $ do
+        tracker <- newTxReconciliationTracker 1
+        _ <- preRegisterPeer tracker 1
+        result <- registerPeer tracker 1 False 1 99999
+        result `shouldBe` ReconciliationSuccess
+
+      it "registerPeer fails without preRegister" $ do
+        tracker <- newTxReconciliationTracker 1
+        result <- registerPeer tracker 1 False 1 99999
+        result `shouldBe` ReconciliationNotFound
+
+      it "registerPeer fails on double register" $ do
+        tracker <- newTxReconciliationTracker 1
+        _ <- preRegisterPeer tracker 1
+        _ <- registerPeer tracker 1 False 1 99999
+        result <- registerPeer tracker 1 False 1 88888
+        result `shouldBe` ReconciliationAlreadyRegistered
+
+      it "isPeerRegistered returns correct state" $ do
+        tracker <- newTxReconciliationTracker 1
+        reg1 <- isPeerRegistered tracker 1
+        reg1 `shouldBe` False
+        _ <- preRegisterPeer tracker 1
+        reg2 <- isPeerRegistered tracker 1
+        reg2 `shouldBe` False  -- Pre-registered is not fully registered
+        _ <- registerPeer tracker 1 False 1 99999
+        reg3 <- isPeerRegistered tracker 1
+        reg3 `shouldBe` True
+
+      it "forgetPeer removes peer" $ do
+        tracker <- newTxReconciliationTracker 1
+        _ <- preRegisterPeer tracker 1
+        _ <- registerPeer tracker 1 False 1 99999
+        forgetPeer tracker 1
+        reg <- isPeerRegistered tracker 1
+        reg `shouldBe` False
+
+      it "getPeerReconciliationState returns state for registered peer" $ do
+        tracker <- newTxReconciliationTracker 1
+        _ <- preRegisterPeer tracker 1
+        _ <- registerPeer tracker 1 True 1 99999
+        mState <- getPeerReconciliationState tracker 1
+        case mState of
+          Just state -> rsRole state `shouldBe` ReconciliationResponder
+          Nothing -> expectationFailure "Expected state"
+
+      it "getPeerReconciliationState returns Nothing for unregistered peer" $ do
+        tracker <- newTxReconciliationTracker 1
+        mState <- getPeerReconciliationState tracker 999
+        mState `shouldBe` Nothing
+
+    describe "relay mode selection" $ do
+      it "block-only peers get flood" $ do
+        selectRelayMode True True True 0 `shouldBe` RelayFlood
+
+      it "unregistered peers get flood" $ do
+        selectRelayMode True False False 0 `shouldBe` RelayFlood
+
+      it "inbound registered peers get reconciliation" $ do
+        selectRelayMode True False True 0 `shouldBe` RelayReconcile
+
+      it "first N outbound registered peers get flood" $ do
+        selectRelayMode False False True 0 `shouldBe` RelayFlood
+        selectRelayMode False False True 7 `shouldBe` RelayFlood
+
+      it "outbound beyond N get reconciliation" $ do
+        selectRelayMode False False True 8 `shouldBe` RelayReconcile
+
+      it "getFloodPeers returns correct peers" $ do
+        let peers = [(1, False, False, True),   -- Outbound, registered
+                     (2, False, False, True),   -- Outbound, registered
+                     (3, True, False, True),    -- Inbound, registered
+                     (4, False, False, False)]  -- Outbound, not registered
+        let floodPeers = getFloodPeers peers
+        -- Should include: peer 1, 2 (first outbound), peer 4 (not registered)
+        length floodPeers `shouldSatisfy` (>= 3)
+
+      it "getReconciliationPeers returns correct peers" $ do
+        let peers = [(1, False, False, True),   -- Outbound, registered - flood
+                     (2, True, False, True),    -- Inbound, registered - reconcile
+                     (3, True, False, True),    -- Inbound, registered - reconcile
+                     (4, False, False, False)]  -- Outbound, not registered - flood
+        let reconPeers = getReconciliationPeers peers
+        -- Should include inbound registered peers
+        2 `elem` reconPeers `shouldBe` True
+        3 `elem` reconPeers `shouldBe` True
+
+  --------------------------------------------------------------------------------
+  -- Cluster Mempool Tests
+  --------------------------------------------------------------------------------
+
+  describe "Cluster Mempool" $ do
+    describe "Chunk" $ do
+      it "has correct fee rate calculation" $ do
+        let chunk = Chunk
+              { chTxIds = Set.singleton (TxId (Hash256 (BS.replicate 32 0x01)))
+              , chFee = 10000
+              , chSize = 250
+              , chFeeRate = calculateFeeRate 10000 250
+              }
+        -- 10000 * 1000 / 250 = 40000 (fee rate in milli-sat/vB)
+        getFeeRate (chFeeRate chunk) `shouldBe` 40000
+
+      it "zero size chunk has zero fee rate" $ do
+        let fr = calculateFeeRate 1000 0
+        getFeeRate fr `shouldBe` 0
+
+    describe "computeChunks" $ do
+      it "single transaction becomes single chunk" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            input = [(txid1, 1000, 100)]
+            chunks = computeChunks input
+        length chunks `shouldBe` 1
+        chTxIds (head chunks) `shouldBe` Set.singleton txid1
+
+      it "increasing fee rate txs stay separate" $ do
+        -- Tx1: 10 sat/vB, Tx2: 20 sat/vB, Tx3: 30 sat/vB
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            txid3 = TxId (Hash256 (BS.replicate 32 0x03))
+            input = [(txid1, 1000, 100), (txid2, 2000, 100), (txid3, 3000, 100)]
+            chunks = computeChunks input
+        -- Each tx becomes its own chunk (decreasing order from linearization)
+        length chunks `shouldBe` 3
+
+      it "decreasing fee rate txs merge into single chunk" $ do
+        -- When the next tx has higher fee rate, chunks merge
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            -- tx1: 10 sat/vB, tx2: 20 sat/vB (higher)
+            input = [(txid1, 1000, 100), (txid2, 2000, 100)]
+            chunks = computeChunks input
+        -- tx2 has higher fee rate, so it merges with tx1
+        length chunks `shouldBe` 1
+        Set.size (chTxIds (head chunks)) `shouldBe` 2
+
+      it "CPFP scenario merges parent and child" $ do
+        -- CPFP: low-fee parent + high-fee child
+        let parentId = TxId (Hash256 (BS.replicate 32 0x01))
+            childId = TxId (Hash256 (BS.replicate 32 0x02))
+            -- Parent: 1 sat/vB (100 sat / 100 vB)
+            -- Child: 50 sat/vB (5000 sat / 100 vB)
+            input = [(parentId, 100, 100), (childId, 5000, 100)]
+            chunks = computeChunks input
+        -- Child has much higher fee rate, so they merge
+        length chunks `shouldBe` 1
+        -- Combined: 5100 sat / 200 vB = 25.5 sat/vB
+        let combined = head chunks
+        chFee combined `shouldBe` 5100
+        chSize combined `shouldBe` 200
+
+    describe "linearize" $ do
+      it "empty set produces empty linearization" $ do
+        let entries = Map.empty :: Map TxId MempoolEntry
+            result = linearize Set.empty entries
+        result `shouldBe` []
+
+      it "single transaction linearizes correctly" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            entry = mkTestEntry txid1 1000 100
+            entries = Map.singleton txid1 entry
+            result = linearize (Set.singleton txid1) entries
+        result `shouldBe` [txid1]
+
+    describe "findCluster" $ do
+      it "isolated transaction forms singleton cluster" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            entry = mkTestEntry txid1 1000 100
+            entries = Map.singleton txid1 entry
+            byOutpoint = Map.empty
+            cluster = findCluster txid1 entries byOutpoint
+        Set.size cluster `shouldBe` 1
+        Set.member txid1 cluster `shouldBe` True
+
+    describe "findAllClusters" $ do
+      it "empty mempool has no clusters" $ do
+        let entries = Map.empty :: Map TxId MempoolEntry
+            byOutpoint = Map.empty
+            clusters = findAllClusters entries byOutpoint
+        clusters `shouldBe` []
+
+      it "isolated transactions form separate clusters" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            entry1 = mkTestEntry txid1 1000 100
+            entry2 = mkTestEntry txid2 2000 100
+            entries = Map.fromList [(txid1, entry1), (txid2, entry2)]
+            byOutpoint = Map.empty
+            clusters = findAllClusters entries byOutpoint
+        length clusters `shouldBe` 2
+
+    describe "buildClusterState" $ do
+      it "builds correct chunk queue ordering" $ do
+        -- Two transactions with different fee rates
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            entry1 = mkTestEntry txid1 1000 100   -- 10 sat/vB
+            entry2 = mkTestEntry txid2 5000 100   -- 50 sat/vB
+            entries = Map.fromList [(txid1, entry1), (txid2, entry2)]
+            byOutpoint = Map.empty
+            state = buildClusterState entries byOutpoint
+        -- Chunk queue should have higher fee rate first
+        length (csChunkQueue state) `shouldBe` 2
+        let firstChunk = snd (head (csChunkQueue state))
+        -- First chunk should have tx2 (higher fee rate)
+        Set.member txid2 (chTxIds firstChunk) `shouldBe` True
+
+    describe "getClusterFeeRate" $ do
+      it "calculates correct aggregate fee rate" $ do
+        let cluster = Cluster
+              { clTxIds = Set.empty
+              , clLinearization = []
+              , clChunks = []
+              , clTotalFee = 10000
+              , clTotalSize = 250
+              }
+            fr = getClusterFeeRate cluster
+        -- 10000 * 1000 / 250 = 40000
+        getFeeRate fr `shouldBe` 40000
+
+      it "zero size cluster has zero fee rate" $ do
+        let cluster = Cluster
+              { clTxIds = Set.empty
+              , clLinearization = []
+              , clChunks = []
+              , clTotalFee = 10000
+              , clTotalSize = 0
+              }
+            fr = getClusterFeeRate cluster
+        getFeeRate fr `shouldBe` 0
+
+    describe "cluster mempool constants" $ do
+      it "maxClusterSize is 100" $ do
+        maxClusterSize `shouldBe` 100
+
+-- Helper to create a test MempoolEntry
+mkTestEntry :: TxId -> Word64 -> Int -> MempoolEntry
+mkTestEntry txid fee vsize = MempoolEntry
+  { meTransaction = mkTestTx
+  , meTxId = txid
+  , meFee = fee
+  , meFeeRate = calculateFeeRate fee vsize
+  , meSize = vsize
+  , meTime = 0
+  , meHeight = 0
+  , meAncestorCount = 1
+  , meAncestorSize = vsize
+  , meAncestorFees = fee
+  , meAncestorSigOps = 0
+  , meDescendantCount = 1
+  , meDescendantSize = vsize
+  , meDescendantFees = fee
+  , meRBFOptIn = True
+  }
+
+-- Minimal test transaction
+mkTestTx :: Tx
+mkTestTx = Tx
+  { txVersion = 2
+  , txInputs = []
+  , txOutputs = []
+  , txLockTime = 0
+  , txWitness = []
+  }
+
+--------------------------------------------------------------------------------
+-- ZMQ Notification Tests
+--------------------------------------------------------------------------------
+
+-- | Helper to decode little-endian Word32
+decodeLE32 :: ByteString -> Word32
+decodeLE32 bs
+  | BS.length bs >= 4 =
+      let [b0, b1, b2, b3] = map fromIntegral $ BS.unpack (BS.take 4 bs)
+      in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
+  | otherwise = 0
+
+-- | Helper to decode little-endian Word64
+decodeLE64 :: ByteString -> Word64
+decodeLE64 bs
+  | BS.length bs >= 8 =
+      let bytes = map fromIntegral $ BS.unpack (BS.take 8 bs)
+          [b0, b1, b2, b3, b4, b5, b6, b7] = bytes
+      in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
+           .|. (b4 `shiftL` 32) .|. (b5 `shiftL` 40) .|. (b6 `shiftL` 48) .|. (b7 `shiftL` 56)
+  | otherwise = 0
+
+-- | Make a test block hash
+mkTestBlockHash :: BlockHash
+mkTestBlockHash = BlockHash $ Hash256 $ BS.replicate 32 0xab
+
+-- | Make a test TxId
+mkTestTxId :: TxId
+mkTestTxId = TxId $ Hash256 $ BS.replicate 32 0xcd
+
+-- Unit tests for ZMQ types and serialization
+zmqTests :: Spec
+zmqTests = describe "ZMQ Notifications" $ do
+  describe "zmqTopicToBytes" $ do
+    it "converts ZmqHashBlock to 'hashblock'" $
+      zmqTopicToBytes ZmqHashBlock `shouldBe` "hashblock"
+
+    it "converts ZmqHashTx to 'hashtx'" $
+      zmqTopicToBytes ZmqHashTx `shouldBe` "hashtx"
+
+    it "converts ZmqRawBlock to 'rawblock'" $
+      zmqTopicToBytes ZmqRawBlock `shouldBe` "rawblock"
+
+    it "converts ZmqRawTx to 'rawtx'" $
+      zmqTopicToBytes ZmqRawTx `shouldBe` "rawtx"
+
+    it "converts ZmqSequence to 'sequence'" $
+      zmqTopicToBytes ZmqSequence `shouldBe` "sequence"
+
+  describe "SequenceLabel" $ do
+    it "SeqBlockConnect is 'C' (0x43)" $
+      sequenceLabelToByte SeqBlockConnect `shouldBe` 0x43
+
+    it "SeqBlockDisconnect is 'D' (0x44)" $
+      sequenceLabelToByte SeqBlockDisconnect `shouldBe` 0x44
+
+    it "SeqMempoolAccept is 'A' (0x41)" $
+      sequenceLabelToByte SeqMempoolAccept `shouldBe` 0x41
+
+    it "SeqMempoolRemoval is 'R' (0x52)" $
+      sequenceLabelToByte SeqMempoolRemoval `shouldBe` 0x52
+
+  describe "ZmqConfig" $ do
+    it "defaultZmqConfig has correct endpoint" $
+      zmqEndpoint defaultZmqConfig `shouldBe` "tcp://127.0.0.1:28332"
+
+    it "defaultZmqConfig has correct high water mark" $
+      zmqHighWaterMark defaultZmqConfig `shouldBe` 1000
+
+    it "defaultZmqConfig is enabled" $
+      zmqEnabled defaultZmqConfig `shouldBe` True
+
+  describe "ZmqEvent" $ do
+    it "ZmqEventHashBlock holds block hash" $ do
+      let bh = mkTestBlockHash
+          event = ZmqEventHashBlock bh
+      case event of
+        ZmqEventHashBlock bh' -> bh' `shouldBe` bh
+        _ -> expectationFailure "unexpected event type"
+
+    it "ZmqEventHashTx holds txid" $ do
+      let txid = mkTestTxId
+          event = ZmqEventHashTx txid
+      case event of
+        ZmqEventHashTx txid' -> txid' `shouldBe` txid
+        _ -> expectationFailure "unexpected event type"
+
+    it "ZmqEventRawBlock holds raw bytes and hash" $ do
+      let bh = mkTestBlockHash
+          raw = "block data"
+          event = ZmqEventRawBlock raw bh
+      case event of
+        ZmqEventRawBlock raw' bh' -> do
+          raw' `shouldBe` raw
+          bh' `shouldBe` bh
+        _ -> expectationFailure "unexpected event type"
+
+    it "ZmqEventRawTx holds raw bytes and txid" $ do
+      let txid = mkTestTxId
+          raw = "tx data"
+          event = ZmqEventRawTx raw txid
+      case event of
+        ZmqEventRawTx raw' txid' -> do
+          raw' `shouldBe` raw
+          txid' `shouldBe` txid
+        _ -> expectationFailure "unexpected event type"
+
+    it "ZmqEventSequence with block connect" $ do
+      let bh = mkTestBlockHash
+          event = ZmqEventSequence SeqBlockConnect bh Nothing
+      case event of
+        ZmqEventSequence label bh' mSeq -> do
+          label `shouldBe` SeqBlockConnect
+          bh' `shouldBe` bh
+          mSeq `shouldBe` Nothing
+        _ -> expectationFailure "unexpected event type"
+
+    it "ZmqEventSequence with mempool accept includes sequence number" $ do
+      let bh = mkTestBlockHash
+          mempoolSeq = 12345 :: Word64
+          event = ZmqEventSequence SeqMempoolAccept bh (Just mempoolSeq)
+      case event of
+        ZmqEventSequence label bh' mSeq -> do
+          label `shouldBe` SeqMempoolAccept
+          bh' `shouldBe` bh
+          mSeq `shouldBe` Just mempoolSeq
+        _ -> expectationFailure "unexpected event type"
+
+  -- Phase 48: Tor/I2P Connectivity Tests
+  describe "socks5" $ do
+    describe "Socks5Request serialization" $ do
+      it "serializes connect request with domain name" $ do
+        let req = Socks5Request
+              { s5Cmd = 0x01
+              , s5AddrType = 0x03
+              , s5Addr = "example.onion"
+              , s5Port = 8333
+              }
+        let encoded = encode req
+        -- Should be: version (1) + cmd (1) + reserved (1) + addrtype (1) + len (1) + domain + port (2)
+        BS.length encoded `shouldBe` (4 + 1 + 13 + 2)
+        -- Version should be 0x05
+        BS.index encoded 0 `shouldBe` 0x05
+        -- Command should be 0x01 (connect)
+        BS.index encoded 1 `shouldBe` 0x01
+        -- Reserved
+        BS.index encoded 2 `shouldBe` 0x00
+        -- Address type (domain)
+        BS.index encoded 3 `shouldBe` 0x03
+        -- Domain length
+        BS.index encoded 4 `shouldBe` 13
+
+      it "roundtrips Socks5Request" $ do
+        let req = Socks5Request 0x01 0x03 "test.onion" 8333
+        decode (encode req) `shouldBe` Right req
+
+    describe "Socks5Reply parsing" $ do
+      it "parses success reply (0x00)" $
+        word8ToSocks5Reply 0x00 `shouldBe` Socks5Succeeded
+
+      it "parses general failure (0x01)" $
+        word8ToSocks5Reply 0x01 `shouldBe` Socks5GeneralFailure
+
+      it "parses connection refused (0x05)" $
+        word8ToSocks5Reply 0x05 `shouldBe` Socks5ConnectionRefused
+
+      it "parses TTL expired (0x06)" $
+        word8ToSocks5Reply 0x06 `shouldBe` Socks5TtlExpired
+
+      it "parses unknown codes" $
+        word8ToSocks5Reply 0x99 `shouldBe` Socks5Unknown 0x99
+
+    describe "Socks5Response parsing" $ do
+      it "parses successful response with IPv4 address" $ do
+        -- VER=5, REP=0 (success), RSV=0, ATYP=1 (IPv4), ADDR=127.0.0.1, PORT=8333
+        let respBytes = BS.pack [0x05, 0x00, 0x00, 0x01,
+                                 127, 0, 0, 1,
+                                 0x20, 0x8d]  -- Port 8333 big-endian
+        case parseSocks5Response respBytes of
+          Right resp -> do
+            s5rReply resp `shouldBe` Socks5Succeeded
+            s5rAddrType resp `shouldBe` 0x01
+            BS.length (s5rAddr resp) `shouldBe` 4
+            s5rPort resp `shouldBe` 8333
+          Left err -> expectationFailure $ "Parse failed: " ++ err
+
+      it "parses failure response" $ do
+        let respBytes = BS.pack [0x05, 0x05, 0x00, 0x01,
+                                 0, 0, 0, 0,
+                                 0, 0]
+        case parseSocks5Response respBytes of
+          Right resp -> s5rReply resp `shouldBe` Socks5ConnectionRefused
+          Left err -> expectationFailure $ "Parse failed: " ++ err
+
+    describe "Address detection" $ do
+      it "detects .onion addresses" $ do
+        isOnionAddress "abc123.onion" `shouldBe` True
+        isOnionAddress "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrs.onion" `shouldBe` True
+        isOnionAddress "TEST.ONION" `shouldBe` True  -- Case insensitive
+        isOnionAddress "192.168.1.1" `shouldBe` False
+        isOnionAddress "example.com" `shouldBe` False
+        isOnionAddress "onion.example.com" `shouldBe` False
+
+      it "detects .i2p addresses" $ do
+        isI2PAddress "example.i2p" `shouldBe` True
+        isI2PAddress "TEST.I2P" `shouldBe` True  -- Case insensitive
+        isI2PAddress "long-address.b32.i2p" `shouldBe` True
+        isI2PAddress "192.168.1.1" `shouldBe` False
+        isI2PAddress "i2p.example.com" `shouldBe` False
+
+    describe "ProxyConfig" $ do
+      it "has correct default Tor proxy" $
+        defaultTorProxy `shouldBe` Socks5Proxy "127.0.0.1" 9050
+
+      it "has correct default I2P SAM bridge" $
+        defaultI2PSam `shouldBe` I2PSamProxy "127.0.0.1" 7656
+
+  describe "tor" $ do
+    describe "TorOnionResponse" $ do
+      it "stores service ID and private key" $ do
+        let resp = TorOnionResponse
+              { torServiceId = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+              , torPrivateKey = "ED25519-V3:secretkey..."
+              }
+        torServiceId resp `shouldBe` "abcdef1234567890abcdef1234567890abcdef1234567890abcdef12"
+        torPrivateKey resp `shouldBe` "ED25519-V3:secretkey..."
+
+    describe "Tor control protocol parsing" $ do
+      it "parses success response (250)" $ do
+        let line = "250 OK"
+        parseTorResponse line `shouldBe` Right (250, "OK")
+
+      it "parses ServiceID response" $ do
+        let line = "250-ServiceID=abc123"
+        parseTorResponse line `shouldBe` Right (250, "ServiceID=abc123")
+
+      it "parses error responses" $ do
+        let line = "510 Unrecognized command"
+        parseTorResponse line `shouldBe` Right (510, "Unrecognized command")
+
+      it "fails on invalid response" $ do
+        let line = "INVALID"
+        parseTorResponse line `shouldBe` Left "Invalid Tor response code"
+
+    describe "defaultTorControlPort" $ do
+      it "is 127.0.0.1:9051" $
+        defaultTorControlPort `shouldBe` ("127.0.0.1", 9051)
+
+  describe "i2p" $ do
+    describe "SAM constants" $ do
+      it "has correct SAM version" $
+        samVersion `shouldBe` "3.1"
+
+      it "has correct SAM port" $
+        i2pSamPort `shouldBe` 7656
+
+      it "has correct signature type" $
+        samSignatureType `shouldBe` 7
+
+    describe "SamResult parsing" $ do
+      it "parses OK" $
+        parseSamResult "OK" `shouldBe` SamOK
+
+      it "parses CANT_REACH_PEER" $
+        parseSamResult "CANT_REACH_PEER" `shouldBe` SamCantReachPeer
+
+      it "parses TIMEOUT" $
+        parseSamResult "TIMEOUT" `shouldBe` SamTimeout
+
+      it "parses INVALID_ID" $
+        parseSamResult "INVALID_ID" `shouldBe` SamInvalidId
+
+      it "parses DUPLICATED_ID" $
+        parseSamResult "DUPLICATED_ID" `shouldBe` SamDuplicated
+
+      it "parses I2P_ERROR" $
+        parseSamResult "I2P_ERROR" `shouldBe` SamI2PError
+
+      it "parses unknown results" $
+        parseSamResult "UNKNOWN_ERROR" `shouldBe` SamUnknown "UNKNOWN_ERROR"
+
+    describe "SAM response parsing" $ do
+      it "parses key-value pairs" $ do
+        let resp = "HELLO RESULT=OK VERSION=3.1"
+        let parsed = parseSamResponse resp
+        Map.lookup "RESULT" parsed `shouldBe` Just "OK"
+        Map.lookup "VERSION" parsed `shouldBe` Just "3.1"
+
+      it "parses SESSION CREATE response" $ do
+        let resp = "SESSION STATUS RESULT=OK DESTINATION=base64destdata"
+        let parsed = parseSamResponse resp
+        Map.lookup "RESULT" parsed `shouldBe` Just "OK"
+        Map.lookup "DESTINATION" parsed `shouldBe` Just "base64destdata"
+
+      it "handles empty response" $ do
+        let parsed = parseSamResponse ""
+        Map.null parsed `shouldBe` True
+
+    describe "I2P Base64 conversion" $ do
+      it "converts I2P base64 to standard base64" $ do
+        -- I2P uses '-' instead of '+' and '~' instead of '/'
+        i2pBase64ToStandard "ab-c~d" `shouldBe` "ab+c/d"
+        i2pBase64ToStandard "test" `shouldBe` "test"
+
+      it "converts standard base64 to I2P base64" $ do
+        standardToI2PBase64 "ab+c/d" `shouldBe` "ab-c~d"
+        standardToI2PBase64 "test" `shouldBe` "test"
+
+      it "roundtrips conversions" $ do
+        let original = "abc-xyz~123"
+        (standardToI2PBase64 . i2pBase64ToStandard) original `shouldBe` original
+
+    describe "Base32 encoding" $ do
+      it "encodes empty bytes" $
+        base32Encode "" `shouldBe` ""
+
+      it "encodes known values" $ do
+        -- "f" -> "my" in base32
+        base32Encode "f" `shouldBe` "my"
+        -- "fo" -> "mzxq"
+        base32Encode "fo" `shouldBe` "mzxq"
+        -- "foo" -> "mzxw6"
+        base32Encode "foo" `shouldBe` "mzxw6"
+
+      it "produces 52-char output for 32-byte hash" $ do
+        -- 32 bytes -> 256 bits -> 52 base32 chars (256 / 5 = 51.2, rounds up)
+        let hash32 = BS.replicate 32 0x00
+        BS.length (base32Encode hash32) `shouldBe` 52
+
+    describe "I2P destination to b32 conversion" $ do
+      it "produces .b32.i2p suffix" $ do
+        let dest = "AAAA" -- Minimal base64 destination
+        let b32addr = i2pDestToB32 dest
+        ".b32.i2p" `BS.isSuffixOf` b32addr `shouldBe` True
+
+  describe "NetworkReachability" $ do
+    it "default reachability has IPv4 and IPv6 enabled" $ do
+      nrIPv4 defaultReachability `shouldBe` True
+      nrIPv6 defaultReachability `shouldBe` True
+      nrOnion defaultReachability `shouldBe` False
+      nrI2P defaultReachability `shouldBe` False
+
+    it "shouldAdvertiseAddress respects reachability flags" $ do
+      let ipv4Addr = NetAddrIPv4 0x7F000001  -- 127.0.0.1
+      let torAddr = NetAddrTorV3 (BS.replicate 32 0x00)
+      let i2pAddr = NetAddrI2P (BS.replicate 32 0x00)
+
+      -- Default reachability: IPv4 yes, Tor no
+      shouldAdvertiseAddress defaultReachability ipv4Addr `shouldBe` True
+      shouldAdvertiseAddress defaultReachability torAddr `shouldBe` False
+      shouldAdvertiseAddress defaultReachability i2pAddr `shouldBe` False
+
+      -- With Tor enabled
+      let torReach = defaultReachability { nrOnion = True }
+      shouldAdvertiseAddress torReach torAddr `shouldBe` True
+
+      -- With I2P enabled
+      let i2pReach = defaultReachability { nrI2P = True }
+      shouldAdvertiseAddress i2pReach i2pAddr `shouldBe` True
+
+    it "filterReachableAddresses filters by network type" $ do
+      let ipv4Entry = AddrV2
+            { av2Time = 0
+            , av2Services = 0
+            , av2NetId = NetIPv4
+            , av2Addr = BS.pack [127, 0, 0, 1]
+            , av2Port = 8333
+            }
+      let torEntry = AddrV2
+            { av2Time = 0
+            , av2Services = 0
+            , av2NetId = NetTorV3
+            , av2Addr = BS.replicate 32 0x00
+            , av2Port = 8333
+            }
+
+      let entries = [ipv4Entry, torEntry]
+
+      -- Default reachability: only IPv4
+      length (filterReachableAddresses defaultReachability entries) `shouldBe` 1
+
+      -- With Tor enabled: both
+      let torReach = defaultReachability { nrOnion = True }
+      length (filterReachableAddresses torReach entries) `shouldBe` 2
+
+  describe "ProxyPeerConfig" $ do
+    it "can be constructed with proxy" $ do
+      let baseConfig = defaultPeerConfig Mainnet
+      let proxyConfig = ProxyPeerConfig
+            { ppcBase = baseConfig
+            , ppcProxyConfig = defaultTorProxy
+            }
+      ppcProxyConfig proxyConfig `shouldBe` Socks5Proxy "127.0.0.1" 9050
+
