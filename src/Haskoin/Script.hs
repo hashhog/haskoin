@@ -36,6 +36,7 @@ module Haskoin.Script
   , encodeP2SH
   , encodeP2WPKH
   , encodeP2WSH
+  , encodeP2TR
   , encodeMultisig
   , encodeOpReturn
     -- * Utilities
@@ -49,6 +50,23 @@ module Haskoin.Script
     -- * Push-Only Check
   , isPushOnly
   , isPushOp
+    -- * Miniscript
+  , Miniscript(..)
+  , MiniscriptType(..)
+  , MiniscriptProps(..)
+  , MiniscriptContext(..)
+  , MiniscriptError(..)
+  , SatisfactionContext(..)
+  , Witness
+  , miniscriptType
+  , miniscriptProps
+  , checkMiniscriptType
+  , compileMiniscript
+  , miniscriptSize
+  , satisfyMiniscript
+  , dissatisfyMiniscript
+  , parseMiniscript
+  , miniscriptToText
   ) where
 
 import Data.ByteString (ByteString)
@@ -61,9 +79,10 @@ import Data.Serialize (runGet, runPut, getWord8, putWord8, getBytes,
 import Control.Monad (when, unless, foldM, forM_)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
 import GHC.Generics (Generic)
-import Data.List (foldl')
+import Data.List (foldl', sortBy, mapMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
+import qualified Data.Map.Strict as Map
 
 import Haskoin.Types
 import Haskoin.Crypto
@@ -849,6 +868,11 @@ encodeP2WPKH (Hash160 h) = Script [OP_0, OP_PUSHDATA h OPCODE]
 -- | Create P2WSH output script
 encodeP2WSH :: Hash256 -> Script
 encodeP2WSH (Hash256 h) = Script [OP_0, OP_PUSHDATA h OPCODE]
+
+-- | Create P2TR (Taproot) output script
+-- OP_1 <32-byte x-only pubkey>
+encodeP2TR :: Hash256 -> Script
+encodeP2TR (Hash256 h) = Script [OP_1, OP_PUSHDATA h OPCODE]
 
 -- | Create m-of-n multisig output script
 encodeMultisig :: Int -> [ByteString] -> Script
@@ -2055,3 +2079,1355 @@ countScriptSigops (Script ops) accurate = go ops 0 Nothing
       OP_15 -> 15
       OP_16 -> 16
       _     -> 20  -- Default to worst case
+
+--------------------------------------------------------------------------------
+-- Miniscript: A Structured Subset of Bitcoin Script
+--------------------------------------------------------------------------------
+-- Reference: BIP-379, https://bitcoin.sipa.be/miniscript/
+-- Bitcoin Core: /src/script/miniscript.cpp
+
+-- | Miniscript expression type.
+-- Represents the structured subset of Bitcoin Script that enables static analysis.
+data Miniscript
+  -- Atomic expressions
+  = MsTrue                                    -- ^ Just 1 (OP_1)
+  | MsFalse                                   -- ^ Just 0 (OP_0)
+  | MsPk !ByteString                          -- ^ pk_k(key) - <key>
+  | MsPkH !ByteString                         -- ^ pk_h(key) - OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY
+  | MsOlder !Word32                           -- ^ older(n) - <n> OP_CHECKSEQUENCEVERIFY
+  | MsAfter !Word32                           -- ^ after(n) - <n> OP_CHECKLOCKTIMEVERIFY
+  -- Hash preimage checks
+  | MsSha256 !ByteString                      -- ^ sha256(h) - OP_SIZE 32 OP_EQUALVERIFY OP_SHA256 <h> OP_EQUAL
+  | MsHash256 !ByteString                     -- ^ hash256(h) - OP_SIZE 32 OP_EQUALVERIFY OP_HASH256 <h> OP_EQUAL
+  | MsRipemd160 !ByteString                   -- ^ ripemd160(h) - OP_SIZE 32 OP_EQUALVERIFY OP_RIPEMD160 <h> OP_EQUAL
+  | MsHash160 !ByteString                     -- ^ hash160(h) - OP_SIZE 32 OP_EQUALVERIFY OP_HASH160 <h> OP_EQUAL
+  -- Connectives
+  | MsAndV !Miniscript !Miniscript            -- ^ and_v(X,Y) - [X] [Y]
+  | MsAndB !Miniscript !Miniscript            -- ^ and_b(X,Y) - [X] [Y] OP_BOOLAND
+  | MsOrB !Miniscript !Miniscript             -- ^ or_b(X,Y) - [X] [Y] OP_BOOLOR
+  | MsOrC !Miniscript !Miniscript             -- ^ or_c(X,Y) - [X] OP_NOTIF [Y] OP_ENDIF
+  | MsOrD !Miniscript !Miniscript             -- ^ or_d(X,Y) - [X] OP_IFDUP OP_NOTIF [Y] OP_ENDIF
+  | MsOrI !Miniscript !Miniscript             -- ^ or_i(X,Y) - OP_IF [X] OP_ELSE [Y] OP_ENDIF
+  | MsAndOr !Miniscript !Miniscript !Miniscript -- ^ andor(X,Y,Z) - [X] OP_NOTIF [Z] OP_ELSE [Y] OP_ENDIF
+  -- Threshold
+  | MsThresh !Int ![Miniscript]               -- ^ thresh(k,X1,...,Xn) - [X1] ... [Xn] OP_ADD ... <k> OP_EQUAL
+  | MsMulti !Int ![ByteString]                -- ^ multi(k,keys) - <k> <keys...> <n> OP_CHECKMULTISIG
+  | MsSortedMulti !Int ![ByteString]          -- ^ sortedmulti(k,keys) - like multi but with sorted keys
+  | MsMultiA !Int ![ByteString]               -- ^ multi_a(k,keys) - tapscript CHECKSIGADD multisig
+  | MsSortedMultiA !Int ![ByteString]         -- ^ sortedmulti_a(k,keys) - sorted tapscript multisig
+  -- Wrappers (these modify sub-expressions)
+  | MsA !Miniscript                           -- ^ a:X - OP_TOALTSTACK [X] OP_FROMALTSTACK
+  | MsS !Miniscript                           -- ^ s:X - OP_SWAP [X]
+  | MsC !Miniscript                           -- ^ c:X - [X] OP_CHECKSIG
+  | MsD !Miniscript                           -- ^ d:X - OP_DUP OP_IF [X] OP_ENDIF
+  | MsV !Miniscript                           -- ^ v:X - [X] OP_VERIFY (or use -VERIFY variant)
+  | MsJ !Miniscript                           -- ^ j:X - OP_SIZE OP_0NOTEQUAL OP_IF [X] OP_ENDIF
+  | MsN !Miniscript                           -- ^ n:X - [X] OP_0NOTEQUAL
+  | MsL !Miniscript                           -- ^ l:X - OP_IF OP_0 OP_ELSE [X] OP_ENDIF
+  | MsU !Miniscript                           -- ^ u:X - OP_IF [X] OP_ELSE OP_0 OP_ENDIF
+  | MsT !Miniscript                           -- ^ t:X - and_v(X,1)
+  deriving (Show, Eq, Generic)
+
+-- | Miniscript basic type (B, V, K, W)
+-- These determine how the expression interacts with the stack.
+data MiniscriptType
+  = TypeB   -- ^ Base: consumes args from stack, pushes 0/nonzero
+  | TypeV   -- ^ Verify: consumes args, pushes nothing, cannot fail nonzero
+  | TypeK   -- ^ Key: pushes a public key, becomes B with OP_CHECKSIG
+  | TypeW   -- ^ Wrapped: like B but operates one below top of stack
+  deriving (Show, Eq, Ord, Enum, Bounded, Generic)
+
+-- | Miniscript type properties.
+-- These boolean flags describe additional constraints on expressions.
+data MiniscriptProps = MiniscriptProps
+  { propZ :: !Bool   -- ^ z (zero-arg): consumes exactly 0 stack elements
+  , propO :: !Bool   -- ^ o (one-arg): consumes exactly 1 stack element
+  , propN :: !Bool   -- ^ n (nonzero): satisfaction never requires zero top element
+  , propD :: !Bool   -- ^ d (dissatisfiable): has a dissatisfaction
+  , propU :: !Bool   -- ^ u (unit): on satisfaction pushes exactly 1 (not just nonzero)
+  , propE :: !Bool   -- ^ e (expression): dissatisfaction is non-malleable
+  , propF :: !Bool   -- ^ f (forced): dissatisfaction requires signature
+  , propS :: !Bool   -- ^ s (safe): satisfaction requires signature
+  , propM :: !Bool   -- ^ m (nonmalleable): every satisfaction has non-malleable form
+  , propX :: !Bool   -- ^ x (expensive verify): last opcode is not EQUAL/CHECKSIG/etc
+  , propG :: !Bool   -- ^ g: contains relative time timelock
+  , propH :: !Bool   -- ^ h: contains relative height timelock
+  , propI :: !Bool   -- ^ i: contains absolute time timelock
+  , propJ :: !Bool   -- ^ j: contains absolute height timelock
+  , propK :: !Bool   -- ^ k: no conflicting timelocks
+  } deriving (Show, Eq, Generic)
+
+-- | Default (empty) properties
+emptyProps :: MiniscriptProps
+emptyProps = MiniscriptProps
+  { propZ = False, propO = False, propN = False, propD = False
+  , propU = False, propE = False, propF = False, propS = False
+  , propM = False, propX = False, propG = False, propH = False
+  , propI = False, propJ = False, propK = True
+  }
+
+-- | Miniscript context (P2WSH vs Tapscript)
+data MiniscriptContext
+  = ContextP2WSH      -- ^ Witness Script Hash context
+  | ContextTapscript  -- ^ Taproot script-path context
+  deriving (Show, Eq, Ord, Enum, Generic)
+
+-- | Miniscript errors
+data MiniscriptError
+  = MsTypeError !String         -- ^ Type checking failed
+  | MsContextError !String      -- ^ Invalid in this context
+  | MsSatisfactionError !String -- ^ Cannot find satisfaction
+  | MsParseError !String        -- ^ Parsing failed
+  | MsResourceError !String     -- ^ Resource limit exceeded
+  deriving (Show, Eq, Generic)
+
+-- | Context for satisfaction: what signatures/preimages are available
+data SatisfactionContext = SatisfactionContext
+  { satSignatures :: !(Map.Map ByteString ByteString)  -- ^ pubkey -> signature
+  , satPreimages  :: !(Map.Map ByteString ByteString)  -- ^ hash -> preimage
+  , satContext    :: !MiniscriptContext                -- ^ P2WSH or Tapscript
+  } deriving (Show, Eq)
+
+-- | A witness stack (list of stack items)
+type Witness = [ByteString]
+
+-- | Internal satisfaction result: witness stack and cost
+data SatResult = SatResult
+  { satWitness   :: !Witness     -- ^ Witness stack items
+  , satCost      :: !Int         -- ^ Total serialized size
+  , satHasSig    :: !Bool        -- ^ Contains at least one signature
+  , satMalleable :: !Bool        -- ^ Is this satisfaction malleable?
+  } deriving (Show, Eq)
+
+-- | Satisfaction unavailable
+satUnavailable :: SatResult
+satUnavailable = SatResult [] maxBound False True
+
+-- | Combine satisfaction results (concatenate witnesses)
+satConcat :: SatResult -> SatResult -> SatResult
+satConcat a b
+  | satCost a == maxBound || satCost b == maxBound = satUnavailable
+  | otherwise = SatResult
+      { satWitness = satWitness a ++ satWitness b
+      , satCost = satCost a + satCost b
+      , satHasSig = satHasSig a || satHasSig b
+      , satMalleable = satMalleable a || satMalleable b
+      }
+
+-- | Choose cheaper satisfaction
+satChoice :: SatResult -> SatResult -> SatResult
+satChoice a b
+  | satCost a == maxBound = b
+  | satCost b == maxBound = a
+  | satCost a <= satCost b = a
+  | otherwise = b
+
+--------------------------------------------------------------------------------
+-- Type Checking
+--------------------------------------------------------------------------------
+
+-- | Get the basic type of a miniscript expression
+miniscriptType :: Miniscript -> MiniscriptType
+miniscriptType ms = case ms of
+  MsTrue       -> TypeB
+  MsFalse      -> TypeB
+  MsPk _       -> TypeK
+  MsPkH _      -> TypeK
+  MsOlder _    -> TypeB
+  MsAfter _    -> TypeB
+  MsSha256 _   -> TypeB
+  MsHash256 _  -> TypeB
+  MsRipemd160 _ -> TypeB
+  MsHash160 _  -> TypeB
+  MsAndV x y   -> if miniscriptType y == TypeV then TypeV else miniscriptType y
+  MsAndB _ _   -> TypeB
+  MsOrB _ _    -> TypeB
+  MsOrC _ _    -> TypeV
+  MsOrD _ _    -> TypeB
+  MsOrI x y    ->
+    let tx = miniscriptType x
+        ty = miniscriptType y
+    in if tx == ty then tx else TypeB  -- Both must have same type
+  MsAndOr _ y _ -> miniscriptType y
+  MsThresh _ _  -> TypeB
+  MsMulti _ _   -> TypeB
+  MsSortedMulti _ _ -> TypeB
+  MsMultiA _ _  -> TypeB
+  MsSortedMultiA _ _ -> TypeB
+  -- Wrappers
+  MsA x        -> TypeW  -- a: converts B to W
+  MsS x        -> TypeW  -- s: converts Bo to W
+  MsC x        -> TypeB  -- c: converts K to B via CHECKSIG
+  MsD x        -> TypeB  -- d: converts Vz to B
+  MsV x        -> TypeV  -- v: converts B to V via VERIFY
+  MsJ x        -> TypeB  -- j: converts Bn to B
+  MsN x        -> TypeB  -- n: keeps as B
+  MsL x        -> if miniscriptType x == TypeB then TypeB else TypeV
+  MsU x        -> TypeB
+  MsT x        -> TypeV  -- t: = and_v(X, 1) -> V
+
+-- | Get the type properties of a miniscript expression
+miniscriptProps :: Miniscript -> MiniscriptProps
+miniscriptProps ms = case ms of
+  MsTrue -> emptyProps
+    { propZ = True, propU = True, propF = True, propM = True, propK = True }
+
+  MsFalse -> emptyProps
+    { propZ = True, propU = True, propD = True, propE = True, propM = True
+    , propS = True, propK = True }
+
+  MsPk _ -> emptyProps
+    { propO = True, propN = True, propD = True, propU = True, propE = True
+    , propM = True, propS = True, propK = True }
+
+  MsPkH _ -> emptyProps
+    { propN = True, propD = True, propU = True, propE = True, propM = True
+    , propS = True, propK = True }
+
+  MsOlder n -> emptyProps
+    { propZ = True, propF = True, propM = True
+    , propH = isRelativeHeight n, propG = isRelativeTime n, propK = True }
+
+  MsAfter n -> emptyProps
+    { propZ = True, propF = True, propM = True
+    , propJ = isAbsoluteHeight n, propI = isAbsoluteTime n, propK = True }
+
+  MsSha256 _ -> hashProps
+  MsHash256 _ -> hashProps
+  MsRipemd160 _ -> hashProps
+  MsHash160 _ -> hashProps
+
+  MsAndV x y ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+    in emptyProps
+      { propZ = propZ px && propZ py
+      , propO = (propZ px && propO py) || (propO px && propZ py)
+      , propN = propN px || (propZ px && propN py)
+      , propD = False  -- and_v cannot be dissatisfied
+      , propU = propU py
+      , propE = False
+      , propF = propF px || propF py
+      , propS = propS px || propS py
+      , propM = propM px && propM py && (propS px || propE py)
+      , propX = propX py
+      , propG = propG px || propG py
+      , propH = propH px || propH py
+      , propI = propI px || propI py
+      , propJ = propJ px || propJ py
+      , propK = propK px && propK py && noTimelockConflict px py
+      }
+
+  MsAndB x y ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+    in emptyProps
+      { propZ = propZ px && propZ py
+      , propO = (propZ px && propO py) || (propO px && propZ py)
+      , propN = propN px || propN py
+      , propD = propD px && propD py
+      , propU = True
+      , propE = (propE px && propE py) || (propE px && propD py) || (propD px && propE py)
+      , propF = propF px || propF py
+      , propS = propS px || propS py
+      , propM = propM px && propM py && (propS px || propE py)
+      , propX = True
+      , propG = propG px || propG py
+      , propH = propH px || propH py
+      , propI = propI px || propI py
+      , propJ = propJ px || propJ py
+      , propK = propK px && propK py && noTimelockConflict px py
+      }
+
+  MsOrB x y ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+    in emptyProps
+      { propZ = propZ px && propZ py
+      , propO = (propZ px && propO py) || (propO px && propZ py)
+      , propN = False
+      , propD = propD px && propD py
+      , propU = True
+      , propE = propE px && propE py
+      , propF = False
+      , propS = propS px && propS py
+      , propM = propM px && propM py && propE px && propE py
+      , propX = True
+      , propG = propG px || propG py
+      , propH = propH px || propH py
+      , propI = propI px || propI py
+      , propJ = propJ px || propJ py
+      , propK = propK px && propK py && noTimelockConflict px py
+      }
+
+  MsOrC x y ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+    in emptyProps
+      { propZ = propZ px && propZ py
+      , propO = propO px && propZ py
+      , propN = False
+      , propD = False
+      , propU = False
+      , propE = False
+      , propF = propF py
+      , propS = propS px && propS py
+      , propM = propM px && propM py && propE px && propS py
+      , propX = True
+      , propG = propG px || propG py
+      , propH = propH px || propH py
+      , propI = propI px || propI py
+      , propJ = propJ px || propJ py
+      , propK = propK px && propK py && noTimelockConflict px py
+      }
+
+  MsOrD x y ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+    in emptyProps
+      { propZ = propZ px && propZ py
+      , propO = propO px && propZ py
+      , propN = False
+      , propD = propD py
+      , propU = propU py
+      , propE = propE py
+      , propF = propF py
+      , propS = propS px && propS py
+      , propM = propM px && propM py && propE px && propS py
+      , propX = True
+      , propG = propG px || propG py
+      , propH = propH px || propH py
+      , propI = propI px || propI py
+      , propJ = propJ px || propJ py
+      , propK = propK px && propK py && noTimelockConflict px py
+      }
+
+  MsOrI x y ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+    in emptyProps
+      { propZ = False
+      , propO = propZ px && propZ py
+      , propN = False
+      , propD = propD px || propD py
+      , propU = propU px && propU py
+      , propE = (propF px && propF py) || (propD px && propE py) || (propE px && propD py)
+      , propF = propF px && propF py
+      , propS = propS px || propS py
+      , propM = propM px && propM py && (propS px || propE py)
+      , propX = True
+      , propG = propG px || propG py
+      , propH = propH px || propH py
+      , propI = propI px || propI py
+      , propJ = propJ px || propJ py
+      , propK = propK px && propK py && noTimelockConflict px py
+      }
+
+  MsAndOr x y z ->
+    let px = miniscriptProps x
+        py = miniscriptProps y
+        pz = miniscriptProps z
+    in emptyProps
+      { propZ = propZ px && propZ py && propZ pz
+      , propO = (propZ px && propO py && propO pz) || (propO px && propZ py && propZ pz)
+      , propN = propN px || (propZ px && propN py) || (propZ px && propN pz)
+      , propD = propD pz
+      , propU = propU py && propU pz
+      , propE = propE pz && (propS px || propF pz)
+      , propF = propF py && propF pz
+      , propS = (propS px || propS py) && propS pz
+      , propM = propM px && propM py && propM pz && propE px && (propS px || propF pz || propS py)
+      , propX = propX py || propX pz
+      , propG = propG px || propG py || propG pz
+      , propH = propH px || propH py || propH pz
+      , propI = propI px || propI py || propI pz
+      , propJ = propJ px || propJ py || propJ pz
+      , propK = propK px && propK py && propK pz && noTimelockConflict3 px py pz
+      }
+
+  MsThresh k subs ->
+    let ps = map miniscriptProps subs
+        n = length subs
+        allZ = all propZ ps
+        countO = length (filter propO ps)
+        restZ = length (filter propZ ps)
+        allE = all propE ps
+        allM = all propM ps
+        anyS = any propS ps
+    in emptyProps
+      { propZ = allZ
+      , propO = countO == 1 && restZ == n - 1
+      , propN = False
+      , propD = k < n
+      , propU = True
+      , propE = if k == n then allE else allE && k == 1
+      , propF = k == n && any propF ps
+      , propS = k <= length (filter propS ps)
+      , propM = allM && (k == 1 || k == n) && allE
+      , propX = True
+      , propG = any propG ps
+      , propH = any propH ps
+      , propI = any propI ps
+      , propJ = any propJ ps
+      , propK = all propK ps && noTimelockConflictList ps
+      }
+
+  MsMulti _ _ -> emptyProps
+    { propN = True, propD = True, propU = True, propE = True, propM = True
+    , propS = True, propK = True }
+
+  MsSortedMulti _ _ -> emptyProps
+    { propN = True, propD = True, propU = True, propE = True, propM = True
+    , propS = True, propK = True }
+
+  MsMultiA _ _ -> emptyProps
+    { propN = True, propD = True, propU = True, propE = True, propM = True
+    , propS = True, propK = True }
+
+  MsSortedMultiA _ _ -> emptyProps
+    { propN = True, propD = True, propU = True, propE = True, propM = True
+    , propS = True, propK = True }
+
+  -- Wrappers
+  MsA x ->
+    let px = miniscriptProps x
+    in px { propO = propZ px }  -- a: converts z to o
+
+  MsS x ->
+    let px = miniscriptProps x
+    in px  -- s: keeps most properties
+
+  MsC x ->
+    let px = miniscriptProps x
+    in emptyProps
+      { propZ = False
+      , propO = propO px
+      , propN = propN px
+      , propD = True
+      , propU = True
+      , propE = True
+      , propF = propF px
+      , propS = True
+      , propM = propM px
+      , propX = False
+      , propG = propG px
+      , propH = propH px
+      , propI = propI px
+      , propJ = propJ px
+      , propK = propK px
+      }
+
+  MsD x ->
+    let px = miniscriptProps x
+    in emptyProps
+      { propZ = True  -- d: consumes nothing extra
+      , propO = propZ px
+      , propN = True
+      , propD = True
+      , propU = propU px
+      , propE = True
+      , propF = propF px
+      , propS = propS px
+      , propM = propM px
+      , propX = True
+      , propG = propG px
+      , propH = propH px
+      , propI = propI px
+      , propJ = propJ px
+      , propK = propK px
+      }
+
+  MsV x ->
+    let px = miniscriptProps x
+    in emptyProps
+      { propZ = propZ px
+      , propO = propO px
+      , propN = propN px
+      , propD = False  -- V cannot be dissatisfied
+      , propU = False  -- V pushes nothing
+      , propE = False
+      , propF = True   -- V always "forced"
+      , propS = propS px
+      , propM = propM px
+      , propX = propX px
+      , propG = propG px
+      , propH = propH px
+      , propI = propI px
+      , propJ = propJ px
+      , propK = propK px
+      }
+
+  MsJ x ->
+    let px = miniscriptProps x
+    in emptyProps
+      { propZ = False
+      , propO = propO px
+      , propN = True
+      , propD = True
+      , propU = propU px
+      , propE = propF px  -- e = f (the dissatisfaction is non-malleable if forcing)
+      , propF = propF px
+      , propS = propS px
+      , propM = propM px
+      , propX = True
+      , propG = propG px
+      , propH = propH px
+      , propI = propI px
+      , propJ = propJ px
+      , propK = propK px
+      }
+
+  MsN x ->
+    let px = miniscriptProps x
+    in px { propU = True }  -- n: forces unit output
+
+  MsL x ->
+    let px = miniscriptProps x
+    in px { propZ = False, propO = propZ px, propD = True, propE = propF px }
+
+  MsU x ->
+    let px = miniscriptProps x
+    in px { propZ = False, propO = propZ px, propD = True, propE = propF px }
+
+  MsT x -> miniscriptProps (MsAndV x MsTrue)
+  where
+    hashProps = emptyProps
+      { propO = True, propN = True, propD = True, propU = True
+      , propM = True, propK = True }
+
+-- | Check if a value represents a relative height lock
+isRelativeHeight :: Word32 -> Bool
+isRelativeHeight n = (n .&. 0x00400000) == 0 && n > 0
+
+-- | Check if a value represents a relative time lock
+isRelativeTime :: Word32 -> Bool
+isRelativeTime n = (n .&. 0x00400000) /= 0
+
+-- | Check if a value represents an absolute height lock
+isAbsoluteHeight :: Word32 -> Bool
+isAbsoluteHeight n = n < 500000000 && n > 0
+
+-- | Check if a value represents an absolute time lock
+isAbsoluteTime :: Word32 -> Bool
+isAbsoluteTime n = n >= 500000000
+
+-- | Check for timelock conflicts between two property sets
+noTimelockConflict :: MiniscriptProps -> MiniscriptProps -> Bool
+noTimelockConflict p1 p2 =
+  -- Cannot mix relative time and height
+  not ((propG p1 || propG p2) && (propH p1 || propH p2)) &&
+  -- Cannot mix absolute time and height
+  not ((propI p1 || propI p2) && (propJ p1 || propJ p2))
+
+-- | Check for timelock conflicts among three property sets
+noTimelockConflict3 :: MiniscriptProps -> MiniscriptProps -> MiniscriptProps -> Bool
+noTimelockConflict3 p1 p2 p3 =
+  noTimelockConflict p1 p2 && noTimelockConflict p2 p3 && noTimelockConflict p1 p3
+
+-- | Check for timelock conflicts in a list of property sets
+noTimelockConflictList :: [MiniscriptProps] -> Bool
+noTimelockConflictList [] = True
+noTimelockConflictList [_] = True
+noTimelockConflictList (p:ps) = all (noTimelockConflict p) ps && noTimelockConflictList ps
+
+-- | Type check a miniscript expression
+checkMiniscriptType :: MiniscriptContext -> Miniscript -> Either MiniscriptError ()
+checkMiniscriptType ctx ms = do
+  -- Top-level must be type B
+  let tp = miniscriptType ms
+  unless (tp == TypeB) $
+    Left $ MsTypeError $ "Top-level must be type B, got " ++ show tp
+  -- Check context-specific restrictions
+  case ctx of
+    ContextP2WSH -> checkP2WSHRestrictions ms
+    ContextTapscript -> checkTapscriptRestrictions ms
+  -- Check k property (no conflicting timelocks)
+  let props = miniscriptProps ms
+  unless (propK props) $
+    Left $ MsTypeError "Conflicting timelocks"
+  -- Check that expression is satisfiable (has signature path)
+  unless (propS props || propF props) $
+    Left $ MsTypeError "Expression has no satisfaction with signatures"
+  return ()
+
+-- | Check P2WSH-specific restrictions
+checkP2WSHRestrictions :: Miniscript -> Either MiniscriptError ()
+checkP2WSHRestrictions ms = case ms of
+  MsMultiA _ _ -> Left $ MsContextError "multi_a not allowed in P2WSH"
+  MsSortedMultiA _ _ -> Left $ MsContextError "sortedmulti_a not allowed in P2WSH"
+  MsA x -> checkP2WSHRestrictions x
+  MsS x -> checkP2WSHRestrictions x
+  MsC x -> checkP2WSHRestrictions x
+  MsD x -> checkP2WSHRestrictions x
+  MsV x -> checkP2WSHRestrictions x
+  MsJ x -> checkP2WSHRestrictions x
+  MsN x -> checkP2WSHRestrictions x
+  MsL x -> checkP2WSHRestrictions x
+  MsU x -> checkP2WSHRestrictions x
+  MsT x -> checkP2WSHRestrictions x
+  MsAndV x y -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y
+  MsAndB x y -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y
+  MsOrB x y -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y
+  MsOrC x y -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y
+  MsOrD x y -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y
+  MsOrI x y -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y
+  MsAndOr x y z -> checkP2WSHRestrictions x >> checkP2WSHRestrictions y >> checkP2WSHRestrictions z
+  MsThresh _ subs -> mapM_ checkP2WSHRestrictions subs
+  _ -> return ()
+
+-- | Check Tapscript-specific restrictions
+checkTapscriptRestrictions :: Miniscript -> Either MiniscriptError ()
+checkTapscriptRestrictions ms = case ms of
+  MsMulti _ _ -> Left $ MsContextError "multi not allowed in Tapscript (use multi_a)"
+  MsSortedMulti _ _ -> Left $ MsContextError "sortedmulti not allowed in Tapscript (use sortedmulti_a)"
+  MsA x -> checkTapscriptRestrictions x
+  MsS x -> checkTapscriptRestrictions x
+  MsC x -> checkTapscriptRestrictions x
+  MsD x -> checkTapscriptRestrictions x
+  MsV x -> checkTapscriptRestrictions x
+  MsJ x -> checkTapscriptRestrictions x
+  MsN x -> checkTapscriptRestrictions x
+  MsL x -> checkTapscriptRestrictions x
+  MsU x -> checkTapscriptRestrictions x
+  MsT x -> checkTapscriptRestrictions x
+  MsAndV x y -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y
+  MsAndB x y -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y
+  MsOrB x y -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y
+  MsOrC x y -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y
+  MsOrD x y -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y
+  MsOrI x y -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y
+  MsAndOr x y z -> checkTapscriptRestrictions x >> checkTapscriptRestrictions y >> checkTapscriptRestrictions z
+  MsThresh _ subs -> mapM_ checkTapscriptRestrictions subs
+  _ -> return ()
+
+--------------------------------------------------------------------------------
+-- Compilation to Script
+--------------------------------------------------------------------------------
+
+-- | Compile a miniscript to a Script
+compileMiniscript :: MiniscriptContext -> Miniscript -> Script
+compileMiniscript ctx ms = Script (compileOps ctx False ms)
+
+-- | Internal compilation with verify flag
+-- The 'verify' flag indicates whether the sub-expression's final opcode
+-- should use a -VERIFY variant if possible
+compileOps :: MiniscriptContext -> Bool -> Miniscript -> [ScriptOp]
+compileOps ctx verify ms = case ms of
+  MsTrue -> [OP_1]
+  MsFalse -> [OP_0]
+
+  MsPk pk -> [pushData pk]
+
+  MsPkH pk ->
+    let Hash160 h = hash160 pk
+    in [OP_DUP, OP_HASH160, pushData h, OP_EQUALVERIFY]
+
+  MsOlder n ->
+    [pushNum (fromIntegral n), OP_CHECKSEQUENCEVERIFY]
+
+  MsAfter n ->
+    [pushNum (fromIntegral n), OP_CHECKLOCKTIMEVERIFY]
+
+  MsSha256 h ->
+    [OP_SIZE, pushNum 32, OP_EQUALVERIFY, OP_SHA256, pushData h] ++
+    if verify then [OP_EQUALVERIFY] else [OP_EQUAL]
+
+  MsHash256 h ->
+    [OP_SIZE, pushNum 32, OP_EQUALVERIFY, OP_HASH256, pushData h] ++
+    if verify then [OP_EQUALVERIFY] else [OP_EQUAL]
+
+  MsRipemd160 h ->
+    [OP_SIZE, pushNum 32, OP_EQUALVERIFY, OP_RIPEMD160, pushData h] ++
+    if verify then [OP_EQUALVERIFY] else [OP_EQUAL]
+
+  MsHash160 h ->
+    [OP_SIZE, pushNum 32, OP_EQUALVERIFY, OP_HASH160, pushData h] ++
+    if verify then [OP_EQUALVERIFY] else [OP_EQUAL]
+
+  MsAndV x y ->
+    compileOps ctx True x ++ compileOps ctx verify y
+
+  MsAndB x y ->
+    compileOps ctx False x ++ compileOps ctx False y ++
+    if verify then [OP_BOOLAND, OP_VERIFY] else [OP_BOOLAND]
+
+  MsOrB x y ->
+    compileOps ctx False x ++ compileOps ctx False y ++
+    if verify then [OP_BOOLOR, OP_VERIFY] else [OP_BOOLOR]
+
+  MsOrC x y ->
+    compileOps ctx False x ++ [OP_NOTIF] ++ compileOps ctx True y ++ [OP_ENDIF]
+
+  MsOrD x y ->
+    compileOps ctx False x ++ [OP_IFDUP, OP_NOTIF] ++ compileOps ctx verify y ++ [OP_ENDIF]
+
+  MsOrI x y ->
+    [OP_IF] ++ compileOps ctx verify x ++ [OP_ELSE] ++ compileOps ctx verify y ++ [OP_ENDIF]
+
+  MsAndOr x y z ->
+    compileOps ctx False x ++ [OP_NOTIF] ++
+    compileOps ctx verify z ++ [OP_ELSE] ++
+    compileOps ctx verify y ++ [OP_ENDIF]
+
+  MsThresh k subs ->
+    let compiled = map (compileOps ctx False) subs
+        -- First expression, then ADD between rest
+        addOps = case compiled of
+                   [] -> []
+                   (first:rest) -> first ++ concatMap (\ops -> ops ++ [OP_ADD]) rest
+    in addOps ++ [pushNum (fromIntegral k)] ++
+       if verify then [OP_EQUALVERIFY] else [OP_EQUAL]
+
+  MsMulti k pks ->
+    [pushNum (fromIntegral k)] ++
+    map pushData pks ++
+    [pushNum (fromIntegral (length pks))] ++
+    if verify then [OP_CHECKMULTISIGVERIFY] else [OP_CHECKMULTISIG]
+
+  MsSortedMulti k pks ->
+    let sortedPks = sortPubKeys pks
+    in [pushNum (fromIntegral k)] ++
+       map pushData sortedPks ++
+       [pushNum (fromIntegral (length pks))] ++
+       if verify then [OP_CHECKMULTISIGVERIFY] else [OP_CHECKMULTISIG]
+
+  MsMultiA k pks ->
+    -- Tapscript: <key0> OP_CHECKSIG <key1> OP_CHECKSIGADD ... <k> OP_NUMEQUAL
+    case pks of
+      [] -> [pushNum (fromIntegral k), OP_NUMEQUAL]
+      [pk] -> [pushData pk] ++
+              if verify then [OP_CHECKSIGVERIFY] else [OP_CHECKSIG]
+      (pk:rest) ->
+        [pushData pk, OP_CHECKSIG] ++
+        concatMap (\p -> [pushData p, OP_CHECKSIGADD]) rest ++
+        [pushNum (fromIntegral k)] ++
+        if verify then [OP_NUMEQUALVERIFY] else [OP_NUMEQUAL]
+    where
+      -- OP_CHECKSIGADD is only in Tapscript
+      OP_CHECKSIGADD = OP_NOP1  -- Placeholder: 0xBA in real Tapscript
+
+  MsSortedMultiA k pks ->
+    compileOps ctx verify (MsMultiA k (sortPubKeys pks))
+
+  -- Wrappers
+  MsA x ->
+    [OP_TOALTSTACK] ++ compileOps ctx False x ++ [OP_FROMALTSTACK]
+
+  MsS x ->
+    [OP_SWAP] ++ compileOps ctx verify x
+
+  MsC x ->
+    compileOps ctx False x ++
+    if verify then [OP_CHECKSIGVERIFY] else [OP_CHECKSIG]
+
+  MsD x ->
+    [OP_DUP, OP_IF] ++ compileOps ctx True x ++ [OP_ENDIF]
+
+  MsV x ->
+    let ops = compileOps ctx False x
+    in if canUseVerify (last ops)
+       then init ops ++ [toVerify (last ops)]
+       else ops ++ [OP_VERIFY]
+
+  MsJ x ->
+    [OP_SIZE, OP_0NOTEQUAL, OP_IF] ++ compileOps ctx True x ++ [OP_ENDIF]
+
+  MsN x ->
+    compileOps ctx False x ++ [OP_0NOTEQUAL]
+
+  MsL x ->
+    [OP_IF, OP_0, OP_ELSE] ++ compileOps ctx verify x ++ [OP_ENDIF]
+
+  MsU x ->
+    [OP_IF] ++ compileOps ctx verify x ++ [OP_ELSE, OP_0, OP_ENDIF]
+
+  MsT x ->
+    compileOps ctx True x  -- t: = and_v(X, 1), just make X verify
+  where
+    -- Push data with optimal encoding
+    pushData :: ByteString -> ScriptOp
+    pushData bs = OP_PUSHDATA bs OPCODE
+
+    -- Push number with optimal encoding
+    pushNum :: Int64 -> ScriptOp
+    pushNum n
+      | n == 0 = OP_0
+      | n == -1 = OP_1NEGATE
+      | n >= 1 && n <= 16 = opN (fromIntegral n)
+      | otherwise = OP_PUSHDATA (encodeScriptNum n) OPCODE
+
+    -- Sort public keys lexicographically
+    sortPubKeys :: [ByteString] -> [ByteString]
+    sortPubKeys = sortBy compare
+
+    -- Check if an opcode can be converted to a -VERIFY variant
+    canUseVerify :: ScriptOp -> Bool
+    canUseVerify op = case op of
+      OP_EQUAL -> True
+      OP_CHECKSIG -> True
+      OP_CHECKMULTISIG -> True
+      OP_NUMEQUAL -> True
+      _ -> False
+
+    -- Convert an opcode to its -VERIFY variant
+    toVerify :: ScriptOp -> ScriptOp
+    toVerify op = case op of
+      OP_EQUAL -> OP_EQUALVERIFY
+      OP_CHECKSIG -> OP_CHECKSIGVERIFY
+      OP_CHECKMULTISIG -> OP_CHECKMULTISIGVERIFY
+      OP_NUMEQUAL -> OP_NUMEQUALVERIFY
+      _ -> op
+
+-- | Calculate the script size of a miniscript
+miniscriptSize :: MiniscriptContext -> Miniscript -> Int
+miniscriptSize ctx ms = BS.length (encodeScript (compileMiniscript ctx ms))
+
+--------------------------------------------------------------------------------
+-- Satisfaction
+--------------------------------------------------------------------------------
+
+-- | Find the minimal-cost satisfaction for a miniscript
+satisfyMiniscript :: SatisfactionContext -> Miniscript -> Either MiniscriptError Witness
+satisfyMiniscript ctx ms = do
+  let result = satisfy ctx ms
+  if satCost result == maxBound
+    then Left $ MsSatisfactionError "Cannot satisfy miniscript"
+    else Right (satWitness result)
+
+-- | Find a dissatisfaction for a miniscript
+dissatisfyMiniscript :: SatisfactionContext -> Miniscript -> Either MiniscriptError Witness
+dissatisfyMiniscript ctx ms = do
+  let result = dissatisfy ctx ms
+  if satCost result == maxBound
+    then Left $ MsSatisfactionError "Cannot dissatisfy miniscript"
+    else Right (satWitness result)
+
+-- | Internal satisfaction function
+satisfy :: SatisfactionContext -> Miniscript -> SatResult
+satisfy ctx ms = case ms of
+  MsTrue -> SatResult [] 0 False False
+
+  MsFalse -> satUnavailable  -- Cannot satisfy false
+
+  MsPk pk ->
+    case Map.lookup pk (satSignatures ctx) of
+      Just sig -> SatResult [sig] (BS.length sig + 1) True False
+      Nothing -> satUnavailable
+
+  MsPkH pk ->
+    case Map.lookup pk (satSignatures ctx) of
+      Just sig -> SatResult [sig, pk] (BS.length sig + BS.length pk + 2) True False
+      Nothing -> satUnavailable
+
+  MsOlder _ -> SatResult [] 0 False False  -- Time-based, no witness needed
+
+  MsAfter _ -> SatResult [] 0 False False  -- Time-based, no witness needed
+
+  MsSha256 h -> satisfyHash ctx h
+  MsHash256 h -> satisfyHash ctx h
+  MsRipemd160 h -> satisfyHash ctx h
+  MsHash160 h -> satisfyHash ctx h
+
+  MsAndV x y ->
+    satConcat (satisfy ctx y) (satisfy ctx x)  -- Y first (top of stack)
+
+  MsAndB x y ->
+    satConcat (satisfy ctx y) (satisfy ctx x)
+
+  MsOrB x y ->
+    -- Either satisfy x and dissatisfy y, or vice versa
+    satChoice
+      (satConcat (dissatisfy ctx y) (satisfy ctx x))
+      (satConcat (satisfy ctx y) (dissatisfy ctx x))
+
+  MsOrC x y ->
+    satChoice (satisfy ctx x) (satisfy ctx y)
+
+  MsOrD x y ->
+    satChoice (satisfy ctx x) (satisfy ctx y)
+
+  MsOrI x y ->
+    -- Choose branch with OP_IF selector
+    let satX = satisfy ctx x
+        satY = satisfy ctx y
+        withX = satConcat (SatResult [BS.singleton 1] 2 False False) satX
+        withY = satConcat (SatResult [BS.empty] 1 False False) satY
+    in satChoice withX withY
+
+  MsAndOr x y z ->
+    -- If X satisfied, use Y. Otherwise use Z.
+    satChoice
+      (satConcat (satisfy ctx y) (satisfy ctx x))
+      (satConcat (satisfy ctx z) (dissatisfy ctx x))
+
+  MsThresh k subs ->
+    satisfyThresh ctx k subs
+
+  MsMulti k pks ->
+    satisfyMulti ctx k pks
+
+  MsSortedMulti k pks ->
+    satisfyMulti ctx k (sortBy compare pks)
+
+  MsMultiA k pks ->
+    satisfyMultiA ctx k pks
+
+  MsSortedMultiA k pks ->
+    satisfyMultiA ctx k (sortBy compare pks)
+
+  -- Wrappers
+  MsA x -> satisfy ctx x
+  MsS x -> satisfy ctx x
+  MsC x -> satisfy ctx x
+  MsD x ->
+    let sat = satisfy ctx x
+    in satConcat (SatResult [BS.singleton 1] 2 False False) sat
+  MsV x -> satisfy ctx x
+  MsJ x -> satisfy ctx x
+  MsN x -> satisfy ctx x
+  MsL x -> satisfy ctx x
+  MsU x -> satisfy ctx x
+  MsT x -> satisfy ctx x
+
+-- | Internal dissatisfaction function
+dissatisfy :: SatisfactionContext -> Miniscript -> SatResult
+dissatisfy ctx ms = case ms of
+  MsTrue -> satUnavailable  -- Cannot dissatisfy true
+  MsFalse -> SatResult [] 0 False False
+
+  MsPk _ -> SatResult [BS.empty] 1 False False  -- Empty signature
+
+  MsPkH pk ->
+    SatResult [BS.empty, pk] (1 + BS.length pk + 1) False False
+
+  MsOlder _ -> satUnavailable  -- Cannot dissatisfy timelock
+  MsAfter _ -> satUnavailable
+
+  MsSha256 _ -> dissatisfyHash
+  MsHash256 _ -> dissatisfyHash
+  MsRipemd160 _ -> dissatisfyHash
+  MsHash160 _ -> dissatisfyHash
+
+  MsAndV _ _ -> satUnavailable  -- Cannot dissatisfy and_v
+
+  MsAndB x y ->
+    -- Dissatisfy either or both
+    satChoice
+      (satConcat (dissatisfy ctx y) (dissatisfy ctx x))
+      (satChoice
+        (satConcat (dissatisfy ctx y) (satisfy ctx x))
+        (satConcat (satisfy ctx y) (dissatisfy ctx x)))
+
+  MsOrB x y ->
+    satConcat (dissatisfy ctx y) (dissatisfy ctx x)
+
+  MsOrC _ _ -> satUnavailable  -- or_c produces V, cannot dissatisfy
+
+  MsOrD x y ->
+    satConcat (dissatisfy ctx y) (dissatisfy ctx x)
+
+  MsOrI x y ->
+    -- Dissatisfy whichever branch we can
+    let dsatX = dissatisfy ctx x
+        dsatY = dissatisfy ctx y
+        withX = satConcat (SatResult [BS.singleton 1] 2 False False) dsatX
+        withY = satConcat (SatResult [BS.empty] 1 False False) dsatY
+    in satChoice withX withY
+
+  MsAndOr _ _ z ->
+    -- Dissatisfy: need X to fail and Z to fail
+    satConcat (dissatisfy ctx z) (dissatisfy ctx (MsFalse))
+
+  MsThresh k subs ->
+    dissatisfyThresh ctx k subs
+
+  MsMulti _ pks ->
+    -- All empty signatures + dummy
+    SatResult (replicate (length pks + 1) BS.empty) (length pks + 1) False False
+
+  MsSortedMulti _ pks ->
+    SatResult (replicate (length pks + 1) BS.empty) (length pks + 1) False False
+
+  MsMultiA _ pks ->
+    SatResult (replicate (length pks) BS.empty) (length pks) False False
+
+  MsSortedMultiA _ pks ->
+    SatResult (replicate (length pks) BS.empty) (length pks) False False
+
+  -- Wrappers
+  MsA x -> dissatisfy ctx x
+  MsS x -> dissatisfy ctx x
+  MsC x -> dissatisfy ctx x
+  MsD _ -> SatResult [BS.empty] 1 False False  -- Push 0 to skip IF
+  MsV _ -> satUnavailable  -- V cannot be dissatisfied
+  MsJ _ -> SatResult [BS.empty] 1 False False  -- Push empty to fail SIZE check
+  MsN x -> dissatisfy ctx x
+  MsL x -> dissatisfy ctx x
+  MsU x -> dissatisfy ctx x
+  MsT _ -> satUnavailable  -- t: = and_v, cannot dissatisfy
+
+-- | Satisfy a hash preimage check
+satisfyHash :: SatisfactionContext -> ByteString -> SatResult
+satisfyHash ctx h =
+  case Map.lookup h (satPreimages ctx) of
+    Just preimage -> SatResult [preimage] (BS.length preimage + 1) False False
+    Nothing -> satUnavailable
+
+-- | Dissatisfy a hash check (32-byte non-preimage)
+dissatisfyHash :: SatResult
+dissatisfyHash = SatResult [BS.replicate 32 0] 33 False True
+
+-- | Satisfy threshold
+satisfyThresh :: SatisfactionContext -> Int -> [Miniscript] -> SatResult
+satisfyThresh ctx k subs =
+  -- Use dynamic programming to find best combination
+  let results = map (\s -> (satisfy ctx s, dissatisfy ctx s)) subs
+      -- Start with dissatisfying all, then upgrade k to satisfied
+      initial = foldl' satConcat (SatResult [] 0 False False)
+                       (map snd results)
+      -- Try different combinations (simplified: greedy approach)
+      sortedByGain = sortBy (\(s1, d1) (s2, d2) ->
+        compare (satCost s1 - satCost d1) (satCost s2 - satCost d2)) results
+      -- Take k cheapest satisfactions
+      chosen = take k sortedByGain
+      rest = drop k sortedByGain
+  in foldl' satConcat (SatResult [] 0 False False)
+            (map fst chosen ++ map snd rest)
+
+-- | Dissatisfy threshold
+dissatisfyThresh :: SatisfactionContext -> Int -> [Miniscript] -> SatResult
+dissatisfyThresh ctx k subs
+  | k == length subs =
+      -- Need to dissatisfy at least one
+      let dsats = map (dissatisfy ctx) subs
+          sats = map (satisfy ctx) subs
+          -- Try dissatisfying one, satisfying rest
+          options = [ satConcat d (foldl' satConcat (SatResult [] 0 False False)
+                        (take i sats ++ drop (i+1) sats))
+                    | (i, d) <- zip [0..] dsats ]
+      in foldl' satChoice satUnavailable options
+  | otherwise =
+      -- Dissatisfy all
+      foldl' satConcat (SatResult [] 0 False False) (map (dissatisfy ctx) subs)
+
+-- | Satisfy multisig
+satisfyMulti :: SatisfactionContext -> Int -> [ByteString] -> SatResult
+satisfyMulti ctx k pks =
+  let sigs = mapMaybe (\pk -> Map.lookup pk (satSignatures ctx)) pks
+  in if length sigs >= k
+     then let chosen = take k sigs
+              -- Add dummy element for CHECKMULTISIG bug
+              witness = BS.empty : chosen
+              cost = sum (map (\s -> BS.length s + 1) chosen) + 1
+          in SatResult witness cost True False
+     else satUnavailable
+
+-- | Satisfy multi_a (tapscript)
+satisfyMultiA :: SatisfactionContext -> Int -> [ByteString] -> SatResult
+satisfyMultiA ctx k pks =
+  -- In tapscript, we provide k signatures for k keys
+  let sigResults = map (\pk ->
+        case Map.lookup pk (satSignatures ctx) of
+          Just sig -> (sig, True)
+          Nothing -> (BS.empty, False)) pks
+      validCount = length (filter snd sigResults)
+  in if validCount >= k
+     then let witness = map fst sigResults
+              cost = sum (map (\(s, _) -> BS.length s + 1) sigResults)
+          in SatResult witness cost True False
+     else satUnavailable
+
+--------------------------------------------------------------------------------
+-- Parsing and Serialization
+--------------------------------------------------------------------------------
+
+-- | Parse a miniscript from text notation
+parseMiniscript :: String -> Either MiniscriptError Miniscript
+parseMiniscript input = parseExpr (filter (not . isSpace) input)
+  where
+    parseExpr :: String -> Either MiniscriptError Miniscript
+    parseExpr s
+      | s == "1" = Right MsTrue
+      | s == "0" = Right MsFalse
+      | "pk(" `isPrefixOf` s = parsePk s
+      | "pk_h(" `isPrefixOf` s = parsePkH s
+      | "older(" `isPrefixOf` s = parseOlder s
+      | "after(" `isPrefixOf` s = parseAfter s
+      | "sha256(" `isPrefixOf` s = parseSha256 s
+      | "hash256(" `isPrefixOf` s = parseHash256 s
+      | "ripemd160(" `isPrefixOf` s = parseRipemd160 s
+      | "hash160(" `isPrefixOf` s = parseHash160 s
+      | "and_v(" `isPrefixOf` s = parseAndV s
+      | "and_b(" `isPrefixOf` s = parseAndB s
+      | "or_b(" `isPrefixOf` s = parseOrB s
+      | "or_c(" `isPrefixOf` s = parseOrC s
+      | "or_d(" `isPrefixOf` s = parseOrD s
+      | "or_i(" `isPrefixOf` s = parseOrI s
+      | "andor(" `isPrefixOf` s = parseAndOr s
+      | "thresh(" `isPrefixOf` s = parseThresh s
+      | "multi(" `isPrefixOf` s = parseMulti s
+      | "sortedmulti(" `isPrefixOf` s = parseSortedMulti s
+      | "multi_a(" `isPrefixOf` s = parseMultiA s
+      | "sortedmulti_a(" `isPrefixOf` s = parseSortedMultiA s
+      -- Wrappers
+      | "a:" `isPrefixOf` s = MsA <$> parseExpr (drop 2 s)
+      | "s:" `isPrefixOf` s = MsS <$> parseExpr (drop 2 s)
+      | "c:" `isPrefixOf` s = MsC <$> parseExpr (drop 2 s)
+      | "d:" `isPrefixOf` s = MsD <$> parseExpr (drop 2 s)
+      | "v:" `isPrefixOf` s = MsV <$> parseExpr (drop 2 s)
+      | "j:" `isPrefixOf` s = MsJ <$> parseExpr (drop 2 s)
+      | "n:" `isPrefixOf` s = MsN <$> parseExpr (drop 2 s)
+      | "l:" `isPrefixOf` s = MsL <$> parseExpr (drop 2 s)
+      | "u:" `isPrefixOf` s = MsU <$> parseExpr (drop 2 s)
+      | "t:" `isPrefixOf` s = MsT <$> parseExpr (drop 2 s)
+      | otherwise = Left $ MsParseError $ "Unknown expression: " ++ take 20 s
+
+    isPrefixOf :: String -> String -> Bool
+    isPrefixOf prefix str = take (length prefix) str == prefix
+
+    parsePk s = do
+      let inner = extractInner "pk(" s
+      case hexToBS inner of
+        Just pk -> Right $ MsPk pk
+        Nothing -> Left $ MsParseError "Invalid hex in pk()"
+
+    parsePkH s = do
+      let inner = extractInner "pk_h(" s
+      case hexToBS inner of
+        Just pk -> Right $ MsPkH pk
+        Nothing -> Left $ MsParseError "Invalid hex in pk_h()"
+
+    parseOlder s = do
+      let inner = extractInner "older(" s
+      case reads inner of
+        [(n, "")] -> Right $ MsOlder n
+        _ -> Left $ MsParseError "Invalid number in older()"
+
+    parseAfter s = do
+      let inner = extractInner "after(" s
+      case reads inner of
+        [(n, "")] -> Right $ MsAfter n
+        _ -> Left $ MsParseError "Invalid number in after()"
+
+    parseSha256 s = do
+      let inner = extractInner "sha256(" s
+      case hexToBS inner of
+        Just h | BS.length h == 32 -> Right $ MsSha256 h
+        _ -> Left $ MsParseError "Invalid hash in sha256()"
+
+    parseHash256 s = do
+      let inner = extractInner "hash256(" s
+      case hexToBS inner of
+        Just h | BS.length h == 32 -> Right $ MsHash256 h
+        _ -> Left $ MsParseError "Invalid hash in hash256()"
+
+    parseRipemd160 s = do
+      let inner = extractInner "ripemd160(" s
+      case hexToBS inner of
+        Just h | BS.length h == 20 -> Right $ MsRipemd160 h
+        _ -> Left $ MsParseError "Invalid hash in ripemd160()"
+
+    parseHash160 s = do
+      let inner = extractInner "hash160(" s
+      case hexToBS inner of
+        Just h | BS.length h == 20 -> Right $ MsHash160 h
+        _ -> Left $ MsParseError "Invalid hash in hash160()"
+
+    parseAndV s = do
+      let inner = extractInner "and_v(" s
+      case splitArgs inner of
+        [a, b] -> MsAndV <$> parseExpr a <*> parseExpr b
+        _ -> Left $ MsParseError "and_v requires 2 arguments"
+
+    parseAndB s = do
+      let inner = extractInner "and_b(" s
+      case splitArgs inner of
+        [a, b] -> MsAndB <$> parseExpr a <*> parseExpr b
+        _ -> Left $ MsParseError "and_b requires 2 arguments"
+
+    parseOrB s = do
+      let inner = extractInner "or_b(" s
+      case splitArgs inner of
+        [a, b] -> MsOrB <$> parseExpr a <*> parseExpr b
+        _ -> Left $ MsParseError "or_b requires 2 arguments"
+
+    parseOrC s = do
+      let inner = extractInner "or_c(" s
+      case splitArgs inner of
+        [a, b] -> MsOrC <$> parseExpr a <*> parseExpr b
+        _ -> Left $ MsParseError "or_c requires 2 arguments"
+
+    parseOrD s = do
+      let inner = extractInner "or_d(" s
+      case splitArgs inner of
+        [a, b] -> MsOrD <$> parseExpr a <*> parseExpr b
+        _ -> Left $ MsParseError "or_d requires 2 arguments"
+
+    parseOrI s = do
+      let inner = extractInner "or_i(" s
+      case splitArgs inner of
+        [a, b] -> MsOrI <$> parseExpr a <*> parseExpr b
+        _ -> Left $ MsParseError "or_i requires 2 arguments"
+
+    parseAndOr s = do
+      let inner = extractInner "andor(" s
+      case splitArgs inner of
+        [a, b, c] -> MsAndOr <$> parseExpr a <*> parseExpr b <*> parseExpr c
+        _ -> Left $ MsParseError "andor requires 3 arguments"
+
+    parseThresh s = do
+      let inner = extractInner "thresh(" s
+      case splitArgs inner of
+        (k:subs) -> do
+          kVal <- case reads k of
+                    [(n, "")] -> Right n
+                    _ -> Left $ MsParseError "Invalid threshold k"
+          subExprs <- mapM parseExpr subs
+          Right $ MsThresh kVal subExprs
+        _ -> Left $ MsParseError "thresh requires k and sub-expressions"
+
+    parseMulti s = do
+      let inner = extractInner "multi(" s
+      case splitArgs inner of
+        (k:pks) -> do
+          kVal <- case reads k of
+                    [(n, "")] -> Right n
+                    _ -> Left $ MsParseError "Invalid multi k"
+          pkBytes <- mapM (\h -> maybe (Left $ MsParseError "Invalid key") Right (hexToBS h)) pks
+          Right $ MsMulti kVal pkBytes
+        _ -> Left $ MsParseError "multi requires k and keys"
+
+    parseSortedMulti s = do
+      let inner = extractInner "sortedmulti(" s
+      case splitArgs inner of
+        (k:pks) -> do
+          kVal <- case reads k of
+                    [(n, "")] -> Right n
+                    _ -> Left $ MsParseError "Invalid sortedmulti k"
+          pkBytes <- mapM (\h -> maybe (Left $ MsParseError "Invalid key") Right (hexToBS h)) pks
+          Right $ MsSortedMulti kVal pkBytes
+        _ -> Left $ MsParseError "sortedmulti requires k and keys"
+
+    parseMultiA s = do
+      let inner = extractInner "multi_a(" s
+      case splitArgs inner of
+        (k:pks) -> do
+          kVal <- case reads k of
+                    [(n, "")] -> Right n
+                    _ -> Left $ MsParseError "Invalid multi_a k"
+          pkBytes <- mapM (\h -> maybe (Left $ MsParseError "Invalid key") Right (hexToBS h)) pks
+          Right $ MsMultiA kVal pkBytes
+        _ -> Left $ MsParseError "multi_a requires k and keys"
+
+    parseSortedMultiA s = do
+      let inner = extractInner "sortedmulti_a(" s
+      case splitArgs inner of
+        (k:pks) -> do
+          kVal <- case reads k of
+                    [(n, "")] -> Right n
+                    _ -> Left $ MsParseError "Invalid sortedmulti_a k"
+          pkBytes <- mapM (\h -> maybe (Left $ MsParseError "Invalid key") Right (hexToBS h)) pks
+          Right $ MsSortedMultiA kVal pkBytes
+        _ -> Left $ MsParseError "sortedmulti_a requires k and keys"
+
+    -- Extract inner contents between "func(" and matching ")"
+    extractInner :: String -> String -> String
+    extractInner prefix s =
+      let afterPrefix = drop (length prefix) s
+          -- Find matching closing paren
+          findMatch :: Int -> String -> String
+          findMatch 0 _ = ""
+          findMatch _ "" = ""
+          findMatch n (')':xs)
+            | n == 1 = ""
+            | otherwise = ')' : findMatch (n-1) xs
+          findMatch n ('(':xs) = '(' : findMatch (n+1) xs
+          findMatch n (x:xs) = x : findMatch n xs
+      in findMatch 1 afterPrefix
+
+    -- Split arguments by comma, respecting nested parentheses
+    splitArgs :: String -> [String]
+    splitArgs s = go 0 "" s
+      where
+        go _ acc "" = [reverse acc]
+        go depth acc ('(':xs) = go (depth+1) ('(':acc) xs
+        go depth acc (')':xs) = go (depth-1) (')':acc) xs
+        go 0 acc (',':xs) = reverse acc : go 0 "" xs
+        go depth acc (x:xs) = go depth (x:acc) xs
+
+    -- Convert hex string to ByteString
+    hexToBS :: String -> Maybe ByteString
+    hexToBS hex
+      | odd (length hex) = Nothing
+      | all isHexChar hex = Just $ BS.pack $ hexPairs hex
+      | otherwise = Nothing
+
+    isHexChar :: Char -> Bool
+    isHexChar c = c `elem` ("0123456789abcdefABCDEF" :: String)
+
+    hexPairs :: String -> [Word8]
+    hexPairs [] = []
+    hexPairs (a:b:rest) = fromIntegral (hexVal a * 16 + hexVal b) : hexPairs rest
+    hexPairs _ = []
+
+    hexVal :: Char -> Int
+    hexVal c
+      | c >= '0' && c <= '9' = fromEnum c - fromEnum '0'
+      | c >= 'a' && c <= 'f' = fromEnum c - fromEnum 'a' + 10
+      | c >= 'A' && c <= 'F' = fromEnum c - fromEnum 'A' + 10
+      | otherwise = 0
+
+    isSpace :: Char -> Bool
+    isSpace c = c `elem` (" \t\n\r" :: String)
+
+-- | Convert a miniscript to text notation
+miniscriptToText :: Miniscript -> String
+miniscriptToText ms = case ms of
+  MsTrue -> "1"
+  MsFalse -> "0"
+  MsPk pk -> "pk(" ++ toHex pk ++ ")"
+  MsPkH pk -> "pk_h(" ++ toHex pk ++ ")"
+  MsOlder n -> "older(" ++ show n ++ ")"
+  MsAfter n -> "after(" ++ show n ++ ")"
+  MsSha256 h -> "sha256(" ++ toHex h ++ ")"
+  MsHash256 h -> "hash256(" ++ toHex h ++ ")"
+  MsRipemd160 h -> "ripemd160(" ++ toHex h ++ ")"
+  MsHash160 h -> "hash160(" ++ toHex h ++ ")"
+  MsAndV x y -> "and_v(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ ")"
+  MsAndB x y -> "and_b(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ ")"
+  MsOrB x y -> "or_b(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ ")"
+  MsOrC x y -> "or_c(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ ")"
+  MsOrD x y -> "or_d(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ ")"
+  MsOrI x y -> "or_i(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ ")"
+  MsAndOr x y z -> "andor(" ++ miniscriptToText x ++ "," ++ miniscriptToText y ++ "," ++ miniscriptToText z ++ ")"
+  MsThresh k subs -> "thresh(" ++ show k ++ "," ++ intercalate "," (map miniscriptToText subs) ++ ")"
+  MsMulti k pks -> "multi(" ++ show k ++ "," ++ intercalate "," (map toHex pks) ++ ")"
+  MsSortedMulti k pks -> "sortedmulti(" ++ show k ++ "," ++ intercalate "," (map toHex pks) ++ ")"
+  MsMultiA k pks -> "multi_a(" ++ show k ++ "," ++ intercalate "," (map toHex pks) ++ ")"
+  MsSortedMultiA k pks -> "sortedmulti_a(" ++ show k ++ "," ++ intercalate "," (map toHex pks) ++ ")"
+  MsA x -> "a:" ++ miniscriptToText x
+  MsS x -> "s:" ++ miniscriptToText x
+  MsC x -> "c:" ++ miniscriptToText x
+  MsD x -> "d:" ++ miniscriptToText x
+  MsV x -> "v:" ++ miniscriptToText x
+  MsJ x -> "j:" ++ miniscriptToText x
+  MsN x -> "n:" ++ miniscriptToText x
+  MsL x -> "l:" ++ miniscriptToText x
+  MsU x -> "u:" ++ miniscriptToText x
+  MsT x -> "t:" ++ miniscriptToText x
+  where
+    toHex :: ByteString -> String
+    toHex = concatMap (printf "%02x") . BS.unpack
+
+    intercalate :: String -> [String] -> String
+    intercalate _ [] = ""
+    intercalate _ [x] = x
+    intercalate sep (x:xs) = x ++ sep ++ intercalate sep xs
+
+    printf :: String -> Word8 -> String
+    printf _ b =
+      let hi = b `shiftR` 4
+          lo = b .&. 0x0f
+          hexChar n = if n < 10 then toEnum (fromEnum '0' + fromIntegral n)
+                      else toEnum (fromEnum 'a' + fromIntegral (n - 10))
+      in [hexChar hi, hexChar lo]
