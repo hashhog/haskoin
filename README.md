@@ -30,6 +30,9 @@ system to make invalid states unrepresentable.
 - [x] CLI with node, wallet, and utility commands
 - [x] Performance optimizations (parallel validation, LRU cache, metrics)
 - [x] Block indexes (txindex, blockfilterindex, coinstatsindex)
+- [x] PSBT (BIP-174/BIP-370) - create, update, sign, combine, finalize
+- [x] Output descriptors (BIP-380-386) - parse, checksum, derive addresses
+- [x] Miniscript (BIP-379) - type system, compilation, satisfaction
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -63,8 +66,8 @@ haskoin/
     Mempool.hs       -- transaction pool, RBF
     FeeEstimator.hs  -- fee rate estimation
     BlockTemplate.hs -- block template for mining
-    Rpc.hs           -- json-rpc server
-    Wallet.hs        -- hd wallet (bip-32/39/44/84)
+    Rpc.hs           -- json-rpc server, importdescriptors
+    Wallet.hs        -- hd wallet, psbt, output descriptors
     Performance.hs   -- parallel validation, LRU cache, metrics
     Index.hs         -- txindex, blockfilterindex, coinstatsindex
   bench/
