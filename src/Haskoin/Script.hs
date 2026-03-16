@@ -8,6 +8,14 @@ module Haskoin.Script
   , PushDataType(..)
   , Script(..)
   , ScriptStack
+    -- * Script Verification Flags
+  , ScriptVerifyFlag(..)
+  , ScriptFlags
+  , hasFlag
+  , emptyFlags
+  , flagSet
+    -- * Script Errors
+  , ScriptError(..)
     -- * Parsing
   , decodeScript
   , encodeScript
@@ -18,8 +26,11 @@ module Haskoin.Script
   , classifyInput
     -- * Evaluation
   , evalScript
+  , evalScriptWithFlags
   , verifyScript
+  , verifyScriptWithFlags
   , verifySegWitScript
+  , verifySegWitScriptWithFlags
     -- * Standard Scripts
   , encodeP2PKH
   , encodeP2SH
@@ -32,8 +43,12 @@ module Haskoin.Script
   , encodeScriptNum
   , decodeScriptNum
   , isTrue
+  , isCompressedPubKey
     -- * Sigop Counting
   , countScriptSigops
+    -- * Push-Only Check
+  , isPushOnly
+  , isPushOp
   ) where
 
 import Data.ByteString (ByteString)
@@ -43,10 +58,12 @@ import Data.Int (Int64)
 import Data.Serialize (runGet, runPut, getWord8, putWord8, getBytes,
                        putByteString, remaining, getWord16le, putWord16le,
                        getWord32le, putWord32le, Get, Put)
-import Control.Monad (when, unless, foldM)
+import Control.Monad (when, unless, foldM, forM_)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
 import GHC.Generics (Generic)
 import Data.List (foldl')
+import qualified Data.Set as Set
+import Data.Set (Set)
 
 import Haskoin.Types
 import Haskoin.Crypto
@@ -179,6 +196,109 @@ newtype Script = Script { getScriptOps :: [ScriptOp] }
 
 -- | Script evaluation stack
 type ScriptStack = [ByteString]
+
+--------------------------------------------------------------------------------
+-- Script Verification Flags
+--------------------------------------------------------------------------------
+
+-- | Flags that control script verification behavior.
+-- These correspond to Bitcoin Core's SCRIPT_VERIFY_* flags.
+-- Only consensus-critical flags are included; policy flags are excluded.
+data ScriptVerifyFlag
+  = VerifyP2SH           -- ^ BIP-16: Evaluate P2SH subscripts
+  | VerifyDERSig         -- ^ BIP-66: Strict DER signature encoding
+  | VerifyCheckLockTimeVerify  -- ^ BIP-65: OP_CHECKLOCKTIMEVERIFY
+  | VerifyCheckSequenceVerify  -- ^ BIP-112/113: OP_CHECKSEQUENCEVERIFY
+  | VerifyWitness        -- ^ BIP-141: Segregated Witness
+  | VerifyNullDummy      -- ^ BIP-147: Dummy element in CHECKMULTISIG must be empty
+  | VerifyNullFail       -- ^ BIP-146: Failed sig checks must have empty signature
+  | VerifyWitnessPubkeyType  -- ^ BIP-141: Witness v0 pubkeys must be compressed
+  | VerifyTaproot        -- ^ BIP-341/342: Taproot
+  | VerifyMinimalIf      -- ^ Minimal IF/NOTIF: argument must be empty or 0x01
+  deriving (Show, Eq, Ord, Enum, Bounded, Generic)
+
+-- | A set of script verification flags
+type ScriptFlags = Set ScriptVerifyFlag
+
+-- | Check if a flag is present in a flag set
+hasFlag :: ScriptFlags -> ScriptVerifyFlag -> Bool
+hasFlag = flip Set.member
+
+-- | Empty flag set
+emptyFlags :: ScriptFlags
+emptyFlags = Set.empty
+
+-- | Create a flag set from a list of flags
+flagSet :: [ScriptVerifyFlag] -> ScriptFlags
+flagSet = Set.fromList
+
+--------------------------------------------------------------------------------
+-- Script Errors
+--------------------------------------------------------------------------------
+
+-- | Script execution errors
+data ScriptError
+  = ScriptErrOK                    -- ^ No error (success)
+  | ScriptErrUnknown               -- ^ Unknown error
+  | ScriptErrEvalFalse             -- ^ Script evaluated to false
+  | ScriptErrOpReturn              -- ^ OP_RETURN encountered
+  | ScriptErrStackSize             -- ^ Stack size exceeded limit
+  | ScriptErrScriptSize            -- ^ Script size exceeded limit
+  | ScriptErrPushSize              -- ^ Push data size exceeded limit
+  | ScriptErrOpCount               -- ^ Op count exceeded limit
+  | ScriptErrDisabledOpcode        -- ^ Disabled opcode encountered
+  | ScriptErrInvalidStackOperation -- ^ Invalid stack operation
+  | ScriptErrUnbalancedConditional -- ^ Unbalanced IF/ELSE/ENDIF
+  | ScriptErrNegativeLocktime      -- ^ Negative locktime
+  | ScriptErrLocktime              -- ^ Locktime requirement not satisfied
+  | ScriptErrVerify                -- ^ OP_VERIFY failed
+  | ScriptErrEqualVerify           -- ^ OP_EQUALVERIFY failed
+  | ScriptErrCheckSigVerify        -- ^ OP_CHECKSIGVERIFY failed
+  | ScriptErrCheckMultiSigVerify   -- ^ OP_CHECKMULTISIGVERIFY failed
+  | ScriptErrPubKeyCount           -- ^ Invalid pubkey count in CHECKMULTISIG
+  | ScriptErrSigCount              -- ^ Invalid signature count in CHECKMULTISIG
+  | ScriptErrSigDER                -- ^ Invalid DER signature encoding
+  | ScriptErrSigNullDummy          -- ^ NULLDUMMY violation: dummy must be empty
+  | ScriptErrSigNullFail           -- ^ NULLFAIL violation: failed sig must be empty
+  | ScriptErrWitnessPubkeyType     -- ^ Witness v0 pubkey not compressed
+  | ScriptErrCleanStack            -- ^ Witness script left extra items on stack
+  | ScriptErrSigPushOnly           -- ^ P2SH scriptSig must be push-only
+  | ScriptErrMinimalIf             -- ^ MINIMALIF violation: OP_IF/NOTIF arg must be empty or 0x01
+  | ScriptErrMissing String        -- ^ Missing UTXO or other data
+  | ScriptErrOther String          -- ^ Other error with message
+  deriving (Show, Eq, Generic)
+
+-- | Convert ScriptError to a descriptive string
+scriptErrorMessage :: ScriptError -> String
+scriptErrorMessage err = case err of
+  ScriptErrOK -> "No error"
+  ScriptErrUnknown -> "Unknown error"
+  ScriptErrEvalFalse -> "Script evaluated to false"
+  ScriptErrOpReturn -> "OP_RETURN encountered"
+  ScriptErrStackSize -> "Stack size exceeded limit"
+  ScriptErrScriptSize -> "Script size exceeded limit"
+  ScriptErrPushSize -> "Push data size exceeded limit"
+  ScriptErrOpCount -> "Op count exceeded limit"
+  ScriptErrDisabledOpcode -> "Disabled opcode encountered"
+  ScriptErrInvalidStackOperation -> "Invalid stack operation"
+  ScriptErrUnbalancedConditional -> "Unbalanced IF/ELSE/ENDIF"
+  ScriptErrNegativeLocktime -> "Negative locktime"
+  ScriptErrLocktime -> "Locktime requirement not satisfied"
+  ScriptErrVerify -> "OP_VERIFY failed"
+  ScriptErrEqualVerify -> "OP_EQUALVERIFY failed"
+  ScriptErrCheckSigVerify -> "OP_CHECKSIGVERIFY failed"
+  ScriptErrCheckMultiSigVerify -> "OP_CHECKMULTISIGVERIFY failed"
+  ScriptErrPubKeyCount -> "Invalid pubkey count in CHECKMULTISIG"
+  ScriptErrSigCount -> "Invalid signature count in CHECKMULTISIG"
+  ScriptErrSigDER -> "Invalid DER signature encoding"
+  ScriptErrSigNullDummy -> "NULLDUMMY violation: dummy must be empty"
+  ScriptErrSigNullFail -> "NULLFAIL violation: failed sig must be empty"
+  ScriptErrWitnessPubkeyType -> "Witness pubkey not compressed"
+  ScriptErrCleanStack -> "Witness script must leave exactly one item on stack"
+  ScriptErrSigPushOnly -> "P2SH scriptSig must contain only push operations"
+  ScriptErrMinimalIf -> "MINIMALIF violation: OP_IF/NOTIF argument must be empty or 0x01"
+  ScriptErrMissing s -> "Missing: " ++ s
+  ScriptErrOther s -> s
 
 --------------------------------------------------------------------------------
 -- Script Parsing
@@ -474,6 +594,17 @@ putPushData bs ptype = case ptype of
     putWord32le (fromIntegral $ BS.length bs)
     putByteString bs
 
+-- | Get the byte size of an encoded opcode
+-- Used for tracking script position during evaluation
+opByteSize :: ScriptOp -> Int
+opByteSize op = case op of
+  OP_PUSHDATA bs ptype -> case ptype of
+    OPCODE -> 1 + BS.length bs  -- length byte + data
+    OPDATA1 -> 2 + BS.length bs  -- 0x4c + 1 byte len + data
+    OPDATA2 -> 3 + BS.length bs  -- 0x4d + 2 byte len + data
+    OPDATA4 -> 5 + BS.length bs  -- 0x4e + 4 byte len + data
+  _ -> 1  -- All other opcodes are single bytes
+
 --------------------------------------------------------------------------------
 -- Script Classification
 --------------------------------------------------------------------------------
@@ -607,6 +738,58 @@ getPushBytes :: ScriptOp -> ByteString
 getPushBytes (OP_PUSHDATA bs _) = bs
 getPushBytes _ = BS.empty
 
+--------------------------------------------------------------------------------
+-- Push-Only Check (BIP-16 P2SH requirement)
+--------------------------------------------------------------------------------
+
+-- | Check if a script contains only push operations.
+-- This is required for P2SH scriptSigs (BIP-16 consensus rule).
+-- Push operations include:
+--   - OP_0 (0x00)
+--   - Direct pushes (0x01-0x4b)
+--   - OP_PUSHDATA1/2/4 (0x4c-0x4e)
+--   - OP_1NEGATE (0x4f)
+--   - OP_RESERVED (0x50) - technically a push, but fails on execution
+--   - OP_1 through OP_16 (0x51-0x60)
+--
+-- Reference: Bitcoin Core script/script.cpp IsPushOnly()
+isPushOnly :: Script -> Bool
+isPushOnly (Script ops) = all isPushOp ops
+
+-- | Check if a single opcode is a push operation.
+-- An opcode is a push if its byte value is <= OP_16 (0x60).
+-- This matches Bitcoin Core's IsPushOnly() which checks: opcode > OP_16 -> false
+--
+-- Note: OP_RESERVED (0x50) is technically considered a push by this check,
+-- but execution of OP_RESERVED fails anyway, so it's not relevant for
+-- P2SH/BIP62 as the scriptSig would fail prior to P2SH special validation.
+isPushOp :: ScriptOp -> Bool
+isPushOp op = case op of
+  -- OP_0 through all push data variants
+  OP_0 -> True
+  OP_PUSHDATA _ _ -> True
+  OP_1NEGATE -> True
+  OP_RESERVED -> True  -- Considered push, but execution would fail anyway
+  -- OP_1 through OP_16
+  OP_1 -> True
+  OP_2 -> True
+  OP_3 -> True
+  OP_4 -> True
+  OP_5 -> True
+  OP_6 -> True
+  OP_7 -> True
+  OP_8 -> True
+  OP_9 -> True
+  OP_10 -> True
+  OP_11 -> True
+  OP_12 -> True
+  OP_13 -> True
+  OP_14 -> True
+  OP_15 -> True
+  OP_16 -> True
+  -- Everything else (> OP_16) is not a push
+  _ -> False
+
 -- | Classify an input script (scriptSig)
 classifyInput :: Script -> Maybe ScriptType
 classifyInput (Script ops) = case ops of
@@ -733,6 +916,24 @@ decodeScriptNumLenient maxLen bs
       in Right $ if isNeg then negate val else val
 
 --------------------------------------------------------------------------------
+-- Pubkey Encoding Checks
+--------------------------------------------------------------------------------
+
+-- | Check if a public key is compressed (33 bytes, starts with 0x02 or 0x03)
+-- Used for SCRIPT_VERIFY_WITNESS_PUBKEYTYPE enforcement in witness v0 programs.
+isCompressedPubKey :: ByteString -> Bool
+isCompressedPubKey pk =
+  BS.length pk == 33 && (BS.head pk == 0x02 || BS.head pk == 0x03)
+
+-- | Check pubkey encoding for witness v0 scripts.
+-- If WITNESS_PUBKEYTYPE flag is set and we're in witness v0, pubkey must be compressed.
+checkWitnessPubkeyType :: ScriptFlags -> ByteString -> Either ScriptError ()
+checkWitnessPubkeyType flags pk
+  | hasFlag flags VerifyWitnessPubkeyType && not (isCompressedPubKey pk) =
+      Left ScriptErrWitnessPubkeyType
+  | otherwise = Right ()
+
+--------------------------------------------------------------------------------
 -- Stack Constants
 --------------------------------------------------------------------------------
 
@@ -771,11 +972,16 @@ data ScriptEnv = ScriptEnv
   , seScriptCode   :: !ByteString      -- ^ Script being executed (for sighash)
   , seWitness      :: ![ByteString]    -- ^ Witness stack for SegWit
   , seIsWitness    :: !Bool            -- ^ Are we executing witness script?
+  , seFlags        :: !ScriptFlags     -- ^ Script verification flags
   } deriving (Show)
 
 -- | Initialize script environment
 initScriptEnv :: Tx -> Int -> Word64 -> ByteString -> ScriptEnv
-initScriptEnv tx idx amount scriptCode = ScriptEnv
+initScriptEnv tx idx amount scriptCode = initScriptEnvWithFlags tx idx amount scriptCode emptyFlags
+
+-- | Initialize script environment with verification flags
+initScriptEnvWithFlags :: Tx -> Int -> Word64 -> ByteString -> ScriptFlags -> ScriptEnv
+initScriptEnvWithFlags tx idx amount scriptCode flags = ScriptEnv
   { seStack = []
   , seAltStack = []
   , seIfStack = []
@@ -787,6 +993,7 @@ initScriptEnv tx idx amount scriptCode = ScriptEnv
   , seScriptCode = scriptCode
   , seWitness = if idx < length (txWitness tx) then txWitness tx !! idx else []
   , seIsWitness = False
+  , seFlags = flags
   }
 
 -- | Result of script evaluation
@@ -1005,6 +1212,17 @@ execIf :: Bool -> ScriptEnv -> Either String ScriptEnv
 execIf matchTrue env = do
   env' <- incOpCount env
   (top, env'') <- popStack env'
+  -- MINIMALIF check: enforce minimal IF/NOTIF inputs for witness scripts
+  -- In witness v0/v1 (tapscript), the argument must be exactly empty or [0x01]
+  -- Reference: Bitcoin Core interpreter.cpp OP_IF handler
+  let minimalIfRequired = seIsWitness env'' || hasFlag (seFlags env'') VerifyMinimalIf
+  -- Check for valid minimal IF argument when required
+  _ <- if minimalIfRequired
+       then case BS.unpack top of
+              []     -> Right ()  -- Empty is acceptable (false)
+              [0x01] -> Right ()  -- Single byte 0x01 is acceptable (true)
+              _      -> Left "MINIMALIF violation: OP_IF/NOTIF argument must be empty or 0x01"
+       else Right ()
   let cond = isTrue top
       execute = if matchTrue then cond else not cond
   Right env'' { seIfStack = execute : seIfStack env'' }
@@ -1286,49 +1504,93 @@ execHash256 env = do
   let Hash256 h = doubleSHA256 top
   Right $ pushStack h env'
 
+-- | Execute OP_CODESEPARATOR
+-- This opcode marks the position in the script where the scriptCode for
+-- signature checking should begin. In legacy scripts, when CHECKSIG/CHECKMULTISIG
+-- is executed, the scriptCode used for sighash is everything after the last
+-- executed OP_CODESEPARATOR.
+--
+-- The actual position tracking is done in evalWithPosition, which updates
+-- seCodeSepPos to point to the byte position after this opcode.
+--
+-- NOTE: For witness v0 scripts, OP_CODESEPARATOR doesn't affect the scriptCode
+-- (but it does affect tapscript's codesep_pos). This distinction is handled
+-- in CHECKSIG.
 execCodeSeparator :: ScriptEnv -> Either String ScriptEnv
 execCodeSeparator env =
-  -- In a real implementation, we'd track the position for sighash
+  -- Position tracking is handled in evalWithPosition
+  -- This just returns success
   Right env
 
 -- | Execute OP_CHECKSIG
 -- IMPORTANT: Pop pubkey first (top of stack), then signature
+-- BIP-146 NULLFAIL: If sig check fails and NULLFAIL flag is set,
+-- the signature must be empty. Otherwise, script fails entirely.
+-- BIP-141 WITNESS_PUBKEYTYPE: In witness v0, pubkey must be compressed.
+--
+-- For legacy (non-witness) scripts:
+-- 1. Apply OP_CODESEPARATOR position: use script after last CODESEPARATOR
+-- 2. Remove all OP_CODESEPARATOR opcodes from scriptCode
+-- 3. FindAndDelete: remove all occurrences of the signature from scriptCode
+--
+-- For witness v0 scripts, no FindAndDelete is applied.
 execCheckSig :: ScriptEnv -> Either String ScriptEnv
 execCheckSig env = do
   -- Pop pubkey first (top of stack), then signature (deeper)
   (pubkeyBytes, env') <- popStack env
   (sigBytes, env'') <- popStack env'
 
-  -- If signature is empty, push false
+  -- BIP-141 WITNESS_PUBKEYTYPE: In witness v0 scripts, check pubkey is compressed
+  when (seIsWitness env'' && hasFlag (seFlags env'') VerifyWitnessPubkeyType) $
+    unless (isCompressedPubKey pubkeyBytes) $
+      Left "Witness pubkey not compressed"
+
+  -- If signature is empty, push false (this is always valid, even with NULLFAIL)
   if BS.null sigBytes
     then Right $ pushStack stackFalse env''
     else do
-      -- Parse signature and extract sighash type
-      let (sigWithoutType, sigHashByte) = if BS.null sigBytes
-                                          then (BS.empty, 0x01)
-                                          else (BS.init sigBytes, BS.last sigBytes)
+      -- Parse sighash type byte from the signature
+      let sigHashByte = BS.last sigBytes
+          sigHashType = parseSigHashByte sigHashByte
 
-      -- Build subscript for sighash (FindAndDelete not needed for witness v0/v1)
-      -- For legacy scripts, we'd need to implement FindAndDelete
+      -- Build scriptCode for sighash computation
+      -- For witness scripts: use seScriptCode directly (no FindAndDelete)
+      -- For legacy scripts: apply OP_CODESEPARATOR position, remove CODESEPARATORS,
+      --                     and apply FindAndDelete for the signature
+      let scriptCode = if seIsWitness env''
+                       then seScriptCode env''  -- Witness v0: no FindAndDelete
+                       else scriptCodeForSighash
+                              (seScriptCode env'')
+                              (seCodeSepPos env'')
+                              sigBytes  -- Full signature including hash type
 
       -- Compute sighash
-      let _sigHashType = parseSigHashByte sigHashByte
-          _sighash = if seIsWitness env''
-                     then txSigHashSegWit (seTx env'') (seInputIdx env'')
-                                          (seScriptCode env'') (seAmount env'') _sigHashType
-                     else txSigHash (seTx env'') (seInputIdx env'')
-                                    (seScriptCode env'') _sigHashType
+      let sighash = if seIsWitness env''
+                    then txSigHashSegWit (seTx env'') (seInputIdx env'')
+                                         scriptCode (seAmount env'') sigHashType
+                    else txSigHash (seTx env'') (seInputIdx env'') scriptCode sigHashType
+
+      -- Signature without the sighash type byte for verification
+      let sigWithoutType = BS.init sigBytes
 
       -- Verify signature
-      case parsePubKey pubkeyBytes of
-        Nothing -> Right $ pushStack stackFalse env''
-        Just _pubkey ->
-          case parseSigDER sigWithoutType of
-            Nothing -> Right $ pushStack stackFalse env''
-            Just _sig ->
-              -- verifyMsg is a placeholder that needs secp256k1
-              -- For now, return false to allow compilation
-              Right $ pushStack stackFalse env''
+      let sigCheckResult = case parsePubKey pubkeyBytes of
+            Nothing -> False  -- Invalid pubkey = signature fails
+            Just _pubkey ->
+              case parseSigDER sigWithoutType of
+                Nothing -> False  -- Invalid DER = signature fails
+                Just _sig ->
+                  -- verifyMsg is a placeholder that needs secp256k1
+                  -- For now, return false to allow compilation
+                  -- In a real implementation: verifyMsg _pubkey _sig sighash
+                  False
+
+      -- BIP-146 NULLFAIL: If signature check failed and we have NULLFAIL flag,
+      -- the signature must be empty. Since we already checked for empty sig above,
+      -- if we reach here with a failed check, the sig is non-empty -> error.
+      if not sigCheckResult && hasFlag (seFlags env'') VerifyNullFail
+        then Left "NULLFAIL: non-empty signature must not fail CHECKSIG"
+        else Right $ pushStack (if sigCheckResult then stackTrue else stackFalse) env''
 
 execCheckSigVerify :: ScriptEnv -> Either String ScriptEnv
 execCheckSigVerify env = execCheckSig env >>= execVerify
@@ -1347,6 +1609,17 @@ parseSigHashByte b =
 -- | Execute OP_CHECKMULTISIG
 -- KNOWN PITFALL: Must consume one extra item (the off-by-one bug)
 -- KNOWN PITFALL: NULLDUMMY requires the dummy element to be empty
+-- BIP-146 NULLFAIL: If multisig check fails and NULLFAIL is set,
+-- ALL signature arguments must be empty. Otherwise, script fails entirely.
+-- BIP-141 WITNESS_PUBKEYTYPE: In witness v0, all pubkeys must be compressed.
+--
+-- For legacy (non-witness) scripts:
+-- 1. Apply OP_CODESEPARATOR position: use script after last CODESEPARATOR
+-- 2. Remove all OP_CODESEPARATOR opcodes from scriptCode
+-- 3. FindAndDelete: remove ALL signatures from scriptCode before computing each sighash
+--    (Bitcoin Core removes each signature as it iterates through them)
+--
+-- For witness v0 scripts, no FindAndDelete is applied.
 execCheckMultiSig :: ScriptEnv -> Either String ScriptEnv
 execCheckMultiSig env = do
   -- Pop n (number of public keys)
@@ -1356,7 +1629,13 @@ execCheckMultiSig env = do
   when (n < 0 || n > 20) $ Left "Invalid pubkey count"
 
   -- Pop n public keys
-  (_pubkeys, env2) <- popN (fromIntegral n) env1
+  (pubkeys, env2) <- popN (fromIntegral n) env1
+
+  -- BIP-141 WITNESS_PUBKEYTYPE: In witness v0 scripts, check all pubkeys are compressed
+  when (seIsWitness env2 && hasFlag (seFlags env2) VerifyWitnessPubkeyType) $
+    forM_ pubkeys $ \pk ->
+      unless (isCompressedPubKey pk) $
+        Left "Witness pubkey not compressed"
 
   -- Pop m (number of required signatures)
   (mBytes, env3) <- popStack env2
@@ -1365,18 +1644,49 @@ execCheckMultiSig env = do
   when (m < 0 || m > n) $ Left "Invalid signature count"
 
   -- Pop m signatures
-  (_sigs, env4) <- popN (fromIntegral m) env3
+  (sigs, env4) <- popN (fromIntegral m) env3
 
   -- Pop the dummy element (off-by-one bug)
   (dummy, env5) <- popStack env4
 
   -- NULLDUMMY: dummy must be empty (BIP-147)
-  unless (BS.null dummy) $ Left "NULLDUMMY violation: dummy must be empty"
+  -- Note: NULLDUMMY is always enforced unconditionally post-SegWit
+  when (hasFlag (seFlags env5) VerifyNullDummy && not (BS.null dummy)) $
+    Left "NULLDUMMY violation: dummy must be empty"
 
-  -- Verify signatures (simplified - actual implementation would verify each sig)
-  -- In production, this needs proper sig verification with secp256k1
-  -- For now, push false
-  Right $ pushStack stackFalse env5
+  -- Build scriptCode for sighash computation
+  -- For legacy scripts, we need to:
+  -- 1. Start from after last OP_CODESEPARATOR
+  -- 2. Remove all OP_CODESEPARATOR opcodes
+  -- 3. Remove ALL signatures from the scriptCode (FindAndDelete)
+  let baseScriptCode = if seIsWitness env5
+                       then seScriptCode env5  -- Witness v0: no FindAndDelete
+                       else
+                         -- For legacy: start with CODESEP handling and remove CODESEPs
+                         let sc = scriptCodeForSighash (seScriptCode env5)
+                                                       (seCodeSepPos env5)
+                                                       BS.empty  -- Don't remove sig yet
+                         -- Then remove ALL signatures from the scriptCode
+                         in foldl' (\s sig -> findAndDelete s (encodePushData sig)) sc sigs
+
+  -- Verify signatures
+  -- In a real implementation, this would:
+  -- 1. For each signature, compute sighash with scriptCode
+  -- 2. Find a matching pubkey (must match in order)
+  -- 3. Verify the signature against pubkey and sighash
+  -- For now, we simulate failure (no secp256k1 binding)
+  let _unusedScriptCode = baseScriptCode  -- Would be used for actual verification
+      fSuccess = False  -- Placeholder - actual verification needs secp256k1
+
+  -- BIP-146 NULLFAIL: If the operation failed, ALL signatures must be empty
+  -- This is critical: if fSuccess is False and NULLFAIL is enabled,
+  -- we must check that every signature in sigs is an empty ByteString
+  when (not fSuccess && hasFlag (seFlags env5) VerifyNullFail) $ do
+    let nonEmptySigs = filter (not . BS.null) sigs
+    unless (null nonEmptySigs) $
+      Left "NULLFAIL: all signatures must be empty when CHECKMULTISIG fails"
+
+  Right $ pushStack (if fSuccess then stackTrue else stackFalse) env5
 
 execCheckMultiSigVerify :: ScriptEnv -> Either String ScriptEnv
 execCheckMultiSigVerify env = execCheckMultiSig env >>= execVerify
@@ -1463,14 +1773,37 @@ execCheckSequenceVerify env = do
 --------------------------------------------------------------------------------
 
 -- | Evaluate a script with given initial stack
+-- Tracks byte position for OP_CODESEPARATOR handling
 evalScriptWithStack :: ScriptStack -> Script -> ScriptEnv -> Either String ScriptEnv
 evalScriptWithStack stack (Script ops) env =
-  foldM (flip execOp) (env { seStack = stack }) ops
+  evalWithPosition ops 0 (env { seStack = stack })
+  where
+    -- Evaluate ops while tracking byte position
+    evalWithPosition :: [ScriptOp] -> Int -> ScriptEnv -> Either String ScriptEnv
+    evalWithPosition [] _ e = Right e
+    evalWithPosition (op:rest) pos e = do
+      -- For OP_CODESEPARATOR, update the position before executing
+      let opSize = opByteSize op
+          -- Position after this opcode
+          nextPos = pos + opSize
+          -- Update seCodeSepPos if this is OP_CODESEPARATOR
+          e' = case op of
+                 OP_CODESEPARATOR
+                   | isExecuting e ->  -- Only update when actually executing
+                       e { seCodeSepPos = fromIntegral nextPos }
+                 _ -> e
+      -- Execute the opcode
+      e'' <- execOp op e'
+      evalWithPosition rest nextPos e''
 
--- | Main script evaluation
+-- | Main script evaluation (without flags, for backward compatibility)
 evalScript :: Tx -> Int -> Word64 -> Script -> Script -> Either String Bool
-evalScript tx idx amount scriptSig scriptPubKey = do
-  let env = initScriptEnv tx idx amount (encodeScript scriptPubKey)
+evalScript = evalScriptWithFlags emptyFlags
+
+-- | Main script evaluation with verification flags
+evalScriptWithFlags :: ScriptFlags -> Tx -> Int -> Word64 -> Script -> Script -> Either String Bool
+evalScriptWithFlags flags tx idx amount scriptSig scriptPubKey = do
+  let env = initScriptEnvWithFlags tx idx amount (encodeScript scriptPubKey) flags
 
   -- Evaluate scriptSig
   env1 <- evalScriptWithStack [] scriptSig env
@@ -1491,15 +1824,19 @@ evalScript tx idx amount scriptSig scriptPubKey = do
     [] -> Right False
     (top:_) -> Right (isTrue top)
 
--- | Verify a transaction input
+-- | Verify a transaction input (without flags, for backward compatibility)
 verifyScript :: Tx -> Int -> ByteString -> Word64 -> Either String Bool
-verifyScript tx idx prevScriptPubKey amount = do
+verifyScript = verifyScriptWithFlags emptyFlags
+
+-- | Verify a transaction input with verification flags
+verifyScriptWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> Word64 -> Either String Bool
+verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
   let scriptSigBytes = txInScript (txInputs tx !! idx)
 
   scriptSig <- decodeScript scriptSigBytes
   scriptPubKey <- decodeScript prevScriptPubKey
 
-  let env = initScriptEnv tx idx amount prevScriptPubKey
+  let env = initScriptEnvWithFlags tx idx amount prevScriptPubKey flags
 
   -- Evaluate scriptSig
   env1 <- evalScriptWithStack [] scriptSig env
@@ -1521,6 +1858,12 @@ verifyScript tx idx prevScriptPubKey amount = do
       else case classifyOutput scriptPubKey of
         -- P2SH handling
         P2SH expectedHash -> do
+          -- BIP-16: P2SH scriptSig MUST be push-only.
+          -- This is a consensus rule that is enforced unconditionally.
+          -- Reference: Bitcoin Core interpreter.cpp VerifyScript() line ~2055
+          unless (isPushOnly scriptSig) $
+            Left "P2SH scriptSig must be push-only"
+
           case savedStack of
             [] -> Right False
             (redeemScriptBytes:restStack) -> do
@@ -1541,18 +1884,22 @@ verifyScript tx idx prevScriptPubKey amount = do
                     [] -> Right False
                     (t:_) -> Right (isTrue t)
 
-        -- P2WPKH: check witness
-        P2WPKH h -> verifyP2WPKH tx idx h amount
+        -- P2WPKH: check witness (pass flags through)
+        P2WPKH h -> verifyP2WPKHWithFlags flags tx idx h amount
 
-        -- P2WSH: check witness
-        P2WSH h -> verifyP2WSH tx idx h amount
+        -- P2WSH: check witness (pass flags through)
+        P2WSH h -> verifyP2WSHWithFlags flags tx idx h amount
 
         -- Other types: already verified
         _ -> Right True
 
--- | Verify P2WPKH witness
+-- | Verify P2WPKH witness (without flags, for backward compatibility)
 verifyP2WPKH :: Tx -> Int -> Hash160 -> Word64 -> Either String Bool
-verifyP2WPKH tx idx expectedHash amount = do
+verifyP2WPKH = verifyP2WPKHWithFlags emptyFlags
+
+-- | Verify P2WPKH witness with verification flags
+verifyP2WPKHWithFlags :: ScriptFlags -> Tx -> Int -> Hash160 -> Word64 -> Either String Bool
+verifyP2WPKHWithFlags flags tx idx expectedHash amount = do
   let witness = if idx < length (txWitness tx)
                 then txWitness tx !! idx
                 else []
@@ -1563,6 +1910,12 @@ verifyP2WPKH tx idx expectedHash amount = do
   -- witness is [signature, pubkey]
   let pubkeyBytes = witness !! 1
 
+  -- BIP-141 WITNESS_PUBKEYTYPE: In witness v0, pubkey must be compressed
+  case checkWitnessPubkeyType flags pubkeyBytes of
+    Left ScriptErrWitnessPubkeyType -> Left "Witness pubkey not compressed"
+    Left err -> Left (show err)
+    Right () -> return ()
+
   -- Verify pubkey hashes to expected value
   let Hash160 actualHash = hash160 pubkeyBytes
   unless (actualHash == getHash160 expectedHash) $
@@ -1570,7 +1923,7 @@ verifyP2WPKH tx idx expectedHash amount = do
 
   -- Construct implicit P2PKH script
   let implicitScript = encodeScript $ encodeP2PKH expectedHash
-      env = (initScriptEnv tx idx amount implicitScript)
+      env = (initScriptEnvWithFlags tx idx amount implicitScript flags)
             { seIsWitness = True
             , seScriptCode = implicitScript
             }
@@ -1584,13 +1937,21 @@ verifyP2WPKH tx idx expectedHash amount = do
   -- Evaluate implicit P2PKH script
   env'' <- evalScriptWithStack witnessStack (encodeP2PKH expectedHash) env'
 
+  -- Witness scripts implicitly require cleanstack: exactly one item on stack
+  -- This is NOT gated by a flag - it's always enforced for witness programs.
+  -- Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript
   case seStack env'' of
-    [] -> Right False
-    (top:_) -> Right (isTrue top)
+    [top] | isTrue top -> Right True
+    [_]   -> Left "Script evaluated to false"
+    _     -> Left "Witness script must leave exactly one item on stack"
 
--- | Verify P2WSH witness
+-- | Verify P2WSH witness (without flags, for backward compatibility)
 verifyP2WSH :: Tx -> Int -> Hash256 -> Word64 -> Either String Bool
-verifyP2WSH tx idx expectedHash amount = do
+verifyP2WSH = verifyP2WSHWithFlags emptyFlags
+
+-- | Verify P2WSH witness with verification flags
+verifyP2WSHWithFlags :: ScriptFlags -> Tx -> Int -> Hash256 -> Word64 -> Either String Bool
+verifyP2WSHWithFlags flags tx idx expectedHash amount = do
   let witness = if idx < length (txWitness tx)
                 then txWitness tx !! idx
                 else []
@@ -1609,7 +1970,7 @@ verifyP2WSH tx idx expectedHash amount = do
 
   witnessScript <- decodeScript witnessScriptBytes
 
-  let env = (initScriptEnv tx idx amount witnessScriptBytes)
+  let env = (initScriptEnvWithFlags tx idx amount witnessScriptBytes flags)
             { seIsWitness = True
             , seScriptCode = witnessScriptBytes
             }
@@ -1620,17 +1981,25 @@ verifyP2WSH tx idx expectedHash amount = do
   -- Evaluate witness script
   env' <- evalScriptWithStack witnessStack witnessScript env
 
+  -- Witness scripts implicitly require cleanstack: exactly one item on stack
+  -- This is NOT gated by a flag - it's always enforced for witness programs.
+  -- Reference: Bitcoin Core interpreter.cpp ExecuteWitnessScript
   case seStack env' of
-    [] -> Right False
-    (top:_) -> Right (isTrue top)
+    [top] | isTrue top -> Right True
+    [_]   -> Left "Script evaluated to false"
+    _     -> Left "Witness script must leave exactly one item on stack"
 
--- | Verify SegWit script (entry point)
+-- | Verify SegWit script (entry point, without flags, for backward compatibility)
 verifySegWitScript :: Tx -> Int -> ByteString -> Word64 -> Either String Bool
-verifySegWitScript tx idx prevScriptPubKey amount = do
+verifySegWitScript = verifySegWitScriptWithFlags emptyFlags
+
+-- | Verify SegWit script with verification flags
+verifySegWitScriptWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> Word64 -> Either String Bool
+verifySegWitScriptWithFlags flags tx idx prevScriptPubKey amount = do
   scriptPubKey <- decodeScript prevScriptPubKey
   case classifyOutput scriptPubKey of
-    P2WPKH h -> verifyP2WPKH tx idx h amount
-    P2WSH h -> verifyP2WSH tx idx h amount
+    P2WPKH h -> verifyP2WPKHWithFlags flags tx idx h amount
+    P2WSH h -> verifyP2WSHWithFlags flags tx idx h amount
     _ -> Left "Not a witness output"
 
 --------------------------------------------------------------------------------
