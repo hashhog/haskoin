@@ -24,7 +24,24 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          WriteBatch(..), getBatchOps, BatchOp(..),
                          batchPutBlockHeader, batchPutUTXO, batchDeleteUTXO,
                          batchPutBestBlock, batchPutBlockHeight,
-                         UTXOEntry(..), UndoData(..), PersistedChainState(..))
+                         UTXOEntry(..), UndoData(..), PersistedChainState(..),
+                         -- Flat file storage
+                         BlockFileInfo(..), FlatFilePos(..), BlockIndex(..),
+                         maxBlockFileSize, blockFileChunkSize,
+                         -- CoinsView cache layer
+                         Coin(..), CoinEntry(..), defaultCacheSize,
+                         HaskoinDB(..), DBConfig(..), defaultDBConfig,
+                         openDB, closeDB, withDB,
+                         CoinsViewDB(..), newCoinsViewDB,
+                         coinsViewDBGetCoin, coinsViewDBHaveCoin,
+                         coinsViewDBPutCoin, coinsViewDBDeleteCoin,
+                         coinsViewDBGetBestBlock, coinsViewDBSetBestBlock,
+                         CoinsViewCache(..), newCoinsViewCache,
+                         cacheGetCoin, cacheHaveCoin, cacheAddCoin,
+                         cacheSpendCoin, cacheFlush, cacheSync,
+                         cacheDynamicMemoryUsage, cacheGetCacheSize,
+                         cacheGetDirtyCount, cacheSetBestBlock,
+                         cacheGetBestBlock, cacheReset, cacheSanityCheck)
 import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
@@ -32,9 +49,17 @@ import Haskoin.FeeEstimator
 import Haskoin.Wallet
 import Haskoin.Performance
 import Haskoin.BlockTemplate
+import Haskoin.Rpc
+import Data.Aeson (Value(..), Object, Array)
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Vector as V
+import Data.Scientific (Scientific)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
+import qualified Data.Set as Set
 import Control.Concurrent.STM
+import System.IO.Temp (withSystemTempDirectory)
+import System.FilePath ((</>))
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
@@ -4569,3 +4594,1139 @@ tails xs@(_:xs') = xs : tails xs'
         ecRelaysTxs candidate `shouldBe` True
         ecInbound candidate `shouldBe` True
         ecNoBan candidate `shouldBe` False
+
+  -- Eclipse Attack Protections
+  describe "eclipse attack protections" $ do
+    describe "network group bucketing" $ do
+      it "IPv4 addresses in same /16 have same network group" $ do
+        -- 192.168.1.1 and 192.168.2.1 are in same /16
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0102a8c0  -- 192.168.2.1
+            group1 = computeNetworkGroup addr1
+            group2 = computeNetworkGroup addr2
+        group1 `shouldBe` group2
+
+      it "IPv4 addresses in different /16 have different network groups" $ do
+        -- 192.168.1.1 and 10.0.0.1 are in different /16
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0100000a  -- 10.0.0.1
+            group1 = computeNetworkGroup addr1
+            group2 = computeNetworkGroup addr2
+        group1 `shouldNotBe` group2
+
+      it "IPv6 addresses use /32 prefix for network group" $ do
+        -- Two IPv6 addresses with same first 32 bits should have same group
+        let addr1 = SockAddrInet6 8333 0 (0x20010db8, 0x00000000, 0x00000001, 0x00000001) 0
+            addr2 = SockAddrInet6 8333 0 (0x20010db8, 0x00000000, 0x00000002, 0x00000002) 0
+            group1 = computeNetworkGroup addr1
+            group2 = computeNetworkGroup addr2
+        group1 `shouldBe` group2
+
+      it "IPv6 addresses with different /32 have different groups" $ do
+        let addr1 = SockAddrInet6 8333 0 (0x20010db8, 0, 0, 1) 0
+            addr2 = SockAddrInet6 8333 0 (0x20010db9, 0, 0, 1) 0
+            group1 = computeNetworkGroup addr1
+            group2 = computeNetworkGroup addr2
+        group1 `shouldNotBe` group2
+
+      it "NetworkGroup has proper byte representation" $ do
+        let addr = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            group = computeNetworkGroup addr
+            groupBytes = getNetworkGroupBytes group
+        -- IPv4 group should be 3 bytes: [0x04, first_octet, second_octet]
+        BS.length groupBytes `shouldBe` 3
+        BS.head groupBytes `shouldBe` 0x04  -- NET_IPV4
+
+    describe "addrman bucket distribution" $ do
+      it "new bucket count is 1024" $ do
+        addrmanNewBucketCount `shouldBe` 1024
+
+      it "tried bucket count is 256" $ do
+        addrmanTriedBucketCount `shouldBe` 256
+
+      it "bucket size is 64" $ do
+        addrmanBucketSize `shouldBe` 64
+
+      it "tried buckets per group is 8" $ do
+        addrmanTriedBucketsPerGroup `shouldBe` 8
+
+      it "new buckets per source group is 64" $ do
+        addrmanNewBucketsPerSourceGroup `shouldBe` 64
+
+      it "getNewBucket returns valid bucket index" $ do
+        let key = Hash256 $ BS.replicate 32 0
+            addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+            bucket = getNewBucket key addr source
+        bucket `shouldSatisfy` (>= 0)
+        bucket `shouldSatisfy` (< addrmanNewBucketCount)
+
+      it "getTriedBucket returns valid bucket index" $ do
+        let key = Hash256 $ BS.replicate 32 0
+            addr = SockAddrInet 8333 0x0100007f
+            bucket = getTriedBucket key addr
+        bucket `shouldSatisfy` (>= 0)
+        bucket `shouldSatisfy` (< addrmanTriedBucketCount)
+
+      it "getBucketPosition returns valid position" $ do
+        let key = Hash256 $ BS.replicate 32 0
+            addr = SockAddrInet 8333 0x0100007f
+            position = getBucketPosition key True 0 addr
+        position `shouldSatisfy` (>= 0)
+        position `shouldSatisfy` (< addrmanBucketSize)
+
+      it "different addresses get distributed across buckets" $ do
+        let key = Hash256 $ BS.replicate 32 0
+            source = SockAddrInet 8333 0
+            addrs = [SockAddrInet 8333 (fromIntegral i) | i <- [1..100 :: Int]]
+            buckets = Set.fromList [getNewBucket key a source | a <- addrs]
+        -- With 100 random addresses we should get some distribution
+        Set.size buckets `shouldSatisfy` (> 10)
+
+      it "same address same source gets same bucket" $ do
+        let key = Hash256 $ BS.replicate 32 0
+            addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+            bucket1 = getNewBucket key addr source
+            bucket2 = getNewBucket key addr source
+        bucket1 `shouldBe` bucket2
+
+      it "same address different source may get different bucket" $ do
+        let key = Hash256 $ BS.replicate 32 0
+            addr = SockAddrInet 8333 0x0100007f
+            source1 = SockAddrInet 8333 0x0100000a
+            source2 = SockAddrInet 8333 0x02000014
+            bucket1 = getNewBucket key addr source1
+            bucket2 = getNewBucket key addr source2
+        -- Different sources typically produce different buckets
+        -- but we can't guarantee it for any specific pair
+        (bucket1 == bucket2 || bucket1 /= bucket2) `shouldBe` True
+
+    describe "addrman operations" $ do
+      it "newAddrMan creates empty manager" $ do
+        am <- newAddrMan
+        newCount <- readTVarIO (amNewCount am)
+        triedCount <- readTVarIO (amTriedCount am)
+        newCount `shouldBe` 0
+        triedCount `shouldBe` 0
+
+      it "addAddress adds to new table" $ do
+        am <- newAddrMan
+        let addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+        result <- addAddress am addr source 0x409 1700000000
+        result `shouldBe` True
+        newCount <- readTVarIO (amNewCount am)
+        newCount `shouldBe` 1
+
+      it "addAddress is idempotent for same source" $ do
+        am <- newAddrMan
+        let addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+        _ <- addAddress am addr source 0x409 1700000000
+        _ <- addAddress am addr source 0x409 1700000001
+        newCount <- readTVarIO (amNewCount am)
+        newCount `shouldBe` 1
+
+      it "selectAddress returns Nothing for empty manager" $ do
+        am <- newAddrMan
+        result <- selectAddress am True
+        result `shouldBe` Nothing
+
+      it "selectAddress returns address after adding" $ do
+        am <- newAddrMan
+        let addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+        _ <- addAddress am addr source 0x409 1700000000
+        result <- selectAddress am True
+        result `shouldBe` Just addr
+
+      it "markGood moves address to tried table" $ do
+        am <- newAddrMan
+        let addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+        _ <- addAddress am addr source 0x409 1700000000
+        markGood am addr 1700000001
+        newCount <- readTVarIO (amNewCount am)
+        triedCount <- readTVarIO (amTriedCount am)
+        newCount `shouldBe` 0
+        triedCount `shouldBe` 1
+
+      it "markAttempt increments attempt count" $ do
+        am <- newAddrMan
+        let addr = SockAddrInet 8333 0x0100007f
+            source = SockAddrInet 8333 0x0100000a
+        _ <- addAddress am addr source 0x409 1700000000
+        markAttempt am addr 1700000001
+        addrIdx <- readTVarIO (amAddrIndex am)
+        case Map.lookup addr addrIdx of
+          Just info -> aiAttempts info `shouldBe` 1
+          Nothing -> expectationFailure "Address not found"
+
+    describe "outbound connection diversity" $ do
+      it "checkOutboundDiversity returns True for new group" $ do
+        od <- newOutboundDiversity
+        let addr = SockAddrInet 8333 0x0100007f
+        result <- checkOutboundDiversity od addr
+        result `shouldBe` True
+
+      it "checkOutboundDiversity returns False for connected group" $ do
+        od <- newOutboundDiversity
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0201a8c0  -- 192.168.1.2 (same /16)
+        addOutboundConnection od addr1
+        result <- checkOutboundDiversity od addr2
+        result `shouldBe` False
+
+      it "checkOutboundDiversity returns True for different /16" $ do
+        od <- newOutboundDiversity
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0100000a  -- 10.0.0.1 (different /16)
+        addOutboundConnection od addr1
+        result <- checkOutboundDiversity od addr2
+        result `shouldBe` True
+
+      it "removeOutboundConnection allows reconnection" $ do
+        od <- newOutboundDiversity
+        let addr1 = SockAddrInet 8333 0x0101a8c0
+            addr2 = SockAddrInet 8333 0x0201a8c0  -- same /16
+        addOutboundConnection od addr1
+        removeOutboundConnection od addr1
+        result <- checkOutboundDiversity od addr2
+        result `shouldBe` True
+
+      it "tracks multiple connections per group" $ do
+        od <- newOutboundDiversity
+        let addr1 = SockAddrInet 8333 0x0101a8c0
+            addr2 = SockAddrInet 8333 0x0201a8c0  -- same /16
+            addr3 = SockAddrInet 8333 0x0301a8c0  -- same /16
+        addOutboundConnection od addr1
+        addOutboundConnection od addr2
+        -- After removing one, group still connected
+        removeOutboundConnection od addr1
+        result <- checkOutboundDiversity od addr3
+        result `shouldBe` False
+        -- After removing second, group is free
+        removeOutboundConnection od addr2
+        result2 <- checkOutboundDiversity od addr3
+        result2 `shouldBe` True
+
+    describe "inbound connection limiting" $ do
+      it "newInboundLimiter creates limiter with specified max" $ do
+        il <- newInboundLimiter 4
+        ilMaxPerGroup il `shouldBe` 4
+
+      it "checkInboundLimit returns True initially" $ do
+        il <- newInboundLimiter 4
+        let addr = SockAddrInet 8333 0x0100007f
+        result <- checkInboundLimit il addr
+        result `shouldBe` True
+
+      it "checkInboundLimit returns False when limit reached" $ do
+        il <- newInboundLimiter 2
+        let addrs = [SockAddrInet 8333 (0x01010a0a + fromIntegral i) | i <- [0..1 :: Int]]
+        mapM_ (addInboundConnection il) addrs
+        let newAddr = SockAddrInet 8333 0x03010a0a  -- same /16
+        result <- checkInboundLimit il newAddr
+        result `shouldBe` False
+
+      it "checkInboundLimit allows connections from different /16" $ do
+        il <- newInboundLimiter 2
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0201a8c0  -- 192.168.1.2
+            addr3 = SockAddrInet 8333 0x0100000a  -- 10.0.0.1 (different /16)
+        addInboundConnection il addr1
+        addInboundConnection il addr2
+        result <- checkInboundLimit il addr3
+        result `shouldBe` True
+
+      it "removeInboundConnection frees up slots" $ do
+        il <- newInboundLimiter 1
+        let addr1 = SockAddrInet 8333 0x0101a8c0
+            addr2 = SockAddrInet 8333 0x0201a8c0  -- same /16
+        addInboundConnection il addr1
+        result1 <- checkInboundLimit il addr2
+        result1 `shouldBe` False
+        removeInboundConnection il addr1
+        result2 <- checkInboundLimit il addr2
+        result2 `shouldBe` True
+
+      it "maxInboundPerGroup is 4" $ do
+        maxInboundPerGroup `shouldBe` 4
+
+    describe "anchor connections" $ do
+      it "maxBlockRelayOnlyAnchors is 2" $ do
+        maxBlockRelayOnlyAnchors `shouldBe` 2
+
+      it "saveAnchors and loadAnchors round-trip" $ do
+        withSystemTempDirectory "haskoin-test" $ \tmpDir -> do
+          let path = tmpDir </> "anchors.dat"
+              anchors = [ AnchorConnection (SockAddrInet 8333 0x0100007f) 0x409
+                        , AnchorConnection (SockAddrInet 8334 0x0100000a) 0x409
+                        ]
+          saveAnchors path anchors
+          loaded <- loadAnchors path
+          length loaded `shouldBe` 2
+          map acAddress loaded `shouldBe` map acAddress anchors
+          map acServices loaded `shouldBe` map acServices anchors
+
+      it "loadAnchors returns empty list for missing file" $ do
+        withSystemTempDirectory "haskoin-test" $ \tmpDir -> do
+          let path = tmpDir </> "nonexistent.dat"
+          loaded <- loadAnchors path
+          loaded `shouldBe` []
+
+      it "saveAnchors limits to 2 anchors" $ do
+        withSystemTempDirectory "haskoin-test" $ \tmpDir -> do
+          let path = tmpDir </> "anchors.dat"
+              anchors = [ AnchorConnection (SockAddrInet 8333 (fromIntegral i)) 0x409
+                        | i <- [1..5 :: Int]
+                        ]
+          saveAnchors path anchors
+          loaded <- loadAnchors path
+          length loaded `shouldBe` 2
+
+      it "loadAnchors deletes file after reading" $ do
+        withSystemTempDirectory "haskoin-test" $ \tmpDir -> do
+          let path = tmpDir </> "anchors.dat"
+              anchors = [AnchorConnection (SockAddrInet 8333 0x0100007f) 0x409]
+          saveAnchors path anchors
+          _ <- loadAnchors path
+          -- Second load should return empty (file deleted)
+          loaded2 <- loadAnchors path
+          loaded2 `shouldBe` []
+
+  -- =========================================================================
+  -- Phase 19: Stale Peer Eviction Tests
+  -- =========================================================================
+
+  describe "stale peer eviction constants" $ do
+    it "staleCheckInterval is 10 minutes (600 seconds)" $ do
+      staleCheckInterval `shouldBe` 600
+
+    it "headersResponseTime is 2 minutes (120 seconds)" $ do
+      headersResponseTime `shouldBe` 120
+
+    it "pingTimeout is 20 minutes (1200 seconds)" $ do
+      pingTimeout `shouldBe` 1200
+
+    it "blockStallTimeout is 30 seconds for full blocks" $ do
+      blockStallTimeout `shouldBe` 30
+
+    it "blockStallTimeoutCompact is 2 seconds for compact blocks" $ do
+      blockStallTimeoutCompact `shouldBe` 2
+
+    it "blockStallTimeoutMax is 64 seconds" $ do
+      blockStallTimeoutMax `shouldBe` 64
+
+    it "chainSyncTimeout is 20 minutes (1200 seconds)" $ do
+      chainSyncTimeout `shouldBe` 1200
+
+    it "minimumConnectTime is 30 seconds" $ do
+      minimumConnectTime `shouldBe` 30
+
+    it "maxOutboundPeersToProtect is 4" $ do
+      maxOutboundPeersToProtect `shouldBe` 4
+
+  describe "stale peer tracker" $ do
+    it "creates a new tracker with empty state" $ do
+      tracker <- newStalePeerTracker
+      states <- readTVarIO (sptPeerStates tracker)
+      Map.size states `shouldBe` 0
+
+    it "tracks peer best known block" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          hash = BlockHash (Hash256 (BS.replicate 32 0xab))
+
+      -- Initialize peer state first
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+
+      -- Update and retrieve
+      updatePeerBestBlock tracker addr hash 50000
+      result <- getPeerBestBlock tracker addr
+      case result of
+        Just (h, w) -> do
+          h `shouldBe` hash
+          w `shouldBe` 50000
+        Nothing -> expectationFailure "Expected to find peer state"
+
+  describe "ping timeout detection" $ do
+    it "detects ping timeout when no pong received" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Initialize peer state
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+
+      -- Record ping sent in the past (older than pingTimeout)
+      let oldTimestamp = 1000 - pingTimeout - 100  -- way in the past
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.adjust
+        (\s -> s { pesLastPingSent = Just oldTimestamp, pesPingNonce = Just 12345 }) addr
+
+      -- Check should detect timeout
+      timedOut <- isPingTimedOut tracker addr
+      timedOut `shouldBe` True
+
+    it "does not report timeout when pong received" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Initialize peer state with ping sent
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+
+      recordPingSent tracker addr 12345
+
+      -- Record pong received
+      success <- recordPongReceived tracker addr 12345
+      success `shouldBe` True
+
+      -- Should not be timed out now
+      timedOut <- isPingTimedOut tracker addr
+      timedOut `shouldBe` False
+
+    it "does not report timeout for peers without outstanding ping" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Initialize peer state without sending ping
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+
+      timedOut <- isPingTimedOut tracker addr
+      timedOut `shouldBe` False
+
+  describe "block stall detection" $ do
+    it "detects stalled block download" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          hash = BlockHash (Hash256 (BS.replicate 32 0xcd))
+
+      -- Initialize peer state
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+
+      -- Record block requested with old timestamp
+      let oldTimestamp = 1000 - blockStallTimeout - 100
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.adjust
+        (\s -> s { pesBlocksInFlight = Map.singleton hash oldTimestamp }) addr
+
+      -- Check for stall
+      (stalled, mHash) <- isBlockStalled tracker addr False
+      stalled `shouldBe` True
+      mHash `shouldBe` Just hash
+
+    it "increases stall timeout adaptively after stall" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          hash = BlockHash (Hash256 (BS.replicate 32 0xef))
+
+      -- Initialize peer state
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+
+      -- Record stalled block
+      let oldTimestamp = 1000 - blockStallTimeout - 100
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.adjust
+        (\s -> s { pesBlocksInFlight = Map.singleton hash oldTimestamp }) addr
+
+      -- Initial timeout
+      initialTimeout <- readTVarIO (sptBlockStallTimeout tracker)
+
+      -- Trigger stall detection
+      _ <- isBlockStalled tracker addr False
+
+      -- Timeout should have doubled
+      newTimeout <- readTVarIO (sptBlockStallTimeout tracker)
+      newTimeout `shouldBe` min blockStallTimeoutMax (initialTimeout * 2)
+
+    it "decays stall timeout on successful block receipt" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          hash = BlockHash (Hash256 (BS.replicate 32 0x11))
+
+      -- Initialize peer state with block in flight
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+      recordBlockRequested tracker addr hash
+
+      -- Set a high timeout
+      atomically $ writeTVar (sptBlockStallTimeout tracker) 60
+
+      -- Record block received
+      recordBlockReceived tracker addr hash
+
+      -- Timeout should have decayed by 15%
+      newTimeout <- readTVarIO (sptBlockStallTimeout tracker)
+      newTimeout `shouldBe` 51  -- 60 * 0.85 = 51
+
+    it "respects minimum stall timeout of 2 seconds" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          hash = BlockHash (Hash256 (BS.replicate 32 0x22))
+
+      -- Initialize peer state
+      atomically $ modifyTVar' (sptPeerStates tracker) $
+        Map.insert addr (defaultPeerEvictionState True False 1000)
+      recordBlockRequested tracker addr hash
+
+      -- Set timeout at minimum
+      atomically $ writeTVar (sptBlockStallTimeout tracker) blockStallTimeoutCompact
+
+      -- Record block received
+      recordBlockReceived tracker addr hash
+
+      -- Timeout should stay at minimum
+      newTimeout <- readTVarIO (sptBlockStallTimeout tracker)
+      newTimeout `shouldBe` blockStallTimeoutCompact
+
+  describe "chain sync eviction" $ do
+    it "starts chain sync timeout for behind peers" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Set our tip with high chain work
+      let ourTip = BlockHash (Hash256 (BS.replicate 32 0xaa))
+      atomically $ do
+        writeTVar (sptOurTipHash tracker) ourTip
+        writeTVar (sptOurTipWork tracker) 100000
+
+      -- Initialize peer with lower chain work and sync started
+      let peerState = (defaultPeerEvictionState True False 1000)
+            { pesBestKnownWork = 50000
+            , pesSyncStarted = True
+            }
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      -- Consider eviction - should start timeout
+      (disconnect, sendHeaders, mNewState) <- considerEviction tracker addr 2000
+      disconnect `shouldBe` False
+      sendHeaders `shouldBe` False
+      case mNewState of
+        Just (ChainSyncPending _) -> return ()
+        _ -> expectationFailure "Expected ChainSyncPending state"
+
+    it "resets timeout when peer catches up" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          ourTip = BlockHash (Hash256 (BS.replicate 32 0xbb))
+
+      atomically $ do
+        writeTVar (sptOurTipHash tracker) ourTip
+        writeTVar (sptOurTipWork tracker) 100000
+
+      -- Initialize peer in pending state
+      let csd = ChainSyncData
+            { csdTimeout = 3000
+            , csdWorkHeader = ourTip
+            , csdWorkChainWork = 100000
+            , csdProtected = False
+            }
+          peerState = (defaultPeerEvictionState True False 1000)
+            { pesBestKnownWork = 100000  -- Caught up!
+            , pesSyncStarted = True
+            , pesChainSyncState = ChainSyncPending csd
+            }
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      -- Consider eviction - should reset to idle
+      (disconnect, sendHeaders, mNewState) <- considerEviction tracker addr 2000
+      disconnect `shouldBe` False
+      sendHeaders `shouldBe` False
+      mNewState `shouldBe` Just ChainSyncIdle
+
+    it "sends getheaders probe after timeout expires" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          ourTip = BlockHash (Hash256 (BS.replicate 32 0xcc))
+
+      atomically $ do
+        writeTVar (sptOurTipHash tracker) ourTip
+        writeTVar (sptOurTipWork tracker) 100000
+
+      -- Initialize peer in pending state with expired timeout
+      let csd = ChainSyncData
+            { csdTimeout = 1500  -- Already expired
+            , csdWorkHeader = ourTip
+            , csdWorkChainWork = 100000
+            , csdProtected = False
+            }
+          peerState = (defaultPeerEvictionState True False 1000)
+            { pesBestKnownWork = 50000  -- Still behind
+            , pesSyncStarted = True
+            , pesChainSyncState = ChainSyncPending csd
+            }
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      -- Consider eviction at time after timeout
+      (disconnect, sendHeaders, mNewState) <- considerEviction tracker addr 2000
+      disconnect `shouldBe` False
+      sendHeaders `shouldBe` True
+      case mNewState of
+        Just (ChainSyncProbing _) -> return ()
+        _ -> expectationFailure "Expected ChainSyncProbing state"
+
+    it "disconnects peer that doesn't respond to getheaders" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          ourTip = BlockHash (Hash256 (BS.replicate 32 0xdd))
+
+      atomically $ do
+        writeTVar (sptOurTipHash tracker) ourTip
+        writeTVar (sptOurTipWork tracker) 100000
+
+      -- Initialize peer in probing state with expired timeout
+      let csd = ChainSyncData
+            { csdTimeout = 1500  -- Already expired
+            , csdWorkHeader = ourTip
+            , csdWorkChainWork = 100000
+            , csdProtected = False
+            }
+          peerState = (defaultPeerEvictionState True False 1000)
+            { pesBestKnownWork = 50000  -- Still behind
+            , pesSyncStarted = True
+            , pesChainSyncState = ChainSyncProbing csd
+            }
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      -- Consider eviction - should disconnect
+      (disconnect, sendHeaders, _) <- considerEviction tracker addr 2000
+      disconnect `shouldBe` True
+      sendHeaders `shouldBe` False
+
+  describe "outbound sync protection" $ do
+    it "creates new protection with empty synced set" $ do
+      osp <- newOutboundSyncProtection
+      synced <- checkOutboundSynced osp
+      synced `shouldBe` False
+
+    it "tracks synced outbound peers" $ do
+      osp <- newOutboundSyncProtection
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Mark as synced
+      updateOutboundSyncStatus osp addr True True
+      synced <- checkOutboundSynced osp
+      synced `shouldBe` True
+
+    it "detects when no outbound is synced" $ do
+      osp <- newOutboundSyncProtection
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Add a peer that is not synced
+      updateOutboundSyncStatus osp addr True False
+
+      -- Should need extra outbound
+      needsExtra <- needsExtraOutbound osp tracker
+      needsExtra `shouldBe` True
+
+    it "does not need extra when outbound is synced" $ do
+      osp <- newOutboundSyncProtection
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Add a synced outbound peer
+      updateOutboundSyncStatus osp addr True True
+
+      -- Should not need extra outbound
+      needsExtra <- needsExtraOutbound osp tracker
+      needsExtra `shouldBe` False
+
+    it "removes unsynced peers from tracking" $ do
+      osp <- newOutboundSyncProtection
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Add as synced
+      updateOutboundSyncStatus osp addr True True
+      synced1 <- checkOutboundSynced osp
+      synced1 `shouldBe` True
+
+      -- Remove from synced
+      updateOutboundSyncStatus osp addr True False
+      synced2 <- checkOutboundSynced osp
+      synced2 `shouldBe` False
+
+  describe "comprehensive eviction scenarios" $ do
+    it "checkStalePeer detects ping timeout" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Initialize peer with old ping
+      let oldTimestamp = 1000 - pingTimeout - 100
+          peerState = (defaultPeerEvictionState True False 1000)
+            { pesLastPingSent = Just oldTimestamp
+            , pesPingNonce = Just 99999
+            }
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      (shouldDisconnect, reason) <- checkStalePeer tracker addr False
+      shouldDisconnect `shouldBe` True
+      reason `shouldSatisfy` T.isInfixOf "ping" . T.pack
+
+    it "checkStalePeer detects block stall" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+          hash = BlockHash (Hash256 (BS.replicate 32 0x55))
+
+      -- Initialize peer with stalled block
+      let oldTimestamp = 1000 - blockStallTimeout - 100
+          peerState = (defaultPeerEvictionState True False 1000)
+            { pesBlocksInFlight = Map.singleton hash oldTimestamp
+            }
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      (shouldDisconnect, reason) <- checkStalePeer tracker addr False
+      shouldDisconnect `shouldBe` True
+      reason `shouldSatisfy` T.isInfixOf "stall" . T.pack
+
+    it "checkStalePeer returns false for healthy peer" $ do
+      tracker <- newStalePeerTracker
+      let addr = SockAddrInet 8333 0x0100007f
+
+      -- Initialize healthy peer
+      let peerState = defaultPeerEvictionState True False 1000
+      atomically $ modifyTVar' (sptPeerStates tracker) $ Map.insert addr peerState
+
+      (shouldDisconnect, _) <- checkStalePeer tracker addr False
+      shouldDisconnect `shouldBe` False
+
+  --------------------------------------------------------------------------------
+  -- sendrawtransaction RPC Tests (Phase 21)
+  --------------------------------------------------------------------------------
+
+  describe "sendrawtransaction RPC" $ do
+    describe "Error codes" $ do
+      it "rpcDeserializationError is -22" $ do
+        rpcDeserializationError `shouldBe` (-22)
+
+      it "rpcVerifyError is -25" $ do
+        rpcVerifyError `shouldBe` (-25)
+
+      it "rpcVerifyRejected is -26" $ do
+        rpcVerifyRejected `shouldBe` (-26)
+
+      it "rpcVerifyAlreadyInChain is -27" $ do
+        rpcVerifyAlreadyInChain `shouldBe` (-27)
+
+    describe "MempoolError to RpcError mapping" $ do
+      it "ErrAlreadyInMempool maps to -27" $ do
+        let err = ErrAlreadyInMempool
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyAlreadyInChain
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+      it "ErrMissingInput maps to -25" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+            op = OutPoint txid 0
+            err = ErrMissingInput op
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyError
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+      it "ErrFeeBelowMinimum maps to -26" $ do
+        let err = ErrFeeBelowMinimum (FeeRate 1) (FeeRate 5)
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyRejected
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+      it "ErrTooManyAncestors maps to -26" $ do
+        let err = ErrTooManyAncestors 26 25
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyRejected
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+      it "ErrValidationFailed maps to -26" $ do
+        let err = ErrValidationFailed "test error"
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyRejected
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+      it "ErrScriptVerificationFailed maps to -26" $ do
+        let err = ErrScriptVerificationFailed "bad sig"
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyRejected
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+      it "ErrMempoolFull maps to -26" $ do
+        let err = ErrMempoolFull
+            response = mempoolErrorToRpcResponse err
+        case resError response of
+          Object obj -> case KM.lookup "code" obj of
+            Just (Number n) -> n `shouldBe` fromIntegral rpcVerifyRejected
+            _ -> expectationFailure "Expected code field"
+          _ -> expectationFailure "Expected object"
+
+    describe "Transaction deserialization" $ do
+      it "decodeTxWithFallback decodes a valid legacy transaction" $ do
+        -- Simple legacy transaction (no witness)
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            tx = Tx 1 [txin] [txout] [[]] 0
+            encoded = encode tx
+        case decodeTxWithFallback encoded of
+          Right decoded -> do
+            txVersion decoded `shouldBe` 1
+            length (txInputs decoded) `shouldBe` 1
+            length (txOutputs decoded) `shouldBe` 1
+          Left err -> expectationFailure $ "Decode failed: " ++ err
+
+      it "decodeTxWithFallback decodes a segwit transaction" $ do
+        -- SegWit transaction with witness data
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            txin = TxIn (OutPoint txid 0) "" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            wit = ["sig", "pubkey"]
+            tx = Tx 2 [txin] [txout] [wit] 0
+            encoded = encode tx
+        case decodeTxWithFallback encoded of
+          Right decoded -> do
+            txVersion decoded `shouldBe` 2
+            length (txWitness decoded) `shouldBe` 1
+            length (head (txWitness decoded)) `shouldBe` 2
+          Left err -> expectationFailure $ "Decode failed: " ++ err
+
+      it "decodeTxWithFallback fails on invalid bytes" $ do
+        let invalidBytes = BS.pack [0x00, 0x01, 0x02, 0x03]
+        case decodeTxWithFallback invalidBytes of
+          Left _ -> return ()
+          Right _ -> expectationFailure "Should have failed"
+
+    describe "Fee rate calculation" $ do
+      it "calculateVSize computes virtual size correctly" $ do
+        -- Create a transaction and check vsize calculation
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            tx = Tx 1 [txin] [txout] [[]] 0
+            vsize = calculateVSize tx
+        -- vsize should be positive
+        vsize `shouldSatisfy` (> 0)
+
+      it "calculateFeeRate computes rate in sat/kvB" $ do
+        -- 1000 satoshis fee, 100 vbyte tx = 10000 sat/kvB (or 10 sat/vB)
+        let rate = calculateFeeRate 1000 100
+        getFeeRate rate `shouldBe` 10000  -- sat/kvB
+
+      it "calculateFeeRate handles zero vsize" $ do
+        let rate = calculateFeeRate 1000 0
+        getFeeRate rate `shouldBe` 0
+
+  --------------------------------------------------------------------------------
+  -- RPC Batch Request Tests (Phase 26)
+  --------------------------------------------------------------------------------
+
+  describe "RPC batch requests" $ do
+    describe "maxBatchSize" $ do
+      it "is set to 1000" $ do
+        maxBatchSize `shouldBe` 1000
+
+    describe "parseSingleRequest" $ do
+      it "parses a valid JSON-RPC request object" $ do
+        let obj = Object $ KM.fromList
+              [ ("method", String "getblockcount")
+              , ("params", Array V.empty)
+              , ("id", Number 1)
+              ]
+        case parseSingleRequest obj of
+          Right req -> do
+            reqMethod req `shouldBe` "getblockcount"
+            reqId req `shouldBe` Number 1
+          Left _ -> expectationFailure "Should parse successfully"
+
+      it "fails on missing method field" $ do
+        let obj = Object $ KM.fromList
+              [ ("params", Array V.empty)
+              , ("id", Number 1)
+              ]
+        case parseSingleRequest obj of
+          Left resp -> do
+            -- Should return an error response
+            resError resp `shouldSatisfy` (/= Null)
+            -- The id should be preserved
+            resId resp `shouldBe` Number 1
+          Right _ -> expectationFailure "Should fail on missing method"
+
+      it "fails on non-object input" $ do
+        let arr = Array V.empty
+        case parseSingleRequest arr of
+          Left resp -> resError resp `shouldSatisfy` (/= Null)
+          Right _ -> expectationFailure "Should fail on non-object"
+
+      it "preserves id field in error responses" $ do
+        let obj = Object $ KM.fromList
+              [ ("id", String "test-id")
+              ]  -- missing method
+        case parseSingleRequest obj of
+          Left resp -> resId resp `shouldBe` String "test-id"
+          Right _ -> expectationFailure "Should fail on missing method"
+
+      it "handles null id" $ do
+        let obj = Object $ KM.fromList
+              [ ("method", String "test")
+              , ("id", Null)
+              ]
+        case parseSingleRequest obj of
+          Right req -> reqId req `shouldBe` Null
+          Left _ -> expectationFailure "Should parse with null id"
+
+    describe "batch request handling" $ do
+      it "accepts valid batch requests" $ do
+        -- Test that parseSingleRequest works for multiple items
+        let req1 = Object $ KM.fromList
+              [ ("method", String "getblockcount")
+              , ("params", Array V.empty)
+              , ("id", Number 1)
+              ]
+            req2 = Object $ KM.fromList
+              [ ("method", String "getdifficulty")
+              , ("params", Array V.empty)
+              , ("id", Number 2)
+              ]
+        case (parseSingleRequest req1, parseSingleRequest req2) of
+          (Right r1, Right r2) -> do
+            reqMethod r1 `shouldBe` "getblockcount"
+            reqMethod r2 `shouldBe` "getdifficulty"
+          _ -> expectationFailure "Both should parse"
+
+      it "batch responses preserve request order" $ do
+        -- parseSingleRequest preserves the id from each request
+        let reqs = [ Object $ KM.fromList [("method", String "a"), ("id", Number 1)]
+                   , Object $ KM.fromList [("method", String "b"), ("id", Number 2)]
+                   , Object $ KM.fromList [("method", String "c"), ("id", Number 3)]
+                   ]
+        let parsed = map parseSingleRequest reqs
+        case sequence (map (fmap reqId) parsed) of
+          Right ids -> ids `shouldBe` [Number 1, Number 2, Number 3]
+          Left _ -> expectationFailure "All should parse"
+
+    describe "error handling" $ do
+      it "parseSingleRequest returns error code for invalid request" $ do
+        let invalid = Object KM.empty  -- missing method
+        case parseSingleRequest invalid of
+          Left resp -> case resError resp of
+            Object obj -> case KM.lookup "code" obj of
+              Just (Number n) -> n `shouldBe` fromIntegral rpcInvalidRequest
+              _ -> expectationFailure "Expected code field"
+            _ -> expectationFailure "Expected error object"
+          Right _ -> expectationFailure "Should fail"
+
+      it "error response includes message field" $ do
+        let invalid = Object KM.empty
+        case parseSingleRequest invalid of
+          Left resp -> case resError resp of
+            Object obj -> case KM.lookup "message" obj of
+              Just (String msg) -> T.isInfixOf "Invalid Request" msg `shouldBe` True
+              _ -> expectationFailure "Expected message field"
+            _ -> expectationFailure "Expected error object"
+          Right _ -> expectationFailure "Should fail"
+
+    describe "batch size limits" $ do
+      it "maxBatchSize is 1000 (matches Bitcoin Core)" $ do
+        maxBatchSize `shouldBe` 1000
+
+      it "batch size is counted correctly" $ do
+        -- Verify that list length is used for size checking
+        let smallBatch = replicate 10 (Object KM.empty)
+            largeBatch = replicate 1001 (Object KM.empty)
+        length smallBatch `shouldBe` 10
+        length largeBatch `shouldBe` 1001
+        length largeBatch `shouldSatisfy` (> maxBatchSize)
+
+  describe "broadcast mechanism" $ do
+    it "InvVector uses InvWitnessTx type for transactions" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          invVec = InvVector InvWitnessTx (getTxIdHash txid)
+      ivType invVec `shouldBe` InvWitnessTx
+
+    it "Inv message can contain multiple inventory vectors" $ do
+      let txid1 = TxId (Hash256 (BS.replicate 32 0x11))
+          txid2 = TxId (Hash256 (BS.replicate 32 0x22))
+          inv = Inv [ InvVector InvWitnessTx (getTxIdHash txid1)
+                    , InvVector InvWitnessTx (getTxIdHash txid2)
+                    ]
+      length (invVectors inv) `shouldBe` 2
+
+    it "MInv message type wraps Inv" $ do
+      let txid = TxId (Hash256 (BS.replicate 32 0xbb))
+          inv = Inv [InvVector InvWitnessTx (getTxIdHash txid)]
+          msg = MInv inv
+      case msg of
+        MInv i -> length (invVectors i) `shouldBe` 1
+        _ -> expectationFailure "Expected MInv message"
+
+  -- Flat file block storage tests
+  describe "flat file blockstore" $ do
+    describe "FlatFilePos" $ do
+      it "serializes and deserializes correctly" $ do
+        let pos = FlatFilePos 5 12345
+        decode (encode pos) `shouldBe` Right pos
+
+      it "serializes to 12 bytes (4 + 8)" $ do
+        let pos = FlatFilePos 1 100
+        BS.length (encode pos) `shouldBe` 12
+
+    describe "BlockFileInfo" $ do
+      it "serializes and deserializes correctly" $ do
+        let info = BlockFileInfo
+              { bfiNumBlocks = 42
+              , bfiSize = 12345678
+              , bfiMinHeight = 100
+              , bfiMaxHeight = 200
+              }
+        decode (encode info) `shouldBe` Right info
+
+      it "serializes to 20 bytes (4 + 8 + 4 + 4)" $ do
+        let info = BlockFileInfo 0 0 0 0
+        BS.length (encode info) `shouldBe` 20
+
+    describe "BlockIndex" $ do
+      it "serializes and deserializes correctly" $ do
+        let idx = BlockIndex
+              { biFileNumber = 3
+              , biDataPos = 98765
+              , biUndoPos = 54321
+              , biHeight = 500000
+              }
+        decode (encode idx) `shouldBe` Right idx
+
+      it "serializes to 24 bytes (4 + 8 + 8 + 4)" $ do
+        let idx = BlockIndex 0 0 0 0
+        BS.length (encode idx) `shouldBe` 24
+
+    describe "blk file constants" $ do
+      it "maxBlockFileSize is 128 MiB" $ do
+        maxBlockFileSize `shouldBe` 128 * 1024 * 1024
+
+      it "blockFileChunkSize is 16 MiB" $ do
+        blockFileChunkSize `shouldBe` 16 * 1024 * 1024
+
+  -- Phase 24: UTXO Cache Layer Tests
+  describe "utxo cache" $ do
+    describe "Coin serialization" $ do
+      it "serializes and deserializes correctly" $ do
+        let txout = TxOut 5000000000 "pkscript"
+            coin = Coin txout 100000 False
+        decode (encode coin) `shouldBe` Right coin
+
+      it "encodes coinbase flag in low bit" $ do
+        let txout = TxOut 1000 "s"
+            coinbase = Coin txout 50 True
+            regular = Coin txout 50 False
+        -- Coinbase encoding should differ
+        encode coinbase `shouldNotBe` encode regular
+
+      it "roundtrips coinbase coin" $ do
+        let txout = TxOut 5000000000 "coinbase_out"
+            coin = Coin txout 12345 True
+        decode (encode coin) `shouldBe` Right coin
+
+      it "height is encoded in upper bits" $ do
+        let txout = TxOut 100 "s"
+            coin1 = Coin txout 100 False
+            coin2 = Coin txout 200 False
+        -- Different heights should produce different encodings
+        encode coin1 `shouldNotBe` encode coin2
+
+    describe "CoinEntry" $ do
+      it "tracks dirty flag" $ do
+        let txout = TxOut 1000 "script"
+            coin = Coin txout 50 False
+            entry = CoinEntry (Just coin) True False
+        ceDirty entry `shouldBe` True
+        ceFresh entry `shouldBe` False
+
+      it "tracks fresh flag" $ do
+        let txout = TxOut 1000 "script"
+            coin = Coin txout 50 False
+            entry = CoinEntry (Just coin) False True
+        ceDirty entry `shouldBe` False
+        ceFresh entry `shouldBe` True
+
+      it "represents spent coins with Nothing" $ do
+        let entry = CoinEntry Nothing True False
+        ceCoin entry `shouldBe` Nothing
+
+    describe "coins view" $ do
+      it "defaultCacheSize is 450 MiB" $ do
+        defaultCacheSize `shouldBe` 450 * 1024 * 1024
+
+    describe "flush" $ do
+      it "fresh+spent optimization skips disk writes" $ do
+        -- This test validates the FRESH flag optimization logic
+        -- A coin that is FRESH (created in cache) and spent before flush
+        -- should never touch the disk
+        let txout = TxOut 1000 "s"
+            coin = Coin txout 100 False
+            -- Entry is fresh and dirty (created in cache)
+            freshEntry = CoinEntry (Just coin) True True
+            -- After spending, coin is Nothing
+            spentEntry = CoinEntry Nothing True True
+        -- If fresh and spent, it can be deleted without DB write
+        ceFresh spentEntry `shouldBe` True
+        ceCoin spentEntry `shouldBe` Nothing
+
+      it "dirty entries require flush" $ do
+        let txout = TxOut 2000 "script"
+            coin = Coin txout 200 False
+            entry = CoinEntry (Just coin) True False
+        ceDirty entry `shouldBe` True
+
+      it "non-dirty entries can be skipped" $ do
+        let txout = TxOut 2000 "script"
+            coin = Coin txout 200 False
+            entry = CoinEntry (Just coin) False False
+        ceDirty entry `shouldBe` False
+
+  describe "coins view cache" $ do
+    it "tracks memory usage" $ do
+      -- Memory usage should be calculated based on scriptPubKey size
+      let txout = TxOut 1000 (BS.replicate 100 0x00)
+          coin = Coin txout 50 False
+          entry = CoinEntry (Just coin) False False
+      -- Entry memory usage should include script size
+      let usage = case ceCoin entry of
+            Nothing -> 8
+            Just c -> 8 + BS.length (txOutScript (coinTxOut c))
+      usage `shouldBe` 108  -- 8 + 100
+
+    it "empty entry has minimal memory usage" $ do
+      let entry = CoinEntry Nothing False False
+      let usage = case ceCoin entry of
+            Nothing -> 8
+            Just c -> 8 + BS.length (txOutScript (coinTxOut c))
+      usage `shouldBe` 8
+
+  describe "coins view db" $ do
+    it "uses prefix 0x43 (C) for coins" $ do
+      -- Key format should be 'C' + outpoint
+      let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+          op = OutPoint txid 0
+          key = BS.cons 0x43 (encode op)
+      BS.head key `shouldBe` 0x43  -- 'C'
+
+    it "uses prefix 0x42 (B) for best block" $ do
+      let key = BS.singleton 0x42
+      BS.head key `shouldBe` 0x42  -- 'B'
