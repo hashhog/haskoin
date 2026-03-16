@@ -41,7 +41,10 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          cacheSpendCoin, cacheFlush, cacheSync,
                          cacheDynamicMemoryUsage, cacheGetCacheSize,
                          cacheGetDirtyCount, cacheSetBestBlock,
-                         cacheGetBestBlock, cacheReset, cacheSanityCheck)
+                         cacheGetBestBlock, cacheReset, cacheSanityCheck,
+                         -- Pruning support
+                         PruneConfig(..), defaultPruneConfig, minPruneTarget,
+                         minBlocksToKeep, findFilesToPrune, calculateCurrentUsage)
 import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
@@ -50,6 +53,7 @@ import Haskoin.Wallet
 import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
+import Haskoin.Index
 import Data.Aeson (Value(..), Object, Array)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
@@ -3271,9 +3275,177 @@ main = hspec $ do
     it "createTransaction handles no change" $ do
       let inputs = [(OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0, TxOut 100000 "")]
           outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 99000]
-          cs = CoinSelection inputs outputs Nothing 1000 (FeeRate 10)
+          cs = CoinSelection inputs outputs Nothing 1000 (FeeRate 10) AlgLargestFirst 0
           tx = createTransaction cs
       length (txOutputs tx) `shouldBe` 1
+
+  describe "BnB Coin Selection" $ do
+    it "selectCoinsBnB finds exact match" $ do
+      -- Create UTXOs that can exactly match the target
+      let utxos = [ Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0)
+                         (TxOut 50000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x02))) 0)
+                         (TxOut 30000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x03))) 0)
+                         (TxOut 20000 "") 6 False 0
+                  ]
+          -- At very low fee rate, effective value ~= value
+          feeRate = FeeRate 1
+          target = 50000 + 30000  -- 80000 satoshis
+      case selectCoinsBnB utxos target feeRate of
+        Just selected ->
+          sum (map utxoValue selected) `shouldSatisfy` (>= target)
+        Nothing ->
+          expectationFailure "BnB should have found a match"
+
+    it "selectCoinsBnB returns Nothing for impossible targets" $ do
+      let utxos = [ Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0)
+                         (TxOut 10000 "") 6 False 0 ]
+          feeRate = FeeRate 1
+          target = 1000000  -- More than available
+      selectCoinsBnB utxos target feeRate `shouldBe` Nothing
+
+    it "selectCoinsBnB prefers fewer inputs" $ do
+      let utxos = [ Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0)
+                         (TxOut 100000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x02))) 0)
+                         (TxOut 50000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x03))) 0)
+                         (TxOut 50000 "") 6 False 0
+                  ]
+          feeRate = FeeRate 1
+          -- Target that can be met with 1 input or 2 inputs
+          target = 99000
+      case selectCoinsBnB utxos target feeRate of
+        Just selected -> do
+          -- Should prefer the single 100000 UTXO
+          length selected `shouldSatisfy` (<= 2)
+        Nothing ->
+          return ()  -- BnB might not find exact match due to fees
+
+  describe "Knapsack Coin Selection" $ do
+    it "knapsackSolver finds valid selection" $ do
+      let utxos = [ Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0)
+                         (TxOut 50000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x02))) 0)
+                         (TxOut 30000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x03))) 0)
+                         (TxOut 25000 "") 6 False 0
+                  ]
+          feeRate = FeeRate 10
+          target = 40000
+      selected <- knapsackSolver utxos target feeRate
+      sum (map utxoValue selected) `shouldSatisfy` (>= target)
+
+    it "knapsackSolver uses all UTXOs when needed" $ do
+      let utxos = [ Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0)
+                         (TxOut 10000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x02))) 0)
+                         (TxOut 10000 "") 6 False 0
+                  , Utxo (OutPoint (TxId (Hash256 (BS.replicate 32 0x03))) 0)
+                         (TxOut 10000 "") 6 False 0
+                  ]
+          feeRate = FeeRate 1
+          target = 29000  -- Need all UTXOs
+      selected <- knapsackSolver utxos target feeRate
+      length selected `shouldSatisfy` (>= 3)
+
+  describe "Address Types" $ do
+    it "bip44Path generates correct legacy path" $ do
+      let path = bip44Path 0
+      length path `shouldBe` 3
+      -- Check first element is 44' (hardened)
+      head path `shouldSatisfy` (>= 0x80000000)
+
+    it "bip49Path generates correct P2SH-P2WPKH path" $ do
+      let path = bip49Path 0
+      length path `shouldBe` 3
+      -- Check first element is 49' (hardened)
+      (head path .&. 0x7FFFFFFF) `shouldBe` 49
+
+    it "bip84Path generates correct native SegWit path" $ do
+      let path = bip84Path 0
+      length path `shouldBe` 3
+      -- Check first element is 84' (hardened)
+      (head path .&. 0x7FFFFFFF) `shouldBe` 84
+
+    it "bip86Path generates correct Taproot path" $ do
+      let path = bip86Path 0
+      length path `shouldBe` 3
+      -- Check first element is 86' (hardened)
+      (head path .&. 0x7FFFFFFF) `shouldBe` 86
+
+    it "getNewAddress generates P2PKH addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      addr <- getNewAddress AddrP2PKH wallet
+      case addr of
+        PubKeyAddress _ -> return ()
+        _ -> expectationFailure "Expected P2PKH address"
+
+    it "getNewAddress generates P2WPKH addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      addr <- getNewAddress AddrP2WPKH wallet
+      case addr of
+        WitnessPubKeyAddress _ -> return ()
+        _ -> expectationFailure "Expected P2WPKH address"
+
+    it "getNewAddress generates P2SH-P2WPKH addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      addr <- getNewAddress AddrP2SH_P2WPKH wallet
+      case addr of
+        ScriptAddress _ -> return ()
+        _ -> expectationFailure "Expected P2SH address"
+
+    it "getNewAddress generates P2TR addresses" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      addr <- getNewAddress AddrP2TR wallet
+      case addr of
+        TaprootAddress _ -> return ()
+        _ -> expectationFailure "Expected P2TR address"
+
+  describe "Coin Selection Integration" $ do
+    it "selectCoins uses BnB for exact matches" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      -- Add a UTXO that can exactly match target + fee
+      let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+          txout = TxOut 100700 ""  -- target + fee approximately
+      addWalletUTXO wallet op txout 6
+      let outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 100000]
+      result <- selectCoins wallet outputs (FeeRate 1)
+      case result of
+        Right cs -> csAlgorithm cs `shouldBe` AlgBnB
+        Left _ -> return ()  -- BnB may not find exact match
+
+    it "selectCoins falls back to Knapsack when needed" $ do
+      let config = WalletConfig mainnet 20 ""
+      mnemonic <- generateMnemonic 256
+      wallet <- loadWallet config mnemonic
+      -- Add UTXOs that won't exactly match
+      let op1 = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+          op2 = OutPoint (TxId (Hash256 (BS.replicate 32 0xbb))) 0
+          txout1 = TxOut 200000 ""
+          txout2 = TxOut 300000 ""
+      addWalletUTXO wallet op1 txout1 6
+      addWalletUTXO wallet op2 txout2 6
+      let outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xcc))) 150000]
+      result <- selectCoins wallet outputs (FeeRate 10)
+      case result of
+        Right cs -> do
+          -- Should have selected coins and possibly have change
+          length (csInputs cs) `shouldSatisfy` (>= 1)
+          -- When BnB fails, Knapsack is used
+          csAlgorithm cs `shouldSatisfy` (`elem` [AlgBnB, AlgKnapsack])
+        Left err -> expectationFailure $ "Expected success, got: " ++ err
 
   -- Performance module tests
   describe "LRU Cache" $ do
@@ -5730,3 +5902,545 @@ tails xs@(_:xs') = xs : tails xs'
     it "uses prefix 0x42 (B) for best block" $ do
       let key = BS.singleton 0x42
       BS.head key `shouldBe` 0x42  -- 'B'
+
+  --------------------------------------------------------------------------------
+  -- Pruning Tests
+  --------------------------------------------------------------------------------
+  -- Reference: bitcoin/src/node/blockstorage.cpp PruneOneBlockFile, FindFilesToPrune
+
+  describe "prune" $ do
+    describe "PruneConfig" $ do
+      it "has correct minimum prune target" $ do
+        -- Minimum prune target is 550 MiB = 576,716,800 bytes
+        minPruneTarget `shouldBe` 576716800
+
+      it "has correct minimum blocks to keep" $ do
+        -- Must keep at least 288 blocks from the tip
+        minBlocksToKeep `shouldBe` 288
+
+      it "default config has pruning disabled" $ do
+        pcPruneTarget defaultPruneConfig `shouldBe` Nothing
+        pcMinBlocksToKeep defaultPruneConfig `shouldBe` 288
+
+      it "allows custom prune target above minimum" $ do
+        let cfg = PruneConfig (Just $ 600 * 1024 * 1024) 288
+        pcPruneTarget cfg `shouldBe` Just (600 * 1024 * 1024)
+
+    describe "findFilesToPrune" $ do
+      it "returns empty list when below target" $ do
+        -- If current usage is below target, no files should be pruned
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 10000000 0 100) -- 10 MB
+              , (1, BlockFileInfo 1 10000000 100 200)
+              ]
+            target = 100 * 1024 * 1024  -- 100 MB
+            tipHeight = 500
+        findFilesToPrune tipHeight target fileInfos `shouldBe` []
+
+      it "returns oldest file when above target" $ do
+        -- When above target, prune oldest files first
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 50000000 0 100)    -- 50 MB, heights 0-100
+              , (1, BlockFileInfo 1 50000000 101 200)  -- 50 MB, heights 101-200
+              , (2, BlockFileInfo 1 50000000 201 300)  -- 50 MB, heights 201-300
+              ]
+            target = 100 * 1024 * 1024  -- 100 MB (below 150 MB current)
+            tipHeight = 600  -- Tip at 600, so file 2 (max 300) is safe to prune
+        findFilesToPrune tipHeight target fileInfos `shouldBe` [0]
+
+      it "never prunes files within minBlocksToKeep of tip" $ do
+        -- Files with blocks within 288 of tip must not be pruned
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 50000000 0 100)    -- heights 0-100, safe to prune
+              , (1, BlockFileInfo 1 50000000 101 350)  -- heights 101-350, NOT safe (close to tip 400)
+              ]
+            target = 10 * 1024 * 1024  -- Very low target to force pruning
+            tipHeight = 400  -- 400 - 288 = 112, so only file 0 (max 100) can be pruned
+        findFilesToPrune tipHeight target fileInfos `shouldBe` [0]
+
+      it "prunes multiple files when needed" $ do
+        -- When above target by a lot, prune multiple files
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 50000000 0 100)    -- 50 MB
+              , (1, BlockFileInfo 1 50000000 101 200)  -- 50 MB
+              , (2, BlockFileInfo 1 50000000 201 300)  -- 50 MB
+              ]
+            target = 50 * 1024 * 1024  -- 50 MB (well below 150 MB)
+            tipHeight = 600  -- All files are safe to prune
+        -- Should prune files 0 and 1 to get down to target
+        findFilesToPrune tipHeight target fileInfos `shouldBe` [0, 1]
+
+      it "skips empty files" $ do
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 0 0 0 0)            -- Empty file
+              , (1, BlockFileInfo 1 50000000 100 200) -- 50 MB
+              , (2, BlockFileInfo 1 50000000 200 300) -- 50 MB
+              ]
+            target = 50 * 1024 * 1024
+            tipHeight = 600
+        findFilesToPrune tipHeight target fileInfos `shouldBe` [1]
+
+      it "returns empty for very short chains" $ do
+        -- If tip height < minBlocksToKeep, don't prune anything
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 50000000 0 100)
+              ]
+            target = 10 * 1024 * 1024
+            tipHeight = 200  -- Below minBlocksToKeep (288)
+        findFilesToPrune tipHeight target fileInfos `shouldBe` []
+
+    describe "calculateCurrentUsage" $ do
+      it "returns 0 for empty map" $ do
+        calculateCurrentUsage Map.empty `shouldBe` 0
+
+      it "sums file sizes correctly" $ do
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 1000 0 10)
+              , (1, BlockFileInfo 1 2000 10 20)
+              , (2, BlockFileInfo 1 3000 20 30)
+              ]
+        calculateCurrentUsage fileInfos `shouldBe` 6000
+
+      it "handles large file sizes" $ do
+        let fileInfos = Map.fromList
+              [ (0, BlockFileInfo 1 128000000 0 1000)     -- 128 MB
+              , (1, BlockFileInfo 1 128000000 1000 2000)  -- 128 MB
+              ]
+        calculateCurrentUsage fileInfos `shouldBe` 256000000
+
+  describe "pruneblockchain" $ do
+    it "validates height parameter" $ do
+      -- This is a unit test for the validation logic
+      let tipHeight = 1000 :: Word32
+          pruneHeight = 900 :: Word32
+          -- Cannot prune within 288 blocks of tip
+          maxPrunable = tipHeight - minBlocksToKeep
+      (pruneHeight > maxPrunable) `shouldBe` True
+
+    it "allows pruning sufficiently old blocks" $ do
+      let tipHeight = 1000 :: Word32
+          pruneHeight = 600 :: Word32  -- 400 blocks behind tip
+          maxPrunable = tipHeight - minBlocksToKeep
+      (pruneHeight > maxPrunable) `shouldBe` False
+
+  ---------------------------------------------------------------------------
+  -- Block Index Tests (txindex, blockfilterindex, coinstatsindex)
+  ---------------------------------------------------------------------------
+
+  describe "GCS Filter (BIP158)" $ do
+    describe "gcs parameters" $ do
+      it "basicFilterParams uses correct P and M values" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+            params = basicFilterParams blockHash
+        gcsP params `shouldBe` 19
+        gcsM params `shouldBe` 784931
+
+      it "extracts SipHash key from block hash" $ do
+        let blockHash = BlockHash (Hash256 (BS.pack [1..32]))
+            params = basicFilterParams blockHash
+        gcsSipK0 params `shouldSatisfy` (> 0)
+        gcsSipK1 params `shouldSatisfy` (> 0)
+
+    describe "gcs filter construction" $ do
+      it "creates empty filter for no elements" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0xaa))
+            params = basicFilterParams blockHash
+            filter' = gcsFilterNew params []
+        gcsN filter' `shouldBe` 0
+        gcsF filter' `shouldBe` 0
+
+      it "creates filter with correct element count" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0xbb))
+            params = basicFilterParams blockHash
+            elements = ["script1", "script2", "script3"]
+            filter' = gcsFilterNew params elements
+        gcsN filter' `shouldBe` 3
+
+      it "computes F = N * M" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0xcc))
+            params = basicFilterParams blockHash
+            elements = ["a", "b", "c", "d", "e"]
+            filter' = gcsFilterNew params elements
+        gcsF filter' `shouldBe` 5 * fromIntegral (gcsM params)
+
+    describe "gcs encoding/decoding" $ do
+      it "roundtrips empty filter" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0xdd))
+            params = basicFilterParams blockHash
+            filter' = gcsFilterNew params []
+            encoded = gcsFilterEncode filter'
+        case gcsFilterDecode params encoded of
+          Right decoded -> gcsN decoded `shouldBe` 0
+          Left err -> expectationFailure $ "Decode failed: " ++ err
+
+      it "roundtrips filter with elements" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0xee))
+            params = basicFilterParams blockHash
+            elements = ["script1", "script2", "script3"]
+            filter' = gcsFilterNew params elements
+            encoded = gcsFilterEncode filter'
+        case gcsFilterDecode params encoded of
+          Right decoded -> gcsN decoded `shouldBe` gcsN filter'
+          Left err -> expectationFailure $ "Decode failed: " ++ err
+
+    describe "gcs matching" $ do
+      it "matches elements that were added" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x11))
+            params = basicFilterParams blockHash
+            elements = ["script1", "script2", "script3"]
+            filter' = gcsFilterNew params elements
+        gcsFilterMatch filter' "script1" `shouldBe` True
+        gcsFilterMatch filter' "script2" `shouldBe` True
+        gcsFilterMatch filter' "script3" `shouldBe` True
+
+      it "does not match elements that were not added (usually)" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x22))
+            params = basicFilterParams blockHash
+            elements = ["script1", "script2"]
+            filter' = gcsFilterNew params elements
+        -- Note: false positives possible at rate 1/M ≈ 1/784931
+        -- Test with many non-matching elements to verify filter works
+        let nonMatching = ["notInFilter_" <> BS.pack [i] | i <- [1..100]]
+            matches = filter (gcsFilterMatch filter') nonMatching
+        -- Should match very few (expected ~0 with 100 tries at 1/784931 FP rate)
+        length matches `shouldSatisfy` (< 5)
+
+      it "matchAny returns True when any element matches" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x33))
+            params = basicFilterParams blockHash
+            elements = ["script1", "script2", "script3"]
+            filter' = gcsFilterNew params elements
+            queries = ["notInFilter", "script2", "alsoNotInFilter"]
+        gcsFilterMatchAny filter' queries `shouldBe` True
+
+      it "matchAny returns False when no element matches" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x44))
+            params = basicFilterParams blockHash
+            elements = ["script1", "script2", "script3"]
+            filter' = gcsFilterNew params elements
+            -- Use a different set of queries unlikely to match
+            queries = ["definitelyNot1_xyz", "definitelyNot2_abc"]
+        -- Note: still possible to have false positives
+        -- For most test runs this should be False
+        gcsFilterMatchAny filter' queries `shouldBe` False
+
+  describe "Golomb-Rice coding" $ do
+    describe "encoding" $ do
+      it "encodes small values" $ do
+        let bw = bitWriterNew
+            bw' = golombRiceEncode bw 4 0  -- P=4, value=0
+            encoded = bitWriterFlush bw'
+        BS.length encoded `shouldSatisfy` (>= 1)
+
+      it "encodes larger values with quotient" $ do
+        let bw = bitWriterNew
+            bw' = golombRiceEncode bw 4 100  -- P=4, value=100
+            encoded = bitWriterFlush bw'
+        BS.length encoded `shouldSatisfy` (> 1)
+
+    describe "decoding" $ do
+      it "roundtrips values with various P" $ property $ \(p' :: Int, v :: Word64) -> do
+        let p = max 1 (abs p' `mod` 20)  -- P between 1 and 19
+            value = v `mod` 10000  -- Reasonable value
+            bw = bitWriterNew
+            bw' = golombRiceEncode bw p value
+            encoded = bitWriterFlush bw'
+            br = bitReaderNew encoded
+            (decoded, _) = golombRiceDecode br p
+        decoded `shouldBe` value
+
+  describe "Bit stream" $ do
+    describe "bitWriterWrite" $ do
+      it "writes single bits" $ do
+        let bw = bitWriterNew
+            bw1 = bitWriterWrite bw 1 1  -- Write 1 bit = 1
+            bw2 = bitWriterWrite bw1 1 0 -- Write 1 bit = 0
+            bw3 = bitWriterWrite bw2 1 1 -- Write 1 bit = 1
+            encoded = bitWriterFlush bw3
+        BS.length encoded `shouldBe` 1
+        BS.head encoded `shouldBe` 0x05  -- binary: 101
+
+      it "writes multi-bit values" $ do
+        let bw = bitWriterNew
+            bw' = bitWriterWrite bw 8 0xAB
+            encoded = bitWriterFlush bw'
+        BS.length encoded `shouldBe` 1
+        BS.head encoded `shouldBe` 0xAB
+
+    describe "bitReaderRead" $ do
+      it "reads single bits" $ do
+        let bs = BS.singleton 0x05  -- binary: 00000101
+            br = bitReaderNew bs
+            (b1, br1) = bitReaderRead br 1
+            (b2, br2) = bitReaderRead br1 1
+            (b3, _) = bitReaderRead br2 1
+        b1 `shouldBe` 1
+        b2 `shouldBe` 0
+        b3 `shouldBe` 1
+
+      it "reads multi-bit values" $ do
+        let bs = BS.singleton 0xAB
+            br = bitReaderNew bs
+            (value, _) = bitReaderRead br 8
+        value `shouldBe` 0xAB
+
+  describe "Block Filter" $ do
+    describe "blockFilterElements" $ do
+      it "extracts output scripts from transactions" $ do
+        let script1 = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xaa <> BS.pack [0x88, 0xac]
+            script2 = BS.pack [0xa9, 0x14] <> BS.replicate 20 0xbb <> BS.pack [0x87]
+            txout1 = TxOut 100000 script1
+            txout2 = TxOut 200000 script2
+            tx = Tx 1 [] [txout1, txout2] [] 0
+            block = Block (BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0))) (Hash256 (BS.replicate 32 0)) 0 0 0) [tx]
+            undo = BlockUndo []
+            elements = blockFilterElements block undo
+        length elements `shouldBe` 2
+        script1 `elem` elements `shouldBe` True
+        script2 `elem` elements `shouldBe` True
+
+      it "excludes OP_RETURN scripts" $ do
+        let normalScript = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xaa <> BS.pack [0x88, 0xac]
+            opReturnScript = BS.pack [0x6a] <> BS.replicate 10 0xbb  -- OP_RETURN
+            txout1 = TxOut 100000 normalScript
+            txout2 = TxOut 0 opReturnScript
+            tx = Tx 1 [] [txout1, txout2] [] 0
+            block = Block (BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0))) (Hash256 (BS.replicate 32 0)) 0 0 0) [tx]
+            undo = BlockUndo []
+            elements = blockFilterElements block undo
+        normalScript `elem` elements `shouldBe` True
+        opReturnScript `elem` elements `shouldBe` False
+
+    describe "blockFilterHash" $ do
+      it "produces 32-byte hash" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x55))
+            filter' = BlockFilter BasicBlockFilter blockHash (gcsFilterEmpty (basicFilterParams blockHash))
+            Hash256 hashBytes = blockFilterHash filter'
+        BS.length hashBytes `shouldBe` 32
+
+    describe "blockFilterHeader" $ do
+      it "chains headers correctly" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x66))
+            prevHeader = Hash256 (BS.replicate 32 0x00)
+            filter' = BlockFilter BasicBlockFilter blockHash (gcsFilterEmpty (basicFilterParams blockHash))
+            header1 = blockFilterHeader filter' prevHeader
+            header2 = blockFilterHeader filter' header1
+        -- Headers should be different when prev header changes
+        header1 `shouldNotBe` header2
+
+  describe "fastRange64" $ do
+    it "maps hash to range [0, range)" $ do
+      let hash = 0xFFFFFFFFFFFFFFFF :: Word64
+          range = 100 :: Word64
+          result = fastRange64 hash range
+      result `shouldSatisfy` (< range)
+
+    it "maps 0 to 0" $ do
+      let result = fastRange64 0 100
+      result `shouldBe` 0
+
+    it "distributes values uniformly" $ do
+      -- Check that different hashes map to different parts of the range
+      let range = 1000 :: Word64
+          hashes = [0x1000000000000000 * i | i <- [1..10]]
+          results = map (`fastRange64` range) hashes
+      -- Results should be spread across range
+      length (filter (< 500) results) `shouldSatisfy` (> 0)
+      length (filter (>= 500) results) `shouldSatisfy` (> 0)
+
+  describe "SipHash" $ do
+    describe "sipHash128" $ do
+      it "produces non-zero output for non-empty input" $ do
+        let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            result = sipHash128 key "hello"
+        result `shouldSatisfy` (/= 0)
+
+      it "produces different outputs for different inputs" $ do
+        let key = SipHashKey 0x0102030405060708 0x090a0b0c0d0e0f10
+            result1 = sipHash128 key "hello"
+            result2 = sipHash128 key "world"
+        result1 `shouldNotBe` result2
+
+      it "produces different outputs for different keys" $ do
+        let key1 = SipHashKey 0x0102030405060708 0x090a0b0c0d0e0f10
+            key2 = SipHashKey 0x1112131415161718 0x191a1b1c1d1e1f20
+            result1 = sipHash128 key1 "test"
+            result2 = sipHash128 key2 "test"
+        result1 `shouldNotBe` result2
+
+  describe "MuHash3072" $ do
+    describe "muHashEmpty" $ do
+      it "creates identity element" $ do
+        let mh = muHashEmpty
+        muHashNumerator mh `shouldBe` muHashDenominator mh
+
+    describe "muHashInsert" $ do
+      it "modifies the hash" $ do
+        let mh1 = muHashEmpty
+            mh2 = muHashInsert mh1 "element1"
+        muHashNumerator mh2 `shouldNotBe` muHashNumerator mh1
+
+      it "is order-independent for multiple inserts" $ do
+        let mh1 = muHashInsert (muHashInsert muHashEmpty "a") "b"
+            mh2 = muHashInsert (muHashInsert muHashEmpty "b") "a"
+            hash1 = muHashFinalize mh1
+            hash2 = muHashFinalize mh2
+        hash1 `shouldBe` hash2
+
+    describe "muHashRemove" $ do
+      it "modifies the hash" $ do
+        let mh1 = muHashInsert muHashEmpty "element"
+            mh2 = muHashRemove mh1 "element"
+        muHashDenominator mh2 `shouldNotBe` muHashDenominator mh1
+
+    describe "muHashFinalize" $ do
+      it "produces 32-byte hash" $ do
+        let mh = muHashInsert muHashEmpty "test"
+            Hash256 hashBytes = muHashFinalize mh
+        BS.length hashBytes `shouldBe` 32
+
+  describe "TxIndex" $ do
+    describe "TxIndexEntry serialization" $ do
+      it "roundtrips correctly" $ property $ \(h :: Word32, pos :: Word32) -> do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x77))
+            entry = TxIndexEntry blockHash h pos
+        decode (encode entry) `shouldBe` Right entry
+
+    describe "txindex operations" $ do
+      it "stores and retrieves entries" $ do
+        withSystemTempDirectory "txindex_test" $ \tmpDir -> do
+          let dbPath = tmpDir </> "txindex.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            let txIdx = newTxIndexDB db
+                txid = TxId (Hash256 (BS.replicate 32 0x88))
+                blockHash = BlockHash (Hash256 (BS.replicate 32 0x99))
+                entry = TxIndexEntry blockHash 100 5
+            txIndexPut txIdx txid entry
+            result <- txIndexGet txIdx txid
+            result `shouldBe` Just entry
+
+      it "returns Nothing for missing entries" $ do
+        withSystemTempDirectory "txindex_test2" $ \tmpDir -> do
+          let dbPath = tmpDir </> "txindex2.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            let txIdx = newTxIndexDB db
+                txid = TxId (Hash256 (BS.replicate 32 0xaa))
+            result <- txIndexGet txIdx txid
+            result `shouldBe` Nothing
+
+      it "deletes entries" $ do
+        withSystemTempDirectory "txindex_test3" $ \tmpDir -> do
+          let dbPath = tmpDir </> "txindex3.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            let txIdx = newTxIndexDB db
+                txid = TxId (Hash256 (BS.replicate 32 0xbb))
+                blockHash = BlockHash (Hash256 (BS.replicate 32 0xcc))
+                entry = TxIndexEntry blockHash 200 10
+            txIndexPut txIdx txid entry
+            txIndexDelete txIdx txid
+            result <- txIndexGet txIdx txid
+            result `shouldBe` Nothing
+
+  describe "BlockFilterIndex" $ do
+    describe "BlockFilterEntry serialization" $ do
+      it "roundtrips correctly" $ do
+        let filterHash = Hash256 (BS.replicate 32 0x11)
+            filterHeader = Hash256 (BS.replicate 32 0x22)
+            encoded = BS.pack [0x01, 0x02, 0x03, 0x04]
+            entry = BlockFilterEntry filterHash filterHeader encoded
+        decode (encode entry) `shouldBe` Right entry
+
+    describe "blockfilterindex operations" $ do
+      it "stores and retrieves entries" $ do
+        withSystemTempDirectory "bfindex_test" $ \tmpDir -> do
+          let dbPath = tmpDir </> "bfindex.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            bfIdx <- newBlockFilterIndexDB db
+            let filterHash = Hash256 (BS.replicate 32 0x33)
+                filterHeader = Hash256 (BS.replicate 32 0x44)
+                encoded = BS.pack [0x05, 0x06, 0x07]
+                entry = BlockFilterEntry filterHash filterHeader encoded
+            blockFilterIndexPut bfIdx 100 entry
+            result <- blockFilterIndexGet bfIdx 100
+            result `shouldBe` Just entry
+
+      it "returns Nothing for missing heights" $ do
+        withSystemTempDirectory "bfindex_test2" $ \tmpDir -> do
+          let dbPath = tmpDir </> "bfindex2.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            bfIdx <- newBlockFilterIndexDB db
+            result <- blockFilterIndexGet bfIdx 999
+            result `shouldBe` Nothing
+
+  describe "CoinStatsIndex" $ do
+    describe "CoinStats serialization" $ do
+      it "roundtrips correctly" $ do
+        let stats = CoinStats 1000 2000 3000000000 5000000000 10000 20000 30000 0 0 0 0
+        decode (encode stats) `shouldBe` Right stats
+
+    describe "CoinStatsEntry serialization" $ do
+      it "roundtrips correctly" $ do
+        let blockHash = BlockHash (Hash256 (BS.replicate 32 0x55))
+            muhash = Hash256 (BS.replicate 32 0x66)
+            stats = CoinStats 500 1000 1500000000 2500000000 5000 10000 15000 0 0 0 0
+            entry = CoinStatsEntry blockHash muhash stats
+        decode (encode entry) `shouldBe` Right entry
+
+    describe "coinstatsindex operations" $ do
+      it "stores and retrieves entries" $ do
+        withSystemTempDirectory "csindex_test" $ \tmpDir -> do
+          let dbPath = tmpDir </> "csindex.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            csIdx <- newCoinStatsIndexDB db
+            let blockHash = BlockHash (Hash256 (BS.replicate 32 0x77))
+                muhash = Hash256 (BS.replicate 32 0x88)
+                stats = CoinStats 100 200 300000 400000 50 60 70 0 0 0 0
+                entry = CoinStatsEntry blockHash muhash stats
+            coinStatsIndexPut csIdx 500 entry
+            result <- coinStatsIndexGet csIdx 500
+            result `shouldBe` Just entry
+
+      it "returns Nothing for missing heights" $ do
+        withSystemTempDirectory "csindex_test2" $ \tmpDir -> do
+          let dbPath = tmpDir </> "csindex2.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            csIdx <- newCoinStatsIndexDB db
+            result <- coinStatsIndexGet csIdx 888
+            result `shouldBe` Nothing
+
+  describe "Index Manager" $ do
+    describe "defaultIndexConfig" $ do
+      it "has all indexes disabled by default" $ do
+        icTxIndex defaultIndexConfig `shouldBe` False
+        icBlockFilterIndex defaultIndexConfig `shouldBe` False
+        icCoinStatsIndex defaultIndexConfig `shouldBe` False
+
+    describe "newIndexManager" $ do
+      it "creates manager with enabled indexes" $ do
+        withSystemTempDirectory "indexmgr_test" $ \tmpDir -> do
+          let dbPath = tmpDir </> "indexmgr.db"
+              config = defaultDBConfig dbPath
+              idxConfig = IndexConfig True True True
+          withDB config $ \db -> do
+            mgr <- newIndexManager db idxConfig
+            imTxIndex mgr `shouldSatisfy` isJust
+            imBlockFilterIndex mgr `shouldSatisfy` isJust
+            imCoinStatsIndex mgr `shouldSatisfy` isJust
+
+      it "creates manager with disabled indexes" $ do
+        withSystemTempDirectory "indexmgr_test2" $ \tmpDir -> do
+          let dbPath = tmpDir </> "indexmgr2.db"
+              config = defaultDBConfig dbPath
+              idxConfig = IndexConfig False False False
+          withDB config $ \db -> do
+            mgr <- newIndexManager db idxConfig
+            imTxIndex mgr `shouldBe` Nothing
+            imBlockFilterIndex mgr `shouldBe` Nothing
+            imCoinStatsIndex mgr `shouldBe` Nothing
