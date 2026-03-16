@@ -19,7 +19,7 @@ system to make invalid states unrepresentable.
 - [x] Script parsing, classification, and interpreter
 - [x] Full consensus validation with all BIP rules
 - [x] RocksDB storage layer with UTXO cache
-- [x] P2P networking with peer manager and misbehavior scoring
+- [x] P2P networking with peer manager, misbehavior scoring, and connection eviction
 - [x] Headers-first sync and IBD pipeline
 - [x] Transaction mempool with RBF support
 - [x] Fee estimation with confirmation tracking
@@ -56,7 +56,7 @@ haskoin/
     Script.hs        -- script parsing and interpreter
     Consensus.hs     -- validation, header sync, reorgs
     Storage.hs       -- rocksdb persistence, UTXO cache
-    Network.hs       -- p2p messages, peer connection, ban scoring
+    Network.hs       -- p2p messages, peer connection, ban scoring, eviction
     Sync.hs          -- block download, IBD pipeline
     Mempool.hs       -- transaction pool, RBF
     FeeEstimator.hs  -- fee rate estimation
