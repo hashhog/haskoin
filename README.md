@@ -20,6 +20,7 @@ system to make invalid states unrepresentable.
 - [x] Full consensus validation with all BIP rules
 - [x] RocksDB storage layer with UTXO cache
 - [x] P2P networking with peer manager, misbehavior scoring, and connection eviction
+- [x] Stale peer eviction (ping timeout, block stall, chain sync timeout)
 - [x] Headers-first sync and IBD pipeline
 - [x] Transaction mempool with RBF support
 - [x] Fee estimation with confirmation tracking
@@ -28,6 +29,7 @@ system to make invalid states unrepresentable.
 - [x] HD wallet (BIP-32/39/44/84)
 - [x] CLI with node, wallet, and utility commands
 - [x] Performance optimizations (parallel validation, LRU cache, metrics)
+- [x] Block indexes (txindex, blockfilterindex, coinstatsindex)
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
@@ -64,6 +66,7 @@ haskoin/
     Rpc.hs           -- json-rpc server
     Wallet.hs        -- hd wallet (bip-32/39/44/84)
     Performance.hs   -- parallel validation, LRU cache, metrics
+    Index.hs         -- txindex, blockfilterindex, coinstatsindex
   bench/
     Bench.hs         -- criterion benchmarks
   app/
