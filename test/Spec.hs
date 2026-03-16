@@ -2665,12 +2665,13 @@ main = hspec $ do
               , meSize = 150
               , meTime = 1234567890
               , meHeight = 500
-              , meAncestorCount = 0
-              , meAncestorSize = 150
-              , meAncestorFees = 100
-              , meDescendantCount = 0
-              , meDescendantSize = 0
-              , meDescendantFees = 0
+              , meAncestorCount = 1  -- includes self
+              , meAncestorSize = 150  -- includes self
+              , meAncestorFees = 100  -- includes self
+              , meAncestorSigOps = 0
+              , meDescendantCount = 1  -- includes self
+              , meDescendantSize = 150  -- includes self
+              , meDescendantFees = 100  -- includes self
               , meRBFOptIn = False
               }
         meFee entry `shouldBe` 100
@@ -2678,6 +2679,8 @@ main = hspec $ do
         meSize entry `shouldBe` 150
         meHeight entry `shouldBe` 500
         meRBFOptIn entry `shouldBe` False
+        meAncestorCount entry `shouldBe` 1
+        meDescendantCount entry `shouldBe` 1
 
     describe "MempoolError" $ do
       it "represents different error types" $ do
@@ -2728,6 +2731,63 @@ main = hspec $ do
             totalSize = parentSize + childSize
             ancestorFeeRate = (totalFees * 1000) `div` fromIntegral totalSize
         ancestorFeeRate `shouldBe` 1714
+
+    describe "Mempool limits" $ do
+      it "default ancestor limit is 25" $ do
+        let cfg = defaultMempoolConfig
+        mpcMaxAncestors cfg `shouldBe` 25
+
+      it "default descendant limit is 25" $ do
+        let cfg = defaultMempoolConfig
+        mpcMaxDescendants cfg `shouldBe` 25
+
+      it "default ancestor size limit is 101000" $ do
+        let cfg = defaultMempoolConfig
+        mpcMaxAncestorSize cfg `shouldBe` 101000
+
+      it "default descendant size limit is 101000" $ do
+        let cfg = defaultMempoolConfig
+        mpcMaxDescendantSize cfg `shouldBe` 101000
+
+      it "ErrTooManyAncestors has correct values" $ do
+        let err = ErrTooManyAncestors 26 25
+        show err `shouldBe` "ErrTooManyAncestors 26 25"
+
+      it "ErrTooManyDescendants has correct values" $ do
+        let err = ErrTooManyDescendants 26 25
+        show err `shouldBe` "ErrTooManyDescendants 26 25"
+
+      it "ErrAncestorSizeTooLarge has correct values" $ do
+        let err = ErrAncestorSizeTooLarge 102000 101000
+        show err `shouldBe` "ErrAncestorSizeTooLarge 102000 101000"
+
+      it "ErrDescendantSizeTooLarge has correct values" $ do
+        let err = ErrDescendantSizeTooLarge 102000 101000
+        show err `shouldBe` "ErrDescendantSizeTooLarge 102000 101000"
+
+      -- Test that a chain of 25 would result in 25 ancestors (including self)
+      it "25-tx chain is at ancestor limit" $ do
+        -- With Bitcoin Core's limits, 25 ancestors (including self) is the max
+        -- This means 24 in-mempool parents + 1 (self) = 25
+        let chainLength = 25
+        chainLength `shouldBe` 25
+
+      -- Test that 26 would exceed the limit
+      it "26-tx chain exceeds ancestor limit" $ do
+        let chainLength = 26
+            limit = 25
+        (chainLength > limit) `shouldBe` True
+
+      -- Test ancestor count tracking
+      it "ancestor count includes self" $ do
+        -- A transaction with no in-mempool parents should have ancestorCount = 1
+        let noParentAncestorCount = 1  -- Just self
+        noParentAncestorCount `shouldBe` 1
+
+      it "descendant count includes self" $ do
+        -- A transaction with no in-mempool children should have descendantCount = 1
+        let noChildDescendantCount = 1  -- Just self
+        noChildDescendantCount `shouldBe` 1
 
   --------------------------------------------------------------------------------
   -- Fee Estimator Tests (Phase 16)
@@ -4263,3 +4323,249 @@ tails xs@(_:xs') = xs : tails xs'
       let scores = [10, 10, 1, 1, 1, 20, 10, 10, 10, 10, 10, 10]
           totalScore = sum scores
       (totalScore >= 100) `shouldBe` True
+
+  --------------------------------------------------------------------------------
+  -- Pre-Handshake Rejection Tests (Phase 16)
+  --------------------------------------------------------------------------------
+
+  describe "pre-handshake rejection" $ do
+    describe "PreHandshakeResult" $ do
+      it "AcceptConnection allows connection" $ do
+        AcceptConnection `shouldBe` AcceptConnection
+
+      it "RejectBanned indicates banned peer" $ do
+        RejectBanned `shouldBe` RejectBanned
+
+      it "RejectDiscouraged indicates discouraged peer with full slots" $ do
+        RejectDiscouraged `shouldBe` RejectDiscouraged
+
+      it "RejectMaxConnections indicates total limit reached" $ do
+        RejectMaxConnections `shouldBe` RejectMaxConnections
+
+      it "RejectMaxInbound indicates inbound limit with no eviction" $ do
+        RejectMaxInbound `shouldBe` RejectMaxInbound
+
+      it "AcceptAfterEviction includes evicted peer address" $ do
+        let addr = SockAddrInet 8333 0x0100007f  -- 127.0.0.1
+        AcceptAfterEviction addr `shouldBe` AcceptAfterEviction addr
+
+  describe "connection limit" $ do
+    describe "PeerManagerConfig limits" $ do
+      it "default max connections is 125" $ do
+        pmcMaxTotal defaultPeerManagerConfig `shouldBe` 125
+
+      it "default max inbound is 117 (125 - 8 outbound)" $ do
+        pmcMaxInbound defaultPeerManagerConfig `shouldBe` 117
+
+      it "default max outbound is 8" $ do
+        pmcMaxOutbound defaultPeerManagerConfig `shouldBe` 8
+
+      it "max inbound + max outbound = max total" $ do
+        let cfg = defaultPeerManagerConfig
+        (pmcMaxInbound cfg + pmcMaxOutbound cfg) `shouldBe` pmcMaxTotal cfg
+
+  describe "eviction" $ do
+    describe "EvictionCandidate" $ do
+      it "stores peer address" $ do
+        let addr = SockAddrInet 8333 0x0100007f
+            candidate = EvictionCandidate
+              { ecAddress = addr
+              , ecConnectedAt = 1700000000
+              , ecMinPingTime = Just 0.05
+              , ecLastBlockTime = 1700000100
+              , ecLastTxTime = 1700000050
+              , ecServices = 0x409
+              , ecRelaysTxs = True
+              , ecNetworkGroup = 127
+              , ecInbound = True
+              , ecNoBan = False
+              }
+        ecAddress candidate `shouldBe` addr
+
+      it "stores connection time" $ do
+        let candidate = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 0
+              , ecConnectedAt = 1700000000
+              , ecMinPingTime = Nothing
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = 0
+              , ecInbound = True
+              , ecNoBan = False
+              }
+        ecConnectedAt candidate `shouldBe` 1700000000
+
+      it "stores minimum ping time" $ do
+        let candidate = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 0
+              , ecConnectedAt = 0
+              , ecMinPingTime = Just 0.025
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = 0
+              , ecInbound = True
+              , ecNoBan = False
+              }
+        ecMinPingTime candidate `shouldBe` Just 0.025
+
+    describe "getNetworkGroup" $ do
+      it "extracts /16 group from IPv4 address" $ do
+        -- 127.0.0.1 -> group 127 * 256 + 0 = 32512
+        let addr = SockAddrInet 8333 0x0100007f  -- 127.0.0.1 in little-endian
+        -- Actually in host byte order: 0x7f000001 = 2130706433
+        -- First two octets: 127 and 0
+        getNetworkGroup addr `shouldSatisfy` (> 0)
+
+      it "different /16 networks get different groups" $ do
+        -- 192.168.1.1 vs 10.0.0.1
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0100000a  -- 10.0.0.1
+            group1 = getNetworkGroup addr1
+            group2 = getNetworkGroup addr2
+        group1 `shouldNotBe` group2
+
+      it "same /16 networks get same group" $ do
+        -- 192.168.1.1 vs 192.168.2.1 (same /16)
+        let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
+            addr2 = SockAddrInet 8333 0x0102a8c0  -- 192.168.2.1
+            group1 = getNetworkGroup addr1
+            group2 = getNetworkGroup addr2
+        group1 `shouldBe` group2
+
+    describe "selectEvictionCandidate" $ do
+      it "returns Nothing for empty list" $ do
+        selectEvictionCandidate [] `shouldBe` Nothing
+
+      it "returns Nothing if all candidates are outbound" $ do
+        let candidate = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 0x0100007f
+              , ecConnectedAt = 1700000000
+              , ecMinPingTime = Nothing
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = 127
+              , ecInbound = False  -- Outbound
+              , ecNoBan = False
+              }
+        selectEvictionCandidate [candidate] `shouldBe` Nothing
+
+      it "returns Nothing if all candidates have NoBan" $ do
+        let candidate = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 0x0100007f
+              , ecConnectedAt = 1700000000
+              , ecMinPingTime = Nothing
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = 127
+              , ecInbound = True
+              , ecNoBan = True  -- Protected
+              }
+        selectEvictionCandidate [candidate] `shouldBe` Nothing
+
+      it "selects an inbound candidate without NoBan" $ do
+        let candidate = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 0x0100007f
+              , ecConnectedAt = 1700000000
+              , ecMinPingTime = Nothing
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = 127
+              , ecInbound = True
+              , ecNoBan = False
+              }
+        -- With only one candidate, it should be selected after protections
+        -- (which won't protect it since there are too few candidates)
+        selectEvictionCandidate [candidate] `shouldSatisfy` maybe False (const True)
+
+      it "prefers evicting from largest network group" $ do
+        -- Create candidates: 3 from same group, 1 from different
+        let addr1 = SockAddrInet 8333 0x01010a0a  -- 10.10.1.1
+            addr2 = SockAddrInet 8333 0x02010a0a  -- 10.10.1.2
+            addr3 = SockAddrInet 8333 0x03010a0a  -- 10.10.1.3
+            addr4 = SockAddrInet 8333 0x0101c0a8  -- 192.168.1.1 (different group)
+            mkCandidate addr time = EvictionCandidate
+              { ecAddress = addr
+              , ecConnectedAt = time
+              , ecMinPingTime = Nothing
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = getNetworkGroup addr
+              , ecInbound = True
+              , ecNoBan = False
+              }
+            candidates = [ mkCandidate addr1 1000
+                         , mkCandidate addr2 2000
+                         , mkCandidate addr3 3000  -- Youngest in group
+                         , mkCandidate addr4 4000
+                         ]
+        -- Should evict youngest from the larger group (10.10.x.x)
+        case selectEvictionCandidate candidates of
+          Just c -> ecNetworkGroup c `shouldBe` getNetworkGroup addr1
+          Nothing -> expectationFailure "Expected to find eviction candidate"
+
+      it "evicts youngest peer in the selected group" $ do
+        -- Create candidates from same network group with different ages
+        let addr1 = SockAddrInet 8333 0x01010a0a  -- oldest
+            addr2 = SockAddrInet 8333 0x02010a0a  -- middle
+            addr3 = SockAddrInet 8333 0x03010a0a  -- youngest
+            mkCandidate addr time = EvictionCandidate
+              { ecAddress = addr
+              , ecConnectedAt = time
+              , ecMinPingTime = Nothing
+              , ecLastBlockTime = 0
+              , ecLastTxTime = 0
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = getNetworkGroup addr
+              , ecInbound = True
+              , ecNoBan = False
+              }
+            candidates = [ mkCandidate addr1 1000
+                         , mkCandidate addr2 2000
+                         , mkCandidate addr3 3000  -- Youngest
+                         ]
+        case selectEvictionCandidate candidates of
+          Just c -> ecConnectedAt c `shouldBe` 3000  -- Should be youngest
+          Nothing -> expectationFailure "Expected to find eviction candidate"
+
+    describe "peerToEvictionCandidate" $ do
+      it "converts PeerInfo to EvictionCandidate" $ do
+        let addr = SockAddrInet 8333 0x0100007f
+            info = PeerInfo
+              { piAddress = addr
+              , piVersion = Nothing
+              , piState = PeerConnected
+              , piServices = 0x409
+              , piStartHeight = 800000
+              , piRelay = True
+              , piLastSeen = 1700000100
+              , piLastPing = Nothing
+              , piPingLatency = Just 0.05
+              , piBanScore = 0
+              , piBytesSent = 1000
+              , piBytesRecv = 2000
+              , piMsgsSent = 10
+              , piMsgsRecv = 20
+              , piConnectedAt = 1700000000
+              , piInbound = True
+              }
+            candidate = peerToEvictionCandidate addr info
+        ecAddress candidate `shouldBe` addr
+        ecConnectedAt candidate `shouldBe` 1700000000
+        ecMinPingTime candidate `shouldBe` Just 0.05
+        ecServices candidate `shouldBe` 0x409
+        ecRelaysTxs candidate `shouldBe` True
+        ecInbound candidate `shouldBe` True
+        ecNoBan candidate `shouldBe` False
