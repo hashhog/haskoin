@@ -91,6 +91,16 @@ module Haskoin.Network
   , clearExpiredBans
   , loadBanList
   , saveBanList
+    -- * Pre-Handshake Rejection
+  , PreHandshakeResult(..)
+  , checkPreHandshake
+  , shouldRejectConnection
+    -- * Connection Eviction
+  , EvictionCandidate(..)
+  , evictConnection
+  , selectEvictionCandidate
+  , peerToEvictionCandidate
+  , getNetworkGroup
     -- * Re-exports from Network.Socket
   , SockAddr(..)
   ) where
@@ -109,7 +119,10 @@ import Control.DeepSeq (NFData)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
-import Data.Maybe (mapMaybe)
+import Data.Maybe (mapMaybe, listToMaybe)
+import Data.List (sortBy, groupBy, partition)
+import Data.Ord (comparing, Down(..))
+import Data.Function (on)
 import Control.Concurrent (threadDelay)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -1561,3 +1574,265 @@ buildBlockLocator chain =
         | idx < 10  = bh : go rest (idx + 1) 1
         | otherwise = bh : go (drop (gap - 1) rest) (idx + 1) (gap * 2)
   in go reversed (0 :: Int) (1 :: Int)
+
+--------------------------------------------------------------------------------
+-- Pre-Handshake Rejection (Phase 16)
+--------------------------------------------------------------------------------
+
+-- | Result of pre-handshake connection check
+-- Reference: Bitcoin Core net.cpp AcceptConnection
+data PreHandshakeResult
+  = AcceptConnection                    -- ^ Connection can proceed
+  | RejectBanned                        -- ^ Peer IP is banned
+  | RejectDiscouraged                   -- ^ Peer is discouraged and slots are nearly full
+  | RejectMaxConnections                -- ^ Total connection limit reached
+  | RejectMaxInbound                    -- ^ Inbound connection limit reached (no eviction candidate)
+  | AcceptAfterEviction SockAddr        -- ^ Accept after evicting the specified peer
+  deriving (Show, Eq)
+
+-- | Check whether to accept a new inbound connection before handshake
+-- This saves resources by rejecting known-bad connections early
+-- Reference: Bitcoin Core net.cpp CConnman::AcceptConnection
+checkPreHandshake :: PeerManager -> SockAddr -> IO PreHandshakeResult
+checkPreHandshake pm addr = do
+  now <- round <$> getPOSIXTime
+  banned <- readTVarIO (pmBannedAddrs pm)
+  peers <- readTVarIO (pmPeers pm)
+
+  let config = pmConfig pm
+      totalCount = Map.size peers
+
+  -- Count inbound connections
+  inboundCount <- countInboundPeers pm
+
+  -- Check 1: Is the peer banned?
+  case Map.lookup addr banned of
+    Just expiry | expiry > now -> return RejectBanned
+    _ -> do
+      -- Check 2: Is the peer discouraged and slots nearly full?
+      -- Bitcoin Core allows discouraged peers when there's room
+      discouraged <- isDiscouraged pm addr
+      if discouraged && inboundCount + 1 >= pmcMaxInbound config
+        then return RejectDiscouraged
+        else do
+          -- Check 3: Total connection limit
+          if totalCount >= pmcMaxTotal config
+            then return RejectMaxConnections
+            else do
+              -- Check 4: Inbound limit with eviction
+              if inboundCount >= pmcMaxInbound config
+                then do
+                  -- Try to evict an existing connection
+                  candidates <- buildEvictionCandidates pm
+                  case selectEvictionCandidate candidates of
+                    Nothing -> return RejectMaxInbound
+                    Just candidate -> return $ AcceptAfterEviction (ecAddress candidate)
+                else return AcceptConnection
+
+-- | Simple check for whether to reject a connection
+-- Returns True if the connection should be rejected
+shouldRejectConnection :: PeerManager -> SockAddr -> IO Bool
+shouldRejectConnection pm addr = do
+  result <- checkPreHandshake pm addr
+  case result of
+    AcceptConnection       -> return False
+    AcceptAfterEviction _  -> return False
+    _                      -> return True
+
+-- | Count inbound peer connections
+countInboundPeers :: PeerManager -> IO Int
+countInboundPeers pm = do
+  peers <- readTVarIO (pmPeers pm)
+  counts <- forM (Map.elems peers) $ \pc -> do
+    info <- readTVarIO (pcInfo pc)
+    return $ if piInbound info then 1 else 0
+  return $ sum counts
+
+--------------------------------------------------------------------------------
+-- Connection Eviction (Phase 16)
+--------------------------------------------------------------------------------
+
+-- | Eviction candidate with scoring data
+-- Reference: Bitcoin Core node/eviction.h NodeEvictionCandidate
+data EvictionCandidate = EvictionCandidate
+  { ecAddress         :: !SockAddr          -- ^ Peer address (used as ID)
+  , ecConnectedAt     :: !Int64             -- ^ Unix timestamp when connected
+  , ecMinPingTime     :: !(Maybe Double)    -- ^ Minimum observed ping time (seconds)
+  , ecLastBlockTime   :: !Int64             -- ^ Last time peer sent us a novel block
+  , ecLastTxTime      :: !Int64             -- ^ Last time peer sent us a novel transaction
+  , ecServices        :: !Word64            -- ^ Services advertised
+  , ecRelaysTxs       :: !Bool              -- ^ Whether peer relays transactions
+  , ecNetworkGroup    :: !Word32            -- ^ /16 network group for IPv4
+  , ecInbound         :: !Bool              -- ^ Is this an inbound connection?
+  , ecNoBan           :: !Bool              -- ^ Has NoBan permission (never evict)
+  } deriving (Show, Eq)
+
+-- | Convert a PeerInfo to an EvictionCandidate
+peerToEvictionCandidate :: SockAddr -> PeerInfo -> EvictionCandidate
+peerToEvictionCandidate addr info = EvictionCandidate
+  { ecAddress       = addr
+  , ecConnectedAt   = piConnectedAt info
+  , ecMinPingTime   = piPingLatency info
+  , ecLastBlockTime = 0  -- Would need to track this in PeerInfo
+  , ecLastTxTime    = 0  -- Would need to track this in PeerInfo
+  , ecServices      = piServices info
+  , ecRelaysTxs     = piRelay info
+  , ecNetworkGroup  = getNetworkGroup addr
+  , ecInbound       = piInbound info
+  , ecNoBan         = False  -- Would need permission system
+  }
+
+-- | Extract /16 network group from an IP address
+-- For IPv4: use first two octets (e.g., 192.168.x.x -> 192.168)
+-- Reference: Bitcoin Core netaddress.cpp GetGroup
+getNetworkGroup :: SockAddr -> Word32
+getNetworkGroup (SockAddrInet _ hostAddr) =
+  -- hostAddr is in network byte order (big-endian on wire, but stored as host order)
+  -- For /16 grouping, we want the first two bytes
+  let a = fromIntegral hostAddr :: Word32
+      -- First two octets (in host byte order)
+      octet1 = a .&. 0xff
+      octet2 = (a `div` 0x100) .&. 0xff
+  in octet1 * 256 + octet2
+getNetworkGroup (SockAddrInet6 _ _ (h1, h2, _, _) _) =
+  -- For IPv6, use first 32 bits as a simplification
+  fromIntegral $ h1 `div` 0x10000
+getNetworkGroup _ = 0  -- Unix sockets, etc.
+
+-- | Build list of eviction candidates from current peers
+buildEvictionCandidates :: PeerManager -> IO [EvictionCandidate]
+buildEvictionCandidates pm = do
+  peers <- readTVarIO (pmPeers pm)
+  forM (Map.toList peers) $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    return $ peerToEvictionCandidate addr info
+
+-- | Select a peer to evict using Bitcoin Core's eviction algorithm
+-- Returns Nothing if no suitable candidate exists
+-- Reference: Bitcoin Core node/eviction.cpp SelectNodeToEvict
+selectEvictionCandidate :: [EvictionCandidate] -> Maybe EvictionCandidate
+selectEvictionCandidate candidates =
+  let -- Step 1: Filter to only inbound, non-NoBan connections
+      inboundCandidates = filter (\c -> ecInbound c && not (ecNoBan c)) candidates
+
+      -- Step 2: Protect peers by various criteria
+      afterProtection = applyProtections inboundCandidates
+
+  in case afterProtection of
+       [] -> Nothing
+       remaining ->
+         -- Step 3: Evict youngest peer from most-connected network group
+         selectFromNetworkGroup remaining
+
+-- | Apply Bitcoin Core's protection rules to filter eviction candidates
+-- Reference: Bitcoin Core node/eviction.cpp SelectNodeToEvict
+applyProtections :: [EvictionCandidate] -> [EvictionCandidate]
+applyProtections candidates =
+  let -- Protect 4 peers by deterministic network group selection
+      afterNetGroup = protectByNetGroup 4 candidates
+
+      -- Protect 8 peers with lowest ping time
+      afterPing = protectByPingTime 8 afterNetGroup
+
+      -- Protect 4 peers that most recently sent transactions
+      afterTx = protectByLastTxTime 4 afterPing
+
+      -- Protect 4 peers that most recently sent blocks
+      afterBlock = protectByLastBlockTime 4 afterTx
+
+      -- Protect 50% of remaining by connection longevity
+      afterLongevity = protectByLongevity afterBlock
+
+  in afterLongevity
+
+-- | Protect N peers from distinct network groups (deterministic selection)
+protectByNetGroup :: Int -> [EvictionCandidate] -> [EvictionCandidate]
+protectByNetGroup n candidates =
+  let -- Group by network group and take one peer from each of the first N groups
+      grouped = groupBy ((==) `on` ecNetworkGroup) $
+                sortBy (comparing ecNetworkGroup) candidates
+      -- Take one peer from each of first N groups (protect them)
+      protectedGroups = take n grouped
+      protectedAddrs = Set.fromList $ map (ecAddress . head) protectedGroups
+  in filter (\c -> not $ Set.member (ecAddress c) protectedAddrs) candidates
+
+-- | Protect N peers with lowest ping time
+protectByPingTime :: Int -> [EvictionCandidate] -> [EvictionCandidate]
+protectByPingTime n candidates =
+  let -- Sort by ping time (Nothing goes to end, lowest first)
+      sortedByPing = sortBy (comparing ecMinPingTime) candidates
+      -- Protect the N with lowest ping
+      protected = take n sortedByPing
+      protectedAddrs = Set.fromList $ map ecAddress protected
+  in filter (\c -> not $ Set.member (ecAddress c) protectedAddrs) candidates
+
+-- | Protect N peers that most recently sent transactions
+protectByLastTxTime :: Int -> [EvictionCandidate] -> [EvictionCandidate]
+protectByLastTxTime n candidates =
+  let -- Sort by last tx time descending (most recent first)
+      sortedByTx = sortBy (comparing (Down . ecLastTxTime)) candidates
+      -- Protect the N most recent
+      protected = take n sortedByTx
+      protectedAddrs = Set.fromList $ map ecAddress protected
+  in filter (\c -> not $ Set.member (ecAddress c) protectedAddrs) candidates
+
+-- | Protect N peers that most recently sent blocks
+protectByLastBlockTime :: Int -> [EvictionCandidate] -> [EvictionCandidate]
+protectByLastBlockTime n candidates =
+  let -- Sort by last block time descending (most recent first)
+      sortedByBlock = sortBy (comparing (Down . ecLastBlockTime)) candidates
+      -- Protect the N most recent
+      protected = take n sortedByBlock
+      protectedAddrs = Set.fromList $ map ecAddress protected
+  in filter (\c -> not $ Set.member (ecAddress c) protectedAddrs) candidates
+
+-- | Protect 50% of remaining peers by connection longevity
+protectByLongevity :: [EvictionCandidate] -> [EvictionCandidate]
+protectByLongevity candidates =
+  let -- Sort by connection time ascending (oldest first)
+      sortedByAge = sortBy (comparing ecConnectedAt) candidates
+      -- Protect the oldest 50%
+      n = length candidates `div` 2
+      protected = take n sortedByAge
+      protectedAddrs = Set.fromList $ map ecAddress protected
+  in filter (\c -> not $ Set.member (ecAddress c) protectedAddrs) candidates
+
+-- | Select peer to evict from the most-connected network group
+-- Evicts the youngest (most recently connected) peer from that group
+selectFromNetworkGroup :: [EvictionCandidate] -> Maybe EvictionCandidate
+selectFromNetworkGroup [] = Nothing
+selectFromNetworkGroup candidates =
+  let -- Group by network group
+      grouped = groupBy ((==) `on` ecNetworkGroup) $
+                sortBy (comparing ecNetworkGroup) candidates
+      -- Find the group with most connections
+      -- Tie-breaker: prefer group with youngest member
+      largestGroups = sortBy compareGroups grouped
+      compareGroups g1 g2 =
+        case compare (length g2) (length g1) of  -- Descending by size
+          EQ -> compare (youngestInGroup g1) (youngestInGroup g2)  -- Then by youngest
+          other -> other
+      youngestInGroup = maximum . map ecConnectedAt
+  in case largestGroups of
+       [] -> Nothing
+       (group:_) ->
+         -- Evict the youngest peer in the largest group
+         listToMaybe $ sortBy (comparing (Down . ecConnectedAt)) group
+
+-- | Evict a connection from the peer manager if needed
+-- Returns the evicted peer's address if eviction occurred
+evictConnection :: PeerManager -> IO (Maybe SockAddr)
+evictConnection pm = do
+  candidates <- buildEvictionCandidates pm
+  case selectEvictionCandidate candidates of
+    Nothing -> return Nothing
+    Just candidate -> do
+      let addr = ecAddress candidate
+      -- Disconnect the evicted peer
+      peers <- readTVarIO (pmPeers pm)
+      case Map.lookup addr peers of
+        Nothing -> return Nothing
+        Just pc -> do
+          disconnectPeer pc
+          atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+          return (Just addr)
