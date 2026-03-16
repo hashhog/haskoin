@@ -1034,6 +1034,109 @@ main = hspec $ do
           dummyTx = Tx 1 [] [] [] 0
       evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
 
+  describe "isPushOnly and push only scripts" $ do
+    it "returns True for empty script" $ do
+      isPushOnly (Script []) `shouldBe` True
+
+    it "returns True for OP_0" $ do
+      isPushOnly (Script [OP_0]) `shouldBe` True
+
+    it "returns True for push data" $ do
+      isPushOnly (Script [OP_PUSHDATA (BS.pack [0x01, 0x02]) OPCODE]) `shouldBe` True
+
+    it "returns True for OP_1 through OP_16" $ do
+      isPushOnly (Script [OP_1, OP_2, OP_3, OP_4, OP_5, OP_6, OP_7, OP_8]) `shouldBe` True
+      isPushOnly (Script [OP_9, OP_10, OP_11, OP_12, OP_13, OP_14, OP_15, OP_16]) `shouldBe` True
+
+    it "returns True for OP_1NEGATE" $ do
+      isPushOnly (Script [OP_1NEGATE]) `shouldBe` True
+
+    it "returns True for mixed push operations" $ do
+      let script = Script [OP_0, OP_PUSHDATA (BS.pack [0xab]) OPCODE, OP_1, OP_16]
+      isPushOnly script `shouldBe` True
+
+    it "returns False for OP_DUP" $ do
+      isPushOnly (Script [OP_DUP]) `shouldBe` False
+
+    it "returns False for OP_ADD" $ do
+      isPushOnly (Script [OP_ADD]) `shouldBe` False
+
+    it "returns False for OP_CHECKSIG" $ do
+      isPushOnly (Script [OP_CHECKSIG]) `shouldBe` False
+
+    it "returns False for OP_HASH160" $ do
+      isPushOnly (Script [OP_HASH160]) `shouldBe` False
+
+    it "returns False for script with any non-push op" $ do
+      isPushOnly (Script [OP_1, OP_2, OP_DUP, OP_3]) `shouldBe` False
+
+  describe "P2SH push only enforcement" $ do
+    it "accepts push-only P2SH scriptSig" $ do
+      -- Create a simple redeem script: OP_1
+      let redeemScript = encodeScript (Script [OP_1])
+          redeemScriptHash = hash160 redeemScript
+          -- P2SH output: OP_HASH160 <hash> OP_EQUAL
+          scriptPubKey = encodeP2SH redeemScriptHash
+          -- scriptSig: just push the redeem script (push-only)
+          scriptSig = Script [OP_PUSHDATA redeemScript OPCODE]
+          -- Create dummy tx with the scriptSig
+          dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
+          txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
+          tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
+      -- verifyScript expects the raw scriptPubKey bytes
+      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+        Right True -> return ()
+        Right False -> expectationFailure "Expected P2SH verification to succeed"
+        Left err -> expectationFailure $ "P2SH verification failed: " ++ err
+
+    it "rejects P2SH scriptSig containing OP_DUP" $ do
+      -- Create a simple redeem script that just returns true
+      let redeemScript = encodeScript (Script [OP_1])
+          redeemScriptHash = hash160 redeemScript
+          -- P2SH output
+          scriptPubKey = encodeP2SH redeemScriptHash
+          -- scriptSig with non-push opcode: OP_DUP followed by redeem script push
+          -- This should fail because OP_DUP is not a push operation
+          scriptSigOps = [OP_DUP, OP_PUSHDATA redeemScript OPCODE]
+          scriptSig = Script scriptSigOps
+          dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
+          txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
+          tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
+      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+        Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
+        Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
+        Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
+
+    it "rejects P2SH scriptSig containing OP_ADD" $ do
+      let redeemScript = encodeScript (Script [OP_1])
+          redeemScriptHash = hash160 redeemScript
+          scriptPubKey = encodeP2SH redeemScriptHash
+          -- scriptSig with OP_ADD (not a push operation)
+          scriptSigOps = [OP_1, OP_1, OP_ADD, OP_PUSHDATA redeemScript OPCODE]
+          scriptSig = Script scriptSigOps
+          dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
+          txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
+          tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
+      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+        Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
+        Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
+        Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
+
+    it "rejects P2SH scriptSig containing OP_CHECKSIG" $ do
+      let redeemScript = encodeScript (Script [OP_1])
+          redeemScriptHash = hash160 redeemScript
+          scriptPubKey = encodeP2SH redeemScriptHash
+          -- scriptSig with OP_CHECKSIG (not a push operation)
+          scriptSigOps = [OP_CHECKSIG, OP_PUSHDATA redeemScript OPCODE]
+          scriptSig = Script scriptSigOps
+          dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
+          txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
+          tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
+      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+        Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
+        Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
+        Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
+
   -- Consensus module tests
   describe "Consensus constants" $ do
     it "maxMoney is 21 million BTC in satoshis" $ do
@@ -3110,7 +3213,7 @@ main = hspec $ do
           coinbase = Tx 1 [] [TxOut 5000000000 ""] [[]] 0
           block = Block header [coinbase]
           utxoMap = Map.empty
-          flags = ConsensusFlags False False False False False False
+          flags = ConsensusFlags False False False False False False False
       verifyBlockScriptsParallel block utxoMap flags `shouldBe` Right ()
 
     it "parallelMap preserves order" $ do
@@ -3128,3 +3231,349 @@ main = hspec $ do
       blockCache `shouldBe` 512 * 1024 * 1024   -- 512 MB
       bloomBits `shouldBe` 10
       compression `shouldBe` True
+
+  -- BIP-141 WITNESS_PUBKEYTYPE tests
+  describe "witness pubkeytype" $ do
+    describe "isCompressedPubKey" $ do
+      it "accepts compressed pubkey with 0x02 prefix" $ do
+        let pk = BS.cons 0x02 (BS.replicate 32 0xab)
+        isCompressedPubKey pk `shouldBe` True
+
+      it "accepts compressed pubkey with 0x03 prefix" $ do
+        let pk = BS.cons 0x03 (BS.replicate 32 0xcd)
+        isCompressedPubKey pk `shouldBe` True
+
+      it "rejects uncompressed pubkey (0x04 prefix, 65 bytes)" $ do
+        let pk = BS.cons 0x04 (BS.replicate 64 0xef)
+        isCompressedPubKey pk `shouldBe` False
+
+      it "rejects pubkey with invalid prefix (0x05)" $ do
+        let pk = BS.cons 0x05 (BS.replicate 32 0x00)
+        isCompressedPubKey pk `shouldBe` False
+
+      it "rejects pubkey with wrong length (32 bytes)" $ do
+        let pk = BS.cons 0x02 (BS.replicate 31 0x00)
+        isCompressedPubKey pk `shouldBe` False
+
+      it "rejects pubkey with wrong length (34 bytes)" $ do
+        let pk = BS.cons 0x02 (BS.replicate 33 0x00)
+        isCompressedPubKey pk `shouldBe` False
+
+      it "rejects empty pubkey" $ do
+        isCompressedPubKey BS.empty `shouldBe` False
+
+    describe "witness v0 P2WPKH pubkey type enforcement" $ do
+      it "rejects uncompressed pubkey in P2WPKH with WITNESS_PUBKEYTYPE flag" $ do
+        -- Create a transaction with witness spending P2WPKH
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xaa))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Uncompressed pubkey (65 bytes, 0x04 prefix)
+            uncompressedPubkey = BS.cons 0x04 (BS.replicate 64 0xab)
+            -- Compute hash160 of the uncompressed pubkey for scriptPubKey
+            Hash160 pkHash = hash160 uncompressedPubkey
+            -- Dummy signature
+            dummySig = BS.pack [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01]
+            -- Witness: [signature, uncompressed_pubkey]
+            witness = [dummySig, uncompressedPubkey]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            -- P2WPKH scriptPubKey: OP_0 <20-byte-hash>
+            scriptPubKey = encodeScript $ encodeP2WPKH (Hash160 pkHash)
+            -- Flags with WITNESS_PUBKEYTYPE enabled
+            flags = flagSet [VerifyWitnessPubkeyType]
+        case verifySegWitScriptWithFlags flags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "not compressed" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected pubkey type error, got: " ++ err
+          Right _ -> expectationFailure "Should reject uncompressed pubkey in witness v0"
+
+      it "accepts compressed pubkey in P2WPKH with WITNESS_PUBKEYTYPE flag" $ do
+        -- Create a transaction with witness spending P2WPKH
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xbb))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Compressed pubkey (33 bytes, 0x02 prefix)
+            compressedPubkey = BS.cons 0x02 (BS.replicate 32 0xcd)
+            -- Compute hash160 of the compressed pubkey for scriptPubKey
+            Hash160 pkHash = hash160 compressedPubkey
+            -- Dummy signature
+            dummySig = BS.pack [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01]
+            -- Witness: [signature, compressed_pubkey]
+            witness = [dummySig, compressedPubkey]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            -- P2WPKH scriptPubKey: OP_0 <20-byte-hash>
+            scriptPubKey = encodeScript $ encodeP2WPKH (Hash160 pkHash)
+            -- Flags with WITNESS_PUBKEYTYPE enabled
+            flags = flagSet [VerifyWitnessPubkeyType]
+        -- Should NOT error on pubkey type (may fail on sig verification, but not pubkey type)
+        case verifySegWitScriptWithFlags flags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "not compressed" `T.isInfixOf` T.pack err ->
+            expectationFailure "Compressed pubkey should not fail WITNESS_PUBKEYTYPE check"
+          _ -> return ()  -- Either success or other error (sig verification) is OK
+
+      it "allows uncompressed pubkey in P2WPKH without WITNESS_PUBKEYTYPE flag" $ do
+        -- Create a transaction with witness spending P2WPKH
+        let prevTxid = TxId (Hash256 (BS.replicate 32 0xcc))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Uncompressed pubkey (65 bytes, 0x04 prefix)
+            uncompressedPubkey = BS.cons 0x04 (BS.replicate 64 0xdd)
+            -- Compute hash160 of the uncompressed pubkey for scriptPubKey
+            Hash160 pkHash = hash160 uncompressedPubkey
+            -- Dummy signature
+            dummySig = BS.pack [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01]
+            -- Witness: [signature, uncompressed_pubkey]
+            witness = [dummySig, uncompressedPubkey]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            -- P2WPKH scriptPubKey: OP_0 <20-byte-hash>
+            scriptPubKey = encodeScript $ encodeP2WPKH (Hash160 pkHash)
+            -- Empty flags (no WITNESS_PUBKEYTYPE)
+            flags = emptyFlags
+        -- Should NOT fail on pubkey type error (may fail on sig verification)
+        case verifySegWitScriptWithFlags flags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "not compressed" `T.isInfixOf` T.pack err ->
+            expectationFailure "Without WITNESS_PUBKEYTYPE flag, uncompressed should be allowed"
+          _ -> return ()  -- Either success or other error is OK
+
+  -- Witness cleanstack enforcement tests
+  -- Per BIP-141 and Bitcoin Core, witness scripts must leave exactly one item on the stack.
+  -- This is NOT gated by SCRIPT_VERIFY_CLEANSTACK - it's always enforced for witness programs.
+  describe "witness cleanstack enforcement" $ do
+    describe "P2WSH cleanstack" $ do
+      it "rejects P2WSH script that leaves extra items on stack" $ do
+        -- Create a witness script that leaves extra items: OP_1 OP_DUP
+        -- This will leave [1, 1] on the stack (two items), violating cleanstack
+        let witnessScript = encodeScriptOps [OP_1, OP_DUP]  -- Pushes 1, duplicates -> [1, 1]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xdd))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: [witnessScript] - empty initial stack, script does the work
+            witness = [witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            -- P2WSH scriptPubKey: OP_0 <32-byte-hash>
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
+          Right _ -> expectationFailure "Should reject script that leaves extra items on stack"
+
+      it "rejects P2WSH script that leaves empty stack" $ do
+        -- Create a witness script that leaves empty stack: OP_1 OP_DROP
+        let witnessScript = encodeScriptOps [OP_1, OP_DROP]  -- Pushes 1, drops it -> []
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xee))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            witness = [witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
+          Right _ -> expectationFailure "Should reject script that leaves empty stack"
+
+      it "accepts P2WSH script that leaves exactly one true item" $ do
+        -- Create a witness script that leaves exactly [1]: OP_1
+        let witnessScript = encodeScriptOps [OP_1]  -- Pushes 1 -> [1] (single true item)
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xff))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            witness = [witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "exactly one item" `T.isInfixOf` T.pack err ->
+            expectationFailure "Script with single true item should pass cleanstack check"
+          Left err -> return ()  -- Other errors (like sig verification) are expected
+          Right True -> return ()
+          Right False -> expectationFailure "Expected True result"
+
+      it "rejects P2WSH script that leaves single false item" $ do
+        -- Create a witness script that leaves exactly [0]: OP_0
+        let witnessScript = encodeScriptOps [OP_0]  -- Pushes 0 -> [0] (single false item)
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xab))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            witness = [witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "evaluated to false" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected eval false error, got: " ++ err
+          Right _ -> expectationFailure "Should reject script that leaves false on stack"
+
+    describe "witness eval edge cases" $ do
+      it "three items on stack fails cleanstack" $ do
+        -- Script that leaves 3 items: OP_1 OP_2 OP_3
+        let witnessScript = encodeScriptOps [OP_1, OP_2, OP_3]  -- [1, 2, 3]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xbc))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            witness = [witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
+          Right _ -> expectationFailure "Should reject script that leaves 3 items on stack"
+
+      it "cleanstack is enforced regardless of flags" $ do
+        -- Even with no flags set, witness cleanstack is always enforced
+        let witnessScript = encodeScriptOps [OP_1, OP_1]  -- [1, 1] - two items
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xcd))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            witness = [witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            -- Explicitly use empty flags to show this isn't flag-gated
+            flags = emptyFlags
+        case verifySegWitScriptWithFlags flags tx 0 (encodeScript scriptPubKey) 100000 of
+          Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
+          Right _ -> expectationFailure "Cleanstack should be enforced even with no flags"
+
+  -- MINIMALIF tests - BIP-143 related rule for witness scripts
+  -- The argument to OP_IF/OP_NOTIF must be exactly empty (false) or [0x01] (true)
+  describe "minimalif enforcement" $ do
+    describe "op_if with minimalif flag" $ do
+      it "accepts empty (false) argument in OP_IF" $ do
+        -- Script: <input> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+        -- Empty input should take the ELSE branch (false), leaving OP_0 on stack
+        -- But we need the final result to be true, so adjust:
+        -- Script: <input> OP_IF OP_0 OP_ELSE OP_1 OP_ENDIF
+        let witnessScript = encodeScriptOps [OP_IF, OP_0, OP_ELSE, OP_1, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xde))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: empty input (false), then the script
+            witness = [BS.empty, witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Right True -> return ()
+          Right False -> expectationFailure "Script should succeed (empty is valid false)"
+          Left err -> expectationFailure $ "Unexpected error: " ++ err
+
+      it "accepts 0x01 (true) argument in OP_IF" $ do
+        -- Script: <input> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+        -- [0x01] input should take the IF branch (true), leaving OP_1 on stack
+        let witnessScript = encodeScriptOps [OP_IF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xdf))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: 0x01 (true), then the script
+            witness = [BS.singleton 0x01, witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Right True -> return ()
+          Right False -> expectationFailure "Script should succeed (0x01 is valid true)"
+          Left err -> expectationFailure $ "Unexpected error: " ++ err
+
+      it "rejects 0x02 argument in OP_IF (MINIMALIF violation)" $ do
+        -- Script: <input> OP_IF OP_1 OP_ELSE OP_0 OP_ENDIF
+        -- [0x02] is a truthy value but NOT minimal - should fail
+        let witnessScript = encodeScriptOps [OP_IF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xe0))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: 0x02 (truthy but not minimal), then the script
+            witness = [BS.singleton 0x02, witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
+          Right _ -> expectationFailure "Should reject 0x02 as OP_IF argument"
+
+      it "rejects 0x00 argument in OP_IF (MINIMALIF violation)" $ do
+        -- [0x00] is falsy but NOT minimal (empty is the minimal false)
+        let witnessScript = encodeScriptOps [OP_IF, OP_0, OP_ELSE, OP_1, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xe1))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: 0x00 (falsy but not minimal), then the script
+            witness = [BS.singleton 0x00, witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
+          Right _ -> expectationFailure "Should reject 0x00 as OP_IF argument"
+
+      it "rejects multi-byte argument in OP_IF (MINIMALIF violation)" $ do
+        -- Multi-byte values like [0x01, 0x00] are truthy but not minimal
+        let witnessScript = encodeScriptOps [OP_IF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xe2))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: [0x01, 0x00] (truthy but not minimal), then the script
+            witness = [BS.pack [0x01, 0x00], witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
+          Right _ -> expectationFailure "Should reject multi-byte OP_IF argument"
+
+    describe "op_notif with minimalif" $ do
+      it "accepts empty (false) argument in OP_NOTIF" $ do
+        -- OP_NOTIF with empty input: takes the IF branch (opposite of IF)
+        let witnessScript = encodeScriptOps [OP_NOTIF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xe3))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            -- Witness: empty (false), so NOTIF takes the IF branch -> OP_1
+            witness = [BS.empty, witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Right True -> return ()
+          Right False -> expectationFailure "Script should succeed"
+          Left err -> expectationFailure $ "Unexpected error: " ++ err
+
+      it "rejects 0x02 argument in OP_NOTIF (MINIMALIF violation)" $ do
+        -- OP_NOTIF with 0x02: should fail MINIMALIF
+        let witnessScript = encodeScriptOps [OP_NOTIF, OP_0, OP_ELSE, OP_1, OP_ENDIF]
+            scriptHash = sha256 witnessScript
+            prevTxid = TxId (Hash256 (BS.replicate 32 0xe4))
+            txIn = TxIn (OutPoint prevTxid 0) "" 0xfffffffe
+            txOut = TxOut 99000 ""
+            witness = [BS.singleton 0x02, witnessScript]
+            tx = Tx 2 [txIn] [txOut] [witness] 0
+            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+          Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
+          Right _ -> expectationFailure "Should reject 0x02 as OP_NOTIF argument"
+
+    describe "minimalif in legacy scripts" $ do
+      it "allows non-minimal OP_IF argument without witness flag" $ do
+        -- In legacy (non-witness) scripts, MINIMALIF is NOT enforced by default
+        let scriptSig = Script [OP_PUSHDATA (BS.singleton 0x02) OPCODE]
+            scriptPubKey = Script [OP_IF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+            dummyTx = Tx 1 [] [] [] 0
+        -- 0x02 is truthy, should take IF branch -> OP_1 -> True
+        evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
+
+      it "rejects non-minimal OP_IF argument with MinimalIf flag" $ do
+        -- When VerifyMinimalIf flag is set, even legacy scripts reject non-minimal
+        let scriptSig = Script [OP_PUSHDATA (BS.singleton 0x02) OPCODE]
+            scriptPubKey = Script [OP_IF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
+            dummyTx = Tx 1 [] [] [] 0
+            flags = flagSet [VerifyMinimalIf]
+        case evalScriptWithFlags flags dummyTx 0 0 scriptSig scriptPubKey of
+          Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
+          Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
+          Right _ -> expectationFailure "Should reject with MinimalIf flag"
