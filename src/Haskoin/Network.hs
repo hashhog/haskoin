@@ -81,6 +81,16 @@ module Haskoin.Network
   , addBanScore
   , handleAddrMessage
   , buildBlockLocator
+    -- * Misbehavior Scoring
+  , MisbehaviorReason(..)
+  , misbehaviorScore
+  , misbehaving
+  , isDiscouraged
+  , isBanned
+  , getBanList
+  , clearExpiredBans
+  , loadBanList
+  , saveBanList
     -- * Re-exports from Network.Socket
   , SockAddr(..)
   ) where
@@ -88,6 +98,7 @@ module Haskoin.Network
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as C8
+import qualified Data.ByteString.Lazy as LBS
 import Data.Serialize
 import Data.Word
 import Data.Int (Int32, Int64)
@@ -100,6 +111,11 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe)
 import Control.Concurrent (threadDelay)
+import Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Aeson as Aeson
+import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
+import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
 
 import Network.Socket (Socket, SockAddr(..), AddrInfo(..), getAddrInfo,
                        socket, connect, close, defaultHints, addrFamily,
@@ -132,6 +148,60 @@ minProtocolVersion = 70015
 -- | User agent string identifying this client
 userAgent :: ByteString
 userAgent = "/Haskoin:0.1.0/"
+
+--------------------------------------------------------------------------------
+-- Misbehavior Scoring (matches Bitcoin Core net_processing.cpp)
+--------------------------------------------------------------------------------
+
+-- | Reasons for peer misbehavior, with associated ban scores
+-- Scores match Bitcoin Core severity levels from net_processing.cpp
+data MisbehaviorReason
+  = InvalidBlockHeader              -- ^ Invalid proof of work or malformed header (100 - immediate ban)
+  | InvalidBlock                    -- ^ Block fails consensus validation (100 - immediate ban)
+  | InvalidTransaction              -- ^ Transaction fails validation (10)
+  | MalformedMessage                -- ^ Cannot parse message payload (10)
+  | WrongNetworkMagic               -- ^ Network magic bytes mismatch (100 - immediate ban)
+  | UnsolicitedMessage              -- ^ Received unrequested data (1)
+  | TooManyAddrMessages             -- ^ Excessive addr message spam (20)
+  | TooLargeInvMessage              -- ^ Inv message exceeds MAX_INV_SZ (20)
+  | TooLargeAddrMessage             -- ^ Addr message exceeds limit (20)
+  | TooLargeHeadersMessage          -- ^ Headers message exceeds 2000 (20)
+  | InvalidCompactBlock             -- ^ Compact block reconstruction failed (100)
+  | NonContinuousHeaders            -- ^ Headers not connected to each other (100)
+  | ChecksumMismatch                -- ^ Message checksum verification failed (10)
+  | PayloadTooLarge                 -- ^ Payload exceeds size limit (10)
+  | DuplicateVersion                -- ^ Sent version after handshake (1)
+  | ProtocolViolation Text          -- ^ Generic protocol violation with description (10)
+  deriving (Show, Eq)
+
+-- | Get the ban score for a misbehavior reason
+-- Returns the number of points to add to the peer's misbehavior score
+-- When score reaches 100, the peer is banned
+misbehaviorScore :: MisbehaviorReason -> Int
+misbehaviorScore InvalidBlockHeader       = 100  -- Immediate ban
+misbehaviorScore InvalidBlock             = 100  -- Immediate ban
+misbehaviorScore InvalidTransaction       = 10
+misbehaviorScore MalformedMessage         = 10
+misbehaviorScore WrongNetworkMagic        = 100  -- Immediate ban
+misbehaviorScore UnsolicitedMessage       = 1
+misbehaviorScore TooManyAddrMessages      = 20
+misbehaviorScore TooLargeInvMessage       = 20
+misbehaviorScore TooLargeAddrMessage      = 20
+misbehaviorScore TooLargeHeadersMessage   = 20
+misbehaviorScore InvalidCompactBlock      = 100  -- Immediate ban
+misbehaviorScore NonContinuousHeaders     = 100  -- Immediate ban
+misbehaviorScore ChecksumMismatch         = 10
+misbehaviorScore PayloadTooLarge          = 10
+misbehaviorScore DuplicateVersion         = 1
+misbehaviorScore (ProtocolViolation _)    = 10
+
+-- | Default ban threshold (matches Bitcoin Core)
+defaultBanThreshold :: Int
+defaultBanThreshold = 100
+
+-- | Default ban duration in seconds (24 hours, matches Bitcoin Core)
+defaultBanDuration :: Int64
+defaultBanDuration = 86400
 
 --------------------------------------------------------------------------------
 -- Service Flags
@@ -1184,41 +1254,45 @@ peerManagerLoop pm = forever $ do
   threadDelay (10 * 1000000)  -- 10 seconds
 
 -- | Try to connect to a peer address
+-- Checks if address is banned before attempting connection
 tryConnect :: PeerManager -> SockAddr -> IO ()
 tryConnect pm addr = do
-  let net = pmNetwork pm
-      config = PeerConfig
-        { pcfgNetwork     = net
-        , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
-        , pcfgBestHeight  = 0
-        , pcfgUserAgent   = userAgent
-        , pcfgRelay       = True
-        , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
-        , pcfgQueueSize   = 100
-        }
-      -- Extract host and port from SockAddr
-      (host, port) = sockAddrToHostPort addr (netDefaultPort net)
+  -- Check if address is discouraged/banned before connecting
+  discouraged <- isDiscouraged pm addr
+  unless discouraged $ do
+    let net = pmNetwork pm
+        config = PeerConfig
+          { pcfgNetwork     = net
+          , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
+          , pcfgBestHeight  = 0
+          , pcfgUserAgent   = userAgent
+          , pcfgRelay       = True
+          , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
+          , pcfgQueueSize   = 100
+          }
+        -- Extract host and port from SockAddr
+        (host, port) = sockAddrToHostPort addr (netDefaultPort net)
 
-  result <- connectPeer config host port
-  case result of
-    Left _ -> return ()
-    Right pc -> do
-      hsResult <- performHandshake config pc
-      case hsResult of
-        Left _ -> disconnectPeer pc
-        Right ver -> do
-          -- Verify peer supports required services
-          unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+    result <- connectPeer config host port
+    case result of
+      Left _ -> return ()
+      Right pc -> do
+        hsResult <- performHandshake config pc
+        case hsResult of
+          Left _ -> disconnectPeer pc
+          Right ver -> do
+            -- Verify peer supports required services
+            unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
 
-          -- Add to peer map
-          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+            -- Add to peer map
+            atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
 
-          -- Start peer threads with message handler
-          pc' <- startPeerThreads pc (pmMessageHandler pm addr)
-          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+            -- Start peer threads with message handler
+            pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+            atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
 
-          -- Request addresses from peer
-          sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+            -- Request addresses from peer
+            sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
 
 -- | Convert SockAddr to host string and port
 sockAddrToHostPort :: SockAddr -> Int -> (String, Int)
@@ -1282,6 +1356,166 @@ addBanScore pm addr score _reason = do
     Nothing -> return ()
     Just pc -> atomically $ modifyTVar' (pcInfo pc) $ \i ->
       i { piBanScore = piBanScore i + score }
+
+--------------------------------------------------------------------------------
+-- Misbehavior Scoring API
+--------------------------------------------------------------------------------
+
+-- | Record misbehavior for a peer (STM version for atomic operations)
+-- Increments the peer's ban score based on the misbehavior reason.
+-- When score reaches threshold (default 100), peer is marked for banning.
+-- Returns the new total score and whether the peer should be banned.
+misbehaving :: PeerManager -> SockAddr -> MisbehaviorReason -> IO (Int, Bool)
+misbehaving pm addr reason = do
+  let score = misbehaviorScore reason
+      threshold = pmcBanThreshold (pmConfig pm)
+
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return (0, False)
+    Just pc -> do
+      (newScore, shouldBan) <- atomically $ do
+        info <- readTVar (pcInfo pc)
+        let oldScore = piBanScore info
+            newScore = oldScore + score
+            shouldBan = newScore >= threshold
+        -- Update the ban score
+        modifyTVar' (pcInfo pc) $ \i ->
+          i { piBanScore = newScore
+            , piState = if shouldBan then PeerBanned else piState i
+            }
+        return (newScore, shouldBan)
+
+      -- If threshold reached, add to ban list
+      when shouldBan $ do
+        banPeer pm addr
+        -- Disconnect the peer
+        disconnectPeer pc
+        atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
+      return (newScore, shouldBan)
+
+-- | Check if an address is currently discouraged/banned
+-- Used before accepting new connections
+isDiscouraged :: PeerManager -> SockAddr -> IO Bool
+isDiscouraged pm addr = do
+  now <- round <$> getPOSIXTime
+  banned <- readTVarIO (pmBannedAddrs pm)
+  case Map.lookup addr banned of
+    Nothing -> return False
+    Just expiry -> return (now < expiry)
+
+-- | Check if an address is banned (alias for isDiscouraged)
+isBanned :: PeerManager -> SockAddr -> IO Bool
+isBanned = isDiscouraged
+
+-- | Get the current ban list with expiry times
+getBanList :: PeerManager -> IO (Map SockAddr Int64)
+getBanList pm = readTVarIO (pmBannedAddrs pm)
+
+-- | Remove expired bans from the ban list
+clearExpiredBans :: PeerManager -> IO Int
+clearExpiredBans pm = do
+  now <- round <$> getPOSIXTime
+  atomically $ do
+    banned <- readTVar (pmBannedAddrs pm)
+    let (expired, active) = Map.partition (<= now) banned
+    writeTVar (pmBannedAddrs pm) active
+    return (Map.size expired)
+
+--------------------------------------------------------------------------------
+-- Ban List Persistence
+--------------------------------------------------------------------------------
+
+-- | JSON representation of a ban entry for persistence
+data BanEntry = BanEntry
+  { beAddress :: !String  -- ^ IP address as string
+  , bePort    :: !Int     -- ^ Port number
+  , beExpiry  :: !Int64   -- ^ Unix timestamp when ban expires
+  } deriving (Show, Eq)
+
+instance ToJSON BanEntry where
+  toJSON be = Aeson.object
+    [ "address" .= beAddress be
+    , "port"    .= bePort be
+    , "expiry"  .= beExpiry be
+    ]
+
+instance FromJSON BanEntry where
+  parseJSON = Aeson.withObject "BanEntry" $ \o -> BanEntry
+    <$> o .: "address"
+    <*> o .: "port"
+    <*> o .: "expiry"
+
+-- | Convert SockAddr to BanEntry
+sockAddrToBanEntry :: SockAddr -> Int64 -> Maybe BanEntry
+sockAddrToBanEntry addr expiry = case addr of
+  SockAddrInet port hostAddr ->
+    let a = fromIntegral hostAddr :: Word32
+        b1 = a .&. 0xff
+        b2 = (a `div` 0x100) .&. 0xff
+        b3 = (a `div` 0x10000) .&. 0xff
+        b4 = (a `div` 0x1000000) .&. 0xff
+        addrStr = show b1 ++ "." ++ show b2 ++ "." ++ show b3 ++ "." ++ show b4
+    in Just $ BanEntry addrStr (fromIntegral port) expiry
+  _ -> Nothing  -- IPv6 not supported for persistence yet
+
+-- | Convert BanEntry back to SockAddr
+banEntryToSockAddr :: BanEntry -> Maybe SockAddr
+banEntryToSockAddr be =
+  case parseIPv4 (beAddress be) of
+    Just hostAddr -> Just $ SockAddrInet (fromIntegral $ bePort be) hostAddr
+    Nothing -> Nothing
+  where
+    parseIPv4 :: String -> Maybe Word32
+    parseIPv4 s = case map read' (splitOn '.' s) of
+      [b1, b2, b3, b4] | all validByte [b1, b2, b3, b4] ->
+        Just $ fromIntegral b1 + fromIntegral b2 * 0x100
+             + fromIntegral b3 * 0x10000 + fromIntegral b4 * 0x1000000
+      _ -> Nothing
+
+    read' :: String -> Int
+    read' str = case reads str of
+      [(n, "")] -> n
+      _ -> -1
+
+    validByte :: Int -> Bool
+    validByte n = n >= 0 && n <= 255
+
+    splitOn :: Char -> String -> [String]
+    splitOn _ [] = [""]
+    splitOn c (x:xs)
+      | c == x    = "" : splitOn c xs
+      | otherwise = let (h:t) = splitOn c xs in (x:h) : t
+
+-- | Save the ban list to a JSON file
+saveBanList :: PeerManager -> FilePath -> IO ()
+saveBanList pm path = do
+  banned <- readTVarIO (pmBannedAddrs pm)
+  let entries = mapMaybe (uncurry sockAddrToBanEntry) (Map.toList banned)
+  withFile path WriteMode $ \h ->
+    hPutStr h (C8.unpack $ LBS.toStrict $ Aeson.encode entries)
+
+-- | Load the ban list from a JSON file
+loadBanList :: PeerManager -> FilePath -> IO (Either String Int)
+loadBanList pm path = do
+  result <- try @IOException $ withFile path ReadMode hGetContents'
+  case result of
+    Left _ -> return $ Left "Could not read ban list file"
+    Right contents ->
+      case Aeson.decodeStrict (C8.pack contents) of
+        Nothing -> return $ Left "Invalid JSON in ban list"
+        Just (entries :: [BanEntry]) -> do
+          now <- round <$> getPOSIXTime
+          let validEntries = filter (\e -> beExpiry e > now) entries
+              banMap = Map.fromList $ mapMaybe toBanPair validEntries
+          atomically $ modifyTVar' (pmBannedAddrs pm) (Map.union banMap)
+          return $ Right (Map.size banMap)
+  where
+    toBanPair :: BanEntry -> Maybe (SockAddr, Int64)
+    toBanPair be = do
+      addr <- banEntryToSockAddr be
+      return (addr, beExpiry be)
 
 --------------------------------------------------------------------------------
 -- Addr Message Handling
