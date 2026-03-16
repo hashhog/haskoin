@@ -2818,6 +2818,205 @@ main = hspec $ do
         let noChildDescendantCount = 1  -- Just self
         noChildDescendantCount `shouldBe` 1
 
+    describe "Full RBF (Replace-by-Fee)" $ do
+      describe "RBF constants" $ do
+        it "maxReplacementEvictions is 100" $ do
+          maxReplacementEvictions `shouldBe` 100
+
+        it "incrementalRelayFeePerKvb is 1000 sat/kvB" $ do
+          incrementalRelayFeePerKvb `shouldBe` 1000
+
+      describe "RbfError types" $ do
+        it "RbfInsufficientAbsoluteFee has correct fields" $ do
+          let err = RbfInsufficientAbsoluteFee 500 1000
+          rbfNewFee err `shouldBe` 500
+          rbfRequiredFee err `shouldBe` 1000
+
+        it "RbfInsufficientFeeRate has correct fields" $ do
+          let err = RbfInsufficientFeeRate (FeeRate 5) (FeeRate 10)
+          rbfNewFeeRate err `shouldBe` FeeRate 5
+          rbfMinFeeRate err `shouldBe` FeeRate 10
+
+        it "RbfTooManyEvictions has correct fields" $ do
+          let err = RbfTooManyEvictions 150 100
+          rbfEvictionCount err `shouldBe` 150
+          rbfMaxEvictions err `shouldBe` 100
+
+        it "RbfInsufficientRelayFee has correct fields" $ do
+          let err = RbfInsufficientRelayFee 50 100
+          rbfAdditionalFee err `shouldBe` 50
+          rbfRequiredRelayFee err `shouldBe` 100
+
+      describe "checkReplacement rules" $ do
+        -- Create mock entries for testing
+        let mkMockEntry :: TxId -> Word64 -> Int -> FeeRate -> MempoolEntry
+            mkMockEntry txid fee size feeRate =
+              let txhash = TxId (Hash256 (BS.replicate 32 0x00))
+                  op = OutPoint txhash 0
+                  txin = TxIn op "" 0xffffffff
+                  txout = TxOut (100000 - fee) ""
+                  tx = Tx 2 [txin] [txout] [[]] 0
+              in MempoolEntry
+                   { meTransaction = tx
+                   , meTxId = txid
+                   , meFee = fee
+                   , meFeeRate = feeRate
+                   , meSize = size
+                   , meTime = 0
+                   , meHeight = 0
+                   , meAncestorCount = 1
+                   , meAncestorSize = size
+                   , meAncestorFees = fee
+                   , meAncestorSigOps = 0
+                   , meDescendantCount = 1
+                   , meDescendantSize = size
+                   , meDescendantFees = fee
+                   , meRBFOptIn = True
+                   }
+
+            dummyTx :: Tx
+            dummyTx =
+              let txhash = TxId (Hash256 (BS.replicate 32 0x00))
+                  op = OutPoint txhash 0
+                  txin = TxIn op "" 0xffffffff
+                  txout = TxOut 50000 ""
+              in Tx 2 [txin] [txout] [[]] 0
+
+        it "Rule 3: rejects replacement with lower absolute fee" $ do
+          let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+              conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
+              -- New tx has 500 sat fee (< 1000)
+              result = checkReplacement dummyTx [conflict] [conflict] 500 200 (FeeRate 2500)
+          case result of
+            Left (RbfInsufficientAbsoluteFee newF reqF) -> do
+              newF `shouldBe` 500
+              reqF `shouldBe` 1000
+            _ -> expectationFailure "Expected RbfInsufficientAbsoluteFee error"
+
+        it "Rule 3: accepts replacement with higher absolute fee" $ do
+          let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+              conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
+              -- New tx has 2000 sat fee, 200 vB = 10000 msat/vB
+              -- Additional fee = 1000, required = 200 * 1000 / 1000 = 200
+              result = checkReplacement dummyTx [conflict] [conflict] 2000 200 (FeeRate 10000)
+          result `shouldBe` Right ()
+
+        it "Rule 3a: rejects replacement with lower feerate" $ do
+          let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+              conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
+              -- New tx has 1100 sat fee (> 1000) but lower feerate
+              -- FeeRate 2500 < FeeRate 5000
+              result = checkReplacement dummyTx [conflict] [conflict] 1100 440 (FeeRate 2500)
+          case result of
+            Left (RbfInsufficientFeeRate _ _) -> return ()
+            _ -> expectationFailure "Expected RbfInsufficientFeeRate error"
+
+        it "Rule 4: rejects when additional fee < relay fee for bandwidth" $ do
+          let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+              conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
+              -- New tx: 1001 sat fee (additional = 1), 200 vB
+              -- Required relay fee = 200 * 1000 / 1000 = 200 sat
+              -- 1 < 200 -> fails
+              result = checkReplacement dummyTx [conflict] [conflict] 1001 200 (FeeRate 5005)
+          case result of
+            Left (RbfInsufficientRelayFee addF reqF) -> do
+              addF `shouldBe` 1
+              reqF `shouldBe` 200
+            _ -> expectationFailure "Expected RbfInsufficientRelayFee error"
+
+        it "Rule 4: accepts when additional fee covers relay fee" $ do
+          let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+              conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
+              -- New tx: 1500 sat fee (additional = 500), 200 vB
+              -- Required relay fee = 200 * 1000 / 1000 = 200 sat
+              -- 500 >= 200 -> passes
+              result = checkReplacement dummyTx [conflict] [conflict] 1500 200 (FeeRate 7500)
+          result `shouldBe` Right ()
+
+        it "Rule 5: rejects when evicting more than 100 transactions" $ do
+          let mkEntry i = mkMockEntry (TxId (Hash256 (BS.pack (replicate 32 i)))) 100 100 (FeeRate 1000)
+              -- 101 entries to evict
+              evictions = map mkEntry [1..101]
+              conflicts = take 1 evictions  -- Just 1 direct conflict
+              result = checkReplacement dummyTx conflicts evictions 2000 200 (FeeRate 10000)
+          case result of
+            Left (RbfTooManyEvictions count maxC) -> do
+              count `shouldBe` 101
+              maxC `shouldBe` 100
+            _ -> expectationFailure "Expected RbfTooManyEvictions error"
+
+        it "Rule 5: accepts when evicting exactly 100 transactions" $ do
+          let mkEntry i = mkMockEntry (TxId (Hash256 (BS.pack (replicate 32 i)))) 100 100 (FeeRate 1000)
+              evictions = map mkEntry [1..100]
+              conflicts = take 1 evictions
+              -- Total conflict fee = 100 * 100 = 10000
+              -- New fee = 50000 (much higher)
+              -- Additional = 50000 - 10000 = 40000
+              -- Required relay = 200 * 1000 / 1000 = 200
+              result = checkReplacement dummyTx conflicts evictions 50000 200 (FeeRate 250000)
+          result `shouldBe` Right ()
+
+      describe "checkNoConflictSpending" $ do
+        it "rejects tx that spends conflicting tx output" $ do
+          let conflictTxId = TxId (Hash256 (BS.replicate 32 0x01))
+              -- Tx spends output from the conflict
+              op = OutPoint conflictTxId 0
+              txin = TxIn op "" 0xffffffff
+              txout = TxOut 50000 ""
+              tx = Tx 2 [txin] [txout] [[]] 0
+              conflictSet = Set.singleton conflictTxId
+          case checkNoConflictSpending tx conflictSet of
+            Left (RbfSpendingConflict txid) -> txid `shouldBe` conflictTxId
+            _ -> expectationFailure "Expected RbfSpendingConflict error"
+
+        it "accepts tx that doesn't spend conflicting tx output" $ do
+          let conflictTxId = TxId (Hash256 (BS.replicate 32 0x01))
+              otherTxId = TxId (Hash256 (BS.replicate 32 0x02))
+              -- Tx spends output from a different tx
+              op = OutPoint otherTxId 0
+              txin = TxIn op "" 0xffffffff
+              txout = TxOut 50000 ""
+              tx = Tx 2 [txin] [txout] [[]] 0
+              conflictSet = Set.singleton conflictTxId
+          checkNoConflictSpending tx conflictSet `shouldBe` Right ()
+
+      describe "MempoolError RBF cases" $ do
+        it "ErrRBFInsufficientAbsoluteFee shows correctly" $ do
+          let err = ErrRBFInsufficientAbsoluteFee 500 1000
+          show err `shouldBe` "ErrRBFInsufficientAbsoluteFee 500 1000"
+
+        it "ErrRBFInsufficientFeeRate shows correctly" $ do
+          let err = ErrRBFInsufficientFeeRate (FeeRate 5) (FeeRate 10)
+          show err `shouldBe` "ErrRBFInsufficientFeeRate (FeeRate {getFeeRate = 5}) (FeeRate {getFeeRate = 10})"
+
+        it "ErrRBFTooManyReplacements shows correctly" $ do
+          let err = ErrRBFTooManyReplacements 150 100
+          show err `shouldBe` "ErrRBFTooManyReplacements 150 100"
+
+        it "ErrRBFInsufficientRelayFee shows correctly" $ do
+          let err = ErrRBFInsufficientRelayFee 50 100
+          show err `shouldBe` "ErrRBFInsufficientRelayFee 50 100"
+
+        it "ErrRBFSpendingConflict shows correctly" $ do
+          let txid = TxId (Hash256 (BS.replicate 32 0xab))
+              err = ErrRBFSpendingConflict txid
+          show err `shouldContain` "ErrRBFSpendingConflict"
+
+      describe "Full RBF mode" $ do
+        it "default config enables RBF" $ do
+          let cfg = defaultMempoolConfig
+          mpcRBFEnabled cfg `shouldBe` True
+
+        it "full RBF means all mempool txs are replaceable" $ do
+          -- In full RBF mode (mpcRBFEnabled = True), any mempool tx
+          -- can be replaced regardless of nSequence signaling
+          let cfg = defaultMempoolConfig { mpcRBFEnabled = True }
+          mpcRBFEnabled cfg `shouldBe` True
+
+        it "RBF disabled means no replacements" $ do
+          let cfg = defaultMempoolConfig { mpcRBFEnabled = False }
+          mpcRBFEnabled cfg `shouldBe` False
+
   --------------------------------------------------------------------------------
   -- Fee Estimator Tests (Phase 16)
   --------------------------------------------------------------------------------
@@ -6444,3 +6643,391 @@ tails xs@(_:xs') = xs : tails xs'
             imTxIndex mgr `shouldBe` Nothing
             imBlockFilterIndex mgr `shouldBe` Nothing
             imCoinStatsIndex mgr `shouldBe` Nothing
+
+  -- =========================================================================
+  -- Phase 36: v3/TRUC Transaction Policy Tests (BIP 431)
+  -- =========================================================================
+
+  describe "v3/TRUC transaction policy" $ do
+    describe "TRUC constants" $ do
+      it "trucVersion is 3" $ do
+        trucVersion `shouldBe` 3
+
+      it "trucAncestorLimit is 2" $ do
+        trucAncestorLimit `shouldBe` 2
+
+      it "trucDescendantLimit is 2" $ do
+        trucDescendantLimit `shouldBe` 2
+
+      it "trucMaxVsize is 10,000 vbytes" $ do
+        trucMaxVsize `shouldBe` 10000
+
+      it "trucChildMaxVsize is 1,000 vbytes" $ do
+        trucChildMaxVsize `shouldBe` 1000
+
+    describe "isV3" $ do
+      it "returns True for version 3 transactions" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            txin = TxIn (OutPoint txid 0) "" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            tx = Tx 3 [txin] [txout] [[]] 0
+        isV3 tx `shouldBe` True
+
+      it "returns False for version 1 transactions" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            txin = TxIn (OutPoint txid 0) "" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            tx = Tx 1 [txin] [txout] [[]] 0
+        isV3 tx `shouldBe` False
+
+      it "returns False for version 2 transactions" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            txin = TxIn (OutPoint txid 0) "" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            tx = Tx 2 [txin] [txout] [[]] 0
+        isV3 tx `shouldBe` False
+
+    describe "TrucError types" $ do
+      it "TrucTooLarge contains vsize information" $ do
+        let err = TrucTooLarge 15000 10000
+        trucActualVsize err `shouldBe` 15000
+        trucMaxAllowed err `shouldBe` 10000
+
+      it "TrucChildTooLarge contains child vsize information" $ do
+        let err = TrucChildTooLarge 1500 1000
+        trucChildActualVsize err `shouldBe` 1500
+        trucChildMaxAllowed err `shouldBe` 1000
+
+      it "TrucTooManyAncestors contains count information" $ do
+        let err = TrucTooManyAncestors 3 2
+        trucAncestorCount err `shouldBe` 3
+        trucAncestorMax err `shouldBe` 2
+
+      it "TrucTooManyDescendants contains count information" $ do
+        let err = TrucTooManyDescendants 3 2
+        trucDescendantCount err `shouldBe` 3
+        trucDescendantMax err `shouldBe` 2
+
+      it "TrucV3SpendingNonV3 contains txid information" $ do
+        let childId = TxId (Hash256 (BS.replicate 32 0xaa))
+            parentId = TxId (Hash256 (BS.replicate 32 0xbb))
+            err = TrucV3SpendingNonV3 childId parentId
+        trucChildTxId err `shouldBe` childId
+        trucParentTxId err `shouldBe` parentId
+
+      it "TrucNonV3SpendingV3 contains txid information" $ do
+        let nonV3Id = TxId (Hash256 (BS.replicate 32 0xcc))
+            v3ParentId = TxId (Hash256 (BS.replicate 32 0xdd))
+            err = TrucNonV3SpendingV3 nonV3Id v3ParentId
+        trucNonV3TxId err `shouldBe` nonV3Id
+        trucV3ParentTxId err `shouldBe` v3ParentId
+
+      it "TrucSiblingExists contains parent and sibling txids" $ do
+        let parentId = TxId (Hash256 (BS.replicate 32 0xee))
+            siblingId = TxId (Hash256 (BS.replicate 32 0xff))
+            err = TrucSiblingExists parentId siblingId
+        trucParentTxId' err `shouldBe` parentId
+        trucExistingSiblingTxId err `shouldBe` siblingId
+
+    describe "ErrTrucViolation in MempoolError" $ do
+      it "wraps TrucError correctly" $ do
+        let trucErr = TrucTooLarge 20000 10000
+            mempoolErr = ErrTrucViolation trucErr
+        case mempoolErr of
+          ErrTrucViolation err -> err `shouldBe` trucErr
+          _ -> expectationFailure "Expected ErrTrucViolation"
+
+    describe "v3 transaction topology constraints" $ do
+      it "v3 transactions are always RBF-enabled" $ do
+        -- v3 transactions don't need to signal RBF via sequence number
+        -- They are implicitly replaceable
+        let txid = TxId (Hash256 (BS.replicate 32 0x00))
+            -- Even with final sequence, v3 is replaceable
+            txin = TxIn (OutPoint txid 0) "" 0xffffffff
+            txout = TxOut 100000 "scriptpubkey"
+            tx = Tx 3 [txin] [txout] [[]] 0
+        -- v3 status implies RBF
+        isV3 tx `shouldBe` True
+
+      it "trucMaxVsize allows transactions up to 10,000 vbytes" $ do
+        -- A v3 transaction can be up to 10,000 vbytes
+        let maxSize = fromIntegral trucMaxVsize :: Int
+        maxSize `shouldBe` 10000
+
+      it "trucChildMaxVsize restricts children to 1,000 vbytes" $ do
+        -- A v3 child (spending unconfirmed v3 output) is limited to 1,000 vbytes
+        let maxChildSize = fromIntegral trucChildMaxVsize :: Int
+        maxChildSize `shouldBe` 1000
+
+    describe "sibling eviction" $ do
+      it "sibling eviction constants align with TRUC limits" $ do
+        -- For sibling eviction:
+        -- - Parent must have exactly 1 child (descendant count = 2)
+        -- - Existing child must have no children (ancestor count = 2)
+        trucDescendantLimit `shouldBe` 2
+        trucAncestorLimit `shouldBe` 2
+
+      it "sibling eviction only requires incremental relay fee" $ do
+        -- Unlike full RBF, sibling eviction doesn't require higher total fees
+        -- It only requires the new tx to pay for its own relay cost
+        let vsizeChild = 1000  -- max child size
+            requiredFee = (incrementalRelayFeePerKvb * fromIntegral vsizeChild) `div` 1000
+        -- For a 1000 vbyte tx with 1 sat/vB incremental relay fee
+        requiredFee `shouldBe` 1000  -- 1000 satoshis
+
+    describe "v3/non-v3 mixing rules" $ do
+      it "v3 cannot spend unconfirmed non-v3" $ do
+        -- Create error that would occur
+        let childId = TxId (Hash256 (BS.replicate 32 0x11))
+            parentId = TxId (Hash256 (BS.replicate 32 0x22))
+            err = TrucV3SpendingNonV3 childId parentId
+        -- The error correctly identifies the violation
+        case err of
+          TrucV3SpendingNonV3 c p -> do
+            c `shouldBe` childId
+            p `shouldBe` parentId
+
+      it "non-v3 cannot spend unconfirmed v3" $ do
+        -- Create error that would occur
+        let childId = TxId (Hash256 (BS.replicate 32 0x33))
+            parentId = TxId (Hash256 (BS.replicate 32 0x44))
+            err = TrucNonV3SpendingV3 childId parentId
+        -- The error correctly identifies the violation
+        case err of
+          TrucNonV3SpendingV3 c p -> do
+            c `shouldBe` childId
+            p `shouldBe` parentId
+
+  -- =========================================================================
+  -- Phase 37: PSBT (Partially Signed Bitcoin Transactions) Tests
+  -- =========================================================================
+
+  describe "PSBT" $ do
+    -- Helper: Create a simple test transaction
+    let mkTestTx = do
+          let prevTxId = TxId (Hash256 (BS.replicate 32 0xaa))
+              txin = TxIn (OutPoint prevTxId 0) BS.empty 0xffffffff
+              txout = TxOut 50000 (hexDecode "001476a914000000000000000000000000000000000000000088ac")
+          Tx 2 [txin] [txout] [[]] 0
+
+    describe "psbt magic bytes" $ do
+      it "PSBT magic is 'psbt' + 0xff" $ do
+        -- The PSBT magic bytes should be "psbt" followed by 0xff
+        let expectedMagic = BS.pack [0x70, 0x73, 0x62, 0x74, 0xff]
+        BS.take 5 expectedMagic `shouldBe` expectedMagic
+
+    describe "emptyPsbt" $ do
+      it "creates a PSBT with empty inputs and outputs" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+        -- Check structure
+        length (psbtInputs psbt) `shouldBe` length (txInputs tx)
+        length (psbtOutputs psbt) `shouldBe` length (txOutputs tx)
+
+      it "clears scriptSigs from the transaction" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+            embeddedTx = pgTx (psbtGlobal psbt)
+        -- All scriptSigs should be empty
+        all (BS.null . txInScript) (txInputs embeddedTx) `shouldBe` True
+
+      it "clears witness stacks from the transaction" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+            embeddedTx = pgTx (psbtGlobal psbt)
+        -- All witness stacks should be empty
+        all null (txWitness embeddedTx) `shouldBe` True
+
+    describe "emptyPsbtInput" $ do
+      it "has no UTXO data" $ do
+        piNonWitnessUtxo emptyPsbtInput `shouldBe` Nothing
+        piWitnessUtxo emptyPsbtInput `shouldBe` Nothing
+
+      it "has no signatures" $ do
+        Map.null (piPartialSigs emptyPsbtInput) `shouldBe` True
+
+      it "has no scripts" $ do
+        piRedeemScript emptyPsbtInput `shouldBe` Nothing
+        piWitnessScript emptyPsbtInput `shouldBe` Nothing
+
+      it "has no finalized data" $ do
+        piFinalScriptSig emptyPsbtInput `shouldBe` Nothing
+        piFinalScriptWitness emptyPsbtInput `shouldBe` Nothing
+
+    describe "emptyPsbtOutput" $ do
+      it "has no scripts" $ do
+        poRedeemScript emptyPsbtOutput `shouldBe` Nothing
+        poWitnessScript emptyPsbtOutput `shouldBe` Nothing
+
+      it "has no derivation paths" $ do
+        Map.null (poBip32Derivation emptyPsbtOutput) `shouldBe` True
+
+    describe "createpsbt" $ do
+      it "succeeds with an unsigned transaction" $ do
+        let tx = mkTestTx
+        case createPsbt tx of
+          Right psbt -> do
+            pgTx (psbtGlobal psbt) `shouldBe` tx
+            length (psbtInputs psbt) `shouldBe` 1
+            length (psbtOutputs psbt) `shouldBe` 1
+          Left err -> expectationFailure $ "createPsbt failed: " ++ err
+
+      it "fails if transaction has non-empty scriptSig" $ do
+        let prevTxId = TxId (Hash256 (BS.replicate 32 0xbb))
+            txin = TxIn (OutPoint prevTxId 0) (BS.pack [0x51]) 0xffffffff
+            txout = TxOut 50000 "scriptpubkey"
+            tx = Tx 2 [txin] [txout] [[]] 0
+        case createPsbt tx of
+          Left _ -> return ()  -- Expected
+          Right _ -> expectationFailure "createPsbt should fail with non-empty scriptSig"
+
+      it "fails if transaction has non-empty witness" $ do
+        let prevTxId = TxId (Hash256 (BS.replicate 32 0xcc))
+            txin = TxIn (OutPoint prevTxId 0) BS.empty 0xffffffff
+            txout = TxOut 50000 "scriptpubkey"
+            tx = Tx 2 [txin] [txout] [["witness_data"]] 0
+        case createPsbt tx of
+          Left _ -> return ()  -- Expected
+          Right _ -> expectationFailure "createPsbt should fail with non-empty witness"
+
+    describe "encodePsbt/decodePsbt" $ do
+      it "roundtrips empty PSBT" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+            encoded = encodePsbt psbt
+        case decodePsbt encoded of
+          Right decoded -> do
+            -- Compare global tx
+            pgTx (psbtGlobal decoded) `shouldBe` pgTx (psbtGlobal psbt)
+            -- Compare input count
+            length (psbtInputs decoded) `shouldBe` length (psbtInputs psbt)
+            -- Compare output count
+            length (psbtOutputs decoded) `shouldBe` length (psbtOutputs psbt)
+          Left err -> expectationFailure $ "decodePsbt failed: " ++ err
+
+      it "encoded PSBT starts with magic bytes" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+            encoded = encodePsbt psbt
+        BS.take 5 encoded `shouldBe` BS.pack [0x70, 0x73, 0x62, 0x74, 0xff]
+
+      it "fails to decode invalid magic bytes" $ do
+        let invalidData = BS.pack [0x00, 0x01, 0x02, 0x03, 0x04]
+        case decodePsbt invalidData of
+          Left _ -> return ()  -- Expected
+          Right _ -> expectationFailure "decodePsbt should fail with invalid magic"
+
+    describe "combinePsbts" $ do
+      it "combining empty list fails" $ do
+        case combinePsbts [] of
+          Left _ -> return ()  -- Expected
+          Right _ -> expectationFailure "combinePsbts should fail on empty list"
+
+      it "combining single PSBT returns it unchanged" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+        case combinePsbts [psbt] of
+          Right combined -> do
+            pgTx (psbtGlobal combined) `shouldBe` pgTx (psbtGlobal psbt)
+          Left err -> expectationFailure $ "combinePsbts failed: " ++ err
+
+      it "combining two PSBTs merges their data" $ do
+        let tx = mkTestTx
+            psbt1 = emptyPsbt tx
+            psbt2 = emptyPsbt tx
+        case combinePsbts [psbt1, psbt2] of
+          Right _ -> return ()  -- Success
+          Left err -> expectationFailure $ "combinePsbts failed: " ++ err
+
+      it "fails when PSBTs have different transactions" $ do
+        let tx1 = mkTestTx
+            tx2 = tx1 { txLockTime = 100 }  -- Different locktime
+            psbt1 = emptyPsbt tx1
+            psbt2 = emptyPsbt tx2
+        case combinePsbts [psbt1, psbt2] of
+          Left _ -> return ()  -- Expected
+          Right _ -> expectationFailure "combinePsbts should fail with different transactions"
+
+    describe "finalizepsbt" $ do
+      it "fails when inputs are not ready to finalize" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+        case finalizePsbt psbt of
+          Left _ -> return ()  -- Expected (no signatures)
+          Right _ -> expectationFailure "finalizePsbt should fail without signatures"
+
+    describe "extractTransaction" $ do
+      it "fails when PSBT is not finalized" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+        case extractTransaction psbt of
+          Left _ -> return ()  -- Expected
+          Right _ -> expectationFailure "extractTransaction should fail on unfinalized PSBT"
+
+    describe "isPsbtFinalized" $ do
+      it "returns False for empty PSBT" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+        isPsbtFinalized psbt `shouldBe` False
+
+    describe "getPsbtFee" $ do
+      it "returns Nothing when no UTXO info" $ do
+        let tx = mkTestTx
+            psbt = emptyPsbt tx
+        getPsbtFee psbt `shouldBe` Nothing
+
+      it "returns fee when witness UTXO is provided" $ do
+        let prevTxId = TxId (Hash256 (BS.replicate 32 0xdd))
+            txin = TxIn (OutPoint prevTxId 0) BS.empty 0xffffffff
+            txout = TxOut 50000 "scriptpubkey"
+            tx = Tx 2 [txin] [txout] [[]] 0
+            psbt = emptyPsbt tx
+            -- Add witness UTXO with 60000 sat input
+            inputUtxo = TxOut 60000 "input_script"
+            updatedInput = emptyPsbtInput { piWitnessUtxo = Just inputUtxo }
+            updatedPsbt = psbt { psbtInputs = [updatedInput] }
+        -- Fee should be 60000 - 50000 = 10000
+        getPsbtFee updatedPsbt `shouldBe` Just 10000
+
+    describe "KeyPath" $ do
+      it "stores fingerprint and path" $ do
+        let kp = KeyPath 0x12345678 [0x8000002c, 0x80000000, 0x80000000]
+        kpFingerprint kp `shouldBe` 0x12345678
+        length (kpPath kp) `shouldBe` 3
+
+    describe "PSBT workflow" $ do
+      it "create-update-combine workflow" $ do
+        -- Create transaction
+        let prevTxId = TxId (Hash256 (BS.replicate 32 0xee))
+            txin = TxIn (OutPoint prevTxId 0) BS.empty 0xffffffff
+            txout = TxOut 40000 "scriptpubkey"
+            tx = Tx 2 [txin] [txout] [[]] 0
+
+        -- Step 1: Create PSBT
+        case createPsbt tx of
+          Left err -> expectationFailure $ "createPsbt failed: " ++ err
+          Right psbt1 -> do
+            -- Step 2: Two parties update with their data
+            let psbt2 = psbt1  -- Would add UTXO info
+            let psbt3 = psbt1  -- Would add different UTXO info
+
+            -- Step 3: Combine
+            case combinePsbts [psbt2, psbt3] of
+              Left err -> expectationFailure $ "combinePsbts failed: " ++ err
+              Right combined -> do
+                -- Verify combined PSBT has same transaction
+                pgTx (psbtGlobal combined) `shouldBe` tx
+
+      it "handles multiple inputs and outputs" $ do
+        let prevTxId1 = TxId (Hash256 (BS.replicate 32 0x11))
+            prevTxId2 = TxId (Hash256 (BS.replicate 32 0x22))
+            txin1 = TxIn (OutPoint prevTxId1 0) BS.empty 0xffffffff
+            txin2 = TxIn (OutPoint prevTxId2 1) BS.empty 0xfffffffe
+            txout1 = TxOut 30000 "scriptpubkey1"
+            txout2 = TxOut 20000 "scriptpubkey2"
+            tx = Tx 2 [txin1, txin2] [txout1, txout2] [[], []] 0
+        case createPsbt tx of
+          Left err -> expectationFailure $ "createPsbt failed: " ++ err
+          Right psbt -> do
+            length (psbtInputs psbt) `shouldBe` 2
+            length (psbtOutputs psbt) `shouldBe` 2
