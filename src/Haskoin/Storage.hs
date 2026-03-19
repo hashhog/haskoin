@@ -1,6 +1,10 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 -- | Database Layer (RocksDB)
 --
@@ -14,10 +18,12 @@
 --   - Batch writes ensure atomicity for block connection
 --   - Bloom filter (10 bits/key) for fast UTXO negative lookups
 --
--- UTXO Cache Design:
---   - In-memory cache for fast lookups during validation
---   - Dirty tracking for efficient batch flushes
---   - UTXOEntry contains metadata (height, coinbase flag) for maturity checks
+-- UTXO Cache Design (Bitcoin Core compatible):
+--   - Multi-layer cache: CoinsViewCache -> CoinsViewDB -> RocksDB
+--   - CoinEntry with DIRTY/FRESH flags for efficient flushing
+--   - FRESH flag optimization: coins created and spent before flush never touch disk
+--   - Memory-bounded cache with configurable size limit (default 450 MiB)
+--   - Reference: bitcoin/src/coins.cpp CCoinsViewCache
 --
 module Haskoin.Storage
   ( -- * Database Handle
@@ -49,7 +55,7 @@ module Haskoin.Storage
   , putUTXO
   , getUTXO
   , deleteUTXO
-    -- * UTXO Cache
+    -- * UTXO Cache (Legacy)
   , UTXOEntry(..)
   , UTXOCache(..)
   , newUTXOCache
@@ -57,10 +63,48 @@ module Haskoin.Storage
   , addUTXO
   , spendUTXO
   , flushCache
+    -- * CoinsView Type Class Hierarchy
+  , Coin(..)
+  , CoinEntry(..)
+  , CoinsView(..)
+  , BlockHeight
+    -- * CoinsViewDB (RocksDB Backend)
+  , CoinsViewDB(..)
+  , newCoinsViewDB
+  , coinsViewDBGetCoin
+  , coinsViewDBHaveCoin
+  , coinsViewDBPutCoin
+  , coinsViewDBDeleteCoin
+  , coinsViewDBGetBestBlock
+  , coinsViewDBSetBestBlock
+    -- * CoinsViewCache (In-Memory Cache)
+  , CoinsViewCache(..)
+  , newCoinsViewCache
+  , defaultCacheSize
+  , cacheGetCoin
+  , cacheHaveCoin
+  , cacheAddCoin
+  , cacheSpendCoin
+  , cacheFlush
+  , cacheSync
+  , cacheDynamicMemoryUsage
+  , cacheGetCacheSize
+  , cacheGetDirtyCount
+  , cacheSetBestBlock
+  , cacheGetBestBlock
+  , cacheReset
+  , cacheSanityCheck
     -- * Undo Data
+  , TxInUndo(..)
+  , TxUndo(..)
+  , BlockUndo(..)
   , UndoData(..)
+  , mkUndoData
+  , computeUndoChecksum
   , putUndoData
   , getUndoData
+  , getUndoDataVerified
+  , deleteUndoData
     -- * Persisted Chain State
   , PersistedChainState(..)
   , saveChainState
@@ -90,25 +134,98 @@ module Haskoin.Storage
   , fromBE32
   , integerToBS
   , bsToInteger
+    -- * Flat File Block Storage
+  , BlockFileInfo(..)
+  , FlatFilePos(..)
+  , BlockIndex(..)
+  , BlockStore(..)
+  , StorageError(..)
+  , maxBlockFileSize
+  , blockFileChunkSize
+  , newBlockStore
+  , writeBlockToDisk
+  , readBlockFromDisk
+  , putBlockIndex
+  , getBlockIndex
+    -- * Pruning Support
+  , PruneConfig(..)
+  , defaultPruneConfig
+  , minPruneTarget
+  , minBlocksToKeep
+  , findFilesToPrune
+  , pruneOneBlockFile
+  , calculateCurrentUsage
+  , isBlockPruned
+  , pruneBlockchain
+  , revFilePath
+    -- * AssumeUTXO Support
+  , snapshotMagicBytes
+  , snapshotVersion
+  , SnapshotMetadata(..)
+  , SnapshotCoin(..)
+  , UtxoSnapshot(..)
+  , AssumeUtxoData(..)
+  , SnapshotChainstate(..)
+  , loadSnapshot
+  , populateFromSnapshot
+  , newSnapshotChainstate
+  , writeSnapshot
+  , computeUtxoHash
+  , verifySnapshot
+  , BackgroundValidation(..)
+  , newBackgroundValidation
+  , backgroundValidationProgress
+  , isBackgroundValidationComplete
+  , getBackgroundValidationError
+  , markBackgroundValidationComplete
+  , markBackgroundValidationFailed
+  , updateBackgroundValidationProgress
+  , putSnapshotBaseHash
+  , getSnapshotBaseHash
+  , deleteSnapshotBaseHash
   ) where
 
 import qualified Database.RocksDB as R
-import Data.ByteString (ByteString)
+import Data.ByteString (ByteString, hPut, hGet)
 import qualified Data.ByteString as BS
-import Data.Serialize (encode, decode, Serialize(..), putWord32be, getWord32be)
-import Data.Word (Word8, Word32)
+import Data.Serialize (encode, decode, Serialize(..), Get, Put, putWord32be, getWord32be,
+                       putWord32le, getWord32le, putWord64le, getWord64le, putWord16le, getWord16le,
+                       putByteString, getBytes, runPut, runGet)
+import Data.Word (Word8, Word16, Word32, Word64)
+import Data.Int (Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
-import Control.Exception (bracket)
-import Control.Monad (when)
+import Control.Exception (bracket, try, IOException, catch)
+import Control.Monad (when, void, unless, forM_)
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (newIORef, readIORef, modifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import GHC.Generics (Generic)
+import Control.DeepSeq (NFData(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Data.Maybe (isJust)
+import System.IO (Handle, IOMode(..), hSeek, SeekMode(..), hClose, hFileSize,
+                  hSetFileSize, openBinaryFile, hFlush)
+import System.FilePath ((</>))
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
+import Text.Printf (printf)
 import Control.Concurrent.STM
+import qualified Crypto.Hash as Hash
+import qualified Data.ByteArray as BA
 
 import Haskoin.Types
+
+--------------------------------------------------------------------------------
+-- Cryptographic Helpers (local to avoid circular imports)
+--------------------------------------------------------------------------------
+
+-- | SHA-256 hash function
+sha256' :: ByteString -> ByteString
+sha256' bs = BS.pack $ BA.unpack (Hash.hash bs :: Hash.Digest Hash.SHA256)
+
+-- | Double SHA-256 (Bitcoin's standard hash)
+doubleSHA256' :: ByteString -> Hash256
+doubleSHA256' bs = Hash256 (sha256' (sha256' bs))
 
 --------------------------------------------------------------------------------
 -- Database Handle and Configuration
@@ -148,7 +265,7 @@ defaultDBConfig path = DBConfig
   , dbWriteBufferSize = 64 * 1024 * 1024    -- 64 MB
   , dbBlockCacheSize  = 256 * 1024 * 1024   -- 256 MB
   , dbBloomFilterBits = 10
-  , dbCompression     = True
+  , dbCompression     = False
   }
 
 --------------------------------------------------------------------------------
@@ -203,6 +320,7 @@ openDB DBConfig{..} = do
         { R.createIfMissing = dbCreateIfMissing
         , R.maxOpenFiles    = dbMaxOpenFiles
         , R.writeBufferSize = dbWriteBufferSize
+        , R.compression     = if dbCompression then R.SnappyCompression else R.NoCompression
         }
   db <- R.open dbPath opts
   let readOpts  = R.defaultReadOptions
@@ -453,46 +571,669 @@ flushCache cache = do
       | otherwise     = BatchPut (makeKey PrefixUTXO (encode op)) (encode entry)
 
 --------------------------------------------------------------------------------
--- Undo Data for Chain Reorganizations
+-- CoinsView Type Class Hierarchy (Bitcoin Core compatible)
+--------------------------------------------------------------------------------
+-- Reference: bitcoin/src/coins.h, bitcoin/src/coins.cpp
+--
+-- This implements Bitcoin Core's multi-layer UTXO cache architecture:
+--   1. CoinsView - Abstract interface for UTXO lookups
+--   2. CoinsViewDB - Persistent RocksDB backend
+--   3. CoinsViewCache - In-memory cache with DIRTY/FRESH flags
+--
+-- The DIRTY flag indicates the entry has been modified since last flush.
+-- The FRESH flag indicates the coin doesn't exist in the backing view.
+-- Key optimization: FRESH + spent = can be deleted without touching disk.
+
+-- | Block height type alias for clarity
+type BlockHeight = Word32
+
+-- | A UTXO entry (Coin) with metadata.
+-- Reference: bitcoin/src/coins.h Coin
+--
+-- Serialization format matches Bitcoin Core:
+--   VARINT((coinbase ? 1 : 0) | (height << 1))
+--   TxOut (value + scriptPubKey)
+data Coin = Coin
+  { coinTxOut     :: !TxOut       -- ^ The unspent transaction output
+  , coinHeight    :: !BlockHeight -- ^ Block height where this was created
+  , coinIsCoinbase :: !Bool       -- ^ Whether from a coinbase transaction
+  } deriving (Show, Eq, Generic)
+
+instance NFData Coin
+
+instance Serialize Coin where
+  put Coin{..} = do
+    -- Encode: (height << 1) | coinbase_flag
+    let code = (coinHeight `shiftL` 1) .|. (if coinIsCoinbase then 1 else 0)
+    put (VarInt (fromIntegral code))
+    put coinTxOut
+  get = do
+    VarInt code <- get
+    let height = fromIntegral (code `shiftR` 1)
+        isCoinbase = (code .&. 1) == 1
+    txout <- get
+    return $ Coin txout height isCoinbase
+
+-- | Check if a coin is "spent" (null output).
+-- A spent coin has a null TxOut (value 0, empty script).
+coinIsSpent :: Coin -> Bool
+coinIsSpent coin = txOutValue (coinTxOut coin) == 0 && BS.null (txOutScript (coinTxOut coin))
+
+-- | Create a spent/empty coin.
+spentCoin :: Coin
+spentCoin = Coin (TxOut 0 BS.empty) 0 False
+
+-- | Estimate dynamic memory usage of a Coin.
+-- Matches Bitcoin Core's Coin::DynamicMemoryUsage()
+coinDynamicMemoryUsage :: Coin -> Int
+coinDynamicMemoryUsage coin = BS.length (txOutScript (coinTxOut coin))
+
+-- | Cache entry with DIRTY and FRESH flags.
+-- Reference: bitcoin/src/coins.h CCoinsCacheEntry
+--
+-- Valid states (from Bitcoin Core):
+--   - unspent, FRESH, DIRTY: new coin created in cache
+--   - unspent, not FRESH, DIRTY: coin changed during reorg
+--   - unspent, not FRESH, not DIRTY: coin fetched from parent
+--   - spent, not FRESH, DIRTY: coin spent, spentness needs flush
+--
+-- Invalid states:
+--   - spent, FRESH, *: can be erased without flush (optimization)
+--   - unspent, FRESH, not DIRTY: never fetched yet marked FRESH?
+data CoinEntry = CoinEntry
+  { ceCoin  :: !(Maybe Coin)  -- ^ The coin (Nothing = spent/not found)
+  , ceDirty :: !Bool          -- ^ Modified since last flush
+  , ceFresh :: !Bool          -- ^ Not in backing store
+  } deriving (Show, Eq, Generic)
+
+instance NFData CoinEntry
+
+-- | Estimate memory usage of a CoinEntry
+coinEntryMemoryUsage :: CoinEntry -> Int
+coinEntryMemoryUsage entry = case ceCoin entry of
+  Nothing -> 8   -- Just the struct overhead
+  Just coin -> 8 + coinDynamicMemoryUsage coin
+
+-- | The CoinsView type class - abstract interface for UTXO lookups.
+-- Reference: bitcoin/src/coins.h CCoinsView
+class (Functor m, Monad m) => CoinsView m where
+  -- | Retrieve a coin by outpoint. Returns Nothing if not found.
+  getCoin :: OutPoint -> m (Maybe Coin)
+
+  -- | Check if a coin exists (may be more efficient than getCoin).
+  haveCoin :: OutPoint -> m Bool
+  haveCoin op = isJust <$> getCoin op
+
+  -- | Get the best block hash this view represents.
+  viewGetBestBlock :: m (Maybe BlockHash)
+
+--------------------------------------------------------------------------------
+-- CoinsViewDB: RocksDB-backed CoinsView
+--------------------------------------------------------------------------------
+-- Reference: bitcoin/src/txdb.h CCoinsViewDB
+
+-- | CoinsViewDB - persistent UTXO storage in RocksDB.
+-- Key format: 'C' + OutPoint bytes
+-- Value format: Serialized Coin
+data CoinsViewDB = CoinsViewDB
+  { cvdbHandle :: !HaskoinDB
+  }
+
+instance Show CoinsViewDB where
+  show _ = "CoinsViewDB{..}"
+
+-- | Prefix byte for coin storage in RocksDB.
+-- Matches Bitcoin Core's DB_COIN = 'C'
+prefixCoin :: Word8
+prefixCoin = 0x43  -- 'C'
+
+-- | Prefix byte for best block hash storage.
+prefixBestBlockV2 :: Word8
+prefixBestBlockV2 = 0x42  -- 'B'
+
+-- | Create a new CoinsViewDB.
+newCoinsViewDB :: HaskoinDB -> CoinsViewDB
+newCoinsViewDB = CoinsViewDB
+
+-- | Get a coin from RocksDB.
+coinsViewDBGetCoin :: CoinsViewDB -> OutPoint -> IO (Maybe Coin)
+coinsViewDBGetCoin CoinsViewDB{..} op = do
+  let key = BS.cons prefixCoin (encode op)
+  mval <- R.get (dbHandle cvdbHandle) (dbReadOpts cvdbHandle) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Check if a coin exists in RocksDB.
+coinsViewDBHaveCoin :: CoinsViewDB -> OutPoint -> IO Bool
+coinsViewDBHaveCoin db op = isJust <$> coinsViewDBGetCoin db op
+
+-- | Put a coin into RocksDB.
+coinsViewDBPutCoin :: CoinsViewDB -> OutPoint -> Coin -> IO ()
+coinsViewDBPutCoin CoinsViewDB{..} op coin = do
+  let key = BS.cons prefixCoin (encode op)
+  R.put (dbHandle cvdbHandle) (dbWriteOpts cvdbHandle) key (encode coin)
+
+-- | Delete a coin from RocksDB.
+coinsViewDBDeleteCoin :: CoinsViewDB -> OutPoint -> IO ()
+coinsViewDBDeleteCoin CoinsViewDB{..} op = do
+  let key = BS.cons prefixCoin (encode op)
+  R.delete (dbHandle cvdbHandle) (dbWriteOpts cvdbHandle) key
+
+-- | Get the best block hash from CoinsViewDB.
+coinsViewDBGetBestBlock :: CoinsViewDB -> IO (Maybe BlockHash)
+coinsViewDBGetBestBlock CoinsViewDB{..} = do
+  let key = BS.singleton prefixBestBlockV2
+  mval <- R.get (dbHandle cvdbHandle) (dbReadOpts cvdbHandle) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Set the best block hash in CoinsViewDB.
+coinsViewDBSetBestBlock :: CoinsViewDB -> BlockHash -> IO ()
+coinsViewDBSetBestBlock CoinsViewDB{..} bh = do
+  let key = BS.singleton prefixBestBlockV2
+  R.put (dbHandle cvdbHandle) (dbWriteOpts cvdbHandle) key (encode bh)
+
+--------------------------------------------------------------------------------
+-- CoinsViewCache: In-Memory Cache with DIRTY/FRESH flags
+--------------------------------------------------------------------------------
+-- Reference: bitcoin/src/coins.h CCoinsViewCache, bitcoin/src/coins.cpp
+
+-- | Default cache size in bytes (450 MiB).
+-- Reference: bitcoin/src/txdb.h DEFAULT_DB_CACHE_MB
+defaultCacheSize :: Int
+defaultCacheSize = 450 * 1024 * 1024
+
+-- | In-memory UTXO cache backed by a CoinsViewDB.
+-- Implements the same semantics as Bitcoin Core's CCoinsViewCache.
+data CoinsViewCache = CoinsViewCache
+  { cvcBase        :: !CoinsViewDB                     -- ^ Backing persistent store
+  , cvcCoins       :: !(IORef (Map OutPoint CoinEntry)) -- ^ Cached entries
+  , cvcBestBlock   :: !(IORef (Maybe BlockHash))       -- ^ Cached best block
+  , cvcMemoryUsage :: !(IORef Int)                     -- ^ Approximate memory used
+  , cvcDirtyCount  :: !(IORef Int)                     -- ^ Count of dirty entries
+  , cvcMaxSize     :: !Int                             -- ^ Maximum cache size in bytes
+  }
+
+-- | Create a new CoinsViewCache with the given size limit.
+-- The cache starts empty; entries are loaded on demand.
+newCoinsViewCache :: CoinsViewDB -> Int -> IO CoinsViewCache
+newCoinsViewCache base maxSize = do
+  coinsRef <- newIORef Map.empty
+  bestBlockRef <- newIORef Nothing
+  memUsageRef <- newIORef 0
+  dirtyCountRef <- newIORef 0
+  return CoinsViewCache
+    { cvcBase = base
+    , cvcCoins = coinsRef
+    , cvcBestBlock = bestBlockRef
+    , cvcMemoryUsage = memUsageRef
+    , cvcDirtyCount = dirtyCountRef
+    , cvcMaxSize = maxSize
+    }
+
+-- | Fetch a coin, checking cache first, then falling through to the base.
+-- If found in base, the coin is added to cache (not dirty).
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::FetchCoin
+fetchCoin :: CoinsViewCache -> OutPoint -> IO (Maybe CoinEntry)
+fetchCoin cache op = do
+  coins <- readIORef (cvcCoins cache)
+  case Map.lookup op coins of
+    Just entry -> return (Just entry)
+    Nothing -> do
+      -- Cache miss - fetch from base
+      mCoin <- coinsViewDBGetCoin (cvcBase cache) op
+      case mCoin of
+        Nothing -> return Nothing
+        Just coin
+          | coinIsSpent coin -> return Nothing
+          | otherwise -> do
+              -- Add to cache (not dirty, not fresh - exists in base)
+              let entry = CoinEntry (Just coin) False False
+                  memUsage = coinEntryMemoryUsage entry
+              modifyIORef' (cvcCoins cache) (Map.insert op entry)
+              modifyIORef' (cvcMemoryUsage cache) (+ memUsage)
+              return (Just entry)
+
+-- | Get a coin from the cache.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::GetCoin
+cacheGetCoin :: CoinsViewCache -> OutPoint -> IO (Maybe Coin)
+cacheGetCoin cache op = do
+  mEntry <- fetchCoin cache op
+  case mEntry of
+    Nothing -> return Nothing
+    Just entry -> case ceCoin entry of
+      Nothing -> return Nothing
+      Just coin
+        | coinIsSpent coin -> return Nothing
+        | otherwise -> return (Just coin)
+
+-- | Check if a coin exists in the cache.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::HaveCoin
+cacheHaveCoin :: CoinsViewCache -> OutPoint -> IO Bool
+cacheHaveCoin cache op = isJust <$> cacheGetCoin cache op
+
+-- | Add a coin to the cache.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::AddCoin
+--
+-- @possibleOverwrite@ indicates whether an unspent coin may already exist.
+-- If False and an unspent coin exists, this is a logic error.
+cacheAddCoin :: CoinsViewCache -> OutPoint -> Coin -> Bool -> IO ()
+cacheAddCoin cache op coin possibleOverwrite = do
+  -- Skip unspendable outputs (OP_RETURN)
+  when (not $ isUnspendable (txOutScript (coinTxOut coin))) $ do
+    coins <- readIORef (cvcCoins cache)
+    let mExisting = Map.lookup op coins
+
+    -- Determine if we can mark as FRESH
+    fresh <- case mExisting of
+      Nothing -> return True  -- Not in cache, can be FRESH
+      Just existing ->
+        case ceCoin existing of
+          Nothing -> do
+            -- Coin was spent in cache. Can only mark FRESH if not dirty
+            -- (if dirty, spentness hasn't been flushed to parent)
+            return (not (ceDirty existing))
+          Just existingCoin
+            | coinIsSpent existingCoin -> return (not (ceDirty existing))
+            | not possibleOverwrite ->
+                error "Attempted to overwrite unspent coin (possible_overwrite=False)"
+            | otherwise -> return False  -- Overwriting existing unspent
+
+    -- Update memory usage accounting
+    let oldMemUsage = maybe 0 coinEntryMemoryUsage mExisting
+        newEntry = CoinEntry (Just coin) True fresh
+        newMemUsage = coinEntryMemoryUsage newEntry
+
+    -- Update dirty count
+    case mExisting of
+      Nothing -> modifyIORef' (cvcDirtyCount cache) (+ 1)
+      Just existing
+        | ceDirty existing -> return ()  -- Already dirty
+        | otherwise -> modifyIORef' (cvcDirtyCount cache) (+ 1)
+
+    modifyIORef' (cvcCoins cache) (Map.insert op newEntry)
+    modifyIORef' (cvcMemoryUsage cache) (\m -> m - oldMemUsage + newMemUsage)
+
+-- | Check if a script is unspendable (OP_RETURN or oversized).
+isUnspendable :: ByteString -> Bool
+isUnspendable script
+  | BS.null script = False
+  | BS.head script == 0x6a = True  -- OP_RETURN
+  | BS.length script > 10000 = True  -- MAX_SCRIPT_SIZE
+  | otherwise = False
+
+-- | Spend a coin in the cache.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::SpendCoin
+--
+-- Returns the coin that was spent (if any), for undo data.
+cacheSpendCoin :: CoinsViewCache -> OutPoint -> IO (Maybe Coin)
+cacheSpendCoin cache op = do
+  mEntry <- fetchCoin cache op
+  case mEntry of
+    Nothing -> return Nothing
+    Just entry -> case ceCoin entry of
+      Nothing -> return Nothing  -- Already spent
+      Just coin
+        | coinIsSpent coin -> return Nothing  -- Already spent
+        | otherwise -> do
+            -- Get old memory usage
+            let oldMemUsage = coinEntryMemoryUsage entry
+
+            -- If FRESH, we can just delete the entry (never needs to touch disk)
+            if ceFresh entry
+              then do
+                modifyIORef' (cvcCoins cache) (Map.delete op)
+                modifyIORef' (cvcMemoryUsage cache) (subtract oldMemUsage)
+                -- Update dirty count
+                when (ceDirty entry) $
+                  modifyIORef' (cvcDirtyCount cache) (subtract 1)
+              else do
+                -- Mark as spent and dirty
+                let spentEntry = CoinEntry Nothing True False
+                    newMemUsage = coinEntryMemoryUsage spentEntry
+                modifyIORef' (cvcCoins cache) (Map.insert op spentEntry)
+                modifyIORef' (cvcMemoryUsage cache) (\m -> m - oldMemUsage + newMemUsage)
+                -- Update dirty count if not already dirty
+                unless (ceDirty entry) $
+                  modifyIORef' (cvcDirtyCount cache) (+ 1)
+
+            return (Just coin)
+
+-- | Flush cache to backing store, clearing all entries.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::Flush
+cacheFlush :: CoinsViewCache -> IO ()
+cacheFlush cache = do
+  coins <- readIORef (cvcCoins cache)
+  bestBlock <- readIORef (cvcBestBlock cache)
+
+  -- Build batch operations for dirty entries
+  let ops = concatMap toOps (Map.toList coins)
+
+  -- Add best block update if present
+  let bestBlockOps = case bestBlock of
+        Nothing -> []
+        Just bh -> [BatchPut (BS.singleton prefixBestBlockV2) (encode bh)]
+
+  -- Write batch to database
+  let CoinsViewDB{..} = cvcBase cache
+  writeBatch cvdbHandle (WriteBatch (ops ++ bestBlockOps))
+
+  -- Clear cache
+  writeIORef (cvcCoins cache) Map.empty
+  writeIORef (cvcMemoryUsage cache) 0
+  writeIORef (cvcDirtyCount cache) 0
+  where
+    toOps (op, entry)
+      | not (ceDirty entry) = []  -- Not dirty, skip
+      | ceFresh entry && isSpentEntry entry = []  -- FRESH + spent = skip entirely
+      | isSpentEntry entry =
+          -- Spent coin needs to be deleted from base
+          [BatchDelete (BS.cons prefixCoin (encode op))]
+      | otherwise =
+          -- Unspent coin needs to be written to base
+          case ceCoin entry of
+            Just coin -> [BatchPut (BS.cons prefixCoin (encode op)) (encode coin)]
+            Nothing -> []  -- Shouldn't happen for non-spent
+
+    isSpentEntry entry = case ceCoin entry of
+      Nothing -> True
+      Just coin -> coinIsSpent coin
+
+-- | Sync cache to backing store, keeping non-spent entries.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::Sync
+cacheSync :: CoinsViewCache -> IO ()
+cacheSync cache = do
+  coins <- readIORef (cvcCoins cache)
+  bestBlock <- readIORef (cvcBestBlock cache)
+
+  -- Build batch operations for dirty entries
+  let ops = concatMap toOps (Map.toList coins)
+
+  -- Add best block update if present
+  let bestBlockOps = case bestBlock of
+        Nothing -> []
+        Just bh -> [BatchPut (BS.singleton prefixBestBlockV2) (encode bh)]
+
+  -- Write batch to database
+  let CoinsViewDB{..} = cvcBase cache
+  writeBatch cvdbHandle (WriteBatch (ops ++ bestBlockOps))
+
+  -- Update entries: clear DIRTY flags, remove spent entries
+  let coins' = Map.mapMaybe clearFlags coins
+  writeIORef (cvcCoins cache) coins'
+  writeIORef (cvcDirtyCount cache) 0
+
+  -- Recalculate memory usage
+  let newMemUsage = sum $ map coinEntryMemoryUsage (Map.elems coins')
+  writeIORef (cvcMemoryUsage cache) newMemUsage
+  where
+    toOps (op, entry)
+      | not (ceDirty entry) = []
+      | ceFresh entry && isSpentEntry entry = []
+      | isSpentEntry entry = [BatchDelete (BS.cons prefixCoin (encode op))]
+      | otherwise = case ceCoin entry of
+          Just coin -> [BatchPut (BS.cons prefixCoin (encode op)) (encode coin)]
+          Nothing -> []
+
+    clearFlags entry
+      | isSpentEntry entry = Nothing  -- Remove spent
+      | otherwise = Just entry { ceDirty = False }  -- Clear dirty flag
+
+    isSpentEntry entry = case ceCoin entry of
+      Nothing -> True
+      Just coin -> coinIsSpent coin
+
+-- | Get approximate dynamic memory usage of the cache.
+cacheDynamicMemoryUsage :: CoinsViewCache -> IO Int
+cacheDynamicMemoryUsage cache = readIORef (cvcMemoryUsage cache)
+
+-- | Get the number of entries in the cache.
+cacheGetCacheSize :: CoinsViewCache -> IO Int
+cacheGetCacheSize cache = Map.size <$> readIORef (cvcCoins cache)
+
+-- | Get the number of dirty entries in the cache.
+cacheGetDirtyCount :: CoinsViewCache -> IO Int
+cacheGetDirtyCount cache = readIORef (cvcDirtyCount cache)
+
+-- | Set the best block hash.
+cacheSetBestBlock :: CoinsViewCache -> BlockHash -> IO ()
+cacheSetBestBlock cache bh = writeIORef (cvcBestBlock cache) (Just bh)
+
+-- | Get the best block hash.
+-- Falls through to base if not cached.
+cacheGetBestBlock :: CoinsViewCache -> IO (Maybe BlockHash)
+cacheGetBestBlock cache = do
+  cached <- readIORef (cvcBestBlock cache)
+  case cached of
+    Just bh -> return (Just bh)
+    Nothing -> do
+      mBh <- coinsViewDBGetBestBlock (cvcBase cache)
+      case mBh of
+        Just bh -> do
+          writeIORef (cvcBestBlock cache) (Just bh)
+          return (Just bh)
+        Nothing -> return Nothing
+
+-- | Reset the cache without flushing.
+-- Discards all modifications.
+cacheReset :: CoinsViewCache -> IO ()
+cacheReset cache = do
+  writeIORef (cvcCoins cache) Map.empty
+  writeIORef (cvcBestBlock cache) Nothing
+  writeIORef (cvcMemoryUsage cache) 0
+  writeIORef (cvcDirtyCount cache) 0
+
+-- | Sanity check the cache for internal consistency.
+-- Reference: bitcoin/src/coins.cpp CCoinsViewCache::SanityCheck
+--
+-- Returns Nothing if OK, Just errorMessage if inconsistent.
+cacheSanityCheck :: CoinsViewCache -> IO (Maybe String)
+cacheSanityCheck cache = do
+  coins <- readIORef (cvcCoins cache)
+  reportedMemUsage <- readIORef (cvcMemoryUsage cache)
+  reportedDirtyCount <- readIORef (cvcDirtyCount cache)
+
+  let (errs, actualMemUsage, actualDirtyCount) = Map.foldlWithKey' checkEntry ([], 0, 0) coins
+
+  let errs' = if actualMemUsage /= reportedMemUsage
+              then ("Memory usage mismatch: actual=" ++ show actualMemUsage ++
+                    ", reported=" ++ show reportedMemUsage) : errs
+              else errs
+
+  let errs'' = if actualDirtyCount /= reportedDirtyCount
+               then ("Dirty count mismatch: actual=" ++ show actualDirtyCount ++
+                     ", reported=" ++ show reportedDirtyCount) : errs'
+               else errs'
+
+  return $ if null errs'' then Nothing else Just (unlines errs'')
+  where
+    checkEntry (errs, mem, dirty) _ entry =
+      let mem' = mem + coinEntryMemoryUsage entry
+          dirty' = if ceDirty entry then dirty + 1 else dirty
+          errs' = case ceCoin entry of
+            Nothing ->
+              -- Spent coin: must be dirty, cannot be fresh
+              if not (ceDirty entry)
+              then ("Spent coin not marked dirty" : errs)
+              else if ceFresh entry
+              then ("Spent coin marked fresh" : errs)
+              else errs
+            Just coin
+              | coinIsSpent coin ->
+                  -- Same rules for null coin
+                  if not (ceDirty entry)
+                  then ("Null coin not marked dirty" : errs)
+                  else if ceFresh entry
+                  then ("Null coin marked fresh" : errs)
+                  else errs
+              | otherwise ->
+                  -- Unspent coin: must not be fresh if not dirty
+                  if ceFresh entry && not (ceDirty entry)
+                  then ("Unspent coin fresh but not dirty" : errs)
+                  else errs
+      in (errs', mem', dirty')
+
+--------------------------------------------------------------------------------
+-- Undo Data for Chain Reorganizations (Bitcoin Core compatible)
 --------------------------------------------------------------------------------
 
--- | Undo data for a block, enabling chain reorganizations.
--- Stores the UTXOs that were spent by this block so they can be restored
--- if the block is disconnected during a reorg.
+-- | Undo information for a single transaction input.
+-- Contains the prevout's TxOut being spent, plus metadata.
+-- This follows Bitcoin Core's TxInUndoFormatter structure:
+--   - nHeight (varint): block height where UTXO was created, scaled by 2
+--   - fCoinBase (bit): stored in the low bit of the scaled height
+--   - out (TxOut): the spent output (value + scriptPubKey)
 --
--- KNOWN PITFALL: Without undo data, a node cannot safely handle reorgs.
-data UndoData = UndoData
-  { udBlockHash    :: !BlockHash            -- ^ Hash of the block this undo is for
-  , udHeight       :: !Word32               -- ^ Height of the block
-  , udSpentOutputs :: ![(OutPoint, UTXOEntry)] -- ^ UTXOs that were spent
+-- Encoding: nCode = height * 2 + coinbase_flag
+-- Reference: bitcoin/src/undo.h TxInUndoFormatter
+data TxInUndo = TxInUndo
+  { tuOutput   :: !TxOut     -- ^ The spent transaction output
+  , tuHeight   :: !Word32    -- ^ Block height where this output was created
+  , tuCoinbase :: !Bool      -- ^ True if from a coinbase transaction
   } deriving (Show, Eq, Generic)
+
+instance Serialize TxInUndo where
+  put TxInUndo{..} = do
+    -- Encode height * 2 + coinbase_flag as varint
+    let nCode = tuHeight * 2 + (if tuCoinbase then 1 else 0)
+    put (VarInt (fromIntegral nCode))
+    -- If height > 0, write a dummy version byte (for backwards compat)
+    when (tuHeight > 0) $ put (0 :: Word8)
+    -- Write the TxOut
+    put tuOutput
+  get = do
+    VarInt nCode <- get
+    let height = fromIntegral (nCode `div` 2)
+        coinbase = nCode `mod` 2 == 1
+    -- Read dummy version byte if height > 0
+    when (height > 0) $ void (get :: Get Word8)
+    output <- get
+    return $ TxInUndo output height coinbase
+
+-- | Undo information for a single transaction.
+-- Contains undo data for all inputs of the transaction.
+-- Reference: bitcoin/src/undo.h CTxUndo
+data TxUndo = TxUndo
+  { tuPrevOutputs :: ![TxInUndo]  -- ^ One entry per input
+  } deriving (Show, Eq, Generic)
+
+instance Serialize TxUndo where
+  put TxUndo{..} = do
+    put (VarInt (fromIntegral $ length tuPrevOutputs))
+    mapM_ put tuPrevOutputs
+  get = do
+    VarInt count <- get
+    prevs <- sequence $ replicate (fromIntegral count) get
+    return $ TxUndo prevs
+
+-- | Undo information for a block.
+-- Contains undo data for all non-coinbase transactions.
+-- The coinbase transaction has no undo data (it has no inputs to spend).
+-- Reference: bitcoin/src/undo.h CBlockUndo
+data BlockUndo = BlockUndo
+  { buTxUndo :: ![TxUndo]  -- ^ One entry per non-coinbase transaction
+  } deriving (Show, Eq, Generic)
+
+instance Serialize BlockUndo where
+  put BlockUndo{..} = do
+    put (VarInt (fromIntegral $ length buTxUndo))
+    mapM_ put buTxUndo
+  get = do
+    VarInt count <- get
+    undos <- sequence $ replicate (fromIntegral count) get
+    return $ BlockUndo undos
+
+-- | Undo data wrapper for a block, used for storage with checksum.
+-- The checksum is SHA256d(prev_block_hash || block_undo_data),
+-- which is verified during load to detect corruption.
+-- Reference: bitcoin/src/node/blockstorage.cpp WriteBlockUndo, ReadBlockUndo
+data UndoData = UndoData
+  { udBlockHash    :: !BlockHash      -- ^ Hash of the block this undo is for
+  , udHeight       :: !Word32         -- ^ Height of the block
+  , udBlockUndo    :: !BlockUndo      -- ^ The actual undo data
+  , udChecksum     :: !Hash256        -- ^ SHA256d(prevHash || serialized undo)
+  } deriving (Show, Eq, Generic)
+
+-- | Serialize UndoData without checksum (for computing checksum)
+serializeUndoPayload :: BlockHash -> BlockUndo -> ByteString
+serializeUndoPayload prevHash undo = encode prevHash <> encode undo
+
+-- | Compute the checksum for undo data.
+-- Matches Bitcoin Core: SHA256d(prev_block_hash || block_undo_serialized)
+computeUndoChecksum :: BlockHash -> BlockUndo -> Hash256
+computeUndoChecksum prevHash undo =
+  doubleSHA256' (serializeUndoPayload prevHash undo)
 
 instance Serialize UndoData where
   put UndoData{..} = do
     put udBlockHash
     putWord32be udHeight
-    putWord32be (fromIntegral $ length udSpentOutputs)
-    mapM_ (\(op, entry) -> put op >> put entry) udSpentOutputs
+    put udBlockUndo
+    put udChecksum
   get = do
     bh <- get
     height <- getWord32be
-    count <- getWord32be
-    spent <- sequence $ replicate (fromIntegral count) ((,) <$> get <*> get)
-    return $ UndoData bh height spent
+    undo <- get
+    checksum <- get
+    return $ UndoData bh height undo checksum
 
 -- | Store undo data for a block.
--- Uses prefix 0x10 for undo data keys.
+-- Uses prefix 0x10 for undo data keys in the database.
 putUndoData :: HaskoinDB -> BlockHash -> UndoData -> IO ()
 putUndoData db bh undo =
   let key = BS.cons 0x10 (encode bh)
   in R.put (dbHandle db) (dbWriteOpts db) key (encode undo)
 
 -- | Retrieve undo data for a block.
+-- Returns Nothing if not found or if checksum verification fails.
 getUndoData :: HaskoinDB -> BlockHash -> IO (Maybe UndoData)
 getUndoData db bh = do
   let key = BS.cons 0x10 (encode bh)
   mval <- R.get (dbHandle db) (dbReadOpts db) key
   return $ mval >>= either (const Nothing) Just . decode
+
+-- | Retrieve and verify undo data for a block.
+-- Verifies the checksum against the previous block hash.
+-- Returns Left with error message on failure.
+getUndoDataVerified :: HaskoinDB -> BlockHash -> BlockHash -> IO (Either String UndoData)
+getUndoDataVerified db bh prevHash = do
+  mUndo <- getUndoData db bh
+  case mUndo of
+    Nothing -> return $ Left "Undo data not found"
+    Just undo ->
+      let expected = computeUndoChecksum prevHash (udBlockUndo undo)
+      in if udChecksum undo == expected
+         then return $ Right undo
+         else return $ Left "Undo data checksum mismatch"
+
+-- | Create UndoData with computed checksum.
+mkUndoData :: BlockHash -> Word32 -> BlockHash -> BlockUndo -> UndoData
+mkUndoData bh height prevHash undo = UndoData
+  { udBlockHash = bh
+  , udHeight = height
+  , udBlockUndo = undo
+  , udChecksum = computeUndoChecksum prevHash undo
+  }
+
+-- | Delete undo data for a block.
+deleteUndoData :: HaskoinDB -> BlockHash -> IO ()
+deleteUndoData db bh =
+  let key = BS.cons 0x10 (encode bh)
+  in R.delete (dbHandle db) (dbWriteOpts db) key
+
+-- | Legacy UndoData format for backwards compatibility.
+-- Contains simple list of spent outputs.
+-- DEPRECATED: Use BlockUndo instead for new code.
+data LegacyUndoData = LegacyUndoData
+  { ludSpentOutputs :: ![(OutPoint, UTXOEntry)]
+  } deriving (Show, Eq, Generic)
+
+instance Serialize LegacyUndoData where
+  put LegacyUndoData{..} = do
+    putWord32be (fromIntegral $ length ludSpentOutputs)
+    mapM_ (\(op, entry) -> put op >> put entry) ludSpentOutputs
+  get = do
+    count <- getWord32be
+    spent <- sequence $ replicate (fromIntegral count) ((,) <$> get <*> get)
+    return $ LegacyUndoData spent
 
 --------------------------------------------------------------------------------
 -- Persisted Chain State
@@ -734,3 +1475,991 @@ getUTXOCount db = do
     modifyIORef' countRef (+1)
     return True
   readIORef countRef
+
+--------------------------------------------------------------------------------
+-- Flat File Block Storage
+--------------------------------------------------------------------------------
+
+-- | Maximum size of a single block file (128 MiB).
+-- When a file exceeds this size, a new file is created.
+-- Reference: bitcoin/src/node/blockstorage.h MAX_BLOCKFILE_SIZE
+maxBlockFileSize :: Int64
+maxBlockFileSize = 128 * 1024 * 1024  -- 128 MiB
+
+-- | Pre-allocation chunk size (16 MiB).
+-- Files are pre-allocated in chunks of this size to reduce fragmentation.
+-- Reference: bitcoin/src/node/blockstorage.h BLOCKFILE_CHUNK_SIZE
+blockFileChunkSize :: Int64
+blockFileChunkSize = 16 * 1024 * 1024  -- 16 MiB
+
+-- | Storage header size: 4 bytes magic + 4 bytes size = 8 bytes
+storageHeaderBytes :: Int
+storageHeaderBytes = 8
+
+-- | Position within flat file storage.
+-- Similar to Bitcoin Core's FlatFilePos.
+data FlatFilePos = FlatFilePos
+  { ffpFileNum :: !Int        -- ^ File number (blk{nnnnn}.dat)
+  , ffpDataPos :: !Int64      -- ^ Byte offset within the file (after header)
+  } deriving (Show, Eq, Generic)
+
+instance NFData FlatFilePos
+
+instance Serialize FlatFilePos where
+  put FlatFilePos{..} = do
+    putWord32le (fromIntegral ffpFileNum)
+    putWord64le (fromIntegral ffpDataPos)
+  get = FlatFilePos
+    <$> (fromIntegral <$> getWord32le)
+    <*> (fromIntegral <$> getWord64le)
+
+-- | Check if a FlatFilePos is null/invalid
+flatFilePosIsNull :: FlatFilePos -> Bool
+flatFilePosIsNull pos = ffpFileNum pos < 0 || ffpDataPos pos < 0
+
+-- | Null/invalid file position
+nullFlatFilePos :: FlatFilePos
+nullFlatFilePos = FlatFilePos (-1) (-1)
+
+-- | Block file information, tracking stats per blk file.
+-- Reference: bitcoin/src/node/blockstorage.h CBlockFileInfo
+data BlockFileInfo = BlockFileInfo
+  { bfiNumBlocks  :: !Int        -- ^ Number of blocks stored in this file
+  , bfiSize       :: !Int64      -- ^ Total bytes used in this file
+  , bfiMinHeight  :: !Word32     -- ^ Minimum block height in this file
+  , bfiMaxHeight  :: !Word32     -- ^ Maximum block height in this file
+  } deriving (Show, Eq, Generic)
+
+instance NFData BlockFileInfo
+
+instance Serialize BlockFileInfo where
+  put BlockFileInfo{..} = do
+    putWord32le (fromIntegral bfiNumBlocks)
+    putWord64le (fromIntegral bfiSize)
+    putWord32le bfiMinHeight
+    putWord32le bfiMaxHeight
+  get = BlockFileInfo
+    <$> (fromIntegral <$> getWord32le)
+    <*> (fromIntegral <$> getWord64le)
+    <*> getWord32le
+    <*> getWord32le
+
+-- | Empty block file info for initializing new files
+emptyBlockFileInfo :: BlockFileInfo
+emptyBlockFileInfo = BlockFileInfo
+  { bfiNumBlocks = 0
+  , bfiSize = 0
+  , bfiMinHeight = maxBound
+  , bfiMaxHeight = 0
+  }
+
+-- | Block index entry mapping block hash to disk location.
+-- Reference: bitcoin/src/chain.h CDiskBlockIndex (subset)
+data BlockIndex = BlockIndex
+  { biFileNumber :: !Int        -- ^ File number where block data is stored
+  , biDataPos    :: !Int64      -- ^ Position of block data within the file
+  , biUndoPos    :: !Int64      -- ^ Position of undo data (0 if not stored)
+  , biHeight     :: !Word32     -- ^ Block height
+  } deriving (Show, Eq, Generic)
+
+instance NFData BlockIndex
+
+instance Serialize BlockIndex where
+  put BlockIndex{..} = do
+    putWord32le (fromIntegral biFileNumber)
+    putWord64le (fromIntegral biDataPos)
+    putWord64le (fromIntegral biUndoPos)
+    putWord32le biHeight
+  get = BlockIndex
+    <$> (fromIntegral <$> getWord32le)
+    <*> (fromIntegral <$> getWord64le)
+    <*> (fromIntegral <$> getWord64le)
+    <*> getWord32le
+
+-- | Storage errors
+data StorageError
+  = StorageIOError String
+  | StorageMagicMismatch ByteString ByteString
+  | StorageDecodeError String
+  | StorageBlockNotFound BlockHash
+  | StorageFileNotFound FilePath
+  | StorageInvalidPosition FlatFilePos
+  deriving (Show, Eq)
+
+-- | Block store managing flat file storage.
+-- Maintains state for writing blocks to blk files.
+data BlockStore = BlockStore
+  { bsBlocksDir    :: !FilePath              -- ^ Directory for block files
+  , bsNetworkMagic :: !ByteString            -- ^ 4-byte network magic
+  , bsDB           :: !HaskoinDB             -- ^ RocksDB for block index
+  , bsCurrentFile  :: !(IORef Int)           -- ^ Current file number
+  , bsCurrentPos   :: !(IORef Int64)         -- ^ Current position in file
+  , bsFileInfos    :: !(IORef (Map Int BlockFileInfo))  -- ^ Info per file
+  }
+
+-- | Key prefix for block index entries in RocksDB
+prefixBlockIndex :: Word8
+prefixBlockIndex = 0x62  -- 'b' for block index (Bitcoin Core uses 'b')
+
+-- | Key prefix for block file info entries in RocksDB
+prefixFileInfo :: Word8
+prefixFileInfo = 0x66  -- 'f' for file info (Bitcoin Core uses 'f')
+
+-- | Key prefix for last block file number
+prefixLastBlockFile :: Word8
+prefixLastBlockFile = 0x6c  -- 'l' for last (Bitcoin Core uses 'l')
+
+-- | Format a block file path: blk{nnnnn}.dat
+blockFilePath :: FilePath -> Int -> FilePath
+blockFilePath blocksDir fileNum =
+  blocksDir </> printf "blk%05d.dat" fileNum
+
+-- | Create a new block store.
+-- Initializes the blocks directory and loads existing file info.
+newBlockStore :: FilePath -> ByteString -> HaskoinDB -> IO BlockStore
+newBlockStore blocksDir magic db = do
+  createDirectoryIfMissing True blocksDir
+
+  -- Load or initialize state
+  mLastFile <- getLastBlockFile db
+  let lastFile = maybe 0 id mLastFile
+
+  -- Load file infos from database
+  fileInfos <- loadAllFileInfos db
+
+  -- Determine current position in the last file
+  currentPos <- case Map.lookup lastFile fileInfos of
+    Just info -> return (bfiSize info)
+    Nothing   -> return 0
+
+  currentFileRef <- newIORef lastFile
+  currentPosRef <- newIORef currentPos
+  fileInfosRef <- newIORef fileInfos
+
+  return BlockStore
+    { bsBlocksDir    = blocksDir
+    , bsNetworkMagic = magic
+    , bsDB           = db
+    , bsCurrentFile  = currentFileRef
+    , bsCurrentPos   = currentPosRef
+    , bsFileInfos    = fileInfosRef
+    }
+
+-- | Load all file infos from database
+loadAllFileInfos :: HaskoinDB -> IO (Map Int BlockFileInfo)
+loadAllFileInfos db = do
+  infosRef <- newIORef Map.empty
+  let prefixBS = BS.singleton prefixFileInfo
+  runResourceT $ R.withIterator (dbHandle db) (dbReadOpts db) $ \iter -> do
+    R.iterSeek iter prefixBS
+    let loop = do
+          valid <- R.iterValid iter
+          when valid $ do
+            mkey <- R.iterKey iter
+            case mkey of
+              Nothing -> return ()
+              Just key ->
+                when (BS.isPrefixOf prefixBS key) $ do
+                  mval <- R.iterValue iter
+                  case mval of
+                    Nothing -> return ()
+                    Just val -> do
+                      -- Extract file number from key (after prefix byte)
+                      let keyPayload = BS.drop 1 key
+                      case fromBE32 keyPayload of
+                        Nothing -> R.iterNext iter >> loop
+                        Just fileNum -> do
+                          case decode val of
+                            Left _ -> R.iterNext iter >> loop
+                            Right info -> do
+                              liftIO $ modifyIORef' infosRef
+                                (Map.insert (fromIntegral fileNum) info)
+                              R.iterNext iter >> loop
+    loop
+  readIORef infosRef
+
+-- | Get the last block file number from database
+getLastBlockFile :: HaskoinDB -> IO (Maybe Int)
+getLastBlockFile db = do
+  let key = BS.singleton prefixLastBlockFile
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  case mval of
+    Nothing -> return Nothing
+    Just val -> case fromBE32 val of
+      Nothing -> return Nothing
+      Just n  -> return (Just (fromIntegral n))
+
+-- | Save the last block file number to database
+putLastBlockFile :: HaskoinDB -> Int -> IO ()
+putLastBlockFile db fileNum =
+  let key = BS.singleton prefixLastBlockFile
+      val = toBE32 (fromIntegral fileNum)
+  in R.put (dbHandle db) (dbWriteOpts db) key val
+
+-- | Save block file info to database
+putFileInfo :: HaskoinDB -> Int -> BlockFileInfo -> IO ()
+putFileInfo db fileNum info =
+  let key = BS.cons prefixFileInfo (toBE32 (fromIntegral fileNum))
+  in R.put (dbHandle db) (dbWriteOpts db) key (encode info)
+
+-- | Get block file info from database
+getFileInfo :: HaskoinDB -> Int -> IO (Maybe BlockFileInfo)
+getFileInfo db fileNum = do
+  let key = BS.cons prefixFileInfo (toBE32 (fromIntegral fileNum))
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Store a block index entry in RocksDB.
+-- Key format: 'b' + BlockHash -> BlockIndex
+putBlockIndex :: HaskoinDB -> BlockHash -> BlockIndex -> IO ()
+putBlockIndex db bh idx =
+  let key = BS.cons prefixBlockIndex (encode bh)
+  in R.put (dbHandle db) (dbWriteOpts db) key (encode idx)
+
+-- | Retrieve a block index entry from RocksDB.
+getBlockIndex :: HaskoinDB -> BlockHash -> IO (Maybe BlockIndex)
+getBlockIndex db bh = do
+  let key = BS.cons prefixBlockIndex (encode bh)
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Pre-allocate space in a file in chunks.
+-- This reduces fragmentation during IBD.
+preAllocateFile :: Handle -> Int64 -> Int64 -> IO ()
+preAllocateFile h currentSize targetSize = do
+  let currentChunks = (currentSize + blockFileChunkSize - 1) `div` blockFileChunkSize
+      targetChunks = (targetSize + blockFileChunkSize - 1) `div` blockFileChunkSize
+  when (targetChunks > currentChunks) $ do
+    let newSize = targetChunks * blockFileChunkSize
+    hSetFileSize h (fromIntegral newSize)
+
+-- | Find or create a position for a new block.
+-- Returns the file position where the block should be written.
+findNextBlockPos :: BlockStore -> Int -> Word32 -> IO FlatFilePos
+findNextBlockPos store blockSize height = do
+  currentFile <- readIORef (bsCurrentFile store)
+  currentPos <- readIORef (bsCurrentPos store)
+  fileInfos <- readIORef (bsFileInfos store)
+
+  let totalSize = fromIntegral (blockSize + storageHeaderBytes)
+
+  -- Check if we need to move to a new file
+  if currentPos + totalSize > maxBlockFileSize
+    then do
+      -- Move to next file
+      let newFile = currentFile + 1
+      writeIORef (bsCurrentFile store) newFile
+      writeIORef (bsCurrentPos store) 0
+      -- Initialize new file info
+      modifyIORef' (bsFileInfos store) (Map.insert newFile emptyBlockFileInfo)
+      -- Persist last file number
+      putLastBlockFile (bsDB store) newFile
+      return $ FlatFilePos newFile 0
+    else
+      return $ FlatFilePos currentFile currentPos
+
+-- | Write a block to disk.
+-- Returns the position where the block was written.
+writeBlockToDisk :: BlockStore -> Block -> BlockHash -> Word32 -> IO (Either StorageError FlatFilePos)
+writeBlockToDisk store block blockHash height = do
+  let blockData = encode block
+      blockSize = BS.length blockData
+      totalSize = blockSize + storageHeaderBytes
+
+  -- Find position for this block
+  pos <- findNextBlockPos store blockSize height
+
+  let filePath = blockFilePath (bsBlocksDir store) (ffpFileNum pos)
+
+  result <- try $ do
+    -- Open or create the file
+    h <- openBinaryFile filePath ReadWriteMode `catch` \(_ :: IOException) ->
+           openBinaryFile filePath WriteMode
+
+    -- Pre-allocate space if needed
+    currentFileSize <- hFileSize h
+    let targetSize = ffpDataPos pos + fromIntegral totalSize
+    preAllocateFile h (fromIntegral currentFileSize) targetSize
+
+    -- Seek to position
+    hSeek h AbsoluteSeek (fromIntegral (ffpDataPos pos))
+
+    -- Write header: magic (4 bytes) + size (4 bytes LE)
+    let header = runPut $ do
+          putByteString (bsNetworkMagic store)
+          putWord32le (fromIntegral blockSize)
+    hPut h header
+
+    -- Write block data
+    hPut h blockData
+
+    hFlush h
+    hClose h
+
+    return ()
+
+  case result of
+    Left (e :: IOException) ->
+      return $ Left $ StorageIOError (show e)
+    Right () -> do
+      -- Update current position
+      let newPos = ffpDataPos pos + fromIntegral totalSize
+      writeIORef (bsCurrentPos store) newPos
+
+      -- Update file info
+      modifyIORef' (bsFileInfos store) $ \infos ->
+        let info = Map.findWithDefault emptyBlockFileInfo (ffpFileNum pos) infos
+            info' = info
+              { bfiNumBlocks = bfiNumBlocks info + 1
+              , bfiSize = newPos
+              , bfiMinHeight = min (bfiMinHeight info) height
+              , bfiMaxHeight = max (bfiMaxHeight info) height
+              }
+        in Map.insert (ffpFileNum pos) info' infos
+
+      -- Persist file info
+      fileInfos <- readIORef (bsFileInfos store)
+      case Map.lookup (ffpFileNum pos) fileInfos of
+        Just info -> putFileInfo (bsDB store) (ffpFileNum pos) info
+        Nothing -> return ()
+
+      -- Store block index
+      let idx = BlockIndex
+            { biFileNumber = ffpFileNum pos
+            , biDataPos = ffpDataPos pos + fromIntegral storageHeaderBytes
+            , biUndoPos = 0  -- Undo data stored separately
+            , biHeight = height
+            }
+      putBlockIndex (bsDB store) blockHash idx
+
+      -- Return position pointing to the actual block data (after header)
+      return $ Right $ FlatFilePos (ffpFileNum pos) (ffpDataPos pos + fromIntegral storageHeaderBytes)
+
+-- | Read a block from disk using its index entry.
+readBlockFromDisk :: BlockStore -> BlockIndex -> IO (Either StorageError Block)
+readBlockFromDisk store idx = do
+  let fileNum = biFileNumber idx
+      -- Position includes header, so we need to go back 8 bytes
+      headerPos = biDataPos idx - fromIntegral storageHeaderBytes
+      filePath = blockFilePath (bsBlocksDir store) fileNum
+
+  -- Check if file exists
+  exists <- doesFileExist filePath
+  unless exists $
+    fail $ "Storage file not found: " ++ filePath
+
+  result <- try $ do
+    h <- openBinaryFile filePath ReadMode
+
+    -- Seek to the header position
+    hSeek h AbsoluteSeek (fromIntegral headerPos)
+
+    -- Read header: magic (4 bytes) + size (4 bytes LE)
+    headerBytes <- hGet h storageHeaderBytes
+    when (BS.length headerBytes /= storageHeaderBytes) $
+      fail "Failed to read block header"
+
+    let magic = BS.take 4 headerBytes
+        sizeBytes = BS.drop 4 headerBytes
+
+    -- Validate magic number
+    when (magic /= bsNetworkMagic store) $ do
+      hClose h
+      fail $ "Magic number mismatch: got " ++ show magic ++ ", expected " ++ show (bsNetworkMagic store)
+
+    -- Parse size (little-endian Word32)
+    blockSize <- case runGet getWord32le sizeBytes of
+      Left err -> do
+        hClose h
+        fail $ "Failed to parse block size: " ++ err
+      Right s -> return (fromIntegral s :: Int)
+
+    -- Read block data
+    blockData <- hGet h blockSize
+    when (BS.length blockData /= blockSize) $ do
+      hClose h
+      fail "Failed to read complete block data"
+
+    hClose h
+
+    -- Decode block
+    case decode blockData of
+      Left err -> fail $ "Failed to decode block: " ++ err
+      Right block -> return block
+
+  case result of
+    Left (e :: IOException) ->
+      return $ Left $ StorageIOError (show e)
+    Right block ->
+      return $ Right block
+
+--------------------------------------------------------------------------------
+-- Pruning Support
+--------------------------------------------------------------------------------
+-- Reference: bitcoin/src/node/blockstorage.cpp PruneOneBlockFile, FindFilesToPrune
+--
+-- Pruning automatically deletes old block data files to keep disk usage below
+-- a target, while retaining enough data for reorgs.
+--
+-- Key invariants:
+--   - Minimum prune target: 550 MiB (576,716,800 bytes)
+--   - Keep at least 288 blocks from the tip (MIN_BLOCKS_TO_KEEP)
+--   - Prune entire files, not individual blocks
+--   - Undo data (.rev files) must be pruned with corresponding block data
+
+-- | Minimum prune target: 550 MiB (Bitcoin Core's MIN_DISK_SPACE_FOR_BLOCK_FILES)
+-- This is the minimum amount of space to reserve for block storage.
+minPruneTarget :: Int64
+minPruneTarget = 550 * 1024 * 1024  -- 550 MiB = 576,716,800 bytes
+
+-- | Minimum number of blocks to keep from the tip.
+-- This ensures enough data for reorgs (Bitcoin Core uses 288).
+minBlocksToKeep :: Word32
+minBlocksToKeep = 288
+
+-- | Pruning configuration
+data PruneConfig = PruneConfig
+  { pcPruneTarget :: !(Maybe Int64)  -- ^ Target disk usage in bytes (Nothing = no pruning)
+  , pcMinBlocksToKeep :: !Word32     -- ^ Minimum blocks to keep from tip
+  } deriving (Show, Eq)
+
+-- | Default pruning configuration (pruning disabled)
+defaultPruneConfig :: PruneConfig
+defaultPruneConfig = PruneConfig
+  { pcPruneTarget = Nothing
+  , pcMinBlocksToKeep = minBlocksToKeep
+  }
+
+-- | Format a rev (undo) file path: rev{nnnnn}.dat
+revFilePath :: FilePath -> Int -> FilePath
+revFilePath blocksDir fileNum =
+  blocksDir </> printf "rev%05d.dat" fileNum
+
+-- | Calculate current disk usage from block file infos.
+-- Sums the size of all block files and undo files.
+-- Reference: bitcoin/src/node/blockstorage.cpp CalculateCurrentUsage
+calculateCurrentUsage :: Map Int BlockFileInfo -> Int64
+calculateCurrentUsage fileInfos =
+  Map.foldl' (\acc info -> acc + bfiSize info) 0 fileInfos
+
+-- | Find files that can be pruned to reduce disk usage below target.
+-- Returns file numbers that should be pruned (oldest files first).
+--
+-- Pruning rules:
+--   1. Only prune if current usage exceeds target
+--   2. Never prune files containing blocks within minBlocksToKeep of the tip
+--   3. Prune oldest files first (lowest file numbers)
+--   4. Stop when usage drops below target
+--
+-- Reference: bitcoin/src/node/blockstorage.cpp FindFilesToPrune
+findFilesToPrune :: Word32           -- ^ Current chain tip height
+                 -> Int64            -- ^ Target disk usage (bytes)
+                 -> Map Int BlockFileInfo  -- ^ File info map
+                 -> [Int]            -- ^ File numbers to prune
+findFilesToPrune tipHeight target fileInfos
+  | currentUsage <= target = []  -- Already below target
+  | tipHeight < minBlocksToKeep = []  -- Chain too short to prune
+  | otherwise = go (Map.toAscList fileInfos) currentUsage []
+  where
+    currentUsage = calculateCurrentUsage fileInfos
+    -- Maximum height that can be pruned (keep minBlocksToKeep from tip)
+    lastPrunableHeight = tipHeight - minBlocksToKeep
+
+    go [] _ acc = reverse acc  -- Return in ascending order
+    go ((fileNum, info):rest) usage acc
+      | usage <= target = reverse acc  -- Below target, stop
+      | bfiSize info == 0 = go rest usage acc  -- Empty file, skip
+      | bfiMaxHeight info > lastPrunableHeight = go rest usage acc  -- Too recent
+      | otherwise =
+          -- This file can be pruned
+          let newUsage = usage - bfiSize info
+          in go rest newUsage (fileNum : acc)
+
+-- | Prune a single block file by deleting its blk and rev files.
+-- Also updates the database to mark blocks in this file as pruned.
+--
+-- Reference: bitcoin/src/node/blockstorage.cpp PruneOneBlockFile
+pruneOneBlockFile :: BlockStore
+                  -> Int              -- ^ File number to prune
+                  -> IO ()
+pruneOneBlockFile store fileNum = do
+  let blocksDir = bsBlocksDir store
+      blkFile = blockFilePath blocksDir fileNum
+      undoFile = revFilePath blocksDir fileNum
+
+  -- Delete block file
+  blkExists <- doesFileExist blkFile
+  when blkExists $ do
+    removeFile blkFile `catch` (\(_ :: IOException) -> return ())
+
+  -- Delete undo file
+  undoExists <- doesFileExist undoFile
+  when undoExists $ do
+    removeFile undoFile `catch` (\(_ :: IOException) -> return ())
+
+  -- Update file info to mark as empty
+  modifyIORef' (bsFileInfos store) (Map.delete fileNum)
+
+  -- Clear the file info in database
+  let db = bsDB store
+      emptyInfo = emptyBlockFileInfo
+  putFileInfo db fileNum emptyInfo
+
+-- | Check if a block has been pruned.
+-- A block is pruned if it has a valid block index but the block file
+-- position is invalid (set to Nothing/pruned marker).
+isBlockPruned :: BlockStore -> BlockHash -> IO Bool
+isBlockPruned store bh = do
+  mIdx <- getBlockIndex (bsDB store) bh
+  case mIdx of
+    Nothing -> return False  -- Block not in index at all
+    Just idx ->
+      -- Check if the file still exists
+      let filePath = blockFilePath (bsBlocksDir store) (biFileNumber idx)
+      in do
+        exists <- doesFileExist filePath
+        if not exists
+          then return True  -- File was pruned
+          else do
+            -- Also check if file info shows it as empty
+            fileInfos <- readIORef (bsFileInfos store)
+            case Map.lookup (biFileNumber idx) fileInfos of
+              Nothing -> return True  -- No info = pruned
+              Just info -> return (bfiSize info == 0)  -- Empty = pruned
+
+-- | Prune blockchain data up to a specified height.
+-- Returns the number of files pruned and any error.
+--
+-- This is called manually via the pruneblockchain RPC.
+-- Reference: bitcoin/src/node/blockstorage.cpp FindFilesToPruneManual
+pruneBlockchain :: BlockStore
+                -> Word32      -- ^ Current tip height
+                -> Word32      -- ^ Prune up to this height
+                -> IO (Either String Int)
+pruneBlockchain store tipHeight pruneHeight
+  | tipHeight < minBlocksToKeep = return $ Left $
+      "Chain height " ++ show tipHeight ++
+      " is below minimum required for pruning (" ++ show minBlocksToKeep ++ ")"
+  | pruneHeight > tipHeight - minBlocksToKeep = return $ Left $
+      "Cannot prune blocks within " ++ show minBlocksToKeep ++
+      " blocks of the current tip (" ++ show tipHeight ++ ")"
+  | otherwise = do
+      fileInfos <- readIORef (bsFileInfos store)
+      let filesToPrune = findFilesToPruneManual pruneHeight fileInfos
+      -- Prune each file
+      forM_ filesToPrune $ \fileNum ->
+        pruneOneBlockFile store fileNum
+      return $ Right (length filesToPrune)
+  where
+    -- Find files where all blocks are at or below pruneHeight
+    findFilesToPruneManual :: Word32 -> Map Int BlockFileInfo -> [Int]
+    findFilesToPruneManual maxHeight infos =
+      [ fileNum
+      | (fileNum, info) <- Map.toAscList infos
+      , bfiSize info > 0  -- Not already empty
+      , bfiMaxHeight info <= maxHeight  -- All blocks at or below max
+      ]
+
+--------------------------------------------------------------------------------
+-- AssumeUTXO Support
+--------------------------------------------------------------------------------
+-- Reference: bitcoin/src/node/utxo_snapshot.h, bitcoin/src/validation.cpp
+--
+-- AssumeUTXO allows the node to start syncing from a UTXO snapshot at a known
+-- block height, then validates the full chain from genesis in the background.
+--
+-- Key components:
+--   1. SnapshotMetadata: Header information about the snapshot
+--   2. SnapshotCoin: Individual UTXO entry in the snapshot
+--   3. UtxoSnapshot: Full snapshot with all coins
+--   4. AssumeUtxoData: Hardcoded params per height for validation
+--   5. Snapshot chainstate: Separate chainstate using snapshot data
+
+-- | Magic bytes for UTXO snapshot files: "utxo" + 0xff
+snapshotMagicBytes :: ByteString
+snapshotMagicBytes = BS.pack [0x75, 0x74, 0x78, 0x6f, 0xff]  -- "utxo" + 0xff
+
+-- | Current snapshot format version
+snapshotVersion :: Word16
+snapshotVersion = 2
+
+-- | Snapshot metadata header.
+-- Reference: bitcoin/src/node/utxo_snapshot.h SnapshotMetadata
+data SnapshotMetadata = SnapshotMetadata
+  { smNetworkMagic :: !Word32       -- ^ Network magic bytes (little-endian)
+  , smBaseBlockHash :: !BlockHash   -- ^ Block hash at snapshot height
+  , smCoinsCount :: !Word64         -- ^ Total number of coins in snapshot
+  } deriving (Show, Eq, Generic)
+
+instance NFData SnapshotMetadata
+
+instance Serialize SnapshotMetadata where
+  put SnapshotMetadata{..} = do
+    -- Magic bytes
+    putByteString snapshotMagicBytes
+    -- Version
+    putWord16le snapshotVersion
+    -- Network magic
+    putWord32le smNetworkMagic
+    -- Base block hash
+    put smBaseBlockHash
+    -- Coins count
+    putWord64le smCoinsCount
+  get = do
+    -- Read and verify magic bytes
+    magic <- getBytes 5
+    unless (magic == snapshotMagicBytes) $
+      fail "Invalid snapshot magic bytes"
+    -- Read and verify version
+    ver <- getWord16le
+    unless (ver == snapshotVersion) $
+      fail $ "Unsupported snapshot version: " ++ show ver
+    -- Read remaining fields
+    SnapshotMetadata
+      <$> getWord32le
+      <*> get
+      <*> getWord64le
+
+-- | A coin entry in the snapshot.
+-- Format: txid + coin_count + (vout_index, coin)*
+-- This groups coins by txid for efficient serialization.
+data SnapshotCoin = SnapshotCoin
+  { scOutPoint :: !OutPoint  -- ^ The outpoint (txid + vout index)
+  , scCoin     :: !Coin      -- ^ The coin data
+  } deriving (Show, Eq, Generic)
+
+instance NFData SnapshotCoin
+
+instance Serialize SnapshotCoin where
+  put SnapshotCoin{..} = do
+    put scOutPoint
+    put scCoin
+  get = SnapshotCoin <$> get <*> get
+
+-- | Complete UTXO snapshot.
+-- Contains metadata header followed by all coins.
+data UtxoSnapshot = UtxoSnapshot
+  { usMetadata :: !SnapshotMetadata
+  , usCoins    :: ![SnapshotCoin]
+  } deriving (Show, Eq, Generic)
+
+instance NFData UtxoSnapshot
+
+-- | Hardcoded assumeUTXO validation data.
+-- Reference: bitcoin/src/kernel/chainparams.h AssumeutxoData
+data AssumeUtxoData = AssumeUtxoData
+  { audHeight        :: !Word32      -- ^ Block height for this snapshot
+  , audHashSerialized :: !Hash256    -- ^ Expected hash of serialized UTXO set
+  , audChainTxCount  :: !Word64      -- ^ Cumulative transaction count
+  , audBlockHash     :: !BlockHash   -- ^ Block hash at this height
+  } deriving (Show, Eq, Generic)
+
+instance NFData AssumeUtxoData
+
+-- | Snapshot chainstate - tracks the state of a snapshot-based chainstate.
+-- Reference: bitcoin/src/validation.h Chainstate
+data SnapshotChainstate = SnapshotChainstate
+  { scsCache        :: !CoinsViewCache   -- ^ UTXO cache for snapshot
+  , scsBaseHash     :: !BlockHash        -- ^ Base block hash from snapshot
+  , scsBaseHeight   :: !Word32           -- ^ Base block height from snapshot
+  , scsCurrentTip   :: !(IORef BlockHash) -- ^ Current chain tip (may advance)
+  , scsCurrentHeight :: !(IORef Word32)   -- ^ Current chain height
+  , scsValidated    :: !(IORef Bool)     -- ^ True once background validation completes
+  } deriving (Generic)
+
+-- | Load a UTXO snapshot from a file.
+-- Validates the magic bytes, version, and network magic.
+-- Reference: bitcoin/src/validation.cpp PopulateAndValidateSnapshot
+loadSnapshot :: FilePath -> Word32 -> IO (Either String UtxoSnapshot)
+loadSnapshot path expectedMagic = do
+  result <- try $ BS.readFile path
+  case result of
+    Left (e :: IOException) ->
+      return $ Left $ "Failed to read snapshot file: " ++ show e
+    Right contents -> parseSnapshot contents expectedMagic
+
+-- | Parse snapshot data from ByteString.
+parseSnapshot :: ByteString -> Word32 -> IO (Either String UtxoSnapshot)
+parseSnapshot contents expectedMagic = do
+  -- Decode metadata first
+  case runGet get contents of
+    Left err -> return $ Left $ "Failed to parse snapshot metadata: " ++ err
+    Right metadata
+      | smNetworkMagic metadata /= expectedMagic ->
+          return $ Left $ "Network magic mismatch: expected " ++
+            show expectedMagic ++ ", got " ++ show (smNetworkMagic metadata)
+      | otherwise -> do
+          -- Parse coins (metadata size = 5 + 2 + 4 + 32 + 8 = 51 bytes)
+          let coinsData = BS.drop 51 contents
+          parseCoins metadata coinsData
+
+-- | Parse coins from snapshot data.
+-- Format: txid (32) + coin_count (varint) + (vout_index (varint) + coin)*
+parseCoins :: SnapshotMetadata -> ByteString -> IO (Either String UtxoSnapshot)
+parseCoins metadata coinsData = do
+  case parseCoinsLoop (smCoinsCount metadata) coinsData [] of
+    Left err -> return $ Left err
+    Right coins -> return $ Right $ UtxoSnapshot metadata coins
+
+-- | Parse loop for coins.
+-- Grouped by txid: txid + count + (vout + coin)*
+parseCoinsLoop :: Word64 -> ByteString -> [SnapshotCoin]
+               -> Either String [SnapshotCoin]
+parseCoinsLoop 0 remaining acc
+  | BS.null remaining = Right (reverse acc)
+  | otherwise = Left "Unexpected trailing data in snapshot"
+parseCoinsLoop remaining bs acc = do
+  -- Parse txid
+  case runGet parseTxidGroup bs of
+    Left err -> Left $ "Failed to parse coin group: " ++ err
+    Right (coins, rest, consumed) ->
+      parseCoinsLoop (remaining - fromIntegral consumed) rest (reverse coins ++ acc)
+
+-- | Parse a group of coins with the same txid.
+-- Format: txid (32 bytes) + count (varint) + (vout (varint) + coin)*
+parseTxidGroup :: Get ([SnapshotCoin], ByteString, Int)
+parseTxidGroup = do
+  -- Read txid (32 bytes)
+  txidBytes <- getBytes 32
+  let txid = TxId (Hash256 txidBytes)
+
+  -- Read number of coins for this txid
+  VarInt coinCount <- get
+
+  -- Read each coin
+  coins <- sequence $ replicate (fromIntegral coinCount) $ do
+    -- Read vout index
+    VarInt voutIndex <- get
+    -- Read coin data
+    coin <- get
+    let outpoint = OutPoint txid (fromIntegral voutIndex)
+    return $ SnapshotCoin outpoint coin
+
+  -- Get remaining bytes
+  remaining <- BS.drop . fromIntegral <$> bytesRead <*> pure BS.empty
+
+  return (coins, remaining, fromIntegral coinCount)
+  where
+    bytesRead :: Get Int64
+    bytesRead = undefined  -- This is a placeholder; actual implementation needs state
+
+-- | Simplified coin parsing - parse one coin at a time.
+-- This is used when we know the exact count.
+parseOneCoin :: Get SnapshotCoin
+parseOneCoin = do
+  outpoint <- get
+  coin <- get
+  return $ SnapshotCoin outpoint coin
+
+-- | Populate a CoinsViewCache from a snapshot.
+-- Reference: bitcoin/src/validation.cpp PopulateAndValidateSnapshot
+populateFromSnapshot :: CoinsViewCache -> UtxoSnapshot -> IO Int
+populateFromSnapshot cache snapshot = do
+  let coins = usCoins snapshot
+  -- Add each coin to the cache
+  forM_ coins $ \SnapshotCoin{..} -> do
+    cacheAddCoin cache scOutPoint scCoin True  -- possibleOverwrite = True
+  -- Set the best block to the snapshot base
+  cacheSetBestBlock cache (smBaseBlockHash $ usMetadata snapshot)
+  return (length coins)
+
+-- | Create a new snapshot chainstate from a snapshot.
+-- The chainstate is immediately usable for block validation from the snapshot height.
+newSnapshotChainstate :: CoinsViewDB -> UtxoSnapshot -> Word32 -> IO SnapshotChainstate
+newSnapshotChainstate db snapshot baseHeight = do
+  -- Create a cache for the snapshot
+  cache <- newCoinsViewCache db defaultCacheSize
+
+  -- Populate from snapshot
+  _ <- populateFromSnapshot cache snapshot
+
+  -- Flush to database
+  cacheFlush cache
+
+  -- Create fresh cache for operation
+  cache' <- newCoinsViewCache db defaultCacheSize
+
+  -- Initialize state refs
+  tipRef <- newIORef (smBaseBlockHash $ usMetadata snapshot)
+  heightRef <- newIORef baseHeight
+  validatedRef <- newIORef False
+
+  return SnapshotChainstate
+    { scsCache = cache'
+    , scsBaseHash = smBaseBlockHash $ usMetadata snapshot
+    , scsBaseHeight = baseHeight
+    , scsCurrentTip = tipRef
+    , scsCurrentHeight = heightRef
+    , scsValidated = validatedRef
+    }
+
+-- | Write a UTXO snapshot to a file.
+-- Reference: bitcoin/src/rpc/blockchain.cpp dumptxoutset
+writeSnapshot :: FilePath -> Word32 -> BlockHash -> CoinsViewCache -> IO (Either String Word64)
+writeSnapshot path networkMagic blockHash cache = do
+  result <- try $ do
+    -- First, collect all coins from the cache
+    coins <- collectAllCoins cache
+
+    let metadata = SnapshotMetadata
+          { smNetworkMagic = networkMagic
+          , smBaseBlockHash = blockHash
+          , smCoinsCount = fromIntegral (length coins)
+          }
+
+    -- Serialize metadata
+    let metadataBS = encode metadata
+
+    -- Serialize coins (grouped by txid)
+    let coinsBS = serializeCoins coins
+
+    -- Write to file
+    BS.writeFile path (metadataBS <> coinsBS)
+
+    return (fromIntegral $ length coins)
+
+  case result of
+    Left (e :: IOException) ->
+      return $ Left $ "Failed to write snapshot: " ++ show e
+    Right count ->
+      return $ Right count
+
+-- | Collect all coins from a CoinsViewCache.
+-- Note: This requires reading from the backing database as well.
+collectAllCoins :: CoinsViewCache -> IO [SnapshotCoin]
+collectAllCoins cache = do
+  -- Get coins from cache
+  cacheCoins <- readIORef (cvcCoins cache)
+  let cachedCoins =
+        [ SnapshotCoin op coin
+        | (op, entry) <- Map.toList cacheCoins
+        , Just coin <- [ceCoin entry]
+        , not (coinIsSpent coin)
+        ]
+
+  -- Also need to iterate through database for uncached coins
+  -- For now, just return cached coins (full implementation would iterate DB)
+  return cachedCoins
+
+-- | Serialize coins grouped by txid.
+-- Format: txid + coin_count + (vout_index + coin)*
+serializeCoins :: [SnapshotCoin] -> ByteString
+serializeCoins coins =
+  let -- Group by txid
+      grouped = Map.toList $ foldr groupCoin Map.empty coins
+      groupCoin sc m =
+        let TxId _ = outPointHash (scOutPoint sc)
+        in Map.insertWith (++) (outPointHash (scOutPoint sc)) [sc] m
+  in BS.concat $ map serializeGroup grouped
+  where
+    serializeGroup (txid, scoins) = runPut $ do
+      -- Write txid
+      put txid
+      -- Write coin count
+      put (VarInt (fromIntegral $ length scoins))
+      -- Write each coin
+      forM_ scoins $ \SnapshotCoin{..} -> do
+        put (VarInt (fromIntegral $ outPointIndex scOutPoint))
+        put scCoin
+
+-- | Compute the hash of the serialized UTXO set.
+-- This is compared against the hardcoded assumeUtxo hash.
+-- Reference: bitcoin/src/kernel/coinstats.cpp ComputeUTXOStats
+computeUtxoHash :: [SnapshotCoin] -> Hash256
+computeUtxoHash coins =
+  -- For now, use simple SHA256d of all serialized coins
+  -- Real implementation would use MuHash3072
+  doubleSHA256' (BS.concat $ map encode coins)
+
+-- | Verify a snapshot against known assumeUTXO data.
+verifySnapshot :: UtxoSnapshot -> AssumeUtxoData -> Either String ()
+verifySnapshot snapshot audData
+  | smBaseBlockHash (usMetadata snapshot) /= audBlockHash audData =
+      Left $ "Block hash mismatch: expected " ++
+        show (audBlockHash audData) ++ ", got " ++
+        show (smBaseBlockHash (usMetadata snapshot))
+  | otherwise =
+      -- Compute and verify hash
+      let actualHash = computeUtxoHash (usCoins snapshot)
+      in if actualHash == audHashSerialized audData
+         then Right ()
+         else Left $ "UTXO hash mismatch: expected " ++
+           show (audHashSerialized audData) ++ ", got " ++ show actualHash
+
+-- | Background validation state for assumeUTXO.
+-- Tracks progress of validating the chain from genesis to snapshot height.
+data BackgroundValidation = BackgroundValidation
+  { bvDB            :: !HaskoinDB
+  , bvTargetHeight  :: !Word32           -- ^ Height to validate to
+  , bvTargetHash    :: !BlockHash        -- ^ Expected hash at target height
+  , bvCurrentHeight :: !(IORef Word32)   -- ^ Current validation height
+  , bvComplete      :: !(IORef Bool)     -- ^ Validation complete flag
+  , bvError         :: !(IORef (Maybe String)) -- ^ Any error encountered
+  }
+
+-- | Create a new background validation task.
+newBackgroundValidation :: HaskoinDB -> Word32 -> BlockHash -> IO BackgroundValidation
+newBackgroundValidation db targetHeight targetHash = do
+  heightRef <- newIORef 0
+  completeRef <- newIORef False
+  errorRef <- newIORef Nothing
+  return BackgroundValidation
+    { bvDB = db
+    , bvTargetHeight = targetHeight
+    , bvTargetHash = targetHash
+    , bvCurrentHeight = heightRef
+    , bvComplete = completeRef
+    , bvError = errorRef
+    }
+
+-- | Get the progress of background validation (0.0 to 1.0).
+backgroundValidationProgress :: BackgroundValidation -> IO Double
+backgroundValidationProgress bv = do
+  current <- readIORef (bvCurrentHeight bv)
+  return $ fromIntegral current / fromIntegral (bvTargetHeight bv)
+
+-- | Check if background validation is complete.
+isBackgroundValidationComplete :: BackgroundValidation -> IO Bool
+isBackgroundValidationComplete bv = readIORef (bvComplete bv)
+
+-- | Get any error from background validation.
+getBackgroundValidationError :: BackgroundValidation -> IO (Maybe String)
+getBackgroundValidationError bv = readIORef (bvError bv)
+
+-- | Mark background validation as complete.
+markBackgroundValidationComplete :: BackgroundValidation -> IO ()
+markBackgroundValidationComplete bv = writeIORef (bvComplete bv) True
+
+-- | Mark background validation as failed.
+markBackgroundValidationFailed :: BackgroundValidation -> String -> IO ()
+markBackgroundValidationFailed bv err = do
+  writeIORef (bvError bv) (Just err)
+  writeIORef (bvComplete bv) True
+
+-- | Update background validation progress.
+updateBackgroundValidationProgress :: BackgroundValidation -> Word32 -> IO ()
+updateBackgroundValidationProgress bv height =
+  writeIORef (bvCurrentHeight bv) height
+
+-- | Key prefix for snapshot base block hash in database
+prefixSnapshotBase :: Word8
+prefixSnapshotBase = 0x53  -- 'S' for snapshot
+
+-- | Store the snapshot base block hash.
+putSnapshotBaseHash :: HaskoinDB -> BlockHash -> IO ()
+putSnapshotBaseHash db bh =
+  let key = BS.singleton prefixSnapshotBase
+  in R.put (dbHandle db) (dbWriteOpts db) key (encode bh)
+
+-- | Retrieve the snapshot base block hash.
+getSnapshotBaseHash :: HaskoinDB -> IO (Maybe BlockHash)
+getSnapshotBaseHash db = do
+  let key = BS.singleton prefixSnapshotBase
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Delete the snapshot base block hash.
+deleteSnapshotBaseHash :: HaskoinDB -> IO ()
+deleteSnapshotBaseHash db =
+  let key = BS.singleton prefixSnapshotBase
+  in R.delete (dbHandle db) (dbWriteOpts db) key

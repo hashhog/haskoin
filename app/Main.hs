@@ -1,5 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main where
 
@@ -11,15 +12,20 @@ import qualified Data.Text.Encoding as TE
 import System.IO (hSetBuffering, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.FilePath ((</>))
-import Control.Concurrent (newEmptyMVar, takeMVar)
+import Control.Concurrent (threadDelay, forkIO)
+import Control.Monad (forM_, unless, when, void, forever)
 import Control.Concurrent.STM
-import Control.Exception (bracket)
-import Data.Word (Word64)
+import Control.Exception (bracket, catch, IOException, SomeException)
+import Data.Word (Word32, Word64)
+import Data.Int (Int32)
+import Data.IORef
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import Data.Serialize (decode)
 
+import qualified Network.Socket as NS (getAddrInfo, addrAddress, AddrInfo)
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeBlockHash, textToAddress, Address(..))
 import Haskoin.Script (decodeScript)
@@ -225,13 +231,36 @@ runNode net dataDir NodeOptions{..} = do
     -- Initialize fee estimator
     fe <- newFeeEstimator
 
-    -- Start peer manager
-    let pmConfig = defaultPeerManagerConfig
-          { pmcMaxOutbound = min 8 noMaxPeers }
-    pm <- startPeerManager net pmConfig (messageHandler db hc cache mp fe)
+    -- Track next expected block height for download
+    nextBlockRef <- newIORef (1 :: Word32)
 
     -- Start header sync
-    _hs <- startHeaderSync net hc pm
+    hs <- startHeaderSync net hc
+
+    -- Start peer manager with sync-aware message handler
+    let pmConfig = defaultPeerManagerConfig
+          { pmcMaxOutbound = min 8 noMaxPeers }
+    pmRef <- newIORef (undefined :: PeerManager)
+    pm <- startPeerManager net pmConfig (syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef)
+    writeIORef pmRef pm
+
+    -- Seed known addresses from --connect flags
+    forM_ noConnect $ \connectStr -> do
+      let (host, portStr) = case break (== ':') connectStr of
+            (h, ':':p) -> (h, p)
+            (h, _)     -> (h, show (netDefaultPort net))
+      case reads portStr of
+        [(port, "")] -> do
+          addrInfos <- NS.getAddrInfo Nothing (Just host) (Just (show (port :: Int))) :: IO [NS.AddrInfo]
+          forM_ addrInfos $ \ai -> do
+            let addr = NS.addrAddress ai
+            putStrLn $ "Adding connect peer: " ++ show addr
+            atomically $ modifyTVar' (pmKnownAddrs pm) (Set.insert addr)
+        _ -> putStrLn $ "Invalid connect address: " ++ connectStr
+
+    -- Spawn a thread to send getheaders once a peer connects
+    void $ forkIO $ getheadersSender pm hc net
+      `catch` (\(e :: SomeException) -> putStrLn $ "getheadersSender error: " ++ show e)
 
     -- Start RPC server
     let rpcConfig = defaultRpcConfig
@@ -239,13 +268,13 @@ runNode net dataDir NodeOptions{..} = do
           , rpcUser = noRpcUser
           , rpcPassword = noRpcPass
           }
-    _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net
+    _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
 
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
-    waitVar <- newEmptyMVar
-    takeMVar waitVar  -- block forever
+    let loop = threadDelay (maxBound `div` 2) >> loop
+    loop
 
 -- | Initialize header chain from database
 initHeaderChainFromDB :: HaskoinDB -> Network -> IO HeaderChain
@@ -278,35 +307,109 @@ initHeaderChainFromDB db net = do
       -- For now, start from genesis
       return ()
 
+  invalidatedVar <- newTVarIO Set.empty
   return HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
     , hcHeight = heightVar
     , hcByHeight = byHeightVar
+    , hcInvalidated = invalidatedVar
     }
 
--- | Central message handler
-messageHandler :: HaskoinDB -> HeaderChain -> UTXOCache -> Mempool
-               -> FeeEstimator -> SockAddr -> Message -> IO ()
-messageHandler _db _hc _cache mp _fe _addr msg = case msg of
+-- | Wait for a peer to connect, then send getheaders
+getheadersSender :: PeerManager -> HeaderChain -> Network -> IO ()
+getheadersSender pm hc _net = do
+  putStrLn "getheadersSender: waiting for peer..."
+  -- Wait until we have at least one peer
+  let waitForPeer :: IO PeerConnection
+      waitForPeer = do
+        peers <- readTVarIO (pmPeers pm)
+        if Map.null peers
+          then threadDelay 500000 >> waitForPeer  -- 0.5s
+          else do
+            putStrLn $ "getheadersSender: found " ++ show (Map.size peers) ++ " peer(s)"
+            return (head $ Map.elems peers)
+  pc <- waitForPeer
+  putStrLn "Peer connected, sending getheaders..."
+
+  -- Build getheaders from our current tip
+  tip <- getChainTip hc
+  let locator = [ceHash tip]
+      zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+      getHdrs = GetHeaders
+        { ghVersion  = fromIntegral protocolVersion
+        , ghLocators = locator
+        , ghHashStop = zeroHash
+        }
+  sendMessage pc (MGetHeaders getHdrs)
+    `catch` (\(_ :: IOException) -> putStrLn "Failed to send getheaders")
+  putStrLn "getheaders sent successfully"
+
+-- | Request blocks for a range of heights from the header chain
+requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> IO ()
+requestBlocks pm hc fromHeight toHeight = do
+  peers <- readTVarIO (pmPeers pm)
+  case Map.elems peers of
+    [] -> putStrLn "No peers to request blocks from"
+    (pc:_) -> do
+      heightMap <- readTVarIO (hcByHeight hc)
+      let hashes = [ h | height <- [fromHeight..toHeight]
+                       , Just h <- [Map.lookup height heightMap] ]
+          invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- hashes ]
+      unless (null invVecs) $ do
+        putStrLn $ "Requesting " ++ show (length invVecs) ++ " blocks (heights "
+                   ++ show fromHeight ++ "-" ++ show toHeight ++ ")"
+        sendMessage pc (MGetData (GetData invVecs))
+          `catch` (\(_ :: IOException) -> putStrLn "Failed to send getdata")
+
+-- | Sync-aware message handler
+syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
+                   -> Mempool -> FeeEstimator -> Network
+                   -> IORef PeerManager -> IORef Word32
+                   -> SockAddr -> Message -> IO ()
+syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = case msg of
   MPing (Ping _nonce) ->
-    -- Respond with pong (handled at peer level)
-    return ()
-  MHeaders _headers ->
-    -- Process in header sync
-    return ()
-  MBlock _block ->
-    -- Process in block download
-    return ()
+    return ()  -- Pong handled at peer level
+
+  MHeaders (Headers hdrs) -> do
+    putStrLn $ "Received " ++ show (length hdrs) ++ " headers"
+    (added, errs) <- handleHeaders hs hdrs
+    putStrLn $ "Added " ++ show added ++ " headers"
+    unless (null errs) $
+      putStrLn $ "Header errors: " ++ show errs
+    -- After adding headers, request the blocks
+    when (added > 0) $ do
+      tip <- getChainTip hc
+      let tipHeight = ceHeight tip
+      nextBlock <- readIORef nextBlockRef
+      pm <- readIORef pmRef
+      requestBlocks pm hc nextBlock tipHeight
+      writeIORef nextBlockRef (tipHeight + 1)
+
+  MBlock block -> do
+    let bh = computeBlockHash (blockHeader block)
+    -- Find the height for this block
+    heightMap <- readTVarIO (hcByHeight hc)
+    let mHeight = Map.foldlWithKey'
+          (\acc h hash -> if hash == bh then Just h else acc) Nothing heightMap
+    case mHeight of
+      Nothing -> putStrLn $ "Received unknown block: " ++ show bh
+      Just height -> do
+        putStrLn $ "Received block at height " ++ show height ++ ": " ++ show bh
+        connectBlock db net block height
+        putBlockHeight db height bh
+        putBestBlockHash db bh
+
   MTx tx -> do
     _ <- addTransaction mp tx
     return ()
+
   MInv _inv ->
-    -- Request unknown transactions and blocks
     return ()
+
   MAddr _addrs ->
-    -- Add to known addresses
     return ()
+
   _ -> return ()
 
 --------------------------------------------------------------------------------
