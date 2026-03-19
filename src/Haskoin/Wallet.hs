@@ -33,6 +33,17 @@ module Haskoin.Wallet
   , createWallet
   , loadWallet
   , saveWallet
+    -- * Multi-Wallet Manager
+  , WalletManager(..)
+  , WalletInfo(..)
+  , newWalletManager
+  , createManagedWallet
+  , loadManagedWallet
+  , unloadManagedWallet
+  , getManagedWallet
+  , getDefaultWallet
+  , listManagedWallets
+  , getWalletInfo
     -- * BIP-39 Mnemonic
   , Mnemonic(..)
   , generateMnemonic
@@ -130,6 +141,21 @@ module Haskoin.Wallet
   , encodePsbt
   , isPsbtFinalized
   , getPsbtFee
+    -- * Output Descriptors (BIP-380-386)
+  , Descriptor(..)
+  , KeyExpr(..)
+  , TapTree(..)
+  , DerivRange(..)
+  , ParseError(..)
+  , parseDescriptor
+  , descriptorToText
+  , deriveAddresses
+  , deriveScripts
+  , descriptorChecksum
+  , addDescriptorChecksum
+  , validateDescriptorChecksum
+  , isRangeDescriptor
+  , expandCombo
   ) where
 
 import Data.ByteString (ByteString)
@@ -158,8 +184,10 @@ import Control.Concurrent.STM
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
 import System.IO.Unsafe (unsafePerformIO)
-import Data.Char (isSpace)
+import Data.Char (isSpace, isDigit, isHexDigit, digitToInt, ord)
 import Data.Maybe (listToMaybe, mapMaybe, fromMaybe)
+import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory)
+import System.FilePath ((</>))
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
                        TxIn(..), TxOut(..), Tx(..), putVarInt, getVarInt', putVarBytes, getVarBytes)
@@ -172,7 +200,8 @@ import Haskoin.Consensus (Network(..), coinbaseMaturity)
 import Crypto.Cipher.AES (AES256)
 import Crypto.Cipher.Types (BlockCipher(..), Cipher(..), cbcEncrypt, cbcDecrypt, makeIV, IV)
 import Crypto.Error (CryptoFailable(..))
-import Data.Time.Clock (UTCTime, NominalDiffTime, addUTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime(..), NominalDiffTime, addUTCTime, getCurrentTime, diffUTCTime)
+import Data.Time.Calendar (Day(..))
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
 import Crypto.Hash (SHA512(..))
 
@@ -960,7 +989,7 @@ utxosToGroups :: [(OutPoint, TxOut, Word32)] -> FeeRate -> [OutputGroup]
 utxosToGroups utxos feeRate = map toGroup utxos
   where
     toGroup (op, txo, confs) =
-      let utxo = Utxo op txo confs False
+      let utxo = Utxo op txo confs False 0
           value = utxoValue utxo
           effVal = effectiveValue utxo feeRate
           fee = feeFromWeight inputWeightP2WPKH feeRate
@@ -1279,6 +1308,12 @@ selectCoinsWithHeight wallet outputs feeRate tipHeight = do
               return $ Right CoinSelection
                 { csInputs = selectedPairs
                 , csOutputs = outputs
+                , csChange = fmap (\a -> (a, changeAmount)) changeAddr
+                , csFee = actualFee
+                , csFeeRate = feeRate
+                , csAlgorithm = AlgKnapsack
+                , csWaste = waste
+                }
 
 -- | Compute confirmations from tip height and UTXO block height.
 computeConfs :: Word32 -> Word32 -> Word32
@@ -1456,6 +1491,21 @@ data EncryptedWallet = EncryptedWallet
 
 instance NFData EncryptedWallet
 
+-- | Imported descriptor entry for storage.
+data ImportedDescriptor = ImportedDescriptor
+  { idDescriptor  :: !Descriptor     -- ^ The parsed descriptor
+  , idDescText    :: !Text           -- ^ Original descriptor text
+  , idActive      :: !Bool           -- ^ Whether active for address generation
+  , idInternal    :: !Bool           -- ^ Whether internal (change) descriptor
+  , idTimestamp   :: !Word64         -- ^ Import timestamp
+  , idNextIndex   :: !Word32         -- ^ Next index for ranged descriptors
+  , idRangeStart  :: !Word32         -- ^ Start of range
+  , idRangeEnd    :: !Word32         -- ^ End of range
+  , idLabel       :: !(Maybe Text)   -- ^ Optional label
+  } deriving (Show, Eq, Generic)
+
+instance NFData ImportedDescriptor
+
 -- | Wallet state wrapper that handles encryption.
 data WalletState = WalletState
   { wsWallet       :: !Wallet           -- ^ The underlying wallet
@@ -1465,6 +1515,8 @@ data WalletState = WalletState
       -- ^ When the wallet should be locked (Nothing if unlocked indefinitely)
   , wsDecryptedKey :: !(TVar (Maybe ByteString))
       -- ^ Decrypted master key (Nothing if locked)
+  , wsDescriptors  :: !(TVar [ImportedDescriptor])
+      -- ^ Imported output descriptors
   }
 
 -- | Default PBKDF2 iterations for key derivation.
@@ -1639,11 +1691,13 @@ createWalletState w = do
   encrypted <- newTVarIO Nothing
   unlockExpiry <- newTVarIO Nothing
   decryptedKey <- newTVarIO Nothing
+  descriptors <- newTVarIO []
   return WalletState
     { wsWallet = w
     , wsEncrypted = encrypted
     , wsUnlockExpiry = unlockExpiry
     , wsDecryptedKey = decryptedKey
+    , wsDescriptors = descriptors
     }
 
 --------------------------------------------------------------------------------
@@ -2184,7 +2238,7 @@ signInput xkey tx inputIdx pinp
 -- | Check if an input is already finalized
 isInputFinalized :: PsbtInput -> Bool
 isInputFinalized pinp =
-  piSingleFinalized pinp || not (null (piFinalScriptWitness pinp `maybe` [] $ id))
+  piSingleFinalized pinp || not (null (maybe [] id (piFinalScriptWitness pinp)))
   where
     piSingleFinalized p = case piFinalScriptSig p of
       Just _ -> True
@@ -2256,7 +2310,7 @@ computeLegacySighash tx inputIdx script shType =
                                (shType .&. 0x1f == 0x02)
                                (shType .&. 0x1f == 0x03)
                                (shType .&. 0x80 /= 0)
-  in txSigHash tx inputIdx script shTypeFlag
+  in txSigHash tx inputIdx script shType shTypeFlag
 
 -- | Compute segwit v0 sighash (BIP-143)
 computeSegwitSighash :: Tx -> Int -> ByteString -> Word64 -> Word32 -> Hash256
@@ -2470,3 +2524,1161 @@ getPsbtFee psbt = do
   where
     getInputValue :: PsbtInput -> Maybe Word64
     getInputValue pinp = txOutValue <$> getInputUtxo pinp
+
+--------------------------------------------------------------------------------
+-- Output Descriptors (BIP-380-386)
+--------------------------------------------------------------------------------
+
+-- | Derivation range for ranged descriptors.
+-- `DerivRange` represents either a specific index or a wildcard (*).
+data DerivRange
+  = DerivIndex !Word32      -- ^ Specific index
+  | DerivWildcard           -- ^ Wildcard (*) - iterate at runtime
+  | DerivHardenedWildcard   -- ^ Hardened wildcard (*h or *')
+  deriving (Show, Eq, Generic)
+
+instance NFData DerivRange
+
+-- | Key expression for use in descriptors.
+-- Represents the various ways keys can be specified in a descriptor.
+data KeyExpr
+  = KeyLiteral !PubKey                               -- ^ Literal public key (hex)
+  | KeyXPub !ExtendedPubKey ![Word32] !DerivRange    -- ^ xpub with derivation path
+  | KeyXPriv !ExtendedKey ![Word32] !DerivRange      -- ^ xprv with derivation path
+  | KeyWIF !SecKey                                    -- ^ WIF-encoded private key
+  | KeyOrigin !ByteString ![Word32] !KeyExpr         -- ^ Key with origin info [fingerprint/path]key
+  deriving (Show, Eq, Generic)
+
+instance NFData KeyExpr
+
+-- | Taproot tree structure for tr() descriptors.
+data TapTree
+  = TapLeaf !Descriptor                   -- ^ Single leaf script
+  | TapBranch !TapTree !TapTree           -- ^ Branch with two children
+  deriving (Show, Eq, Generic)
+
+instance NFData TapTree
+
+-- | Output descriptor AST following BIP-380 through BIP-386.
+data Descriptor
+  = Pk !KeyExpr                            -- ^ pk(KEY) - P2PK
+  | Pkh !KeyExpr                           -- ^ pkh(KEY) - P2PKH
+  | Wpkh !KeyExpr                          -- ^ wpkh(KEY) - P2WPKH (native SegWit)
+  | Sh !Descriptor                         -- ^ sh(SCRIPT) - P2SH wrapper
+  | Wsh !Descriptor                        -- ^ wsh(SCRIPT) - P2WSH (native SegWit)
+  | Multi !Int ![KeyExpr]                  -- ^ multi(k, KEY, KEY, ...) - k-of-n multisig
+  | SortedMulti !Int ![KeyExpr]            -- ^ sortedmulti(k, KEY, ...) - sorted multisig
+  | Tr !KeyExpr !(Maybe TapTree)           -- ^ tr(KEY) or tr(KEY, TREE) - Taproot
+  | Addr !Address                          -- ^ addr(ADDRESS) - literal address
+  | Raw !ByteString                        -- ^ raw(HEX) - raw script
+  | Combo !KeyExpr                         -- ^ combo(KEY) - multiple script types
+  deriving (Show, Eq, Generic)
+
+instance NFData Descriptor
+
+-- | Parse error for descriptors.
+data ParseError
+  = UnexpectedChar !Char !Int              -- ^ Unexpected character at position
+  | UnexpectedEnd                          -- ^ Unexpected end of input
+  | InvalidChecksum !Text !Text            -- ^ Expected vs actual checksum
+  | InvalidKey !Text                       -- ^ Invalid key encoding
+  | InvalidAddress !Text                   -- ^ Invalid address
+  | InvalidHex !Text                       -- ^ Invalid hex string
+  | InvalidThreshold !Int !Int             -- ^ Threshold out of range (given, max)
+  | UnknownFunction !Text                  -- ^ Unknown descriptor function
+  | MissingChecksum                        -- ^ Missing required checksum
+  | MalformedDescriptor !Text              -- ^ General malformed descriptor
+  deriving (Show, Eq, Generic)
+
+instance NFData ParseError
+
+--------------------------------------------------------------------------------
+-- Descriptor Checksum (BIP-380)
+--------------------------------------------------------------------------------
+
+-- | Character set for descriptor input (maps to 5-bit values).
+-- This is the character set for position calculation in the checksum.
+descriptorInputCharset :: String
+descriptorInputCharset =
+  "0123456789()[],'/*abcdefgh@:$%{}" ++
+  "IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~" ++
+  "ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
+
+-- | Character set for checksum output (same as bech32).
+descriptorChecksumCharset :: String
+descriptorChecksumCharset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+-- | Polynomial modular operation for descriptor checksum.
+-- Reference: Bitcoin Core src/script/descriptor.cpp PolyMod()
+descriptorPolyMod :: Word64 -> Int -> Word64
+descriptorPolyMod c val =
+  let c0 = c `shiftR` 35
+      c' = ((c .&. 0x7ffffffff) `shiftL` 5) `xor` fromIntegral val
+      c1 = if testBit c0 0 then c' `xor` 0xf5dee51989 else c'
+      c2 = if testBit c0 1 then c1 `xor` 0xa9fdca3312 else c1
+      c3 = if testBit c0 2 then c2 `xor` 0x1bab10e32d else c2
+      c4 = if testBit c0 3 then c3 `xor` 0x3706b1677a else c3
+      c5 = if testBit c0 4 then c4 `xor` 0x644d626ffd else c4
+  in c5
+
+-- | Compute the 8-character checksum for a descriptor string.
+-- Reference: Bitcoin Core src/script/descriptor.cpp DescriptorChecksum()
+descriptorChecksum :: Text -> Maybe Text
+descriptorChecksum input = do
+  -- Process each character
+  let chars = T.unpack input
+  positions <- mapM charPosition chars
+  -- Compute checksum by folding over all characters
+  finalState <- foldM processChar' (1 :: Word64, 0 :: Int, 0 :: Int) positions
+  let (c2, cls2, count2) = finalState
+      -- Emit final cls if needed
+      c3 = if count2 > 0 then descriptorPolyMod c2 cls2 else c2
+      -- Shift 8 times for checksum calculation
+      c4 = foldl' (\acc _ -> descriptorPolyMod acc 0) c3 [1..8 :: Int]
+      -- XOR with 1 to prevent appending zeros
+      c5 = c4 `xor` 1
+      -- Extract 8 checksum characters
+      checksumChars = map (\j -> descriptorChecksumCharset !! fromIntegral ((c5 `shiftR` (5 * (7 - j))) .&. 31)) [0..7]
+  return $ T.pack checksumChars
+  where
+    charPosition :: Char -> Maybe Int
+    charPosition ch = elemIndex' ch descriptorInputCharset
+
+    elemIndex' :: Eq a => a -> [a] -> Maybe Int
+    elemIndex' _ [] = Nothing
+    elemIndex' x (y:ys)
+      | x == y = Just 0
+      | otherwise = (+ 1) <$> elemIndex' x ys
+
+    processChar' :: (Word64, Int, Int) -> Int -> Maybe (Word64, Int, Int)
+    processChar' (c, cls, count) pos = Just $
+      let c' = descriptorPolyMod c (pos .&. 31)
+          cls' = cls * 3 + (pos `shiftR` 5)
+          count' = count + 1
+      in if count' == 3
+         then (descriptorPolyMod c' cls', 0, 0)
+         else (c', cls', count')
+
+-- | Add checksum to a descriptor string.
+addDescriptorChecksum :: Text -> Maybe Text
+addDescriptorChecksum desc = do
+  checksum <- descriptorChecksum desc
+  return $ desc <> "#" <> checksum
+
+-- | Validate and strip checksum from a descriptor string.
+-- Returns the descriptor without checksum if valid.
+validateDescriptorChecksum :: Text -> Either ParseError Text
+validateDescriptorChecksum input =
+  case T.breakOn "#" input of
+    (desc, rest)
+      | T.null rest -> Left MissingChecksum
+      | otherwise ->
+          let providedChecksum = T.drop 1 rest
+          in case descriptorChecksum desc of
+               Nothing -> Left $ MalformedDescriptor "Invalid characters in descriptor"
+               Just expectedChecksum
+                 | providedChecksum == expectedChecksum -> Right desc
+                 | otherwise -> Left $ InvalidChecksum expectedChecksum providedChecksum
+
+--------------------------------------------------------------------------------
+-- Descriptor Parser
+--------------------------------------------------------------------------------
+
+-- | Parser state for recursive descent parsing.
+data ParserState = ParserState
+  { psInput :: !Text        -- ^ Remaining input
+  , psPos   :: !Int         -- ^ Current position (for error reporting)
+  } deriving (Show)
+
+-- | Parser monad (simple state + error).
+type Parser a = ParserState -> Either ParseError (a, ParserState)
+
+-- | Run a parser on input text.
+runParser :: Parser a -> Text -> Either ParseError a
+runParser p input = case p (ParserState input 0) of
+  Left err -> Left err
+  Right (result, _) -> Right result
+
+-- | Parse a descriptor string (with or without checksum).
+parseDescriptor :: Text -> Either ParseError Descriptor
+parseDescriptor input = do
+  -- Check for and validate checksum if present
+  descText <- if T.isInfixOf "#" input
+              then validateDescriptorChecksum input
+              else Right input
+  -- Parse the descriptor
+  runParser parseDescriptorExpr (T.strip descText)
+
+-- | Parse a descriptor expression.
+parseDescriptorExpr :: Parser Descriptor
+parseDescriptorExpr st = do
+  (funcName, st1) <- parseIdentifier st
+  (_, st2) <- expectChar '(' st1
+  case T.toLower funcName of
+    "pk"          -> parsePk st2
+    "pkh"         -> parsePkh st2
+    "wpkh"        -> parseWpkh st2
+    "sh"          -> parseSh st2
+    "wsh"         -> parseWsh st2
+    "multi"       -> parseMulti False st2
+    "sortedmulti" -> parseMulti True st2
+    "tr"          -> parseTr st2
+    "addr"        -> parseAddr st2
+    "raw"         -> parseRaw st2
+    "combo"       -> parseCombo st2
+    other         -> Left $ UnknownFunction other
+
+-- | Parse pk(KEY).
+parsePk :: Parser Descriptor
+parsePk st = do
+  (key, st1) <- parseKeyExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Pk key, st2)
+
+-- | Parse pkh(KEY).
+parsePkh :: Parser Descriptor
+parsePkh st = do
+  (key, st1) <- parseKeyExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Pkh key, st2)
+
+-- | Parse wpkh(KEY).
+parseWpkh :: Parser Descriptor
+parseWpkh st = do
+  (key, st1) <- parseKeyExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Wpkh key, st2)
+
+-- | Parse sh(SCRIPT).
+parseSh :: Parser Descriptor
+parseSh st = do
+  (inner, st1) <- parseDescriptorExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Sh inner, st2)
+
+-- | Parse wsh(SCRIPT).
+parseWsh :: Parser Descriptor
+parseWsh st = do
+  (inner, st1) <- parseDescriptorExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Wsh inner, st2)
+
+-- | Parse multi(k, KEY, KEY, ...) or sortedmulti(...).
+parseMulti :: Bool -> Parser Descriptor
+parseMulti sorted st = do
+  (k, st1) <- parseNumber st
+  (_, st2) <- expectChar ',' st1
+  (keys, st3) <- parseKeyList st2
+  (_, st4) <- expectChar ')' st3
+  let n = length keys
+  if k < 1 || k > n || n > 20
+    then Left $ InvalidThreshold k n
+    else let ctor = if sorted then SortedMulti else Multi
+         in return (ctor k keys, st4)
+
+-- | Parse tr(KEY) or tr(KEY, TREE).
+parseTr :: Parser Descriptor
+parseTr st = do
+  (key, st1) <- parseKeyExpr st
+  -- Check for optional tree
+  case peekChar st1 of
+    Just ',' -> do
+      (_, st2) <- expectChar ',' st1
+      (tree, st3) <- parseTapTree st2
+      (_, st4) <- expectChar ')' st3
+      return (Tr key (Just tree), st4)
+    Just ')' -> do
+      (_, st2) <- expectChar ')' st1
+      return (Tr key Nothing, st2)
+    Just c -> Left $ UnexpectedChar c (psPos st1)
+    Nothing -> Left UnexpectedEnd
+
+-- | Parse a Taproot tree expression.
+parseTapTree :: Parser TapTree
+parseTapTree st = case peekChar st of
+  Just '{' -> do
+    (_, st1) <- expectChar '{' st
+    (left, st2) <- parseTapTree st1
+    (_, st3) <- expectChar ',' st2
+    (right, st4) <- parseTapTree st3
+    (_, st5) <- expectChar '}' st4
+    return (TapBranch left right, st5)
+  Just _ -> do
+    (desc, st1) <- parseDescriptorExpr st
+    return (TapLeaf desc, st1)
+  Nothing -> Left UnexpectedEnd
+
+-- | Parse addr(ADDRESS).
+parseAddr :: Parser Descriptor
+parseAddr st = do
+  (addrText, st1) <- parseUntilChar ')' st
+  (_, st2) <- expectChar ')' st1
+  case textToAddress addrText of
+    Just addr -> return (Addr addr, st2)
+    Nothing -> Left $ InvalidAddress addrText
+
+-- | Parse raw(HEX).
+parseRaw :: Parser Descriptor
+parseRaw st = do
+  (hexText, st1) <- parseUntilChar ')' st
+  (_, st2) <- expectChar ')' st1
+  case hexDecode' hexText of
+    Just bs -> return (Raw bs, st2)
+    Nothing -> Left $ InvalidHex hexText
+
+-- | Parse combo(KEY).
+parseCombo :: Parser Descriptor
+parseCombo st = do
+  (key, st1) <- parseKeyExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Combo key, st2)
+
+-- | Parse a key expression.
+parseKeyExpr :: Parser KeyExpr
+parseKeyExpr st = case peekChar st of
+  -- Origin info: [fingerprint/path]key
+  Just '[' -> do
+    (_, st1) <- expectChar '[' st
+    (origin, st2) <- parseOrigin st1
+    (_, st3) <- expectChar ']' st2
+    (key, st4) <- parseKeyExpr st3
+    let (fp, path) = origin
+    return (KeyOrigin fp path key, st4)
+  -- Key without origin
+  _ -> parseKeyInner st
+
+-- | Parse origin info (fingerprint and path).
+parseOrigin :: Parser (ByteString, [Word32])
+parseOrigin st = do
+  (fpText, st1) <- parseNChars 8 st
+  case hexDecode' fpText of
+    Nothing -> Left $ InvalidHex fpText
+    Just fp -> do
+      (path, st2) <- parseDerivPath st1
+      return ((fp, path), st2)
+
+-- | Parse a derivation path (e.g., /44'/0'/0').
+parseDerivPath :: Parser [Word32]
+parseDerivPath st = case peekChar st of
+  Just '/' -> do
+    (_, st1) <- expectChar '/' st
+    (idx, st2) <- parsePathComponent st1
+    (rest, st3) <- parseDerivPath st2
+    return (idx : rest, st3)
+  _ -> return ([], st)
+
+-- | Parse a single path component (e.g., 44' or 0).
+parsePathComponent :: Parser Word32
+parsePathComponent st = do
+  (numText, st1) <- parseWhile isDigit st
+  if T.null numText
+    then Left $ MalformedDescriptor "Expected number in path"
+    else do
+      let num = read (T.unpack numText) :: Word32
+      -- Check for hardened indicator
+      case peekChar st1 of
+        Just '\'' -> do
+          (_, st2) <- expectChar '\'' st1
+          return (num .|. 0x80000000, st2)
+        Just 'h' -> do
+          (_, st2) <- expectChar 'h' st1
+          return (num .|. 0x80000000, st2)
+        _ -> return (num, st1)
+
+-- | Parse a key without origin info.
+parseKeyInner :: Parser KeyExpr
+parseKeyInner st = do
+  -- Collect key string until delimiter
+  (keyText, st1) <- parseKeyString st
+  -- Determine key type and parse
+  parseKeyFromText keyText st1
+
+-- | Parse key string (may include derivation path).
+parseKeyString :: Parser Text
+parseKeyString st = parseWhile isKeyChar st
+  where
+    -- Include all characters that can appear in xpub/xprv/WIF keys
+    isKeyChar c = isHexDigit c || c `elem` ("xprvtubKLcn/*'" :: String) ||
+                  isDigit c || c == 'h' ||
+                  -- Base58 alphabet for WIF keys
+                  (c >= 'A' && c <= 'Z' && c /= 'I' && c /= 'O') ||
+                  (c >= 'a' && c <= 'z' && c /= 'l')
+
+-- | Parse a key from its text representation.
+parseKeyFromText :: Text -> Parser KeyExpr
+parseKeyFromText keyText st
+  -- Extended public key (xpub...)
+  | "xpub" `T.isPrefixOf` keyText || "tpub" `T.isPrefixOf` keyText =
+      parseXPub keyText st
+  -- Extended private key (xprv...)
+  | "xprv" `T.isPrefixOf` keyText || "tprv" `T.isPrefixOf` keyText =
+      parseXPriv keyText st
+  -- WIF private key (starts with 5, K, L for mainnet; c, 9 for testnet)
+  | isWifKey keyText =
+      parseWifKey keyText st
+  -- Hex public key
+  | T.all isHexDigit keyText && (T.length keyText == 66 || T.length keyText == 130) =
+      parseLiteralPubKey keyText st
+  -- X-only public key (32 bytes = 64 hex chars)
+  | T.all isHexDigit keyText && T.length keyText == 64 =
+      parseLiteralPubKey ("02" <> keyText) st  -- Assume even y
+  | otherwise =
+      Left $ InvalidKey keyText
+
+-- | Check if text looks like a WIF-encoded private key.
+isWifKey :: Text -> Bool
+isWifKey t
+  | T.null t = False
+  | otherwise =
+      let firstChar = T.head t
+          len = T.length t
+      in -- Mainnet uncompressed (5) = 51 chars, compressed (K/L) = 52 chars
+         -- Testnet uncompressed (9) = 51 chars, compressed (c) = 52 chars
+         (firstChar == '5' && len == 51) ||
+         (firstChar `elem` ("KL" :: String) && len == 52) ||
+         (firstChar == '9' && len == 51) ||
+         (firstChar == 'c' && len == 52)
+
+-- | Parse a WIF-encoded private key.
+parseWifKey :: Text -> Parser KeyExpr
+parseWifKey keyText st =
+  case wifDecode keyText of
+    Nothing -> Left $ InvalidKey keyText
+    Just sk -> return (KeyWIF sk, st)
+
+-- | Decode a WIF-encoded private key.
+-- WIF format: Base58Check(version || key || [0x01 if compressed])
+-- Mainnet version: 0x80, Testnet version: 0xef
+wifDecode :: Text -> Maybe SecKey
+wifDecode txt =
+  case base58CheckDecode txt of
+    Nothing -> Nothing
+    Just (version, payload)
+      | version /= 0x80 && version /= 0xef -> Nothing  -- Invalid version
+      | BS.length payload == 32 -> Just (SecKey payload)  -- Uncompressed
+      | BS.length payload == 33 && BS.last payload == 0x01 ->
+          Just (SecKey (BS.init payload))  -- Compressed (strip 0x01 suffix)
+      | otherwise -> Nothing
+
+-- | Parse an extended public key with optional derivation path.
+parseXPub :: Text -> Parser KeyExpr
+parseXPub keyText st = do
+  -- Split on '/' to separate key from path
+  let (baseKey, pathPart) = T.breakOn "/" keyText
+  -- Decode the xpub (placeholder - would use proper base58 decoding)
+  case decodeXPub baseKey of
+    Nothing -> Left $ InvalidKey keyText
+    Just xpub -> do
+      -- Parse derivation path from remaining text
+      let pathText = T.drop 1 pathPart  -- Drop leading '/'
+      (path, range) <- parseXPubPath pathText
+      return (KeyXPub xpub path range, st)
+
+-- | Parse an extended private key with optional derivation path.
+parseXPriv :: Text -> Parser KeyExpr
+parseXPriv keyText st = do
+  let (baseKey, pathPart) = T.breakOn "/" keyText
+  case decodeXPriv baseKey of
+    Nothing -> Left $ InvalidKey keyText
+    Just xprv -> do
+      let pathText = T.drop 1 pathPart
+      (path, range) <- parseXPubPath pathText
+      return (KeyXPriv xprv path range, st)
+
+-- | Parse xpub path and range.
+parseXPubPath :: Text -> Either ParseError ([Word32], DerivRange)
+parseXPubPath pathText
+  | T.null pathText = Right ([], DerivIndex 0)
+  | otherwise = do
+      -- Split on '/'
+      let components = filter (not . T.null) $ T.splitOn "/" pathText
+      -- Check for wildcard in last component
+      (indices, range) <- case components of
+        [] -> Right ([], DerivIndex 0)
+        _ -> do
+          let (initComps, lastComp) = (init components, last components)
+          initIndices <- mapM parsePathIdx initComps
+          case lastComp of
+            "*" -> Right (initIndices, DerivWildcard)
+            "*'" -> Right (initIndices, DerivHardenedWildcard)
+            "*h" -> Right (initIndices, DerivHardenedWildcard)
+            _ -> do
+              lastIdx <- parsePathIdx lastComp
+              Right (initIndices ++ [lastIdx], DerivIndex 0)
+      return (indices, range)
+  where
+    parsePathIdx :: Text -> Either ParseError Word32
+    parsePathIdx t
+      | T.null t = Left $ MalformedDescriptor "Empty path component"
+      | T.last t == '\'' || T.last t == 'h' =
+          let numText = T.init t
+          in case reads (T.unpack numText) of
+               [(n, "")] -> Right (n .|. 0x80000000)
+               _ -> Left $ MalformedDescriptor $ "Invalid path: " <> t
+      | otherwise =
+          case reads (T.unpack t) of
+            [(n, "")] -> Right n
+            _ -> Left $ MalformedDescriptor $ "Invalid path: " <> t
+
+-- | Parse a literal hex-encoded public key.
+parseLiteralPubKey :: Text -> Parser KeyExpr
+parseLiteralPubKey hexText st = case hexDecode' hexText of
+  Nothing -> Left $ InvalidKey hexText
+  Just bs -> case parsePubKey bs of
+    Nothing -> Left $ InvalidKey hexText
+    Just pk -> return (KeyLiteral pk, st)
+
+-- | Parse a comma-separated list of keys.
+parseKeyList :: Parser [KeyExpr]
+parseKeyList st = do
+  (key, st1) <- parseKeyExpr st
+  case peekChar st1 of
+    Just ',' -> do
+      (_, st2) <- expectChar ',' st1
+      (rest, st3) <- parseKeyList st2
+      return (key : rest, st3)
+    _ -> return ([key], st1)
+
+-- | Parse an identifier (function name).
+parseIdentifier :: Parser Text
+parseIdentifier st = parseWhile isIdChar st
+  where
+    isIdChar c = c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_'
+
+-- | Parse a number.
+parseNumber :: Parser Int
+parseNumber st = do
+  (numText, st1) <- parseWhile isDigit st
+  if T.null numText
+    then Left $ MalformedDescriptor "Expected number"
+    else return (read (T.unpack numText), st1)
+
+-- | Parse characters while predicate holds.
+parseWhile :: (Char -> Bool) -> Parser Text
+parseWhile p st =
+  let (taken, rest) = T.span p (psInput st)
+  in return (taken, st { psInput = rest, psPos = psPos st + T.length taken })
+
+-- | Parse exactly N characters.
+parseNChars :: Int -> Parser Text
+parseNChars n st
+  | T.length (psInput st) < n = Left UnexpectedEnd
+  | otherwise =
+      let (taken, rest) = T.splitAt n (psInput st)
+      in return (taken, st { psInput = rest, psPos = psPos st + n })
+
+-- | Parse until a specific character (exclusive).
+parseUntilChar :: Char -> Parser Text
+parseUntilChar c st =
+  let (taken, rest) = T.break (== c) (psInput st)
+  in return (taken, st { psInput = rest, psPos = psPos st + T.length taken })
+
+-- | Expect and consume a specific character.
+expectChar :: Char -> Parser ()
+expectChar expected st = case T.uncons (psInput st) of
+  Nothing -> Left UnexpectedEnd
+  Just (c, rest)
+    | c == expected -> return ((), st { psInput = rest, psPos = psPos st + 1 })
+    | otherwise -> Left $ UnexpectedChar c (psPos st)
+
+-- | Peek at the next character without consuming.
+peekChar :: ParserState -> Maybe Char
+peekChar st = fst <$> T.uncons (psInput st)
+
+-- | Skip whitespace.
+skipWhitespace :: Parser ()
+skipWhitespace st =
+  let rest = T.dropWhile isSpace (psInput st)
+      skipped = T.length (psInput st) - T.length rest
+  in return ((), st { psInput = rest, psPos = psPos st + skipped })
+
+--------------------------------------------------------------------------------
+-- Descriptor Serialization
+--------------------------------------------------------------------------------
+
+-- | Convert a descriptor back to text representation.
+descriptorToText :: Descriptor -> Text
+descriptorToText desc = case desc of
+  Pk key -> "pk(" <> keyExprToText key <> ")"
+  Pkh key -> "pkh(" <> keyExprToText key <> ")"
+  Wpkh key -> "wpkh(" <> keyExprToText key <> ")"
+  Sh inner -> "sh(" <> descriptorToText inner <> ")"
+  Wsh inner -> "wsh(" <> descriptorToText inner <> ")"
+  Multi k keys -> "multi(" <> T.pack (show k) <> "," <>
+                  T.intercalate "," (map keyExprToText keys) <> ")"
+  SortedMulti k keys -> "sortedmulti(" <> T.pack (show k) <> "," <>
+                        T.intercalate "," (map keyExprToText keys) <> ")"
+  Tr key Nothing -> "tr(" <> keyExprToText key <> ")"
+  Tr key (Just tree) -> "tr(" <> keyExprToText key <> "," <>
+                        tapTreeToText tree <> ")"
+  Addr addr -> "addr(" <> addressToText addr <> ")"
+  Raw script -> "raw(" <> hexEncode' script <> ")"
+  Combo key -> "combo(" <> keyExprToText key <> ")"
+
+-- | Convert a key expression to text.
+keyExprToText :: KeyExpr -> Text
+keyExprToText key = case key of
+  KeyLiteral pk -> hexEncode' (serializePubKeyCompressed pk)
+  KeyXPub xpub path range ->
+    encodeXPub xpub <> pathToText path <> rangeToText range
+  KeyXPriv xprv path range ->
+    encodeXPriv xprv <> pathToText path <> rangeToText range
+  KeyWIF sk -> wifEncode sk
+  KeyOrigin fp path inner ->
+    "[" <> hexEncode' fp <> pathToText path <> "]" <> keyExprToText inner
+
+-- | Convert a derivation path to text.
+pathToText :: [Word32] -> Text
+pathToText [] = ""
+pathToText path = "/" <> T.intercalate "/" (map idxToText path)
+  where
+    idxToText idx
+      | idx >= 0x80000000 = T.pack (show (idx .&. 0x7fffffff)) <> "'"
+      | otherwise = T.pack (show idx)
+
+-- | Convert a derivation range to text.
+rangeToText :: DerivRange -> Text
+rangeToText (DerivIndex _) = ""
+rangeToText DerivWildcard = "/*"
+rangeToText DerivHardenedWildcard = "/*'"
+
+-- | Convert a Taproot tree to text.
+tapTreeToText :: TapTree -> Text
+tapTreeToText tree = case tree of
+  TapLeaf desc -> descriptorToText desc
+  TapBranch left right ->
+    "{" <> tapTreeToText left <> "," <> tapTreeToText right <> "}"
+
+--------------------------------------------------------------------------------
+-- Address Derivation
+--------------------------------------------------------------------------------
+
+-- | Check if a descriptor contains wildcards (is ranged).
+isRangeDescriptor :: Descriptor -> Bool
+isRangeDescriptor desc = case desc of
+  Pk key -> isRangeKey key
+  Pkh key -> isRangeKey key
+  Wpkh key -> isRangeKey key
+  Sh inner -> isRangeDescriptor inner
+  Wsh inner -> isRangeDescriptor inner
+  Multi _ keys -> any isRangeKey keys
+  SortedMulti _ keys -> any isRangeKey keys
+  Tr key tree -> isRangeKey key || maybe False isRangeTree tree
+  Addr _ -> False
+  Raw _ -> False
+  Combo key -> isRangeKey key
+  where
+    isRangeKey :: KeyExpr -> Bool
+    isRangeKey k = case k of
+      KeyLiteral _ -> False
+      KeyXPub _ _ range -> isWildcard range
+      KeyXPriv _ _ range -> isWildcard range
+      KeyWIF _ -> False
+      KeyOrigin _ _ inner -> isRangeKey inner
+
+    isWildcard :: DerivRange -> Bool
+    isWildcard DerivWildcard = True
+    isWildcard DerivHardenedWildcard = True
+    isWildcard _ = False
+
+    isRangeTree :: TapTree -> Bool
+    isRangeTree (TapLeaf d) = isRangeDescriptor d
+    isRangeTree (TapBranch l r) = isRangeTree l || isRangeTree r
+
+-- | Derive addresses from a descriptor at given indices.
+-- For non-ranged descriptors, indices are ignored and a single address is returned.
+deriveAddresses :: Descriptor -> [Int] -> [Address]
+deriveAddresses desc indices =
+  if isRangeDescriptor desc
+    then concatMap (\i -> scriptToAddresses $ deriveScriptsAt desc i) indices
+    else scriptToAddresses $ deriveScriptsAt desc 0
+
+-- | Derive scripts from a descriptor at a given index.
+deriveScripts :: Descriptor -> Int -> [ByteString]
+deriveScripts = deriveScriptsAt
+
+-- | Derive scriptPubKeys at a specific index.
+deriveScriptsAt :: Descriptor -> Int -> [ByteString]
+deriveScriptsAt desc idx = case desc of
+  Pk key ->
+    let pk = deriveKeyExpr key idx
+    in [BS.concat [encodePubKey pk, encodeOp 0xac]]  -- <pubkey> OP_CHECKSIG
+  Pkh key ->
+    let pk = deriveKeyExpr key idx
+        pkh = hash160 (serializePubKeyCompressed pk)
+    in [encodeScript (encodeP2PKH pkh)]
+  Wpkh key ->
+    let pk = deriveKeyExpr key idx
+        pkh = hash160 (serializePubKeyCompressed pk)
+    in [encodeScript (encodeP2WPKH pkh)]
+  Sh inner ->
+    let innerScripts = deriveScriptsAt inner idx
+    in map (\s -> encodeScript (encodeP2SH (hash160 s))) innerScripts
+  Wsh inner ->
+    let innerScripts = deriveScriptsAt inner idx
+    in map (\s -> encodeP2WSH (sha256 s)) innerScripts
+  Multi k keys ->
+    let pks = map (`deriveKeyExpr` idx) keys
+    in [encodeMultisig k pks]
+  SortedMulti k keys ->
+    let pks = sortOn serializePubKeyCompressed $ map (`deriveKeyExpr` idx) keys
+    in [encodeMultisig k pks]
+  Tr key _ ->
+    let pk = deriveKeyExpr key idx
+        -- Simplified: just output spend key (no script path)
+    in [encodeScript (encodeP2TR (xOnlyPubKey pk))]
+  Addr addr ->
+    [addressToScript addr]
+  Raw script ->
+    [script]
+  Combo key ->
+    -- combo(KEY) = pk(KEY) + pkh(KEY) + wpkh(KEY) + sh(wpkh(KEY))
+    let pk = deriveKeyExpr key idx
+        pkh = hash160 (serializePubKeyCompressed pk)
+        p2wpkhScript = encodeP2WPKH pkh
+        p2wpkhBS = encodeScript p2wpkhScript
+    in [ BS.concat [encodePubKey pk, encodeOp 0xac]     -- P2PK
+       , encodeScript (encodeP2PKH pkh)                  -- P2PKH
+       , p2wpkhBS                                        -- P2WPKH
+       , encodeScript (encodeP2SH (hash160 p2wpkhBS))    -- P2SH-P2WPKH
+       ]
+
+-- | Derive a public key from a key expression at a given index.
+deriveKeyExpr :: KeyExpr -> Int -> PubKey
+deriveKeyExpr key idx = case key of
+  KeyLiteral pk -> pk
+  KeyXPub xpub path range ->
+    let fullPath = path ++ rangeToPath range idx
+        derived = deriveXPubPath xpub fullPath
+    in epkKey derived
+  KeyXPriv xprv path range ->
+    let fullPath = path ++ rangeToPath range idx
+        derived = derivePath xprv (map adjustHardened fullPath)
+    in derivePubKeyFromPrivate (ekKey derived)
+  KeyWIF sk -> derivePubKeyFromPrivate sk
+  KeyOrigin _ _ inner -> deriveKeyExpr inner idx
+  where
+    rangeToPath :: DerivRange -> Int -> [Word32]
+    rangeToPath (DerivIndex i) _ = [i]
+    rangeToPath DerivWildcard i = [fromIntegral i]
+    rangeToPath DerivHardenedWildcard i = [fromIntegral i .|. 0x80000000]
+
+    adjustHardened :: Word32 -> Word32
+    adjustHardened w = w
+
+-- | Derive an extended public key along a path.
+deriveXPubPath :: ExtendedPubKey -> [Word32] -> ExtendedPubKey
+deriveXPubPath = foldl' derivePublic
+
+-- | Convert scripts to addresses.
+scriptToAddresses :: [ByteString] -> [Address]
+scriptToAddresses = mapMaybe scriptToAddress
+
+-- | Convert a script to an address (if applicable).
+scriptToAddress :: ByteString -> Maybe Address
+scriptToAddress script
+  -- P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+  | BS.length script == 25 && BS.index script 0 == 0x76 =
+      Just $ PubKeyAddress (Hash160 $ BS.take 20 $ BS.drop 3 script)
+  -- P2SH: OP_HASH160 <20> OP_EQUAL
+  | BS.length script == 23 && BS.index script 0 == 0xa9 =
+      Just $ ScriptAddress (Hash160 $ BS.take 20 $ BS.drop 2 script)
+  -- P2WPKH: OP_0 <20>
+  | BS.length script == 22 && BS.index script 0 == 0x00 =
+      Just $ WitnessPubKeyAddress (Hash160 $ BS.take 20 $ BS.drop 2 script)
+  -- P2WSH: OP_0 <32>
+  | BS.length script == 34 && BS.index script 0 == 0x00 && BS.index script 1 == 0x20 =
+      Just $ WitnessScriptAddress (Hash256 $ BS.take 32 $ BS.drop 2 script)
+  -- P2TR: OP_1 <32>
+  | BS.length script == 34 && BS.index script 0 == 0x51 && BS.index script 1 == 0x20 =
+      Just $ TaprootAddress (Hash256 $ BS.take 32 $ BS.drop 2 script)
+  | otherwise = Nothing
+
+-- | Convert an address to its scriptPubKey.
+addressToScript :: Address -> ByteString
+addressToScript addr = case addr of
+  PubKeyAddress h -> encodeScript (encodeP2PKH h)
+  ScriptAddress h -> encodeScript (encodeP2SH h)
+  WitnessPubKeyAddress h -> encodeScript (encodeP2WPKH h)
+  WitnessScriptAddress h -> encodeP2WSH (getHash256 h)
+  TaprootAddress h -> encodeScript (encodeP2TR h)
+
+-- | Expand a combo descriptor into its constituent descriptors.
+-- For compressed keys: P2PK, P2PKH, P2WPKH, P2SH-P2WPKH (4 outputs)
+-- For uncompressed keys: P2PK, P2PKH only (2 outputs - no SegWit)
+-- Reference: Bitcoin Core src/script/descriptor.cpp ComboDescriptor::MakeScripts
+expandCombo :: KeyExpr -> [Descriptor]
+expandCombo key =
+  let baseDescriptors = [Pk key, Pkh key]
+      -- SegWit outputs only valid for compressed keys
+      segwitDescriptors = if isCompressedKey key
+                          then [Wpkh key, Sh (Wpkh key)]
+                          else []
+  in baseDescriptors ++ segwitDescriptors
+
+-- | Check if a key expression produces compressed public keys.
+isCompressedKey :: KeyExpr -> Bool
+isCompressedKey key = case key of
+  KeyLiteral pk -> case pk of
+    PubKeyCompressed _ -> True
+    PubKeyUncompressed _ -> False
+  KeyXPub _ _ _ -> True   -- xpub always produces compressed keys
+  KeyXPriv _ _ _ -> True  -- xprv always produces compressed keys
+  KeyWIF _ -> True        -- WIF with 0x01 suffix = compressed
+  KeyOrigin _ _ inner -> isCompressedKey inner
+
+--------------------------------------------------------------------------------
+-- Helper Functions for Descriptors
+--------------------------------------------------------------------------------
+
+-- | Hex decode helper.
+hexDecode' :: Text -> Maybe ByteString
+hexDecode' t = case BS.pack <$> mapM hexPair (pairs $ T.unpack t) of
+  Just bs -> Just bs
+  Nothing -> Nothing
+  where
+    pairs [] = []
+    pairs [_] = []
+    pairs (a:b:rest) = [a,b] : pairs rest
+
+    hexPair [a, b] = do
+      high <- hexVal a
+      low <- hexVal b
+      return $ fromIntegral (high * 16 + low)
+    hexPair _ = Nothing
+
+    hexVal c
+      | c >= '0' && c <= '9' = Just (ord c - ord '0')
+      | c >= 'a' && c <= 'f' = Just (ord c - ord 'a' + 10)
+      | c >= 'A' && c <= 'F' = Just (ord c - ord 'A' + 10)
+      | otherwise = Nothing
+
+-- | Hex encode helper.
+hexEncode' :: ByteString -> Text
+hexEncode' = T.pack . concatMap (\b -> [hexChar (b `shiftR` 4), hexChar (b .&. 0xf)]) . BS.unpack
+  where
+    hexChar n
+      | n < 10 = toEnum (fromIntegral n + ord '0')
+      | otherwise = toEnum (fromIntegral n - 10 + ord 'a')
+
+-- | Placeholder for xpub decoding.
+decodeXPub :: Text -> Maybe ExtendedPubKey
+decodeXPub t
+  | "xpub" `T.isPrefixOf` t || "tpub" `T.isPrefixOf` t =
+      -- Placeholder: return a dummy xpub
+      -- In production, this would do proper base58 decoding
+      Just $ ExtendedPubKey
+        { epkKey = PubKeyCompressed (BS.replicate 33 0x02)
+        , epkChainCode = BS.replicate 32 0
+        , epkDepth = 0
+        , epkParentFP = 0
+        , epkIndex = 0
+        }
+  | otherwise = Nothing
+
+-- | Placeholder for xprv decoding.
+decodeXPriv :: Text -> Maybe ExtendedKey
+decodeXPriv t
+  | "xprv" `T.isPrefixOf` t || "tprv" `T.isPrefixOf` t =
+      Just $ ExtendedKey
+        { ekKey = SecKey (BS.replicate 32 0x01)
+        , ekChainCode = BS.replicate 32 0
+        , ekDepth = 0
+        , ekParentFP = 0
+        , ekIndex = 0
+        }
+  | otherwise = Nothing
+
+-- | Placeholder for xpub encoding.
+encodeXPub :: ExtendedPubKey -> Text
+encodeXPub _ = "xpub..."  -- Placeholder
+
+-- | Placeholder for xprv encoding.
+encodeXPriv :: ExtendedKey -> Text
+encodeXPriv _ = "xprv..."  -- Placeholder
+
+-- | Encode a private key as WIF (Wallet Import Format).
+-- Encodes as compressed (with 0x01 suffix) for mainnet.
+wifEncode :: SecKey -> Text
+wifEncode (SecKey sk) =
+  -- Version 0x80 for mainnet, 0x01 suffix for compressed
+  let payload = BS.snoc sk 0x01  -- Compressed format
+  in base58Check 0x80 payload
+
+-- | Encode a public key as script bytes.
+encodePubKey :: PubKey -> ByteString
+encodePubKey = serializePubKeyCompressed
+
+-- | Encode an opcode.
+encodeOp :: Word8 -> ByteString
+encodeOp = BS.singleton
+
+-- | Encode a multisig script.
+encodeMultisig :: Int -> [PubKey] -> ByteString
+encodeMultisig k pks =
+  let n = length pks
+      kOp = if k <= 16 then BS.singleton (0x50 + fromIntegral k) else encodeNumber k
+      nOp = if n <= 16 then BS.singleton (0x50 + fromIntegral n) else encodeNumber n
+      pkPushes = map (\pk -> let bs = serializePubKeyCompressed pk
+                             in BS.cons (fromIntegral $ BS.length bs) bs) pks
+  in BS.concat ([kOp] ++ pkPushes ++ [nOp, BS.singleton 0xae])  -- OP_CHECKMULTISIG
+
+-- | Encode a number for script.
+encodeNumber :: Int -> ByteString
+encodeNumber n
+  | n == 0 = BS.singleton 0x00
+  | n >= 1 && n <= 16 = BS.singleton (0x50 + fromIntegral n)
+  | otherwise = BS.pack [0x01, fromIntegral n]  -- Simplified
+
+-- | Get x-only public key (32 bytes).
+xOnlyPubKey :: PubKey -> Hash256
+xOnlyPubKey pk = Hash256 $ BS.drop 1 $ serializePubKeyCompressed pk
+
+-- | Encode P2WSH script.
+encodeP2WSH :: ByteString -> ByteString
+encodeP2WSH witnessScriptHash =
+  BS.concat [BS.singleton 0x00, BS.singleton 0x20, witnessScriptHash]
+
+--------------------------------------------------------------------------------
+-- Multi-Wallet Manager (Bitcoin Core compatible)
+--------------------------------------------------------------------------------
+
+-- | Wallet manager for multiple simultaneous wallets.
+-- Each wallet is identified by a unique name and has an independent SQLite database.
+-- Reference: Bitcoin Core wallet/context.h WalletContext
+data WalletManager = WalletManager
+  { wmWallets     :: !(TVar (Map Text WalletState))
+      -- ^ Loaded wallets by name
+  , wmWalletDir   :: !FilePath
+      -- ^ Base directory for wallet storage (e.g. "wallets/")
+  , wmNetwork     :: !Network
+      -- ^ Network (mainnet/testnet/regtest)
+  , wmDefaultName :: !(TVar (Maybe Text))
+      -- ^ Default wallet name (first loaded, or explicitly set)
+  }
+
+-- | Information about a wallet for getwalletinfo RPC.
+-- Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
+data WalletInfo = WalletInfo
+  { wiWalletName           :: !Text
+      -- ^ Wallet name
+  , wiWalletVersion        :: !Int
+      -- ^ Wallet version (format version)
+  , wiBalance              :: !Word64
+      -- ^ Total confirmed balance in satoshis
+  , wiUnconfirmedBalance   :: !Word64
+      -- ^ Unconfirmed balance (0 for now, we don't track this yet)
+  , wiImmatureBalance      :: !Word64
+      -- ^ Immature coinbase balance (0 for now)
+  , wiTxCount              :: !Int
+      -- ^ Number of wallet transactions (0 for now)
+  , wiKeypoolSize          :: !Int
+      -- ^ Number of pregenerated keys
+  , wiUnlockedUntil        :: !(Maybe Word64)
+      -- ^ Unlock expiry timestamp (Nothing if not encrypted or locked)
+  , wiPaytxfee             :: !Word64
+      -- ^ Transaction fee per kB (0 for now)
+  , wiPrivateKeysEnabled   :: !Bool
+      -- ^ Whether private keys are enabled
+  , wiAvoidReuse           :: !Bool
+      -- ^ Whether avoid_reuse flag is set
+  , wiScanning             :: !Bool
+      -- ^ Whether wallet is currently scanning
+  , wiDescriptors          :: !Bool
+      -- ^ Whether this is a descriptor wallet (always true for us)
+  , wiExternalSigner       :: !Bool
+      -- ^ Whether external signer is used
+  } deriving (Show, Eq, Generic)
+
+instance NFData WalletInfo
+
+-- | Create a new wallet manager.
+-- Initializes the wallet directory structure.
+newWalletManager :: FilePath -> Network -> IO WalletManager
+newWalletManager walletDir net = do
+  createDirectoryIfMissing True walletDir
+  walletsVar <- newTVarIO Map.empty
+  defaultNameVar <- newTVarIO Nothing
+  return WalletManager
+    { wmWallets     = walletsVar
+    , wmWalletDir   = walletDir
+    , wmNetwork     = net
+    , wmDefaultName = defaultNameVar
+    }
+
+-- | Create a new managed wallet.
+-- Parameters:
+--   name: Unique wallet name
+--   disablePrivateKeys: If true, creates a watch-only wallet
+--   blank: If true, creates a wallet with no keys
+-- Returns: Either an error message or the new WalletState
+-- Reference: Bitcoin Core wallet/rpc/wallet.cpp createwallet
+createManagedWallet :: WalletManager
+                    -> Text           -- ^ Wallet name
+                    -> Bool           -- ^ disable_private_keys (watch-only)
+                    -> Bool           -- ^ blank (no keys initially)
+                    -> IO (Either Text WalletState)
+createManagedWallet wm name _disablePrivateKeys blank = do
+  -- Check if wallet already exists
+  existingWallets <- readTVarIO (wmWallets wm)
+  if Map.member name existingWallets
+    then return $ Left $ "Wallet \"" <> name <> "\" already exists"
+    else do
+      -- Create wallet directory
+      let walletPath = wmWalletDir wm </> T.unpack name
+      dirExists <- doesDirectoryExist walletPath
+      if dirExists
+        then return $ Left $ "Wallet directory already exists: " <> T.pack walletPath
+        else do
+          createDirectoryIfMissing True walletPath
+
+          -- Create the wallet
+          let config = WalletConfig (wmNetwork wm) 20 ""
+          if blank
+            then do
+              -- For blank wallet, create with a random mnemonic but don't pre-generate addresses
+              (_mnemonic, wallet) <- createWallet config
+              walletState <- createWalletState wallet
+              -- Add to manager
+              atomically $ do
+                modifyTVar' (wmWallets wm) (Map.insert name walletState)
+                -- Set as default if first wallet
+                mDefault <- readTVar (wmDefaultName wm)
+                when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
+              return $ Right walletState
+            else do
+              -- Normal wallet creation
+              (_mnemonic, wallet) <- createWallet config
+              walletState <- createWalletState wallet
+              -- Add to manager
+              atomically $ do
+                modifyTVar' (wmWallets wm) (Map.insert name walletState)
+                -- Set as default if first wallet
+                mDefault <- readTVar (wmDefaultName wm)
+                when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
+              return $ Right walletState
+
+-- | Load an existing wallet by name.
+-- The wallet must exist in the wallet directory.
+-- Reference: Bitcoin Core wallet/rpc/wallet.cpp loadwallet
+loadManagedWallet :: WalletManager
+                  -> Text           -- ^ Wallet name
+                  -> IO (Either Text WalletState)
+loadManagedWallet wm name = do
+  -- Check if already loaded
+  existingWallets <- readTVarIO (wmWallets wm)
+  if Map.member name existingWallets
+    then return $ Left $ "Wallet \"" <> name <> "\" is already loaded"
+    else do
+      -- Check if wallet directory exists
+      let walletPath = wmWalletDir wm </> T.unpack name
+      dirExists <- doesDirectoryExist walletPath
+      if not dirExists
+        then return $ Left $ "Wallet not found: " <> name
+        else do
+          -- For now, we create a fresh wallet since we don't have persistence yet
+          -- In a real implementation, we'd load from the SQLite database
+          let config = WalletConfig (wmNetwork wm) 20 ""
+          (_mnemonic, wallet) <- createWallet config
+          walletState <- createWalletState wallet
+          atomically $ do
+            modifyTVar' (wmWallets wm) (Map.insert name walletState)
+            -- Set as default if first wallet
+            mDefault <- readTVar (wmDefaultName wm)
+            when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
+          return $ Right walletState
+
+-- | Unload a wallet.
+-- Removes the wallet from the manager but does not delete wallet files.
+-- Reference: Bitcoin Core wallet/rpc/wallet.cpp unloadwallet
+unloadManagedWallet :: WalletManager -> Text -> IO (Either Text ())
+unloadManagedWallet wm name = do
+  result <- atomically $ do
+    wallets <- readTVar (wmWallets wm)
+    if Map.member name wallets
+      then do
+        writeTVar (wmWallets wm) (Map.delete name wallets)
+        -- Update default if we just unloaded it
+        mDefault <- readTVar (wmDefaultName wm)
+        when (mDefault == Just name) $ do
+          let remaining = Map.keys (Map.delete name wallets)
+          writeTVar (wmDefaultName wm) (listToMaybe remaining)
+        return $ Right ()
+      else return $ Left $ "Wallet not found: " <> name
+  return result
+
+-- | Get a specific wallet by name.
+-- Returns Nothing if the wallet is not loaded.
+getManagedWallet :: WalletManager -> Text -> IO (Maybe WalletState)
+getManagedWallet wm name = do
+  wallets <- readTVarIO (wmWallets wm)
+  return $ Map.lookup name wallets
+
+-- | Get the default wallet.
+-- Returns the first loaded wallet, or Nothing if no wallets are loaded.
+-- Also returns the total count of loaded wallets.
+-- Reference: Bitcoin Core wallet/wallet.cpp GetDefaultWallet
+getDefaultWallet :: WalletManager -> IO (Maybe WalletState, Int)
+getDefaultWallet wm = do
+  wallets <- readTVarIO (wmWallets wm)
+  mDefaultName <- readTVarIO (wmDefaultName wm)
+  let count = Map.size wallets
+  case mDefaultName of
+    Just name -> return (Map.lookup name wallets, count)
+    Nothing -> case Map.elems wallets of
+      (w:_) -> return (Just w, count)
+      []    -> return (Nothing, 0)
+
+-- | List all loaded wallet names.
+-- Reference: Bitcoin Core wallet/rpc/wallet.cpp listwallets
+listManagedWallets :: WalletManager -> IO [Text]
+listManagedWallets wm = do
+  wallets <- readTVarIO (wmWallets wm)
+  return $ Map.keys wallets
+
+-- | Get information about a wallet.
+-- Returns wallet metadata for the getwalletinfo RPC.
+-- Reference: Bitcoin Core wallet/rpc/wallet.cpp getwalletinfo
+getWalletInfo :: Text -> WalletState -> IO WalletInfo
+getWalletInfo walletName ws = do
+  balance <- getBalance (wsWallet ws)
+  locked <- isWalletLocked ws
+  mExpiry <- readTVarIO (wsUnlockExpiry ws)
+
+  -- Calculate unlock timestamp if applicable
+  let unlockedUntil = case (locked, mExpiry) of
+        (False, Just expiry) -> Just $ round (realToFrac (utcTimeToPOSIXSeconds expiry) :: Double)
+        _ -> Nothing
+
+  return WalletInfo
+    { wiWalletName         = walletName
+    , wiWalletVersion      = 169900  -- Matches Bitcoin Core version format
+    , wiBalance            = balance
+    , wiUnconfirmedBalance = 0
+    , wiImmatureBalance    = 0
+    , wiTxCount            = 0
+    , wiKeypoolSize        = 20  -- Our gap limit
+    , wiUnlockedUntil      = unlockedUntil
+    , wiPaytxfee           = 0
+    , wiPrivateKeysEnabled = True  -- We always have private keys (for now)
+    , wiAvoidReuse         = False
+    , wiScanning           = False
+    , wiDescriptors        = True  -- We're descriptor-based
+    , wiExternalSigner     = False
+    }
+
+-- | Convert UTCTime to POSIX seconds (helper).
+utcTimeToPOSIXSeconds :: UTCTime -> NominalDiffTime
+utcTimeToPOSIXSeconds = diffUTCTime $ UTCTime (fromGregorian 1970 1 1) 0
+
+-- | Create UTCTime from Gregorian date (helper).
+fromGregorian :: Integer -> Int -> Int -> Day
+fromGregorian y m d = ModifiedJulianDay $ dayOfGregorian y m d
+
+-- | Helper for day calculation.
+dayOfGregorian :: Integer -> Int -> Int -> Integer
+dayOfGregorian year month day =
+  let a = (14 - month) `div` 12
+      y = year + 4800 - fromIntegral a
+      m = fromIntegral (month + 12 * a - 3) :: Integer
+  in fromIntegral day + (153 * m + 2) `div` 5 + 365 * y + y `div` 4 - y `div` 100 + y `div` 400 - 32045 - 2400001

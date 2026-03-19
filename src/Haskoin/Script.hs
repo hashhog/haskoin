@@ -37,14 +37,21 @@ module Haskoin.Script
   , encodeP2WPKH
   , encodeP2WSH
   , encodeP2TR
+  , encodeP2A
   , encodeMultisig
   , encodeOpReturn
+    -- * Pay-to-Anchor (P2A)
+  , isPayToAnchor
+  , p2aWitnessProgram
+  , p2aDustThreshold
     -- * Utilities
   , opN
   , encodeScriptNum
   , decodeScriptNum
   , isTrue
   , isCompressedPubKey
+    -- * Tapscript OP_SUCCESS (BIP-342)
+  , isTapscriptSuccess
     -- * Sigop Counting
   , countScriptSigops
     -- * Push-Only Check
@@ -79,7 +86,8 @@ import Data.Serialize (runGet, runPut, getWord8, putWord8, getBytes,
 import Control.Monad (when, unless, foldM, forM_)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit)
 import GHC.Generics (Generic)
-import Data.List (foldl', sortBy, mapMaybe)
+import Data.List (foldl', sortBy)
+import Data.Maybe (mapMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import qualified Data.Map.Strict as Map
@@ -234,6 +242,10 @@ data ScriptVerifyFlag
   | VerifyWitnessPubkeyType  -- ^ BIP-141: Witness v0 pubkeys must be compressed
   | VerifyTaproot        -- ^ BIP-341/342: Taproot
   | VerifyMinimalIf      -- ^ Minimal IF/NOTIF: argument must be empty or 0x01
+  | VerifyDiscourageUpgradableWitnessProgram  -- ^ Fail on unknown witness versions (policy)
+  | VerifyDiscourageUpgradableNops            -- ^ Fail on upgradable NOPs (policy)
+  | VerifyDiscourageOpSuccess                 -- ^ Fail on OP_SUCCESS opcodes (policy)
+  | VerifyConstScriptcode                    -- ^ OP_CODESEPARATOR forbidden in witness v0
   deriving (Show, Eq, Ord, Enum, Bounded, Generic)
 
 -- | A set of script verification flags
@@ -635,6 +647,7 @@ data ScriptType
   | P2WPKH !Hash160                   -- ^ OP_0 <20>
   | P2WSH !Hash256                    -- ^ OP_0 <32>
   | P2TR !Hash256                     -- ^ OP_1 <32>
+  | P2A                               -- ^ OP_1 <0x4e73> (Pay-to-Anchor, anyone-can-spend)
   | P2PK !ByteString                  -- ^ <pubkey> OP_CHECKSIG
   | P2MultiSig !Int ![ByteString]     -- ^ m <keys...> n OP_CHECKMULTISIG
   | OpReturn !ByteString              -- ^ OP_RETURN <data>
@@ -663,6 +676,11 @@ classifyOutput (Script ops) = case ops of
   -- P2TR: OP_1 <32>
   [OP_1, OP_PUSHDATA h _]
     | BS.length h == 32 -> P2TR (Hash256 h)
+
+  -- P2A (Pay-to-Anchor): OP_1 <0x4e73> (witness v1, 2-byte program)
+  -- Anyone-can-spend anchor output for Lightning Network commitment transactions
+  [OP_1, OP_PUSHDATA h _]
+    | h == p2aWitnessProgram -> P2A
 
   -- P2PK: <pubkey> OP_CHECKSIG
   [OP_PUSHDATA pk _, OP_CHECKSIG]
@@ -873,6 +891,30 @@ encodeP2WSH (Hash256 h) = Script [OP_0, OP_PUSHDATA h OPCODE]
 -- OP_1 <32-byte x-only pubkey>
 encodeP2TR :: Hash256 -> Script
 encodeP2TR (Hash256 h) = Script [OP_1, OP_PUSHDATA h OPCODE]
+
+-- | P2A (Pay-to-Anchor) witness program bytes: 0x4e73
+-- This is a witness v1 program with a 2-byte program (shorter than normal
+-- Taproot's 32 bytes), designed to be anyone-can-spend for anchor outputs.
+p2aWitnessProgram :: ByteString
+p2aWitnessProgram = BS.pack [0x4e, 0x73]
+
+-- | Create P2A (Pay-to-Anchor) output script
+-- OP_1 <0x4e73> (witness v1, 2-byte program, anyone-can-spend)
+-- Used for anchor outputs in Lightning Network commitment transactions.
+encodeP2A :: Script
+encodeP2A = Script [OP_1, OP_PUSHDATA p2aWitnessProgram OPCODE]
+
+-- | Check if a script is a Pay-to-Anchor (P2A) output.
+-- P2A is exactly: OP_1 OP_PUSHBYTES_2 0x4e73 (4 bytes total)
+isPayToAnchor :: Script -> Bool
+isPayToAnchor (Script [OP_1, OP_PUSHDATA h _]) = h == p2aWitnessProgram
+isPayToAnchor _ = False
+
+-- | P2A dust threshold in satoshis.
+-- P2A outputs have a lower dust threshold (240 sats) than typical witness outputs
+-- because they're designed to be spent with minimal witness data (empty witness).
+p2aDustThreshold :: Word64
+p2aDustThreshold = 240
 
 -- | Create m-of-n multisig output script
 encodeMultisig :: Int -> [ByteString] -> Script
@@ -1191,19 +1233,26 @@ execOp op env
       OP_CHECKMULTISIGVERIFY -> incOpCount env >>= execCheckMultiSigVerify
 
       -- Locktime
-      OP_NOP1 -> incOpCount env
+      OP_NOP1 -> incOpCount env >>= checkDiscourageNop
       OP_CHECKLOCKTIMEVERIFY -> incOpCount env >>= execCheckLockTimeVerify
       OP_CHECKSEQUENCEVERIFY -> incOpCount env >>= execCheckSequenceVerify
-      OP_NOP4 -> incOpCount env
-      OP_NOP5 -> incOpCount env
-      OP_NOP6 -> incOpCount env
-      OP_NOP7 -> incOpCount env
-      OP_NOP8 -> incOpCount env
-      OP_NOP9 -> incOpCount env
-      OP_NOP10 -> incOpCount env
+      OP_NOP4 -> incOpCount env >>= checkDiscourageNop
+      OP_NOP5 -> incOpCount env >>= checkDiscourageNop
+      OP_NOP6 -> incOpCount env >>= checkDiscourageNop
+      OP_NOP7 -> incOpCount env >>= checkDiscourageNop
+      OP_NOP8 -> incOpCount env >>= checkDiscourageNop
+      OP_NOP9 -> incOpCount env >>= checkDiscourageNop
+      OP_NOP10 -> incOpCount env >>= checkDiscourageNop
 
       -- Invalid
       OP_INVALIDOPCODE b -> Left $ "Invalid opcode: " ++ show b
+
+-- | Check DISCOURAGE_UPGRADABLE_NOPS flag and fail if set
+checkDiscourageNop :: ScriptEnv -> Either String ScriptEnv
+checkDiscourageNop env
+  | hasFlag (seFlags env) VerifyDiscourageUpgradableNops =
+      Left "discouraged upgradable NOP"
+  | otherwise = Right env
 
 -- | Process flow control ops when not executing
 execFlowControlOnly :: ScriptOp -> ScriptEnv -> Either String ScriptEnv
@@ -1542,9 +1591,14 @@ execHash256 env = do
 -- in CHECKSIG.
 execCodeSeparator :: ScriptEnv -> Either String ScriptEnv
 execCodeSeparator env =
-  -- Position tracking is handled in evalWithPosition
-  -- This just returns success
-  Right env
+  -- In witness v0, OP_CODESEPARATOR is forbidden if CONST_SCRIPTCODE is set
+  -- (In tapscript, OP_CODESEPARATOR is valid and updates codesep_pos)
+  if seIsWitness env && hasFlag (seFlags env) VerifyConstScriptcode
+    then Left "OP_CODESEPARATOR in witness v0 script"
+    else
+      -- Position tracking is handled in evalWithPosition
+      -- This just returns success
+      Right env
 
 -- | Execute OP_CHECKSIG
 -- IMPORTANT: Pop pubkey first (top of stack), then signature
@@ -1589,10 +1643,11 @@ execCheckSig env = do
                               sigBytes  -- Full signature including hash type
 
       -- Compute sighash
-      let sighash = if seIsWitness env''
+      let sigHashW32 = fromIntegral sigHashByte :: Word32
+          sighash = if seIsWitness env''
                     then txSigHashSegWit (seTx env'') (seInputIdx env'')
                                          scriptCode (seAmount env'') sigHashType
-                    else txSigHash (seTx env'') (seInputIdx env'') scriptCode sigHashType
+                    else txSigHash (seTx env'') (seInputIdx env'') scriptCode sigHashW32 sigHashType
 
       -- Signature without the sighash type byte for verification
       let sigWithoutType = BS.init sigBytes
@@ -1791,6 +1846,32 @@ execCheckSequenceVerify env = do
             Left "Sequence not satisfied"
 
           Right env
+
+--------------------------------------------------------------------------------
+-- Tapscript OP_SUCCESS Detection (BIP-342)
+--------------------------------------------------------------------------------
+
+-- | Check if a raw opcode byte is an OP_SUCCESS in tapscript context.
+--
+-- Per BIP-342, the following opcodes are redefined as OP_SUCCESSx in tapscript:
+--   0x50, 0x62, 0x7e-0x81, 0x83-0x86, 0x89-0x8a, 0x8d-0x8e,
+--   0x95-0xb9, 0xbb-0xfe
+--
+-- When any of these opcodes appears in a tapscript, the script succeeds
+-- unconditionally (unless DISCOURAGE_OP_SUCCESS flag is set, in which
+-- case it fails for policy enforcement).
+--
+-- Note: 0xba (OP_CHECKSIGADD) is NOT OP_SUCCESS -- it is a valid
+-- tapscript opcode for Schnorr multisig.
+isTapscriptSuccess :: Word8 -> Bool
+isTapscriptSuccess op =
+  op == 0x50 || op == 0x62 ||
+  (op >= 0x7e && op <= 0x81) ||
+  (op >= 0x83 && op <= 0x86) ||
+  (op >= 0x89 && op <= 0x8a) ||
+  (op >= 0x8d && op <= 0x8e) ||
+  (op >= 0x95 && op <= 0xb9) ||
+  (op >= 0xbb && op <= 0xfe)
 
 --------------------------------------------------------------------------------
 -- Script Evaluation Entry Points
@@ -2799,12 +2880,12 @@ compileOps ctx verify ms = case ms of
               if verify then [OP_CHECKSIGVERIFY] else [OP_CHECKSIG]
       (pk:rest) ->
         [pushData pk, OP_CHECKSIG] ++
-        concatMap (\p -> [pushData p, OP_CHECKSIGADD]) rest ++
+        concatMap (\p -> [pushData p, opChecksigAdd]) rest ++
         [pushNum (fromIntegral k)] ++
         if verify then [OP_NUMEQUALVERIFY] else [OP_NUMEQUAL]
     where
-      -- OP_CHECKSIGADD is only in Tapscript
-      OP_CHECKSIGADD = OP_NOP1  -- Placeholder: 0xBA in real Tapscript
+      -- OP_CHECKSIGADD is only in Tapscript (0xBA)
+      opChecksigAdd = OP_NOP1  -- Placeholder: 0xBA in real Tapscript
 
   MsSortedMultiA k pks ->
     compileOps ctx verify (MsMultiA k (sortPubKeys pks))

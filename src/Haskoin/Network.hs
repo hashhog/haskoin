@@ -6,6 +6,8 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE CApiFFI #-}
 
 module Haskoin.Network
   ( -- * Message Envelope
@@ -319,7 +321,7 @@ module Haskoin.Network
   , erlayReconInterval
   , erlayStaticSalt
   , erlayFloodOutboundCount
-    -- ** Minisketch
+    -- ** Minisketch (Pure Haskell)
   , Minisketch(..)
   , SketchError(..)
   , newMinisketch
@@ -329,6 +331,16 @@ module Haskoin.Network
   , sketchSerialize
   , sketchDeserialize
   , sketchCapacity
+    -- ** Minisketch FFI (libminisketch)
+  , MinisketchFFI
+  , withMinisketchFFI
+  , minisketchFFICreate
+  , minisketchFFIAdd
+  , minisketchFFIMerge
+  , minisketchFFIDecode
+  , minisketchFFISerialize
+  , minisketchFFIDeserialize
+  , minisketchFFISupported
     -- ** GF(2^32) Field Arithmetic
   , GF2_32(..)
   , gfAdd
@@ -367,6 +379,14 @@ module Haskoin.Network
   , selectRelayMode
   , getFloodPeers
   , getReconciliationPeers
+    -- ** Erlay Reconciliation Protocol
+  , ErlayPeerState(..)
+  , newErlayPeerState
+  , initiateReconciliation
+  , handleReqRecon
+  , handleReconcilDiff
+  , getReconciliationTimer
+  , erlayPoissonDelay
     -- * Tor/I2P Connectivity (Phase 48)
     -- ** SOCKS5 Proxy
   , Socks5Reply(..)
@@ -421,6 +441,7 @@ module Haskoin.Network
     -- ** Proxy Peer Connection
   , ProxyPeerConfig(..)
   , connectPeerThroughProxy
+  , connectViaProxy
   , createPeerConnectionFromSocket
     -- ** Network Reachability
   , NetworkReachability(..)
@@ -439,11 +460,19 @@ import Data.Int (Int32, Int64)
 import Data.Bits ((.&.), (.|.), shiftR, shiftL, xor, complement, rotateL)
 import Control.Monad (replicateM, forM_, forM, when, forever, unless, void)
 import GHC.Generics (Generic)
-import Control.DeepSeq (NFData)
+import Control.DeepSeq (NFData(..))
+import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr)
+import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
+import Foreign.C.Types (CUInt(..), CSize(..), CInt(..), CChar)
+import Foreign.Marshal.Alloc (mallocBytes, free)
+import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
+import Foreign.Storable (peek, poke)
+import Control.Exception (bracket)
 import qualified Data.Map.Strict as Map
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import qualified Crypto.Cipher.ChaCha as ChaCha
+import Crypto.Error (CryptoFailable(..))
 import qualified Crypto.MAC.Poly1305 as Poly1305
 import qualified Crypto.Hash as H
 import qualified Crypto.MAC.HMAC as HMAC
@@ -463,10 +492,10 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
 import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
 
-import Network.Socket (Socket, SockAddr(..), AddrInfo(..), getAddrInfo,
-                       socket, connect, close, defaultHints, addrFamily,
-                       addrSocketType, addrProtocol, addrAddress,
+import Network.Socket (Socket, SockAddr(..), getAddrInfo,
+                       socket, connect, close, defaultHints,
                        SocketType(..), PortNumber)
+import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -474,7 +503,7 @@ import System.Random (randomIO, randomRIO)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException, catch, mask_, IOException)
-import Data.Hashable (Hashable)
+import Data.Hashable (Hashable(..))
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, sha256)
@@ -1319,6 +1348,24 @@ data Message
     -- BIP155 ADDRv2
   | MSendAddrV2                -- ^ Signal support for addrv2 (empty payload)
   | MAddrV2 !AddrV2Msg         -- ^ ADDRv2 message with variable-length addresses
+    -- BIP339 wtxid relay
+  | MWtxidRelay                 -- ^ Signal support for wtxid-based relay (empty payload)
+    -- BIP37 Bloom Filter
+  | MFilterLoad !ByteString     -- ^ Load a bloom filter
+  | MFilterAdd !ByteString      -- ^ Add element to bloom filter
+  | MFilterClear                -- ^ Clear bloom filter (empty payload)
+  | MMerkleBlock !ByteString    -- ^ Filtered block with merkle proof
+    -- BIP157/158 Compact Block Filters
+  | MGetCFilters !ByteString    -- ^ Request compact block filters
+  | MCFilter !ByteString        -- ^ Compact block filter
+  | MGetCFHeaders !ByteString   -- ^ Request compact block filter headers
+  | MCFHeaders !ByteString      -- ^ Compact block filter headers
+  | MGetCFCheckpt !ByteString   -- ^ Request compact block filter checkpoints
+  | MCFCheckpt !ByteString      -- ^ Compact block filter checkpoints
+    -- BIP-330 Erlay reconciliation round-trip
+  | MReqRecon !ReqRecon         -- ^ Request set reconciliation
+  | MReconcilDiff !ReconcilDiff -- ^ Report reconciliation differences
+  | MSketchExt !SketchExt      -- ^ Sketch extension for failed reconciliation
     -- BIP-331 Package Relay
   | MSendTxRcncl !SendTxRcncl  -- ^ Negotiate transaction reconciliation
   | MAncPkgInfo !AncPkgInfo    -- ^ Announce package information
@@ -1352,6 +1399,20 @@ commandName (MGetBlockTxn _) = "getblocktxn"
 commandName (MBlockTxn _)   = "blocktxn"
 commandName MSendAddrV2     = "sendaddrv2"
 commandName (MAddrV2 _)     = "addrv2"
+commandName MWtxidRelay     = "wtxidrelay"
+commandName (MFilterLoad _)  = "filterload"
+commandName (MFilterAdd _)   = "filteradd"
+commandName MFilterClear     = "filterclear"
+commandName (MMerkleBlock _) = "merkleblock"
+commandName (MGetCFilters _) = "getcfilters"
+commandName (MCFilter _)     = "cfilter"
+commandName (MGetCFHeaders _) = "getcfheaders"
+commandName (MCFHeaders _)   = "cfheaders"
+commandName (MGetCFCheckpt _) = "getcfcheckpt"
+commandName (MCFCheckpt _)   = "cfcheckpt"
+commandName (MReqRecon _)    = "reqrecon"
+commandName (MReconcilDiff _) = "reconcildiff"
+commandName (MSketchExt _)   = "sketchext"
 commandName (MSendTxRcncl _) = "sendtxrcncl"
 commandName (MAncPkgInfo _) = "ancpkginfo"
 commandName (MGetPkgTxns _) = "getpkgtxns"
@@ -1383,6 +1444,20 @@ encodePayload (MGetBlockTxn g) = encode g
 encodePayload (MBlockTxn b)   = encode b
 encodePayload MSendAddrV2     = BS.empty
 encodePayload (MAddrV2 a)     = encode a
+encodePayload MWtxidRelay     = BS.empty
+encodePayload (MFilterLoad d)  = d
+encodePayload (MFilterAdd d)   = d
+encodePayload MFilterClear     = BS.empty
+encodePayload (MMerkleBlock d) = d
+encodePayload (MGetCFilters d) = d
+encodePayload (MCFilter d)     = d
+encodePayload (MGetCFHeaders d) = d
+encodePayload (MCFHeaders d)   = d
+encodePayload (MGetCFCheckpt d) = d
+encodePayload (MCFCheckpt d)   = d
+encodePayload (MReqRecon r)    = encode r
+encodePayload (MReconcilDiff d) = encode d
+encodePayload (MSketchExt s)   = encode s
 encodePayload (MSendTxRcncl s) = encode s
 encodePayload (MAncPkgInfo a)  = encode a
 encodePayload (MGetPkgTxns g)  = encode g
@@ -1431,6 +1506,20 @@ decodeMessage cmd payload = case cmd of
   "blocktxn"    -> MBlockTxn <$> decode payload
   "sendaddrv2"  -> Right MSendAddrV2
   "addrv2"      -> MAddrV2 <$> decode payload
+  "wtxidrelay"  -> Right MWtxidRelay
+  "filterload"  -> Right $ MFilterLoad payload
+  "filteradd"   -> Right $ MFilterAdd payload
+  "filterclear" -> Right MFilterClear
+  "merkleblock" -> Right $ MMerkleBlock payload
+  "getcfilters" -> Right $ MGetCFilters payload
+  "cfilter"     -> Right $ MCFilter payload
+  "getcfheaders" -> Right $ MGetCFHeaders payload
+  "cfheaders"   -> Right $ MCFHeaders payload
+  "getcfcheckpt" -> Right $ MGetCFCheckpt payload
+  "cfcheckpt"   -> Right $ MCFCheckpt payload
+  "reqrecon"    -> MReqRecon <$> decode payload
+  "reconcildiff" -> MReconcilDiff <$> decode payload
+  "sketchext"   -> MSketchExt <$> decode payload
   "sendtxrcncl" -> MSendTxRcncl <$> decode payload
   "ancpkginfo"  -> MAncPkgInfo <$> decode payload
   "getpkgtxns"  -> MGetPkgTxns <$> decode payload
@@ -1524,16 +1613,16 @@ defaultPeerConfig net = PeerConfig
 connectPeer :: PeerConfig -> String -> Int -> IO (Either String PeerConnection)
 connectPeer config host port = do
   result <- try @SomeException $ do
-    let hints = defaultHints { addrSocketType = Stream }
+    let hints = defaultHints { NS.addrSocketType = Stream }
     addrs <- getAddrInfo (Just hints) (Just host) (Just (show port))
     case addrs of
       [] -> fail $ "Cannot resolve: " ++ host
       (addr:_) -> do
-        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-        connect sock (addrAddress addr)
+        sock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect sock (NS.addrAddress addr)
         now <- round <$> getPOSIXTime
         let info = PeerInfo
-              { piAddress       = addrAddress addr
+              { piAddress       = NS.addrAddress addr
               , piVersion       = Nothing
               , piState         = PeerConnecting
               , piServices      = 0
@@ -1869,7 +1958,7 @@ discoverPeers net = do
   results <- forM (netDNSSeeds net) $ \seed -> do
     result <- try @SomeException $ do
       addrInfos <- getAddrInfo Nothing (Just seed) (Just (show (netDefaultPort net)))
-      return $ map addrAddress addrInfos
+      return $ map NS.addrAddress addrInfos
     case result of
       Left _     -> return []
       Right addrs -> return addrs
@@ -4744,7 +4833,7 @@ fsCrypt cipher input =
 
       -- Update counter and possibly re-key
       newCounter = fsc20Counter cipher + 1
-      cipher' = if newCounter == fsc20RekeyInt
+      cipher' = if newCounter == fsc20RekeyInt cipher
                 then rekey cipher
                 else cipher { fsc20Counter = newCounter }
   in (cipher', output)
@@ -4803,7 +4892,7 @@ fsEncrypt cipher aad plaintext =
 
       -- Update counter and possibly re-key
       newCounter = fscpCounter cipher + 1
-      cipher' = if newCounter == fscpRekeyInt
+      cipher' = if newCounter == fscpRekeyInt cipher
                 then rekeyAead cipher
                 else cipher { fscpCounter = newCounter }
 
@@ -4826,7 +4915,7 @@ fsDecrypt cipher aad input
 
           -- Update counter and possibly re-key
           newCounter = fscpCounter cipher + 1
-          cipher' = if newCounter == fscpRekeyInt
+          cipher' = if newCounter == fscpRekeyInt cipher
                     then rekeyAead cipher
                     else cipher { fscpCounter = newCounter }
 
@@ -4924,16 +5013,18 @@ encodeLen64 n = BS.pack
 -- | Compute Poly1305 tag
 computePoly1305Tag :: ByteString -> ByteString -> ByteString
 computePoly1305Tag key msg =
-  let state = Poly1305.initialize key
-      state' = Poly1305.update state msg
-      auth = Poly1305.finalize state'
-  in convert auth
+  case Poly1305.initialize key of
+    CryptoFailed _ -> BS.replicate 16 0  -- Should not happen with valid key
+    CryptoPassed state ->
+      let state' = Poly1305.update state msg
+          auth = Poly1305.finalize state'
+      in convert auth
 
 -- | Constant-time comparison to prevent timing attacks
 constantTimeEq :: ByteString -> ByteString -> Bool
 constantTimeEq a b
   | BS.length a /= BS.length b = False
-  | otherwise = BS.foldl' (\acc (x, y) -> acc .|. (x `xor` y)) 0
+  | otherwise = foldl' (\acc (x, y) -> acc .|. (x `xor` y)) (0 :: Word8)
                           (BS.zip a b) == 0
 
 --------------------------------------------------------------------------------
@@ -5593,6 +5684,114 @@ chienSearch lambda
       in getGF2_32 result == 0
 
 --------------------------------------------------------------------------------
+-- Minisketch FFI Bindings (libminisketch)
+-- High-performance BCH set reconciliation via C library
+--------------------------------------------------------------------------------
+
+-- | Opaque pointer to C minisketch structure
+data CMinisketch
+
+-- FFI imports for libminisketch
+-- Note: These require libminisketch to be installed and linked
+foreign import ccall unsafe "minisketch_bits_supported"
+  c_minisketch_bits_supported :: CUInt -> CInt
+
+foreign import ccall unsafe "minisketch_create"
+  c_minisketch_create :: CUInt -> CUInt -> CSize -> IO (Ptr CMinisketch)
+
+foreign import ccall unsafe "&minisketch_destroy"
+  c_minisketch_destroy :: FunPtr (Ptr CMinisketch -> IO ())
+
+foreign import ccall unsafe "minisketch_add_uint64"
+  c_minisketch_add :: Ptr CMinisketch -> Word64 -> IO ()
+
+foreign import ccall unsafe "minisketch_merge"
+  c_minisketch_merge :: Ptr CMinisketch -> Ptr CMinisketch -> IO CSize
+
+foreign import ccall unsafe "minisketch_decode"
+  c_minisketch_decode :: Ptr CMinisketch -> CSize -> Ptr Word64 -> IO CSize
+
+foreign import ccall unsafe "minisketch_serialized_size"
+  c_minisketch_serialized_size :: Ptr CMinisketch -> IO CSize
+
+foreign import ccall unsafe "minisketch_serialize"
+  c_minisketch_serialize :: Ptr CMinisketch -> Ptr Word8 -> IO ()
+
+foreign import ccall unsafe "minisketch_deserialize"
+  c_minisketch_deserialize :: Ptr CMinisketch -> Ptr Word8 -> IO ()
+
+foreign import ccall unsafe "minisketch_clone"
+  c_minisketch_clone :: Ptr CMinisketch -> IO (Ptr CMinisketch)
+
+-- | FFI wrapper for minisketch with automatic resource management
+newtype MinisketchFFI = MinisketchFFI (ForeignPtr CMinisketch)
+
+-- | Check if minisketch supports a given field size
+minisketchFFISupported :: Word32 -> Bool
+minisketchFFISupported bits = c_minisketch_bits_supported (CUInt bits) /= 0
+
+-- | Create a new minisketch with given bits and capacity
+-- Uses implementation 0 (default/auto-detect)
+minisketchFFICreate :: Word32 -> Word32 -> IO (Maybe MinisketchFFI)
+minisketchFFICreate bits capacity = do
+  ptr <- c_minisketch_create (CUInt bits) 0 (CSize $ fromIntegral capacity)
+  if ptr == nullPtr
+    then return Nothing
+    else do
+      fptr <- newForeignPtr c_minisketch_destroy ptr
+      return $ Just (MinisketchFFI fptr)
+
+-- | Run an action with a minisketch, ensuring proper cleanup
+withMinisketchFFI :: MinisketchFFI -> (Ptr CMinisketch -> IO a) -> IO a
+withMinisketchFFI (MinisketchFFI fptr) = withForeignPtr fptr
+
+-- | Add an element to the sketch (modifies in place via FFI)
+minisketchFFIAdd :: MinisketchFFI -> Word64 -> IO ()
+minisketchFFIAdd sketch elem =
+  withMinisketchFFI sketch $ \ptr -> c_minisketch_add ptr elem
+
+-- | Merge another sketch into this one (XOR operation)
+-- Returns the new capacity, or 0 if merge failed
+minisketchFFIMerge :: MinisketchFFI -> MinisketchFFI -> IO Int
+minisketchFFIMerge sketch other =
+  withMinisketchFFI sketch $ \ptr ->
+    withMinisketchFFI other $ \otherPtr -> do
+      CSize result <- c_minisketch_merge ptr otherPtr
+      return (fromIntegral result)
+
+-- | Decode the sketch to find set difference elements
+-- Returns Nothing if decode failed (difference too large)
+minisketchFFIDecode :: MinisketchFFI -> Int -> IO (Maybe [Word64])
+minisketchFFIDecode sketch maxElems =
+  withMinisketchFFI sketch $ \ptr ->
+    allocaArray maxElems $ \outputPtr -> do
+      CSize count <- c_minisketch_decode ptr (CSize $ fromIntegral maxElems) outputPtr
+      -- -1 cast to CSize is maxBound, indicating failure
+      if fromIntegral count > fromIntegral maxElems
+        then return Nothing
+        else do
+          elems <- peekArray (fromIntegral count) outputPtr
+          return $ Just elems
+
+-- | Serialize the sketch to bytes
+minisketchFFISerialize :: MinisketchFFI -> IO ByteString
+minisketchFFISerialize sketch =
+  withMinisketchFFI sketch $ \ptr -> do
+    CSize size <- c_minisketch_serialized_size ptr
+    buf <- mallocBytes (fromIntegral size)
+    c_minisketch_serialize ptr buf
+    bs <- BS.packCStringLen (castPtr buf, fromIntegral size)
+    free buf
+    return bs
+
+-- | Deserialize bytes into an existing sketch
+minisketchFFIDeserialize :: MinisketchFFI -> ByteString -> IO ()
+minisketchFFIDeserialize sketch bs =
+  withMinisketchFFI sketch $ \ptr ->
+    BS.useAsCStringLen bs $ \(cstr, _len) ->
+      c_minisketch_deserialize ptr (castPtr cstr)
+
+--------------------------------------------------------------------------------
 -- Erlay Short TxId Computation
 --------------------------------------------------------------------------------
 
@@ -5611,7 +5810,7 @@ computeErlaySalt localSalt remoteSalt =
         , runPut (putWord64le minSalt)
         , runPut (putWord64le maxSalt)
         ]
-      hashResult = getHash256 (sha256 input)
+      hashResult = sha256 input
       -- Extract two 64-bit keys from hash
       k0 = either (const 0) id $ runGet getWord64le (BS.take 8 hashResult)
       k1 = either (const 0) id $ runGet getWord64le (BS.take 8 (BS.drop 8 hashResult))
@@ -5923,6 +6122,172 @@ getReconciliationPeers peers =
      ]
 
 --------------------------------------------------------------------------------
+-- Erlay Reconciliation Protocol (BIP330)
+-- High-level protocol operations for transaction set reconciliation
+--------------------------------------------------------------------------------
+
+-- | Per-peer Erlay state for active reconciliation
+data ErlayPeerState = ErlayPeerState
+  { epsReconciliationState :: !ReconciliationState  -- ^ Core reconciliation data
+  , epsReconciliationSet   :: !ReconciliationSet    -- ^ Pending txs for this peer
+  , epsLastReconTime       :: !(TVar Int64)         -- ^ Timestamp of last reconciliation
+  , epsNextReconTime       :: !(TVar Int64)         -- ^ When to initiate next reconciliation
+  , epsExtensionAllowed    :: !(TVar Bool)          -- ^ Whether extension round is allowed
+  }
+
+-- | Create a new Erlay peer state from reconciliation state
+newErlayPeerState :: ReconciliationState -> IO ErlayPeerState
+newErlayPeerState rs = do
+  rset <- newReconciliationSet (rsSipKey rs)
+  lastTime <- newTVarIO 0
+  nextTime <- newTVarIO 0
+  extAllowed <- newTVarIO True
+  return ErlayPeerState
+    { epsReconciliationState = rs
+    , epsReconciliationSet = rset
+    , epsLastReconTime = lastTime
+    , epsNextReconTime = nextTime
+    , epsExtensionAllowed = extAllowed
+    }
+
+-- | Compute Poisson delay for reconciliation interval (BIP330)
+-- Returns delay in microseconds
+erlayPoissonDelay :: Int64 -> IO Int64
+erlayPoissonDelay meanInterval = do
+  u <- randomRIO (0.0 :: Double, 1.0)
+  let delay = negate (log u) * fromIntegral meanInterval
+  -- Clamp to reasonable bounds (100ms to 30 seconds)
+  return $ max 100000 $ min 30000000 $ round delay
+
+-- | Get the time until next reconciliation should be initiated
+getReconciliationTimer :: ErlayPeerState -> IO Int64
+getReconciliationTimer eps = do
+  now <- round <$> getPOSIXTime
+  nextTime <- readTVarIO (epsNextReconTime eps)
+  if nextTime <= 0
+    then do
+      -- First reconciliation: schedule with Poisson delay
+      delay <- erlayPoissonDelay erlayReconInterval
+      let next = now * 1000000 + delay  -- Convert to microseconds
+      atomically $ writeTVar (epsNextReconTime eps) next
+      return delay
+    else return $ max 0 (nextTime - now * 1000000)
+
+-- | Initiate reconciliation with a peer (as initiator)
+-- Returns the ReqRecon message to send
+initiateReconciliation :: ErlayPeerState -> IO ReqRecon
+initiateReconciliation eps = do
+  now <- round <$> getPOSIXTime
+  atomically $ writeTVar (epsLastReconTime eps) now
+
+  -- Build sketch from our reconciliation set
+  let rset = epsReconciliationSet eps
+  shortIdMap <- readTVarIO (rsetShortIds rset)
+  let setSize = Map.size shortIdMap
+      -- Estimate capacity: 10% of set size + some buffer
+      -- This is the expected set difference
+      estimatedDiff = max 1 (setSize `div` 10 + 2)
+      capacity = estimatedDiff * 2  -- Double for safety
+
+  sketch <- buildSketchFromSet rset capacity
+  let sketchBytes = sketchSerialize sketch
+
+  -- Reset extension allowance for new reconciliation
+  atomically $ writeTVar (epsExtensionAllowed eps) True
+
+  -- Schedule next reconciliation
+  delay <- erlayPoissonDelay erlayReconInterval
+  atomically $ writeTVar (epsNextReconTime eps) (now * 1000000 + delay)
+
+  return ReqRecon
+    { rrSetSize = fromIntegral setSize
+    , rrQ = fromIntegral estimatedDiff
+    , rrSketch = sketchBytes
+    }
+
+-- | Handle a ReqRecon message from peer (as responder)
+-- Returns either a ReconcilDiff or SketchExt for extension
+handleReqRecon :: ErlayPeerState
+               -> ReqRecon
+               -> IO (Either ReconcilDiff SketchExt)
+handleReqRecon eps req = do
+  let rset = epsReconciliationSet eps
+
+  -- Deserialize their sketch
+  case sketchDeserialize (rrSketch req) of
+    Left _err -> return $ Left ReconcilDiff
+      { rdSuccess = False
+      , rdMissing = []
+      , rdExtra = []
+      }
+    Right theirSketch -> do
+      -- Compute set difference
+      let capacity = sketchCapacity theirSketch
+      result <- computeSetDifference rset theirSketch capacity
+
+      case result of
+        Left _err -> do
+          -- Decode failed, need extension or fallback
+          -- For now, return failure
+          return $ Left ReconcilDiff
+            { rdSuccess = False
+            , rdMissing = []
+            , rdExtra = []
+            }
+
+        Right (weHave, _theyHaveShortIds) -> do
+          -- Successful decode
+          -- weHave = TxIds we have that they don't (we announce to them)
+          -- theyHaveShortIds = short IDs they have that we don't (we request)
+          -- Note: We can't convert theyHaveShortIds to TxIds here since
+          -- we don't have those txs. The initiator knows them.
+
+          -- Clear the reconciliation set after successful reconciliation
+          atomically $ do
+            writeTVar (rsetTxs rset) Set.empty
+            writeTVar (rsetShortIds rset) Map.empty
+
+          return $ Left ReconcilDiff
+            { rdSuccess = True
+            , rdMissing = []  -- Initiator figures this out from the sketch
+            , rdExtra = weHave  -- TxIds initiator is missing
+            }
+
+-- | Handle a ReconcilDiff message from peer (as initiator)
+-- Returns (txids to request via getdata, txids to announce via inv)
+handleReconcilDiff :: ErlayPeerState
+                   -> ReconcilDiff
+                   -> IO ([TxId], [TxId])
+handleReconcilDiff eps diff = do
+  if rdSuccess diff
+    then do
+      -- Successful reconciliation
+      -- rdExtra = TxIds we have that they don't (announce via INV)
+      -- rdMissing = TxIds they have that we don't (request via GETDATA)
+      let toAnnounce = rdExtra diff
+          toRequest = rdMissing diff
+
+      -- Clear our reconciliation set
+      let rset = epsReconciliationSet eps
+      atomically $ do
+        writeTVar (rsetTxs rset) Set.empty
+        writeTVar (rsetShortIds rset) Map.empty
+
+      return (toRequest, toAnnounce)
+    else do
+      -- Reconciliation failed, fall back to flooding
+      -- Send all our pending txs via INV
+      let rset = epsReconciliationSet eps
+      txs <- readTVarIO (rsetTxs rset)
+
+      -- Clear the set
+      atomically $ do
+        writeTVar (rsetTxs rset) Set.empty
+        writeTVar (rsetShortIds rset) Map.empty
+
+      return ([], Set.toList txs)
+
+--------------------------------------------------------------------------------
 -- Tor/I2P Connectivity (Phase 48)
 -- SOCKS5 proxy for Tor, SAM protocol for I2P, hidden service support
 --------------------------------------------------------------------------------
@@ -6138,13 +6503,13 @@ connectThroughTor :: String -> Int -> String -> Word16
                   -> IO (Either String Socket)
 connectThroughTor proxyHost proxyPort targetHost targetPort = do
   result <- try @SomeException $ do
-    let hints = defaultHints { addrSocketType = Stream }
+    let hints = defaultHints { NS.addrSocketType = Stream }
     addrs <- getAddrInfo (Just hints) (Just proxyHost) (Just (show proxyPort))
     case addrs of
       [] -> fail $ "Cannot resolve SOCKS5 proxy: " ++ proxyHost
       (addr:_) -> do
-        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-        connect sock (addrAddress addr)
+        sock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect sock (NS.addrAddress addr)
 
         -- Perform SOCKS5 handshake
         handshakeResult <- socks5Handshake sock
@@ -6317,13 +6682,13 @@ createTorHiddenService :: String -> Int -> Word16 -> String -> Word16
                        -> IO (Either String TorOnionResponse)
 createTorHiddenService ctrlHost ctrlPort virtualPort targetHost targetPort = do
   result <- try @SomeException $ do
-    let hints = defaultHints { addrSocketType = Stream }
+    let hints = defaultHints { NS.addrSocketType = Stream }
     addrs <- getAddrInfo (Just hints) (Just ctrlHost) (Just (show ctrlPort))
     case addrs of
       [] -> fail $ "Cannot resolve Tor control: " ++ ctrlHost
       (addr:_) -> do
-        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-        connect sock (addrAddress addr)
+        sock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect sock (NS.addrAddress addr)
 
         -- Authenticate
         authResult <- torAuthenticate sock
@@ -6482,7 +6847,7 @@ i2pDestToB32 dest =
         Right d -> d
         Left _  -> BS.empty
       -- SHA256 hash
-      hash = getHash256 $ sha256 decoded
+      hash = sha256 decoded
       -- Base32 encode (lowercase)
       b32 = base32Encode hash
   in b32 <> ".b32.i2p"
@@ -6588,13 +6953,13 @@ samStreamConnect sess destAddr = do
       else return destAddr  -- Already a full destination
 
     -- Create a new socket for the stream
-    let hints = defaultHints { addrSocketType = Stream }
+    let hints = defaultHints { NS.addrSocketType = Stream }
     addrs <- getAddrInfo (Just hints) (Just "127.0.0.1") (Just (show i2pSamPort))
     case addrs of
       [] -> fail "Cannot resolve SAM bridge"
       (addr:_) -> do
-        streamSock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-        connect streamSock (addrAddress addr)
+        streamSock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect streamSock (NS.addrAddress addr)
 
         -- HELLO on stream socket
         helloResult <- samHello streamSock
@@ -6649,13 +7014,13 @@ samStreamAccept :: SamSession -> IO (Either String (Socket, ByteString))
 samStreamAccept sess = do
   result <- try @SomeException $ do
     -- Create a new socket for accepting
-    let hints = defaultHints { addrSocketType = Stream }
+    let hints = defaultHints { NS.addrSocketType = Stream }
     addrs <- getAddrInfo (Just hints) (Just "127.0.0.1") (Just (show i2pSamPort))
     case addrs of
       [] -> fail "Cannot resolve SAM bridge"
       (addr:_) -> do
-        acceptSock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-        connect acceptSock (addrAddress addr)
+        acceptSock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect acceptSock (NS.addrAddress addr)
 
         -- HELLO
         helloResult <- samHello acceptSock
@@ -6698,13 +7063,13 @@ samStreamAccept sess = do
 createI2PSession :: String -> Int -> IO (Either String SamSession)
 createI2PSession host port = do
   result <- try @SomeException $ do
-    let hints = defaultHints { addrSocketType = Stream }
+    let hints = defaultHints { NS.addrSocketType = Stream }
     addrs <- getAddrInfo (Just hints) (Just host) (Just (show port))
     case addrs of
       [] -> fail $ "Cannot resolve SAM bridge: " ++ host
       (addr:_) -> do
-        sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
-        connect sock (addrAddress addr)
+        sock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect sock (NS.addrAddress addr)
 
         -- HELLO
         helloResult <- samHello sock
@@ -6773,6 +7138,54 @@ connectPeerThroughProxy ppc host port
 
   -- Regular clearnet address
   | otherwise = connectPeer (ppcBase ppc) host port
+
+-- | Connect to a destination through a SOCKS5 proxy, returning the tunneled socket.
+--
+-- This is a convenience wrapper that performs the SOCKS5 handshake and connect
+-- in a single call. Supports domain name resolution through the proxy (no local
+-- DNS leak). IPv4 addresses and domain names are supported.
+--
+-- Usage:
+-- @
+--   sock <- connectViaProxy "127.0.0.1" 9050 Nothing "example.onion" 8333
+-- @
+connectViaProxy :: String           -- ^ Proxy host
+                -> Int              -- ^ Proxy port
+                -> Maybe (String, String)  -- ^ Optional (username, password) — currently unused (no-auth only)
+                -> String           -- ^ Destination host (domain or IPv4)
+                -> Int              -- ^ Destination port
+                -> IO (Either String Socket)
+connectViaProxy proxyHostAddr proxyPortNum _proxyAuth destHost destPort = do
+  result <- try @SomeException $ do
+    let hints = defaultHints { NS.addrSocketType = Stream }
+    addrs <- getAddrInfo (Just hints) (Just proxyHostAddr) (Just (show proxyPortNum))
+    case addrs of
+      [] -> fail $ "Cannot resolve SOCKS5 proxy: " ++ proxyHostAddr
+      (addr:_) -> do
+        sock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
+        connect sock (NS.addrAddress addr)
+        -- SOCKS5 greeting: version=5, 1 method, no-auth=0
+        handshakeResult <- socks5Handshake sock
+        case handshakeResult of
+          Left err -> do
+            close sock
+            fail err
+          Right () -> do
+            -- SOCKS5 connect request
+            connectResult <- socks5Connect sock destHost (fromIntegral destPort)
+            case connectResult of
+              Left err -> do
+                close sock
+                fail err
+              Right resp ->
+                case s5rReply resp of
+                  Socks5Succeeded -> return sock
+                  other -> do
+                    close sock
+                    fail $ "SOCKS5 connect failed: " ++ show other
+  case result of
+    Left e    -> return $ Left (show e)
+    Right sock -> return $ Right sock
 
 -- | Create PeerConnection from an already-connected socket
 createPeerConnectionFromSocket :: PeerConfig -> Socket -> String
