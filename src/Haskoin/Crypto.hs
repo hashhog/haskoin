@@ -32,6 +32,11 @@ module Haskoin.Crypto
   , sigHashTypeToWord32
   , txSigHash
   , txSigHashSegWit
+    -- * Legacy sighash helpers
+  , findAndDelete
+  , removeCodeSeparators
+  , scriptCodeForSighash
+  , encodePushData
     -- * Transaction/Block hashing
   , computeTxId
   , computeBlockHash
@@ -65,6 +70,7 @@ import Data.List (elemIndex)
 import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Text as T
 import Data.Text (Text)
+import Control.DeepSeq (NFData)
 import GHC.Generics (Generic)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
@@ -108,13 +114,17 @@ hmacSHA512 key msg = convert (HMAC.hmacGetDigest hmacResult)
 
 -- | Secret (private) key: 32 bytes
 newtype SecKey = SecKey { getSecKey :: ByteString }
-  deriving (Show, Eq, Generic)
+  deriving (Show, Eq, Ord, Generic)
+
+instance NFData SecKey
 
 -- | Public key: compressed (33 bytes) or uncompressed (65 bytes)
 data PubKey
   = PubKeyCompressed !ByteString     -- 33 bytes: 0x02/0x03 + x
   | PubKeyUncompressed !ByteString   -- 65 bytes: 0x04 + x + y
-  deriving (Show, Eq, Generic)
+  deriving (Show, Eq, Ord, Generic)
+
+instance NFData PubKey
 
 -- | Derive public key from secret key
 -- Uses secp256k1 curve: y^2 = x^3 + 7 (mod p)
@@ -215,49 +225,185 @@ sigHashTypeToWord32 sh =
   in base .|. acp
 
 --------------------------------------------------------------------------------
+-- FindAndDelete for Legacy Sighash
+--------------------------------------------------------------------------------
+
+-- | FindAndDelete removes all occurrences of a byte pattern from a script.
+-- This operates on raw bytes, matching Bitcoin Core's behavior:
+-- - Only matches at opcode boundaries (doesn't match inside push data)
+-- - Single-pass removal (removing one occurrence may create another, but that's not removed)
+--
+-- Reference: Bitcoin Core src/script/interpreter.cpp FindAndDelete()
+findAndDelete :: ByteString -> ByteString -> ByteString
+findAndDelete script pattern
+  | BS.null pattern = script  -- Empty pattern = no-op
+  | otherwise = go script BS.empty 0
+  where
+    patLen = BS.length pattern
+    scriptLen = BS.length script
+
+    -- Walk through script at opcode boundaries
+    go :: ByteString -> ByteString -> Int -> ByteString
+    go remaining result pos
+      | BS.null remaining = result
+      | otherwise =
+          -- At each opcode boundary, check if pattern matches
+          let matchesHere = BS.length remaining >= patLen &&
+                           BS.take patLen remaining == pattern
+          in if matchesHere
+             then -- Skip the pattern, continue from after it
+                  go (BS.drop patLen remaining) result (pos + patLen)
+             else -- Copy this opcode to result, advance to next opcode
+                  let (opBytes, nextRemaining, advance) = getNextOpcode remaining
+                  in go nextRemaining (BS.append result opBytes) (pos + advance)
+
+    -- Get the bytes for the next opcode (opcode + any push data)
+    getNextOpcode :: ByteString -> (ByteString, ByteString, Int)
+    getNextOpcode bs
+      | BS.null bs = (BS.empty, BS.empty, 0)
+      | otherwise =
+          let op = BS.head bs
+          in case getPushDataLength op (BS.tail bs) of
+               Just (dataLen, prefixLen) ->
+                 let totalLen = 1 + prefixLen + dataLen
+                     opcodeBytes = BS.take totalLen bs
+                     rest = BS.drop totalLen bs
+                 in (opcodeBytes, rest, totalLen)
+               Nothing ->
+                 -- Not a push data opcode, just the single byte
+                 (BS.take 1 bs, BS.tail bs, 1)
+
+    -- Get the length of push data for a given opcode
+    -- Returns (data length, prefix length after opcode)
+    getPushDataLength :: Word8 -> ByteString -> Maybe (Int, Int)
+    getPushDataLength op rest
+      | op <= 0x4b = Just (fromIntegral op, 0)  -- OP_PUSHDATA direct: op is the length
+      | op == 0x4c && not (BS.null rest) =      -- OP_PUSHDATA1: 1 byte length
+          Just (fromIntegral (BS.head rest), 1)
+      | op == 0x4d && BS.length rest >= 2 =     -- OP_PUSHDATA2: 2 byte length (LE)
+          let len = fromIntegral (BS.index rest 0) +
+                    fromIntegral (BS.index rest 1) * 256
+          in Just (len, 2)
+      | op == 0x4e && BS.length rest >= 4 =     -- OP_PUSHDATA4: 4 byte length (LE)
+          let len = fromIntegral (BS.index rest 0) +
+                    fromIntegral (BS.index rest 1) * 256 +
+                    fromIntegral (BS.index rest 2) * 65536 +
+                    fromIntegral (BS.index rest 3) * 16777216
+          in Just (len, 4)
+      | otherwise = Nothing  -- Not a push data opcode
+
+-- | Remove all OP_CODESEPARATOR (0xab) opcodes from a script
+-- This is used when preparing the scriptCode for legacy sighash computation
+removeCodeSeparators :: ByteString -> ByteString
+removeCodeSeparators script = findAndDelete script (BS.singleton 0xab)
+
+-- | Prepare scriptCode for sighash computation in legacy mode.
+-- Takes the original subscript, optionally the position after last OP_CODESEPARATOR,
+-- and the signature being checked (to be removed via FindAndDelete).
+--
+-- For legacy (non-witness) scripts:
+-- 1. If codeSepPos is set, take script from that position onward
+-- 2. Remove all OP_CODESEPARATOR opcodes
+-- 3. Remove all occurrences of the signature (with its push opcode prefix)
+--
+-- Note: FindAndDelete removes the push-encoded signature, not just raw bytes
+scriptCodeForSighash :: ByteString        -- ^ Original subscript
+                     -> Word32            -- ^ Code separator position (0xFFFFFFFF = none)
+                     -> ByteString        -- ^ Signature bytes to remove (including hash type)
+                     -> ByteString        -- ^ Prepared scriptCode
+scriptCodeForSighash subscript codeSepPos sigBytes =
+  let -- Step 1: Handle OP_CODESEPARATOR position
+      -- If codeSepPos is not 0xFFFFFFFF, take from that position
+      scriptAfterCodeSep = if codeSepPos /= 0xFFFFFFFF && fromIntegral codeSepPos < BS.length subscript
+                           then BS.drop (fromIntegral codeSepPos) subscript
+                           else subscript
+      -- Step 2: Remove all OP_CODESEPARATOR opcodes from the script
+      scriptNoCodeSep = removeCodeSeparators scriptAfterCodeSep
+      -- Step 3: Create the push-encoded signature for FindAndDelete
+      -- The signature is removed with its push opcode prefix
+      sigPushEncoded = encodePushData sigBytes
+      -- Step 4: Remove all occurrences of the push-encoded signature
+  in if BS.null sigBytes
+     then scriptNoCodeSep
+     else findAndDelete scriptNoCodeSep sigPushEncoded
+
+-- | Encode a byte string as a push data operation (for FindAndDelete)
+-- This matches Bitcoin Core's CScript operator<< behavior
+encodePushData :: ByteString -> ByteString
+encodePushData bs
+  | BS.null bs = BS.singleton 0x00  -- OP_0 for empty
+  | BS.length bs <= 75 = BS.cons (fromIntegral $ BS.length bs) bs  -- Direct push
+  | BS.length bs <= 255 =
+      BS.cons 0x4c (BS.cons (fromIntegral $ BS.length bs) bs)  -- OP_PUSHDATA1
+  | BS.length bs <= 65535 =
+      let len = BS.length bs
+          lenBytes = BS.pack [fromIntegral (len .&. 0xff), fromIntegral ((len `shiftR` 8) .&. 0xff)]
+      in BS.cons 0x4d (BS.append lenBytes bs)  -- OP_PUSHDATA2
+  | otherwise =
+      let len = BS.length bs
+          lenBytes = BS.pack [ fromIntegral (len .&. 0xff)
+                             , fromIntegral ((len `shiftR` 8) .&. 0xff)
+                             , fromIntegral ((len `shiftR` 16) .&. 0xff)
+                             , fromIntegral ((len `shiftR` 24) .&. 0xff)
+                             ]
+      in BS.cons 0x4e (BS.append lenBytes bs)  -- OP_PUSHDATA4
+
+--------------------------------------------------------------------------------
 -- Sighash Computation
 --------------------------------------------------------------------------------
 
 -- | Compute legacy sighash for transaction signing
 -- Serializes the transaction with script in signing input, then double-SHA256
-txSigHash :: Tx -> Int -> ByteString -> SigHashType -> Hash256
-txSigHash tx inputIdx subScript shType =
-  let hashTypeW32 = sigHashTypeToWord32 shType
-      -- Clear all input scripts, set signing input's script to subscript
-      inputs' = zipWith (\i inp ->
-        if i == inputIdx
-          then inp { txInScript = subScript }
-          else inp { txInScript = BS.empty }
-        ) [0..] (txInputs tx)
-      -- Handle SIGHASH_NONE and SIGHASH_SINGLE output modifications
-      outputs' = case () of
-        _ | shNone shType -> []
-          | shSingle shType && inputIdx < length (txOutputs tx) ->
-              replicate inputIdx (TxOut 0xffffffffffffffff BS.empty)
-              ++ [txOutputs tx !! inputIdx]
-          | shSingle shType -> []  -- inputIdx >= length outputs, return empty
-          | otherwise -> txOutputs tx
-      -- Handle sequence modifications for SIGHASH_NONE and SIGHASH_SINGLE
-      inputs'' = if shNone shType || shSingle shType
-        then zipWith (\i inp ->
+--
+-- The raw Word32 hash type is appended as-is to the serialized transaction
+-- before hashing. This is critical: Bitcoin Core appends the original wire
+-- value, not a canonicalized version. The SigHashType flags control the
+-- serialization behavior (which inputs/outputs to include).
+--
+-- IMPORTANT: For SIGHASH_SINGLE with inputIdx >= len(outputs), Bitcoin Core
+-- returns a hash of uint256(1) - this is a historical bug that became consensus.
+txSigHash :: Tx -> Int -> ByteString -> Word32 -> SigHashType -> Hash256
+txSigHash tx inputIdx subScript hashTypeW32 shType =
+  -- SIGHASH_SINGLE with inputIdx >= length outputs: return hash of 1
+  if shSingle shType && inputIdx >= length (txOutputs tx)
+  then Hash256 (BS.pack $ 0x01 : replicate 31 0x00)  -- uint256(1) in little-endian
+  else
+    let -- Remove OP_CODESEPARATOR from subscript (FindAndDelete)
+        cleanScript = removeCodeSeparators subScript
+        -- Clear all input scripts, set signing input's script to cleaned subscript
+        inputs' = zipWith (\i inp ->
           if i == inputIdx
-            then inp
-            else inp { txInSequence = 0 }
-          ) [0..] inputs'
-        else inputs'
-      -- Handle ANYONECANPAY: only include the signing input
-      finalInputs = if shAnyoneCanPay shType
-        then [inputs'' !! inputIdx]
-        else inputs''
-      modifiedTx = runPut $ do
-        putWord32le (fromIntegral $ txVersion tx)
-        putVarInt (fromIntegral $ length finalInputs)
-        mapM_ putTxIn finalInputs
-        putVarInt (fromIntegral $ length outputs')
-        mapM_ putTxOut outputs'
-        putWord32le (txLockTime tx)
-        putWord32le hashTypeW32
-  in doubleSHA256 modifiedTx
+            then inp { txInScript = cleanScript }
+            else inp { txInScript = BS.empty }
+          ) [0..] (txInputs tx)
+        -- Handle SIGHASH_NONE and SIGHASH_SINGLE output modifications
+        outputs' = case () of
+          _ | shNone shType -> []
+            | shSingle shType && inputIdx < length (txOutputs tx) ->
+                replicate inputIdx (TxOut 0xffffffffffffffff BS.empty)
+                ++ [txOutputs tx !! inputIdx]
+            | otherwise -> txOutputs tx
+        -- Handle sequence modifications for SIGHASH_NONE and SIGHASH_SINGLE
+        inputs'' = if shNone shType || shSingle shType
+          then zipWith (\i inp ->
+            if i == inputIdx
+              then inp
+              else inp { txInSequence = 0 }
+            ) [0..] inputs'
+          else inputs'
+        -- Handle ANYONECANPAY: only include the signing input
+        finalInputs = if shAnyoneCanPay shType
+          then [inputs'' !! inputIdx]
+          else inputs''
+        modifiedTx = runPut $ do
+          putWord32le (fromIntegral $ txVersion tx)
+          putVarInt (fromIntegral $ length finalInputs)
+          mapM_ putTxIn finalInputs
+          putVarInt (fromIntegral $ length outputs')
+          mapM_ putTxOut outputs'
+          putWord32le (txLockTime tx)
+          putWord32le hashTypeW32
+    in doubleSHA256 modifiedTx
 
 -- | BIP-143 SegWit sighash computation
 -- Fixes quadratic hashing by pre-computing hash of prevouts, sequences, outputs
@@ -346,7 +492,9 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
-  deriving (Show, Eq, Generic)
+  deriving (Show, Eq, Ord, Generic)
+
+instance NFData Address
 
 --------------------------------------------------------------------------------
 -- Address Construction
@@ -589,21 +737,25 @@ addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
 textToAddress txt
-  | T.isPrefixOf "bc1q" txtLower || T.isPrefixOf "BC1Q" txt = -- Bech32 P2WPKH/P2WSH
+  | T.isPrefixOf "bc1q" txtLower || T.isPrefixOf "BC1Q" txt
+    || T.isPrefixOf "bcrt1q" txtLower || T.isPrefixOf "tb1q" txtLower = -- Bech32 P2WPKH/P2WSH
       case bech32Decode txt of
         Just (_, 0, prog)
           | BS.length prog == 20 -> Just $ WitnessPubKeyAddress (Hash160 prog)
           | BS.length prog == 32 -> Just $ WitnessScriptAddress (Hash256 prog)
         _ -> Nothing
-  | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt = -- Bech32m P2TR
+  | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt
+    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
       case bech32Decode txt of
         Just (_, 1, prog)
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
         _ -> Nothing
-  | otherwise = -- Base58Check
+  | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
       case base58CheckDecode txt of
         Just (0x00, h) | BS.length h == 20 -> Just $ PubKeyAddress (Hash160 h)
+        Just (0x6f, h) | BS.length h == 20 -> Just $ PubKeyAddress (Hash160 h)
         Just (0x05, h) | BS.length h == 20 -> Just $ ScriptAddress (Hash160 h)
+        Just (0xc4, h) | BS.length h == 20 -> Just $ ScriptAddress (Hash160 h)
         _ -> Nothing
   where
     txtLower = T.toLower txt

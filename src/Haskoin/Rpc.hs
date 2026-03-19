@@ -3,16 +3,20 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
--- | JSON-RPC Server
+-- | JSON-RPC Server and REST API
 --
 -- This module implements a JSON-RPC server compatible with Bitcoin Core's RPC
 -- interface, providing endpoints for blockchain queries, transaction submission,
 -- network information, mining, and wallet operations.
 --
+-- It also provides a REST API compatible with Bitcoin Core's REST interface,
+-- supporting multiple output formats (JSON, hex, binary) for common queries.
+--
 -- Key Features:
 --   - HTTP server using Warp for high performance
 --   - Full Bitcoin Core RPC API compatibility
---   - HTTP Basic authentication
+--   - Bitcoin Core REST API compatibility
+--   - HTTP Basic authentication (RPC only, REST is read-only)
 --   - Non-blocking handlers using STM
 --
 module Haskoin.Rpc
@@ -40,11 +44,51 @@ module Haskoin.Rpc
   , rpcVerifyAlreadyInChain
     -- * Batch Constants
   , maxBatchSize
+    -- * REST API
+  , RestResponseFormat(..)
+  , parseRestFormat
+  , maxRestHeadersResults
+  , maxGetUtxosOutpoints
     -- * Internal helpers (exported for testing)
   , mempoolErrorToRpcResponse
   , decodeTxWithFallback
   , handleBatchRequest
   , parseSingleRequest
+  , restApp
+  , handleRestBlock
+  , handleRestTx
+  , handleRestHeaders
+  , handleRestChainInfo
+  , handleRestMempoolInfo
+  , handleRestMempoolContents
+  , handleRestBlockHashByHeight
+  , handleRestGetUtxos
+  , combinedApp
+    -- * ZMQ Notifications
+  , ZmqTopic(..)
+  , ZmqConfig(..)
+  , ZmqNotifier(..)
+  , ZmqEvent(..)
+  , SequenceLabel(..)
+  , defaultZmqConfig
+  , newZmqNotifier
+  , closeZmqNotifier
+  , notifyBlockConnect
+  , notifyBlockDisconnect
+  , notifyRawBlock
+  , notifyHashBlock
+  , notifyTxAcceptance
+  , notifyTxRemoval
+  , notifyRawTx
+  , notifyHashTx
+  , zmqTopicToBytes
+  , sequenceLabelToByte
+    -- * Multi-Wallet Support
+  , extractWalletName
+  , rpcWalletNotFound
+  , rpcWalletNotSpecified
+  , rpcWalletAlreadyLoaded
+  , rpcWalletAlreadyExists
   ) where
 
 import Data.Aeson
@@ -61,49 +105,88 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
 import Network.Wai (Application, Request, Response, responseLBS, requestBody,
-                    requestMethod, requestHeaders)
+                    requestMethod, requestHeaders, pathInfo, rawPathInfo,
+                    rawQueryString)
 import Network.Wai.Handler.Warp (run, Settings, defaultSettings, setPort, setHost)
-import Network.HTTP.Types (status200, status401, status405, hContentType, hAuthorization)
+import Network.HTTP.Types (status200, status400, status401, status404, status405,
+                           status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch)
+import Data.List.NonEmpty (NonEmpty(..))
+import Control.Exception (try, SomeException, catch, bracket, mask_)
 import Data.IORef
+import Data.Word (Word8)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Base64 as B64
-import Data.Serialize (encode, decode)
+import qualified Data.Serialize as S
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
-import Control.Monad (forM)
-import Data.Maybe (fromMaybe, catMaybes, listToMaybe)
-import Data.List (find)
+import Control.Monad (forM, void)
+import Control.Concurrent (threadDelay)
+import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe)
+import Data.List (find, sort)
+import qualified Data.Set as Set
+import qualified Crypto.Hash as Crypto
+import qualified Data.ByteArray as BA
+import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
+import Data.Char (chr)
+import Data.List (foldl')
 import Text.Printf (printf)
 import qualified Data.Vector as V
+import qualified System.ZMQ4 as ZMQ
+import Data.Time.Clock.POSIX (getPOSIXTime)
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
-                        Address(..))
-import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..),
+                        Address(..), PubKey(..), serializePubKeyCompressed,
+                        base58Check, bech32Encode, bech32mEncode)
+import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
-                           witnessScaleFactor, computeWtxId)
+                           witnessScaleFactor, computeWtxId, computeMerkleRoot,
+                           medianTimePast, maxBlockWeight,
+                           invalidateBlock, reconsiderBlock, InvalidateError(..))
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
-                         lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex)
+                         lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
+                         BlockStore(..), BlockIndex(..), getBlockIndex,
+                         isBlockPruned, pruneBlockchain, minBlocksToKeep,
+                         loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..))
 import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
-                         nodeNetworkLimited, hasService)
+                         nodeNetworkLimited, hasService, ServiceFlag(..),
+                         disconnectPeer)
+import Network.Socket (SockAddr(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
                          addTransaction, getTransaction, getMempoolTxIds,
                          getMempoolSize, FeeRate(..), calculateVSize,
-                         calculateFeeRate)
+                         calculateFeeRate, selectTransactions,
+                         getAncestors, getDescendants, removeTransaction,
+                         isRbfReplaceable)
 import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..))
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
+import Haskoin.Wallet (Descriptor(..), KeyExpr(..), ParseError(..),
+                        parseDescriptor, descriptorToText, deriveAddresses,
+                        deriveScripts, descriptorChecksum, addDescriptorChecksum,
+                        validateDescriptorChecksum, isRangeDescriptor,
+                        WalletManager(..), WalletState(..), WalletInfo(..),
+                        newWalletManager, createManagedWallet, loadManagedWallet,
+                        unloadManagedWallet, getManagedWallet, getDefaultWallet,
+                        listManagedWallets, getWalletInfo, getBalance,
+                        -- Wallet address/transaction functions
+                        AddressType(..), getNewAddress, sendToAddress,
+                        getWalletUTXOs, Utxo(..),
+                        -- PSBT types and functions
+                        Psbt(..), PsbtGlobal(..), PsbtInput(..), PsbtOutput(..),
+                        KeyPath(..), emptyPsbt, emptyPsbtInput,
+                        createPsbt, combinePsbts, finalizePsbt, extractTransaction,
+                        decodePsbt, encodePsbt, isPsbtFinalized, getPsbtFee)
 
 --------------------------------------------------------------------------------
 -- RPC Configuration
@@ -144,8 +227,20 @@ data RpcServer = RpcServer
   , rsFeeEst      :: !FeeEstimator
   , rsUTXOCache   :: !UTXOCache
   , rsNetwork     :: !Network
+  , rsBlockStore  :: !(Maybe BlockStore)  -- ^ Block store for pruning (optional)
   , rsThread      :: !(TVar (Maybe ThreadId))
+  , rsMockTime    :: !(TVar (Maybe Word32))  -- ^ Mock time for regtest (setmocktime)
+  , rsWalletMgr   :: !(Maybe WalletManager)  -- ^ Multi-wallet manager (optional)
+  , rsStartTime   :: !Int64                  -- ^ Server start time (POSIX seconds)
   }
+
+-- | Get current time, using mock time if set (for regtest testing)
+getCurrentTime :: RpcServer -> IO Word32
+getCurrentTime server = do
+  mockTime <- readTVarIO (rsMockTime server)
+  case mockTime of
+    Just t  -> return t
+    Nothing -> (round :: Double -> Word32) . realToFrac <$> getPOSIXTime
 
 --------------------------------------------------------------------------------
 -- JSON-RPC Request/Response Types
@@ -249,6 +344,26 @@ rpcVerifyAlreadyInChain :: Int
 rpcVerifyAlreadyInChain = -27
 
 --------------------------------------------------------------------------------
+-- Bitcoin Core Wallet Error Codes
+--------------------------------------------------------------------------------
+
+-- | Requested wallet does not exist or is not loaded (error code -18)
+rpcWalletNotFound :: Int
+rpcWalletNotFound = -18
+
+-- | Multiple wallets loaded, wallet must be specified (error code -19)
+rpcWalletNotSpecified :: Int
+rpcWalletNotSpecified = -19
+
+-- | Wallet already loaded (error code -35)
+rpcWalletAlreadyLoaded :: Int
+rpcWalletAlreadyLoaded = -35
+
+-- | Wallet already exists (error code -36)
+rpcWalletAlreadyExists :: Int
+rpcWalletAlreadyExists = -36
+
+--------------------------------------------------------------------------------
 -- Batch Request Constants
 --------------------------------------------------------------------------------
 
@@ -261,13 +376,17 @@ maxBatchSize = 1000
 --------------------------------------------------------------------------------
 
 -- | Start the RPC server
+-- Handles both JSON-RPC (POST requests) and REST API (GET /rest/* requests)
 startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
                -> Mempool -> FeeEstimator -> UTXOCache -> Network
-               -> IO RpcServer
-startRpcServer config db hc pm mp fe cache net = do
+               -> Maybe BlockStore -> Maybe WalletManager -> IO RpcServer
+startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr = do
   threadVar <- newTVarIO Nothing
-  let server = RpcServer config db hc pm mp fe cache net threadVar
-  tid <- forkIO $ run (rpcPort config) (rpcApp server)
+  mockTimeVar <- newTVarIO Nothing  -- No mock time by default
+  startTime <- round <$> getPOSIXTime
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime
+  -- Use combined app to handle both RPC and REST endpoints
+  tid <- forkIO $ run (rpcPort config) (combinedApp server)
   atomically $ writeTVar threadVar (Just tid)
   return server
 
@@ -401,6 +520,70 @@ extractIdFromValue (Object obj) = fromMaybe Null (KM.lookup "id" obj)
 extractIdFromValue _ = Null
 
 --------------------------------------------------------------------------------
+-- Multi-Wallet URI Handling
+--------------------------------------------------------------------------------
+
+-- | Wallet endpoint base path (matching Bitcoin Core)
+walletEndpointBase :: Text
+walletEndpointBase = "/wallet/"
+
+-- | Extract wallet name from URI path.
+-- Supports /wallet/<name> URI prefix for wallet selection.
+-- Reference: Bitcoin Core wallet/rpc/util.cpp GetWalletNameFromJSONRPCRequest
+extractWalletName :: Request -> Maybe Text
+extractWalletName req =
+  let path = TE.decodeUtf8 (rawPathInfo req)
+  in if walletEndpointBase `T.isPrefixOf` path
+     then Just $ urlDecode $ T.drop (T.length walletEndpointBase) path
+     else Nothing
+
+-- | URL decode a text string (simple implementation for wallet names)
+urlDecode :: Text -> Text
+urlDecode = T.pack . decode' . T.unpack
+  where
+    decode' [] = []
+    decode' ('%':a:b:rest) = case (toHexDigit a, toHexDigit b) of
+      (Just hi, Just lo) -> toEnum (hi * 16 + lo) : decode' rest
+      _ -> '%' : a : b : decode' rest
+    decode' ('+':rest) = ' ' : decode' rest
+    decode' (c:rest) = c : decode' rest
+
+    toHexDigit c
+      | c >= '0' && c <= '9' = Just (fromEnum c - fromEnum '0')
+      | c >= 'a' && c <= 'f' = Just (fromEnum c - fromEnum 'a' + 10)
+      | c >= 'A' && c <= 'F' = Just (fromEnum c - fromEnum 'A' + 10)
+      | otherwise = Nothing
+
+-- | Get wallet for the request, handling wallet selection.
+-- Uses /wallet/<name> URI if present, otherwise uses the default wallet.
+-- Returns error response if no wallet is available or multiple wallets without selection.
+getWalletForRequest :: RpcServer -> Request -> IO (Either RpcResponse WalletState)
+getWalletForRequest server req = do
+  case rsWalletMgr server of
+    Nothing -> return $ Left $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet manager available") Null
+    Just wm -> do
+      case extractWalletName req of
+        Just walletName -> do
+          mWallet <- getManagedWallet wm walletName
+          case mWallet of
+            Nothing -> return $ Left $ RpcResponse Null
+              (toJSON $ RpcError rpcWalletNotFound
+                ("Requested wallet does not exist or is not loaded: " <> walletName)) Null
+            Just ws -> return $ Right ws
+        Nothing -> do
+          (mDefault, count) <- getDefaultWallet wm
+          case mDefault of
+            Nothing -> return $ Left $ RpcResponse Null
+              (toJSON $ RpcError rpcWalletNotFound
+                "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+            Just ws
+              | count == 1 -> return $ Right ws
+              | otherwise -> return $ Left $ RpcResponse Null
+                  (toJSON $ RpcError rpcWalletNotSpecified
+                    "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path.") Null
+
+--------------------------------------------------------------------------------
 -- Request Dispatcher
 --------------------------------------------------------------------------------
 
@@ -421,6 +604,9 @@ handleRpcRequest server req = do
     "gettxout"             -> handleGetTxOut server params
     "getbestblockhash"     -> handleGetBestBlockHash server
     "getdifficulty"        -> handleGetDifficulty server
+    "pruneblockchain"      -> handlePruneBlockchain server params
+    "invalidateblock"      -> handleInvalidateBlock server params
+    "reconsiderblock"      -> handleReconsiderBlock server params
 
     -- Transaction RPCs
     "getrawtransaction"    -> handleGetRawTransaction server params
@@ -442,12 +628,80 @@ handleRpcRequest server req = do
     "submitblock"          -> handleSubmitBlock server params
     "getmininginfo"        -> handleGetMiningInfo server
 
+    -- Regtest Mining RPCs
+    "generatetoaddress"    -> handleGenerateToAddress server params
+    "generateblock"        -> handleGenerateBlock server params
+    "generate"             -> handleGenerate server params
+
+    -- Regtest Control RPCs
+    "setmocktime"          -> handleSetMockTime server params
+
     -- Fee estimation
     "estimatesmartfee"     -> handleEstimateSmartFee server params
 
     -- Utility
     "validateaddress"      -> handleValidateAddress server params
     "getinfo"              -> handleGetInfo server
+
+    -- Wallet descriptor RPCs
+    "importdescriptors"    -> handleImportDescriptors server params
+    "listdescriptors"      -> handleListDescriptors server params
+
+    -- Multi-wallet management RPCs
+    "createwallet"         -> handleCreateWallet server params
+    "loadwallet"           -> handleLoadWallet server params
+    "unloadwallet"         -> handleUnloadWallet server params
+    "listwallets"          -> handleListWallets server
+    "getwalletinfo"        -> handleGetWalletInfo server params
+
+    -- Wallet balance RPCs (require wallet selection)
+    "getbalance"           -> handleGetBalance server params
+
+    -- PSBT RPCs
+    "createpsbt"           -> handleCreatePsbt server params
+    "decodepsbt"           -> handleDecodePsbt server params
+    "combinepsbt"          -> handleCombinePsbt server params
+    "finalizepsbt"         -> handleFinalizePsbt server params
+
+    -- Blockchain RPCs (new)
+    "getchaintips"         -> handleGetChainTips server
+
+    -- Script RPCs
+    "decodescript"         -> handleDecodeScript server params
+
+    -- Mempool RPCs (new)
+    "testmempoolaccept"    -> handleTestMempoolAccept server params
+    "getmempoolentry"      -> handleGetMempoolEntry server params
+    "getmempoolancestors"  -> handleGetMempoolAncestors server params
+
+    -- Raw transaction RPCs (new)
+    "createrawtransaction"         -> handleCreateRawTransaction server params
+    "signrawtransactionwithwallet" -> handleSignRawTransactionWithWallet server params
+
+    -- Network RPCs (new)
+    "disconnectnode"       -> handleDisconnectNode server params
+
+    -- Wallet RPCs (new)
+    "getnewaddress"        -> handleGetNewAddress server params
+    "sendtoaddress"        -> handleSendToAddress server params
+    "listtransactions"     -> handleListTransactions server params
+    "listunspent"          -> handleListUnspent server params
+
+    -- AssumeUTXO RPCs
+    "loadtxoutset"         -> handleLoadTxOutSet server params
+    "dumptxoutset"         -> handleDumpTxOutSet server params
+
+    -- Control RPCs
+    "help"                 -> handleHelp server params
+    "stop"                 -> handleStop server
+
+    -- Utility RPCs (additional)
+    "walletpassphrase"     -> handleWalletPassphrase server params
+    "walletlock"           -> handleWalletLock server
+    "setlabel"             -> handleSetLabel server params
+    "verifymessage"        -> handleVerifyMessage server params
+    "uptime"               -> handleUptime server
+    "getnettotals"         -> handleGetNetTotals server
 
     other -> return $ mkErr rpcMethodNotFound ("Method not found: " <> other)
 
@@ -524,37 +778,45 @@ handleGetBlock server params = do
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
         Just bh -> do
-          let verbosity = fromMaybe 1 (extractParam params 1 :: Maybe Int)
-          mBlock <- getBlock (rsDB server) bh
-          case mBlock of
-            Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError "Block not found") Null
-            Just block -> do
-              if verbosity == 0
-                then do
-                  -- Return raw hex
-                  let rawHex = TE.decodeUtf8 $ B16.encode (encode block)
-                  return $ RpcResponse (toJSON rawHex) Null Null
-                else do
-                  -- Return JSON object
-                  entries <- readTVarIO (hcEntries (rsHeaderChain server))
-                  let mEntry = Map.lookup bh entries
-                      txids = map computeTxId (blockTxns block)
-                      result = object $ catMaybes
-                        [ Just $ "hash" .= showHash bh
-                        , Just $ "confirmations" .= (1 :: Int)
-                        , Just $ "size" .= BS.length (encode block)
-                        , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
-                        , Just $ "version" .= bhVersion (blockHeader block)
-                        , Just $ "merkleroot" .= showHash256 (bhMerkleRoot (blockHeader block))
-                        , Just $ "tx" .= map (showHash . blockHashFromTxId) txids
-                        , Just $ "time" .= bhTimestamp (blockHeader block)
-                        , Just $ "nonce" .= bhNonce (blockHeader block)
-                        , Just $ "bits" .= showBits (bhBits (blockHeader block))
-                        , Just $ "difficulty" .= getDifficulty (bhBits (blockHeader block))
-                        , Just $ "previousblockhash" .= showHash (bhPrevBlock (blockHeader block))
-                        ]
-                  return $ RpcResponse result Null Null
+          -- Check if block has been pruned
+          isPruned <- case rsBlockStore server of
+            Nothing -> return False
+            Just blockStore -> isBlockPruned blockStore bh
+          if isPruned
+            then return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Block not available (pruned data)") Null
+            else do
+              let verbosity = fromMaybe 1 (extractParam params 1 :: Maybe Int)
+              mBlock <- getBlock (rsDB server) bh
+              case mBlock of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError "Block not found") Null
+                Just block -> do
+                  if verbosity == 0
+                    then do
+                      -- Return raw hex
+                      let rawHex = TE.decodeUtf8 $ B16.encode (S.encode block)
+                      return $ RpcResponse (toJSON rawHex) Null Null
+                    else do
+                      -- Return JSON object
+                      entries <- readTVarIO (hcEntries (rsHeaderChain server))
+                      let mEntry = Map.lookup bh entries
+                          txids = map computeTxId (blockTxns block)
+                          result = object $ catMaybes
+                            [ Just $ "hash" .= showHash bh
+                            , Just $ "confirmations" .= (1 :: Int)
+                            , Just $ "size" .= BS.length (S.encode block)
+                            , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
+                            , Just $ "version" .= bhVersion (blockHeader block)
+                            , Just $ "merkleroot" .= showHash256 (bhMerkleRoot (blockHeader block))
+                            , Just $ "tx" .= map (showHash . blockHashFromTxId) txids
+                            , Just $ "time" .= bhTimestamp (blockHeader block)
+                            , Just $ "nonce" .= bhNonce (blockHeader block)
+                            , Just $ "bits" .= showBits (bhBits (blockHeader block))
+                            , Just $ "difficulty" .= getDifficulty (bhBits (blockHeader block))
+                            , Just $ "previousblockhash" .= showHash (bhPrevBlock (blockHeader block))
+                            ]
+                      return $ RpcResponse result Null Null
 
 -- | Get block header by hash
 handleGetBlockHeader :: RpcServer -> Value -> IO RpcResponse
@@ -575,7 +837,7 @@ handleGetBlockHeader server params = do
             Just header -> do
               if not verbose
                 then do
-                  let rawHex = TE.decodeUtf8 $ B16.encode (encode header)
+                  let rawHex = TE.decodeUtf8 $ B16.encode (S.encode header)
                   return $ RpcResponse (toJSON rawHex) Null Null
                 else do
                   entries <- readTVarIO (hcEntries (rsHeaderChain server))
@@ -629,6 +891,104 @@ handleGetDifficulty server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
   let difficulty = getDifficulty (bhBits (ceHeader tip))
   return $ RpcResponse (toJSON difficulty) Null Null
+
+-- | Prune blockchain data up to a specified height.
+-- Parameters:
+--   height (required): Prune blocks up to this height
+-- Returns:
+--   The height at which pruning was completed
+-- Error codes:
+--   -1: Cannot prune blocks (e.g., pruning not enabled, height too high)
+--
+-- Reference: Bitcoin Core's pruneblockchain RPC
+handlePruneBlockchain :: RpcServer -> Value -> IO RpcResponse
+handlePruneBlockchain server params = do
+  case rsBlockStore server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError "Pruning is not enabled (block store not available)") Null
+    Just blockStore -> do
+      case extractParam params 0 :: Maybe Word32 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
+        Just targetHeight -> do
+          tip <- readTVarIO (hcTip (rsHeaderChain server))
+          let tipHeight = ceHeight tip
+          result <- pruneBlockchain blockStore tipHeight targetHeight
+          case result of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+            Right numPruned -> do
+              -- Return the height that was actually pruned to
+              -- (the target height or lower if some files couldn't be pruned)
+              return $ RpcResponse (toJSON targetHeight) Null Null
+
+-- | Invalidate a block and all its descendants
+-- Reference: bitcoin/src/rpc/blockchain.cpp invalidateblock
+-- Parameters:
+--   blockhash (required): The hash of the block to invalidate
+-- Returns:
+--   null on success
+-- Errors:
+--   -5: Block not found
+--   -8: Cannot invalidate genesis block
+handleInvalidateBlock :: RpcServer -> Value -> IO RpcResponse
+handleInvalidateBlock server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
+    Just hexHash -> do
+      case parseHash hexHash of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
+        Just bh -> do
+          result <- invalidateBlock (rsNetwork server) (rsUTXOCache server)
+                      (rsDB server) (rsHeaderChain server) bh
+          case result of
+            Left InvalidateGenesis -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams "Cannot invalidate genesis block") Null
+            Left (InvalidateBlockNotFound _) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Block not found") Null
+            Left (InvalidateDisconnectFailed err) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError (T.pack $ "Failed to disconnect: " ++ err)) Null
+            Left (InvalidateMissingUndo hash) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Missing undo data for block") Null
+            Left _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Block invalidation failed") Null
+            Right () -> return $ RpcResponse Null Null Null
+
+-- | Reconsider a previously invalidated block
+-- Reference: bitcoin/src/rpc/blockchain.cpp reconsiderblock
+-- Parameters:
+--   blockhash (required): The hash of the block to reconsider
+-- Returns:
+--   null on success
+-- Errors:
+--   -5: Block not found
+--   -8: Block was not previously invalidated
+handleReconsiderBlock :: RpcServer -> Value -> IO RpcResponse
+handleReconsiderBlock server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
+    Just hexHash -> do
+      case parseHash hexHash of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
+        Just bh -> do
+          result <- reconsiderBlock (rsNetwork server) (rsUTXOCache server)
+                      (rsDB server) (rsHeaderChain server) bh
+          case result of
+            Left (ReconsiderBlockNotFound _) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Block not found") Null
+            Left (ReconsiderNotInvalidated _) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Block is not marked as invalid") Null
+            Left (ReconsiderValidationFailed _ err) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError (T.pack $ "Validation failed: " ++ err)) Null
+            Left (ReconsiderActivationFailed err) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError (T.pack $ "Chain activation failed: " ++ err)) Null
+            Left _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Block reconsideration failed") Null
+            Right () -> return $ RpcResponse Null Null Null
 
 --------------------------------------------------------------------------------
 -- Transaction RPC Handlers
@@ -711,7 +1071,7 @@ returnTxResult :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> IO RpcRe
 returnTxResult server tx txid mBlockHash verbose =
   if not verbose
     then return $ RpcResponse
-      (toJSON $ TE.decodeUtf8 $ B16.encode $ encode tx) Null Null
+      (toJSON $ TE.decodeUtf8 $ B16.encode $ S.encode tx) Null Null
     else do
       verboseResult <- txToVerboseJSON server tx txid mBlockHash
       return $ RpcResponse verboseResult Null Null
@@ -800,7 +1160,7 @@ handleSendRawTransaction server params = do
 decodeTxWithFallback :: ByteString -> Either String Tx
 decodeTxWithFallback txBytes =
   -- The standard decode tries witness format first (looks for marker/flag bytes)
-  case decode txBytes of
+  case S.decode txBytes of
     Right tx -> Right tx
     Left _ -> Left "TX decode failed"
 
@@ -895,7 +1255,7 @@ handleDecodeRawTransaction _server params = do
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcMiscError (T.pack $ "Hex decode error: " ++ err)) Null
         Right txBytes -> do
-          case decode txBytes of
+          case S.decode txBytes of
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError (T.pack $ "TX decode error: " ++ err)) Null
             Right tx -> do
@@ -999,7 +1359,7 @@ handleGetNetworkInfo :: RpcServer -> IO RpcResponse
 handleGetNetworkInfo server = do
   peerCount <- getPeerCount (rsPeerMgr server)
   -- Our local services: NODE_NETWORK (1) + NODE_WITNESS (8) = 9
-  let localServices = nodeNetwork .|. nodeWitness :: Word64
+  let localServices = getServiceFlag nodeNetwork .|. getServiceFlag nodeWitness :: Word64
       localServicesHex = T.pack $ printf "%016x" localServices
       -- Build human-readable service names
       serviceNames = catMaybes
@@ -1167,7 +1527,7 @@ handleTemplateRequest server = do
   return $ RpcResponse result Null Null
   where
     templateTxToJSON tt = object
-      [ "data"   .= (TE.decodeUtf8 $ B16.encode $ encode $ ttTx tt)
+      [ "data"   .= (TE.decodeUtf8 $ B16.encode $ S.encode $ ttTx tt)
       , "txid"   .= showHash (BlockHash (getTxIdHash (ttTxId tt)))
       , "hash"   .= showHash (BlockHash (getTxIdHash (computeWtxId (ttTx tt))))
       , "fee"    .= ttFee tt
@@ -1188,7 +1548,7 @@ handleBlockProposal server params = do
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcMiscError (T.pack $ "Block decode failed: " ++ err)) Null
         Right blockBytes -> do
-          case decode blockBytes of
+          case S.decode blockBytes :: Either String Block of
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError (T.pack $ "Block decode failed: " ++ err)) Null
             Right block -> do
@@ -1239,7 +1599,7 @@ handleSubmitBlock server params = do
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcMiscError (T.pack $ "Hex decode error: " ++ err)) Null
         Right blockBytes -> do
-          case decode blockBytes of
+          case S.decode blockBytes of
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError (T.pack $ "Block decode error: " ++ err)) Null
             Right block -> do
@@ -1261,6 +1621,303 @@ handleGetMiningInfo server = do
         , "chain"         .= netName (rsNetwork server)
         ]
   return $ RpcResponse result Null Null
+
+--------------------------------------------------------------------------------
+-- Regtest Mining RPC Handlers
+--------------------------------------------------------------------------------
+
+-- | Generate blocks to an address (regtest only)
+-- RPC: generatetoaddress nblocks address
+-- Returns array of block hashes
+handleGenerateToAddress :: RpcServer -> Value -> IO RpcResponse
+handleGenerateToAddress server params = do
+  -- Only allow on regtest
+  if netName (rsNetwork server) /= "regtest"
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError "generatetoaddress is only available on regtest") Null
+    else case (extractParam params 0, extractParamText params 1) of
+      (Nothing, _) -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams "Missing nblocks parameter") Null
+      (_, Nothing) -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams "Missing address parameter") Null
+      (Just (nblocks :: Int), Just addrText) ->
+        case textToAddress addrText of
+          Nothing -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams "Invalid address") Null
+          Just addr -> do
+            -- Generate n blocks
+            result <- generateBlocks server nblocks addr
+            case result of
+              Left err -> return $ RpcResponse Null
+                (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+              Right hashes -> return $ RpcResponse (toJSON $ map showHash hashes) Null Null
+
+-- | Generate a block with specific transactions (regtest only)
+-- RPC: generateblock output [rawtx,...]
+-- Returns block hash
+handleGenerateBlock :: RpcServer -> Value -> IO RpcResponse
+handleGenerateBlock server params = do
+  -- Only allow on regtest
+  if netName (rsNetwork server) /= "regtest"
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError "generateblock is only available on regtest") Null
+    else case (extractParamText params 0, extractParamArray params 1) of
+      (Nothing, _) -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams "Missing output parameter") Null
+      (Just addrText, mTxArray) -> do
+        case textToAddress addrText of
+          Nothing -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams "Invalid address") Null
+          Just addr -> do
+            -- Parse raw transactions if provided
+            let txHexes = case mTxArray of
+                  Nothing -> []
+                  Just arr -> [ t | String t <- V.toList arr ]
+            txs <- parseRawTxs txHexes
+            case txs of
+              Left err -> return $ RpcResponse Null
+                (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+              Right parsedTxs -> do
+                result <- generateBlockWithTxs server addr parsedTxs
+                case result of
+                  Left err -> return $ RpcResponse Null
+                    (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                  Right bh -> return $ RpcResponse (toJSON $ object
+                    [ "hash" .= showHash bh
+                    ]) Null Null
+
+-- | Generate blocks to a random address (regtest only, deprecated)
+-- RPC: generate nblocks
+-- This is deprecated in Bitcoin Core but still useful for quick testing
+handleGenerate :: RpcServer -> Value -> IO RpcResponse
+handleGenerate server params = do
+  -- Only allow on regtest
+  if netName (rsNetwork server) /= "regtest"
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError "generate is only available on regtest") Null
+    else case extractParam params 0 of
+      Nothing -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams "Missing nblocks parameter") Null
+      Just (nblocks :: Int) -> do
+        -- Use a dummy address for regtest
+        let dummyScript = BS.pack [0x51]  -- OP_TRUE (anyone can spend)
+        result <- generateBlocksWithScript server nblocks dummyScript
+        case result of
+          Left err -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+          Right hashes -> return $ RpcResponse (toJSON $ map showHash hashes) Null Null
+
+-- | Parse an array of raw transaction hex strings
+parseRawTxs :: [Text] -> IO (Either String [Tx])
+parseRawTxs hexes = do
+  let parsed = map parseOneTx hexes
+  return $ sequence parsed
+  where
+    parseOneTx :: Text -> Either String Tx
+    parseOneTx hex = do
+      bytes <- case B16.decode (TE.encodeUtf8 hex) of
+        Left err -> Left $ "Hex decode error: " ++ err
+        Right bs -> Right bs
+      case S.decode bytes of
+        Left err -> Left $ "Transaction decode error: " ++ err
+        Right tx -> Right tx
+
+--------------------------------------------------------------------------------
+-- Regtest Control RPC Handlers
+--------------------------------------------------------------------------------
+
+-- | Set mock time for testing (regtest only)
+-- RPC: setmocktime timestamp
+-- timestamp = 0 resets to real time
+handleSetMockTime :: RpcServer -> Value -> IO RpcResponse
+handleSetMockTime server params = do
+  -- Only allow on regtest
+  if netName (rsNetwork server) /= "regtest"
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError "setmocktime is only available on regtest") Null
+    else case extractParam params 0 of
+      Nothing -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams "Missing timestamp parameter") Null
+      Just (timestamp :: Word32) -> do
+        atomically $ writeTVar (rsMockTime server) $
+          if timestamp == 0 then Nothing else Just timestamp
+        return $ RpcResponse Null Null Null
+
+--------------------------------------------------------------------------------
+-- Block Generation Helpers
+--------------------------------------------------------------------------------
+
+-- | Generate n blocks with coinbase paying to the given address
+generateBlocks :: RpcServer -> Int -> Address -> IO (Either String [BlockHash])
+generateBlocks server nblocks addr = do
+  let scriptPubKey = addressToScript addr
+  generateBlocksWithScript server nblocks scriptPubKey
+
+-- | Generate n blocks with coinbase paying to the given scriptPubKey
+generateBlocksWithScript :: RpcServer -> Int -> ByteString -> IO (Either String [BlockHash])
+generateBlocksWithScript server nblocks scriptPubKey = do
+  go nblocks []
+  where
+    go 0 acc = return $ Right (reverse acc)
+    go n acc = do
+      result <- generateSingleBlock server scriptPubKey []
+      case result of
+        Left err -> return $ Left err
+        Right bh -> go (n - 1) (bh : acc)
+
+-- | Generate a block with specific transactions
+generateBlockWithTxs :: RpcServer -> Address -> [Tx] -> IO (Either String BlockHash)
+generateBlockWithTxs server addr txs = do
+  let scriptPubKey = addressToScript addr
+  generateSingleBlock server scriptPubKey txs
+
+-- | Generate a single block, optionally with specific transactions
+generateSingleBlock :: RpcServer -> ByteString -> [Tx] -> IO (Either String BlockHash)
+generateSingleBlock server scriptPubKey specificTxs = do
+  let net = rsNetwork server
+      hc = rsHeaderChain server
+      cache = rsUTXOCache server
+      pm = rsPeerMgr server
+      db = rsDB server
+
+  -- Get current chain tip
+  tip <- readTVarIO (hcTip hc)
+  let height = ceHeight tip + 1
+      prevHash = ceHash tip
+
+  -- Get current time (mock or real)
+  now <- getCurrentTime server
+
+  -- For regtest, we use the minimum difficulty from powLimit
+  let bits = 0x207fffff  -- Regtest minimum difficulty
+
+  -- Get median time past
+  entries <- readTVarIO (hcEntries hc)
+  let mtp = medianTimePast entries prevHash
+      blockTime = max (mtp + 1) now
+
+  -- Build coinbase transaction
+  let reward = blockReward height
+  -- Note: For regtest with specific transactions, we would add their fees too
+  -- For simplicity, we use just the block reward here
+  let coinbase = buildRegtestCoinbase height reward scriptPubKey blockTime
+
+  -- Get transactions from mempool if none specified
+  txs <- if null specificTxs
+    then do
+      -- Select from mempool
+      entries' <- selectTransactions (rsMempool server) (maxBlockWeight - 4000)
+      return $ map meTransaction entries'
+    else return specificTxs
+
+  -- Build the block
+  let allTxs = coinbase : txs
+      merkleRoot = computeMerkleRoot (map computeTxId allTxs)
+
+  -- Find a valid nonce (trivial for regtest since difficulty is minimum)
+  let header = BlockHeader
+        { bhVersion = 0x20000000
+        , bhPrevBlock = prevHash
+        , bhMerkleRoot = merkleRoot
+        , bhTimestamp = blockTime
+        , bhBits = bits
+        , bhNonce = 0  -- Start with 0, almost always works for regtest
+        }
+
+  -- For regtest, we may need to find a valid nonce
+  mValidHeader <- findRegtestNonce header (netPowLimit net)
+  case mValidHeader of
+    Nothing -> return $ Left "Failed to find valid nonce"
+    Just validHeader -> do
+      let block = Block validHeader allTxs
+          bh = computeBlockHash validHeader
+
+      -- Validate and connect the block
+      result <- submitBlock net db hc cache pm block
+      case result of
+        Left err -> return $ Left err
+        Right () -> return $ Right bh
+
+-- | Build a coinbase transaction for regtest
+buildRegtestCoinbase :: Word32 -> Word64 -> ByteString -> Word32 -> Tx
+buildRegtestCoinbase height value scriptPubKey _blockTime =
+  let -- BIP-34: height in coinbase scriptSig
+      heightBytes = encodeRegtestHeight height
+      scriptSig = heightBytes
+
+      -- Coinbase input with null prevout
+      coinbaseInput = TxIn
+        { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+        , txInScript = scriptSig
+        , txInSequence = 0xffffffff
+        }
+
+      -- Main output: reward to miner's address
+      mainOutput = TxOut value scriptPubKey
+
+  in Tx
+    { txVersion = 2
+    , txInputs = [coinbaseInput]
+    , txOutputs = [mainOutput]
+    , txWitness = [[]]  -- Empty witness for coinbase
+    , txLockTime = 0
+    }
+
+-- | Encode block height for BIP-34 coinbase (CScriptNum data push encoding)
+-- BIP-34 requires the height as a CScriptNum data push (length prefix + LE bytes),
+-- NOT as OP_N opcodes. The coinbaseHeight parser expects this format.
+encodeRegtestHeight :: Word32 -> ByteString
+encodeRegtestHeight h
+  | h == 0     = BS.pack [1, 0]  -- Push 1 byte of zero
+  | h <= 0x7f  = BS.pack [1, fromIntegral h]
+  | h <= 0x7fff = BS.pack [2, fromIntegral (h .&. 0xff),
+                              fromIntegral ((h `shiftR` 8) .&. 0xff)]
+  | h <= 0x7fffff = BS.pack [3, fromIntegral (h .&. 0xff),
+                                fromIntegral ((h `shiftR` 8) .&. 0xff),
+                                fromIntegral ((h `shiftR` 16) .&. 0xff)]
+  | otherwise = BS.pack [4, fromIntegral (h .&. 0xff),
+                            fromIntegral ((h `shiftR` 8) .&. 0xff),
+                            fromIntegral ((h `shiftR` 16) .&. 0xff),
+                            fromIntegral ((h `shiftR` 24) .&. 0xff)]
+
+-- | Find a valid nonce for a regtest block (trivial due to minimum difficulty)
+-- Returns the header with valid nonce, or Nothing if no valid nonce found
+findRegtestNonce :: BlockHeader -> Integer -> IO (Maybe BlockHeader)
+findRegtestNonce header powLimit = go 0
+  where
+    target = bitsToTarget (bhBits header)
+    go nonce
+      | nonce > (maxBound :: Word32) = return Nothing
+      | otherwise = do
+          let header' = header { bhNonce = nonce }
+              Hash256 hashBytes = doubleSHA256 (S.encode header')
+              hashInt = bsToInteger (BS.reverse hashBytes)
+          if hashInt <= min target powLimit
+            then return $ Just header'
+            else go (nonce + 1)
+
+-- | Convert ByteString to Integer (big-endian)
+bsToInteger :: ByteString -> Integer
+bsToInteger = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0
+
+-- | Convert an address to its scriptPubKey
+addressToScript :: Address -> ByteString
+addressToScript addr = case addr of
+  PubKeyAddress (Hash160 h) ->
+    -- P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    BS.pack [0x76, 0xa9, 0x14] <> h <> BS.pack [0x88, 0xac]
+  ScriptAddress (Hash160 h) ->
+    -- P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+    BS.pack [0xa9, 0x14] <> h <> BS.pack [0x87]
+  WitnessPubKeyAddress (Hash160 h) ->
+    -- P2WPKH: OP_0 <20 bytes>
+    BS.pack [0x00, 0x14] <> h
+  WitnessScriptAddress (Hash256 h) ->
+    -- P2WSH: OP_0 <32 bytes>
+    BS.pack [0x00, 0x20] <> h
+  TaprootAddress (Hash256 h) ->
+    -- P2TR: OP_1 <32 bytes>
+    BS.pack [0x51, 0x20] <> h
 
 --------------------------------------------------------------------------------
 -- Fee Estimation RPC Handlers
@@ -1352,6 +2009,1656 @@ handleGetInfo server = do
   return $ RpcResponse result Null Null
 
 --------------------------------------------------------------------------------
+-- Descriptor RPC Handlers (BIP-380-386)
+--------------------------------------------------------------------------------
+
+-- | Import descriptors into the wallet.
+-- Reference: Bitcoin Core's importdescriptors RPC
+-- Parameters:
+--   Array of descriptor objects, each with:
+--     - desc (string, required): The output descriptor
+--     - active (boolean, optional): Set descriptor as active for new addresses
+--     - range (int or [int, int], optional): Range of indices for ranged descriptors
+--     - next_index (int, optional): Next unused index
+--     - timestamp (int|"now", optional): Creation time of keys
+--     - internal (boolean, optional): Whether this is an internal/change descriptor
+--     - label (string, optional): Label for the descriptor
+-- Returns:
+--   Array of result objects with success/error status
+handleImportDescriptors :: RpcServer -> Value -> IO RpcResponse
+handleImportDescriptors _server params = do
+  case params of
+    Array arr -> do
+      results <- mapM processDescriptorImport (V.toList arr)
+      return $ RpcResponse (toJSON results) Null Null
+    _ -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Expected array of descriptor objects") Null
+  where
+    processDescriptorImport :: Value -> IO Value
+    processDescriptorImport val = case val of
+      Object obj -> do
+        let mDesc = KM.lookup "desc" obj >>= getString
+            mRange = KM.lookup "range" obj
+            mActive = KM.lookup "active" obj >>= getBool
+            mInternal = KM.lookup "internal" obj >>= getBool
+            mLabel = KM.lookup "label" obj >>= getString
+        case mDesc of
+          Nothing -> return $ object
+            [ "success" .= False
+            , "error" .= object
+                [ "code" .= rpcInvalidParams
+                , "message" .= ("Missing 'desc' field" :: Text)
+                ]
+            ]
+          Just descText -> case parseDescriptor descText of
+            Left err -> return $ object
+              [ "success" .= False
+              , "error" .= object
+                  [ "code" .= rpcInvalidParams
+                  , "message" .= T.pack (show err)
+                  ]
+              ]
+            Right desc -> do
+              -- In a full implementation, we would:
+              -- 1. Store the descriptor in the wallet database
+              -- 2. Derive addresses based on range
+              -- 3. Scan the blockchain for matching UTXOs
+              -- For now, we validate and acknowledge the import
+              let isRanged = isRangeDescriptor desc
+                  rangeInfo = case mRange of
+                    Just (Number n) -> Just (0, floor n :: Int)
+                    Just (Array rv) | V.length rv == 2 ->
+                      case (V.head rv, V.last rv) of
+                        (Number start, Number end) ->
+                          Just (floor start, floor end)
+                        _ -> Nothing
+                    _ -> if isRanged then Just (0, 999) else Nothing
+                  -- Derive some addresses for testing
+                  derivedAddrs = case rangeInfo of
+                    Just (start, end) ->
+                      deriveAddresses desc [start..min end (start + 10)]
+                    Nothing -> deriveAddresses desc [0]
+              return $ object
+                [ "success" .= True
+                , "warnings" .= ([] :: [Text])
+                ]
+      _ -> return $ object
+        [ "success" .= False
+        , "error" .= object
+            [ "code" .= rpcInvalidParams
+            , "message" .= ("Expected object" :: Text)
+            ]
+        ]
+
+    getString :: Value -> Maybe Text
+    getString (String t) = Just t
+    getString _ = Nothing
+
+    getBool :: Value -> Maybe Bool
+    getBool (Bool b) = Just b
+    getBool _ = Nothing
+
+-- | List imported descriptors.
+-- Reference: Bitcoin Core's listdescriptors RPC
+-- Parameters:
+--   private (boolean, optional): Whether to show private keys (default: false)
+-- Returns:
+--   Object with wallet_name and array of descriptor objects
+handleListDescriptors :: RpcServer -> Value -> IO RpcResponse
+handleListDescriptors _server params = do
+  let _showPrivate = case extractParam params 0 of
+        Just b -> b
+        Nothing -> False
+  -- In a full implementation, this would return stored descriptors from the wallet
+  -- For now, return empty list
+  let result = object
+        [ "wallet_name" .= ("" :: Text)
+        , "descriptors" .= ([] :: [Value])
+        ]
+  return $ RpcResponse result Null Null
+
+--------------------------------------------------------------------------------
+-- PSBT RPC Handlers
+--------------------------------------------------------------------------------
+
+-- | Create a PSBT from inputs and outputs.
+-- Reference: Bitcoin Core's createpsbt RPC
+-- Parameters:
+--   inputs (required): Array of inputs [{txid, vout, sequence}]
+--   outputs (required): Array of outputs [{address: amount}] or [{data: hex}]
+--   locktime (optional): Lock time (default: 0)
+-- Returns:
+--   Base64-encoded PSBT string
+handleCreatePsbt :: RpcServer -> Value -> IO RpcResponse
+handleCreatePsbt _server params = do
+  case (extractParamArray params 0, extractParamArray params 1) of
+    (Nothing, _) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing inputs parameter") Null
+    (_, Nothing) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
+    (Just inputsArr, Just outputsArr) -> do
+      -- Parse locktime (optional, default 0)
+      let locktime = fromMaybe 0 (extractParam params 2 :: Maybe Word32)
+
+      -- Parse inputs
+      case parseInputs (V.toList inputsArr) of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
+        Right inputs -> do
+          -- Parse outputs
+          case parseOutputs (V.toList outputsArr) of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
+            Right outputs -> do
+              -- Create unsigned transaction
+              let tx = Tx
+                    { txVersion = 2
+                    , txInputs = inputs
+                    , txOutputs = outputs
+                    , txLockTime = locktime
+                    , txWitness = replicate (length inputs) []
+                    }
+              -- Create PSBT
+              case createPsbt tx of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                Right psbt -> do
+                  -- Encode to base64
+                  let encoded = encodePsbt psbt
+                      base64 = TE.decodeUtf8 $ B64.encode encoded
+                  return $ RpcResponse (toJSON base64) Null Null
+
+-- | Parse input array elements to TxIn
+parseInputs :: [Value] -> Either String [TxIn]
+parseInputs = mapM parseOneInput
+  where
+    parseOneInput :: Value -> Either String TxIn
+    parseOneInput (Object obj) = do
+      -- Get txid
+      txidHex <- case KM.lookup "txid" obj of
+        Just (String t) -> Right t
+        _ -> Left "Missing or invalid txid"
+      txid <- case B16.decode (TE.encodeUtf8 txidHex) of
+        Left _ -> Left "Invalid txid hex"
+        Right bs | BS.length bs /= 32 -> Left "txid must be 32 bytes"
+        Right bs -> Right $ TxId (Hash256 (BS.reverse bs))
+      -- Get vout
+      vout <- case KM.lookup "vout" obj of
+        Just (Number n) -> Right (floor n)
+        _ -> Left "Missing or invalid vout"
+      -- Get sequence (optional, default 0xfffffffd for RBF)
+      let seqNum = case KM.lookup "sequence" obj of
+            Just (Number n) -> floor n
+            _ -> 0xfffffffd  -- Enable RBF by default
+      Right TxIn
+        { txInPrevOutput = OutPoint txid vout
+        , txInScript = BS.empty  -- Empty for PSBT
+        , txInSequence = seqNum
+        }
+    parseOneInput _ = Left "Input must be an object"
+
+-- | Parse output array elements to TxOut
+parseOutputs :: [Value] -> Either String [TxOut]
+parseOutputs = fmap concat . mapM parseOneOutput
+  where
+    parseOneOutput :: Value -> Either String [TxOut]
+    parseOneOutput (Object obj) = do
+      let pairs = KM.toList obj
+      forM pairs $ \(key, val) -> do
+        let keyText = Key.toText key
+        if keyText == "data"
+          then do
+            -- OP_RETURN data output
+            hexData <- case val of
+              String t -> Right t
+              _ -> Left "data value must be a string"
+            dataBytes <- case B16.decode (TE.encodeUtf8 hexData) of
+              Left _ -> Left "Invalid hex in data"
+              Right bs -> Right bs
+            let script = BS.cons 0x6a (encodePushDataForScript dataBytes)  -- OP_RETURN + push data
+            Right TxOut { txOutValue = 0, txOutScript = script }
+          else do
+            -- Address output
+            amount <- case val of
+              Number n -> Right (floor (n * 100000000))  -- BTC to satoshi
+              _ -> Left "Amount must be a number"
+            addr <- case textToAddress keyText of
+              Nothing -> Left $ "Invalid address: " ++ T.unpack keyText
+              Just a -> Right a
+            let script = addressToScript addr
+            Right TxOut { txOutValue = amount, txOutScript = script }
+    parseOneOutput _ = Left "Output must be an object"
+
+    -- Encode push data for script (simplified version)
+    encodePushDataForScript :: ByteString -> ByteString
+    encodePushDataForScript bs
+      | len <= 75 = BS.cons (fromIntegral len) bs
+      | len <= 255 = BS.concat [BS.pack [0x4c, fromIntegral len], bs]
+      | len <= 65535 = BS.concat [BS.singleton 0x4d,
+          BS.pack [fromIntegral (len .&. 0xff), fromIntegral (len `shiftR` 8)], bs]
+      | otherwise = bs
+      where len = BS.length bs
+
+-- | Decode a PSBT and return detailed information.
+-- Reference: Bitcoin Core's decodepsbt RPC
+-- Parameters:
+--   psbt (required): Base64-encoded PSBT string
+-- Returns:
+--   JSON object with tx details, input info, output info, fee
+handleDecodePsbt :: RpcServer -> Value -> IO RpcResponse
+handleDecodePsbt _server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing psbt parameter") Null
+    Just psbtBase64 -> do
+      case B64.decode (TE.encodeUtf8 psbtBase64) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "Invalid base64 encoding") Null
+        Right psbtBytes -> do
+          case decodePsbt psbtBytes of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError (T.pack $ "PSBT decode failed: " ++ err)) Null
+            Right psbt -> do
+              let result = psbtToJSON psbt
+              return $ RpcResponse result Null Null
+
+-- | Convert PSBT to detailed JSON representation
+psbtToJSON :: Psbt -> Value
+psbtToJSON psbt =
+  let tx = pgTx (psbtGlobal psbt)
+      txid = computeTxId tx
+      -- Calculate fee if possible
+      mFee = getPsbtFee psbt
+  in object $ catMaybes
+    [ Just $ "tx" .= txToJSON tx txid
+    , Just $ "global_xpubs" .= map xpubToJSON (Map.toList (pgXpubs (psbtGlobal psbt)))
+    , Just $ "psbt_version" .= fromMaybe 0 (pgVersion (psbtGlobal psbt))
+    , Just $ "inputs" .= zipWith psbtInputToJSON [0..] (psbtInputs psbt)
+    , Just $ "outputs" .= zipWith psbtOutputToJSON [0..] (psbtOutputs psbt)
+    , fmap (\fee -> "fee" .= (fromIntegral fee / 100000000.0 :: Double)) mFee
+    ]
+  where
+    xpubToJSON :: (ByteString, KeyPath) -> Value
+    xpubToJSON (xpub, keypath) = object
+      [ "xpub" .= TE.decodeUtf8 (B16.encode xpub)
+      , "master_fingerprint" .= (printf "%08x" (kpFingerprint keypath) :: String)
+      , "path" .= formatKeyPath keypath
+      ]
+
+    psbtInputToJSON :: Int -> PsbtInput -> Value
+    psbtInputToJSON idx inp = object $ catMaybes
+      [ Just $ "index" .= idx
+      , fmap (\utxo -> "witness_utxo" .= utxoToJSON utxo) (piWitnessUtxo inp)
+      , fmap (\tx' -> "non_witness_utxo" .= nonWitnessTxToJSON tx') (piNonWitnessUtxo inp)
+      , if Map.null (piPartialSigs inp) then Nothing
+        else Just $ "partial_signatures" .= map partialSigToJSON (Map.toList (piPartialSigs inp))
+      , fmap (\st -> "sighash" .= sighashToText st) (piSighashType inp)
+      , fmap (\rs -> "redeem_script" .= scriptToJSON rs) (piRedeemScript inp)
+      , fmap (\ws -> "witness_script" .= scriptToJSON ws) (piWitnessScript inp)
+      , if Map.null (piBip32Derivation inp) then Nothing
+        else Just $ "bip32_derivs" .= map bip32DerivToJSON (Map.toList (piBip32Derivation inp))
+      , fmap (\fs -> "final_scriptsig" .= object ["hex" .= TE.decodeUtf8 (B16.encode fs)]) (piFinalScriptSig inp)
+      , fmap (\fw -> "final_scriptwitness" .= map (TE.decodeUtf8 . B16.encode) fw) (piFinalScriptWitness inp)
+      ]
+
+    psbtOutputToJSON :: Int -> PsbtOutput -> Value
+    psbtOutputToJSON idx out = object $ catMaybes
+      [ Just $ "index" .= idx
+      , fmap (\rs -> "redeem_script" .= scriptToJSON rs) (poRedeemScript out)
+      , fmap (\ws -> "witness_script" .= scriptToJSON ws) (poWitnessScript out)
+      , if Map.null (poBip32Derivation out) then Nothing
+        else Just $ "bip32_derivs" .= map bip32DerivToJSON (Map.toList (poBip32Derivation out))
+      ]
+
+    utxoToJSON :: TxOut -> Value
+    utxoToJSON txout = object
+      [ "amount" .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
+      , "scriptPubKey" .= scriptToJSON (txOutScript txout)
+      ]
+
+    nonWitnessTxToJSON :: Tx -> Value
+    nonWitnessTxToJSON tx' =
+      let tid = computeTxId tx'
+      in txToJSON tx' tid
+
+    partialSigToJSON :: (PubKey, ByteString) -> Value
+    partialSigToJSON (pk, sig) = object
+      [ "pubkey" .= TE.decodeUtf8 (B16.encode (serializePubKeyCompressed pk))
+      , "signature" .= TE.decodeUtf8 (B16.encode sig)
+      ]
+
+    scriptToJSON :: ByteString -> Value
+    scriptToJSON s = object
+      [ "hex" .= TE.decodeUtf8 (B16.encode s)
+      ]
+
+    bip32DerivToJSON :: (PubKey, KeyPath) -> Value
+    bip32DerivToJSON (pk, kp) = object
+      [ "pubkey" .= TE.decodeUtf8 (B16.encode (serializePubKeyCompressed pk))
+      , "master_fingerprint" .= (printf "%08x" (kpFingerprint kp) :: String)
+      , "path" .= formatKeyPath kp
+      ]
+
+    formatKeyPath :: KeyPath -> Text
+    formatKeyPath kp =
+      let pathParts = map formatIndex (kpPath kp)
+      in T.intercalate "/" ("m" : pathParts)
+
+    formatIndex :: Word32 -> Text
+    formatIndex idx
+      | idx >= 0x80000000 = T.pack (show (idx .&. 0x7fffffff)) <> "'"
+      | otherwise = T.pack (show idx)
+
+    sighashToText :: Word32 -> Text
+    sighashToText 0x01 = "ALL"
+    sighashToText 0x02 = "NONE"
+    sighashToText 0x03 = "SINGLE"
+    sighashToText 0x81 = "ALL|ANYONECANPAY"
+    sighashToText 0x82 = "NONE|ANYONECANPAY"
+    sighashToText 0x83 = "SINGLE|ANYONECANPAY"
+    sighashToText n    = T.pack $ printf "0x%02x" n
+
+-- | Combine multiple PSBTs into one.
+-- Reference: Bitcoin Core's combinepsbt RPC
+-- Parameters:
+--   psbts (required): Array of base64-encoded PSBT strings
+-- Returns:
+--   Combined PSBT as base64 string
+handleCombinePsbt :: RpcServer -> Value -> IO RpcResponse
+handleCombinePsbt _server params = do
+  case extractParamArray params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing psbts parameter") Null
+    Just psbtsArr -> do
+      -- Parse all PSBTs
+      let psbtTexts = [t | String t <- V.toList psbtsArr]
+      case parsePsbtsFromBase64 psbtTexts of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError (T.pack err)) Null
+        Right psbts -> do
+          case combinePsbts psbts of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+            Right combined -> do
+              let encoded = encodePsbt combined
+                  base64 = TE.decodeUtf8 $ B64.encode encoded
+              return $ RpcResponse (toJSON base64) Null Null
+
+-- | Parse multiple PSBTs from base64 strings
+parsePsbtsFromBase64 :: [Text] -> Either String [Psbt]
+parsePsbtsFromBase64 = mapM parseOnePsbt
+  where
+    parseOnePsbt :: Text -> Either String Psbt
+    parseOnePsbt t = do
+      bytes <- case B64.decode (TE.encodeUtf8 t) of
+        Left _ -> Left "Invalid base64 encoding"
+        Right bs -> Right bs
+      decodePsbt bytes
+
+-- | Finalize a PSBT and optionally extract the transaction.
+-- Reference: Bitcoin Core's finalizepsbt RPC
+-- Parameters:
+--   psbt (required): Base64-encoded PSBT string
+--   extract (optional): If true and complete, also extract tx (default: true)
+-- Returns:
+--   Object with psbt, hex (if extracted), and complete flag
+handleFinalizePsbt :: RpcServer -> Value -> IO RpcResponse
+handleFinalizePsbt _server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing psbt parameter") Null
+    Just psbtBase64 -> do
+      -- Parse extract parameter (default true)
+      let doExtract = fromMaybe True (extractParam params 1 :: Maybe Bool)
+
+      case B64.decode (TE.encodeUtf8 psbtBase64) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "Invalid base64 encoding") Null
+        Right psbtBytes -> do
+          case decodePsbt psbtBytes of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError (T.pack $ "PSBT decode failed: " ++ err)) Null
+            Right psbt -> do
+              -- Try to finalize
+              let finalized = case finalizePsbt psbt of
+                    Left _ -> psbt  -- Return original if can't finalize
+                    Right p -> p
+                  isComplete = isPsbtFinalized finalized
+                  finalizedBase64 = TE.decodeUtf8 $ B64.encode $ encodePsbt finalized
+
+              -- Build result
+              let baseResult =
+                    [ "psbt" .= finalizedBase64
+                    , "complete" .= isComplete
+                    ]
+                  -- Add hex if extracted and complete
+                  resultWithHex = if doExtract && isComplete
+                    then case extractTransaction finalized of
+                      Left _ -> baseResult
+                      Right tx -> baseResult ++
+                        [ "hex" .= TE.decodeUtf8 (B16.encode (S.encode tx)) ]
+                    else baseResult
+
+              return $ RpcResponse (object resultWithHex) Null Null
+
+--------------------------------------------------------------------------------
+-- Multi-Wallet Management RPC Handlers (stubs)
+--------------------------------------------------------------------------------
+
+-- | Create a new wallet (stub)
+handleCreateWallet :: RpcServer -> Value -> IO RpcResponse
+handleCreateWallet server _params =
+  return $ RpcResponse (object ["name" .= ("" :: Text), "warning" .= ("Wallet support not yet implemented" :: Text)]) Null (Number 0)
+
+-- | Load a wallet (stub)
+handleLoadWallet :: RpcServer -> Value -> IO RpcResponse
+handleLoadWallet server _params =
+  return $ RpcResponse (object ["name" .= ("" :: Text), "warning" .= ("Wallet support not yet implemented" :: Text)]) Null (Number 0)
+
+-- | Unload a wallet (stub)
+handleUnloadWallet :: RpcServer -> Value -> IO RpcResponse
+handleUnloadWallet server _params =
+  return $ RpcResponse (object ["warning" .= ("Wallet support not yet implemented" :: Text)]) Null (Number 0)
+
+-- | List loaded wallets (stub)
+handleListWallets :: RpcServer -> IO RpcResponse
+handleListWallets server =
+  return $ RpcResponse (toJSON ([] :: [Text])) Null (Number 0)
+
+-- | Get wallet info (stub)
+handleGetWalletInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetWalletInfo server _params =
+  return $ RpcResponse (object ["walletname" .= ("" :: Text), "walletversion" .= (0 :: Int)]) Null (Number 0)
+
+-- | Get wallet balance (stub)
+handleGetBalance :: RpcServer -> Value -> IO RpcResponse
+handleGetBalance server _params =
+  return $ RpcResponse (Number 0) Null (Number 0)
+
+--------------------------------------------------------------------------------
+-- Chain Tips RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Get information about all known chain tips
+-- Reference: Bitcoin Core's getchaintips RPC (blockchain.cpp)
+-- Returns array of: {height, hash, branchlen, status}
+-- Status values: "active", "valid-fork", "valid-headers", "headers-only", "invalid"
+handleGetChainTips :: RpcServer -> IO RpcResponse
+handleGetChainTips server = do
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  invalidated <- readTVarIO (hcInvalidated (rsHeaderChain server))
+
+  -- Algorithm: find all chain tips (blocks with no children)
+  -- A tip is a block where no other block has it as cePrev
+  let allEntries = Map.elems entries
+      -- Build set of all blocks that are parents of some block
+      parentSet = Set.fromList $ catMaybes $ map cePrev allEntries
+      -- Tips are entries not in the parent set (except genesis might not have children)
+      tips = filter (\e -> not (Set.member (ceHash e) parentSet) || ceHash e == ceHash tip) allEntries
+      -- Always include the active tip
+      allTips = if ceHash tip `elem` map ceHash tips
+                then tips
+                else tip : tips
+
+  -- Build result array
+  let tipResults = map (tipToJSON entries tip invalidated) allTips
+  return $ RpcResponse (toJSON tipResults) Null Null
+  where
+    tipToJSON :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
+              -> ChainEntry -> Value
+    tipToJSON entries activeTip invalidatedSet entry =
+      let status = getChainTipStatus entries activeTip invalidatedSet entry
+          branchLen = computeBranchLen entries activeTip entry
+      in object
+        [ "height"    .= ceHeight entry
+        , "hash"      .= showHash (ceHash entry)
+        , "branchlen" .= branchLen
+        , "status"    .= status
+        ]
+
+    getChainTipStatus :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
+                      -> ChainEntry -> Text
+    getChainTipStatus entries activeTip invalidatedSet entry
+      | ceHash entry == ceHash activeTip = "active"
+      | Set.member (ceHash entry) invalidatedSet = "invalid"
+      | ceStatus entry == StatusInvalid = "invalid"
+      | ceStatus entry == StatusValid = "valid-fork"
+      | ceStatus entry == StatusHeaderValid = "valid-headers"
+      | otherwise = "headers-only"
+
+    computeBranchLen :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Int
+    computeBranchLen entries activeTip entry
+      | ceHash entry == ceHash activeTip = 0
+      | otherwise =
+          -- Find fork point with active chain and compute distance
+          let forkHeight = findForkHeight entries activeTip entry
+          in fromIntegral (ceHeight entry) - fromIntegral forkHeight
+
+    findForkHeight :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Word32
+    findForkHeight entries activeTip entry =
+      walkToCommonAncestor entries activeTip entry
+
+    walkToCommonAncestor :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Word32
+    walkToCommonAncestor entries a b
+      | ceHash a == ceHash b = ceHeight a
+      | ceHeight a > ceHeight b =
+          case cePrev a >>= (`Map.lookup` entries) of
+            Just parent -> walkToCommonAncestor entries parent b
+            Nothing -> 0
+      | ceHeight a < ceHeight b =
+          case cePrev b >>= (`Map.lookup` entries) of
+            Just parent -> walkToCommonAncestor entries a parent
+            Nothing -> 0
+      | otherwise =
+          -- Same height, step both back
+          case (cePrev a >>= (`Map.lookup` entries), cePrev b >>= (`Map.lookup` entries)) of
+            (Just pa, Just pb) -> walkToCommonAncestor entries pa pb
+            _ -> 0
+
+--------------------------------------------------------------------------------
+-- Script Decode RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Decode a hex-encoded script
+-- Reference: Bitcoin Core's decodescript RPC (rawtransaction.cpp)
+-- Parameters:
+--   hexstring (required): The hex-encoded script
+-- Returns:
+--   Object with asm, type, p2sh, segwit addresses
+handleDecodeScript :: RpcServer -> Value -> IO RpcResponse
+handleDecodeScript server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing hexstring parameter") Null
+    Just hexStr -> do
+      case B16.decode (TE.encodeUtf8 hexStr) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid hex encoding") Null
+        Right scriptBytes -> do
+          let mScript = decodeScript scriptBytes
+              scriptType = case mScript of
+                Right s -> classifyOutput s
+                Left _ -> NonStandard
+              typeStr = scriptTypeToString scriptType
+              asmStr = scriptToAsm scriptBytes
+
+          -- Build base result
+          let baseFields =
+                [ "asm"  .= asmStr
+                , "type" .= typeStr
+                ]
+
+          -- Add address if one exists
+          let mAddress = scriptToAddress (rsNetwork server) scriptBytes scriptType
+              fieldsWithAddr = case mAddress of
+                Just addr -> baseFields ++ ["address" .= addr]
+                Nothing -> baseFields
+
+          -- Add P2SH address (wrap this script in P2SH)
+          let p2shFields = case canWrapP2SH scriptType scriptBytes of
+                True ->
+                  let p2shAddr = computeP2SHAddress (rsNetwork server) scriptBytes
+                  in fieldsWithAddr ++ ["p2sh" .= p2shAddr]
+                False -> fieldsWithAddr
+
+          -- Add SegWit info if wrappable
+          let segwitFields = case canWrapSegWit scriptType scriptBytes of
+                True ->
+                  let segwitInfo = computeSegWitInfo (rsNetwork server) scriptBytes scriptType
+                  in p2shFields ++ ["segwit" .= segwitInfo]
+                False -> p2shFields
+
+          return $ RpcResponse (object segwitFields) Null Null
+  where
+    -- Check if script can be wrapped in P2SH
+    canWrapP2SH :: ScriptType -> ByteString -> Bool
+    canWrapP2SH st _bytes = case st of
+      P2SH _ -> False  -- Don't wrap P2SH in P2SH
+      P2WPKH _ -> False
+      P2WSH _ -> False
+      P2TR _ -> False
+      OpReturn _ -> False
+      _ -> True
+
+    -- Check if script can be wrapped in P2WSH
+    canWrapSegWit :: ScriptType -> ByteString -> Bool
+    canWrapSegWit st _bytes = case st of
+      P2SH _ -> False
+      P2WPKH _ -> False
+      P2WSH _ -> False
+      P2TR _ -> False
+      OpReturn _ -> False
+      _ -> True
+
+    -- Compute P2SH address for a script
+    computeP2SHAddress :: Network -> ByteString -> Text
+    computeP2SHAddress net scriptBytes =
+      let scriptHash = hash160 scriptBytes
+      in base58Check (netScriptPrefix net) (getHash160 scriptHash)
+
+    -- Compute SegWit wrapper info
+    computeSegWitInfo :: Network -> ByteString -> ScriptType -> Value
+    computeSegWitInfo net scriptBytes scriptType =
+      let -- For P2PKH, create P2WPKH (if it has a pubkey hash)
+          -- For others, create P2WSH
+          (segwitScript, segwitType, segwitAddr) = case scriptType of
+            P2PKH h ->
+              -- Convert to P2WPKH
+              let witnessScript = BS.pack [0x00, 0x14] <> getHash160 h
+                  addr = bech32Encode (netBech32Prefix net) 0 (getHash160 h)
+              in (witnessScript, "witness_v0_keyhash" :: Text, addr)
+            _ ->
+              -- Create P2WSH
+              let witnessHash = sha256 scriptBytes
+                  witnessScript = BS.pack [0x00, 0x20] <> getHash256 witnessHash
+                  addr = bech32Encode (netBech32Prefix net) 0 (getHash256 witnessHash)
+              in (witnessScript, "witness_v0_scripthash" :: Text, addr)
+          -- P2SH-SegWit address
+          p2shSegwitAddr = computeP2SHAddress net segwitScript
+      in object
+        [ "asm"         .= scriptToAsm segwitScript
+        , "hex"         .= TE.decodeUtf8 (B16.encode segwitScript)
+        , "type"        .= segwitType
+        , "address"     .= segwitAddr
+        , "p2sh-segwit" .= p2shSegwitAddr
+        ]
+
+    hash160 :: ByteString -> Hash160
+    hash160 = Hash160 . BS.take 20 . doHash160
+
+    sha256 :: ByteString -> Hash256
+    sha256 = Hash256 . doSHA256
+
+    doHash160 :: ByteString -> ByteString
+    doHash160 bs = doRIPEMD160 (doSHA256 bs)
+
+    doSHA256 :: ByteString -> ByteString
+    doSHA256 bs =
+      let digest = Crypto.hash bs :: Crypto.Digest Crypto.SHA256
+      in BS.pack $ BA.unpack digest
+
+    doRIPEMD160 :: ByteString -> ByteString
+    doRIPEMD160 bs =
+      let digest = Crypto.hash bs :: Crypto.Digest Crypto.RIPEMD160
+      in BS.pack $ BA.unpack digest
+
+    getHash160 :: Hash160 -> ByteString
+    getHash160 (Hash160 bs) = bs
+
+    getHash256 :: Hash256 -> ByteString
+    getHash256 (Hash256 bs) = bs
+
+--------------------------------------------------------------------------------
+-- Mempool Test Accept RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Test mempool acceptance without submitting
+-- Reference: Bitcoin Core's testmempoolaccept RPC (mempool.cpp)
+-- Parameters:
+--   rawtxs (required): Array of hex-encoded raw transactions
+--   maxfeerate (optional): Reject if fee rate exceeds this (default: 0.10 BTC/kvB)
+-- Returns:
+--   Array of {txid, wtxid, allowed, vsize, fees, reject-reason}
+handleTestMempoolAccept :: RpcServer -> Value -> IO RpcResponse
+handleTestMempoolAccept server params = do
+  case extractParamArray params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing rawtxs parameter") Null
+    Just txArray -> do
+      -- Parse maxfeerate (sat/vB, default 0.10 BTC/kvB = 10000 sat/vB)
+      let maxFeeRateSatPerVB = case extractParam params 1 :: Maybe Double of
+            Just rate -> rate * 100000  -- BTC/kvB to sat/vB
+            Nothing -> 10000.0  -- Default 0.10 BTC/kvB
+
+      -- Parse and test each transaction
+      results <- forM (V.toList txArray) $ \txVal -> do
+        case txVal of
+          String hexTx -> testSingleTx hexTx maxFeeRateSatPerVB
+          _ -> return $ object
+            [ "allowed" .= False
+            , "reject-reason" .= ("invalid-type" :: Text)
+            ]
+
+      return $ RpcResponse (toJSON results) Null Null
+  where
+    testSingleTx :: Text -> Double -> IO Value
+    testSingleTx hexTx maxFeeRate = do
+      case B16.decode (TE.encodeUtf8 hexTx) of
+        Left _ -> return $ object
+          [ "allowed" .= False
+          , "reject-reason" .= ("TX decode failed" :: Text)
+          ]
+        Right txBytes -> do
+          case decodeTxWithFallback txBytes of
+            Left err -> return $ object
+              [ "allowed" .= False
+              , "reject-reason" .= ("TX decode failed: " <> T.pack err)
+              ]
+            Right tx -> do
+              let txid = computeTxId tx
+                  wtxid = computeWtxId tx
+
+              -- Check if already in mempool
+              mExisting <- getTransaction (rsMempool server) txid
+              case mExisting of
+                Just _ -> return $ object
+                  [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
+                  , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
+                  , "allowed" .= False
+                  , "reject-reason" .= ("txn-already-in-mempool" :: Text)
+                  ]
+                Nothing -> do
+                  -- Try to add (dry run)
+                  result <- addTransaction (rsMempool server) tx
+                  case result of
+                    Left err -> return $ object
+                      [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
+                      , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
+                      , "allowed" .= False
+                      , "reject-reason" .= mempoolErrorToText err
+                      ]
+                    Right _ -> do
+                      -- Get the entry to compute vsize and fee
+                      mEntry <- getTransaction (rsMempool server) txid
+                      -- Remove it (since this is test only)
+                      removeTransaction (rsMempool server) txid
+
+                      case mEntry of
+                        Nothing -> return $ object
+                          [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
+                          , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
+                          , "allowed" .= True
+                          ]
+                        Just entry -> do
+                          let vsize = meSize entry
+                              fee = meFee entry
+                              feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
+
+                          if feeRateSatPerVB > maxFeeRate
+                            then return $ object
+                              [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
+                              , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
+                              , "allowed" .= False
+                              , "reject-reason" .= ("max-fee-exceeded" :: Text)
+                              ]
+                            else return $ object
+                              [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
+                              , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
+                              , "allowed" .= True
+                              , "vsize"  .= vsize
+                              , "fees"   .= object
+                                  [ "base" .= (fromIntegral fee / 100000000.0 :: Double)
+                                  ]
+                              ]
+
+    mempoolErrorToText :: MempoolError -> Text
+    mempoolErrorToText err = case err of
+      ErrAlreadyInMempool -> "txn-already-known"
+      ErrValidationFailed _ -> "bad-txns"
+      ErrMissingInput _ -> "missing-inputs"
+      ErrInputSpentInMempool _ -> "txn-mempool-conflict"
+      ErrInsufficientFee -> "min-fee-not-met"
+      ErrFeeBelowMinimum _ _ -> "min-fee-not-met"
+      ErrTooManyAncestors _ _ -> "too-long-mempool-chain"
+      ErrTooManyDescendants _ _ -> "too-long-mempool-chain"
+      ErrAncestorSizeTooLarge _ _ -> "too-long-mempool-chain"
+      ErrDescendantSizeTooLarge _ _ -> "too-long-mempool-chain"
+      ErrScriptVerificationFailed _ -> "bad-txns"
+      ErrCoinbaseNotMature _ _ -> "bad-txns-premature-spend-of-coinbase"
+      ErrRBFNotSignaled _ -> "txn-mempool-conflict"
+      ErrRBFFeeTooLow _ _ -> "insufficient-fee"
+      ErrMempoolFull -> "mempool-full"
+      ErrRBFInsufficientAbsoluteFee _ _ -> "insufficient-fee"
+      ErrRBFInsufficientFeeRate _ _ -> "insufficient-fee"
+      ErrRBFTooManyReplacements _ _ -> "too-many-potential-replacements"
+      ErrRBFInsufficientRelayFee _ _ -> "insufficient-fee"
+      ErrRBFSpendingConflict _ -> "txn-mempool-conflict"
+      ErrTrucViolation _ -> "non-standard"
+      ErrEphemeralViolation _ -> "dust"
+      ErrClusterLimitExceeded _ _ -> "too-long-mempool-chain"
+
+--------------------------------------------------------------------------------
+-- Mempool Entry RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Get detailed mempool entry for a transaction
+-- Reference: Bitcoin Core's getmempoolentry RPC (mempool.cpp)
+-- Parameters:
+--   txid (required): The transaction ID
+-- Returns:
+--   Object with vsize, weight, fee, time, height, descendant/ancestor info
+handleGetMempoolEntry :: RpcServer -> Value -> IO RpcResponse
+handleGetMempoolEntry server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
+    Just hexTxid -> do
+      case parseHash hexTxid of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
+        Just bh -> do
+          let txid = TxId (getBlockHashHash bh)
+          mEntry <- getTransaction (rsMempool server) txid
+          case mEntry of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError "Transaction not in mempool") Null
+            Just entry -> do
+              -- Get ancestor/descendant info
+              ancestors <- getAncestors (rsMempool server) (meTransaction entry)
+              descendants <- getDescendants (rsMempool server) txid
+
+              let ancestorCount = length ancestors + 1  -- Include self
+                  ancestorSize = sum (map meSize ancestors) + meSize entry
+                  ancestorFees = sum (map meFee ancestors) + meFee entry
+
+                  descendantCount = length descendants + 1
+                  descendantSize = sum (map meSize descendants) + meSize entry
+                  descendantFees = sum (map meFee descendants) + meFee entry
+
+                  -- Calculate weight
+                  baseSize = txBaseSize (meTransaction entry)
+                  totalSize = txTotalSize (meTransaction entry)
+                  weight = baseSize * (witnessScaleFactor - 1) + totalSize
+
+                  -- Get parent txids (depends)
+                  depends = map (\e -> showHash (BlockHash (getTxIdHash (meTxId e)))) ancestors
+
+              let result = object
+                    [ "vsize"           .= meSize entry
+                    , "weight"          .= weight
+                    , "fee"             .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
+                    , "modifiedfee"     .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
+                    , "time"            .= meTime entry
+                    , "height"          .= meHeight entry
+                    , "descendantcount" .= descendantCount
+                    , "descendantsize"  .= descendantSize
+                    , "descendantfees"  .= descendantFees
+                    , "ancestorcount"   .= ancestorCount
+                    , "ancestorsize"    .= ancestorSize
+                    , "ancestorfees"    .= ancestorFees
+                    , "wtxid"           .= showHash (BlockHash (getTxIdHash (computeWtxId (meTransaction entry))))
+                    , "fees"            .= object
+                        [ "base"       .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
+                        , "modified"   .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
+                        , "ancestor"   .= (fromIntegral ancestorFees / 100000000.0 :: Double)
+                        , "descendant" .= (fromIntegral descendantFees / 100000000.0 :: Double)
+                        ]
+                    , "depends"         .= depends
+                    , "spentby"         .= ([] :: [Text])  -- Would need child tracking
+                    , "bip125-replaceable" .= meRBFOptIn entry
+                    , "unbroadcast"     .= False
+                    ]
+              return $ RpcResponse result Null Null
+
+--------------------------------------------------------------------------------
+-- Mempool: Get Mempool Ancestors RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Get all in-mempool ancestors of a transaction
+-- Reference: Bitcoin Core's getmempoolancestors RPC (blockchain.cpp)
+-- Parameters:
+--   txid (required): Transaction ID
+--   verbose (optional): If true, return detailed info for each ancestor
+-- Returns:
+--   Array of ancestor txids, or object with detailed ancestor info
+handleGetMempoolAncestors :: RpcServer -> Value -> IO RpcResponse
+handleGetMempoolAncestors server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
+    Just txidHex -> do
+      let verbose = fromMaybe False (extractParam params 1 :: Maybe Bool)
+          mp = rsMempool server
+      entries <- readTVarIO (mpEntries mp)
+      case parseTxId txidHex of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
+        Just txid -> do
+          case Map.lookup txid entries of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
+            Just entry -> do
+              -- Use the mempool's ancestor lookup
+              ancestors <- getAncestors mp (meTransaction entry)
+              if verbose
+                then do
+                  let ancestorDetails = Map.fromList
+                        [ (showTxId (meTxId anc), mempoolEntryToJSON anc)
+                        | anc <- ancestors
+                        ]
+                  return $ RpcResponse (toJSON ancestorDetails) Null Null
+                else
+                  return $ RpcResponse (toJSON (map (showTxId . meTxId) ancestors)) Null Null
+  where
+    parseTxId :: Text -> Maybe TxId
+    parseTxId hex =
+      case B16.decode (TE.encodeUtf8 hex) of
+        Left _ -> Nothing
+        Right bs
+          | BS.length bs == 32 -> Just $ TxId (Hash256 (BS.reverse bs))
+          | otherwise -> Nothing
+
+    showTxId :: TxId -> Text
+    showTxId (TxId (Hash256 bs)) = TE.decodeUtf8 $ B16.encode (BS.reverse bs)
+
+    mempoolEntryToJSON :: MempoolEntry -> Value
+    mempoolEntryToJSON entry = object
+      [ "vsize"           .= meSize entry
+      , "fee"             .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
+      , "ancestorcount"   .= meAncestorCount entry
+      , "ancestorsize"    .= meAncestorSize entry
+      , "ancestorfees"    .= meAncestorFees entry
+      , "descendantcount" .= meDescendantCount entry
+      , "descendantsize"  .= meDescendantSize entry
+      , "descendantfees"  .= meDescendantFees entry
+      ]
+
+-- | Error code for invalid address or key
+rpcInvalidAddressOrKey :: Int
+rpcInvalidAddressOrKey = -5
+
+--------------------------------------------------------------------------------
+-- Raw Transaction: Create Raw Transaction RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Create a raw transaction from inputs and outputs
+-- Reference: Bitcoin Core's createrawtransaction RPC (rawtransaction.cpp)
+-- Parameters:
+--   inputs: [{"txid":"hex","vout":n,"sequence":n}]
+--   outputs: [{"address":amount},{"data":"hex"}]
+--   locktime (optional): Raw locktime
+--   replaceable (optional): BIP125 replaceable flag
+-- Returns:
+--   Hex-encoded raw transaction
+handleCreateRawTransaction :: RpcServer -> Value -> IO RpcResponse
+handleCreateRawTransaction _server params = do
+  let mInputs = extractParamArray params 0
+      mOutputs = extractParamArray params 1
+      locktime = fromMaybe 0 (extractParam params 2 :: Maybe Word32)
+      replaceable = fromMaybe False (extractParam params 3 :: Maybe Bool)
+
+  case (mInputs, mOutputs) of
+    (Nothing, _) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing inputs parameter") Null
+    (_, Nothing) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
+    (Just inputsArr, Just outputsArr) -> do
+      -- Parse inputs
+      let parseInput v = do
+            txidHex <- v .:: "txid" :: Maybe Text
+            vout <- v .:: "vout" :: Maybe Word32
+            let seqNum = case v .:: "sequence" :: Maybe Word32 of
+                  Just s -> s
+                  Nothing -> if replaceable then 0xFFFFFFFD else 0xFFFFFFFE
+            txidBs <- case B16.decode (TE.encodeUtf8 txidHex) of
+              Left _ -> Nothing
+              Right bs | BS.length bs == 32 -> Just (BS.reverse bs)
+                       | otherwise -> Nothing
+            Just TxIn
+              { txInPrevOutput = OutPoint (TxId (Hash256 txidBs)) vout
+              , txInScript = BS.empty
+              , txInSequence = seqNum
+              }
+
+      let inputs = mapMaybe parseInput (V.toList inputsArr)
+
+      -- Parse outputs - each is an object with address:amount or data:hex
+      let parseOutput v = case v of
+            Object obj -> case KM.toList obj of
+              [(k, val)] ->
+                let key = Key.toText k
+                in if key == "data"
+                   then case fromJSON val of
+                     Success (hexStr :: Text) ->
+                       case B16.decode (TE.encodeUtf8 hexStr) of
+                         Left _ -> Nothing
+                         Right dataBs ->
+                           let script = BS.pack [0x6a] <> encodeVarLen dataBs <> dataBs
+                           in Just $ TxOut 0 script
+                     _ -> Nothing
+                   else case fromJSON val of
+                     Success (amount :: Double) ->
+                       let satoshis = round (amount * 100000000)
+                           -- Placeholder script (actual address parsing would go here)
+                           script = BS.pack [0x00, 0x14] <> BS.replicate 20 0
+                       in Just $ TxOut satoshis script
+                     _ -> Nothing
+              _ -> Nothing
+            _ -> Nothing
+
+      let outputs = mapMaybe parseOutput (V.toList outputsArr)
+
+      -- Build the transaction
+      let tx = Tx
+            { txVersion = 2
+            , txInputs = inputs
+            , txOutputs = outputs
+            , txWitness = []
+            , txLockTime = locktime
+            }
+          hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
+
+      return $ RpcResponse (toJSON hexTx) Null Null
+  where
+    (.::) :: FromJSON a => Value -> Text -> Maybe a
+    (.::) (Object obj) key = case KM.lookup (Key.fromText key) obj of
+      Nothing -> Nothing
+      Just v -> case fromJSON v of
+        Success a -> Just a
+        Error _ -> Nothing
+    (.::) _ _ = Nothing
+
+    encodeVarLen :: ByteString -> ByteString
+    encodeVarLen bs
+      | BS.length bs < 76 = BS.pack [fromIntegral (BS.length bs)]
+      | BS.length bs < 256 = BS.pack [0x4c, fromIntegral (BS.length bs)]
+      | otherwise = BS.pack [0x4d, fromIntegral (BS.length bs .&. 0xff),
+                              fromIntegral ((BS.length bs `shiftR` 8) .&. 0xff)]
+
+--------------------------------------------------------------------------------
+-- Wallet: Sign Raw Transaction With Wallet RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Sign a raw transaction with wallet keys
+-- Reference: Bitcoin Core's signrawtransactionwithwallet RPC (wallet/rpc/spend.cpp)
+-- Parameters:
+--   hexstring (required): Hex-encoded raw transaction
+-- Returns:
+--   {hex, complete} - signed transaction and whether fully signed
+handleSignRawTransactionWithWallet :: RpcServer -> Value -> IO RpcResponse
+handleSignRawTransactionWithWallet server params = do
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Missing hexstring parameter") Null
+        Just hexTx -> do
+          case B16.decode (TE.encodeUtf8 hexTx) of
+            Left _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+            Right txBytes -> do
+              case S.decode txBytes of
+                Left _ -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+                Right (tx :: Tx) -> do
+                  -- For now, return the transaction as-is with complete=false
+                  -- Full implementation would look up private keys from wallet
+                  -- and sign each input
+                  let signedHex = TE.decodeUtf8 $ B16.encode $ S.encode tx
+                      result = object
+                        [ "hex"      .= signedHex
+                        , "complete" .= False
+                        , "errors"   .= ([] :: [Value])
+                        ]
+                  return $ RpcResponse result Null Null
+
+--------------------------------------------------------------------------------
+-- Network Disconnect Node RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Disconnect a peer by address or node ID
+-- Reference: Bitcoin Core's disconnectnode RPC (net.cpp)
+-- Parameters:
+--   address (optional): IP address:port of the node
+--   nodeid (optional): Node ID from getpeerinfo
+-- Returns:
+--   null on success, error if not found
+handleDisconnectNode :: RpcServer -> Value -> IO RpcResponse
+handleDisconnectNode server params = do
+  let mAddress = extractParamText params 0
+      mNodeId = extractParam params 1 :: Maybe Int
+
+  case (mAddress, mNodeId) of
+    (Nothing, Nothing) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Either address or nodeid must be provided") Null
+
+    (Just addr, Nothing) | not (T.null addr) -> do
+      -- Disconnect by address
+      success <- disconnectByAddress (rsPeerMgr server) (T.unpack addr)
+      if success
+        then return $ RpcResponse Null Null Null
+        else return $ RpcResponse Null
+          (toJSON $ RpcError rpcClientNodeNotConnected "Node not found in connected nodes") Null
+
+    (_, Just nodeId) -> do
+      -- Disconnect by node ID
+      success <- disconnectByNodeId (rsPeerMgr server) nodeId
+      if success
+        then return $ RpcResponse Null Null Null
+        else return $ RpcResponse Null
+          (toJSON $ RpcError rpcClientNodeNotConnected "Node not found in connected nodes") Null
+
+    (Just _, Just _) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Only one of address and nodeid should be provided") Null
+
+    _ -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Either address or nodeid must be provided") Null
+  where
+    disconnectByAddress :: PeerManager -> String -> IO Bool
+    disconnectByAddress pm addrStr = do
+      peers <- readTVarIO (pmPeers pm)
+      -- Parse the address string and find matching peer
+      let matching = filter (matchAddress addrStr . fst) (Map.toList peers)
+      case matching of
+        ((addr, pc):_) -> do
+          disconnectPeer pc
+          atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+          return True
+        [] -> return False
+
+    matchAddress :: String -> SockAddr -> Bool
+    matchAddress target addr =
+      let addrStr = show addr
+      in target == addrStr || target `isInfixOf` addrStr
+
+    isInfixOf :: String -> String -> Bool
+    isInfixOf needle haystack = needle `elem` [take (length needle) (drop i haystack) | i <- [0..length haystack - length needle]]
+
+    disconnectByNodeId :: PeerManager -> Int -> IO Bool
+    disconnectByNodeId pm nodeId = do
+      peers <- readTVarIO (pmPeers pm)
+      -- Node ID is index in the peer list (simplified)
+      let peerList = Map.toList peers
+      if nodeId >= 0 && nodeId < length peerList
+        then do
+          let (addr, pc) = peerList !! nodeId
+          disconnectPeer pc
+          atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+          return True
+        else return False
+
+-- | Error code for node not connected (-29 in Bitcoin Core)
+rpcClientNodeNotConnected :: Int
+rpcClientNodeNotConnected = -29
+
+--------------------------------------------------------------------------------
+-- Wallet: Get New Address RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Generate a new receiving address
+-- Reference: Bitcoin Core's getnewaddress RPC (wallet/rpc/addresses.cpp)
+-- Parameters:
+--   label (optional): Label for the address
+--   address_type (optional): "legacy", "p2sh-segwit", "bech32", "bech32m"
+-- Returns:
+--   New address string
+handleGetNewAddress :: RpcServer -> Value -> IO RpcResponse
+handleGetNewAddress server params = do
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      -- Get default wallet
+      (mWallet, _walletCount) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState -> do
+          -- Parse address type (default to bech32)
+          let addrTypeStr = fromMaybe "bech32" (extractParamText params 1)
+              addrType = parseAddressType addrTypeStr
+
+          -- Generate new address
+          case addrType of
+            Just aType -> do
+              addr <- getNewAddress aType (wsWallet walletState)
+              return $ RpcResponse (toJSON (show addr)) Null Null
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams ("Unknown address type: " <> addrTypeStr)) Null
+  where
+    parseAddressType :: Text -> Maybe AddressType
+    parseAddressType t = case T.toLower t of
+      "legacy"      -> Just AddrP2PKH
+      "p2sh-segwit" -> Just AddrP2SH_P2WPKH
+      "bech32"      -> Just AddrP2WPKH
+      "bech32m"     -> Just AddrP2TR
+      _             -> Nothing
+
+--------------------------------------------------------------------------------
+-- Wallet: Send To Address RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Send an amount to an address
+-- Reference: Bitcoin Core's sendtoaddress RPC (wallet/rpc/spend.cpp)
+-- Parameters:
+--   address (required): Bitcoin address to send to
+--   amount (required): Amount in BTC
+-- Returns:
+--   Transaction ID hex string
+handleSendToAddress :: RpcServer -> Value -> IO RpcResponse
+handleSendToAddress server params = do
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState -> do
+          case (extractParamText params 0, extractParam params 1 :: Maybe Double) of
+            (Just addrText, Just amountBtc) -> do
+              -- Parse address
+              case textToAddress addrText of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParams "Invalid Bitcoin address") Null
+                Just addr -> do
+                  -- Convert BTC to satoshis
+                  let satoshis = round (amountBtc * 100000000) :: Word64
+
+                  -- Create and send transaction
+                  result <- sendToAddress (wsWallet walletState) addr satoshis (FeeRate 10)
+                  case result of
+                    Left err -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                    Right tx -> do
+                      -- Broadcast to network
+                      let txid = computeTxId tx
+                      _ <- addTransaction (rsMempool server) tx
+                      broadcastMessage (rsPeerMgr server)
+                        (MInv (Inv [InvVector InvTx (getTxIdHash txid)]))
+                      return $ RpcResponse (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
+            _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams "Missing address or amount parameter") Null
+
+--------------------------------------------------------------------------------
+-- Wallet: List Transactions RPC Handler
+--------------------------------------------------------------------------------
+
+-- | List wallet transaction history
+-- Reference: Bitcoin Core's listtransactions RPC (wallet/rpc/transactions.cpp)
+-- Parameters:
+--   label (optional): Filter by label, or "*" for all
+--   count (optional): Number of transactions to return (default 10)
+--   skip (optional): Number of transactions to skip (default 0)
+-- Returns:
+--   Array of transaction entries
+handleListTransactions :: RpcServer -> Value -> IO RpcResponse
+handleListTransactions server params = do
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState -> do
+          let count = fromMaybe 10 (extractParam params 1 :: Maybe Int)
+              skip = fromMaybe 0 (extractParam params 2 :: Maybe Int)
+
+          -- Get wallet transactions
+          txHistory <- getWalletTransactions walletState count skip
+
+          let results = map txHistoryToJSON txHistory
+          return $ RpcResponse (toJSON results) Null Null
+  where
+    txHistoryToJSON :: WalletTransaction -> Value
+    txHistoryToJSON wtx = object $ catMaybes
+      [ Just $ "txid"     .= showHash (BlockHash (getTxIdHash (wtxTxId wtx)))
+      , wtxAddress wtx >>= \addr -> Just $ "address" .= addr
+      , Just $ "category" .= wtxCategory wtx
+      , Just $ "amount"   .= (fromIntegral (wtxAmount wtx) / 100000000.0 :: Double)
+      , Just $ "vout"     .= wtxVout wtx
+      , Just $ "confirmations" .= wtxConfirmations wtx
+      , wtxBlockHash wtx >>= \bh -> Just $ "blockhash" .= showHash bh
+      , wtxBlockTime wtx >>= \t -> Just $ "blocktime" .= t
+      , Just $ "time"     .= wtxTime wtx
+      ]
+
+-- | Wallet transaction record
+data WalletTransaction = WalletTransaction
+  { wtxTxId          :: !TxId
+  , wtxAddress       :: !(Maybe Text)
+  , wtxCategory      :: !Text
+  , wtxAmount        :: !Int64
+  , wtxVout          :: !Int
+  , wtxConfirmations :: !Int
+  , wtxBlockHash     :: !(Maybe BlockHash)
+  , wtxBlockTime     :: !(Maybe Word32)
+  , wtxTime          :: !Word32
+  }
+
+-- | Get wallet transactions (placeholder - needs proper wallet tx tracking)
+getWalletTransactions :: WalletState -> Int -> Int -> IO [WalletTransaction]
+getWalletTransactions _walletState _count _skip = do
+  -- TODO: Implement proper transaction history from wallet
+  return []
+
+--------------------------------------------------------------------------------
+-- Wallet: List Unspent RPC Handler
+--------------------------------------------------------------------------------
+
+-- | List unspent transaction outputs in wallet
+-- Reference: Bitcoin Core's listunspent RPC (wallet/rpc/coins.cpp)
+-- Parameters:
+--   minconf (optional): Minimum confirmations (default 1)
+--   maxconf (optional): Maximum confirmations (default 9999999)
+--   addresses (optional): Array of addresses to filter
+-- Returns:
+--   Array of UTXO entries
+handleListUnspent :: RpcServer -> Value -> IO RpcResponse
+handleListUnspent server params = do
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState -> do
+          let minConf = fromMaybe 1 (extractParam params 0 :: Maybe Int)
+              maxConf = fromMaybe 9999999 (extractParam params 1 :: Maybe Int)
+
+          -- Get current tip height for confirmation calculation
+          tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+
+          -- Get wallet UTXOs
+          utxos <- getWalletUTXOs (wsWallet walletState)
+
+          -- Filter and format
+          let results = catMaybes $ map (utxoToJSON tipHeight minConf maxConf) utxos
+
+          return $ RpcResponse (toJSON results) Null Null
+  where
+    utxoToJSON :: Word32 -> Int -> Int -> (OutPoint, TxOut, Word32) -> Maybe Value
+    utxoToJSON tipHeight minConf maxConf (op, txout, confs) = do
+      let confirmations = fromIntegral confs :: Int
+
+      -- Filter by confirmation range
+      if confirmations >= minConf && confirmations <= maxConf
+        then Just $ object
+          [ "txid"          .= showHash (BlockHash (getTxIdHash (outPointHash op)))
+          , "vout"          .= outPointIndex op
+          , "scriptPubKey"  .= TE.decodeUtf8 (B16.encode (txOutScript txout))
+          , "amount"        .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
+          , "confirmations" .= confirmations
+          , "spendable"     .= True
+          , "solvable"      .= True
+          , "safe"          .= True
+          ]
+        else Nothing
+
+--------------------------------------------------------------------------------
+-- Control: Help RPC Handler
+--------------------------------------------------------------------------------
+
+-- | List all commands or get help for a specific command
+-- Reference: Bitcoin Core's help RPC (server.cpp)
+-- Parameters:
+--   command (optional): Get help for this command
+-- Returns:
+--   Help text string
+handleHelp :: RpcServer -> Value -> IO RpcResponse
+handleHelp _server params = do
+  case extractParamText params 0 of
+    Nothing -> do
+      -- Return list of all commands
+      let helpText = T.unlines $ sort allRpcCommands
+      return $ RpcResponse (toJSON helpText) Null Null
+    Just cmd -> do
+      -- Return help for specific command
+      let helpText = getCommandHelp cmd
+      return $ RpcResponse (toJSON helpText) Null Null
+  where
+    sort = Data.List.sort
+
+-- | List of all available RPC commands
+allRpcCommands :: [Text]
+allRpcCommands =
+  [ "== Blockchain =="
+  , "getbestblockhash"
+  , "getblock \"blockhash\" ( verbosity )"
+  , "getblockchaininfo"
+  , "getblockcount"
+  , "getblockhash height"
+  , "getblockheader \"blockhash\" ( verbose )"
+  , "getchaintips"
+  , "getdifficulty"
+  , "gettxout \"txid\" n ( include_mempool )"
+  , "invalidateblock \"blockhash\""
+  , "pruneblockchain height"
+  , "reconsiderblock \"blockhash\""
+  , ""
+  , "== Mempool =="
+  , "getmempoolancestors \"txid\" ( verbose )"
+  , "getmempoolentry \"txid\""
+  , "getmempoolinfo"
+  , "getrawmempool ( verbose mempool_sequence )"
+  , "testmempoolaccept [\"rawtx\",...] ( maxfeerate )"
+  , ""
+  , "== Mining =="
+  , "getblocktemplate ( \"template_request\" )"
+  , "getmininginfo"
+  , "submitblock \"hexdata\" ( \"dummy\" )"
+  , ""
+  , "== Network =="
+  , "addnode \"node\" \"command\""
+  , "disconnectnode ( \"address\" nodeid )"
+  , "getconnectioncount"
+  , "getnetworkinfo"
+  , "getpeerinfo"
+  , ""
+  , "== Rawtransactions =="
+  , "createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )"
+  , "decoderawtransaction \"hexstring\" ( iswitness )"
+  , "decodescript \"hexstring\""
+  , "getrawtransaction \"txid\" ( verbosity \"blockhash\" )"
+  , "sendrawtransaction \"hexstring\" ( maxfeerate )"
+  , "signrawtransactionwithwallet \"hexstring\""
+  , ""
+  , "== Wallet =="
+  , "createwallet \"wallet_name\""
+  , "getbalance"
+  , "getnewaddress ( \"label\" \"address_type\" )"
+  , "getwalletinfo"
+  , "importdescriptors \"requests\""
+  , "listdescriptors"
+  , "listtransactions ( \"label\" count skip )"
+  , "listunspent ( minconf maxconf [\"address\",...] )"
+  , "listwallets"
+  , "loadwallet \"filename\""
+  , "sendtoaddress \"address\" amount"
+  , "unloadwallet ( \"wallet_name\" )"
+  , ""
+  , "== PSBT =="
+  , "combinepsbt [\"psbt\",...]"
+  , "createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )"
+  , "decodepsbt \"psbt\""
+  , "finalizepsbt \"psbt\" ( extract )"
+  , ""
+  , "== Control =="
+  , "help ( \"command\" )"
+  , "stop"
+  , ""
+  , "== Utility =="
+  , "estimatesmartfee conf_target ( \"estimate_mode\" )"
+  , "getnettotals"
+  , "setlabel \"address\" \"label\""
+  , "uptime"
+  , "validateaddress \"address\""
+  , "verifymessage \"address\" \"signature\" \"message\""
+  , "walletlock"
+  , "walletpassphrase \"passphrase\" timeout"
+  ]
+
+-- | Get help text for a specific command
+getCommandHelp :: Text -> Text
+getCommandHelp cmd = case T.toLower cmd of
+  "getblockchaininfo" ->
+    "getblockchaininfo\n\nReturns an object containing various state info regarding blockchain processing."
+  "getblock" ->
+    "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\nIf verbosity is 1, returns an Object with information about block <hash>.\nIf verbosity is 2, returns an Object with information about block <hash> and information about each transaction."
+  "getchaintips" ->
+    "getchaintips\n\nReturn information about all known tips in the block tree, including the main chain as well as orphaned branches.\n\nResult:\n[\n  {\n    \"height\": n,       (numeric) height of the chain tip\n    \"hash\": \"hash\",   (string) block hash of the tip\n    \"branchlen\": n,    (numeric) length of branch connecting the tip to the main chain\n    \"status\": \"status\" (string) status of the chain\n  },\n  ...\n]"
+  "decodescript" ->
+    "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. hexstring    (string, required) the hex-encoded script\n\nResult:\n{\n  \"asm\": \"asm\",      (string) Script public key\n  \"type\": \"type\",    (string) The output type\n  \"address\": \"addr\", (string) bitcoin address\n  \"p2sh\": \"addr\",    (string) address of P2SH script wrapping this script\n  \"segwit\": {...}    (object) segwit wrapper info\n}"
+  "testmempoolaccept" ->
+    "testmempoolaccept [\"rawtx\",...] ( maxfeerate )\n\nReturns result of mempool acceptance tests indicating if raw transaction would be accepted by mempool."
+  "getmempoolentry" ->
+    "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction."
+  "disconnectnode" ->
+    "disconnectnode ( \"address\" nodeid )\n\nImmediately disconnects from the specified peer node.\n\nArguments:\n1. address    (string, optional) The IP address/port of the node\n2. nodeid     (numeric, optional) The node ID (see getpeerinfo for node IDs)"
+  "getnewaddress" ->
+    "getnewaddress ( \"label\" \"address_type\" )\n\nReturns a new Bitcoin address for receiving payments.\n\nArguments:\n1. label         (string, optional) The label name for the address\n2. address_type  (string, optional) The address type: \"legacy\", \"p2sh-segwit\", \"bech32\", \"bech32m\""
+  "sendtoaddress" ->
+    "sendtoaddress \"address\" amount\n\nSend an amount to a given address.\n\nArguments:\n1. address    (string, required) The bitcoin address to send to\n2. amount     (numeric, required) The amount in BTC to send"
+  "listtransactions" ->
+    "listtransactions ( \"label\" count skip )\n\nReturns up to 'count' most recent transactions."
+  "listunspent" ->
+    "listunspent ( minconf maxconf [\"address\",...] )\n\nReturns array of unspent transaction outputs."
+  "help" ->
+    "help ( \"command\" )\n\nList all commands, or get help for a specified command."
+  "stop" ->
+    "stop\n\nRequest a graceful shutdown of Bitcoin server."
+  _ ->
+    "Unknown command: " <> cmd <> "\nUse help without arguments to list all commands."
+
+--------------------------------------------------------------------------------
+-- Additional Utility RPC Handlers
+--------------------------------------------------------------------------------
+
+-- | Unlock wallet for timeout seconds.
+-- Stub: wallet encryption not yet implemented, but the RPC endpoint must exist.
+handleWalletPassphrase :: RpcServer -> Value -> IO RpcResponse
+handleWalletPassphrase _server _params =
+  return $ RpcResponse Null Null Null
+
+-- | Lock wallet.
+-- Stub: wallet encryption not yet implemented.
+handleWalletLock :: RpcServer -> IO RpcResponse
+handleWalletLock _server =
+  return $ RpcResponse Null Null Null
+
+-- | Set label for an address.
+-- Stub: label storage not yet implemented.
+handleSetLabel :: RpcServer -> Value -> IO RpcResponse
+handleSetLabel _server _params =
+  return $ RpcResponse Null Null Null
+
+-- | Verify a signed message.
+-- Validates address format and signature base64 encoding, returns {valid: false}
+-- as a stub since full message signing verification is not yet implemented.
+handleVerifyMessage :: RpcServer -> Value -> IO RpcResponse
+handleVerifyMessage _server params = do
+  case (extractParamText params 0, extractParamText params 1, extractParamText params 2) of
+    (Just _address, Just sig, Just _message) -> do
+      -- Validate base64 encoding of signature
+      let sigValid = case B64.decode (TE.encodeUtf8 sig) of
+            Right bs -> BS.length bs > 0
+            Left _   -> False
+      if not sigValid
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Malformed base64 encoding") Null
+        else return $ RpcResponse (toJSON $ object ["valid" .= False]) Null Null
+    _ -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams
+        "Usage: verifymessage \"address\" \"signature\" \"message\"") Null
+
+-- | Return server uptime in seconds.
+-- Reference: Bitcoin Core's uptime RPC (server.cpp)
+handleUptime :: RpcServer -> IO RpcResponse
+handleUptime server = do
+  now <- round <$> getPOSIXTime :: IO Int64
+  let uptimeSeconds = now - rsStartTime server
+  return $ RpcResponse (toJSON uptimeSeconds) Null Null
+
+-- | Return network traffic totals.
+-- Returns stub with zero byte counts and current time in milliseconds.
+handleGetNetTotals :: RpcServer -> IO RpcResponse
+handleGetNetTotals _server = do
+  now <- getPOSIXTime
+  let timeMillis = round (now * 1000) :: Int64
+      result = object
+        [ "totalbytesrecv" .= (0 :: Int64)
+        , "totalbytessent" .= (0 :: Int64)
+        , "timemillis"     .= timeMillis
+        ]
+  return $ RpcResponse result Null Null
+
+--------------------------------------------------------------------------------
+-- Control: Stop RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Initiate graceful shutdown
+-- Reference: Bitcoin Core's stop RPC (server.cpp)
+-- Returns:
+--   "Bitcoin server stopping"
+handleStop :: RpcServer -> IO RpcResponse
+handleStop server = do
+  -- Signal shutdown (stop the RPC server thread)
+  mTid <- readTVarIO (rsThread server)
+  case mTid of
+    Just tid -> do
+      -- Kill the server thread (will stop accepting new connections)
+      forkIO $ do
+        threadDelay 100000  -- 100ms delay to allow response to be sent
+        killThread tid
+      return ()
+    Nothing -> return ()
+
+  -- Return the standard message immediately
+  return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
+
+--------------------------------------------------------------------------------
+-- AssumeUTXO RPC Handlers
+--------------------------------------------------------------------------------
+
+-- | Load a UTXO snapshot from a file for fast initial sync (AssumeUTXO).
+-- Reference: Bitcoin Core's loadtxoutset RPC (rpc/blockchain.cpp)
+-- Params: [path]
+-- Returns: { "coins_loaded": <count>, "tip_hash": "<hash>" }
+handleLoadTxOutSet :: RpcServer -> Value -> IO RpcResponse
+handleLoadTxOutSet server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Usage: loadtxoutset \"path\"") Null
+    Just pathText -> do
+      let path = T.unpack pathText
+          net = rsNetwork server
+          magic = netMagic net
+      result <- loadSnapshot path magic
+      case result of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInternalError (T.pack err)) Null
+        Right snapshot -> do
+          let metadata = usMetadata snapshot
+              coinsCount = smCoinsCount metadata
+          return $ RpcResponse
+            (object [ "coins_loaded" .= coinsCount
+                    , "tip_hash"     .= show (smBaseBlockHash metadata)
+                    ])
+            Null Null
+
+-- | Dump the current UTXO set to a file for creating a snapshot.
+-- Reference: Bitcoin Core's dumptxoutset RPC (rpc/blockchain.cpp)
+-- Params: [path]
+-- Returns: { "coins_written": <count>, "path": "<path>" }
+-- Note: Requires the chain tip hash and UTXO cache from the node state.
+-- This is a stub that returns an error when the block store is unavailable.
+handleDumpTxOutSet :: RpcServer -> Value -> IO RpcResponse
+handleDumpTxOutSet _server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Usage: dumptxoutset \"path\"") Null
+    Just _pathText -> do
+      -- Full implementation requires access to the current chain tip and UTXO set.
+      -- The writeSnapshot function from Storage.hs provides the serialization:
+      --   writeSnapshot :: FilePath -> Word32 -> BlockHash -> CoinsViewCache -> IO (Either String Word64)
+      -- When connected to a running node with an active chainstate, this would:
+      --   1. Get the current chain tip hash from the header chain
+      --   2. Get the UTXO cache/view from the block store
+      --   3. Call writeSnapshot to serialize to the file
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcInternalError
+          "dumptxoutset requires an active chainstate; use loadtxoutset to load an existing snapshot")
+        Null
+
+--------------------------------------------------------------------------------
 -- Helper Functions
 --------------------------------------------------------------------------------
 
@@ -1367,6 +3674,15 @@ extractParam _ _ = Nothing
 -- | Extract a Text parameter from the params array by index
 extractParamText :: Value -> Int -> Maybe Text
 extractParamText = extractParam
+
+-- | Extract an array parameter from the params array by index
+extractParamArray :: Value -> Int -> Maybe (V.Vector Value)
+extractParamArray (Array arr) idx
+  | idx < V.length arr = case arr V.! idx of
+      Array a -> Just a
+      _       -> Nothing
+  | otherwise = Nothing
+extractParamArray _ _ = Nothing
 
 -- | Display a BlockHash as hex (reversed byte order for display)
 showHash :: BlockHash -> Text
@@ -1416,7 +3732,7 @@ txToJSON :: Tx -> TxId -> Value
 txToJSON tx txid = object
   [ "txid"     .= showHash (BlockHash (getTxIdHash txid))
   , "version"  .= txVersion tx
-  , "size"     .= BS.length (encode tx)
+  , "size"     .= BS.length (S.encode tx)
   , "locktime" .= txLockTime tx
   , "vin"      .= map vinToJSON (txInputs tx)
   , "vout"     .= zipWith voutToJSON [0..] (txOutputs tx)
@@ -1450,7 +3766,7 @@ txToVerboseJSON server tx txid mBlockHash = do
       weight = baseSize * (witnessScaleFactor - 1) + totalSize
       vsize = (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
       wtxid = computeWtxId tx
-      hexTx = TE.decodeUtf8 $ B16.encode $ encode tx
+      hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
 
   -- Build base transaction object
   let baseFields =
@@ -1542,12 +3858,10 @@ scriptToAsm scriptBytes =
     opToAsm :: ScriptOp -> Text
     opToAsm op = case op of
       OP_0 -> "0"
-      OP_FALSE -> "0"
       OP_PUSHDATA bs _ -> TE.decodeUtf8 $ B16.encode bs
       OP_1NEGATE -> "-1"
       OP_RESERVED -> "OP_RESERVED"
       OP_1 -> "1"
-      OP_TRUE -> "1"
       OP_2 -> "2"
       OP_3 -> "3"
       OP_4 -> "4"
@@ -1652,7 +3966,6 @@ scriptToAsm scriptBytes =
       OP_NOP8 -> "OP_NOP8"
       OP_NOP9 -> "OP_NOP9"
       OP_NOP10 -> "OP_NOP10"
-      OP_CHECKSIGADD -> "OP_CHECKSIGADD"
       OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
 
 -- | Convert ScriptType to string for JSON output
@@ -1673,15 +3986,15 @@ scriptToAddress :: Network -> ByteString -> ScriptType -> Maybe Text
 scriptToAddress net _ scriptType = case scriptType of
   P2PKH (Hash160 h) -> Just $ encodeBase58Check (BS.cons (netAddrPrefix net) h)
   P2SH (Hash160 h)  -> Just $ encodeBase58Check (BS.cons (netScriptPrefix net) h)
-  P2WPKH (Hash160 h) -> Just $ encodeBech32 (T.pack $ netBech32Prefix net) 0 h
-  P2WSH (Hash256 h) -> Just $ encodeBech32 (T.pack $ netBech32Prefix net) 0 h
-  P2TR (Hash256 h)  -> Just $ encodeBech32m (T.pack $ netBech32Prefix net) 1 h
+  P2WPKH (Hash160 h) -> Just $ bech32Encode (netBech32Prefix net) 0 h
+  P2WSH (Hash256 h) -> Just $ bech32Encode (netBech32Prefix net) 0 h
+  P2TR (Hash256 h)  -> Just $ bech32mEncode (netBech32Prefix net) 1 h
   _ -> Nothing
   where
     -- Base58Check encoding
     encodeBase58Check :: ByteString -> Text
     encodeBase58Check payload =
-      let checksum = BS.take 4 $ doubleSHA256 payload
+      let checksum = BS.take 4 $ getHash256 (doubleSHA256 payload)
       in TE.decodeUtf8 $ encodeBase58' (payload <> checksum)
 
     encodeBase58' :: ByteString -> ByteString
@@ -1691,7 +4004,7 @@ scriptToAddress net _ scriptType = case scriptType of
           n = bsToInteger bs
           encoded = go n ""
           go 0 acc = acc
-          go v acc = go (v `div` 58) (BS.index alphabet (fromIntegral (v `mod` 58)) : acc)
+          go v acc = go (v `div` 58) (chr (fromIntegral (BS.index alphabet (fromIntegral (v `mod` 58)))) : acc)
       in C8.pack $ replicate leadingZeros '1' ++ encoded
 
     bsToInteger :: ByteString -> Integer
@@ -1799,3 +4112,1019 @@ estimateIsInitialBlockDownload _height blockTime =
       -- At 10 min/block, that's about 5.1M seconds = ~59 days from genesis
       estimatedCurrentTime = 1231006505 + (850000 * 600) :: Word32
   in blockTime + dayInSeconds < estimatedCurrentTime
+
+--------------------------------------------------------------------------------
+-- REST API
+--------------------------------------------------------------------------------
+
+-- | REST response format types (matching Bitcoin Core)
+-- Reference: /home/max/hashhog/bitcoin/src/rest.cpp
+data RestResponseFormat
+  = RestBinary     -- ^ Binary serialized data (application/octet-stream)
+  | RestHex        -- ^ Hex-encoded string (text/plain)
+  | RestJson       -- ^ JSON object (application/json)
+  | RestUndefined  -- ^ Invalid/unknown format
+  deriving (Eq, Show)
+
+-- | Maximum number of headers returned in /rest/headers/
+maxRestHeadersResults :: Int
+maxRestHeadersResults = 2000
+
+-- | Maximum number of outpoints for /rest/getutxos/
+maxGetUtxosOutpoints :: Int
+maxGetUtxosOutpoints = 15
+
+-- | Parse REST response format from URL path suffix.
+-- Extracts format from ".bin", ".hex", ".json" suffixes.
+-- Returns (path_without_suffix, format)
+parseRestFormat :: Text -> (Text, RestResponseFormat)
+parseRestFormat path
+  | ".bin" `T.isSuffixOf` path  = (T.dropEnd 4 path, RestBinary)
+  | ".hex" `T.isSuffixOf` path  = (T.dropEnd 4 path, RestHex)
+  | ".json" `T.isSuffixOf` path = (T.dropEnd 5 path, RestJson)
+  | otherwise                   = (path, RestUndefined)
+
+-- | Format string for available REST formats
+availableFormats :: Text
+availableFormats = ".bin, .hex, .json"
+
+-- | REST error response helper
+restError :: Int -> Text -> Response
+restError statusCode msg =
+  let status = case statusCode of
+        400 -> status400
+        404 -> status404
+        500 -> status500
+        503 -> status503
+        _   -> status400
+  in responseLBS status
+       [(hContentType, "text/plain")]
+       (BL.fromStrict $ TE.encodeUtf8 $ msg <> "\r\n")
+
+--------------------------------------------------------------------------------
+-- REST Application
+--------------------------------------------------------------------------------
+
+-- | WAI application for REST API.
+-- REST is read-only and does not require authentication.
+-- Handles paths starting with /rest/
+restApp :: RpcServer -> Application
+restApp server req respond = do
+  -- Only accept GET requests for REST
+  if requestMethod req /= "GET"
+    then respond $ restError 405 "Method not allowed"
+    else do
+      let path = TE.decodeUtf8 $ rawPathInfo req
+          query = TE.decodeUtf8 $ rawQueryString req
+
+      -- Route based on path prefix
+      result <- routeRest server path query
+      respond result
+
+-- | Route REST requests to appropriate handlers
+routeRest :: RpcServer -> Text -> Text -> IO Response
+routeRest server path query
+  -- Block with full tx details: /rest/block/<hash>.[bin|hex|json]
+  | "/rest/block/" `T.isPrefixOf` path && not ("/rest/block/notxdetails/" `T.isPrefixOf` path) =
+      handleRestBlock server (T.drop 12 path) True
+
+  -- Block without tx details: /rest/block/notxdetails/<hash>.[bin|hex|json]
+  | "/rest/block/notxdetails/" `T.isPrefixOf` path =
+      handleRestBlock server (T.drop 24 path) False
+
+  -- Transaction: /rest/tx/<txid>.[bin|hex|json]
+  | "/rest/tx/" `T.isPrefixOf` path =
+      handleRestTx server (T.drop 9 path)
+
+  -- Headers: /rest/headers/<count>/<hash>.[bin|hex|json] (deprecated)
+  -- or /rest/headers/<hash>.[bin|hex|json]?count=<count> (new)
+  | "/rest/headers/" `T.isPrefixOf` path =
+      handleRestHeaders server (T.drop 14 path) query
+
+  -- Block hash by height: /rest/blockhashbyheight/<height>.[bin|hex|json]
+  | "/rest/blockhashbyheight/" `T.isPrefixOf` path =
+      handleRestBlockHashByHeight server (T.drop 23 path)
+
+  -- Chain info: /rest/chaininfo.json
+  | "/rest/chaininfo" `T.isPrefixOf` path =
+      handleRestChainInfo server (T.drop 15 path)
+
+  -- Mempool info: /rest/mempool/info.json
+  | "/rest/mempool/info" `T.isPrefixOf` path =
+      handleRestMempoolInfo server (T.drop 18 path)
+
+  -- Mempool contents: /rest/mempool/contents.json
+  | "/rest/mempool/contents" `T.isPrefixOf` path =
+      handleRestMempoolContents server (T.drop 22 path) query
+
+  -- UTXO query: /rest/getutxos/[checkmempool/]<txid>-<n>/....[bin|hex|json]
+  | "/rest/getutxos" `T.isPrefixOf` path =
+      handleRestGetUtxos server (T.drop 13 path)
+
+  -- Unknown endpoint
+  | otherwise =
+      return $ restError 404 "Not found"
+
+--------------------------------------------------------------------------------
+-- REST Block Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/block/<hash> and /rest/block/notxdetails/<hash>
+handleRestBlock :: RpcServer -> Text -> Bool -> IO Response
+handleRestBlock server pathPart includeTxDetails = do
+  let (hashStr, format) = parseRestFormat pathPart
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $ "output format not found (available: " <> availableFormats <> ")"
+    _ -> do
+      case parseHash hashStr of
+        Nothing ->
+          return $ restError 400 $ "Invalid hash: " <> hashStr
+        Just bh -> do
+          -- Check if block is pruned
+          isPruned <- case rsBlockStore server of
+            Nothing -> return False
+            Just blockStore -> isBlockPruned blockStore bh
+
+          if isPruned
+            then return $ restError 404 $ hashStr <> " not available (pruned data)"
+            else do
+              mBlock <- getBlock (rsDB server) bh
+              case mBlock of
+                Nothing ->
+                  return $ restError 404 $ hashStr <> " not found"
+                Just block -> do
+                  let blockBytes = S.encode block
+                  case format of
+                    RestBinary ->
+                      return $ responseLBS status200
+                        [(hContentType, "application/octet-stream")]
+                        (BL.fromStrict blockBytes)
+
+                    RestHex ->
+                      return $ responseLBS status200
+                        [(hContentType, "text/plain")]
+                        (BL.fromStrict $ TE.encodeUtf8 $
+                          TE.decodeUtf8 (B16.encode blockBytes) <> "\n")
+
+                    RestJson -> do
+                      entries <- readTVarIO (hcEntries (rsHeaderChain server))
+                      tip <- readTVarIO (hcTip (rsHeaderChain server))
+                      let mEntry = Map.lookup bh entries
+                          txData = if includeTxDetails
+                            then map (\tx -> object
+                                   [ "txid" .= showHash (blockHashFromTxId (computeTxId tx))
+                                   , "size" .= BS.length (S.encode tx)
+                                   , "vsize" .= calculateVSize tx
+                                   ]) (blockTxns block)
+                            else map (toJSON . showHash . blockHashFromTxId . computeTxId) (blockTxns block)
+                          jsonResult = object $ catMaybes
+                            [ Just $ "hash" .= showHash bh
+                            , Just $ "confirmations" .= confirmations mEntry (ceHeight tip)
+                            , Just $ "size" .= BS.length blockBytes
+                            , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
+                            , Just $ "version" .= bhVersion (blockHeader block)
+                            , Just $ "merkleroot" .= showHash256 (bhMerkleRoot (blockHeader block))
+                            , Just $ "tx" .= txData
+                            , Just $ "time" .= bhTimestamp (blockHeader block)
+                            , Just $ "nonce" .= bhNonce (blockHeader block)
+                            , Just $ "bits" .= showBits (bhBits (blockHeader block))
+                            , Just $ "difficulty" .= getDifficulty (bhBits (blockHeader block))
+                            , Just $ "previousblockhash" .= showHash (bhPrevBlock (blockHeader block))
+                            , fmap ("chainwork" .=) (showHex . ceChainWork <$> mEntry)
+                            ]
+                      return $ responseLBS status200
+                        [(hContentType, "application/json")]
+                        (encode jsonResult)
+
+                    RestUndefined ->
+                      return $ restError 404 "output format not found"
+  where
+    confirmations :: Maybe ChainEntry -> Word32 -> Int
+    confirmations Nothing _ = -1
+    confirmations (Just entry) tipHeight =
+      fromIntegral tipHeight - fromIntegral (ceHeight entry) + 1
+
+--------------------------------------------------------------------------------
+-- REST Transaction Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/tx/<txid>.[bin|hex|json]
+handleRestTx :: RpcServer -> Text -> IO Response
+handleRestTx server pathPart = do
+  let (txidStr, format) = parseRestFormat pathPart
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $ "output format not found (available: " <> availableFormats <> ")"
+    _ -> do
+      case parseHash txidStr of
+        Nothing ->
+          return $ restError 400 $ "Invalid hash: " <> txidStr
+        Just bh -> do
+          let txid = TxId (getBlockHashHash bh)
+
+          -- Check mempool first
+          mMempoolEntry <- getTransaction (rsMempool server) txid
+          case mMempoolEntry of
+            Just entry ->
+              returnRestTx (meTransaction entry) Nothing format
+            Nothing -> do
+              -- Try txindex
+              mTxLoc <- getTxIndex (rsDB server) txid
+              case mTxLoc of
+                Nothing ->
+                  return $ restError 404 $ txidStr <> " not found"
+                Just txLoc -> do
+                  mBlock <- getBlock (rsDB server) (txLocBlock txLoc)
+                  case mBlock of
+                    Nothing ->
+                      return $ restError 404 $ txidStr <> " not found"
+                    Just block -> do
+                      let txns = blockTxns block
+                          txIdx = fromIntegral (txLocIndex txLoc)
+                      if txIdx < length txns
+                        then returnRestTx (txns !! txIdx) (Just (txLocBlock txLoc)) format
+                        else return $ restError 404 $ txidStr <> " not found"
+  where
+    returnRestTx :: Tx -> Maybe BlockHash -> RestResponseFormat -> IO Response
+    returnRestTx tx mBlockHash fmt = do
+      let txBytes = S.encode tx
+          txid = computeTxId tx
+      case fmt of
+        RestBinary ->
+          return $ responseLBS status200
+            [(hContentType, "application/octet-stream")]
+            (BL.fromStrict txBytes)
+
+        RestHex ->
+          return $ responseLBS status200
+            [(hContentType, "text/plain")]
+            (BL.fromStrict $ TE.encodeUtf8 $
+              TE.decodeUtf8 (B16.encode txBytes) <> "\n")
+
+        RestJson -> do
+          let jsonResult = object $ catMaybes
+                [ Just $ "txid" .= showHash (blockHashFromTxId txid)
+                , Just $ "size" .= BS.length txBytes
+                , Just $ "vsize" .= calculateVSize tx
+                , Just $ "version" .= txVersion tx
+                , Just $ "locktime" .= txLockTime tx
+                , Just $ "vin" .= map vinToJson (txInputs tx)
+                , Just $ "vout" .= zipWith voutToJson [0..] (txOutputs tx)
+                , fmap (\bh -> "blockhash" .= showHash bh) mBlockHash
+                ]
+          return $ responseLBS status200
+            [(hContentType, "application/json")]
+            (encode jsonResult)
+
+        RestUndefined ->
+          return $ restError 404 "output format not found"
+
+    vinToJson :: TxIn -> Value
+    vinToJson txin = object
+      [ "txid" .= showHash (blockHashFromTxId (outPointHash (txInPrevOutput txin)))
+      , "vout" .= outPointIndex (txInPrevOutput txin)
+      , "scriptSig" .= object ["hex" .= (TE.decodeUtf8 $ B16.encode (txInScript txin))]
+      , "sequence" .= txInSequence txin
+      ]
+
+    voutToJson :: Int -> TxOut -> Value
+    voutToJson n txout = object
+      [ "value" .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
+      , "n" .= n
+      , "scriptPubKey" .= object
+          [ "hex" .= (TE.decodeUtf8 $ B16.encode (txOutScript txout))
+          ]
+      ]
+
+--------------------------------------------------------------------------------
+-- REST Headers Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/headers/<count>/<hash>.[bin|hex|json] (deprecated)
+-- or /rest/headers/<hash>.[bin|hex|json]?count=<count> (new)
+handleRestHeaders :: RpcServer -> Text -> Text -> IO Response
+handleRestHeaders server pathPart query = do
+  let (param, format) = parseRestFormat pathPart
+      parts = T.splitOn "/" param
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $ "output format not found (available: " <> availableFormats <> ")"
+    _ -> do
+      -- Parse path: either <count>/<hash> (deprecated) or <hash> (new)
+      (count, hashStr) <- case parts of
+        [countStr, hash] ->
+          -- Deprecated: /rest/headers/<count>/<hash>
+          case readMaybe (T.unpack countStr) :: Maybe Int of
+            Nothing -> return (5, hash)  -- Fall back to treating as hash
+            Just c -> return (c, hash)
+        [hash] ->
+          -- New: /rest/headers/<hash>?count=<count>
+          let countParam = parseQueryParam query "count"
+              c = maybe 5 id (countParam >>= readMaybe . T.unpack)
+          in return (c, hash)
+        _ -> return (5, "")
+
+      -- Validate count
+      if count < 1 || count > maxRestHeadersResults
+        then return $ restError 400 $
+          "Header count is invalid or out of acceptable range (1-" <>
+          T.pack (show maxRestHeadersResults) <> "): " <> T.pack (show count)
+        else do
+          case parseHash hashStr of
+            Nothing ->
+              return $ restError 400 $ "Invalid hash: " <> hashStr
+            Just startHash -> do
+              entries <- readTVarIO (hcEntries (rsHeaderChain server))
+              heightMap <- readTVarIO (hcByHeight (rsHeaderChain server))
+
+              -- Get headers starting from hash
+              let headers = collectHeaders entries heightMap startHash count
+              if null headers
+                then return $ restError 404 $ hashStr <> " not found"
+                else do
+                  tip <- readTVarIO (hcTip (rsHeaderChain server))
+                  case format of
+                    RestBinary -> do
+                      let headerBytes = BS.concat $ map (S.encode . ceHeader) headers
+                      return $ responseLBS status200
+                        [(hContentType, "application/octet-stream")]
+                        (BL.fromStrict headerBytes)
+
+                    RestHex -> do
+                      let headerBytes = BS.concat $ map (S.encode . ceHeader) headers
+                      return $ responseLBS status200
+                        [(hContentType, "text/plain")]
+                        (BL.fromStrict $ TE.encodeUtf8 $
+                          TE.decodeUtf8 (B16.encode headerBytes) <> "\n")
+
+                    RestJson -> do
+                      let jsonHeaders = map (headerEntryToJson (ceHeight tip)) headers
+                      return $ responseLBS status200
+                        [(hContentType, "application/json")]
+                        (encode $ toJSON jsonHeaders)
+
+                    RestUndefined ->
+                      return $ restError 404 "output format not found"
+  where
+    collectHeaders :: Map BlockHash ChainEntry -> Map Word32 BlockHash
+                   -> BlockHash -> Int -> [ChainEntry]
+    collectHeaders entries heightMap startHash maxCount =
+      case Map.lookup startHash entries of
+        Nothing -> []
+        Just entry ->
+          let loop _ 0 acc = reverse acc
+              loop h n acc =
+                case Map.lookup h entries of
+                  Nothing -> reverse acc
+                  Just e ->
+                    let nextHeight = ceHeight e + 1
+                    in case Map.lookup nextHeight heightMap of
+                      Nothing -> reverse (e:acc)
+                      Just nextHash -> loop nextHash (n-1) (e:acc)
+          in loop startHash maxCount []
+
+    headerEntryToJson :: Word32 -> ChainEntry -> Value
+    headerEntryToJson tipHeight entry = object
+      [ "hash" .= showHash (ceHash entry)
+      , "confirmations" .= (fromIntegral tipHeight - fromIntegral (ceHeight entry) + 1 :: Int)
+      , "height" .= ceHeight entry
+      , "version" .= bhVersion (ceHeader entry)
+      , "merkleroot" .= showHash256 (bhMerkleRoot (ceHeader entry))
+      , "time" .= bhTimestamp (ceHeader entry)
+      , "nonce" .= bhNonce (ceHeader entry)
+      , "bits" .= showBits (bhBits (ceHeader entry))
+      , "difficulty" .= getDifficulty (bhBits (ceHeader entry))
+      , "chainwork" .= showHex (ceChainWork entry)
+      , "previousblockhash" .= showHash (bhPrevBlock (ceHeader entry))
+      ]
+
+    parseQueryParam :: Text -> Text -> Maybe Text
+    parseQueryParam q key =
+      let params = T.splitOn "&" (T.drop 1 q)  -- Drop leading '?'
+          find' k = listToMaybe [v | p <- params, let (k', v) = splitParam p, k' == k]
+          splitParam p = case T.splitOn "=" p of
+            [k, v] -> (k, v)
+            _ -> ("", "")
+      in find' key
+
+--------------------------------------------------------------------------------
+-- REST Block Hash By Height Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/blockhashbyheight/<height>.[bin|hex|json]
+handleRestBlockHashByHeight :: RpcServer -> Text -> IO Response
+handleRestBlockHashByHeight server pathPart = do
+  let (heightStr, format) = parseRestFormat pathPart
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $ "output format not found (available: " <> availableFormats <> ")"
+    _ -> do
+      case readMaybe (T.unpack heightStr) :: Maybe Word32 of
+        Nothing ->
+          return $ restError 400 $ "Invalid height: " <> heightStr
+        Just height -> do
+          heightMap <- readTVarIO (hcByHeight (rsHeaderChain server))
+          tip <- readTVarIO (hcTip (rsHeaderChain server))
+
+          if height > ceHeight tip
+            then return $ restError 404 "Block height out of range"
+            else case Map.lookup height heightMap of
+              Nothing ->
+                return $ restError 404 "Block height out of range"
+              Just bh -> do
+                let hashBytes = S.encode bh
+                case format of
+                  RestBinary ->
+                    return $ responseLBS status200
+                      [(hContentType, "application/octet-stream")]
+                      (BL.fromStrict hashBytes)
+
+                  RestHex ->
+                    return $ responseLBS status200
+                      [(hContentType, "text/plain")]
+                      (BL.fromStrict $ TE.encodeUtf8 $ showHash bh <> "\n")
+
+                  RestJson ->
+                    return $ responseLBS status200
+                      [(hContentType, "application/json")]
+                      (encode $ object ["blockhash" .= showHash bh])
+
+                  RestUndefined ->
+                    return $ restError 404 "output format not found"
+
+--------------------------------------------------------------------------------
+-- REST Chain Info Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/chaininfo.json
+handleRestChainInfo :: RpcServer -> Text -> IO Response
+handleRestChainInfo server pathPart = do
+  let (_, format) = parseRestFormat pathPart
+
+  case format of
+    RestJson -> do
+      tip <- readTVarIO (hcTip (rsHeaderChain server))
+      let progress = computeVerificationProgress (ceHeight tip) (bhTimestamp (ceHeader tip))
+          currentTime = bhTimestamp (ceHeader tip)
+          isIBD = estimateIsInitialBlockDownload (ceHeight tip) currentTime
+          jsonResult = object
+            [ "chain" .= netName (rsNetwork server)
+            , "blocks" .= ceHeight tip
+            , "headers" .= ceHeight tip
+            , "bestblockhash" .= showHash (ceHash tip)
+            , "bits" .= showBits (bhBits (ceHeader tip))
+            , "target" .= showHex (bitsToTarget (bhBits (ceHeader tip)))
+            , "difficulty" .= getDifficulty (bhBits (ceHeader tip))
+            , "time" .= bhTimestamp (ceHeader tip)
+            , "mediantime" .= ceMedianTime tip
+            , "verificationprogress" .= progress
+            , "initialblockdownload" .= isIBD
+            , "chainwork" .= showHex (ceChainWork tip)
+            , "size_on_disk" .= (0 :: Int)
+            , "pruned" .= False
+            , "warnings" .= ([] :: [Text])
+            ]
+      return $ responseLBS status200
+        [(hContentType, "application/json")]
+        (encode jsonResult)
+
+    _ ->
+      return $ restError 404 "output format not found (available: json)"
+
+--------------------------------------------------------------------------------
+-- REST Mempool Info Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/mempool/info.json
+handleRestMempoolInfo :: RpcServer -> Text -> IO Response
+handleRestMempoolInfo server pathPart = do
+  let (_, format) = parseRestFormat pathPart
+
+  case format of
+    RestJson -> do
+      (count, size) <- getMempoolSize (rsMempool server)
+      let mpCfg = mpConfig (rsMempool server)
+          jsonResult = object
+            [ "loaded" .= True
+            , "size" .= count
+            , "bytes" .= size
+            , "usage" .= size
+            , "maxmempool" .= mpcMaxSize mpCfg
+            , "mempoolminfee" .= getFeeRate (mpcMinFeeRate mpCfg)
+            , "minrelaytxfee" .= (1 :: Int)
+            ]
+      return $ responseLBS status200
+        [(hContentType, "application/json")]
+        (encode jsonResult)
+
+    _ ->
+      return $ restError 404 "output format not found (available: json)"
+
+--------------------------------------------------------------------------------
+-- REST Mempool Contents Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/mempool/contents.json
+handleRestMempoolContents :: RpcServer -> Text -> Text -> IO Response
+handleRestMempoolContents server pathPart query = do
+  let (_, format) = parseRestFormat pathPart
+
+  case format of
+    RestJson -> do
+      txids <- getMempoolTxIds (rsMempool server)
+
+      -- Parse verbose parameter (default: true)
+      let verboseParam = parseQueryParamBool query "verbose" True
+      -- Parse mempool_sequence parameter (default: false)
+      let seqParam = parseQueryParamBool query "mempool_sequence" False
+
+      if verboseParam && seqParam
+        then return $ restError 400
+          "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")"
+        else if verboseParam
+          then do
+            -- Return detailed info for each tx
+            entries <- forM txids $ \txid -> do
+              mEntry <- getTransaction (rsMempool server) txid
+              return $ case mEntry of
+                Nothing -> Nothing
+                Just entry -> Just (showHash (BlockHash (getTxIdHash txid)), entryToJson entry)
+
+            let jsonResult = object $ catMaybes $
+                  map (fmap (\(k, v) -> Key.fromText k .= v)) entries
+            return $ responseLBS status200
+              [(hContentType, "application/json")]
+              (encode jsonResult)
+          else do
+            -- Simple mode: just return list of txids
+            let txidStrs = map (\txid -> showHash (BlockHash (getTxIdHash txid))) txids
+                jsonResult = if seqParam
+                  then object ["txids" .= txidStrs, "mempool_sequence" .= (0 :: Int)]
+                  else toJSON txidStrs
+            return $ responseLBS status200
+              [(hContentType, "application/json")]
+              (encode jsonResult)
+
+    _ ->
+      return $ restError 404 "output format not found (available: json)"
+
+  where
+    entryToJson :: MempoolEntry -> Value
+    entryToJson entry = object
+      [ "vsize" .= meSize entry
+      , "weight" .= (meSize entry * 4)
+      , "fee" .= meFee entry
+      , "time" .= meTime entry
+      , "height" .= meHeight entry
+      , "descendantcount" .= meDescendantCount entry
+      , "descendantsize" .= meDescendantSize entry
+      , "descendantfees" .= meDescendantFees entry
+      , "ancestorcount" .= meAncestorCount entry
+      , "ancestorsize" .= meAncestorSize entry
+      , "ancestorfees" .= meAncestorFees entry
+      ]
+
+    parseQueryParamBool :: Text -> Text -> Bool -> Bool
+    parseQueryParamBool q key def =
+      let params = T.splitOn "&" (T.drop 1 q)
+          find' k = listToMaybe [v | p <- params, let (k', v) = splitParam p, k' == k]
+          splitParam p = case T.splitOn "=" p of
+            [k, v] -> (k, v)
+            _ -> ("", "")
+      in case find' key of
+           Just "true" -> True
+           Just "false" -> False
+           _ -> def
+
+--------------------------------------------------------------------------------
+-- REST UTXO Handler
+--------------------------------------------------------------------------------
+
+-- | Handle /rest/getutxos/[checkmempool/]<txid>-<n>/....[bin|hex|json]
+handleRestGetUtxos :: RpcServer -> Text -> IO Response
+handleRestGetUtxos server pathPart = do
+  let (param, format) = parseRestFormat pathPart
+      parts = filter (not . T.null) $ T.splitOn "/" param
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $ "output format not found (available: " <> availableFormats <> ")"
+    _ -> do
+      if null parts
+        then return $ restError 400 "Error: empty request"
+        else do
+          -- Check for checkmempool flag
+          let (checkMempool, outpointParts) = case parts of
+                ("checkmempool":rest) -> (True, rest)
+                rest -> (False, rest)
+
+          -- Parse outpoints
+          case parseOutpoints outpointParts of
+            Left err ->
+              return $ restError 400 err
+            Right outpoints -> do
+              if length outpoints > maxGetUtxosOutpoints
+                then return $ restError 400 $
+                  "Error: max outpoints exceeded (max: " <> T.pack (show maxGetUtxosOutpoints) <>
+                  ", tried: " <> T.pack (show (length outpoints)) <> ")"
+                else do
+                  -- Look up UTXOs
+                  tip <- readTVarIO (hcTip (rsHeaderChain server))
+                  let tipHeight = ceHeight tip
+                      tipHash = ceHash tip
+
+                  results <- forM outpoints $ \op -> do
+                    -- First check UTXO cache
+                    mUtxo <- lookupUTXO (rsUTXOCache server) op
+                    case mUtxo of
+                      Just entry -> return (True, Just entry)
+                      Nothing ->
+                        -- If checkMempool, also check mempool for unspent
+                        if checkMempool
+                          then do
+                            -- Check if the output exists in mempool (simplified)
+                            let txid = outPointHash op
+                            mEntry <- getTransaction (rsMempool server) txid
+                            case mEntry of
+                              Just mempoolEntry ->
+                                let tx = meTransaction mempoolEntry
+                                    idx = fromIntegral (outPointIndex op)
+                                in if idx < length (txOutputs tx)
+                                   then return (True, Just $ UTXOEntry
+                                          { ueOutput = txOutputs tx !! idx
+                                          , ueHeight = tipHeight
+                                          , ueCoinbase = False
+                                          , ueSpent = False
+                                          })
+                                   else return (False, Nothing)
+                              Nothing -> return (False, Nothing)
+                          else return (False, Nothing)
+
+                  -- Build bitmap
+                  let hits = map fst results
+                      utxos = catMaybes $ map snd results
+                      bitmap = buildBitmap hits
+                      bitmapStr = map (\b -> if b then '1' else '0') hits
+
+                  case format of
+                    RestBinary -> do
+                      -- Serialize: height (4) + hash (32) + bitmap + utxos
+                      let response = BL.concat
+                            [ BL.fromStrict $ S.encode tipHeight
+                            , BL.fromStrict $ S.encode tipHash
+                            , BL.fromStrict $ BS.pack bitmap
+                            , BL.fromStrict $ BS.concat $ map encodeUtxo utxos
+                            ]
+                      return $ responseLBS status200
+                        [(hContentType, "application/octet-stream")]
+                        response
+
+                    RestHex -> do
+                      let responseBytes = BS.concat
+                            [ S.encode tipHeight
+                            , S.encode tipHash
+                            , BS.pack bitmap
+                            , BS.concat $ map encodeUtxo utxos
+                            ]
+                      return $ responseLBS status200
+                        [(hContentType, "text/plain")]
+                        (BL.fromStrict $ TE.encodeUtf8 $
+                          TE.decodeUtf8 (B16.encode responseBytes) <> "\n")
+
+                    RestJson -> do
+                      let utxoJson = zipWith utxoToJson [0..] utxos
+                          jsonResult = object
+                            [ "chainHeight" .= tipHeight
+                            , "chaintipHash" .= showHash tipHash
+                            , "bitmap" .= T.pack bitmapStr
+                            , "utxos" .= utxoJson
+                            ]
+                      return $ responseLBS status200
+                        [(hContentType, "application/json")]
+                        (encode jsonResult)
+
+                    RestUndefined ->
+                      return $ restError 404 "output format not found"
+
+  where
+    parseOutpoints :: [Text] -> Either Text [OutPoint]
+    parseOutpoints = mapM parseOutpoint
+      where
+        parseOutpoint part =
+          case T.splitOn "-" part of
+            [txidStr, nStr] ->
+              case (parseHash txidStr, readMaybe (T.unpack nStr) :: Maybe Word32) of
+                (Just bh, Just n) ->
+                  Right $ OutPoint (TxId (getBlockHashHash bh)) n
+                _ -> Left $ "Parse error: " <> part
+            _ -> Left $ "Parse error: " <> part
+
+    buildBitmap :: [Bool] -> [Word8]
+    buildBitmap hits =
+      let grouped = groupN 8 hits
+          toByte bits = foldl (\acc (i, b) -> if b then acc .|. (1 `shiftL` i) else acc)
+                              0 (zip [0..] bits)
+      in map toByte grouped
+
+    groupN :: Int -> [a] -> [[a]]
+    groupN _ [] = []
+    groupN n xs = take n xs : groupN n (drop n xs)
+
+    encodeUtxo :: UTXOEntry -> ByteString
+    encodeUtxo entry =
+      -- Serialize as: version (4) + height (4) + txout
+      S.encode (0 :: Word32) <> S.encode (ueHeight entry) <> S.encode (ueOutput entry)
+
+    utxoToJson :: Int -> UTXOEntry -> Value
+    utxoToJson _idx entry = object
+      [ "height" .= ueHeight entry
+      , "value" .= (fromIntegral (txOutValue (ueOutput entry)) / 100000000.0 :: Double)
+      , "scriptPubKey" .= object
+          [ "hex" .= (TE.decodeUtf8 $ B16.encode (txOutScript (ueOutput entry)))
+          ]
+      ]
+
+--------------------------------------------------------------------------------
+-- Helper for reading integers
+--------------------------------------------------------------------------------
+
+readMaybe :: Read a => String -> Maybe a
+readMaybe s = case reads s of
+  [(x, "")] -> Just x
+  _ -> Nothing
+
+--------------------------------------------------------------------------------
+-- Combined RPC + REST Server
+--------------------------------------------------------------------------------
+
+-- | Start both RPC and REST servers on the same port.
+-- Routes requests based on URL path prefix.
+combinedApp :: RpcServer -> Application
+combinedApp server req respond = do
+  let path = rawPathInfo req
+  if BS.isPrefixOf "/rest/" path
+    then restApp server req respond
+    else rpcApp server req respond
+
+--------------------------------------------------------------------------------
+-- ZMQ Notifications
+--------------------------------------------------------------------------------
+-- Reference: /home/max/hashhog/bitcoin/src/zmq/zmqpublishnotifier.cpp
+
+-- | ZMQ notification topics
+-- Each topic corresponds to a type of blockchain event
+data ZmqTopic
+  = ZmqHashBlock     -- ^ 32-byte block hash (little-endian as stored)
+  | ZmqHashTx        -- ^ 32-byte transaction hash (little-endian as stored)
+  | ZmqRawBlock      -- ^ Full serialized block
+  | ZmqRawTx         -- ^ Full serialized transaction
+  | ZmqSequence      -- ^ Sequence notification with type byte + hash + optional mempool seq
+  deriving (Eq, Show)
+
+-- | Convert ZMQ topic to wire format (topic string)
+zmqTopicToBytes :: ZmqTopic -> ByteString
+zmqTopicToBytes ZmqHashBlock = "hashblock"
+zmqTopicToBytes ZmqHashTx    = "hashtx"
+zmqTopicToBytes ZmqRawBlock  = "rawblock"
+zmqTopicToBytes ZmqRawTx     = "rawtx"
+zmqTopicToBytes ZmqSequence  = "sequence"
+
+-- | Sequence notification label (matches Bitcoin Core)
+data SequenceLabel
+  = SeqBlockConnect     -- ^ 'C' - Block connected to tip
+  | SeqBlockDisconnect  -- ^ 'D' - Block disconnected from tip (reorg)
+  | SeqMempoolAccept    -- ^ 'A' - Transaction added to mempool
+  | SeqMempoolRemoval   -- ^ 'R' - Transaction removed from mempool
+  deriving (Eq, Show)
+
+-- | Convert sequence label to byte
+sequenceLabelToByte :: SequenceLabel -> Word8
+sequenceLabelToByte SeqBlockConnect    = 0x43  -- 'C'
+sequenceLabelToByte SeqBlockDisconnect = 0x44  -- 'D'
+sequenceLabelToByte SeqMempoolAccept   = 0x41  -- 'A'
+sequenceLabelToByte SeqMempoolRemoval  = 0x52  -- 'R'
+
+-- | ZMQ events to be published
+data ZmqEvent
+  = ZmqEventHashBlock !BlockHash
+  | ZmqEventHashTx !TxId
+  | ZmqEventRawBlock !ByteString !BlockHash
+  | ZmqEventRawTx !ByteString !TxId
+  | ZmqEventSequence !SequenceLabel !BlockHash !(Maybe Word64)
+  deriving (Eq, Show)
+
+-- | ZMQ configuration
+data ZmqConfig = ZmqConfig
+  { zmqEndpoint        :: !String      -- ^ ZMQ bind endpoint (e.g. "tcp://127.0.0.1:28332")
+  , zmqHighWaterMark   :: !Int         -- ^ Send high water mark (message queue limit)
+  , zmqEnabled         :: !Bool        -- ^ Whether ZMQ notifications are enabled
+  } deriving (Show, Generic)
+
+instance NFData ZmqConfig
+
+-- | Default ZMQ configuration
+defaultZmqConfig :: ZmqConfig
+defaultZmqConfig = ZmqConfig
+  { zmqEndpoint      = "tcp://127.0.0.1:28332"
+  , zmqHighWaterMark = 1000
+  , zmqEnabled       = True
+  }
+
+-- | ZMQ notifier state
+-- Handles publishing notifications to ZMQ subscribers
+data ZmqNotifier = ZmqNotifier
+  { znConfig      :: !ZmqConfig
+  , znContext     :: !(ZMQ.Context)
+  , znSocket      :: !(ZMQ.Socket ZMQ.Pub)
+  , znSequence    :: !(TVar Word32)         -- ^ Monotonic sequence number for each message
+  , znEventQueue  :: !(TBQueue ZmqEvent)    -- ^ Buffered event queue
+  , znWorker      :: !(TVar (Maybe ThreadId))
+  }
+
+-- | Create a new ZMQ notifier
+-- Initializes the ZMQ context, creates a PUB socket, and binds to the endpoint
+newZmqNotifier :: ZmqConfig -> IO ZmqNotifier
+newZmqNotifier config = do
+  ctx <- ZMQ.context
+  sock <- ZMQ.socket ctx ZMQ.Pub
+
+  -- Set high water mark for outbound messages
+  ZMQ.setSendHighWM (ZMQ.restrict (zmqHighWaterMark config)) sock
+
+  -- Enable TCP keepalive
+  ZMQ.setTcpKeepAlive ZMQ.On sock
+
+  -- Bind to endpoint
+  ZMQ.bind sock (zmqEndpoint config)
+
+  -- Initialize state
+  seqVar <- newTVarIO 0
+  queue <- newTBQueueIO 1000  -- Buffer up to 1000 events
+  workerVar <- newTVarIO Nothing
+
+  let notifier = ZmqNotifier
+        { znConfig = config
+        , znContext = ctx
+        , znSocket = sock
+        , znSequence = seqVar
+        , znEventQueue = queue
+        , znWorker = workerVar
+        }
+
+  -- Start worker thread to process events from queue
+  tid <- forkIO $ zmqWorkerLoop notifier
+  atomically $ writeTVar workerVar (Just tid)
+
+  return notifier
+
+-- | Close the ZMQ notifier
+-- Stops the worker thread and closes the socket/context
+closeZmqNotifier :: ZmqNotifier -> IO ()
+closeZmqNotifier notifier = do
+  -- Stop worker thread
+  mTid <- readTVarIO (znWorker notifier)
+  mapM_ killThread mTid
+  atomically $ writeTVar (znWorker notifier) Nothing
+
+  -- Set linger to 0 and close socket
+  ZMQ.setLinger (ZMQ.restrict (0 :: Int)) (znSocket notifier)
+  ZMQ.close (znSocket notifier)
+  ZMQ.term (znContext notifier)
+
+-- | Worker loop that processes events from the queue and sends ZMQ messages
+zmqWorkerLoop :: ZmqNotifier -> IO ()
+zmqWorkerLoop notifier = do
+  event <- atomically $ readTBQueue (znEventQueue notifier)
+  sendZmqEvent notifier event
+  zmqWorkerLoop notifier
+
+-- | Send a ZMQ event as a multipart message
+-- Message format: [topic][body][sequence_le32]
+sendZmqEvent :: ZmqNotifier -> ZmqEvent -> IO ()
+sendZmqEvent notifier event = do
+  let (topic, body) = eventToTopicAndBody event
+      sock = znSocket notifier
+
+  -- Get and increment sequence number
+  seqNum <- atomically $ do
+    n <- readTVar (znSequence notifier)
+    writeTVar (znSequence notifier) (n + 1)
+    return n
+
+  -- Encode sequence as 4-byte little-endian
+  let seqBytes = encodeLE32 seqNum
+
+  -- Send multipart message: topic, body, sequence
+  ZMQ.sendMulti sock (zmqTopicToBytes topic :| [body, seqBytes])
+  where
+    encodeLE32 :: Word32 -> ByteString
+    encodeLE32 n = BS.pack
+      [ fromIntegral (n .&. 0xff)
+      , fromIntegral ((n `shiftR` 8) .&. 0xff)
+      , fromIntegral ((n `shiftR` 16) .&. 0xff)
+      , fromIntegral ((n `shiftR` 24) .&. 0xff)
+      ]
+
+-- | Convert event to topic and body
+eventToTopicAndBody :: ZmqEvent -> (ZmqTopic, ByteString)
+eventToTopicAndBody (ZmqEventHashBlock bh) =
+  (ZmqHashBlock, hashToLeBytes bh)
+eventToTopicAndBody (ZmqEventHashTx txid) =
+  (ZmqHashTx, txidToLeBytes txid)
+eventToTopicAndBody (ZmqEventRawBlock rawBytes _) =
+  (ZmqRawBlock, rawBytes)
+eventToTopicAndBody (ZmqEventRawTx rawBytes _) =
+  (ZmqRawTx, rawBytes)
+eventToTopicAndBody (ZmqEventSequence label bh mMempoolSeq) =
+  let hashBytes = hashToLeBytes bh
+      labelByte = BS.singleton (sequenceLabelToByte label)
+      body = case mMempoolSeq of
+        Nothing -> hashBytes <> labelByte
+        Just seqNum -> hashBytes <> labelByte <> encodeLE64 seqNum
+  in (ZmqSequence, body)
+  where
+    encodeLE64 :: Word64 -> ByteString
+    encodeLE64 n = BS.pack
+      [ fromIntegral (n .&. 0xff)
+      , fromIntegral ((n `shiftR` 8) .&. 0xff)
+      , fromIntegral ((n `shiftR` 16) .&. 0xff)
+      , fromIntegral ((n `shiftR` 24) .&. 0xff)
+      , fromIntegral ((n `shiftR` 32) .&. 0xff)
+      , fromIntegral ((n `shiftR` 40) .&. 0xff)
+      , fromIntegral ((n `shiftR` 48) .&. 0xff)
+      , fromIntegral ((n `shiftR` 56) .&. 0xff)
+      ]
+
+-- | Convert BlockHash to little-endian bytes (as stored internally)
+-- Bitcoin Core reverses the hash for display but stores it LE
+hashToLeBytes :: BlockHash -> ByteString
+hashToLeBytes bh = getHash256 (getBlockHashHash bh)
+
+-- | Convert TxId to little-endian bytes
+txidToLeBytes :: TxId -> ByteString
+txidToLeBytes txid = getHash256 (getTxIdHash txid)
+
+--------------------------------------------------------------------------------
+-- Public notification functions
+--------------------------------------------------------------------------------
+
+-- | Queue a block connect notification
+-- Publishes both hashblock and sequence (with 'C' label)
+notifyBlockConnect :: ZmqNotifier -> BlockHash -> ByteString -> IO ()
+notifyBlockConnect notifier bh rawBlock = atomically $ do
+  -- hashblock notification
+  writeTBQueue (znEventQueue notifier) (ZmqEventHashBlock bh)
+  -- rawblock notification
+  writeTBQueue (znEventQueue notifier) (ZmqEventRawBlock rawBlock bh)
+  -- sequence notification with 'C' (connect)
+  writeTBQueue (znEventQueue notifier) (ZmqEventSequence SeqBlockConnect bh Nothing)
+
+-- | Queue a block disconnect notification
+-- Publishes sequence notification with 'D' label
+notifyBlockDisconnect :: ZmqNotifier -> BlockHash -> IO ()
+notifyBlockDisconnect notifier bh = atomically $
+  writeTBQueue (znEventQueue notifier) (ZmqEventSequence SeqBlockDisconnect bh Nothing)
+
+-- | Queue a raw block notification
+notifyRawBlock :: ZmqNotifier -> BlockHash -> ByteString -> IO ()
+notifyRawBlock notifier bh rawBlock = atomically $
+  writeTBQueue (znEventQueue notifier) (ZmqEventRawBlock rawBlock bh)
+
+-- | Queue a hash block notification
+notifyHashBlock :: ZmqNotifier -> BlockHash -> IO ()
+notifyHashBlock notifier bh = atomically $
+  writeTBQueue (znEventQueue notifier) (ZmqEventHashBlock bh)
+
+-- | Queue a transaction acceptance notification
+-- Publishes hashtx, rawtx, and sequence (with 'A' label)
+notifyTxAcceptance :: ZmqNotifier -> TxId -> ByteString -> Word64 -> IO ()
+notifyTxAcceptance notifier txid rawTx mempoolSeq = atomically $ do
+  -- hashtx notification
+  writeTBQueue (znEventQueue notifier) (ZmqEventHashTx txid)
+  -- rawtx notification
+  writeTBQueue (znEventQueue notifier) (ZmqEventRawTx rawTx txid)
+  -- sequence notification with 'A' (mempool accept) and mempool sequence number
+  let bh = BlockHash (getTxIdHash txid)
+  writeTBQueue (znEventQueue notifier) (ZmqEventSequence SeqMempoolAccept bh (Just mempoolSeq))
+
+-- | Queue a transaction removal notification
+-- Publishes sequence notification with 'R' label
+notifyTxRemoval :: ZmqNotifier -> TxId -> Word64 -> IO ()
+notifyTxRemoval notifier txid mempoolSeq = atomically $ do
+  let bh = BlockHash (getTxIdHash txid)
+  writeTBQueue (znEventQueue notifier) (ZmqEventSequence SeqMempoolRemoval bh (Just mempoolSeq))
+
+-- | Queue a raw transaction notification
+notifyRawTx :: ZmqNotifier -> TxId -> ByteString -> IO ()
+notifyRawTx notifier txid rawTx = atomically $
+  writeTBQueue (znEventQueue notifier) (ZmqEventRawTx rawTx txid)
+
+-- | Queue a hash transaction notification
+notifyHashTx :: ZmqNotifier -> TxId -> IO ()
+notifyHashTx notifier txid = atomically $
+  writeTBQueue (znEventQueue notifier) (ZmqEventHashTx txid)

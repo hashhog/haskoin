@@ -455,8 +455,8 @@ gcsFilterNew params elements
     encodeCompactSize :: Word64 -> ByteString
     encodeCompactSize n
       | n < 0xfd = BS.singleton (fromIntegral n)
-      | n <= 0xffff = BS.cons 0xfd (encodeLE16 (fromIntegral n))
-      | n <= 0xffffffff = BS.cons 0xfe (encodeLE32 (fromIntegral n))
+      | n <= 0xffff = BS.cons 0xfd (encodeLE16 (fromIntegral n :: Word16))
+      | n <= 0xffffffff = BS.cons 0xfe (encodeLE32 (fromIntegral n :: Word32))
       | otherwise = BS.cons 0xff (encodeLE64 n)
 
     encodeLE16 w = BS.pack [fromIntegral w, fromIntegral (w `shiftR` 8)]
@@ -946,10 +946,11 @@ computeTxId tx =
   where
     putVarInt n
       | n < 0xfd = putWord8 (fromIntegral n)
-      | n <= 0xffff = putWord8 0xfd >> putWord16le (fromIntegral n)
-      | n <= 0xffffffff = putWord8 0xfe >> putWord32le (fromIntegral n)
+      | n <= 0xffff = putWord8 0xfd >> putWord16le (fromIntegral n :: Word16)
+      | n <= 0xffffffff = putWord8 0xfe >> putWord32le (fromIntegral n :: Word32)
       | otherwise = putWord8 0xff >> putWord64le n
 
+    putWord16le :: Word16 -> Put
     putWord16le w = do
       putWord8 (fromIntegral w)
       putWord8 (fromIntegral (w `shiftR` 8))
@@ -989,10 +990,11 @@ instance Serialize BlockFilterEntry where
     where
       putVarInt n
         | n < 0xfd = putWord8 (fromIntegral n)
-        | n <= 0xffff = putWord8 0xfd >> putWord16le (fromIntegral n)
-        | n <= 0xffffffff = putWord8 0xfe >> putWord32le (fromIntegral n)
+        | n <= 0xffff = putWord8 0xfd >> putWord16le (fromIntegral n :: Word16)
+        | n <= 0xffffffff = putWord8 0xfe >> putWord32le (fromIntegral n :: Word32)
         | otherwise = putWord8 0xff >> putWord64le n
 
+      putWord16le :: Word16 -> Put
       putWord16le w = do
         putWord8 (fromIntegral w)
         putWord8 (fromIntegral (w `shiftR` 8))
@@ -1095,32 +1097,32 @@ instance Serialize CoinStats where
     putWord64le csBogoSize
     putWord64le csTotalAmount
     putWord64le csTotalSubsidy
-    putInteger csTotalPrevoutSpent
-    putInteger csTotalNewOutputs
-    putInteger csTotalCoinbaseAmount
+    putInteger' csTotalPrevoutSpent
+    putInteger' csTotalNewOutputs
+    putInteger' csTotalCoinbaseAmount
     putWord64le csUnspendablesGenesis
     putWord64le csUnspendablesBIP30
     putWord64le csUnspendablesScripts
     putWord64le csUnspendablesUnclaimed
+    where
+      putInteger' n = do
+        let bs = integerToBS n
+        putWord32le (fromIntegral (BS.length bs))
+        putByteString bs
   get = CoinStats
     <$> getWord64le
     <*> getWord64le
     <*> getWord64le
     <*> getWord64le
-    <*> getInteger
-    <*> getInteger
-    <*> getInteger
+    <*> getInteger'
+    <*> getInteger'
+    <*> getInteger'
     <*> getWord64le
     <*> getWord64le
     <*> getWord64le
     <*> getWord64le
     where
-      putInteger n = do
-        let bs = integerToBS n
-        putWord32le (fromIntegral (BS.length bs))
-        putByteString bs
-
-      getInteger = do
+      getInteger' = do
         len <- getWord32le
         bs <- getBytes (fromIntegral len)
         return $ bsToInteger bs

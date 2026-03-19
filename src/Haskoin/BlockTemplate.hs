@@ -31,6 +31,12 @@ module Haskoin.BlockTemplate
     -- * Witness Commitment
   , computeWitnessCommitment
   , buildBlockUTXOMap
+    -- * Transaction Finality (Locktime)
+  , isFinalTx
+  , locktimeThreshold
+  , sequenceFinal
+    -- * Anti-Fee-Sniping
+  , setAntiFeeSniping
   ) where
 
 import Data.ByteString (ByteString)
@@ -58,10 +64,55 @@ import Haskoin.Consensus (Network(..), validateFullBlock, blockReward,
                            addHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
-                         lookupUTXO, putUndoData, UndoData(..), addUTXO, spendUTXO)
+                         lookupUTXO, putUndoData, UndoData(..), addUTXO, spendUTXO,
+                         TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
+                         putBlockHeader, putBlockHeight, putBlock)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
                          Inv(..), InvVector(..), InvType(..))
+
+--------------------------------------------------------------------------------
+-- Transaction Finality Constants
+--------------------------------------------------------------------------------
+
+-- | Locktime threshold: values below this are block heights, above are timestamps
+-- LOCKTIME_THRESHOLD = 500000000 (Tue Nov 5 00:53:20 1985 UTC)
+locktimeThreshold :: Word32
+locktimeThreshold = 500000000
+
+-- | SEQUENCE_FINAL: if all inputs have this sequence, nLockTime is ignored
+sequenceFinal :: Word32
+sequenceFinal = 0xffffffff
+
+--------------------------------------------------------------------------------
+-- Transaction Finality Check
+--------------------------------------------------------------------------------
+
+-- | Check if a transaction is final at the given block height and time.
+-- A transaction is final if:
+--   1. nLockTime == 0, OR
+--   2. nLockTime < threshold (height-based: nLockTime < nBlockHeight), OR
+--      nLockTime < nBlockTime (time-based: nLockTime >= 500000000), OR
+--   3. All inputs have nSequence == 0xFFFFFFFF (SEQUENCE_FINAL)
+--
+-- This is a pure function matching Bitcoin Core's IsFinalTx().
+isFinalTx :: Tx       -- ^ Transaction to check
+          -> Word32   -- ^ Block height
+          -> Word32   -- ^ Block time (median time past for mining)
+          -> Bool
+isFinalTx tx blockHeight blockTime
+  -- Case 1: nLockTime == 0 means always final
+  | txLockTime tx == 0 = True
+  -- Case 2: Check if locktime constraint is satisfied
+  | isLockTimeSatisfied = True
+  -- Case 3: All inputs have SEQUENCE_FINAL (0xFFFFFFFF)
+  | otherwise = all (\inp -> txInSequence inp == sequenceFinal) (txInputs tx)
+  where
+    lockTime = txLockTime tx
+    -- If lockTime < 500000000, it's a block height; otherwise it's a timestamp
+    isLockTimeSatisfied
+      | lockTime < locktimeThreshold = lockTime < blockHeight
+      | otherwise                    = lockTime < blockTime
 
 --------------------------------------------------------------------------------
 -- Block Template Types
@@ -137,18 +188,22 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
   let reservedWeight = 4000
   allEntries <- selectTransactions mp (maxBlockWeight - reservedWeight)
 
+  -- Filter out transactions that are not final at this height/time
+  -- For block template, use MTP (median time past) as the time threshold
+  let finalEntries = filter (isFinalEntry height mtp) allEntries
+
   -- Build template transactions with dependency tracking
-  let txIdSet = Set.fromList $ map meTxId allEntries
-      templateTxs = zipWith (buildTemplateTx txIdSet allEntries) [0..] allEntries
+  let txIdSet = Set.fromList $ map meTxId finalEntries
+      templateTxs = zipWith (buildTemplateTx txIdSet finalEntries) [0..] finalEntries
 
   -- Calculate total fees from selected transactions
-  let totalFees = sum $ map meFee allEntries
+  let totalFees = sum $ map meFee finalEntries
       reward = blockReward height
       coinbaseValue = reward + totalFees
 
   -- Calculate witness commitment
   let wtxids = TxId (Hash256 (BS.replicate 32 0))  -- coinbase wtxid is zeros
-               : map (computeWtxIdFromEntry) allEntries
+               : map (computeWtxIdFromEntry) finalEntries
       witnessRoot = computeMerkleRoot wtxids
       witnessNonce = BS.replicate 32 0
       witnessCommitment = getHash256 $
@@ -174,6 +229,10 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
     , btWitnessCommitment = witnessCommitment
     , btDefaultWitnessNonce = witnessNonce
     }
+
+-- | Check if a mempool entry is final at the given height and time
+isFinalEntry :: Word32 -> Word32 -> MempoolEntry -> Bool
+isFinalEntry height mtp entry = isFinalTx (meTransaction entry) height mtp
 
 -- | Build a TemplateTransaction from a MempoolEntry
 -- Tracks which other transactions in the template this one depends on
@@ -346,7 +405,13 @@ submitBlock net db hc cache pm block = do
           -- Store undo data for potential reorgs
           putUndoData db bh undo
 
-          -- Add header to chain
+          -- Persist block header, height, and full block to the database
+          -- so that getblockheader / getblockhash / getblock can find it.
+          putBlockHeader db bh (blockHeader block)
+          putBlockHeight db height bh
+          putBlock db bh block
+
+          -- Add header to chain (in-memory index + tip update)
           void $ addHeader net hc (blockHeader block)
 
           -- Broadcast to peers
@@ -376,15 +441,16 @@ applyBlockToCache :: UTXOCache -> Network -> Block -> Word32
 applyBlockToCache cache net block height = do
   let bh = computeBlockHash (blockHeader block)
       txns = blockTxns block
+      prevHash = bhPrevBlock (blockHeader block)
 
-  -- Collect spent outputs for undo data
-  spentOutputsRef <- newTVarIO []
+  -- Collect TxUndo for each non-coinbase transaction
+  txUndosRef <- newTVarIO []
 
   -- Process each transaction
   results <- forM (zip [0..] txns) $ \(txIdx :: Int, tx) -> do
     if txIdx == 0  -- Coinbase
       then do
-        -- Coinbase: only create outputs
+        -- Coinbase: only create outputs, no undo data
         atomically $ forM_ (zip [(0::Word32)..] (txOutputs tx)) $ \(outIdx, txout) -> do
           let op = OutPoint (computeTxId tx) outIdx
               entry = UTXOEntry txout height True False
@@ -392,6 +458,9 @@ applyBlockToCache cache net block height = do
         return (Right ())
       else do
         -- Regular transaction: spend inputs, create outputs
+        -- Collect TxInUndo for each input
+        inputUndosRef <- newTVarIO []
+
         inputResults <- forM (txInputs tx) $ \inp -> do
           let op = txInPrevOutput inp
           mEntry <- lookupUTXO cache op
@@ -402,14 +471,25 @@ applyBlockToCache cache net block height = do
               if ueCoinbase entry && height - ueHeight entry < fromIntegral (netCoinbaseMaturity net)
                 then return $ Left "Coinbase not yet mature"
                 else do
+                  -- Build TxInUndo from the spent UTXO
+                  let txInUndo = TxInUndo
+                        { tuOutput   = ueOutput entry
+                        , tuHeight   = ueHeight entry
+                        , tuCoinbase = ueCoinbase entry
+                        }
                   atomically $ do
                     void $ spendUTXO cache op
-                    modifyTVar' spentOutputsRef ((op, entry) :)
+                    modifyTVar' inputUndosRef (txInUndo :)
                   return (Right ())
 
         case sequence inputResults of
           Left err -> return (Left err)
           Right _ -> do
+            -- Collect the TxUndo for this transaction
+            inputUndos <- readTVarIO inputUndosRef
+            let txUndo = TxUndo { tuPrevOutputs = reverse inputUndos }
+            atomically $ modifyTVar' txUndosRef (txUndo :)
+
             -- Create outputs
             atomically $ forM_ (zip [(0::Word32)..] (txOutputs tx)) $ \(outIdx, txout) -> do
               let op = OutPoint (computeTxId tx) outIdx
@@ -420,9 +500,29 @@ applyBlockToCache cache net block height = do
   case sequence results of
     Left err -> return (Left err)
     Right _ -> do
-      spent <- readTVarIO spentOutputsRef
-      return $ Right UndoData
-        { udBlockHash = bh
-        , udHeight = height
-        , udSpentOutputs = spent
-        }
+      txUndos <- readTVarIO txUndosRef
+      let blockUndo = BlockUndo { buTxUndo = reverse txUndos }
+      return $ Right $ mkUndoData bh height prevHash blockUndo
+
+--------------------------------------------------------------------------------
+-- Anti-Fee-Sniping
+--------------------------------------------------------------------------------
+
+-- | Set anti-fee-sniping parameters on a transaction for wallet use.
+-- This sets nLockTime to the current block height, which prevents
+-- the transaction from being mined in any block before this height.
+--
+-- Anti-fee-sniping discourages miners from reorging the chain to
+-- steal fees from transactions in recent blocks, since those
+-- transactions would not be valid in the reorged chain.
+--
+-- The transaction's inputs should NOT have nSequence == 0xFFFFFFFF
+-- (SEQUENCE_FINAL) to ensure the locktime is enforced.
+--
+-- Arguments:
+--   - currentHeight: The current chain tip height
+--   - tx: The transaction to modify
+--
+-- Returns the transaction with nLockTime set to currentHeight.
+setAntiFeeSniping :: Word32 -> Tx -> Tx
+setAntiFeeSniping currentHeight tx = tx { txLockTime = currentHeight }

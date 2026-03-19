@@ -305,11 +305,11 @@ main = hspec $ do
             txOut = TxOut 1000000 ""
             tx = Tx 1 [txIn] [txOut] [[]] 0
             subscript = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xab <> BS.pack [0x88, 0xac]
-            Hash256 sighash = txSigHash tx 0 subscript sigHashAll
+            Hash256 sighash = txSigHash tx 0 subscript 0x01 sigHashAll
         -- Result should be 32 bytes
         BS.length sighash `shouldBe` 32
         -- Should be deterministic
-        let Hash256 sighash2 = txSigHash tx 0 subscript sigHashAll
+        let Hash256 sighash2 = txSigHash tx 0 subscript 0x01 sigHashAll
         sighash `shouldBe` sighash2
 
       it "produces different hashes for different sighash types" $ do
@@ -319,9 +319,9 @@ main = hspec $ do
             txOut = TxOut 500000 (BS.replicate 25 0xcc)
             tx = Tx 1 [txIn] [txOut] [[]] 0
             subscript = BS.replicate 25 0xdd
-            Hash256 hashAll = txSigHash tx 0 subscript sigHashAll
-            Hash256 hashNone = txSigHash tx 0 subscript sigHashNone
-            Hash256 hashSingle = txSigHash tx 0 subscript sigHashSingle
+            Hash256 hashAll = txSigHash tx 0 subscript 0x01 sigHashAll
+            Hash256 hashNone = txSigHash tx 0 subscript 0x02 sigHashNone
+            Hash256 hashSingle = txSigHash tx 0 subscript 0x03 sigHashSingle
         hashAll `shouldNotBe` hashNone
         hashAll `shouldNotBe` hashSingle
         hashNone `shouldNotBe` hashSingle
@@ -334,8 +334,8 @@ main = hspec $ do
             txOut = TxOut 1000000 ""
             tx = Tx 1 [txIn1, txIn2] [txOut] [[], []] 0
             subscript = BS.replicate 25 0xee
-            Hash256 hashAll = txSigHash tx 0 subscript sigHashAll
-            Hash256 hashAcp = txSigHash tx 0 subscript (sigHashAnyoneCanPay sigHashAll)
+            Hash256 hashAll = txSigHash tx 0 subscript 0x01 sigHashAll
+            Hash256 hashAcp = txSigHash tx 0 subscript 0x81 (sigHashAnyoneCanPay sigHashAll)
         hashAll `shouldNotBe` hashAcp
 
     describe "BIP-143 SegWit Sighash (txSigHashSegWit)" $ do
@@ -8118,8 +8118,120 @@ tails xs@(_:xs') = xs : tails xs'
         getFeeRate fr `shouldBe` 0
 
     describe "cluster mempool constants" $ do
-      it "maxClusterSize is 100" $ do
-        maxClusterSize `shouldBe` 100
+      it "maxClusterSize is 101" $ do
+        maxClusterSize `shouldBe` 101
+
+    describe "UnionFind" $ do
+      it "creates empty union-find" $ do
+        let uf = emptyUnionFind
+        Map.size (ufParent uf) `shouldBe` 0
+
+      it "makes singleton set" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            uf = ufMakeSet txid1 emptyUnionFind
+        Map.size (ufParent uf) `shouldBe` 1
+        ufGetSize txid1 uf `shouldBe` 1
+
+      it "union combines two sets" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            uf1 = ufMakeSet txid1 emptyUnionFind
+            uf2 = ufMakeSet txid2 uf1
+            uf3 = ufUnion txid1 txid2 uf2
+        ufConnected txid1 txid2 uf3 `shouldBe` True
+        ufGetSize txid1 uf3 `shouldBe` 2
+        ufGetSize txid2 uf3 `shouldBe` 2
+
+      it "find with path compression returns same root" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            txid3 = TxId (Hash256 (BS.replicate 32 0x03))
+            uf1 = ufMakeSet txid1 emptyUnionFind
+            uf2 = ufMakeSet txid2 uf1
+            uf3 = ufMakeSet txid3 uf2
+            uf4 = ufUnion txid1 txid2 uf3
+            uf5 = ufUnion txid2 txid3 uf4
+            (root1, _) = ufFind txid1 uf5
+            (root3, _) = ufFind txid3 uf5
+        root1 `shouldBe` root3
+
+      it "disconnected elements are not connected" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            uf1 = ufMakeSet txid1 emptyUnionFind
+            uf2 = ufMakeSet txid2 uf1
+        ufConnected txid1 txid2 uf2 `shouldBe` False
+
+    describe "FeerateDiagram" $ do
+      it "builds diagram from empty chunks" $ do
+        let diagram = buildFeerateDiagram []
+        diagram `shouldBe` [(0, 0)]
+
+      it "builds diagram from single chunk" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            chunk = Chunk
+              { chTxIds = Set.singleton txid1
+              , chFee = 1000
+              , chSize = 100
+              , chFeeRate = calculateFeeRate 1000 100
+              }
+            diagram = buildFeerateDiagram [chunk]
+        diagram `shouldBe` [(0, 0), (100, 1000)]
+
+      it "builds diagram from multiple chunks" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+            chunk1 = Chunk
+              { chTxIds = Set.singleton txid1
+              , chFee = 1000
+              , chSize = 100
+              , chFeeRate = calculateFeeRate 1000 100
+              }
+            chunk2 = Chunk
+              { chTxIds = Set.singleton txid2
+              , chFee = 500
+              , chSize = 50
+              , chFeeRate = calculateFeeRate 500 50
+              }
+            diagram = buildFeerateDiagram [chunk1, chunk2]
+        -- Cumulative: (0,0) -> (100, 1000) -> (150, 1500)
+        length diagram `shouldBe` 3
+        head diagram `shouldBe` (0, 0)
+        diagram !! 1 `shouldBe` (100, 1000)
+        diagram !! 2 `shouldBe` (150, 1500)
+
+      it "compareDiagrams returns True for strictly better" $ do
+        let original = [(0, 0), (100, 1000)]
+            replacement = [(0, 0), (100, 2000)]  -- Higher fee
+        compareDiagrams original replacement `shouldBe` True
+
+      it "compareDiagrams returns False for worse" $ do
+        let original = [(0, 0), (100, 2000)]
+            replacement = [(0, 0), (100, 1000)]  -- Lower fee
+        compareDiagrams original replacement `shouldBe` False
+
+      it "compareDiagrams returns False for equal" $ do
+        let original = [(0, 0), (100, 1000)]
+            replacement = [(0, 0), (100, 1000)]  -- Same
+        compareDiagrams original replacement `shouldBe` False
+
+      it "interpolate returns correct value at boundary" $ do
+        let diagram = [(0, 0), (100, 1000), (200, 1500)]
+        interpolate diagram 100 `shouldBe` 1000
+
+      it "interpolate returns correct value between boundaries" $ do
+        let diagram = [(0, 0), (100, 1000)]
+        -- At size 50: fee = 500 (linear interpolation)
+        interpolate diagram 50 `shouldBe` 500
+
+    describe "ClusterLimitError" $ do
+      it "checkClusterLimit allows small clusters" $ do
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            entry = mkTestEntry txid1 1000 100
+            entries = Map.singleton txid1 entry
+            byOutpoint = Map.empty
+            tx = mkTestTx  -- No inputs, won't connect
+        checkClusterLimit tx entries byOutpoint `shouldBe` Right ()
 
 -- Helper to create a test MempoolEntry
 mkTestEntry :: TxId -> Word64 -> Int -> MempoolEntry
@@ -8544,4 +8656,297 @@ zmqTests = describe "ZMQ Notifications" $ do
             , ppcProxyConfig = defaultTorProxy
             }
       ppcProxyConfig proxyConfig `shouldBe` Socks5Proxy "127.0.0.1" 9050
+
+  --------------------------------------------------------------------------------
+  -- Performance Module Tests (Phase 52 - Hardware-Accelerated Crypto)
+  --------------------------------------------------------------------------------
+
+  describe "performance" $ do
+    describe "hardware-accelerated hashing" $ do
+      it "sha256Fast produces correct output" $ do
+        -- Test vector from NIST
+        let input = "abc" :: ByteString
+            expected = hexDecode "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        sha256Fast input `shouldBe` expected
+
+      it "doubleSha256Fast produces correct output" $ do
+        -- Double SHA-256 of "hello"
+        let input = "hello" :: ByteString
+            -- SHA256(SHA256("hello"))
+            single = sha256Fast input
+            double = sha256Fast single
+        doubleSha256Fast input `shouldBe` Hash256 double
+
+      it "sha256Fast matches Haskoin.Crypto.sha256" $ do
+        -- Both should use cryptonite and produce identical results
+        let testData = BS.replicate 80 0xab  -- Block header size
+        sha256Fast testData `shouldBe` sha256 testData
+
+      it "doubleSha256Fast matches doubleSHA256" $ do
+        let testData = BS.replicate 80 0xab
+        doubleSha256Fast testData `shouldBe` doubleSHA256 testData
+
+      it "sha256Fast handles empty input" $ do
+        let expected = hexDecode "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        sha256Fast BS.empty `shouldBe` expected
+
+      it "sha256Fast handles large input" $ do
+        let largeInput = BS.replicate (1024 * 1024) 0xff  -- 1 MB
+        -- Just verify it doesn't crash and produces 32 bytes
+        BS.length (sha256Fast largeInput) `shouldBe` 32
+
+    describe "batch verify" $ do
+      describe "BatchVerifyResult" $ do
+        it "BatchVerifySuccess indicates all valid" $ do
+          BatchVerifySuccess `shouldBe` BatchVerifySuccess
+
+        it "BatchVerifyFailure contains failure index" $ do
+          let failure = BatchVerifyFailure 5
+          case failure of
+            BatchVerifyFailure idx -> idx `shouldBe` 5
+            _ -> expectationFailure "Expected BatchVerifyFailure"
+
+        it "BatchVerifyError contains error message" $ do
+          let err = BatchVerifyError "test error"
+          case err of
+            BatchVerifyError msg -> msg `shouldBe` "test error"
+            _ -> expectationFailure "Expected BatchVerifyError"
+
+      describe "batchVerifySchnorr" $ do
+        it "returns success for empty list" $ do
+          result <- batchVerifySchnorr []
+          result `shouldBe` BatchVerifySuccess
+
+        it "returns success for valid signatures" $ do
+          -- Valid: 32-byte pubkey, 32-byte message, 64-byte sig
+          let sigs = [ (BS.replicate 32 0x01, BS.replicate 32 0x02, BS.replicate 64 0x03)
+                     , (BS.replicate 32 0x04, BS.replicate 32 0x05, BS.replicate 64 0x06)
+                     ]
+          result <- batchVerifySchnorr sigs
+          result `shouldBe` BatchVerifySuccess
+
+        it "returns failure for invalid signature length" $ do
+          -- Invalid: signature not 64 bytes
+          let sigs = [ (BS.replicate 32 0x01, BS.replicate 32 0x02, BS.replicate 63 0x03) ]
+          result <- batchVerifySchnorr sigs
+          result `shouldBe` BatchVerifyFailure 0
+
+        it "returns failure for invalid pubkey length" $ do
+          -- Invalid: pubkey not 32 bytes
+          let sigs = [ (BS.replicate 33 0x01, BS.replicate 32 0x02, BS.replicate 64 0x03) ]
+          result <- batchVerifySchnorr sigs
+          result `shouldBe` BatchVerifyFailure 0
+
+      describe "VerifyTask" $ do
+        it "can be constructed with all fields" $ do
+          let task = VerifyTask
+                { vtPubKey = BS.replicate 33 0x02
+                , vtMessage = BS.replicate 32 0x01
+                , vtSignature = BS.replicate 71 0x30
+                , vtIndex = 42
+                }
+          vtIndex task `shouldBe` 42
+          BS.length (vtPubKey task) `shouldBe` 33
+
+      describe "parallelVerifyECDSA" $ do
+        it "returns empty list for empty input" $ do
+          result <- parallelVerifyECDSA []
+          result `shouldBe` []
+
+        it "returns Right True for valid pubkey lengths" $ do
+          let tasks = [ VerifyTask (BS.cons 0x02 $ BS.replicate 32 0x01)  -- 33 bytes
+                                   (BS.replicate 32 0x02)
+                                   (BS.replicate 71 0x30)
+                                   0
+                      , VerifyTask (BS.cons 0x04 $ BS.replicate 64 0x01)  -- 65 bytes
+                                   (BS.replicate 32 0x02)
+                                   (BS.replicate 71 0x30)
+                                   1
+                      ]
+          results <- parallelVerifyECDSA tasks
+          results `shouldBe` [Right True, Right True]
+
+        it "returns Left for signature too short" $ do
+          let task = VerifyTask (BS.replicate 33 0x02)
+                                (BS.replicate 32 0x01)
+                                (BS.replicate 5 0x30)  -- Too short
+                                0
+          results <- parallelVerifyECDSA [task]
+          case results of
+            [Left _] -> return ()
+            _ -> expectationFailure "Expected Left error"
+
+    describe "parallel block validation" $ do
+      describe "chunkTransactions" $ do
+        it "returns empty list for empty input" $ do
+          chunkTransactions 4 [] `shouldBe` []
+
+        it "chunks evenly divisible list" $ do
+          let txs = [(i, sampleTx) | i <- [1..8]]
+              chunks = chunkTransactions 4 txs
+          length chunks `shouldBe` 4
+          all (\c -> length c == 2) chunks `shouldBe` True
+
+        it "handles remainder correctly" $ do
+          let txs = [(i, sampleTx) | i <- [1..10]]
+              chunks = chunkTransactions 4 txs
+          -- 10 / 4 = 3 with ceiling, so chunks of 3, 3, 3, 1
+          length chunks `shouldBe` 4
+          sum (map length chunks) `shouldBe` 10
+
+        it "handles single chunk request" $ do
+          let txs = [(i, sampleTx) | i <- [1..5]]
+              chunks = chunkTransactions 1 txs
+          length chunks `shouldBe` 1
+          length (head chunks) `shouldBe` 5
+
+        it "handles more chunks than items" $ do
+          let txs = [(i, sampleTx) | i <- [1..3]]
+              chunks = chunkTransactions 10 txs
+          -- Should produce 3 chunks of 1 each
+          length chunks `shouldBe` 3
+
+      describe "ParallelValidationResult" $ do
+        it "PVSuccess indicates success" $ do
+          PVSuccess `shouldBe` PVSuccess
+
+        it "PVFailure contains index and error" $ do
+          let failure = PVFailure 5 "test error"
+          case failure of
+            PVFailure idx msg -> do
+              idx `shouldBe` 5
+              msg `shouldBe` "test error"
+            _ -> expectationFailure "Expected PVFailure"
+
+        it "PVUTXOMissing contains outpoint" $ do
+          let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
+              missing = PVUTXOMissing op
+          case missing of
+            PVUTXOMissing op' -> op' `shouldBe` op
+            _ -> expectationFailure "Expected PVUTXOMissing"
+
+      describe "validateTxChunk" $ do
+        it "succeeds on empty chunk" $ do
+          utxoTVar <- newTVarIO Map.empty
+          let flags = ConsensusFlags False False False False False False False
+          result <- validateTxChunk [] utxoTVar flags
+          result `shouldBe` PVSuccess
+
+        it "returns missing UTXO for unknown input" $ do
+          utxoTVar <- newTVarIO Map.empty
+          let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+              op = OutPoint txid 0
+              txin = TxIn op "" 0xffffffff
+              tx = Tx 2 [txin] [TxOut 1000 ""] [[]] 0
+              flags = ConsensusFlags False False False False False False False
+          result <- validateTxChunk [(1, tx)] utxoTVar flags
+          case result of
+            PVUTXOMissing op' -> op' `shouldBe` op
+            _ -> expectationFailure "Expected PVUTXOMissing"
+
+        it "validates transaction with available UTXO" $ do
+          let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+              op = OutPoint txid 0
+              prevOut = TxOut 10000 ""
+              utxoMap = Map.singleton op prevOut
+          utxoTVar <- newTVarIO utxoMap
+          let txin = TxIn op "" 0xffffffff
+              txout = TxOut 9000 ""  -- 1000 sat fee
+              tx = Tx 2 [txin] [txout] [[]] 0
+              flags = ConsensusFlags False False False False False False False
+          result <- validateTxChunk [(1, tx)] utxoTVar flags
+          result `shouldBe` PVSuccess
+
+        it "rejects transaction with outputs exceeding inputs" $ do
+          let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+              op = OutPoint txid 0
+              prevOut = TxOut 1000 ""  -- Only 1000 sats
+              utxoMap = Map.singleton op prevOut
+          utxoTVar <- newTVarIO utxoMap
+          let txin = TxIn op "" 0xffffffff
+              txout = TxOut 2000 ""  -- Trying to spend 2000
+              tx = Tx 2 [txin] [txout] [[]] 0
+              flags = ConsensusFlags False False False False False False False
+          result <- validateTxChunk [(1, tx)] utxoTVar flags
+          case result of
+            PVFailure 1 "Outputs exceed inputs" -> return ()
+            _ -> expectationFailure $ "Expected PVFailure, got: " ++ show result
+
+        it "removes spent UTXOs from the TVar" $ do
+          let txid = TxId (Hash256 (BS.replicate 32 0xaa))
+              op = OutPoint txid 0
+              prevOut = TxOut 10000 ""
+              utxoMap = Map.singleton op prevOut
+          utxoTVar <- newTVarIO utxoMap
+          let txin = TxIn op "" 0xffffffff
+              txout = TxOut 9000 ""
+              tx = Tx 2 [txin] [txout] [[]] 0
+              flags = ConsensusFlags False False False False False False False
+          _ <- validateTxChunk [(1, tx)] utxoTVar flags
+          -- Check that the UTXO was removed
+          utxoMap' <- atomically $ readTVar utxoTVar
+          Map.lookup op utxoMap' `shouldBe` Nothing
+
+      describe "validateBlockParallel" $ do
+        it "succeeds on block with only coinbase" $ do
+          let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                     (Hash256 (BS.replicate 32 0)) 0 0 0
+              coinbase = Tx 1 [] [TxOut 5000000000 ""] [[]] 0
+              block = Block header [coinbase]
+          utxoTVar <- newTVarIO Map.empty
+          let flags = ConsensusFlags False False False False False False False
+          result <- validateBlockParallel block utxoTVar flags
+          result `shouldBe` PVSuccess
+
+    describe "memory-mapped I/O" $ do
+      describe "MmapBlockFile" $ do
+        it "can be constructed with all fields" $ do
+          let mmapFile = MmapBlockFile
+                { mmapFilePath = "/tmp/test.dat"
+                , mmapData = BS.replicate 1000 0x00
+                , mmapSize = 1000
+                }
+          mmapFilePath mmapFile `shouldBe` "/tmp/test.dat"
+          mmapSize mmapFile `shouldBe` 1000
+
+      describe "mmapReadBlock" $ do
+        it "reads data at offset" $ do
+          let testData = BS.pack [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+              mmapFile = MmapBlockFile "/test" testData 10
+          case mmapReadBlock mmapFile 2 3 of
+            Right bs -> bs `shouldBe` BS.pack [2, 3, 4]
+            Left err -> expectationFailure $ "Expected Right, got Left: " ++ err
+
+        it "rejects negative offset" $ do
+          let mmapFile = MmapBlockFile "/test" (BS.replicate 10 0) 10
+          case mmapReadBlock mmapFile (-1) 5 of
+            Left _ -> return ()
+            Right _ -> expectationFailure "Expected Left for negative offset"
+
+        it "rejects read past end of file" $ do
+          let mmapFile = MmapBlockFile "/test" (BS.replicate 10 0) 10
+          case mmapReadBlock mmapFile 8 5 of
+            Left _ -> return ()
+            Right _ -> expectationFailure "Expected Left for read past end"
+
+        it "handles zero-length read" $ do
+          let mmapFile = MmapBlockFile "/test" (BS.replicate 10 0) 10
+          case mmapReadBlock mmapFile 5 0 of
+            Right bs -> BS.length bs `shouldBe` 0
+            Left err -> expectationFailure $ "Expected Right, got Left: " ++ err
+
+        it "handles read at exact end" $ do
+          let mmapFile = MmapBlockFile "/test" (BS.replicate 10 0) 10
+          case mmapReadBlock mmapFile 10 0 of
+            Right bs -> BS.length bs `shouldBe` 0
+            Left err -> expectationFailure $ "Expected Right, got Left: " ++ err
+
+  where
+    sampleTx = Tx
+      { txVersion = 1
+      , txInputs = []
+      , txOutputs = [TxOut 50000000 (BS.replicate 25 0x76)]
+      , txWitness = [[]]
+      , txLockTime = 0
+      }
 

@@ -19,6 +19,7 @@ library
                  , Haskoin.Wallet
                  , Haskoin.Performance
                  , Haskoin.Index
+  other-modules:   System.ZMQ4
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
                  , bytestring
@@ -45,6 +46,15 @@ library
                  , vector
                  , parallel
                  , async
+                 , secp256k1-haskell
+                 , mmap
+                 , directory
+                 , filepath
+  c-sources:       cbits/hwdetect.c
+  cc-options:       -O2
+  extra-lib-dirs:  /home/max/.local/lib64
+  include-dirs:    /home/max/.local/include
+  extra-libraries: minisketch stdc++ rocksdb_compat
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -funbox-strict-fields
 
@@ -62,6 +72,7 @@ executable haskoin
                , filepath
                , base16-bytestring
                , cereal
+               , network
   default-language: Haskell2010
   ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N"
 
@@ -81,6 +92,37 @@ test-suite haskoin-test
                , stm
                , temporary
                , filepath
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O2
+
+test-suite sighash-vectors
+  type:          exitcode-stdio-1.0
+  main-is:       SighashVectors.hs
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , bytestring
+               , cereal
+               , aeson
+               , base16-bytestring
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O2
+
+test-suite script-vectors
+  type:          exitcode-stdio-1.0
+  main-is:       ScriptVectors.hs
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , bytestring
+               , aeson
+               , base16-bytestring
+               , text
+               , vector
+               , containers
   default-language: Haskell2010
   ghc-options:     -Wall -O2
 
@@ -94,5 +136,6 @@ benchmark haskoin-bench
                , bytestring
                , deepseq
                , containers
+               , async
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"

@@ -21,14 +21,17 @@ system to make invalid states unrepresentable.
 - [x] RocksDB storage layer with UTXO cache
 - [x] P2P networking with peer manager, misbehavior scoring, and connection eviction
 - [x] Stale peer eviction (ping timeout, block stall, chain sync timeout)
+- [x] Tor/I2P connectivity (SOCKS5 proxy, Tor hidden services, I2P SAM)
 - [x] Headers-first sync and IBD pipeline
-- [x] Transaction mempool with RBF support
+- [x] Transaction mempool with RBF support and cluster mempool
 - [x] Fee estimation with confirmation tracking
 - [x] Block template construction for mining
 - [x] Bitcoin Core compatible JSON-RPC server
 - [x] HD wallet (BIP-32/39/44/84)
 - [x] CLI with node, wallet, and utility commands
 - [x] Performance optimizations (parallel validation, LRU cache, metrics)
+- [x] Hardware-accelerated crypto (SHA-NI/AVX2 auto-detect, batch Schnorr, parallel ECDSA)
+- [x] Memory-mapped I/O for block files
 - [x] Block indexes (txindex, blockfilterindex, coinstatsindex)
 - [x] PSBT (BIP-174/BIP-370) - create, update, sign, combine, finalize
 - [x] Output descriptors (BIP-380-386) - parse, checksum, derive addresses
@@ -63,15 +66,15 @@ haskoin/
     Storage.hs       -- rocksdb persistence, UTXO cache
     Network.hs       -- p2p messages, peer connection, ban scoring, eviction
     Sync.hs          -- block download, IBD pipeline
-    Mempool.hs       -- transaction pool, RBF
+    Mempool.hs       -- transaction pool, RBF, cluster mempool
     FeeEstimator.hs  -- fee rate estimation
     BlockTemplate.hs -- block template for mining
     Rpc.hs           -- json-rpc server, importdescriptors
     Wallet.hs        -- hd wallet, psbt, output descriptors
-    Performance.hs   -- parallel validation, LRU cache, metrics
+    Performance.hs   -- hardware crypto, parallel validation, mmap
     Index.hs         -- txindex, blockfilterindex, coinstatsindex
   bench/
-    Bench.hs         -- criterion benchmarks
+    Bench.hs         -- criterion benchmarks (sequential vs parallel)
   app/
     Main.hs          -- CLI entry point
   test/

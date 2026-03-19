@@ -27,33 +27,48 @@ module Haskoin.Sync
   , getIBDState
     -- * Block Handling
   , handleBlockMessage
+    -- * Header Sync Anti-DoS (PRESYNC/REDOWNLOAD)
+  , HeaderSyncState(..)
+  , PresyncData(..)
+  , HeaderSyncParams(..)
+  , HeaderSyncPeer(..)
+  , initHeaderSyncPeer
+  , processPresyncHeaders
+  , processRedownloadHeaders
+  , getHeaderSyncState
+  , shouldStartPresync
+  , maxHeadersPerMessage
     -- * Internal (exposed for testing)
   , downloadScheduler
   , downloadWorker
   , blockProcessor
   , buildUTXOMap
   , flushTBQueueN
+  , commitmentHash
   ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 import Data.Int (Int64)
-import Control.Monad (when, unless, forever, forM, forM_, void)
+import Data.Bits (xor, (.&.))
+import Control.Monad (when, unless, forever, forM, forM_)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
-import qualified Data.Set as Set
+import qualified Data.Sequence as Seq
+import Data.Sequence (Seq, (|>))
 import Control.Concurrent.STM
 import Control.Concurrent (forkIO, threadDelay, ThreadId, killThread)
-import Control.Exception (try, SomeException, catch)
+import Control.Exception (SomeException, catch)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Data.Maybe (mapMaybe, catMaybes)
+import Data.Maybe (mapMaybe)
 import Data.Serialize (encode)
 import GHC.Generics (Generic)
 import Network.Socket (SockAddr)
+import System.Random (randomRIO)
 
 import Haskoin.Types
-import Haskoin.Crypto (computeBlockHash)
+import Haskoin.Crypto (computeBlockHash, sha256)
 import Haskoin.Consensus
 import Haskoin.Storage
 import Haskoin.Network
@@ -418,3 +433,290 @@ handleBlockMessage bd _addr block = do
   -- Mark as received
   atomically $ modifyTVar' (bdPendingBlocks bd) $
     Map.adjust (\r -> r { brReceived = True }) bh
+
+--------------------------------------------------------------------------------
+-- Header Sync Anti-DoS (PRESYNC/REDOWNLOAD)
+--------------------------------------------------------------------------------
+
+-- | Maximum headers per message (Bitcoin protocol limit)
+maxHeadersPerMessage :: Int
+maxHeadersPerMessage = 2000
+
+-- | Parameters for header sync anti-DoS protection
+data HeaderSyncParams = HeaderSyncParams
+  { hspCommitmentPeriod    :: !Int     -- ^ Distance in blocks between commitments
+  , hspRedownloadBufferSize :: !Int    -- ^ Min validated headers before accepting to chain
+  } deriving (Show, Eq, Generic)
+
+-- | Default header sync parameters (mainnet values)
+defaultHeaderSyncParams :: HeaderSyncParams
+defaultHeaderSyncParams = HeaderSyncParams
+  { hspCommitmentPeriod    = 641   -- Store 1-bit commitment every 641 headers
+  , hspRedownloadBufferSize = 15218  -- ~23.7 commitments of validation buffer
+  }
+
+-- | Header sync state machine
+--
+-- Based on Bitcoin Core's HeadersSyncState. During initial sync:
+--   1. PRESYNC: Accept headers without storing them permanently.
+--      Track only cumulative work, last hash, and count. Store 1-bit
+--      commitments every N blocks for later verification.
+--   2. REDOWNLOAD: Once sufficient work is demonstrated, re-request
+--      all headers and verify they match the commitments.
+--   3. SYNCED: Headers accepted, can proceed to block download.
+data HeaderSyncState
+  = Presync !PresyncData
+  | Redownload !RedownloadData
+  | Synced
+  deriving (Show, Eq, Generic)
+
+-- | Data tracked during PRESYNC phase
+--
+-- Memory-efficient: stores only summary info, not actual headers.
+-- 1-bit commitments (LSB of hash) every commitment_period blocks.
+data PresyncData = PresyncData
+  { pdCumulativeWork   :: !Integer       -- ^ Total PoW accumulated
+  , pdLastHeaderHash   :: !BlockHash     -- ^ Hash of most recent header
+  , pdLastHeaderBits   :: !Word32        -- ^ Bits (difficulty) of last header
+  , pdCount            :: !Int           -- ^ Number of headers processed
+  , pdCommitments      :: !(Seq Bool)    -- ^ 1-bit commitments (LSB of hash)
+  , pdCommitOffset     :: !Int           -- ^ Random offset for commitment period
+  , pdStartHash        :: !BlockHash     -- ^ Hash of chain start (genesis/fork point)
+  , pdMinimumWork      :: !Integer       -- ^ Target work threshold to proceed
+  , pdParams           :: !HeaderSyncParams
+  } deriving (Show, Eq, Generic)
+
+-- | Data tracked during REDOWNLOAD phase
+data RedownloadData = RedownloadData
+  { rdLastHeaderHash   :: !BlockHash     -- ^ Hash of most recent redownloaded header
+  , rdLastHeaderBits   :: !Word32        -- ^ Bits (difficulty) of last header
+  , rdCumulativeWork   :: !Integer       -- ^ Cumulative work in redownload
+  , rdCount            :: !Int           -- ^ Number of headers redownloaded
+  , rdCommitments      :: !(Seq Bool)    -- ^ Remaining commitments to verify
+  , rdCommitOffset     :: !Int           -- ^ Same offset used in PRESYNC
+  , rdBuffer           :: !(Seq BlockHeader)  -- ^ Buffered headers for acceptance
+  , rdMinimumWork      :: !Integer       -- ^ Work threshold from PRESYNC
+  , rdWorkReached      :: !Bool          -- ^ True once cumulative work >= minimum
+  , rdParams           :: !HeaderSyncParams
+  } deriving (Show, Eq, Generic)
+
+-- | Per-peer header sync state
+data HeaderSyncPeer = HeaderSyncPeer
+  { hspState      :: !(TVar HeaderSyncState)
+  , hspNetwork    :: !Network
+  , hspSalt       :: !Word64            -- ^ Random salt for commitment hashing
+  } deriving (Generic)
+
+-- | Compute a salted commitment hash (SipHash-like) for anti-DoS
+--
+-- Returns the LSB of the hash as the 1-bit commitment.
+commitmentHash :: Word64 -> BlockHash -> Bool
+commitmentHash salt (BlockHash (Hash256 bs)) =
+  let -- Simple salted hash: combine salt with block hash bytes
+      saltBytes = BS.pack [ fromIntegral (salt `xor` (fromIntegral (BS.index bs i) :: Word64))
+                          | i <- [0..min 7 (BS.length bs - 1)] ]
+      combined = sha256 (BS.append saltBytes bs)
+  in case BS.uncons combined of
+       Just (b, _) -> (b .&. 1) == 1
+       Nothing     -> False
+
+-- | Initialize a header sync peer for PRESYNC
+initHeaderSyncPeer :: Network -> BlockHash -> Integer -> IO HeaderSyncPeer
+initHeaderSyncPeer net startHash currentWork = do
+  salt <- randomRIO (0, maxBound :: Word64)
+  commitOffset <- randomRIO (0, hspCommitmentPeriod defaultHeaderSyncParams - 1)
+
+  let threshold = max (netMinimumChainWork net) currentWork
+      presyncData = PresyncData
+        { pdCumulativeWork = 0
+        , pdLastHeaderHash = startHash
+        , pdLastHeaderBits = 0x1d00ffff  -- Default difficulty
+        , pdCount = 0
+        , pdCommitments = Seq.empty
+        , pdCommitOffset = commitOffset
+        , pdStartHash = startHash
+        , pdMinimumWork = threshold
+        , pdParams = defaultHeaderSyncParams
+        }
+
+  stateVar <- newTVarIO (Presync presyncData)
+  return HeaderSyncPeer
+    { hspState = stateVar
+    , hspNetwork = net
+    , hspSalt = salt
+    }
+
+-- | Get the current header sync state
+getHeaderSyncState :: HeaderSyncPeer -> STM HeaderSyncState
+getHeaderSyncState = readTVar . hspState
+
+-- | Check if we should start PRESYNC for a peer's headers
+--
+-- Returns True if the claimed work is below the minimum threshold.
+shouldStartPresync :: Network -> Integer -> Integer -> Bool
+shouldStartPresync net claimedWork currentWork =
+  let threshold = max (netMinimumChainWork net) currentWork
+  in claimedWork < threshold
+
+-- | Process headers during PRESYNC phase
+--
+-- Validates PoW, accumulates work, stores commitments.
+-- Returns:
+--   Left error: validation failed, disconnect peer
+--   Right (state, readyHeaders): updated state, headers ready for chain (empty in PRESYNC)
+processPresyncHeaders :: HeaderSyncPeer -> [BlockHeader] -> STM (Either String (HeaderSyncState, [BlockHeader]))
+processPresyncHeaders peer headers = do
+  state <- readTVar (hspState peer)
+  case state of
+    Presync pd -> do
+      let result = runPresync (hspSalt peer) (hspNetwork peer) pd headers
+      case result of
+        Left err -> return $ Left err
+        Right (newState, ready) -> do
+          writeTVar (hspState peer) newState
+          return $ Right (newState, ready)
+    _ -> return $ Left "not in presync state"
+
+-- | Pure PRESYNC processing logic
+runPresync :: Word64 -> Network -> PresyncData -> [BlockHeader]
+           -> Either String (HeaderSyncState, [BlockHeader])
+runPresync _ _ pd [] = Right (Presync pd, [])
+runPresync salt net pd (h:hs) = do
+  -- Check connectivity: header must chain to last
+  let headerHash = computeBlockHash h
+      prevHash = bhPrevBlock h
+
+  if pdCount pd > 0 && prevHash /= pdLastHeaderHash pd
+    then Left "presync: header does not connect to chain"
+    else do
+      -- Validate difficulty transition (simplified: just check bits are reasonable)
+      let bits = bhBits h
+      if bits == 0 || bits > 0x207fffff  -- Max regtest difficulty
+        then Left "presync: invalid difficulty bits"
+        else do
+          -- Calculate work for this header
+          let work = headerWork h
+              newWork = pdCumulativeWork pd + work
+              newCount = pdCount pd + 1
+
+          -- Store commitment at each commitment period
+          let commitPeriod = hspCommitmentPeriod (pdParams pd)
+              shouldCommit = newCount `mod` commitPeriod == pdCommitOffset pd
+              newCommitments = if shouldCommit
+                then pdCommitments pd |> commitmentHash salt headerHash
+                else pdCommitments pd
+
+          let newPd = pd
+                { pdCumulativeWork = newWork
+                , pdLastHeaderHash = headerHash
+                , pdLastHeaderBits = bits
+                , pdCount = newCount
+                , pdCommitments = newCommitments
+                }
+
+          -- Check if we've reached sufficient work
+          if newWork >= pdMinimumWork pd
+            then
+              -- Transition to REDOWNLOAD
+              let rd = RedownloadData
+                    { rdLastHeaderHash = pdStartHash newPd
+                    , rdLastHeaderBits = 0x1d00ffff
+                    , rdCumulativeWork = 0
+                    , rdCount = 0
+                    , rdCommitments = pdCommitments newPd
+                    , rdCommitOffset = pdCommitOffset newPd
+                    , rdBuffer = Seq.empty
+                    , rdMinimumWork = pdMinimumWork newPd
+                    , rdWorkReached = False
+                    , rdParams = pdParams newPd
+                    }
+              in Right (Redownload rd, [])
+            else
+              -- Continue PRESYNC with remaining headers
+              runPresync salt net newPd hs
+
+-- | Process headers during REDOWNLOAD phase
+--
+-- Validates headers match commitments from PRESYNC.
+-- Returns headers ready for chain acceptance when buffer fills.
+processRedownloadHeaders :: HeaderSyncPeer -> [BlockHeader] -> STM (Either String (HeaderSyncState, [BlockHeader]))
+processRedownloadHeaders peer headers = do
+  state <- readTVar (hspState peer)
+  case state of
+    Redownload rd -> do
+      let result = runRedownload (hspSalt peer) rd headers
+      case result of
+        Left err -> return $ Left err
+        Right (newState, ready) -> do
+          writeTVar (hspState peer) newState
+          return $ Right (newState, ready)
+    _ -> return $ Left "not in redownload state"
+
+-- | Pure REDOWNLOAD processing logic
+runRedownload :: Word64 -> RedownloadData -> [BlockHeader]
+              -> Either String (HeaderSyncState, [BlockHeader])
+runRedownload _ rd [] =
+  -- Pop ready headers from buffer
+  let bufferSize = hspRedownloadBufferSize (rdParams rd)
+      (ready, remaining) = if rdWorkReached rd
+        then (toList $ rdBuffer rd, Seq.empty)
+        else splitBuffer bufferSize (rdBuffer rd)
+      newRd = rd { rdBuffer = remaining }
+      state = if rdWorkReached rd && Seq.null remaining
+                then Synced
+                else Redownload newRd
+  in Right (state, ready)
+runRedownload salt rd (h:hs) = do
+  -- Check connectivity
+  let headerHash = computeBlockHash h
+      prevHash = bhPrevBlock h
+
+  if rdCount rd > 0 && prevHash /= rdLastHeaderHash rd
+    then Left "redownload: header does not connect to chain"
+    else do
+      -- Calculate work
+      let work = headerWork h
+          newWork = rdCumulativeWork rd + work
+          newCount = rdCount rd + 1
+          workReached = rdWorkReached rd || newWork >= rdMinimumWork rd
+
+      -- Verify commitment at each commitment period (only before work reached)
+      let commitPeriod = hspCommitmentPeriod (rdParams rd)
+          shouldVerify = not workReached &&
+                        newCount `mod` commitPeriod == rdCommitOffset rd
+
+      newCommitments <- if shouldVerify
+        then case Seq.viewl (rdCommitments rd) of
+          Seq.EmptyL -> Left "redownload: missing commitment"
+          (expected Seq.:< rest) ->
+            let actual = commitmentHash salt headerHash
+            in if actual == expected
+               then Right rest
+               else Left "redownload: commitment mismatch (peer changed chain)"
+        else Right (rdCommitments rd)
+
+      let newRd = rd
+            { rdLastHeaderHash = headerHash
+            , rdLastHeaderBits = bhBits h
+            , rdCumulativeWork = newWork
+            , rdCount = newCount
+            , rdCommitments = newCommitments
+            , rdBuffer = rdBuffer rd |> h
+            , rdWorkReached = workReached
+            }
+
+      -- Continue with remaining headers
+      runRedownload salt newRd hs
+
+-- | Split buffer at threshold, keeping recent headers
+splitBuffer :: Int -> Seq a -> ([a], Seq a)
+splitBuffer threshold buf
+  | Seq.length buf > threshold =
+      let excess = Seq.length buf - threshold
+          (ready, keep) = Seq.splitAt excess buf
+      in (toList ready, keep)
+  | otherwise = ([], buf)
+
+-- | Convert Seq to list
+toList :: Seq a -> [a]
+toList = foldr (:) []
