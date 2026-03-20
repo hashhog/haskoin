@@ -10,7 +10,7 @@ module Main where
 import qualified Data.ByteString.Lazy as LBS
 import           Data.ByteString      (ByteString)
 import qualified Data.ByteString      as BS
-import           Data.Word            (Word8, Word32)
+import           Data.Word            (Word8)
 import           Data.Int             (Int64)
 import           Data.Bits            ((.&.), (.|.), shiftR, testBit)
 import           Data.Aeson           (eitherDecode, Value(..))
@@ -19,12 +19,12 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Text            as T
 import           System.Exit          (exitFailure, exitSuccess)
-import           System.IO            (hFlush, stdout)
 import           Text.Read            (readMaybe)
 import           Data.IORef
 
 import           Haskoin.Types        (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
                                        TxId(..), Hash256(..))
+import           Haskoin.Crypto       (computeTxId)
 import           Haskoin.Script
 
 -- | Opcode name (without OP_ prefix) -> byte value
@@ -193,17 +193,36 @@ parseFlags str =
       "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" -> []
       _               -> []
 
--- | Create a dummy transaction for script verification
-makeDummyTx :: ByteString -> Tx
-makeDummyTx scriptSigBytes = Tx
+-- | Build a crediting transaction (Bitcoin Core's approach for script_tests).
+-- version 1, locktime 0, one input (null prevout:0xFFFFFFFF, scriptSig = OP_0 OP_0,
+-- sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value 0).
+buildCreditingTx :: ByteString -> Tx
+buildCreditingTx scriptPubKeyBytes = Tx
   { txVersion  = 1
   , txInputs   = [TxIn
       { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+      , txInScript     = BS.pack [0x00, 0x00]  -- OP_0 OP_0
+      , txInSequence   = 0xffffffff
+      }]
+  , txOutputs  = [TxOut { txOutValue = 0, txOutScript = scriptPubKeyBytes }]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
+-- | Build a spending transaction that spends the crediting transaction.
+-- version 1, locktime 0, one input (prevout = crediting txid : 0,
+-- scriptSig = test's scriptSig, sequence 0xFFFFFFFF),
+-- one output (scriptPubKey = empty, value 0).
+buildSpendingTx :: Tx -> ByteString -> Tx
+buildSpendingTx creditingTx scriptSigBytes = Tx
+  { txVersion  = 1
+  , txInputs   = [TxIn
+      { txInPrevOutput = OutPoint (computeTxId creditingTx) 0
       , txInScript     = scriptSigBytes
       , txInSequence   = 0xffffffff
       }]
   , txOutputs  = [TxOut { txOutValue = 0, txOutScript = BS.empty }]
-  , txWitness  = [[]]  -- one empty witness stack per input
+  , txWitness  = [[]]
   , txLockTime = 0
   }
 
@@ -238,7 +257,8 @@ main = do
                   scriptSigBytes   = assembleScript sigAsmS
                   scriptPubKeyBytes = assembleScript pubAsmS
                   flags = parseFlags flagsStrS
-                  tx = makeDummyTx scriptSigBytes
+                  creditingTx = buildCreditingTx scriptPubKeyBytes
+                  tx = buildSpendingTx creditingTx scriptSigBytes
                   result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes 0
                   gotOk = case result of
                             Right True -> True

@@ -22,6 +22,7 @@ module Haskoin.Crypto
   , Sig(..)
   , signMsg
   , verifyMsg
+  , verifyMsgLax
   , serializeSigDER
   , parseSigDER
   , isValidDERSignature
@@ -77,9 +78,21 @@ import Data.Text (Text)
 import Control.DeepSeq (NFData)
 import GHC.Generics (Generic)
 
+import System.IO.Unsafe (unsafePerformIO)
+import Foreign.C.Types (CUChar, CSize(..), CInt(..))
+import Foreign.Ptr (Ptr, castPtr)
+
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
                       Tx(..), TxIn(..), TxOut(..), BlockHeader(..), OutPoint(..),
                       putVarInt, putVarBytes)
+
+-- | FFI binding to our C wrapper: lax DER parse + normalize + verify.
+-- Matches Bitcoin Core's CPubKey::Verify behavior exactly.
+foreign import ccall unsafe "haskoin_ecdsa_verify_lax"
+  c_ecdsa_verify_lax :: Ptr CUChar -> CSize
+                     -> Ptr CUChar -> CSize
+                     -> Ptr CUChar
+                     -> IO CInt
 
 --------------------------------------------------------------------------------
 -- Hashing Functions
@@ -180,10 +193,31 @@ newtype Sig = Sig { getSigBytes :: ByteString }
 signMsg :: SecKey -> Hash256 -> Sig
 signMsg _sk _hash = error "signMsg: requires secp256k1 FFI"
 
--- | Verify a signature against a public key and message hash
--- Placeholder - requires secp256k1 FFI for production use
+-- | Verify a signature against a public key and message hash (strict DER).
+-- Uses the same lax path since strict DER is a subset.
 verifyMsg :: PubKey -> Sig -> Hash256 -> Bool
-verifyMsg _pk _sig _hash = error "verifyMsg: requires secp256k1 FFI"
+verifyMsg = verifyMsgLax
+
+-- | Verify a signature against a public key and message hash (lax DER parsing).
+-- This matches Bitcoin Core's CPubKey::Verify which uses ecdsa_signature_parse_der_lax.
+-- Calls directly into libsecp256k1 via our C wrapper.
+verifyMsgLax :: PubKey -> Sig -> Hash256 -> Bool
+verifyMsgLax pk (Sig sigDer) (Hash256 hashBytes) =
+  unsafePerformIO $ do
+    let pkBytes = serializePubKeyRaw pk
+    BS.useAsCStringLen pkBytes $ \(pkPtr, pkLen) ->
+      BS.useAsCStringLen sigDer $ \(sigPtr, sigLen) ->
+        BS.useAsCStringLen hashBytes $ \(hashPtr, _) -> do
+          result <- c_ecdsa_verify_lax
+            (castPtr pkPtr) (fromIntegral pkLen)
+            (castPtr sigPtr) (fromIntegral sigLen)
+            (castPtr hashPtr)
+          return (result == 1)
+
+-- | Get raw bytes of a public key (compressed or uncompressed)
+serializePubKeyRaw :: PubKey -> ByteString
+serializePubKeyRaw (PubKeyCompressed bs) = bs
+serializePubKeyRaw (PubKeyUncompressed bs) = bs
 
 -- | Serialize signature in DER format
 serializeSigDER :: Sig -> ByteString
