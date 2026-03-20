@@ -19,7 +19,9 @@ import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.Text            as T
 import           System.Exit          (exitFailure, exitSuccess)
+import           System.IO            (hFlush, stdout)
 import           Text.Read            (readMaybe)
+import           Data.IORef
 
 import           Haskoin.Types        (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
                                        TxId(..), Hash256(..))
@@ -216,50 +218,63 @@ main = do
       putStrLn $ "ERROR: Failed to parse JSON: " ++ err
       exitFailure
     Right (Array vectors) -> do
-      let (passCount, failCount, errorCount, skipCount, totalCount) =
-            V.foldl' processEntry (0::Int, 0::Int, 0::Int, 0::Int, 0::Int) vectors
+      passRef <- newIORef (0 :: Int)
+      failRef <- newIORef (0 :: Int)
+      skipRef <- newIORef (0 :: Int)
+      totalRef <- newIORef (0 :: Int)
+
+      V.forM_ vectors $ \entry -> case entry of
+        Array arr -> do
+          let n = V.length arr
+          if n <= 3 then return ()  -- comment or malformed
+          else if n >= 6 then modifyIORef' skipRef (+1)  -- witness test
+          else case V.toList arr of
+            (String sigAsm : String pubAsm : String flagsStr : String expected : _) -> do
+              let sigAsmS   = T.unpack sigAsm
+                  pubAsmS   = T.unpack pubAsm
+                  flagsStrS = T.unpack flagsStr
+                  expectedS = T.unpack expected
+                  expectedOk = expectedS == "OK"
+                  scriptSigBytes   = assembleScript sigAsmS
+                  scriptPubKeyBytes = assembleScript pubAsmS
+                  flags = parseFlags flagsStrS
+                  tx = makeDummyTx scriptSigBytes
+                  result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes 0
+                  gotOk = case result of
+                            Right True -> True
+                            _          -> False
+              modifyIORef' totalRef (+1)
+              if gotOk == expectedOk
+                then modifyIORef' passRef (+1)
+                else do
+                  modifyIORef' failRef (+1)
+                  let resultStr = case result of
+                        Right True  -> "OK"
+                        Right False -> "FAIL(false)"
+                        Left e      -> "ERR:" ++ e
+                  putStrLn $ "FAIL: sigAsm=" ++ sigAsmS
+                           ++ " | pubAsm=" ++ pubAsmS
+                           ++ " | flags=" ++ flagsStrS
+                           ++ " | expected=" ++ expectedS
+                           ++ " | got=" ++ resultStr
+            _ -> return ()
+        _ -> return ()
+
+      passCount <- readIORef passRef
+      failCount <- readIORef failRef
+      skipCount <- readIORef skipRef
+      totalCount <- readIORef totalRef
 
       putStrLn "\n=== Script Test Vector Results ==="
       putStrLn $ "Total non-witness tests: " ++ show totalCount
       putStrLn $ "  PASS:  " ++ show passCount
       putStrLn $ "  FAIL:  " ++ show failCount
-      putStrLn $ "  ERROR: " ++ show errorCount
       putStrLn $ "  Skipped (witness): " ++ show skipCount
 
-      if failCount > 0 || errorCount > 0
+      if failCount > 0
         then exitFailure
         else exitSuccess
 
     _ -> do
       putStrLn "ERROR: Top-level JSON is not an array"
       exitFailure
-
-processEntry :: (Int, Int, Int, Int, Int) -> Value -> (Int, Int, Int, Int, Int)
-processEntry (p, f, e, s, t) (Array arr) =
-  let n = V.length arr
-  in if n <= 3 then (p, f, e, s, t)  -- comment or malformed
-     else if n >= 6 then (p, f, e, s + 1, t)  -- witness test, skip
-     else
-       -- 4 or 5 element test
-       case (V.toList arr) of
-         (String sigAsm : String pubAsm : String flagsStr : String expected : _) ->
-           let sigAsmS   = T.unpack sigAsm
-               pubAsmS   = T.unpack pubAsm
-               flagsStrS = T.unpack flagsStr
-               expectedS = T.unpack expected
-               expectedOk = expectedS == "OK"
-
-               scriptSigBytes   = assembleScript sigAsmS
-               scriptPubKeyBytes = assembleScript pubAsmS
-               flags = parseFlags flagsStrS
-               tx = makeDummyTx scriptSigBytes
-
-               result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes 0
-               gotOk = case result of
-                         Right True -> True
-                         _          -> False
-           in if gotOk == expectedOk
-              then (p + 1, f, e, s, t + 1)
-              else (p, f + 1, e, s, t + 1)
-         _ -> (p, f, e, s, t)  -- malformed entry
-processEntry acc _ = acc

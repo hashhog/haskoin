@@ -1031,6 +1031,16 @@ isCompressedPubKey :: ByteString -> Bool
 isCompressedPubKey pk =
   BS.length pk == 33 && (BS.head pk == 0x02 || BS.head pk == 0x03)
 
+-- | Check if a public key has valid encoding for STRICTENC.
+-- Valid encodings: compressed (33 bytes, 02/03 prefix) or
+-- uncompressed (65 bytes, 04 prefix).
+isValidPubKeyEncoding :: ByteString -> Bool
+isValidPubKeyEncoding pk
+  | BS.null pk = False
+  | BS.length pk == 33 = BS.head pk == 0x02 || BS.head pk == 0x03
+  | BS.length pk == 65 = BS.head pk == 0x04
+  | otherwise = False
+
 -- | Check pubkey encoding for witness v0 scripts.
 -- If WITNESS_PUBKEYTYPE flag is set and we're in witness v0, pubkey must be compressed.
 checkWitnessPubkeyType :: ScriptFlags -> ByteString -> Either ScriptError ()
@@ -1278,8 +1288,16 @@ execOp op env
 
       -- Locktime
       OP_NOP1 -> incOpCount env >>= checkDiscourageNop
-      OP_CHECKLOCKTIMEVERIFY -> incOpCount env >>= execCheckLockTimeVerify
-      OP_CHECKSEQUENCEVERIFY -> incOpCount env >>= execCheckSequenceVerify
+      OP_CHECKLOCKTIMEVERIFY -> do
+        env' <- incOpCount env
+        if hasFlag (seFlags env') VerifyCheckLockTimeVerify
+          then execCheckLockTimeVerify env'
+          else checkDiscourageNop env'
+      OP_CHECKSEQUENCEVERIFY -> do
+        env' <- incOpCount env
+        if hasFlag (seFlags env') VerifyCheckSequenceVerify
+          then execCheckSequenceVerify env'
+          else checkDiscourageNop env'
       OP_NOP4 -> incOpCount env >>= checkDiscourageNop
       OP_NOP5 -> incOpCount env >>= checkDiscourageNop
       OP_NOP6 -> incOpCount env >>= checkDiscourageNop
@@ -1298,38 +1316,54 @@ checkDiscourageNop env
       Left "discouraged upgradable NOP"
   | otherwise = Right env
 
+-- | Check if an opcode is a non-push opcode (counts toward 201 limit)
+isCountedOp :: ScriptOp -> Bool
+isCountedOp op = case op of
+  OP_0 -> False
+  OP_PUSHDATA _ _ -> False
+  OP_1NEGATE -> False
+  OP_RESERVED -> False
+  OP_1  -> False; OP_2  -> False; OP_3  -> False; OP_4  -> False
+  OP_5  -> False; OP_6  -> False; OP_7  -> False; OP_8  -> False
+  OP_9  -> False; OP_10 -> False; OP_11 -> False; OP_12 -> False
+  OP_13 -> False; OP_14 -> False; OP_15 -> False; OP_16 -> False
+  _ -> True
+
 -- | Process flow control ops when not executing
 execFlowControlOnly :: ScriptOp -> ScriptEnv -> Either String ScriptEnv
-execFlowControlOnly op env = case op of
-  OP_IF -> Right env { seIfStack = False : seIfStack env }
-  OP_NOTIF -> Right env { seIfStack = False : seIfStack env }
-  OP_ELSE ->
-    case seIfStack env of
-      [] -> Left "OP_ELSE without OP_IF"
-      (x:xs) -> Right env { seIfStack = not x : xs }
-  OP_ENDIF ->
-    case seIfStack env of
-      [] -> Left "OP_ENDIF without OP_IF"
-      (_:xs) -> Right env { seIfStack = xs }
-  OP_VERIF -> Left "OP_VERIF is disabled"
-  OP_VERNOTIF -> Left "OP_VERNOTIF is disabled"
-  -- Disabled opcodes must fail even in unexecuted branches
-  OP_CAT -> Left "OP_CAT is disabled"
-  OP_SUBSTR -> Left "OP_SUBSTR is disabled"
-  OP_LEFT -> Left "OP_LEFT is disabled"
-  OP_RIGHT -> Left "OP_RIGHT is disabled"
-  OP_INVERT -> Left "OP_INVERT is disabled"
-  OP_AND -> Left "OP_AND is disabled"
-  OP_OR -> Left "OP_OR is disabled"
-  OP_XOR -> Left "OP_XOR is disabled"
-  OP_2MUL -> Left "OP_2MUL is disabled"
-  OP_2DIV -> Left "OP_2DIV is disabled"
-  OP_MUL -> Left "OP_MUL is disabled"
-  OP_DIV -> Left "OP_DIV is disabled"
-  OP_MOD -> Left "OP_MOD is disabled"
-  OP_LSHIFT -> Left "OP_LSHIFT is disabled"
-  OP_RSHIFT -> Left "OP_RSHIFT is disabled"
-  _ -> Right env  -- All other ops are skipped
+execFlowControlOnly op env = do
+  -- Count non-push opcodes even in non-executing branches
+  env' <- if isCountedOp op then incOpCount env else Right env
+  case op of
+    OP_IF -> Right env' { seIfStack = False : seIfStack env' }
+    OP_NOTIF -> Right env' { seIfStack = False : seIfStack env' }
+    OP_ELSE ->
+      case seIfStack env' of
+        [] -> Left "OP_ELSE without OP_IF"
+        (x:xs) -> Right env' { seIfStack = not x : xs }
+    OP_ENDIF ->
+      case seIfStack env' of
+        [] -> Left "OP_ENDIF without OP_IF"
+        (_:xs) -> Right env' { seIfStack = xs }
+    OP_VERIF -> Left "OP_VERIF is disabled"
+    OP_VERNOTIF -> Left "OP_VERNOTIF is disabled"
+    -- Disabled opcodes must fail even in unexecuted branches
+    OP_CAT -> Left "OP_CAT is disabled"
+    OP_SUBSTR -> Left "OP_SUBSTR is disabled"
+    OP_LEFT -> Left "OP_LEFT is disabled"
+    OP_RIGHT -> Left "OP_RIGHT is disabled"
+    OP_INVERT -> Left "OP_INVERT is disabled"
+    OP_AND -> Left "OP_AND is disabled"
+    OP_OR -> Left "OP_OR is disabled"
+    OP_XOR -> Left "OP_XOR is disabled"
+    OP_2MUL -> Left "OP_2MUL is disabled"
+    OP_2DIV -> Left "OP_2DIV is disabled"
+    OP_MUL -> Left "OP_MUL is disabled"
+    OP_DIV -> Left "OP_DIV is disabled"
+    OP_MOD -> Left "OP_MOD is disabled"
+    OP_LSHIFT -> Left "OP_LSHIFT is disabled"
+    OP_RSHIFT -> Left "OP_RSHIFT is disabled"
+    _ -> Right env'  -- All other ops are skipped
 
 -- | Check element size limit (520 bytes for non-witness, 10000 for witness)
 checkElementSize :: ByteString -> Either String ()
@@ -1616,9 +1650,7 @@ execRipemd160 env = do
 execSha1 :: ScriptEnv -> Either String ScriptEnv
 execSha1 env = do
   (top, env') <- popStack env
-  -- Using SHA256 as placeholder - proper SHA1 would need cryptonite's SHA1
-  -- For now, this is incorrect but allows compilation
-  Right $ pushStack (BS.take 20 $ sha256 top) env'
+  Right $ pushStack (sha1 top) env'
 
 execSha256Op :: ScriptEnv -> Either String ScriptEnv
 execSha256Op env = do
@@ -1687,41 +1719,58 @@ execCheckSig env = do
   if BS.null sigBytes
     then Right $ pushStack stackFalse env''
     else do
+      -- STRICTENC / DERSIG: validate DER encoding of the signature
+      -- The signature includes the sighash type byte at the end
+      when (hasFlag (seFlags env'') VerifyStrictEncoding || hasFlag (seFlags env'') VerifyDERSig) $ do
+        unless (isValidDERSignature sigBytes) $
+          Left "Non-canonical DER signature"
+
+      -- STRICTENC: validate sighash type byte
+      when (hasFlag (seFlags env'') VerifyStrictEncoding) $ do
+        let sigHashByte = BS.last sigBytes
+        unless (isDefinedSigHashType sigHashByte) $
+          Left "Invalid sighash type"
+
+      -- STRICTENC: validate pubkey encoding
+      when (hasFlag (seFlags env'') VerifyStrictEncoding && not (BS.null pubkeyBytes)) $ do
+        unless (isValidPubKeyEncoding pubkeyBytes) $
+          Left "Invalid public key encoding"
+
+      -- LOW_S: validate S value is low
+      when (hasFlag (seFlags env'') VerifyLowS) $ do
+        unless (isLowDERSignature sigBytes) $
+          Left "Non-canonical signature: S value is unnecessarily high"
+
       -- Parse sighash type byte from the signature
       let sigHashByte = BS.last sigBytes
           sigHashType = parseSigHashByte sigHashByte
 
       -- Build scriptCode for sighash computation
-      -- For witness scripts: use seScriptCode directly (no FindAndDelete)
-      -- For legacy scripts: apply OP_CODESEPARATOR position, remove CODESEPARATORS,
-      --                     and apply FindAndDelete for the signature
       let scriptCode = if seIsWitness env''
-                       then seScriptCode env''  -- Witness v0: no FindAndDelete
+                       then seScriptCode env''
                        else scriptCodeForSighash
                               (seScriptCode env'')
                               (seCodeSepPos env'')
-                              sigBytes  -- Full signature including hash type
+                              sigBytes
 
       -- Compute sighash
       let sigHashW32 = fromIntegral sigHashByte :: Word32
-          sighash = if seIsWitness env''
+          _sighash = if seIsWitness env''
                     then txSigHashSegWit (seTx env'') (seInputIdx env'')
                                          scriptCode (seAmount env'') sigHashType
                     else txSigHash (seTx env'') (seInputIdx env'') scriptCode sigHashW32 sigHashType
 
       -- Signature without the sighash type byte for verification
-      let sigWithoutType = BS.init sigBytes
+      let _sigWithoutType = BS.init sigBytes
 
       -- Verify signature
       let sigCheckResult = case parsePubKey pubkeyBytes of
-            Nothing -> False  -- Invalid pubkey = signature fails
+            Nothing -> False
             Just _pubkey ->
-              case parseSigDER sigWithoutType of
-                Nothing -> False  -- Invalid DER = signature fails
+              case parseSigDER _sigWithoutType of
+                Nothing -> False
                 Just _sig ->
                   -- verifyMsg is a placeholder that needs secp256k1
-                  -- For now, return false to allow compilation
-                  -- In a real implementation: verifyMsg _pubkey _sig sighash
                   False
 
       -- BIP-146 NULLFAIL: If signature check failed and we have NULLFAIL flag,
@@ -1770,14 +1819,19 @@ execCheckMultiSig env = do
   -- Pop n public keys
   (pubkeys, env2) <- popN (fromIntegral n) env1
 
+  -- Add nKeysCount to opcount (CHECKMULTISIG counts pubkeys toward limit)
+  let newOpCount = seOpCount env2 + fromIntegral n
+  when (newOpCount > 201) $ Left "Opcode limit exceeded"
+  let env2' = env2 { seOpCount = newOpCount }
+
   -- BIP-141 WITNESS_PUBKEYTYPE: In witness v0 scripts, check all pubkeys are compressed
-  when (seIsWitness env2 && hasFlag (seFlags env2) VerifyWitnessPubkeyType) $
+  when (seIsWitness env2' && hasFlag (seFlags env2') VerifyWitnessPubkeyType) $
     forM_ pubkeys $ \pk ->
       unless (isCompressedPubKey pk) $
         Left "Witness pubkey not compressed"
 
   -- Pop m (number of required signatures)
-  (mBytes, env3) <- popStack env2
+  (mBytes, env3) <- popStack env2'
   m <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) mBytes
 
   when (m < 0 || m > n) $ Left "Invalid signature count"
@@ -1792,6 +1846,34 @@ execCheckMultiSig env = do
   -- Note: NULLDUMMY is always enforced unconditionally post-SegWit
   when (hasFlag (seFlags env5) VerifyNullDummy && not (BS.null dummy)) $
     Left "NULLDUMMY violation: dummy must be empty"
+
+  -- STRICTENC / DERSIG: validate DER encoding of all non-empty signatures
+  when (hasFlag (seFlags env5) VerifyStrictEncoding || hasFlag (seFlags env5) VerifyDERSig) $
+    forM_ sigs $ \s ->
+      unless (BS.null s) $
+        unless (isValidDERSignature s) $
+          Left "Non-canonical DER signature"
+
+  -- STRICTENC: validate sighash type bytes of all non-empty signatures
+  when (hasFlag (seFlags env5) VerifyStrictEncoding) $
+    forM_ sigs $ \s ->
+      unless (BS.null s) $
+        unless (isDefinedSigHashType (BS.last s)) $
+          Left "Invalid sighash type"
+
+  -- STRICTENC: validate pubkey encoding for all pubkeys
+  when (hasFlag (seFlags env5) VerifyStrictEncoding) $
+    forM_ pubkeys $ \pk ->
+      unless (BS.null pk) $
+        unless (isValidPubKeyEncoding pk) $
+          Left "Invalid public key encoding"
+
+  -- LOW_S: validate S value is low for all non-empty signatures
+  when (hasFlag (seFlags env5) VerifyLowS) $
+    forM_ sigs $ \s ->
+      unless (BS.null s) $
+        unless (isLowDERSignature s) $
+          Left "Non-canonical signature: S value is unnecessarily high"
 
   -- Build scriptCode for sighash computation
   -- For legacy scripts, we need to:
@@ -1940,7 +2022,10 @@ isTapscriptSuccess op =
 -- | Evaluate a script with given initial stack
 -- Tracks byte position for OP_CODESEPARATOR handling
 evalScriptWithStack :: ScriptStack -> Script -> ScriptEnv -> Either String ScriptEnv
-evalScriptWithStack stack (Script ops) env =
+evalScriptWithStack stack (Script ops) env = do
+  -- Check script size limit (10000 bytes)
+  let scriptBytes = encodeScriptOps ops
+  when (BS.length scriptBytes > 10000) $ Left "Script size exceeds 10000 bytes"
   evalWithPosition ops 0 (env { seStack = stack })
   where
     -- Evaluate ops while tracking byte position
@@ -2033,45 +2118,50 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
               when (hasFlag flags VerifyCleanStack && length finalStack /= 1) $
                 Left "Stack not clean after evaluation"
               Right True
-        case classifyOutput scriptPubKey of
-          -- P2SH handling
-          P2SH expectedHash -> do
-            -- BIP-16: P2SH scriptSig MUST be push-only.
-            -- This is a consensus rule that is enforced unconditionally.
-            -- Reference: Bitcoin Core interpreter.cpp VerifyScript() line ~2055
-            unless (isPushOnly scriptSig) $
-              Left "P2SH scriptSig must be push-only"
+        -- P2SH handling is only active when VerifyP2SH flag is set
+        let isP2SH = hasFlag flags VerifyP2SH && case classifyOutput scriptPubKey of
+                        P2SH _ -> True
+                        _      -> False
+        if isP2SH
+          then case classifyOutput scriptPubKey of
+            P2SH expectedHash -> do
+              -- BIP-16: P2SH scriptSig MUST be push-only.
+              unless (isPushOnly scriptSig) $
+                Left "P2SH scriptSig must be push-only"
 
-            case savedStack of
-              [] -> Right False
-              (redeemScriptBytes:restStack) -> do
-                -- Verify hash matches
-                let Hash160 actualHash = hash160 redeemScriptBytes
-                if actualHash /= getHash160 expectedHash
-                  then Right False
-                  else do
-                    -- Deserialize and evaluate redeem script
-                    redeemScript <- decodeScript redeemScriptBytes
-                    let env4 = env3 { seStack = restStack
-                                    , seOpCount = 0
-                                    , seIfStack = []
-                                    , seScriptCode = redeemScriptBytes
-                                    }
-                    env5 <- evalScriptWithStack restStack redeemScript env4
-                    case seStack env5 of
-                      [] -> Right False
-                      (t:_) ->
-                        if not (isTrue t) then Right False
-                        else checkClean (seStack env5)
+              case savedStack of
+                [] -> Right False
+                (redeemScriptBytes:restStack) -> do
+                  -- Verify hash matches
+                  let Hash160 actualHash = hash160 redeemScriptBytes
+                  if actualHash /= getHash160 expectedHash
+                    then Right False
+                    else do
+                      -- Deserialize and evaluate redeem script
+                      redeemScript <- decodeScript redeemScriptBytes
+                      let env4 = env3 { seStack = restStack
+                                      , seOpCount = 0
+                                      , seIfStack = []
+                                      , seScriptCode = redeemScriptBytes
+                                      }
+                      env5 <- evalScriptWithStack restStack redeemScript env4
+                      case seStack env5 of
+                        [] -> Right False
+                        (t:_) ->
+                          if not (isTrue t) then Right False
+                          else checkClean (seStack env5)
+            _ -> checkClean (seStack env3)  -- Can't happen
+          else case classifyOutput scriptPubKey of
+            -- P2WPKH: check witness (pass flags through)
+            P2WPKH h | hasFlag flags VerifyWitness ->
+              verifyP2WPKHWithFlags flags tx idx h amount
 
-          -- P2WPKH: check witness (pass flags through)
-          P2WPKH h -> verifyP2WPKHWithFlags flags tx idx h amount
+            -- P2WSH: check witness (pass flags through)
+            P2WSH h | hasFlag flags VerifyWitness ->
+              verifyP2WSHWithFlags flags tx idx h amount
 
-          -- P2WSH: check witness (pass flags through)
-          P2WSH h -> verifyP2WSHWithFlags flags tx idx h amount
-
-          -- Other types: already verified
-          _ -> checkClean (seStack env3)
+            -- Other types: already verified
+            _ -> checkClean (seStack env3)
 
 -- | Verify P2WPKH witness (without flags, for backward compatibility)
 verifyP2WPKH :: Tx -> Int -> Hash160 -> Word64 -> Either String Bool
