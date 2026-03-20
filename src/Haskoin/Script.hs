@@ -1763,15 +1763,13 @@ execCheckSig env = do
       -- Signature without the sighash type byte for verification
       let _sigWithoutType = BS.init sigBytes
 
-      -- Verify signature
+      -- Verify signature using secp256k1 with lax DER parsing
+      -- (matches Bitcoin Core's CPubKey::Verify which uses ecdsa_signature_parse_der_lax)
       let sigCheckResult = case parsePubKey pubkeyBytes of
             Nothing -> False
-            Just _pubkey ->
-              case parseSigDER _sigWithoutType of
-                Nothing -> False
-                Just _sig ->
-                  -- verifyMsg is a placeholder that needs secp256k1
-                  False
+            Just pubkey ->
+              let sig = Sig _sigWithoutType
+              in verifyMsgLax pubkey sig _sighash
 
       -- BIP-146 NULLFAIL: If signature check failed and we have NULLFAIL flag,
       -- the signature must be empty. Since we already checked for empty sig above,
@@ -1890,14 +1888,35 @@ execCheckMultiSig env = do
                          -- Then remove ALL signatures from the scriptCode
                          in foldl' (\s sig -> findAndDelete s (encodePushData sig)) sc sigs
 
-  -- Verify signatures
-  -- In a real implementation, this would:
-  -- 1. For each signature, compute sighash with scriptCode
-  -- 2. Find a matching pubkey (must match in order)
-  -- 3. Verify the signature against pubkey and sighash
-  -- For now, we simulate failure (no secp256k1 binding)
-  let _unusedScriptCode = baseScriptCode  -- Would be used for actual verification
-      fSuccess = False  -- Placeholder - actual verification needs secp256k1
+  -- Verify signatures against pubkeys in order.
+  -- Bitcoin Core's algorithm: two cursors walk forward through sigs and pubkeys.
+  -- For each sig, try pubkeys from current position. If match, advance both.
+  -- If no match, advance pubkey cursor only. Fail if remaining pubkeys < remaining sigs.
+  let verifyMultiSig [] _ _ = True  -- All sigs verified
+      verifyMultiSig (_:_) [] _ = False  -- Sigs left but no pubkeys
+      verifyMultiSig sigsLeft@(s:restSigs) (pk:restPks) nSigsRemaining =
+        -- Check if enough pubkeys remain for the sigs we still need
+        if length (pk:restPks) < nSigsRemaining
+        then False
+        else if BS.null s || BS.length s < 2
+             then verifyMultiSig restSigs (pk:restPks) (nSigsRemaining - 1)
+             else
+               let sigHashByte = BS.last s
+                   sigWithoutType = BS.init s
+                   sigHashType = parseSigHashByte sigHashByte
+                   sigHashW32 = fromIntegral sigHashByte :: Word32
+                   sighash = if seIsWitness env5
+                             then txSigHashSegWit (seTx env5) (seInputIdx env5)
+                                                   baseScriptCode (seAmount env5) sigHashType
+                             else txSigHash (seTx env5) (seInputIdx env5) baseScriptCode sigHashW32 sigHashType
+                   matched = case parsePubKey pk of
+                     Nothing -> False
+                     Just pubkey ->
+                       verifyMsgLax pubkey (Sig sigWithoutType) sighash
+               in if matched
+                  then verifyMultiSig restSigs restPks (nSigsRemaining - 1)
+                  else verifyMultiSig sigsLeft restPks nSigsRemaining
+      fSuccess = verifyMultiSig sigs pubkeys (length sigs)
 
   -- BIP-146 NULLFAIL: If the operation failed, ALL signatures must be empty
   -- This is critical: if fSuccess is False and NULLFAIL is enabled,
