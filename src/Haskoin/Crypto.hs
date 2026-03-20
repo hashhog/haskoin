@@ -5,6 +5,7 @@
 module Haskoin.Crypto
   ( -- * Hashing
     sha256
+  , sha1
   , doubleSHA256
   , ripemd160
   , hash160
@@ -23,6 +24,9 @@ module Haskoin.Crypto
   , verifyMsg
   , serializeSigDER
   , parseSigDER
+  , isValidDERSignature
+  , isDefinedSigHashType
+  , isLowDERSignature
     -- * Sighash
   , SigHashType(..)
   , sigHashAll
@@ -84,6 +88,10 @@ import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
 -- | SHA-256 hash
 sha256 :: ByteString -> ByteString
 sha256 bs = convert (H.hashWith H.SHA256 bs)
+
+-- | SHA-1 hash
+sha1 :: ByteString -> ByteString
+sha1 bs = convert (H.hashWith H.SHA1 bs)
 
 -- | Double SHA-256 hash (SHA256(SHA256(data)))
 doubleSHA256 :: ByteString -> Hash256
@@ -186,6 +194,79 @@ parseSigDER :: ByteString -> Maybe Sig
 parseSigDER bs
   | BS.length bs >= 8 && BS.head bs == 0x30 = Just (Sig bs)
   | otherwise = Nothing
+
+-- | Strict DER signature validation (BIP-66).
+-- The input is the full signature WITH the sighash type byte appended.
+-- This implements Bitcoin Core's IsValidSignatureEncoding().
+isValidDERSignature :: ByteString -> Bool
+isValidDERSignature sig
+  | BS.length sig < 9 = False   -- Min: 30 06 02 01 R 02 01 S hashtype
+  | BS.length sig > 73 = False  -- Max: 30 46 02 21 R(33) 02 21 S(33) hashtype
+  | otherwise =
+    let len = BS.length sig
+        -- sig without the hashtype byte
+        -- The DER structure is: 0x30 <total-len> 0x02 <r-len> <r> 0x02 <s-len> <s>
+        b0 = BS.index sig 0  -- Must be 0x30 (compound structure)
+        b1 = BS.index sig 1  -- Length of the rest (excluding hashtype byte)
+        b2 = BS.index sig 2  -- Must be 0x02 (integer marker for R)
+        rLen = fromIntegral (BS.index sig 3) :: Int -- Length of R
+        -- Position of S integer marker
+        sMarkerPos = 4 + rLen
+    in b0 == 0x30
+       && fromIntegral b1 == len - 3  -- total length check (len - compound header(2) - hashtype(1))
+       && b2 == 0x02                  -- R integer marker
+       && rLen > 0                    -- R must be non-empty
+       && sMarkerPos < len - 1        -- S marker must exist
+       && BS.index sig sMarkerPos == 0x02  -- S integer marker
+       && let sLen = fromIntegral (BS.index sig (sMarkerPos + 1)) :: Int
+          in sLen > 0                 -- S must be non-empty
+             && rLen + sLen + 7 == len  -- Total length consistency (including hashtype)
+             -- R value checks
+             && not (BS.index sig 4 .&. 0x80 /= 0)  -- R must not be negative
+             && not (rLen > 1 && BS.index sig 4 == 0x00 && BS.index sig 5 .&. 0x80 == 0)  -- No excess padding in R
+             -- S value checks
+             && not (BS.index sig (sMarkerPos + 2) .&. 0x80 /= 0)  -- S must not be negative
+             && not (sLen > 1 && BS.index sig (sMarkerPos + 2) == 0x00 && BS.index sig (sMarkerPos + 3) .&. 0x80 == 0)  -- No excess padding in S
+
+-- | Check if a sighash type byte is a defined/valid hash type.
+-- Valid base types: SIGHASH_ALL (1), SIGHASH_NONE (2), SIGHASH_SINGLE (3)
+-- Optionally combined with SIGHASH_ANYONECANPAY (0x80)
+isDefinedSigHashType :: Word8 -> Bool
+isDefinedSigHashType b =
+  let base = b .&. 0x7f  -- mask off ANYONECANPAY bit (0x80)
+  in base >= 1 && base <= 3
+
+-- | Check if a DER signature has low S value (BIP-62 LOW_S rule).
+-- The input is the full signature WITH the sighash type byte appended.
+-- S must be <= order/2 where order is the secp256k1 curve order.
+-- This assumes the signature already passed isValidDERSignature.
+isLowDERSignature :: ByteString -> Bool
+isLowDERSignature sig
+  | BS.length sig < 9 = False
+  | otherwise =
+    let rLen = fromIntegral (BS.index sig 3) :: Int
+        sMarkerPos = 4 + rLen
+        sLen = fromIntegral (BS.index sig (sMarkerPos + 1)) :: Int
+        sBytes = BS.take sLen (BS.drop (sMarkerPos + 2) sig)
+        -- secp256k1 half-order (order / 2):
+        -- order = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        -- order/2 = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+        halfOrder = BS.pack [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                             0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
+                             0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0]
+    in compareBigEndian sBytes halfOrder /= GT
+  where
+    -- Compare two big-endian byte strings as unsigned integers
+    compareBigEndian :: ByteString -> ByteString -> Ordering
+    compareBigEndian a b =
+      let la = BS.length a
+          lb = BS.length b
+          -- Pad shorter value with leading zeros
+          (a', b') = if la > lb
+                     then (a, BS.replicate (la - lb) 0 <> b)
+                     else (BS.replicate (lb - la) 0 <> a, b)
+      in compare a' b'
 
 --------------------------------------------------------------------------------
 -- Sighash Types
