@@ -181,13 +181,11 @@ parseFlags str =
       "DISCOURAGE_UPGRADABLE_NOPS"               -> [VerifyDiscourageUpgradableNops]
       "DISCOURAGE_OP_SUCCESS"                    -> [VerifyDiscourageOpSuccess]
       "CONST_SCRIPTCODE"                         -> [VerifyConstScriptcode]
-      -- Flags not supported by Haskoin are silently ignored:
-      -- STRICTENC, LOW_S, SIGPUSHONLY, MINIMALDATA, CLEANSTACK
-      "STRICTENC"     -> []
-      "LOW_S"         -> []
-      "SIGPUSHONLY"   -> []
-      "MINIMALDATA"   -> []
-      "CLEANSTACK"    -> []
+      "STRICTENC"     -> [VerifyStrictEncoding]
+      "LOW_S"         -> [VerifyLowS]
+      "SIGPUSHONLY"   -> [VerifySigPushOnly]
+      "MINIMALDATA"   -> [VerifyMinimalData]
+      "CLEANSTACK"    -> [VerifyCleanStack]
       "NONE"          -> []
       "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" -> []
       "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" -> []
@@ -209,7 +207,7 @@ makeDummyTx scriptSigBytes = Tx
 
 main :: IO ()
 main = do
-  let vectorPath = "/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json"
+  let vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
   jsonData <- LBS.readFile vectorPath
   putStrLn $ "Loaded test vectors from: " ++ vectorPath
 

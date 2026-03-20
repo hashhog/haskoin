@@ -241,11 +241,16 @@ data ScriptVerifyFlag
   | VerifyNullFail       -- ^ BIP-146: Failed sig checks must have empty signature
   | VerifyWitnessPubkeyType  -- ^ BIP-141: Witness v0 pubkeys must be compressed
   | VerifyTaproot        -- ^ BIP-341/342: Taproot
+  | VerifyMinimalData    -- ^ BIP-62: Require minimal encoding for script numbers
   | VerifyMinimalIf      -- ^ Minimal IF/NOTIF: argument must be empty or 0x01
   | VerifyDiscourageUpgradableWitnessProgram  -- ^ Fail on unknown witness versions (policy)
   | VerifyDiscourageUpgradableNops            -- ^ Fail on upgradable NOPs (policy)
   | VerifyDiscourageOpSuccess                 -- ^ Fail on OP_SUCCESS opcodes (policy)
   | VerifyConstScriptcode                    -- ^ OP_CODESEPARATOR forbidden in witness v0
+  | VerifyStrictEncoding                     -- ^ BIP-62: Strict signature/pubkey encoding
+  | VerifyLowS                              -- ^ BIP-62: Low-S signatures
+  | VerifySigPushOnly                        -- ^ BIP-62: scriptSig must be push-only
+  | VerifyCleanStack                         -- ^ BIP-62: Stack must be clean after evaluation
   deriving (Show, Eq, Ord, Enum, Bounded, Generic)
 
 -- | A set of script verification flags
@@ -827,6 +832,37 @@ isPushOp op = case op of
   -- Everything else (> OP_16) is not a push
   _ -> False
 
+-- | Check that a push opcode uses the minimal encoding (BIP-62 MINIMALDATA).
+-- Returns True if the push is minimally encoded, False otherwise.
+-- Reference: Bitcoin Core script/interpreter.cpp CheckMinimalPush()
+checkMinimalPush :: ScriptOp -> Bool
+checkMinimalPush op = case op of
+  OP_PUSHDATA bs OPCODE ->
+    let len = BS.length bs
+    in if len == 0
+       then False  -- Should have used OP_0
+       else if len == 1
+            then let b = BS.index bs 0
+                 in if b >= 1 && b <= 16
+                    then False  -- Should have used OP_1..OP_16
+                    else if b == 0x81
+                         then False  -- Should have used OP_1NEGATE
+                         else True
+            else if len <= 75
+                 then True  -- OPCODE is correct for 1..75 bytes
+                 else False -- Should have used OPDATA1/2/4
+  OP_PUSHDATA bs OPDATA1 ->
+    -- OPDATA1 is only minimal if len > 75
+    BS.length bs > 75
+  OP_PUSHDATA bs OPDATA2 ->
+    -- OPDATA2 is only minimal if len > 255
+    BS.length bs > 255
+  OP_PUSHDATA bs OPDATA4 ->
+    -- OPDATA4 is only minimal if len > 65535
+    BS.length bs > 65535
+  -- Non-push ops and OP_0, OP_1NEGATE, OP_1..OP_16 are always minimal
+  _ -> True
+
 -- | Classify an input script (scriptSig)
 classifyInput :: Script -> Maybe ScriptType
 classifyInput (Script ops) = case ops of
@@ -952,10 +988,14 @@ encodeScriptNum n =
              else BS.pack $ init bytes ++ [if neg then lastByte .|. 0x80 else lastByte]
 
 -- | Decode a Bitcoin script number
-decodeScriptNum :: ByteString -> Either String Int64
-decodeScriptNum bs
+decodeScriptNum :: Bool -> ByteString -> Either String Int64
+decodeScriptNum requireMinimal bs
   | BS.null bs = Right 0
   | BS.length bs > 4 = Left "Script number overflow"
+  | requireMinimal && BS.length bs > 1
+    && (BS.last bs .&. 0x7f) == 0
+    && not (BS.index bs (BS.length bs - 2) `testBit` 7)
+    = Left "Non-minimal script number encoding"
   | otherwise =
       let bytes = BS.unpack bs
           lastByte = last bytes
@@ -1119,7 +1159,11 @@ execOp op env
   | otherwise = case op of
       -- Constants (push operations don't count toward op limit)
       OP_0 -> Right $ pushStack BS.empty env
-      OP_PUSHDATA bs _ -> checkElementSize bs >> Right (pushStack bs env)
+      OP_PUSHDATA bs pdt -> do
+        checkElementSize bs
+        when (hasFlag (seFlags env) VerifyMinimalData && not (checkMinimalPush (OP_PUSHDATA bs pdt))) $
+          Left "Non-minimal push encoding"
+        Right (pushStack bs env)
       OP_1NEGATE -> Right $ pushStack (encodeScriptNum (-1)) env
       OP_1 -> Right $ pushStack (encodeScriptNum 1) env
       OP_2 -> Right $ pushStack (encodeScriptNum 2) env
@@ -1269,6 +1313,22 @@ execFlowControlOnly op env = case op of
       (_:xs) -> Right env { seIfStack = xs }
   OP_VERIF -> Left "OP_VERIF is disabled"
   OP_VERNOTIF -> Left "OP_VERNOTIF is disabled"
+  -- Disabled opcodes must fail even in unexecuted branches
+  OP_CAT -> Left "OP_CAT is disabled"
+  OP_SUBSTR -> Left "OP_SUBSTR is disabled"
+  OP_LEFT -> Left "OP_LEFT is disabled"
+  OP_RIGHT -> Left "OP_RIGHT is disabled"
+  OP_INVERT -> Left "OP_INVERT is disabled"
+  OP_AND -> Left "OP_AND is disabled"
+  OP_OR -> Left "OP_OR is disabled"
+  OP_XOR -> Left "OP_XOR is disabled"
+  OP_2MUL -> Left "OP_2MUL is disabled"
+  OP_2DIV -> Left "OP_2DIV is disabled"
+  OP_MUL -> Left "OP_MUL is disabled"
+  OP_DIV -> Left "OP_DIV is disabled"
+  OP_MOD -> Left "OP_MOD is disabled"
+  OP_LSHIFT -> Left "OP_LSHIFT is disabled"
+  OP_RSHIFT -> Left "OP_RSHIFT is disabled"
   _ -> Right env  -- All other ops are skipped
 
 -- | Check element size limit (520 bytes for non-witness, 10000 for witness)
@@ -1401,7 +1461,7 @@ execOver env = case seStack env of
 execPick :: ScriptEnv -> Either String ScriptEnv
 execPick env = do
   (top, env') <- popStack env
-  n <- decodeScriptNum top
+  n <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) top
   let idx = fromIntegral n
   if idx < 0 || idx >= length (seStack env')
     then Left "Stack underflow"
@@ -1410,7 +1470,7 @@ execPick env = do
 execRoll :: ScriptEnv -> Either String ScriptEnv
 execRoll env = do
   (top, env') <- popStack env
-  n <- decodeScriptNum top
+  n <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) top
   let idx = fromIntegral n
   if idx < 0 || idx >= length (seStack env')
     then Left "Stack underflow"
@@ -1460,28 +1520,28 @@ execEqualVerify env = execEqual env >>= execVerify
 execUnaryArith :: (Int64 -> Int64) -> ScriptEnv -> Either String ScriptEnv
 execUnaryArith f env = do
   (top, env') <- popStack env
-  n <- decodeScriptNum top
+  n <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) top
   Right $ pushStack (encodeScriptNum (f n)) env'
 
 execBinaryArith :: (Int64 -> Int64 -> Int64) -> ScriptEnv -> Either String ScriptEnv
 execBinaryArith f env = do
   (a, env') <- popStack env
   (b, env'') <- popStack env'
-  na <- decodeScriptNum a
-  nb <- decodeScriptNum b
+  na <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) a
+  nb <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) b
   Right $ pushStack (encodeScriptNum (f nb na)) env''
 
 execNot :: ScriptEnv -> Either String ScriptEnv
 execNot env = do
   (top, env') <- popStack env
-  n <- decodeScriptNum top
+  n <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) top
   let result = if n == 0 then 1 else 0
   Right $ pushStack (encodeScriptNum result) env'
 
 exec0NotEqual :: ScriptEnv -> Either String ScriptEnv
 exec0NotEqual env = do
   (top, env') <- popStack env
-  n <- decodeScriptNum top
+  n <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) top
   let result = if n /= 0 then 1 else 0
   Right $ pushStack (encodeScriptNum result) env'
 
@@ -1489,8 +1549,8 @@ execBoolAnd :: ScriptEnv -> Either String ScriptEnv
 execBoolAnd env = do
   (a, env') <- popStack env
   (b, env'') <- popStack env'
-  na <- decodeScriptNum a
-  nb <- decodeScriptNum b
+  na <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) a
+  nb <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) b
   let result = if na /= 0 && nb /= 0 then 1 else 0
   Right $ pushStack (encodeScriptNum result) env''
 
@@ -1498,8 +1558,8 @@ execBoolOr :: ScriptEnv -> Either String ScriptEnv
 execBoolOr env = do
   (a, env') <- popStack env
   (b, env'') <- popStack env'
-  na <- decodeScriptNum a
-  nb <- decodeScriptNum b
+  na <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) a
+  nb <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) b
   let result = if na /= 0 || nb /= 0 then 1 else 0
   Right $ pushStack (encodeScriptNum result) env''
 
@@ -1507,8 +1567,8 @@ execNumEqual :: ScriptEnv -> Either String ScriptEnv
 execNumEqual env = do
   (a, env') <- popStack env
   (b, env'') <- popStack env'
-  na <- decodeScriptNum a
-  nb <- decodeScriptNum b
+  na <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) a
+  nb <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) b
   let result = if na == nb then stackTrue else stackFalse
   Right $ pushStack result env''
 
@@ -1519,8 +1579,8 @@ execNumNotEqual :: ScriptEnv -> Either String ScriptEnv
 execNumNotEqual env = do
   (a, env') <- popStack env
   (b, env'') <- popStack env'
-  na <- decodeScriptNum a
-  nb <- decodeScriptNum b
+  na <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) a
+  nb <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) b
   let result = if na /= nb then stackTrue else stackFalse
   Right $ pushStack result env''
 
@@ -1528,8 +1588,8 @@ execBinaryCompare :: (Int64 -> Int64 -> Bool) -> ScriptEnv -> Either String Scri
 execBinaryCompare cmp env = do
   (a, env') <- popStack env
   (b, env'') <- popStack env'
-  na <- decodeScriptNum a
-  nb <- decodeScriptNum b
+  na <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) a
+  nb <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) b
   let result = if cmp nb na then stackTrue else stackFalse
   Right $ pushStack result env''
 
@@ -1538,9 +1598,9 @@ execWithin env = do
   (maxVal, env') <- popStack env
   (minVal, env'') <- popStack env'
   (x, env''') <- popStack env''
-  nMax <- decodeScriptNum maxVal
-  nMin <- decodeScriptNum minVal
-  nX <- decodeScriptNum x
+  nMax <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) maxVal
+  nMin <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) minVal
+  nX <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) x
   let result = if nX >= nMin && nX < nMax then stackTrue else stackFalse
   Right $ pushStack result env'''
 
@@ -1703,7 +1763,7 @@ execCheckMultiSig :: ScriptEnv -> Either String ScriptEnv
 execCheckMultiSig env = do
   -- Pop n (number of public keys)
   (nBytes, env1) <- popStack env
-  n <- decodeScriptNum nBytes
+  n <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) nBytes
 
   when (n < 0 || n > 20) $ Left "Invalid pubkey count"
 
@@ -1718,7 +1778,7 @@ execCheckMultiSig env = do
 
   -- Pop m (number of required signatures)
   (mBytes, env3) <- popStack env2
-  m <- decodeScriptNum mBytes
+  m <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) mBytes
 
   when (m < 0 || m > n) $ Left "Invalid signature count"
 
@@ -1914,8 +1974,9 @@ evalScriptWithFlags flags tx idx amount scriptSig scriptPubKey = do
   env1 <- evalScriptWithStack [] scriptSig env
   let sigStack = seStack env1
 
+  -- Clear altstack between scriptSig and scriptPubKey evaluation
   -- Reset for scriptPubKey evaluation
-  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [] }
+  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [], seAltStack = [] }
 
   -- Evaluate scriptPubKey
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
@@ -1943,13 +2004,18 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
 
   let env = initScriptEnvWithFlags tx idx amount prevScriptPubKey flags
 
+  -- SIGPUSHONLY: When flag is set, scriptSig must be push-only
+  when (hasFlag flags VerifySigPushOnly && not (isPushOnly scriptSig)) $
+    Left "scriptSig is not push-only"
+
   -- Evaluate scriptSig
   env1 <- evalScriptWithStack [] scriptSig env
   let sigStack = seStack env1
       savedStack = sigStack  -- Save for P2SH
 
-  -- Evaluate scriptPubKey
-  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [] }
+  -- Clear altstack between scriptSig and scriptPubKey evaluation
+  -- Reset for scriptPubKey evaluation
+  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [], seAltStack = [] }
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
 
   unless (null $ seIfStack env3) $
@@ -1960,43 +2026,52 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
     (top:_) ->
       if not (isTrue top)
       then Right False
-      else case classifyOutput scriptPubKey of
-        -- P2SH handling
-        P2SH expectedHash -> do
-          -- BIP-16: P2SH scriptSig MUST be push-only.
-          -- This is a consensus rule that is enforced unconditionally.
-          -- Reference: Bitcoin Core interpreter.cpp VerifyScript() line ~2055
-          unless (isPushOnly scriptSig) $
-            Left "P2SH scriptSig must be push-only"
+      else do
+        -- CLEANSTACK: after scriptPubKey evaluation (and P2SH if applicable),
+        -- the stack must have exactly one element
+        let checkClean finalStack = do
+              when (hasFlag flags VerifyCleanStack && length finalStack /= 1) $
+                Left "Stack not clean after evaluation"
+              Right True
+        case classifyOutput scriptPubKey of
+          -- P2SH handling
+          P2SH expectedHash -> do
+            -- BIP-16: P2SH scriptSig MUST be push-only.
+            -- This is a consensus rule that is enforced unconditionally.
+            -- Reference: Bitcoin Core interpreter.cpp VerifyScript() line ~2055
+            unless (isPushOnly scriptSig) $
+              Left "P2SH scriptSig must be push-only"
 
-          case savedStack of
-            [] -> Right False
-            (redeemScriptBytes:restStack) -> do
-              -- Verify hash matches
-              let Hash160 actualHash = hash160 redeemScriptBytes
-              if actualHash /= getHash160 expectedHash
-                then Right False
-                else do
-                  -- Deserialize and evaluate redeem script
-                  redeemScript <- decodeScript redeemScriptBytes
-                  let env4 = env3 { seStack = restStack
-                                  , seOpCount = 0
-                                  , seIfStack = []
-                                  , seScriptCode = redeemScriptBytes
-                                  }
-                  env5 <- evalScriptWithStack restStack redeemScript env4
-                  case seStack env5 of
-                    [] -> Right False
-                    (t:_) -> Right (isTrue t)
+            case savedStack of
+              [] -> Right False
+              (redeemScriptBytes:restStack) -> do
+                -- Verify hash matches
+                let Hash160 actualHash = hash160 redeemScriptBytes
+                if actualHash /= getHash160 expectedHash
+                  then Right False
+                  else do
+                    -- Deserialize and evaluate redeem script
+                    redeemScript <- decodeScript redeemScriptBytes
+                    let env4 = env3 { seStack = restStack
+                                    , seOpCount = 0
+                                    , seIfStack = []
+                                    , seScriptCode = redeemScriptBytes
+                                    }
+                    env5 <- evalScriptWithStack restStack redeemScript env4
+                    case seStack env5 of
+                      [] -> Right False
+                      (t:_) ->
+                        if not (isTrue t) then Right False
+                        else checkClean (seStack env5)
 
-        -- P2WPKH: check witness (pass flags through)
-        P2WPKH h -> verifyP2WPKHWithFlags flags tx idx h amount
+          -- P2WPKH: check witness (pass flags through)
+          P2WPKH h -> verifyP2WPKHWithFlags flags tx idx h amount
 
-        -- P2WSH: check witness (pass flags through)
-        P2WSH h -> verifyP2WSHWithFlags flags tx idx h amount
+          -- P2WSH: check witness (pass flags through)
+          P2WSH h -> verifyP2WSHWithFlags flags tx idx h amount
 
-        -- Other types: already verified
-        _ -> Right True
+          -- Other types: already verified
+          _ -> checkClean (seStack env3)
 
 -- | Verify P2WPKH witness (without flags, for backward compatibility)
 verifyP2WPKH :: Tx -> Int -> Hash160 -> Word64 -> Either String Bool
