@@ -667,7 +667,9 @@ classifyOutput (Script ops) = case ops of
     | BS.length h == 20 -> P2PKH (Hash160 h)
 
   -- P2SH: OP_HASH160 <20> OP_EQUAL
-  [OP_HASH160, OP_PUSHDATA h _, OP_EQUAL]
+  -- Must use direct push (OPCODE type), matching Bitcoin Core's IsPayToScriptHash()
+  -- which requires exactly 23 bytes: 0xa9 0x14 <20 bytes> 0x87
+  [OP_HASH160, OP_PUSHDATA h OPCODE, OP_EQUAL]
     | BS.length h == 20 -> P2SH (Hash160 h)
 
   -- P2WPKH: OP_0 <20>
@@ -992,9 +994,9 @@ decodeScriptNum :: Bool -> ByteString -> Either String Int64
 decodeScriptNum requireMinimal bs
   | BS.null bs = Right 0
   | BS.length bs > 4 = Left "Script number overflow"
-  | requireMinimal && BS.length bs > 1
+  | requireMinimal && BS.length bs > 0
     && (BS.last bs .&. 0x7f) == 0
-    && not (BS.index bs (BS.length bs - 2) `testBit` 7)
+    && (BS.length bs <= 1 || not (BS.index bs (BS.length bs - 2) `testBit` 7))
     = Left "Non-minimal script number encoding"
   | otherwise =
       let bytes = BS.unpack bs
@@ -1363,6 +1365,11 @@ execFlowControlOnly op env = do
     OP_MOD -> Left "OP_MOD is disabled"
     OP_LSHIFT -> Left "OP_LSHIFT is disabled"
     OP_RSHIFT -> Left "OP_RSHIFT is disabled"
+    -- Push data size must be checked even in non-executing branches
+    -- (Bitcoin Core checks this during instruction read, before fExec)
+    OP_PUSHDATA bs _ -> do
+      checkElementSize bs
+      Right env'
     _ -> Right env'  -- All other ops are skipped
 
 -- | Check element size limit (520 bytes for non-witness, 10000 for witness)
@@ -1382,7 +1389,7 @@ execIf matchTrue env = do
   -- MINIMALIF check: enforce minimal IF/NOTIF inputs for witness scripts
   -- In witness v0/v1 (tapscript), the argument must be exactly empty or [0x01]
   -- Reference: Bitcoin Core interpreter.cpp OP_IF handler
-  let minimalIfRequired = seIsWitness env'' || hasFlag (seFlags env'') VerifyMinimalIf
+  let minimalIfRequired = seIsWitness env'' && hasFlag (seFlags env'') VerifyMinimalIf
   -- Check for valid minimal IF argument when required
   _ <- if minimalIfRequired
        then case BS.unpack top of
@@ -1437,17 +1444,17 @@ exec2Drop env = do
 
 exec2Dup :: ScriptEnv -> Either String ScriptEnv
 exec2Dup env = case seStack env of
-  (a:b:_) -> checkStackSize $ pushStack b $ pushStack a env
+  (a:b:_) -> checkStackSize $ pushStack a $ pushStack b env
   _ -> Left "Stack underflow"
 
 exec3Dup :: ScriptEnv -> Either String ScriptEnv
 exec3Dup env = case seStack env of
-  (a:b:c:_) -> checkStackSize $ pushStack c $ pushStack b $ pushStack a env
+  (a:b:c:_) -> checkStackSize $ pushStack a $ pushStack b $ pushStack c env
   _ -> Left "Stack underflow"
 
 exec2Over :: ScriptEnv -> Either String ScriptEnv
 exec2Over env = case seStack env of
-  (_:_:a:b:_) -> checkStackSize $ pushStack b $ pushStack a env
+  (_:_:a:b:_) -> checkStackSize $ pushStack a $ pushStack b env
   _ -> Left "Stack underflow"
 
 exec2Rot :: ScriptEnv -> Either String ScriptEnv
@@ -1715,26 +1722,30 @@ execCheckSig env = do
     unless (isCompressedPubKey pubkeyBytes) $
       Left "Witness pubkey not compressed"
 
+  -- Encoding checks happen BEFORE the empty sig shortcut, matching Bitcoin Core.
+  -- CheckSignatureEncoding passes for empty sigs, then CheckPubKeyEncoding is checked.
+  unless (BS.null sigBytes) $ do
+    -- STRICTENC / DERSIG: validate DER encoding of the signature
+    -- The signature includes the sighash type byte at the end
+    when (hasFlag (seFlags env'') VerifyStrictEncoding || hasFlag (seFlags env'') VerifyDERSig) $ do
+      unless (isValidDERSignature sigBytes) $
+        Left "Non-canonical DER signature"
+
+    -- STRICTENC: validate sighash type byte
+    when (hasFlag (seFlags env'') VerifyStrictEncoding) $ do
+      let sigHashByte = BS.last sigBytes
+      unless (isDefinedSigHashType sigHashByte) $
+        Left "Invalid sighash type"
+
+  -- STRICTENC: validate pubkey encoding (checked even with empty sig)
+  when (hasFlag (seFlags env'') VerifyStrictEncoding) $ do
+    unless (isValidPubKeyEncoding pubkeyBytes) $
+      Left "Invalid public key encoding"
+
   -- If signature is empty, push false (this is always valid, even with NULLFAIL)
   if BS.null sigBytes
     then Right $ pushStack stackFalse env''
     else do
-      -- STRICTENC / DERSIG: validate DER encoding of the signature
-      -- The signature includes the sighash type byte at the end
-      when (hasFlag (seFlags env'') VerifyStrictEncoding || hasFlag (seFlags env'') VerifyDERSig) $ do
-        unless (isValidDERSignature sigBytes) $
-          Left "Non-canonical DER signature"
-
-      -- STRICTENC: validate sighash type byte
-      when (hasFlag (seFlags env'') VerifyStrictEncoding) $ do
-        let sigHashByte = BS.last sigBytes
-        unless (isDefinedSigHashType sigHashByte) $
-          Left "Invalid sighash type"
-
-      -- STRICTENC: validate pubkey encoding
-      when (hasFlag (seFlags env'') VerifyStrictEncoding && not (BS.null pubkeyBytes)) $ do
-        unless (isValidPubKeyEncoding pubkeyBytes) $
-          Left "Invalid public key encoding"
 
       -- LOW_S: validate S value is low
       when (hasFlag (seFlags env'') VerifyLowS) $ do
@@ -1845,34 +1856,6 @@ execCheckMultiSig env = do
   when (hasFlag (seFlags env5) VerifyNullDummy && not (BS.null dummy)) $
     Left "NULLDUMMY violation: dummy must be empty"
 
-  -- STRICTENC / DERSIG: validate DER encoding of all non-empty signatures
-  when (hasFlag (seFlags env5) VerifyStrictEncoding || hasFlag (seFlags env5) VerifyDERSig) $
-    forM_ sigs $ \s ->
-      unless (BS.null s) $
-        unless (isValidDERSignature s) $
-          Left "Non-canonical DER signature"
-
-  -- STRICTENC: validate sighash type bytes of all non-empty signatures
-  when (hasFlag (seFlags env5) VerifyStrictEncoding) $
-    forM_ sigs $ \s ->
-      unless (BS.null s) $
-        unless (isDefinedSigHashType (BS.last s)) $
-          Left "Invalid sighash type"
-
-  -- STRICTENC: validate pubkey encoding for all pubkeys
-  when (hasFlag (seFlags env5) VerifyStrictEncoding) $
-    forM_ pubkeys $ \pk ->
-      unless (BS.null pk) $
-        unless (isValidPubKeyEncoding pk) $
-          Left "Invalid public key encoding"
-
-  -- LOW_S: validate S value is low for all non-empty signatures
-  when (hasFlag (seFlags env5) VerifyLowS) $
-    forM_ sigs $ \s ->
-      unless (BS.null s) $
-        unless (isLowDERSignature s) $
-          Left "Non-canonical signature: S value is unnecessarily high"
-
   -- Build scriptCode for sighash computation
   -- For legacy scripts, we need to:
   -- 1. Start from after last OP_CODESEPARATOR
@@ -1892,31 +1875,64 @@ execCheckMultiSig env = do
   -- Bitcoin Core's algorithm: two cursors walk forward through sigs and pubkeys.
   -- For each sig, try pubkeys from current position. If match, advance both.
   -- If no match, advance pubkey cursor only. Fail if remaining pubkeys < remaining sigs.
-  let verifyMultiSig [] _ _ = True  -- All sigs verified
-      verifyMultiSig (_:_) [] _ = False  -- Sigs left but no pubkeys
+  --
+  -- IMPORTANT: Encoding checks (STRICTENC, DERSIG, LOW_S) happen INSIDE the
+  -- iteration loop, not before it. This matches Bitcoin Core's behavior where
+  -- pubkey and signature encoding are only checked when they are actually
+  -- compared during the iteration. If there are 0 signatures, no checks happen.
+  let verifyMultiSig :: [ByteString] -> [ByteString] -> Int -> Either String Bool
+      verifyMultiSig [] _ _ = Right True  -- All sigs verified
+      verifyMultiSig (_:_) [] _ = Right False  -- Sigs left but no pubkeys
       verifyMultiSig sigsLeft@(s:restSigs) (pk:restPks) nSigsRemaining =
         -- Check if enough pubkeys remain for the sigs we still need
         if length (pk:restPks) < nSigsRemaining
-        then False
-        else if BS.null s || BS.length s < 2
-             then verifyMultiSig restSigs (pk:restPks) (nSigsRemaining - 1)
-             else
-               let sigHashByte = BS.last s
-                   sigWithoutType = BS.init s
-                   sigHashType = parseSigHashByte sigHashByte
-                   sigHashW32 = fromIntegral sigHashByte :: Word32
-                   sighash = if seIsWitness env5
-                             then txSigHashSegWit (seTx env5) (seInputIdx env5)
-                                                   baseScriptCode (seAmount env5) sigHashType
-                             else txSigHash (seTx env5) (seInputIdx env5) baseScriptCode sigHashW32 sigHashType
-                   matched = case parsePubKey pk of
-                     Nothing -> False
-                     Just pubkey ->
-                       verifyMsgLax pubkey (Sig sigWithoutType) sighash
-               in if matched
+        then Right False
+        else if BS.null s
+             -- Empty signatures never match; just advance pubkey cursor
+             then verifyMultiSig sigsLeft restPks nSigsRemaining
+             else do
+               -- Encoding checks for non-empty signatures (matching Bitcoin Core's
+               -- CheckSignatureEncoding/CheckPubKeyEncoding inside the while loop)
+
+               -- STRICTENC / DERSIG: validate DER encoding of current signature
+               when (hasFlag (seFlags env5) VerifyStrictEncoding || hasFlag (seFlags env5) VerifyDERSig) $
+                 unless (isValidDERSignature s) $
+                   Left "Non-canonical DER signature"
+
+               -- STRICTENC: validate sighash type byte
+               when (hasFlag (seFlags env5) VerifyStrictEncoding) $
+                 unless (isDefinedSigHashType (BS.last s)) $
+                   Left "Invalid sighash type"
+
+               -- STRICTENC: validate pubkey encoding
+               when (hasFlag (seFlags env5) VerifyStrictEncoding) $
+                 unless (isValidPubKeyEncoding pk) $
+                   Left "Invalid public key encoding"
+
+               -- LOW_S: validate S value is low
+               when (hasFlag (seFlags env5) VerifyLowS) $
+                 unless (isLowDERSignature s) $
+                   Left "Non-canonical signature: S value is unnecessarily high"
+
+               -- Attempt verification only if sig has at least 2 bytes (hashtype + data)
+               let matched = if BS.length s < 2
+                    then False  -- Too short to be a valid signature
+                    else let sigHashByte = BS.last s
+                             sigWithoutType = BS.init s
+                             sigHashType = parseSigHashByte sigHashByte
+                             sigHashW32 = fromIntegral sigHashByte :: Word32
+                             sighash = if seIsWitness env5
+                                       then txSigHashSegWit (seTx env5) (seInputIdx env5)
+                                                             baseScriptCode (seAmount env5) sigHashType
+                                       else txSigHash (seTx env5) (seInputIdx env5) baseScriptCode sigHashW32 sigHashType
+                         in case parsePubKey pk of
+                              Nothing -> False
+                              Just pubkey ->
+                                verifyMsgLax pubkey (Sig sigWithoutType) sighash
+               if matched
                   then verifyMultiSig restSigs restPks (nSigsRemaining - 1)
                   else verifyMultiSig sigsLeft restPks nSigsRemaining
-      fSuccess = verifyMultiSig sigs pubkeys (length sigs)
+  fSuccess <- verifyMultiSig sigs pubkeys (length sigs)
 
   -- BIP-146 NULLFAIL: If the operation failed, ALL signatures must be empty
   -- This is critical: if fSuccess is False and NULLFAIL is enabled,
@@ -2117,6 +2133,10 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
   let sigStack = seStack env1
       savedStack = sigStack  -- Save for P2SH
 
+  -- Check for unbalanced IF/ENDIF in scriptSig
+  unless (null $ seIfStack env1) $
+    Left "Unbalanced IF/ENDIF"
+
   -- Clear altstack between scriptSig and scriptPubKey evaluation
   -- Reset for scriptPubKey evaluation
   let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [], seAltStack = [] }
@@ -2164,6 +2184,8 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
                                       , seScriptCode = redeemScriptBytes
                                       }
                       env5 <- evalScriptWithStack restStack redeemScript env4
+                      unless (null $ seIfStack env5) $
+                        Left "Unbalanced IF/ENDIF"
                       case seStack env5 of
                         [] -> Right False
                         (t:_) ->
