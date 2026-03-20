@@ -176,7 +176,7 @@ parsePubKey :: ByteString -> Maybe PubKey
 parsePubKey bs
   | BS.length bs == 33 && (BS.head bs == 0x02 || BS.head bs == 0x03) =
       Just (PubKeyCompressed bs)
-  | BS.length bs == 65 && BS.head bs == 0x04 =
+  | BS.length bs == 65 && (BS.head bs == 0x04 || BS.head bs == 0x06 || BS.head bs == 0x07) =
       Just (PubKeyUncompressed bs)
   | otherwise = Nothing
 
