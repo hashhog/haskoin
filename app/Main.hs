@@ -47,7 +47,7 @@ data Options = Options
   , optCommand   :: !Command
   } deriving (Show)
 
-data NetworkName = Mainnet | Testnet | Regtest
+data NetworkName = Mainnet | Testnet | Testnet4 | Regtest
   deriving (Show, Read, Eq)
 
 data Command
@@ -96,7 +96,7 @@ parseOptions = Options
         <> value "~/.haskoin" <> help "Data directory" )
   <*> option auto
       ( long "network" <> short 'n' <> metavar "NETWORK"
-        <> value Mainnet <> help "Network: Mainnet, Testnet, Regtest" )
+        <> value Mainnet <> help "Network: Mainnet, Testnet, Testnet4, Regtest" )
   <*> hsubparser
       ( command "node" (info (CmdNode <$> parseNodeOptions)
           (progDesc "Run the full node"))
@@ -166,9 +166,10 @@ main = do
 runCommand :: Options -> IO ()
 runCommand Options{..} = do
   let net = case optNetwork of
-              Mainnet -> mainnet
-              Testnet -> testnet3
-              Regtest -> regtest
+              Mainnet  -> mainnet
+              Testnet  -> testnet3
+              Testnet4 -> testnet4
+              Regtest  -> regtest
 
   -- Expand ~ in data directory
   dataDir <- expandPath optDataDir
@@ -316,34 +317,35 @@ initHeaderChainFromDB db net = do
     , hcInvalidated = invalidatedVar
     }
 
--- | Wait for a peer to connect, then send getheaders
+-- | Periodically send getheaders to sync the chain
 getheadersSender :: PeerManager -> HeaderChain -> Network -> IO ()
 getheadersSender pm hc _net = do
-  putStrLn "getheadersSender: waiting for peer..."
-  -- Wait until we have at least one peer
-  let waitForPeer :: IO PeerConnection
-      waitForPeer = do
-        peers <- readTVarIO (pmPeers pm)
-        if Map.null peers
-          then threadDelay 500000 >> waitForPeer  -- 0.5s
-          else do
-            putStrLn $ "getheadersSender: found " ++ show (Map.size peers) ++ " peer(s)"
-            return (head $ Map.elems peers)
-  pc <- waitForPeer
-  putStrLn "Peer connected, sending getheaders..."
+  putStrLn "getheadersSender: starting periodic sync..."
+  forever $ do
+    -- Wait until we have at least one peer
+    let waitForPeer :: IO PeerConnection
+        waitForPeer = do
+          peers <- readTVarIO (pmPeers pm)
+          if Map.null peers
+            then threadDelay 500000 >> waitForPeer  -- 0.5s
+            else return (head $ Map.elems peers)
+    pc <- waitForPeer
 
-  -- Build getheaders from our current tip
-  tip <- getChainTip hc
-  let locator = [ceHash tip]
-      zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
-      getHdrs = GetHeaders
-        { ghVersion  = fromIntegral protocolVersion
-        , ghLocators = locator
-        , ghHashStop = zeroHash
-        }
-  sendMessage pc (MGetHeaders getHdrs)
-    `catch` (\(_ :: IOException) -> putStrLn "Failed to send getheaders")
-  putStrLn "getheaders sent successfully"
+    -- Build getheaders from our current tip
+    tip <- getChainTip hc
+    let locator = [ceHash tip]
+        zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+        getHdrs = GetHeaders
+          { ghVersion  = fromIntegral protocolVersion
+          , ghLocators = locator
+          , ghHashStop = zeroHash
+          }
+    putStrLn $ "getheadersSender: requesting headers from height " ++ show (ceHeight tip)
+    sendMessage pc (MGetHeaders getHdrs)
+      `catch` (\(_ :: IOException) -> putStrLn "Failed to send getheaders")
+
+    -- Wait 5 seconds before next check
+    threadDelay 5000000
 
 -- | Request blocks for a range of heights from the header chain
 requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> IO ()
@@ -385,6 +387,22 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = cas
       pm <- readIORef pmRef
       requestBlocks pm hc nextBlock tipHeight
       writeIORef nextBlockRef (tipHeight + 1)
+      -- If we got a full batch (2000), request more headers
+      when (added >= 2000) $ do
+        let locator = [ceHash tip]
+            zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+            getHdrs = GetHeaders
+              { ghVersion  = fromIntegral protocolVersion
+              , ghLocators = locator
+              , ghHashStop = zeroHash
+              }
+        peers <- readTVarIO (pmPeers pm)
+        case Map.elems peers of
+          (pc:_) -> do
+            putStrLn $ "Requesting next batch of headers from height " ++ show tipHeight
+            sendMessage pc (MGetHeaders getHdrs)
+              `catch` (\(_ :: IOException) -> putStrLn "Failed to send getheaders")
+          [] -> putStrLn "No peers to request more headers from"
 
   MBlock block -> do
     let bh = computeBlockHash (blockHeader block)
