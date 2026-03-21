@@ -13,9 +13,9 @@ import System.IO (hSetBuffering, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO)
-import Control.Monad (forM_, unless, when, void, forever)
+import Control.Monad (forM, forM_, unless, when, void, forever, filterM)
 import Control.Concurrent.STM
-import Control.Exception (bracket, catch, IOException, SomeException)
+import Control.Exception (bracket, catch, SomeException)
 import Data.Word (Word32, Word64)
 import Data.Int (Int32)
 import Data.IORef
@@ -234,6 +234,8 @@ runNode net dataDir NodeOptions{..} = do
 
     -- Track next expected block height for download
     nextBlockRef <- newIORef (1 :: Word32)
+    -- Track highest block we've requested (for sliding window)
+    requestedUpToRef <- newIORef (0 :: Word32)
 
     -- Start header sync
     hs <- startHeaderSync net hc
@@ -242,7 +244,9 @@ runNode net dataDir NodeOptions{..} = do
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers }
     pmRef <- newIORef (undefined :: PeerManager)
-    pm <- startPeerManager net pmConfig (syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef)
+    pm <- startPeerManager net pmConfig (\addr msg ->
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef addr msg
+        `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
     -- Seed known addresses from --connect flags
@@ -262,6 +266,8 @@ runNode net dataDir NodeOptions{..} = do
     -- Spawn a thread to send getheaders once a peer connects
     void $ forkIO $ getheadersSender pm hc net
       `catch` (\(e :: SomeException) -> putStrLn $ "getheadersSender error: " ++ show e)
+
+    -- Block downloading is done from the MHeaders and MBlock handlers
 
     -- Start RPC server
     let rpcConfig = defaultRpcConfig
@@ -317,59 +323,101 @@ initHeaderChainFromDB db net = do
     , hcInvalidated = invalidatedVar
     }
 
+-- | Send a message to a peer.
+-- Use sendMessage directly since the send queue approach has issues
+-- with dead send threads. sendMessage is simpler and works.
+safeSendMessage :: PeerConnection -> Message -> IO ()
+safeSendMessage = sendMessage
+
 -- | Periodically send getheaders to sync the chain
 getheadersSender :: PeerManager -> HeaderChain -> Network -> IO ()
 getheadersSender pm hc _net = do
   putStrLn "getheadersSender: starting periodic sync..."
   forever $ do
-    -- Wait until we have at least one peer
-    let waitForPeer :: IO PeerConnection
-        waitForPeer = do
-          peers <- readTVarIO (pmPeers pm)
-          if Map.null peers
-            then threadDelay 500000 >> waitForPeer  -- 0.5s
-            else return (head $ Map.elems peers)
-    pc <- waitForPeer
-
-    -- Build getheaders from our current tip
-    tip <- getChainTip hc
-    let locator = [ceHash tip]
-        zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
-        getHdrs = GetHeaders
-          { ghVersion  = fromIntegral protocolVersion
-          , ghLocators = locator
-          , ghHashStop = zeroHash
-          }
-    putStrLn $ "getheadersSender: requesting headers from height " ++ show (ceHeight tip)
-    sendMessage pc (MGetHeaders getHdrs)
-      `catch` (\(_ :: IOException) -> putStrLn "Failed to send getheaders")
+    -- Get a fresh peer snapshot each iteration, filtering for connected peers
+    connectedPeers <- getConnectedPeerList pm
+    if null connectedPeers
+      then threadDelay 1000000  -- 1s wait if no peers
+      else do
+        tip <- getChainTip hc
+        -- Use proper exponential-backoff block locator instead of single hash
+        locator <- buildBlockLocatorFromChain hc
+        let finalLocator = if null locator then [ceHash tip] else locator
+            zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+            getHdrs = GetHeaders
+              { ghVersion  = fromIntegral protocolVersion
+              , ghLocators = finalLocator
+              , ghHashStop = zeroHash
+              }
+        -- Send to ALL connected peers, not just the first one that works
+        -- This way if some peers are stale we still get headers from others
+        sentCount <- sendToAllPeers connectedPeers (MGetHeaders getHdrs)
+        when (sentCount > 0) $
+          putStrLn $ "getheadersSender: requesting headers from height " ++ show (ceHeight tip)
+            ++ " (locator size " ++ show (length finalLocator) ++ ", sent to " ++ show sentCount ++ " peers)"
+        when (sentCount == 0) $
+          putStrLn "getheadersSender: no reachable peers, will retry..."
 
     -- Wait 5 seconds before next check
     threadDelay 5000000
+  where
+    -- Send a message to all peers, return count of successful sends
+    sendToAllPeers :: [PeerConnection] -> Message -> IO Int
+    sendToAllPeers pcs msg = do
+      results <- forM pcs $ \pc ->
+        (safeSendMessage pc msg >> return (1 :: Int))
+          `catch` (\(_ :: SomeException) -> return 0)
+      return (sum results)
+
+-- | Get list of peers that are in PeerConnected state
+getConnectedPeerList :: PeerManager -> IO [PeerConnection]
+getConnectedPeerList pm = do
+  peers <- readTVarIO (pmPeers pm)
+  filterM isPeerConnected (Map.elems peers)
+  where
+    isPeerConnected pc = do
+      peerInfo <- readTVarIO (pcInfo pc)
+      return (piState peerInfo == PeerConnected)
 
 -- | Request blocks for a range of heights from the header chain
+-- Batches requests in groups of 16 to avoid overwhelming peers
 requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> IO ()
 requestBlocks pm hc fromHeight toHeight = do
-  peers <- readTVarIO (pmPeers pm)
-  case Map.elems peers of
-    [] -> putStrLn "No peers to request blocks from"
-    (pc:_) -> do
+  peerList <- getConnectedPeerList pm
+  case peerList of
+    [] -> putStrLn "No connected peers to request blocks from"
+    _ -> do
       heightMap <- readTVarIO (hcByHeight hc)
       let hashes = [ h | height <- [fromHeight..toHeight]
                        , Just h <- [Map.lookup height heightMap] ]
-          invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- hashes ]
-      unless (null invVecs) $ do
-        putStrLn $ "Requesting " ++ show (length invVecs) ++ " blocks (heights "
-                   ++ show fromHeight ++ "-" ++ show toHeight ++ ")"
-        sendMessage pc (MGetData (GetData invVecs))
-          `catch` (\(_ :: IOException) -> putStrLn "Failed to send getdata")
+          -- Split into batches of 16
+          batches = chunksOf 16 hashes
+          numPeers = length peerList
+      unless (null hashes) $ do
+        putStrLn $ "Requesting " ++ show (length hashes) ++ " blocks (heights "
+                   ++ show fromHeight ++ "-" ++ show toHeight
+                   ++ ") from " ++ show numPeers ++ " peers"
+        -- Distribute batches across available peers (round-robin)
+        forM_ (zip [0..] batches) $ \(idx :: Int, batch) -> do
+          let pc = peerList !! (idx `mod` numPeers)
+              invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- batch ]
+          ok <- (safeSendMessage pc (MGetData (GetData invVecs)) >> return True)
+            `catch` (\(e :: SomeException) -> do
+              putStrLn $ "Failed to send getdata: " ++ show e
+              return False)
+          unless ok $ return ()
+
+-- | Split a list into chunks of n
+chunksOf :: Int -> [a] -> [[a]]
+chunksOf _ [] = []
+chunksOf n xs = let (chunk, rest) = splitAt n xs in chunk : chunksOf n rest
 
 -- | Sync-aware message handler
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
-                   -> IORef PeerManager -> IORef Word32
+                   -> IORef PeerManager -> IORef Word32 -> IORef Word32
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = case msg of
+syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -379,7 +427,30 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = cas
     putStrLn $ "Added " ++ show added ++ " headers"
     unless (null errs) $
       putStrLn $ "Header errors: " ++ show errs
-    -- After adding headers, request the blocks
+    -- If we got a full batch (2000), request more headers immediately
+    when (added >= 2000) $ do
+      tip <- getChainTip hc
+      let tipHeight = ceHeight tip
+          locator = [ceHash tip]
+          zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+          getHdrs = GetHeaders
+            { ghVersion  = fromIntegral protocolVersion
+            , ghLocators = locator
+            , ghHashStop = zeroHash
+            }
+      pm <- readIORef pmRef
+      connPeers <- getConnectedPeerList pm
+      case connPeers of
+        [] -> putStrLn "No peers to request more headers from"
+        _  -> do
+          putStrLn $ "Requesting next batch of headers from height " ++ show tipHeight
+          let trySend [] = putStrLn "Failed to send getheaders to any peer"
+              trySend (pc:rest) = do
+                ok <- (safeSendMessage pc (MGetHeaders getHdrs) >> return True)
+                  `catch` (\(_ :: SomeException) -> return False)
+                unless ok $ trySend rest
+          trySend connPeers
+    -- After headers, request ALL blocks up to new tip
     when (added > 0) $ do
       tip <- getChainTip hc
       let tipHeight = ceHeight tip
@@ -387,22 +458,7 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = cas
       pm <- readIORef pmRef
       requestBlocks pm hc nextBlock tipHeight
       writeIORef nextBlockRef (tipHeight + 1)
-      -- If we got a full batch (2000), request more headers
-      when (added >= 2000) $ do
-        let locator = [ceHash tip]
-            zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
-            getHdrs = GetHeaders
-              { ghVersion  = fromIntegral protocolVersion
-              , ghLocators = locator
-              , ghHashStop = zeroHash
-              }
-        peers <- readTVarIO (pmPeers pm)
-        case Map.elems peers of
-          (pc:_) -> do
-            putStrLn $ "Requesting next batch of headers from height " ++ show tipHeight
-            sendMessage pc (MGetHeaders getHdrs)
-              `catch` (\(_ :: IOException) -> putStrLn "Failed to send getheaders")
-          [] -> putStrLn "No peers to request more headers from"
+      writeIORef requestedUpToRef tipHeight
 
   MBlock block -> do
     let bh = computeBlockHash (blockHeader block)
@@ -411,12 +467,21 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = cas
     let mHeight = Map.foldlWithKey'
           (\acc h hash -> if hash == bh then Just h else acc) Nothing heightMap
     case mHeight of
-      Nothing -> putStrLn $ "Received unknown block: " ++ show bh
+      Nothing -> return ()  -- Ignore unknown blocks silently
       Just height -> do
-        putStrLn $ "Received block at height " ++ show height ++ ": " ++ show bh
-        connectBlock db net block height
-        putBlockHeight db height bh
-        putBestBlockHash db bh
+        let result = do
+              connectBlock db net block height
+              putBlockHeight db height bh
+              putBestBlockHash db bh
+        result `catch` (\(e :: SomeException) ->
+          putStrLn $ "ERROR connecting block " ++ show height ++ ": " ++ show e)
+        when (height `mod` 500 == 0) $
+          putStrLn $ "Connected block at height " ++ show height
+        -- Advance the next-block pointer past this height
+        -- This allows the download window to slide forward
+        nextBlock <- readIORef nextBlockRef
+        when (height >= nextBlock) $
+          writeIORef nextBlockRef (height + 1)
 
   MTx tx -> do
     _ <- addTransaction mp tx
@@ -428,7 +493,20 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef _addr msg = cas
   MAddr _addrs ->
     return ()
 
-  _ -> return ()
+  MNotFound (NotFound invs) ->
+    putStrLn $ "Peer says not found: " ++ show (length invs) ++ " items"
+
+  MReject (Reject cmd code reason _) ->
+    putStrLn $ "Peer rejected " ++ show cmd ++ ": code=" ++ show code ++ " reason=" ++ show reason
+
+  MPong _ -> return ()
+  MVerAck -> return ()
+  MSendHeaders -> return ()
+  MSendCmpct _ -> return ()
+  MFeeFilter _ -> return ()
+  MWtxidRelay -> return ()
+
+  _other -> return ()  -- Silently ignore other messages
 
 --------------------------------------------------------------------------------
 -- Wallet Commands

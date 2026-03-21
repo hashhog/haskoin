@@ -484,7 +484,7 @@ import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe)
 import Data.List (sortBy, groupBy, partition, foldl')
 import Data.Ord (comparing, Down(..))
-import Data.Function (on)
+import Data.Function (fix, on)
 import Control.Concurrent (threadDelay)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -501,6 +501,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO, randomRIO)
 import Control.Concurrent (ThreadId, forkIO, killThread)
+import System.Timeout (timeout)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException, catch, mask_, IOException)
 import Data.Hashable (Hashable(..))
@@ -1688,9 +1689,9 @@ sendMessage pc msg = do
       }
 
 -- | Receive exactly n bytes from the socket, buffering partial reads
--- KNOWN PITFALL: Uses mask_ to prevent async exceptions from desyncing TCP stream
+-- Uses a 60-second timeout to detect dead connections
 recvExact :: PeerConnection -> Int -> IO (Maybe ByteString)
-recvExact pc n = mask_ $ do
+recvExact pc n = do
   buf <- readIORef (pcReadBuffer pc)
   if BS.length buf >= n
     then do
@@ -1698,12 +1699,14 @@ recvExact pc n = mask_ $ do
       writeIORef (pcReadBuffer pc) rest
       return (Just result)
     else do
-      -- Need more data
-      mChunk <- (Just <$> recv (pcSocket pc) (max 4096 (n - BS.length buf)))
-                `catch` (\(_ :: IOException) -> return Nothing)
-      case mChunk of
-        Nothing -> return Nothing  -- Connection closed or error
-        Just chunk
+      -- Need more data - use timeout to avoid blocking forever on dead connections
+      mResult <- timeout (60 * 1000000) $  -- 60 second timeout
+        (Just <$> recv (pcSocket pc) (max 4096 (n - BS.length buf)))
+          `catch` (\(_ :: IOException) -> return Nothing)
+      case mResult of
+        Nothing -> return Nothing  -- Timeout: peer unresponsive
+        Just Nothing -> return Nothing  -- Connection closed or error
+        Just (Just chunk)
           | BS.null chunk -> return Nothing  -- Connection closed
           | otherwise -> do
               writeIORef (pcReadBuffer pc) (BS.append buf chunk)
@@ -1880,18 +1883,21 @@ startPeerThreads pc handler = do
     sendMessage pc msg `catch` (\(_ :: SomeException) -> disconnectPeer pc)
 
   -- Receive thread: reads from socket and calls handler
-  recvTid <- forkIO $ forever $ do
+  recvTid <- forkIO $ fix $ \loop -> do
     result <- receiveMessage pc
     case result of
       Right msg -> do
         -- Update last seen timestamp
         now <- round <$> getPOSIXTime
         atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastSeen = now })
-        -- Also put in receive queue for async processing
-        atomically $ writeTBQueue (pcRecvQueue pc) msg
-        -- Call handler
+        -- Call handler (recv queue intentionally not used — handler is called
+        -- directly to avoid blocking when the bounded queue fills up)
         handler msg
-      Left _ -> disconnectPeer pc
+        loop
+      Left err -> do
+        disconnectPeer pc
+        -- Do NOT loop after disconnect: socket is closed, further reads
+        -- would spin indefinitely.
 
   return pc { pcSendThread = Just sendTid, pcRecvThread = Just recvTid }
 
@@ -1914,6 +1920,8 @@ data PeerManager = PeerManager
   , pmBestHeight     :: !(TVar Int32)
   , pmManagerThread  :: !(TVar (Maybe ThreadId))
   , pmMessageHandler :: !(SockAddr -> Message -> IO ())
+  , pmFailedAddrs    :: !(TVar (Set.Set SockAddr))  -- ^ Addresses that failed to connect
+  , pmLastDNSRefresh :: !(TVar Int64)                -- ^ Last DNS re-discovery timestamp
   }
 
 -- | Configuration for the peer manager
@@ -1991,6 +1999,8 @@ startPeerManager net config handler = do
     <*> newTVarIO 0
     <*> newTVarIO Nothing
     <*> pure handler
+    <*> newTVarIO Set.empty
+    <*> newTVarIO 0
   tid <- forkIO $ peerManagerLoop pm
   atomically $ writeTVar (pmManagerThread pm) (Just tid)
   return pm
@@ -2006,6 +2016,13 @@ stopPeerManager pm = do
 -- | Main peer manager loop - maintains connections and handles timeouts
 peerManagerLoop :: PeerManager -> IO ()
 peerManagerLoop pm = forever $ do
+  -- Clean up disconnected peers from the map
+  allPeers <- readTVarIO (pmPeers pm)
+  forM_ (Map.toList allPeers) $ \(addr, pc) -> do
+    peerInfo <- readTVarIO (pcInfo pc)
+    when (piState peerInfo == PeerDisconnected) $
+      atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
   -- Maintain target outbound connections
   peers <- readTVarIO (pmPeers pm)
   let outboundCount = Map.size peers  -- simplified: count all as outbound
@@ -2014,26 +2031,41 @@ peerManagerLoop pm = forever $ do
   when (outboundCount < target) $ do
     known <- readTVarIO (pmKnownAddrs pm)
     banned <- readTVarIO (pmBannedAddrs pm)
+    failed <- readTVarIO (pmFailedAddrs pm)
+    lastDNS <- readTVarIO (pmLastDNSRefresh pm)
     now <- round <$> getPOSIXTime
 
     -- Filter out expired bans
     let activeBans = Map.filter (> now) banned
         connected = Map.keysSet peers
+        -- Exclude connected, banned, AND recently-failed addresses
         candidates = Set.toList $
-          Set.difference known (Set.union connected (Map.keysSet activeBans))
+          Set.difference known (Set.unions [connected, Map.keysSet activeBans, failed])
 
-    -- If no known addresses, discover via DNS
-    candidates' <- if null candidates
+    -- Re-discover via DNS if no viable candidates OR every 120 seconds
+    candidates' <- if null candidates || (now - lastDNS > 120)
       then do
         putStrLn $ "peerManagerLoop: discovering peers via DNS..."
         discovered <- discoverPeers (pmNetwork pm)
         putStrLn $ "peerManagerLoop: discovered " ++ show (length discovered) ++ " peers"
-        return discovered
+        atomically $ do
+          modifyTVar' (pmKnownAddrs pm) (Set.union (Set.fromList discovered))
+          -- Clear failed set on DNS refresh so we retry previously-failed addresses
+          writeTVar (pmFailedAddrs pm) Set.empty
+          writeTVar (pmLastDNSRefresh pm) now
+        -- Recompute candidates with fresh data
+        known' <- readTVarIO (pmKnownAddrs pm)
+        let candidates2 = Set.toList $
+              Set.difference known' (Set.union connected (Map.keysSet activeBans))
+        if null candidates2
+          then return discovered
+          else return candidates2
       else return candidates
 
     -- Connect to candidates
     let toConnect = take (target - outboundCount) candidates'
-    putStrLn $ "peerManagerLoop: connecting to " ++ show (length toConnect) ++ " candidates"
+    unless (null toConnect) $
+      putStrLn $ "peerManagerLoop: connecting to " ++ show (length toConnect) ++ " candidates"
     mapM_ (void . forkIO . tryConnect pm) toConnect
 
   -- Ping peers and disconnect stale ones
@@ -2089,7 +2121,10 @@ tryConnect pm addr = do
     putStrLn $ "tryConnect: attempting " ++ host ++ ":" ++ show port
     result <- connectPeer config host port
     case result of
-      Left err -> putStrLn $ "tryConnect: connect failed to " ++ host ++ ": " ++ err
+      Left err -> do
+        putStrLn $ "tryConnect: connect failed to " ++ host ++ ": " ++ err
+        -- Track this address as failed so we don't keep retrying it
+        atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
       Right pc -> do
         putStrLn $ "tryConnect: connected to " ++ host ++ ", starting handshake..."
         hsResult <- performHandshake config pc
@@ -2097,6 +2132,7 @@ tryConnect pm addr = do
           Left err -> do
             putStrLn $ "tryConnect: handshake failed with " ++ host ++ ": " ++ err
             disconnectPeer pc
+            atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
           Right ver -> do
             -- Verify peer supports required services
             unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
