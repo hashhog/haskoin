@@ -850,7 +850,7 @@ testnet3 = Network
 testnet4 :: Network
 testnet4 = Network
   { netName              = "testnet4"
-  , netMagic             = 0x1c163f28   -- testnet4 magic bytes
+  , netMagic             = 0x283f161c   -- Wire bytes: 1C 16 3F 28 (little-endian)
   , netDefaultPort       = 48333
   , netAddrPrefix        = 0x6F        -- Same as testnet3
   , netScriptPrefix      = 0xC4
@@ -895,11 +895,13 @@ testnet4GenesisHeader :: BlockHeader
 testnet4GenesisHeader = BlockHeader
   { bhVersion    = 1
   , bhPrevBlock  = BlockHash (Hash256 (BS.replicate 32 0))
-  , bhMerkleRoot = hexToHash256 "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+  , bhMerkleRoot = hexToHash256 "4e7b2b9128fe0291db0693af2ae418b767e657cd407e80cb1434221eaea7a07a"
   , bhTimestamp  = 1714777860   -- 2024-05-03
   , bhBits       = 0x1d00ffff
   , bhNonce      = 393743547
   }
+  -- Genesis block hash: 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043
+  -- Coinbase message: "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
 
 -- | Testnet4 genesis block
 testnet4GenesisBlock :: Block
@@ -912,12 +914,14 @@ testnet4GenesisBlock = Block
       { txVersion  = 1
       , txInputs   = [TxIn
           { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
-          , txInScript = hexToBS "04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73"
+          , txInScript = hexToBS "04ffff001d01044c4c30332f4d61792f323032342030303030303030303030303030303030303030303165626435386332343439373062336161396437383362623030313031316662653865613865393865303065"
+            -- Contains: \x04\xff\xff\x00\x1d\x01\x04\x4c\x4c 03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e
           , txInSequence = 0xffffffff
           }]
       , txOutputs  = [TxOut
-          { txOutValue  = 5000000000
-          , txOutScript = hexToBS "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac"
+          { txOutValue  = 5000000000  -- 50 BTC
+          , txOutScript = hexToBS "2100000000000000000000000000000000000000000000000000000000000000000000ac"
+            -- 33 zero bytes (push 0x21) + OP_CHECKSIG (0xac)
           }]
       , txWitness  = [[]]
       , txLockTime = 0
