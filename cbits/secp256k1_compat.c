@@ -7,6 +7,7 @@
  */
 
 #include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -240,4 +241,53 @@ int haskoin_ecdsa_verify_lax(
 
     /* Verify */
     return secp256k1_ecdsa_verify(ctx, &sig, msghash32, &pubkey);
+}
+
+/* ---- X-only pubkey tweak for Taproot (BIP-341) -------------------------- */
+
+/*
+ * Compute tweaked x-only public key for Taproot.
+ *
+ * Given a 32-byte x-only internal public key and a 32-byte tweak,
+ * computes the tweaked public key: output_key = internal_key + tweak * G
+ *
+ * Returns:
+ *   1 on success (output_pubkey32 filled with 32-byte x-only tweaked key,
+ *                  output_parity set to 0 or 1)
+ *   0 on failure
+ */
+int haskoin_xonly_pubkey_tweak_add(
+    const unsigned char *internal_pubkey32,
+    const unsigned char *tweak32,
+    unsigned char *output_pubkey32,
+    int *output_parity
+) {
+    secp256k1_context *ctx = get_verify_ctx();
+    secp256k1_xonly_pubkey internal_pk;
+    secp256k1_pubkey tweaked_pk;
+    secp256k1_xonly_pubkey tweaked_xonly;
+
+    if (!ctx) return 0;
+
+    /* Parse the 32-byte x-only internal public key */
+    if (!secp256k1_xonly_pubkey_parse(ctx, &internal_pk, internal_pubkey32)) {
+        return 0;
+    }
+
+    /* Tweak the internal key: tweaked_pk = internal_pk + tweak * G */
+    if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_pk, &internal_pk, tweak32)) {
+        return 0;
+    }
+
+    /* Convert the tweaked full pubkey to x-only and get parity */
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, output_parity, &tweaked_pk)) {
+        return 0;
+    }
+
+    /* Serialize the x-only tweaked key to 32 bytes */
+    if (!secp256k1_xonly_pubkey_serialize(ctx, output_pubkey32, &tweaked_xonly)) {
+        return 0;
+    }
+
+    return 1;
 }
