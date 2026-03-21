@@ -5,3 +5,5 @@ dist-newstyle/
 haskoin-regtest
 .claude/skills/
 dist-test/
+dist-testnet4/
+dist-newstyle2/
