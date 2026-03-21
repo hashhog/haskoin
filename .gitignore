@@ -4,3 +4,4 @@ dist-newstyle/
 .env
 haskoin-regtest
 .claude/skills/
+dist-test/
