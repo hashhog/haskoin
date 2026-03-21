@@ -1,6 +1,7 @@
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Haskoin.Crypto
   ( -- * Hashing
@@ -59,6 +60,9 @@ module Haskoin.Crypto
   , bech32Encode
   , bech32Decode
   , bech32mEncode
+    -- * Taproot Utilities
+  , taggedHash
+  , xonlyPubkeyTweakAdd
   ) where
 
 import qualified Crypto.Hash as H
@@ -81,6 +85,9 @@ import GHC.Generics (Generic)
 import System.IO.Unsafe (unsafePerformIO)
 import Foreign.C.Types (CUChar, CSize(..), CInt(..))
 import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Marshal.Array (allocaArray)
+import Foreign.Storable (peek)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
                       Tx(..), TxIn(..), TxOut(..), BlockHeader(..), OutPoint(..),
@@ -93,6 +100,14 @@ foreign import ccall unsafe "haskoin_ecdsa_verify_lax"
                      -> Ptr CUChar -> CSize
                      -> Ptr CUChar
                      -> IO CInt
+
+-- | FFI binding for x-only pubkey tweak add (Taproot BIP-341).
+foreign import ccall unsafe "haskoin_xonly_pubkey_tweak_add"
+  c_xonly_pubkey_tweak_add :: Ptr CUChar   -- internal_pubkey32
+                           -> Ptr CUChar   -- tweak32
+                           -> Ptr CUChar   -- output_pubkey32
+                           -> Ptr CInt     -- output_parity
+                           -> IO CInt
 
 --------------------------------------------------------------------------------
 -- Hashing Functions
@@ -121,6 +136,33 @@ hash160 bs = Hash160 (ripemd160 (sha256 bs))
 -- | Alias for doubleSHA256
 hash256 :: ByteString -> Hash256
 hash256 = doubleSHA256
+
+-- | BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data)
+taggedHash :: ByteString -> ByteString -> ByteString
+taggedHash tag msg =
+  let tagHash = sha256 tag
+  in sha256 (tagHash <> tagHash <> msg)
+
+-- | Compute tweaked x-only public key for Taproot (BIP-341).
+-- Given a 32-byte x-only internal key and a 32-byte tweak,
+-- returns (tweaked_x_only_key, parity) or Nothing on failure.
+xonlyPubkeyTweakAdd :: ByteString -> ByteString -> Maybe (ByteString, Int)
+xonlyPubkeyTweakAdd internalKey tweak
+  | BS.length internalKey /= 32 || BS.length tweak /= 32 = Nothing
+  | otherwise = unsafePerformIO $ do
+      BS.useAsCStringLen internalKey $ \(ikPtr, _) ->
+        BS.useAsCStringLen tweak $ \(twPtr, _) ->
+          allocaArray (32 :: Int) $ \(outPtr :: Ptr CUChar) ->
+            alloca $ \(parityPtr :: Ptr CInt) -> do
+              result <- c_xonly_pubkey_tweak_add
+                (castPtr ikPtr) (castPtr twPtr)
+                outPtr parityPtr
+              if result == 1
+                then do
+                  outKey <- BS.packCStringLen (castPtr outPtr, 32)
+                  parity <- peek parityPtr
+                  return $ Just (outKey, fromIntegral parity)
+                else return Nothing
 
 -- | HMAC-SHA512, used for BIP-32 key derivation
 hmacSHA512 :: ByteString -> ByteString -> ByteString

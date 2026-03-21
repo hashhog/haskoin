@@ -23,7 +23,7 @@ import           Text.Read            (readMaybe)
 import           Data.IORef
 import           Haskoin.Types        (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
                                        TxId(..), Hash256(..))
-import           Haskoin.Crypto       (computeTxId)
+import           Haskoin.Crypto       (computeTxId, taggedHash, xonlyPubkeyTweakAdd)
 import           Haskoin.Script
 
 -- | Opcode name (without OP_ prefix) -> byte value
@@ -237,13 +237,128 @@ jsonHexToBytes (String t) = decodeHex (T.unpack t)
 jsonHexToBytes _          = Nothing
 
 -- | Check if a test vector contains Taproot-specific placeholders
--- that we can't handle yet (#SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT#)
 hasTaprootPlaceholders :: [Value] -> Bool
 hasTaprootPlaceholders vals = any hasPlaceholder vals
   where
     hasPlaceholder (String t) = any (`T.isInfixOf` t) ["#SCRIPT#", "#CONTROLBLOCK#", "#TAPROOTOUTPUT#"]
     hasPlaceholder (Array arr) = any hasPlaceholder (V.toList arr)
     hasPlaceholder _           = False
+
+-- | The secp256k1 generator point x-coordinate (x-only, 32 bytes)
+internalKeyBytes :: ByteString
+internalKeyBytes = case B16.decode "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798" of
+  Right bs -> bs
+  Left _   -> error "Failed to decode internal key"
+
+-- | Encode a compact size integer (Bitcoin varint for small values)
+compactSize :: Int -> ByteString
+compactSize n
+  | n < 0xfd  = BS.singleton (fromIntegral n)
+  | n <= 0xffff = BS.pack [0xfd, fromIntegral (n .&. 0xff), fromIntegral ((n `shiftR` 8) .&. 0xff)]
+  | otherwise = error "compactSize: value too large"
+
+-- | Compute tapleaf hash for a script with leaf version 0xc0
+-- tagged hash "TapLeaf" of (leafVersion || compact_size(script_len) || script)
+tapleafHash :: ByteString -> ByteString
+tapleafHash script =
+  let leafVersion = BS.singleton 0xc0
+      scriptLen = compactSize (BS.length script)
+  in taggedHash "TapLeaf" (leafVersion <> scriptLen <> script)
+
+-- | Compute taproot output key from internal key and merkle root
+-- tweak = tagged hash "TapTweak" of (internal_key || merkle_root)
+-- output_key = internal_key + tweak * G
+computeTaprootOutputKey :: ByteString -> ByteString -> Maybe (ByteString, Int)
+computeTaprootOutputKey intKey merkleRoot =
+  let tweak = taggedHash "TapTweak" (intKey <> merkleRoot)
+  in xonlyPubkeyTweakAdd intKey tweak
+
+-- | Build control block for a single-leaf taproot script path
+-- control_block = (0xc0 | output_parity) || internal_key (33 bytes total)
+buildControlBlock :: Int -> ByteString -> ByteString
+buildControlBlock parity intKey =
+  let leafByte = fromIntegral (0xc0 .|. (parity .&. 0x01)) :: Word8
+  in BS.cons leafByte intKey
+
+-- | Resolve #SCRIPT# prefix: extract the ASM part after "#SCRIPT#",
+-- assemble to script bytes
+resolveScriptPlaceholder :: String -> ByteString
+resolveScriptPlaceholder s =
+  let prefix = "#SCRIPT# "
+      prefixLen = length prefix
+  in if take prefixLen s == prefix
+     then assembleScript (drop prefixLen s)
+     else if s == "#SCRIPT#"
+          then BS.empty
+          else assembleScript s
+
+-- | Sentinel value used to mark control block placeholder positions
+controlBlockSentinel :: ByteString
+controlBlockSentinel = BS8.pack "##CONTROLBLOCK_SENTINEL##"
+
+-- | Resolve taproot placeholders in a witness array.
+-- Items are the witness stack elements (without amount).
+-- Returns resolved witness items and the script bytes (for output key computation).
+resolveTaprootWitness :: [Value] -> Maybe ([ByteString], ByteString)
+resolveTaprootWitness items =
+  let go [] scriptBytes resolved = Just (reverse resolved, scriptBytes)
+      go (String t : rest) scriptBytes resolved
+        | T.isInfixOf "#CONTROLBLOCK#" t =
+            -- Mark with sentinel, will be replaced after we know the script
+            go rest scriptBytes (controlBlockSentinel : resolved)
+        | T.isInfixOf "#SCRIPT#" t =
+            let s = T.unpack t
+                script = resolveScriptPlaceholder s
+            in go rest script (script : resolved)
+        | otherwise =
+            case decodeHex (T.unpack t) of
+              Just bs -> go rest scriptBytes (bs : resolved)
+              Nothing -> Nothing
+      go _ _ _ = Nothing
+  in case go items BS.empty [] of
+       Just (resolvedItems, scriptBytes) ->
+         -- Now compute control block and replace the sentinel
+         let leafH = tapleafHash scriptBytes
+             merkleRoot = leafH  -- single leaf
+         in case computeTaprootOutputKey internalKeyBytes merkleRoot of
+              Just (_outputKey, parity) ->
+                let controlBlock = buildControlBlock parity internalKeyBytes
+                    replaceSentinel x
+                      | x == controlBlockSentinel = controlBlock
+                      | otherwise = x
+                in Just (map replaceSentinel resolvedItems, scriptBytes)
+              Nothing -> Nothing
+       Nothing -> Nothing
+
+-- | Resolve #TAPROOTOUTPUT# in scriptPubKey ASM
+resolveTaprootOutput :: String -> ByteString -> Maybe String
+resolveTaprootOutput asmStr scriptBytes =
+  if "#TAPROOTOUTPUT#" `isInfixOfStr` asmStr
+  then let leafH = tapleafHash scriptBytes
+           merkleRoot = leafH
+       in case computeTaprootOutputKey internalKeyBytes merkleRoot of
+            Just (outputKey, _parity) ->
+              let hexKey = "0x" ++ BS8.unpack (B16.encode outputKey)
+              in Just (replaceStr "#TAPROOTOUTPUT#" hexKey asmStr)
+            Nothing -> Nothing
+  else Just asmStr
+
+-- | Check if a string contains a substring
+isInfixOfStr :: String -> String -> Bool
+isInfixOfStr needle haystack = any (startsWith needle) (tails' haystack)
+  where
+    startsWith [] _ = True
+    startsWith _ [] = False
+    startsWith (n:ns) (h:hs) = n == h && startsWith ns hs
+    tails' [] = [[]]
+    tails' s@(_:rest) = s : tails' rest
+
+-- | Replace first occurrence of a substring
+replaceStr :: String -> String -> String -> String
+replaceStr _ _ [] = []
+replaceStr old new s@(x:xs)
+  | take (length old) s == old = new ++ drop (length old) s
+  | otherwise = x : replaceStr old new xs
 
 main :: IO ()
 main = do
@@ -277,7 +392,55 @@ main = do
             case elems of
               (Array witnessArr : _)
                 | hasTaprootPlaceholders elems -> do
-                    modifyIORef' witSkipRef (+1)  -- Skip Taproot tests
+                    -- Resolve Taproot placeholders
+                    let witnessItems = V.toList witnessArr
+                    case (reverse witnessItems, drop 1 elems) of
+                      (amtVal : revWitItems, String sigAsm : String pubAsm : String flagsStr : String expected : _) -> do
+                        case jsonNumToSatoshis amtVal of
+                          Nothing -> modifyIORef' witSkipRef (+1)
+                          Just amount -> do
+                            let witItems = reverse revWitItems
+                            case resolveTaprootWitness witItems of
+                              Nothing -> do
+                                putStrLn "TAPROOT SKIP: failed to resolve witness placeholders"
+                                modifyIORef' witSkipRef (+1)
+                              Just (witStack, scriptBytesForOutput) -> do
+                                let pubAsmS = T.unpack pubAsm
+                                case resolveTaprootOutput pubAsmS scriptBytesForOutput of
+                                  Nothing -> do
+                                    putStrLn "TAPROOT SKIP: failed to resolve output placeholder"
+                                    modifyIORef' witSkipRef (+1)
+                                  Just resolvedPubAsm -> do
+                                    let sigAsmS   = T.unpack sigAsm
+                                        flagsStrS = T.unpack flagsStr
+                                        expectedS = T.unpack expected
+                                        expectedOk = expectedS == "OK"
+
+                                        scriptSigBytes    = assembleScript sigAsmS
+                                        scriptPubKeyBytes = assembleScript resolvedPubAsm
+                                        flags = parseFlags flagsStrS
+
+                                        creditingTx = buildCreditingTx scriptPubKeyBytes amount
+                                        tx = buildSpendingTx creditingTx scriptSigBytes [witStack] amount
+                                        result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes amount
+                                        gotOk = case result of
+                                                  Right True -> True
+                                                  _          -> False
+
+                                    modifyIORef' witTotalRef (+1)
+                                    if gotOk == expectedOk
+                                      then modifyIORef' witPassRef (+1)
+                                      else do
+                                        modifyIORef' witFailRef (+1)
+                                        let resultStr = case result of
+                                              Right True  -> "OK"
+                                              Right False -> "FAIL(false)"
+                                              Left e      -> "ERR:" ++ e
+                                        putStrLn $ "TAPROOT FAIL: pubAsm=" ++ resolvedPubAsm
+                                                 ++ " | flags=" ++ flagsStrS
+                                                 ++ " | expected=" ++ expectedS
+                                                 ++ " | got=" ++ resultStr
+                      _ -> modifyIORef' witSkipRef (+1)
                 | otherwise -> do
                     -- Parse witness vector
                     let witnessItems = V.toList witnessArr
