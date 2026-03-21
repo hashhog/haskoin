@@ -494,7 +494,7 @@ import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
 
 import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        socket, connect, close, defaultHints,
-                       SocketType(..), PortNumber)
+                       SocketType(..), PortNumber, Family(..))
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -1699,12 +1699,15 @@ recvExact pc n = mask_ $ do
       return (Just result)
     else do
       -- Need more data
-      chunk <- recv (pcSocket pc) (max 4096 (n - BS.length buf))
-      if BS.null chunk
-        then return Nothing  -- Connection closed
-        else do
-          writeIORef (pcReadBuffer pc) (BS.append buf chunk)
-          recvExact pc n
+      mChunk <- (Just <$> recv (pcSocket pc) (max 4096 (n - BS.length buf)))
+                `catch` (\(_ :: IOException) -> return Nothing)
+      case mChunk of
+        Nothing -> return Nothing  -- Connection closed or error
+        Just chunk
+          | BS.null chunk -> return Nothing  -- Connection closed
+          | otherwise -> do
+              writeIORef (pcReadBuffer pc) (BS.append buf chunk)
+              recvExact pc n
 
 -- | Receive a complete message from a peer
 -- Returns Left on error, Right on success
@@ -1957,7 +1960,8 @@ discoverPeers :: Network -> IO [SockAddr]
 discoverPeers net = do
   results <- forM (netDNSSeeds net) $ \seed -> do
     result <- try @SomeException $ do
-      addrInfos <- getAddrInfo Nothing (Just seed) (Just (show (netDefaultPort net)))
+      let hints = defaultHints { NS.addrFamily = AF_INET, NS.addrSocketType = Stream }
+      addrInfos <- getAddrInfo (Just hints) (Just seed) (Just (show (netDefaultPort net)))
       return $ map NS.addrAddress addrInfos
     case result of
       Left _     -> return []
@@ -2020,11 +2024,16 @@ peerManagerLoop pm = forever $ do
 
     -- If no known addresses, discover via DNS
     candidates' <- if null candidates
-      then discoverPeers (pmNetwork pm)
+      then do
+        putStrLn $ "peerManagerLoop: discovering peers via DNS..."
+        discovered <- discoverPeers (pmNetwork pm)
+        putStrLn $ "peerManagerLoop: discovered " ++ show (length discovered) ++ " peers"
+        return discovered
       else return candidates
 
     -- Connect to candidates
     let toConnect = take (target - outboundCount) candidates'
+    putStrLn $ "peerManagerLoop: connecting to " ++ show (length toConnect) ++ " candidates"
     mapM_ (void . forkIO . tryConnect pm) toConnect
 
   -- Ping peers and disconnect stale ones
@@ -2077,13 +2086,17 @@ tryConnect pm addr = do
         -- Extract host and port from SockAddr
         (host, port) = sockAddrToHostPort addr (netDefaultPort net)
 
+    putStrLn $ "tryConnect: attempting " ++ host ++ ":" ++ show port
     result <- connectPeer config host port
     case result of
-      Left _ -> return ()
+      Left err -> putStrLn $ "tryConnect: connect failed to " ++ host ++ ": " ++ err
       Right pc -> do
+        putStrLn $ "tryConnect: connected to " ++ host ++ ", starting handshake..."
         hsResult <- performHandshake config pc
         case hsResult of
-          Left _ -> disconnectPeer pc
+          Left err -> do
+            putStrLn $ "tryConnect: handshake failed with " ++ host ++ ": " ++ err
+            disconnectPeer pc
           Right ver -> do
             -- Verify peer supports required services
             unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
