@@ -54,6 +54,8 @@ module Haskoin.Script
   , isTapscriptSuccess
     -- * Sigop Counting
   , countScriptSigops
+    -- * Witness Program Detection
+  , isWitnessProgram
     -- * Push-Only Check
   , isPushOnly
   , isPushOp
@@ -702,6 +704,33 @@ classifyOutput (Script ops) = case ops of
   _ | isMultisig ops -> parseMultisig ops
 
   _ -> NonStandard
+
+-- | Check if a script is a witness program (BIP-141).
+-- A witness program is: version byte (OP_0 to OP_16) + single direct push of 2-40 bytes.
+-- Returns Just (version, program) or Nothing.
+isWitnessProgram :: Script -> Maybe (Int, ByteString)
+isWitnessProgram (Script [versionOp, OP_PUSHDATA prog OPCODE])
+  | len >= 2 && len <= 40 = case versionOp of
+      OP_0 -> Just (0, prog)
+      OP_1 -> Just (1, prog)
+      OP_2 -> Just (2, prog)
+      OP_3 -> Just (3, prog)
+      OP_4 -> Just (4, prog)
+      OP_5 -> Just (5, prog)
+      OP_6 -> Just (6, prog)
+      OP_7 -> Just (7, prog)
+      OP_8 -> Just (8, prog)
+      OP_9 -> Just (9, prog)
+      OP_10 -> Just (10, prog)
+      OP_11 -> Just (11, prog)
+      OP_12 -> Just (12, prog)
+      OP_13 -> Just (13, prog)
+      OP_14 -> Just (14, prog)
+      OP_15 -> Just (15, prog)
+      OP_16 -> Just (16, prog)
+      _     -> Nothing
+  where len = BS.length prog
+isWitnessProgram _ = Nothing
 
 -- | Check if ops form a multisig pattern
 isMultisig :: [ScriptOp] -> Bool
@@ -1833,11 +1862,9 @@ execCheckMultiSig env = do
   when (newOpCount > 201) $ Left "Opcode limit exceeded"
   let env2' = env2 { seOpCount = newOpCount }
 
-  -- BIP-141 WITNESS_PUBKEYTYPE: In witness v0 scripts, check all pubkeys are compressed
-  when (seIsWitness env2' && hasFlag (seFlags env2') VerifyWitnessPubkeyType) $
-    forM_ pubkeys $ \pk ->
-      unless (isCompressedPubKey pk) $
-        Left "Witness pubkey not compressed"
+  -- Note: BIP-141 WITNESS_PUBKEYTYPE check is done inside the matching loop,
+  -- only for pubkeys that are actually compared against a signature.
+  -- This matches Bitcoin Core's behavior.
 
   -- Pop m (number of required signatures)
   (mBytes, env3) <- popStack env2'
@@ -1908,6 +1935,11 @@ execCheckMultiSig env = do
                when (hasFlag (seFlags env5) VerifyStrictEncoding) $
                  unless (isValidPubKeyEncoding pk) $
                    Left "Invalid public key encoding"
+
+               -- BIP-141 WITNESS_PUBKEYTYPE: In witness v0 scripts, pubkey must be compressed
+               when (seIsWitness env5 && hasFlag (seFlags env5) VerifyWitnessPubkeyType) $
+                 unless (isCompressedPubKey pk) $
+                   Left "Witness pubkey not compressed"
 
                -- LOW_S: validate S value is low
                when (hasFlag (seFlags env5) VerifyLowS) $
@@ -2157,11 +2189,54 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
               when (hasFlag flags VerifyCleanStack && length finalStack /= 1) $
                 Left "Stack not clean after evaluation"
               Right True
+        let witness = if idx < length (txWitness tx)
+                     then txWitness tx !! idx
+                     else []
         -- P2SH handling is only active when VerifyP2SH flag is set
-        let isP2SH = hasFlag flags VerifyP2SH && case classifyOutput scriptPubKey of
+        let isP2SHOutput = hasFlag flags VerifyP2SH && case classifyOutput scriptPubKey of
                         P2SH _ -> True
                         _      -> False
-        if isP2SH
+
+        -- Track whether we found a witness program (for WITNESS_UNEXPECTED check)
+        let verifyWitnessProgram :: ByteString -> Bool -> Either String Bool
+            verifyWitnessProgram wpBytes isP2SHWrapped = do
+              wpScript <- decodeScript wpBytes
+              case isWitnessProgram wpScript of
+                Nothing -> if isP2SHWrapped
+                           then checkClean (seStack env3)
+                           else checkClean (seStack env3)
+                Just (ver, prog) -> do
+                  -- For native witness: scriptSig must be empty
+                  when (not isP2SHWrapped && not (BS.null scriptSigBytes)) $
+                    Left "Witness program scriptSig must be empty"
+                  -- For P2SH-wrapped witness: scriptSig must be exactly the push of the witness program
+                  when (isP2SHWrapped && not (isPushOnly scriptSig)) $
+                    Left "P2SH witness scriptSig must be push-only"
+                  when isP2SHWrapped $ do
+                    -- scriptSig must be exactly one push that equals the witness program
+                    case scriptSig of
+                      Script [OP_PUSHDATA d _] | d == wpBytes -> return ()
+                      _ -> Left "P2SH witness scriptSig malleated"
+                  -- Dispatch on witness version
+                  case ver of
+                    0 -> do
+                      let progLen = BS.length prog
+                      if progLen == 20
+                        then verifyP2WPKHWithFlags flags tx idx (Hash160 prog) amount
+                        else if progLen == 32
+                          then verifyP2WSHWithFlags flags tx idx (Hash256 prog) amount
+                          else Left "Witness program wrong length"
+                    _ -> do
+                      -- Unknown witness version
+                      when (hasFlag flags VerifyDiscourageUpgradableWitnessProgram) $
+                        Left "Upgradable witness program discouraged"
+                      -- Unknown witness versions succeed if WITNESS flag is set
+                      -- (they're treated as anyone-can-spend)
+                      when (not (null witness) || not (BS.null scriptSigBytes)) $
+                        return ()
+                      Right True
+
+        if isP2SHOutput
           then case classifyOutput scriptPubKey of
             P2SH expectedHash -> do
               -- BIP-16: P2SH scriptSig MUST be push-only.
@@ -2190,19 +2265,31 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
                         [] -> Right False
                         (t:_) ->
                           if not (isTrue t) then Right False
-                          else checkClean (seStack env5)
+                          else do
+                            -- Check for P2SH-wrapped witness program
+                            if hasFlag flags VerifyWitness
+                              then case decodeScript redeemScriptBytes of
+                                Right redeemS -> case isWitnessProgram redeemS of
+                                  Just _ -> verifyWitnessProgram redeemScriptBytes True
+                                  Nothing -> do
+                                    -- Not a witness program; check WITNESS_UNEXPECTED
+                                    when (hasFlag flags VerifyWitness && not (null witness)) $
+                                      Left "Witness unexpected"
+                                    checkClean (seStack env5)
+                                Left _ -> checkClean (seStack env5)
+                              else checkClean (seStack env5)
             _ -> checkClean (seStack env3)  -- Can't happen
-          else case classifyOutput scriptPubKey of
-            -- P2WPKH: check witness (pass flags through)
-            P2WPKH h | hasFlag flags VerifyWitness ->
-              verifyP2WPKHWithFlags flags tx idx h amount
-
-            -- P2WSH: check witness (pass flags through)
-            P2WSH h | hasFlag flags VerifyWitness ->
-              verifyP2WSHWithFlags flags tx idx h amount
-
-            -- Other types: already verified
-            _ -> checkClean (seStack env3)
+          else do
+            -- Not P2SH: check for native witness program
+            if hasFlag flags VerifyWitness
+              then case isWitnessProgram scriptPubKey of
+                Just _ -> verifyWitnessProgram prevScriptPubKey False
+                Nothing -> do
+                  -- Not a witness program; check WITNESS_UNEXPECTED
+                  when (not (null witness)) $
+                    Left "Witness unexpected"
+                  checkClean (seStack env3)
+              else checkClean (seStack env3)
 
 -- | Verify P2WPKH witness (without flags, for backward compatibility)
 verifyP2WPKH :: Tx -> Int -> Hash160 -> Word64 -> Either String Bool

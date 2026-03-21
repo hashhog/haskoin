@@ -3,14 +3,14 @@
 -- | Test harness for Bitcoin Core script_tests.json vectors.
 --
 -- Parses ASM notation, assembles to raw script bytes, and runs verifyScript.
--- Skips witness tests (6+ elements) for now, focusing on ~1157 non-witness tests.
+-- Supports both legacy (4-5 element) and witness (6 element) test vectors.
 
 module Main where
 
 import qualified Data.ByteString.Lazy as LBS
 import           Data.ByteString      (ByteString)
 import qualified Data.ByteString      as BS
-import           Data.Word            (Word8)
+import           Data.Word            (Word8, Word64)
 import           Data.Int             (Int64)
 import           Data.Bits            ((.&.), (.|.), shiftR, testBit)
 import           Data.Aeson           (eitherDecode, Value(..))
@@ -21,7 +21,6 @@ import qualified Data.Text            as T
 import           System.Exit          (exitFailure, exitSuccess)
 import           Text.Read            (readMaybe)
 import           Data.IORef
-
 import           Haskoin.Types        (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
                                        TxId(..), Hash256(..))
 import           Haskoin.Crypto       (computeTxId)
@@ -195,16 +194,16 @@ parseFlags str =
 
 -- | Build a crediting transaction (Bitcoin Core's approach for script_tests).
 -- version 1, locktime 0, one input (null prevout:0xFFFFFFFF, scriptSig = OP_0 OP_0,
--- sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value 0).
-buildCreditingTx :: ByteString -> Tx
-buildCreditingTx scriptPubKeyBytes = Tx
+-- sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value = amount).
+buildCreditingTx :: ByteString -> Word64 -> Tx
+buildCreditingTx scriptPubKeyBytes amount = Tx
   { txVersion  = 1
   , txInputs   = [TxIn
       { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
       , txInScript     = BS.pack [0x00, 0x00]  -- OP_0 OP_0
       , txInSequence   = 0xffffffff
       }]
-  , txOutputs  = [TxOut { txOutValue = 0, txOutScript = scriptPubKeyBytes }]
+  , txOutputs  = [TxOut { txOutValue = amount, txOutScript = scriptPubKeyBytes }]
   , txWitness  = [[]]
   , txLockTime = 0
   }
@@ -212,19 +211,39 @@ buildCreditingTx scriptPubKeyBytes = Tx
 -- | Build a spending transaction that spends the crediting transaction.
 -- version 1, locktime 0, one input (prevout = crediting txid : 0,
 -- scriptSig = test's scriptSig, sequence 0xFFFFFFFF),
--- one output (scriptPubKey = empty, value 0).
-buildSpendingTx :: Tx -> ByteString -> Tx
-buildSpendingTx creditingTx scriptSigBytes = Tx
+-- one output (scriptPubKey = empty, value = amount).
+buildSpendingTx :: Tx -> ByteString -> [[ByteString]] -> Word64 -> Tx
+buildSpendingTx creditingTx scriptSigBytes witnessStacks amount = Tx
   { txVersion  = 1
   , txInputs   = [TxIn
       { txInPrevOutput = OutPoint (computeTxId creditingTx) 0
       , txInScript     = scriptSigBytes
       , txInSequence   = 0xffffffff
       }]
-  , txOutputs  = [TxOut { txOutValue = 0, txOutScript = BS.empty }]
-  , txWitness  = [[]]
+  , txOutputs  = [TxOut { txOutValue = amount, txOutScript = BS.empty }]
+  , txWitness  = witnessStacks
   , txLockTime = 0
   }
+
+-- | Parse a JSON number to satoshis (handles both integer and decimal BTC amounts).
+-- The test vectors use BTC amounts like 0.00000001 (= 1 satoshi) or 1e-08.
+jsonNumToSatoshis :: Value -> Maybe Word64
+jsonNumToSatoshis (Number n) = Just $ round (toRational n * 100000000)
+jsonNumToSatoshis _          = Nothing
+
+-- | Decode a hex string from a JSON Value
+jsonHexToBytes :: Value -> Maybe ByteString
+jsonHexToBytes (String t) = decodeHex (T.unpack t)
+jsonHexToBytes _          = Nothing
+
+-- | Check if a test vector contains Taproot-specific placeholders
+-- that we can't handle yet (#SCRIPT#, #CONTROLBLOCK#, #TAPROOTOUTPUT#)
+hasTaprootPlaceholders :: [Value] -> Bool
+hasTaprootPlaceholders vals = any hasPlaceholder vals
+  where
+    hasPlaceholder (String t) = any (`T.isInfixOf` t) ["#SCRIPT#", "#CONTROLBLOCK#", "#TAPROOTOUTPUT#"]
+    hasPlaceholder (Array arr) = any hasPlaceholder (V.toList arr)
+    hasPlaceholder _           = False
 
 main :: IO ()
 main = do
@@ -237,17 +256,79 @@ main = do
       putStrLn $ "ERROR: Failed to parse JSON: " ++ err
       exitFailure
     Right (Array vectors) -> do
-      passRef <- newIORef (0 :: Int)
-      failRef <- newIORef (0 :: Int)
-      skipRef <- newIORef (0 :: Int)
-      totalRef <- newIORef (0 :: Int)
+      passRef    <- newIORef (0 :: Int)
+      failRef    <- newIORef (0 :: Int)
+      _skipRef   <- newIORef (0 :: Int)
+      totalRef   <- newIORef (0 :: Int)
+      witPassRef <- newIORef (0 :: Int)
+      witFailRef <- newIORef (0 :: Int)
+      witSkipRef <- newIORef (0 :: Int)
+      witTotalRef <- newIORef (0 :: Int)
 
       V.forM_ vectors $ \entry -> case entry of
         Array arr -> do
           let n = V.length arr
+              elems = V.toList arr
           if n <= 3 then return ()  -- comment or malformed
-          else if n >= 6 then modifyIORef' skipRef (+1)  -- witness test
-          else case V.toList arr of
+          else if n >= 6 then do
+            -- Witness test vector:
+            -- [witnessStack, amount, scriptSig, scriptPubKey, flags, expected, comment?]
+            -- where witnessStack is [hex_item1, hex_item2, ...] and last element is amount
+            case elems of
+              (Array witnessArr : _)
+                | hasTaprootPlaceholders elems -> do
+                    modifyIORef' witSkipRef (+1)  -- Skip Taproot tests
+                | otherwise -> do
+                    -- Parse witness vector
+                    let witnessItems = V.toList witnessArr
+                    -- Last element of witnessArr is the amount (in BTC)
+                    -- All preceding elements are hex-encoded witness stack items
+                    case (reverse witnessItems, drop 1 elems) of
+                      (amtVal : revWitHexes, String sigAsm : String pubAsm : String flagsStr : String expected : _) -> do
+                        case jsonNumToSatoshis amtVal of
+                          Nothing -> modifyIORef' witSkipRef (+1)
+                          Just amount -> do
+                            -- Parse witness stack hex items (in wire order)
+                            let witHexes = reverse revWitHexes
+                                mWitStack = mapM jsonHexToBytes witHexes
+                            case mWitStack of
+                              Nothing -> modifyIORef' witSkipRef (+1)
+                              Just witStack -> do
+                                let sigAsmS   = T.unpack sigAsm
+                                    pubAsmS   = T.unpack pubAsm
+                                    flagsStrS = T.unpack flagsStr
+                                    expectedS = T.unpack expected
+                                    expectedOk = expectedS == "OK"
+
+                                    scriptSigBytes    = assembleScript sigAsmS
+                                    scriptPubKeyBytes = assembleScript pubAsmS
+                                    flags = parseFlags flagsStrS
+
+                                    creditingTx = buildCreditingTx scriptPubKeyBytes amount
+                                    tx = buildSpendingTx creditingTx scriptSigBytes [witStack] amount
+                                    result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes amount
+                                    gotOk = case result of
+                                              Right True -> True
+                                              _          -> False
+
+                                modifyIORef' witTotalRef (+1)
+                                if gotOk == expectedOk
+                                  then modifyIORef' witPassRef (+1)
+                                  else do
+                                    modifyIORef' witFailRef (+1)
+                                    let resultStr = case result of
+                                          Right True  -> "OK"
+                                          Right False -> "FAIL(false)"
+                                          Left e      -> "ERR:" ++ e
+                                    putStrLn $ "WITNESS FAIL: sigAsm=" ++ sigAsmS
+                                             ++ " | pubAsm=" ++ pubAsmS
+                                             ++ " | flags=" ++ flagsStrS
+                                             ++ " | expected=" ++ expectedS
+                                             ++ " | got=" ++ resultStr
+                                             ++ " | witness_items=" ++ show (length witStack)
+                      _ -> modifyIORef' witSkipRef (+1)
+              _ -> modifyIORef' witSkipRef (+1)
+          else case elems of
             (String sigAsm : String pubAsm : String flagsStr : String expected : _) -> do
               let sigAsmS   = T.unpack sigAsm
                   pubAsmS   = T.unpack pubAsm
@@ -257,8 +338,8 @@ main = do
                   scriptSigBytes   = assembleScript sigAsmS
                   scriptPubKeyBytes = assembleScript pubAsmS
                   flags = parseFlags flagsStrS
-                  creditingTx = buildCreditingTx scriptPubKeyBytes
-                  tx = buildSpendingTx creditingTx scriptSigBytes
+                  creditingTx = buildCreditingTx scriptPubKeyBytes 0
+                  tx = buildSpendingTx creditingTx scriptSigBytes [[]] 0
                   result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes 0
                   gotOk = case result of
                             Right True -> True
@@ -282,16 +363,23 @@ main = do
 
       passCount <- readIORef passRef
       failCount <- readIORef failRef
-      skipCount <- readIORef skipRef
       totalCount <- readIORef totalRef
+      witPassCount <- readIORef witPassRef
+      witFailCount <- readIORef witFailRef
+      witSkipCount <- readIORef witSkipRef
+      witTotalCount <- readIORef witTotalRef
 
       putStrLn "\n=== Script Test Vector Results ==="
-      putStrLn $ "Total non-witness tests: " ++ show totalCount
+      putStrLn $ "Legacy tests: " ++ show totalCount
       putStrLn $ "  PASS:  " ++ show passCount
       putStrLn $ "  FAIL:  " ++ show failCount
-      putStrLn $ "  Skipped (witness): " ++ show skipCount
+      putStrLn $ "\nWitness tests: " ++ show witTotalCount
+      putStrLn $ "  PASS:  " ++ show witPassCount
+      putStrLn $ "  FAIL:  " ++ show witFailCount
+      putStrLn $ "  Skipped (taproot/unparseable): " ++ show witSkipCount
 
-      if failCount > 0
+      let totalFails = failCount + witFailCount
+      if totalFails > 0
         then exitFailure
         else exitSuccess
 
