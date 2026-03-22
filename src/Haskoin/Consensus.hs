@@ -170,6 +170,7 @@ module Haskoin.Consensus
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
@@ -2329,7 +2330,8 @@ addHeader net hc header = do
   case Map.lookup hash entries of
     Just existing -> return $ Right existing
     Nothing -> case Map.lookup prevHash entries of
-      Nothing -> return $ Left "Unknown previous block"
+      Nothing -> return $ Left ("Unknown previous block: " ++ show (B16.encode (BS.reverse (getHash256 (getBlockHashHash prevHash)))))
+
       Just parent -> do
         let height = ceHeight parent + 1
 
