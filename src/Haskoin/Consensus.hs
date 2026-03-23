@@ -242,6 +242,7 @@ data Network = Network
   , netEnforceBIP94      :: !Bool           -- ^ BIP94 time warp fix (testnet4)
   , netMinimumChainWork  :: !Integer        -- ^ Anti-DoS: minimum chain work for header sync
   , netAssumeUtxo        :: ![(Word32, AssumeUtxoParams)]  -- ^ AssumeUTXO snapshot parameters
+  , netAssumeValidHeight :: !Word32         -- ^ Assume-valid: skip script verification up to this height
   } deriving (Show)
 
 -- | AssumeUTXO snapshot parameters for a specific block height.
@@ -799,6 +800,7 @@ mainnet = Network
           , aupBlockHash = hashFromHex "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
           })
       ]
+  , netAssumeValidHeight = 0
   }
 
 -- | Bitcoin testnet3 configuration
@@ -845,6 +847,7 @@ testnet3 = Network
           , aupBlockHash = hashFromHex "0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f"
           })
       ]
+  , netAssumeValidHeight = 0
   }
 
 -- | Bitcoin testnet4 configuration (BIP94)
@@ -889,6 +892,9 @@ testnet4 = Network
           , aupBlockHash = hashFromHex "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b"
           })
       ]
+  -- Assume-valid: skip script verification up to this height
+  -- Hash: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a
+  , netAssumeValidHeight = 123613
   }
 
 -- | Testnet4 genesis block header (BIP94)
@@ -970,6 +976,7 @@ regtest = Network
           , aupBlockHash = hashFromHex "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
           })
       ]
+  , netAssumeValidHeight = 0
   }
 
 --------------------------------------------------------------------------------
