@@ -355,6 +355,11 @@ blockProcessor bd = forever $ do
 
                   let cs = ChainState currentHeight bh 0 0
                             (consensusFlagsAtHeight (bdNetwork bd) nextHeight)
+                      assumeValidH = netAssumeValidHeight (bdNetwork bd)
+                      _skipScripts = assumeValidH > 0 && nextHeight <= assumeValidH
+                      -- TODO: when script verification is wired in, use _skipScripts
+                      -- to gate signature/script checks while still performing
+                      -- structural validation (merkle root, UTXO, coinbase, etc.)
 
                   case validateFullBlock (bdNetwork bd) cs block utxoMap of
                     Left err -> do
