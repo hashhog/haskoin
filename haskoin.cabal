@@ -55,7 +55,7 @@ library
   cc-options:       -O2
   extra-lib-dirs:  /home/max/.local/lib64
   include-dirs:    /home/max/.local/include
-  extra-libraries: minisketch stdc++ rocksdb_compat secp256k1
+  extra-libraries: minisketch stdc++ rocksdb_compat rocksdb secp256k1
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -funbox-strict-fields
 
