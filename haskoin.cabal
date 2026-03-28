@@ -53,8 +53,11 @@ library
   c-sources:       cbits/hwdetect.c
                  , cbits/secp256k1_compat.c
   cc-options:       -O2
-  extra-lib-dirs:  /home/max/.local/lib64
-  include-dirs:    /home/max/.local/include
+  -- System dependencies: sudo apt install -y librocksdb-dev libsecp256k1-dev
+  -- Also requires libminisketch (build from https://github.com/sipa/minisketch)
+  -- RocksDB 9.x removed rocksdb_filterpolicy_create; rocksdb_compat is a shim
+  -- that provides it. Build the shim with: scripts/build-rocksdb-compat.sh
+  -- and install to /usr/local/lib or set extra-lib-dirs below.
   extra-libraries: minisketch stdc++ rocksdb_compat rocksdb secp256k1
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -funbox-strict-fields
