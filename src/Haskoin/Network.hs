@@ -1976,10 +1976,12 @@ discoverPeers net = do
       Right addrs -> return addrs
   let discovered = concat results
   -- Fall back to hardcoded addresses if DNS resolution fails
+  -- Regtest uses no seeds at all (matches Bitcoin Core CRegTestParams)
   if null discovered
-    then return $ if netDefaultPort net == 8333
-                  then fallbackMainnetPeers
-                  else fallbackTestnetPeers
+    then case netDefaultPort net of
+           8333  -> return fallbackMainnetPeers
+           18444 -> return []  -- regtest: no seeds, peers added via addnode
+           _     -> return fallbackTestnetPeers
     else return discovered
 
 --------------------------------------------------------------------------------
