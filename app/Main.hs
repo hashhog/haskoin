@@ -470,13 +470,15 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
 
   MBlock block -> do
     let bh = computeBlockHash (blockHeader block)
-    -- Find the height for this block
-    heightMap <- readTVarIO (hcByHeight hc)
-    let mHeight = Map.foldlWithKey'
-          (\acc h hash -> if hash == bh then Just h else acc) Nothing heightMap
-    case mHeight of
-      Nothing -> return ()  -- Ignore unknown blocks silently
-      Just height -> do
+        hdr = blockHeader block
+    -- First, ensure the header is in our chain index.
+    -- For unsolicited blocks (received via inv->getdata), the header may
+    -- not yet be in the chain. addHeader is idempotent if already known.
+    addResult <- addHeader net hc hdr
+    case addResult of
+      Left err -> putStrLn $ "Block header rejected: " ++ err
+      Right entry -> do
+        let height = ceHeight entry
         let result = do
               connectBlock db net block height
               putBlockHeight db height bh
@@ -490,6 +492,22 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
         nextBlock <- readIORef nextBlockRef
         when (height >= nextBlock) $
           writeIORef nextBlockRef (height + 1)
+        -- Broadcast the block inv to other peers so it propagates
+        pm <- readIORef pmRef
+        let invVec = InvVector InvBlock (getBlockHashHash bh)
+        broadcastMessage pm $ MInv $ Inv [invVec]
+        -- After connecting a new block from a peer, request headers
+        -- to discover any further blocks we might be missing.
+        connPeers <- getConnectedPeerList pm
+        unless (null connPeers) $ do
+          let zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+              getHdrs = GetHeaders
+                { ghVersion  = fromIntegral protocolVersion
+                , ghLocators = [bh]
+                , ghHashStop = zeroHash
+                }
+          void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
+            `catch` (\(_ :: SomeException) -> return ())
 
   MTx tx -> do
     _ <- addTransaction mp tx
@@ -528,8 +546,80 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
             (MNotFound (NotFound [iv]))
       _ -> requestFromPeer pm addr (MNotFound (NotFound [iv]))
 
-  MInv _inv ->
-    return ()
+  MInv (Inv ivs) -> do
+    -- Request any block inventory items we don't already have.
+    -- This is critical for block propagation: peers announce new blocks
+    -- via inv, and we must respond with getdata to fetch them.
+    let blockIvs = filter (\iv -> ivType iv == InvBlock
+                                || ivType iv == InvWitnessBlock) ivs
+    unless (null blockIvs) $ do
+      entries <- readTVarIO (hcEntries hc)
+      let unknown = filter (\iv ->
+            not $ Map.member (BlockHash (ivHash iv)) entries) blockIvs
+      unless (null unknown) $ do
+        pm <- readIORef pmRef
+        -- Request as witness blocks to get full witness data
+        let witnessIvs = map (\iv -> iv { ivType = InvWitnessBlock }) unknown
+        requestFromPeer pm addr (MGetData (GetData witnessIvs))
+          `catch` (\(_ :: SomeException) -> return ())
+
+  MGetHeaders (GetHeaders _ver locators hashStop) -> do
+    -- Respond to getheaders from peers so they can sync from us.
+    -- Find the fork point using the locator hashes, then send up to 2000 headers.
+    entries <- readTVarIO (hcEntries hc)
+    heightMap <- readTVarIO (hcByHeight hc)
+    tipHeight <- readTVarIO (hcHeight hc)
+    -- Find the starting point from locator hashes (first known hash)
+    let findStart [] = 0  -- Genesis
+        findStart (loc:rest) = case Map.lookup loc entries of
+          Just e  -> ceHeight e
+          Nothing -> findStart rest
+        startHeight = findStart locators
+        stopHash = hashStop
+        zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+        -- Collect up to 2000 headers starting after the locator match
+        maxHeaders = 2000 :: Int
+        collectHeaders h acc
+          | length acc >= maxHeaders = acc
+          | h > tipHeight = acc
+          | otherwise = case Map.lookup h heightMap of
+              Nothing -> acc
+              Just bh | bh == stopHash -> acc ++ [bh]
+                      | stopHash /= zeroHash && bh == stopHash -> acc ++ [bh]
+                      | otherwise -> collectHeaders (h + 1) (acc ++ [bh])
+        headerHashes = collectHeaders (startHeight + 1) []
+        headersList = [ ceHeader e | bh <- headerHashes
+                                   , Just e <- [Map.lookup bh entries] ]
+    unless (null headersList) $ do
+      pm <- readIORef pmRef
+      requestFromPeer pm addr (MHeaders (Headers headersList))
+        `catch` (\(_ :: SomeException) -> return ())
+
+  MGetBlocks (GetBlocks _ver locators hashStop) -> do
+    -- Respond to getblocks from peers by sending inv messages.
+    entries <- readTVarIO (hcEntries hc)
+    heightMap <- readTVarIO (hcByHeight hc)
+    tipHeight <- readTVarIO (hcHeight hc)
+    let findStart [] = 0
+        findStart (loc:rest) = case Map.lookup loc entries of
+          Just e  -> ceHeight e
+          Nothing -> findStart rest
+        startHeight = findStart locators
+        zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+        maxInv = 500 :: Int
+        collectInv h acc
+          | length acc >= maxInv = acc
+          | h > tipHeight = acc
+          | otherwise = case Map.lookup h heightMap of
+              Nothing -> acc
+              Just bh | hashStop /= zeroHash && bh == hashStop -> acc ++ [bh]
+                      | otherwise -> collectInv (h + 1) (acc ++ [bh])
+        invHashes = collectInv (startHeight + 1) []
+        invVecs = [ InvVector InvBlock (getBlockHashHash bh) | bh <- invHashes ]
+    unless (null invVecs) $ do
+      pm <- readIORef pmRef
+      requestFromPeer pm addr (MInv (Inv invVecs))
+        `catch` (\(_ :: SomeException) -> return ())
 
   MAddr _addrs ->
     return ()
