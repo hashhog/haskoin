@@ -50,6 +50,7 @@ library
                  , mmap
                  , directory
                  , filepath
+                 , unix
   c-sources:       cbits/hwdetect.c
                  , cbits/secp256k1_compat.c
   cc-options:       -O2
