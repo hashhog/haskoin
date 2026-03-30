@@ -124,6 +124,9 @@ module Haskoin.Network
     -- * Peer Manager Operations
   , startPeerManager
   , stopPeerManager
+  , startInboundListener
+  , addNodeConnect
+  , sockAddrToHostPort
   , discoverPeers
   , broadcastMessage
   , requestFromPeer
@@ -494,7 +497,9 @@ import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
 
 import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        socket, connect, close, defaultHints,
-                       SocketType(..), PortNumber, Family(..))
+                       SocketType(..), PortNumber, Family(..),
+                       bind, listen, accept, setSocketOption,
+                       SocketOption(..))
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -2161,6 +2166,99 @@ sockAddrToHostPort addr defaultPort = case addr of
     in (show b1 ++ "." ++ show b2 ++ "." ++ show b3 ++ "." ++ show b4,
         fromIntegral port)
   _ -> ("127.0.0.1", defaultPort)  -- Fallback for IPv6, etc.
+
+-- | Start a TCP listener for inbound P2P connections
+startInboundListener :: PeerManager -> Int -> IO ()
+startInboundListener pm port = do
+  let hints = defaultHints { NS.addrSocketType = Stream }
+  addrInfos <- getAddrInfo (Just hints) (Just "0.0.0.0") (Just (show port))
+  case addrInfos of
+    [] -> putStrLn $ "startInboundListener: cannot resolve bind address for port " ++ show port
+    (addrInfo:_) -> do
+      sock <- socket (NS.addrFamily addrInfo) (NS.addrSocketType addrInfo) (NS.addrProtocol addrInfo)
+      setSocketOption sock ReuseAddr 1
+      bind sock (NS.addrAddress addrInfo)
+      listen sock 128
+      putStrLn $ "P2P listener started on port " ++ show port
+      void $ forkIO $ acceptLoop sock
+  where
+    acceptLoop :: Socket -> IO ()
+    acceptLoop listenSock = forever $ do
+      (clientSock, clientAddr) <- accept listenSock
+      void $ forkIO $ handleInbound clientSock clientAddr
+        `catch` (\(e :: SomeException) -> do
+          putStrLn $ "Inbound connection error from " ++ show clientAddr ++ ": " ++ show e
+          close clientSock)
+
+    handleInbound :: Socket -> SockAddr -> IO ()
+    handleInbound sock addr = do
+      now <- round <$> getPOSIXTime
+      let info = PeerInfo
+            { piAddress       = addr
+            , piVersion       = Nothing
+            , piState         = PeerConnecting
+            , piServices      = 0
+            , piStartHeight   = 0
+            , piRelay         = True
+            , piLastSeen      = now
+            , piLastPing      = Nothing
+            , piPingLatency   = Nothing
+            , piBanScore      = 0
+            , piBytesSent     = 0
+            , piBytesRecv     = 0
+            , piMsgsSent      = 0
+            , piMsgsRecv      = 0
+            , piConnectedAt   = now
+            , piInbound       = True
+            , piWantsAddrV2   = False
+            , piFeeFilterReceived = 0
+            , piFeeFilterSent     = 0
+            , piNextFeeFilterSend = 0
+            , piBlockOnly     = False
+            }
+      infoVar <- newTVarIO info
+      sendQ <- newTBQueueIO 100
+      recvQ <- newTBQueueIO 100
+      bufRef <- newIORef BS.empty
+      let pc = PeerConnection
+            { pcSocket      = sock
+            , pcInfo        = infoVar
+            , pcSendQueue   = sendQ
+            , pcRecvQueue   = recvQ
+            , pcSendThread  = Nothing
+            , pcRecvThread  = Nothing
+            , pcNetwork     = pmNetwork pm
+            , pcReadBuffer  = bufRef
+            }
+      -- Perform inbound handshake (receive version first, then send ours)
+      let net = pmNetwork pm
+          config = PeerConfig
+            { pcfgNetwork     = net
+            , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
+            , pcfgBestHeight  = 0
+            , pcfgUserAgent   = userAgent
+            , pcfgRelay       = True
+            , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
+            , pcfgQueueSize   = 100
+            }
+      hsResult <- performHandshake config pc
+      case hsResult of
+        Left err -> do
+          putStrLn $ "Inbound handshake failed from " ++ show addr ++ ": " ++ err
+          close sock
+        Right _ver -> do
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+          pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+          putStrLn $ "Accepted inbound connection from " ++ show addr
+
+-- | Connect to a peer by host:port string (for addnode RPC)
+addNodeConnect :: PeerManager -> String -> Int -> IO ()
+addNodeConnect pm host port = do
+  addrInfos <- getAddrInfo Nothing (Just host) (Just (show port)) :: IO [NS.AddrInfo]
+  case addrInfos of
+    [] -> putStrLn $ "addNodeConnect: cannot resolve " ++ host
+    (ai:_) -> tryConnect pm (NS.addrAddress ai)
 
 --------------------------------------------------------------------------------
 -- Peer Manager API
