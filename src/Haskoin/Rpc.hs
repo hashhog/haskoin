@@ -137,6 +137,11 @@ import Text.Printf (printf)
 import qualified Data.Vector as V
 import qualified System.ZMQ4 as ZMQ
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import qualified Crypto.Random as CryptoRandom
+import System.Directory (removeFile)
+import System.FilePath ((</>))
+import System.Posix.Files (setFileMode)
+import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
@@ -199,6 +204,7 @@ data RpcConfig = RpcConfig
   , rpcUser     :: !Text       -- ^ RPC username
   , rpcPassword :: !Text       -- ^ RPC password
   , rpcAllowIp  :: ![String]   -- ^ Allowed IP addresses
+  , rpcDataDir  :: !FilePath   -- ^ Data directory for cookie file
   } deriving (Show, Generic)
 
 instance NFData RpcConfig
@@ -211,6 +217,7 @@ defaultRpcConfig = RpcConfig
   , rpcUser     = "haskoin"
   , rpcPassword = "haskoin"
   , rpcAllowIp  = ["127.0.0.1"]
+  , rpcDataDir  = "."
   }
 
 --------------------------------------------------------------------------------
@@ -219,19 +226,21 @@ defaultRpcConfig = RpcConfig
 
 -- | RPC server handle
 data RpcServer = RpcServer
-  { rsConfig      :: !RpcConfig
-  , rsDB          :: !HaskoinDB
-  , rsHeaderChain :: !HeaderChain
-  , rsPeerMgr     :: !PeerManager
-  , rsMempool     :: !Mempool
-  , rsFeeEst      :: !FeeEstimator
-  , rsUTXOCache   :: !UTXOCache
-  , rsNetwork     :: !Network
-  , rsBlockStore  :: !(Maybe BlockStore)  -- ^ Block store for pruning (optional)
-  , rsThread      :: !(TVar (Maybe ThreadId))
-  , rsMockTime    :: !(TVar (Maybe Word32))  -- ^ Mock time for regtest (setmocktime)
-  , rsWalletMgr   :: !(Maybe WalletManager)  -- ^ Multi-wallet manager (optional)
-  , rsStartTime   :: !Int64                  -- ^ Server start time (POSIX seconds)
+  { rsConfig         :: !RpcConfig
+  , rsDB             :: !HaskoinDB
+  , rsHeaderChain    :: !HeaderChain
+  , rsPeerMgr        :: !PeerManager
+  , rsMempool        :: !Mempool
+  , rsFeeEst         :: !FeeEstimator
+  , rsUTXOCache      :: !UTXOCache
+  , rsNetwork        :: !Network
+  , rsBlockStore     :: !(Maybe BlockStore)  -- ^ Block store for pruning (optional)
+  , rsThread         :: !(TVar (Maybe ThreadId))
+  , rsMockTime       :: !(TVar (Maybe Word32))  -- ^ Mock time for regtest (setmocktime)
+  , rsWalletMgr      :: !(Maybe WalletManager)  -- ^ Multi-wallet manager (optional)
+  , rsStartTime      :: !Int64                  -- ^ Server start time (POSIX seconds)
+  , rsCookieFile     :: !FilePath               -- ^ Path to the .cookie file
+  , rsCookiePassword :: !Text                   -- ^ Cookie password (__cookie__ auth)
   }
 
 -- | Get current time, using mock time if set (for regtest testing)
@@ -375,6 +384,22 @@ maxBatchSize = 1000
 -- Server Lifecycle
 --------------------------------------------------------------------------------
 
+-- | Generate a 32-byte random cookie password, hex-encoded (64 chars)
+generateCookiePassword :: IO Text
+generateCookiePassword = do
+  bytes <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
+  return $! TE.decodeUtf8 (B16.encode bytes)
+
+-- | Write the cookie file and set permissions to 0o600 (owner read/write only)
+writeCookieFile :: FilePath -> Text -> IO ()
+writeCookieFile cookiePath cookiePass = do
+  withFile cookiePath WriteMode $ \h -> do
+    hSetEncoding h utf8
+    let content = "__cookie__:" <> T.unpack cookiePass <> "\n"
+    hPutStr h content
+  -- Restrict to owner read+write only: no group or other permissions
+  setFileMode cookiePath 0o600
+
 -- | Start the RPC server
 -- Handles both JSON-RPC (POST requests) and REST API (GET /rest/* requests)
 startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
@@ -384,7 +409,11 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr = do
   threadVar <- newTVarIO Nothing
   mockTimeVar <- newTVarIO Nothing  -- No mock time by default
   startTime <- round <$> getPOSIXTime
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime
+  -- Generate cookie and write to {datadir}/.cookie
+  cookiePass <- generateCookiePassword
+  let cookiePath = rpcDataDir config </> ".cookie"
+  writeCookieFile cookiePath cookiePass
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass
   -- Use combined app to handle both RPC and REST endpoints
   tid <- forkIO $ run (rpcPort config) (combinedApp server)
   atomically $ writeTVar threadVar (Just tid)
@@ -396,6 +425,8 @@ stopRpcServer rs = do
   mTid <- readTVarIO (rsThread rs)
   mapM_ killThread mTid
   atomically $ writeTVar (rsThread rs) Nothing
+  -- Remove the cookie file on clean shutdown; ignore errors (e.g. already deleted)
+  removeFile (rsCookieFile rs) `catch` (\(_ :: SomeException) -> return ())
 
 --------------------------------------------------------------------------------
 -- HTTP Application
@@ -412,7 +443,7 @@ rpcApp server req respond = do
            "{\"error\": \"Method not allowed\"}"
     else do
       -- Check authentication
-      let authOk = checkAuth (rsConfig server) req
+      let authOk = checkAuth server req
       if not authOk
         then respond $ responseLBS status401
                [(hContentType, "application/json")]
@@ -480,15 +511,31 @@ parseSingleRequest val =
       -- Try to extract id from the value if possible
       (extractIdFromValue val)
 
--- | Check HTTP Basic authentication
-checkAuth :: RpcConfig -> Request -> Bool
-checkAuth config req =
+-- | Check HTTP Basic authentication.
+-- Accepts either:
+--   (a) configured rpcUser:rpcPassword, or
+--   (b) __cookie__:<cookie-password> (cookie-based auth for local clients)
+checkAuth :: RpcServer -> Request -> Bool
+checkAuth server req =
   case lookup hAuthorization (requestHeaders req) of
     Nothing -> False
     Just authHeader ->
-      let expected = "Basic " <> B64.encode (TE.encodeUtf8 $
-            rpcUser config <> ":" <> rpcPassword config)
-      in authHeader == expected
+      let config = rsConfig server
+          -- Decode the Base64 "Basic <credentials>" header
+          decoded = case BS.stripPrefix "Basic " authHeader of
+            Nothing  -> Nothing
+            Just b64 -> case B64.decode b64 of
+              Left _    -> Nothing
+              Right raw -> Just (TE.decodeUtf8Lenient raw)
+      in case decoded of
+           Nothing -> False
+           Just creds ->
+             let (user, rest) = T.breakOn ":" creds
+                 pass = T.drop 1 rest  -- drop the leading ':'
+             in -- Cookie auth: username must be exactly "__cookie__"
+                (user == "__cookie__" && pass == rsCookiePassword server)
+                -- Configured user/password auth
+                || (user == rpcUser config && pass == rpcPassword config)
 
 -- | Read the full request body
 readBody :: Request -> IO ByteString

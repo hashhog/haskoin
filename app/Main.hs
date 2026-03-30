@@ -271,9 +271,10 @@ runNode net dataDir NodeOptions{..} = do
 
     -- Start RPC server
     let rpcConfig = defaultRpcConfig
-          { rpcPort = noRpcPort
-          , rpcUser = noRpcUser
+          { rpcPort     = noRpcPort
+          , rpcUser     = noRpcUser
           , rpcPassword = noRpcPass
+          , rpcDataDir  = dataDir
           }
     _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
