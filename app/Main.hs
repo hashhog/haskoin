@@ -115,7 +115,7 @@ parseNodeOptions = NodeOptions
   <*> many (strOption (long "connect" <> help "Peer to connect to"))
   <*> switch (long "prune" <> help "Enable pruning")
   <*> option auto (long "dbcache" <> value 450 <> help "DB cache in MB")
-  <*> switch (long "listen" <> help "Accept incoming connections")
+  <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
 
 parseWalletCommand :: Parser WalletCommand
@@ -277,6 +277,14 @@ runNode net dataDir NodeOptions{..} = do
           }
     _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
+
+    -- Start P2P listener for inbound connections
+    let listenPort = if noListenPort == 8333
+          then netDefaultPort net  -- Use network-appropriate default
+          else noListenPort
+    when noListen $ do
+      startInboundListener pm listenPort
+      putStrLn $ "P2P listener started on port " ++ show listenPort
 
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
