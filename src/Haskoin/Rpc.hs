@@ -1446,7 +1446,7 @@ handleAddNode :: RpcServer -> Value -> IO RpcResponse
 handleAddNode server params = do
   case params of
     Array arr | V.length arr >= 2 ->
-      case (V.index arr 0, V.index arr 1) of
+      case ((arr V.!) 0, (arr V.!) 1) of
         (String nodeStr, String cmd) -> do
           let net = rsNetwork server
               defaultPort = netDefaultPort net
