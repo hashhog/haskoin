@@ -123,7 +123,7 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.Serialize as S
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
-import Control.Monad (forM, void)
+import Control.Monad (forM, forM_, void, when)
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe)
 import Data.List (find, sort)
@@ -159,7 +159,7 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          Message(..), Inv(..), InvVector(..), InvType(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, hasService, ServiceFlag(..),
-                         disconnectPeer)
+                         disconnectPeer, addNodeConnect, sockAddrToHostPort)
 import Network.Socket (SockAddr(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
@@ -1443,9 +1443,43 @@ handleGetConnectionCount server = do
 
 -- | Add a node to connect to
 handleAddNode :: RpcServer -> Value -> IO RpcResponse
-handleAddNode _server _params =
-  -- Placeholder - would actually initiate a connection
-  return $ RpcResponse (toJSON True) Null Null
+handleAddNode server params = do
+  case params of
+    Array arr | V.length arr >= 2 ->
+      case (V.index arr 0, V.index arr 1) of
+        (String nodeStr, String cmd) -> do
+          let net = rsNetwork server
+              defaultPort = netDefaultPort net
+              (host, port) = case T.breakOnEnd ":" nodeStr of
+                (h, p) | not (T.null h) && not (T.null p) ->
+                  case reads (T.unpack p) of
+                    [(portNum, "")] -> (T.unpack (T.init h), portNum)
+                    _ -> (T.unpack nodeStr, defaultPort)
+                _ -> (T.unpack nodeStr, defaultPort)
+          case cmd of
+            "onetry" -> do
+              void $ forkIO $ addNodeConnect (rsPeerMgr server) host port
+              return $ RpcResponse Null Null Null
+            "add" -> do
+              void $ forkIO $ addNodeConnect (rsPeerMgr server) host port
+              return $ RpcResponse Null Null Null
+            "remove" -> do
+              -- Find and disconnect peers matching the host:port
+              peers <- readTVarIO (pmPeers (rsPeerMgr server))
+              forM_ (Map.toList peers) $ \(addr, pc) -> do
+                let (peerHost, peerPort) = sockAddrToHostPort addr defaultPort
+                when (peerHost == host && peerPort == port) $
+                  disconnectPeer pc
+              return $ RpcResponse Null Null Null
+            _ ->
+              return $ RpcResponse Null
+                (toJSON $ String "Invalid command, expected onetry/add/remove") Null
+        _ ->
+          return $ RpcResponse Null
+            (toJSON $ String "Invalid parameter types") Null
+    _ ->
+      return $ RpcResponse Null
+        (toJSON $ String "Expected [node, command]") Null
 
 --------------------------------------------------------------------------------
 -- Mining RPC Handlers
