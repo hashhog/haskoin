@@ -495,6 +495,39 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
     _ <- addTransaction mp tx
     return ()
 
+  MGetData (GetData ivs) -> do
+    pm <- readIORef pmRef
+    forM_ ivs $ \iv -> case ivType iv of
+      InvBlock -> do
+        let bh = BlockHash (ivHash iv)
+        mBlock <- getBlock db bh
+        case mBlock of
+          Just block -> requestFromPeer pm addr (MBlock block)
+          Nothing    -> requestFromPeer pm addr
+            (MNotFound (NotFound [iv]))
+      InvWitnessBlock -> do
+        let bh = BlockHash (ivHash iv)
+        mBlock <- getBlock db bh
+        case mBlock of
+          Just block -> requestFromPeer pm addr (MBlock block)
+          Nothing    -> requestFromPeer pm addr
+            (MNotFound (NotFound [iv]))
+      InvTx -> do
+        let txid = TxId (ivHash iv)
+        mEntry <- getTransaction mp txid
+        case mEntry of
+          Just entry -> requestFromPeer pm addr (MTx (meTransaction entry))
+          Nothing    -> requestFromPeer pm addr
+            (MNotFound (NotFound [iv]))
+      InvWitnessTx -> do
+        let txid = TxId (ivHash iv)
+        mEntry <- getTransaction mp txid
+        case mEntry of
+          Just entry -> requestFromPeer pm addr (MTx (meTransaction entry))
+          Nothing    -> requestFromPeer pm addr
+            (MNotFound (NotFound [iv]))
+      _ -> requestFromPeer pm addr (MNotFound (NotFound [iv]))
+
   MInv _inv ->
     return ()
 
