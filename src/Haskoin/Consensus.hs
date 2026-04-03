@@ -2986,8 +2986,10 @@ backgroundValidationLoop state db getBlockAtHeight = do
               -- Update progress
               writeIORef (ausCurrentHeight state) height
 
-              -- Flush cache periodically
-              when (height `mod` 2000 == 0) $ do
+              -- Flush cache every 500 blocks — more frequent than before to
+              -- keep Haskell Map memory bounded. Each flush clears the entire
+              -- cache and forces GC.
+              when (height `mod` 500 == 0) $ do
                 flushCache cache
 
   case result of
