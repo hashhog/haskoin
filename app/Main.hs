@@ -236,6 +236,8 @@ runNode net dataDir NodeOptions{..} = do
     nextBlockRef <- newIORef (1 :: Word32)
     -- Track highest block we've requested (for sliding window)
     requestedUpToRef <- newIORef (0 :: Word32)
+    -- IBD mode flag: skip block inv requests until header sync catches up
+    ibdModeRef <- newIORef True
 
     -- Start header sync
     hs <- startHeaderSync net hc
@@ -245,7 +247,7 @@ runNode net dataDir NodeOptions{..} = do
           { pmcMaxOutbound = min 8 noMaxPeers }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef addr msg
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef addr msg
         `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
@@ -425,8 +427,9 @@ chunksOf n xs = let (chunk, rest) = splitAt n xs in chunk : chunksOf n rest
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
                    -> IORef PeerManager -> IORef Word32 -> IORef Word32
+                   -> IORef Bool
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef addr msg = case msg of
+syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -459,6 +462,13 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
                   `catch` (\(_ :: SomeException) -> return False)
                 unless ok $ trySend rest
           trySend connPeers
+    -- Detect when header sync has caught up (peer returned < 2000 headers)
+    when (added > 0 && added < 2000) $ do
+      wasIBD <- readIORef ibdModeRef
+      when wasIBD $ do
+        putStrLn "Header sync complete — leaving IBD mode"
+        writeIORef ibdModeRef False
+
     -- After headers, request ALL blocks up to new tip
     when (added > 0) $ do
       tip <- getChainTip hc
@@ -477,7 +487,10 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
     -- not yet be in the chain. addHeader is idempotent if already known.
     addResult <- addHeader net hc hdr
     case addResult of
-      Left err -> putStrLn $ "Block header rejected: " ++ err
+      Left err -> do
+        isIBD <- readIORef ibdModeRef
+        unless isIBD $
+          putStrLn $ "Block header rejected: " ++ err
       Right entry -> do
         let height = ceHeight entry
         let result = do
@@ -548,21 +561,23 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
       _ -> requestFromPeer pm addr (MNotFound (NotFound [iv]))
 
   MInv (Inv ivs) -> do
-    -- Request any block inventory items we don't already have.
-    -- This is critical for block propagation: peers announce new blocks
-    -- via inv, and we must respond with getdata to fetch them.
-    let blockIvs = filter (\iv -> ivType iv == InvBlock
-                                || ivType iv == InvWitnessBlock) ivs
-    unless (null blockIvs) $ do
-      entries <- readTVarIO (hcEntries hc)
-      let unknown = filter (\iv ->
-            not $ Map.member (BlockHash (ivHash iv)) entries) blockIvs
-      unless (null unknown) $ do
-        pm <- readIORef pmRef
-        -- Request as witness blocks to get full witness data
-        let witnessIvs = map (\iv -> iv { ivType = InvWitnessBlock }) unknown
-        requestFromPeer pm addr (MGetData (GetData witnessIvs))
-          `catch` (\(_ :: SomeException) -> return ())
+    -- During IBD, skip block inv requests — we download blocks sequentially
+    -- via the header chain. Requesting inv blocks during IBD wastes bandwidth
+    -- on blocks at the chain tip that can't be connected yet.
+    isIBD <- readIORef ibdModeRef
+    unless isIBD $ do
+      let blockIvs = filter (\iv -> ivType iv == InvBlock
+                                  || ivType iv == InvWitnessBlock) ivs
+      unless (null blockIvs) $ do
+        entries <- readTVarIO (hcEntries hc)
+        let unknown = filter (\iv ->
+              not $ Map.member (BlockHash (ivHash iv)) entries) blockIvs
+        unless (null unknown) $ do
+          pm <- readIORef pmRef
+          -- Request as witness blocks to get full witness data
+          let witnessIvs = map (\iv -> iv { ivType = InvWitnessBlock }) unknown
+          requestFromPeer pm addr (MGetData (GetData witnessIvs))
+            `catch` (\(_ :: SomeException) -> return ())
 
   MGetHeaders (GetHeaders _ver locators hashStop) -> do
     -- Respond to getheaders from peers so they can sync from us.
