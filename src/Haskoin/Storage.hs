@@ -554,9 +554,10 @@ spendUTXO cache op = do
       modifyTVar' (ucSize cache) (subtract 1)
       return (Just entry)
 
--- | Flush all dirty entries to the database.
--- Spent entries are deleted, new/modified entries are written.
--- Uses batch writes for atomicity.
+-- | Flush all dirty entries to the database and evict clean entries
+-- to bound memory. Spent entries are deleted from DB, new/modified
+-- entries are written. After flush, only keeps ucMaxSize entries in
+-- the cache (evicts oldest clean entries).
 flushCache :: UTXOCache -> IO ()
 flushCache cache = do
   dirty <- atomically $ do
@@ -565,6 +566,24 @@ flushCache cache = do
     return d
   let ops = map toOp (Map.toList dirty)
   writeBatch (ucDB cache) (WriteBatch ops)
+
+  -- Evict clean entries to bound memory. After flush, all entries
+  -- are clean (dirty map is empty). Remove spent entries and trim
+  -- to maxSize to prevent unbounded growth.
+  atomically $ do
+    entries <- readTVar (ucEntries cache)
+    -- Remove all spent entries (they're deleted from DB now)
+    let live = Map.filter (not . ueSpent) entries
+        maxSz = ucMaxSize cache
+    if Map.size live > maxSz
+      then do
+        -- Keep only maxSize entries (drop oldest by key order)
+        let trimmed = Map.fromList $ take maxSz $ Map.toList live
+        writeTVar (ucEntries cache) trimmed
+        writeTVar (ucSize cache) (Map.size trimmed)
+      else do
+        writeTVar (ucEntries cache) live
+        writeTVar (ucSize cache) (Map.size live)
   where
     toOp (op, entry)
       | ueSpent entry = BatchDelete (makeKey PrefixUTXO (encode op))
@@ -737,9 +756,10 @@ coinsViewDBSetBestBlock CoinsViewDB{..} bh = do
 -- Reference: bitcoin/src/coins.h CCoinsViewCache, bitcoin/src/coins.cpp
 
 -- | Default cache size in bytes (450 MiB).
--- Reference: bitcoin/src/txdb.h DEFAULT_DB_CACHE_MB
+-- Maximum UTXO cache entries. Haskell Map entries are ~200-300 bytes each,
+-- so 5M entries ≈ 1-1.5 GB. Flushed to RocksDB when exceeded.
 defaultCacheSize :: Int
-defaultCacheSize = 450 * 1024 * 1024
+defaultCacheSize = 5000000
 
 -- | In-memory UTXO cache backed by a CoinsViewDB.
 -- Implements the same semantics as Bitcoin Core's CCoinsViewCache.
