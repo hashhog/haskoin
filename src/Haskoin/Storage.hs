@@ -196,6 +196,7 @@ import Data.Int (Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Control.Exception (bracket, try, IOException, catch)
 import Control.Monad (when, void, unless, forM_)
+import System.Mem (performGC)
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
@@ -554,10 +555,9 @@ spendUTXO cache op = do
       modifyTVar' (ucSize cache) (subtract 1)
       return (Just entry)
 
--- | Flush all dirty entries to the database and evict clean entries
--- to bound memory. Spent entries are deleted from DB, new/modified
--- entries are written. After flush, only keeps ucMaxSize entries in
--- the cache (evicts oldest clean entries).
+-- | Flush all dirty entries to the database and clear the in-memory
+-- cache entirely. This ensures bounded memory by releasing all Map
+-- nodes to GC. Entries will be re-loaded from RocksDB on demand.
 flushCache :: UTXOCache -> IO ()
 flushCache cache = do
   dirty <- atomically $ do
@@ -567,23 +567,15 @@ flushCache cache = do
   let ops = map toOp (Map.toList dirty)
   writeBatch (ucDB cache) (WriteBatch ops)
 
-  -- Evict clean entries to bound memory. After flush, all entries
-  -- are clean (dirty map is empty). Remove spent entries and trim
-  -- to maxSize to prevent unbounded growth.
+  -- Clear the entire cache — entries will be re-fetched from DB on
+  -- demand. This is the only reliable way to bound Haskell Map memory
+  -- because GHC's allocator doesn't shrink Maps in-place.
   atomically $ do
-    entries <- readTVar (ucEntries cache)
-    -- Remove all spent entries (they're deleted from DB now)
-    let live = Map.filter (not . ueSpent) entries
-        maxSz = ucMaxSize cache
-    if Map.size live > maxSz
-      then do
-        -- Keep only maxSize entries (drop oldest by key order)
-        let trimmed = Map.fromList $ take maxSz $ Map.toList live
-        writeTVar (ucEntries cache) trimmed
-        writeTVar (ucSize cache) (Map.size trimmed)
-      else do
-        writeTVar (ucEntries cache) live
-        writeTVar (ucSize cache) (Map.size live)
+    writeTVar (ucEntries cache) Map.empty
+    writeTVar (ucSize cache) 0
+
+  -- Force GC to reclaim the old Map's tree nodes
+  performGC
   where
     toOp (op, entry)
       | ueSpent entry = BatchDelete (makeKey PrefixUTXO (encode op))
@@ -756,10 +748,10 @@ coinsViewDBSetBestBlock CoinsViewDB{..} bh = do
 -- Reference: bitcoin/src/coins.h CCoinsViewCache, bitcoin/src/coins.cpp
 
 -- | Default cache size in bytes (450 MiB).
--- Maximum UTXO cache entries. Haskell Map entries are ~200-300 bytes each,
--- so 5M entries ≈ 1-1.5 GB. Flushed to RocksDB when exceeded.
+-- Maximum UTXO cache entries. Haskell Map entries are ~300-400 bytes each
+-- (tree node overhead + spine + thunks + data). 2M entries ≈ 600-800 MB.
 defaultCacheSize :: Int
-defaultCacheSize = 5000000
+defaultCacheSize = 2000000
 
 -- | In-memory UTXO cache backed by a CoinsViewDB.
 -- Implements the same semantics as Bitcoin Core's CCoinsViewCache.
