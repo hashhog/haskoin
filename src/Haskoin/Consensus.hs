@@ -610,7 +610,7 @@ genesisBlockHeader :: BlockHeader
 genesisBlockHeader = BlockHeader
   { bhVersion    = 1
   , bhPrevBlock  = BlockHash (Hash256 (BS.replicate 32 0))
-  , bhMerkleRoot = hexToHash256 "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+  , bhMerkleRoot = hexToHash256 "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
   , bhTimestamp  = 1231006505   -- 2009-01-03 18:15:05 UTC
   , bhBits       = 0x1d00ffff   -- Difficulty 1
   , bhNonce      = 2083236893
@@ -651,7 +651,7 @@ testnet3GenesisHeader :: BlockHeader
 testnet3GenesisHeader = BlockHeader
   { bhVersion    = 1
   , bhPrevBlock  = BlockHash (Hash256 (BS.replicate 32 0))
-  , bhMerkleRoot = hexToHash256 "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+  , bhMerkleRoot = hexToHash256 "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a"
   , bhTimestamp  = 1296688602   -- 2011-02-02
   , bhBits       = 0x1d00ffff
   , bhNonce      = 414098458
