@@ -2986,10 +2986,13 @@ backgroundValidationLoop state db getBlockAtHeight = do
               -- Update progress
               writeIORef (ausCurrentHeight state) height
 
-              -- Flush cache every 500 blocks — more frequent than before to
-              -- keep Haskell Map memory bounded. Each flush clears the entire
-              -- cache and forces GC.
-              when (height `mod` 500 == 0) $ do
+              -- Flush on either interval or entry count limit.
+              -- At height 400K+, each block has ~4000 outputs, so 100 blocks
+              -- = ~400K entries ≈ 120MB. Hard limit at 500K entries catches
+              -- blocks with unusually many outputs.
+              cacheEntries <- readTVarIO (ucSize cache)
+              when (height `mod` 100 == 0 || cacheEntries > 500000) $ do
+                putStrLn $ "Flushing UTXO cache: " ++ show cacheEntries ++ " entries at height " ++ show height
                 flushCache cache
 
   case result of
