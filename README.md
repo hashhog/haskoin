@@ -36,6 +36,7 @@ system to make invalid states unrepresentable.
 - [x] PSBT (BIP-174/BIP-370) - create, update, sign, combine, finalize
 - [x] Output descriptors (BIP-380-386) - parse, checksum, derive addresses
 - [x] Miniscript (BIP-379) - type system, compilation, satisfaction
+- [x] Mainnet sync (fully synced to chain tip at block 943,571)
 - [ ] ECDSA signing/verification (requires secp256k1)
 
 ## Quick start
