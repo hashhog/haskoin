@@ -800,7 +800,7 @@ mainnet = Network
           , aupBlockHash = hashFromHex "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
           })
       ]
-  , netAssumeValidHeight = 0
+  , netAssumeValidHeight = 938343
   }
 
 -- | Bitcoin testnet3 configuration
