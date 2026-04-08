@@ -1591,10 +1591,19 @@ coinbaseHeight tx
   | not (isCoinbase tx) = Nothing
   | BS.null script = Nothing
   | otherwise =
-      let len = fromIntegral (BS.head script)
-      in if len > 0 && len <= 4 && BS.length script > len
-         then Just $ decodeLittleEndian (BS.take len (BS.drop 1 script))
-         else Nothing
+      let firstByte = BS.head script
+      in case firstByte of
+           -- OP_0 encodes height 0
+           0x00 -> Just 0
+           -- OP_1NEGATE (0x4f) encodes -1, invalid as a block height
+           0x4f -> Nothing
+           -- OP_1 (0x51) through OP_16 (0x60) encode heights 1-16
+           b | b >= 0x51 && b <= 0x60 -> Just (fromIntegral b - 0x50)
+           -- Standard CScriptNum: first byte is the push length (1-4),
+           -- followed by that many little-endian bytes encoding the height
+           len | len >= 0x01 && len <= 0x04 && BS.length script > fromIntegral len ->
+                   Just $ decodeLittleEndian (BS.take (fromIntegral len) (BS.drop 1 script))
+           _ -> Nothing
   where
     script = txInScript (head (txInputs tx))
     -- Decode little-endian bytes to Word32
