@@ -1838,6 +1838,9 @@ continueHandshake pc theirVersion = do
       -- Send post-handshake feature negotiation messages
       sendMessage pc MSendHeaders
       sendMessage pc (MSendCmpct (SendCmpct False 2))
+      -- BIP133: Send initial feefilter (100 sat/vbyte = 100000 sat/kvB)
+      when (vRelay theirVersion) $
+        sendMessage pc (MFeeFilter (FeeFilter 100000))
 
       return $ Right theirVersion
 
