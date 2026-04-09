@@ -14,6 +14,7 @@ import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
+import Data.Maybe (mapMaybe)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
 import Data.Word (Word32, Word64)
@@ -644,8 +645,30 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
       requestFromPeer pm addr (MInv (Inv invVecs))
         `catch` (\(_ :: SomeException) -> return ())
 
-  MAddr _addrs ->
-    return ()
+  MAddr addrs -> do
+    -- BIP155: Store addresses and relay to 2 random peers
+    pm <- readIORef pmRef
+    handleAddrMessage pm addrs
+    relayAddrToRandomPeers pm addr (MAddr addrs)
+
+  MAddrV2 addrv2msg -> do
+    -- BIP155: Handle addrv2 message - extract IPv4/IPv6 and store
+    pm <- readIORef pmRef
+    let converted = mapMaybe addrV2ToAddrEntry (getAddrV2List addrv2msg)
+    unless (null converted) $ do
+      handleAddrMessage pm (Addr (map (\ae -> (0, ae)) converted))
+      relayAddrToRandomPeers pm addr (MAddrV2 addrv2msg)
+
+  MFeeFilter (FeeFilter fee) -> do
+    -- BIP133: Store peer's fee filter
+    pm <- readIORef pmRef
+    let peerMap = pmPeers pm
+    mInfo <- atomically $ do
+      m <- readTVar peerMap
+      return (Map.lookup addr m)
+    case mInfo of
+      Just infoVar -> void $ handleFeeFilter infoVar fee
+      Nothing -> return ()
 
   MNotFound (NotFound invs) ->
     putStrLn $ "Peer says not found: " ++ show (length invs) ++ " items"
@@ -681,10 +704,23 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
   MPong _ -> return ()
   MVerAck -> return ()
   MSendHeaders -> return ()
-  MFeeFilter _ -> return ()
+  MSendCmpct _ -> return ()
   MWtxidRelay -> return ()
 
   _other -> return ()  -- Silently ignore other messages
+
+-- | Relay a message to up to 2 random connected peers, excluding the source.
+-- Implements Bitcoin Core's RelayAddress behavior (BIP155).
+relayAddrToRandomPeers :: PeerManager -> SockAddr -> Message -> IO ()
+relayAddrToRandomPeers pm sourceAddr msg = do
+  peerMap <- atomically $ readTVar (pmPeers pm)
+  let candidates = Map.keys $ Map.filterWithKey (\a _ -> a /= sourceAddr) peerMap
+  unless (null candidates) $ do
+    -- Pick up to 2 random peers (simple approach: take first 2)
+    let targets = take 2 candidates
+    forM_ targets $ \targetAddr ->
+      requestFromPeer pm targetAddr msg
+        `catch` (\(_ :: SomeException) -> return ())
 
 --------------------------------------------------------------------------------
 -- Wallet Commands
