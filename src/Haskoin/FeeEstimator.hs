@@ -1,5 +1,8 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | Fee Estimation
 --
@@ -29,6 +32,9 @@ module Haskoin.FeeEstimator
     -- * Bucket Types
   , FeeBucket(..)
   , PendingTxInfo(..)
+    -- * Persistence
+  , saveFeeEstimates
+  , loadFeeEstimates
     -- * Constants
   , numBuckets
   , maxConfirmBlocks
@@ -39,11 +45,15 @@ module Haskoin.FeeEstimator
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Control.Concurrent.STM
+import Control.Exception (catch, SomeException)
 import Control.Monad (forM, forM_, when)
+import Data.Aeson (ToJSON, FromJSON, encode, eitherDecode')
+import qualified Data.ByteString.Lazy as LBS
 import Data.Word (Word64, Word32)
 import Data.Maybe (mapMaybe)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
+import System.Directory (doesFileExist, renameFile)
 
 import Haskoin.Types (TxId)
 
@@ -90,6 +100,8 @@ data FeeBucket = FeeBucket
   } deriving (Show, Eq, Generic)
 
 instance NFData FeeBucket
+instance ToJSON FeeBucket
+instance FromJSON FeeBucket
 
 -- | Information about a pending transaction being tracked
 data PendingTxInfo = PendingTxInfo
@@ -277,3 +289,48 @@ estimateSmartFee fe targetBlocks mode = do
     adjustForMode :: Word64 -> FeeEstimateMode -> Word64
     adjustForMode rate FeeConservative = rate + (rate `div` 10)
     adjustForMode rate FeeEconomical   = rate
+
+--------------------------------------------------------------------------------
+-- Persistence
+--------------------------------------------------------------------------------
+
+-- | Serializable snapshot of fee estimator state (buckets only, not pending txs).
+data FeeEstimatorSnapshot = FeeEstimatorSnapshot
+  { snapBuckets    :: !(Map Int FeeBucket)
+  , snapBestHeight :: !Word32
+  } deriving (Show, Eq, Generic)
+
+instance ToJSON FeeEstimatorSnapshot
+instance FromJSON FeeEstimatorSnapshot
+
+-- | Save fee estimator state to a JSON file.
+-- Writes to a temporary file first, then renames for atomicity.
+saveFeeEstimates :: FeeEstimator -> FilePath -> IO ()
+saveFeeEstimates fe path = do
+  let go = do
+        (buckets, height) <- atomically $ do
+          b <- readTVar (feeBuckets fe)
+          h <- readTVar (feeBestHeight fe)
+          return (b, h)
+        let snapshot = FeeEstimatorSnapshot buckets height
+            tmpPath = path ++ ".tmp"
+        LBS.writeFile tmpPath (encode snapshot)
+        renameFile tmpPath path
+  go `catch` (\(_ :: SomeException) -> return ())
+
+-- | Load fee estimator state from a JSON file.
+-- Returns without error if the file doesn't exist or is invalid.
+loadFeeEstimates :: FeeEstimator -> FilePath -> IO ()
+loadFeeEstimates fe path = do
+  exists <- doesFileExist path
+  when exists $ do
+    contents <- LBS.readFile path
+    case eitherDecode' contents of
+      Left _err -> return ()
+      Right snapshot -> do
+        let loadedBuckets = snapBuckets snapshot
+            loadedHeight  = snapBestHeight snapshot
+        when (Map.size loadedBuckets == numBuckets) $
+          atomically $ do
+            writeTVar (feeBuckets fe) loadedBuckets
+            writeTVar (feeBestHeight fe) loadedHeight

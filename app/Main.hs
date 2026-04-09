@@ -230,8 +230,10 @@ runNode net dataDir NodeOptions{..} = do
     -- Initialize mempool
     mp <- newMempool net cache defaultMempoolConfig 0
 
-    -- Initialize fee estimator
+    -- Initialize fee estimator with persistence
     fe <- newFeeEstimator
+    let feeEstimatesPath = dataDir </> "fee_estimates.json"
+    loadFeeEstimates fe feeEstimatesPath
 
     -- Track next expected block height for download
     nextBlockRef <- newIORef (1 :: Word32)
@@ -239,6 +241,8 @@ runNode net dataDir NodeOptions{..} = do
     requestedUpToRef <- newIORef (0 :: Word32)
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
+    -- Recently-rejected transaction filter (cleared on each new block)
+    recentlyRejectedRef <- newIORef (Set.empty :: Set.Set TxId)
 
     -- Start header sync
     hs <- startHeaderSync net hc
@@ -250,7 +254,7 @@ runNode net dataDir NodeOptions{..} = do
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef addr msg
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef addr msg
         `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
@@ -294,8 +298,14 @@ runNode net dataDir NodeOptions{..} = do
 
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
-    let loop = threadDelay (maxBound `div` 2) >> loop
-    loop
+    shutdownVar <- newEmptyMVar
+    void $ installHandler sigINT (Catch $ putMVar shutdownVar ()) Nothing
+    void $ installHandler sigTERM (Catch $ putMVar shutdownVar ()) Nothing
+    takeMVar shutdownVar
+    putStrLn "Shutting down..."
+    saveFeeEstimates fe feeEstimatesPath
+    putStrLn $ "Fee estimates saved to " ++ feeEstimatesPath
+    putStrLn "Shutdown complete."
 
 -- | Initialize header chain from database
 initHeaderChainFromDB :: HaskoinDB -> Network -> IO HeaderChain
@@ -430,9 +440,9 @@ chunksOf n xs = let (chunk, rest) = splitAt n xs in chunk : chunksOf n rest
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
                    -> IORef PeerManager -> IORef Word32 -> IORef Word32
-                   -> IORef Bool
+                   -> IORef Bool -> IORef (Set.Set TxId)
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef addr msg = case msg of
+syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -514,6 +524,9 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
         nextBlock <- readIORef nextBlockRef
         when (height >= nextBlock) $
           writeIORef nextBlockRef (height + 1)
+        -- Remove confirmed txs from mempool and clear rejection filter
+        blockConnected mp block
+        writeIORef recentlyRejectedRef Set.empty
         -- Broadcast the block inv to other peers so it propagates
         pm <- readIORef pmRef
         let invVec = InvVector InvBlock (getBlockHashHash bh)
@@ -532,8 +545,19 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
             `catch` (\(_ :: SomeException) -> return ())
 
   MTx tx -> do
-    _ <- addTransaction mp tx
-    return ()
+    let txid = computeTxId tx
+    result <- addTransaction mp tx
+    case result of
+      Right _ -> do
+        -- Relay accepted tx inv to all connected peers
+        pm <- readIORef pmRef
+        let invVec = InvVector InvWitnessTx (getTxIdHash txid)
+        broadcastMessage pm (MInv (Inv [invVec]))
+      Left _err -> do
+        -- Add to recently-rejected filter
+        rejected <- readIORef recentlyRejectedRef
+        when (Set.size rejected < 50000) $
+          writeIORef recentlyRejectedRef (Set.insert txid rejected)
 
   MGetData (GetData ivs) -> do
     pm <- readIORef pmRef
@@ -586,6 +610,29 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
           let witnessIvs = map (\iv -> iv { ivType = InvWitnessBlock }) unknown
           requestFromPeer pm addr (MGetData (GetData witnessIvs))
             `catch` (\(_ :: SomeException) -> return ())
+
+    -- Request unknown transactions (not in mempool, not recently rejected)
+    let txIvs = filter (\iv -> ivType iv == InvTx
+                             || ivType iv == InvWitnessTx) ivs
+    unless (null txIvs) $ do
+      rejected <- readIORef recentlyRejectedRef
+      -- Filter to unknown txs: not in mempool and not recently rejected
+      unknown <- filterM (\iv -> do
+            let txid = TxId (ivHash iv)
+            if Set.member txid rejected
+              then return False
+              else do
+                mEntry <- getTransaction mp txid
+                case mEntry of
+                  Just _  -> return False
+                  Nothing -> return True
+            ) txIvs
+      unless (null unknown) $ do
+        pm <- readIORef pmRef
+        -- Request as witness txs for full witness data
+        let witnessTxIvs = map (\iv -> iv { ivType = InvWitnessTx }) unknown
+        requestFromPeer pm addr (MGetData (GetData witnessTxIvs))
+          `catch` (\(_ :: SomeException) -> return ())
 
   MGetHeaders (GetHeaders _ver locators hashStop) -> do
     -- Respond to getheaders from peers so they can sync from us.
@@ -656,7 +703,7 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
     pm <- readIORef pmRef
     let converted = mapMaybe addrV2ToAddrEntry (getAddrV2List addrv2msg)
     unless (null converted) $ do
-      handleAddrMessage pm (Addr (map (\ae -> (0, ae)) converted))
+      handleAddrMessage pm (Haskoin.Network.Addr converted)
       relayAddrToRandomPeers pm addr (MAddrV2 addrv2msg)
 
   MFeeFilter (FeeFilter fee) -> do
@@ -667,7 +714,7 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
       m <- readTVar peerMap
       return (Map.lookup addr m)
     case mInfo of
-      Just infoVar -> void $ handleFeeFilter infoVar fee
+      Just pc -> void $ handleFeeFilter (pcInfo pc) fee
       Nothing -> return ()
 
   MNotFound (NotFound invs) ->

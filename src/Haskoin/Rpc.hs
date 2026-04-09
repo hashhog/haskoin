@@ -1317,15 +1317,24 @@ handleDecodeRawTransaction _server params = do
 handleGetMempoolInfo :: RpcServer -> IO RpcResponse
 handleGetMempoolInfo server = do
   (count, size) <- getMempoolSize (rsMempool server)
+  -- Calculate total fees from all mempool entries
+  txids <- getMempoolTxIds (rsMempool server)
+  entries <- forM txids $ \txid -> getTransaction (rsMempool server) txid
+  let totalFeeSat = sum [meFee e | Just e <- entries]
   let mpCfg = mpConfig (rsMempool server)
+      minFeeRate = getFeeRate (mpcMinFeeRate mpCfg)
       result = object
-        [ "loaded"          .= True
-        , "size"            .= count
-        , "bytes"           .= size
-        , "usage"           .= size
-        , "maxmempool"      .= mpcMaxSize mpCfg
-        , "mempoolminfee"   .= getFeeRate (mpcMinFeeRate mpCfg)
-        , "minrelaytxfee"   .= (1 :: Int)
+        [ "loaded"              .= True
+        , "size"                .= count
+        , "bytes"               .= size
+        , "usage"               .= size
+        , "total_fee"           .= (fromIntegral totalFeeSat / 100000000.0 :: Double)
+        , "maxmempool"          .= mpcMaxSize mpCfg
+        , "mempoolminfee"       .= minFeeRate
+        , "minrelaytxfee"       .= (0.00001 :: Double)
+        , "incrementalrelayfee" .= (0.00001 :: Double)
+        , "unbroadcastcount"    .= (0 :: Int)
+        , "fullrbf"             .= True
         ]
   return $ RpcResponse result Null Null
 
@@ -1463,23 +1472,41 @@ handleGetNetworkInfo server = do
 handleGetPeerInfo :: RpcServer -> IO RpcResponse
 handleGetPeerInfo server = do
   peers <- getConnectedPeers (rsPeerMgr server)
-  let peerInfos = map peerToJSON peers
+  let peerInfos = zipWith peerToJSON [0..] peers
   return $ RpcResponse (toJSON peerInfos) Null Null
   where
-    peerToJSON (addr, info) = object
-      [ "addr"            .= show addr
-      , "services"        .= show (piServices info)
+    peerToJSON idx (addr, info) =
+      let services = piServices info
+          serviceNames = catMaybes
+            [ if services .&. 1 /= 0 then Just ("NETWORK" :: Text) else Nothing
+            , if services .&. 8 /= 0 then Just "WITNESS" else Nothing
+            , if services .&. 1024 /= 0 then Just "NETWORK_LIMITED" else Nothing
+            ]
+          isInbound = piInbound info
+      in object
+      [ "id"              .= (idx :: Int)
+      , "addr"            .= show addr
+      , "network"         .= ("ipv4" :: Text)
+      , "services"        .= (T.pack $ printf "%016x" services)
+      , "servicesnames"   .= serviceNames
+      , "relaytxes"       .= True
       , "lastsend"        .= piLastSeen info
       , "lastrecv"        .= piLastSeen info
+      , "bytessent"       .= piBytesSent info
+      , "bytesrecv"       .= piBytesRecv info
       , "conntime"        .= piConnectedAt info
+      , "timeoffset"      .= (0 :: Int)
       , "pingtime"        .= fromMaybe (0 :: Double) (piPingLatency info)
       , "version"         .= maybe (0 :: Int32) vVersion (piVersion info)
       , "subver"          .= maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info)
-      , "inbound"         .= piInbound info
+      , "inbound"         .= isInbound
+      , "bip152_hb_to"    .= False
+      , "bip152_hb_from"  .= False
       , "startingheight"  .= piStartHeight info
-      , "banscore"        .= piBanScore info
-      , "bytessent"       .= piBytesSent info
-      , "bytesrecv"       .= piBytesRecv info
+      , "synced_headers"  .= (-1 :: Int)
+      , "synced_blocks"   .= (-1 :: Int)
+      , "inflight"        .= ([] :: [Int])
+      , "connection_type" .= (if isInbound then "inbound" :: Text else "outbound-full-relay")
       ]
 
 -- | Get the number of connected peers
@@ -2012,11 +2039,17 @@ handleEstimateSmartFee server params = do
       (toJSON $ RpcError rpcInvalidParams "Missing conf_target") Null
     Just (confTarget :: Int) -> do
       (feeRate, blocks) <- estimateSmartFee (rsFeeEst server) confTarget FeeConservative
-      let btcPerKb = fromIntegral feeRate / 100000.0 :: Double
-      return $ RpcResponse (object
-        [ "feerate" .= btcPerKb
-        , "blocks"  .= blocks
-        ]) Null Null
+      if feeRate <= 0
+        then return $ RpcResponse (object
+          [ "errors" .= (["Insufficient data or no feerate found"] :: [Text])
+          , "blocks" .= blocks
+          ]) Null Null
+        else do
+          let btcPerKb = fromIntegral feeRate / 100000.0 :: Double
+          return $ RpcResponse (object
+            [ "feerate" .= btcPerKb
+            , "blocks"  .= blocks
+            ]) Null Null
 
 --------------------------------------------------------------------------------
 -- Utility RPC Handlers
