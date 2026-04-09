@@ -1,0 +1,13 @@
+services:
+  haskoin:
+    build: .
+    container_name: haskoin
+    restart: unless-stopped
+    volumes:
+      - haskoin-data:/data
+    ports:
+      - "8333:8333"
+      - "8332:8332"
+
+volumes:
+  haskoin-data:
