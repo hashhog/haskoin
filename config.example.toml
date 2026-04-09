@@ -1,0 +1,41 @@
+# Haskoin - Bitcoin Full Node (Haskell)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: Mainnet, Testnet, Testnet4, Regtest
+network = "Mainnet"
+
+[storage]
+# Data directory
+datadir = "~/.haskoin"
+# Database cache size in MB
+dbcache = 450
+# Enable pruning
+prune = false
+
+[rpc]
+# RPC port
+rpcport = 8332
+# RPC authentication
+rpcuser = "haskoin"
+rpcpassword = "haskoin"
+
+[p2p]
+# P2P listen port
+port = 8333
+# Accept inbound connections
+listen = true
+# Maximum peer connections
+maxpeers = 125
+
+[mempool]
+# (Uses Bitcoin Core defaults internally)
+
+[logging]
+# (Haskell logging via stdout)
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332
