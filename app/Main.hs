@@ -13,7 +13,9 @@ import System.IO (hSetBuffering, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
+import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import Data.Maybe (mapMaybe)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
@@ -729,24 +731,58 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
                ++ ", announce=" ++ show (scAnnounce sc)
 
   MCmpctBlock cb -> do
-    -- We don't have a mempool, so we can't reconstruct the block from
-    -- short IDs. Fall back to requesting the full block via getdata.
+    -- BIP 152: Reconstruct block from compact block + mempool
     let bh = computeBlockHash (cbHeader cb)
-    putStrLn $ "Received cmpctblock, falling back to full block request (hash=" ++ show bh ++ ")"
-    pm <- readIORef pmRef
-    let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
-    requestFromPeer pm addr (MGetData (GetData [iv]))
-      `catch` (\(_ :: SomeException) -> return ())
+    entries <- readTVarIO (mpEntries mp)
+    let mempoolTxMap = Map.map meTransaction entries
+    case initPartialBlock cb mempoolTxMap of
+      Left err -> do
+        putStrLn $ "Compact block " ++ show bh ++ " init failed: " ++ err
+        pm <- readIORef pmRef
+        let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+        requestFromPeer pm addr (MGetData (GetData [iv]))
+          `catch` (\(_ :: SomeException) -> return ())
+      Right (pdb, missing) ->
+        if null missing
+          then case fillPartialBlock pdb [] of
+            Right block -> do
+              putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
+              syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef addr (MBlock block)
+            Left err -> do
+              putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
+              pm <- readIORef pmRef
+              let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+              requestFromPeer pm addr (MGetData (GetData [iv]))
+                `catch` (\(_ :: SomeException) -> return ())
+          else do
+            let missPct = fromIntegral (length missing) / fromIntegral (pdbTotalTxns pdb) * 100.0 :: Double
+            if missPct > 50.0
+              then do
+                putStrLn $ "Compact block " ++ show bh ++ " too many missing, requesting full block"
+                pm <- readIORef pmRef
+                let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+                requestFromPeer pm addr (MGetData (GetData [iv]))
+                  `catch` (\(_ :: SomeException) -> return ())
+              else do
+                putStrLn $ "Compact block " ++ show bh ++ " missing " ++ show (length missing) ++ " txns, sending getblocktxn"
+                pm <- readIORef pmRef
+                let gbt = GetBlockTxn bh (map fromIntegral missing)
+                requestFromPeer pm addr (MGetBlockTxn gbt)
+                  `catch` (\(_ :: SomeException) -> return ())
 
-  MGetBlockTxn _gbt -> do
-    -- Peer requesting missing transactions for compact block reconstruction.
-    -- We don't serve compact blocks yet, so ignore.
-    return ()
+  MGetBlockTxn (GetBlockTxn blockHash indices) -> do
+    -- Serve missing transactions for compact block reconstruction
+    mBlock <- getBlock db blockHash
+    case mBlock of
+      Just block -> do
+        let txns = mapMaybe (\i -> let idx = fromIntegral i in if idx < length (blockTxns block) then Just (blockTxns block !! idx) else Nothing) indices
+        pm <- readIORef pmRef
+        requestFromPeer pm addr (MBlockTxn (BlockTxn blockHash txns))
+          `catch` (\(_ :: SomeException) -> return ())
+      Nothing -> return ()
 
-  MBlockTxn _bt -> do
-    -- Response to our getblocktxn request. Since we fall back to full block
-    -- download, we shouldn't receive these. Ignore.
-    return ()
+  MBlockTxn (BlockTxn blockHash txns) ->
+    putStrLn $ "Received blocktxn for " ++ show blockHash ++ " (" ++ show (length txns) ++ " txns)"
 
   MPong _ -> return ()
   MVerAck -> return ()

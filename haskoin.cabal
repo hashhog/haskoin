@@ -78,6 +78,7 @@ executable haskoin
                , base16-bytestring
                , cereal
                , network
+               , unix
   default-language: Haskell2010
   ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N"
 
