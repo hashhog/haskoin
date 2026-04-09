@@ -26,7 +26,11 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
+import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Serialize (decode)
+import qualified Network.Wai as Wai
+import qualified Network.Wai.Handler.Warp as Warp
+import qualified Network.HTTP.Types as HTTP
 
 import qualified Network.Socket as NS (getAddrInfo, addrAddress, AddrInfo)
 import Haskoin.Types
@@ -69,6 +73,7 @@ data NodeOptions = NodeOptions
   , noDbCache    :: !Int
   , noListen     :: !Bool
   , noListenPort :: !Int
+  , noMetricsPort :: !Int
   } deriving (Show)
 
 data WalletCommand
@@ -120,6 +125,7 @@ parseNodeOptions = NodeOptions
   <*> option auto (long "dbcache" <> value 450 <> help "DB cache in MB")
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
+  <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -289,6 +295,28 @@ runNode net dataDir NodeOptions{..} = do
           }
     _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
+
+    -- Start Prometheus metrics server
+    when (noMetricsPort > 0) $ do
+      void $ forkIO $ Warp.run noMetricsPort $ \_ respond -> do
+        height <- readTVarIO (hcHeight hc)
+        peers <- Map.size <$> readTVarIO (pmPeers pm)
+        mempoolCount <- Map.size <$> readTVarIO (mpEntries mp)
+        let body = BL8.pack $ unlines
+              [ "# HELP bitcoin_blocks_total Current block height"
+              , "# TYPE bitcoin_blocks_total gauge"
+              , "bitcoin_blocks_total " ++ show height
+              , "# HELP bitcoin_peers_connected Number of connected peers"
+              , "# TYPE bitcoin_peers_connected gauge"
+              , "bitcoin_peers_connected " ++ show peers
+              , "# HELP bitcoin_mempool_size Mempool transaction count"
+              , "# TYPE bitcoin_mempool_size gauge"
+              , "bitcoin_mempool_size " ++ show mempoolCount
+              ]
+        respond $ Wai.responseLBS HTTP.status200
+          [(HTTP.hContentType, "text/plain; version=0.0.4; charset=utf-8")]
+          body
+      putStrLn $ "Prometheus metrics server listening on port " ++ show noMetricsPort
 
     -- Start P2P listener for inbound connections
     let listenPort = if noListenPort == 8333
