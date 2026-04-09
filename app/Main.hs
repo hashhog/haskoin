@@ -244,7 +244,9 @@ runNode net dataDir NodeOptions{..} = do
 
     -- Start peer manager with sync-aware message handler
     let pmConfig = defaultPeerManagerConfig
-          { pmcMaxOutbound = min 8 noMaxPeers }
+          { pmcMaxOutbound = min 8 noMaxPeers
+          , pmcDataDir     = dataDir
+          }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
       syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef addr msg
@@ -651,10 +653,34 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
   MReject (Reject cmd code reason _) ->
     putStrLn $ "Peer rejected " ++ show cmd ++ ": code=" ++ show code ++ " reason=" ++ show reason
 
+  -- BIP 152: Compact block relay messages
+  MSendCmpct sc -> do
+    putStrLn $ "Peer supports compact blocks: version=" ++ show (scVersion sc)
+               ++ ", announce=" ++ show (scAnnounce sc)
+
+  MCmpctBlock cb -> do
+    -- We don't have a mempool, so we can't reconstruct the block from
+    -- short IDs. Fall back to requesting the full block via getdata.
+    let bh = computeBlockHash (cbHeader cb)
+    putStrLn $ "Received cmpctblock, falling back to full block request (hash=" ++ show bh ++ ")"
+    pm <- readIORef pmRef
+    let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+    requestFromPeer pm addr (MGetData (GetData [iv]))
+      `catch` (\(_ :: SomeException) -> return ())
+
+  MGetBlockTxn _gbt -> do
+    -- Peer requesting missing transactions for compact block reconstruction.
+    -- We don't serve compact blocks yet, so ignore.
+    return ()
+
+  MBlockTxn _bt -> do
+    -- Response to our getblocktxn request. Since we fall back to full block
+    -- download, we shouldn't receive these. Ignore.
+    return ()
+
   MPong _ -> return ()
   MVerAck -> return ()
   MSendHeaders -> return ()
-  MSendCmpct _ -> return ()
   MFeeFilter _ -> return ()
   MWtxidRelay -> return ()
 
