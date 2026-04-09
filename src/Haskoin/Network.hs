@@ -461,7 +461,7 @@ import Data.Serialize
 import Data.Word
 import Data.Int (Int32, Int64)
 import Data.Bits ((.&.), (.|.), shiftR, shiftL, xor, complement, rotateL)
-import Control.Monad (replicateM, forM_, forM, when, forever, unless, void)
+import Control.Monad (replicateM, forM_, forM, when, forever, unless, void, filterM)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr)
@@ -493,6 +493,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Aeson as Aeson
 import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
+import System.FilePath ((</>))
 import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
 
 import Network.Socket (Socket, SockAddr(..), getAddrInfo,
@@ -554,6 +555,9 @@ data MisbehaviorReason
   | PayloadTooLarge                 -- ^ Payload exceeds size limit (10)
   | DuplicateVersion                -- ^ Sent version after handshake (1)
   | ProtocolViolation Text          -- ^ Generic protocol violation with description (10)
+  | HeadersDontConnect              -- ^ Headers don't connect to our chain (20)
+  | BlockDownloadStall              -- ^ Peer stalling block download (50)
+  | UnrequestedData                 -- ^ Sending unrequested blocks/transactions (5)
   deriving (Show, Eq)
 
 -- | Get the ban score for a misbehavior reason
@@ -571,11 +575,14 @@ misbehaviorScore TooLargeInvMessage       = 20
 misbehaviorScore TooLargeAddrMessage      = 20
 misbehaviorScore TooLargeHeadersMessage   = 20
 misbehaviorScore InvalidCompactBlock      = 100  -- Immediate ban
-misbehaviorScore NonContinuousHeaders     = 100  -- Immediate ban
+misbehaviorScore NonContinuousHeaders     = 20   -- Headers not connected (proportional)
 misbehaviorScore ChecksumMismatch         = 10
 misbehaviorScore PayloadTooLarge          = 10
 misbehaviorScore DuplicateVersion         = 1
 misbehaviorScore (ProtocolViolation _)    = 10
+misbehaviorScore HeadersDontConnect       = 20   -- Headers don't connect to chain
+misbehaviorScore BlockDownloadStall       = 50   -- Block download stalling
+misbehaviorScore UnrequestedData          = 5    -- Sending unrequested data
 
 -- | Default ban threshold (matches Bitcoin Core)
 defaultBanThreshold :: Int
@@ -1917,39 +1924,44 @@ queueMessage pc msg = writeTBQueue (pcSendQueue pc) msg
 -- | Peer manager for maintaining multiple peer connections
 -- Handles peer discovery, connection management, and message routing
 data PeerManager = PeerManager
-  { pmPeers          :: !(TVar (Map SockAddr PeerConnection))
-  , pmKnownAddrs     :: !(TVar (Set.Set SockAddr))
-  , pmBannedAddrs    :: !(TVar (Map SockAddr Int64))
-  , pmConfig         :: !PeerManagerConfig
-  , pmNetwork        :: !Network
-  , pmBestHeight     :: !(TVar Int32)
-  , pmManagerThread  :: !(TVar (Maybe ThreadId))
-  , pmMessageHandler :: !(SockAddr -> Message -> IO ())
-  , pmFailedAddrs    :: !(TVar (Set.Set SockAddr))  -- ^ Addresses that failed to connect
-  , pmLastDNSRefresh :: !(TVar Int64)                -- ^ Last DNS re-discovery timestamp
+  { pmPeers              :: !(TVar (Map SockAddr PeerConnection))
+  , pmKnownAddrs         :: !(TVar (Set.Set SockAddr))
+  , pmBannedAddrs        :: !(TVar (Map SockAddr Int64))
+  , pmConfig             :: !PeerManagerConfig
+  , pmNetwork            :: !Network
+  , pmBestHeight         :: !(TVar Int32)
+  , pmManagerThread      :: !(TVar (Maybe ThreadId))
+  , pmMessageHandler     :: !(SockAddr -> Message -> IO ())
+  , pmFailedAddrs        :: !(TVar (Set.Set SockAddr))  -- ^ Addresses that failed to connect
+  , pmLastDNSRefresh     :: !(TVar Int64)                -- ^ Last DNS re-discovery timestamp
+  , pmOutboundDiversity  :: !OutboundDiversity            -- ^ Netgroup diversity tracker
   }
 
 -- | Configuration for the peer manager
 data PeerManagerConfig = PeerManagerConfig
-  { pmcMaxOutbound    :: !Int        -- ^ Maximum outbound connections (default 8)
-  , pmcMaxInbound     :: !Int        -- ^ Maximum inbound connections (default 117)
-  , pmcMaxTotal       :: !Int        -- ^ Maximum total connections (default 125)
-  , pmcBanDuration    :: !Int64      -- ^ Ban duration in seconds (default 86400 = 24h)
-  , pmcBanThreshold   :: !Int        -- ^ Ban score threshold (default 100)
-  , pmcPingInterval   :: !Int        -- ^ Ping interval in seconds (default 120)
-  , pmcConnectTimeout :: !Int        -- ^ Connection timeout in seconds (default 5)
+  { pmcMaxOutbound      :: !Int        -- ^ Maximum full-relay outbound connections (default 8)
+  , pmcMaxBlockRelayOnly :: !Int       -- ^ Maximum block-relay-only outbound connections (default 2)
+  , pmcMaxInbound       :: !Int        -- ^ Maximum inbound connections (default 117)
+  , pmcMaxTotal         :: !Int        -- ^ Maximum total connections (default 125)
+  , pmcBanDuration      :: !Int64      -- ^ Ban duration in seconds (default 86400 = 24h)
+  , pmcBanThreshold     :: !Int        -- ^ Ban score threshold (default 100)
+  , pmcPingInterval     :: !Int        -- ^ Ping interval in seconds (default 120)
+  , pmcConnectTimeout   :: !Int        -- ^ Connection timeout in seconds (default 5)
+  , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
 defaultPeerManagerConfig :: PeerManagerConfig
 defaultPeerManagerConfig = PeerManagerConfig
-  { pmcMaxOutbound    = 8
-  , pmcMaxInbound     = 117
-  , pmcMaxTotal       = 125
-  , pmcBanDuration    = 86400    -- 24 hours
-  , pmcBanThreshold   = 100
-  , pmcPingInterval   = 120      -- 2 minutes
-  , pmcConnectTimeout = 5
+  { pmcMaxOutbound      = 8
+  , pmcMaxBlockRelayOnly = 2
+  , pmcMaxInbound       = 117
+  , pmcMaxTotal         = 125
+  , pmcBanDuration      = 86400    -- 24 hours
+  , pmcBanThreshold     = 100
+  , pmcPingInterval     = 120      -- 2 minutes
+  , pmcConnectTimeout   = 5
+  , pmcDataDir          = "."
   }
 
 --------------------------------------------------------------------------------
@@ -1997,6 +2009,7 @@ discoverPeers net = do
 startPeerManager :: Network -> PeerManagerConfig
                  -> (SockAddr -> Message -> IO ()) -> IO PeerManager
 startPeerManager net config handler = do
+  od <- newOutboundDiversity
   pm <- PeerManager
     <$> newTVarIO Map.empty
     <*> newTVarIO Set.empty
@@ -2008,6 +2021,17 @@ startPeerManager net config handler = do
     <*> pure handler
     <*> newTVarIO Set.empty
     <*> newTVarIO 0
+    <*> pure od
+
+  -- Load anchor connections from previous session
+  let anchorsPath = pmcDataDir config </> "anchors.json"
+  anchors <- loadAnchors anchorsPath
+  unless (null anchors) $
+    putStrLn $ "startPeerManager: loaded " ++ show (length anchors) ++
+               " anchor(s), connecting as block-relay-only"
+  forM_ anchors $ \ac ->
+    void $ forkIO $ tryConnectBlockRelay pm (acAddress ac)
+
   tid <- forkIO $ peerManagerLoop pm
   atomically $ writeTVar (pmManagerThread pm) (Just tid)
   return pm
@@ -2015,9 +2039,22 @@ startPeerManager net config handler = do
 -- | Stop the peer manager and disconnect all peers
 stopPeerManager :: PeerManager -> IO ()
 stopPeerManager pm = do
+  -- Save block-relay-only peers as anchors before disconnecting
+  peers <- readTVarIO (pmPeers pm)
+  anchorAddrs <- forM (Map.toList peers) $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    return (addr, piBlockOnly info, piServices info)
+  let blockRelayAnchors = [ AnchorConnection addr svcs
+                          | (addr, isBlock, svcs) <- anchorAddrs
+                          , isBlock
+                          ]
+  let anchorsPath = pmcDataDir (pmConfig pm) </> "anchors.json"
+  saveAnchors anchorsPath blockRelayAnchors
+  unless (null blockRelayAnchors) $
+    putStrLn $ "stopPeerManager: saved " ++ show (length blockRelayAnchors) ++ " anchor(s)"
+
   mTid <- readTVarIO (pmManagerThread pm)
   mapM_ killThread mTid
-  peers <- readTVarIO (pmPeers pm)
   mapM_ disconnectPeer (Map.elems peers)
 
 -- | Main peer manager loop - maintains connections and handles timeouts
@@ -2027,15 +2064,29 @@ peerManagerLoop pm = forever $ do
   allPeers <- readTVarIO (pmPeers pm)
   forM_ (Map.toList allPeers) $ \(addr, pc) -> do
     peerInfo <- readTVarIO (pcInfo pc)
-    when (piState peerInfo == PeerDisconnected) $
+    when (piState peerInfo == PeerDisconnected) $ do
+      -- Remove from netgroup diversity tracker if outbound
+      unless (piInbound peerInfo) $
+        removeOutboundConnection (pmOutboundDiversity pm) addr
       atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
 
-  -- Maintain target outbound connections
+  -- Maintain target outbound connections (8 full-relay + 2 block-relay-only)
   peers <- readTVarIO (pmPeers pm)
-  let outboundCount = Map.size peers  -- simplified: count all as outbound
-      target = pmcMaxOutbound (pmConfig pm)
 
-  when (outboundCount < target) $ do
+  -- Count full-relay and block-relay-only outbound peers separately
+  peerInfos <- forM (Map.toList peers) $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    return (addr, info)
+  let fullRelayCount = length [ () | (_, info) <- peerInfos
+                              , not (piInbound info), not (piBlockOnly info) ]
+      blockRelayCount = length [ () | (_, info) <- peerInfos
+                               , not (piInbound info), piBlockOnly info ]
+      fullRelayTarget = pmcMaxOutbound (pmConfig pm)
+      blockRelayTarget = pmcMaxBlockRelayOnly (pmConfig pm)
+      totalTarget = fullRelayTarget + blockRelayTarget
+
+  let outboundCount = fullRelayCount + blockRelayCount
+  when (outboundCount < totalTarget) $ do
     known <- readTVarIO (pmKnownAddrs pm)
     banned <- readTVarIO (pmBannedAddrs pm)
     failed <- readTVarIO (pmFailedAddrs pm)
@@ -2069,11 +2120,23 @@ peerManagerLoop pm = forever $ do
           else return candidates2
       else return candidates
 
-    -- Connect to candidates
-    let toConnect = take (target - outboundCount) candidates'
-    unless (null toConnect) $
-      putStrLn $ "peerManagerLoop: connecting to " ++ show (length toConnect) ++ " candidates"
-    mapM_ (void . forkIO . tryConnect pm) toConnect
+    -- Filter candidates by netgroup diversity (eclipse attack mitigation)
+    let od = pmOutboundDiversity pm
+    diverseCandidates <- filterM (checkOutboundDiversity od) candidates'
+
+    -- Fill full-relay slots first, then block-relay-only
+    let fullRelayNeeded = max 0 (fullRelayTarget - fullRelayCount)
+        blockRelayNeeded = max 0 (blockRelayTarget - blockRelayCount)
+        (forFullRelay, rest) = splitAt fullRelayNeeded diverseCandidates
+        forBlockRelay = take blockRelayNeeded rest
+
+    unless (null forFullRelay) $
+      putStrLn $ "peerManagerLoop: connecting " ++ show (length forFullRelay) ++ " full-relay"
+    mapM_ (void . forkIO . tryConnect pm) forFullRelay
+
+    unless (null forBlockRelay) $
+      putStrLn $ "peerManagerLoop: connecting " ++ show (length forBlockRelay) ++ " block-relay-only"
+    mapM_ (void . forkIO . tryConnectBlockRelay pm) forBlockRelay
 
   -- Ping peers and disconnect stale ones
   now <- round <$> getPOSIXTime
@@ -2108,7 +2171,15 @@ peerManagerLoop pm = forever $ do
 -- | Try to connect to a peer address
 -- Checks if address is banned before attempting connection
 tryConnect :: PeerManager -> SockAddr -> IO ()
-tryConnect pm addr = do
+tryConnect pm addr = tryConnectWithType pm addr False
+
+-- | Try to connect as a block-relay-only peer (no tx relay, no addr exchange)
+tryConnectBlockRelay :: PeerManager -> SockAddr -> IO ()
+tryConnectBlockRelay pm addr = tryConnectWithType pm addr True
+
+-- | Internal: connect to a peer with optional block-relay-only mode
+tryConnectWithType :: PeerManager -> SockAddr -> Bool -> IO ()
+tryConnectWithType pm addr blockRelayOnly = do
   -- Check if address is discouraged/banned before connecting
   discouraged <- isDiscouraged pm addr
   unless discouraged $ do
@@ -2118,14 +2189,15 @@ tryConnect pm addr = do
           , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
           , pcfgBestHeight  = 0
           , pcfgUserAgent   = userAgent
-          , pcfgRelay       = True
+          , pcfgRelay       = not blockRelayOnly  -- block-relay-only: no tx relay
           , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
           , pcfgQueueSize   = 100
           }
         -- Extract host and port from SockAddr
         (host, port) = sockAddrToHostPort addr (netDefaultPort net)
+        connLabel = if blockRelayOnly then "block-relay-only" else "full-relay"
 
-    putStrLn $ "tryConnect: attempting " ++ host ++ ":" ++ show port
+    putStrLn $ "tryConnect[" ++ connLabel ++ "]: attempting " ++ host ++ ":" ++ show port
     result <- connectPeer config host port
     case result of
       Left err -> do
@@ -2144,6 +2216,13 @@ tryConnect pm addr = do
             -- Verify peer supports required services
             unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
 
+            -- Mark as block-relay-only if requested
+            when blockRelayOnly $
+              atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
+
+            -- Track netgroup diversity for outbound connections
+            addOutboundConnection (pmOutboundDiversity pm) addr
+
             -- Add to peer map
             atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
 
@@ -2151,8 +2230,9 @@ tryConnect pm addr = do
             pc' <- startPeerThreads pc (pmMessageHandler pm addr)
             atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
 
-            -- Request addresses from peer
-            sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+            -- Only request addresses from full-relay peers (not block-relay-only)
+            unless blockRelayOnly $
+              sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
 
 -- | Convert SockAddr to host string and port
 sockAddrToHostPort :: SockAddr -> Int -> (String, Int)
