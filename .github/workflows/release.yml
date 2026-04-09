@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (linux-amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.8"
+          cabal-version: "3.12"
+      - run: cabal update
+      - run: cabal build all
+      - name: Package
+        run: |
+          BIN=$(cabal list-bin haskoin)
+          cp "$BIN" haskoin-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haskoin-linux-amd64
+          path: haskoin-linux-amd64
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
