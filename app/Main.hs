@@ -766,23 +766,25 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
               else do
                 putStrLn $ "Compact block " ++ show bh ++ " missing " ++ show (length missing) ++ " txns, sending getblocktxn"
                 pm <- readIORef pmRef
-                let gbt = GetBlockTxn bh (map fromIntegral missing)
+                let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
                 requestFromPeer pm addr (MGetBlockTxn gbt)
                   `catch` (\(_ :: SomeException) -> return ())
 
-  MGetBlockTxn (GetBlockTxn blockHash indices) -> do
+  MGetBlockTxn gbt -> do
     -- Serve missing transactions for compact block reconstruction
+    let blockHash = gbtBlockHash gbt
+        indices = gbtIndexes gbt
     mBlock <- getBlock db blockHash
     case mBlock of
       Just block -> do
         let txns = mapMaybe (\i -> let idx = fromIntegral i in if idx < length (blockTxns block) then Just (blockTxns block !! idx) else Nothing) indices
         pm <- readIORef pmRef
-        requestFromPeer pm addr (MBlockTxn (BlockTxn blockHash txns))
+        requestFromPeer pm addr (MBlockTxn (BlockTxn { btBlockHash = blockHash, btTxns = txns }))
           `catch` (\(_ :: SomeException) -> return ())
       Nothing -> return ()
 
-  MBlockTxn (BlockTxn blockHash txns) ->
-    putStrLn $ "Received blocktxn for " ++ show blockHash ++ " (" ++ show (length txns) ++ " txns)"
+  MBlockTxn bt ->
+    putStrLn $ "Received blocktxn for " ++ show (btBlockHash bt) ++ " (" ++ show (length (btTxns bt)) ++ " txns)"
 
   MPong _ -> return ()
   MVerAck -> return ()
