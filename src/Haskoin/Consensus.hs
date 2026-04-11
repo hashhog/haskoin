@@ -723,7 +723,7 @@ regtestGenesisBlock = Block
 -- | Bitcoin mainnet configuration
 mainnet :: Network
 mainnet = Network
-  { netName              = "mainnet"
+  { netName              = "main"
   , netMagic             = 0xD9B4BEF9  -- Wire bytes: F9 BE B4 D9 (little-endian)
   , netDefaultPort       = 8333
   , netAddrPrefix        = 0x00        -- P2PKH addresses start with '1'
@@ -1329,11 +1329,11 @@ deploymentNeverActive = -2
 taprootDeployment :: Network -> Deployment
 taprootDeployment net = Deployment
   { depBit = 2
-  , depStartTime = if netName net == "mainnet" then 1619222400 else deploymentAlwaysActive  -- 2021-04-24
-  , depTimeout = if netName net == "mainnet" then 1628640000 else maxBound  -- 2021-08-11
-  , depMinActivationHeight = if netName net == "mainnet" then 709632 else 0
+  , depStartTime = if netName net == "main" then 1619222400 else deploymentAlwaysActive  -- 2021-04-24
+  , depTimeout = if netName net == "main" then 1628640000 else maxBound  -- 2021-08-11
+  , depMinActivationHeight = if netName net == "main" then 709632 else 0
   , depPeriod = 2016
-  , depThreshold = if netName net == "mainnet" then mainnetThreshold else testnetThreshold
+  , depThreshold = if netName net == "main" then mainnetThreshold else testnetThreshold
   }
 
 -- | Check if a block version signals for a given deployment bit.
