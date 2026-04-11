@@ -48,7 +48,7 @@ decodeHex t =
 
 main :: IO ()
 main = do
-  raw <- LBS.readFile "/home/max/hashhog/ouroboros/bitcoin/src/test/data/sighash.json"
+  raw <- LBS.readFile "resources/sighash.json"
   case eitherDecode raw :: Either String Value of
     Left err -> do
       putStrLn $ "Failed to parse JSON: " ++ err

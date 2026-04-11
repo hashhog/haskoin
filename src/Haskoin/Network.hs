@@ -106,6 +106,7 @@ module Haskoin.Network
   , PeerInfo(..)
   , PeerConnection(..)
   , PeerConfig(..)
+  , defaultPeerConfig
     -- * Peer Connection Management
   , connectPeer
   , disconnectPeer
@@ -146,6 +147,9 @@ module Haskoin.Network
   , clearExpiredBans
   , loadBanList
   , saveBanList
+  , BanEntry(..)
+  , sockAddrToBanEntry
+  , banEntryToSockAddr
     -- * Pre-Handshake Rejection
   , PreHandshakeResult(..)
   , checkPreHandshake
@@ -575,7 +579,7 @@ misbehaviorScore TooLargeInvMessage       = 20
 misbehaviorScore TooLargeAddrMessage      = 20
 misbehaviorScore TooLargeHeadersMessage   = 20
 misbehaviorScore InvalidCompactBlock      = 100  -- Immediate ban
-misbehaviorScore NonContinuousHeaders     = 20   -- Headers not connected (proportional)
+misbehaviorScore NonContinuousHeaders     = 100  -- Immediate ban (headers not connected)
 misbehaviorScore ChecksumMismatch         = 10
 misbehaviorScore PayloadTooLarge          = 10
 misbehaviorScore DuplicateVersion         = 1
@@ -3339,6 +3343,10 @@ addrmanRetries = 3
 addrmanMaxFailures :: Int
 addrmanMaxFailures = 10
 
+-- | Minimum time since last success before failure count matters (1 week)
+addrmanMinFail :: Int64
+addrmanMinFail = 7 * 24 * 60 * 60
+
 --------------------------------------------------------------------------------
 -- AddrInfo - Per-address metadata
 -- Reference: Bitcoin Core addrman_impl.h AddrInfo
@@ -3364,15 +3372,18 @@ instance NFData AddrInfo
 -- Reference: Bitcoin Core addrman.cpp AddrInfo::IsTerrible
 isTerribleAddress :: Int64 -> AddrInfo -> Bool
 isTerribleAddress now info =
-  let age = now - aiLastTry info
-      -- Never tried and older than horizon
-      neverTried = aiAttempts info == 0 && aiLastTry info == 0
-                   && age > addrmanHorizon
-      -- Too many failures
-      tooManyFailures = aiAttempts info >= addrmanMaxFailures
-      -- Failed recently and too many attempts
-      failedRecently = age < 60 && aiAttempts info > 0
-  in neverTried || tooManyFailures || failedRecently
+  let lastTry = aiLastTry info
+      -- Never remove things tried in the last minute
+      triedVeryRecently = lastTry > 0 && now - lastTry <= 60
+      -- Too many failed attempts with no success
+      tooManyRetries = aiLastSuccess info == 0
+                       && aiAttempts info >= addrmanRetries
+      -- Many successive failures in the last week
+      tooManyFailures = now - aiLastSuccess info > addrmanMinFail
+                        && aiAttempts info >= addrmanMaxFailures
+  in if triedVeryRecently
+       then False
+       else tooManyRetries || tooManyFailures
 
 -- | Calculate address selection chance
 -- Reference: Bitcoin Core addrman.cpp AddrInfo::GetChance
@@ -5838,7 +5849,7 @@ sketchDecode sketch
 -- | Berlekamp-Massey algorithm to find error locator polynomial
 -- Returns coefficients of Lambda(x) = 1 + L1*x + L2*x^2 + ...
 berlekampMassey :: Minisketch -> Either SketchError (VU.Vector Word32)
-berlekampMassey sketch = go 0 initC initB 1 1 (GF2_32 1)
+berlekampMassey sketch = go 0 initC initB 0 1 (GF2_32 1)
   where
     syndromes = msSyndromes sketch
     n = VU.length syndromes
@@ -5883,32 +5894,28 @@ berlekampMassey sketch = go 0 initC initB 1 1 (GF2_32 1)
               ci `xor` getGF2_32 (gfMul factor (GF2_32 (b VU.! (i - m))))
           | otherwise = ci
 
--- | Chien search to find roots of the error locator polynomial
--- Each root r corresponds to an element r^(-1) in the set difference
+-- | Chien search to find elements in the set difference.
+-- For each candidate element e in [1..65535], checks whether Lambda(gfInv(e)) == 0.
+-- A zero at gfInv(e) means e is a root's inverse, i.e., e is in the set difference.
 chienSearch :: VU.Vector Word32 -> Either SketchError [Word32]
 chienSearch lambda
   | VU.length lambda <= 1 = Right []
   | otherwise = do
       let degree = VU.length lambda - 1
-          -- Test all possible roots in GF(2^32)
-          -- In practice, we only need to test 2^32 values, but we limit
-          -- the search for efficiency
-          roots = findRoots lambda
-      if length roots /= degree
+          elements = findElements lambda
+      if length elements /= degree
          then Left SketchDecodeFailed
-         else Right $ map (\r -> getGF2_32 (gfInv (GF2_32 r))) roots
+         else Right elements
   where
-    findRoots :: VU.Vector Word32 -> [Word32]
-    findRoots coeffs = filter (isRoot coeffs) testValues
+    -- For each candidate element e, check if Lambda(gfInv(e)) == 0
+    findElements :: VU.Vector Word32 -> [Word32]
+    findElements coeffs = filter (isElement coeffs) [1..65535]
 
-    -- Test a subset of field elements (practical limitation)
-    -- In a full implementation, we'd use a more efficient approach
-    testValues :: [Word32]
-    testValues = [1..65535]  -- Test first 2^16 elements
-
-    isRoot :: VU.Vector Word32 -> Word32 -> Bool
-    isRoot coeffs x =
-      let terms = [ gfPow (GF2_32 x) (fromIntegral i)
+    -- Check if element e is in the set: Lambda(gfInv(e)) == 0
+    isElement :: VU.Vector Word32 -> Word32 -> Bool
+    isElement coeffs e =
+      let r = getGF2_32 (gfInv (GF2_32 e))
+          terms = [ gfPow (GF2_32 r) (fromIntegral i)
                   | i <- [0 .. VU.length coeffs - 1] ]
           products = zipWith (\c t -> gfMul (GF2_32 c) t)
                              (VU.toList coeffs) terms
