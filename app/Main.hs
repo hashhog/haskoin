@@ -243,10 +243,13 @@ runNode net dataDir NodeOptions{..} = do
     let feeEstimatesPath = dataDir </> "fee_estimates.json"
     loadFeeEstimates fe feeEstimatesPath
 
-    -- Track next expected block height for download
-    nextBlockRef <- newIORef (1 :: Word32)
+    -- Track next expected block height for download.
+    -- Resume from the loaded header chain tip so we don't re-request
+    -- blocks that are already connected.
+    loadedHeight <- readTVarIO (hcHeight hc)
+    nextBlockRef <- newIORef (loadedHeight + 1)
     -- Track highest block we've requested (for sliding window)
-    requestedUpToRef <- newIORef (0 :: Word32)
+    requestedUpToRef <- newIORef loadedHeight
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
     -- Recently-rejected transaction filter (cleared on each new block)
@@ -352,23 +355,51 @@ initHeaderChainFromDB db net = do
         , ceMedianTime = bhTimestamp (blockHeader genesis)
         }
 
-  -- Load best block hash from DB to determine tip
-  mBestHash <- getBestBlockHash db
-
   entriesVar <- newTVarIO (Map.singleton genesisHash genesisEntry)
   tipVar <- newTVarIO genesisEntry
   heightVar <- newTVarIO 0
   byHeightVar <- newTVarIO (Map.singleton 0 genesisHash)
+  invalidatedVar <- newTVarIO Set.empty
 
-  -- If we have persisted state, update the tip
+  -- Load persisted headers from the height index to rebuild the in-memory chain.
+  -- connectBlock writes PrefixBlockHeader and PrefixBlockHeight for every
+  -- connected block, so we can walk the height index sequentially.
+  mBestHash <- getBestBlockHash db
   case mBestHash of
     Nothing -> return ()
-    Just _bestHash -> do
-      -- In a full implementation, we'd load headers from DB
-      -- For now, start from genesis
-      return ()
+    Just _ -> do
+      putStrLn "Loading persisted headers from database..."
+      let go height prevEntry = do
+            mHash <- getBlockHeight db height
+            case mHash of
+              Nothing -> return ()
+              Just bh -> do
+                mHeader <- getBlockHeader db bh
+                case mHeader of
+                  Nothing -> return ()
+                  Just header -> do
+                    let work = ceChainWork prevEntry + headerWork header
+                        entry = ChainEntry
+                          { ceHeader = header
+                          , ceHash = bh
+                          , ceHeight = height
+                          , ceChainWork = work
+                          , cePrev = Just (ceHash prevEntry)
+                          , ceStatus = StatusValid
+                          , ceMedianTime = bhTimestamp header
+                          }
+                    atomically $ do
+                      modifyTVar' entriesVar (Map.insert bh entry)
+                      modifyTVar' byHeightVar (Map.insert height bh)
+                      writeTVar tipVar entry
+                      writeTVar heightVar height
+                    when (height `mod` 100000 == 0) $
+                      putStrLn $ "  loaded headers up to height " ++ show height
+                    go (height + 1) entry
+      go 1 genesisEntry
+      finalHeight <- readTVarIO heightVar
+      putStrLn $ "Loaded " ++ show finalHeight ++ " headers from database"
 
-  invalidatedVar <- newTVarIO Set.empty
   return HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
@@ -483,7 +514,14 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
     added <- foldM (\count hdr -> do
         result <- addHeader net hc hdr
         case result of
-            Right _ -> return (count + 1)
+            Right entry -> do
+              -- Persist header and height index so the chain survives restarts.
+              -- putBlockHeader/putBlockHeight are idempotent for duplicates.
+              let bh = ceHash entry
+                  h  = ceHeight entry
+              putBlockHeader db bh hdr
+              putBlockHeight db h bh
+              return (count + 1)
             Left _  -> return count
         ) (0 :: Int) hdrs
     putStrLn $ "Added " ++ show added ++ " of " ++ show (length hdrs) ++ " headers"
