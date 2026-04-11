@@ -50,6 +50,7 @@ module Haskoin.Rpc
   , maxRestHeadersResults
   , maxGetUtxosOutpoints
     -- * Internal helpers (exported for testing)
+  , deploymentInfoForEntry
   , mempoolErrorToRpcResponse
   , decodeTxWithFallback
   , handleBatchRequest
@@ -151,7 +152,8 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
                            medianTimePast, maxBlockWeight,
-                           invalidateBlock, reconsiderBlock, InvalidateError(..))
+                           invalidateBlock, reconsiderBlock, InvalidateError(..),
+                           Deployment(..), taprootDeployment)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
@@ -644,6 +646,7 @@ handleRpcRequest server req = do
   result <- case reqMethod req of
     -- Blockchain RPCs
     "getblockchaininfo"    -> handleGetBlockchainInfo server
+    "getdeploymentinfo"    -> handleGetDeploymentInfo server params
     "getblockcount"        -> handleGetBlockCount server
     "getblockhash"         -> handleGetBlockHash server params
     "getblock"             -> handleGetBlock server params
@@ -788,6 +791,118 @@ handleGetBlockchainInfo server = do
         , "warnings"             .= ([] :: [Text])
         ]
   return $ RpcResponse result Null Null
+
+-- | Pure helper: build the full getdeploymentinfo result for a given
+-- network configuration and chain entry.
+--
+-- All deployments in haskoin are currently modelled as "buried"
+-- activations (fixed activation heights from the Network record).
+-- Taproot on mainnet is reported as BIP9/active because Bitcoin Core
+-- activated it via BIP9 (speedy trial) at block 709632.  Testdummy is
+-- a stub BIP9 entry; full state-machine wiring is tracked in follow-up
+-- issue: "getdeploymentinfo: wire full BIP9 state machine for mainnet
+-- taproot / testdummy".
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp getdeploymentinfo.
+deploymentInfoForEntry :: Network -> ChainEntry -> Value
+deploymentInfoForEntry net entry =
+  let height = ceHeight entry
+      bHash  = showHash (ceHash entry)
+
+      -- Helper: build a buried-style deployment object.
+      buried activH =
+        object [ "type"   .= ("buried" :: Text)
+               , "active" .= (height >= activH)
+               , "height" .= activH
+               ]
+
+      -- Helper: build a BIP9-style deployment object.
+      -- statusStr / sinceH are approximations until the full state
+      -- machine is wired; mActivH carries the activation height when known.
+      bip9Obj dep statusStr sinceH isActive mActivH =
+        let bip9Sub = object
+              [ "bit"                   .= depBit dep
+              , "start_time"            .= depStartTime dep
+              , "timeout"               .= depTimeout dep
+              , "min_activation_height" .= depMinActivationHeight dep
+              , "status"                .= (statusStr :: Text)
+              , "since"                 .= (sinceH :: Word32)
+              , "status_next"           .= (statusStr :: Text)
+              ]
+            base = [ "type"   .= ("bip9" :: Text)
+                   , "active" .= isActive
+                   , "bip9"   .= bip9Sub
+                   ]
+            withHeight = case mActivH of
+              Just h  -> ("height" .= (h :: Word32)) : base
+              Nothing -> base
+        in object withHeight
+
+      -- Taproot: buried on regtest / testnet4 (activated at height 0 or 1),
+      -- BIP9/active on mainnet (locked-in via speedy trial, height 709632).
+      taprootObj =
+        if netName net == "main"
+          then
+            let dep     = taprootDeployment net
+                activH  = netTaprootHeight net
+                isAct   = height >= activH
+            in bip9Obj dep "active" activH isAct (Just activH)
+          else
+            buried (netTaprootHeight net)
+
+      -- Testdummy: BIP9 stub.  State machine not yet wired; always
+      -- reported as defined/inactive.
+      -- TODO: wire full BIP9 state machine (follow-up issue).
+      testdummyDep = Deployment
+        { depBit                = 28
+        , depStartTime          = 0
+        , depTimeout            = maxBound
+        , depMinActivationHeight = 0
+        , depPeriod             = 144
+        , depThreshold          = 108
+        }
+      testdummyObj = bip9Obj testdummyDep "defined" 0 False Nothing
+
+      deployments = object
+        [ "bip34"     .= buried (fromIntegral (netBIP34Height net))
+        , "bip65"     .= buried (fromIntegral (netBIP65Height net))
+        , "bip66"     .= buried (fromIntegral (netBIP66Height net))
+        , "csv"       .= buried (fromIntegral (netCSVHeight net))
+        , "segwit"    .= buried (fromIntegral (netSegwitHeight net))
+        , "taproot"   .= taprootObj
+        , "testdummy" .= testdummyObj
+        ]
+  in object
+      [ "hash"        .= bHash
+      , "height"      .= height
+      , "deployments" .= deployments
+      ]
+
+-- | Return deployment info for each known soft fork.
+-- Accepts an optional block-hash parameter (default: chain tip).
+handleGetDeploymentInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetDeploymentInfo server params = do
+  let net = rsNetwork server
+      hc  = rsHeaderChain server
+
+  -- Resolve the target block entry.
+  mEntry <- case extractParamText params 0 of
+    Nothing -> do
+      tip <- readTVarIO (hcTip hc)
+      return (Just tip)
+    Just hexHash ->
+      case parseHash hexHash of
+        Nothing -> return Nothing
+        Just bh -> do
+          entries <- readTVarIO (hcEntries hc)
+          return (Map.lookup bh entries)
+
+  case mEntry of
+    Nothing ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams "Block not found") Null
+    Just entry ->
+      return $ RpcResponse (deploymentInfoForEntry net entry) Null Null
 
 -- | Get the current block height
 handleGetBlockCount :: RpcServer -> IO RpcResponse
@@ -3529,6 +3644,7 @@ allRpcCommands =
   , "getblock \"blockhash\" ( verbosity )"
   , "getblockchaininfo"
   , "getblockcount"
+  , "getdeploymentinfo ( \"blockhash\" )"
   , "getblockhash height"
   , "getblockheader \"blockhash\" ( verbose )"
   , "getchaintips"
