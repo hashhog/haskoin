@@ -747,11 +747,9 @@ coinsViewDBSetBestBlock CoinsViewDB{..} bh = do
 --------------------------------------------------------------------------------
 -- Reference: bitcoin/src/coins.h CCoinsViewCache, bitcoin/src/coins.cpp
 
--- | Default cache size in bytes (450 MiB).
--- Maximum UTXO cache entries. Haskell Map entries are ~300-400 bytes each
--- (tree node overhead + spine + thunks + data). 2M entries ≈ 600-800 MB.
+-- | Default cache size in bytes (450 MiB = 471859200 bytes).
 defaultCacheSize :: Int
-defaultCacheSize = 2000000
+defaultCacheSize = 450 * 1024 * 1024
 
 -- | In-memory UTXO cache backed by a CoinsViewDB.
 -- Implements the same semantics as Bitcoin Core's CCoinsViewCache.

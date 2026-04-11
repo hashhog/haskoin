@@ -362,7 +362,7 @@ replaceStr old new s@(x:xs)
 
 main :: IO ()
 main = do
-  let vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
+  let vectorPath = "resources/script_tests.json"
   jsonData <- LBS.readFile vectorPath
   putStrLn $ "Loaded test vectors from: " ++ vectorPath
 

@@ -20,6 +20,23 @@ jobs:
         with:
           ghc-version: "9.8"
           cabal-version: "3.12"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            librocksdb-dev libsecp256k1-dev pkg-config \
+            zlib1g-dev build-essential
+      - name: Build and install minisketch
+        run: |
+          git clone --depth 1 https://github.com/sipa/minisketch.git /tmp/minisketch
+          cd /tmp/minisketch
+          ./autogen.sh
+          ./configure
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+      - name: Build and install rocksdb_compat shim
+        run: bash scripts/build-rocksdb-compat.sh
       - run: cabal update
       - run: cabal build all
 
@@ -32,6 +49,23 @@ jobs:
         with:
           ghc-version: "9.8"
           cabal-version: "3.12"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            librocksdb-dev libsecp256k1-dev pkg-config \
+            zlib1g-dev build-essential
+      - name: Build and install minisketch
+        run: |
+          git clone --depth 1 https://github.com/sipa/minisketch.git /tmp/minisketch
+          cd /tmp/minisketch
+          ./autogen.sh
+          ./configure
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+      - name: Build and install rocksdb_compat shim
+        run: bash scripts/build-rocksdb-compat.sh
       - run: cabal update
       - run: cabal test all
 

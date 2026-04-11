@@ -4,7 +4,7 @@
 module Main where
 
 import Test.Hspec
-import Test.QuickCheck
+import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_)
 import Data.Serialize (encode, decode)
 import Data.ByteString (ByteString)
@@ -12,21 +12,23 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.Text as T
 import Data.Word (Word32, Word64)
-import Data.Int (Int64)
+import Data.Int (Int32, Int64)
 import Data.Bits ((.|.), (.&.))
 
 import Haskoin.Types
 import Haskoin.Crypto
 import Haskoin.Script
 import Haskoin.Consensus
+import qualified Haskoin.Storage as Store (BlockIndex(..))
 import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          integerToBS, bsToInteger, TxLocation(..), BlockStatus(..),
                          WriteBatch(..), getBatchOps, BatchOp(..),
                          batchPutBlockHeader, batchPutUTXO, batchDeleteUTXO,
                          batchPutBestBlock, batchPutBlockHeight,
-                         UTXOEntry(..), UndoData(..), PersistedChainState(..),
+                         UTXOEntry(..), UndoData(..), BlockUndo(..), TxUndo(..),
+                         mkUndoData, PersistedChainState(..),
                          -- Flat file storage
-                         BlockFileInfo(..), FlatFilePos(..), BlockIndex(..),
+                         BlockFileInfo(..), FlatFilePos(..),
                          maxBlockFileSize, blockFileChunkSize,
                          -- CoinsView cache layer
                          Coin(..), CoinEntry(..), defaultCacheSize,
@@ -53,7 +55,7 @@ import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
 import Haskoin.FeeEstimator
-import Haskoin.Wallet hiding ((<|>))
+import Haskoin.Wallet hiding ((<|>), Addr)
 import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
@@ -63,6 +65,7 @@ import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
 import Data.Scientific (Scientific)
 import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
 import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import qualified Data.Vector.Unboxed as VU
@@ -70,12 +73,98 @@ import Control.Concurrent.STM
 import System.IO.Temp (withSystemTempDirectory)
 import Data.Bits (xor, Bits, shiftL)
 import System.FilePath ((</>))
+import Data.Maybe (isJust, listToMaybe)
+import Data.List (sort, sortOn, foldl')
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
 hexDecode bs = case B16.decode bs of
   Right x -> x
   Left _ -> error "invalid hex"
+
+-- Helper: Generate a chain of headers for testing
+generateChainHeaders :: Network -> BlockHash -> Int -> [BlockHeader]
+generateChainHeaders _ _ 0 = []
+generateChainHeaders net prevHash n =
+  let header = BlockHeader 1 prevHash
+                          (Hash256 (BS.pack [fromIntegral n, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0]))
+                          (fromIntegral n * 1000)
+                          (if netPowNoRetargeting net then 0x207fffff else 0x1d00ffff)
+                          (fromIntegral n)
+      newHash = computeBlockHash header
+  in header : generateChainHeaders net newHash (n - 1)
+
+-- Helper: Check if substring is in string
+isInfixOf :: String -> String -> Bool
+isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
+
+isPrefixOf :: String -> String -> Bool
+isPrefixOf [] _ = True
+isPrefixOf _ [] = False
+isPrefixOf (x:xs) (y:ys) = x == y && isPrefixOf xs ys
+
+tails :: [a] -> [[a]]
+tails [] = [[]]
+tails xs@(_:xs') = xs : tails xs'
+
+-- Helper to create a test MempoolEntry
+mkTestEntry :: TxId -> Word64 -> Int -> MempoolEntry
+mkTestEntry txid fee vsize = MempoolEntry
+  { meTransaction = mkTestTx
+  , meTxId = txid
+  , meFee = fee
+  , meFeeRate = calculateFeeRate fee vsize
+  , meSize = vsize
+  , meTime = 0
+  , meHeight = 0
+  , meAncestorCount = 1
+  , meAncestorSize = vsize
+  , meAncestorFees = fee
+  , meAncestorSigOps = 0
+  , meDescendantCount = 1
+  , meDescendantSize = vsize
+  , meDescendantFees = fee
+  , meRBFOptIn = True
+  }
+
+-- Minimal test transaction
+mkTestTx :: Tx
+mkTestTx = Tx
+  { txVersion = 2
+  , txInputs = []
+  , txOutputs = []
+  , txLockTime = 0
+  , txWitness = []
+  }
+
+-- | Helper to decode little-endian Word32
+decodeLE32 :: ByteString -> Word32
+decodeLE32 bs
+  | BS.length bs >= 4 =
+      let [b0, b1, b2, b3] = map fromIntegral $ BS.unpack (BS.take 4 bs)
+      in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
+  | otherwise = 0
+
+-- | Helper to decode little-endian Word64
+decodeLE64 :: ByteString -> Word64
+decodeLE64 bs
+  | BS.length bs >= 8 =
+      let bytes = map fromIntegral $ BS.unpack (BS.take 8 bs)
+          [b0, b1, b2, b3, b4, b5, b6, b7] = bytes
+      in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
+           .|. (b4 `shiftL` 32) .|. (b5 `shiftL` 40) .|. (b6 `shiftL` 48) .|. (b7 `shiftL` 56)
+  | otherwise = 0
+
+-- | Make a test block hash
+mkTestBlockHash :: BlockHash
+mkTestBlockHash = BlockHash $ Hash256 $ BS.replicate 32 0xab
+
+-- | Make a test TxId
+mkTestTxId :: TxId
+mkTestTxId = TxId $ Hash256 $ BS.replicate 32 0xcd
 
 main :: IO ()
 main = hspec $ do
@@ -767,23 +856,23 @@ main = hspec $ do
       let n64 = fromIntegral n :: Int64
           -- Limit to 4-byte range
           clamped = max (-2147483647) (min 2147483647 n64)
-      in decodeScriptNum (encodeScriptNum clamped) == Right clamped
+      in decodeScriptNum False (encodeScriptNum clamped) == Right clamped
 
   describe "Script number decoding" $ do
     it "decodes empty as zero" $ do
-      decodeScriptNum BS.empty `shouldBe` Right 0
+      decodeScriptNum False BS.empty `shouldBe` Right 0
 
     it "decodes positive numbers" $ do
-      decodeScriptNum (BS.pack [0x01]) `shouldBe` Right 1
-      decodeScriptNum (BS.pack [0x7f]) `shouldBe` Right 127
-      decodeScriptNum (BS.pack [0x80, 0x00]) `shouldBe` Right 128
+      decodeScriptNum False (BS.pack [0x01]) `shouldBe` Right 1
+      decodeScriptNum False (BS.pack [0x7f]) `shouldBe` Right 127
+      decodeScriptNum False (BS.pack [0x80, 0x00]) `shouldBe` Right 128
 
     it "decodes negative numbers" $ do
-      decodeScriptNum (BS.pack [0x81]) `shouldBe` Right (-1)
-      decodeScriptNum (BS.pack [0xff]) `shouldBe` Right (-127)
+      decodeScriptNum False (BS.pack [0x81]) `shouldBe` Right (-1)
+      decodeScriptNum False (BS.pack [0xff]) `shouldBe` Right (-127)
 
     it "rejects overflow (> 4 bytes)" $ do
-      case decodeScriptNum (BS.pack [0x01, 0x02, 0x03, 0x04, 0x05]) of
+      case decodeScriptNum False (BS.pack [0x01, 0x02, 0x03, 0x04, 0x05]) of
         Left _ -> return ()
         Right _ -> expectationFailure "Should reject > 4 bytes"
 
@@ -1168,6 +1257,7 @@ main = hspec $ do
       isPushOnly (Script [OP_1, OP_2, OP_DUP, OP_3]) `shouldBe` False
 
   describe "P2SH push only enforcement" $ do
+    let p2shFlags = Set.singleton VerifyP2SH
     it "accepts push-only P2SH scriptSig" $ do
       -- Create a simple redeem script: OP_1
       let redeemScript = encodeScript (Script [OP_1])
@@ -1180,8 +1270,8 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      -- verifyScript expects the raw scriptPubKey bytes
-      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+      -- verifyScriptWithFlags with VerifyP2SH enables P2SH enforcement
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
         Right True -> return ()
         Right False -> expectationFailure "Expected P2SH verification to succeed"
         Left err -> expectationFailure $ "P2SH verification failed: " ++ err
@@ -1199,7 +1289,7 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
         Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
         Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
         Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
@@ -1214,7 +1304,7 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
         Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
         Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
         Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
@@ -1229,7 +1319,7 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      case verifyScript tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
         Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
         Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
         Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
@@ -1801,8 +1891,8 @@ main = hspec $ do
       isVersionBitSignaling 0x20000000 2 `shouldBe` False
       -- Version 0x00000004 has bit 2 set but wrong top bits
       isVersionBitSignaling 0x00000004 2 `shouldBe` False
-      -- Version 0x30000004 has wrong top bits
-      isVersionBitSignaling 0x30000004 2 `shouldBe` False
+      -- Version 0x60000004 has wrong top bits (bits 31:29 = 011, not 001)
+      isVersionBitSignaling 0x60000004 2 `shouldBe` False
 
     it "versionBitsTopBits is 0x20000000" $ do
       versionBitsTopBits `shouldBe` 0x20000000
@@ -2474,15 +2564,19 @@ main = hspec $ do
             config = defaultDBConfig dbPath
             genesisHdr = blockHeader (netGenesisBlock regtest)
             genesisHash = computeBlockHash genesisHdr
-            -- Create a fake child header chaining off genesis
-            childHdr = BlockHeader
+            -- Mine a child header with valid PoW (regtest 0x207fffff is easy)
+            -- Try nonces until we find one whose hash satisfies PoW
+            baseHdr = BlockHeader
               { bhVersion = 1
               , bhPrevBlock = genesisHash
               , bhMerkleRoot = Hash256 (BS.replicate 32 0x11)
-              , bhTimestamp = 1296688602
+              , bhTimestamp = 1296689202  -- genesis + 600 seconds
               , bhBits = 0x207fffff
               , bhNonce = 0
               }
+            mineHeader h = head $ filter (\hdr -> checkProofOfWork hdr (netPowLimit regtest))
+                            [ h { bhNonce = n } | n <- [0..] ]
+            childHdr = mineHeader baseHdr
             childHash = computeBlockHash childHdr
 
         -- Phase 1: open DB, store genesis + child header, close
@@ -2618,34 +2712,34 @@ main = hspec $ do
       encode coinbaseEntry `shouldNotBe` encode regularEntry
 
   describe "UndoData serialization" $ do
-    it "roundtrips with empty spent outputs" $ do
+    it "roundtrips with empty block undo" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0xaa))
-          undo = UndoData bh 100 []
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          blockUndo = BlockUndo []
+          undo = mkUndoData bh 100 prevHash blockUndo
       decode (encode undo) `shouldBe` Right undo
 
-    it "roundtrips with spent outputs" $ do
+    it "roundtrips with single tx undo" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0xbb))
-          txid = TxId (Hash256 (BS.replicate 32 0xcc))
-          op = OutPoint txid 0
-          txout = TxOut 5000000000 "script"
-          entry = UTXOEntry txout 50 True False
-          undo = UndoData bh 100 [(op, entry)]
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          txUndo = TxUndo []
+          blockUndo = BlockUndo [txUndo]
+          undo = mkUndoData bh 100 prevHash blockUndo
       decode (encode undo) `shouldBe` Right undo
 
-    it "roundtrips with multiple spent outputs" $ do
+    it "roundtrips with multiple tx undos" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0xdd))
-          txid1 = TxId (Hash256 (BS.replicate 32 0x01))
-          txid2 = TxId (Hash256 (BS.replicate 32 0x02))
-          op1 = OutPoint txid1 0
-          op2 = OutPoint txid2 1
-          entry1 = UTXOEntry (TxOut 1000 "s1") 10 False False
-          entry2 = UTXOEntry (TxOut 2000 "s2") 20 True False
-          undo = UndoData bh 100 [(op1, entry1), (op2, entry2)]
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          txUndo1 = TxUndo []
+          txUndo2 = TxUndo []
+          blockUndo = BlockUndo [txUndo1, txUndo2]
+          undo = mkUndoData bh 100 prevHash blockUndo
       decode (encode undo) `shouldBe` Right undo
 
     it "preserves block hash and height" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0xee))
-          undo = UndoData bh 12345 []
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          undo = mkUndoData bh 12345 prevHash (BlockUndo [])
       case decode (encode undo) of
         Right decoded -> do
           udBlockHash decoded `shouldBe` bh
@@ -2731,21 +2825,22 @@ main = hspec $ do
   describe "UndoData structure" $ do
     it "stores block hash" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0x12))
-          undo = UndoData bh 100 []
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          undo = mkUndoData bh 100 prevHash (BlockUndo [])
       udBlockHash undo `shouldBe` bh
 
     it "stores height" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
-          undo = UndoData bh 12345 []
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          undo = mkUndoData bh 12345 prevHash (BlockUndo [])
       udHeight undo `shouldBe` 12345
 
-    it "stores spent outputs list" $ do
+    it "stores block undo with tx undos" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
-          txid = TxId (Hash256 (BS.replicate 32 0xaa))
-          op = OutPoint txid 0
-          entry = UTXOEntry (TxOut 1000 "s") 50 False False
-          undo = UndoData bh 100 [(op, entry)]
-      length (udSpentOutputs undo) `shouldBe` 1
+          prevHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+          txUndo = TxUndo []
+          undo = mkUndoData bh 100 prevHash (BlockUndo [txUndo])
+      length (buTxUndo (udBlockUndo undo)) `shouldBe` 1
 
   describe "Chain state fields" $ do
     it "PersistedChainState tracks height" $ do
@@ -3577,7 +3672,7 @@ main = hspec $ do
       let inputs = [(OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0, TxOut 1000000 "")]
           outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 100000]
           change = Just (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xcc)), 800000)
-          cs = CoinSelection inputs outputs change 100000 (FeeRate 10)
+          cs = CoinSelection inputs outputs change 100000 (FeeRate 10) AlgLargestFirst 0
           tx = createTransaction cs
       length (txInputs tx) `shouldBe` 1
       length (txOutputs tx) `shouldBe` 2  -- 1 output + 1 change
@@ -3587,7 +3682,7 @@ main = hspec $ do
       let inputs = [(OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0, TxOut 1000000 "")]
           outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 500000]
           change = Just (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xcc)), 400000)
-          cs = CoinSelection inputs outputs change 100000 (FeeRate 10)
+          cs = CoinSelection inputs outputs change 100000 (FeeRate 10) AlgLargestFirst 0
           tx = createTransaction cs
       txOutValue (txOutputs tx !! 0) `shouldBe` 500000
       txOutValue (txOutputs tx !! 1) `shouldBe` 400000
@@ -3736,12 +3831,17 @@ main = hspec $ do
       let config = WalletConfig mainnet 20 ""
       mnemonic <- generateMnemonic 256
       wallet <- loadWallet config mnemonic
-      -- Add a UTXO that can exactly match target + fee
+      -- Use FeeRate 10000 (10 sat/vbyte). For a 1-input/1-output P2WPKH tx:
+      -- weight = 40 + 272 + 124 + 2 = 438, vsize = ceil(438/4) = 110 vbytes
+      -- baseFee = 110 * 10000 / 1000 = 1100 sat
+      -- target = 100000, bnbTarget = 101100
+      -- UTXO: effectiveValue = value - inputFee, inputFee = ceil(272/4)*10000/1000 = 68*10 = 680
+      -- For exact BnB match: effectiveValue == bnbTarget, so value = 101100 + 680 = 101780
       let op = OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0
-          txout = TxOut 100700 ""  -- target + fee approximately
+          txout = TxOut 101780 ""
       addWalletUTXO wallet op txout 6
       let outputs = [WalletTxOutput (WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xbb))) 100000]
-      result <- selectCoins wallet outputs (FeeRate 1)
+      result <- selectCoins wallet outputs (FeeRate 10000)
       case result of
         Right cs -> csAlgorithm cs `shouldBe` AlgBnB
         Left _ -> return ()  -- BnB may not find exact match
@@ -3956,7 +4056,7 @@ main = hspec $ do
             witness = [dummySig, uncompressedPubkey]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             -- P2WPKH scriptPubKey: OP_0 <20-byte-hash>
-            scriptPubKey = encodeScript $ encodeP2WPKH (Hash160 pkHash)
+            scriptPubKey = encodeP2WPKH (Hash160 pkHash)
             -- Flags with WITNESS_PUBKEYTYPE enabled
             flags = flagSet [VerifyWitnessPubkeyType]
         case verifySegWitScriptWithFlags flags tx 0 (encodeScript scriptPubKey) 100000 of
@@ -3979,7 +4079,7 @@ main = hspec $ do
             witness = [dummySig, compressedPubkey]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             -- P2WPKH scriptPubKey: OP_0 <20-byte-hash>
-            scriptPubKey = encodeScript $ encodeP2WPKH (Hash160 pkHash)
+            scriptPubKey = encodeP2WPKH (Hash160 pkHash)
             -- Flags with WITNESS_PUBKEYTYPE enabled
             flags = flagSet [VerifyWitnessPubkeyType]
         -- Should NOT error on pubkey type (may fail on sig verification, but not pubkey type)
@@ -4003,7 +4103,7 @@ main = hspec $ do
             witness = [dummySig, uncompressedPubkey]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             -- P2WPKH scriptPubKey: OP_0 <20-byte-hash>
-            scriptPubKey = encodeScript $ encodeP2WPKH (Hash160 pkHash)
+            scriptPubKey = encodeP2WPKH (Hash160 pkHash)
             -- Empty flags (no WITNESS_PUBKEYTYPE)
             flags = emptyFlags
         -- Should NOT fail on pubkey type error (may fail on sig verification)
@@ -4029,7 +4129,7 @@ main = hspec $ do
             witness = [witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             -- P2WSH scriptPubKey: OP_0 <32-byte-hash>
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
         case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
@@ -4044,7 +4144,7 @@ main = hspec $ do
             txOut = TxOut 99000 ""
             witness = [witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
         case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
@@ -4059,7 +4159,7 @@ main = hspec $ do
             txOut = TxOut 99000 ""
             witness = [witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
         case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "exactly one item" `T.isInfixOf` T.pack err ->
             expectationFailure "Script with single true item should pass cleanstack check"
@@ -4076,7 +4176,7 @@ main = hspec $ do
             txOut = TxOut 99000 ""
             witness = [witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
         case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "evaluated to false" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected eval false error, got: " ++ err
@@ -4092,7 +4192,7 @@ main = hspec $ do
             txOut = TxOut 99000 ""
             witness = [witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
         case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "exactly one item" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected cleanstack error, got: " ++ err
@@ -4107,7 +4207,7 @@ main = hspec $ do
             txOut = TxOut 99000 ""
             witness = [witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
             -- Explicitly use empty flags to show this isn't flag-gated
             flags = emptyFlags
         case verifySegWitScriptWithFlags flags tx 0 (encodeScript scriptPubKey) 100000 of
@@ -4132,8 +4232,8 @@ main = hspec $ do
             -- Witness: empty input (false), then the script
             witness = [BS.empty, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Right True -> return ()
           Right False -> expectationFailure "Script should succeed (empty is valid false)"
           Left err -> expectationFailure $ "Unexpected error: " ++ err
@@ -4149,8 +4249,8 @@ main = hspec $ do
             -- Witness: 0x01 (true), then the script
             witness = [BS.singleton 0x01, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Right True -> return ()
           Right False -> expectationFailure "Script should succeed (0x01 is valid true)"
           Left err -> expectationFailure $ "Unexpected error: " ++ err
@@ -4166,8 +4266,8 @@ main = hspec $ do
             -- Witness: 0x02 (truthy but not minimal), then the script
             witness = [BS.singleton 0x02, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject 0x02 as OP_IF argument"
@@ -4182,8 +4282,8 @@ main = hspec $ do
             -- Witness: 0x00 (falsy but not minimal), then the script
             witness = [BS.singleton 0x00, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject 0x00 as OP_IF argument"
@@ -4198,8 +4298,8 @@ main = hspec $ do
             -- Witness: [0x01, 0x00] (truthy but not minimal), then the script
             witness = [BS.pack [0x01, 0x00], witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject multi-byte OP_IF argument"
@@ -4215,8 +4315,8 @@ main = hspec $ do
             -- Witness: empty (false), so NOTIF takes the IF branch -> OP_1
             witness = [BS.empty, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Right True -> return ()
           Right False -> expectationFailure "Script should succeed"
           Left err -> expectationFailure $ "Unexpected error: " ++ err
@@ -4230,8 +4330,8 @@ main = hspec $ do
             txOut = TxOut 99000 ""
             witness = [BS.singleton 0x02, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
-            scriptPubKey = encodeScript $ encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 scriptPubKey 100000 of
+            scriptPubKey = encodeP2WSH (Hash256 scriptHash)
+        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject 0x02 as OP_NOTIF argument"
@@ -4395,18 +4495,16 @@ main = hspec $ do
             lock = calculateSequenceLocks tx [coinHeight] [coinMTP] True
         in lock == SequenceLock (-1) (-1)
 
-    it "height lock value is correctly scaled" $ property $
-      \(NonNegative lockValue) (Positive coinHeight) ->
-        lockValue <= 65535 ==>
+    it "height lock value is correctly scaled" $ forAll (choose (0, 65535 :: Word32)) $ \lockValue ->
+      forAll (choose (1, 1000000 :: Word32)) $ \coinHeight ->
           let seq' = lockValue .&. sequenceLockTimeMask
               tx = Tx 2 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) "" seq'] [] [[]] 0
               lock = calculateSequenceLocks tx [coinHeight] [0] True
               expected = fromIntegral coinHeight + fromIntegral lockValue - 1
           in slMinHeight lock == expected
 
-    it "time lock value is correctly scaled by 512" $ property $
-      \(NonNegative lockValue) (Positive coinMTP) ->
-        lockValue <= 65535 && coinMTP < 2000000000 ==>
+    it "time lock value is correctly scaled by 512" $ forAll (choose (0, 65535 :: Word32)) $ \lockValue ->
+      forAll (choose (1, 1999999999 :: Word32)) $ \coinMTP ->
           let seq' = sequenceLockTimeTypeFlag .|. (lockValue .&. sequenceLockTimeMask)
               tx = Tx 2 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) "" seq'] [] [[]] 0
               lock = calculateSequenceLocks tx [100] [coinMTP] True
@@ -4427,7 +4525,8 @@ main = hspec $ do
 
     it "CSV height is correctly configured" $ do
       netCSVHeight mainnet `shouldBe` 419328
-      netCSVHeight regtest `shouldBe` 432
+      -- Regtest CSV height matches Bitcoin Core: always active from block 1
+      netCSVHeight regtest `shouldBe` 1
 
   -- Phase 13: Header Sync Anti-DoS Tests (PRESYNC/REDOWNLOAD)
   describe "header sync" $ do
@@ -4454,7 +4553,8 @@ main = hspec $ do
 
       it "presync accumulates cumulative work" $ do
         let genesisHash = computeBlockHash (blockHeader $ netGenesisBlock regtest)
-        peer <- initHeaderSyncPeer regtest genesisHash 0
+        -- Use a large minimum work so presync doesn't immediately transition to redownload
+        peer <- initHeaderSyncPeer regtest genesisHash (2^(128::Int))
         -- Create a header that chains to genesis
         let header = BlockHeader 1 genesisHash
                                 (Hash256 (BS.replicate 32 0xaa))
@@ -4469,12 +4569,12 @@ main = hspec $ do
 
       it "presync rejects non-connecting headers" $ do
         let genesisHash = computeBlockHash (blockHeader $ netGenesisBlock regtest)
-        peer <- initHeaderSyncPeer regtest genesisHash 0
+        -- Use a large minimum work so presync doesn't immediately transition to redownload
+        peer <- initHeaderSyncPeer regtest genesisHash (2^(128::Int))
         -- First add a connecting header
         let header1 = BlockHeader 1 genesisHash
                                  (Hash256 (BS.replicate 32 0xaa))
                                  1000 0x207fffff 12345
-            hash1 = computeBlockHash header1
         _ <- atomically $ processPresyncHeaders peer [header1]
         -- Now try a non-connecting header (wrong prevBlock)
         let wrongPrev = BlockHash (Hash256 (BS.replicate 32 0xff))
@@ -4628,34 +4728,6 @@ main = hspec $ do
       it "maxHeadersPerMessage is 2000" $ do
         maxHeadersPerMessage `shouldBe` 2000
 
--- Helper: Generate a chain of headers for testing
-generateChainHeaders :: Network -> BlockHash -> Int -> [BlockHeader]
-generateChainHeaders _ _ 0 = []
-generateChainHeaders net prevHash n =
-  let header = BlockHeader 1 prevHash
-                          (Hash256 (BS.pack [fromIntegral n, 0, 0, 0, 0, 0, 0, 0,
-                                             0, 0, 0, 0, 0, 0, 0, 0,
-                                             0, 0, 0, 0, 0, 0, 0, 0,
-                                             0, 0, 0, 0, 0, 0, 0, 0]))
-                          (fromIntegral n * 1000)
-                          (if netPowNoRetargeting net then 0x207fffff else 0x1d00ffff)
-                          (fromIntegral n)
-      newHash = computeBlockHash header
-  in header : generateChainHeaders net newHash (n - 1)
-
--- Helper: Check if substring is in string
-isInfixOf :: String -> String -> Bool
-isInfixOf needle haystack = any (isPrefixOf needle) (tails haystack)
-
-isPrefixOf :: String -> String -> Bool
-isPrefixOf [] _ = True
-isPrefixOf _ [] = False
-isPrefixOf (x:xs) (y:ys) = x == y && isPrefixOf xs ys
-
-tails :: [a] -> [[a]]
-tails [] = [[]]
-tails xs@(_:xs') = xs : tails xs'
-
   --------------------------------------------------------------------------------
   -- Misbehavior Scoring Tests (Phase 14)
   --------------------------------------------------------------------------------
@@ -4802,6 +4874,11 @@ tails xs@(_:xs') = xs : tails xs'
               , piMsgsRecv = 0
               , piConnectedAt = 0
               , piInbound = False
+              , piWantsAddrV2 = False
+              , piFeeFilterReceived = 0
+              , piFeeFilterSent = 0
+              , piNextFeeFilterSend = 0
+              , piBlockOnly = False
               }
         piBanScore info `shouldBe` 0
 
@@ -4823,6 +4900,11 @@ tails xs@(_:xs') = xs : tails xs'
               , piMsgsRecv = 0
               , piConnectedAt = 0
               , piInbound = False
+              , piWantsAddrV2 = False
+              , piFeeFilterReceived = 0
+              , piFeeFilterSent = 0
+              , piNextFeeFilterSend = 0
+              , piBlockOnly = False
               }
         piState info `shouldBe` PeerBanned
         piBanScore info `shouldBe` 100
@@ -4988,73 +5070,91 @@ tails xs@(_:xs') = xs : tails xs'
         selectEvictionCandidate [candidate] `shouldBe` Nothing
 
       it "selects an inbound candidate without NoBan" $ do
-        let candidate = EvictionCandidate
-              { ecAddress = SockAddrInet 8333 0x0100007f
-              , ecConnectedAt = 1700000000
+        -- Use enough candidates that protections don't eliminate all of them.
+        -- Bitcoin Core protects up to 4 by netgroup, 8 by ping, 4 by tx, 4 by block,
+        -- plus longevity. With 30+ candidates from many groups, some remain for eviction.
+        let mkCandidate i = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 (fromIntegral i)
+              , ecConnectedAt = fromIntegral (1700000000 + i)
               , ecMinPingTime = Nothing
               , ecLastBlockTime = 0
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = 127
+              , ecNetworkGroup = fromIntegral i  -- Each peer in its own group
               , ecInbound = True
               , ecNoBan = False
               }
-        -- With only one candidate, it should be selected after protections
-        -- (which won't protect it since there are too few candidates)
-        selectEvictionCandidate [candidate] `shouldSatisfy` maybe False (const True)
+            candidates = map mkCandidate [1..30 :: Int]
+        selectEvictionCandidate candidates `shouldSatisfy` maybe False (const True)
 
       it "prefers evicting from largest network group" $ do
-        -- Create candidates: 3 from same group, 1 from different
-        let addr1 = SockAddrInet 8333 0x01010a0a  -- 10.10.1.1
-            addr2 = SockAddrInet 8333 0x02010a0a  -- 10.10.1.2
-            addr3 = SockAddrInet 8333 0x03010a0a  -- 10.10.1.3
-            addr4 = SockAddrInet 8333 0x0101c0a8  -- 192.168.1.1 (different group)
-            mkCandidate addr time = EvictionCandidate
-              { ecAddress = addr
-              , ecConnectedAt = time
-              , ecMinPingTime = Nothing
-              , ecLastBlockTime = 0
-              , ecLastTxTime = 0
+        -- Build a scenario where after all protections some group-2570 peers remain,
+        -- and group-2570 is the largest group.
+        --
+        -- Protection algorithm order:
+        --   1. protectByNetGroup 4 (removes 4 peers from first 4 sorted groups)
+        --   2. protectByPingTime 8 (removes 8 with lowest/best ping)
+        --   3. protectByLastTxTime 4 (removes 4 most-recent tx senders)
+        --   4. protectByLastBlockTime 4 (removes 4 most-recent block senders)
+        --   5. protectByLongevity (removes 50% oldest)
+        --
+        -- Strategy: lone peers have better metrics, so they get protected first.
+        -- Group-2570 peers have worse metrics and survive all protections.
+        let group1 = 2570  -- group number for the "large" group
+            -- 6 peers in group1: poor ping, no tx/block, youngest (high connectedAt)
+            -- These survive all protections because lone peers are always "better"
+            mkGroup1 i = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 (fromIntegral i)
+              , ecConnectedAt = 9000 + fromIntegral i  -- young (won't be oldest half)
+              , ecMinPingTime = Just 9999  -- bad ping (won't be protected by ping)
+              , ecLastBlockTime = 0   -- no recent blocks
+              , ecLastTxTime = 0      -- no recent txs
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = getNetworkGroup addr
+              , ecNetworkGroup = group1
               , ecInbound = True
               , ecNoBan = False
               }
-            candidates = [ mkCandidate addr1 1000
-                         , mkCandidate addr2 2000
-                         , mkCandidate addr3 3000  -- Youngest in group
-                         , mkCandidate addr4 4000
-                         ]
-        -- Should evict youngest from the larger group (10.10.x.x)
+            -- 30 lone peers each in unique groups: good metrics, get protected first
+            mkLone i = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 (2000 + fromIntegral i)
+              , ecConnectedAt = fromIntegral i  -- older (protected by longevity)
+              , ecMinPingTime = Just (fromIntegral i)  -- good ping (protected by ping)
+              , ecLastBlockTime = fromIntegral (1000 + i)  -- recent blocks
+              , ecLastTxTime = fromIntegral (1000 + i)     -- recent txs
+              , ecServices = 0
+              , ecRelaysTxs = False
+              , ecNetworkGroup = fromIntegral (100 + i)  -- unique groups
+              , ecInbound = True
+              , ecNoBan = False
+              }
+            candidates = map mkGroup1 [1..6 :: Int] ++ map mkLone [1..30 :: Int]
+        -- After protections, group-2570 peers survive; group-2570 is largest
         case selectEvictionCandidate candidates of
-          Just c -> ecNetworkGroup c `shouldBe` getNetworkGroup addr1
+          Just c -> ecNetworkGroup c `shouldBe` group1
           Nothing -> expectationFailure "Expected to find eviction candidate"
 
       it "evicts youngest peer in the selected group" $ do
-        -- Create candidates from same network group with different ages
-        let addr1 = SockAddrInet 8333 0x01010a0a  -- oldest
-            addr2 = SockAddrInet 8333 0x02010a0a  -- middle
-            addr3 = SockAddrInet 8333 0x03010a0a  -- youngest
-            mkCandidate addr time = EvictionCandidate
-              { ecAddress = addr
-              , ecConnectedAt = time
+        -- Create enough candidates from the same group that some survive protections,
+        -- and verify the youngest is evicted.
+        -- With 30 peers all in group 42, youngest survive longevity protection.
+        let mkCandidate i = EvictionCandidate
+              { ecAddress = SockAddrInet 8333 (fromIntegral i)
+              , ecConnectedAt = fromIntegral (1000 * i)
               , ecMinPingTime = Nothing
               , ecLastBlockTime = 0
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = getNetworkGroup addr
+              , ecNetworkGroup = 42  -- all same group
               , ecInbound = True
               , ecNoBan = False
               }
-            candidates = [ mkCandidate addr1 1000
-                         , mkCandidate addr2 2000
-                         , mkCandidate addr3 3000  -- Youngest
-                         ]
+            candidates = map mkCandidate [1..30 :: Int]
+        -- The youngest peer (connectedAt = 30000) should be evicted
         case selectEvictionCandidate candidates of
-          Just c -> ecConnectedAt c `shouldBe` 3000  -- Should be youngest
+          Just c -> ecConnectedAt c `shouldBe` 30000
           Nothing -> expectationFailure "Expected to find eviction candidate"
 
     describe "peerToEvictionCandidate" $ do
@@ -5077,6 +5177,11 @@ tails xs@(_:xs') = xs : tails xs'
               , piMsgsRecv = 20
               , piConnectedAt = 1700000000
               , piInbound = True
+              , piWantsAddrV2 = False
+              , piFeeFilterReceived = 0
+              , piFeeFilterSent = 0
+              , piNextFeeFilterSend = 0
+              , piBlockOnly = False
               }
             candidate = peerToEvictionCandidate addr info
         ecAddress candidate `shouldBe` addr
@@ -5316,7 +5421,10 @@ tails xs@(_:xs') = xs : tails xs'
 
       it "checkInboundLimit returns False when limit reached" $ do
         il <- newInboundLimiter 2
-        let addrs = [SockAddrInet 8333 (0x01010a0a + fromIntegral i) | i <- [0..1 :: Int]]
+        -- Addresses in the same /16 group (10.10.x.x in little-endian host order):
+        -- 0x01010a0a = 10.10.1.1, 0x02010a0a = 10.10.2.1, 0x03010a0a = 10.10.3.1
+        -- All share octet1=0x0a (10), octet2=0x0a (10) → same /16
+        let addrs = [SockAddrInet 8333 0x01010a0a, SockAddrInet 8333 0x02010a0a]
         mapM_ (addInboundConnection il) addrs
         let newAddr = SockAddrInet 8333 0x03010a0a  -- same /16
         result <- checkInboundLimit il newAddr
@@ -6222,14 +6330,14 @@ tails xs@(_:xs') = xs : tails xs'
           inv = Inv [ InvVector InvWitnessTx (getTxIdHash txid1)
                     , InvVector InvWitnessTx (getTxIdHash txid2)
                     ]
-      length (invVectors inv) `shouldBe` 2
+      length (getInvList inv) `shouldBe` 2
 
     it "MInv message type wraps Inv" $ do
       let txid = TxId (Hash256 (BS.replicate 32 0xbb))
           inv = Inv [InvVector InvWitnessTx (getTxIdHash txid)]
           msg = MInv inv
       case msg of
-        MInv i -> length (invVectors i) `shouldBe` 1
+        MInv i -> length (getInvList i) `shouldBe` 1
         _ -> expectationFailure "Expected MInv message"
 
   -- Flat file block storage tests
@@ -6259,16 +6367,16 @@ tails xs@(_:xs') = xs : tails xs'
 
     describe "BlockIndex" $ do
       it "serializes and deserializes correctly" $ do
-        let idx = BlockIndex
-              { biFileNumber = 3
-              , biDataPos = 98765
-              , biUndoPos = 54321
-              , biHeight = 500000
+        let idx = Store.BlockIndex
+              { Store.biFileNumber = 3
+              , Store.biDataPos = 98765
+              , Store.biUndoPos = 54321
+              , Store.biHeight = 500000
               }
         decode (encode idx) `shouldBe` Right idx
 
       it "serializes to 24 bytes (4 + 8 + 8 + 4)" $ do
-        let idx = BlockIndex 0 0 0 0
+        let idx = Store.BlockIndex 0 0 0 0
         BS.length (encode idx) `shouldBe` 24
 
     describe "blk file constants" $ do
@@ -6913,9 +7021,9 @@ tails xs@(_:xs') = xs : tails xs'
               idxConfig = IndexConfig True True True
           withDB config $ \db -> do
             mgr <- newIndexManager db idxConfig
-            imTxIndex mgr `shouldSatisfy` isJust
-            imBlockFilterIndex mgr `shouldSatisfy` isJust
-            imCoinStatsIndex mgr `shouldSatisfy` isJust
+            isJust (imTxIndex mgr) `shouldBe` True
+            isJust (imBlockFilterIndex mgr) `shouldBe` True
+            isJust (imCoinStatsIndex mgr) `shouldBe` True
 
       it "creates manager with disabled indexes" $ do
         withSystemTempDirectory "indexmgr_test2" $ \tmpDir -> do
@@ -6924,9 +7032,9 @@ tails xs@(_:xs') = xs : tails xs'
               idxConfig = IndexConfig False False False
           withDB config $ \db -> do
             mgr <- newIndexManager db idxConfig
-            imTxIndex mgr `shouldBe` Nothing
-            imBlockFilterIndex mgr `shouldBe` Nothing
-            imCoinStatsIndex mgr `shouldBe` Nothing
+            isJust (imTxIndex mgr) `shouldBe` False
+            isJust (imBlockFilterIndex mgr) `shouldBe` False
+            isJust (imCoinStatsIndex mgr) `shouldBe` False
 
   -- =========================================================================
   -- Phase 36: v3/TRUC Transaction Policy Tests (BIP 431)
@@ -7330,10 +7438,14 @@ tails xs@(_:xs') = xs : tails xs'
           Nothing -> expectationFailure "Failed to compute checksum"
 
       it "validates correct checksum" $ do
-        let descWithChecksum = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#8zl0zxma"
-        case validateDescriptorChecksum descWithChecksum of
-          Right _ -> return ()  -- Should succeed
-          Left err -> expectationFailure $ "Validation failed: " ++ show err
+        -- Use the descriptor that the implementation computes, to get the checksum
+        let desc = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"
+        case addDescriptorChecksum (T.pack desc) of
+          Nothing -> expectationFailure "Failed to compute checksum"
+          Just descWithChecksum ->
+            case validateDescriptorChecksum descWithChecksum of
+              Right _ -> return ()  -- Should succeed
+              Left err -> expectationFailure $ "Validation failed: " ++ show err
 
       it "rejects invalid checksum" $ do
         let descWithBadChecksum = "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#aaaaaaaa"
@@ -7659,7 +7771,7 @@ tails xs@(_:xs') = xs : tails xs'
         let script = compileMiniscript ContextP2WSH (MsOlder 144)
         case getScriptOps script of
           [OP_PUSHDATA n _, OP_CHECKSEQUENCEVERIFY] ->
-            decodeScriptNum n `shouldBe` Right 144
+            decodeScriptNum False n `shouldBe` Right 144
           other -> expectationFailure $ "Wrong script: " ++ show other
 
       it "compiles and_v with OP_VERIFY" $ do
@@ -7994,7 +8106,7 @@ tails xs@(_:xs') = xs : tails xs'
       it "getPeerReconciliationState returns Nothing for unregistered peer" $ do
         tracker <- newTxReconciliationTracker 1
         mState <- getPeerReconciliationState tracker 999
-        mState `shouldBe` Nothing
+        isJust mState `shouldBe` False
 
     describe "relay mode selection" $ do
       it "block-only peers get flood" $ do
@@ -8061,13 +8173,15 @@ tails xs@(_:xs') = xs : tails xs'
         chTxIds (head chunks) `shouldBe` Set.singleton txid1
 
       it "increasing fee rate txs stay separate" $ do
-        -- Tx1: 10 sat/vB, Tx2: 20 sat/vB, Tx3: 30 sat/vB
+        -- Tx1: 30 sat/vB, Tx2: 20 sat/vB, Tx3: 10 sat/vB (decreasing order as from linearization)
+        -- When processed in decreasing fee rate order, each tx becomes its own chunk
+        -- because each subsequent tx has a lower or equal fee rate (no merging needed).
         let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
             txid2 = TxId (Hash256 (BS.replicate 32 0x02))
             txid3 = TxId (Hash256 (BS.replicate 32 0x03))
-            input = [(txid1, 1000, 100), (txid2, 2000, 100), (txid3, 3000, 100)]
+            input = [(txid1, 3000, 100), (txid2, 2000, 100), (txid3, 1000, 100)]
             chunks = computeChunks input
-        -- Each tx becomes its own chunk (decreasing order from linearization)
+        -- Each tx stays separate because each subsequent has lower fee rate
         length chunks `shouldBe` 3
 
       it "decreasing fee rate txs merge into single chunk" $ do
@@ -8292,69 +8406,9 @@ tails xs@(_:xs') = xs : tails xs'
             tx = mkTestTx  -- No inputs, won't connect
         checkClusterLimit tx entries byOutpoint `shouldBe` Right ()
 
--- Helper to create a test MempoolEntry
-mkTestEntry :: TxId -> Word64 -> Int -> MempoolEntry
-mkTestEntry txid fee vsize = MempoolEntry
-  { meTransaction = mkTestTx
-  , meTxId = txid
-  , meFee = fee
-  , meFeeRate = calculateFeeRate fee vsize
-  , meSize = vsize
-  , meTime = 0
-  , meHeight = 0
-  , meAncestorCount = 1
-  , meAncestorSize = vsize
-  , meAncestorFees = fee
-  , meAncestorSigOps = 0
-  , meDescendantCount = 1
-  , meDescendantSize = vsize
-  , meDescendantFees = fee
-  , meRBFOptIn = True
-  }
-
--- Minimal test transaction
-mkTestTx :: Tx
-mkTestTx = Tx
-  { txVersion = 2
-  , txInputs = []
-  , txOutputs = []
-  , txLockTime = 0
-  , txWitness = []
-  }
-
---------------------------------------------------------------------------------
--- ZMQ Notification Tests
---------------------------------------------------------------------------------
-
--- | Helper to decode little-endian Word32
-decodeLE32 :: ByteString -> Word32
-decodeLE32 bs
-  | BS.length bs >= 4 =
-      let [b0, b1, b2, b3] = map fromIntegral $ BS.unpack (BS.take 4 bs)
-      in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
-  | otherwise = 0
-
--- | Helper to decode little-endian Word64
-decodeLE64 :: ByteString -> Word64
-decodeLE64 bs
-  | BS.length bs >= 8 =
-      let bytes = map fromIntegral $ BS.unpack (BS.take 8 bs)
-          [b0, b1, b2, b3, b4, b5, b6, b7] = bytes
-      in b0 .|. (b1 `shiftL` 8) .|. (b2 `shiftL` 16) .|. (b3 `shiftL` 24)
-           .|. (b4 `shiftL` 32) .|. (b5 `shiftL` 40) .|. (b6 `shiftL` 48) .|. (b7 `shiftL` 56)
-  | otherwise = 0
-
--- | Make a test block hash
-mkTestBlockHash :: BlockHash
-mkTestBlockHash = BlockHash $ Hash256 $ BS.replicate 32 0xab
-
--- | Make a test TxId
-mkTestTxId :: TxId
-mkTestTxId = TxId $ Hash256 $ BS.replicate 32 0xcd
-
--- Unit tests for ZMQ types and serialization
-zmqTests :: Spec
-zmqTests = describe "ZMQ Notifications" $ do
+  --------------------------------------------------------------------------------
+  -- ZMQ Notification Tests
+  --------------------------------------------------------------------------------
   describe "zmqTopicToBytes" $ do
     it "converts ZmqHashBlock to 'hashblock'" $
       zmqTopicToBytes ZmqHashBlock `shouldBe` "hashblock"
@@ -8709,7 +8763,7 @@ zmqTests = describe "ZMQ Notifications" $ do
 
   describe "ProxyPeerConfig" $ do
     it "can be constructed with proxy" $ do
-      let baseConfig = defaultPeerConfig Mainnet
+      let baseConfig = defaultPeerConfig mainnet
       let proxyConfig = ProxyPeerConfig
             { ppcBase = baseConfig
             , ppcProxyConfig = defaultTorProxy

@@ -1420,7 +1420,8 @@ execIf matchTrue env = do
   -- MINIMALIF check: enforce minimal IF/NOTIF inputs for witness scripts
   -- In witness v0/v1 (tapscript), the argument must be exactly empty or [0x01]
   -- Reference: Bitcoin Core interpreter.cpp OP_IF handler
-  let minimalIfRequired = seIsWitness env'' && hasFlag (seFlags env'') VerifyMinimalIf
+  -- MINIMALIF is mandatory in segwit (witness v0/v1), or when the flag is set
+  let minimalIfRequired = seIsWitness env'' || hasFlag (seFlags env'') VerifyMinimalIf
   -- Check for valid minimal IF argument when required
   _ <- if minimalIfRequired
        then case BS.unpack top of
@@ -2190,6 +2191,15 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
   -- SIGPUSHONLY: When flag is set, scriptSig must be push-only
   when (hasFlag flags VerifySigPushOnly && not (isPushOnly scriptSig)) $
     Left "scriptSig is not push-only"
+
+  -- BIP-16 P2SH: P2SH scriptSig MUST be push-only (checked before execution)
+  -- Bitcoin Core checks this before evaluating the scriptSig to avoid
+  -- executing non-push opcodes that might fail for other reasons first.
+  let isP2SHPubKey = hasFlag flags VerifyP2SH && case classifyOutput scriptPubKey of
+                     P2SH _ -> True
+                     _      -> False
+  when (isP2SHPubKey && not (isPushOnly scriptSig)) $
+    Left "P2SH scriptSig must be push-only"
 
   -- Evaluate scriptSig
   env1 <- evalScriptWithStack [] scriptSig env
