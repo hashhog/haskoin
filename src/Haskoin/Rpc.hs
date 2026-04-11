@@ -2117,7 +2117,7 @@ handleGetInfo server = do
         , "connections"     .= peerCount
         , "proxy"           .= ("" :: Text)
         , "difficulty"      .= getDifficulty (bhBits (ceHeader tip))
-        , "testnet"         .= (netName (rsNetwork server) /= "mainnet")
+        , "testnet"         .= (netName (rsNetwork server) /= "main")
         , "errors"          .= ("" :: Text)
         ]
   return $ RpcResponse result Null Null
