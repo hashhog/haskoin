@@ -95,6 +95,7 @@ module Haskoin.Wallet
   , knapsackSolver
     -- * UTXO Types
   , Utxo(..)
+  , utxoValue
   , OutputGroup(..)
   , WalletUtxoEntry(..)
   , getWalletUTXOsFull
@@ -308,7 +309,7 @@ verifyMnemonicChecksum words'
   | null words' = False
   | otherwise =
       let -- Convert words back to indices
-          indices = map wordToIndex words'
+          indices = map wordToIndex' words'
           -- Convert indices to 11-bit groups
           bits = concatMap (intToBits 11) indices
           -- Calculate entropy and checksum lengths

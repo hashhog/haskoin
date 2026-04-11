@@ -82,6 +82,7 @@ module Haskoin.Index
   , indexManagerSync
   , indexManagerConnectBlock
     -- * SipHash
+  , SipHashKey(..)
   , sipHash128
   , sipHashKey
     -- * Utilities
@@ -184,9 +185,13 @@ sipHash128 (SipHashKey k0 k1) msg =
           in processBlocks v0' v1' v2' v3' rest
 
     buildFinalBlock leftover totalLen =
-      let padded = leftover `BS.append` BS.replicate (7 - BS.length leftover) 0
+      -- Pad to exactly 8 bytes: 7 data bytes + 1 length byte
+      -- The length byte goes in the high byte (bits 56-63)
+      let padded = leftover `BS.append` BS.replicate (8 - BS.length leftover) 0
           lenByte = fromIntegral (totalLen .&. 0xff) `shiftL` 56
-      in decodeLE64 padded .|. lenByte
+          w = decodeLE64 padded
+          -- Replace the high byte with the length byte
+      in (w .&. 0x00ffffffffffffff) .|. lenByte
 
     sipRound2 !v0 !v1 !v2 !v3 m =
       let v3' = v3 `xor` m

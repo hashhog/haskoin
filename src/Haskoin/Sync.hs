@@ -30,7 +30,9 @@ module Haskoin.Sync
     -- * Header Sync Anti-DoS (PRESYNC/REDOWNLOAD)
   , HeaderSyncState(..)
   , PresyncData(..)
+  , RedownloadData(..)
   , HeaderSyncParams(..)
+  , defaultHeaderSyncParams
   , HeaderSyncPeer(..)
   , initHeaderSyncPeer
   , processPresyncHeaders

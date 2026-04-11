@@ -1,11 +1,3 @@
 packages: .
 
 constraints: secp256k1-haskell >= 1.4
-
-package secp256k1-haskell
-  extra-lib-dirs: /home/max/.local/lib64
-  extra-include-dirs: /home/max/.local/include
-
-package rocksdb-haskell
-  extra-lib-dirs: /home/max/.local/lib64
-  extra-include-dirs: /home/max/.local/include

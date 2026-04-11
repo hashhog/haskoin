@@ -1436,9 +1436,9 @@ walkBackAndCompute dep getMTP cache pindex period toCompute =
       computeForward dep getMTP state cache toCompute period
     Nothing
       | biHeight pindex < period ->
-          -- At or before genesis, start from DEFINED
-          let cache' = Map.insert periodHash Defined cache
-          in computeForward dep getMTP Defined cache' toCompute period
+          -- No prior period exists; initial state is DEFINED.
+          -- Still need to compute the transition for this period boundary.
+          computeForward dep getMTP Defined cache (pindex : toCompute) period
       | fromIntegral mtp < startTime ->
           -- Optimization: before start time, must be DEFINED
           let cache' = Map.insert periodHash Defined cache
@@ -1447,9 +1447,8 @@ walkBackAndCompute dep getMTP cache pindex period toCompute =
           -- Go back one period
           case getBlockIndexAncestor pindex (biHeight pindex - period) of
             Nothing ->
-              -- Genesis
-              let cache' = Map.insert periodHash Defined cache
-              in computeForward dep getMTP Defined cache' toCompute period
+              -- No ancestor found (shouldn't normally happen since height >= period)
+              computeForward dep getMTP Defined cache (pindex : toCompute) period
             Just prevPeriod ->
               walkBackAndCompute dep getMTP cache prevPeriod period (pindex : toCompute)
 
