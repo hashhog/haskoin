@@ -44,7 +44,11 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          cacheGetBestBlock, cacheReset, cacheSanityCheck,
                          -- Pruning support
                          PruneConfig(..), defaultPruneConfig, minPruneTarget,
-                         minBlocksToKeep, findFilesToPrune, calculateCurrentUsage)
+                         minBlocksToKeep, findFilesToPrune, calculateCurrentUsage,
+                         -- Header persistence (for restart tests)
+                         putBlockHeader, getBlockHeader,
+                         putBlockHeight, getBlockHeight,
+                         putBestBlockHash, getBestBlockHash)
 import Haskoin.Network
 import Haskoin.Sync
 import Haskoin.Mempool
@@ -2462,6 +2466,61 @@ main = hspec $ do
       tip <- getChainTip hc
       ancestor <- getAncestor hc (ceHash tip) 100
       ancestor `shouldBe` Nothing
+
+  describe "Header chain persistence (restart recovery)" $ do
+    it "headers survive DB close/reopen and can rebuild the chain" $ do
+      withSystemTempDirectory "haskoin-restart-test" $ \tmpDir -> do
+        let dbPath = tmpDir </> "restart.db"
+            config = defaultDBConfig dbPath
+            genesisHdr = blockHeader (netGenesisBlock regtest)
+            genesisHash = computeBlockHash genesisHdr
+            -- Create a fake child header chaining off genesis
+            childHdr = BlockHeader
+              { bhVersion = 1
+              , bhPrevBlock = genesisHash
+              , bhMerkleRoot = Hash256 (BS.replicate 32 0x11)
+              , bhTimestamp = 1296688602
+              , bhBits = 0x207fffff
+              , bhNonce = 0
+              }
+            childHash = computeBlockHash childHdr
+
+        -- Phase 1: open DB, store genesis + child header, close
+        withDB config $ \db -> do
+          putBlockHeader db genesisHash genesisHdr
+          putBlockHeight db 0 genesisHash
+          putBlockHeader db childHash childHdr
+          putBlockHeight db 1 childHash
+          putBestBlockHash db childHash
+
+        -- Phase 2: reopen DB and verify data survived
+        withDB config $ \db -> do
+          mBest <- getBestBlockHash db
+          mBest `shouldBe` Just childHash
+
+          mHdr0 <- getBlockHeader db genesisHash
+          mHdr0 `shouldBe` Just genesisHdr
+
+          mHash1 <- getBlockHeight db 1
+          mHash1 `shouldBe` Just childHash
+
+          mHdr1 <- getBlockHeader db childHash
+          mHdr1 `shouldBe` Just childHdr
+
+          -- Rebuild chain from height index (same logic as initHeaderChainFromDB)
+          hc <- initHeaderChain regtest
+          case mHdr1 of
+            Just hdr -> do
+              result <- addHeader regtest hc hdr
+              case result of
+                Right entry -> do
+                  ceHeight entry `shouldBe` 1
+                  ceHash entry `shouldBe` childHash
+                Left err -> expectationFailure $ "addHeader failed: " ++ err
+            Nothing -> expectationFailure "Header not found in DB"
+
+          tip <- getChainTip hc
+          ceHeight tip `shouldBe` 1
 
   -- Phase 13: Block Download & IBD tests
   describe "IBDState" $ do
