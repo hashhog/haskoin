@@ -9054,6 +9054,116 @@ main = hspec $ do
             Right bs -> BS.length bs `shouldBe` 0
             Left err -> expectationFailure $ "Expected Right, got Left: " ++ err
 
+  describe "getdeploymentinfo" $ do
+    -- Helper: extract the "deployments" sub-object from a deploymentInfoForEntry result.
+    let getDeployments net entry =
+          case deploymentInfoForEntry net entry of
+            Object km -> case KM.lookup "deployments" km of
+              Just (Object dm) -> dm
+              _ -> KM.empty
+            _ -> KM.empty
+
+    -- Build a minimal ChainEntry at height 0 using the regtest genesis.
+    let makeEntry h = ChainEntry
+          { ceHeader    = BlockHeader 0x20000000
+                            (BlockHash (Hash256 (BS.replicate 32 0)))
+                            (Hash256 (BS.replicate 32 0))
+                            0 0x207fffff 0
+          , ceHash      = BlockHash (Hash256 (BS.replicate 32 0xAB))
+          , ceHeight    = h
+          , ceChainWork = 1
+          , cePrev      = Nothing
+          , ceStatus    = StatusHeaderValid
+          , ceMedianTime = 0
+          }
+
+    it "returns non-empty deployments on regtest" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      KM.size deployments `shouldSatisfy` (> 0)
+
+    it "includes segwit deployment on regtest" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      KM.member "segwit" deployments `shouldBe` True
+
+    it "includes taproot deployment on regtest" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      KM.member "taproot" deployments `shouldBe` True
+
+    it "segwit is active at genesis on regtest (netSegwitHeight = 0)" $ do
+      -- On regtest, netSegwitHeight = 0 so segwit is active from block 0.
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      case KM.lookup "segwit" deployments of
+        Just (Object sf) -> case KM.lookup "active" sf of
+          Just (Bool b) -> b `shouldBe` True
+          other -> expectationFailure $ "Expected Bool, got: " ++ show other
+        other -> expectationFailure $ "Expected Object for segwit, got: " ++ show other
+
+    it "taproot is active at genesis on regtest (netTaprootHeight = 0)" $ do
+      -- On regtest, netTaprootHeight = 0 so taproot is active from block 0.
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      case KM.lookup "taproot" deployments of
+        Just (Object sf) -> case KM.lookup "active" sf of
+          Just (Bool b) -> b `shouldBe` True
+          other -> expectationFailure $ "Expected Bool, got: " ++ show other
+        other -> expectationFailure $ "Expected Object for taproot, got: " ++ show other
+
+    it "segwit type is buried on regtest" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      case KM.lookup "segwit" deployments of
+        Just (Object sf) -> case KM.lookup "type" sf of
+          Just (String t) -> t `shouldBe` "buried"
+          other -> expectationFailure $ "Expected String, got: " ++ show other
+        other -> expectationFailure $ "Expected Object for segwit, got: " ++ show other
+
+    it "taproot type is buried on regtest" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      case KM.lookup "taproot" deployments of
+        Just (Object sf) -> case KM.lookup "type" sf of
+          Just (String t) -> t `shouldBe` "buried"
+          other -> expectationFailure $ "Expected String, got: " ++ show other
+        other -> expectationFailure $ "Expected Object for taproot, got: " ++ show other
+
+    it "csv, bip34, bip65, bip66, testdummy are all present" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      mapM_ (\k -> KM.member k deployments `shouldBe` True)
+        ["csv", "bip34", "bip65", "bip66", "testdummy"]
+
+    it "testdummy is bip9 type" $ do
+      let entry       = makeEntry 0
+          deployments = getDeployments regtest entry
+      case KM.lookup "testdummy" deployments of
+        Just (Object sf) -> case KM.lookup "type" sf of
+          Just (String t) -> t `shouldBe` "bip9"
+          other -> expectationFailure $ "Expected String, got: " ++ show other
+        other -> expectationFailure $ "Expected Object for testdummy, got: " ++ show other
+
+    it "result contains hash and height fields" $ do
+      let entry  = makeEntry 5
+          result = deploymentInfoForEntry regtest entry
+      case result of
+        Object km -> do
+          KM.member "hash" km `shouldBe` True
+          KM.member "height" km `shouldBe` True
+          KM.member "deployments" km `shouldBe` True
+        _ -> expectationFailure "Expected Object result"
+
+    it "getdeploymentinfo uses chain tip by default (IO test)" $ do
+      hc  <- initHeaderChain regtest
+      tip <- readTVarIO (hcTip hc)
+      let result = deploymentInfoForEntry regtest tip
+      case result of
+        Object km ->
+          KM.member "deployments" km `shouldBe` True
+        _ -> expectationFailure "Expected Object result"
+
   where
     sampleTx = Tx
       { txVersion = 1
