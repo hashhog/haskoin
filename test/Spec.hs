@@ -9164,6 +9164,98 @@ main = hspec $ do
           KM.member "deployments" km `shouldBe` True
         _ -> expectationFailure "Expected Object result"
 
+  -- Regtest-only bridge test: assert that getblockchaininfo.softforks and
+  -- getdeploymentinfo.deployments read from one shared helper and therefore
+  -- contain identical data for every deployment key and field.
+  describe "getblockchaininfo/getdeploymentinfo softfork bridge (regtest)" $ do
+    -- Build a minimal ChainEntry at various heights.
+    let makeEntry' h = ChainEntry
+          { ceHeader    = BlockHeader 0x20000000
+                            (BlockHash (Hash256 (BS.replicate 32 0)))
+                            (Hash256 (BS.replicate 32 0))
+                            0 0x207fffff 0
+          , ceHash      = BlockHash (Hash256 (BS.replicate 32 0xCD))
+          , ceHeight    = h
+          , ceChainWork = 1
+          , cePrev      = Nothing
+          , ceStatus    = StatusHeaderValid
+          , ceMedianTime = 0
+          }
+
+    it "softforksFromEntry equals the deployments sub-object of deploymentInfoForEntry at height 0" $ do
+      let entry = makeEntry' 0
+          -- getblockchaininfo source of truth
+          sforks = softforksFromEntry regtest entry
+          -- getdeploymentinfo source of truth
+          depResult = deploymentInfoForEntry regtest entry
+          depForks = case depResult of
+            Object km -> case KM.lookup "deployments" km of
+              Just v  -> v
+              Nothing -> Object KM.empty
+            _ -> Object KM.empty
+      sforks `shouldBe` depForks
+
+    it "softforksFromEntry equals deployments at height 100" $ do
+      let entry = makeEntry' 100
+          sforks   = softforksFromEntry regtest entry
+          depResult = deploymentInfoForEntry regtest entry
+          depForks = case depResult of
+            Object km -> case KM.lookup "deployments" km of
+              Just v  -> v
+              Nothing -> Object KM.empty
+            _ -> Object KM.empty
+      sforks `shouldBe` depForks
+
+    it "softforksFromEntry is a non-empty object on regtest" $ do
+      let entry   = makeEntry' 0
+          sforks  = softforksFromEntry regtest entry
+      case sforks of
+        Object km -> KM.size km `shouldSatisfy` (> 0)
+        _         -> expectationFailure "Expected Object from softforksFromEntry"
+
+    it "every key present in getdeploymentinfo.deployments is present in getblockchaininfo.softforks" $ do
+      let entry = makeEntry' 0
+          sforks = softforksFromEntry regtest entry
+          depResult = deploymentInfoForEntry regtest entry
+          depKeys = case depResult of
+            Object km -> case KM.lookup "deployments" km of
+              Just (Object dm) -> KM.keys dm
+              _                -> []
+            _ -> []
+          sforkKeys = case sforks of
+            Object km -> KM.keys km
+            _         -> []
+      sort sforkKeys `shouldBe` sort depKeys
+
+    it "each deployment's 'active' field agrees between the two RPCs on regtest" $ do
+      -- Walk every deployment key and verify the 'active' Bool matches.
+      let entry = makeEntry' 0
+          sforks = softforksFromEntry regtest entry
+          depResult = deploymentInfoForEntry regtest entry
+          depForks = case depResult of
+            Object km -> case KM.lookup "deployments" km of
+              Just (Object dm) -> dm
+              _                -> KM.empty
+            _ -> KM.empty
+          sforkMap = case sforks of
+            Object km -> km
+            _         -> KM.empty
+          deploymentKeys = KM.keys depForks
+      forM_ deploymentKeys $ \k -> do
+        let getActive m = case KM.lookup k m of
+              Just (Object obj) -> KM.lookup "active" obj
+              _                 -> Nothing
+        getActive sforkMap `shouldBe` getActive depForks
+
+    it "softforksFromEntry includes segwit, taproot, csv, bip34, bip65, bip66, testdummy on regtest" $ do
+      let entry  = makeEntry' 0
+          sforks = softforksFromEntry regtest entry
+          skeys  = case sforks of
+            Object km -> km
+            _         -> KM.empty
+      mapM_ (\k -> KM.member k skeys `shouldBe` True)
+        ["segwit", "taproot", "csv", "bip34", "bip65", "bip66", "testdummy"]
+
   where
     sampleTx = Tx
       { txVersion = 1

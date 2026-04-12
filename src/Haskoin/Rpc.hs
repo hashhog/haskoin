@@ -51,6 +51,7 @@ module Haskoin.Rpc
   , maxGetUtxosOutpoints
     -- * Internal helpers (exported for testing)
   , deploymentInfoForEntry
+  , softforksFromEntry
   , mempoolErrorToRpcResponse
   , decodeTxWithFallback
   , handleBatchRequest
@@ -773,6 +774,9 @@ handleGetBlockchainInfo server = do
       -- or if we're significantly behind the estimated chain height
       currentTime = bhTimestamp (ceHeader tip)
       isIBD = estimateIsInitialBlockDownload (ceHeight tip) currentTime
+      -- Soft-fork state: always sourced from the shared softforksFromEntry
+      -- helper so getblockchaininfo and getdeploymentinfo cannot disagree.
+      sforks = softforksFromEntry (rsNetwork server) tip
   let result = object
         [ "chain"                .= netName (rsNetwork server)
         , "blocks"               .= ceHeight tip
@@ -788,6 +792,7 @@ handleGetBlockchainInfo server = do
         , "chainwork"            .= showHex (ceChainWork tip)
         , "size_on_disk"         .= (0 :: Int)
         , "pruned"               .= False
+        , "softforks"            .= sforks
         , "warnings"             .= ([] :: [Text])
         ]
   return $ RpcResponse result Null Null
@@ -877,6 +882,19 @@ deploymentInfoForEntry net entry =
       , "height"      .= height
       , "deployments" .= deployments
       ]
+
+-- | Pure helper: extract just the deployment-state map from
+-- 'deploymentInfoForEntry'.  This is the single source of truth for
+-- soft-fork state; both 'getblockchaininfo' (.softforks) and
+-- 'getdeploymentinfo' (.deployments) project from this value so the
+-- two RPCs can never disagree.
+softforksFromEntry :: Network -> ChainEntry -> Value
+softforksFromEntry net entry =
+  case deploymentInfoForEntry net entry of
+    Object km -> case KM.lookup "deployments" km of
+      Just v  -> v
+      Nothing -> object []
+    _ -> object []
 
 -- | Return deployment info for each known soft fork.
 -- Accepts an optional block-hash parameter (default: chain tip).
@@ -4802,6 +4820,9 @@ handleRestChainInfo server pathPart = do
       let progress = computeVerificationProgress (ceHeight tip) (bhTimestamp (ceHeader tip))
           currentTime = bhTimestamp (ceHeader tip)
           isIBD = estimateIsInitialBlockDownload (ceHeight tip) currentTime
+          -- Use the shared soft-fork helper so REST /chaininfo and RPC
+          -- getblockchaininfo / getdeploymentinfo all read the same source.
+          sforks = softforksFromEntry (rsNetwork server) tip
           jsonResult = object
             [ "chain" .= netName (rsNetwork server)
             , "blocks" .= ceHeight tip
@@ -4817,6 +4838,7 @@ handleRestChainInfo server pathPart = do
             , "chainwork" .= showHex (ceChainWork tip)
             , "size_on_disk" .= (0 :: Int)
             , "pruned" .= False
+            , "softforks" .= sforks
             , "warnings" .= ([] :: [Text])
             ]
       return $ responseLBS status200
