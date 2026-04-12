@@ -357,13 +357,17 @@ blockProcessor bd = forever $ do
 
                   let cs = ChainState currentHeight bh 0 0
                             (consensusFlagsAtHeight (bdNetwork bd) nextHeight)
-                      assumeValidH = netAssumeValidHeight (bdNetwork bd)
-                      _skipScripts = assumeValidH > 0 && nextHeight <= assumeValidH
-                      -- TODO: when script verification is wired in, use _skipScripts
-                      -- to gate signature/script checks while still performing
-                      -- structural validation (merkle root, UTXO, coinbase, etc.)
 
-                  case validateFullBlock (bdNetwork bd) cs block utxoMap of
+                  -- Compute the assumevalid skip decision using the real
+                  -- ancestor-check semantics (Bitcoin Core v28.0 equivalent).
+                  -- All six conditions are evaluated inside shouldSkipScripts.
+                  blockEntries <- readTVarIO (hcEntries (bdHeaderChain bd))
+                  bestHdr      <- readTVarIO (hcTip (bdHeaderChain bd))
+                  let blockTs    = bhTimestamp (blockHeader block)
+                      skipScripts = shouldSkipScripts bh nextHeight blockTs
+                                      (bdNetwork bd) blockEntries bestHdr
+
+                  case validateFullBlock (bdNetwork bd) cs skipScripts block utxoMap of
                     Left err -> do
                       putStrLn $ "Block validation failed at height "
                                  ++ show nextHeight ++ ": " ++ err

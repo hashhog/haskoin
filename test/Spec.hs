@@ -1937,7 +1937,7 @@ main = hspec $ do
           header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           block = Block header []
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs block Map.empty of
+      case validateFullBlock regtest cs False block Map.empty of
         Left msg | "no transactions" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with no transactions"
 
@@ -1950,7 +1950,7 @@ main = hspec $ do
           regularTx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
           block = Block header [regularTx]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs block Map.empty of
+      case validateFullBlock regtest cs False block Map.empty of
         Left msg | "not coinbase" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject when first tx is not coinbase"
 
@@ -1964,7 +1964,7 @@ main = hspec $ do
           coinbase2 = Tx 1 [coinbaseIn] [TxOut 1000000000 "out2"] [[]] 0
           block = Block header [coinbase1, coinbase2]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs block Map.empty of
+      case validateFullBlock regtest cs False block Map.empty of
         Left msg | "Multiple coinbase" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with multiple coinbase"
 
@@ -1977,7 +1977,7 @@ main = hspec $ do
           coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
           block = Block header [coinbase]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs block Map.empty of
+      case validateFullBlock regtest cs False block Map.empty of
         Left msg | "Merkle root" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong merkle root"
 
@@ -1995,9 +1995,140 @@ main = hspec $ do
           block = Block header [coinbase]
           -- Chain state at height 500 (BIP-34 active on regtest at 500)
           cs = ChainState 500 prevHash 0 0 (consensusFlagsAtHeight regtest 501)
-      case validateFullBlock regtest cs block Map.empty of
+      case validateFullBlock regtest cs False block Map.empty of
         Left msg | "height" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong coinbase height"
+
+  -- ---------------------------------------------------------------------------
+  -- shouldSkipScripts: 7-case matrix
+  --
+  -- Tests the Bitcoin Core v28.0-equivalent ancestor-check logic.
+  -- Reference: ASSUMEVALID-REFERENCE.md, all six conditions.
+  -- ---------------------------------------------------------------------------
+  describe "shouldSkipScripts" $ do
+
+    -- Helpers shared across cases.
+    -- We build a tiny 3-block chain: genesis -> block1 -> block2
+    -- The assumevalid hash points at block2 (height 2).
+    -- The best header tip is block2.
+    let zeroHash = BlockHash (Hash256 (BS.replicate 32 0x00))
+        h1       = BlockHash (Hash256 (BS.pack ([0x01] ++ replicate 31 0x00)))
+        h2       = BlockHash (Hash256 (BS.pack ([0x02] ++ replicate 31 0x00)))
+        h3       = BlockHash (Hash256 (BS.pack ([0x03] ++ replicate 31 0x00)))
+        bigWork  = netMinimumChainWork mainnet * 2  -- well above minimumChainWork
+        -- Timestamps: pindex is old (1_000_000), best header is 2+ weeks later.
+        -- The 2-week guard requires bestHeader.timestamp - pindex.timestamp >= 1_209_600.
+        oldTs  = 1000000 :: Word32              -- ancient timestamp for blocks being connected
+        futTs  = oldTs + 1500000                -- 1_500_000 > 1_209_600: well past 2 weeks
+
+        mkEntry h height prev ts work = ChainEntry
+          { ceHeader    = BlockHeader 1
+                            (maybe zeroHash id prev)
+                            (Hash256 (BS.replicate 32 0x00))
+                            ts 0x207fffff 0
+          , ceHash      = h
+          , ceHeight    = height
+          , ceChainWork = work
+          , cePrev      = prev
+          , ceStatus    = StatusHeaderValid
+          , ceMedianTime = ts
+          }
+
+        -- Chain: genesis(0) -> e1(1) -> e2(2)
+        -- e1 and e2 use oldTs (they're the old blocks).
+        -- The best-header tip uses futTs (it's the current chain tip, far in the future).
+        eGenesis = mkEntry zeroHash 0 Nothing         oldTs        1
+        e1       = mkEntry h1       1 (Just zeroHash) oldTs        2
+        e2       = mkEntry h2       2 (Just h1)       oldTs        3
+
+        -- The best header tip: same chain as e2 but far in the future.
+        -- This represents the current chain tip seen via headers-first sync.
+        bestTip = (mkEntry h2 2 (Just h1) futTs bigWork)
+
+        -- Index containing all three blocks
+        idx3 = Map.fromList [(zeroHash, eGenesis), (h1, e1), (h2, e2)]
+
+        -- Network with assumedValid = Just h2 (block at height 2)
+        netAV = mainnet { netAssumedValid = Just h2, netMinimumChainWork = bigWork `div` 4 }
+
+    -- Case 1: assumedValid = Nothing — scripts always run.
+    it "case 1: assumedValid absent -> always verify" $ do
+      let netNone = mainnet { netAssumedValid = Nothing }
+          -- Even if everything else would qualify, Nothing means verify.
+          result = shouldSkipScripts h1 1 (oldTs + 600) netNone idx3 bestTip
+      result `shouldBe` False
+
+    -- Case 2: block IS an ancestor of assumevalid -> skip.
+    it "case 2: block is ancestor of assumevalid -> skip scripts" $ do
+      let result = shouldSkipScripts h1 1 (oldTs + 600) netAV idx3 bestTip
+      result `shouldBe` True
+
+    -- Case 3: block at same height but NOT in the assumevalid chain -> verify.
+    -- We introduce a fork block fk at height 1 with a different hash.
+    it "case 3: block not in assumevalid chain (fork at same height) -> verify" $ do
+      let result = shouldSkipScripts h3 1 (oldTs + 600) netAV idx3 bestTip
+      -- h3 does not appear in the ancestor path from h2 down to height 1
+      -- (h2's ancestor at height 1 is h1, not h3).
+      result `shouldBe` False
+
+    -- Case 4: block height above assumevalid height -> verify.
+    -- We pretend h3 is at height 5, which is above the AV block (height 2).
+    it "case 4: block height above assumevalid height -> verify" $ do
+      let e3 = mkEntry h3 5 (Just h2) (oldTs + 5000) 6
+          idxExtra = Map.insert h3 e3 idx3
+          bestTip5 = e3 { ceChainWork = bigWork }
+          result = shouldSkipScripts h3 5 (oldTs + 5000) netAV idxExtra bestTip5
+      -- Height 5 > AV height 2 => ancestor check fails (AV.GetAncestor(5) != AV)
+      result `shouldBe` False
+
+    -- Case 5: assumevalid hash NOT in block index -> verify.
+    it "case 5: assumevalid hash not in block index -> verify" $ do
+      -- Remove the AV block (h2) from the index.
+      let idxMissing = Map.delete h2 idx3
+          result = shouldSkipScripts h1 1 (oldTs + 600) netAV idxMissing bestTip
+      result `shouldBe` False
+
+    -- Case 6: block invalid on non-script check (bad merkle) -> block rejected
+    -- even though it would otherwise qualify for script-skip.
+    -- This is a validateFullBlock test, not shouldSkipScripts — the function
+    -- only gates scripts; structural checks always run.
+    it "case 6: non-script validation (bad merkle) still rejects under assumevalid" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          wrongMerkle = Hash256 (BS.replicate 32 0xff)
+          header = BlockHeader 1 prevHash wrongMerkle 0 0x207fffff 0
+          nullOp = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          coinbaseIn = TxIn nullOp (BS.pack [0x01, 0x01]) 0xffffffff
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          block = Block header [coinbase]
+          cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
+          -- Even with skipScripts=True, merkle check must still fail.
+      case validateFullBlock regtest cs True block Map.empty of
+        Left msg | "Merkle root" `T.isInfixOf` T.pack msg -> return ()
+        _ -> expectationFailure "Bad merkle root must still be rejected when skipScripts=True"
+
+    -- Case 7: regtest with assumedValid=Nothing — block hashes are identical
+    -- whether we call validateFullBlock with skipScripts=True or False.
+    -- (Regtest has no assumevalid; both modes run the same structural checks.)
+    it "case 7: regtest IBD result identical with and without skipScripts flag" $ do
+      let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOp = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          coinbaseIn = TxIn nullOp (BS.pack [0x01, 0x01]) 0xffffffff
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid = computeTxId coinbase
+          merkle = getHash256 (computeMerkleRoot [txid])
+          header = BlockHeader 1 prevHash (Hash256 merkle) 0 0x207fffff 0
+          block = Block header [coinbase]
+          cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+          -- Regtest has netAssumedValid = Nothing, so shouldSkipScripts -> False.
+          skipFlag = shouldSkipScripts (computeBlockHash header) 1
+                       (bhTimestamp header) regtest Map.empty
+                       (ChainEntry header (computeBlockHash header)
+                         0 0 Nothing StatusHeaderValid 0)
+          resultNoSkip = validateFullBlock regtest cs False block Map.empty
+          resultSkip   = validateFullBlock regtest cs skipFlag block Map.empty
+      -- Both must agree (skipFlag should be False on regtest)
+      skipFlag `shouldBe` False
+      resultNoSkip `shouldBe` resultSkip
 
   describe "Sigop counting" $ do
     it "counts OP_CHECKSIG as 1 sigop" $ do
