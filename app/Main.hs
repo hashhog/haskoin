@@ -13,8 +13,9 @@ import qualified Data.Text.Encoding as TE
 import System.IO (hSetBuffering, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.FilePath ((</>))
-import Control.Concurrent (threadDelay, forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (threadDelay, forkIO, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
@@ -308,7 +309,7 @@ runNode net dataDir NodeOptions{..} = do
           , rpcPassword = noRpcPass
           , rpcDataDir  = dataDir
           }
-    _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
+    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
 
     -- Periodic chainstate flush.
@@ -321,7 +322,7 @@ runNode net dataDir NodeOptions{..} = do
     -- first wins.
     let flushTimeInterval  = 300  :: Integer  -- seconds
         flushTimerDelayUs  = 30 * 1_000_000   -- wake every 30s to check
-    void $ forkIO $ forever $ do
+    flushThreadId <- forkIO $ forever $ do
       threadDelay flushTimerDelayUs
       now <- round <$> getPOSIXTime
       lastF <- readIORef lastFlushEpochRef
@@ -368,10 +369,36 @@ runNode net dataDir NodeOptions{..} = do
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
     shutdownVar <- newEmptyMVar
-    void $ installHandler sigINT (Catch $ putMVar shutdownVar ()) Nothing
-    void $ installHandler sigTERM (Catch $ putMVar shutdownVar ()) Nothing
+    -- Use tryPutMVar so re-delivery of SIGINT/SIGTERM never blocks in
+    -- the signal handler. The original Catch used putMVar, which is
+    -- synchronous on a full MVar and would wedge the signal handler
+    -- if a second signal arrived during shutdown.
+    void $ installHandler sigINT  (Catch $ void $ tryPutMVar shutdownVar ()) Nothing
+    void $ installHandler sigTERM (Catch $ void $ tryPutMVar shutdownVar ()) Nothing
     takeMVar shutdownVar
     putStrLn "Shutting down..."
+
+    -- Hard-exit watchdog: if the graceful shutdown below hangs for any
+    -- reason (stuck FFI call, uninterruptible thread, RocksDB close
+    -- waiting on a compaction), force-exit after 30s. Wave 2 observed
+    -- the process printing "Shutdown complete." yet staying alive
+    -- with 1017 FDs open and the RPC/P2P ports bound; a guaranteed
+    -- exit is required to avoid that.
+    void $ forkIO $ do
+      threadDelay (30 * 1_000_000)
+      putStrLn "Shutdown watchdog: forcing exit after 30s"
+      exitWith (ExitFailure 2)
+
+    -- Stop background workers first so they don't race with the final
+    -- flush / closeDB. killThread on Haskell threads is cooperative
+    -- (delivers an async exception at the next safe point); we don't
+    -- wait for them to report completion.
+    (stopRpcServer rpcServer
+       `catch` (\(e :: SomeException) -> putStrLn $ "stopRpcServer error: " ++ show e))
+    (stopPeerManager pm
+       `catch` (\(e :: SomeException) -> putStrLn $ "stopPeerManager error: " ++ show e))
+    killThread flushThreadId
+      `catch` (\(e :: SomeException) -> putStrLn $ "killThread flushThreadId error: " ++ show e)
 
     -- Final durable flush of the chainstate before we close the DB.
     -- Without this, any blocks connected since the last periodic flush
@@ -387,6 +414,12 @@ runNode net dataDir NodeOptions{..} = do
     saveFeeEstimates fe feeEstimatesPath
     putStrLn $ "Fee estimates saved to " ++ feeEstimatesPath
     putStrLn "Shutdown complete."
+    -- Explicit exit. Without this, any forked thread mid-FFI call
+    -- (accept on the inbound listener, RocksDB I/O, Warp thread in
+    -- the middle of a response) keeps the RTS alive after main
+    -- returns. exitSuccess raises ExitSuccess which unwinds the
+    -- surrounding bracket (running closeDB) and then terminates.
+    exitSuccess
 
 -- | Initialize header chain from database
 initHeaderChainFromDB :: HaskoinDB -> Network -> IO HeaderChain
