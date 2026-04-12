@@ -33,6 +33,7 @@ module Haskoin.Storage
   , openDB
   , closeDB
   , withDB
+  , syncFlush
     -- * Key Prefixes
   , KeyPrefix(..)
   , prefixByte
@@ -339,6 +340,29 @@ closeDB HaskoinDB{..} = R.close dbHandle
 -- | Run an action with a database, ensuring it is closed afterward
 withDB :: DBConfig -> (HaskoinDB -> IO a) -> IO a
 withDB config = bracket (openDB config) closeDB
+
+-- | Force a durable flush of the write-ahead log to disk.
+--
+-- The normal write path uses asynchronous WAL writes (@sync=False@) for
+-- throughput: writes go into the WAL buffer without an @fsync@. That is
+-- safe across process crashes (kernel still has the data), but a machine
+-- crash or a non-graceful shutdown (SIGKILL, OOM, power loss) can lose
+-- any writes that hadn't been fsync'd yet. Running this function forces
+-- an @fsync@ of the WAL, which also durably persists every prior
+-- asynchronous write in the same log.
+--
+-- We implement the fsync by issuing a single synchronous write to a
+-- dedicated sentinel key. rocksdb-haskell doesn't expose the raw
+-- @FlushWAL@ C-API, but a synchronous write has equivalent semantics:
+-- it calls @fsync@ on the WAL and thereby durably commits all prior
+-- pending writes.
+--
+-- Reference: Bitcoin Core src/validation.cpp FlushStateToDisk.
+syncFlush :: HaskoinDB -> IO ()
+syncFlush HaskoinDB{..} = do
+  let syncOpts = R.defaultWriteOptions { R.sync = True }
+      key = makeKey PrefixBestBlock (BS.singleton 0xFF) -- reserved sentinel
+  R.put dbHandle syncOpts key BS.empty
 
 --------------------------------------------------------------------------------
 -- Block Header Storage

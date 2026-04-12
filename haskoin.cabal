@@ -82,6 +82,7 @@ executable haskoin
                , wai
                , warp
                , http-types
+               , time
   default-language: Haskell2010
   ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N"
 
