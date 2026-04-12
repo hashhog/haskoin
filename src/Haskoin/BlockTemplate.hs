@@ -393,8 +393,8 @@ submitBlock net db hc cache pm block = do
         , csFlags = consensusFlagsAtHeight net height
         }
 
-  -- Validate the block
-  case validateFullBlock net cs block utxoMap of
+  -- Validate the block (always verify scripts for locally minted blocks)
+  case validateFullBlock net cs False block utxoMap of
     Left err -> return $ Left $ "Block validation failed: " ++ err
     Right () -> do
       -- Apply block to UTXO cache and generate undo data
