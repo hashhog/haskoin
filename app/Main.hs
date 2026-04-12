@@ -1,6 +1,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE NumericUnderscores #-}
 
 module Main where
 
@@ -14,6 +15,7 @@ import System.Directory (createDirectoryIfMissing, getHomeDirectory)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import Data.Maybe (mapMaybe)
@@ -254,6 +256,16 @@ runNode net dataDir NodeOptions{..} = do
     ibdModeRef <- newIORef True
     -- Recently-rejected transaction filter (cleared on each new block)
     recentlyRejectedRef <- newIORef (Set.empty :: Set.Set TxId)
+    -- Durability: count blocks since last chainstate flush. We do a
+    -- periodic synchronous WAL fsync (see doPeriodicFlush) every
+    -- flushBlockInterval blocks OR every flushTimeInterval seconds,
+    -- whichever comes first. This closes the durability gap observed
+    -- in Wave 2 where 133k connected blocks were lost because a
+    -- non-graceful shutdown skipped closeDB.
+    blocksSinceFlushRef <- newIORef (0 :: Word32)
+    lastFlushEpochRef <- do
+      t0 <- round <$> getPOSIXTime
+      newIORef (t0 :: Integer)
 
     -- Start header sync
     hs <- startHeaderSync net hc
@@ -265,7 +277,7 @@ runNode net dataDir NodeOptions{..} = do
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef addr msg
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef addr msg
         `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
@@ -298,6 +310,30 @@ runNode net dataDir NodeOptions{..} = do
           }
     _rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
+
+    -- Periodic chainstate flush.
+    -- Bitcoin Core's FlushStateToDisk flushes on a wall-clock interval
+    -- (~1h) plus on size/shutdown. We use a more conservative 5-minute
+    -- interval here because the cost of a sync write is small and the
+    -- cost of losing even a few thousand validated blocks on restart
+    -- is large. The syncMessageHandler also triggers a flush every
+    -- flushBlockInterval blocks via doPeriodicFlush — whichever fires
+    -- first wins.
+    let flushTimeInterval  = 300  :: Integer  -- seconds
+        flushTimerDelayUs  = 30 * 1_000_000   -- wake every 30s to check
+    void $ forkIO $ forever $ do
+      threadDelay flushTimerDelayUs
+      now <- round <$> getPOSIXTime
+      lastF <- readIORef lastFlushEpochRef
+      when (now - lastF >= flushTimeInterval) $ do
+        h <- readTVarIO (hcHeight hc)
+        putStrLn $ "Periodic flush: syncing WAL + UTXO cache at height=" ++ show h
+        flushCache cache
+          `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
+        syncFlush db
+          `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
+        writeIORef lastFlushEpochRef now
+        writeIORef blocksSinceFlushRef 0
 
     -- Start Prometheus metrics server
     when (noMetricsPort > 0) $ do
@@ -336,6 +372,18 @@ runNode net dataDir NodeOptions{..} = do
     void $ installHandler sigTERM (Catch $ putMVar shutdownVar ()) Nothing
     takeMVar shutdownVar
     putStrLn "Shutting down..."
+
+    -- Final durable flush of the chainstate before we close the DB.
+    -- Without this, any blocks connected since the last periodic flush
+    -- live only in the RocksDB memtable and are lost if the process is
+    -- SIGKILL'd or otherwise killed before closeDB returns.
+    putStrLn "Flushing chainstate to disk..."
+    (flushCache cache
+       `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e))
+    (syncFlush db
+       `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e))
+    putStrLn "Chainstate flushed."
+
     saveFeeEstimates fe feeEstimatesPath
     putStrLn $ "Fee estimates saved to " ++ feeEstimatesPath
     putStrLn "Shutdown complete."
@@ -502,8 +550,9 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
                    -> IORef PeerManager -> IORef Word32 -> IORef Word32
                    -> IORef Bool -> IORef (Set.Set TxId)
+                   -> IORef Word32 -> IORef Integer
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -592,6 +641,22 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
         nextBlock <- readIORef nextBlockRef
         when (height >= nextBlock) $
           writeIORef nextBlockRef (height + 1)
+        -- Durability: flush WAL + UTXO cache every flushBlockInterval
+        -- blocks. This bounds the data-loss window on a non-graceful
+        -- shutdown. Reference: Bitcoin Core src/validation.cpp
+        -- FlushStateToDisk (50 MB of UTXO changes / 24h).
+        let flushBlockInterval = 1000 :: Word32
+        cnt <- atomicModifyIORef' blocksSinceFlushRef (\c -> (c + 1, c + 1))
+        when (cnt >= flushBlockInterval) $ do
+          putStrLn $ "Block-count flush at height=" ++ show height
+                     ++ " (" ++ show cnt ++ " blocks since last flush)"
+          flushCache cache
+            `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
+          syncFlush db
+            `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
+          writeIORef blocksSinceFlushRef 0
+          nowE <- round <$> getPOSIXTime
+          writeIORef lastFlushEpochRef nowE
         -- Remove confirmed txs from mempool and clear rejection filter
         blockConnected mp block
         writeIORef recentlyRejectedRef Set.empty
@@ -813,7 +878,7 @@ syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRe
           then case fillPartialBlock pdb [] of
             Right block -> do
               putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-              syncMessageHandler db hc hs _cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef addr (MBlock block)
+              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef addr (MBlock block)
             Left err -> do
               putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
               pm <- readIORef pmRef
