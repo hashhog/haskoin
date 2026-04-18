@@ -654,6 +654,7 @@ handleRpcRequest server req = do
     "getblockheader"       -> handleGetBlockHeader server params
     "gettxout"             -> handleGetTxOut server params
     "getbestblockhash"     -> handleGetBestBlockHash server
+    "getsyncstate"         -> handleGetSyncState server
     "getdifficulty"        -> handleGetDifficulty server
     "pruneblockchain"      -> handlePruneBlockchain server params
     "invalidateblock"      -> handleInvalidateBlock server params
@@ -933,6 +934,33 @@ handleGetBestBlockHash :: RpcServer -> IO RpcResponse
 handleGetBestBlockHash server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
   return $ RpcResponse (toJSON $ showHash (ceHash tip)) Null Null
+
+-- | hashhog W70: uniform fleet-wide sync-state report.
+-- Spec: meta-repo `spec/getsyncstate.md`.
+handleGetSyncState :: RpcServer -> IO RpcResponse
+handleGetSyncState server = do
+  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  peerCount <- getPeerCount (rsPeerMgr server)
+  let tipHeight = ceHeight tip
+      tipHash   = showHash (ceHash tip)
+      blockTime = bhTimestamp (ceHeader tip)
+      isIBD     = estimateIsInitialBlockDownload tipHeight blockTime
+      progress  = computeVerificationProgress tipHeight blockTime
+      result = object
+        [ "tip_height"               .= tipHeight
+        , "tip_hash"                 .= tipHash
+        , "best_header_height"       .= tipHeight
+        , "best_header_hash"         .= tipHash
+        , "initial_block_download"   .= isIBD
+        , "num_peers"                .= peerCount
+        , "verification_progress"    .= progress
+        , "blocks_in_flight"         .= Null
+        , "blocks_pending_connect"   .= Null
+        , "last_block_received_time" .= Null
+        , "chain"                    .= netName (rsNetwork server)
+        , "protocol_version"         .= protocolVersion
+        ]
+  return $ RpcResponse result Null Null
 
 -- | Get block hash at a specific height
 handleGetBlockHash :: RpcServer -> Value -> IO RpcResponse
@@ -3662,6 +3690,7 @@ allRpcCommands =
   , "getblock \"blockhash\" ( verbosity )"
   , "getblockchaininfo"
   , "getblockcount"
+  , "getsyncstate"
   , "getdeploymentinfo ( \"blockhash\" )"
   , "getblockhash height"
   , "getblockheader \"blockhash\" ( verbose )"
