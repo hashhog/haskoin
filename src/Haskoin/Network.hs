@@ -1576,6 +1576,7 @@ data PeerInfo = PeerInfo
   , piMsgsSent           :: !Word64            -- ^ Total messages sent
   , piMsgsRecv           :: !Word64            -- ^ Total messages received
   , piConnectedAt        :: !Int64             -- ^ Unix timestamp of connection
+  , piTimeOffset         :: !Int64             -- ^ Clock-skew: peer version timestamp - our unix time at handshake (seconds)
   , piInbound            :: !Bool              -- ^ True if peer connected to us
   , piWantsAddrV2        :: !Bool              -- ^ True if peer sent sendaddrv2 (BIP155)
     -- BIP133 Feefilter fields
@@ -1654,6 +1655,7 @@ connectPeer config host port = do
               , piMsgsSent           = 0
               , piMsgsRecv           = 0
               , piConnectedAt        = now
+              , piTimeOffset         = 0
               , piInbound            = False
               , piWantsAddrV2        = False
               , piFeeFilterReceived  = 0
@@ -1831,12 +1833,14 @@ continueHandshake pc theirVersion = do
   case r of
     Right MVerAck -> do
       -- Update peer info with their version data
+      now <- round <$> getPOSIXTime
       atomically $ modifyTVar' (pcInfo pc) $ \i ->
         i { piState       = PeerConnected
           , piVersion     = Just theirVersion
           , piServices    = vServices theirVersion
           , piStartHeight = vStartHeight theirVersion
           , piRelay       = vRelay theirVersion
+          , piTimeOffset  = vTimestamp theirVersion - now
           }
 
       -- Send post-handshake feature negotiation messages
@@ -2296,6 +2300,7 @@ startInboundListener pm port = do
             , piMsgsSent      = 0
             , piMsgsRecv      = 0
             , piConnectedAt   = now
+            , piTimeOffset    = 0
             , piInbound       = True
             , piWantsAddrV2   = False
             , piFeeFilterReceived = 0
@@ -7450,6 +7455,7 @@ createPeerConnectionFromSocket config sock _host = do
           , piMsgsSent      = 0
           , piMsgsRecv      = 0
           , piConnectedAt   = now
+          , piTimeOffset    = 0
           , piInbound       = False
           , piWantsAddrV2   = True  -- Tor/I2P peers want ADDRv2
           , piFeeFilterReceived = 0

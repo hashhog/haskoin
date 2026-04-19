@@ -127,7 +127,7 @@ import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
 import Control.Monad (forM, forM_, void, when)
 import Control.Concurrent (threadDelay)
-import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust)
 import Data.List (find, sort)
 import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
@@ -1575,6 +1575,20 @@ handleGetRawMempool server params = do
 handleGetNetworkInfo :: RpcServer -> IO RpcResponse
 handleGetNetworkInfo server = do
   peerCount <- getPeerCount (rsPeerMgr server)
+  peersForOffset <- getConnectedPeers (rsPeerMgr server)
+  -- Median clock-skew across peers that have completed the VERSION handshake.
+  -- Matches Bitcoin Core GetTimeOffset() / getnetworkinfo.timeoffset semantics.
+  let offsets = sort [ piTimeOffset info
+                     | (_, info) <- peersForOffset
+                     , isJust (piVersion info) ]
+      timeOffsetMedian :: Int64
+      timeOffsetMedian = case offsets of
+        [] -> 0
+        xs -> let n = length xs
+                  m = n `div` 2
+              in if odd n
+                 then xs !! m
+                 else (xs !! (m - 1) + xs !! m) `div` 2
   -- Our local services: NODE_NETWORK (1) + NODE_WITNESS (8) = 9
   let localServices = getServiceFlag nodeNetwork .|. getServiceFlag nodeWitness :: Word64
       localServicesHex = T.pack $ printf "%016x" localServices
@@ -1616,7 +1630,7 @@ handleGetNetworkInfo server = do
         , "localservices"      .= localServicesHex
         , "localservicesnames" .= serviceNames
         , "localrelay"         .= True
-        , "timeoffset"         .= (0 :: Int)
+        , "timeoffset"         .= timeOffsetMedian
         , "networkactive"      .= True
         , "connections"        .= peerCount
         , "connections_in"     .= (0 :: Int)  -- Would need to count inbound peers
@@ -1656,7 +1670,7 @@ handleGetPeerInfo server = do
       , "bytessent"       .= piBytesSent info
       , "bytesrecv"       .= piBytesRecv info
       , "conntime"        .= piConnectedAt info
-      , "timeoffset"      .= (0 :: Int)
+      , "timeoffset"      .= piTimeOffset info
       , "pingtime"        .= fromMaybe (0 :: Double) (piPingLatency info)
       , "version"         .= maybe (0 :: Int32) vVersion (piVersion info)
       , "subver"          .= maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info)
