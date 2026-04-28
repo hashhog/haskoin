@@ -63,6 +63,7 @@ module Haskoin.Crypto
     -- * Taproot Utilities
   , taggedHash
   , xonlyPubkeyTweakAdd
+  , verifySchnorr
   ) where
 
 import qualified Crypto.Hash as H
@@ -108,6 +109,13 @@ foreign import ccall unsafe "haskoin_xonly_pubkey_tweak_add"
                            -> Ptr CUChar   -- output_pubkey32
                            -> Ptr CInt     -- output_parity
                            -> IO CInt
+
+-- | FFI binding for BIP-340 Schnorr signature verification.
+foreign import ccall unsafe "haskoin_schnorrsig_verify"
+  c_schnorrsig_verify :: Ptr CUChar   -- sig64
+                      -> Ptr CUChar   -- msg32
+                      -> Ptr CUChar   -- pubkey_x32
+                      -> IO CInt
 
 --------------------------------------------------------------------------------
 -- Hashing Functions
@@ -163,6 +171,19 @@ xonlyPubkeyTweakAdd internalKey tweak
                   parity <- peek parityPtr
                   return $ Just (outKey, fromIntegral parity)
                 else return Nothing
+
+-- | Verify a BIP-340 Schnorr signature.
+-- Returns True iff the 64-byte signature is valid for the 32-byte message
+-- digest under the 32-byte x-only public key.
+verifySchnorr :: ByteString -> ByteString -> ByteString -> Bool
+verifySchnorr sig msg pubkey
+  | BS.length sig /= 64 || BS.length msg /= 32 || BS.length pubkey /= 32 = False
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen sig $ \(sigPtr, _) ->
+        BS.useAsCStringLen msg $ \(msgPtr, _) ->
+          BS.useAsCStringLen pubkey $ \(pkPtr, _) -> do
+            r <- c_schnorrsig_verify (castPtr sigPtr) (castPtr msgPtr) (castPtr pkPtr)
+            return (r == 1)
 
 -- | HMAC-SHA512, used for BIP-32 key derivation
 hmacSHA512 :: ByteString -> ByteString -> ByteString

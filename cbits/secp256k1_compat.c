@@ -8,6 +8,7 @@
 
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
+#include <secp256k1_schnorrsig.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -290,4 +291,33 @@ int haskoin_xonly_pubkey_tweak_add(
     }
 
     return 1;
+}
+
+/* ---- BIP-340 Schnorr signature verification ------------------------------ */
+
+/*
+ * Verify a 64-byte BIP-340 Schnorr signature.
+ *
+ * sig64:        64-byte signature
+ * msg32:        32-byte message digest (typically the BIP-341 sighash)
+ * pubkey_x32:   32-byte x-only public key (for Taproot, the witness program
+ *               for key-path or the tweaked output key for tapscript)
+ *
+ * Returns 1 on valid signature, 0 otherwise.
+ */
+int haskoin_schnorrsig_verify(
+    const unsigned char *sig64,
+    const unsigned char *msg32,
+    const unsigned char *pubkey_x32
+) {
+    secp256k1_context *ctx = get_verify_ctx();
+    secp256k1_xonly_pubkey xonly;
+
+    if (!ctx) return 0;
+
+    if (!secp256k1_xonly_pubkey_parse(ctx, &xonly, pubkey_x32)) {
+        return 0;
+    }
+
+    return secp256k1_schnorrsig_verify(ctx, sig64, msg32, 32, &xonly);
 }
