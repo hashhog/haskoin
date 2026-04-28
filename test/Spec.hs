@@ -5010,6 +5010,7 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
+              , piTimeOffset = 0
               }
         piBanScore info `shouldBe` 0
 
@@ -5036,6 +5037,7 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
+              , piTimeOffset = 0
               }
         piState info `shouldBe` PeerBanned
         piBanScore info `shouldBe` 100
@@ -5313,6 +5315,7 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
+              , piTimeOffset = 0
               }
             candidate = peerToEvictionCandidate addr info
         ecAddress candidate `shouldBe` addr
