@@ -149,6 +149,7 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            txBaseSize, txTotalSize, coinbaseMaturity)
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
+import qualified Haskoin.Script as Script
 
 --------------------------------------------------------------------------------
 -- Fee Rate
@@ -708,19 +709,34 @@ resolveInput mp op = do
                  else return $ Left (ErrMissingInput op)
             Nothing -> return $ Left (ErrMissingInput op)
 
--- | Verify all scripts for a transaction
+-- | Verify all scripts for a transaction.
+--
+-- Pre-collects per-input prevouts (amounts + scriptPubKeys) before
+-- verifying each input so Taproot's BIP-341 @sha_amounts@ /
+-- @sha_scriptpubkeys@ commitments can be computed correctly. Falls
+-- back to script-only behaviour for legacy / SegWit-v0 inputs.
 verifyAllScripts :: Mempool -> Tx -> Map OutPoint TxOut -> IO (Either MempoolError ())
 verifyAllScripts _mp tx inputMap = do
-  let indexed = zip [0..] (txInputs tx)
-  results <- forM indexed $ \(idx, inp) ->
-    case Map.lookup (txInPrevOutput inp) inputMap of
-      Nothing -> return $ Left (ErrMissingInput (txInPrevOutput inp))
-      Just prevOut ->
-        case verifyScript tx idx (txOutScript prevOut) (txOutValue prevOut) of
+  -- First pass: resolve every input's prevout, fail fast on missing.
+  let resolveAll = traverse
+        (\inp -> case Map.lookup (txInPrevOutput inp) inputMap of
+            Nothing -> Left (ErrMissingInput (txInPrevOutput inp))
+            Just prevOut -> Right prevOut)
+        (txInputs tx)
+  case resolveAll of
+    Left err -> return $ Left err
+    Right prevs -> do
+      let spentAmounts = map txOutValue prevs
+          spentScripts = map txOutScript prevs
+          indexed = zip [0..] prevs
+      results <- forM indexed $ \(idx, prevOut) ->
+        case Script.verifyScriptWithFlags Script.emptyFlags tx idx
+               (txOutScript prevOut) (txOutValue prevOut)
+               spentAmounts spentScripts of
           Left err -> return $ Left (ErrScriptVerificationFailed err)
           Right False -> return $ Left (ErrScriptVerificationFailed "Script returned false")
           Right True -> return $ Right ()
-  return $ sequence_ results
+      return $ sequence_ results
 
 -- | Check ancestor, descendant, and cluster size limits.
 -- Returns the list of ancestors on success.
@@ -1577,19 +1593,30 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
                                 ]
                           go rest (txid : acc) (Map.union newOutputs localOutputs)
 
--- | Verify all scripts for a transaction
+-- | Verify all scripts for a transaction (variant returning String error).
+-- Same Taproot-aware refactor as 'verifyAllScripts': pre-collect prevouts
+-- and pass to 'verifyScriptWithFlags' so BIP-341 sighash works.
 verifyAllScripts' :: Tx -> Map OutPoint TxOut -> IO (Either String ())
 verifyAllScripts' tx inputMap = do
-  let indexed = zip [0..] (txInputs tx)
-  results <- forM indexed $ \(idx, inp) ->
-    case Map.lookup (txInPrevOutput inp) inputMap of
-      Nothing -> return $ Left $ "Missing input: " ++ show (txInPrevOutput inp)
-      Just prevOut ->
-        case verifyScript tx idx (txOutScript prevOut) (txOutValue prevOut) of
+  let resolveAll = traverse
+        (\inp -> case Map.lookup (txInPrevOutput inp) inputMap of
+            Nothing -> Left $ "Missing input: " ++ show (txInPrevOutput inp)
+            Just prevOut -> Right prevOut)
+        (txInputs tx)
+  case resolveAll of
+    Left err -> return $ Left err
+    Right prevs -> do
+      let spentAmounts = map txOutValue prevs
+          spentScripts = map txOutScript prevs
+          indexed = zip [0..] prevs
+      results <- forM indexed $ \(idx, prevOut) ->
+        case Script.verifyScriptWithFlags Script.emptyFlags tx idx
+               (txOutScript prevOut) (txOutValue prevOut)
+               spentAmounts spentScripts of
           Left err -> return $ Left err
           Right False -> return $ Left "Script returned false"
           Right True -> return $ Right ()
-  return $ sequence_ results
+      return $ sequence_ results
 
 -- | Add a single transaction to the mempool (internal helper)
 addTransactionToMempool :: Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> Word64 -> Int -> IO (Either MempoolError ())

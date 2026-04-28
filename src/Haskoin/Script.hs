@@ -96,6 +96,8 @@ import qualified Data.Map.Strict as Map
 
 import Haskoin.Types
 import Haskoin.Crypto
+import qualified Haskoin.Crypto as Crypto
+import qualified Haskoin.TaprootSighash as TS
 
 --------------------------------------------------------------------------------
 -- Script Types
@@ -2174,13 +2176,21 @@ evalScriptWithFlags flags tx idx amount scriptSig scriptPubKey = do
     [] -> Right False
     (top:_) -> Right (isTrue top)
 
--- | Verify a transaction input (without flags, for backward compatibility)
+-- | Verify a transaction input (without flags, for backward compatibility).
+-- Pre-Taproot use only — passes empty prevouts so any Taproot input fails
+-- closed. Use 'verifyScriptWithPrevouts' for Taproot-correct verification.
 verifyScript :: Tx -> Int -> ByteString -> Word64 -> Either String Bool
-verifyScript = verifyScriptWithFlags emptyFlags
+verifyScript tx idx prevScriptPubKey amount =
+  verifyScriptWithFlags emptyFlags tx idx prevScriptPubKey amount [] []
 
--- | Verify a transaction input with verification flags
-verifyScriptWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> Word64 -> Either String Bool
-verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
+-- | Verify a transaction input with verification flags.
+-- 'spentAmounts' and 'spentScripts' are the per-input prevouts of the
+-- whole transaction (one entry per 'txInputs' element). Required by
+-- BIP-341's @sha_amounts@ and @sha_scriptpubkeys@ for Taproot inputs;
+-- ignored for legacy / SegWit-v0. Empty lists fail Taproot inputs closed.
+verifyScriptWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> Word64
+                      -> [Word64] -> [ByteString] -> Either String Bool
+verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScripts = do
   let scriptSigBytes = txInScript (txInputs tx !! idx)
 
   scriptSig <- decodeScript scriptSigBytes
@@ -2269,7 +2279,7 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount = do
                           else Left "Witness program wrong length"
                     1 | BS.length prog == 32 && hasFlag flags VerifyTaproot ->
                       -- BIP-341: Taproot witness v1
-                      verifyTaprootWithFlags flags tx idx prog witness amount
+                      verifyTaprootWithFlags flags tx idx prog witness amount spentAmounts spentScripts
                     _ -> do
                       -- Unknown witness version
                       when (hasFlag flags VerifyDiscourageUpgradableWitnessProgram) $
@@ -2434,23 +2444,47 @@ verifyP2WSHWithFlags flags tx idx expectedHash amount = do
 -- | Verify Taproot (BIP-341/342) witness v1 program.
 -- Handles both key-path (single witness element = Schnorr sig) and
 -- script-path (witness stack + script + control block).
-verifyTaprootWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> [ByteString] -> Word64 -> Either String Bool
-verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount = do
+verifyTaprootWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> [ByteString] -> Word64 -> [Word64] -> [ByteString] -> Either String Bool
+verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts spentScripts = do
   when (null witness) $
     Left "Taproot witness empty"
 
   -- Check for annex: if >= 2 items and last starts with 0x50
-  let (effectiveWitness, _annex) =
+  let (effectiveWitness, annex) =
         if length witness >= 2 && not (BS.null (last witness)) && BS.head (last witness) == 0x50
         then (init witness, Just (last witness))
         else (witness, Nothing)
 
   case effectiveWitness of
-    [_sig] ->
-      -- Key-path spend: single element is a Schnorr signature
-      -- For now, we don't verify Schnorr signatures, just succeed
-      -- (the test vectors we care about are all script-path)
-      Right True
+    [sig] -> do
+      -- Key-path spend: single element is a 64- or 65-byte Schnorr sig
+      -- verified against the witness program (the tweaked output key Q)
+      -- under BIP-341 sighash with ext_flag = 0.
+      let sigLen = BS.length sig
+      when (sigLen /= 64 && sigLen /= 65) $
+        Left "Taproot key-path sig length must be 64 or 65"
+      let (sigBytes, hashType) =
+            if sigLen == 65
+            then (BS.take 64 sig, BS.last sig)
+            else (sig, TS.sighashDefault)
+      -- Strict: explicit SIGHASH_DEFAULT byte (0x00) is invalid; the
+      -- 64-byte form must be used for default.
+      when (sigLen == 65 && hashType == TS.sighashDefault) $
+        Left "Taproot: explicit SIGHASH_DEFAULT byte"
+      -- Need full prevouts; if the caller didn't supply them, fail closed.
+      when (length spentAmounts /= length (txInputs tx) ||
+            length spentScripts /= length (txInputs tx)) $
+        Left "Taproot: caller did not supply per-input prevouts"
+      let _ = amount  -- subsumed by spentAmounts !! idx for Taproot
+      let prevouts = TS.TaprootPrevouts spentAmounts spentScripts
+      sighash <- case TS.computeTaprootSighash tx idx prevouts hashType annex Nothing of
+        Right h -> Right h
+        Left e  -> Left ("Taproot sighash: " ++ show e)
+      when (BS.length outputKeyBytes /= 32) $
+        Left "Taproot: witness program is not 32 bytes"
+      if Crypto.verifySchnorr sigBytes sighash outputKeyBytes
+        then Right True
+        else Left "Taproot key-path Schnorr verify failed"
 
     _ | length effectiveWitness >= 2 -> do
       -- Script-path spend: [...stack items..., script, control_block]
