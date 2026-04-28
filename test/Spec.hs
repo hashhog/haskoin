@@ -1271,7 +1271,7 @@ main = hspec $ do
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
       -- verifyScriptWithFlags with VerifyP2SH enables P2SH enforcement
-      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 [] [] of
         Right True -> return ()
         Right False -> expectationFailure "Expected P2SH verification to succeed"
         Left err -> expectationFailure $ "P2SH verification failed: " ++ err
@@ -1289,7 +1289,7 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 [] [] of
         Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
         Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
         Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
@@ -1304,7 +1304,7 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 [] [] of
         Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
         Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
         Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
@@ -1319,7 +1319,7 @@ main = hspec $ do
           dummyTxId = TxId (Hash256 (BS.replicate 32 0x00))
           txin = TxIn (OutPoint dummyTxId 0) (encodeScript scriptSig) 0xffffffff
           tx = Tx 1 [txin] [TxOut 0 (encodeScript scriptPubKey)] [[]] 0
-      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 of
+      case verifyScriptWithFlags p2shFlags tx 0 (encodeScript scriptPubKey) 0 [] [] of
         Left err | "push-only" `T.isInfixOf` T.pack err -> return ()
         Left err -> expectationFailure $ "Expected push-only error, got: " ++ err
         Right _ -> expectationFailure "Expected P2SH to reject non-push-only scriptSig"
