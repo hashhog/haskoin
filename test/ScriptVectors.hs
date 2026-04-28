@@ -422,7 +422,7 @@ main = do
 
                                         creditingTx = buildCreditingTx scriptPubKeyBytes amount
                                         tx = buildSpendingTx creditingTx scriptSigBytes [witStack] amount
-                                        result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes amount [] []
+                                        result = verifyScriptWithFlags flags tx 0 scriptPubKeyBytes amount [amount] [scriptPubKeyBytes]
                                         gotOk = case result of
                                                   Right True -> True
                                                   _          -> False

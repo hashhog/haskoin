@@ -80,6 +80,7 @@ module Haskoin.Script
 
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BC
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
 import Data.Serialize (runGet, runPut, getWord8, putWord8, getBytes,
@@ -1123,6 +1124,12 @@ data ScriptEnv = ScriptEnv
   , seIsWitness    :: !Bool            -- ^ Are we executing witness script?
   , seIsTapscript  :: !Bool            -- ^ Are we executing tapscript (witness v1 script-path)?
   , seFlags        :: !ScriptFlags     -- ^ Script verification flags
+    -- Taproot context (BIP-341/342). Only meaningful when seIsWitness or
+    -- seIsTapscript is True; ignored for legacy / SegWit-v0.
+  , seSpentAmounts :: ![Word64]        -- ^ per-input amounts (for sha_amounts)
+  , seSpentScripts :: ![ByteString]    -- ^ per-input scriptPubKeys (for sha_scriptpubkeys)
+  , seTapleafHash  :: !(Maybe ByteString) -- ^ tapleaf hash for ext_flag=1 sighash
+  , seTaprootAnnex :: !(Maybe ByteString) -- ^ witness annex (with leading 0x50)
   } deriving (Show)
 
 -- | Initialize script environment
@@ -1145,6 +1152,10 @@ initScriptEnvWithFlags tx idx amount scriptCode flags = ScriptEnv
   , seIsWitness = False
   , seIsTapscript = False
   , seFlags = flags
+  , seSpentAmounts = []
+  , seSpentScripts = []
+  , seTapleafHash  = Nothing
+  , seTaprootAnnex = Nothing
   }
 
 -- | Result of script evaluation
@@ -1761,17 +1772,50 @@ execCheckSig env = do
       if BS.length pubkeyBytes /= 32
         then
           -- Unknown pubkey type: if sig is non-empty, push true; if empty, push false
+          -- (BIP-342 soft-fork-safe forward compatibility)
           if BS.null sigBytes
             then Right $ pushStack stackFalse env''
             else Right $ pushStack stackTrue env''
         else
-          -- 32-byte pubkey: Schnorr signature verification
-          -- For now, treat as: if sig empty -> push false, else push true
-          -- (Full Schnorr verification not implemented but not needed for these test vectors)
+          -- 32-byte pubkey: BIP-340 Schnorr signature verification with
+          -- BIP-341 ext_flag=1 sighash (tapleaf_hash + codesep_pos).
           if BS.null sigBytes
             then Right $ pushStack stackFalse env''
-            else Right $ pushStack stackTrue env''
+            else case verifyTapscriptSchnorr env'' sigBytes pubkeyBytes of
+              Right True  -> Right $ pushStack stackTrue env''
+              Right False -> Left "Tapscript Schnorr verify failed (NULLFAIL)"
+              Left err    -> Left err
     else execCheckSigLegacy env'' pubkeyBytes sigBytes
+
+-- | Verify a Schnorr signature inside a tapscript leaf (BIP-342).
+-- Computes the BIP-341 sighash with ext_flag=1 using the env's
+-- spent prevouts, tapleaf hash, codesep_pos, and annex.
+verifyTapscriptSchnorr :: ScriptEnv -> ByteString -> ByteString -> Either String Bool
+verifyTapscriptSchnorr env sigBytesRaw pubkey32 = do
+  let sigLen = BS.length sigBytesRaw
+  when (sigLen /= 64 && sigLen /= 65) $
+    Left "Tapscript sig must be 64 or 65 bytes"
+  let (sig64, ht) = if sigLen == 65
+                    then (BS.take 64 sigBytesRaw, BS.last sigBytesRaw)
+                    else (sigBytesRaw, TS.sighashDefault)
+  when (sigLen == 65 && ht == TS.sighashDefault) $
+    Left "Tapscript: explicit SIGHASH_DEFAULT byte"
+  tlh <- case seTapleafHash env of
+    Just h -> Right h
+    Nothing -> Left "Tapscript checksig: tapleaf_hash missing in env"
+  let prevouts = TS.TaprootPrevouts (seSpentAmounts env) (seSpentScripts env)
+  when (length (seSpentAmounts env) /= length (txInputs (seTx env)) ||
+        length (seSpentScripts env) /= length (txInputs (seTx env))) $
+    Left "Tapscript checksig: per-input prevouts missing in env"
+  let sp = TS.TapscriptContext
+             { TS.tapleafHash = tlh
+             , TS.codesepPos = seCodeSepPos env
+             }
+  sighash <- case TS.computeTaprootSighash (seTx env) (seInputIdx env)
+                    prevouts ht (seTaprootAnnex env) (Just sp) of
+    Right h -> Right h
+    Left  e -> Left ("Tapscript sighash: " ++ show e)
+  pure $ Crypto.verifySchnorr sig64 sighash pubkey32
 
 -- | Legacy/witness-v0 CHECKSIG path (non-tapscript)
 execCheckSigLegacy :: ScriptEnv -> ByteString -> ByteString -> Either String ScriptEnv
@@ -2499,14 +2543,40 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
         Left "Taproot control block invalid length"
 
       let leafVersion = BS.head controlBlock .&. 0xfe
-          -- For BIP-342 tapscript, leaf version must be 0xc0
-          _internalKey = BS.take 32 (BS.drop 1 controlBlock)
-          _merklePathLen = (BS.length controlBlock - 33) `div` 32
+          parityBit   = BS.head controlBlock .&. 0x01
+          internalKey = BS.take 32 (BS.drop 1 controlBlock)
 
-      -- Verify the control block against the output key
-      -- (We trust the test vector construction here - the placeholder resolver
-      -- produces correct control blocks. Full verification would require
-      -- recomputing the taproot output key from internal key + merkle root.)
+      -- Compute the BIP-341 TapLeaf hash for this leaf. Reused below for
+      -- the merkle path verify and threaded into ScriptEnv so tapscript
+      -- OP_CHECKSIG can compute ext_flag=1 sighash.
+      let tapleafHashBytes =
+            taggedHash (BC.pack "TapLeaf")
+              (BS.singleton leafVersion <>
+               serVarBytesPrefix tapscriptBytes)
+
+      -- BIP-341 control-block verification (was previously stubbed
+      -- with a "We trust the test vector construction here" comment).
+      -- Walks the merkle path bottom-up, then checks that internal_key
+      -- tweaked by tagged_hash("TapTweak", internal_key || merkle_root)
+      -- equals outputKeyBytes, with the parity bit matching control[0].
+      when (BS.length outputKeyBytes /= 32) $
+        Left "Taproot: witness program is not 32 bytes"
+      let merkleRoot = walkMerklePath tapleafHashBytes
+                         (drop33Chunks controlBlock)
+          tweakHash  = taggedHash (BC.pack "TapTweak") (internalKey <> merkleRoot)
+      case xonlyPubkeyTweakAdd internalKey tweakHash of
+        Nothing -> Left "Taproot: tweak failed"
+        Just (tweakedKey, parity) -> do
+          when (tweakedKey /= outputKeyBytes) $
+            Left "Taproot: control block does not match output key"
+          when (fromIntegral parityBit /= parity) $
+            Left "Taproot: control block parity mismatch"
+
+      -- Need full prevouts before we exec the tapscript so OP_CHECKSIG
+      -- inside it can compute ext_flag=1 sighash.
+      when (length spentAmounts /= length (txInputs tx) ||
+            length spentScripts /= length (txInputs tx)) $
+        Left "Taproot script-path: caller did not supply per-input prevouts"
 
       -- Check leaf version: 0xc0 = tapscript (BIP-342)
       if leafVersion == 0xc0
@@ -2529,6 +2599,10 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
                         { seIsWitness = True
                         , seIsTapscript = True
                         , seScriptCode = tapscriptBytes
+                        , seSpentAmounts = spentAmounts
+                        , seSpentScripts = spentScripts
+                        , seTapleafHash  = Just tapleafHashBytes
+                        , seTaprootAnnex = annex
                         }
 
               -- Evaluate tapscript with the witness stack (reversed for wire order)
@@ -2545,6 +2619,33 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
           Right True
 
     _ -> Left "Taproot witness invalid"
+
+-- | Strip the first 33 bytes (leaf_version + internal_key) of a
+-- taproot control block and return the merkle path as a list of
+-- 32-byte sibling hashes (length is ((len - 33) / 32)).
+drop33Chunks :: ByteString -> [ByteString]
+drop33Chunks ctrl = go (BS.drop 33 ctrl)
+  where
+    go b
+      | BS.null b = []
+      | otherwise = BS.take 32 b : go (BS.drop 32 b)
+
+-- | Walk a BIP-341 merkle path from a leaf hash and a list of
+-- 32-byte sibling hashes, returning the root.
+-- Each step: k = tagged_hash("TapBranch", min(k, sib) || max(k, sib))
+walkMerklePath :: ByteString -> [ByteString] -> ByteString
+walkMerklePath = foldl' step
+  where
+    step k sib =
+      let (lo, hi) = if k <= sib then (k, sib) else (sib, k)
+      in taggedHash (BC.pack "TapBranch") (lo <> hi)
+
+-- | Encode a ByteString as compact-size length prefix || bytes.
+-- Used for the @compact_size(script_len) || script@ portion of the
+-- BIP-341 TapLeaf hash preimage.
+serVarBytesPrefix :: ByteString -> ByteString
+serVarBytesPrefix bs =
+  runPut (putVarInt (fromIntegral (BS.length bs)) >> putByteString bs)
 
 -- | Verify SegWit script (entry point, without flags, for backward compatibility)
 verifySegWitScript :: Tx -> Int -> ByteString -> Word64 -> Either String Bool
