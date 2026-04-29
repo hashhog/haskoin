@@ -1649,10 +1649,13 @@ data PeerConfig = PeerConfig
   } deriving (Show)
 
 -- | Default peer configuration
+-- Advertises NODE_NETWORK + NODE_BLOOM + NODE_WITNESS (BIP-37/BIP-35/BIP-141).
+-- Bitcoin Core advertises NODE_BLOOM by default; gating is per-runtime via
+-- the peer manager (see 'pmcPeerBloomFilters').
 defaultPeerConfig :: Network -> PeerConfig
 defaultPeerConfig net = PeerConfig
   { pcfgNetwork      = net
-  , pcfgServices     = combineServices [nodeNetwork, nodeWitness]
+  , pcfgServices     = combineServices [nodeNetwork, nodeBloom, nodeWitness]
   , pcfgBestHeight   = 0
   , pcfgUserAgent    = userAgent
   , pcfgRelay        = True
@@ -2383,6 +2386,7 @@ data PeerManagerConfig = PeerManagerConfig
   , pmcPingInterval     :: !Int        -- ^ Ping interval in seconds (default 120)
   , pmcConnectTimeout   :: !Int        -- ^ Connection timeout in seconds (default 5)
   , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
+  , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default True)
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -2397,6 +2401,7 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcPingInterval     = 120      -- 2 minutes
   , pmcConnectTimeout   = 5
   , pmcDataDir          = "."
+  , pmcPeerBloomFilters = True     -- Bitcoin Core default
   }
 
 --------------------------------------------------------------------------------
@@ -2665,9 +2670,13 @@ tryConnectWithType pm addr blockRelayOnly = do
   discouraged <- isDiscouraged pm addr
   unless discouraged $ do
     let net = pmNetwork pm
+        baseFlags = [nodeNetwork, nodeWitness]
+        flags = if pmcPeerBloomFilters (pmConfig pm)
+                  then nodeBloom : baseFlags
+                  else baseFlags
         config = PeerConfig
           { pcfgNetwork     = net
-          , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
+          , pcfgServices    = combineServices flags
           , pcfgBestHeight  = 0
           , pcfgUserAgent   = userAgent
           , pcfgRelay       = not blockRelayOnly  -- block-relay-only: no tx relay
@@ -2887,9 +2896,13 @@ startInboundListener pm port = do
             }
       -- Perform inbound handshake (receive version first, then send ours)
       let net = pmNetwork pm
+          baseFlagsIn = [nodeNetwork, nodeWitness]
+          flagsIn = if pmcPeerBloomFilters (pmConfig pm)
+                      then nodeBloom : baseFlagsIn
+                      else baseFlagsIn
           config = PeerConfig
             { pcfgNetwork     = net
-            , pcfgServices    = combineServices [nodeNetwork, nodeWitness]
+            , pcfgServices    = combineServices flagsIn
             , pcfgBestHeight  = 0
             , pcfgUserAgent   = userAgent
             , pcfgRelay       = True

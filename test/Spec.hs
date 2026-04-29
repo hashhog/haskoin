@@ -2229,6 +2229,16 @@ main = hspec $ do
       hasService flags nodeWitness `shouldBe` True
       hasService flags nodeBloom `shouldBe` False
 
+    -- BIP-35 / BIP-37 advertisement parity with Bitcoin Core.
+    it "defaultPeerConfig advertises NODE_BLOOM (BIP-35/BIP-37)" $ do
+      let cfg = defaultPeerConfig mainnet
+      hasService (pcfgServices cfg) nodeBloom `shouldBe` True
+      hasService (pcfgServices cfg) nodeNetwork `shouldBe` True
+      hasService (pcfgServices cfg) nodeWitness `shouldBe` True
+
+    it "defaultPeerManagerConfig enables peer bloom filters by default" $ do
+      pmcPeerBloomFilters defaultPeerManagerConfig `shouldBe` True
+
   describe "Ping/Pong" $ do
     it "Ping roundtrips correctly" $ do
       let ping = Ping 0x123456789ABCDEF0
