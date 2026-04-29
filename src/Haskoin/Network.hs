@@ -328,6 +328,12 @@ module Haskoin.Network
   , writeEncryptedPacket
   , readGarbageUntilTerminator
   , ellSwiftXdhBIP324
+    -- ** Outbound v2 fallback bookkeeping
+  , bip324V2OutboundEnabled
+  , markV1Only
+  , isV1Only
+  , v1OnlyCacheMax
+  , v2ProbeDeadlineMicros
     -- ** Service Flags
   , nodeP2PV2
     -- * BIP330 Erlay Transaction Reconciliation
@@ -508,6 +514,7 @@ import qualified Data.Aeson as Aeson
 import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
 import System.FilePath ((</>))
 import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
+import System.Environment (lookupEnv)
 
 import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        socket, connect, close, defaultHints,
@@ -1607,6 +1614,10 @@ data PeerConnection = PeerConnection
   , pcRecvThread  :: !(Maybe ThreadId)    -- ^ Receive thread ID
   , pcNetwork     :: !Network             -- ^ Network configuration
   , pcReadBuffer  :: !(IORef ByteString)  -- ^ Buffered partial reads
+  , pcV2Transport :: !(IORef (Maybe V2Transport))
+                  -- ^ BIP-324 v2 cipher state once handshake completes.
+                  -- 'Nothing' for v1 peers; 'sendMessage' / 'receiveMessage'
+                  -- dispatch on this to apply v2 framing/encryption.
   }
 
 -- | Configuration for establishing peer connections
@@ -1676,6 +1687,7 @@ connectPeer config host port = do
         sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
         recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
         bufRef <- newIORef BS.empty
+        v2Ref  <- newIORef Nothing
         return PeerConnection
           { pcSocket      = sock
           , pcInfo        = infoVar
@@ -1685,6 +1697,7 @@ connectPeer config host port = do
           , pcRecvThread  = Nothing
           , pcNetwork     = pcfgNetwork config
           , pcReadBuffer  = bufRef
+          , pcV2Transport = v2Ref
           }
   case result of
     Left e   -> return $ Left (show e)
@@ -1704,16 +1717,39 @@ disconnectPeer pc = do
 -- Message I/O with Buffered Reads
 --------------------------------------------------------------------------------
 
--- | Send a message to a peer
+-- | Send a message to a peer.
+--
+-- Dispatches on 'pcV2Transport': if the BIP-324 v2 cipher state has been
+-- attached (after a successful v2 handshake), encrypt the message via
+-- 'v2TransportSend' and write the resulting bytes; otherwise fall through
+-- to the v1 framing path (network magic + 24-byte header + payload).
 sendMessage :: PeerConnection -> Message -> IO ()
 sendMessage pc msg = do
-  let magic = netMagic (pcNetwork pc)
-      encoded = encodeMessage magic msg
-  sendAll (pcSocket pc) encoded
-  atomically $ modifyTVar' (pcInfo pc) $ \i ->
-    i { piBytesSent = piBytesSent i + fromIntegral (BS.length encoded)
-      , piMsgsSent = piMsgsSent i + 1
-      }
+  mV2 <- readIORef (pcV2Transport pc)
+  case mV2 of
+    Just transport -> do
+      result <- v2TransportSend transport msg
+      case result of
+        Left err -> do
+          -- Cipher state corruption — disconnect and let the recv side
+          -- surface the error.  We deliberately don't throw because the
+          -- v1 path doesn't either; callers rely on send being best-effort.
+          atomically $ modifyTVar' (pcInfo pc) (\i -> i { piState = PeerDisconnected })
+          putStrLn $ "v2: sendMessage encrypt failed: " ++ err
+        Right encrypted -> do
+          sendAll (pcSocket pc) encrypted
+          atomically $ modifyTVar' (pcInfo pc) $ \i ->
+            i { piBytesSent = piBytesSent i + fromIntegral (BS.length encrypted)
+              , piMsgsSent = piMsgsSent i + 1
+              }
+    Nothing -> do
+      let magic = netMagic (pcNetwork pc)
+          encoded = encodeMessage magic msg
+      sendAll (pcSocket pc) encoded
+      atomically $ modifyTVar' (pcInfo pc) $ \i ->
+        i { piBytesSent = piBytesSent i + fromIntegral (BS.length encoded)
+          , piMsgsSent = piMsgsSent i + 1
+          }
 
 -- | Receive exactly n bytes from the socket, buffering partial reads
 -- Uses a 60-second timeout to detect dead connections
@@ -1739,44 +1775,79 @@ recvExact pc n = do
               writeIORef (pcReadBuffer pc) (BS.append buf chunk)
               recvExact pc n
 
--- | Receive a complete message from a peer
--- Returns Left on error, Right on success
+-- | Receive a complete message from a peer.
+--
+-- Dispatches on 'pcV2Transport': if the BIP-324 v2 cipher state has been
+-- attached, read one encrypted packet (3-byte enc-length || header ||
+-- ciphertext || 16-byte tag) via 'readEncryptedPacket' and decode the
+-- v2 message envelope; otherwise fall through to the v1 framing path
+-- (24-byte header || payload).
+--
+-- Returns 'Left' on error, 'Right' on success.
 receiveMessage :: PeerConnection -> IO (Either String Message)
 receiveMessage pc = do
-  -- Read 24-byte header
-  mHeader <- recvExact pc 24
-  case mHeader of
-    Nothing -> return $ Left "Connection closed"
-    Just headerBytes ->
-      case decodeMessageHeader headerBytes of
-        Left err -> return $ Left $ "Header parse error: " ++ err
-        Right header
-          -- Verify network magic
-          | mhMagic header /= netMagic (pcNetwork pc) ->
-              return $ Left "Wrong network magic"
-          -- Check payload size limit (32 MB)
-          | mhLength header > 32 * 1024 * 1024 ->
-              return $ Left "Payload too large"
+  mV2 <- readIORef (pcV2Transport pc)
+  case mV2 of
+    Just transport -> receiveV2 transport
+    Nothing        -> receiveV1
+  where
+    receiveV1 = do
+      -- Read 24-byte header
+      mHeader <- recvExact pc 24
+      case mHeader of
+        Nothing -> return $ Left "Connection closed"
+        Just headerBytes ->
+          case decodeMessageHeader headerBytes of
+            Left err -> return $ Left $ "Header parse error: " ++ err
+            Right header
+              -- Verify network magic
+              | mhMagic header /= netMagic (pcNetwork pc) ->
+                  return $ Left "Wrong network magic"
+              -- Check payload size limit (32 MB)
+              | mhLength header > 32 * 1024 * 1024 ->
+                  return $ Left "Payload too large"
+              | otherwise -> do
+                  -- Read payload
+                  let payloadLen = fromIntegral (mhLength header)
+                  mPayload <- recvExact pc payloadLen
+                  case mPayload of
+                    Nothing -> return $ Left "Connection closed during payload"
+                    Just payload -> do
+                      -- Verify checksum
+                      let checkBytes = BS.take 4 $ getHash256 $ doubleSHA256 payload
+                          checksumOk = either (const False) (== mhChecksum header)
+                                         (runGet getWord32le checkBytes)
+                      if not checksumOk
+                        then return $ Left "Checksum mismatch"
+                        else do
+                          -- Update stats
+                          atomically $ modifyTVar' (pcInfo pc) $ \i ->
+                            i { piBytesRecv = piBytesRecv i + fromIntegral (24 + payloadLen)
+                              , piMsgsRecv = piMsgsRecv i + 1
+                              }
+                          return $ decodeMessage (mhCommand header) payload
+
+    -- v2 path: read one encrypted packet, skip ignore-flag packets, decode.
+    receiveV2 transport = do
+      -- AAD on app-data packets is empty per BIP-324.  Garbage-auth AAD
+      -- handling is done by the handshake driver, not here.
+      pkt <- readEncryptedPacket pc transport BS.empty
+      case pkt of
+        Left err -> return $ Left $ "v2: " ++ err
+        Right (ignore, contents)
+          | ignore -> do
+              -- Decoy packet — caller asked us for a message, recurse.
+              receiveV2 transport
           | otherwise -> do
-              -- Read payload
-              let payloadLen = fromIntegral (mhLength header)
-              mPayload <- recvExact pc payloadLen
-              case mPayload of
-                Nothing -> return $ Left "Connection closed during payload"
-                Just payload -> do
-                  -- Verify checksum
-                  let checkBytes = BS.take 4 $ getHash256 $ doubleSHA256 payload
-                      checksumOk = either (const False) (== mhChecksum header)
-                                     (runGet getWord32le checkBytes)
-                  if not checksumOk
-                    then return $ Left "Checksum mismatch"
-                    else do
-                      -- Update stats
-                      atomically $ modifyTVar' (pcInfo pc) $ \i ->
-                        i { piBytesRecv = piBytesRecv i + fromIntegral (24 + payloadLen)
-                          , piMsgsRecv = piMsgsRecv i + 1
-                          }
-                      return $ decodeMessage (mhCommand header) payload
+              -- Stats: we only know the wire size approximately
+              -- (length-prefix + header + payload + tag).  Use plaintext
+              -- size + 20 byte fixed overhead as a reasonable approximation.
+              let approxWire = BS.length contents + 20
+              atomically $ modifyTVar' (pcInfo pc) $ \i ->
+                i { piBytesRecv = piBytesRecv i + fromIntegral approxWire
+                  , piMsgsRecv = piMsgsRecv i + 1
+                  }
+              return $ decodeV2Message contents
 
 --------------------------------------------------------------------------------
 -- Transport-Version Classification (BIP-324 vs v1)
@@ -2223,6 +2294,12 @@ data PeerManager = PeerManager
   , pmFailedAddrs        :: !(TVar (Set.Set SockAddr))  -- ^ Addresses that failed to connect
   , pmLastDNSRefresh     :: !(TVar Int64)                -- ^ Last DNS re-discovery timestamp
   , pmOutboundDiversity  :: !OutboundDiversity            -- ^ Netgroup diversity tracker
+  , pmV1OnlyAddrs        :: !(TVar (Set.Set SockAddr))
+                            -- ^ Addresses that failed BIP-324 v2 negotiation;
+                            --   future outbound attempts skip the v2 probe and
+                            --   go straight to v1 (mirrors clearbit's
+                            --   v2_fallback_set).  Soft-capped via 'markV1Only'
+                            --   to prevent unbounded growth.
   }
 
 -- | Configuration for the peer manager
@@ -2310,6 +2387,7 @@ startPeerManager net config handler = do
     <*> newTVarIO Set.empty
     <*> newTVarIO 0
     <*> pure od
+    <*> newTVarIO Set.empty
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -2465,6 +2543,47 @@ tryConnect pm addr = tryConnectWithType pm addr False
 tryConnectBlockRelay :: PeerManager -> SockAddr -> IO ()
 tryConnectBlockRelay pm addr = tryConnectWithType pm addr True
 
+-- | BIP-324 v2 outbound probe deadline.  Bitcoin Core's @net.cpp@ uses
+-- ~30s; we mirror that.  Short enough that a stalled remote doesn't wedge
+-- the maintainOutbound caller for long.
+v2ProbeDeadlineMicros :: Int
+v2ProbeDeadlineMicros = 30 * 1000000
+
+-- | Soft cap on the v1-only fallback set so a hostile peer who churns
+-- many ephemeral source addresses can't OOM us.  Mirrors clearbit's
+-- @V2_FALLBACK_CACHE_MAX@ in spirit.
+v1OnlyCacheMax :: Int
+v1OnlyCacheMax = 1024
+
+-- | Mark @address@ as v1-only so future outbound attempts skip the v2 probe.
+-- Soft-cap enforced via 'v1OnlyCacheMax': when full, drop one
+-- arbitrary entry before inserting (Set's order is implementation-defined,
+-- so the dropped entry is effectively random).
+markV1Only :: PeerManager -> SockAddr -> IO ()
+markV1Only pm addr = atomically $ modifyTVar' (pmV1OnlyAddrs pm) $ \s ->
+  let s1 = if Set.size s >= v1OnlyCacheMax
+             then case Set.minView s of
+                    Nothing       -> s
+                    Just (_, s')  -> s'
+             else s
+  in Set.insert addr s1
+
+-- | Returns 'True' if 'address' is in the v1-only fallback set.
+isV1Only :: PeerManager -> SockAddr -> IO Bool
+isV1Only pm addr = Set.member addr <$> readTVarIO (pmV1OnlyAddrs pm)
+
+-- | Read the @HASKOIN_BIP324_V2_OUTBOUND@ environment variable; v2 outbound
+-- is OFF by default to match the rest of the fleet's roll-out posture.
+-- Treats any value other than @0@/empty/unset as enabled.
+bip324V2OutboundEnabled :: IO Bool
+bip324V2OutboundEnabled = do
+  m <- lookupEnv "HASKOIN_BIP324_V2_OUTBOUND"
+  return $ case m of
+    Nothing -> False
+    Just "" -> False
+    Just "0" -> False
+    Just _  -> True
+
 -- | Internal: connect to a peer with optional block-relay-only mode
 tryConnectWithType :: PeerManager -> SockAddr -> Bool -> IO ()
 tryConnectWithType pm addr blockRelayOnly = do
@@ -2485,42 +2604,133 @@ tryConnectWithType pm addr blockRelayOnly = do
         (host, port) = sockAddrToHostPort addr (netDefaultPort net)
         connLabel = if blockRelayOnly then "block-relay-only" else "full-relay"
 
-    putStrLn $ "tryConnect[" ++ connLabel ++ "]: attempting " ++ host ++ ":" ++ show port
-    result <- connectPeer config host port
-    case result of
+    -- BIP-324: try v2 first when enabled and the address is not in the
+    -- v1-only fall-back set.  v2 garbage is destructive on a v1 peer
+    -- (the bytes look like garbled magic) so on failure we MUST close the
+    -- socket and reconnect for the v1 attempt rather than retrying on the
+    -- same TCP connection.  Mirrors clearbit's connectOutboundNegotiated.
+    -- Both full-relay and block-relay-only outbound attempts try v2 first;
+    -- block-relay semantics (no tx relay, no addr exchange) are orthogonal
+    -- to the transport-layer encryption choice.
+    v2Enabled <- bip324V2OutboundEnabled
+    v1Only    <- isV1Only pm addr
+    let tryV2 = v2Enabled && not v1Only
+    if tryV2
+      then do
+        putStrLn $ "tryConnect[" ++ connLabel ++ "][v2]: attempting " ++ host ++ ":" ++ show port
+        v2res <- attemptV2Outbound pm config blockRelayOnly addr host port
+        case v2res of
+          Just () -> return ()  -- v2 succeeded and the peer is registered
+          Nothing -> do
+            putStrLn $ "tryConnect[" ++ connLabel ++ "][v2->v1]: falling back to v1 for " ++ host
+            attemptV1Outbound pm config blockRelayOnly addr host port
+      else do
+        putStrLn $ "tryConnect[" ++ connLabel ++ "]: attempting " ++ host ++ ":" ++ show port
+        attemptV1Outbound pm config blockRelayOnly addr host port
+
+-- | Attempt a BIP-324 v2 outbound handshake on a fresh socket.  Returns
+-- 'Just ()' if the peer was successfully registered (v2 cipher state
+-- attached, app-version exchanged, peer threads started).  Returns
+-- 'Nothing' on any failure: in that case the socket is already closed and
+-- the address is marked v1-only so the caller falls through to v1.
+--
+-- Wrapped in a single 'timeout' (@v2ProbeDeadlineMicros@) so a stalled
+-- remote can't wedge us indefinitely.
+attemptV2Outbound :: PeerManager -> PeerConfig -> Bool -> SockAddr -> String -> Int -> IO (Maybe ())
+attemptV2Outbound pm config blockRelayOnly addr host port = do
+  let net = pcfgNetwork config
+  mResult <- timeout v2ProbeDeadlineMicros $ do
+    cr <- connectPeer config host port
+    case cr of
       Left err -> do
-        putStrLn $ "tryConnect: connect failed to " ++ host ++ ": " ++ err
-        -- Track this address as failed so we don't keep retrying it
-        atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+        putStrLn $ "v2 outbound: connect failed to " ++ host ++ ": " ++ err
+        return Nothing
       Right pc -> do
-        putStrLn $ "tryConnect: connected to " ++ host ++ ", starting handshake..."
-        hsResult <- performHandshake config pc
-        case hsResult of
+        hsRes <- v2OutboundHandshake pc net
+        case hsRes of
           Left err -> do
-            putStrLn $ "tryConnect: handshake failed with " ++ host ++ ": " ++ err
+            putStrLn $ "v2 outbound handshake failed with " ++ host ++ ": " ++ err
             disconnectPeer pc
-            atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
-          Right ver -> do
-            -- Verify peer supports required services
-            unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+            return Nothing
+          Right transport -> do
+            -- Cipher handshake done.  Attach the transport so subsequent
+            -- 'sendMessage' / 'receiveMessage' use v2 framing+encryption.
+            writeIORef (pcV2Transport pc) (Just transport)
+            -- Run the application version/verack handshake on the encrypted
+            -- transport.  performHandshake calls sendMessage/receiveMessage,
+            -- which now dispatches on pcV2Transport.
+            appRes <- performHandshake config pc
+            case appRes of
+              Left err -> do
+                putStrLn $ "v2 outbound app-handshake failed with " ++ host ++ ": " ++ err
+                disconnectPeer pc
+                return Nothing
+              Right ver -> do
+                if not (hasService (vServices ver) nodeNetwork)
+                  then do
+                    disconnectPeer pc
+                    return Nothing
+                  else do
+                    -- Mark as block-relay-only if requested
+                    when blockRelayOnly $
+                      atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
+                    addOutboundConnection (pmOutboundDiversity pm) addr
+                    atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+                    pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+                    atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+                    -- Only request addresses from full-relay peers (not block-relay-only)
+                    unless blockRelayOnly $
+                      sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+                    putStrLn $ "v2 outbound: connected (encrypted) to " ++ host
+                    return (Just ())
+  case mResult of
+    Just (Just ()) -> return (Just ())
+    _              -> do
+      -- Either timeout or explicit Nothing.  Either way, mark v1-only so
+      -- the next attempt skips the v2 probe.
+      markV1Only pm addr
+      return Nothing
 
-            -- Mark as block-relay-only if requested
-            when blockRelayOnly $
-              atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
+-- | Run a v1 (cleartext-magic-framed) outbound handshake on a fresh socket.
+-- Used both as the explicit v1 path and as the fallback after a failed v2
+-- negotiation.
+attemptV1Outbound :: PeerManager -> PeerConfig -> Bool -> SockAddr -> String -> Int -> IO ()
+attemptV1Outbound pm config blockRelayOnly addr host port = do
+  result <- connectPeer config host port
+  case result of
+    Left err -> do
+      putStrLn $ "tryConnect: connect failed to " ++ host ++ ": " ++ err
+      -- Track this address as failed so we don't keep retrying it
+      atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+    Right pc -> do
+      putStrLn $ "tryConnect: connected to " ++ host ++ ", starting handshake..."
+      hsResult <- performHandshake config pc
+      case hsResult of
+        Left err -> do
+          putStrLn $ "tryConnect: handshake failed with " ++ host ++ ": " ++ err
+          disconnectPeer pc
+          atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+        Right ver -> do
+          -- Verify peer supports required services
+          unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
 
-            -- Track netgroup diversity for outbound connections
-            addOutboundConnection (pmOutboundDiversity pm) addr
+          -- Mark as block-relay-only if requested
+          when blockRelayOnly $
+            atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
 
-            -- Add to peer map
-            atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+          -- Track netgroup diversity for outbound connections
+          addOutboundConnection (pmOutboundDiversity pm) addr
 
-            -- Start peer threads with message handler
-            pc' <- startPeerThreads pc (pmMessageHandler pm addr)
-            atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+          -- Add to peer map
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
 
-            -- Only request addresses from full-relay peers (not block-relay-only)
-            unless blockRelayOnly $
-              sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+          -- Start peer threads with message handler
+          pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+
+          -- Only request addresses from full-relay peers (not block-relay-only)
+          unless blockRelayOnly $
+            sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
 
 -- | Convert SockAddr to host string and port
 sockAddrToHostPort :: SockAddr -> Int -> (String, Int)
@@ -2589,6 +2799,7 @@ startInboundListener pm port = do
       sendQ <- newTBQueueIO 100
       recvQ <- newTBQueueIO 100
       bufRef <- newIORef BS.empty
+      v2Ref  <- newIORef Nothing
       let pc = PeerConnection
             { pcSocket      = sock
             , pcInfo        = infoVar
@@ -2598,6 +2809,7 @@ startInboundListener pm port = do
             , pcRecvThread  = Nothing
             , pcNetwork     = pmNetwork pm
             , pcReadBuffer  = bufRef
+            , pcV2Transport = v2Ref
             }
       -- Perform inbound handshake (receive version first, then send ours)
       let net = pmNetwork pm
@@ -2632,22 +2844,30 @@ startInboundListener pm port = do
               atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
               putStrLn $ "Accepted inbound v1 connection from " ++ show addr
         Just TransportV2 -> do
-          -- BIP-324 v2 inbound handshake.  We currently complete the
-          -- transport handshake, then close the socket: the post-v2
-          -- (encrypted) version exchange is not yet wired through the
-          -- existing send/recv-thread machinery (which assumes v1 framing
-          -- on every read).  This still represents a major step forward
-          -- vs. the previous behaviour of immediately dropping any peer
-          -- that sent an EllSwift pubkey instead of v1 magic.
+          -- BIP-324 v2 inbound handshake.  Once the cipher handshake
+          -- completes we attach the V2Transport to the PeerConnection so
+          -- subsequent 'sendMessage' / 'receiveMessage' use the encrypted
+          -- v2 framing.  performHandshake then drives the application
+          -- version/verack exchange over the encrypted transport.
           hsResult <- v2InboundHandshake pc net
           case hsResult of
             Left err -> do
               putStrLn $ "Inbound v2 handshake failed from " ++ show addr ++ ": " ++ err
               close sock
-            Right _transport -> do
-              putStrLn $ "Inbound v2 handshake completed from " ++ show addr
-                ++ " (encrypted post-handshake send/recv threads not yet wired)"
-              close sock
+            Right transport -> do
+              writeIORef (pcV2Transport pc) (Just transport)
+              appRes <- performHandshake config pc
+              case appRes of
+                Left err -> do
+                  putStrLn $ "Inbound v2 app-handshake failed from " ++ show addr
+                    ++ ": " ++ err
+                  close sock
+                Right _ver -> do
+                  atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+                  pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+                  atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+                  putStrLn $ "Accepted inbound v2 (encrypted) connection from "
+                    ++ show addr
 
 -- | Connect to a peer by host:port string (for addnode RPC)
 addNodeConnect :: PeerManager -> String -> Int -> IO ()
@@ -7948,6 +8168,7 @@ createPeerConnectionFromSocket config sock _host = do
     sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
     recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
     bufRef <- newIORef BS.empty
+    v2Ref  <- newIORef Nothing
     return PeerConnection
       { pcSocket     = sock
       , pcInfo       = infoVar
@@ -7957,6 +8178,7 @@ createPeerConnectionFromSocket config sock _host = do
       , pcRecvThread = Nothing
       , pcNetwork    = pcfgNetwork config
       , pcReadBuffer = bufRef
+      , pcV2Transport = v2Ref
       }
   case result of
     Left e   -> return $ Left (show e)

@@ -71,6 +71,7 @@ import qualified Data.Set as Set
 import qualified Data.Vector.Unboxed as VU
 import Control.Concurrent.STM
 import System.IO.Temp (withSystemTempDirectory)
+import qualified System.Environment as SE
 import Data.Bits (xor, Bits, shiftL)
 import System.FilePath ((</>))
 import Data.Maybe (isJust, listToMaybe)
@@ -9533,6 +9534,68 @@ main = hspec $ do
         case result of
           Left _ -> pure ()
           Right _ -> expectationFailure "expected length validation failure"
+
+    describe "BIP-324 v2 outbound enable + v1-only fallback" $ do
+      it "bip324V2OutboundEnabled is OFF when env var is unset" $ do
+        SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        on <- bip324V2OutboundEnabled
+        on `shouldBe` False
+
+      it "bip324V2OutboundEnabled treats '0' as OFF" $ do
+        SE.setEnv "HASKOIN_BIP324_V2_OUTBOUND" "0"
+        on <- bip324V2OutboundEnabled
+        SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        on `shouldBe` False
+
+      it "bip324V2OutboundEnabled treats '1' as ON" $ do
+        SE.setEnv "HASKOIN_BIP324_V2_OUTBOUND" "1"
+        on <- bip324V2OutboundEnabled
+        SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        on `shouldBe` True
+
+      it "bip324V2OutboundEnabled treats arbitrary non-empty as ON" $ do
+        SE.setEnv "HASKOIN_BIP324_V2_OUTBOUND" "yes"
+        on <- bip324V2OutboundEnabled
+        SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        on `shouldBe` True
+
+      it "markV1Only / isV1Only round-trip on IPv4" $ do
+        pm <- startPeerManager regtest defaultPeerManagerConfig
+                (\_ _ -> return ())
+        let addr = SockAddrInet 8333 0x7f000001  -- 127.0.0.1:8333
+        b0 <- isV1Only pm addr
+        b0 `shouldBe` False
+        markV1Only pm addr
+        b1 <- isV1Only pm addr
+        b1 `shouldBe` True
+        stopPeerManager pm
+
+      it "markV1Only is per-address (does not bleed across distinct addrs)" $ do
+        pm <- startPeerManager regtest defaultPeerManagerConfig
+                (\_ _ -> return ())
+        let a = SockAddrInet 8333 0x7f000001
+            b = SockAddrInet 8333 0x7f000002
+        markV1Only pm a
+        ba <- isV1Only pm a
+        bb <- isV1Only pm b
+        ba `shouldBe` True
+        bb `shouldBe` False
+        stopPeerManager pm
+
+      it "v1-only set is bounded by v1OnlyCacheMax" $ do
+        pm <- startPeerManager regtest defaultPeerManagerConfig
+                (\_ _ -> return ())
+        -- Insert (cacheMax + 50) distinct addresses; size must not exceed cap.
+        let addrs = [ SockAddrInet 8333 (fromIntegral (i :: Int))
+                    | i <- [1 .. v1OnlyCacheMax + 50] ]
+        forM_ addrs (markV1Only pm)
+        s <- atomically $ readTVar (pmV1OnlyAddrs pm)
+        Set.size s `shouldSatisfy` (<= v1OnlyCacheMax)
+        Set.size s `shouldSatisfy` (>= v1OnlyCacheMax - 1)
+        stopPeerManager pm
+
+      it "v2ProbeDeadlineMicros is the documented 30s" $ do
+        v2ProbeDeadlineMicros `shouldBe` (30 * 1000000)
 
   where
     sampleTx = Tx
