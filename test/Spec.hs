@@ -9564,6 +9564,24 @@ main = hspec $ do
         SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
         on `shouldBe` True
 
+      -- The cross-impl interop harness (tools/bip324-interop-matrix.sh,
+      -- wave-bip324-live-core-2026-04-29/run-bc-interop.sh) exports the
+      -- generic HASKOIN_BIP324_V2 alias rather than the long form; we
+      -- accept both so the harness exercises the v2 path without churn.
+      it "bip324V2OutboundEnabled accepts the HASKOIN_BIP324_V2 alias" $ do
+        SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        SE.setEnv "HASKOIN_BIP324_V2" "1"
+        on <- bip324V2OutboundEnabled
+        SE.unsetEnv "HASKOIN_BIP324_V2"
+        on `shouldBe` True
+
+      it "bip324V2OutboundEnabled HASKOIN_BIP324_V2 alias respects '0' as OFF" $ do
+        SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        SE.setEnv "HASKOIN_BIP324_V2" "0"
+        on <- bip324V2OutboundEnabled
+        SE.unsetEnv "HASKOIN_BIP324_V2"
+        on `shouldBe` False
+
       it "markV1Only / isV1Only round-trip on IPv4" $ do
         pm <- startPeerManager regtest defaultPeerManagerConfig
                 (\_ _ -> return ())
