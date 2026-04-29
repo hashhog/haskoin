@@ -2230,14 +2230,20 @@ main = hspec $ do
       hasService flags nodeBloom `shouldBe` False
 
     -- BIP-35 / BIP-37 advertisement parity with Bitcoin Core.
-    it "defaultPeerConfig advertises NODE_BLOOM (BIP-35/BIP-37)" $ do
+    -- Core's DEFAULT_PEERBLOOMFILTERS = false (net_processing.h:44); the
+    -- service flag is opt-in via --peerbloomfilters / pmcPeerBloomFilters.
+    it "defaultPeerConfig does NOT advertise NODE_BLOOM by default" $ do
       let cfg = defaultPeerConfig mainnet
-      hasService (pcfgServices cfg) nodeBloom `shouldBe` True
+      hasService (pcfgServices cfg) nodeBloom `shouldBe` False
       hasService (pcfgServices cfg) nodeNetwork `shouldBe` True
       hasService (pcfgServices cfg) nodeWitness `shouldBe` True
 
-    it "defaultPeerManagerConfig enables peer bloom filters by default" $ do
-      pmcPeerBloomFilters defaultPeerManagerConfig `shouldBe` True
+    it "defaultPeerManagerConfig disables peer bloom filters by default" $ do
+      pmcPeerBloomFilters defaultPeerManagerConfig `shouldBe` False
+
+    it "pmcPeerBloomFilters=True opts in to NODE_BLOOM advertisement" $ do
+      let cfg = defaultPeerManagerConfig { pmcPeerBloomFilters = True }
+      pmcPeerBloomFilters cfg `shouldBe` True
 
   describe "Ping/Pong" $ do
     it "Ping roundtrips correctly" $ do
