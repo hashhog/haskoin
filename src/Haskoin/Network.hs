@@ -1649,13 +1649,14 @@ data PeerConfig = PeerConfig
   } deriving (Show)
 
 -- | Default peer configuration
--- Advertises NODE_NETWORK + NODE_BLOOM + NODE_WITNESS (BIP-37/BIP-35/BIP-141).
--- Bitcoin Core advertises NODE_BLOOM by default; gating is per-runtime via
--- the peer manager (see 'pmcPeerBloomFilters').
+-- Advertises NODE_NETWORK + NODE_WITNESS (BIP-141).  NODE_BLOOM is OFF by
+-- default to match Bitcoin Core's DEFAULT_PEERBLOOMFILTERS = false
+-- (net_processing.h:44); operators can opt-in via 'pmcPeerBloomFilters' /
+-- the --peerbloomfilters CLI flag, which adds nodeBloom at connection time.
 defaultPeerConfig :: Network -> PeerConfig
 defaultPeerConfig net = PeerConfig
   { pcfgNetwork      = net
-  , pcfgServices     = combineServices [nodeNetwork, nodeBloom, nodeWitness]
+  , pcfgServices     = combineServices [nodeNetwork, nodeWitness]
   , pcfgBestHeight   = 0
   , pcfgUserAgent    = userAgent
   , pcfgRelay        = True
@@ -2386,7 +2387,7 @@ data PeerManagerConfig = PeerManagerConfig
   , pmcPingInterval     :: !Int        -- ^ Ping interval in seconds (default 120)
   , pmcConnectTimeout   :: !Int        -- ^ Connection timeout in seconds (default 5)
   , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
-  , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default True)
+  , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default False, matches Core's DEFAULT_PEERBLOOMFILTERS)
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -2401,7 +2402,7 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcPingInterval     = 120      -- 2 minutes
   , pmcConnectTimeout   = 5
   , pmcDataDir          = "."
-  , pmcPeerBloomFilters = True     -- Bitcoin Core default
+  , pmcPeerBloomFilters = False    -- Bitcoin Core default (DEFAULT_PEERBLOOMFILTERS=false, net_processing.h:44)
   }
 
 --------------------------------------------------------------------------------

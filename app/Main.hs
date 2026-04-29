@@ -130,8 +130,8 @@ parseNodeOptions = NodeOptions
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
-  <*> option auto (long "peerbloomfilters" <> value True
-        <> help "Advertise NODE_BLOOM and serve BIP-37/BIP-35 (default: True)")
+  <*> option auto (long "peerbloomfilters" <> value False
+        <> help "Advertise NODE_BLOOM and serve BIP-37/BIP-35 (default: False, matches Core)")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
