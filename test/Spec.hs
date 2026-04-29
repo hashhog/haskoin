@@ -2466,10 +2466,15 @@ main = hspec $ do
     it "decodes sendheaders message" $ do
       decodeMessage "sendheaders" BS.empty `shouldBe` Right MSendHeaders
 
-    it "returns error for unknown command" $ do
+    it "returns MUnknown sentinel for unknown command (BIP-324 forward-compat)" $ do
+      -- Pre-fix: decodeMessage tore down the connection (Left ...).
+      -- Post-fix: decodeMessage returns 'Right (MUnknown cmd)' so the
+      -- recv loop drops the frame without disconnecting the peer.
+      -- See bitcoin-core/src/net.cpp:680-684 + net_processing.cpp:5078.
       case decodeMessage "unknown" BS.empty of
-        Left _ -> return ()
-        Right _ -> expectationFailure "Should reject unknown command"
+        Right (MUnknown "unknown") -> return ()
+        other -> expectationFailure $
+          "Expected Right (MUnknown \"unknown\"), got: " ++ show other
 
   describe "commandName" $ do
     it "returns correct names for all message types" $ do
