@@ -9,6 +9,7 @@
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
+#include <secp256k1_ellswift.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -320,4 +321,66 @@ int haskoin_schnorrsig_verify(
     }
 
     return secp256k1_schnorrsig_verify(ctx, sig64, msg32, 32, &xonly);
+}
+
+/* ---- BIP-324 ElligatorSwift bindings ------------------------------------- */
+
+/*
+ * Lazily-allocated context with VERIFY|SIGN flags for ellswift_create
+ * (which performs a private-key derivation step internally).  Reused for
+ * ellswift_xdh as well, which only needs VERIFY but is fine with both.
+ */
+static secp256k1_context *g_ellswift_ctx = NULL;
+
+static secp256k1_context *get_ellswift_ctx(void) {
+    if (g_ellswift_ctx == NULL) {
+        g_ellswift_ctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+    }
+    return g_ellswift_ctx;
+}
+
+/*
+ * Wrap secp256k1_ellswift_create.  Produces a 64-byte ElligatorSwift-encoded
+ * public key from a 32-byte secret key and 32-byte aux randomness.
+ * Returns 1 on success, 0 on failure.
+ */
+int haskoin_ellswift_create(
+    const unsigned char *seckey32,
+    const unsigned char *auxrnd32,
+    unsigned char *ell64
+) {
+    secp256k1_context *ctx = get_ellswift_ctx();
+    if (!ctx) return 0;
+    return secp256k1_ellswift_create(ctx, ell64, seckey32, auxrnd32);
+}
+
+/*
+ * Wrap secp256k1_ellswift_xdh with the BIP-324 hash function.
+ * Produces a 32-byte shared secret given our seckey and both ellswift pubkeys.
+ *
+ * party = 0 if we are the initiator (ell_a = our pubkey, ell_b = peer pubkey)
+ * party = 1 if we are the responder (ell_a = peer pubkey, ell_b = our pubkey)
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+int haskoin_ellswift_xdh_bip324(
+    const unsigned char *ell_a64,
+    const unsigned char *ell_b64,
+    const unsigned char *seckey32,
+    int party,
+    unsigned char *output32
+) {
+    secp256k1_context *ctx = get_ellswift_ctx();
+    if (!ctx) return 0;
+    return secp256k1_ellswift_xdh(
+        ctx,
+        output32,
+        ell_a64,
+        ell_b64,
+        seckey32,
+        party,
+        secp256k1_ellswift_xdh_hash_function_bip324,
+        NULL
+    );
 }
