@@ -77,6 +77,7 @@ data NodeOptions = NodeOptions
   , noListen     :: !Bool
   , noListenPort :: !Int
   , noMetricsPort :: !Int
+  , noPeerBloomFilters :: !Bool
   } deriving (Show)
 
 data WalletCommand
@@ -129,6 +130,8 @@ parseNodeOptions = NodeOptions
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
+  <*> option auto (long "peerbloomfilters" <> value True
+        <> help "Advertise NODE_BLOOM and serve BIP-37/BIP-35 (default: True)")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -275,6 +278,7 @@ runNode net dataDir NodeOptions{..} = do
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcDataDir     = dataDir
+          , pmcPeerBloomFilters = noPeerBloomFilters
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
@@ -955,6 +959,42 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
   MSendHeaders -> return ()
   MSendCmpct _ -> return ()
   MWtxidRelay -> return ()
+
+  MMemPool -> do
+    -- BIP-35: serve our mempool to the requesting peer.
+    -- Mirrors Bitcoin Core net_processing.cpp NetMsgType::MEMPOOL handler:
+    -- only honour the request if we advertised NODE_BLOOM (per-runtime via
+    -- pmcPeerBloomFilters); otherwise drop and disconnect the peer.
+    pm <- readIORef pmRef
+    let bloomEnabled = pmcPeerBloomFilters (pmConfig pm)
+    if not bloomEnabled
+      then do
+        putStrLn $ "MMemPool from " ++ show addr
+                ++ " but NODE_BLOOM is disabled; disconnecting"
+        peerMap <- readTVarIO (pmPeers pm)
+        case Map.lookup addr peerMap of
+          Just pc -> disconnectPeer pc
+                       `catch` (\(_ :: SomeException) -> return ())
+          Nothing -> return ()
+      else do
+        -- Determine inv type per peer: MSG_WTX (0x40000002) for nodeWitness
+        -- peers, otherwise MSG_TX (1). Bitcoin Core picks per peer state.
+        peerMap <- readTVarIO (pmPeers pm)
+        peerWantsWitness <- case Map.lookup addr peerMap of
+          Just pc -> do
+            info <- readTVarIO (pcInfo pc)
+            return $ hasService (piServices info) nodeWitness
+          Nothing -> return False
+        let invKind = if peerWantsWitness then InvWitnessTx else InvTx
+        txids <- getMempoolTxIds mp
+        let invs   = [ InvVector invKind (getTxIdHash t) | t <- txids ]
+            -- Bitcoin Core MAX_INV_SZ = 50000 entries per inv message.
+            chunks = chunksOf 50000 invs
+        forM_ chunks $ \chunk -> unless (null chunk) $
+          requestFromPeer pm addr (MInv (Inv chunk))
+            `catch` (\(_ :: SomeException) -> return ())
+        putStrLn $ "MMemPool: served " ++ show (length invs)
+                ++ " inv entries to " ++ show addr
 
   _other -> return ()  -- Silently ignore other messages
 
