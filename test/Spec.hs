@@ -9390,6 +9390,150 @@ main = hspec $ do
       mapM_ (\k -> KM.member k skeys `shouldBe` True)
         ["segwit", "taproot", "csv", "bip34", "bip65", "bip66", "testdummy"]
 
+  describe "BIP-324 v2 transport" $ do
+    let mainnetMagic = BS.pack [0xf9, 0xbe, 0xb4, 0xd9]
+
+    describe "detectTransportVersion" $ do
+      it "returns Nothing for fewer than 4 bytes" $ do
+        detectTransportVersion (BS.pack [0xf9, 0xbe, 0xb4]) mainnetMagic
+          `shouldBe` Nothing
+
+      it "classifies a v1 peer (matches network magic)" $ do
+        detectTransportVersion mainnetMagic mainnetMagic
+          `shouldBe` Just TransportV1
+
+      it "classifies a v2 peer (random first 4 bytes != magic)" $ do
+        let randomLooking = BS.pack [0xa1, 0xb2, 0xc3, 0xd4]
+        detectTransportVersion randomLooking mainnetMagic
+          `shouldBe` Just TransportV2
+
+      it "classifies a longer prefix correctly" $ do
+        let prefix = BS.pack [0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72]
+        detectTransportVersion prefix mainnetMagic
+          `shouldBe` Just TransportV1
+        detectTransportVersion (BS.cons 0x00 (BS.tail prefix)) mainnetMagic
+          `shouldBe` Just TransportV2
+
+    describe "FSChaCha20 continuous keystream within an epoch" $ do
+      -- The pre-W90/cb04a1f implementation built a fresh keystream from
+      -- block 0 per crypt() call, so packets 2..N had different (wrong)
+      -- ciphertexts than a continuous-stream cipher.  The fix produces
+      -- a continuous keystream within a rekey epoch.  Below we verify
+      -- that property structurally:
+      --   crypt 3 bytes followed by crypt 3 bytes
+      -- gives the same output bytes as
+      --   crypt 6 bytes
+      -- (exclusive of the chunk-counter bookkeeping, which only affects
+      -- the rekey boundary, not byte ordering within the epoch).
+      let key = BS.replicate 32 0x42
+          cipher0 = newFSChaCha20 key 224
+
+      it "two 3-byte crypts == 6 bytes drawn contiguously from epoch keystream" $ do
+        -- The crypts are XORs against the keystream, so for a zero
+        -- plaintext the ciphertexts ARE the keystream bytes.  If the
+        -- cipher is continuous within an epoch, then crypt(zeros[3]) ++
+        -- crypt(zeros[3]) must equal the contiguous keystream draw of
+        -- 6 bytes via fsCrypt(zeros[6]) on a fresh cipher.
+        let plaintext6 = BS.replicate 6 0x00
+            (cA1, ctA1) = fsCrypt cipher0 (BS.take 3 plaintext6)
+            (_,   ctA2) = fsCrypt cA1     (BS.drop 3 plaintext6)
+            joined      = ctA1 `BS.append` ctA2
+            (_,   ct6)  = fsCrypt cipher0 plaintext6
+        -- The first 3 bytes of a single 6-byte crypt MUST equal the
+        -- first crypt's 3-byte output (this is true for both broken
+        -- and fixed implementations).  But the LAST 3 bytes only
+        -- match if the keystream is continuous — under the broken
+        -- cipher, the second crypt restarts at block 0, producing
+        -- the SAME 3 bytes as the first crypt, not the next 3.
+        BS.take 3 ct6 `shouldBe` ctA1
+        BS.drop 3 ct6 `shouldBe` ctA2
+        joined `shouldBe` ct6
+        -- Sanity: the second 3-byte chunk must NOT equal the first
+        -- (vanishingly unlikely with random keystream).
+        ctA1 `shouldNotBe` ctA2
+
+      it "advances chunk counter and stream position correctly" $ do
+        let (cA, _) = fsCrypt cipher0 (BS.replicate 3 0)
+            (cB, _) = fsCrypt cA      (BS.replicate 3 0)
+        fsc20Counter cA   `shouldBe` 1
+        fsc20Counter cB   `shouldBe` 2
+        fsc20StreamPos cA `shouldBe` 3
+        fsc20StreamPos cB `shouldBe` 6
+
+    describe "FSChaCha20Poly1305 nonce uses (packet || rekey) layout" $ do
+      let key = BS.replicate 32 0x55
+          aead0 = newFSChaCha20Poly1305 key 224
+
+      it "encrypt + decrypt roundtrips with empty AAD" $ do
+        let pt = BS.pack [1, 2, 3, 4, 5]
+            (aead1, ct) = fsEncrypt aead0 BS.empty pt
+            (_, mPt)    = fsDecrypt aead0 BS.empty ct
+        mPt `shouldBe` Just pt
+        fscpCounter aead1 `shouldBe` 1
+
+      it "encrypt then decrypt with the *same* state in lockstep" $ do
+        let pt1 = BS.pack [10, 20]
+            pt2 = BS.pack [30, 40, 50]
+            (a1, ct1) = fsEncrypt aead0 BS.empty pt1
+            (a2, ct2) = fsEncrypt a1   BS.empty pt2
+            (b1, m1)  = fsDecrypt aead0 BS.empty ct1
+            (_,  m2)  = fsDecrypt b1   BS.empty ct2
+        (m1, m2) `shouldBe` (Just pt1, Just pt2)
+        fscpCounter a2 `shouldBe` 2
+
+      it "tag is rejected if AAD differs" $ do
+        let pt = BS.pack [9, 9, 9]
+            (_, ct) = fsEncrypt aead0 (BS.pack [0xaa, 0xbb]) pt
+            (_, m)  = fsDecrypt aead0 (BS.pack [0xaa, 0xbc]) ct
+        m `shouldBe` Nothing
+
+    describe "BIP-324 cipher pair (ECDH via secp256k1_ellswift_xdh)" $ do
+      it "two parties derive the same session id from real ECDH" $ do
+        -- Use deterministic seckeys + entropy so the test is stable.
+        let aSeck = BS.replicate 32 0x11
+            aEnt  = BS.replicate 32 0x22
+            bSeck = BS.replicate 32 0x33
+            bEnt  = BS.replicate 32 0x44
+        cA0 <- newBIP324Cipher aSeck aEnt
+        cB0 <- newBIP324Cipher bSeck bEnt
+        Right cA <- initializeBIP324 cA0 (b324OurPubKey cB0) mainnetMagic True
+        Right cB <- initializeBIP324 cB0 (b324OurPubKey cA0) mainnetMagic False
+        b324SessionId cA `shouldBe` b324SessionId cB
+        BS.length (b324SessionId cA) `shouldBe` 32
+        -- And the two sides' garbage terminators are exchanged:
+        b324SendGarbage cA `shouldBe` b324RecvGarbage cB
+        b324SendGarbage cB `shouldBe` b324RecvGarbage cA
+
+      it "encrypt-decrypt roundtrip across two BIP-324 cipher instances" $ do
+        let aSeck = BS.replicate 32 0x55
+            aEnt  = BS.replicate 32 0x66
+            bSeck = BS.replicate 32 0x77
+            bEnt  = BS.replicate 32 0x88
+        cA0 <- newBIP324Cipher aSeck aEnt
+        cB0 <- newBIP324Cipher bSeck bEnt
+        Right cA <- initializeBIP324 cA0 (b324OurPubKey cB0) mainnetMagic True
+        Right cB <- initializeBIP324 cB0 (b324OurPubKey cA0) mainnetMagic False
+        let plaintext = BS.pack [0x01, 0xde, 0xad, 0xbe, 0xef]
+            Right (_,  packet)         = bip324Encrypt cA plaintext BS.empty False
+        -- Receiver: decrypt length, then payload.  The packet starts with
+        -- 3 encrypted bytes (length), then the AEAD-encrypted body.
+        let (encLen, body) = BS.splitAt 3 packet
+        Right (cB1, len) <- pure $ bip324DecryptLength cB encLen
+        len `shouldBe` fromIntegral (BS.length plaintext)
+        Right (_, ignore, recovered) <- pure $ bip324Decrypt cB1 body BS.empty
+        ignore `shouldBe` False
+        recovered `shouldBe` plaintext
+
+      it "rejects ECDH for invalid (length-mismatched) inputs" $ do
+        result <- ellSwiftXdhBIP324
+                    (EllSwiftPubKey (BS.replicate 63 0x00))   -- 63 != 64
+                    (EllSwiftPubKey (BS.replicate 64 0x00))
+                    (BS.replicate 32 0x01)
+                    True
+        case result of
+          Left _ -> pure ()
+          Right _ -> expectationFailure "expected length validation failure"
+
   where
     sampleTx = Tx
       { txVersion = 1

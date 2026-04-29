@@ -318,8 +318,16 @@ module Haskoin.Network
     -- ** V2/V1 Negotiation
   , TransportVersion(..)
   , detectTransportVersion
+  , peekTransportVersion
   , v2HandshakeInitiator
+  , v2HandshakeInitiatorFinalize
   , v2HandshakeResponder
+  , v2InboundHandshake
+  , v2OutboundHandshake
+  , readEncryptedPacket
+  , writeEncryptedPacket
+  , readGarbageUntilTerminator
+  , ellSwiftXdhBIP324
     -- ** Service Flags
   , nodeP2PV2
     -- * BIP330 Erlay Transaction Reconciliation
@@ -470,10 +478,11 @@ import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr)
 import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
-import Foreign.C.Types (CUInt(..), CSize(..), CInt(..), CChar)
-import Foreign.Marshal.Alloc (mallocBytes, free)
+import Foreign.C.Types (CUInt(..), CSize(..), CInt(..), CChar, CUChar)
+import Foreign.Marshal.Alloc (mallocBytes, free, alloca, allocaBytes)
 import Foreign.Marshal.Array (allocaArray, peekArray, pokeArray)
 import Foreign.Storable (peek, poke)
+import qualified Data.ByteString.Unsafe as BSU
 import Control.Exception (bracket)
 import qualified Data.Map.Strict as Map
 import qualified Data.Vector.Unboxed as VU
@@ -1770,6 +1779,41 @@ receiveMessage pc = do
                       return $ decodeMessage (mhCommand header) payload
 
 --------------------------------------------------------------------------------
+-- Transport-Version Classification (BIP-324 vs v1)
+--------------------------------------------------------------------------------
+
+-- | Encode the @netMagic@ 'Word32' as the 4 little-endian bytes that
+-- actually appear on the wire (matching @putWord32le@ in the
+-- @MessageHeader@ Serialize instance).  This is the form expected by
+-- 'detectTransportVersion' and 'newV2Transport'.
+netMagicBytes :: Network -> ByteString
+netMagicBytes net = runPut (putWord32le (netMagic net))
+
+-- | Peek the first 4 bytes from the wire (using buffered reads in
+-- 'pcReadBuffer' so the bytes remain available to the v1 path) and
+-- classify the connection as v1 or v2.
+--
+-- A v1 peer's first message starts with the 4-byte network magic
+-- (e.g. @0xf9beb4d9@ on mainnet).  A v2 peer's first message is a
+-- 64-byte ElligatorSwift-encoded pubkey, which is computationally
+-- indistinguishable from random (~1 in 2^32 chance of accidentally
+-- matching the magic).  See BIP-324, "Transport version negotiation".
+--
+-- Returns 'Nothing' if the peer closed the connection before sending
+-- 4 bytes.
+peekTransportVersion :: PeerConnection -> IO (Maybe TransportVersion)
+peekTransportVersion pc = do
+  mFirst <- recvExact pc 4
+  case mFirst of
+    Nothing -> return Nothing
+    Just first4 -> do
+      -- Push the bytes back at the head of the read buffer so the
+      -- v1 path's recvExact still sees them.
+      buf <- readIORef (pcReadBuffer pc)
+      writeIORef (pcReadBuffer pc) (first4 `BS.append` buf)
+      return $ detectTransportVersion first4 (netMagicBytes (pcNetwork pc))
+
+--------------------------------------------------------------------------------
 -- Version Handshake
 --------------------------------------------------------------------------------
 
@@ -1891,6 +1935,239 @@ msgTypeName (MGetBlockTxn _) = "getblocktxn"
 msgTypeName (MBlockTxn _)   = "blocktxn"
 msgTypeName MSendAddrV2     = "sendaddrv2"
 msgTypeName (MAddrV2 _)     = "addrv2"
+
+--------------------------------------------------------------------------------
+-- BIP-324 v2 Handshake Driver (responder + initiator)
+--------------------------------------------------------------------------------
+
+-- | Read up to @maxBytes@ bytes from a peer's socket, scanning for a
+-- 16-byte garbage terminator.  Returns @(garbage, remainingBuffer)@ on
+-- success, or 'Nothing' if the peer closed before the terminator was
+-- found within @maxBytes + 16@ bytes.
+--
+-- The terminator may be split across socket reads, so we accumulate
+-- in 'pcReadBuffer' and scan progressively.
+readGarbageUntilTerminator
+  :: PeerConnection
+  -> ByteString    -- ^ Expected 16-byte terminator
+  -> Int           -- ^ Maximum garbage bytes (4095 per BIP-324)
+  -> IO (Maybe ByteString)
+readGarbageUntilTerminator pc terminator maxBytes = loop
+  where
+    termLen = BS.length terminator
+    loop = do
+      buf <- readIORef (pcReadBuffer pc)
+      case findIndex_ buf terminator of
+        Just idx
+          | idx > maxBytes ->
+              return Nothing  -- terminator too far in: peer is misbehaving
+          | otherwise -> do
+              let garbage = BS.take idx buf
+                  rest    = BS.drop (idx + termLen) buf
+              writeIORef (pcReadBuffer pc) rest
+              return (Just garbage)
+        Nothing
+          | BS.length buf > maxBytes + termLen ->
+              return Nothing  -- ran past the cap without seeing the terminator
+          | otherwise -> do
+              -- Pull more bytes from the wire.
+              mChunk <- timeout (60 * 1000000) $
+                (Just <$> recv (pcSocket pc) 4096)
+                  `catch` (\(_ :: IOException) -> return Nothing)
+              case mChunk of
+                Nothing -> return Nothing
+                Just Nothing -> return Nothing
+                Just (Just chunk)
+                  | BS.null chunk -> return Nothing
+                  | otherwise -> do
+                      writeIORef (pcReadBuffer pc) (buf `BS.append` chunk)
+                      loop
+
+-- | Find the first index of needle in haystack, or 'Nothing' if absent.
+-- Uses 'BS.breakSubstring' to keep it O(n) and dependency-free.
+findIndex_ :: ByteString -> ByteString -> Maybe Int
+findIndex_ haystack needle =
+  let (prefix, suffix) = BS.breakSubstring needle haystack
+  in if BS.null suffix then Nothing else Just (BS.length prefix)
+
+-- | After the responder has sent its (pubkey || garbage || terminator) and
+-- the initiator has done the same, both sides exchange a "garbage
+-- authentication" decoy packet (empty plaintext) whose AAD is the
+-- garbage that the receiver previously got from the sender.  This
+-- proves the garbage was not tampered with by a MITM.  We then read
+-- one encrypted "version" packet (also empty payload by default) to
+-- complete the BIP-324 v2 handshake.  Reference: BIP-324 §
+-- "Authentication of garbage" + "Version negotiation".
+readEncryptedPacket
+  :: PeerConnection
+  -> V2Transport
+  -> ByteString   -- ^ AAD for this packet (peer-garbage on first call,
+                  -- empty on subsequent calls per BIP-324)
+  -> IO (Either String (Bool, ByteString))
+                  -- ^ Right (ignoreFlag, plaintextContents) on success
+readEncryptedPacket pc transport aad = do
+  mEnc <- recvExact pc v2LengthLen
+  case mEnc of
+    Nothing -> return $ Left "v2: connection closed reading length"
+    Just encLen -> do
+      cipher <- readTVarIO (v2tCipher transport)
+      case bip324DecryptLength cipher encLen of
+        Left err -> return $ Left err
+        Right (cipher1, len) -> do
+          let payloadLen = fromIntegral len + v2HeaderLen + 16  -- header + payload + tag
+          mPayload <- recvExact pc payloadLen
+          case mPayload of
+            Nothing -> return $ Left "v2: connection closed reading payload"
+            Just payload ->
+              case bip324Decrypt cipher1 payload aad of
+                Left err -> return $ Left err
+                Right (cipher2, ignore, contents) -> do
+                  atomically $ writeTVar (v2tCipher transport) cipher2
+                  return $ Right (ignore, contents)
+
+-- | Send an encrypted packet over the wire.
+writeEncryptedPacket
+  :: PeerConnection
+  -> V2Transport
+  -> ByteString   -- ^ AAD
+  -> ByteString   -- ^ Plaintext contents
+  -> Bool         -- ^ Set the ignore flag?
+  -> IO (Either String ())
+writeEncryptedPacket pc transport aad contents ignore = do
+  cipher <- readTVarIO (v2tCipher transport)
+  case bip324Encrypt cipher contents aad ignore of
+    Left err -> return (Left err)
+    Right (cipher', encrypted) -> do
+      atomically $ writeTVar (v2tCipher transport) cipher'
+      sendAll (pcSocket pc) encrypted
+      return (Right ())
+
+-- | Drive the BIP-324 v2 handshake on the responder (inbound) side.
+--
+-- Wire ordering (responder PoV):
+-- @
+--   <-- their EllSwift pubkey (64 bytes)        -- already detected
+--   --> our  EllSwift pubkey (64) || our garbage || send_terminator (16)
+--   <-- their garbage || recv_terminator (16)
+--   <-- their garbage-auth decoy packet (AAD = our garbage we sent)
+--   --> our  garbage-auth decoy packet (AAD = their garbage we received)
+--   <-- their version packet
+--   --> our  version packet
+-- @
+--
+-- After this returns 'Right', the v2 transport is in app-data state and
+-- ready for normal Bitcoin v1-equivalent message exchange (re-using the
+-- same encryption).
+v2InboundHandshake
+  :: PeerConnection
+  -> Network
+  -> IO (Either String V2Transport)
+v2InboundHandshake pc net = do
+  -- Step 1: read peer's 64-byte EllSwift pubkey.
+  mTheirPub <- recvExact pc 64
+  case mTheirPub of
+    Nothing -> return $ Left "v2: closed reading peer pubkey"
+    Just theirPubBs -> do
+      -- Step 2: build our cipher + our garbage.  Use 32 bytes of garbage
+      -- by default (a small but non-zero amount, well within the 4095
+      -- cap) — the size is opaque to the protocol.
+      seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+      auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+      garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+
+      transport <- newV2Transport seckey auxRnd (netMagicBytes net) False garbage
+      respRes <- v2HandshakeResponder transport (EllSwiftPubKey theirPubBs)
+      case respRes of
+        Left err -> return $ Left ("v2: " ++ err)
+        Right toSend -> do
+          -- Step 3: send our pubkey || garbage || terminator on the wire.
+          sendAll (pcSocket pc) toSend
+
+          -- Step 4: read their garbage up to and including their terminator.
+          cipher <- readTVarIO (v2tCipher transport)
+          let theirTerm = getBIP324RecvGarbageTerminator cipher
+          mGarbage <- readGarbageUntilTerminator pc theirTerm v2MaxGarbageLen
+          case mGarbage of
+            Nothing -> return $ Left "v2: failed to read peer garbage / terminator"
+            Just theirGarbage -> do
+              -- Step 5: read their garbage-authentication decoy packet.
+              -- AAD for this first packet is the garbage they sent us.
+              gaResult <- readEncryptedPacket pc transport theirGarbage
+              case gaResult of
+                Left err -> return $ Left ("v2: garbage-auth recv: " ++ err)
+                Right (_ignore1, _contents1) -> do
+                  -- Step 6: send our garbage-auth decoy packet (empty
+                  -- contents, AAD = our garbage we previously sent).
+                  -- Our garbage was the (toSend - 64 - 16) middle slice.
+                  let ourGarbage = BS.take (BS.length toSend - 64 - 16)
+                                     (BS.drop 64 toSend)
+                  gaSend <- writeEncryptedPacket pc transport ourGarbage BS.empty True
+                  case gaSend of
+                    Left err -> return $ Left ("v2: garbage-auth send: " ++ err)
+                    Right () -> do
+                      -- Step 7: transport is now in app-data state.
+                      atomically $ modifyTVar' (v2tState transport) $ \s ->
+                        s { v2tsRecvState = V2RecvAppData }
+                      return $ Right transport
+
+-- | Drive the BIP-324 v2 handshake on the initiator (outbound) side.
+--
+-- Wire ordering (initiator PoV):
+-- @
+--   --> our   EllSwift pubkey (64) || our  garbage
+--   <-- their EllSwift pubkey (64) || their garbage || their_terminator (16)
+--   --> our  send_terminator (16)
+--   --> our  garbage-auth packet (AAD = our garbage)
+--   <-- their garbage-auth packet (AAD = their garbage)
+--   ... version exchange
+-- @
+v2OutboundHandshake
+  :: PeerConnection
+  -> Network
+  -> IO (Either String V2Transport)
+v2OutboundHandshake pc net = do
+  seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+  auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+  garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+
+  transport <- newV2Transport seckey auxRnd (netMagicBytes net) True garbage
+
+  -- Step 1: send our pubkey + our garbage.
+  initBytes <- v2HandshakeInitiator transport
+  sendAll (pcSocket pc) initBytes
+
+  -- Step 2: read their pubkey (64) and finalize keys.
+  mTheirPub <- recvExact pc 64
+  case mTheirPub of
+    Nothing -> return $ Left "v2: closed reading peer pubkey"
+    Just theirPubBs -> do
+      finRes <- v2HandshakeInitiatorFinalize transport (EllSwiftPubKey theirPubBs)
+      case finRes of
+        Left err -> return $ Left ("v2: " ++ err)
+        Right ourTerm -> do
+          -- Step 3: send our terminator.
+          sendAll (pcSocket pc) ourTerm
+
+          -- Step 4: read their garbage up to their terminator.
+          cipher <- readTVarIO (v2tCipher transport)
+          let theirTerm = getBIP324RecvGarbageTerminator cipher
+          mGarbage <- readGarbageUntilTerminator pc theirTerm v2MaxGarbageLen
+          case mGarbage of
+            Nothing -> return $ Left "v2: failed to read peer garbage / terminator"
+            Just theirGarbage -> do
+              -- Step 5: send our garbage-auth packet (AAD = our garbage).
+              gaSend <- writeEncryptedPacket pc transport garbage BS.empty True
+              case gaSend of
+                Left err -> return $ Left ("v2: garbage-auth send: " ++ err)
+                Right () -> do
+                  -- Step 6: read their garbage-auth packet.
+                  gaRecv <- readEncryptedPacket pc transport theirGarbage
+                  case gaRecv of
+                    Left err -> return $ Left ("v2: garbage-auth recv: " ++ err)
+                    Right (_ignore, _contents) -> do
+                      atomically $ modifyTVar' (v2tState transport) $ \s ->
+                        s { v2tsRecvState = V2RecvAppData }
+                      return $ Right transport
 
 --------------------------------------------------------------------------------
 -- Send/Receive Threads
@@ -2333,16 +2610,44 @@ startInboundListener pm port = do
             , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
             , pcfgQueueSize   = 100
             }
-      hsResult <- performHandshake config pc
-      case hsResult of
-        Left err -> do
-          putStrLn $ "Inbound handshake failed from " ++ show addr ++ ": " ++ err
+
+      -- BIP-324 transport-version classification: peek the first 4 bytes
+      -- and dispatch to v1 (network magic) or v2 (random ElligatorSwift
+      -- pubkey) handshake.  Peeked bytes are pushed back into the read
+      -- buffer so the v1 path's existing 24-byte header read still works.
+      mVer <- peekTransportVersion pc
+      case mVer of
+        Nothing -> do
+          putStrLn $ "Inbound peer " ++ show addr ++ " closed before sending data"
           close sock
-        Right _ver -> do
-          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
-          pc' <- startPeerThreads pc (pmMessageHandler pm addr)
-          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
-          putStrLn $ "Accepted inbound connection from " ++ show addr
+        Just TransportV1 -> do
+          hsResult <- performHandshake config pc
+          case hsResult of
+            Left err -> do
+              putStrLn $ "Inbound v1 handshake failed from " ++ show addr ++ ": " ++ err
+              close sock
+            Right _ver -> do
+              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+              pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+              putStrLn $ "Accepted inbound v1 connection from " ++ show addr
+        Just TransportV2 -> do
+          -- BIP-324 v2 inbound handshake.  We currently complete the
+          -- transport handshake, then close the socket: the post-v2
+          -- (encrypted) version exchange is not yet wired through the
+          -- existing send/recv-thread machinery (which assumes v1 framing
+          -- on every read).  This still represents a major step forward
+          -- vs. the previous behaviour of immediately dropping any peer
+          -- that sent an EllSwift pubkey instead of v1 magic.
+          hsResult <- v2InboundHandshake pc net
+          case hsResult of
+            Left err -> do
+              putStrLn $ "Inbound v2 handshake failed from " ++ show addr ++ ": " ++ err
+              close sock
+            Right _transport -> do
+              putStrLn $ "Inbound v2 handshake completed from " ++ show addr
+                ++ " (encrypted post-handshake send/recv threads not yet wired)"
+              close sock
 
 -- | Connect to a peer by host:port string (for addnode RPC)
 addNodeConnect :: PeerManager -> String -> Int -> IO ()
@@ -4929,27 +5234,80 @@ newtype EllSwiftPubKey = EllSwiftPubKey { getEllSwiftPubKey :: ByteString }
   deriving stock (Show, Eq, Generic)
   deriving newtype (NFData)
 
--- | Create an ElligatorSwift encoded public key from a secret key
--- NOTE: This is a simplified implementation. Full ElligatorSwift requires
--- secp256k1 library support for proper encoding.
--- Reference: Bitcoin Core key.cpp EllSwiftCreate
+-- | FFI: secp256k1_ellswift_create wrapper.
+-- Returns 1 on success, 0 on failure.
+foreign import ccall unsafe "haskoin_ellswift_create"
+  c_ellswift_create :: Ptr CUChar    -- seckey32
+                    -> Ptr CUChar    -- auxrnd32
+                    -> Ptr CUChar    -- ell64 (output)
+                    -> IO CInt
+
+-- | FFI: secp256k1_ellswift_xdh wrapper using BIP-324 hash function.
+-- Returns 1 on success, 0 on failure.
+foreign import ccall unsafe "haskoin_ellswift_xdh_bip324"
+  c_ellswift_xdh_bip324 :: Ptr CUChar  -- ell_a64
+                        -> Ptr CUChar  -- ell_b64
+                        -> Ptr CUChar  -- seckey32
+                        -> CInt        -- party (0=initiator, 1=responder)
+                        -> Ptr CUChar  -- output32 (shared secret)
+                        -> IO CInt
+
+-- | Create an ElligatorSwift encoded public key from a 32-byte secret key
+-- and 32 bytes of auxiliary randomness, calling into libsecp256k1.
+-- Throws 'IOError' if libsecp256k1 reports failure.
+-- Reference: bitcoin-core/src/secp256k1/include/secp256k1_ellswift.h
 ellSwiftCreate :: ByteString -> ByteString -> IO EllSwiftPubKey
-ellSwiftCreate secretKey entropy = do
-  -- In a full implementation, this would use secp256k1_ellswift_create
-  -- For now, we use a deterministic derivation that maintains the security
-  -- property of being indistinguishable from random
-  let combined = BS.append secretKey entropy
-      -- Use HKDF to derive 64 bytes that look random
-      expanded = hkdfSha256 combined "secp256k1_ellswift" 64
-  return $ EllSwiftPubKey expanded
+ellSwiftCreate secretKey entropy
+  | BS.length secretKey /= 32 = ioError (userError "ellSwiftCreate: secretKey must be 32 bytes")
+  | BS.length entropy   /= 32 = ioError (userError "ellSwiftCreate: entropy must be 32 bytes")
+  | otherwise =
+      BSU.unsafeUseAsCString secretKey $ \skPtr ->
+      BSU.unsafeUseAsCString entropy   $ \auxPtr ->
+        allocaBytes 64 $ \outPtr -> do
+          rc <- c_ellswift_create
+                  (castPtr skPtr) (castPtr auxPtr) (castPtr outPtr)
+          if rc /= 1
+            then ioError (userError "ellSwiftCreate: secp256k1_ellswift_create failed")
+            else do
+              bs <- BS.packCStringLen (castPtr outPtr, 64)
+              return (EllSwiftPubKey bs)
 
 -- | Decode an ElligatorSwift public key to a standard compressed public key
--- NOTE: This requires secp256k1 library for proper implementation
+-- NOTE: We do not currently expose secp256k1_ellswift_decode through the C
+-- shim because BIP-324 only requires `xdh`, not `decode`, and adding `decode`
+-- would force a `secp256k1_pubkey` round-trip we don't otherwise need.
 ellSwiftDecode :: EllSwiftPubKey -> Maybe ByteString
-ellSwiftDecode (EllSwiftPubKey _bs) =
-  -- In a full implementation, this would use secp256k1_ellswift_decode
-  -- For now, return Nothing as we cannot properly decode without secp256k1
-  Nothing
+ellSwiftDecode (EllSwiftPubKey _bs) = Nothing
+
+-- | BIP-324 ECDH: derive a 32-byte shared secret from our seckey and both
+-- ElligatorSwift-encoded pubkeys.  party=0 if we are the initiator (ell_a is
+-- our pubkey), party=1 if we are the responder (ell_b is our pubkey).
+-- This uses libsecp256k1's @secp256k1_ellswift_xdh@ with the BIP-324 hash
+-- function to mix the encoded pubkeys into the shared secret.
+ellSwiftXdhBIP324
+  :: EllSwiftPubKey   -- ^ ell_a (initiator side)
+  -> EllSwiftPubKey   -- ^ ell_b (responder side)
+  -> ByteString       -- ^ Our 32-byte secret key
+  -> Bool             -- ^ Are we the initiator?
+  -> IO (Either String ByteString)
+ellSwiftXdhBIP324 (EllSwiftPubKey ellA) (EllSwiftPubKey ellB) seckey initiator
+  | BS.length ellA /= 64    = return (Left "ellSwiftXdhBIP324: ell_a must be 64 bytes")
+  | BS.length ellB /= 64    = return (Left "ellSwiftXdhBIP324: ell_b must be 64 bytes")
+  | BS.length seckey /= 32  = return (Left "ellSwiftXdhBIP324: seckey must be 32 bytes")
+  | otherwise =
+      BSU.unsafeUseAsCString ellA   $ \aPtr  ->
+      BSU.unsafeUseAsCString ellB   $ \bPtr  ->
+      BSU.unsafeUseAsCString seckey $ \skPtr ->
+        allocaBytes 32 $ \outPtr -> do
+          let party = if initiator then 0 else 1
+          rc <- c_ellswift_xdh_bip324
+                  (castPtr aPtr) (castPtr bPtr) (castPtr skPtr)
+                  (fromIntegral (party :: Int)) (castPtr outPtr)
+          if rc /= 1
+            then return (Left "ellSwiftXdhBIP324: secp256k1_ellswift_xdh failed")
+            else do
+              bs <- BS.packCStringLen (castPtr outPtr, 32)
+              return (Right bs)
 
 --------------------------------------------------------------------------------
 -- HKDF-SHA256 Key Derivation (RFC 5869)
@@ -5052,12 +5410,31 @@ deriveV2SessionKeys ecdhSecret netMagic initiator =
 -- FSChaCha20 (Forward-Secure ChaCha20)
 --------------------------------------------------------------------------------
 
--- | Forward-secure ChaCha20 stream cipher with automatic re-keying
--- Reference: Bitcoin Core crypto/chacha20.h FSChaCha20
+-- | Forward-secure ChaCha20 stream cipher with automatic re-keying.
+--
+-- BIP-324 length cipher.  Per BIP-324 \/ Bitcoin Core / ouroboros, the
+-- keystream is __continuous within a rekey epoch__: each crypt() call
+-- consumes the next @input.len@ bytes of a single ChaCha20 keystream
+-- initialised at the start of the epoch.  The per-epoch nonce is
+-- @[0,0,0,0] || LE64(rekey_counter)@ (constant within an epoch); the
+-- ChaCha20 block counter starts at 0 and increments per 64-byte block.
+-- After @rekeyInterval@ crypt() calls, the next 32 bytes of keystream
+-- become the new key, @rekey_counter@ bumps by 1, and the keystream
+-- restarts at block 0 with the new nonce.
+--
+-- The previous implementation incorrectly built a fresh keystream
+-- starting at block 0 per crypt() call, so packet N's first byte was
+-- not the (N*3)th byte of a single epoch keystream.  See clearbit
+-- @cb04a1f3a@ for the equivalent Zig-side fix; this Haskell version
+-- mirrors the same state machine.
 data FSChaCha20 = FSChaCha20
-  { fsc20Key       :: !ByteString   -- ^ Current 32-byte key
-  , fsc20Counter   :: !Word32       -- ^ Message counter (for re-keying)
-  , fsc20RekeyInt  :: !Word32       -- ^ Re-key interval
+  { fsc20Key          :: !ByteString   -- ^ Current 32-byte key
+  , fsc20Counter      :: !Word32       -- ^ Chunk counter (resets at rekey)
+  , fsc20RekeyCounter :: !Word64       -- ^ Rekey epoch counter (nonce[4..12])
+  , fsc20RekeyInt     :: !Word32       -- ^ Re-key interval
+  , fsc20StreamPos    :: !Word64       -- ^ Bytes already consumed in the
+                                       -- current epoch's keystream.  Resets
+                                       -- to 0 on rekey.
   } deriving (Show, Eq, Generic)
 
 instance NFData FSChaCha20
@@ -5065,54 +5442,107 @@ instance NFData FSChaCha20
 -- | Create a new FSChaCha20 cipher
 newFSChaCha20 :: ByteString -> Word32 -> FSChaCha20
 newFSChaCha20 key rekeyInterval = FSChaCha20
-  { fsc20Key      = key
-  , fsc20Counter  = 0
-  , fsc20RekeyInt = rekeyInterval
+  { fsc20Key          = key
+  , fsc20Counter      = 0
+  , fsc20RekeyCounter = 0
+  , fsc20RekeyInt     = rekeyInterval
+  , fsc20StreamPos    = 0
   }
 
--- | Encrypt/decrypt using FSChaCha20 (XOR operation)
--- Returns the new cipher state and the output
+-- | Build the per-epoch ChaCha20 nonce: @[0,0,0,0] || LE64(rekey_counter)@.
+fsc20EpochNonce :: Word64 -> ByteString
+fsc20EpochNonce rkc =
+  let bytes = [ fromIntegral (rkc .&. 0xff)
+              , fromIntegral ((rkc `shiftR`  8) .&. 0xff)
+              , fromIntegral ((rkc `shiftR` 16) .&. 0xff)
+              , fromIntegral ((rkc `shiftR` 24) .&. 0xff)
+              , fromIntegral ((rkc `shiftR` 32) .&. 0xff)
+              , fromIntegral ((rkc `shiftR` 40) .&. 0xff)
+              , fromIntegral ((rkc `shiftR` 48) .&. 0xff)
+              , fromIntegral ((rkc `shiftR` 56) .&. 0xff)
+              ]
+  in BS.pack ([0, 0, 0, 0] ++ bytes)
+
+-- | Pull @nbytes@ of keystream starting at byte position @streamPos@ within
+-- the current epoch.  We use cryptonite's stateful ChaCha 'ChaCha.combine':
+-- 'ChaCha.initialize' starts at block 0, and 'ChaCha.combine' advances the
+-- block counter as it consumes input.  To "seek" to @streamPos@ we discard
+-- @streamPos@ keystream bytes, then take @nbytes@.  Good enough for the
+-- BIP-324 length cipher (3-byte packets) within one epoch (224 packets *
+-- 3 bytes = 672 bytes, well under one block boundary even with discards).
+fsc20DrawKeystream :: ByteString -> Word64 -> Word64 -> Int -> ByteString
+fsc20DrawKeystream key rkc streamPos nbytes =
+  let nonce  = fsc20EpochNonce rkc
+      st0    = ChaCha.initialize 20 key nonce
+      total  = fromIntegral streamPos + nbytes
+      (out, _) = ChaCha.combine st0 (BS.replicate total 0)
+  in BS.drop (fromIntegral streamPos) out
+
+-- | Encrypt/decrypt using FSChaCha20 (XOR with continuous keystream).
+-- Returns the new cipher state and the output.
 fsCrypt :: FSChaCha20 -> ByteString -> (FSChaCha20, ByteString)
 fsCrypt cipher input =
-  let nonce = BS.replicate 12 0  -- Nonce is always zero
-      -- ChaCha20 keystream generation
-      (keystream, _) = chacha20KeyStream (fsc20Key cipher) nonce (BS.length input)
-      output = BS.pack $ BS.zipWith xor input keystream
+  let inLen     = BS.length input
+      keystream = fsc20DrawKeystream (fsc20Key cipher)
+                                     (fsc20RekeyCounter cipher)
+                                     (fsc20StreamPos cipher)
+                                     inLen
+      output    = BS.pack $ BS.zipWith xor input keystream
+      cipher1   = cipher { fsc20StreamPos = fsc20StreamPos cipher + fromIntegral inLen }
 
-      -- Update counter and possibly re-key
-      newCounter = fsc20Counter cipher + 1
-      cipher' = if newCounter == fsc20RekeyInt cipher
-                then rekey cipher
-                else cipher { fsc20Counter = newCounter }
-  in (cipher', output)
+      newCounter = fsc20Counter cipher1 + 1
+      cipher2 = if newCounter == fsc20RekeyInt cipher1
+                then rekey cipher1
+                else cipher1 { fsc20Counter = newCounter }
+  in (cipher2, output)
 
--- | Re-key the FSChaCha20 cipher
+-- | Re-key the FSChaCha20 cipher.  Pulls the next 32 bytes of the current
+-- epoch's keystream as the new key, bumps @rekey_counter@, and resets
+-- chunk counter + stream position so the next chunk begins a fresh
+-- keystream at block 0 under the new nonce.
 rekey :: FSChaCha20 -> FSChaCha20
 rekey cipher =
-  let nonce = BS.replicate 12 0
-      (newKey, _) = chacha20KeyStream (fsc20Key cipher) nonce 32
-  in cipher { fsc20Key = newKey, fsc20Counter = 0 }
+  let newKey = fsc20DrawKeystream (fsc20Key cipher)
+                                  (fsc20RekeyCounter cipher)
+                                  (fsc20StreamPos cipher)
+                                  32
+  in cipher
+       { fsc20Key          = newKey
+       , fsc20Counter      = 0
+       , fsc20RekeyCounter = fsc20RekeyCounter cipher + 1
+       , fsc20StreamPos    = 0
+       }
 
--- | Generate ChaCha20 keystream (simplified implementation)
+-- | Generate raw ChaCha20 keystream (helper, kept for backward-compat with
+-- any external callers).  Uses block counter 0 with the given key+nonce.
 chacha20KeyStream :: ByteString -> ByteString -> Int -> (ByteString, ByteString)
 chacha20KeyStream key nonce len =
-  -- Use cryptonite's ChaCha implementation
   let st = ChaCha.initialize 20 key nonce
-      -- Generate keystream by encrypting zeros
       zeros = BS.replicate len 0
-      (output, st') = ChaCha.combine st zeros
-  in (output, BS.empty)  -- We don't need the state for this use case
+      (output, _) = ChaCha.combine st zeros
+  in (output, BS.empty)
 
 --------------------------------------------------------------------------------
 -- FSChaCha20Poly1305 (Forward-Secure AEAD)
 --------------------------------------------------------------------------------
 
--- | Forward-secure ChaCha20-Poly1305 AEAD
--- Reference: Bitcoin Core crypto/chacha20poly1305.h FSChaCha20Poly1305
+-- | Forward-secure ChaCha20-Poly1305 AEAD.
+--
+-- BIP-324 packet AEAD.  The per-packet nonce is
+-- @LE32(packet_counter) || LE64(rekey_counter)@ (12 bytes total).  After
+-- @rekey_interval@ packets, the new key is derived by ChaCha20-encrypting
+-- 32 zero bytes with key=current key and a special rekey nonce of
+-- @LE32(0xFFFFFFFF) || LE64(rekey_counter)@ at block counter 1.
+-- @packet_counter@ resets to 0 and @rekey_counter@ bumps by 1.
+--
+-- The previous implementation set the high 8 bytes of the nonce to zero
+-- and used a pure ChaCha20 keystream-from-block-0 derivation for rekey,
+-- both incompatible with Bitcoin Core / ouroboros peers.
 data FSChaCha20Poly1305 = FSChaCha20Poly1305
-  { fscpKey       :: !ByteString   -- ^ Current 32-byte key
-  , fscpCounter   :: !Word32       -- ^ Message counter
-  , fscpRekeyInt  :: !Word32       -- ^ Re-key interval
+  { fscpKey          :: !ByteString   -- ^ Current 32-byte key
+  , fscpCounter      :: !Word32       -- ^ Packet counter (nonce[0..4])
+  , fscpRekeyCounter :: !Word64       -- ^ Rekey epoch counter (nonce[4..12])
+  , fscpRekeyInt     :: !Word32       -- ^ Re-key interval
   } deriving (Show, Eq, Generic)
 
 instance NFData FSChaCha20Poly1305
@@ -5120,9 +5550,10 @@ instance NFData FSChaCha20Poly1305
 -- | Create a new FSChaCha20Poly1305 cipher
 newFSChaCha20Poly1305 :: ByteString -> Word32 -> FSChaCha20Poly1305
 newFSChaCha20Poly1305 key rekeyInterval = FSChaCha20Poly1305
-  { fscpKey      = key
-  , fscpCounter  = 0
-  , fscpRekeyInt = rekeyInterval
+  { fscpKey          = key
+  , fscpCounter      = 0
+  , fscpRekeyCounter = 0
+  , fscpRekeyInt     = rekeyInterval
   }
 
 -- | Encrypt with FSChaCha20-Poly1305
@@ -5132,13 +5563,9 @@ fsEncrypt :: FSChaCha20Poly1305
           -> ByteString       -- ^ Plaintext
           -> (FSChaCha20Poly1305, ByteString)
 fsEncrypt cipher aad plaintext =
-  let -- Build nonce from counter (little-endian, 12 bytes)
-      nonce = encodeNonce (fscpCounter cipher)
-
-      -- ChaCha20-Poly1305 AEAD encryption
+  let nonce = fscpBuildNonce (fscpCounter cipher) (fscpRekeyCounter cipher)
       (ciphertext, tag) = chacha20Poly1305Encrypt (fscpKey cipher) nonce aad plaintext
 
-      -- Update counter and possibly re-key
       newCounter = fscpCounter cipher + 1
       cipher' = if newCounter == fscpRekeyInt cipher
                 then rekeyAead cipher
@@ -5156,12 +5583,13 @@ fsDecrypt cipher aad input
   | BS.length input < 16 = (cipher, Nothing)  -- Need at least a tag
   | otherwise =
       let (ciphertext, tag) = BS.splitAt (BS.length input - 16) input
-          nonce = encodeNonce (fscpCounter cipher)
-
-          -- ChaCha20-Poly1305 AEAD decryption
+          nonce = fscpBuildNonce (fscpCounter cipher) (fscpRekeyCounter cipher)
           result = chacha20Poly1305Decrypt (fscpKey cipher) nonce aad ciphertext tag
 
-          -- Update counter and possibly re-key
+          -- Always advance the cipher counter, even on auth failure: the
+          -- packet was attempted and the keystream slot is "burned".  Real
+          -- BIP-324 peers drop the connection on the first auth failure
+          -- anyway, but matching this behaviour avoids divergence in tests.
           newCounter = fscpCounter cipher + 1
           cipher' = if newCounter == fscpRekeyInt cipher
                     then rekeyAead cipher
@@ -5169,25 +5597,48 @@ fsDecrypt cipher aad input
 
       in (cipher', result)
 
--- | Re-key the AEAD cipher
+-- | Re-key the AEAD cipher.  Per Bitcoin Core / clearbit / ouroboros, the
+-- new key is the keystream of a __fresh__ ChaCha20 invocation with key =
+-- current key, nonce = @LE32(0xFFFFFFFF) || LE64(rekey_counter)@, starting
+-- at __block counter 1__ (skipping the Poly1305 OTK derivation block).
 rekeyAead :: FSChaCha20Poly1305 -> FSChaCha20Poly1305
 rekeyAead cipher =
-  let nonce = encodeNonce (fscpCounter cipher)
-      -- Generate new key by encrypting zeros
-      zeros = BS.replicate 32 0
-      (newKey, _) = chacha20Poly1305Encrypt (fscpKey cipher) nonce BS.empty zeros
-      -- Take first 32 bytes as new key
-  in cipher { fscpKey = BS.take 32 newKey, fscpCounter = 0 }
+  let rekeyNonce = fscpBuildNonce 0xFFFFFFFF (fscpRekeyCounter cipher)
+      st0      = ChaCha.initialize 20 (fscpKey cipher) rekeyNonce
+      -- Burn block 0 (Poly1305 key block) by pulling 64 keystream bytes.
+      (_, st1) = ChaCha.combine st0 (BS.replicate 64 0)
+      (newKey, _) = ChaCha.combine st1 (BS.replicate 32 0)
+  in cipher
+       { fscpKey          = newKey
+       , fscpCounter      = 0
+       , fscpRekeyCounter = fscpRekeyCounter cipher + 1
+       }
 
--- | Encode counter as 12-byte little-endian nonce
+-- | Build the FSChaCha20Poly1305 12-byte nonce:
+--   @LE32(packet_counter) || LE64(rekey_counter)@.
+fscpBuildNonce :: Word32 -> Word64 -> ByteString
+fscpBuildNonce pc rkc =
+  let pcBytes = [ fromIntegral (pc .&. 0xff)
+                , fromIntegral ((pc `shiftR`  8) .&. 0xff)
+                , fromIntegral ((pc `shiftR` 16) .&. 0xff)
+                , fromIntegral ((pc `shiftR` 24) .&. 0xff)
+                ]
+      rkBytes = [ fromIntegral (rkc .&. 0xff)
+                , fromIntegral ((rkc `shiftR`  8) .&. 0xff)
+                , fromIntegral ((rkc `shiftR` 16) .&. 0xff)
+                , fromIntegral ((rkc `shiftR` 24) .&. 0xff)
+                , fromIntegral ((rkc `shiftR` 32) .&. 0xff)
+                , fromIntegral ((rkc `shiftR` 40) .&. 0xff)
+                , fromIntegral ((rkc `shiftR` 48) .&. 0xff)
+                , fromIntegral ((rkc `shiftR` 56) .&. 0xff)
+                ]
+  in BS.pack (pcBytes ++ rkBytes)
+
+-- | Encode counter as 12-byte little-endian nonce (legacy helper, retained
+-- for any external caller relying on it).  Equivalent to @fscpBuildNonce
+-- pc 0@.
 encodeNonce :: Word32 -> ByteString
-encodeNonce counter =
-  let bytes = [ fromIntegral (counter .&. 0xff)
-              , fromIntegral ((counter `shiftR` 8) .&. 0xff)
-              , fromIntegral ((counter `shiftR` 16) .&. 0xff)
-              , fromIntegral ((counter `shiftR` 24) .&. 0xff)
-              ]
-  in BS.pack bytes `BS.append` BS.replicate 8 0  -- Pad to 12 bytes
+encodeNonce pc = fscpBuildNonce pc 0
 
 -- | ChaCha20-Poly1305 AEAD encryption
 -- Returns (ciphertext, 16-byte tag)
@@ -5312,38 +5763,45 @@ newBIP324Cipher secretKey entropy = do
     , b324RecvGarbage = BS.empty
     }
 
--- | Initialize the BIP324 cipher after receiving the peer's public key
--- This performs ECDH and derives all session keys
+-- | Initialize the BIP324 cipher after receiving the peer's public key.
+--
+-- This now performs *real* x-only ECDH via libsecp256k1's
+-- @secp256k1_ellswift_xdh@ with the BIP-324 hash function (which mixes the
+-- encoded pubkeys into the shared secret).  Returns 'Left' if libsecp256k1
+-- rejects the inputs (which itself means the peer sent an invalid pubkey
+-- and we should drop the connection).
+--
+-- The original placeholder used HMAC-SHA256(ourSecret, theirPubKey), which
+-- could never interoperate with a real BIP-324 peer.
 initializeBIP324 :: BIP324Cipher
                  -> EllSwiftPubKey  -- ^ Their public key
                  -> ByteString      -- ^ Network magic (4 bytes)
                  -> Bool            -- ^ Are we the initiator?
-                 -> BIP324Cipher
-initializeBIP324 cipher theirPubKey netMagic initiator =
-  let -- Perform ECDH (simplified - needs secp256k1 for real implementation)
-      -- In a real implementation: ecdhSecret = ECDH(ourSecret, theirPubKey)
-      -- For now, use a deterministic derivation
-      ecdhSecret = hmacSha256 (b324SecretKey cipher)
-                              (getEllSwiftPubKey theirPubKey)
-
-      -- Derive session keys
-      sessionKeys = deriveV2SessionKeys ecdhSecret netMagic initiator
-
-      -- Initialize ciphers
-      sendLCipher = newFSChaCha20 (v2skSendLKey sessionKeys) v2RekeyInterval
-      recvLCipher = newFSChaCha20 (v2skRecvLKey sessionKeys) v2RekeyInterval
-      sendPCipher = newFSChaCha20Poly1305 (v2skSendPKey sessionKeys) v2RekeyInterval
-      recvPCipher = newFSChaCha20Poly1305 (v2skRecvPKey sessionKeys) v2RekeyInterval
-
-  in cipher
-       { b324SendLCipher = Just sendLCipher
-       , b324RecvLCipher = Just recvLCipher
-       , b324SendPCipher = Just sendPCipher
-       , b324RecvPCipher = Just recvPCipher
-       , b324SessionId   = v2skSessionId sessionKeys
-       , b324SendGarbage = v2skSendGarbage sessionKeys
-       , b324RecvGarbage = v2skRecvGarbage sessionKeys
-       }
+                 -> IO (Either String BIP324Cipher)
+initializeBIP324 cipher theirPubKey netMagic initiator = do
+  let ourPubKey = b324OurPubKey cipher
+      -- ell_a is the initiator's pubkey, ell_b is the responder's pubkey,
+      -- independent of which side we are running.
+      (ellA, ellB) = if initiator then (ourPubKey, theirPubKey)
+                                  else (theirPubKey, ourPubKey)
+  ecdhResult <- ellSwiftXdhBIP324 ellA ellB (b324SecretKey cipher) initiator
+  case ecdhResult of
+    Left err -> return (Left err)
+    Right ecdhSecret -> do
+      let sessionKeys = deriveV2SessionKeys ecdhSecret netMagic initiator
+          sendLCipher = newFSChaCha20 (v2skSendLKey sessionKeys) v2RekeyInterval
+          recvLCipher = newFSChaCha20 (v2skRecvLKey sessionKeys) v2RekeyInterval
+          sendPCipher = newFSChaCha20Poly1305 (v2skSendPKey sessionKeys) v2RekeyInterval
+          recvPCipher = newFSChaCha20Poly1305 (v2skRecvPKey sessionKeys) v2RekeyInterval
+      return $ Right cipher
+        { b324SendLCipher = Just sendLCipher
+        , b324RecvLCipher = Just recvLCipher
+        , b324SendPCipher = Just sendPCipher
+        , b324RecvPCipher = Just recvPCipher
+        , b324SessionId   = v2skSessionId sessionKeys
+        , b324SendGarbage = v2skSendGarbage sessionKeys
+        , b324RecvGarbage = v2skRecvGarbage sessionKeys
+        }
 
 -- | Encrypt a BIP324 packet
 -- Returns (updated cipher, encrypted packet)
@@ -5626,46 +6084,69 @@ detectTransportVersion firstBytes netMagic
   | BS.take 4 firstBytes == netMagic = Just TransportV1
   | otherwise = Just TransportV2  -- Assume V2 if not V1 magic
 
--- | Initiate V2 handshake (for outbound connections)
--- Returns bytes to send (our EllSwift pubkey + garbage + terminator)
+-- | Initiate V2 handshake (for outbound connections).
+-- Returns bytes to send first: our 64-byte EllSwift pubkey + 0-4095 bytes
+-- of garbage.  The 16-byte garbage terminator is appended later by
+-- 'v2HandshakeInitiatorFinalize' after the peer's pubkey is known.
 v2HandshakeInitiator :: V2Transport -> IO ByteString
 v2HandshakeInitiator transport = do
   cipher <- readTVarIO (v2tCipher transport)
 
-  -- Initialize cipher after we know their key (this is pre-handshake setup)
   let ourPubKey = getEllSwiftPubKey (b324OurPubKey cipher)
       garbage = v2tOurGarbage transport
 
   atomically $ modifyTVar' (v2tState transport) $ \s ->
     s { v2tsSendState = V2SendAwaitingTheirKey }
 
-  -- Return: our pubkey (64 bytes) + garbage (0-4095 bytes)
-  -- The garbage terminator will be appended after we receive their key
   return $ ourPubKey `BS.append` garbage
 
--- | Respond to V2 handshake (for inbound connections)
--- Takes their public key, returns bytes to send
+-- | Finish the initiator side of the BIP-324 handshake by deriving session
+-- keys from the peer's EllSwift pubkey and returning the 16-byte garbage
+-- terminator that should be appended to our garbage on the wire.
+v2HandshakeInitiatorFinalize
+  :: V2Transport
+  -> EllSwiftPubKey   -- ^ Peer's pubkey (received over the wire)
+  -> IO (Either String ByteString)
+v2HandshakeInitiatorFinalize transport theirPubKey = do
+  cipher <- readTVarIO (v2tCipher transport)
+  initRes <- initializeBIP324 cipher theirPubKey (v2tNetMagic transport) True
+  case initRes of
+    Left err -> return (Left err)
+    Right cipher' -> do
+      atomically $ do
+        writeTVar (v2tCipher transport) cipher'
+        modifyTVar' (v2tState transport) $ \s ->
+          s { v2tsSendState = V2SendReady
+            , v2tsRecvState = V2RecvGarbage
+            }
+      return $ Right (getBIP324SendGarbageTerminator cipher')
+
+-- | Respond to V2 handshake (for inbound connections).
+-- Takes their public key, returns bytes to send.
+-- Now returns 'Either String ByteString' because the underlying ECDH
+-- (libsecp256k1 @secp256k1_ellswift_xdh@) can fail if the peer sent an
+-- invalid pubkey.
 v2HandshakeResponder :: V2Transport
                      -> EllSwiftPubKey  -- ^ Their public key
-                     -> IO ByteString
+                     -> IO (Either String ByteString)
 v2HandshakeResponder transport theirPubKey = do
-  -- Initialize the cipher with their key
-  atomically $ do
-    cipher <- readTVar (v2tCipher transport)
-    let cipher' = initializeBIP324 cipher theirPubKey (v2tNetMagic transport) False
-    writeTVar (v2tCipher transport) cipher'
-    modifyTVar' (v2tState transport) $ \s ->
-      s { v2tsSendState = V2SendReady
-        , v2tsRecvState = V2RecvGarbage
-        }
+  cipher <- readTVarIO (v2tCipher transport)
+  initRes <- initializeBIP324 cipher theirPubKey (v2tNetMagic transport) False
+  case initRes of
+    Left err -> return (Left err)
+    Right cipher' -> do
+      atomically $ do
+        writeTVar (v2tCipher transport) cipher'
+        modifyTVar' (v2tState transport) $ \s ->
+          s { v2tsSendState = V2SendReady
+            , v2tsRecvState = V2RecvGarbage
+            }
 
-  cipher' <- readTVarIO (v2tCipher transport)
+      let ourPubKey  = getEllSwiftPubKey (b324OurPubKey cipher')
+          garbage    = v2tOurGarbage transport
+          terminator = getBIP324SendGarbageTerminator cipher'
 
-  let ourPubKey = getEllSwiftPubKey (b324OurPubKey cipher')
-      garbage = v2tOurGarbage transport
-      terminator = getBIP324SendGarbageTerminator cipher'
-
-  return $ ourPubKey `BS.append` garbage `BS.append` terminator
+      return $ Right (ourPubKey `BS.append` garbage `BS.append` terminator)
 
 --------------------------------------------------------------------------------
 -- BIP330 Erlay Transaction Reconciliation (Phase 41)
