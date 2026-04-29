@@ -1404,6 +1404,16 @@ data Message
   | MAncPkgInfo !AncPkgInfo    -- ^ Announce package information
   | MGetPkgTxns !GetPkgTxns    -- ^ Request package transactions
   | MPkgTxns !PkgTxns          -- ^ Package transactions
+    -- BIP-324 forward-compat sentinel.  Per BIP-324 message types reserved
+    -- for future use (short IDs 29-32 in net.cpp:919) and any unrecognised
+    -- 12-byte command MUST be ignored without disconnecting the peer; see
+    -- bitcoin-core/src/net.cpp:680 ("Drop the message but don't disconnect
+    -- the peer.").  We surface them here so the receive loop can skip them
+    -- without tearing down the v1/v2 connection.  The 'ByteString' carries
+    -- the original command (or "v2-id-N" for an unknown short ID) for log
+    -- triage.  Never produced by the encoder — this constructor only flows
+    -- inbound.
+  | MUnknown !ByteString
   deriving (Show, Eq)
 
 -- | Get the command name for a message
@@ -1450,6 +1460,7 @@ commandName (MSendTxRcncl _) = "sendtxrcncl"
 commandName (MAncPkgInfo _) = "ancpkginfo"
 commandName (MGetPkgTxns _) = "getpkgtxns"
 commandName (MPkgTxns _)    = "pkgtxns"
+commandName (MUnknown cmd)  = cmd  -- Inbound-only sentinel; never re-encoded.
 
 -- | Encode message payload
 encodePayload :: Message -> ByteString
@@ -1495,6 +1506,7 @@ encodePayload (MSendTxRcncl s) = encode s
 encodePayload (MAncPkgInfo a)  = encode a
 encodePayload (MGetPkgTxns g)  = encode g
 encodePayload (MPkgTxns p)     = encode p
+encodePayload (MUnknown _)     = BS.empty  -- Inbound-only; never sent.
 
 -- | Encode a complete message with header
 -- Takes network magic and message, returns header + payload bytes
@@ -1557,7 +1569,12 @@ decodeMessage cmd payload = case cmd of
   "ancpkginfo"  -> MAncPkgInfo <$> decode payload
   "getpkgtxns"  -> MGetPkgTxns <$> decode payload
   "pkgtxns"     -> MPkgTxns <$> decode payload
-  _             -> Left $ "Unknown command: " ++ C8.unpack cmd
+  -- Forward-compat: unknown command names are returned as 'MUnknown' so the
+  -- recv loop drops them without disconnecting the peer.  Mirrors Core's
+  -- behaviour at net_processing.cpp:5078 ("Ignore unknown message types
+  -- for extensibility") and net.cpp:680 ("Drop the message but don't
+  -- disconnect the peer.").
+  _             -> Right $ MUnknown cmd
 
 --------------------------------------------------------------------------------
 -- Peer State Types
@@ -1916,29 +1933,38 @@ performHandshake config pc = do
   -- Send our version
   sendMessage pc (MVersion ourVersion)
 
-  -- Receive their version
-  r1 <- receiveMessage pc
-  case r1 of
-    Left err -> return $ Left $ "Handshake failed: " ++ err
-    Right (MVersion theirVersion)
-      -- Validate their version
-      | vVersion theirVersion < minProtocolVersion ->
-          return $ Left "Protocol version too low"
-      -- Check for self-connection
-      | vNonce theirVersion == nonce ->
-          return $ Left "Self-connection detected"
-      | otherwise -> do
-          -- BIP155: Send sendaddrv2 BEFORE verack to signal addrv2 support
-          sendMessage pc MSendAddrV2
-
-          -- Send verack
-          sendMessage pc MVerAck
-
-          -- Handle pre-verack messages (sendaddrv2, etc.)
-          -- Loop until we receive verack
-          continueHandshake pc theirVersion
-
-    Right other -> return $ Left $ "Expected version, got: " ++ msgTypeName other
+  -- Receive their version.  BIP-324 forward-compat (Core net.cpp:680-684,
+  -- "Drop the message but don't disconnect the peer.") means we may
+  -- receive 'MUnknown' frames before "version" if the peer's BIP-324
+  -- short-ID table differs from ours.  Skip them up to a small bound so a
+  -- malicious peer can't keep us blocked indefinitely.  preVersionSkipMax
+  -- chosen to absorb a handful of forward-compat / extension frames
+  -- without admitting a flood.
+  let preVersionSkipMax :: Int
+      preVersionSkipMax = 8
+      recvVersion 0 = return $ Left "Too many pre-version frames"
+      recvVersion n = do
+        r1 <- receiveMessage pc
+        case r1 of
+          Left err -> return $ Left $ "Handshake failed: " ++ err
+          Right (MVersion theirVersion)
+            -- Validate their version
+            | vVersion theirVersion < minProtocolVersion ->
+                return $ Left "Protocol version too low"
+            -- Check for self-connection
+            | vNonce theirVersion == nonce ->
+                return $ Left "Self-connection detected"
+            | otherwise -> do
+                -- BIP155: Send sendaddrv2 BEFORE verack to signal addrv2
+                sendMessage pc MSendAddrV2
+                -- Send verack
+                sendMessage pc MVerAck
+                -- Handle pre-verack messages (sendaddrv2, etc.) until verack
+                continueHandshake pc theirVersion
+          -- Forward-compat: drop the frame, retry for the version.
+          Right (MUnknown _) -> recvVersion (n - 1)
+          Right _other        -> recvVersion (n - 1)
+  recvVersion preVersionSkipMax
 
 -- | Continue handshake after version exchange, handling pre-verack feature messages
 -- BIP155 requires handling sendaddrv2 between version and verack
@@ -2006,6 +2032,25 @@ msgTypeName (MGetBlockTxn _) = "getblocktxn"
 msgTypeName (MBlockTxn _)   = "blocktxn"
 msgTypeName MSendAddrV2     = "sendaddrv2"
 msgTypeName (MAddrV2 _)     = "addrv2"
+msgTypeName MWtxidRelay     = "wtxidrelay"
+msgTypeName (MFilterLoad _) = "filterload"
+msgTypeName (MFilterAdd _)  = "filteradd"
+msgTypeName MFilterClear    = "filterclear"
+msgTypeName (MMerkleBlock _) = "merkleblock"
+msgTypeName (MGetCFilters _) = "getcfilters"
+msgTypeName (MCFilter _)    = "cfilter"
+msgTypeName (MGetCFHeaders _) = "getcfheaders"
+msgTypeName (MCFHeaders _)  = "cfheaders"
+msgTypeName (MGetCFCheckpt _) = "getcfcheckpt"
+msgTypeName (MCFCheckpt _)  = "cfcheckpt"
+msgTypeName (MReqRecon _)   = "reqrecon"
+msgTypeName (MReconcilDiff _) = "reconcildiff"
+msgTypeName (MSketchExt _)  = "sketchext"
+msgTypeName (MSendTxRcncl _) = "sendtxrcncl"
+msgTypeName (MAncPkgInfo _) = "ancpkginfo"
+msgTypeName (MGetPkgTxns _) = "getpkgtxns"
+msgTypeName (MPkgTxns _)    = "pkgtxns"
+msgTypeName (MUnknown cmd)  = "unknown:" ++ C8.unpack cmd
 
 --------------------------------------------------------------------------------
 -- BIP-324 v2 Handshake Driver (responder + initiator)
@@ -2117,18 +2162,22 @@ writeEncryptedPacket pc transport aad contents ignore = do
 --
 -- Wire ordering (responder PoV):
 -- @
---   <-- their EllSwift pubkey (64 bytes)        -- already detected
+--   <-- their EllSwift pubkey (64 bytes)         -- already detected
 --   --> our  EllSwift pubkey (64) || our garbage || send_terminator (16)
 --   <-- their garbage || recv_terminator (16)
---   <-- their garbage-auth decoy packet (AAD = our garbage we sent)
---   --> our  garbage-auth decoy packet (AAD = their garbage we received)
---   <-- their version packet
---   --> our  version packet
+--   <-- their version-negotiation packet (AAD = our garbage we sent)
+--   --> our  version-negotiation packet (AAD = their garbage we received)
+--   ... application-message exchange (Bitcoin VERSION/VERACK/...)
 -- @
 --
 -- After this returns 'Right', the v2 transport is in app-data state and
 -- ready for normal Bitcoin v1-equivalent message exchange (re-using the
 -- same encryption).
+--
+-- Reference: BIP-324 § "Version negotiation"; Bitcoin Core net.cpp lines
+-- 1166-1171 (send VERSION_CONTENTS as the first encrypted packet with
+-- AAD=garbage and ignore=false) + 1247-1268 (responder/initiator advance
+-- out of VERSION state on the first non-decoy packet, contents discarded).
 v2InboundHandshake
   :: PeerConnection
   -> Network
@@ -2161,20 +2210,23 @@ v2InboundHandshake pc net = do
           case mGarbage of
             Nothing -> return $ Left "v2: failed to read peer garbage / terminator"
             Just theirGarbage -> do
-              -- Step 5: read their garbage-authentication decoy packet.
-              -- AAD for this first packet is the garbage they sent us.
-              gaResult <- readEncryptedPacket pc transport theirGarbage
-              case gaResult of
-                Left err -> return $ Left ("v2: garbage-auth recv: " ++ err)
-                Right (_ignore1, _contents1) -> do
-                  -- Step 6: send our garbage-auth decoy packet (empty
-                  -- contents, AAD = our garbage we previously sent).
-                  -- Our garbage was the (toSend - 64 - 16) middle slice.
+              -- Step 5: read their BIP-324 "version" negotiation packet.
+              -- AAD = the garbage they sent us.  Contents discarded per
+              -- BIP-324 § "Version negotiation" (Bitcoin Core net.cpp
+              -- 1252-1254).
+              vnResult <- readEncryptedPacket pc transport theirGarbage
+              case vnResult of
+                Left err -> return $ Left ("v2: version-pkt recv: " ++ err)
+                Right _ -> do
+                  -- Step 6: send our BIP-324 "version" negotiation packet.
+                  -- AAD = the garbage WE sent (the (toSend - 64 - 16)
+                  -- middle slice).  ignore=false so the initiator
+                  -- advances out of VERSION state.  Contents empty.
                   let ourGarbage = BS.take (BS.length toSend - 64 - 16)
                                      (BS.drop 64 toSend)
-                  gaSend <- writeEncryptedPacket pc transport ourGarbage BS.empty True
-                  case gaSend of
-                    Left err -> return $ Left ("v2: garbage-auth send: " ++ err)
+                  vnSend <- writeEncryptedPacket pc transport ourGarbage BS.empty False
+                  case vnSend of
+                    Left err -> return $ Left ("v2: version-pkt send: " ++ err)
                     Right () -> do
                       -- Step 7: transport is now in app-data state.
                       atomically $ modifyTVar' (v2tState transport) $ \s ->
@@ -2188,10 +2240,15 @@ v2InboundHandshake pc net = do
 --   --> our   EllSwift pubkey (64) || our  garbage
 --   <-- their EllSwift pubkey (64) || their garbage || their_terminator (16)
 --   --> our  send_terminator (16)
---   --> our  garbage-auth packet (AAD = our garbage)
---   <-- their garbage-auth packet (AAD = their garbage)
---   ... version exchange
+--   --> our  version-negotiation packet (AAD = our garbage)
+--   <-- their version-negotiation packet (AAD = their garbage)
+--   ... application-message exchange (Bitcoin VERSION/VERACK/...)
 -- @
+--
+-- Reference: BIP-324 § "Version negotiation"; Bitcoin Core net.cpp lines
+-- 1166-1171 (initiator buffers VERSION_CONTENTS with AAD=garbage and
+-- ignore=false alongside the terminator) + 1247-1268 (peer advances out of
+-- VERSION state on the first non-decoy packet, contents discarded).
 v2OutboundHandshake
   :: PeerConnection
   -> Network
@@ -2226,16 +2283,29 @@ v2OutboundHandshake pc net = do
           case mGarbage of
             Nothing -> return $ Left "v2: failed to read peer garbage / terminator"
             Just theirGarbage -> do
-              -- Step 5: send our garbage-auth packet (AAD = our garbage).
-              gaSend <- writeEncryptedPacket pc transport garbage BS.empty True
-              case gaSend of
-                Left err -> return $ Left ("v2: garbage-auth send: " ++ err)
+              -- Step 5: send our BIP-324 "version" negotiation packet.
+              -- This is the FIRST encrypted packet from us, so AAD = our
+              -- garbage; ignore=false so the responder advances out of
+              -- VERSION state into APP.  Contents are empty per the spec
+              -- (Bitcoin Core net.cpp:1166-1171: VERSION_CONTENTS = {}).
+              -- Reference: BIP-324 § "Version negotiation".  This must NOT
+              -- be a decoy (ignore=true) — that would leave the responder
+              -- stuck in VERSION state and cause subsequent application
+              -- messages to be silently consumed as the version-pkt
+              -- placeholder rather than parsed (BC's net.cpp:1247-1268).
+              vnSend <- writeEncryptedPacket pc transport garbage BS.empty False
+              case vnSend of
+                Left err -> return $ Left ("v2: version-pkt send: " ++ err)
                 Right () -> do
-                  -- Step 6: read their garbage-auth packet.
-                  gaRecv <- readEncryptedPacket pc transport theirGarbage
-                  case gaRecv of
-                    Left err -> return $ Left ("v2: garbage-auth recv: " ++ err)
-                    Right (_ignore, _contents) -> do
+                  -- Step 6: read their BIP-324 "version" negotiation packet.
+                  -- AAD = the garbage they sent us; ignore is informational
+                  -- (BC sends ignore=false but we accept either).  Contents
+                  -- discarded — matches BC's "the contents is ignored, but
+                  -- can be used for future extensions" (net.cpp:1252-1254).
+                  vnRecv <- readEncryptedPacket pc transport theirGarbage
+                  case vnRecv of
+                    Left err -> return $ Left ("v2: version-pkt recv: " ++ err)
+                    Right _ -> do
                       atomically $ modifyTVar' (v2tState transport) $ \s ->
                         s { v2tsRecvState = V2RecvAppData }
                       return $ Right transport
@@ -2572,17 +2642,21 @@ markV1Only pm addr = atomically $ modifyTVar' (pmV1OnlyAddrs pm) $ \s ->
 isV1Only :: PeerManager -> SockAddr -> IO Bool
 isV1Only pm addr = Set.member addr <$> readTVarIO (pmV1OnlyAddrs pm)
 
--- | Read the @HASKOIN_BIP324_V2_OUTBOUND@ environment variable; v2 outbound
--- is OFF by default to match the rest of the fleet's roll-out posture.
--- Treats any value other than @0@/empty/unset as enabled.
+-- | Read the @HASKOIN_BIP324_V2_OUTBOUND@ or generic @HASKOIN_BIP324_V2@
+-- environment variable; v2 outbound is OFF by default to match the rest of
+-- the fleet's roll-out posture.  Treats any value other than @0@/empty/
+-- unset as enabled on either name; the generic @HASKOIN_BIP324_V2@ is the
+-- convention used by the cross-impl interop harness
+-- (@tools/bip324-interop-matrix.sh@), so accepting both keeps the live
+-- interop test wired without forcing harness churn.
 bip324V2OutboundEnabled :: IO Bool
 bip324V2OutboundEnabled = do
-  m <- lookupEnv "HASKOIN_BIP324_V2_OUTBOUND"
-  return $ case m of
-    Nothing -> False
-    Just "" -> False
-    Just "0" -> False
-    Just _  -> True
+  m1 <- lookupEnv "HASKOIN_BIP324_V2_OUTBOUND"
+  m2 <- lookupEnv "HASKOIN_BIP324_V2"
+  return $ enabled m1 || enabled m2
+  where
+    enabled (Just s) | s /= "" && s /= "0" = True
+    enabled _                              = False
 
 -- | Internal: connect to a peer with optional block-relay-only mode
 tryConnectWithType :: PeerManager -> SockAddr -> Bool -> IO ()
@@ -5397,9 +5471,9 @@ nodeP2PV2 = ServiceFlag (1 `shiftL` 11)
 -- | Short message ID (1 byte instead of 12 byte ASCII command)
 type V2MessageId = Word8
 
--- | V2 short message IDs
--- Index 0 means use 12-byte ASCII command (fallback)
--- Reference: Bitcoin Core net.cpp V2_MESSAGE_IDS
+-- | V2 short message IDs (BIP-324 spec range, 1..28).
+-- Index 0 means use 12-byte ASCII command (fallback).
+-- Reference: Bitcoin Core net.cpp V2_MESSAGE_IDS (constexpr array of 33).
 v2MessageIds :: [(V2MessageId, ByteString)]
 v2MessageIds =
   [ (0,  "")           -- 12 bytes follow for message type (like V1)
@@ -5431,18 +5505,52 @@ v2MessageIds =
   , (26, "getcfcheckpt")
   , (27, "cfcheckpt")
   , (28, "addrv2")
-  -- 29-32 reserved for future use
+  -- 29-32 reserved for future use per BIP-324; do NOT add encoder mappings
+  -- for these — see 'decodeShortMsgId' for the de-facto interop table.
   ]
 
--- | Get short message ID for a command name
--- Returns Nothing if the command requires 12-byte encoding
+-- | De-facto extended decoder mapping for short IDs that several hashhog
+-- impls (blockbrew, nimrod, beamchain, ouroboros) emit on the wire even
+-- though BIP-324 marks 0x1d-0x22 as "reserved for future use".  These
+-- impls reuse those IDs for messages that the spec requires to be sent
+-- via the long (12-byte) encoding.  We accept them on input only — the
+-- haskoin encoder still uses the canonical long form for these messages
+-- so our outbound traffic stays spec-compliant for strict v2 peers.
+--
+-- Pre-fix evidence: the BIP-324 v2 interop matrix at
+-- wave-bip324-interop-rerun-2026-04-29/MATRIX.md shows the haskoin column
+-- with five `no-conn` outcomes (blockbrew, nimrod, beamchain, ouroboros,
+-- lunarblock as src).  Reproduction with blockbrew→haskoin yielded the
+-- haskoin log line: "Inbound v2 app-handshake failed from 127.0.0.1:NNNNN:
+-- Handshake failed: Unknown short message ID: 32" — i.e. blockbrew's
+-- "version"=0x20 mapping (internal/p2p/bip324.go:344).
+v2ExtendedDecodeIds :: [(V2MessageId, ByteString)]
+v2ExtendedDecodeIds =
+  [ (0x1d, "wtxidrelay")
+  , (0x1e, "sendaddrv2")
+  , (0x1f, "sendheaders")
+  , (0x20, "version")
+  , (0x21, "verack")
+  , (0x22, "getaddr")
+  ]
+
+-- | Get short message ID for a command name (encoder direction).
+-- Returns 'Nothing' if the command requires 12-byte encoding.  Only the
+-- BIP-324 spec range 1..28 is used here; haskoin never emits the de-facto
+-- IDs from 'v2ExtendedDecodeIds' on the wire.
 shortMsgId :: ByteString -> Maybe V2MessageId
 shortMsgId cmd = lookup cmd [(c, i) | (i, c) <- v2MessageIds, not (BS.null c)]
 
--- | Get command name from short message ID
--- Returns Nothing for unknown IDs
+-- | Get command name from short message ID (decoder direction).
+-- Tries the BIP-324 spec range first, then falls back to the de-facto
+-- extended mapping used by other hashhog impls.  Returns 'Nothing' for
+-- IDs that are still unknown after both lookups; the caller is expected
+-- to emit 'MUnknown' rather than disconnect the peer (forward-compat).
 shortMsgIdToCommand :: V2MessageId -> Maybe ByteString
-shortMsgIdToCommand mid = lookup mid v2MessageIds
+shortMsgIdToCommand mid =
+  case lookup mid v2MessageIds of
+    Just c | not (BS.null c) -> Just c
+    _                        -> lookup mid v2ExtendedDecodeIds
 
 --------------------------------------------------------------------------------
 -- ElligatorSwift Encoding (BIP324)
@@ -6278,9 +6386,14 @@ decodeV2Message contents
               else let cmd = BS.takeWhile (/= 0) (BS.take 12 rest)
                        payload = BS.drop 12 rest
                    in decodeMessage cmd payload
-         -- Short encoding: firstByte is the message ID
+         -- Short encoding: firstByte is the message ID.  Unknown IDs
+         -- (outside both the BIP-324 spec range 1..28 and the de-facto
+         -- 0x1d..0x22 interop mapping) are surfaced as 'MUnknown' so the
+         -- recv loop drops the message without disconnecting the peer.
+         -- Mirrors Core net.cpp:1426-1428 + net.cpp:680-684.
          else case shortMsgIdToCommand firstByte of
-                Nothing -> Left $ "Unknown short message ID: " ++ show firstByte
+                Nothing  -> Right $ MUnknown
+                              (C8.pack ("v2-id-" ++ show firstByte))
                 Just cmd -> decodeMessage cmd rest
 
 --------------------------------------------------------------------------------
