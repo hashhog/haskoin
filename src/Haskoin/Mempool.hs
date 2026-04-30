@@ -153,6 +153,7 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
+import qualified Haskoin.Policy.Standard as Std
 
 --------------------------------------------------------------------------------
 -- Fee Rate
@@ -268,6 +269,8 @@ data MempoolError
   | ErrEphemeralViolation !EphemeralError          -- ^ Ephemeral anchor policy violation
   -- Cluster size limit errors
   | ErrClusterLimitExceeded !Int !Int              -- ^ (actual_size, max_size)
+  -- Relay-policy / standardness (Bitcoin Core IsStandardTx)
+  | ErrNonStandard !String                         -- ^ short reason tag (e.g. "tx-size", "scriptpubkey")
   deriving (Show, Eq, Generic)
 
 instance NFData MempoolError
@@ -486,18 +489,27 @@ addTransactionInner mp tx txid = do
   -- 2. Basic context-free validation
   case validateTransaction tx of
     Left err -> return $ Left (ErrValidationFailed err)
-    Right () -> do
+    Right () ->
+      -- 2b. Relay-policy standardness gate (Bitcoin Core IsStandardTx).
+      -- Mirrors policy/policy.cpp:IsStandardTx — version bounds, weight
+      -- cap (MAX_STANDARD_TX_WEIGHT=400_000), pushOnly scriptSigs,
+      -- standard scriptPubKeys, OP_RETURN budget, dust limit.
+      -- Failures are policy, not consensus, so we tag them with
+      -- 'ErrNonStandard <reason>' for parity with Core's RPC errors.
+      case Std.checkStandardTx tx of
+        Left stdErr -> return $ Left (ErrNonStandard (renderStdReason stdErr))
+        Right () -> do
 
-      -- 3. Check for conflicts first (before resolving inputs)
-      conflicts <- getConflicts mp tx
+          -- 3. Check for conflicts first (before resolving inputs)
+          conflicts <- getConflicts mp tx
 
-      if null conflicts
-        -- No conflicts: proceed with normal addition
-        then addTransactionNoConflicts mp tx txid
-        -- Has conflicts: attempt RBF replacement
-        else if mpcRBFEnabled (mpConfig mp)
-          then addTransactionWithReplacement mp tx txid conflicts
-          else return $ Left (ErrInputSpentInMempool (head conflicts))
+          if null conflicts
+            -- No conflicts: proceed with normal addition
+            then addTransactionNoConflicts mp tx txid
+            -- Has conflicts: attempt RBF replacement
+            else if mpcRBFEnabled (mpConfig mp)
+              then addTransactionWithReplacement mp tx txid conflicts
+              else return $ Left (ErrInputSpentInMempool (head conflicts))
 
 -- | Add a transaction with no conflicts (normal case)
 addTransactionNoConflicts :: Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
@@ -2685,3 +2697,24 @@ evictEphemeralParent mp childTxId = do
                 -- If no other children spend the ephemeral, evict parent
                 when (null otherSpenders) $
                   removeTransaction mp parentTxId
+
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+-- | Render an Haskoin.Policy.Standard.StandardError as a Bitcoin Core
+-- IsStandardTx reason tag (e.g. "tx-size", "scriptpubkey", "dust").
+-- These tags appear in Core's RPC error messages and are useful for
+-- cross-impl test compatibility.
+renderStdReason :: Std.StandardError -> String
+renderStdReason e = case e of
+  Std.StdBadVersion {}           -> "version"
+  Std.StdTxWeight {}             -> "tx-size"
+  Std.StdNonWitnessTooSmall {}   -> "tx-size-small"
+  Std.StdScriptSigSize {}        -> "scriptsig-size"
+  Std.StdScriptSigNotPushOnly {} -> "scriptsig-not-pushonly"
+  Std.StdScriptPubKey {}         -> "scriptpubkey"
+  Std.StdDataCarrierTooLarge {}  -> "datacarrier"
+  Std.StdMultipleOpReturns {}    -> "multi-op-return"
+  Std.StdBareMultisig            -> "bare-multisig"
+  Std.StdDust {}                 -> "dust"

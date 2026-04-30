@@ -13,6 +13,7 @@ library
                  , Haskoin.Network
                  , Haskoin.Sync
                  , Haskoin.Mempool
+                 , Haskoin.Policy.Standard
                  , Haskoin.FeeEstimator
                  , Haskoin.BlockTemplate
                  , Haskoin.Rpc
