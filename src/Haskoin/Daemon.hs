@@ -59,6 +59,12 @@ module Haskoin.Daemon
     -- * Health endpoint
   , healthApp
   , runHealthServer
+    -- * systemd sd_notify
+  , sdNotify
+  , sdNotifyReady
+  , sdNotifyStopping
+  , sdNotifyStatus
+  , sdNotifyWatchdog
   ) where
 
 import Control.Concurrent (ThreadId, forkIO)
@@ -69,11 +75,15 @@ import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (dropWhileEnd)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import qualified Network.HTTP.Types as HTTP
+import qualified Network.Socket as Sock
+import qualified Network.Socket.ByteString as SockBS
 import qualified Network.Wai as Wai
 import qualified Network.Wai.Handler.Warp as Warp
 import System.Directory (doesFileExist, removeFile)
+import System.Environment (lookupEnv)
 import System.IO
   ( BufferMode(..)
   , Handle
@@ -553,3 +563,94 @@ runHealthServer port = do
   return (Just tid)
 
 
+--------------------------------------------------------------------------------
+-- systemd sd_notify
+--------------------------------------------------------------------------------
+--
+-- The sd_notify protocol is a one-way write to a Unix-domain DGRAM
+-- socket whose path is published in the @NOTIFY_SOCKET@ environment
+-- variable. We deliberately do NOT depend on any libsystemd / libsd
+-- binding: every message is a plain ASCII line, and the OS socket
+-- API in @network@ is enough to deliver it.
+--
+-- Reference: @man 3 sd_notify@ and Bitcoin Core's
+-- @src\/util\/syscall_sandbox.cpp@ (which calls @sd_notify@ via the
+-- libsystemd-shim include path). We mirror the four messages haskoin
+-- actually needs:
+--
+-- * @READY=1@        — sent once the node finishes initial setup.
+-- * @STOPPING=1@     — sent at the top of graceful shutdown.
+-- * @STATUS=<text>@  — short human-readable status (height etc.).
+-- * @WATCHDOG=1@     — keep-alive ping for @WatchdogSec=@ units.
+--
+-- All functions are no-ops when @NOTIFY_SOCKET@ is unset (the common
+-- case for non-systemd launches), and silently swallow socket errors
+-- so a misconfigured supervisor never crashes the node.
+
+-- | Address-family decoder for @NOTIFY_SOCKET@. systemd accepts:
+--
+-- * Absolute paths beginning with @\/@ (Unix path namespace).
+-- * Strings beginning with @\@@ (Linux abstract namespace; the
+--   leading @\@@ is replaced by NUL on the wire).
+--
+-- See @sd_notify(3)@. Other formats are unsupported.
+notifySocketAddr :: String -> Maybe Sock.SockAddr
+notifySocketAddr s = case s of
+  ('/':_)  -> Just (Sock.SockAddrUnix s)
+  ('@':rs) -> Just (Sock.SockAddrUnix ('\0' : rs))
+  _        -> Nothing
+
+-- | Send a raw notification payload (e.g. @\"READY=1\\n\"@,
+-- @\"STATUS=Synced to 947000\\nWATCHDOG=1\\n\"@) to systemd via the
+-- @NOTIFY_SOCKET@ datagram socket. No-op if the env var is unset
+-- or the socket is unreachable; never raises.
+--
+-- Multiple variables can be packed into one call by separating them
+-- with @\\n@ in the payload (matches @sd_notify@ semantics).
+sdNotify :: String -> IO ()
+sdNotify msg = do
+  mEnv <- lookupEnv "NOTIFY_SOCKET"
+  case mEnv >>= notifySocketAddr of
+    Nothing   -> return ()
+    Just addr -> sendOne addr `catch` swallow
+  where
+    swallow :: SomeException -> IO ()
+    swallow _ = return ()
+
+    sendOne addr = bracket
+      (Sock.socket Sock.AF_UNIX Sock.Datagram 0)
+      (\s -> Sock.close s `catch` swallow)
+      (\s -> do
+        Sock.connect s addr
+        -- Use sendAll: sd_notify lets the kernel atomically deliver
+        -- the whole datagram or fail. EAGAIN/EWOULDBLOCK on a full
+        -- queue is rare for sub-128B notifications.
+        SockBS.sendAll s (BS8.pack msg))
+
+-- | Notify systemd that startup has completed. Equivalent to
+-- @sd_notify(0, "READY=1")@. Call this once, after the node is
+-- accepting RPC and P2P traffic.
+sdNotifyReady :: IO ()
+sdNotifyReady = sdNotify "READY=1\n"
+
+-- | Notify systemd that graceful shutdown has begun. Equivalent to
+-- @sd_notify(0, "STOPPING=1")@. Call this from the SIGINT/SIGTERM
+-- shutdown path BEFORE long flushes — systemd uses it to extend
+-- @TimeoutStopSec=@.
+sdNotifyStopping :: IO ()
+sdNotifyStopping = sdNotify "STOPPING=1\n"
+
+-- | Send a free-form status string to systemd. Shows up in
+-- @systemctl status haskoin@ output. Newlines in @s@ are stripped
+-- so the wire format stays single-line.
+sdNotifyStatus :: String -> IO ()
+sdNotifyStatus s =
+  let cleaned = filter (\c -> c /= '\n' && c /= '\r') s
+  in sdNotify ("STATUS=" ++ cleaned ++ "\n")
+
+-- | Send a watchdog keep-alive. Required when the unit file sets
+-- @WatchdogSec=@; if the daemon goes silent for longer than that
+-- interval, systemd will SIGABRT it. Call from a background thread
+-- at half the watchdog interval.
+sdNotifyWatchdog :: IO ()
+sdNotifyWatchdog = sdNotify "WATCHDOG=1\n"

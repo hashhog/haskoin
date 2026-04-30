@@ -80,6 +80,10 @@ import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Directory as Dir
 import Control.Exception (catch, SomeException)
 import qualified System.Environment as SE
+import System.Environment (lookupEnv, setEnv, unsetEnv)
+import qualified Network.Socket as NS
+import qualified Network.Socket.ByteString as NSBS
+import qualified Data.ByteString.Char8 as BS8
 import Data.Bits (xor, Bits, shiftL)
 import System.FilePath ((</>))
 import Data.Maybe (isJust, listToMaybe)
@@ -10208,6 +10212,53 @@ main = hspec $ do
         Daemon.removePidFile path  -- still should not throw
         exists <- Dir.doesFileExist path
         exists `shouldBe` False
+
+  describe "Haskoin.Daemon: sd_notify (systemd)" $ do
+    it "sdNotify is a silent no-op when NOTIFY_SOCKET is unset" $ do
+      -- Save and unset the env var so the test is deterministic.
+      original <- lookupEnv "NOTIFY_SOCKET"
+      unsetEnv "NOTIFY_SOCKET"
+      Daemon.sdNotifyReady       -- must not throw
+      Daemon.sdNotifyStopping
+      Daemon.sdNotifyWatchdog
+      Daemon.sdNotifyStatus "Synced to height 947000"
+      Daemon.sdNotify "BLOB=anything goes\n"
+      -- Restore (best-effort) so other tests aren't disturbed.
+      forM_ original $ \v -> setEnv "NOTIFY_SOCKET" v
+      True `shouldBe` True
+    it "sdNotify delivers READY=1 to a real Unix DGRAM socket" $
+      withSystemTempDirectory "haskoin-sdnotify" $ \dir -> do
+        let path = dir </> "notify.sock"
+        sock <- NS.socket NS.AF_UNIX NS.Datagram 0
+        NS.bind sock (NS.SockAddrUnix path)
+        original <- lookupEnv "NOTIFY_SOCKET"
+        setEnv "NOTIFY_SOCKET" path
+        -- Fire READY=1 from the daemon helper.
+        Daemon.sdNotifyReady
+        -- Receive the datagram (1KB is plenty for a sd_notify line).
+        bytes <- NSBS.recv sock 1024
+        BS8.unpack bytes `shouldBe` "READY=1\n"
+        -- Cleanup.
+        NS.close sock
+        case original of
+          Just v  -> setEnv "NOTIFY_SOCKET" v
+          Nothing -> unsetEnv "NOTIFY_SOCKET"
+    it "sdNotifyStatus strips embedded newlines so the wire stays single-line" $
+      withSystemTempDirectory "haskoin-sdnotify2" $ \dir -> do
+        let path = dir </> "notify.sock"
+        sock <- NS.socket NS.AF_UNIX NS.Datagram 0
+        NS.bind sock (NS.SockAddrUnix path)
+        original <- lookupEnv "NOTIFY_SOCKET"
+        setEnv "NOTIFY_SOCKET" path
+        Daemon.sdNotifyStatus "line one\nline two"
+        bytes <- NSBS.recv sock 1024
+        -- Newlines inside the user-supplied status are stripped, but
+        -- the trailing terminator the helper appends is preserved.
+        BS8.unpack bytes `shouldBe` "STATUS=line oneline two\n"
+        NS.close sock
+        case original of
+          Just v  -> setEnv "NOTIFY_SOCKET" v
+          Nothing -> unsetEnv "NOTIFY_SOCKET"
 
   describe "Haskoin.Daemon: log file SIGHUP reopen" $ do
     it "reopenLogFile re-creates after rename (logrotate path)" $
