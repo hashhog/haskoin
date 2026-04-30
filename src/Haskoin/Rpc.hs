@@ -176,6 +176,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
                          isRbfReplaceable)
+import qualified Haskoin.Mempool.Persist as MPP
 import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..))
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
@@ -725,6 +726,9 @@ handleRpcRequest server req = do
     "testmempoolaccept"    -> handleTestMempoolAccept server params
     "getmempoolentry"      -> handleGetMempoolEntry server params
     "getmempoolancestors"  -> handleGetMempoolAncestors server params
+    "savemempool"          -> handleSaveMempool server
+    "importmempool"        -> handleImportMempool server params
+    "loadmempool"          -> handleImportMempool server params
 
     -- Raw transaction RPCs (new)
     "createrawtransaction"         -> handleCreateRawTransaction server params
@@ -3894,6 +3898,54 @@ handleStop server = do
 
   -- Return the standard message immediately
   return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
+
+--------------------------------------------------------------------------------
+-- Mempool persistence RPCs (Bitcoin Core compatible)
+--------------------------------------------------------------------------------
+
+-- | Dump the mempool to disk in Bitcoin Core mempool.dat format.
+-- Equivalent of Bitcoin Core's @savemempool@ RPC.
+-- Returns: { "filename": "<absolute path>" }
+handleSaveMempool :: RpcServer -> IO RpcResponse
+handleSaveMempool server = do
+  let path = MPP.defaultMempoolDatPath (rpcDataDir (rsConfig server))
+  r <- MPP.dumpMempool (rsMempool server) path
+  case r of
+    Right _n ->
+      return $ RpcResponse
+        (object [ "filename" .= (T.pack path) ])
+        Null Null
+    Left e ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcMiscError (T.pack ("savemempool: " ++ e))) Null
+
+-- | Import (load) the mempool from a Bitcoin Core mempool.dat file.
+-- Equivalent of Bitcoin Core's @importmempool@ / @loadmempool@ RPCs.
+-- Optional first param is the path; defaults to <datadir>/mempool.dat.
+-- Returns the same shape as Bitcoin Core: counts of accepted/failed/etc.
+handleImportMempool :: RpcServer -> Value -> IO RpcResponse
+handleImportMempool server params = do
+  let defaultPath = MPP.defaultMempoolDatPath (rpcDataDir (rsConfig server))
+      path = case extractParamText params 0 of
+        Just p  -> T.unpack p
+        Nothing -> defaultPath
+      expirySecs = 14 * 24 * 3600  -- 14 days, matches Bitcoin Core default
+  r <- MPP.loadMempool (rsMempool server) path expirySecs
+  case r of
+    Right (loaded, failed, expired, already) ->
+      return $ RpcResponse
+        (object
+          [ "imported"     .= loaded
+          , "failed"       .= failed
+          , "expired"      .= expired
+          , "already_there".= already
+          , "filename"     .= T.pack path
+          ])
+        Null Null
+    Left e ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcMiscError
+          (T.pack ("importmempool: " ++ e))) Null
 
 --------------------------------------------------------------------------------
 -- AssumeUTXO RPC Handlers

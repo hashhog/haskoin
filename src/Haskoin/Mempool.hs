@@ -452,6 +452,12 @@ data Mempool = Mempool
     -- ^ Network configuration
   , mpHeight     :: !(TVar Word32)
     -- ^ Current chain height
+  , mpFeeDeltas  :: !(TVar (Map TxId Int64))
+    -- ^ Prioritisetransaction fee deltas (in satoshis); persisted in
+    -- mempool.dat alongside transactions.
+  , mpUnbroadcast :: !(TVar (Set TxId))
+    -- ^ Transactions originated locally that have not yet been confirmed
+    -- relayed to a peer. Persisted in mempool.dat.
   }
 
 -- | Create a new empty mempool
@@ -466,6 +472,8 @@ newMempool net cache config height = Mempool
   <*> newTVarIO 0
   <*> pure net
   <*> newTVarIO height
+  <*> newTVarIO Map.empty
+  <*> newTVarIO Set.empty
 
 --------------------------------------------------------------------------------
 -- Transaction Addition
