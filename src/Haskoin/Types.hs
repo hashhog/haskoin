@@ -8,6 +8,7 @@ module Haskoin.Types
     Hash256(..)
   , Hash160(..)
   , TxId(..)
+  , Wtxid(..)
   , BlockHash(..)
     -- * Core Structures
   , OutPoint(..)
@@ -65,6 +66,12 @@ instance Serialize Hash160 where
 
 -- | Transaction ID (hash of transaction data, excluding witness)
 newtype TxId = TxId { getTxIdHash :: Hash256 }
+  deriving stock (Show, Eq, Ord, Generic)
+  deriving newtype (Serialize, Hashable, NFData)
+
+-- | Witness Transaction ID (BIP-141/BIP-339): hash of transaction data
+-- INCLUDING witness data. Equals TxId for non-segwit txs.
+newtype Wtxid = Wtxid { getWtxidHash :: Hash256 }
   deriving stock (Show, Eq, Ord, Generic)
   deriving newtype (Serialize, Hashable, NFData)
 
