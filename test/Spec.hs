@@ -1,3 +1,4 @@
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
@@ -11,7 +12,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.Text as T
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits ((.|.), (.&.))
 
@@ -50,8 +51,10 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          -- Header persistence (for restart tests)
                          putBlockHeader, getBlockHeader,
                          putBlockHeight, getBlockHeight,
-                         putBestBlockHash, getBestBlockHash)
-import Haskoin.Network
+                         putBestBlockHash, getBestBlockHash,
+                         -- UTXO cache (for mempool wtxid test)
+                         UTXOCache(..), newUTXOCache)
+import Haskoin.Network hiding (computeWtxid)
 import Haskoin.Sync
 import Haskoin.Mempool
 import Haskoin.FeeEstimator
@@ -116,6 +119,7 @@ mkTestEntry :: TxId -> Word64 -> Int -> MempoolEntry
 mkTestEntry txid fee vsize = MempoolEntry
   { meTransaction = mkTestTx
   , meTxId = txid
+  , meWtxid = computeWtxid mkTestTx
   , meFee = fee
   , meFeeRate = calculateFeeRate fee vsize
   , meSize = vsize
@@ -3058,6 +3062,7 @@ main = hspec $ do
         let entry = MempoolEntry
               { meTransaction = tx
               , meTxId = computeTxId tx
+              , meWtxid = computeWtxid tx
               , meFee = 100
               , meFeeRate = FeeRate 10
               , meSize = 150
@@ -3228,6 +3233,7 @@ main = hspec $ do
               in MempoolEntry
                    { meTransaction = tx
                    , meTxId = txid
+                   , meWtxid = computeWtxid tx
                    , meFee = fee
                    , meFeeRate = feeRate
                    , meSize = size
@@ -9635,6 +9641,83 @@ main = hspec $ do
 
       it "v2ProbeDeadlineMicros is the documented 30s" $ do
         v2ProbeDeadlineMicros `shouldBe` (30 * 1000000)
+
+  ------------------------------------------------------------------------------
+  -- Wtxid (BIP-141 / BIP-339) coverage
+  ------------------------------------------------------------------------------
+
+  describe "Wtxid (BIP-141 / BIP-339)" $ do
+    it "wtxid == txid for non-segwit transactions" $ do
+      let prev = TxId (Hash256 (BS.replicate 32 0x11))
+          tin  = TxIn (OutPoint prev 0) "scriptsig" 0xffffffff
+          tout = TxOut 1000 "scriptpubkey"
+          tx   = Tx 1 [tin] [tout] [[]] 0
+          TxId h1 = computeTxId tx
+          Wtxid h2 = computeWtxid tx
+      h1 `shouldBe` h2
+
+    it "wtxid differs from txid when witness is present" $ do
+      let prev = TxId (Hash256 (BS.replicate 32 0x22))
+          tin  = TxIn (OutPoint prev 0) "" 0xffffffff
+          tout = TxOut 1000 "scriptpubkey"
+          tx   = Tx 2 [tin] [tout] [[BS.replicate 64 0xab, BS.replicate 33 0x02]] 0
+          TxId h1 = computeTxId tx
+          Wtxid h2 = computeWtxid tx
+      h1 `shouldNotBe` h2
+
+  describe "Mempool wtxid dual index" $ do
+    it "lookup by wtxid returns the same entry as lookup by txid" $ do
+      -- Exercise the dual index purely in-memory by inserting an entry
+      -- through the typed index TVars. We bypass the full
+      -- addTransaction pipeline (which requires UTXO + script
+      -- verification) and instead seed mpEntries and mpByWtxid
+      -- directly to verify the lookup invariant.
+      let prev = TxId (Hash256 (BS.replicate 32 0x33))
+          op   = OutPoint prev 0
+          outScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa
+          tin = TxIn op "" 0xfffffffe
+          tout = TxOut 50000 outScript
+          tx   = Tx 2 [tin] [tout] [[BS.replicate 71 0xcc, BS.replicate 33 0x03]] 0
+          expectedTxid  = computeTxId tx
+          expectedWtxid = computeWtxid tx
+      withSystemTempDirectory "haskoin-mp-wtxid" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db -> do
+          cache <- newUTXOCache db 1024
+          mp <- newMempool regtest cache defaultMempoolConfig 0
+          let entry = MempoolEntry
+                { meTransaction = tx
+                , meTxId = expectedTxid
+                , meWtxid = expectedWtxid
+                , meFee = 1000
+                , meFeeRate = FeeRate 10
+                , meSize = 100
+                , meTime = 1700000000
+                , meHeight = 0
+                , meAncestorCount = 1
+                , meAncestorSize = 100
+                , meAncestorFees = 1000
+                , meAncestorSigOps = 0
+                , meDescendantCount = 1
+                , meDescendantSize = 100
+                , meDescendantFees = 1000
+                , meRBFOptIn = True
+                }
+          atomically $ do
+            modifyTVar' (mpEntries mp)  (Map.insert expectedTxid entry)
+            modifyTVar' (mpByWtxid mp)  (Map.insert expectedWtxid expectedTxid)
+          byTxid  <- getTransaction        mp expectedTxid
+          byWtxid <- getTransactionByWtxid mp expectedWtxid
+          fmap meTxId  byTxid  `shouldBe` Just expectedTxid
+          fmap meTxId  byWtxid `shouldBe` Just expectedTxid
+          fmap meWtxid byWtxid `shouldBe` Just expectedWtxid
+          t <- txIdForWtxid mp expectedWtxid
+          t `shouldBe` Just expectedTxid
+          removeTransaction mp expectedTxid
+          byTxid'  <- getTransaction        mp expectedTxid
+          byWtxid' <- getTransactionByWtxid mp expectedWtxid
+          fmap meTxId byTxid'  `shouldBe` Nothing
+          fmap meTxId byWtxid' `shouldBe` Nothing
 
   where
     sampleTx = Tx

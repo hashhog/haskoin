@@ -5136,7 +5136,10 @@ computeShortId key wtxidBytes =
   sipHash128 key wtxidBytes .&. 0xffffffffffff  -- Mask to 48 bits
 
 -- | Compute witness txid (wtxid) for a transaction
--- For version 2 compact blocks, this includes witness data
+-- For version 2 compact blocks, this includes witness data.
+--
+-- Returns the raw 'Hash256' bytes. New code should prefer the typed
+-- 'Haskoin.Crypto.computeWtxid' which returns a typed 'Wtxid' newtype.
 computeWtxid :: Tx -> Hash256
 computeWtxid tx = doubleSHA256 (encode tx)
 
