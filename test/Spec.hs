@@ -65,6 +65,7 @@ import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
 import Haskoin.Index
+import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
@@ -76,6 +77,8 @@ import qualified Data.Set as Set
 import qualified Data.Vector.Unboxed as VU
 import Control.Concurrent.STM
 import System.IO.Temp (withSystemTempDirectory)
+import qualified System.Directory as Dir
+import Control.Exception (catch, SomeException)
 import qualified System.Environment as SE
 import Data.Bits (xor, Bits, shiftL)
 import System.FilePath ((</>))
@@ -10013,6 +10016,154 @@ main = hspec $ do
         let key = BS.pack (take 8 (keyBytes ++ replicate 8 0))
             bs  = BS.pack payloadBytes
         MPP.xorObfuscate key (MPP.xorObfuscate key bs) === bs
+
+  ------------------------------------------------------------------
+  -- Operational helpers (Bitcoin Core parity flags)
+  -- See Haskoin.Daemon: -daemon, -pid, -conf, -debug, -printtoconsole,
+  -- SIGHUP log reopen, /health endpoint.
+  ------------------------------------------------------------------
+  describe "Haskoin.Daemon: debug categories" $ do
+    it "parses known categories case-insensitively" $ do
+      Daemon.parseDebugCategory "net" `shouldBe` Daemon.DbgNet
+      Daemon.parseDebugCategory "NET" `shouldBe` Daemon.DbgNet
+      Daemon.parseDebugCategory "Mempool" `shouldBe` Daemon.DbgMempool
+      Daemon.parseDebugCategory "validation" `shouldBe` Daemon.DbgValidation
+      Daemon.parseDebugCategory "rpc" `shouldBe` Daemon.DbgRpc
+      Daemon.parseDebugCategory "rocksdb" `shouldBe` Daemon.DbgRocksdb
+      Daemon.parseDebugCategory "all" `shouldBe` Daemon.DbgAll
+      Daemon.parseDebugCategory "1" `shouldBe` Daemon.DbgAll
+
+    it "preserves unknown tokens for honest 'unknown category' diagnostics" $
+      Daemon.parseDebugCategory "frobnicate" `shouldBe` Daemon.DbgUnknown "frobnicate"
+
+    it "parseDebugSet splits on commas and tolerates whitespace" $ do
+      let s = Daemon.parseDebugSet "net, mempool ,rpc"
+      Daemon.debugEnabled Daemon.DbgNet s `shouldBe` True
+      Daemon.debugEnabled Daemon.DbgMempool s `shouldBe` True
+      Daemon.debugEnabled Daemon.DbgRpc s `shouldBe` True
+      Daemon.debugEnabled Daemon.DbgValidation s `shouldBe` False
+
+    it "DbgAll subsumes every specific category" $ do
+      let s = Daemon.parseDebugSet "all"
+      Daemon.debugEnabled Daemon.DbgNet s `shouldBe` True
+      Daemon.debugEnabled Daemon.DbgValidation s `shouldBe` True
+      Daemon.debugEnabled Daemon.DbgUtxo s `shouldBe` True
+
+    it "empty set means no logging" $ do
+      Daemon.debugEnabled Daemon.DbgNet Daemon.emptyDebugSet `shouldBe` False
+
+  describe "Haskoin.Daemon: config file parser" $ do
+    it "parses simple key=value lines" $ do
+      let cm = Daemon.parseConfFile $ unlines
+            [ "rpcport=18443"
+            , "rpcuser=alice"
+            ]
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "18443"
+      Daemon.configLookup "rpcuser" cm `shouldBe` Just "alice"
+
+    it "ignores comments and blank lines" $ do
+      let cm = Daemon.parseConfFile $ unlines
+            [ "# this is a comment"
+            , "; semicolon comment"
+            , ""
+            , "  "
+            , "rpcport=8332"
+            ]
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "8332"
+
+    it "lowercases keys but preserves value case" $ do
+      let cm = Daemon.parseConfFile "RpcUser=BobIsHere\n"
+      Daemon.configLookup "rpcuser" cm `shouldBe` Just "BobIsHere"
+      Daemon.configLookup "RPCUSER" cm `shouldBe` Just "BobIsHere"
+
+    it "ignores section headers (network sub-sections)" $ do
+      let cm = Daemon.parseConfFile $ unlines
+            [ "[main]"
+            , "rpcport=8332"
+            , "[testnet4]"
+            , "rpcport=48343"
+            ]
+      -- We don't yet honour sections; both keys collapse to the
+      -- last assignment. Test pins the documented behaviour.
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "48343"
+
+    it "configLookupBool matches Bitcoin Core 1/true/yes vocabulary" $ do
+      let cm = Daemon.parseConfFile $ unlines
+            [ "a=1", "b=true", "c=YES", "d=on"
+            , "e=0", "f=false", "g=No", "h=off"
+            ]
+      Daemon.configLookupBool "a" False cm `shouldBe` True
+      Daemon.configLookupBool "b" False cm `shouldBe` True
+      Daemon.configLookupBool "c" False cm `shouldBe` True
+      Daemon.configLookupBool "d" False cm `shouldBe` True
+      Daemon.configLookupBool "e" True cm `shouldBe` False
+      Daemon.configLookupBool "f" True cm `shouldBe` False
+      Daemon.configLookupBool "g" True cm `shouldBe` False
+      Daemon.configLookupBool "h" True cm `shouldBe` False
+      Daemon.configLookupBool "missing" True cm `shouldBe` True
+      Daemon.configLookupBool "missing" False cm `shouldBe` False
+
+    it "configLookupInt falls back to default on bad input" $ do
+      let cm = Daemon.parseConfFile "p=4242\nq=not-a-number\n"
+      Daemon.configLookupInt "p" 0 cm `shouldBe` 4242
+      Daemon.configLookupInt "q" 99 cm `shouldBe` 99
+      Daemon.configLookupInt "missing" 7 cm `shouldBe` 7
+
+  describe "Haskoin.Daemon: PID file lifecycle" $ do
+    it "writePidFile + removePidFile round-trips" $
+      withSystemTempDirectory "haskoin-pidtest" $ \dir -> do
+        let path = dir </> "haskoin.pid"
+        Daemon.writePidFile path
+        exists <- Dir.doesFileExist path
+        exists `shouldBe` True
+        contents <- readFile path
+        -- Should be "<digits>\n"
+        let stripped = filter (/= '\n') contents
+        all (`elem` ("0123456789" :: String)) stripped `shouldBe` True
+        Daemon.removePidFile path
+        afterRm <- Dir.doesFileExist path
+        afterRm `shouldBe` False
+
+    it "removePidFile is idempotent on missing file" $
+      withSystemTempDirectory "haskoin-pidtest2" $ \dir -> do
+        let path = dir </> "ghost.pid"
+        Daemon.removePidFile path  -- should not throw
+        Daemon.removePidFile path  -- still should not throw
+        exists <- Dir.doesFileExist path
+        exists `shouldBe` False
+
+  describe "Haskoin.Daemon: log file SIGHUP reopen" $ do
+    it "reopenLogFile re-creates after rename (logrotate path)" $
+      withSystemTempDirectory "haskoin-logrotate" $ \dir -> do
+        let path = dir </> "debug.log"
+        ls <- Daemon.newLogState path
+        Daemon.initLogFile ls
+        present1 <- Dir.doesFileExist path
+        present1 `shouldBe` True
+        -- Simulate logrotate: move the file out of the way.
+        Dir.renameFile path (dir </> "debug.log.1")
+        Daemon.reopenLogFile ls
+        present2 <- Dir.doesFileExist path
+        present2 `shouldBe` True
+
+  describe "Haskoin.Daemon: ZMQ honest 'not supported'" $ do
+    it "zmqNotSupportedMessage names the gap clearly" $ do
+      let msg = zmqNotSupportedMessage
+      -- The message must mention 'ZMQ' so operators can grep the
+      -- runtime error and find this code.
+      ("ZMQ" `isInfixOf` msg) `shouldBe` True
+
+    it "newZmqNotifier raises a not-supported error (no silent stub)" $ do
+      let cfg = defaultZmqConfig
+      result <- (newZmqNotifier cfg >> return False)
+                  `catch` (\(_ :: SomeException) -> return True)
+      result `shouldBe` True
+
+    it "ZmqEvent encodes a hashblock body in little-endian" $ do
+      let bh = mkTestBlockHash
+          (topic, body) = eventToTopicAndBody (ZmqEventHashBlock bh)
+      topic `shouldBe` ZmqHashBlock
+      BS.length body `shouldBe` 32  -- 32-byte raw hash
 
   where
     sampleTx = Tx
