@@ -85,6 +85,10 @@ module Haskoin.Rpc
   , notifyHashTx
   , zmqTopicToBytes
   , sequenceLabelToByte
+  , eventToTopicAndBody
+  , hashToLeBytes
+  , txidToLeBytes
+  , zmqNotSupportedMessage
     -- * Multi-Wallet Support
   , extractWalletName
   , rpcWalletNotFound
@@ -114,7 +118,6 @@ import Network.HTTP.Types (status200, status400, status401, status404, status405
                            status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
-import Data.List.NonEmpty (NonEmpty(..))
 import Control.Exception (try, SomeException, catch, bracket, mask_)
 import Data.IORef
 import Data.Word (Word8)
@@ -137,7 +140,6 @@ import Data.Char (chr)
 import Data.List (foldl')
 import Text.Printf (printf)
 import qualified Data.Vector as V
-import qualified System.ZMQ4 as ZMQ
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified Crypto.Random as CryptoRandom
 import System.Directory (removeFile)
@@ -5473,100 +5475,61 @@ defaultZmqConfig = ZmqConfig
   , zmqEnabled       = True
   }
 
--- | ZMQ notifier state
--- Handles publishing notifications to ZMQ subscribers
+-- | ZMQ notifier state.
+--
+-- IMPORTANT: ZMQ runtime publishing is NOT compiled into this build.
+-- Bitcoin Core's ZMQ notification interface (zmqpublishnotifier.cpp)
+-- requires linking libzmq + zeromq4-haskell, neither of which are
+-- currently wired into haskoin.cabal. The previous implementation
+-- relied on a no-op stub of @System.ZMQ4@, which silently accepted
+-- @bind@ / @sendMulti@ calls and dropped every event on the floor —
+-- worse than admitting "not supported" because callers thought their
+-- subscribers were receiving messages.
+--
+-- We keep the @ZmqConfig@, @ZmqEvent@, @ZmqTopic@, @SequenceLabel@
+-- types and the pure encoding helpers (@zmqTopicToBytes@,
+-- @sequenceLabelToByte@, @eventToTopicAndBody@, @hashToLeBytes@,
+-- @txidToLeBytes@) so wire-format tests remain meaningful and so
+-- a future patch that links @zeromq4-haskell@ has a stable surface
+-- to plug into. But @newZmqNotifier@ now raises an honest error
+-- and there is no internal socket/context/worker.
 data ZmqNotifier = ZmqNotifier
   { znConfig      :: !ZmqConfig
-  , znContext     :: !(ZMQ.Context)
-  , znSocket      :: !(ZMQ.Socket ZMQ.Pub)
   , znSequence    :: !(TVar Word32)         -- ^ Monotonic sequence number for each message
   , znEventQueue  :: !(TBQueue ZmqEvent)    -- ^ Buffered event queue
   , znWorker      :: !(TVar (Maybe ThreadId))
   }
 
--- | Create a new ZMQ notifier
--- Initializes the ZMQ context, creates a PUB socket, and binds to the endpoint
+-- | Error message used when ZMQ runtime publishing is requested but
+-- this build was not linked against libzmq / zeromq4-haskell.
+zmqNotSupportedMessage :: String
+zmqNotSupportedMessage =
+  "ZMQ notifications are not compiled into this haskoin build. " ++
+  "Rebuild after wiring zeromq4-haskell into haskoin.cabal " ++
+  "(see Haskoin.Rpc ZMQ section). The pure ZmqConfig / ZmqEvent " ++
+  "API is still available for offline encoding/testing."
+
+-- | Create a new ZMQ notifier.
+--
+-- Honest "not supported" failure when ZMQ runtime publishing is not
+-- compiled in. Callers (e.g. node startup) should treat this as a
+-- soft failure: ZMQ is opt-in (Bitcoin Core's @-zmqpub*@ flags),
+-- and a node should still come up if the operator did not request
+-- ZMQ. See @app\/Main.hs@ for the wiring pattern (it does not call
+-- this function at all in the current build).
 newZmqNotifier :: ZmqConfig -> IO ZmqNotifier
-newZmqNotifier config = do
-  ctx <- ZMQ.context
-  sock <- ZMQ.socket ctx ZMQ.Pub
+newZmqNotifier _config = error zmqNotSupportedMessage
 
-  -- Set high water mark for outbound messages
-  ZMQ.setSendHighWM (ZMQ.restrict (zmqHighWaterMark config)) sock
-
-  -- Enable TCP keepalive
-  ZMQ.setTcpKeepAlive ZMQ.On sock
-
-  -- Bind to endpoint
-  ZMQ.bind sock (zmqEndpoint config)
-
-  -- Initialize state
-  seqVar <- newTVarIO 0
-  queue <- newTBQueueIO 1000  -- Buffer up to 1000 events
-  workerVar <- newTVarIO Nothing
-
-  let notifier = ZmqNotifier
-        { znConfig = config
-        , znContext = ctx
-        , znSocket = sock
-        , znSequence = seqVar
-        , znEventQueue = queue
-        , znWorker = workerVar
-        }
-
-  -- Start worker thread to process events from queue
-  tid <- forkIO $ zmqWorkerLoop notifier
-  atomically $ writeTVar workerVar (Just tid)
-
-  return notifier
-
--- | Close the ZMQ notifier
--- Stops the worker thread and closes the socket/context
+-- | Close the ZMQ notifier.
+--
+-- No-op when ZMQ runtime publishing is not compiled in. Safe to call
+-- on any notifier value (none can be constructed in this build, but
+-- keeping the function lets callers compile against a stable API).
 closeZmqNotifier :: ZmqNotifier -> IO ()
 closeZmqNotifier notifier = do
-  -- Stop worker thread
   mTid <- readTVarIO (znWorker notifier)
   mapM_ killThread mTid
   atomically $ writeTVar (znWorker notifier) Nothing
-
-  -- Set linger to 0 and close socket
-  ZMQ.setLinger (ZMQ.restrict (0 :: Int)) (znSocket notifier)
-  ZMQ.close (znSocket notifier)
-  ZMQ.term (znContext notifier)
-
--- | Worker loop that processes events from the queue and sends ZMQ messages
-zmqWorkerLoop :: ZmqNotifier -> IO ()
-zmqWorkerLoop notifier = do
-  event <- atomically $ readTBQueue (znEventQueue notifier)
-  sendZmqEvent notifier event
-  zmqWorkerLoop notifier
-
--- | Send a ZMQ event as a multipart message
--- Message format: [topic][body][sequence_le32]
-sendZmqEvent :: ZmqNotifier -> ZmqEvent -> IO ()
-sendZmqEvent notifier event = do
-  let (topic, body) = eventToTopicAndBody event
-      sock = znSocket notifier
-
-  -- Get and increment sequence number
-  seqNum <- atomically $ do
-    n <- readTVar (znSequence notifier)
-    writeTVar (znSequence notifier) (n + 1)
-    return n
-
-  -- Encode sequence as 4-byte little-endian
-  let seqBytes = encodeLE32 seqNum
-
-  -- Send multipart message: topic, body, sequence
-  ZMQ.sendMulti sock (zmqTopicToBytes topic :| [body, seqBytes])
-  where
-    encodeLE32 :: Word32 -> ByteString
-    encodeLE32 n = BS.pack
-      [ fromIntegral (n .&. 0xff)
-      , fromIntegral ((n `shiftR` 8) .&. 0xff)
-      , fromIntegral ((n `shiftR` 16) .&. 0xff)
-      , fromIntegral ((n `shiftR` 24) .&. 0xff)
-      ]
 
 -- | Convert event to topic and body
 eventToTopicAndBody :: ZmqEvent -> (ZmqTopic, ByteString)

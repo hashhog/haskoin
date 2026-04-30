@@ -11,7 +11,7 @@ import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import qualified Data.Text.Encoding as TE
 import System.IO (hSetBuffering, stdout, BufferMode(..))
-import System.Directory (createDirectoryIfMissing, getHomeDirectory)
+import System.Directory (createDirectoryIfMissing, getHomeDirectory, doesFileExist)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
@@ -19,7 +19,8 @@ import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
-import Data.Maybe (mapMaybe)
+import qualified Haskoin.Daemon as Daemon
+import Data.Maybe (mapMaybe, fromMaybe)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
 import Data.Word (Word32, Word64)
@@ -79,6 +80,14 @@ data NodeOptions = NodeOptions
   , noListenPort :: !Int
   , noMetricsPort :: !Int
   , noPeerBloomFilters :: !Bool
+    -- Operational / supervisor flags (Bitcoin Core parity).
+  , noDaemon     :: !Bool       -- ^ -daemon: detach to background
+  , noPidFile    :: !(Maybe FilePath) -- ^ -pid=<file>; defaults to <datadir>/haskoin.pid
+  , noConfFile   :: !(Maybe FilePath) -- ^ -conf=<file>; defaults to <datadir>/haskoin.conf
+  , noDebug      :: ![String]   -- ^ -debug=<cat>; comma-separated allowed
+  , noPrintToConsole :: !Bool   -- ^ -printtoconsole: explicit, default True when foreground
+  , noLogFile    :: !(Maybe FilePath) -- ^ -logfile=<path>; defaults to <datadir>/debug.log when daemonised
+  , noHealthPort :: !Int        -- ^ /health endpoint port (0 disables)
   } deriving (Show)
 
 data WalletCommand
@@ -133,6 +142,21 @@ parseNodeOptions = NodeOptions
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
   <*> option auto (long "peerbloomfilters" <> value False
         <> help "Advertise NODE_BLOOM and serve BIP-37/BIP-35 (default: False, matches Core)")
+  -- Operational flags
+  <*> switch (long "daemon"
+        <> help "Detach to background (Bitcoin Core -daemon)")
+  <*> optional (strOption (long "pid" <> metavar "PATH"
+        <> help "PID file path (default: <datadir>/haskoin.pid)"))
+  <*> optional (strOption (long "conf" <> metavar "PATH"
+        <> help "Config file path (default: <datadir>/haskoin.conf)"))
+  <*> many (strOption (long "debug" <> metavar "CAT"
+        <> help "Enable debug category (net, mempool, validation, rpc, rocksdb, all). Repeatable."))
+  <*> switch (long "printtoconsole"
+        <> help "Force log output to stdout even when --daemon (Bitcoin Core -printtoconsole)")
+  <*> optional (strOption (long "logfile" <> metavar "PATH"
+        <> help "Log file path (default: <datadir>/debug.log when --daemon, none otherwise). SIGHUP reopens."))
+  <*> option auto (long "healthport" <> value 0
+        <> help "HTTP /health endpoint port (0 disables)")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -214,7 +238,169 @@ expandPath path
 --------------------------------------------------------------------------------
 
 runNode :: Network -> FilePath -> NodeOptions -> IO ()
-runNode net dataDir NodeOptions{..} = do
+runNode net dataDir nodeOptsCli = do
+  -- 1. Load the config file (if any) and overlay onto CLI options.
+  --    Bitcoin Core precedence: CLI > config > built-in default. We
+  --    only override CLI fields that still equal the compile-time
+  --    default (sentinel comparison); explicit CLI flags always win.
+  let confPath = case noConfFile nodeOptsCli of
+                   Just p  -> p
+                   Nothing -> dataDir </> "haskoin.conf"
+  confResult <- Daemon.readConfFile confPath
+  cm <- case confResult of
+    Right m -> do
+      unless (null m) $
+        putStrLn $ "Loaded config file " ++ confPath
+                ++ " (" ++ show (length m) ++ " entries)"
+      return m
+    Left e -> do
+      putStrLn $ "Config file warning: " ++ e
+      return mempty
+  let nodeOpts = applyConfigOverlay cm nodeOptsCli
+      NodeOptions{..} = nodeOpts
+
+  -- 2. Wire up debug categories (process-global) early so subsequent
+  --    setup messages can call logDebug.
+  let debugSet = Daemon.parseDebugSet (concatPlus noDebug)
+  Daemon.setGlobalDebugSet debugSet
+  unless (Daemon.debugEnabled Daemon.DbgAll debugSet
+            && null noDebug) $
+    Daemon.logDebug Daemon.DbgAll $
+      "debug categories enabled: " ++ show (length noDebug) ++ " token(s)"
+
+  -- 3. Decide effective log file path. If --daemon and no --logfile,
+  --    default to <datadir>/debug.log. If --printtoconsole, leave
+  --    stdio alone; otherwise daemonised mode redirects to logfile.
+  let effectiveLogFile :: Maybe FilePath
+      effectiveLogFile = case noLogFile of
+        Just p  -> Just p
+        Nothing -> if noDaemon
+                     then Just (dataDir </> "debug.log")
+                     else Nothing
+
+  -- 4. PID file path (default <datadir>/haskoin.pid).
+  let pidFilePath = case noPidFile of
+        Just p  -> p
+        Nothing -> dataDir </> "haskoin.pid"
+
+  -- Run the actual node body. Wrapped so daemonize can supply it
+  -- as the grandchild's continuation.
+  let nodeMain = runNodeBody net dataDir nodeOpts effectiveLogFile pidFilePath
+
+  if noDaemon
+    then do
+      putStrLn $ "Daemonising; logs -> "
+              ++ maybe "/dev/null" id effectiveLogFile
+              ++ ", pid -> " ++ pidFilePath
+      Daemon.daemonize effectiveLogFile nodeMain
+    else nodeMain
+
+-- | Apply a parsed config file as a fallback to CLI-provided
+-- 'NodeOptions'. CLI values that differ from the compile-time
+-- defaults are preserved. See 'parseNodeOptions' for the defaults.
+applyConfigOverlay :: Daemon.ConfigMap -> NodeOptions -> NodeOptions
+applyConfigOverlay cm n = n
+  { noRpcPort    = if noRpcPort n == 8332
+                     then Daemon.configLookupInt "rpcport" 8332 cm
+                     else noRpcPort n
+  , noRpcUser    = if noRpcUser n == "haskoin"
+                     then T.pack (fromMaybe "haskoin" (Daemon.configLookup "rpcuser" cm))
+                     else noRpcUser n
+  , noRpcPass    = if noRpcPass n == "haskoin"
+                     then T.pack (fromMaybe "haskoin" (Daemon.configLookup "rpcpassword" cm))
+                     else noRpcPass n
+  , noMaxPeers   = if noMaxPeers n == 125
+                     then Daemon.configLookupInt "maxpeers" 125 cm
+                     else noMaxPeers n
+  , noPrune      = if not (noPrune n)
+                     then Daemon.configLookupBool "prune" False cm
+                     else noPrune n
+  , noDbCache    = if noDbCache n == 450
+                     then Daemon.configLookupInt "dbcache" 450 cm
+                     else noDbCache n
+  , noListen     = if noListen n
+                     then Daemon.configLookupBool "listen" True cm
+                     else noListen n
+  , noListenPort = if noListenPort n == 8333
+                     then Daemon.configLookupInt "port" 8333 cm
+                     else noListenPort n
+  , noMetricsPort = if noMetricsPort n == 9332
+                     then Daemon.configLookupInt "metricsport" 9332 cm
+                     else noMetricsPort n
+  , noPeerBloomFilters = if not (noPeerBloomFilters n)
+                     then Daemon.configLookupBool "peerbloomfilters" False cm
+                     else noPeerBloomFilters n
+  , noDaemon     = if not (noDaemon n)
+                     then Daemon.configLookupBool "daemon" False cm
+                     else noDaemon n
+  , noPidFile    = case noPidFile n of
+                     Just _ -> noPidFile n
+                     Nothing -> Daemon.configLookup "pid" cm
+  , noPrintToConsole = if not (noPrintToConsole n)
+                     then Daemon.configLookupBool "printtoconsole" False cm
+                     else noPrintToConsole n
+  , noLogFile    = case noLogFile n of
+                     Just _ -> noLogFile n
+                     Nothing -> Daemon.configLookup "logfile" cm
+  , noHealthPort = if noHealthPort n == 0
+                     then Daemon.configLookupInt "healthport" 0 cm
+                     else noHealthPort n
+  -- noConnect (peer list) and noDebug are list-valued: append from conf.
+  , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
+  , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
+  -- Pass-through (not in conf overlay).
+  , noConfFile   = noConfFile n
+  }
+  where
+    splitCsv = filter (not . null) . map trim . wordsBy (== ',')
+    trim = dropWhile (== ' ') . reverse . dropWhile (== ' ') . reverse
+    wordsBy p s = case break p s of
+      (h, [])      -> [h]
+      (h, _ : rest) -> h : wordsBy p rest
+
+-- | Concatenate debug-flag tokens with commas so the daemon-side
+-- parser can split on ','. Tolerates duplicates.
+concatPlus :: [String] -> String
+concatPlus xs = case xs of
+  []     -> ""
+  (h:tl) -> foldl (\a b -> a ++ "," ++ b) h tl
+
+-- | The actual node startup body. Extracted from 'runNode' so
+-- 'Daemon.daemonize' can run it as the grandchild's continuation
+-- after fork+setsid+stdio-redirect.
+runNodeBody :: Network -> FilePath -> NodeOptions
+            -> Maybe FilePath -> FilePath -> IO ()
+runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
+  -- 0. Set up logging file + SIGHUP handler, if requested. We keep
+  --    LineBuffering so log lines flush immediately even when the
+  --    process is daemonised.
+  hSetBuffering stdout LineBuffering
+  case effectiveLogFile of
+    Nothing -> return ()
+    Just lp -> do
+      ls <- Daemon.newLogState lp
+      Daemon.initLogFile ls
+        `catch` (\(e :: SomeException) ->
+                   putStrLn $ "Could not open log file " ++ lp
+                            ++ ": " ++ show e)
+      Daemon.installSighupHandler ls
+      Daemon.logDebug Daemon.DbgAll $
+        "log file: " ++ lp ++ " (SIGHUP reopens)"
+
+  -- 1. Write PID file. Bracket-style: removed on graceful shutdown
+  --    via the existing exitSuccess path (we explicitly remove at
+  --    the end of nodeBodyInner; for SIGKILL we accept the stale
+  --    file is a known limitation, matching Bitcoin Core).
+  Daemon.writePidFile pidFilePath
+    `catch` (\(e :: SomeException) ->
+               putStrLn $ "Could not write PID file " ++ pidFilePath
+                        ++ ": " ++ show e)
+
+  -- 2. Optional /health endpoint for process supervisors.
+  _healthTid <- Daemon.runHealthServer noHealthPort
+  when (noHealthPort > 0) $
+    putStrLn $ "Health endpoint listening on port " ++ show noHealthPort
+
   putStrLn $ "Starting Haskoin on " ++ netName net
   putStrLn $ "Data directory: " ++ dataDir
 
@@ -446,6 +632,12 @@ runNode net dataDir NodeOptions{..} = do
       case r of
         Right n -> putStrLn $ "Dumped " ++ show n ++ " transactions to " ++ mempoolDatPath
         Left e  -> putStrLn $ "Failed to dump mempool: " ++ e
+
+    -- Remove PID file as part of graceful shutdown so external
+    -- supervisors (systemd, runit, monit) see we're really gone.
+    Daemon.removePidFile pidFilePath
+      `catch` (\(e :: SomeException) ->
+                 putStrLn $ "removePidFile error: " ++ show e)
 
     putStrLn "Shutdown complete."
     -- Explicit exit. Without this, any forked thread mid-FFI call
