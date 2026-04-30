@@ -130,6 +130,8 @@ module Haskoin.Storage
     -- * Iterator
   , iterateWithPrefix
   , getUTXOCount
+    -- * Chainstate reset (for -reindex-chainstate)
+  , wipeChainstate
     -- * Utilities
   , toBE32
   , fromBE32
@@ -1509,6 +1511,75 @@ getUTXOCount db = do
     modifyIORef' countRef (+1)
     return True
   readIORef countRef
+
+-- | Wipe every chainstate-derived prefix from RocksDB so the chain
+-- can be re-played from genesis. This is the storage half of
+-- @-reindex-chainstate@ (Bitcoin Core's @\/\/ Wipe and reload all
+-- chainstate@ block in @init.cpp@'s @LoadChainstate@). Block headers
+-- (@PrefixBlockHeader@), the height index (@PrefixBlockHeight@), and
+-- raw block data (@PrefixBlockData@) are KEPT — the rebuild walks
+-- them sequentially.
+--
+-- Wiped prefixes:
+--
+-- * 'PrefixUTXO'        — every coin in the UTXO set
+-- * 'PrefixBestBlock'   — the singleton tip pointer
+-- * 'PrefixTxIndex'     — txid -> block-locator
+-- * 'PrefixChainWork'   — cumulative work per block
+-- * 'PrefixBlockStatus' — per-block validation status
+-- * 'PrefixAddrHistory' — wallet/index reverse lookups
+-- * 'PrefixAddrBalance' — wallet/index balance cache
+-- * 'PrefixAddrUTXO'    — address-by-outpoint reverse index
+--
+-- Implementation: iterate each prefix, accumulate keys into batches
+-- of 'wipeBatchSize', and apply them one batch at a time. RocksDB
+-- 9.x has no @deleteRange@ exposed by @rocksdb-haskell@, so the
+-- O(N) scan + batched delete is the cleanest portable approach.
+-- 'returnedCount' is the number of keys deleted across all prefixes
+-- (useful for the operator-visible progress log).
+wipeChainstate :: HaskoinDB -> IO Int
+wipeChainstate db = do
+  totalRef <- newIORef (0 :: Int)
+  let wipeBatchSize = 4096 :: Int
+      prefixes :: [KeyPrefix]
+      prefixes =
+        [ PrefixUTXO
+        , PrefixBestBlock
+        , PrefixTxIndex
+        , PrefixChainWork
+        , PrefixBlockStatus
+        , PrefixAddrHistory
+        , PrefixAddrBalance
+        , PrefixAddrUTXO
+        ]
+  -- The 'syncFlush' sentinel key (PrefixBestBlock + 0xFF) is a
+  -- reserved no-data marker used to force an fsync of the WAL.
+  -- Skip it during the wipe so 'wipeChainstate' is idempotent
+  -- across the syncFlush we do at the bottom of this function.
+  let syncSentinel = makeKey PrefixBestBlock (BS.singleton 0xFF)
+  forM_ prefixes $ \p -> do
+    pendingRef <- newIORef ([] :: [BatchOp])
+    countRef   <- newIORef (0 :: Int)
+    let flushBatch = do
+          ops <- atomicModifyIORef' pendingRef (\xs -> ([], xs))
+          unless (null ops) $
+            writeBatch db (WriteBatch ops)
+    iterateWithPrefix db p $ \key _val ->
+      if key == syncSentinel
+        then return True
+        else do
+          let op = BatchDelete key
+          modifyIORef' pendingRef (op:)
+          n <- atomicModifyIORef' countRef (\x -> (x + 1, x + 1))
+          when (n `mod` wipeBatchSize == 0) flushBatch
+          return True
+    flushBatch
+    n <- readIORef countRef
+    modifyIORef' totalRef (+ n)
+  -- One synchronous flush so the wipe is durable before the caller
+  -- starts replaying connectBlock against the empty UTXO set.
+  syncFlush db
+  readIORef totalRef
 
 --------------------------------------------------------------------------------
 -- Flat File Block Storage
