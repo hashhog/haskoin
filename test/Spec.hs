@@ -57,6 +57,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
 import Haskoin.Network hiding (computeWtxid)
 import Haskoin.Sync
 import Haskoin.Mempool
+import qualified Haskoin.Policy.Standard as Std
 import Haskoin.FeeEstimator
 import Haskoin.Wallet hiding ((<|>), Addr)
 import Haskoin.Performance
@@ -9718,6 +9719,98 @@ main = hspec $ do
           byWtxid' <- getTransactionByWtxid mp expectedWtxid
           fmap meTxId byTxid'  `shouldBe` Nothing
           fmap meTxId byWtxid' `shouldBe` Nothing
+
+  ------------------------------------------------------------------------------
+  -- IsStandardTx (relay-policy / standardness) coverage
+  ------------------------------------------------------------------------------
+
+  describe "IsStandardTx (Bitcoin Core policy)" $ do
+    let mkTx version inSize outScript =
+          let prev = TxId (Hash256 (BS.replicate 32 0x44))
+              tin = TxIn (OutPoint prev 0) (BS.replicate inSize 0x51) 0xffffffff
+              tout = TxOut 100000 outScript
+          in Tx version [tin] [tout] [[]] 0
+        -- Std P2PKH scriptPubKey: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+        p2pkhScript = BS.pack ([0x76, 0xa9, 0x14] ++ replicate 20 0xab ++ [0x88, 0xac])
+
+    it "accepts a minimal standard P2PKH transaction" $ do
+      let tx = mkTx 1 0 p2pkhScript
+      Std.checkStandardTx tx `shouldBe` Right ()
+
+    it "rejects version 0 (below TX_MIN_STANDARD_VERSION)" $ do
+      let tx = mkTx 0 0 p2pkhScript
+      case Std.checkStandardTx tx of
+        Left (Std.StdBadVersion 0) -> return ()
+        other -> expectationFailure ("expected StdBadVersion, got " ++ show other)
+
+    it "rejects version 4 (above TX_MAX_STANDARD_VERSION)" $ do
+      let tx = mkTx 4 0 p2pkhScript
+      case Std.checkStandardTx tx of
+        Left (Std.StdBadVersion 4) -> return ()
+        other -> expectationFailure ("expected StdBadVersion, got " ++ show other)
+
+    it "rejects scriptSig > 1650 bytes (MAX_STANDARD_SCRIPTSIG_SIZE)" $ do
+      let tx = mkTx 1 1651 p2pkhScript
+      case Std.checkStandardTx tx of
+        Left (Std.StdScriptSigSize _ sz) -> sz `shouldBe` 1651
+        other -> expectationFailure ("expected StdScriptSigSize, got " ++ show other)
+
+    it "rejects non-pushonly scriptSig" $ do
+      -- 0xac == OP_CHECKSIG (not a push opcode)
+      let prev = TxId (Hash256 (BS.replicate 32 0x55))
+          tin = TxIn (OutPoint prev 0) (BS.pack [0xac]) 0xffffffff
+          tout = TxOut 100000 p2pkhScript
+          tx = Tx 1 [tin] [tout] [[]] 0
+      case Std.checkStandardTx tx of
+        Left (Std.StdScriptSigNotPushOnly _) -> return ()
+        other -> expectationFailure
+          ("expected StdScriptSigNotPushOnly, got " ++ show other)
+
+    it "rejects non-standard scriptPubKey" $ do
+      -- Build a tx large enough to clear the 65-byte non-witness floor;
+      -- pad the scriptSig with NOPs (push-only doesn't matter — we
+      -- override the scriptPubKey with a non-standard one).
+      -- 0xff is OP_INVALIDOPCODE; this scriptPubKey can't be classified.
+      let prev = TxId (Hash256 (BS.replicate 32 0x57))
+          tin = TxIn (OutPoint prev 0) (BS.replicate 32 0x51) 0xffffffff
+          tout = TxOut 100000 (BS.replicate 30 0xff)
+          tx = Tx 1 [tin] [tout] [[]] 0
+      case Std.checkStandardTx tx of
+        Left (Std.StdScriptPubKey _) -> return ()
+        other -> expectationFailure
+          ("expected StdScriptPubKey, got " ++ show other)
+
+    it "enforces tx weight cap (MAX_STANDARD_TX_WEIGHT = 400_000)" $ do
+      -- Build many outputs to exceed the weight cap
+      let prev = TxId (Hash256 (BS.replicate 32 0x66))
+          tin = TxIn (OutPoint prev 0) "" 0xffffffff
+          -- ~100k outputs of ~40 bytes each = 4MB nonwitness => weight 16MB
+          outs = replicate 100000 (TxOut 1000 p2pkhScript)
+          tx = Tx 1 [tin] outs [[]] 0
+      case Std.checkStandardTx tx of
+        Left (Std.StdTxWeight w _) ->
+          w `shouldSatisfy` (> Std.maxStandardTxWeight)
+        other -> expectationFailure
+          ("expected StdTxWeight, got " ++ show other)
+
+    it "rejects two OP_RETURN outputs" $ do
+      -- OP_RETURN <empty data>
+      let opReturn = BS.pack [0x6a]
+          prev = TxId (Hash256 (BS.replicate 32 0x77))
+          tin = TxIn (OutPoint prev 0) "" 0xffffffff
+          tx = Tx 1 [tin]
+                  [TxOut 0 opReturn, TxOut 0 opReturn]
+                  [[]] 0
+      case Std.checkStandardTx tx of
+        Left (Std.StdMultipleOpReturns 2) -> return ()
+        other -> expectationFailure
+          ("expected StdMultipleOpReturns, got " ++ show other)
+
+    it "exposes maxStandardTxWeight = 400_000" $
+      Std.maxStandardTxWeight `shouldBe` 400_000
+
+    it "exposes dustRelayTxFee = 3000" $
+      Std.dustRelayTxFee `shouldBe` 3000
 
   where
     sampleTx = Tx
