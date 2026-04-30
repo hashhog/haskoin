@@ -5486,6 +5486,28 @@ defaultZmqConfig = ZmqConfig
 -- worse than admitting "not supported" because callers thought their
 -- subscribers were receiving messages.
 --
+-- = Path-a (proper linkage) audit, 2026-04-29
+--
+-- The Cat F deferred work asked: "now switch to path-a if libzmq3-dev
+-- + zeromq4-haskell are available." We checked:
+--
+-- * @libzmq3-dev@: NOT installed on maxbox. Only the runtime
+--   @libzmq.so.5@ shared object is present; the @zmq.h@ headers
+--   needed to compile the Haskell binding are missing
+--   (no @\/usr\/include\/zmq.h@). Installing @libzmq3-dev@ requires
+--   @sudo apt install@, which the build sandbox cannot do.
+-- * @zeromq4-haskell@: AVAILABLE on Hackage at version 0.8.0
+--   (verified via @cabal list zeromq4-haskell@). Build will
+--   succeed once @zmq.h@ is on the include path.
+--
+-- Decision: keep path-b in place. Once an operator with sudo on
+-- maxbox runs @apt install libzmq3-dev@, switching to path-a is
+-- mechanical: add @zeromq4-haskell@ to @haskoin.cabal@ and replace
+-- @newZmqNotifier@ below with the documented 5-topic publisher
+-- (rawblock, hashblock, rawtx, hashtx, sequence) using the
+-- 3-frame @[topic | body | LE u32 sequence]@ wire format that
+-- @eventToTopicAndBody@ already produces.
+--
 -- We keep the @ZmqConfig@, @ZmqEvent@, @ZmqTopic@, @SequenceLabel@
 -- types and the pure encoding helpers (@zmqTopicToBytes@,
 -- @sequenceLabelToByte@, @eventToTopicAndBody@, @hashToLeBytes@,
