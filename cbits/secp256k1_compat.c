@@ -10,6 +10,7 @@
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
 #include <secp256k1_ellswift.h>
+#include <secp256k1_recovery.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -383,4 +384,129 @@ int haskoin_ellswift_xdh_bip324(
         secp256k1_ellswift_xdh_hash_function_bip324,
         NULL
     );
+}
+
+/* ---- ECDSA signing (recoverable + standard) ----------------------------- */
+
+/*
+ * Lazily-allocated context with VERIFY|SIGN flags for signing operations.
+ */
+static secp256k1_context *g_sign_ctx = NULL;
+
+static secp256k1_context *get_sign_ctx(void) {
+    if (g_sign_ctx == NULL) {
+        g_sign_ctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+    }
+    return g_sign_ctx;
+}
+
+/*
+ * Derive the public key for a 32-byte secret key.
+ * Writes 33 bytes (compressed) or 65 bytes (uncompressed) to output.
+ *
+ * Returns 1 on success (output filled, *out_len set), 0 on failure
+ * (e.g. invalid seckey).
+ */
+int haskoin_ec_pubkey_create(
+    const unsigned char *seckey32,
+    int compressed,
+    unsigned char *output,
+    size_t *out_len
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_pubkey pubkey;
+
+    if (!ctx) return 0;
+    if (!secp256k1_ec_pubkey_create(ctx, &pubkey, seckey32)) {
+        return 0;
+    }
+    unsigned int flags = compressed ? SECP256K1_EC_COMPRESSED
+                                    : SECP256K1_EC_UNCOMPRESSED;
+    *out_len = compressed ? 33 : 65;
+    return secp256k1_ec_pubkey_serialize(ctx, output, out_len, &pubkey, flags);
+}
+
+/*
+ * Produce a Bitcoin "compact recoverable" ECDSA signature, as used by
+ * signmessage / verifymessage.  Output buffer must be 65 bytes; the layout
+ * is: [header_byte][R(32)][S(32)] where header = 27 + recid + (4 if compressed).
+ *
+ * Matches Bitcoin Core's CKey::SignCompact (src/key.cpp:250).
+ *
+ * Returns 1 on success, 0 on failure.
+ */
+int haskoin_ecdsa_sign_recoverable_compact(
+    const unsigned char *seckey32,
+    const unsigned char *msghash32,
+    int compressed,
+    unsigned char *out65
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_ecdsa_recoverable_signature rsig;
+    int recid = -1;
+
+    if (!ctx) return 0;
+
+    if (!secp256k1_ecdsa_sign_recoverable(
+            ctx, &rsig, msghash32, seckey32,
+            secp256k1_nonce_function_rfc6979, NULL)) {
+        return 0;
+    }
+
+    if (!secp256k1_ecdsa_recoverable_signature_serialize_compact(
+            ctx, out65 + 1, &recid, &rsig)) {
+        return 0;
+    }
+
+    if (recid < 0 || recid > 3) {
+        return 0;
+    }
+
+    out65[0] = (unsigned char)(27 + recid + (compressed ? 4 : 0));
+    return 1;
+}
+
+/*
+ * Recover the public key from a 65-byte compact recoverable ECDSA signature
+ * (header byte + 64 byte R||S) and a 32-byte message hash.
+ *
+ * The caller supplies an output buffer of 33 bytes (compressed) or 65 bytes
+ * (uncompressed); compression is selected via the `compressed` flag, which
+ * MUST match the encoding implied by the header byte (header & 4).
+ *
+ * Returns 1 on success (output filled, *out_len set), 0 on failure.
+ */
+int haskoin_ecdsa_recover_compact(
+    const unsigned char *sig65,
+    const unsigned char *msghash32,
+    int compressed,
+    unsigned char *output,
+    size_t *out_len
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_ecdsa_recoverable_signature rsig;
+    secp256k1_pubkey pubkey;
+    unsigned char header = sig65[0];
+    int recid;
+
+    if (!ctx) return 0;
+
+    /* Header byte must be in [27..34]. recid = (header - 27) & 3. */
+    if (header < 27 || header > 34) return 0;
+    recid = (header - 27) & 3;
+
+    if (!secp256k1_ecdsa_recoverable_signature_parse_compact(
+            ctx, &rsig, sig65 + 1, recid)) {
+        return 0;
+    }
+
+    if (!secp256k1_ecdsa_recover(ctx, &pubkey, &rsig, msghash32)) {
+        return 0;
+    }
+
+    unsigned int flags = compressed ? SECP256K1_EC_COMPRESSED
+                                    : SECP256K1_EC_UNCOMPRESSED;
+    *out_len = compressed ? 33 : 65;
+    return secp256k1_ec_pubkey_serialize(ctx, output, out_len, &pubkey, flags);
 }

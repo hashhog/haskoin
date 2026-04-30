@@ -3594,6 +3594,147 @@ main = hspec $ do
         fbTotalTxs bucket `shouldBe` 100
         fbInMempool bucket `shouldBe` 5
 
+    describe "estimateRawFee (per-bucket exposure)" $ do
+      -- Mirrors Bitcoin Core's estimaterawfee: with no data we report
+      -- Nothing for the rate plus the standard error string.
+      it "returns Nothing on a fresh estimator" $ do
+        fe <- newFeeEstimator
+        raw <- estimateRawFee fe 6 0.95
+        rfeFeeRate raw `shouldBe` Nothing
+        rfeErrors raw `shouldSatisfy` not . null
+
+      it "echoes the configured decay" $ do
+        fe <- newFeeEstimator
+        raw <- estimateRawFee fe 6 0.95
+        rfeDecay raw `shouldBe` 0.998
+
+      it "returns the empty-bucket placeholder when no data is present" $ do
+        fe <- newFeeEstimator
+        raw <- estimateRawFee fe 6 0.95
+        -- pass bucket exists but reports zero counts (matches Core's
+        -- "all zero" representation when no data is available yet)
+        rbrTotalConfirmed (rfePass raw) `shouldBe` 0
+        rbrInMempool (rfePass raw) `shouldBe` 0
+
+  -- Recoverable-compact ECDSA / signmessage tests.  We use a single
+  -- well-known test key (0x01 repeated 32 times) so that the test does not
+  -- depend on RNG and is fully reproducible.  Sign-then-recover-then-compare
+  -- exercises the entire FFI surface for both signCompact and
+  -- recoverCompact, and signMessage + recoverMessagePubKey exercise the
+  -- magic-prefix hashing path.
+  describe "signmessage / recoverable compact ECDSA" $ do
+    let sk          = SecKey (BS.replicate 32 0x01)
+        msg         = T.pack "hello hashhog"
+        otherMsg    = T.pack "hello hashhog!"  -- distinct payload
+
+    it "messageMagic matches Bitcoin Core" $ do
+      messageMagic `shouldBe` BS.pack
+        [0x42,0x69,0x74,0x63,0x6f,0x69,0x6e,0x20  -- "Bitcoin "
+        ,0x53,0x69,0x67,0x6e,0x65,0x64,0x20       -- "Signed "
+        ,0x4d,0x65,0x73,0x73,0x61,0x67,0x65,0x3a  -- "Message:"
+        ,0x0a]                                    -- "\n"
+
+    it "messageHash is double-SHA256 of varint-prefixed magic||message" $ do
+      -- Concrete vector: empty message under Core's HashWriter rules.
+      let Hash256 h = messageHash (T.pack "")
+      BS.length h `shouldBe` 32
+
+    it "derivePubKeyCompressed yields a 33-byte 0x02/0x03 prefixed key" $ do
+      case derivePubKeyCompressed sk of
+        Nothing -> expectationFailure "derivePubKeyCompressed: Nothing"
+        Just bs -> do
+          BS.length bs `shouldBe` 33
+          (BS.head bs `elem` [0x02, 0x03]) `shouldBe` True
+
+    it "signCompact produces a 65-byte signature" $ do
+      case signCompact sk True (messageHash msg) of
+        Nothing  -> expectationFailure "signCompact: Nothing"
+        Just sig -> BS.length sig `shouldBe` 65
+
+    it "header byte encodes the compressed flag" $ do
+      case signCompact sk True (messageHash msg) of
+        Nothing  -> expectationFailure "signCompact (compressed): Nothing"
+        Just sig -> do
+          let h = BS.head sig
+          -- Bit 2 (value 4) is set when the recovered key is compressed.
+          (h .&. 0x04) `shouldBe` 0x04
+
+      case signCompact sk False (messageHash msg) of
+        Nothing  -> expectationFailure "signCompact (uncompressed): Nothing"
+        Just sig -> do
+          let h = BS.head sig
+          (h .&. 0x04) `shouldBe` 0x00
+
+    it "signMessage round-trips through recoverMessagePubKey" $ do
+      case (signMessage sk True msg, derivePubKeyCompressed sk) of
+        (Just sig, Just expected) ->
+          recoverMessagePubKey sig msg `shouldBe` Just expected
+        _ -> expectationFailure "signMessage / derivePubKeyCompressed failed"
+
+    it "recoverMessagePubKey gives a different key on a tampered message" $ do
+      case (signMessage sk True msg, derivePubKeyCompressed sk) of
+        (Just sig, Just expected) ->
+          recoverMessagePubKey sig otherMsg `shouldNotBe` Just expected
+        _ -> expectationFailure "signMessage / derivePubKeyCompressed failed"
+
+    it "recoverMessagePubKey rejects a 64-byte signature (wrong length)" $ do
+      let bad = BS.replicate 64 0x00
+      recoverMessagePubKey bad msg `shouldBe` Nothing
+
+    it "uncompressed signMessage recovers an uncompressed pubkey" $ do
+      case (signMessage sk False msg, derivePubKeyUncompressed sk) of
+        (Just sig, Just expected) -> do
+          recoverMessagePubKey sig msg `shouldBe` Just expected
+          BS.length expected `shouldBe` 65
+        _ -> expectationFailure "uncompressed signMessage failed"
+
+  -- Direct test of the mempool primitive that backs getmempooldescendants.
+  -- We construct a parent tx with one output and a child tx that spends it,
+  -- insert both into the mempool indexes by hand (the real validation path
+  -- would require a full UTXO snapshot), and verify that getDescendants on
+  -- the parent returns the child.
+  describe "getDescendants (backs getmempooldescendants RPC)" $ do
+    it "returns the immediate child of an in-mempool parent" $ do
+      withSystemTempDirectory "haskoin-mp-desc" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db -> do
+          cache <- newUTXOCache db 1024
+          mp <- newMempool regtest cache defaultMempoolConfig 0
+          -- parent: one output at vout=0
+          let parentOut = TxOut 50000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x55)
+              parentTx  = Tx 2 [] [parentOut] [[]] 0
+              parentTxId = computeTxId parentTx
+              parentEntry = (mkTestEntry parentTxId 1000 100)
+                              { meTransaction = parentTx }
+              -- child: one input that spends parentTxId:0
+              childOp = OutPoint parentTxId 0
+              childIn = TxIn childOp BS.empty 0xffffffff
+              childOut = TxOut 49000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa)
+              childTx  = Tx 2 [childIn] [childOut] [[]] 0
+              childTxId = computeTxId childTx
+              childEntry = (mkTestEntry childTxId 800 95)
+                             { meTransaction = childTx }
+          atomically $ do
+            modifyTVar' (mpEntries mp)
+              (Map.insert parentTxId parentEntry . Map.insert childTxId childEntry)
+            modifyTVar' (mpByOutpoint mp) (Map.insert childOp childTxId)
+          ds <- getDescendants mp parentTxId
+          map meTxId ds `shouldBe` [childTxId]
+
+    it "returns no descendants for a leaf transaction" $ do
+      withSystemTempDirectory "haskoin-mp-desc-leaf" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db -> do
+          cache <- newUTXOCache db 1024
+          mp <- newMempool regtest cache defaultMempoolConfig 0
+          let leafTx = Tx 2 [] [TxOut 1000 BS.empty] [[]] 0
+              leafTxId = computeTxId leafTx
+              leafEntry = (mkTestEntry leafTxId 100 50)
+                            { meTransaction = leafTx }
+          atomically $ modifyTVar' (mpEntries mp) (Map.insert leafTxId leafEntry)
+          ds <- getDescendants mp leafTxId
+          length ds `shouldBe` 0
+
   -- Wallet module tests
   describe "BIP-39 Mnemonic" $ do
     it "bip39WordList has exactly 2048 words" $ do

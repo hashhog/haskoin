@@ -157,6 +157,10 @@ module Haskoin.Wallet
   , validateDescriptorChecksum
   , isRangeDescriptor
   , expandCombo
+    -- * WIF (private-key text encoding)
+  , wifDecode
+  , wifEncode
+  , isWifKey
   ) where
 
 import Data.ByteString (ByteString)
