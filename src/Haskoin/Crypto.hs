@@ -45,6 +45,7 @@ module Haskoin.Crypto
   , encodePushData
     -- * Transaction/Block hashing
   , computeTxId
+  , computeWtxid
   , computeBlockHash
     -- * Addresses
   , Address(..)
@@ -90,7 +91,7 @@ import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Storable (peek)
 
-import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..),
+import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), Wtxid(..), BlockHash(..),
                       Tx(..), TxIn(..), TxOut(..), BlockHeader(..), OutPoint(..),
                       putVarInt, putVarBytes)
 
@@ -631,6 +632,20 @@ computeTxId tx = TxId $ doubleSHA256 $ runPut $ do
   putVarInt (fromIntegral $ length $ txOutputs tx)
   mapM_ putTxOut (txOutputs tx)
   putWord32le (txLockTime tx)
+
+-- | Compute the witness transaction ID (BIP-141 wtxid): SHA256d of the
+-- full serialization INCLUDING witness data. For non-segwit transactions
+-- (no witness items present), this equals the txid.
+--
+-- Reference: BIP-141 "Specification of Witness Program" and BIP-339
+-- "WTXID-based transaction relay".
+--
+-- Note: by BIP-141 the coinbase wtxid is conventionally all-zeroes when
+-- used in the witness commitment merkle, but this function returns the
+-- structural hash. Callers that need the BIP-141 commitment-merkle
+-- coinbase value should use a zero-hash directly.
+computeWtxid :: Tx -> Wtxid
+computeWtxid tx = Wtxid $ doubleSHA256 (encode tx)
 
 -- | Compute the block hash (hash of 80-byte header)
 computeBlockHash :: BlockHeader -> BlockHash

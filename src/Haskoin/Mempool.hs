@@ -35,7 +35,10 @@ module Haskoin.Mempool
   , addTransaction
   , removeTransaction
   , getTransaction
+  , getTransactionByWtxid
+  , txIdForWtxid
   , getMempoolTxIds
+  , getMempoolWtxids
   , getMempoolSize
   , getMempoolInfo
   , getMempoolMinFeeRate
@@ -144,7 +147,7 @@ import Control.DeepSeq (NFData)
 import Data.Serialize (encode)
 
 import Haskoin.Types
-import Haskoin.Crypto (computeTxId)
+import Haskoin.Crypto (computeTxId, computeWtxid)
 import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            txBaseSize, txTotalSize, coinbaseMaturity)
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
@@ -213,7 +216,8 @@ defaultMempoolConfig = MempoolConfig
 -- | A transaction entry in the mempool with computed metadata
 data MempoolEntry = MempoolEntry
   { meTransaction      :: !Tx         -- ^ The transaction
-  , meTxId             :: !TxId       -- ^ Transaction ID (cached)
+  , meTxId             :: !TxId       -- ^ Transaction ID (cached, no witness)
+  , meWtxid            :: !Wtxid      -- ^ Witness Transaction ID (BIP-141/339)
   , meFee              :: !Word64     -- ^ Fee in satoshis
   , meFeeRate          :: !FeeRate    -- ^ Fee rate in sat/vB
   , meSize             :: !Int        -- ^ Virtual size (vB)
@@ -421,9 +425,16 @@ instance NFData EphemeralError
 --------------------------------------------------------------------------------
 
 -- | The transaction memory pool
+--
+-- Per Bitcoin Core (txmempool.h: boost::multi_index over CTxMemPoolEntry),
+-- mempool entries are addressable by both txid AND wtxid. We mirror that
+-- with two parallel maps. The wtxid index is required for BIP-339 wtxid
+-- relay (deduplication by wtxid in inv messages and getdata pruning).
 data Mempool = Mempool
   { mpEntries    :: !(TVar (Map TxId MempoolEntry))
     -- ^ All mempool entries indexed by TxId
+  , mpByWtxid    :: !(TVar (Map Wtxid TxId))
+    -- ^ BIP-339 dual index: Wtxid -> TxId. Always synced with mpEntries.
   , mpByOutpoint :: !(TVar (Map OutPoint TxId))
     -- ^ Index: spent outpoint -> spending transaction
   , mpByFeeRate  :: !(TVar (Map (FeeRate, TxId) ()))
@@ -444,6 +455,7 @@ data Mempool = Mempool
 newMempool :: Network -> UTXOCache -> MempoolConfig -> Word32 -> IO Mempool
 newMempool net cache config height = Mempool
   <$> newTVarIO Map.empty
+  <*> newTVarIO Map.empty
   <*> newTVarIO Map.empty
   <*> newTVarIO Map.empty
   <*> pure config
@@ -625,9 +637,11 @@ continueAddTransaction mp tx txid fee vsize ancestors = do
       ancestorSize = sum (map meSize ancestors) + vsize
       ancestorFees = sum (map meFee ancestors) + fee
       ancestorSigOps = sum (map meAncestorSigOps ancestors)
+      wtxid = computeWtxid tx
       entry = MempoolEntry
         { meTransaction = tx
         , meTxId = txid
+        , meWtxid = wtxid
         , meFee = fee
         , meFeeRate = feeRate
         , meSize = vsize
@@ -643,9 +657,10 @@ continueAddTransaction mp tx txid fee vsize ancestors = do
         , meRBFOptIn = rbfOptIn
         }
 
-  -- Insert atomically
+  -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync)
   atomically $ do
     modifyTVar' (mpEntries mp) (Map.insert txid entry)
+    modifyTVar' (mpByWtxid mp) (Map.insert wtxid txid)
     forM_ (txInputs tx) $ \inp ->
       modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
     modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
@@ -809,6 +824,8 @@ removeTransaction mp txid = do
       atomically $ do
         -- Remove from main index
         modifyTVar' (mpEntries mp) (Map.delete txid)
+        -- Remove from wtxid dual index (BIP-339)
+        modifyTVar' (mpByWtxid mp) (Map.delete (meWtxid entry))
         -- Remove from outpoint index
         forM_ (txInputs (meTransaction entry)) $ \inp ->
           modifyTVar' (mpByOutpoint mp) (Map.delete (txInPrevOutput inp))
@@ -891,6 +908,27 @@ getTransaction mp txid =
 getMempoolTxIds :: Mempool -> IO [TxId]
 getMempoolTxIds mp =
   atomically $ Map.keys <$> readTVar (mpEntries mp)
+
+-- | Get all witness transaction IDs (wtxids) in the mempool.
+-- BIP-339 callers (e.g. wtxid-relay 'inv') use this to enumerate
+-- announcements without re-deriving wtxids from cached transactions.
+getMempoolWtxids :: Mempool -> IO [Wtxid]
+getMempoolWtxids mp =
+  atomically $ Map.keys <$> readTVar (mpByWtxid mp)
+
+-- | Look up a mempool entry by witness transaction id (BIP-339).
+-- Returns Nothing if the wtxid is not in the dual index.
+getTransactionByWtxid :: Mempool -> Wtxid -> IO (Maybe MempoolEntry)
+getTransactionByWtxid mp wtxid = atomically $ do
+  byW <- readTVar (mpByWtxid mp)
+  case Map.lookup wtxid byW of
+    Nothing   -> return Nothing
+    Just txid -> Map.lookup txid <$> readTVar (mpEntries mp)
+
+-- | Resolve a wtxid to its txid (without fetching the full entry).
+txIdForWtxid :: Mempool -> Wtxid -> IO (Maybe TxId)
+txIdForWtxid mp wtxid =
+  atomically $ Map.lookup wtxid <$> readTVar (mpByWtxid mp)
 
 -- | Get mempool size (count, total vsize)
 getMempoolSize :: Mempool -> IO (Int, Int)
@@ -1634,9 +1672,11 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
           ancestorSize = sum (map meSize ancestors) + vsize
           ancestorFees = sum (map meFee ancestors) + fee
           ancestorSigOps = sum (map meAncestorSigOps ancestors)
+          wtxid = computeWtxid tx
           entry = MempoolEntry
             { meTransaction = tx
             , meTxId = txid
+            , meWtxid = wtxid
             , meFee = fee
             , meFeeRate = feeRate
             , meSize = vsize
@@ -1652,9 +1692,10 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
             , meRBFOptIn = rbfOptIn
             }
 
-      -- Insert atomically
+      -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync)
       atomically $ do
         modifyTVar' (mpEntries mp) (Map.insert txid entry)
+        modifyTVar' (mpByWtxid mp) (Map.insert wtxid txid)
         forM_ (txInputs tx) $ \inp ->
           modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
         modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
