@@ -577,6 +577,26 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       startInboundListener pm listenPort
       putStrLn $ "P2P listener started on port " ++ show listenPort
 
+    -- Notify systemd we're up. No-op when NOTIFY_SOCKET is unset
+    -- (typical for non-systemd launches via nohup, supervisord, etc).
+    -- Sends READY=1 + an initial STATUS line; periodic STATUS pings
+    -- track tip height for `systemctl status haskoin` operators.
+    do
+      h0 <- readTVarIO (hcHeight hc)
+      Daemon.sdNotifyStatus $
+        "Started on " ++ netName net ++ " at height " ++ show h0
+      Daemon.sdNotifyReady
+    -- Background watchdog/status pinger: keeps systemd's
+    -- WatchdogSec= alive (no-op if unset) and refreshes the
+    -- STATUS string with the current tip every 30s.
+    statusTid <- forkIO $ forever $ do
+      threadDelay (30 * 1_000_000)
+      h' <- readTVarIO (hcHeight hc)
+      peers' <- Map.size <$> readTVarIO (pmPeers pm)
+      Daemon.sdNotifyStatus $
+        "height=" ++ show h' ++ " peers=" ++ show peers'
+      Daemon.sdNotifyWatchdog
+
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
     shutdownVar <- newEmptyMVar
@@ -588,6 +608,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     void $ installHandler sigTERM (Catch $ void $ tryPutMVar shutdownVar ()) Nothing
     takeMVar shutdownVar
     putStrLn "Shutting down..."
+    -- Tell systemd we are intentionally exiting so it extends
+    -- TimeoutStopSec= and doesn't escalate to SIGKILL mid-flush.
+    Daemon.sdNotifyStopping
+    Daemon.sdNotifyStatus "Shutting down: flushing chainstate"
+    killThread statusTid
+      `catch` (\(e :: SomeException) -> putStrLn $ "killThread statusTid error: " ++ show e)
 
     -- Hard-exit watchdog: if the graceful shutdown below hangs for any
     -- reason (stuck FFI call, uninterruptible thread, RocksDB close
