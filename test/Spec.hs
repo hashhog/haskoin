@@ -52,6 +52,9 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          putBlockHeader, getBlockHeader,
                          putBlockHeight, getBlockHeight,
                          putBestBlockHash, getBestBlockHash,
+                         -- UTXO single-key API (for wipeChainstate test)
+                         putUTXO, getUTXO, putTxIndex, getTxIndex,
+                         wipeChainstate,
                          -- UTXO cache (for mempool wtxid test)
                          UTXOCache(..), newUTXOCache)
 import Haskoin.Network hiding (computeWtxid)
@@ -78,7 +81,7 @@ import qualified Data.Vector.Unboxed as VU
 import Control.Concurrent.STM
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Directory as Dir
-import Control.Exception (catch, SomeException)
+import Control.Exception (bracket, catch, SomeException)
 import qualified System.Environment as SE
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import qualified Network.Socket as NS
@@ -10020,6 +10023,81 @@ main = hspec $ do
         let key = BS.pack (take 8 (keyBytes ++ replicate 8 0))
             bs  = BS.pack payloadBytes
         MPP.xorObfuscate key (MPP.xorObfuscate key bs) === bs
+
+  ------------------------------------------------------------------
+  -- -reindex-chainstate: wipeChainstate must clear UTXO/best/tx-index
+  -- but PRESERVE the block-index (headers + height index).
+  ------------------------------------------------------------------
+  describe "Haskoin.Storage: wipeChainstate (reindex-chainstate)" $ do
+    it "wipes UTXO/best/tx-index but preserves block headers + height index" $
+      withSystemTempDirectory "haskoin-wipe-test" $ \tmpDir -> do
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          -- Seed block-index: genesis header + height 0 mapping.
+          let genesisHash = BlockHash (Hash256 (BS.replicate 32 1))
+              childHash   = BlockHash (Hash256 (BS.replicate 32 2))
+              hdr h prev = BlockHeader
+                { bhVersion       = 1
+                , bhPrevBlock     = prev
+                , bhMerkleRoot    = Hash256 (BS.replicate 32 0)
+                , bhTimestamp     = h
+                , bhBits          = 0x1d00ffff
+                , bhNonce         = 0
+                }
+              zeroHash    = BlockHash (Hash256 (BS.replicate 32 0))
+          putBlockHeader db genesisHash (hdr 0 zeroHash)
+          putBlockHeader db childHash   (hdr 1 genesisHash)
+          putBlockHeight db 0 genesisHash
+          putBlockHeight db 1 childHash
+          putBestBlockHash db childHash
+          -- Seed chainstate to be wiped.
+          let txid = TxId (Hash256 (BS.replicate 32 0xAA))
+              op0  = OutPoint txid 0
+              op1  = OutPoint txid 1
+              txo  = TxOut 50000000 "scriptpubkey"
+          putUTXO db op0 txo
+          putUTXO db op1 txo
+          putTxIndex db txid (TxLocation childHash 7)
+
+          -- Sanity: chainstate exists pre-wipe.
+          mPreUtxo <- getUTXO db op0
+          mPreUtxo `shouldSatisfy` isJust
+          mPreTx <- getTxIndex db txid
+          mPreTx `shouldSatisfy` isJust
+          mPreBest <- getBestBlockHash db
+          mPreBest `shouldBe` Just childHash
+
+          -- Run the wipe.
+          n <- wipeChainstate db
+          -- 2 UTXOs + 1 best-block + 1 tx-index = 4 keys minimum.
+          n `shouldSatisfy` (>= 4)
+
+          -- POST-WIPE: chainstate gone.
+          mPostUtxo0 <- getUTXO db op0
+          mPostUtxo0 `shouldBe` Nothing
+          mPostUtxo1 <- getUTXO db op1
+          mPostUtxo1 `shouldBe` Nothing
+          mPostTx <- getTxIndex db txid
+          mPostTx `shouldBe` Nothing
+          mPostBest <- getBestBlockHash db
+          mPostBest `shouldBe` Nothing
+
+          -- POST-WIPE: block-index PRESERVED.
+          mPostHdr0 <- getBlockHeader db genesisHash
+          mPostHdr0 `shouldSatisfy` isJust
+          mPostHdr1 <- getBlockHeader db childHash
+          mPostHdr1 `shouldSatisfy` isJust
+          mPostHt0 <- getBlockHeight db 0
+          mPostHt0 `shouldBe` Just genesisHash
+          mPostHt1 <- getBlockHeight db 1
+          mPostHt1 `shouldBe` Just childHash
+
+    it "is idempotent on an already-wiped database" $
+      withSystemTempDirectory "haskoin-wipe-test2" $ \tmpDir -> do
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          n1 <- wipeChainstate db
+          n1 `shouldBe` 0
+          n2 <- wipeChainstate db
+          n2 `shouldBe` 0
 
   ------------------------------------------------------------------
   -- Operational helpers (Bitcoin Core parity flags)
