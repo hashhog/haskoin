@@ -118,7 +118,9 @@ import Network.HTTP.Types (status200, status400, status401, status404, status405
                            status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch, bracket, mask_)
+import Control.Exception (try, SomeException, catch, bracket, mask_, handle)
+import Data.List.NonEmpty (NonEmpty(..))
+import qualified System.ZMQ4 as ZMQ
 import Data.IORef
 import Data.Word (Word8)
 import qualified Data.Map.Strict as Map
@@ -5477,81 +5479,155 @@ defaultZmqConfig = ZmqConfig
 
 -- | ZMQ notifier state.
 --
--- IMPORTANT: ZMQ runtime publishing is NOT compiled into this build.
--- Bitcoin Core's ZMQ notification interface (zmqpublishnotifier.cpp)
--- requires linking libzmq + zeromq4-haskell, neither of which are
--- currently wired into haskoin.cabal. The previous implementation
--- relied on a no-op stub of @System.ZMQ4@, which silently accepted
--- @bind@ / @sendMulti@ calls and dropped every event on the floor —
--- worse than admitting "not supported" because callers thought their
--- subscribers were receiving messages.
+-- = Wire-up
 --
--- = Path-a (proper linkage) audit, 2026-04-29
+-- ZMQ runtime publishing IS compiled into this build via direct FFI
+-- against @libzmq.so.5@ (see @cbits\/zmq_stubs.c@ + @src\/System\/ZMQ4.hs@).
+-- We do not depend on @libzmq3-dev@ — only on the runtime SONAME, which
+-- ships in Debian's @libzmq5@ package. This mirrors the camlcoin
+-- pattern (commit 23c02ac).
 --
--- The Cat F deferred work asked: "now switch to path-a if libzmq3-dev
--- + zeromq4-haskell are available." We checked:
+-- = Mechanism
 --
--- * @libzmq3-dev@: NOT installed on maxbox. Only the runtime
---   @libzmq.so.5@ shared object is present; the @zmq.h@ headers
---   needed to compile the Haskell binding are missing
---   (no @\/usr\/include\/zmq.h@). Installing @libzmq3-dev@ requires
---   @sudo apt install@, which the build sandbox cannot do.
--- * @zeromq4-haskell@: AVAILABLE on Hackage at version 0.8.0
---   (verified via @cabal list zeromq4-haskell@). Build will
---   succeed once @zmq.h@ is on the include path.
+-- 'newZmqNotifier' opens a ZMQ context, creates a PUB socket, sets
+-- @LINGER=0@ + @SNDHWM=znConfig.zmqHighWaterMark@ + TCP keepalive, binds
+-- to @znConfig.zmqEndpoint@, then spawns a worker that drains the
+-- 'TBQueue' and pushes each event as a 3-frame
+-- @[topic | body | LE u32 sequence]@ message — same wire format as
+-- Bitcoin Core's @CZMQPublishNotifier::SendZmqMessage@.
 --
--- Decision: keep path-b in place. Once an operator with sudo on
--- maxbox runs @apt install libzmq3-dev@, switching to path-a is
--- mechanical: add @zeromq4-haskell@ to @haskoin.cabal@ and replace
--- @newZmqNotifier@ below with the documented 5-topic publisher
--- (rawblock, hashblock, rawtx, hashtx, sequence) using the
--- 3-frame @[topic | body | LE u32 sequence]@ wire format that
--- @eventToTopicAndBody@ already produces.
+-- = Failure semantics
 --
--- We keep the @ZmqConfig@, @ZmqEvent@, @ZmqTopic@, @SequenceLabel@
--- types and the pure encoding helpers (@zmqTopicToBytes@,
--- @sequenceLabelToByte@, @eventToTopicAndBody@, @hashToLeBytes@,
--- @txidToLeBytes@) so wire-format tests remain meaningful and so
--- a future patch that links @zeromq4-haskell@ has a stable surface
--- to plug into. But @newZmqNotifier@ now raises an honest error
--- and there is no internal socket/context/worker.
+-- All three frames are sent with @ZMQ_DONTWAIT@; if SNDHWM is hit the
+-- message is dropped silently (same as Core). Bind failures are
+-- surfaced as exceptions from 'newZmqNotifier' so the operator sees
+-- "address already in use" / "no permission" loudly instead of
+-- discovering a silent broken pipe later.
+--
+-- The pure encoding helpers (@zmqTopicToBytes@, @sequenceLabelToByte@,
+-- @eventToTopicAndBody@, @hashToLeBytes@, @txidToLeBytes@) remain
+-- testable in isolation — wire-format tests need no live socket.
 data ZmqNotifier = ZmqNotifier
   { znConfig      :: !ZmqConfig
+  , znContext     :: !ZMQ.Context
+  , znSocket      :: !(ZMQ.Socket ZMQ.Pub)
   , znSequence    :: !(TVar Word32)         -- ^ Monotonic sequence number for each message
   , znEventQueue  :: !(TBQueue ZmqEvent)    -- ^ Buffered event queue
   , znWorker      :: !(TVar (Maybe ThreadId))
   }
 
--- | Error message used when ZMQ runtime publishing is requested but
--- this build was not linked against libzmq / zeromq4-haskell.
+-- | Legacy error message kept for callers that previously checked
+-- whether the build supported ZMQ. It now describes the (rare)
+-- failure mode where 'newZmqNotifier' itself throws — e.g. the bind
+-- address is in use.
 zmqNotSupportedMessage :: String
 zmqNotSupportedMessage =
-  "ZMQ notifications are not compiled into this haskoin build. " ++
-  "Rebuild after wiring zeromq4-haskell into haskoin.cabal " ++
-  "(see Haskoin.Rpc ZMQ section). The pure ZmqConfig / ZmqEvent " ++
-  "API is still available for offline encoding/testing."
+  "ZMQ notifier could not be initialised. Either the bind address is " ++
+  "in use, libzmq.so.5 is not on the runtime loader path, or the " ++
+  "configured endpoint syntax is invalid. See cbits/zmq_stubs.c."
 
 -- | Create a new ZMQ notifier.
 --
--- Honest "not supported" failure when ZMQ runtime publishing is not
--- compiled in. Callers (e.g. node startup) should treat this as a
--- soft failure: ZMQ is opt-in (Bitcoin Core's @-zmqpub*@ flags),
--- and a node should still come up if the operator did not request
--- ZMQ. See @app\/Main.hs@ for the wiring pattern (it does not call
--- this function at all in the current build).
+-- Opens a libzmq PUB socket and binds it to 'zmqEndpoint'. The high
+-- water mark is configured before bind (libzmq requires this order),
+-- TCP keepalive is enabled, and LINGER is set to 0 so shutdown is
+-- prompt. A worker thread is forked which drains the event queue and
+-- pushes each entry as a 3-frame message.
+--
+-- @newZmqNotifier@ raises 'ZMQ.ZmqError' if the bind fails; the
+-- caller (e.g. node startup) is responsible for downgrading that to
+-- a warning if ZMQ is opt-in.
 newZmqNotifier :: ZmqConfig -> IO ZmqNotifier
-newZmqNotifier _config = error zmqNotSupportedMessage
+newZmqNotifier config = mask_ $ do
+  ctx  <- ZMQ.context
+  sock <- ZMQ.socket ctx ZMQ.Pub `catch` \(e :: SomeException) -> do
+            ZMQ.term ctx
+            error (zmqNotSupportedMessage ++ " (socket: " ++ show e ++ ")")
+  -- Order: setsockopt before bind (libzmq 4.x ABI contract).
+  ZMQ.setSendHighWM (ZMQ.restrict (zmqHighWaterMark config)) sock
+  ZMQ.setLinger     (ZMQ.restrict (0 :: Int))                 sock
+  ZMQ.setTcpKeepAlive ZMQ.On sock
+  (ZMQ.bind sock (zmqEndpoint config))
+    `catch` \(e :: SomeException) -> do
+      ZMQ.close sock
+      ZMQ.term ctx
+      error (zmqNotSupportedMessage ++ " (bind " ++ zmqEndpoint config
+             ++ ": " ++ show e ++ ")")
+  seqVar     <- newTVarIO 0
+  queue      <- newTBQueueIO 1000
+  workerVar  <- newTVarIO Nothing
+  let n = ZmqNotifier
+        { znConfig      = config
+        , znContext     = ctx
+        , znSocket      = sock
+        , znSequence    = seqVar
+        , znEventQueue  = queue
+        , znWorker      = workerVar
+        }
+  tid <- forkIO (zmqWorkerLoop n)
+  atomically $ writeTVar workerVar (Just tid)
+  pure n
 
 -- | Close the ZMQ notifier.
 --
--- No-op when ZMQ runtime publishing is not compiled in. Safe to call
--- on any notifier value (none can be constructed in this build, but
--- keeping the function lets callers compile against a stable API).
+-- Stops the worker thread, closes the socket (LINGER=0 means in-flight
+-- messages are dropped), and terminates the context (which blocks
+-- until I/O thread cleanup is complete). Idempotent in practice
+-- because the underlying ForeignPtr finalisers are no-ops once run.
 closeZmqNotifier :: ZmqNotifier -> IO ()
 closeZmqNotifier notifier = do
   mTid <- readTVarIO (znWorker notifier)
   mapM_ killThread mTid
   atomically $ writeTVar (znWorker notifier) Nothing
+  -- Best-effort teardown — exceptions during shutdown are logged via
+  -- 'handle' rather than escalated; we do not want a half-stopped
+  -- node to fail the shutdown sequence.
+  handle (\(_ :: SomeException) -> pure ()) $
+    ZMQ.close (znSocket notifier)
+  handle (\(_ :: SomeException) -> pure ()) $
+    ZMQ.term (znContext notifier)
+
+-- | Worker loop that drains the event queue and pushes each event as
+-- a 3-frame ZMQ message. Runs forever; killed by 'closeZmqNotifier'.
+--
+-- Errors from 'sendZmqEvent' are caught and ignored — a slow or
+-- disconnected subscriber must not stall block validation. The
+-- underlying 'ZMQ.sendMulti' already returns silently on SNDHWM hits,
+-- so this catch only covers programming errors (e.g. socket already
+-- closed during shutdown race).
+zmqWorkerLoop :: ZmqNotifier -> IO ()
+zmqWorkerLoop notifier = do
+  event <- atomically $ readTBQueue (znEventQueue notifier)
+  handle (\(_ :: SomeException) -> pure ()) (sendZmqEvent notifier event)
+  zmqWorkerLoop notifier
+
+-- | Encode a single 'ZmqEvent' as a 3-frame ZMQ message and push it
+-- on the wire. Frame layout matches Bitcoin Core
+-- (@CZMQPublishNotifier::SendZmqMessage@):
+--
+-- @
+--   frame 0: topic   (e.g. "rawblock", "hashtx")
+--   frame 1: body    (event-specific bytes — see eventToTopicAndBody)
+--   frame 2: seq     (4-byte little-endian uint32, monotonic per notifier)
+-- @
+sendZmqEvent :: ZmqNotifier -> ZmqEvent -> IO ()
+sendZmqEvent notifier event = do
+  let (topic, body) = eventToTopicAndBody event
+  seqNum <- atomically $ do
+    n <- readTVar (znSequence notifier)
+    writeTVar (znSequence notifier) (n + 1)
+    pure n
+  let seqBytes = encodeLE32 seqNum
+  ZMQ.sendMulti (znSocket notifier)
+    (zmqTopicToBytes topic :| [body, seqBytes])
+  where
+    encodeLE32 :: Word32 -> ByteString
+    encodeLE32 n = BS.pack
+      [ fromIntegral (n .&. 0xff)
+      , fromIntegral ((n `shiftR` 8)  .&. 0xff)
+      , fromIntegral ((n `shiftR` 16) .&. 0xff)
+      , fromIntegral ((n `shiftR` 24) .&. 0xff)
+      ]
 
 -- | Convert event to topic and body
 eventToTopicAndBody :: ZmqEvent -> (ZmqTopic, ByteString)
