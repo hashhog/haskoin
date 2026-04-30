@@ -29,6 +29,9 @@ module Haskoin.FeeEstimator
     -- * Fee Estimation
   , estimateFee
   , estimateSmartFee
+  , estimateRawFee
+  , RawFeeEstimate(..)
+  , RawBucketRange(..)
     -- * Bucket Types
   , FeeBucket(..)
   , PendingTxInfo(..)
@@ -50,7 +53,8 @@ import Control.Monad (forM, forM_, when)
 import Data.Aeson (ToJSON, FromJSON, encode, eitherDecode')
 import qualified Data.ByteString.Lazy as LBS
 import Data.Word (Word64, Word32)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, isJust, mapMaybe)
+import Data.Text (Text)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
 import System.Directory (doesFileExist, renameFile)
@@ -289,6 +293,113 @@ estimateSmartFee fe targetBlocks mode = do
     adjustForMode :: Word64 -> FeeEstimateMode -> Word64
     adjustForMode rate FeeConservative = rate + (rate `div` 10)
     adjustForMode rate FeeEconomical   = rate
+
+--------------------------------------------------------------------------------
+-- Raw fee estimation (per-bucket data, like Bitcoin Core's estimaterawfee)
+--------------------------------------------------------------------------------
+
+-- | Per-bucket statistics returned by 'estimateRawFee'.  Mirrors the
+-- @pass@/@fail@ objects emitted by Bitcoin Core's @estimaterawfee@ RPC
+-- (see @bitcoin-core/src/rpc/fees.cpp@).
+data RawBucketRange = RawBucketRange
+  { rbrStartRange     :: !Word64   -- ^ Inclusive lower edge, sat/vB
+  , rbrEndRange       :: !Word64   -- ^ Inclusive upper edge, sat/vB
+  , rbrWithinTarget   :: !Double   -- ^ Tx count confirmed within target
+  , rbrTotalConfirmed :: !Double   -- ^ Tx count confirmed at any point
+  , rbrInMempool      :: !Double   -- ^ Currently in the mempool
+  , rbrLeftMempool    :: !Double   -- ^ Left the mempool unconfirmed
+  } deriving (Show, Eq, Generic)
+
+instance NFData RawBucketRange
+
+-- | Result returned by 'estimateRawFee'.  We only operate over a single
+-- horizon (the existing 'FeeEstimator' is not bucketed by horizon the way
+-- Bitcoin Core's @CBlockPolicyEstimator@ is); RPC layers typically expose
+-- this under all three Core horizons by returning the same payload.
+data RawFeeEstimate = RawFeeEstimate
+  { rfeFeeRate :: !(Maybe Word64)       -- ^ Sat/vB (Nothing = no estimate)
+  , rfeDecay   :: !Double               -- ^ Per-block decay
+  , rfeScale   :: !Int                  -- ^ Confirmation slot resolution
+  , rfePass    :: !RawBucketRange       -- ^ Lowest passing bucket
+  , rfeFail    :: !(Maybe RawBucketRange) -- ^ Highest failing bucket
+  , rfeErrors  :: ![Text]               -- ^ Errors during estimation
+  } deriving (Show, Eq, Generic)
+
+instance NFData RawFeeEstimate
+
+-- | Same per-bucket exposure that @CBlockPolicyEstimator::estimateRawFee@
+-- provides.  Walks buckets from highest fee rate to lowest, accumulating
+-- confirmation statistics and returning the lowest range whose hit rate
+-- meets @threshold@ within @targetBlocks@ confirmations.  When no
+-- bucket meets the threshold, @rfeFeeRate@ is @Nothing@ and the
+-- highest-rate failing bucket is reported under @rfeFail@.
+estimateRawFee :: FeeEstimator -> Int -> Double -> IO RawFeeEstimate
+estimateRawFee fe targetBlocks threshold = do
+  buckets <- readTVarIO (feeBuckets fe)
+  let bucketList = Map.toDescList buckets   -- highest fee rate first
+      (mPass, mFail, errors) = walk bucketList
+                                emptyRange  -- accumulator
+                                Nothing
+                                Nothing
+  let pass = fromMaybe emptyRange mPass
+      feeRate = case mPass of
+        Just r  -> Just (rbrStartRange r)
+        Nothing -> Nothing
+      finalErrors =
+        if isJust mPass
+          then []
+          else "Insufficient data or no feerate found which meets threshold"
+                 : errors
+  return RawFeeEstimate
+    { rfeFeeRate = feeRate
+    , rfeDecay   = feeDecay fe
+    , rfeScale   = 1
+    , rfePass    = pass
+    , rfeFail    = mFail
+    , rfeErrors  = finalErrors
+    }
+  where
+    -- An empty bucket-range placeholder; matches Core's "start = -1" sentinel
+    -- modeling for the case when no bucket data is available.
+    emptyRange = RawBucketRange 0 0 0 0 0 0
+
+    -- | Compute pass/fail for a single bucket against the configured target
+    -- and threshold, returning a 'RawBucketRange' summary.
+    summarize :: FeeBucket -> RawBucketRange
+    summarize b =
+      let confirmedInTarget =
+            if targetBlocks > 0 && targetBlocks <= length (fbConfirmations b)
+              then fbConfirmations b !! (targetBlocks - 1)
+              else 0
+      in RawBucketRange
+        { rbrStartRange     = fbMinFeeRate b
+        , rbrEndRange       = fbMaxFeeRate b
+        , rbrWithinTarget   = confirmedInTarget
+        , rbrTotalConfirmed = fbTotalTxs b
+        , rbrInMempool      = fbInMempool b
+        , rbrLeftMempool    = max 0 (fbTotalTxs b - confirmedInTarget)
+        }
+
+    -- | Walk buckets from highest to lowest fee rate; remember the lowest
+    -- passing bucket and the highest failing bucket seen so far.
+    walk :: [(Int, FeeBucket)]
+         -> RawBucketRange
+         -> Maybe RawBucketRange
+         -> Maybe RawBucketRange
+         -> (Maybe RawBucketRange, Maybe RawBucketRange, [Text])
+    walk [] _ p f = (p, f, [])
+    walk ((_, b) : rest) _ p f =
+      let r = summarize b
+          totalTxs = fbTotalTxs b
+          rate = if totalTxs > 0 then rbrWithinTarget r / totalTxs else 0
+          passes = totalTxs >= minTxsForEstimate && rate >= threshold
+      in if passes
+           then walk rest r (Just r) f
+           else
+             let f' = case f of
+                        Nothing -> Just r
+                        Just _  -> f   -- keep highest-rate failing bucket
+             in walk rest r p f'
 
 --------------------------------------------------------------------------------
 -- Persistence

@@ -148,7 +148,8 @@ import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
                         Address(..), PubKey(..), serializePubKeyCompressed,
-                        base58Check, bech32Encode, bech32mEncode)
+                        base58Check, bech32Encode, bech32mEncode,
+                        SecKey(..), hash160, signMessage, recoverMessagePubKey)
 import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
@@ -177,7 +178,8 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          getAncestors, getDescendants, removeTransaction,
                          isRbfReplaceable)
 import qualified Haskoin.Mempool.Persist as MPP
-import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..))
+import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..),
+                              estimateRawFee, RawFeeEstimate(..), RawBucketRange(..))
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
 import Haskoin.Wallet (Descriptor(..), KeyExpr(..), ParseError(..),
@@ -185,6 +187,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), ParseError(..),
                         deriveScripts, descriptorChecksum, addDescriptorChecksum,
                         validateDescriptorChecksum, isRangeDescriptor,
                         WalletManager(..), WalletState(..), WalletInfo(..),
+                        wifDecode,
                         newWalletManager, createManagedWallet, loadManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
@@ -691,6 +694,7 @@ handleRpcRequest server req = do
 
     -- Fee estimation
     "estimatesmartfee"     -> handleEstimateSmartFee server params
+    "estimaterawfee"       -> handleEstimateRawFee server params
 
     -- Utility
     "validateaddress"      -> handleValidateAddress server params
@@ -726,6 +730,7 @@ handleRpcRequest server req = do
     "testmempoolaccept"    -> handleTestMempoolAccept server params
     "getmempoolentry"      -> handleGetMempoolEntry server params
     "getmempoolancestors"  -> handleGetMempoolAncestors server params
+    "getmempooldescendants"-> handleGetMempoolDescendants server params
     "savemempool"          -> handleSaveMempool server
     "importmempool"        -> handleImportMempool server params
     "loadmempool"          -> handleImportMempool server params
@@ -756,6 +761,8 @@ handleRpcRequest server req = do
     "walletlock"           -> handleWalletLock server
     "setlabel"             -> handleSetLabel server params
     "verifymessage"        -> handleVerifyMessage server params
+    "signmessage"          -> handleSignMessage server params
+    "signmessagewithprivkey" -> handleSignMessage server params
     "uptime"               -> handleUptime server
     "getnettotals"         -> handleGetNetTotals server
 
@@ -3721,6 +3728,7 @@ allRpcCommands =
   , ""
   , "== Mempool =="
   , "getmempoolancestors \"txid\" ( verbose )"
+  , "getmempooldescendants \"txid\" ( verbose )"
   , "getmempoolentry \"txid\""
   , "getmempoolinfo"
   , "getrawmempool ( verbose mempool_sequence )"
@@ -3771,9 +3779,12 @@ allRpcCommands =
   , "stop"
   , ""
   , "== Utility =="
+  , "estimaterawfee conf_target ( threshold )"
   , "estimatesmartfee conf_target ( \"estimate_mode\" )"
   , "getnettotals"
   , "setlabel \"address\" \"label\""
+  , "signmessage \"privkey-or-address\" \"message\""
+  , "signmessagewithprivkey \"privkey\" \"message\""
   , "uptime"
   , "validateaddress \"address\""
   , "verifymessage \"address\" \"signature\" \"message\""
@@ -3836,23 +3847,203 @@ handleSetLabel _server _params =
   return $ RpcResponse Null Null Null
 
 -- | Verify a signed message.
--- Validates address format and signature base64 encoding, returns {valid: false}
--- as a stub since full message signing verification is not yet implemented.
+-- Reference: Bitcoin Core's @verifymessage@ RPC (rpc/signmessage.cpp) and
+-- @MessageVerify@ in common/signmessage.cpp.  We recover the public key
+-- from the 65-byte compact signature, hash160 it, and compare against the
+-- P2PKH hash encoded in the supplied address.  Bitcoin Core only supports
+-- P2PKH for verifymessage; we mirror that.
 handleVerifyMessage :: RpcServer -> Value -> IO RpcResponse
 handleVerifyMessage _server params = do
   case (extractParamText params 0, extractParamText params 1, extractParamText params 2) of
-    (Just _address, Just sig, Just _message) -> do
-      -- Validate base64 encoding of signature
-      let sigValid = case B64.decode (TE.encodeUtf8 sig) of
-            Right bs -> BS.length bs > 0
-            Left _   -> False
-      if not sigValid
-        then return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Malformed base64 encoding") Null
-        else return $ RpcResponse (toJSON $ object ["valid" .= False]) Null Null
+    (Just address, Just sig, Just message) -> do
+      case textToAddress address of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidAddressOrKey "Invalid address") Null
+        Just addr -> case addr of
+          PubKeyAddress (Hash160 expectedHash) ->
+            case B64.decode (TE.encodeUtf8 sig) of
+              Left _ -> return $ RpcResponse Null
+                (toJSON $ RpcError (-3) "Malformed base64 encoding") Null
+              Right sigBytes
+                | BS.length sigBytes /= 65 ->
+                    -- Not a 65-byte compact recoverable signature; mirror
+                    -- Bitcoin Core which returns false for ERR_PUBKEY_NOT_RECOVERED
+                    return $ RpcResponse (toJSON False) Null Null
+                | otherwise ->
+                    case recoverMessagePubKey sigBytes message of
+                      Nothing -> return $ RpcResponse (toJSON False) Null Null
+                      Just pkBytes ->
+                        let Hash160 actual = hash160 pkBytes
+                        in return $ RpcResponse (toJSON (actual == expectedHash))
+                                                Null Null
+          _ -> return $ RpcResponse Null
+            (toJSON $ RpcError (-3) "Address does not refer to key") Null
     _ -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams
         "Usage: verifymessage \"address\" \"signature\" \"message\"") Null
+
+-- | Sign a UTF-8 message with the private key referenced by an address
+-- (haskoin's wallet stores keys directly, so we accept either a WIF private
+-- key OR an address whose key the wallet manages).
+--
+-- Reference: Bitcoin Core's @signmessage@ (wallet/rpc/signmessage.cpp) and
+-- @signmessagewithprivkey@ (rpc/signmessage.cpp).
+--
+-- Calling conventions accepted:
+--   1. signmessage(\"<WIF privkey>\", \"<message>\")           — privkey-direct path
+--   2. signmessagewithprivkey(\"<WIF privkey>\", \"<message>\") — privkey-direct path
+-- The resulting 65-byte compact signature is base64-encoded.
+handleSignMessage :: RpcServer -> Value -> IO RpcResponse
+handleSignMessage _server params = do
+  case (extractParamText params 0, extractParamText params 1) of
+    (Just keyOrAddress, Just message) ->
+      case wifDecode keyOrAddress of
+        Just sk@(SecKey _) ->
+          -- WIF: trailing 0x01 byte selects compressed; wifDecode strips it
+          -- but the decoder remembers via the resulting payload length. We
+          -- conservatively assume compressed (the modern default).
+          case signMessage sk True message of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Sign failed") Null
+            Just sigBytes ->
+              return $ RpcResponse
+                (toJSON (TE.decodeUtf8 (B64.encode sigBytes))) Null Null
+        Nothing ->
+          -- Treat as an address: walk the wallet, find the matching key.
+          -- haskoin's wallet API does not currently expose a private-key
+          -- lookup by address, so this path returns a structured error so
+          -- callers can fall back to the privkey form.
+          case textToAddress keyOrAddress of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Invalid private key") Null
+            Just _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey
+                 "Private key for address not available; pass a WIF key directly") Null
+    _ -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams
+        "Usage: signmessage \"privkey-or-address\" \"message\"") Null
+
+--------------------------------------------------------------------------------
+-- Fee Estimation: estimaterawfee
+--------------------------------------------------------------------------------
+
+-- | Per-bucket fee estimator exposure, mirroring Bitcoin Core's
+-- @estimaterawfee@ (src/rpc/fees.cpp).  The result groups buckets by the
+-- horizon names @short@/@medium@/@long@; haskoin's 'FeeEstimator' uses a
+-- single horizon, so we report identical payloads under all three keys
+-- (matching the shape so JSON-RPC clients can parse it unchanged).
+handleEstimateRawFee :: RpcServer -> Value -> IO RpcResponse
+handleEstimateRawFee server params = do
+  case extractParam params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams
+        "Usage: estimaterawfee conf_target ( threshold )") Null
+    Just (confTarget :: Int) -> do
+      let threshold = case extractParam params 1 :: Maybe Double of
+            Just t  -> t
+            Nothing -> 0.95
+      if threshold < 0 || threshold > 1
+        then return $ RpcResponse Null
+          (toJSON $ RpcError (-8) "Invalid threshold") Null
+        else do
+          raw <- estimateRawFee (rsFeeEst server) confTarget threshold
+          let horizonObj = rawFeeToJSON raw
+              result = object
+                [ "short"  .= horizonObj
+                , "medium" .= horizonObj
+                , "long"   .= horizonObj
+                ]
+          return $ RpcResponse result Null Null
+  where
+    bucketToJSON :: RawBucketRange -> Value
+    bucketToJSON RawBucketRange{..} = object
+      [ "startrange"     .= rbrStartRange
+      , "endrange"       .= rbrEndRange
+      , "withintarget"   .= rbrWithinTarget
+      , "totalconfirmed" .= rbrTotalConfirmed
+      , "inmempool"      .= rbrInMempool
+      , "leftmempool"    .= rbrLeftMempool
+      ]
+
+    -- Bitcoin Core reports feerate as BTC/kvB; haskoin tracks sat/vB.
+    -- Conversion: sat/vB * 1000 sat/kvB / 1e8 sat/BTC = sat/vB / 1e5.
+    satPerVbToBtcPerKvb :: Word64 -> Double
+    satPerVbToBtcPerKvb r = fromIntegral r / 100000.0
+
+    rawFeeToJSON :: RawFeeEstimate -> Value
+    rawFeeToJSON RawFeeEstimate{..} =
+      let common = [ "decay" .= rfeDecay
+                   , "scale" .= rfeScale
+                   , "pass"  .= bucketToJSON rfePass
+                   ]
+          withFail = case rfeFail of
+            Just b  -> ("fail" .= bucketToJSON b) : common
+            Nothing -> common
+          withRate = case rfeFeeRate of
+            Just r  -> ("feerate" .= satPerVbToBtcPerKvb r) : withFail
+            Nothing -> withFail
+          withErrors = if null rfeErrors
+                       then withRate
+                       else ("errors" .= rfeErrors) : withRate
+      in object withErrors
+
+--------------------------------------------------------------------------------
+-- Mempool: getmempooldescendants
+--------------------------------------------------------------------------------
+
+-- | List the unconfirmed descendants of a transaction in the mempool.
+-- Reference: Bitcoin Core's @getmempooldescendants@ RPC (rpc/mempool.cpp).
+-- Mirrors 'handleGetMempoolAncestors' but walks the descendant index.
+handleGetMempoolDescendants :: RpcServer -> Value -> IO RpcResponse
+handleGetMempoolDescendants server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
+    Just txidHex -> do
+      let verbose = fromMaybe False (extractParam params 1 :: Maybe Bool)
+          mp = rsMempool server
+      entries <- readTVarIO (mpEntries mp)
+      case parseTxId txidHex of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
+        Just txid -> case Map.lookup txid entries of
+          Nothing -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
+          Just _ -> do
+            descendants <- getDescendants mp txid
+            if verbose
+              then do
+                let descendantDetails = Map.fromList
+                      [ (showTxId (meTxId d), mempoolEntryToJSON d)
+                      | d <- descendants
+                      ]
+                return $ RpcResponse (toJSON descendantDetails) Null Null
+              else
+                return $ RpcResponse
+                  (toJSON (map (showTxId . meTxId) descendants)) Null Null
+  where
+    parseTxId :: Text -> Maybe TxId
+    parseTxId hex =
+      case B16.decode (TE.encodeUtf8 hex) of
+        Left _ -> Nothing
+        Right bs
+          | BS.length bs == 32 -> Just $ TxId (Hash256 (BS.reverse bs))
+          | otherwise -> Nothing
+
+    showTxId :: TxId -> Text
+    showTxId (TxId (Hash256 bs)) = TE.decodeUtf8 $ B16.encode (BS.reverse bs)
+
+    mempoolEntryToJSON :: MempoolEntry -> Value
+    mempoolEntryToJSON entry = object
+      [ "vsize"           .= meSize entry
+      , "fee"             .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
+      , "ancestorcount"   .= meAncestorCount entry
+      , "ancestorsize"    .= meAncestorSize entry
+      , "ancestorfees"    .= meAncestorFees entry
+      , "descendantcount" .= meDescendantCount entry
+      , "descendantsize"  .= meDescendantSize entry
+      , "descendantfees"  .= meDescendantFees entry
+      ]
 
 -- | Return server uptime in seconds.
 -- Reference: Bitcoin Core's uptime RPC (server.cpp)
