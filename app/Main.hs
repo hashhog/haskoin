@@ -44,6 +44,7 @@ import Haskoin.Consensus
 import Haskoin.Storage
 import Haskoin.Rpc
 import Haskoin.Mempool
+import qualified Haskoin.Mempool.Persist as MPP
 import Haskoin.FeeEstimator
 import Haskoin.Wallet
 
@@ -244,6 +245,23 @@ runNode net dataDir NodeOptions{..} = do
     -- Initialize mempool
     mp <- newMempool net cache defaultMempoolConfig 0
 
+    -- Load mempool.dat (Core-format), if present. We use a 14-day
+    -- expiry (matches Bitcoin Core's DEFAULT_MEMPOOL_EXPIRY_HOURS = 336).
+    let mempoolDatPath = MPP.defaultMempoolDatPath dataDir
+        mempoolExpirySecs = 14 * 24 * 3600  -- 14 days
+    do
+      r <- MPP.loadMempool mp mempoolDatPath mempoolExpirySecs
+             `catch` (\(e :: SomeException) -> do
+                       putStrLn $ "loadMempool error: " ++ show e
+                       return (Right (0, 0, 0, 0)))
+      case r of
+        Right (loaded, failed, expired, already) ->
+          when (loaded + failed + expired + already > 0) $
+            putStrLn $ "Loaded mempool.dat: " ++ show loaded ++ " accepted, " ++
+                       show failed ++ " failed, " ++ show expired ++
+                       " expired, " ++ show already ++ " already there"
+        Left e -> putStrLn $ "Could not parse mempool.dat: " ++ e
+
     -- Initialize fee estimator with persistence
     fe <- newFeeEstimator
     let feeEstimatesPath = dataDir </> "fee_estimates.json"
@@ -417,6 +435,18 @@ runNode net dataDir NodeOptions{..} = do
 
     saveFeeEstimates fe feeEstimatesPath
     putStrLn $ "Fee estimates saved to " ++ feeEstimatesPath
+
+    -- Persist mempool.dat in Bitcoin Core wire format. Failure here is
+    -- non-fatal; we just log and continue the shutdown sequence.
+    do
+      r <- MPP.dumpMempool mp mempoolDatPath
+             `catch` (\(e :: SomeException) -> do
+                       putStrLn $ "dumpMempool error: " ++ show e
+                       return (Left "exception"))
+      case r of
+        Right n -> putStrLn $ "Dumped " ++ show n ++ " transactions to " ++ mempoolDatPath
+        Left e  -> putStrLn $ "Failed to dump mempool: " ++ e
+
     putStrLn "Shutdown complete."
     -- Explicit exit. Without this, any forked thread mid-FFI call
     -- (accept on the inbound listener, RocksDB I/O, Warp thread in
