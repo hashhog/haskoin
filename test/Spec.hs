@@ -57,6 +57,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
 import Haskoin.Network hiding (computeWtxid)
 import Haskoin.Sync
 import Haskoin.Mempool
+import qualified Haskoin.Mempool.Persist as MPP
 import qualified Haskoin.Policy.Standard as Std
 import Haskoin.FeeEstimator
 import Haskoin.Wallet hiding ((<|>), Addr)
@@ -9811,6 +9812,66 @@ main = hspec $ do
 
     it "exposes dustRelayTxFee = 3000" $
       Std.dustRelayTxFee `shouldBe` 3000
+
+  ------------------------------------------------------------------------------
+  -- mempool.dat (Bitcoin Core wire format) coverage
+  ------------------------------------------------------------------------------
+
+  describe "MempoolDump (Bitcoin Core mempool.dat format)" $ do
+    let prev = TxId (Hash256 (BS.replicate 32 0x88))
+        tin  = TxIn (OutPoint prev 0) "scriptsig" 0xffffffff
+        tout = TxOut 100000 (BS.pack ([0x76, 0xa9, 0x14] ++ replicate 20 0xab ++ [0x88, 0xac]))
+        sampleDt = MPP.DumpedTx
+                     (Tx 1 [tin] [tout] [[]] 0)
+                     1700000000
+                     0
+
+    it "roundtrips an empty v2 dump" $ do
+      let dump = MPP.MempoolDump
+                   { MPP.mdVersion = MPP.mempoolDumpVersion
+                   , MPP.mdXorKey  = BS.replicate 8 0x42
+                   , MPP.mdTxs     = []
+                   , MPP.mdDeltas  = Map.empty
+                   , MPP.mdUnbroadcast = Set.empty
+                   }
+          bytes = MPP.encodeMempoolDat dump
+      MPP.decodeMempoolDat bytes `shouldBe` Right dump
+
+    it "roundtrips a v2 dump with one transaction" $ do
+      let dump = MPP.MempoolDump
+                   { MPP.mdVersion = MPP.mempoolDumpVersion
+                   , MPP.mdXorKey  = BS.pack [1,2,3,4,5,6,7,8]
+                   , MPP.mdTxs     = [sampleDt]
+                   , MPP.mdDeltas  = Map.fromList [(prev, 12345 :: Int64)]
+                   , MPP.mdUnbroadcast = Set.fromList [prev]
+                   }
+          bytes = MPP.encodeMempoolDat dump
+      MPP.decodeMempoolDat bytes `shouldBe` Right dump
+
+    it "roundtrips a v1 (unobfuscated) dump for backward compatibility" $ do
+      let dump = MPP.MempoolDump
+                   { MPP.mdVersion = MPP.mempoolDumpVersionNoXorKey
+                   , MPP.mdXorKey  = BS.empty
+                   , MPP.mdTxs     = [sampleDt]
+                   , MPP.mdDeltas  = Map.empty
+                   , MPP.mdUnbroadcast = Set.empty
+                   }
+          bytes = MPP.encodeMempoolDat dump
+      MPP.decodeMempoolDat bytes `shouldBe` Right dump
+
+    it "rejects unknown versions" $ do
+      let badVersion = BS.pack
+            [ 0x99, 0, 0, 0, 0, 0, 0, 0  -- u64 version = 0x99
+            ]
+      case MPP.decodeMempoolDat badVersion of
+        Left _  -> return ()
+        Right _ -> expectationFailure "should have rejected version 0x99"
+
+    it "xorObfuscate is its own inverse" $
+      property $ \(payloadBytes :: [Word8]) keyBytes -> do
+        let key = BS.pack (take 8 (keyBytes ++ replicate 8 0))
+            bs  = BS.pack payloadBytes
+        MPP.xorObfuscate key (MPP.xorObfuscate key bs) === bs
 
   where
     sampleTx = Tx
