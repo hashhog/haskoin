@@ -246,7 +246,10 @@ runNode net dataDir nodeOptsCli = do
   let confPath = case noConfFile nodeOptsCli of
                    Just p  -> p
                    Nothing -> dataDir </> "haskoin.conf"
-  confResult <- Daemon.readConfFile confPath
+  -- Network-aware config parse: keys under [main]/[test]/[testnet4]/
+  -- [regtest] are filtered to the active network; top-of-file keys
+  -- (no section) apply globally. See Haskoin.Daemon.networkSection.
+  confResult <- Daemon.readConfFileForNetwork (netName net) confPath
   cm <- case confResult of
     Right m -> do
       unless (null m) $

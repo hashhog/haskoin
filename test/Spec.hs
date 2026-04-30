@@ -10083,9 +10083,86 @@ main = hspec $ do
             , "[testnet4]"
             , "rpcport=48343"
             ]
-      -- We don't yet honour sections; both keys collapse to the
-      -- last assignment. Test pins the documented behaviour.
+      -- The section-blind 'parseConfFile' collapses both keys to the
+      -- last assignment. The network-aware 'parseConfFileForNetwork'
+      -- (tested below) is the one that honours [main]/[testnet4].
       Daemon.configLookup "rpcport" cm `shouldBe` Just "48343"
+
+    it "parseConfFileForNetwork honours [main] section" $ do
+      let txt = unlines
+            [ "rpcuser=alice"               -- global
+            , "[main]"
+            , "rpcport=8332"
+            , "[testnet4]"
+            , "rpcport=48343"
+            , "[regtest]"
+            , "rpcport=18443"
+            ]
+          cm = Daemon.parseConfFileForNetwork "main" txt
+      Daemon.configLookup "rpcuser" cm `shouldBe` Just "alice"
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "8332"
+
+    it "parseConfFileForNetwork honours [testnet4] section" $ do
+      let txt = unlines
+            [ "rpcuser=alice"
+            , "[main]"
+            , "rpcport=8332"
+            , "[testnet4]"
+            , "rpcport=48343"
+            ]
+          cm = Daemon.parseConfFileForNetwork "testnet4" txt
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "48343"
+
+    it "parseConfFileForNetwork honours [regtest] section" $ do
+      let txt = unlines
+            [ "[main]"
+            , "rpcport=8332"
+            , "[regtest]"
+            , "rpcport=18443"
+            ]
+          cm = Daemon.parseConfFileForNetwork "regtest" txt
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "18443"
+
+    it "parseConfFileForNetwork: section overrides global key" $ do
+      let txt = unlines
+            [ "rpcport=1234"      -- global default
+            , "[main]"
+            , "rpcport=8332"      -- main override
+            ]
+          cmMain = Daemon.parseConfFileForNetwork "main" txt
+          cmReg  = Daemon.parseConfFileForNetwork "regtest" txt
+      -- main: section override wins
+      Daemon.configLookup "rpcport" cmMain `shouldBe` Just "8332"
+      -- regtest: no [regtest] section, falls back to global
+      Daemon.configLookup "rpcport" cmReg  `shouldBe` Just "1234"
+
+    it "parseConfFileForNetwork: testnet3 maps to [test]" $ do
+      let txt = unlines
+            [ "[test]"
+            , "rpcport=18332"
+            , "[testnet4]"
+            , "rpcport=48343"
+            ]
+          cm = Daemon.parseConfFileForNetwork "testnet3" txt
+      Daemon.configLookup "rpcport" cm `shouldBe` Just "18332"
+
+    it "parseConfFileForNetwork: keys for OTHER networks are dropped" $ do
+      let txt = unlines
+            [ "[main]"
+            , "rpcuser=mainuser"
+            , "[regtest]"
+            , "rpcuser=regtestuser"
+            ]
+          cmMain = Daemon.parseConfFileForNetwork "main"    txt
+          cmReg  = Daemon.parseConfFileForNetwork "regtest" txt
+      Daemon.configLookup "rpcuser" cmMain `shouldBe` Just "mainuser"
+      Daemon.configLookup "rpcuser" cmReg  `shouldBe` Just "regtestuser"
+
+    it "networkSection maps haskoin netNames to Core sections" $ do
+      Daemon.networkSection "main"     `shouldBe` "main"
+      Daemon.networkSection "testnet3" `shouldBe` "test"
+      Daemon.networkSection "testnet4" `shouldBe` "testnet4"
+      Daemon.networkSection "regtest"  `shouldBe` "regtest"
 
     it "configLookupBool matches Bitcoin Core 1/true/yes vocabulary" $ do
       let cm = Daemon.parseConfFile $ unlines
