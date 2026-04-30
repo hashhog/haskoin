@@ -29,6 +29,15 @@ module Haskoin.Crypto
   , isValidDERSignature
   , isDefinedSigHashType
   , isLowDERSignature
+    -- * Recoverable / message signing
+  , derivePubKeyCompressed
+  , derivePubKeyUncompressed
+  , signCompact
+  , recoverCompact
+  , messageMagic
+  , messageHash
+  , signMessage
+  , recoverMessagePubKey
     -- * Sighash
   , SigHashType(..)
   , sigHashAll
@@ -80,6 +89,7 @@ import Data.Char (ord, toLower)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe, mapMaybe)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Text (Text)
 import Control.DeepSeq (NFData)
 import GHC.Generics (Generic)
@@ -117,6 +127,33 @@ foreign import ccall unsafe "haskoin_schnorrsig_verify"
                       -> Ptr CUChar   -- msg32
                       -> Ptr CUChar   -- pubkey_x32
                       -> IO CInt
+
+-- | FFI binding for ECDSA pubkey derivation from a 32-byte secret key.
+foreign import ccall unsafe "haskoin_ec_pubkey_create"
+  c_ec_pubkey_create :: Ptr CUChar    -- seckey32
+                     -> CInt          -- compressed flag (0/1)
+                     -> Ptr CUChar    -- output (33 or 65 bytes)
+                     -> Ptr CSize     -- in/out length
+                     -> IO CInt
+
+-- | FFI binding for ECDSA recoverable-compact signing
+-- (signmessage / verifymessage layout: header byte + 64 byte R||S).
+foreign import ccall unsafe "haskoin_ecdsa_sign_recoverable_compact"
+  c_ecdsa_sign_recoverable_compact :: Ptr CUChar  -- seckey32
+                                   -> Ptr CUChar  -- msghash32
+                                   -> CInt        -- compressed flag (0/1)
+                                   -> Ptr CUChar  -- out 65 bytes
+                                   -> IO CInt
+
+-- | FFI binding for ECDSA pubkey recovery from a 65-byte compact recoverable
+-- signature.
+foreign import ccall unsafe "haskoin_ecdsa_recover_compact"
+  c_ecdsa_recover_compact :: Ptr CUChar  -- sig65
+                          -> Ptr CUChar  -- msghash32
+                          -> CInt        -- compressed flag (0/1)
+                          -> Ptr CUChar  -- output (33 or 65)
+                          -> Ptr CSize   -- out length
+                          -> IO CInt
 
 --------------------------------------------------------------------------------
 -- Hashing Functions
@@ -365,6 +402,116 @@ isLowDERSignature sig
                      then (a, BS.replicate (la - lb) 0 <> b)
                      else (BS.replicate (lb - la) 0 <> a, b)
       in compare a' b'
+
+--------------------------------------------------------------------------------
+-- Recoverable / Message Signing (signmessage / verifymessage, BIP-137 era)
+--------------------------------------------------------------------------------
+
+-- | Message magic prefix used by Bitcoin Core's signmessage / verifymessage.
+-- See @bitcoin-core/src/common/signmessage.cpp@.
+messageMagic :: ByteString
+messageMagic = TE.encodeUtf8 (T.pack "Bitcoin Signed Message:\n")
+
+-- | Hash a message exactly the way Bitcoin Core does: double-SHA256 over
+-- @CompactSize(magic) || magic || CompactSize(message) || message@.
+-- This matches @MessageHash@ in @src/common/signmessage.cpp@.
+messageHash :: Text -> Hash256
+messageHash msg =
+  let msgBytes = TE.encodeUtf8 msg
+      buf = runPut $ do
+              putVarBytes messageMagic
+              putVarBytes msgBytes
+  in doubleSHA256 buf
+
+-- | Derive the compressed public key (33 bytes) for a secret key.
+-- Returns 'Nothing' if the seckey is invalid (out of range, all zero, etc.).
+derivePubKeyCompressed :: SecKey -> Maybe ByteString
+derivePubKeyCompressed = derivePubKeyRaw 1 33
+
+-- | Derive the uncompressed public key (65 bytes) for a secret key.
+derivePubKeyUncompressed :: SecKey -> Maybe ByteString
+derivePubKeyUncompressed = derivePubKeyRaw 0 65
+
+derivePubKeyRaw :: CInt -> Int -> SecKey -> Maybe ByteString
+derivePubKeyRaw compressedFlag bufLen (SecKey skBytes)
+  | BS.length skBytes /= 32 = Nothing
+  | otherwise = unsafePerformIO $ do
+      BS.useAsCStringLen skBytes $ \(skPtr, _) ->
+        allocaArray bufLen $ \outPtr ->
+          alloca $ \lenPtr -> do
+            ok <- c_ec_pubkey_create
+                    (castPtr skPtr) compressedFlag
+                    outPtr lenPtr
+            if ok == 1
+              then do
+                actualLen <- peek lenPtr
+                bs <- BS.packCStringLen (castPtr outPtr, fromIntegral actualLen)
+                return (Just bs)
+              else return Nothing
+
+-- | Produce a 65-byte compact recoverable ECDSA signature over @msghash@.
+-- The header byte encodes the recovery id and whether the public key is
+-- compressed (header = 27 + recid + (4 if compressed)).
+-- Mirrors @CKey::SignCompact@ in @bitcoin-core/src/key.cpp@.
+signCompact :: SecKey -> Bool -> Hash256 -> Maybe ByteString
+signCompact (SecKey skBytes) compressed (Hash256 hashBytes)
+  | BS.length skBytes /= 32 = Nothing
+  | BS.length hashBytes /= 32 = Nothing
+  | otherwise = unsafePerformIO $ do
+      BS.useAsCStringLen skBytes $ \(skPtr, _) ->
+        BS.useAsCStringLen hashBytes $ \(hashPtr, _) ->
+          allocaArray 65 $ \outPtr -> do
+            ok <- c_ecdsa_sign_recoverable_compact
+                    (castPtr skPtr) (castPtr hashPtr)
+                    (if compressed then 1 else 0) outPtr
+            if ok == 1
+              then Just <$> BS.packCStringLen (castPtr outPtr, 65)
+              else return Nothing
+
+-- | Recover the public key from a 65-byte compact recoverable signature
+-- and a message hash.  Returns the bytes of the recovered key, in either
+-- compressed (33 byte) or uncompressed (65 byte) form, as encoded by the
+-- header byte (header & 4).
+recoverCompact :: ByteString -> Hash256 -> Maybe ByteString
+recoverCompact sig65 (Hash256 hashBytes)
+  | BS.length sig65 /= 65 = Nothing
+  | BS.length hashBytes /= 32 = Nothing
+  | otherwise =
+      let header = BS.head sig65
+      in if header < 27 || header > 34
+         then Nothing
+         else
+           let compressed = (header - 27) >= 4
+               bufLen = if compressed then 33 else 65
+           in unsafePerformIO $ do
+                BS.useAsCStringLen sig65 $ \(sigPtr, _) ->
+                  BS.useAsCStringLen hashBytes $ \(hashPtr, _) ->
+                    allocaArray bufLen $ \outPtr ->
+                      alloca $ \lenPtr -> do
+                        ok <- c_ecdsa_recover_compact
+                                (castPtr sigPtr) (castPtr hashPtr)
+                                (if compressed then 1 else 0)
+                                outPtr lenPtr
+                        if ok == 1
+                          then do
+                            actualLen <- peek lenPtr
+                            bs <- BS.packCStringLen
+                                    (castPtr outPtr, fromIntegral actualLen)
+                            return (Just bs)
+                          else return Nothing
+
+-- | Sign a UTF-8 message with a private key, exactly like Bitcoin Core's
+-- @signmessage@ / @signmessagewithprivkey@.  Returns the 65-byte recoverable
+-- compact signature on success.  The caller is responsible for base64
+-- encoding for wire transport.
+signMessage :: SecKey -> Bool -> Text -> Maybe ByteString
+signMessage sk compressed msg = signCompact sk compressed (messageHash msg)
+
+-- | Recover the public key bytes used to sign a UTF-8 message.  Returns
+-- the same compressed/uncompressed encoding implied by the signature
+-- header byte.  Used by 'verifymessage' to compare against the address.
+recoverMessagePubKey :: ByteString -> Text -> Maybe ByteString
+recoverMessagePubKey sig msg = recoverCompact sig (messageHash msg)
 
 --------------------------------------------------------------------------------
 -- Sighash Types
