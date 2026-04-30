@@ -88,6 +88,8 @@ data NodeOptions = NodeOptions
   , noPrintToConsole :: !Bool   -- ^ -printtoconsole: explicit, default True when foreground
   , noLogFile    :: !(Maybe FilePath) -- ^ -logfile=<path>; defaults to <datadir>/debug.log when daemonised
   , noHealthPort :: !Int        -- ^ /health endpoint port (0 disables)
+  , noReindex            :: !Bool -- ^ -reindex: full block-index rebuild (TODO: partial impl, see below)
+  , noReindexChainstate  :: !Bool -- ^ -reindex-chainstate: wipe + replay UTXO set from existing block-index
   } deriving (Show)
 
 data WalletCommand
@@ -157,6 +159,15 @@ parseNodeOptions = NodeOptions
         <> help "Log file path (default: <datadir>/debug.log when --daemon, none otherwise). SIGHUP reopens."))
   <*> option auto (long "healthport" <> value 0
         <> help "HTTP /health endpoint port (0 disables)")
+  <*> switch (long "reindex"
+        <> help "Wipe chainstate AND rebuild block index (PARTIAL: \
+                \today this implies --reindex-chainstate; full block-index \
+                \rebuild from blk*.dat is TODO).")
+  <*> switch (long "reindex-chainstate"
+        <> help "Wipe UTXO/best-block/tx-index and replay connectBlock from \
+                \height 1 to the current header tip. Block-index (headers \
+                \+ block data) is preserved. Bitcoin Core's \
+                \-reindex-chainstate semantics.")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -348,6 +359,12 @@ applyConfigOverlay cm n = n
   , noHealthPort = if noHealthPort n == 0
                      then Daemon.configLookupInt "healthport" 0 cm
                      else noHealthPort n
+  , noReindex   = if not (noReindex n)
+                     then Daemon.configLookupBool "reindex" False cm
+                     else noReindex n
+  , noReindexChainstate = if not (noReindexChainstate n)
+                     then Daemon.configLookupBool "reindex-chainstate" False cm
+                     else noReindexChainstate n
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
@@ -425,8 +442,94 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       Just state ->
         putStrLn $ "Resuming from height " ++ show (pcsHeight state)
 
+    -- -reindex / -reindex-chainstate.
+    --
+    -- Bitcoin Core distinguishes two reindex modes (init.cpp):
+    --
+    --   * -reindex             rebuild block-index from blk*.dat,
+    --                          THEN replay chainstate.
+    --   * -reindex-chainstate  keep block-index, wipe + replay
+    --                          chainstate only.
+    --
+    -- Today haskoin only implements -reindex-chainstate. The full
+    -- -reindex (parsing blk*.dat from scratch) is TODO; if -reindex
+    -- is passed we log that we are downgrading to chainstate-only
+    -- and continue. This matches the "honest progress" Cat-F
+    -- decision (nimrod c14311d shipped the same scope).
+    let doReindexChainstate = noReindex || noReindexChainstate
+    when noReindex $
+      putStrLn $ "Note: -reindex ran as -reindex-chainstate "
+              ++ "(block-index rebuild from blk*.dat is TODO)."
+    when doReindexChainstate $ do
+      putStrLn "[-reindex-chainstate] Wiping chainstate (UTXO + tx-index + best-block)..."
+      n <- wipeChainstate db
+        `catch` (\(e :: SomeException) -> do
+                   putStrLn $ "[-reindex-chainstate] wipe error: " ++ show e
+                   return 0)
+      putStrLn $ "[-reindex-chainstate] wiped " ++ show n ++ " keys."
+      -- Re-pin best-block to the genesis hash so the rebuild starts
+      -- from height 0 (any pre-existing tip pointer was just wiped).
+      let genesis     = netGenesisBlock net
+          genesisHash = computeBlockHash (blockHeader genesis)
+      putBestBlockHash db genesisHash
+      putBlockHeight db 0 genesisHash
+
     -- Initialize header chain
     hc <- initHeaderChainFromDB db net
+
+    -- Replay phase of -reindex-chainstate: walk every height we
+    -- still have a block for, and replay connectBlock so the UTXO
+    -- set + tx-index are rebuilt. This MUST run after
+    -- initHeaderChainFromDB so the height index is loaded into
+    -- memory, and BEFORE the peer manager / RPC server start
+    -- (otherwise concurrent block download would race the rebuild).
+    when doReindexChainstate $ do
+      tipH <- readTVarIO (hcHeight hc)
+      putStrLn $ "[-reindex-chainstate] Rebuilding chainstate "
+              ++ "by replaying blocks 1.." ++ show tipH
+      let logEvery = 10000 :: Word32
+          replay h
+            | h > tipH = return h
+            | otherwise = do
+                mHash <- getBlockHeight db h
+                case mHash of
+                  Nothing -> do
+                    -- Honest progress: stop at the first missing
+                    -- block-data instead of pretending to continue.
+                    putStrLn $ "[-reindex-chainstate] no block at height "
+                            ++ show h ++ "; stopping replay."
+                    return (h - 1)
+                  Just bh -> do
+                    mBlk <- getBlock db bh
+                    case mBlk of
+                      Nothing -> do
+                        -- TODO(reindex): if haskoin is configured to
+                        -- store block bodies in the flat-file store
+                        -- (writeBlockToDisk), look them up via
+                        -- BlockIndex / readBlockFromDisk here. For
+                        -- now we honestly stop, matching Core's
+                        -- "missing block data, exiting" log.
+                        putStrLn $ "[-reindex-chainstate] block data "
+                                ++ "missing at height " ++ show h
+                                ++ " (hash=" ++ show bh
+                                ++ "); stopping replay."
+                        return (h - 1)
+                      Just blk -> do
+                        connectBlock db net blk h
+                          `catch` (\(e :: SomeException) ->
+                            putStrLn $ "[-reindex-chainstate] connectBlock "
+                                    ++ "h=" ++ show h ++ " error: " ++ show e)
+                        when (h `mod` logEvery == 0) $ do
+                          putStrLn $ "[-reindex-chainstate] replayed "
+                                  ++ "height=" ++ show h
+                          syncFlush db `catch` (\(e :: SomeException) ->
+                            putStrLn $ "syncFlush during replay error: " ++ show e)
+                        replay (h + 1)
+      finalH <- replay 1
+      syncFlush db `catch` (\(e :: SomeException) ->
+        putStrLn $ "syncFlush after replay error: " ++ show e)
+      putStrLn $ "[-reindex-chainstate] Done. Replayed up to height "
+              ++ show finalH ++ "."
 
     -- Initialize UTXO cache
     cache <- newUTXOCache db (noDbCache * 1024 * 1024 `div` 100)
