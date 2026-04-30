@@ -43,10 +43,13 @@ module Haskoin.Daemon
     -- * Config file
   , ConfigMap
   , parseConfFile
+  , parseConfFileForNetwork
   , readConfFile
+  , readConfFileForNetwork
   , configLookup
   , configLookupBool
   , configLookupInt
+  , networkSection
     -- * Log file rotation
   , LogState
   , newLogState
@@ -306,21 +309,88 @@ logDebug cat msg = do
 -- Bitcoin Core's case-insensitive option handling).
 type ConfigMap = Map.Map String String
 
--- | Parse the contents of a Bitcoin-Core-style config file.
+-- | Map a haskoin 'netName' string to the Bitcoin Core conf-file
+-- section header. Core uses @[main]@, @[test]@ (for testnet3),
+-- @[testnet4]@, @[signet]@, and @[regtest]@. We match those names
+-- exactly so a @bitcoin.conf@ written for Core works unchanged.
+networkSection :: String -> String
+networkSection n = case map toLower n of
+  "main"     -> "main"
+  "mainnet"  -> "main"
+  "testnet"  -> "test"
+  "testnet3" -> "test"
+  "test"     -> "test"
+  "testnet4" -> "testnet4"
+  "signet"   -> "signet"
+  "regtest"  -> "regtest"
+  other      -> other
+
+-- | Parse a Bitcoin-Core-style config file and return the entries
+-- visible to a node running on the given network.
 --
--- Recognised syntax (matches @bitcoin.conf@):
+-- Section semantics (matches @bitcoin.conf(5)@):
 --
--- * @key=value@ — sets the option.
--- * @key=@ (empty) — sets the option to the empty string.
--- * Lines starting with @#@ or @;@ — comments.
--- * Blank lines — ignored.
--- * Section headers @[section]@ — currently ignored (network sections
---   are matched at the call site against the active network).
+-- * Keys above the first @[section]@ header apply to ALL networks.
+-- * Keys under @[main]@ apply only when the active network is
+--   mainnet; ditto @[test]@ (testnet3), @[testnet4]@, @[signet]@,
+--   @[regtest]@.
+-- * A section-specific key OVERRIDES a global key of the same name.
+--   This mirrors Core's left-to-right merge order in @ArgsManager@.
+-- * Sections that don't match the active network are dropped silently
+--   (they're valid for OTHER networks).
 --
--- This is intentionally minimal. We do NOT support TOML; the
--- @config.example.toml@ shipped in the repo is a placeholder. The
--- intended user-visible format is the Core conf syntax everyone
--- already knows, parsed identically across the fleet.
+-- The @network@ argument is the haskoin 'netName' (\"main\",
+-- \"testnet3\", \"testnet4\", \"regtest\"). 'networkSection' maps it
+-- to the corresponding Core section header before filtering.
+parseConfFileForNetwork :: String -> String -> ConfigMap
+parseConfFileForNetwork network = mergeSections . sectionedLines
+  where
+    target = networkSection network
+
+    -- Walk lines, threading the current section state. Emit
+    -- (section, key, value) triples; the merge step downstream
+    -- filters by section and overlays section-specific entries on
+    -- top of the global ones.
+    sectionedLines :: String -> [(Maybe String, String, String)]
+    sectionedLines = go Nothing . lines
+      where
+        go _   []         = []
+        go cur (raw:rest) =
+          let stripped = dropWhile isSpace raw
+          in case stripped of
+               ""        -> go cur rest
+               ('#':_)   -> go cur rest
+               (';':_)   -> go cur rest
+               ('[':xs)  ->
+                 let nameAndRest = takeWhile (/= ']') xs
+                     newSection  = map toLower (trim nameAndRest)
+                 in go (Just newSection) rest
+               _ -> case break (== '=') stripped of
+                      (k, '=':v) ->
+                        let key   = map toLower (trim k)
+                            value = trimVal v
+                        in (cur, key, value) : go cur rest
+                      _ -> go cur rest
+
+    trim     = dropWhile isSpace . dropWhileEnd isSpace
+    trimVal  = dropWhile isSpace . dropWhileEnd isSpace . takeWhile (/= '#')
+
+    -- Two-pass merge: globals first, then section-specific entries
+    -- override. Within each pass, last-wins (matches Core).
+    mergeSections :: [(Maybe String, String, String)] -> ConfigMap
+    mergeSections triples =
+      let globals = Map.fromList [(k, v) | (Nothing, k, v) <- triples]
+          scoped  = Map.fromList [(k, v) | (Just s, k, v) <- triples
+                                         , s == target]
+      in Map.union scoped globals
+
+-- | Backwards-compatible parser: ignores section headers entirely,
+-- merging every @key=value@ in the file into a single 'ConfigMap'.
+-- Use 'parseConfFileForNetwork' for proper @[main]@\/@[test]@\/
+-- @[testnet4]@\/@[regtest]@ scoping. This is kept so existing
+-- callers (and tests) that don't know the active network still work,
+-- but they will silently absorb cross-network keys — prefer the
+-- network-aware variant in production code.
 parseConfFile :: String -> ConfigMap
 parseConfFile = Map.fromList . concatMap parseLine . zip [1 :: Int ..] . lines
   where
@@ -343,6 +413,9 @@ parseConfFile = Map.fromList . concatMap parseLine . zip [1 :: Int ..] . lines
 -- (not an error) if the file is absent — this matches Bitcoin Core,
 -- which silently tolerates a missing default @bitcoin.conf@.
 -- Permission errors / decode errors propagate as @Left msg@.
+--
+-- This is the section-blind variant; for @[main]@\/@[test]@\/
+-- @[testnet4]@\/@[regtest]@ scoping use 'readConfFileForNetwork'.
 readConfFile :: FilePath -> IO (Either String ConfigMap)
 readConfFile path = do
   exists <- doesFileExist path
@@ -353,6 +426,20 @@ readConfFile path = do
       case r of
         Left e  -> return (Left ("readConfFile " ++ path ++ ": " ++ show e))
         Right s -> return (Right (parseConfFile s))
+
+-- | Read and parse a config file, filtering entries by the active
+-- network's @[section]@. See 'parseConfFileForNetwork' for the
+-- section semantics. Missing file = empty map (matches Core).
+readConfFileForNetwork :: String -> FilePath -> IO (Either String ConfigMap)
+readConfFileForNetwork network path = do
+  exists <- doesFileExist path
+  if not exists
+    then return (Right Map.empty)
+    else do
+      r <- try (readFile path) :: IO (Either SomeException String)
+      case r of
+        Left e  -> return (Left ("readConfFile " ++ path ++ ": " ++ show e))
+        Right s -> return (Right (parseConfFileForNetwork network s))
 
 -- | Look up a config key, returning the raw string value if present.
 configLookup :: String -> ConfigMap -> Maybe String
