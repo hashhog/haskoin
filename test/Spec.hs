@@ -12,6 +12,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits ((.|.), (.&.))
@@ -79,7 +80,7 @@ import Haskoin.Rpc
 import Haskoin.Index
 import qualified Haskoin.MuHash as MuHash
 import qualified Haskoin.Daemon as Daemon
-import Data.Aeson (Value(..), Object, Array)
+import Data.Aeson (Value(..), Object, Array, object, (.=))
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
 import Data.Scientific (Scientific)
@@ -10772,6 +10773,168 @@ main = hspec $ do
                        | (OutPoint txid vout, TxOut val scr) <- entries
                        ]
                 got `shouldBe` expected
+
+    -- ------------------------------------------------------------------
+    -- dumptxoutset rollback parameter parsing + target resolution
+    --
+    -- Reference: bitcoin-core/src/rpc/blockchain.cpp:3074-3130. We
+    -- exercise the two pure helpers exported from 'Haskoin.Rpc':
+    --
+    --   * 'parseDumpTxOutSetParams' — JSON params → 'DumpTarget'
+    --   * 'resolveDumpTarget'       — 'DumpTarget' + chain → (h, hash)
+    --
+    -- The wiring in 'handleDumpTxOutSet' is a thin pass-through: parse,
+    -- resolve, and either dump-at-tip (the only case wired today; see
+    -- the TODO in 'handleDumpTxOutSet' explaining why rollback writes
+    -- still refuse) or report a friendly error.
+    describe "dumptxoutset rollback param parsing" $ do
+      let mkArr xs = Array (V.fromList xs)
+          mkBaseHash byte = BlockHash (Hash256 (BS.replicate 32 byte))
+
+      it "parses [\"path\"] as DumpLatest" $
+        parseDumpTxOutSetParams (mkArr [String "utxo.dat"])
+          `shouldBe` Right ("utxo.dat", DumpLatest)
+
+      it "parses [\"path\", \"latest\"] as DumpLatest" $
+        parseDumpTxOutSetParams (mkArr [String "utxo.dat", String "latest"])
+          `shouldBe` Right ("utxo.dat", DumpLatest)
+
+      it "parses [\"path\", \"\"] as DumpLatest (empty type)" $
+        parseDumpTxOutSetParams (mkArr [String "utxo.dat", String ""])
+          `shouldBe` Right ("utxo.dat", DumpLatest)
+
+      it "parses [\"path\", \"rollback\"] as DumpRollbackLatestSnapshot" $
+        parseDumpTxOutSetParams (mkArr [String "utxo.dat", String "rollback"])
+          `shouldBe` Right ("utxo.dat", DumpRollbackLatestSnapshot)
+
+      it "parses options.rollback as a height" $
+        let opts = object [ "rollback" .= (840000 :: Word32) ]
+        in parseDumpTxOutSetParams
+             (mkArr [String "utxo.dat", String "rollback", opts])
+             `shouldBe` Right ("utxo.dat", DumpRollbackToHeight 840000)
+
+      it "accepts options.rollback with empty type arg" $
+        let opts = object [ "rollback" .= (910000 :: Word32) ]
+        in parseDumpTxOutSetParams
+             (mkArr [String "utxo.dat", String "", opts])
+             `shouldBe` Right ("utxo.dat", DumpRollbackToHeight 910000)
+
+      it "parses options.rollback as a 64-char hex hash" $ do
+        -- BlockHash hex display reverses the underlying bytes (Bitcoin
+        -- consensus rule). For an all-0xab payload the displayed and
+        -- underlying bytes are the same.
+        let h = mkBaseHash 0xab
+            hHex = TE.decodeUtf8 (B16.encode (BS.replicate 32 0xab))
+            opts = object [ "rollback" .= hHex ]
+        parseDumpTxOutSetParams
+             (mkArr [String "utxo.dat", String "rollback", opts])
+             `shouldBe` Right ("utxo.dat", DumpRollbackToHash h)
+
+      it "rejects type=latest with options.rollback (Core 3117)" $
+        let opts = object [ "rollback" .= (840000 :: Word32) ]
+        in case parseDumpTxOutSetParams
+                  (mkArr [String "utxo.dat", String "latest", opts]) of
+             Left msg -> msg `shouldSatisfy`
+               ("specified with rollback option" `T.isInfixOf`)
+             Right t -> expectationFailure $
+               "expected rejection, got " <> show t
+
+      it "rejects an unknown type string (Core 3128)" $
+        case parseDumpTxOutSetParams
+                (mkArr [String "utxo.dat", String "wat"]) of
+          Left msg -> msg `shouldSatisfy`
+            ("rollback" `T.isInfixOf`)
+          Right t -> expectationFailure $
+            "expected rejection, got " <> show t
+
+      it "rejects missing path" $
+        case parseDumpTxOutSetParams (mkArr []) of
+          Left _  -> pure ()
+          Right t -> expectationFailure $
+            "expected rejection, got " <> show t
+
+    describe "dumptxoutset latestAvailableSnapshotHeight" $ do
+      it "returns the highest mainnet entry ≤ tip (tip = 950000 → 935000)" $
+        latestAvailableSnapshotHeight mainnet 950000 `shouldBe` Just 935000
+
+      it "returns the lowest entry when tip is between two (tip = 850000 → 840000)" $
+        latestAvailableSnapshotHeight mainnet 850000 `shouldBe` Just 840000
+
+      it "returns Nothing when tip is below the lowest entry" $
+        latestAvailableSnapshotHeight mainnet 100 `shouldBe` Nothing
+
+      it "regtest has [(110, _)] and tip 200 → 110" $
+        latestAvailableSnapshotHeight regtest 200 `shouldBe` Just 110
+
+    describe "dumptxoutset resolveDumpTarget" $ do
+      let mkEntry h height prev ts = ChainEntry
+            { ceHeader    = BlockHeader 1
+                              (maybe (BlockHash (Hash256 (BS.replicate 32 0))) id prev)
+                              (Hash256 (BS.replicate 32 0))
+                              ts 0x207fffff 0
+            , ceHash      = h
+            , ceHeight    = height
+            , ceChainWork = fromIntegral height
+            , cePrev      = prev
+            , ceStatus    = StatusHeaderValid
+            , ceMedianTime = ts
+            }
+          -- Build a tiny three-block synthetic chain: 0 → 1 → 2.
+          h0 = BlockHash (Hash256 (BS.replicate 32 0xa0))
+          h1 = BlockHash (Hash256 (BS.replicate 32 0xa1))
+          h2 = BlockHash (Hash256 (BS.replicate 32 0xa2))
+          e0 = mkEntry h0 0 Nothing       1000
+          e1 = mkEntry h1 1 (Just h0)     1010
+          e2 = mkEntry h2 2 (Just h1)     1020
+          entries  = Map.fromList [(h0, e0), (h1, e1), (h2, e2)]
+          byHeight = Map.fromList [(0, h0), (1, h1), (2, h2)]
+          tip      = e2
+
+      it "DumpLatest resolves to the current tip" $
+        resolveDumpTarget regtest entries byHeight tip DumpLatest
+          `shouldBe` Right (2, h2)
+
+      it "DumpRollbackToHeight 1 resolves to the on-chain hash at h=1" $
+        resolveDumpTarget regtest entries byHeight tip
+          (DumpRollbackToHeight 1)
+          `shouldBe` Right (1, h1)
+
+      it "DumpRollbackToHeight above tip is rejected" $
+        case resolveDumpTarget regtest entries byHeight tip
+               (DumpRollbackToHeight 99) of
+          Left msg -> msg `shouldSatisfy`
+            ("above current tip" `T.isInfixOf`)
+          Right t -> expectationFailure $
+            "expected rejection, got " <> show t
+
+      it "DumpRollbackToHash for an unknown hash is rejected" $
+        let bogus = BlockHash (Hash256 (BS.replicate 32 0xff))
+        in case resolveDumpTarget regtest entries byHeight tip
+                  (DumpRollbackToHash bogus) of
+             Left msg -> msg `shouldSatisfy`
+               ("not found" `T.isInfixOf`)
+             Right t -> expectationFailure $
+               "expected rejection, got " <> show t
+
+      it "DumpRollbackToHash for an off-chain (sister) block is rejected" $
+        -- Build a sister block at height 2 with a different hash than h2.
+        let hSister = BlockHash (Hash256 (BS.replicate 32 0xaa))
+            eSister = mkEntry hSister 2 (Just h1) 1025
+            entries' = Map.insert hSister eSister entries
+        in case resolveDumpTarget regtest entries' byHeight tip
+                  (DumpRollbackToHash hSister) of
+             Left msg -> msg `shouldSatisfy`
+               ("not on the current best chain" `T.isInfixOf`)
+             Right t -> expectationFailure $
+               "expected rejection, got " <> show t
+
+      it "DumpRollbackLatestSnapshot fails on regtest tip < 110" $
+        case resolveDumpTarget regtest entries byHeight tip
+               DumpRollbackLatestSnapshot of
+          Left msg -> msg `shouldSatisfy`
+            ("No assumeutxo snapshot height available" `T.isInfixOf`)
+          Right t -> expectationFailure $
+            "expected rejection, got " <> show t
 
     -- ------------------------------------------------------------------
     -- Core-strict assumeutxo whitelist (loadtxoutset RPC guard)
