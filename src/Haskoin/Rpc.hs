@@ -160,7 +160,8 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            medianTimePast, maxBlockWeight,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
                            Deployment(..), taprootDeployment,
-                           checkAssumeutxoWhitelist)
+                           checkAssumeutxoWhitelist,
+                           AssumeUtxoParams(..), assumeUtxoForBlockHash)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
@@ -168,7 +169,8 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
                          loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..),
-                         dumpTxOutSetFromDB)
+                         dumpTxOutSetFromDB,
+                         AssumeUtxoData(..), verifySnapshot)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
@@ -4202,11 +4204,37 @@ handleLoadTxOutSet server params = do
                 Left err -> return $ RpcResponse Null
                   (toJSON $ RpcError rpcInternalError (T.pack err)) Null
                 Right () ->
-                  return $ RpcResponse
-                    (object [ "coins_loaded" .= coinsCount
-                            , "tip_hash"     .= show baseHash
-                            ])
-                    Null Null
+                  -- Step 3: strict hash validation per
+                  -- bitcoin-core/src/validation.cpp:5912-5914
+                  -- ('PopulateAndValidateSnapshot'). Recompute Core's
+                  -- HASH_SERIALIZED over the loaded coin set and compare
+                  -- against the whitelisted 'audHashSerialized' for this
+                  -- block hash. Refusal here means the snapshot file's
+                  -- contents do not match the chainparams commitment, so
+                  -- we must not load it (that is also Core's behaviour).
+                  case assumeUtxoForBlockHash net baseHash of
+                    Nothing -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcInternalError
+                        (T.pack ("loadtxoutset: no assumeutxo data for "
+                                 ++ show baseHash))) Null
+                    Just params ->
+                      let audData = AssumeUtxoData
+                            { audHeight = aupHeight params
+                            , audHashSerialized = aupHashSerialized params
+                            , audChainTxCount = aupChainTxCount params
+                            , audBlockHash = aupBlockHash params
+                            }
+                      in case verifySnapshot snapshot audData of
+                           Left vErr -> return $ RpcResponse Null
+                             (toJSON $ RpcError rpcInternalError
+                               (T.pack ("Bad snapshot content hash: " ++ vErr))) Null
+                           Right () ->
+                             return $ RpcResponse
+                               (object [ "coins_loaded" .= coinsCount
+                                       , "tip_hash"     .= show baseHash
+                                       , "base_height"  .= ceHeight entry
+                                       ])
+                               Null Null
 
 -- | Dump the current UTXO set to a file for creating a snapshot.
 -- Reference: Bitcoin Core's dumptxoutset RPC (rpc/blockchain.cpp).

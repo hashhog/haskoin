@@ -21,6 +21,7 @@ library
                  , Haskoin.Wallet
                  , Haskoin.Performance
                  , Haskoin.Index
+                 , Haskoin.MuHash
                  , Haskoin.TaprootSighash
                  , Haskoin.Daemon
                  , System.ZMQ4

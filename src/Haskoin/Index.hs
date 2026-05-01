@@ -37,7 +37,7 @@ module Haskoin.Index
   , blockFilterHeader
   , encodeBlockFilter
   , decodeBlockFilter
-    -- * MuHash3072 (Multiplicative Hash)
+    -- * MuHash3072 (Multiplicative Hash) — re-exported from "Haskoin.MuHash"
   , MuHash3072(..)
   , Num3072(..)
   , muHashEmpty
@@ -124,6 +124,19 @@ import qualified Data.ByteArray as BA
 import Haskoin.Types
 import Haskoin.Storage (HaskoinDB(..), BlockUndo(..), TxUndo(..), TxInUndo(..),
                          Coin(..), BlockHeight, integerToBS, bsToInteger)
+import Haskoin.MuHash (MuHash3072(..), Num3072(..),
+                       muHashEmpty, muHashInsert, muHashRemove,
+                       muHashCombine, muHashFinalize,
+                       num3072ToBytes, num3072Multiply, num3072GetInverse,
+                       muHashToNum3072)
+import qualified Haskoin.MuHash as MuHash
+
+-- | Back-compat alias: the old 'Index.num3072FromBytes' was the
+-- ChaCha20-based element expansion. Forward to 'muHashToNum3072' so
+-- existing call sites (and re-exports via "Haskoin.Index") continue
+-- to work.
+num3072FromBytes :: ByteString -> Num3072
+num3072FromBytes = muHashToNum3072
 
 --------------------------------------------------------------------------------
 -- SipHash Implementation
@@ -670,204 +683,20 @@ decodeBlockFilter filterType blockHash encoded = do
 --------------------------------------------------------------------------------
 -- MuHash3072 (Multiplicative Hash for UTXO set)
 --------------------------------------------------------------------------------
-
--- | 3072-bit number for MuHash
--- Stored as 48 Word64 limbs in little-endian order
-newtype Num3072 = Num3072 { num3072Limbs :: [Word64] }
-  deriving (Show, Eq, Generic)
-
-instance NFData Num3072
-
--- | MuHash3072 state (numerator and denominator)
-data MuHash3072 = MuHash3072
-  { muHashNumerator   :: !Num3072
-  , muHashDenominator :: !Num3072
-  } deriving (Show, Eq, Generic)
-
-instance NFData MuHash3072
-
--- | The modulus: 2^3072 - 1103717
-modulus3072Diff :: Word64
-modulus3072Diff = 1103717
-
--- | Create an empty MuHash (identity element = 1)
-muHashEmpty :: MuHash3072
-muHashEmpty = MuHash3072
-  { muHashNumerator = num3072One
-  , muHashDenominator = num3072One
-  }
-  where
-    num3072One = Num3072 (1 : replicate 47 0)
-
--- | Convert bytes to Num3072 using ChaCha20 expansion
--- Reference: bitcoin/src/crypto/muhash.cpp ToNum3072
-num3072FromBytes :: ByteString -> Num3072
-num3072FromBytes bs =
-  -- First hash with SHA256, then expand with simple hash-based expansion
-  let hashed = sha256Single bs
-      -- Expand to 384 bytes using iterative hashing
-      expanded = expandToBytes 384 (getHash256 hashed)
-      -- Convert to 48 Word64 limbs (little-endian)
-      limbs = [decodeLE64 (BS.take 8 (BS.drop (i * 8) expanded)) | i <- [0..47]]
-  in Num3072 limbs
-  where
-    sha256Single bs' = Hash256 $ BS.pack $ BA.unpack (Hash.hash bs' :: Hash.Digest Hash.SHA256)
-
-    expandToBytes targetLen seed = go BS.empty seed
-      where
-        go !acc !s
-          | BS.length acc >= targetLen = BS.take targetLen acc
-          | otherwise =
-              let newHash = sha256Single (s `BS.append` BS.singleton (fromIntegral (BS.length acc)))
-              in go (acc `BS.append` getHash256 newHash) (getHash256 newHash)
-
--- | Convert Num3072 to bytes
-num3072ToBytes :: Num3072 -> ByteString
-num3072ToBytes (Num3072 limbs) =
-  BS.concat [encodeLE64 l | l <- limbs]
-
--- | Multiply two Num3072 values modulo the prime
--- This is a simplified implementation - for production use secp256k1 style optimizations
-num3072Multiply :: Num3072 -> Num3072 -> Num3072
-num3072Multiply (Num3072 a) (Num3072 b) =
-  -- Simplified schoolbook multiplication with reduction
-  -- For a full implementation, use Karatsuba or better
-  let n = length a
-      -- Full product would be 96 limbs
-      product' = schoolbookMul a b
-      -- Reduce modulo 2^3072 - modulus3072Diff
-      reduced = reduceProduct product'
-  in Num3072 reduced
-  where
-    schoolbookMul :: [Word64] -> [Word64] -> [Word64]
-    schoolbookMul xs ys =
-      let n = max (length xs) (length ys)
-          xs' = xs ++ replicate (2 * n - length xs) 0
-          ys' = ys ++ replicate (2 * n - length ys) 0
-          result = replicate (2 * n) 0
-      in foldl' addPartial result [(i, j) | i <- [0..n-1], j <- [0..n-1]]
-      where
-        addPartial :: [Word64] -> (Int, Int) -> [Word64]
-        addPartial acc (i, j) =
-          let (hi, lo) = mulWord64Full (xs !! i) (ys !! j)
-              -- Add lo at position i+j, hi at position i+j+1
-              acc' = addAtIndex acc (i + j) lo
-              acc'' = addAtIndex acc' (i + j + 1) hi
-          in acc''
-
-        addAtIndex :: [Word64] -> Int -> Word64 -> [Word64]
-        addAtIndex lst idx val
-          | idx >= length lst = lst
-          | otherwise =
-              let (before, current:after) = splitAt idx lst
-                  (newVal, carry) = addWithCarry current val 0
-                  after' = propagateCarry after carry
-              in before ++ [newVal] ++ after'
-
-        addWithCarry :: Word64 -> Word64 -> Word64 -> (Word64, Word64)
-        addWithCarry a' b' c =
-          let sum' = a' + b' + c
-              carry = if sum' < a' || (sum' == a' && (b' > 0 || c > 0)) then 1 else 0
-          in (sum', carry)
-
-        propagateCarry :: [Word64] -> Word64 -> [Word64]
-        propagateCarry [] _ = []
-        propagateCarry (x:xs') 0 = x : xs'
-        propagateCarry (x:xs') c =
-          let (newX, newCarry) = addWithCarry x c 0
-          in newX : propagateCarry xs' newCarry
-
-    mulWord64Full :: Word64 -> Word64 -> (Word64, Word64)
-    mulWord64Full x y =
-      let xLo = x .&. 0xffffffff
-          xHi = x `shiftR` 32
-          yLo = y .&. 0xffffffff
-          yHi = y `shiftR` 32
-          p0 = xLo * yLo
-          p1 = xLo * yHi
-          p2 = xHi * yLo
-          p3 = xHi * yHi
-          carry0 = (p0 `shiftR` 32) + (p1 .&. 0xffffffff) + (p2 .&. 0xffffffff)
-          hi = p3 + (p1 `shiftR` 32) + (p2 `shiftR` 32) + (carry0 `shiftR` 32)
-          lo = (carry0 `shiftL` 32) .|. (p0 .&. 0xffffffff)
-      in (hi, lo)
-
-    reduceProduct :: [Word64] -> [Word64]
-    reduceProduct product' =
-      -- Reduce 96 limbs to 48 limbs modulo 2^3072 - diff
-      let lo = take 48 product'
-          hi = drop 48 product'
-          -- hi * 2^3072 ≡ hi * diff (mod 2^3072 - diff)
-          -- So result ≡ lo + hi * diff
-          hiTimesDiff = multiplyByScalar hi modulus3072Diff
-          combined = addLimbs lo hiTimesDiff
-      in take 48 combined
-
-    multiplyByScalar :: [Word64] -> Word64 -> [Word64]
-    multiplyByScalar limbs scalar = go limbs 0
-      where
-        go [] carry = if carry > 0 then [carry] else []
-        go (x:xs') carry =
-          let (hi, lo) = mulWord64Full x scalar
-              newLo = lo + carry
-              newCarry = hi + (if newLo < lo then 1 else 0)
-          in newLo : go xs' newCarry
-
-    addLimbs :: [Word64] -> [Word64] -> [Word64]
-    addLimbs xs ys =
-      let maxLen = max (length xs) (length ys)
-          xs' = xs ++ replicate (maxLen - length xs) 0
-          ys' = ys ++ replicate (maxLen - length ys) 0
-      in go xs' ys' 0
-      where
-        go [] [] 0 = []
-        go [] [] c = [c]
-        go (x:xs'') (y:ys'') carry =
-          let sum' = x + y + carry
-              newCarry = if sum' < x || (sum' == x && (y > 0 || carry > 0)) then 1 else 0
-          in sum' : go xs'' ys'' newCarry
-        go _ _ _ = []
-
--- | Get multiplicative inverse using extended GCD
--- Simplified implementation - for production use safegcd algorithm
-num3072GetInverse :: Num3072 -> Num3072
-num3072GetInverse n =
-  -- For now, return identity if input is identity
-  -- Full implementation would use safegcd as in Bitcoin Core
-  n  -- Placeholder
-
--- | Insert an element into MuHash
-muHashInsert :: MuHash3072 -> ByteString -> MuHash3072
-muHashInsert mh element =
-  let num = num3072FromBytes element
-      newNumerator = num3072Multiply (muHashNumerator mh) num
-  in mh { muHashNumerator = newNumerator }
-
--- | Remove an element from MuHash
-muHashRemove :: MuHash3072 -> ByteString -> MuHash3072
-muHashRemove mh element =
-  let num = num3072FromBytes element
-      newDenominator = num3072Multiply (muHashDenominator mh) num
-  in mh { muHashDenominator = newDenominator }
-
--- | Combine two MuHash values
-muHashCombine :: MuHash3072 -> MuHash3072 -> MuHash3072
-muHashCombine a b = MuHash3072
-  { muHashNumerator = num3072Multiply (muHashNumerator a) (muHashNumerator b)
-  , muHashDenominator = num3072Multiply (muHashDenominator a) (muHashDenominator b)
-  }
-
--- | Finalize MuHash to get a 256-bit hash
-muHashFinalize :: MuHash3072 -> Hash256
-muHashFinalize mh =
-  let -- Divide numerator by denominator
-      invDenom = num3072GetInverse (muHashDenominator mh)
-      result = num3072Multiply (muHashNumerator mh) invDenom
-      -- Convert to bytes and hash
-      resultBytes = num3072ToBytes result
-  in sha256Single resultBytes
-  where
-    sha256Single bs = Hash256 $ BS.pack $ BA.unpack (Hash.hash bs :: Hash.Digest Hash.SHA256)
+--
+-- The MuHash primitives live in 'Haskoin.MuHash' as a clean,
+-- byte-compatible Haskell port of bitcoin-core/src/crypto/muhash.{h,cpp}.
+-- We re-export the names that the rest of haskoin (CoinStatsIndex,
+-- Storage.computeUtxoHash) was wired against, plus a few aliases that
+-- map the old "fromBytes/toBytes/multiply/inverse" surface onto the
+-- 'muHash*' / 'num3072*' API. Existing call sites do not need to change.
+--
+-- Earlier versions of this module hand-rolled a 48-limb Num3072 with a
+-- broken modular multiply and a placeholder inverse ("return self").
+-- The new implementation uses GHC's GMP-backed 'Integer' for both
+-- multiply and modular inverse (extended Euclidean), which gives
+-- byte-identical results to Core for the canonical test vectors in
+-- 'src/test/crypto_tests.cpp' BOOST_AUTO_TEST_CASE(muhash_tests).
 
 --------------------------------------------------------------------------------
 -- TxIndex Database
