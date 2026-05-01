@@ -376,8 +376,13 @@ blockProcessor bd = forever $ do
                       -- TODO: Could try to find alternative chain
 
                     Right () -> do
-                      -- Connect the block
-                      connectBlock (bdDB bd) (bdNetwork bd) block nextHeight
+                      -- Connect the block. Pass the same utxoMap that
+                      -- validation just consumed so connectBlock can
+                      -- write per-block undo data (TxOuts the block
+                      -- spends) atomically with the UTXO mutation.
+                      -- Without this, dumptxoutset rollback can't
+                      -- rewind: see handleDumpTxOutSet in Rpc.hs.
+                      connectBlock (bdDB bd) (bdNetwork bd) block nextHeight utxoMap
 
                       atomically $ do
                         writeTVar (bdCurrentHeight bd) nextHeight
