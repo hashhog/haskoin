@@ -66,6 +66,12 @@ module Haskoin.Rpc
   , handleRestBlockHashByHeight
   , handleRestGetUtxos
   , combinedApp
+    -- * dumptxoutset rollback resolution (exported for testing)
+  , DumpTarget(..)
+  , RollbackSpec(..)
+  , parseDumpTxOutSetParams
+  , latestAvailableSnapshotHeight
+  , resolveDumpTarget
     -- * ZMQ Notifications
   , ZmqTopic(..)
   , ZmqConfig(..)
@@ -99,6 +105,7 @@ module Haskoin.Rpc
 
 import Data.Aeson
 import Data.Aeson.Types (Parser, Result(..))
+import Data.Scientific (toBoundedInteger)
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.ByteString (ByteString)
@@ -4236,11 +4243,177 @@ handleLoadTxOutSet server params = do
                                        ])
                                Null Null
 
--- | Dump the current UTXO set to a file for creating a snapshot.
+-- | What snapshot height the @dumptxoutset@ RPC has been asked to
+-- produce. Mirrors Bitcoin Core's three modes from
+-- @bitcoin-core/src/rpc/blockchain.cpp@:
+--
+--   * @latest@   (the default) — dump the current chain tip's UTXO set.
+--   * @rollback@ — resolve to the highest 'netAssumeUtxo' entry that is
+--     not above the current tip.
+--   * @rollback=<height|hash>@ — resolve to a specific historical block.
+data DumpTarget
+  = DumpLatest
+    -- ^ Snapshot the current tip (default; equivalent to no @type@ arg
+    -- or @"latest"@).
+  | DumpRollbackLatestSnapshot
+    -- ^ Snapshot at the highest 'netAssumeUtxo' entry that is not above
+    -- the current tip. Matches Core's @"rollback"@ default behaviour
+    -- (see @GetAvailableSnapshotHeights@ in chainparams.cpp).
+  | DumpRollbackToHeight !Word32
+    -- ^ Snapshot at the given height.
+  | DumpRollbackToHash !BlockHash
+    -- ^ Snapshot at the block with the given hash (must be on the
+    -- current best chain).
+  deriving (Show, Eq)
+
+-- | Caller-supplied @rollback=<…>@ value. Used by 'parseDumpTxOutSetParams'.
+data RollbackSpec
+  = RollbackByHeight !Word32
+  | RollbackByHash   !BlockHash
+  deriving (Show, Eq)
+
+-- | Parse the JSON params accepted by @dumptxoutset@.
+--
+-- The shapes accepted (matching Core 3076-3107):
+--
+-- @
+--   [\"path\"]                                  -- DumpLatest
+--   [\"path\", \"latest\"]                      -- DumpLatest
+--   [\"path\", \"rollback\"]                    -- DumpRollbackLatestSnapshot
+--   [\"path\", \"\", { \"rollback\": <h|hash> }]  -- DumpRollbackToHeight/Hash
+--   [\"path\", \"rollback\", { \"rollback\": <h|hash> }]
+-- @
+--
+-- The same conflict-detection rule Core uses (3117) is enforced: if the
+-- options object carries an explicit @rollback=<…>@ but the @type@ arg
+-- is something other than @\"\"@ or @\"rollback\"@, that's an error.
+--
+-- Returns @Left@ with an actionable message on bad params, @Right@ with
+-- the resolved request shape on success.
+parseDumpTxOutSetParams :: Value -> Either Text (FilePath, DumpTarget)
+parseDumpTxOutSetParams params =
+  case extractParamText params 0 of
+    Nothing -> Left "Usage: dumptxoutset \"path\" [type] [{\"rollback\": <height|hash>}]"
+    Just pathText ->
+      let path     = T.unpack pathText
+          mTypeArg = extractParamText params 1
+          mOptions = case params of
+            Array arr | V.length arr > 2 ->
+              case arr V.! 2 of
+                Object km -> Just km
+                Null      -> Nothing
+                _         -> Nothing
+            _ -> Nothing
+          mRollback = mOptions >>= KM.lookup "rollback" >>= rollbackSpecFromValue
+      in case (mTypeArg, mRollback) of
+           -- Explicit rollback=<…> in options
+           (typeArg, Just spec)
+             | maybe True (\t -> T.null t || t == "rollback") typeArg ->
+                 Right (path, rollbackSpecToTarget spec)
+             | otherwise ->
+                 Left $ "Invalid snapshot type \""
+                        <> fromMaybe "" typeArg
+                        <> "\" specified with rollback option"
+           -- "rollback" with no explicit target → latest assumeutxo entry
+           (Just t, Nothing) | t == "rollback" ->
+             Right (path, DumpRollbackLatestSnapshot)
+           -- "" / "latest" / no type → tip
+           (Just t, Nothing)
+             | T.null t || t == "latest" -> Right (path, DumpLatest)
+           (Nothing, Nothing) -> Right (path, DumpLatest)
+           -- Anything else
+           (Just t, Nothing) ->
+             Left $ "Invalid snapshot type \"" <> t
+                    <> "\" specified. Please specify \"rollback\" or \"latest\""
+  where
+    rollbackSpecFromValue :: Value -> Maybe RollbackSpec
+    rollbackSpecFromValue v = case v of
+      Number n -> case toBoundedInteger n :: Maybe Word32 of
+        Just h  -> Just (RollbackByHeight h)
+        Nothing -> Nothing
+      String s
+        | T.length s == 64 -> RollbackByHash <$> parseHash s
+        | otherwise        -> case readMaybeInt (T.unpack s) of
+            Just h  -> Just (RollbackByHeight (fromIntegral (h :: Integer)))
+            Nothing -> Nothing
+      _ -> Nothing
+
+    readMaybeInt :: String -> Maybe Integer
+    readMaybeInt s = case reads s of
+      [(n, "")] -> Just n
+      _         -> Nothing
+
+    rollbackSpecToTarget :: RollbackSpec -> DumpTarget
+    rollbackSpecToTarget (RollbackByHeight h) = DumpRollbackToHeight h
+    rollbackSpecToTarget (RollbackByHash h)   = DumpRollbackToHash h
+
+-- | Highest 'netAssumeUtxo' entry that is not above @tipHeight@.
+-- Mirrors Core's @GetAvailableSnapshotHeights()@ + @std::max_element@
+-- from rpc/blockchain.cpp:3122-3125. Returns @Nothing@ if no whitelisted
+-- snapshot is available at or below the tip — which on regtest at
+-- height < 110 or testnet/mainnet pre-snapshot is a normal early-IBD
+-- state.
+latestAvailableSnapshotHeight :: Network -> Word32 -> Maybe Word32
+latestAvailableSnapshotHeight net tipHeight =
+  let candidates = [ h | (h, _) <- netAssumeUtxo net, h <= tipHeight ]
+  in if null candidates then Nothing else Just (maximum candidates)
+
+-- | Resolve a 'DumpTarget' against the live header chain to a concrete
+-- @(height, hash)@. Returns @Left@ with a Core-style error on failure
+-- (target above tip, hash not on chain, no snapshot available, …).
+resolveDumpTarget
+  :: Network
+  -> Map BlockHash ChainEntry  -- ^ from @hcEntries@
+  -> Map Word32 BlockHash      -- ^ from @hcByHeight@ (height index of best chain)
+  -> ChainEntry                -- ^ current tip
+  -> DumpTarget
+  -> Either Text (Word32, BlockHash)
+resolveDumpTarget net entries byHeight tip target = case target of
+  DumpLatest -> Right (ceHeight tip, ceHash tip)
+  DumpRollbackLatestSnapshot ->
+    case latestAvailableSnapshotHeight net (ceHeight tip) of
+      Nothing -> Left $ T.pack $
+        "No assumeutxo snapshot height available at or below tip "
+        <> show (ceHeight tip) <> " for network " <> netName net
+      Just h -> resolveByHeight h
+  DumpRollbackToHeight h
+    | h > ceHeight tip ->
+        Left $ T.pack $ "Target height " <> show h
+                       <> " is above current tip " <> show (ceHeight tip)
+    | otherwise -> resolveByHeight h
+  DumpRollbackToHash bh ->
+    case Map.lookup bh entries of
+      Nothing -> Left $ "Block hash not found in header chain: " <> showHash bh
+      Just ce
+        | ceHeight ce > ceHeight tip ->
+            Left $ T.pack $ "Target block at height "
+                           <> show (ceHeight ce)
+                           <> " is above current tip "
+                           <> show (ceHeight tip)
+        | Map.lookup (ceHeight ce) byHeight /= Just bh ->
+            Left $ "Block " <> showHash bh
+                  <> " is not on the current best chain"
+        | otherwise -> Right (ceHeight ce, bh)
+  where
+    resolveByHeight h = case Map.lookup h byHeight of
+      Nothing -> Left $ T.pack $
+        "No block on best chain at height " <> show h
+      Just bh -> Right (h, bh)
+
+-- | Dump the UTXO set to a file for creating a snapshot.
 -- Reference: Bitcoin Core's dumptxoutset RPC (rpc/blockchain.cpp).
 --
--- Params: [path]
--- Returns: { coins_written, base_hash, base_height, path }
+-- Params accepted (matching Core; see 'parseDumpTxOutSetParams'):
+--
+-- @
+--   dumptxoutset \"path\"
+--   dumptxoutset \"path\" \"latest\"
+--   dumptxoutset \"path\" \"rollback\"
+--   dumptxoutset \"path\" \"rollback\" {\"rollback\": <height|hash>}
+--   dumptxoutset \"path\" \"\" {\"rollback\": <height|hash>}
+-- @
+--
+-- Returns: { coins_written, base_hash, base_height, path, rollback_status }
 --
 -- Implementation notes:
 --   * Iterates the legacy 'PrefixUTXO' keyspace via 'dumpTxOutSetFromDB'.
@@ -4251,28 +4424,70 @@ handleLoadTxOutSet server params = do
 --     legacy UTXO row only persists the TxOut. This is documented in
 --     'dumpTxOutSetFromDB' and is the same lossy mode the rest of the
 --     codebase already operates in.
+--
+-- Rollback dance status (TODO):
+--   * Param parsing + assumeutxo-height resolution + on-chain validation
+--     are wired and tested. The actual UTXO rewind, however, is *not*
+--     fully usable yet: 'disconnectBlock' (Consensus.hs:2289) only
+--     deletes outputs created by the disconnected block — it does not
+--     restore inputs that block spent, because haskoin's IBD code path
+--     never calls 'putUndoData' (only 'BlockTemplate' does, see
+--     Storage.hs:1234). Without per-block undo data on disk we cannot
+--     reconstruct the historical UTXO set.
+--   * To keep the API surface honest, when @target /= tip@ we currently
+--     refuse with a clear message instead of silently writing a
+--     truncated UTXO set. The TODO is to: (1) populate undo data from
+--     'connectBlock' during IBD, then (2) walk tip→target via
+--     'disconnectBlock' applying undo, dump, then re-walk back. The
+--     header-chain side of the dance is straightforward; the UTXO side
+--     is the gating piece.
 handleDumpTxOutSet :: RpcServer -> Value -> IO RpcResponse
 handleDumpTxOutSet server params = do
-  case extractParamText params 0 of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Usage: dumptxoutset \"path\"") Null
-    Just pathText -> do
-      let path = T.unpack pathText
-          net = rsNetwork server
+  case parseDumpTxOutSetParams params of
+    Left msg -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams msg) Null
+    Right (path, target) -> do
+      let net   = rsNetwork server
           magic = netMagic net
-      tip <- readTVarIO (hcTip (rsHeaderChain server))
-      let tipHash = ceHash tip
-          tipHeight = ceHeight tip
-      result <- dumpTxOutSetFromDB (rsDB server) path magic tipHash
+          hc    = rsHeaderChain server
+      tip       <- readTVarIO (hcTip hc)
+      entries   <- readTVarIO (hcEntries hc)
+      byHeight  <- readTVarIO (hcByHeight hc)
+      case resolveDumpTarget net entries byHeight tip target of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams err) Null
+        Right (baseHeight, baseHash) ->
+          if baseHash == ceHash tip
+             then doDump path magic baseHeight baseHash "tip"
+             else
+               -- TODO: Implement the temporary-rollback dance once
+               -- 'connectBlock' writes UndoData during IBD. Until then
+               -- we deliberately refuse rather than emit a UTXO set
+               -- that is missing the spent-input restorations we cannot
+               -- replay.
+               return $ RpcResponse Null
+                 (toJSON $ RpcError rpcMiscError (T.pack
+                   ("dumptxoutset: rollback to height "
+                    <> show baseHeight
+                    <> " requires per-block undo data, which haskoin's "
+                    <> "IBD path does not currently persist (see "
+                    <> "Consensus.hs:2289 disconnectBlock and "
+                    <> "BlockTemplate.hs:406 putUndoData). Refusing to "
+                    <> "emit a truncated UTXO set. Use \"latest\" "
+                    <> "(or omit type) to dump the current tip."))) Null
+  where
+    doDump path magic baseHeight baseHash status = do
+      result <- dumpTxOutSetFromDB (rsDB server) path magic baseHash
       case result of
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInternalError (T.pack err)) Null
         Right cnt ->
           return $ RpcResponse
-            (object [ "coins_written" .= cnt
-                    , "base_hash"     .= showHash tipHash
-                    , "base_height"   .= tipHeight
-                    , "path"          .= pathText
+            (object [ "coins_written"   .= cnt
+                    , "base_hash"       .= showHash baseHash
+                    , "base_height"     .= baseHeight
+                    , "path"            .= T.pack path
+                    , "rollback_status" .= (status :: Text)
                     ])
             Null Null
 
