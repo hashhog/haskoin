@@ -7,7 +7,7 @@ module Main where
 import Test.Hspec
 import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_)
-import Data.Serialize (encode, decode)
+import Data.Serialize (encode, decode, runPut, runGet)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
@@ -56,7 +56,16 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          putUTXO, getUTXO, putTxIndex, getTxIndex,
                          wipeChainstate,
                          -- UTXO cache (for mempool wtxid test)
-                         UTXOCache(..), newUTXOCache)
+                         UTXOCache(..), newUTXOCache,
+                         -- AssumeUTXO snapshot
+                         SnapshotMetadata(..), SnapshotCoin(..),
+                         UtxoSnapshot(..), snapshotMagicBytes,
+                         snapshotVersion, loadSnapshot, parseSnapshotCoin,
+                         dumpTxOutSetFromDB, loadSnapshotIntoLegacyUTXO,
+                         compressAmount, decompressAmount,
+                         putCompressedScript, getCompressedScript,
+                         putCoreVarInt, getCoreVarInt,
+                         serializeSnapshotCoin)
 import Haskoin.Network hiding (computeWtxid)
 import Haskoin.Sync
 import Haskoin.Mempool
@@ -10432,6 +10441,222 @@ main = hspec $ do
       if null received
         then pendingWith "slow-joiner race; FFI wiring verified by the other ZMQ tests"
         else received `shouldBe` want
+
+  -- ----------------------------------------------------------------------
+  -- AssumeUTXO snapshot (Bitcoin Core utxo.dat format)
+  --
+  -- Regression coverage for the @bytesRead = undefined@ crash that
+  -- previously sat in @parseTxidGroup@: any call into 'loadSnapshot'
+  -- on a non-empty file would explode with @Prelude.undefined@. The
+  -- round-trip tests exercise the full dump → load path with the
+  -- crash-bug data shapes (multiple coins under multiple txids) so a
+  -- regression would re-trip the panic instead of returning a parsed
+  -- 'UtxoSnapshot'.
+  describe "AssumeUTXO snapshot (Core byte format)" $ do
+    let mainnetMagic :: Word32
+        mainnetMagic = 0xd9b4bef9   -- mainnet message-start, LE-as-Word32
+
+        mkTxId :: Word8 -> TxId
+        mkTxId b = TxId (Hash256 (BS.replicate 32 b))
+
+        sampleP2PKH :: ByteString
+        sampleP2PKH = BS.concat
+          [ BS.pack [0x76, 0xa9, 20]
+          , BS.replicate 20 0x42
+          , BS.pack [0x88, 0xac]
+          ]
+
+        sampleP2SH :: ByteString
+        sampleP2SH = BS.concat
+          [ BS.pack [0xa9, 20]
+          , BS.replicate 20 0x33
+          , BS.singleton 0x87
+          ]
+
+        sampleP2PKCompressed :: ByteString
+        sampleP2PKCompressed = BS.concat
+          [ BS.singleton 33
+          , BS.singleton 0x02
+          , BS.replicate 32 0x77
+          , BS.singleton 0xac
+          ]
+
+        sampleArbitrary :: ByteString
+        sampleArbitrary = BS.pack [0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]  -- OP_RETURN <data>
+
+        sampleCoin val script = Coin
+          { coinTxOut = TxOut val script
+          , coinHeight = 0
+          , coinIsCoinbase = False
+          }
+
+    describe "compressAmount / decompressAmount" $ do
+      it "round-trips zero" $
+        decompressAmount (compressAmount 0) `shouldBe` 0
+
+      it "round-trips a 1 BTC amount" $
+        decompressAmount (compressAmount 100_000_000) `shouldBe` 100_000_000
+
+      it "round-trips a sub-satoshi-block of values" $
+        forM_ [0, 1, 7, 100, 999, 1_000_000, 21_000_000_00000000]
+              (\v -> decompressAmount (compressAmount v) `shouldBe` v)
+
+      it "matches the Bitcoin Core compress_tests fixture (1 BTC -> 9)" $
+        -- Derivation: 100_000_000 sat -> trim 8 trailing zeros so
+        -- n=1, e=8. Since e<9 we take d = n%10 = 1, n2 = n/10 = 0,
+        -- result = 1 + (n2*9 + d - 1)*10 + e = 1 + 0 + 8 = 9.
+        -- Cross-checked against bitcoin-core/src/test/compress_tests.cpp
+        -- (the `BOOST_CHECK_EQUAL(CompressAmount(COIN), 9)` line).
+        compressAmount 100_000_000 `shouldBe` 9
+
+    describe "putCoreVarInt / getCoreVarInt" $ do
+      it "round-trips a range of values" $
+        forM_ [0, 1, 0x7f, 0x80, 0xff, 0x100, 0xffff, 0x123456, 0xffffffff,
+               0x1234567890abcdef]
+              (\v -> runGet getCoreVarInt (runPut (putCoreVarInt v))
+                       `shouldBe` Right v)
+
+      it "encodes 0x00 to a single 0x00 byte (Bitcoin Core fixture)" $
+        runPut (putCoreVarInt 0) `shouldBe` BS.singleton 0x00
+
+      it "encodes 0x7F to a single 0x7F byte" $
+        runPut (putCoreVarInt 0x7f) `shouldBe` BS.singleton 0x7f
+
+      it "encodes 0x80 to two bytes [0x80, 0x00]" $
+        -- In Core's VARINT, 0x80 -> we shift right by 7 to get n=1, then
+        -- subtract 1 to get 0; loop emits [byte0=0x80|0=0x80, byte1=0x00].
+        runPut (putCoreVarInt 0x80) `shouldBe` BS.pack [0x80, 0x00]
+
+    describe "putCompressedScript / getCompressedScript" $ do
+      it "round-trips P2PKH (21 bytes on disk: 0x00 + h160)" $ do
+        let bs = runPut (putCompressedScript sampleP2PKH)
+        BS.length bs `shouldBe` 21
+        BS.head bs   `shouldBe` 0x00
+        runGet getCompressedScript bs `shouldBe` Right sampleP2PKH
+
+      it "round-trips P2SH (21 bytes on disk: 0x01 + h160)" $ do
+        let bs = runPut (putCompressedScript sampleP2SH)
+        BS.length bs `shouldBe` 21
+        BS.head bs   `shouldBe` 0x01
+        runGet getCompressedScript bs `shouldBe` Right sampleP2SH
+
+      it "round-trips P2PK with 0x02 prefix (33 bytes on disk)" $ do
+        let bs = runPut (putCompressedScript sampleP2PKCompressed)
+        BS.length bs `shouldBe` 33
+        BS.head bs   `shouldBe` 0x02
+        runGet getCompressedScript bs `shouldBe` Right sampleP2PKCompressed
+
+      it "round-trips an arbitrary script via the passthrough path" $ do
+        let bs = runPut (putCompressedScript sampleArbitrary)
+        runGet getCompressedScript bs `shouldBe` Right sampleArbitrary
+
+      it "passthrough size encoding has no special-script collision" $ do
+        -- nSize for an arbitrary script is (size + 6); for our 6-byte
+        -- script that's 12, well above the special-tag range 0..5.
+        let bs = runPut (putCompressedScript sampleArbitrary)
+        BS.head bs `shouldBe` (fromIntegral (BS.length sampleArbitrary + 6))
+
+    describe "serializeSnapshotCoin / parseSnapshotCoin" $ do
+      it "round-trips a single (vout, Coin) pair without crashing" $ do
+        -- Regression for the bytesRead=undefined crash: in the old
+        -- code parseSnapshotCoin (and its parseTxidGroup ancestor)
+        -- would short-circuit to undefined. We invoke the parser
+        -- explicitly so the test exercises the same code path
+        -- 'parseCoins' uses internally.
+        let bs = serializeSnapshotCoin 7 (sampleCoin 100_000_000 sampleP2PKH)
+        runGet parseSnapshotCoin bs
+          `shouldBe` Right (7, sampleCoin 100_000_000 sampleP2PKH)
+
+    describe "Snapshot file (writeFile/readFile round trip)" $ do
+      it "decodes a metadata-only file with zero coins" $ do
+        let meta = SnapshotMetadata
+              { smNetworkMagic = mainnetMagic
+              , smBaseBlockHash = BlockHash (Hash256 (BS.replicate 32 0xee))
+              , smCoinsCount = 0
+              }
+            bytes = encode meta
+        BS.length bytes `shouldBe` 51
+        -- Use loadSnapshot via a temp file so we exercise the same
+        -- IO + parseSnapshot path the production RPC uses.
+        withSystemTempDirectory "haskoin-snap" $ \tmp -> do
+          let p = tmp </> "empty.utxo.dat"
+          BS.writeFile p bytes
+          r <- loadSnapshot p mainnetMagic
+          case r of
+            Right snap -> do
+              smCoinsCount (usMetadata snap) `shouldBe` 0
+              usCoins snap `shouldBe` []
+            Left e -> expectationFailure $ "loadSnapshot empty: " ++ e
+
+      it "rejects a snapshot with the wrong network magic" $
+        withSystemTempDirectory "haskoin-snap" $ \tmp -> do
+          let p = tmp </> "wrong.utxo.dat"
+              meta = SnapshotMetadata
+                { smNetworkMagic = mainnetMagic
+                , smBaseBlockHash = BlockHash (Hash256 (BS.replicate 32 0xee))
+                , smCoinsCount = 0
+                }
+          BS.writeFile p (encode meta)
+          r <- loadSnapshot p 0xfabfb5da   -- testnet3 magic, mismatched
+          case r of
+            Left _   -> pure ()
+            Right _  -> expectationFailure
+              "loadSnapshot accepted a snapshot with wrong network magic"
+
+      it "dumpTxOutSetFromDB → loadSnapshot round-trips and does NOT \
+         \re-trip the bytesRead=undefined crash" $
+        withSystemTempDirectory "haskoin-snap-rt" $ \tmp -> do
+          -- Spin up a fresh RocksDB, populate a handful of UTXOs,
+          -- dump, parse the file back, and check the coin count
+          -- matches. The point is that 'loadSnapshot' walks the
+          -- exact bytes 'dumpTxOutSetFromDB' wrote, including
+          -- multiple txid groups — which is the data shape that
+          -- previously panicked.
+          let dbDir = tmp </> "db"
+              snapPath = tmp </> "out.utxo.dat"
+          Dir.createDirectoryIfMissing True dbDir
+          let cfg = (defaultDBConfig dbDir)
+                { dbCreateIfMissing = True
+                , dbCompression     = False
+                }
+          bracket (openDB cfg) closeDB $ \db -> do
+            -- Three txids, varying numbers of vouts each, varying scripts.
+            let entries =
+                  [ (OutPoint (mkTxId 0x01) 0, TxOut 100_000 sampleP2PKH)
+                  , (OutPoint (mkTxId 0x01) 1, TxOut 200_000 sampleP2SH)
+                  , (OutPoint (mkTxId 0x02) 0, TxOut 300_000 sampleP2PKCompressed)
+                  , (OutPoint (mkTxId 0x03) 0, TxOut      0 sampleArbitrary)
+                  , (OutPoint (mkTxId 0x03) 7, TxOut 999_999 sampleP2PKH)
+                  ]
+            forM_ entries $ \(op, tx) -> putUTXO db op tx
+            r <- dumpTxOutSetFromDB db snapPath mainnetMagic
+                   (BlockHash (Hash256 (BS.replicate 32 0x55)))
+            case r of
+              Left e ->
+                expectationFailure $ "dumpTxOutSetFromDB: " ++ e
+              Right cnt -> cnt `shouldBe` 5
+
+            -- Now read it back. This is the call that previously
+            -- crashed with Prelude.undefined.
+            r2 <- loadSnapshot snapPath mainnetMagic
+            case r2 of
+              Left e -> expectationFailure $ "loadSnapshot: " ++ e
+              Right snap -> do
+                smCoinsCount (usMetadata snap) `shouldBe` 5
+                length (usCoins snap)         `shouldBe` 5
+                -- And the outpoints round-trip exactly.
+                let got = sort
+                       [ (outPointHash (scOutPoint sc),
+                          outPointIndex (scOutPoint sc),
+                          txOutValue (coinTxOut (scCoin sc)),
+                          txOutScript (coinTxOut (scCoin sc)))
+                       | sc <- usCoins snap
+                       ]
+                    expected = sort
+                       [ (txid, vout, val, scr)
+                       | (OutPoint txid vout, TxOut val scr) <- entries
+                       ]
+                got `shouldBe` expected
 
   where
     sampleTx = Tx
