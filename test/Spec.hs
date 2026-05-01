@@ -56,6 +56,10 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          -- UTXO single-key API (for wipeChainstate test)
                          putUTXO, getUTXO, putTxIndex, getTxIndex,
                          wipeChainstate,
+                         -- Undo data round-trip (for dumptxoutset rollback)
+                         buildSpentUtxoMapFromDB, getUndoData, putUndoData,
+                         deleteUndoData, TxInUndo(..), TxUndo(..),
+                         BlockUndo(..),
                          -- UTXO cache (for mempool wtxid test)
                          UTXOCache(..), newUTXOCache,
                          -- AssumeUTXO snapshot
@@ -105,6 +109,7 @@ import Data.Bits (xor, Bits, shiftL)
 import System.FilePath ((</>))
 import Data.Maybe (isJust, listToMaybe)
 import Data.List (sort, sortOn, foldl')
+import qualified Data.List as DL
 
 -- Helper for hex decoding that works with Either-based API
 hexDecode :: ByteString -> ByteString
@@ -4909,7 +4914,7 @@ main = hspec $ do
                                    2000 0x207fffff 67890
         result <- atomically $ processPresyncHeaders peer [badHeader]
         case result of
-          Left err -> err `shouldSatisfy` ("connect" `isInfixOf`)
+          Left err -> err `shouldSatisfy` ("connect" `DL.isInfixOf`)
           Right _ -> expectationFailure "Expected rejection"
 
       it "presync stores commitments at commitment period" $ do
@@ -10486,7 +10491,7 @@ main = hspec $ do
       -- The message is now only seen on rare init failures (bind in
       -- use, etc.) but the keyword 'ZMQ' must still appear so log
       -- searches still find this site.
-      ("ZMQ" `isInfixOf` msg) `shouldBe` True
+      ("ZMQ" `DL.isInfixOf` msg) `shouldBe` True
 
     it "ZmqEvent encodes a hashblock body in little-endian (pure)" $ do
       let bh = mkTestBlockHash
@@ -10935,6 +10940,218 @@ main = hspec $ do
             ("No assumeutxo snapshot height available" `T.isInfixOf`)
           Right t -> expectationFailure $
             "expected rejection, got " <> show t
+
+    -- ------------------------------------------------------------------
+    -- connectBlock / disconnectBlock undo-data round-trip
+    --
+    -- These tests cover the undo-data write/read cycle that powers the
+    -- @dumptxoutset@ rollback dance:
+    --
+    --   * 'connectBlock' captures the spent prevouts (from 'spentUtxos'
+    --     map) and writes a 'BlockUndo' record alongside the UTXO
+    --     mutation.
+    --   * 'disconnectBlock' reads that record and restores the spent
+    --     UTXOs to 'PrefixUTXO' before deleting the block's outputs.
+    --
+    -- The pre-existing chain-reorg path in 'Consensus.disconnectChain'
+    -- uses a different (UTXOCache-based) flow — we exercise the
+    -- DB-batch path used by IBD and 'dumptxoutset' specifically.
+    --
+    -- Reference: bitcoin/src/validation.cpp ConnectBlock /
+    -- DisconnectBlock + bitcoin/src/undo.h CBlockUndo.
+    describe "connectBlock undo-data round-trip" $ do
+      let mkPrevHash byte = BlockHash (Hash256 (BS.replicate 32 byte))
+          -- A minimal Block whose tx1 spends one output created by tx0
+          -- (the coinbase). Block-internal spend pattern is rare on
+          -- mainnet but is the most-stress test for round-tripping.
+          mkTestBlock prev = do
+            let cbTxId = TxId (Hash256 (BS.replicate 32 0xC0))
+                cbTxOut = TxOut 5000000000 "coinbase-script"
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ cbTxOut ]
+                  [] 0
+                -- Spend a prevout "from a previous block" — for this
+                -- test we seed it directly into the UTXO set before
+                -- connectBlock.
+                spentOp = OutPoint (TxId (Hash256 (BS.replicate 32 0xAB))) 0
+                spentTxOut = TxOut 1000000 "spent-script"
+                regularTx = Tx 1
+                  [ TxIn spentOp "" 0xFFFFFFFE ]
+                  [ TxOut 999000 "new-script" ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                    1700000000 0x207fffff 0
+            return (Block hdr [cbTx, regularTx], spentOp, spentTxOut, cbTxId)
+
+      it "writes undo data when a block is connected" $
+        withSystemTempDirectory "haskoin-undo-rt" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x10
+            (block, spentOp, spentTxOut, _) <- mkTestBlock prev
+            -- Seed the spent prevout into PrefixUTXO so connectBlock
+            -- can see it via buildSpentUtxoMapFromDB.
+            putUTXO db spentOp spentTxOut
+            spent <- buildSpentUtxoMapFromDB db block
+            connectBlock db regtest block 100 spent
+            -- The undo record must be on disk, keyed by block hash.
+            mUndo <- getUndoData db (computeBlockHash (blockHeader block))
+            mUndo `shouldSatisfy` isJust
+            case mUndo of
+              Just ud -> do
+                -- One TxUndo for the one non-coinbase tx, with one
+                -- TxInUndo restoring the spent output.
+                length (buTxUndo (udBlockUndo ud)) `shouldBe` 1
+                let txUndo = head (buTxUndo (udBlockUndo ud))
+                length (tuPrevOutputs txUndo) `shouldBe` 1
+                tuOutput (head (tuPrevOutputs txUndo)) `shouldBe` spentTxOut
+              Nothing -> expectationFailure "undo data not persisted"
+
+      it "round-trips: connect then disconnect restores the prevout" $
+        withSystemTempDirectory "haskoin-undo-rt2" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x11
+            (block, spentOp, spentTxOut, _) <- mkTestBlock prev
+            putUTXO db spentOp spentTxOut
+            spent <- buildSpentUtxoMapFromDB db block
+            connectBlock db regtest block 100 spent
+
+            -- After connect: prevout is gone, new output exists.
+            mPrePrev <- getUTXO db spentOp
+            mPrePrev `shouldBe` Nothing
+            let newOp = OutPoint (computeTxId (blockTxns block !! 1)) 0
+            mPreNew <- getUTXO db newOp
+            mPreNew `shouldSatisfy` isJust
+
+            -- Disconnect: prevout restored, new output gone.
+            r <- disconnectBlock db block prev
+            r `shouldBe` Right ()
+            mPostPrev <- getUTXO db spentOp
+            mPostPrev `shouldBe` Just spentTxOut
+            mPostNew <- getUTXO db newOp
+            mPostNew `shouldBe` Nothing
+
+      it "disconnectBlock returns Left when undo data is missing" $
+        withSystemTempDirectory "haskoin-undo-missing" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x12
+            (block, _, _, _) <- mkTestBlock prev
+            -- Don't connect — so no undo record is written. Then try
+            -- to disconnect, which must surface the missing undo as
+            -- a Left rather than silently produce a corrupt UTXO set.
+            r <- disconnectBlock db block prev
+            case r of
+              Left err -> err `shouldSatisfy`
+                (\e -> "Undo data not found" `DL.isInfixOf` e
+                    || "undo" `DL.isInfixOf` e)
+              Right () -> expectationFailure
+                "expected disconnectBlock to refuse without undo data"
+
+      it "disconnectBlock detects undo-data checksum mismatch" $
+        withSystemTempDirectory "haskoin-undo-bad-cksum" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x13
+                bogusPrev = mkPrevHash 0xFF
+            (block, spentOp, spentTxOut, _) <- mkTestBlock prev
+            putUTXO db spentOp spentTxOut
+            spent <- buildSpentUtxoMapFromDB db block
+            connectBlock db regtest block 100 spent
+            -- Lie about prevHash → checksum verification fails.
+            r <- disconnectBlock db block bogusPrev
+            case r of
+              Left err -> err `shouldSatisfy`
+                ("checksum" `DL.isInfixOf`)
+              Right () -> expectationFailure
+                "expected checksum mismatch"
+
+      it "buildSpentUtxoMapFromDB returns only existing prevouts" $
+        withSystemTempDirectory "haskoin-spent-map" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x14
+            (block, spentOp, spentTxOut, _) <- mkTestBlock prev
+            -- Don't seed the prevout: we expect the helper to omit
+            -- missing entries rather than crash.
+            empty1 <- buildSpentUtxoMapFromDB db block
+            empty1 `shouldBe` Map.empty
+            -- Now seed and verify it shows up.
+            putUTXO db spentOp spentTxOut
+            seeded <- buildSpentUtxoMapFromDB db block
+            Map.lookup spentOp seeded `shouldBe` Just spentTxOut
+            -- Coinbase prevouts must be skipped (would otherwise look
+            -- up the all-zeros sentinel and fail).
+            let cbOp = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF
+            Map.lookup cbOp seeded `shouldBe` Nothing
+
+      it "two-block sequence: disconnect tip, then disconnect parent" $
+        -- Mirrors the dumptxoutset-rollback dance walking tip→target.
+        -- Confirms that a multi-block rewind chain works when each
+        -- block has its own undo record.
+        withSystemTempDirectory "haskoin-undo-twoblock" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prevA = mkPrevHash 0x20
+            (blockA, spentOpA, spentTxOutA, _) <- mkTestBlock prevA
+            putUTXO db spentOpA spentTxOutA
+            spentA <- buildSpentUtxoMapFromDB db blockA
+            connectBlock db regtest blockA 200 spentA
+
+            -- Block B spends one of block A's outputs.
+            let aTxId = computeTxId (blockTxns blockA !! 1)
+                spentOpB = OutPoint aTxId 0
+                spentTxOutB = TxOut 999000 "new-script"
+                cbTxB = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5000000000 "cb-B" ] [] 0
+                regTxB = Tx 1
+                  [ TxIn spentOpB "" 0xFFFFFFFE ]
+                  [ TxOut 998000 "B-out" ] [] 0
+                hdrB = BlockHeader 1 (computeBlockHash (blockHeader blockA))
+                         (Hash256 (BS.replicate 32 0)) 1700000001 0x207fffff 0
+                blockB = Block hdrB [cbTxB, regTxB]
+            spentB <- buildSpentUtxoMapFromDB db blockB
+            connectBlock db regtest blockB 201 spentB
+
+            -- Disconnect tip first (B), then parent (A). Each step
+            -- must succeed.
+            rB <- disconnectBlock db blockB
+                    (computeBlockHash (blockHeader blockA))
+            rB `shouldBe` Right ()
+            -- After disconnecting B, A's output is restored.
+            mAfterB <- getUTXO db spentOpB
+            mAfterB `shouldBe` Just spentTxOutB
+
+            rA <- disconnectBlock db blockA prevA
+            rA `shouldBe` Right ()
+            -- After disconnecting A, the original prevout is restored.
+            mAfterA <- getUTXO db spentOpA
+            mAfterA `shouldBe` Just spentTxOutA
+
+      it "round-trip: re-connect after disconnect lands the same UTXO state" $
+        -- Mirrors the dance's reconnect phase: after the dump, we
+        -- re-apply the same blocks and the chainstate should be
+        -- bit-identical to before the rewind.
+        withSystemTempDirectory "haskoin-undo-replay" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x30
+            (block, spentOp, spentTxOut, _) <- mkTestBlock prev
+            putUTXO db spentOp spentTxOut
+            spent1 <- buildSpentUtxoMapFromDB db block
+            connectBlock db regtest block 300 spent1
+
+            let newOp = OutPoint (computeTxId (blockTxns block !! 1)) 0
+            mNewBefore <- getUTXO db newOp
+
+            _ <- disconnectBlock db block prev
+            -- Re-connect: spentUtxos lookup re-runs against the now
+            -- rewound chainstate.
+            spent2 <- buildSpentUtxoMapFromDB db block
+            connectBlock db regtest block 300 spent2
+
+            mNewAfter <- getUTXO db newOp
+            mNewAfter `shouldBe` mNewBefore
+            mPrev <- getUTXO db spentOp
+            mPrev `shouldBe` Nothing
 
     -- ------------------------------------------------------------------
     -- Core-strict assumeutxo whitelist (loadtxoutset RPC guard)
