@@ -77,6 +77,7 @@ import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
 import Haskoin.Index
+import qualified Haskoin.MuHash as MuHash
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array)
 import qualified Data.Aeson.KeyMap as KM
@@ -7187,6 +7188,12 @@ main = hspec $ do
         result1 `shouldNotBe` result2
 
   describe "MuHash3072" $ do
+    -- Helper: Core's FromInt(i) is MuHash3072(tmp) where tmp = [i, 0, 0, ..., 0]
+    -- (32 bytes, only the first is i). The 'tmp' buffer is hashed by ToNum3072
+    -- internally; here we just construct the same 32-byte input.
+    let fromInt :: Word8 -> ByteString
+        fromInt i = BS.cons i (BS.replicate 31 0)
+
     describe "muHashEmpty" $ do
       it "creates identity element" $ do
         let mh = muHashEmpty
@@ -7211,11 +7218,119 @@ main = hspec $ do
             mh2 = muHashRemove mh1 "element"
         muHashDenominator mh2 `shouldNotBe` muHashDenominator mh1
 
+      it "Insert then Remove returns to identity" $ do
+        -- Element-level inverse property: hash of empty == hash of {x} \ {x}
+        let mh = muHashRemove (muHashInsert muHashEmpty "x") "x"
+            empty = muHashEmpty
+        muHashFinalize mh `shouldBe` muHashFinalize empty
+
     describe "muHashFinalize" $ do
       it "produces 32-byte hash" $ do
         let mh = muHashInsert muHashEmpty "test"
             Hash256 hashBytes = muHashFinalize mh
         BS.length hashBytes `shouldBe` 32
+
+      -- Core test vector (bitcoin-core/src/test/crypto_tests.cpp:1245-1249):
+      --   acc = FromInt(0); acc *= FromInt(1); acc /= FromInt(2);
+      --   Finalize(acc) == uint256{"10d312b1...5863"}
+      --
+      -- Bitcoin Core's 'uint256' prints in *reverse* byte order (big-endian
+      -- display); the raw little-endian bytes match the byte-reverse of
+      -- the displayed hex. So we compare against `BS.reverse expected`.
+      it "matches Core vector: FromInt(0) * FromInt(1) / FromInt(2)" $ do
+        let acc0 = MuHash.muHashFromBytes (fromInt 0)
+            acc1 = MuHash.muHashCombine acc0 (MuHash.muHashFromBytes (fromInt 1))
+            acc2 = MuHash.muHashDivide  acc1 (MuHash.muHashFromBytes (fromInt 2))
+            Hash256 out = MuHash.muHashFinalize acc2
+            expectedDisplayHex = "10d312b100cbd32ada024a6646e40d3482fcff103668d2625f10002a607d5863"
+            expectedLE = BS.reverse (hexDecode expectedDisplayHex)
+        out `shouldBe` expectedLE
+
+      -- Same vector via Insert/Remove:
+      --   acc = FromInt(0); acc.Insert(tmp{1,0,..}); acc.Remove(tmp{2,0,..})
+      --   Finalize(acc) == same digest as above
+      it "matches Core vector: Insert/Remove path" $ do
+        let acc0 = MuHash.muHashFromBytes (fromInt 0)
+            acc  = MuHash.muHashRemove (MuHash.muHashInsert acc0 (fromInt 1)) (fromInt 2)
+            Hash256 out = MuHash.muHashFinalize acc
+            expectedDisplayHex = "10d312b100cbd32ada024a6646e40d3482fcff103668d2625f10002a607d5863"
+            expectedLE = BS.reverse (hexDecode expectedDisplayHex)
+        out `shouldBe` expectedLE
+
+      -- Order-independence with Insert/Remove (Core vector property at
+      -- bitcoin-core/src/test/crypto_tests.cpp:1205-1227):
+      --   For random inputs, the finalised digest is invariant under any
+      -- permutation of insert/remove operations.
+      it "is order-independent across permutations" $ do
+        let ops = [ ("ins", "alpha"), ("rem", "beta")
+                  , ("ins", "gamma"), ("rem", "delta") ]
+            apply mh ("ins", e) = MuHash.muHashInsert mh e
+            apply mh ("rem", e) = MuHash.muHashRemove mh e
+            apply mh _          = mh
+            -- Two permutations that produce different intermediate states
+            r1 = foldl' apply MuHash.muHashEmpty ops
+            r2 = foldl' apply MuHash.muHashEmpty (reverse ops)
+        MuHash.muHashFinalize r1 `shouldBe` MuHash.muHashFinalize r2
+
+      -- Inverse property (Core vector at crypto_tests.cpp:1229-1242):
+      --   z = X * Y, y' = Y * X (commutative), z / y' = 1.
+      it "satisfies (X*Y) / (Y*X) = identity" $ do
+        let x  = MuHash.muHashFromBytes (fromInt 5)
+            y  = MuHash.muHashFromBytes (fromInt 7)
+            z0 = MuHash.muHashCombine MuHash.muHashEmpty x
+            z  = MuHash.muHashCombine z0 y
+            y' = MuHash.muHashCombine y x
+            r  = MuHash.muHashDivide z y'
+        MuHash.muHashFinalize r `shouldBe` MuHash.muHashFinalize MuHash.muHashEmpty
+
+    describe "Num3072" $ do
+      it "modular multiplication is associative" $ do
+        let a = MuHash.muHashToNum3072 "a"
+            b = MuHash.muHashToNum3072 "b"
+            c = MuHash.muHashToNum3072 "c"
+            ab_c = MuHash.num3072Multiply (MuHash.num3072Multiply a b) c
+            a_bc = MuHash.num3072Multiply a (MuHash.num3072Multiply b c)
+        ab_c `shouldBe` a_bc
+
+      it "modular inverse: x * x^-1 == 1" $ do
+        let x    = MuHash.muHashToNum3072 "x"
+            xInv = MuHash.num3072GetInverse x
+            one  = MuHash.num3072Multiply x xInv
+        one `shouldBe` MuHash.num3072One
+
+      it "to/from bytes round-trip" $ do
+        let n = MuHash.muHashToNum3072 "round-trip-payload"
+            b = MuHash.num3072ToBytes n
+        BS.length b `shouldBe` MuHash.num3072ByteSize
+        MuHash.num3072FromBytes b `shouldBe` n
+
+    describe "MuHash3072 serialization" $ do
+      it "round-trips through (de)serialize" $ do
+        let mh0 = MuHash.muHashFromBytes (fromInt 1)
+            mh  = MuHash.muHashCombine mh0 (MuHash.muHashFromBytes (fromInt 2))
+            ser = MuHash.muHashSerialize mh
+        BS.length ser `shouldBe` 2 * MuHash.num3072ByteSize
+        MuHash.muHashDeserialize ser `shouldBe` Right mh
+
+      -- Core overflow vector (crypto_tests.cpp:1274-1281): a serialized
+      -- MuHash whose internal numerator overflows the modulus must still
+      -- finalise to the prescribed digest. The serialized blob is
+      -- 768 bytes: numerator = 0xff..ff (all 384 LE bytes 0xff, which is
+      -- larger than the modulus), denominator = 0x01 || 0x00..0x00 (=1).
+      it "matches Core overflow vector" $ do
+        let numBytes = BS.replicate MuHash.num3072ByteSize 0xff
+            denBytes = BS.cons 0x01 (BS.replicate (MuHash.num3072ByteSize - 1) 0x00)
+            ser = numBytes `BS.append` denBytes
+        case MuHash.muHashDeserialize ser of
+          Left e -> expectationFailure ("deserialize failed: " ++ e)
+          Right mh -> do
+            let Hash256 out = MuHash.muHashFinalize mh
+                -- Core asserts via 'HexStr(out4)' (NOT 'uint256{...}'), so the
+                -- expected hex is in the same canonical SHA256 byte order
+                -- our 'out' uses — no reversal here.
+                expectedRawHex = "3a31e6903aff0de9f62f9a9f7f8b861de76ce2cda09822b90014319ae5dc2271"
+                expectedLE = hexDecode expectedRawHex
+            out `shouldBe` expectedLE
 
   describe "TxIndex" $ do
     describe "TxIndexEntry serialization" $ do
