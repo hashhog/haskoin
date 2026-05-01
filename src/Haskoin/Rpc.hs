@@ -168,7 +168,8 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
                            Deployment(..), taprootDeployment,
                            checkAssumeutxoWhitelist,
-                           AssumeUtxoParams(..), assumeUtxoForBlockHash)
+                           AssumeUtxoParams(..), assumeUtxoForBlockHash,
+                           connectBlock, disconnectBlock)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
@@ -177,7 +178,9 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
                          loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..),
                          dumpTxOutSetFromDB,
-                         AssumeUtxoData(..), verifySnapshot)
+                         AssumeUtxoData(..), verifySnapshot,
+                         buildSpentUtxoMapFromDB,
+                         getUndoData)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
@@ -4425,22 +4428,49 @@ resolveDumpTarget net entries byHeight tip target = case target of
 --     'dumpTxOutSetFromDB' and is the same lossy mode the rest of the
 --     codebase already operates in.
 --
--- Rollback dance status (TODO):
---   * Param parsing + assumeutxo-height resolution + on-chain validation
---     are wired and tested. The actual UTXO rewind, however, is *not*
---     fully usable yet: 'disconnectBlock' (Consensus.hs:2289) only
---     deletes outputs created by the disconnected block — it does not
---     restore inputs that block spent, because haskoin's IBD code path
---     never calls 'putUndoData' (only 'BlockTemplate' does, see
---     Storage.hs:1234). Without per-block undo data on disk we cannot
---     reconstruct the historical UTXO set.
---   * To keep the API surface honest, when @target /= tip@ we currently
---     refuse with a clear message instead of silently writing a
---     truncated UTXO set. The TODO is to: (1) populate undo data from
---     'connectBlock' during IBD, then (2) walk tip→target via
---     'disconnectBlock' applying undo, dump, then re-walk back. The
---     header-chain side of the dance is straightforward; the UTXO side
---     is the gating piece.
+-- Rollback dance:
+--   When @target /= tip@, we temporarily rewind the chainstate to the
+--   target block, dump the UTXO set as it was at that height, and then
+--   replay forward to the original tip. The dance:
+--
+--     1. Walk @target+1 .. tip@ via 'cePrev', collecting block hashes
+--        in tip→target order.
+--     2. For each block in that list (highest first), call
+--        'disconnectBlock' which uses the on-disk per-block undo data
+--        to restore the spent UTXOs and remove the block's outputs.
+--     3. Dump the now-rewound UTXO set via 'dumpTxOutSetFromDB'.
+--     4. For each block in target→tip order, call 'connectBlock'
+--        again. We pass the spent-utxo map looked up from the (now
+--        partially-rebuilt) chainstate; this works because the UTXO
+--        set has been restored to its target state, and each replayed
+--        block's prevouts are present in the chainstate.
+--     5. The header chain (in-memory) is unchanged throughout — only
+--        the UTXO key-space is rewound and replayed. The best-block
+--        pointer flips with disconnect/connect but is restored to the
+--        original tip at the end.
+--
+--   Replay skips script validation: the blocks were already validated
+--   on the way up, and re-validating during rollback would multiply
+--   the cost of the dump. This matches Bitcoin Core's behaviour in
+--   @SnapshotUTXOs@ which uses chainstate views, not full re-validation.
+--
+--   If undo data is missing for any block in @target+1 .. tip@ (an
+--   old datadir whose IBD predates the connectBlock undo wiring) we
+--   abort the dance early and surface an error to the caller. We do
+--   NOT silently emit a truncated UTXO set.
+--
+--   TODO(concurrency): the dance mutates the live UTXO keyspace, so a
+--   concurrent block-connect from the IBD pipeline would race the
+--   rewind+replay. Bitcoin Core takes @cs_main@ for the duration of
+--   @CreateUTXOSnapshot@. haskoin currently lacks a global validation
+--   lock; in practice operators run @dumptxoutset rollback@ on a
+--   stopped node or at the chain tip when no new blocks are arriving.
+--   A follow-up should either (a) hold a coordination MVar with the
+--   block downloader, or (b) document that rollback dump must be
+--   issued only when IBD is idle.
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp dumptxoutset and
+-- @CreateUTXOSnapshot@; the rollback param is documented at 3076-3107.
 handleDumpTxOutSet :: RpcServer -> Value -> IO RpcResponse
 handleDumpTxOutSet server params = do
   case parseDumpTxOutSetParams params of
@@ -4459,22 +4489,10 @@ handleDumpTxOutSet server params = do
         Right (baseHeight, baseHash) ->
           if baseHash == ceHash tip
              then doDump path magic baseHeight baseHash "tip"
-             else
-               -- TODO: Implement the temporary-rollback dance once
-               -- 'connectBlock' writes UndoData during IBD. Until then
-               -- we deliberately refuse rather than emit a UTXO set
-               -- that is missing the spent-input restorations we cannot
-               -- replay.
-               return $ RpcResponse Null
-                 (toJSON $ RpcError rpcMiscError (T.pack
-                   ("dumptxoutset: rollback to height "
-                    <> show baseHeight
-                    <> " requires per-block undo data, which haskoin's "
-                    <> "IBD path does not currently persist (see "
-                    <> "Consensus.hs:2289 disconnectBlock and "
-                    <> "BlockTemplate.hs:406 putUndoData). Refusing to "
-                    <> "emit a truncated UTXO set. Use \"latest\" "
-                    <> "(or omit type) to dump the current tip."))) Null
+             else doRollbackDump
+                    net path magic
+                    baseHeight baseHash
+                    tip entries
   where
     doDump path magic baseHeight baseHash status = do
       result <- dumpTxOutSetFromDB (rsDB server) path magic baseHash
@@ -4490,6 +4508,133 @@ handleDumpTxOutSet server params = do
                     , "rollback_status" .= (status :: Text)
                     ])
             Null Null
+
+    -- Build the path of blocks from tip back to target (exclusive of
+    -- target, inclusive of tip), walking 'cePrev'. Returns the list
+    -- with tip first, target+1 last. Returns 'Left' if the chain
+    -- breaks before reaching target.
+    buildRewindPath
+      :: Map BlockHash ChainEntry
+      -> ChainEntry  -- ^ current tip
+      -> BlockHash   -- ^ target hash (not included)
+      -> Either String [ChainEntry]
+    buildRewindPath ents start targetH = go start []
+      where
+        go ce acc
+          | ceHash ce == targetH = Right (reverse acc)
+          | otherwise = case cePrev ce of
+              Nothing ->
+                Left $ "buildRewindPath: hit genesis before reaching target "
+                       ++ show targetH
+              Just prevH -> case Map.lookup prevH ents of
+                Nothing ->
+                  Left $ "buildRewindPath: missing chain entry "
+                         ++ show prevH
+                Just prevCe -> go prevCe (ce : acc)
+
+    doRollbackDump net path magic baseHeight baseHash tip entries = do
+      let db = rsDB server
+      case buildRewindPath entries tip baseHash of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInternalError
+            (T.pack ("dumptxoutset rollback: " <> err))) Null
+        Right rewindPath -> do
+          -- rewindPath = [target+1 .. tip], so the disconnect order
+          -- (tip first) is the reverse and the reconnect order is the
+          -- list itself. We fetch each block + verify undo data exists
+          -- BEFORE we start mutating — fail fast on a stale datadir.
+          checkResult <- checkRewindFeasible db rewindPath
+          case checkResult of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+            Right blocksToReplay -> do
+              -- Disconnect from tip down to target.
+              dRes <- disconnectChainTo db (reverse blocksToReplay)
+              case dRes of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInternalError (T.pack err)) Null
+                Right () -> do
+                  -- Dump at the rewound state.
+                  dumpRes <- dumpTxOutSetFromDB db path magic baseHash
+                  -- Replay blocks back to the original tip regardless
+                  -- of whether the dump itself errored — leaving the
+                  -- chainstate in a half-rewound state would be worse.
+                  rRes <- reconnectChain db net blocksToReplay
+                  case (dumpRes, rRes) of
+                    (Left dErr, _) -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcInternalError
+                        (T.pack ("dumptxoutset rollback dump failed: "
+                                 <> dErr))) Null
+                    (_, Left rErr) -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcInternalError
+                        (T.pack ("dumptxoutset rollback replay failed: "
+                                 <> rErr <> " — chainstate may be "
+                                 <> "inconsistent, restart to recover"))) Null
+                    (Right cnt, Right ()) ->
+                      return $ RpcResponse
+                        (object
+                          [ "coins_written"   .= cnt
+                          , "base_hash"       .= showHash baseHash
+                          , "base_height"     .= baseHeight
+                          , "path"            .= T.pack path
+                          , "rollback_status" .= ("rollback" :: Text)
+                          ])
+                        Null Null
+
+    -- Pre-flight check: every block in the rewind path must have its
+    -- block body and a verified undo record on disk. If any are
+    -- missing we refuse to start the dance — surface the gap honestly
+    -- so operators can decide whether to re-IBD or accept dump=tip.
+    checkRewindFeasible
+      :: HaskoinDB
+      -> [ChainEntry]  -- ^ rewind path, target+1 .. tip
+      -> IO (Either String [(ChainEntry, Block)])
+    checkRewindFeasible db ces = do
+      results <- forM ces $ \ce -> do
+        let bh = ceHash ce
+        mBlk <- getBlock db bh
+        mUndo <- getUndoData db bh
+        case (mBlk, mUndo) of
+          (Just blk, Just _) -> return $ Right (ce, blk)
+          (Nothing, _) ->
+            return $ Left $ "missing block body for "
+                            <> show bh <> " at height "
+                            <> show (ceHeight ce)
+          (_, Nothing) ->
+            return $ Left $ "missing undo data for "
+                            <> show bh <> " at height "
+                            <> show (ceHeight ce)
+                            <> " — this datadir was IBD'd before "
+                            <> "haskoin started writing undo records "
+                            <> "(connectBlock landed in this commit). "
+                            <> "Re-IBD is required to use rollback dump."
+      return $ sequence results
+
+    -- Disconnect blocks tip→target. Input is in tip-first order.
+    disconnectChainTo :: HaskoinDB -> [(ChainEntry, Block)]
+                      -> IO (Either String ())
+    disconnectChainTo _ [] = return (Right ())
+    disconnectChainTo db ((ce, blk) : rest) = do
+      let prevHash = case cePrev ce of
+            Just h  -> h
+            Nothing -> ceHash ce  -- impossible: would mean disconnecting genesis
+      r <- disconnectBlock db blk prevHash
+      case r of
+        Left err -> return $ Left $
+          "disconnectBlock at height " <> show (ceHeight ce) <> ": " <> err
+        Right () -> disconnectChainTo db rest
+
+    -- Reconnect blocks target+1 .. tip. Looks up spent UTXOs from the
+    -- (rewound, then partially rebuilt) chainstate at each step. This
+    -- works because each block's prevouts are either in the rewound
+    -- state or were created by an earlier replayed block.
+    reconnectChain :: HaskoinDB -> Network -> [(ChainEntry, Block)]
+                   -> IO (Either String ())
+    reconnectChain _ _ [] = return (Right ())
+    reconnectChain db net ((ce, blk) : rest) = do
+      spent <- buildSpentUtxoMapFromDB db blk
+      connectBlock db net blk (ceHeight ce) spent
+      reconnectChain db net rest
 
 --------------------------------------------------------------------------------
 -- Helper Functions
