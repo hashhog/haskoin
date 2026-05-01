@@ -177,6 +177,7 @@ module Haskoin.Storage
   , writeSnapshot
   , dumpTxOutSetFromDB
   , computeUtxoHash
+  , computeUtxoMuHash
   , verifySnapshot
     -- ** Core-compatible compression primitives
   , compressAmount
@@ -220,6 +221,8 @@ import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.List as L
+import Data.List (foldl')
 import Data.Maybe (isJust)
 import System.IO (Handle, IOMode(..), hSeek, SeekMode(..), hClose, hFileSize,
                   hSetFileSize, openBinaryFile, hFlush)
@@ -231,6 +234,8 @@ import qualified Crypto.Hash as Hash
 import qualified Data.ByteArray as BA
 
 import Haskoin.Types
+import qualified Haskoin.MuHash as MuHash
+import Haskoin.MuHash (MuHash3072)
 
 --------------------------------------------------------------------------------
 -- Cryptographic Helpers (local to avoid circular imports)
@@ -2821,19 +2826,76 @@ getCoreCoin = do
     , coinIsCoinbase = (code .&. 1) == 1
     }
 
--- | Compute a hash over the serialised UTXO set in a stable, format-tied way.
+-- | Compute Core's @HASH_SERIALIZED@ digest over a UTXO set.
 --
--- This is NOT byte-identical to Bitcoin Core's @hash_serialized@
--- (Core uses MuHash3072) but is a deterministic SHA256d over the
--- Core-format coin bytes, which is good enough for round-trip
--- integrity checks in tests. Replacing this with MuHash3072 to match
--- @audHashSerialized@ exactly is tracked by the assumeutxo plumbing
--- ticket — until then 'verifySnapshot' returns a hash-mismatch error
--- for snapshots produced by Core, which is the safe failure mode.
--- Reference: bitcoin/src/kernel/coinstats.cpp ComputeUTXOStats.
+-- This is now byte-identical to Bitcoin Core's @CoinStatsHashType::HASH_SERIALIZED@,
+-- which is the digest @loadtxoutset@ checks (see validation.cpp:5912-5914
+-- @PopulateAndValidateSnapshot@). Each coin contributes
+-- @TxOutSer(outpoint, coin)@ to a single 'HashWriter' (i.e. a streamed
+-- SHA256d), where 'TxOutSer' is:
+--
+-- @
+--   outpoint                                -- 32-byte txid + LE32 vout
+--   uint32_t (height << 1) | fCoinBase      -- LE32
+--   coin.out                                -- LE64 value + varint(scriptLen) + script
+-- @
+--
+-- Reference: bitcoin/src/kernel/coinstats.cpp 'TxOutSer' / 'ApplyCoinHash' /
+-- 'FinalizeHash(HashWriter&, ...)' (which calls 'HashWriter::GetHash' =
+-- double-SHA256).
+--
+-- The previous implementation here SHA256d'd the snapshot's
+-- 'serializeCoins' (Core's compressed snapshot wire format), which
+-- is *not* what 'audHashSerialized' commits to — so we always
+-- mismatched. Now both are computed in the same units.
+--
+-- Note on coin grouping: Core walks the coins DB cursor (which is keyed
+-- by outpoint, sorted), so coins for the same txid arrive together.
+-- 'ApplyHash' then iterates the per-txid map by ascending @vout@. We
+-- replicate the latter ordering by sorting coins on (txid, vout) before
+-- streaming, so the bytes hashed match Core regardless of the input
+-- order.
 computeUtxoHash :: [SnapshotCoin] -> Hash256
 computeUtxoHash coins =
-  doubleSHA256' (serializeCoins coins)
+  let !sortedCoins = sortCoinsForHash coins
+      !payload = runPut $ forM_ sortedCoins $ \SnapshotCoin{..} ->
+                   putTxOutSer scOutPoint scCoin
+  in doubleSHA256' payload
+
+-- | Compute Core's @MUHASH@ digest over a UTXO set.
+--
+-- 'computeUtxoMuHash' is order-independent: 'MuHash3072.Insert' multiplies
+-- each element into the numerator under a commutative group, so any
+-- permutation of the input produces the same finalised 32-byte hash.
+--
+-- Reference: bitcoin/src/kernel/coinstats.cpp 'CoinStatsHashType::MUHASH'
+-- (the alternate hash mode). For 'loadtxoutset' itself, Core uses
+-- 'HASH_SERIALIZED' — see 'computeUtxoHash'.
+computeUtxoMuHash :: [SnapshotCoin] -> Hash256
+computeUtxoMuHash coins =
+  let !mh0 = MuHash.muHashEmpty
+      !mh  = foldl' insertCoin mh0 coins
+  in MuHash.muHashFinalize mh
+  where
+    insertCoin :: MuHash3072 -> SnapshotCoin -> MuHash3072
+    insertCoin acc SnapshotCoin{..} =
+      MuHash.muHashInsert acc (runPut (putTxOutSer scOutPoint scCoin))
+
+-- | Bitcoin Core's per-coin commitment payload (kernel/coinstats.cpp
+-- 'TxOutSer'). Streams: outpoint || LE32(height << 1 | coinbase) || TxOut.
+putTxOutSer :: OutPoint -> Coin -> Put
+putTxOutSer op coin = do
+  put op
+  putWord32le ((fromIntegral (coinHeight coin) `shiftL` 1) .|.
+               (if coinIsCoinbase coin then 1 else 0))
+  put (coinTxOut coin)
+
+-- | Sort coins for 'computeUtxoHash' so the streamed bytes match Core's
+-- cursor-driven order: outpoint hash ascending, then vout ascending.
+sortCoinsForHash :: [SnapshotCoin] -> [SnapshotCoin]
+sortCoinsForHash =
+  let key sc = (outPointHash (scOutPoint sc), outPointIndex (scOutPoint sc))
+  in L.sortBy (\a b -> compare (key a) (key b))
 
 -- | Verify a snapshot against known assumeUTXO data.
 verifySnapshot :: UtxoSnapshot -> AssumeUtxoData -> Either String ()
