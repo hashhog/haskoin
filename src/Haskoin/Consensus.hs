@@ -14,6 +14,8 @@ module Haskoin.Consensus
   , AssumeUtxoParams(..)
   , assumeUtxoForHeight
   , assumeUtxoForBlockHash
+  , assumeutxoWhitelistError
+  , checkAssumeutxoWhitelist
     -- * Consensus Constants
   , maxBlockSize
   , maxBlockWeight
@@ -268,6 +270,33 @@ assumeUtxoForBlockHash net bh =
   where
     listToMaybe [] = Nothing
     listToMaybe (x:_) = Just x
+
+-- | Canonical Bitcoin Core error message for an unrecognized assumeutxo
+-- height in snapshot metadata.
+--
+-- Reference: bitcoin/src/validation.cpp ~L5778:
+--
+-- > "Assumeutxo height in snapshot metadata not recognized
+-- >  (%d) - refusing to load snapshot"
+--
+-- Kept as a single function so the wording stays in lock-step with Core
+-- and so the loadtxoutset RPC and its tests share the exact string.
+assumeutxoWhitelistError :: Word32 -> String
+assumeutxoWhitelistError h =
+  "Assumeutxo height in snapshot metadata not recognized ("
+  ++ show h
+  ++ ") - refusing to load snapshot"
+
+-- | Core-strict whitelist check: a snapshot's base block height must
+-- appear in 'netAssumeUtxo' or it is refused outright.
+--
+-- Reference: bitcoin/src/validation.cpp PopulateAndValidateSnapshot
+-- (the 'GetParams().AssumeutxoForHeight(base_height)' guard).
+checkAssumeutxoWhitelist :: Network -> Word32 -> Either String ()
+checkAssumeutxoWhitelist net height =
+  case assumeUtxoForHeight net height of
+    Just _  -> Right ()
+    Nothing -> Left (assumeutxoWhitelistError height)
 
 --------------------------------------------------------------------------------
 -- AssumeValid: ancestor-check script-skip

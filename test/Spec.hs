@@ -10658,6 +10658,52 @@ main = hspec $ do
                        ]
                 got `shouldBe` expected
 
+    -- ------------------------------------------------------------------
+    -- Core-strict assumeutxo whitelist (loadtxoutset RPC guard)
+    --
+    -- Reference: bitcoin/src/validation.cpp PopulateAndValidateSnapshot
+    -- (the @GetParams().AssumeutxoForHeight(base_height)@ check).
+    --
+    -- The 'handleLoadTxOutSet' RPC handler resolves the snapshot's
+    -- @base_blockhash@ to a height through the header chain and then
+    -- defers the whitelist policy to 'checkAssumeutxoWhitelist'. We test
+    -- the policy function directly so the test does not need to spin up
+    -- a full 'RpcServer' / 'HeaderChain' — the wiring in 'Rpc.hs' is a
+    -- thin pass-through (lookup + this guard + ok-path).
+    describe "Core-strict assumeutxo whitelist (checkAssumeutxoWhitelist)" $ do
+      it "rejects regtest genesis (height 0) with the canonical message" $ do
+        -- Regtest's whitelist is [(110, _)]; height 0 is the genesis
+        -- block hash and is NOT in m_assumeutxo_data. This is the same
+        -- shape as feeding a regtest-genesis snapshot through
+        -- loadtxoutset on a regtest node — Core would refuse it with
+        -- the exact string below.
+        let regtestGenesisHash = computeBlockHash (blockHeader (netGenesisBlock regtest))
+        -- Sanity: the regtest genesis hash is not on the whitelist by
+        -- block hash either.
+        assumeUtxoForBlockHash regtest regtestGenesisHash `shouldBe` Nothing
+        -- The actual whitelist check is by height, matching Core.
+        case checkAssumeutxoWhitelist regtest 0 of
+          Right () ->
+            expectationFailure
+              "checkAssumeutxoWhitelist regtest 0: expected rejection"
+          Left err ->
+            err `shouldBe`
+              "Assumeutxo height in snapshot metadata not recognized \
+              \(0) - refusing to load snapshot"
+
+      it "accepts a whitelisted regtest height (110)" $
+        -- Sanity-check the positive path: regtest's lone whitelisted
+        -- height (110) must round-trip cleanly through the guard.
+        checkAssumeutxoWhitelist regtest 110 `shouldBe` Right ()
+
+      it "rejects an arbitrary mainnet non-whitelist height with \
+         \the canonical message" $
+        -- Mainnet's whitelist is {840000, 880000, 910000, 935000};
+        -- height 840001 is intentionally one off the lowest entry.
+        checkAssumeutxoWhitelist mainnet 840001 `shouldBe`
+          Left "Assumeutxo height in snapshot metadata not recognized \
+               \(840001) - refusing to load snapshot"
+
   where
     sampleTx = Tx
       { txVersion = 1

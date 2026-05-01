@@ -159,7 +159,8 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
                            medianTimePast, maxBlockWeight,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
-                           Deployment(..), taprootDeployment)
+                           Deployment(..), taprootDeployment,
+                           checkAssumeutxoWhitelist)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
@@ -4148,7 +4149,27 @@ handleImportMempool server params = do
 --------------------------------------------------------------------------------
 
 -- | Load a UTXO snapshot from a file for fast initial sync (AssumeUTXO).
--- Reference: Bitcoin Core's loadtxoutset RPC (rpc/blockchain.cpp)
+-- Reference: Bitcoin Core's loadtxoutset RPC (rpc/blockchain.cpp) and
+-- 'PopulateAndValidateSnapshot' in validation.cpp.
+--
+-- Core-strict guard ported here:
+--
+--   1. The snapshot's @base_blockhash@ must resolve to a known
+--      'ChainEntry' in the header chain. If not, refuse with the same
+--      "Did not find snapshot start blockheader %s" message Core uses.
+--
+--   2. The resolved height must appear in 'netAssumeUtxo' (the
+--      'm_assumeutxo_data' map in Core). If not, refuse with the
+--      canonical
+--      "Assumeutxo height in snapshot metadata not recognized (%d)
+--       - refusing to load snapshot"
+--      message — see 'checkAssumeutxoWhitelist' /
+--      'assumeutxoWhitelistError'.
+--
+-- Without these guards a malicious or misconfigured snapshot could be
+-- loaded against an arbitrary base block, since 'loadSnapshot' itself
+-- only validates magic + version + on-disk shape.
+--
 -- Params: [path]
 -- Returns: { "coins_loaded": <count>, "tip_hash": "<hash>" }
 handleLoadTxOutSet :: RpcServer -> Value -> IO RpcResponse
@@ -4167,11 +4188,25 @@ handleLoadTxOutSet server params = do
         Right snapshot -> do
           let metadata = usMetadata snapshot
               coinsCount = smCoinsCount metadata
-          return $ RpcResponse
-            (object [ "coins_loaded" .= coinsCount
-                    , "tip_hash"     .= show (smBaseBlockHash metadata)
-                    ])
-            Null Null
+              baseHash   = smBaseBlockHash metadata
+          -- Step 1: resolve base blockhash → height via the header chain.
+          entries <- readTVarIO (hcEntries (rsHeaderChain server))
+          case Map.lookup baseHash entries of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInternalError
+                (T.pack ("Did not find snapshot start blockheader "
+                         ++ show baseHash))) Null
+            Just entry ->
+              -- Step 2: that height must be whitelisted in netAssumeUtxo.
+              case checkAssumeutxoWhitelist net (ceHeight entry) of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInternalError (T.pack err)) Null
+                Right () ->
+                  return $ RpcResponse
+                    (object [ "coins_loaded" .= coinsCount
+                            , "tip_hash"     .= show baseHash
+                            ])
+                    Null Null
 
 -- | Dump the current UTXO set to a file for creating a snapshot.
 -- Reference: Bitcoin Core's dumptxoutset RPC (rpc/blockchain.cpp).
