@@ -191,6 +191,7 @@ import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Exception (try, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Network.Socket (SockAddr)
+import Data.Maybe (mapMaybe)
 
 import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
@@ -2250,13 +2251,49 @@ computeWtxId tx = TxId (doubleSHA256 (encode tx))
 -- Block Connection and Disconnection
 --------------------------------------------------------------------------------
 
--- | Connect a block to the chain state, updating UTXO set and indexes.
--- Must be called atomically via batch writes.
-connectBlock :: HaskoinDB -> Network -> Block -> Word32 -> IO ()
-connectBlock db _net block height = do
+-- | Connect a block to the chain state, updating UTXO set and indexes,
+-- and writing per-block undo data for future rewinds.
+--
+-- The @spentUtxos@ argument carries the @TxOut@ for every non-coinbase
+-- input the block consumes; it is the same map @Sync.buildUTXOMap@
+-- already produces just before validation. We persist those outputs as
+-- a 'BlockUndo' record so 'disconnectBlock' (and the @dumptxoutset@
+-- rollback dance) can restore them later.
+--
+-- Reference: bitcoin-core/src/validation.cpp @ConnectBlock@ — Core
+-- writes a parallel @rev*.dat@ undo entry for each connected block via
+-- @WriteBlockUndo@. We piggy-back the equivalent record on the same
+-- RocksDB write batch so the UTXO mutation and the undo record commit
+-- atomically; partial commits on shutdown can never desync them.
+--
+-- The undo record stores only @TxOut@ (no height/coinbase) because the
+-- legacy @PrefixUTXO@ keyspace is itself lossy in the same way (see
+-- 'dumpTxOutSetFromDB' notes). 'disconnectBlock' restores raw @TxOut@
+-- back into @PrefixUTXO@, which is consistent with the connect-side
+-- write format.
+connectBlock :: HaskoinDB -> Network -> Block -> Word32
+             -> Map OutPoint TxOut  -- ^ Spent UTXOs (prevouts being consumed
+                                    --   by non-coinbase inputs in this block).
+             -> IO ()
+connectBlock db _net block height spentUtxos = do
   let bh = computeBlockHash (blockHeader block)
+      prevHash = bhPrevBlock (blockHeader block)
       txns = blockTxns block
       txids = map computeTxId txns
+      -- Build BlockUndo: one TxUndo per non-coinbase tx, in tx order.
+      -- For each input we record (TxOut, height=0, coinbase=False);
+      -- height/coinbase are 0/false because PrefixUTXO storage is
+      -- already TxOut-only (lossy by design, see Storage.hs:1130-1145).
+      mkTxInUndo inp = case Map.lookup (txInPrevOutput inp) spentUtxos of
+        Just txout -> Just (TxInUndo txout 0 False)
+        Nothing    -> Nothing  -- caller's responsibility; logged below
+      mkTxUndo tx = TxUndo
+        { tuPrevOutputs = mapMaybe mkTxInUndo (txInputs tx) }
+      blockUndo = BlockUndo
+        { buTxUndo = map mkTxUndo (drop 1 txns)  -- skip coinbase
+        }
+      undoData = mkUndoData bh height prevHash blockUndo
+      undoKey  = BS.cons 0x10 (encode bh)
       ops = concat
         [ -- Add new UTXOs from all transactions
           [ BatchPut (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
@@ -2266,9 +2303,12 @@ connectBlock db _net block height = do
           ]
         , -- Remove spent UTXOs (skip coinbase as it has no real inputs)
           [ BatchDelete (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
-          | tx <- tail txns
+          | tx <- drop 1 txns
           , inp <- txInputs tx
           ]
+        , -- Per-block undo data (key prefix 0x10, see Storage.putUndoData).
+          -- Atomically committed with the UTXO mutation above.
+          [ BatchPut undoKey (encode undoData) ]
         , -- Transaction index entries
           [ BatchPut (makeKey PrefixTxIndex (encode txid))
                      (encode (TxLocation bh (fromIntegral i)))
@@ -2284,24 +2324,61 @@ connectBlock db _net block height = do
         ]
   writeBatch db (WriteBatch ops)
 
--- | Disconnect a block from the chain state (for reorgs).
--- Note: Full undo requires storing spent UTXO values when connecting.
-disconnectBlock :: HaskoinDB -> Block -> BlockHash -> IO ()
+-- | Disconnect a block from the chain state.
+--
+-- Restores the UTXO set to its state before this block was connected:
+--   1. Re-add UTXOs the block spent (read from undo data).
+--   2. Remove UTXOs the block created.
+--   3. Update best block pointer to the previous hash.
+--
+-- Order matters — re-adding spent before removing created lets
+-- block-internal spends (a tx in this block that spends an output
+-- created by an earlier tx in the same block) round-trip cleanly.
+--
+-- Returns 'Left' when undo data is missing or fails its checksum
+-- (e.g. an old datadir whose IBD predates the connectBlock undo wiring).
+-- Callers must handle the error rather than silently produce a
+-- truncated UTXO set.
+--
+-- Reference: bitcoin-core/src/validation.cpp @DisconnectBlock@ +
+-- @ApplyBlockUndo@.
+disconnectBlock :: HaskoinDB -> Block -> BlockHash -> IO (Either String ())
 disconnectBlock db block prevHash = do
-  let txns = blockTxns block
-      txids = map computeTxId txns
-      ops = concat
-        [ -- Remove outputs created by this block
-          [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
-          | (txid, tx) <- zip txids txns
-          , (i, _) <- zip [0..] (txOutputs tx)
-          ]
-        -- Note: Restoring spent UTXOs would require undo data
-        -- In production, store undo data when connecting blocks
-        , -- Update best block to previous
-          [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
-        ]
-  writeBatch db (WriteBatch ops)
+  let bh = computeBlockHash (blockHeader block)
+      txns = blockTxns block
+  undoResult <- getUndoDataVerified db bh prevHash
+  case undoResult of
+    Left err -> return $ Left $
+      "disconnectBlock " <> show bh <> ": " <> err
+    Right undoData -> do
+      let txUndos = buTxUndo (udBlockUndo undoData)
+          nonCoinbase = drop 1 txns
+      -- Sanity: BlockUndo must have one TxUndo per non-coinbase tx.
+      if length txUndos /= length nonCoinbase
+        then return $ Left $
+          "disconnectBlock " <> show bh
+          <> ": undo data has " <> show (length txUndos)
+          <> " TxUndo entries, but block has "
+          <> show (length nonCoinbase)
+          <> " non-coinbase txs"
+        else do
+          let txids = map computeTxId txns
+              -- Restore spent inputs first, then remove created outputs.
+              restoreOps =
+                [ BatchPut (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
+                           (encode (tuOutput tin))
+                | (tx, txUndo) <- zip nonCoinbase txUndos
+                , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
+                ]
+              removeOps =
+                [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
+                | (txid, tx) <- zip txids txns
+                , (i, _) <- zip [0..] (txOutputs tx)
+                ]
+              bestBlockOp =
+                [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
+          writeBatch db (WriteBatch (restoreOps ++ removeOps ++ bestBlockOp))
+          return (Right ())
 
 --------------------------------------------------------------------------------
 -- Header Chain Types

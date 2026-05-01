@@ -57,6 +57,7 @@ module Haskoin.Storage
   , putUTXO
   , getUTXO
   , deleteUTXO
+  , buildSpentUtxoMapFromDB
     -- * UTXO Cache (Legacy)
   , UTXOEntry(..)
   , UTXOCache(..)
@@ -498,6 +499,32 @@ deleteUTXO :: HaskoinDB -> OutPoint -> IO ()
 deleteUTXO db outpoint =
   let key = makeKey PrefixUTXO (encode outpoint)
   in R.delete (dbHandle db) (dbWriteOpts db) key
+
+-- | Look up the spent (prevout) @TxOut@ for every non-coinbase input
+-- in a block, by fetching from the legacy @PrefixUTXO@ keyspace.
+--
+-- This is the IBD/reindex companion to @Sync.buildUTXOMap@ — same
+-- output shape, but builds the map directly from the DB without
+-- requiring a 'BlockDownloader'. Callers use it to construct the
+-- @spentUtxos@ argument that 'Consensus.connectBlock' needs to write
+-- per-block undo data.
+--
+-- Inputs with no entry in the UTXO set (already spent, or pre-IBD
+-- block being reindexed against a partial chainstate) are silently
+-- omitted from the result. The caller is the place that decides
+-- whether that's a fatal error.
+buildSpentUtxoMapFromDB :: HaskoinDB -> Block -> IO (Map OutPoint TxOut)
+buildSpentUtxoMapFromDB db block = do
+  let -- Coinbase has no real prevouts; skip it.
+      nonCoinbaseTxs = drop 1 (blockTxns block)
+      outpoints = [ txInPrevOutput inp
+                  | tx <- nonCoinbaseTxs
+                  , inp <- txInputs tx
+                  ]
+  pairs <- mapM (\op -> do
+                   m <- getUTXO db op
+                   return (op, m)) outpoints
+  return $ Map.fromList [ (op, txo) | (op, Just txo) <- pairs ]
 
 --------------------------------------------------------------------------------
 -- UTXO Entry with Metadata

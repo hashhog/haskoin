@@ -527,7 +527,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                 ++ "); stopping replay."
                         return (h - 1)
                       Just blk -> do
-                        connectBlock db net blk h
+                        -- Look up the spent UTXOs from the in-progress
+                        -- chainstate so connectBlock can write per-block
+                        -- undo data alongside the UTXO mutation.
+                        spent <- buildSpentUtxoMapFromDB db blk
+                        connectBlock db net blk h spent
                           `catch` (\(e :: SomeException) ->
                             putStrLn $ "[-reindex-chainstate] connectBlock "
                                     ++ "h=" ++ show h ++ " error: " ++ show e)
@@ -1053,8 +1057,10 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           putStrLn $ "Block header rejected: " ++ err
       Right entry -> do
         let height = ceHeight entry
+        -- Look up spent UTXOs so connectBlock writes undo data atomically.
+        spent <- buildSpentUtxoMapFromDB db block
         let result = do
-              connectBlock db net block height
+              connectBlock db net block height spent
               putBlockHeight db height bh
               putBestBlockHash db bh
         result `catch` (\(e :: SomeException) ->
