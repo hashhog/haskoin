@@ -90,6 +90,7 @@ data NodeOptions = NodeOptions
   , noHealthPort :: !Int        -- ^ /health endpoint port (0 disables)
   , noReindex            :: !Bool -- ^ -reindex: full block-index rebuild (TODO: partial impl, see below)
   , noReindexChainstate  :: !Bool -- ^ -reindex-chainstate: wipe + replay UTXO set from existing block-index
+  , noLoadSnapshot       :: !(Maybe FilePath) -- ^ --load-snapshot=<path>: import a Core-format UTXO snapshot before starting peer/RPC threads
   } deriving (Show)
 
 data WalletCommand
@@ -168,6 +169,14 @@ parseNodeOptions = NodeOptions
                 \height 1 to the current header tip. Block-index (headers \
                 \+ block data) is preserved. Bitcoin Core's \
                 \-reindex-chainstate semantics.")
+  <*> optional (strOption (long "load-snapshot" <> metavar "PATH"
+        <> help "Load a Core-format UTXO snapshot from PATH before \
+                \starting the network/RPC threads (assumeutxo bootstrap). \
+                \The file must be a 'utxo'+0xff snapshot for the same \
+                \network magic; mismatched snapshots are rejected. \
+                \Equivalent to invoking the loadtxoutset RPC at \
+                \startup, useful when the node has not yet started \
+                \listening on RPC."))
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -365,6 +374,9 @@ applyConfigOverlay cm n = n
   , noReindexChainstate = if not (noReindexChainstate n)
                      then Daemon.configLookupBool "reindex-chainstate" False cm
                      else noReindexChainstate n
+  , noLoadSnapshot = case noLoadSnapshot n of
+                     Just _  -> noLoadSnapshot n
+                     Nothing -> Daemon.configLookup "load-snapshot" cm
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
@@ -533,6 +545,28 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
 
     -- Initialize UTXO cache
     cache <- newUTXOCache db (noDbCache * 1024 * 1024 `div` 100)
+
+    -- --load-snapshot: import a Core-format UTXO snapshot before any
+    -- peer or RPC activity. We bail out early on parse / magic mismatch
+    -- so misconfigured operators see the failure immediately rather
+    -- than silently starting from genesis. Reference: Bitcoin Core's
+    -- assumeutxo bootstrap (rpc/blockchain.cpp loadtxoutset).
+    forM_ noLoadSnapshot $ \snapshotPath -> do
+      putStrLn $ "[--load-snapshot] reading " ++ snapshotPath
+      let magic = netMagic net
+      r <- loadSnapshot snapshotPath magic
+      case r of
+        Left err -> do
+          putStrLn $ "[--load-snapshot] FATAL: " ++ err
+          exitWith (ExitFailure 1)
+        Right snap -> do
+          let m = usMetadata snap
+          putStrLn $ "[--load-snapshot] base hash = "
+                  ++ show (smBaseBlockHash m)
+                  ++ ", coins = " ++ show (smCoinsCount m)
+          n <- loadSnapshotIntoLegacyUTXO db snap
+          putStrLn $ "[--load-snapshot] imported " ++ show n
+                  ++ " UTXO(s); best-block pinned to snapshot base."
 
     -- Initialize mempool
     mp <- newMempool net cache defaultMempoolConfig 0

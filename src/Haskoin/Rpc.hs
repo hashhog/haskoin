@@ -166,7 +166,8 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
-                         loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..))
+                         loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..),
+                         dumpTxOutSetFromDB)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
@@ -4173,28 +4174,44 @@ handleLoadTxOutSet server params = do
             Null Null
 
 -- | Dump the current UTXO set to a file for creating a snapshot.
--- Reference: Bitcoin Core's dumptxoutset RPC (rpc/blockchain.cpp)
+-- Reference: Bitcoin Core's dumptxoutset RPC (rpc/blockchain.cpp).
+--
 -- Params: [path]
--- Returns: { "coins_written": <count>, "path": "<path>" }
--- Note: Requires the chain tip hash and UTXO cache from the node state.
--- This is a stub that returns an error when the block store is unavailable.
+-- Returns: { coins_written, base_hash, base_height, path }
+--
+-- Implementation notes:
+--   * Iterates the legacy 'PrefixUTXO' keyspace via 'dumpTxOutSetFromDB'.
+--   * Emits a Core byte-format snapshot (51-byte SnapshotMetadata header
+--     followed by per-txid groups of (vout, Coin) pairs using
+--     CompressAmount + ScriptCompression).
+--   * 'height' / 'isCoinbase' are stored as 0/false because haskoin's
+--     legacy UTXO row only persists the TxOut. This is documented in
+--     'dumpTxOutSetFromDB' and is the same lossy mode the rest of the
+--     codebase already operates in.
 handleDumpTxOutSet :: RpcServer -> Value -> IO RpcResponse
-handleDumpTxOutSet _server params = do
+handleDumpTxOutSet server params = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Usage: dumptxoutset \"path\"") Null
-    Just _pathText -> do
-      -- Full implementation requires access to the current chain tip and UTXO set.
-      -- The writeSnapshot function from Storage.hs provides the serialization:
-      --   writeSnapshot :: FilePath -> Word32 -> BlockHash -> CoinsViewCache -> IO (Either String Word64)
-      -- When connected to a running node with an active chainstate, this would:
-      --   1. Get the current chain tip hash from the header chain
-      --   2. Get the UTXO cache/view from the block store
-      --   3. Call writeSnapshot to serialize to the file
-      return $ RpcResponse Null
-        (toJSON $ RpcError rpcInternalError
-          "dumptxoutset requires an active chainstate; use loadtxoutset to load an existing snapshot")
-        Null
+    Just pathText -> do
+      let path = T.unpack pathText
+          net = rsNetwork server
+          magic = netMagic net
+      tip <- readTVarIO (hcTip (rsHeaderChain server))
+      let tipHash = ceHash tip
+          tipHeight = ceHeight tip
+      result <- dumpTxOutSetFromDB (rsDB server) path magic tipHash
+      case result of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInternalError (T.pack err)) Null
+        Right cnt ->
+          return $ RpcResponse
+            (object [ "coins_written" .= cnt
+                    , "base_hash"     .= showHash tipHash
+                    , "base_height"   .= tipHeight
+                    , "path"          .= pathText
+                    ])
+            Null Null
 
 --------------------------------------------------------------------------------
 -- Helper Functions
