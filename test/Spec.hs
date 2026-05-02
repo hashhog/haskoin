@@ -10603,6 +10603,39 @@ main = hspec $ do
           , BS.singleton 0xac
           ]
 
+        -- Generator G of secp256k1 in 65-byte uncompressed form (0x04 || X || Y).
+        -- Derived from the standard SEC1 specification; cross-checked against
+        -- bitcoin-core/src/secp256k1/src/ecmult_gen.h.
+        --   X = 79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+        --   Y = 483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+        -- Y's last byte 0xB8 has parity bit 0, so the on-disk tag is 0x04
+        -- (= 0x04 | (0xB8 & 0x01)) and the equivalent compressed key starts
+        -- 0x02 (= even-Y).
+        generatorG_X :: ByteString
+        generatorG_X = BS.pack
+          [ 0x79,0xBE,0x66,0x7E,0xF9,0xDC,0xBB,0xAC
+          , 0x55,0xA0,0x62,0x95,0xCE,0x87,0x0B,0x07
+          , 0x02,0x9B,0xFC,0xDB,0x2D,0xCE,0x28,0xD9
+          , 0x59,0xF2,0x81,0x5B,0x16,0xF8,0x17,0x98
+          ]
+        generatorG_Y :: ByteString
+        generatorG_Y = BS.pack
+          [ 0x48,0x3A,0xDA,0x77,0x26,0xA3,0xC4,0x65
+          , 0x5D,0xA4,0xFB,0xFC,0x0E,0x11,0x08,0xA8
+          , 0xFD,0x17,0xB4,0x48,0xA6,0x85,0x54,0x19
+          , 0x9C,0x47,0xD0,0x8F,0xFB,0x10,0xD4,0xB8
+          ]
+
+        -- 67-byte uncompressed P2PK: 0x41 (push 65) + 0x04 + X + Y + 0xac.
+        sampleP2PKUncompressed :: ByteString
+        sampleP2PKUncompressed = BS.concat
+          [ BS.singleton 65         -- OP_PUSHBYTES_65
+          , BS.singleton 0x04
+          , generatorG_X
+          , generatorG_Y
+          , BS.singleton 0xac       -- OP_CHECKSIG
+          ]
+
         sampleArbitrary :: ByteString
         sampleArbitrary = BS.pack [0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]  -- OP_RETURN <data>
 
@@ -10667,6 +10700,36 @@ main = hspec $ do
         BS.length bs `shouldBe` 33
         BS.head bs   `shouldBe` 0x02
         runGet getCompressedScript bs `shouldBe` Right sampleP2PKCompressed
+
+      -- Regression: tags 0x04/0x05 (uncompressed-P2PK) used to fail-closed
+      -- in haskoin's getCompressedScript. With libsecp256k1 wired in via
+      -- haskoin_ec_pubkey_decompress, snapshots from Bitcoin Core that
+      -- contain Satoshi-era P2PK coinbases now decode correctly.
+      -- Reference: bitcoin-core/src/compressor.cpp DecompressScript.
+      it "round-trips uncompressed P2PK at generator G (33 bytes on disk: 0x04 + X)" $ do
+        let bs = runPut (putCompressedScript sampleP2PKUncompressed)
+        BS.length bs `shouldBe` 33
+        BS.head bs   `shouldBe` 0x04   -- Y parity 0 → tag 0x04
+        BS.tail bs   `shouldBe` generatorG_X
+        runGet getCompressedScript bs `shouldBe` Right sampleP2PKUncompressed
+
+      it "decodes a hand-crafted tag-0x04 record into G's full 67-byte P2PK script" $ do
+        -- Hand-craft a Core-format ScriptCompression record (one VARINT
+        -- byte 0x04 + 32-byte X) and verify the decoder rebuilds the
+        -- canonical 67-byte uncompressed P2PK script.  This is the
+        -- shape we'd encounter in a real Core 840k+ utxo.dat snapshot.
+        let bs = BS.cons 0x04 generatorG_X
+        runGet getCompressedScript bs `shouldBe` Right sampleP2PKUncompressed
+
+      it "fail-closes on tag 0x04 with an invalid X coordinate" $ do
+        -- All-0xFF is not a valid secp256k1 X coordinate (it overflows
+        -- the field prime). libsecp256k1's pubkey_parse rejects it, so
+        -- the decoder must fail rather than emit an unverifiable script.
+        let bs = BS.cons 0x04 (BS.replicate 32 0xff)
+        case runGet getCompressedScript bs of
+          Left _  -> pure ()
+          Right s -> expectationFailure $
+            "expected decode failure for invalid X, got " ++ show s
 
       it "round-trips an arbitrary script via the passthrough path" $ do
         let bs = runPut (putCompressedScript sampleArbitrary)
