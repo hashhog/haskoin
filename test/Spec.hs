@@ -54,7 +54,8 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          putBlockHeight, getBlockHeight,
                          putBestBlockHash, getBestBlockHash,
                          -- UTXO single-key API (for wipeChainstate test)
-                         putUTXO, getUTXO, putTxIndex, getTxIndex,
+                         putUTXO, getUTXO, putUTXOCoin, getUTXOCoin,
+                         putTxIndex, getTxIndex,
                          wipeChainstate,
                          -- Undo data round-trip (for dumptxoutset rollback)
                          buildSpentUtxoMapFromDB, getUndoData, putUndoData,
@@ -11152,6 +11153,144 @@ main = hspec $ do
             mNewAfter `shouldBe` mNewBefore
             mPrev <- getUTXO db spentOp
             mPrev `shouldBe` Nothing
+
+    -- ------------------------------------------------------------------
+    -- connectBlock + dumpTxOutSetFromDB: per-coin Coin metadata
+    --
+    -- Regression for: cross-impl snapshot byte-identity bug (haskoin
+    -- emitted a 51-byte header-only snapshot, then a 7861-byte snapshot
+    -- with @code = 0@ for every coin, when reference is 7908 bytes).
+    -- Root cause: 'submitBlock' only updated the in-memory @UTXOCache@
+    -- (STM TVars) and never reached RocksDB; a subsequent
+    -- @dumptxoutset@ iteration of @PrefixUTXO@ saw nothing or, after
+    -- the first patch, saw bare 'TxOut' entries with no
+    -- height/coinbase metadata. The fix routes 'submitBlock' through
+    -- 'connectBlock' (the IBD-tested writer) and changes the on-disk
+    -- @PrefixUTXO@ value format from raw 'TxOut' to full Core-format
+    -- 'Coin' (varint code + TxOut), so 'dumpTxOutSetFromDB' produces a
+    -- byte-identical snapshot.
+    -- ------------------------------------------------------------------
+    describe "connectBlock writes Core-format Coin to PrefixUTXO" $ do
+      let mkPrev byte = BlockHash (Hash256 (BS.replicate 32 byte))
+
+      it "preserves height and coinbase flag through connectBlock + getUTXOCoin" $
+        withSystemTempDirectory "haskoin-coin-meta" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrev 0x40
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5000000000 "coinbase-script" ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700000010 0x207fffff 0
+                block = Block hdr [cbTx]
+                cbTxId = computeTxId cbTx
+                cbOp = OutPoint cbTxId 0
+                blockHeightVal = 425 :: Word32
+            connectBlock db regtest block blockHeightVal Map.empty
+
+            -- The on-disk Coin must carry the connectBlock-supplied height
+            -- and the coinbase=True flag (txIdx == 0).
+            mCoin <- getUTXOCoin db cbOp
+            case mCoin of
+              Nothing -> expectationFailure "connectBlock did not persist coinbase output"
+              Just c  -> do
+                coinHeight c     `shouldBe` blockHeightVal
+                coinIsCoinbase c `shouldBe` True
+                coinTxOut c      `shouldBe` TxOut 5000000000 "coinbase-script"
+
+      it "skips OP_RETURN outputs when writing PrefixUTXO (witness commitment)" $
+        -- Regtest miners stamp a BIP-141 witness commitment as an
+        -- OP_RETURN output on the coinbase. Core's CCoinsViewCache::AddCoin
+        -- (coins.cpp:91) drops unspendable scripts before they ever
+        -- reach the chainstate. We must do the same — otherwise
+        -- @dumptxoutset@ emits 2× the expected coin count.
+        withSystemTempDirectory "haskoin-coin-opreturn" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrev 0x41
+                spendable     = TxOut 5000000000 "spendable-script"
+                witCommitment = TxOut 0 (BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+                                          <> BS.replicate 36 0xff)
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ spendable, witCommitment ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700000020 0x207fffff 0
+                block = Block hdr [cbTx]
+                cbTxId = computeTxId cbTx
+            connectBlock db regtest block 426 Map.empty
+            mSpend  <- getUTXOCoin db (OutPoint cbTxId 0)
+            mOpRet  <- getUTXOCoin db (OutPoint cbTxId 1)
+            mSpend `shouldSatisfy` isJust
+            mOpRet `shouldBe` Nothing
+
+      it "dumpTxOutSetFromDB emits non-zero Core code for each persisted coin" $
+        -- This is the smoking gun for the byte-identity bug. Before
+        -- this fix the dump put @code = 0@ for every coin even though
+        -- the live chain populated PrefixUTXO with non-coinbase, non-
+        -- height-zero outputs. We dump after a connectBlock and parse
+        -- the per-coin record back; the @code@ field must reflect
+        -- (height << 1) | coinbase from the on-disk 'Coin'.
+        withSystemTempDirectory "haskoin-dump-code" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev   = mkPrev 0x42
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5000000000 "coinbase-script" ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700000030 0x207fffff 0
+                block = Block hdr [cbTx]
+                blockHeightVal = 110 :: Word32
+                snapPath = tmpDir </> "out.utxo.dat"
+            connectBlock db regtest block blockHeightVal Map.empty
+            r <- dumpTxOutSetFromDB db snapPath 0xfabfb5da
+                   (computeBlockHash hdr)
+            case r of
+              Left err -> expectationFailure $ "dumpTxOutSetFromDB: " ++ err
+              Right cnt -> cnt `shouldBe` 1
+            -- Walk the file structure to confirm the per-coin code is
+            -- @(height << 1) | 1@. Snapshot layout:
+            -- [51-byte SnapshotMetadata][32-byte txid][compactsize n_coins=1]
+            -- [compactsize vout=0][Coin = varint code + compressed TxOut].
+            raw <- BS.readFile snapPath
+            -- Skip metadata + txid + 2 byte compactsizes.
+            let body  = BS.drop (51 + 32 + 1 + 1) raw
+                expectedCode = ((fromIntegral blockHeightVal :: Word64) `shiftL` 1) .|. 1
+            case runGet getCoreVarInt body of
+              Right code -> code `shouldBe` expectedCode
+              Left err -> expectationFailure
+                ("could not parse Core varint code from per-coin record: " ++ err)
+
+      it "putUTXO + getUTXO round-trips (TxOut shape, default metadata)" $
+        -- The legacy 'putUTXO' / 'getUTXO' API still takes a bare
+        -- 'TxOut' — that's the test/contract surface haskoin already
+        -- documents. With the new on-disk format we need to make sure
+        -- the round-trip still works (height and coinbase default
+        -- silently to 0/false).
+        withSystemTempDirectory "haskoin-putget-rt" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let txid = TxId (Hash256 (BS.replicate 32 0xC1))
+                op   = OutPoint txid 0
+                txo  = TxOut 12345 "round-trip"
+            putUTXO db op txo
+            mGot <- getUTXO db op
+            mGot `shouldBe` Just txo
+            -- And the Coin-flavoured getter sees the default metadata
+            -- so that 'dumpTxOutSetFromDB' is well-defined for the
+            -- legacy callers (tests, snapshot-load fallbacks).
+            mCoin <- getUTXOCoin db op
+            case mCoin of
+              Just c  -> do
+                coinTxOut c      `shouldBe` txo
+                coinHeight c     `shouldBe` 0
+                coinIsCoinbase c `shouldBe` False
+              Nothing -> expectationFailure
+                "getUTXOCoin lost the entry that putUTXO just wrote"
 
     -- ------------------------------------------------------------------
     -- Core-strict assumeutxo whitelist (loadtxoutset RPC guard)

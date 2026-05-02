@@ -207,6 +207,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO,
                         putUndoData, getUndoData, getUndoDataVerified, getBlock,
+                        isUnspendable, Coin(..),
                         -- AssumeUTXO support
                         SnapshotMetadata(..), UtxoSnapshot(..), AssumeUtxoData(..),
                         loadSnapshot, verifySnapshot,
@@ -2294,12 +2295,33 @@ connectBlock db _net block height spentUtxos = do
         }
       undoData = mkUndoData bh height prevHash blockUndo
       undoKey  = BS.cons 0x10 (encode bh)
+      -- Tag each output with the txIdx so we can record isCoinbase in the
+      -- on-disk Coin entry. txIdx == 0 is the coinbase tx by construction.
+      coinbaseFlag txIdx = txIdx == (0 :: Int)
       ops = concat
-        [ -- Add new UTXOs from all transactions
+        [ -- Add new UTXOs from all transactions, skipping unspendables.
+          -- Reference: bitcoin-core/src/coins.cpp CCoinsViewCache::AddCoin
+          -- (line 91): @if (coin.out.scriptPubKey.IsUnspendable()) return;@
+          -- — provably-unspendable outputs (OP_RETURN, oversized scripts)
+          -- are never inserted into the UTXO set.  Without this filter the
+          -- coinbase witness-commitment output (an OP_RETURN carrying
+          -- aa21a9ed||commitment under BIP-141) would be persisted, and
+          -- @dumptxoutset@ would emit a snapshot that is roughly 2x the
+          -- byte-identity reference and disagrees with every other impl.
+          --
+          -- Each entry is the full Core-format @Coin@ — varint
+          -- @code = (height << 1) | coinbase@ followed by the @TxOut@.
+          -- Storing the metadata at rest is what lets @dumptxoutset@
+          -- emit byte-identical snapshots: Core's WriteUTXOSnapshot
+          -- (rpc/blockchain.cpp:3306-3309) writes the same @code@ for
+          -- every coin, sourced from the leveldb chainstate cursor.
           [ BatchPut (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
-                     (encode txout)
-          | (txid, tx) <- zip txids txns
+                     (encode (Coin { coinTxOut = txout
+                                   , coinHeight = height
+                                   , coinIsCoinbase = coinbaseFlag txIdx }))
+          | (txIdx, txid, tx) <- zip3 [0..] txids txns
           , (i, txout) <- zip [0..] (txOutputs tx)
+          , not (isUnspendable (txOutScript txout))
           ]
         , -- Remove spent UTXOs (skip coinbase as it has no real inputs)
           [ BatchDelete (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
@@ -2364,9 +2386,15 @@ disconnectBlock db block prevHash = do
         else do
           let txids = map computeTxId txns
               -- Restore spent inputs first, then remove created outputs.
+              -- Each restored entry is a full Core-format @Coin@ (varint
+              -- code + TxOut). The undo record carries the original
+              -- height/coinbase flag (@TxInUndo.tuHeight@ / @tuCoinbase@)
+              -- so the restored UTXO entry round-trips byte-identically.
               restoreOps =
                 [ BatchPut (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
-                           (encode (tuOutput tin))
+                           (encode (Coin { coinTxOut = tuOutput tin
+                                         , coinHeight = tuHeight tin
+                                         , coinIsCoinbase = tuCoinbase tin }))
                 | (tx, txUndo) <- zip nonCoinbase txUndos
                 , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
                 ]
