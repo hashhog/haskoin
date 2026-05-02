@@ -66,7 +66,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, blockReward,
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlock)
+                         putBlock, Coin(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
                          Inv(..), InvVector(..), InvType(..))
@@ -381,8 +381,12 @@ submitBlock net db hc cache pm block = do
   tip <- readTVarIO (hcTip hc)
   let height = ceHeight tip + 1
 
-  -- Build UTXO map for validation
+  -- Build UTXO map for validation. We carry full Core-format
+  -- 'Coin' (TxOut + height + coinbase flag) so 'connectBlock' can
+  -- record byte-identical undo entries; 'validateFullBlock' only
+  -- needs the TxOut projection.
   utxoMap <- buildBlockUTXOMap cache block
+  let utxoTxOutMap = fmap coinTxOut utxoMap
 
   -- Build chain state for validation
   let cs = ChainState
@@ -394,7 +398,7 @@ submitBlock net db hc cache pm block = do
         }
 
   -- Validate the block (always verify scripts for locally minted blocks)
-  case validateFullBlock net cs False block utxoMap of
+  case validateFullBlock net cs False block utxoTxOutMap of
     Left err -> return $ Left $ "Block validation failed: " ++ err
     Right () -> do
       -- Apply block to in-memory UTXO cache (drives maturity check + builds
@@ -413,8 +417,10 @@ submitBlock net db hc cache pm block = do
           -- legacy PrefixUTXO keyspace stayed empty unless a periodic
           -- 'flushCache' ran. dumptxoutset iterates PrefixUTXO directly,
           -- so it saw nothing. Routing through connectBlock writes
-          -- TxOut-format coins to PrefixUTXO immediately, which is also
-          -- the on-disk format 'getUTXO' / 'dumpTxOutSetFromDB' expect.
+          -- Core-format Coins to PrefixUTXO immediately, which is also
+          -- the on-disk format 'getUTXOCoin' / 'dumpTxOutSetFromDB'
+          -- expect. The Coin map carries height/coinbase metadata so the
+          -- per-block undo record round-trips through 'disconnectBlock'.
           --
           -- connectBlock also handles per-block undo data (so we drop the
           -- separate 'putUndoData'), block-index keys (so we drop
@@ -436,20 +442,35 @@ submitBlock net db hc cache pm block = do
 
           return $ Right ()
 
--- | Build a UTXO map for block validation
--- Looks up all inputs needed by non-coinbase transactions
-buildBlockUTXOMap :: UTXOCache -> Block -> IO (Map OutPoint TxOut)
+-- | Build a UTXO map for block validation.
+--
+-- Returns 'Map OutPoint Coin' (full Core-format metadata: TxOut +
+-- height + coinbase flag). Validation paths that only consume the
+-- 'TxOut' (e.g. 'validateFullBlock') project via @fmap coinTxOut@.
+-- 'connectBlock' uses the metadata to populate 'BlockUndo' so that
+-- 'disconnectBlock' restores byte-identical UTXO entries.
+--
+-- The metadata is sourced from the in-memory 'UTXOCache'
+-- ('UTXOEntry'), which carries the height and coinbase flag the
+-- block originally created the output at.
+buildBlockUTXOMap :: UTXOCache -> Block -> IO (Map OutPoint Coin)
 buildBlockUTXOMap cache block = do
   -- Collect all inputs from non-coinbase transactions
   let inputs = concatMap txInputs (tail $ blockTxns block)
       outpoints = map txInPrevOutput inputs
 
-  -- Look up each outpoint
+  -- Look up each outpoint, lifting UTXOEntry → Coin so the metadata
+  -- (height, coinbase flag) flows into the connectBlock undo record.
   utxos <- forM outpoints $ \op -> do
     mEntry <- lookupUTXO cache op
-    return (op, fmap ueOutput mEntry)
+    return (op, fmap entryToCoin mEntry)
 
-  return $ Map.fromList [(op, txo) | (op, Just txo) <- utxos]
+  return $ Map.fromList [(op, c) | (op, Just c) <- utxos]
+  where
+    entryToCoin e = Coin { coinTxOut      = ueOutput e
+                         , coinHeight     = ueHeight e
+                         , coinIsCoinbase = ueCoinbase e
+                         }
 
 -- | Apply a block to the UTXO cache, generating undo data
 applyBlockToCache :: UTXOCache -> Network -> Block -> Word32

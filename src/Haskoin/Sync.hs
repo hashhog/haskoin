@@ -352,8 +352,13 @@ blockProcessor bd = forever $ do
               case mBlock of
                 Nothing -> threadDelay (100 * 1000)
                 Just block -> do
-                  -- Build UTXO map for this block's inputs
+                  -- Build UTXO map for this block's inputs (full Coin
+                  -- metadata; needed by connectBlock so the BlockUndo
+                  -- record carries height + coinbase flag for each
+                  -- spent prevout). validateFullBlock only consumes
+                  -- the TxOut projection.
                   utxoMap <- buildUTXOMap bd block
+                  let utxoTxOutMap = fmap coinTxOut utxoMap
 
                   let cs = ChainState currentHeight bh 0 0
                             (consensusFlagsAtHeight (bdNetwork bd) nextHeight)
@@ -367,7 +372,7 @@ blockProcessor bd = forever $ do
                       skipScripts = shouldSkipScripts bh nextHeight blockTs
                                       (bdNetwork bd) blockEntries bestHdr
 
-                  case validateFullBlock (bdNetwork bd) cs skipScripts block utxoMap of
+                  case validateFullBlock (bdNetwork bd) cs skipScripts block utxoTxOutMap of
                     Left err -> do
                       putStrLn $ "Block validation failed at height "
                                  ++ show nextHeight ++ ": " ++ err
@@ -415,7 +420,17 @@ blockProcessor bd = forever $ do
 --
 -- Looks up all UTXOs that the block's non-coinbase transactions spend.
 -- This is the bottleneck during IBD.
-buildUTXOMap :: BlockDownloader -> Block -> IO (Map OutPoint TxOut)
+--
+-- Returns 'Map OutPoint Coin' (full Core-format metadata: TxOut +
+-- height + coinbase flag) so 'connectBlock' can write per-block
+-- undo data that round-trips byte-identically through
+-- 'disconnectBlock'. Callers that only need the @TxOut@ projection
+-- (e.g. 'validateFullBlock') can derive it via @fmap coinTxOut@.
+--
+-- Reference: bitcoin-core/src/validation.cpp @ConnectBlock@ populates
+-- @CTxUndo::vprevout@ with full @Coin@ data; @DisconnectBlock@ reads
+-- it and restores Coins via @view.AddCoin(..)@.
+buildUTXOMap :: BlockDownloader -> Block -> IO (Map OutPoint Coin)
 buildUTXOMap bd block = do
   -- Get all inputs from non-coinbase transactions
   let inputs = case blockTxns block of
@@ -423,12 +438,12 @@ buildUTXOMap bd block = do
         (_:txs) -> concatMap txInputs txs  -- Skip coinbase
       outpoints = map txInPrevOutput inputs
 
-  -- Look up each UTXO
+  -- Look up each UTXO with full Core metadata.
   utxos <- forM outpoints $ \op -> do
-    mUtxo <- getUTXO (bdDB bd) op
-    return (op, mUtxo)
+    mCoin <- getUTXOCoin (bdDB bd) op
+    return (op, mCoin)
 
-  return $ Map.fromList [(op, txo) | (op, Just txo) <- utxos]
+  return $ Map.fromList [(op, c) | (op, Just c) <- utxos]
 
 --------------------------------------------------------------------------------
 -- Block Message Handling
