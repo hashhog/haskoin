@@ -3959,6 +3959,73 @@ main = hspec $ do
       balance <- getBalance wallet
       balance `shouldBe` 0
 
+  describe "Wallet Encryption" $ do
+    -- Exercises the primitives that back the encryptwallet /
+    -- walletpassphrase / walletlock RPCs in Haskoin.Rpc.  See
+    -- bitcoin-core/src/wallet/rpc/encrypt.cpp for the canonical behaviours
+    -- being mirrored here.
+    let mkWalletState = do
+          let config = WalletConfig mainnet 20 ""
+          mnemonic <- generateMnemonic 256
+          wallet <- loadWallet config mnemonic
+          createWalletState wallet
+
+    it "encryptWallet succeeds on a fresh wallet" $ do
+      ws <- mkWalletState
+      result <- encryptWallet "correct horse battery staple" ws
+      case result of
+        Left err -> expectationFailure $ "Expected success, got: " ++ err
+        Right _  -> return ()
+
+    it "encryptWallet refuses to encrypt twice" $ do
+      ws <- mkWalletState
+      _   <- encryptWallet "first" ws
+      r2  <- encryptWallet "second" ws
+      case r2 of
+        Left err  -> err `shouldSatisfy` ("already encrypted" `isInfixOf`)
+        Right _   -> expectationFailure "Expected double-encrypt to fail"
+
+    it "unlockWallet rejects a wrong passphrase" $ do
+      ws <- mkWalletState
+      _  <- encryptWallet "right" ws
+      r  <- unlockWallet "wrong" 60 ws
+      case r of
+        Left _  -> do
+          locked <- isWalletLocked ws
+          locked `shouldBe` True
+        Right _ -> expectationFailure "Expected wrong-passphrase rejection"
+
+    it "unlockWallet accepts the right passphrase and the wallet is unlocked" $ do
+      ws <- mkWalletState
+      _  <- encryptWallet "right" ws
+      r  <- unlockWallet "right" 60 ws
+      case r of
+        Left err -> expectationFailure $ "Expected unlock success: " ++ err
+        Right _  -> do
+          locked <- isWalletLocked ws
+          locked `shouldBe` False
+
+    it "lockWallet drops the in-memory key" $ do
+      ws <- mkWalletState
+      _  <- encryptWallet "right" ws
+      _  <- unlockWallet "right" 60 ws
+      lockWallet ws
+      locked <- isWalletLocked ws
+      locked `shouldBe` True
+
+    it "auto-relock fires after the timeout window" $ do
+      -- Mirrors what handleWalletPassphrase forks: we unlock with a
+      -- 1-second window, then sleep slightly past it and assert that
+      -- isWalletLocked observes expiry (this is the passive path; the
+      -- active forkIO is exercised end-to-end by an in-process RPC test
+      -- harness which is too heavy for this unit suite).
+      ws <- mkWalletState
+      _  <- encryptWallet "right" ws
+      _  <- unlockWallet "right" 1 ws
+      threadDelay 1_500_000  -- 1.5 s
+      locked <- isWalletLocked ws
+      locked `shouldBe` True
+
   describe "Coin Selection" $ do
     it "selectCoins returns error for insufficient funds" $ do
       let config = WalletConfig mainnet 20 ""
