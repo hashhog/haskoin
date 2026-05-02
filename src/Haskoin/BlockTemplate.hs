@@ -62,11 +62,11 @@ import Haskoin.Consensus (Network(..), validateFullBlock, blockReward,
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
                            addHeader, computeMerkleRoot, ChainState(..),
-                           consensusFlagsAtHeight)
+                           consensusFlagsAtHeight, connectBlock)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
-                         lookupUTXO, putUndoData, UndoData(..), addUTXO, spendUTXO,
+                         lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlockHeader, putBlockHeight, putBlock)
+                         putBlock)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
                          Inv(..), InvVector(..), InvType(..))
@@ -397,18 +397,34 @@ submitBlock net db hc cache pm block = do
   case validateFullBlock net cs False block utxoMap of
     Left err -> return $ Left $ "Block validation failed: " ++ err
     Right () -> do
-      -- Apply block to UTXO cache and generate undo data
+      -- Apply block to in-memory UTXO cache (drives maturity check + builds
+      -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
+      -- spend an output created earlier in the same session without round-
+      -- tripping through disk.
       undoResult <- applyBlockToCache cache net block height
       case undoResult of
         Left err -> return $ Left err
-        Right undo -> do
-          -- Store undo data for potential reorgs
-          putUndoData db bh undo
+        Right _undo -> do
+          -- Persist UTXOs + undo data + header + height + best-block in a
+          -- single atomic write batch via 'connectBlock' (the same path
+          -- IBD uses; see 'Sync.connectBlock' wiring). This is the FIX
+          -- for dumptxoutset emitting a 0-coin snapshot: 'applyBlockToCache'
+          -- only mutates STM TVars and never reaches RocksDB, so the
+          -- legacy PrefixUTXO keyspace stayed empty unless a periodic
+          -- 'flushCache' ran. dumptxoutset iterates PrefixUTXO directly,
+          -- so it saw nothing. Routing through connectBlock writes
+          -- TxOut-format coins to PrefixUTXO immediately, which is also
+          -- the on-disk format 'getUTXO' / 'dumpTxOutSetFromDB' expect.
+          --
+          -- connectBlock also handles per-block undo data (so we drop the
+          -- separate 'putUndoData'), block-index keys (so we drop
+          -- 'putBlockHeader' / 'putBlockHeight'), and best-block pointer.
+          -- The only thing left for us is the full block body and the
+          -- in-memory header chain update.
+          connectBlock db net block height utxoMap
 
-          -- Persist block header, height, and full block to the database
-          -- so that getblockheader / getblockhash / getblock can find it.
-          putBlockHeader db bh (blockHeader block)
-          putBlockHeight db height bh
+          -- Persist the full block body (separate keyspace from headers
+          -- so that getblock can return raw bytes).
           putBlock db bh block
 
           -- Add header to chain (in-memory index + tip update)
