@@ -56,8 +56,11 @@ module Haskoin.Storage
     -- * UTXO Operations
   , putUTXO
   , getUTXO
+  , putUTXOCoin
+  , getUTXOCoin
   , deleteUTXO
   , buildSpentUtxoMapFromDB
+  , isUnspendable
     -- * UTXO Cache (Legacy)
   , UTXOEntry(..)
   , UTXOCache(..)
@@ -479,16 +482,43 @@ getBlockHeight db height = do
 -- UTXO Operations
 --------------------------------------------------------------------------------
 
--- | Store a UTXO (unspent transaction output).
--- The key is the OutPoint (txid + output index), value is the TxOut.
+-- | Store a UTXO under the legacy 'PrefixUTXO' keyspace.
+--
+-- On-disk format: full @Coin@ (varint @code = (height << 1) | coinbase@ +
+-- @TxOut@ via 'Coin'\'s 'Serialize' instance — see 'Storage.hs' line ~686).
+-- This is the same format Bitcoin Core writes per-coin, modulo the
+-- @TxOutCompression@ wrapper Core adds at @dumptxoutset@ time (we apply
+-- that wrapper in 'serializeSnapshotCoin' / 'putCoreCoin' rather than at
+-- rest).
+--
+-- The TxOut-only signature is preserved for test ergonomics — when a
+-- caller doesn't have height/coinbase metadata available, height=0 and
+-- coinbase=False is recorded. Real chainstate writes go through
+-- 'putUTXOCoin' / 'connectBlock', which carry the actual metadata so
+-- @dumptxoutset@ produces a byte-identical snapshot.
 putUTXO :: HaskoinDB -> OutPoint -> TxOut -> IO ()
 putUTXO db outpoint txout =
-  let key = makeKey PrefixUTXO (encode outpoint)
-  in R.put (dbHandle db) (dbWriteOpts db) key (encode txout)
+  putUTXOCoin db outpoint (Coin { coinTxOut = txout
+                                , coinHeight = 0
+                                , coinIsCoinbase = False })
 
--- | Retrieve a UTXO by its OutPoint
+-- | Store a full @Coin@ (TxOut + height + coinbase flag) under the
+-- legacy 'PrefixUTXO' keyspace. This is what @connectBlock@ uses so that
+-- @dumptxoutset@ can recover the per-coin metadata Core records in its
+-- snapshot's @code@ varint.
+putUTXOCoin :: HaskoinDB -> OutPoint -> Coin -> IO ()
+putUTXOCoin db outpoint coin =
+  let key = makeKey PrefixUTXO (encode outpoint)
+  in R.put (dbHandle db) (dbWriteOpts db) key (encode coin)
+
+-- | Retrieve a UTXO by its OutPoint, projecting away the height/coinbase
+-- metadata that 'getUTXOCoin' returns.
 getUTXO :: HaskoinDB -> OutPoint -> IO (Maybe TxOut)
-getUTXO db outpoint = do
+getUTXO db outpoint = fmap coinTxOut <$> getUTXOCoin db outpoint
+
+-- | Retrieve a UTXO with full Core-format @Coin@ metadata.
+getUTXOCoin :: HaskoinDB -> OutPoint -> IO (Maybe Coin)
+getUTXOCoin db outpoint = do
   let key = makeKey PrefixUTXO (encode outpoint)
   mval <- R.get (dbHandle db) (dbReadOpts db) key
   return $ mval >>= either (const Nothing) Just . decode
@@ -629,6 +659,10 @@ spendUTXO cache op = do
 -- | Flush all dirty entries to the database and clear the in-memory
 -- cache entirely. This ensures bounded memory by releasing all Map
 -- nodes to GC. Entries will be re-loaded from RocksDB on demand.
+--
+-- Entries are written in Core-format @Coin@ (varint code + TxOut), the
+-- same on-disk shape 'connectBlock' uses, so a flush is invisible to
+-- 'getUTXO' / 'dumpTxOutSetFromDB'.
 flushCache :: UTXOCache -> IO ()
 flushCache cache = do
   dirty <- atomically $ do
@@ -648,9 +682,15 @@ flushCache cache = do
   -- Force GC to reclaim the old Map's tree nodes
   performGC
   where
+    entryCoin entry = Coin
+      { coinTxOut = ueOutput entry
+      , coinHeight = ueHeight entry
+      , coinIsCoinbase = ueCoinbase entry
+      }
     toOp (op, entry)
       | ueSpent entry = BatchDelete (makeKey PrefixUTXO (encode op))
-      | otherwise     = BatchPut (makeKey PrefixUTXO (encode op)) (encode entry)
+      | otherwise     = BatchPut (makeKey PrefixUTXO (encode op))
+                                 (encode (entryCoin entry))
 
 --------------------------------------------------------------------------------
 -- CoinsView Type Class Hierarchy (Bitcoin Core compatible)
@@ -1493,10 +1533,19 @@ batchPutBlockHeader :: BlockHash -> BlockHeader -> BatchOp
 batchPutBlockHeader bh header =
   BatchPut (makeKey PrefixBlockHeader (encode bh)) (encode header)
 
--- | Create a batch operation to put a UTXO
+-- | Create a batch operation to put a UTXO. The on-disk value format is
+-- the full Core 'Coin' (varint code + 'TxOut') matching what
+-- 'connectBlock' / 'putUTXO' write — height/coinbase default to 0/false
+-- because this batch helper only carries 'TxOut'. Callers that need to
+-- preserve the metadata should build the @BatchPut@ directly with
+-- @encode (Coin{...})@.
 batchPutUTXO :: OutPoint -> TxOut -> BatchOp
 batchPutUTXO outpoint txout =
-  BatchPut (makeKey PrefixUTXO (encode outpoint)) (encode txout)
+  let coin = Coin { coinTxOut = txout
+                  , coinHeight = 0
+                  , coinIsCoinbase = False
+                  }
+  in BatchPut (makeKey PrefixUTXO (encode outpoint)) (encode coin)
 
 -- | Create a batch operation to delete a UTXO
 batchDeleteUTXO :: OutPoint -> BatchOp
@@ -2430,18 +2479,17 @@ populateFromSnapshot cache snapshot = do
 --
 -- Used by the @--load-snapshot@ CLI flag and the @loadtxoutset@ RPC
 -- when the node is running the legacy single-key UTXO store. Each
--- coin's 'TxOut' is written under @PrefixUTXO ++ outpoint@; the
--- snapshot's height/coinbase metadata is currently dropped on the
--- floor (matching the rest of haskoin's UTXO persistence — same
--- limitation as 'dumpTxOutSetFromDB'). After the import we set the
--- best-block pointer to the snapshot base so the node continues
--- syncing from the snapshot's tip.
+-- coin is written under @PrefixUTXO ++ outpoint@ in full Core
+-- @Coin@ format (varint code + 'TxOut'), so the snapshot's
+-- height/coinbase metadata is preserved on disk. After the import we
+-- set the best-block pointer to the snapshot base so the node
+-- continues syncing from the snapshot's tip.
 loadSnapshotIntoLegacyUTXO :: HaskoinDB -> UtxoSnapshot -> IO Int
 loadSnapshotIntoLegacyUTXO db snapshot = do
   let coins = usCoins snapshot
       meta  = usMetadata snapshot
   forM_ coins $ \SnapshotCoin{..} ->
-    putUTXO db scOutPoint (coinTxOut scCoin)
+    putUTXOCoin db scOutPoint scCoin
   putBestBlockHash db (smBaseBlockHash meta)
   syncFlush db
   return (length coins)
@@ -2527,14 +2575,9 @@ collectAllCoins cache = do
 -- | Iterate the legacy 'PrefixUTXO' (0x05) keyspace and emit a
 -- Core-format @utxo.dat@ file at @path@.
 --
--- This is the dumptxoutset entry point used by the RPC handler when
--- the running node only has the legacy single-key UTXO store
--- (haskoin's chainstate as of 2026-04). On-disk @PrefixUTXO@ values
--- are bare 'TxOut's, so the per-coin @height@ and @isCoinbase@
--- metadata is lost. We honestly emit @code = 0@ (height 0,
--- not-coinbase) for every coin and document the limitation. A future
--- refactor that stores 'UTXOEntry' (or 'Coin') on disk will let us
--- populate @code@ correctly without touching the on-the-wire format.
+-- On-disk @PrefixUTXO@ values are full Core-format 'Coin's (varint @code@
+-- + 'TxOut'), so the per-coin @height@ and @isCoinbase@ metadata round-
+-- trips faithfully into the snapshot's per-coin record.
 dumpTxOutSetFromDB :: HaskoinDB
                    -> FilePath
                    -> Word32                 -- ^ network magic (little-endian)
@@ -2546,15 +2589,11 @@ dumpTxOutSetFromDB db path networkMagic tipHash = do
     countRef <- newIORef (0 :: Word64)
     iterateWithPrefix db PrefixUTXO $ \key val -> do
       -- Key layout: [prefix=0x05][outpoint = 32-byte txid + 4-byte vout LE].
-      -- Value layout: encode txout (Word64 LE value + varbytes script).
+      -- Value layout: full Core-format @Coin@ (varint code + TxOut) — see
+      -- Storage.hs Coin Serialize instance and connectBlock above.
       let opBytes = BS.drop 1 key
-      case (decode opBytes :: Either String OutPoint, decode val :: Either String TxOut) of
-        (Right op, Right txout) -> do
-          let coin = Coin
-                { coinTxOut = txout
-                , coinHeight = 0       -- metadata not retained on disk
-                , coinIsCoinbase = False
-                }
+      case (decode opBytes :: Either String OutPoint, decode val :: Either String Coin) of
+        (Right op, Right coin) -> do
           modifyIORef' coinsRef (SnapshotCoin op coin :)
           modifyIORef' countRef (+ 1)
           return True
