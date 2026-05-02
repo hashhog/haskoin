@@ -11078,7 +11078,11 @@ main = hspec $ do
             -- Now seed and verify it shows up.
             putUTXO db spentOp spentTxOut
             seeded <- buildSpentUtxoMapFromDB db block
-            Map.lookup spentOp seeded `shouldBe` Just spentTxOut
+            -- buildSpentUtxoMapFromDB returns 'Map OutPoint Coin'
+            -- now (full Core metadata for the connectBlock undo
+            -- record). The TxOut projection is the original prevout.
+            fmap coinTxOut (Map.lookup spentOp seeded)
+              `shouldBe` Just spentTxOut
             -- Coinbase prevouts must be skipped (would otherwise look
             -- up the all-zeros sentinel and fail).
             let cbOp = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF
@@ -11153,6 +11157,149 @@ main = hspec $ do
             mNewAfter `shouldBe` mNewBefore
             mPrev <- getUTXO db spentOp
             mPrev `shouldBe` Nothing
+
+      -- Regression: mkTxInUndo must preserve the spent Coin's height
+      -- and coinbase flag in the BlockUndo record so disconnectBlock
+      -- restores byte-identical metadata. Before this fix the undo
+      -- record always wrote (height=0, coinbase=False), corrupting
+      -- the chainstate on any reorg that crossed an actual spend.
+      -- Reference: bitcoin/src/validation.cpp DisconnectBlock +
+      -- bitcoin/src/undo.h CTxUndo::vprevout.
+      it "mkTxInUndo preserves spent UTXO height + coinbase through connect/disconnect" $
+        withSystemTempDirectory "haskoin-undo-meta" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prevA = mkPrevHash 0x60
+                -- Block A: a coinbase that we will later spend in block B.
+                cbTxA = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5000000000 "cbA-script" ]
+                  [] 0
+                hdrA  = BlockHeader 1 prevA (Hash256 (BS.replicate 32 0))
+                                    1700000040 0x207fffff 0
+                blockA = Block hdrA [cbTxA]
+                heightA = 700 :: Word32
+            connectBlock db regtest blockA heightA Map.empty
+
+            -- Sanity: block A's coinbase output is now in PrefixUTXO
+            -- with the right height + coinbase flag.
+            let spentOp = OutPoint (computeTxId cbTxA) 0
+            mPreA <- getUTXOCoin db spentOp
+            case mPreA of
+              Just c  -> do
+                coinHeight c     `shouldBe` heightA
+                coinIsCoinbase c `shouldBe` True
+              Nothing -> expectationFailure
+                "block A's coinbase output not persisted to PrefixUTXO"
+
+            -- Block B spends block A's coinbase.
+            let cbTxB = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5000000000 "cbB-script" ]
+                  [] 0
+                regTxB = Tx 1
+                  [ TxIn spentOp "" 0xFFFFFFFE ]
+                  [ TxOut 4999000000 "B-out" ]
+                  [] 0
+                hdrB = BlockHeader 1 (computeBlockHash hdrA)
+                                   (Hash256 (BS.replicate 32 0))
+                                   1700000041 0x207fffff 0
+                blockB = Block hdrB [cbTxB, regTxB]
+                heightB = heightA + 101  -- past coinbase maturity
+            spentB <- buildSpentUtxoMapFromDB db blockB
+            -- The Coin map must carry the right metadata for A's coinbase.
+            case Map.lookup spentOp spentB of
+              Just c  -> do
+                coinHeight c     `shouldBe` heightA
+                coinIsCoinbase c `shouldBe` True
+              Nothing -> expectationFailure
+                "buildSpentUtxoMapFromDB lost block A's coinbase entry"
+
+            connectBlock db regtest blockB heightB spentB
+
+            -- Inspect the BlockUndo record: TxInUndo for block B's
+            -- regular tx must record A's coinbase at (heightA, True)
+            -- — not the (0, False) placeholders the bug emitted.
+            mUndo <- getUndoData db (computeBlockHash hdrB)
+            case mUndo of
+              Just ud -> do
+                let txUndos = buTxUndo (udBlockUndo ud)
+                length txUndos `shouldBe` 1
+                let prevs = tuPrevOutputs (head txUndos)
+                length prevs `shouldBe` 1
+                let tin = head prevs
+                tuHeight tin   `shouldBe` heightA
+                tuCoinbase tin `shouldBe` True
+              Nothing -> expectationFailure "undo data not persisted for block B"
+
+            -- Disconnect block B. The restored entry under
+            -- spentOp must regain the original (heightA, True)
+            -- metadata, not (0, False). This is the user-visible
+            -- bug: a reorg without this fix corrupts the UTXO set
+            -- with placeholder metadata.
+            r <- disconnectBlock db blockB (computeBlockHash hdrA)
+            r `shouldBe` Right ()
+            mPostB <- getUTXOCoin db spentOp
+            case mPostB of
+              Just c  -> do
+                coinTxOut c      `shouldBe` TxOut 5000000000 "cbA-script"
+                coinHeight c     `shouldBe` heightA
+                coinIsCoinbase c `shouldBe` True
+              Nothing -> expectationFailure
+                "disconnectBlock did not restore the spent UTXO"
+
+      it "mkTxInUndo carries non-coinbase regular-tx metadata too" $
+        -- Counterpoint to the coinbase test above: when the spent
+        -- prevout was created by a regular (non-coinbase) tx at some
+        -- height H, the undo record must carry (H, False) — not the
+        -- placeholder (0, False) which would silently match for
+        -- height-0 prevouts but corrupt anything else.
+        withSystemTempDirectory "haskoin-undo-meta-reg" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrevHash 0x61
+                spentOp     = OutPoint (TxId (Hash256 (BS.replicate 32 0xCC))) 0
+                spentTxOut  = TxOut 250000 "regular-prevout"
+                spentHeight = 432 :: Word32
+            -- Seed PrefixUTXO with a regular-tx Coin (coinbase=False).
+            putUTXOCoin db spentOp
+              (Coin spentTxOut spentHeight False)
+
+            let cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5000000000 "cb-script" ]
+                  [] 0
+                regTx = Tx 1
+                  [ TxIn spentOp "" 0xFFFFFFFE ]
+                  [ TxOut 249000 "spend-out" ]
+                  [] 0
+                hdr   = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                    1700000050 0x207fffff 0
+                block = Block hdr [cbTx, regTx]
+                blockHeightVal = 540 :: Word32
+            spent <- buildSpentUtxoMapFromDB db block
+            connectBlock db regtest block blockHeightVal spent
+
+            mUndo <- getUndoData db (computeBlockHash hdr)
+            case mUndo of
+              Just ud -> do
+                let prevs = tuPrevOutputs (head (buTxUndo (udBlockUndo ud)))
+                    tin   = head prevs
+                tuOutput tin   `shouldBe` spentTxOut
+                tuHeight tin   `shouldBe` spentHeight
+                tuCoinbase tin `shouldBe` False
+              Nothing -> expectationFailure "undo data not persisted"
+
+            -- Disconnect, then verify the restored Coin matches.
+            _ <- disconnectBlock db block prev
+            mPost <- getUTXOCoin db spentOp
+            case mPost of
+              Just c  -> do
+                coinTxOut c      `shouldBe` spentTxOut
+                coinHeight c     `shouldBe` spentHeight
+                coinIsCoinbase c `shouldBe` False
+              Nothing -> expectationFailure "spent UTXO not restored on disconnect"
 
     -- ------------------------------------------------------------------
     -- connectBlock + dumpTxOutSetFromDB: per-coin Coin metadata
