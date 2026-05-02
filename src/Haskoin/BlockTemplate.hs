@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -37,6 +38,9 @@ module Haskoin.BlockTemplate
   , sequenceFinal
     -- * Anti-Fee-Sniping
   , setAntiFeeSniping
+    -- * Sigop Budget Enforcement
+  , templateLegacySigOpCost
+  , selectWithinSigopBudget
   ) where
 
 import Data.ByteString (ByteString)
@@ -58,11 +62,13 @@ import qualified Data.Serialize as S
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
 import Haskoin.Consensus (Network(..), validateFullBlock, blockReward,
-                           maxBlockWeight, maxBlockSigops, witnessScaleFactor,
+                           maxBlockWeight, maxBlockSigops, maxBlockSigOpsCost,
+                           witnessScaleFactor,
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
                            addHeader, computeMerkleRoot, ChainState(..),
-                           consensusFlagsAtHeight, connectBlock)
+                           consensusFlagsAtHeight, connectBlock,
+                           getLegacySigOpCount)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -190,7 +196,18 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
 
   -- Filter out transactions that are not final at this height/time
   -- For block template, use MTP (median time past) as the time threshold
-  let finalEntries = filter (isFinalEntry height mtp) allEntries
+  let mtpFinalEntries = filter (isFinalEntry height mtp) allEntries
+
+  -- Enforce the per-block sigop cost budget (BIP-141 / MAX_BLOCK_SIGOPS_COST = 80,000).
+  -- Without UTXO-resolved prevouts at template time we use the legacy sigop count
+  -- (scriptSig + scriptPubKey) scaled by WITNESS_SCALE_FACTOR. This is the same
+  -- conservative lower bound Bitcoin Core uses as a starting point in
+  -- GetTransactionSigOpCost (consensus/tx_verify.cpp:143-162) before adding
+  -- P2SH/witness sigops once prevouts are known. Mining a block whose legacy
+  -- cost alone would exceed the limit is always invalid, so we drop those txs
+  -- here and skip any tx that would push the running total over 80k. See
+  -- node/miner.cpp:239-247 (TestChunkBlockLimits) for Core's analogous gate.
+  let finalEntries = selectWithinSigopBudget mtpFinalEntries
 
   -- Build template transactions with dependency tracking
   let txIdSet = Set.fromList $ map meTxId finalEntries
@@ -234,6 +251,33 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
 isFinalEntry :: Word32 -> Word32 -> MempoolEntry -> Bool
 isFinalEntry height mtp entry = isFinalTx (meTransaction entry) height mtp
 
+-- | Lower-bound legacy sigop cost for a transaction in template-construction
+-- context.  Counts sigops in scriptSig + scriptPubKey (inaccurate counting,
+-- so OP_CHECKMULTISIG counts as MAX_PUBKEYS_PER_MULTISIG = 20) and scales by
+-- WITNESS_SCALE_FACTOR to match the per-block cost units defined by
+-- 'maxBlockSigOpsCost'.  This matches the legacy term in Bitcoin Core's
+-- GetTransactionSigOpCost (consensus/tx_verify.cpp:145).  P2SH redeem-script
+-- and witness-script sigops are not added here because they require
+-- UTXO-resolved prevouts which are not available at template time.
+templateLegacySigOpCost :: Tx -> Int
+templateLegacySigOpCost tx = getLegacySigOpCount tx * witnessScaleFactor
+
+-- | Greedy filter that drops mempool entries whose legacy sigop cost would
+-- push the running block total past 'maxBlockSigOpsCost' (80,000).  Order is
+-- preserved (highest ancestor fee rate first, as supplied by
+-- 'selectTransactions').  Mirrors the chunk-level gate in Bitcoin Core's
+-- BlockAssembler::TestChunkBlockLimits (node/miner.cpp:239-247).
+selectWithinSigopBudget :: [MempoolEntry] -> [MempoolEntry]
+selectWithinSigopBudget = go 0
+  where
+    go _      []           = []
+    go !running (e : rest) =
+      let cost     = templateLegacySigOpCost (meTransaction e)
+          running' = running + cost
+      in if running' > maxBlockSigOpsCost
+         then go running rest          -- skip this tx; keep scanning
+         else e : go running' rest
+
 -- | Build a TemplateTransaction from a MempoolEntry
 -- Tracks which other transactions in the template this one depends on
 buildTemplateTx :: Set TxId           -- ^ Set of all TxIds in the template
@@ -254,11 +298,15 @@ buildTemplateTx txIdSet allEntries idx entry =
       base = txBaseSize tx
       total = txTotalSize tx
       weight = base * (witnessScaleFactor - 1) + total
+      -- Per-tx legacy sigop cost (matches the budget enforced in
+      -- selectWithinSigopBudget, so consumers reading 'btTransactions' see
+      -- the same units the template was built against).
+      sigops = templateLegacySigOpCost tx
   in TemplateTransaction
     { ttTx = tx
     , ttTxId = meTxId entry
     , ttFee = meFee entry
-    , ttSigops = 0  -- Simplified; could count actual sigops
+    , ttSigops = sigops
     , ttWeight = weight
     , ttRequired = False
     , ttDepends = depends

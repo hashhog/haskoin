@@ -2192,6 +2192,105 @@ main = hspec $ do
       -- P2PKH has 1 OP_CHECKSIG
       countScriptSigops script False `shouldBe` 1
 
+  -- Regression: BlockTemplate must enforce MAX_BLOCK_SIGOPS_COST = 80,000.
+  -- Cat I mining audit (PARITY-MATRIX.md commit c830524) found that the
+  -- selection loop ignored sigOpsLimit even though the template advertised
+  -- it. Reference: bitcoin-core/src/node/miner.cpp:239-247
+  -- (BlockAssembler::TestChunkBlockLimits) and consensus/tx_verify.cpp:143-162
+  -- (GetTransactionSigOpCost).
+  describe "BlockTemplate sigop budget (regression for Cat I audit)" $ do
+    let -- A "fat" tx whose only output is a scriptPubKey full of OP_CHECKSIG.
+        -- Inaccurate counting (P2SH/witness ignored at template time) gives
+        --   sigops_per_tx = nChecksig
+        -- Cost = sigops_per_tx * WITNESS_SCALE_FACTOR (=4).
+        mkFatTx :: Word32 -> Int -> Tx
+        mkFatTx tag nChecksig =
+          let dummyTxId = TxId (Hash256 (BS.replicate 32 (fromIntegral tag)))
+              prevOp    = OutPoint dummyTxId 0
+              txin      = TxIn prevOp BS.empty 0xffffffff
+              -- scriptPubKey: nChecksig copies of OP_CHECKSIG.
+              spk       = encodeScript $ Script (replicate nChecksig OP_CHECKSIG)
+              txout     = TxOut 0 spk
+          in Tx 1 [txin] [txout] [[]] 0
+
+        mkFatEntry :: Word32 -> Int -> Word64 -> MempoolEntry
+        mkFatEntry tag nChecksig fee =
+          let tx = mkFatTx tag nChecksig
+          in MempoolEntry
+               { meTransaction = tx
+               , meTxId = computeTxId tx
+               , meWtxid = computeWtxid tx
+               , meFee = fee
+               , meFeeRate = calculateFeeRate fee 200
+               , meSize = 200
+               , meTime = 0
+               , meHeight = 0
+               , meAncestorCount = 1
+               , meAncestorSize = 200
+               , meAncestorFees = fee
+               , meAncestorSigOps = 0
+               , meDescendantCount = 1
+               , meDescendantSize = 200
+               , meDescendantFees = fee
+               , meRBFOptIn = False
+               }
+
+    it "templateLegacySigOpCost scales by WITNESS_SCALE_FACTOR" $ do
+      let tx = mkFatTx 0 10
+      -- 10 OP_CHECKSIG * WITNESS_SCALE_FACTOR (4) = 40
+      templateLegacySigOpCost tx `shouldBe` 40
+
+    it "selectWithinSigopBudget keeps txs that fit under MAX_BLOCK_SIGOPS_COST" $ do
+      -- 10 txs * 1000 sigops * 4 = 40,000 cost (well under 80k)
+      let entries = [ mkFatEntry (fromIntegral i) 1000 1000 | i <- [1..10 :: Int] ]
+      length (selectWithinSigopBudget entries) `shouldBe` 10
+
+    it "selectWithinSigopBudget drops txs that would exceed MAX_BLOCK_SIGOPS_COST" $ do
+      -- Each fat tx: 5000 OP_CHECKSIG * 4 = 20,000 cost.
+      -- After 4 txs: 80,000 cost == MAX_BLOCK_SIGOPS_COST. The 5th would
+      -- push the running total past the limit (Core's > comparison) and
+      -- must be dropped. (Note: budget check uses strict >, so exactly
+      -- 80,000 is allowed, the 5th tx at 100,000 is rejected.)
+      let entries = [ mkFatEntry (fromIntegral i) 5000 1000 | i <- [1..6 :: Int] ]
+          kept    = selectWithinSigopBudget entries
+      length kept `shouldBe` 4
+      -- Running cost of kept txs is 4 * 20,000 = 80,000 (== limit).
+      sum (map (templateLegacySigOpCost . meTransaction) kept)
+        `shouldBe` 80000
+
+    it "selectWithinSigopBudget skips a single oversized tx and keeps later fitting ones" $ do
+      -- One huge tx (would alone exceed the budget) followed by small txs.
+      --   huge: 25,000 OP_CHECKSIG * 4 = 100,000  -> dropped
+      --   small: 100  OP_CHECKSIG * 4 =     400   -> kept (3 of them)
+      let huge   = mkFatEntry 1 25000 1000
+          smalls = [ mkFatEntry (fromIntegral i) 100 1000 | i <- [2..4 :: Int] ]
+          kept   = selectWithinSigopBudget (huge : smalls)
+      length kept `shouldBe` 3
+      map meTxId kept `shouldBe` map meTxId smalls
+
+    it "selectWithinSigopBudget preserves order of accepted txs" $ do
+      let entries = [ mkFatEntry 1 100 5000  -- highest fee, accepted first
+                    , mkFatEntry 2 100 4000
+                    , mkFatEntry 3 100 3000
+                    ]
+          kept = selectWithinSigopBudget entries
+      map meTxId kept `shouldBe` map meTxId entries
+
+    it "templateLegacySigOpCost handles OP_CHECKMULTISIG inaccurate counting" $ do
+      -- Inaccurate counting: OP_CHECKMULTISIG always counts as
+      -- MAX_PUBKEYS_PER_MULTISIG = 20 sigops. Cost = 20 * 4 = 80.
+      let dummyTxId = TxId (Hash256 (BS.replicate 32 0xfe))
+          prevOp    = OutPoint dummyTxId 0
+          txin      = TxIn prevOp BS.empty 0xffffffff
+          spk       = encodeScript $ Script [OP_CHECKMULTISIG]
+          txout     = TxOut 0 spk
+          tx        = Tx 1 [txin] [txout] [[]] 0
+      templateLegacySigOpCost tx `shouldBe` 80
+
+    it "templateLegacySigOpCost is zero for an empty tx" $ do
+      let tx = Tx 1 [] [] [] 0
+      templateLegacySigOpCost tx `shouldBe` 0
+
   describe "ChainState" $ do
     it "can be constructed" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0))

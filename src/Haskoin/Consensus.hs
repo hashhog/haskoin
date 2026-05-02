@@ -85,6 +85,7 @@ module Haskoin.Consensus
   , countBlockSigops
   , countTxSigops
   , countScriptSigops
+  , getLegacySigOpCount
     -- * Witness Commitment
   , validateWitnessCommitment
   , computeWtxId
