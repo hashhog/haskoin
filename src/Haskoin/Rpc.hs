@@ -150,6 +150,8 @@ import Data.List (foldl')
 import Text.Printf (printf)
 import qualified Data.Vector as V
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock (NominalDiffTime)
+import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
 import System.Directory (removeFile)
 import System.FilePath ((</>))
@@ -209,6 +211,9 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), ParseError(..),
                         newWalletManager, createManagedWallet, loadManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
+                        -- Wallet encryption (BIP-38-style passphrase locking)
+                        Passphrase, encryptWallet, unlockWallet, lockWallet,
+                        isWalletLocked,
                         -- Wallet address/transaction functions
                         AddressType(..), getNewAddress, sendToAddress,
                         getWalletUTXOs, Utxo(..),
@@ -396,6 +401,28 @@ rpcWalletAlreadyLoaded = -35
 -- | Wallet already exists (error code -36)
 rpcWalletAlreadyExists :: Int
 rpcWalletAlreadyExists = -36
+
+-- | Wallet passphrase entered was incorrect (error code -14, mirrors Bitcoin
+--   Core's @RPC_WALLET_PASSPHRASE_INCORRECT@).
+rpcWalletPassphraseIncorrect :: Int
+rpcWalletPassphraseIncorrect = -14
+
+-- | Wallet is in an invalid state for the requested operation (error code -15,
+--   mirrors Bitcoin Core's @RPC_WALLET_WRONG_ENC_STATE@).  E.g. calling
+--   @walletpassphrase@ on an unencrypted wallet, or @encryptwallet@ on an
+--   already-encrypted one.
+rpcWalletWrongEncState :: Int
+rpcWalletWrongEncState = -15
+
+-- | Wallet encryption failed (error code -16, mirrors Bitcoin Core's
+--   @RPC_WALLET_ENCRYPTION_FAILED@).
+rpcWalletEncryptionFailed :: Int
+rpcWalletEncryptionFailed = -16
+
+-- | Maximum @walletpassphrase@ unlock duration in seconds (~3.17 years).
+--   Matches Bitcoin Core's @MAX_SLEEP_TIME@ in wallet/rpc/encrypt.cpp.
+walletPassphraseMaxSleepTime :: Int
+walletPassphraseMaxSleepTime = 100000000
 
 --------------------------------------------------------------------------------
 -- Batch Request Constants
@@ -775,6 +802,7 @@ handleRpcRequest server req = do
     "stop"                 -> handleStop server
 
     -- Utility RPCs (additional)
+    "encryptwallet"        -> handleEncryptWallet server params
     "walletpassphrase"     -> handleWalletPassphrase server params
     "walletlock"           -> handleWalletLock server
     "setlabel"             -> handleSetLabel server params
@@ -3774,6 +3802,7 @@ allRpcCommands =
   , ""
   , "== Wallet =="
   , "createwallet \"wallet_name\""
+  , "encryptwallet \"passphrase\""
   , "getbalance"
   , "getnewaddress ( \"label\" \"address_type\" )"
   , "getwalletinfo"
@@ -3846,17 +3875,140 @@ getCommandHelp cmd = case T.toLower cmd of
 -- Additional Utility RPC Handlers
 --------------------------------------------------------------------------------
 
--- | Unlock wallet for timeout seconds.
--- Stub: wallet encryption not yet implemented, but the RPC endpoint must exist.
-handleWalletPassphrase :: RpcServer -> Value -> IO RpcResponse
-handleWalletPassphrase _server _params =
-  return $ RpcResponse Null Null Null
+-- | Encrypt the default wallet with a passphrase.
+-- Reference: Bitcoin Core's @encryptwallet@ RPC (wallet/rpc/encrypt.cpp).
+-- The wallet must be currently unencrypted; otherwise we return
+-- 'rpcWalletWrongEncState' to mirror Core's @RPC_WALLET_WRONG_ENC_STATE@.
+-- An empty passphrase is rejected with 'rpcInvalidParams'.  Once encrypted,
+-- the wallet remains *unlocked* for the lifetime of this call (no automatic
+-- lock) — callers should follow up with @walletlock@ to drop the in-memory
+-- key, matching Core's documented behaviour.
+handleEncryptWallet :: RpcServer -> Value -> IO RpcResponse
+handleEncryptWallet server params =
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState ->
+          case extractParamText params 0 of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams
+                "Usage: encryptwallet \"passphrase\"") Null
+            Just passphrase
+              | T.null passphrase -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParams
+                    "passphrase cannot be empty") Null
+              | otherwise -> do
+                  result <- encryptWallet passphrase walletState
+                  case result of
+                    Left err
+                      | "already encrypted" `T.isInfixOf` T.toLower (T.pack err) ->
+                          return $ RpcResponse Null
+                            (toJSON $ RpcError rpcWalletWrongEncState
+                              (T.pack ("Error: " ++ err))) Null
+                      | otherwise ->
+                          return $ RpcResponse Null
+                            (toJSON $ RpcError rpcWalletEncryptionFailed
+                              (T.pack ("Error: " ++ err))) Null
+                    Right _ -> return $ RpcResponse
+                      (toJSON ("wallet encrypted; the keypool has been flushed and a \
+                               \new HD seed was generated. You need to make a new backup." :: Text))
+                      Null Null
 
--- | Lock wallet.
--- Stub: wallet encryption not yet implemented.
+-- | Unlock the default wallet for @timeout@ seconds.
+-- Reference: Bitcoin Core's @walletpassphrase@ RPC (wallet/rpc/encrypt.cpp).
+-- Calling this on an unencrypted wallet returns 'rpcWalletWrongEncState';
+-- a wrong passphrase returns 'rpcWalletPassphraseIncorrect'; a negative
+-- timeout returns 'rpcInvalidParams'.  Timeout is clamped to
+-- 'walletPassphraseMaxSleepTime' (matches Core).  After the timeout we
+-- also actively re-lock the wallet via 'forkIO' / 'threadDelay' so that
+-- callers reading the in-memory key directly observe the lock without
+-- needing to poll 'isWalletLocked'.
+handleWalletPassphrase :: RpcServer -> Value -> IO RpcResponse
+handleWalletPassphrase server params =
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState ->
+          case (extractParamText params 0, extractParam params 1 :: Maybe Int) of
+            (Just _, Nothing) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams
+                "Usage: walletpassphrase \"passphrase\" timeout") Null
+            (Nothing, _) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams
+                "Usage: walletpassphrase \"passphrase\" timeout") Null
+            (Just passphrase, Just timeoutSec)
+              | T.null passphrase -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParams
+                    "passphrase cannot be empty") Null
+              | timeoutSec < 0 -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParams
+                    "Timeout cannot be negative.") Null
+              | otherwise -> do
+                  let clamped = min timeoutSec walletPassphraseMaxSleepTime
+                      duration = fromIntegral clamped :: NominalDiffTime
+                  result <- unlockWallet passphrase duration walletState
+                  case result of
+                    Left err
+                      | "not encrypted" `T.isInfixOf` T.toLower (T.pack err) ->
+                          return $ RpcResponse Null
+                            (toJSON $ RpcError rpcWalletWrongEncState
+                              "Error: running with an unencrypted wallet, but \
+                              \walletpassphrase was called.") Null
+                      | otherwise ->
+                          return $ RpcResponse Null
+                            (toJSON $ RpcError rpcWalletPassphraseIncorrect
+                              "Error: The wallet passphrase entered was incorrect.") Null
+                    Right _ -> do
+                      -- Active re-lock callback.  Bitcoin Core schedules this
+                      -- via the wallet scheduler so the most-recent
+                      -- walletpassphrase wins; we mirror that with an expiry
+                      -- check before locking, so a second walletpassphrase
+                      -- call that bumps 'wsUnlockExpiry' past our deadline
+                      -- will keep the wallet unlocked.
+                      _ <- forkIO $ do
+                        threadDelay (clamped * 1000000)
+                        mExpiry <- readTVarIO (wsUnlockExpiry walletState)
+                        nowT <- TimeClock.getCurrentTime
+                        case mExpiry of
+                          Just expiry | nowT < expiry ->
+                            -- A later walletpassphrase extended the lease.
+                            return ()
+                          _ -> lockWallet walletState
+                      return $ RpcResponse Null Null Null
+
+-- | Lock the default wallet, dropping the decrypted key from memory.
+-- Reference: Bitcoin Core's @walletlock@ RPC (wallet/rpc/encrypt.cpp).
+-- Locking an unencrypted wallet returns 'rpcWalletWrongEncState'.
 handleWalletLock :: RpcServer -> IO RpcResponse
-handleWalletLock _server =
-  return $ RpcResponse Null Null Null
+handleWalletLock server =
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState -> do
+          mEncrypted <- readTVarIO (wsEncrypted walletState)
+          case mEncrypted of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcWalletWrongEncState
+                "Error: running with an unencrypted wallet, but walletlock \
+                \was called.") Null
+            Just _ -> do
+              lockWallet walletState
+              return $ RpcResponse Null Null Null
 
 -- | Set label for an address.
 -- Stub: label storage not yet implemented.
