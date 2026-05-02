@@ -2255,26 +2255,29 @@ computeWtxId tx = TxId (doubleSHA256 (encode tx))
 -- | Connect a block to the chain state, updating UTXO set and indexes,
 -- and writing per-block undo data for future rewinds.
 --
--- The @spentUtxos@ argument carries the @TxOut@ for every non-coinbase
--- input the block consumes; it is the same map @Sync.buildUTXOMap@
--- already produces just before validation. We persist those outputs as
--- a 'BlockUndo' record so 'disconnectBlock' (and the @dumptxoutset@
--- rollback dance) can restore them later.
+-- The @spentUtxos@ argument carries the full Core-format @Coin@
+-- (TxOut + height + coinbase flag) for every non-coinbase input the
+-- block consumes; it is the same map @Sync.buildUTXOMap@ produces
+-- just before validation, sourced from 'getUTXOCoin' against the
+-- 'PrefixUTXO' keyspace. We persist those Coins as a 'BlockUndo'
+-- record so 'disconnectBlock' (and the @dumptxoutset@ rollback dance)
+-- can restore the spent UTXO entries with their original height and
+-- coinbase flag intact — a byte-identical round-trip.
 --
 -- Reference: bitcoin-core/src/validation.cpp @ConnectBlock@ — Core
--- writes a parallel @rev*.dat@ undo entry for each connected block via
--- @WriteBlockUndo@. We piggy-back the equivalent record on the same
--- RocksDB write batch so the UTXO mutation and the undo record commit
--- atomically; partial commits on shutdown can never desync them.
---
--- The undo record stores only @TxOut@ (no height/coinbase) because the
--- legacy @PrefixUTXO@ keyspace is itself lossy in the same way (see
--- 'dumpTxOutSetFromDB' notes). 'disconnectBlock' restores raw @TxOut@
--- back into @PrefixUTXO@, which is consistent with the connect-side
--- write format.
+-- populates @CTxUndo::vprevout@ with full @Coin@ data including
+-- height + fCoinBase, then writes a parallel @rev*.dat@ undo entry
+-- via @WriteBlockUndo@. @DisconnectBlock@ reads it and restores
+-- Coins via @view.AddCoin(..)@. We piggy-back the equivalent record
+-- on the same RocksDB write batch so the UTXO mutation and the undo
+-- record commit atomically; partial commits on shutdown can never
+-- desync them.
 connectBlock :: HaskoinDB -> Network -> Block -> Word32
-             -> Map OutPoint TxOut  -- ^ Spent UTXOs (prevouts being consumed
-                                    --   by non-coinbase inputs in this block).
+             -> Map OutPoint Coin  -- ^ Spent UTXOs (prevouts being consumed
+                                   --   by non-coinbase inputs in this block);
+                                   --   carries Core-format height + coinbase
+                                   --   metadata for byte-identical round-trip
+                                   --   through 'disconnectBlock'.
              -> IO ()
 connectBlock db _net block height spentUtxos = do
   let bh = computeBlockHash (blockHeader block)
@@ -2282,12 +2285,17 @@ connectBlock db _net block height spentUtxos = do
       txns = blockTxns block
       txids = map computeTxId txns
       -- Build BlockUndo: one TxUndo per non-coinbase tx, in tx order.
-      -- For each input we record (TxOut, height=0, coinbase=False);
-      -- height/coinbase are 0/false because PrefixUTXO storage is
-      -- already TxOut-only (lossy by design, see Storage.hs:1130-1145).
+      -- For each spent prevout, copy the full Core @Coin@ metadata
+      -- (TxOut + height + coinbase flag) into the @TxInUndo@ so
+      -- @disconnectBlock@ can restore the original UTXO entry
+      -- byte-identically. This matches Core's @CTxUndo::vprevout@
+      -- which stores @Coin@ (out, height, fCoinBase) packed via
+      -- @TxInUndoSerializer@ (undo.h:33-66).
       mkTxInUndo inp = case Map.lookup (txInPrevOutput inp) spentUtxos of
-        Just txout -> Just (TxInUndo txout 0 False)
-        Nothing    -> Nothing  -- caller's responsibility; logged below
+        Just c  -> Just (TxInUndo (coinTxOut c)
+                                  (coinHeight c)
+                                  (coinIsCoinbase c))
+        Nothing -> Nothing  -- caller's responsibility; logged below
       mkTxUndo tx = TxUndo
         { tuPrevOutputs = mapMaybe mkTxInUndo (txInputs tx) }
       blockUndo = BlockUndo
