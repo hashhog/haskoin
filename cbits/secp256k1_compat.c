@@ -510,3 +510,44 @@ int haskoin_ecdsa_recover_compact(
     *out_len = compressed ? 33 : 65;
     return secp256k1_ec_pubkey_serialize(ctx, output, out_len, &pubkey, flags);
 }
+
+/* ---- Pubkey decompression for ScriptCompression tags 0x04/0x05 ---------- */
+
+/*
+ * Recover the full uncompressed (65-byte) form of a compressed public key.
+ *
+ * Used by Storage.hs `getCompressedScript` to inflate Core's
+ * ScriptCompression tags 0x04 / 0x05 (which store only the X coordinate
+ * plus the uncompressed-form Y parity) back into a 65-byte P2PK key, so
+ * that ancient Satoshi-era P2PK coinbase outputs round-trip correctly out
+ * of `loadtxoutset` snapshots.
+ *
+ * Reference: bitcoin-core/src/compressor.cpp `DecompressScript`, which:
+ *   - Builds a 33-byte compressed key as `(0x02 | (tag - 0x02)) + x[32]`.
+ *   - Calls `secp256k1_ec_pubkey_parse` on those 33 bytes.
+ *   - Calls `secp256k1_ec_pubkey_serialize` with SECP256K1_EC_UNCOMPRESSED
+ *     to produce the 65-byte form.
+ *
+ * Inputs:
+ *   compressed33 : 33-byte compressed pubkey (must start with 0x02 or 0x03).
+ *   out65        : 65-byte output buffer (will be filled with 0x04 + X + Y).
+ *
+ * Returns 1 on success, 0 on failure (e.g. X not on the curve).
+ */
+int haskoin_ec_pubkey_decompress(
+    const unsigned char *compressed33,
+    unsigned char *out65
+) {
+    secp256k1_context *ctx = get_verify_ctx();
+    secp256k1_pubkey pubkey;
+    size_t out_len = 65;
+
+    if (!ctx) return 0;
+
+    if (!secp256k1_ec_pubkey_parse(ctx, &pubkey, compressed33, 33)) {
+        return 0;
+    }
+
+    return secp256k1_ec_pubkey_serialize(
+        ctx, out65, &out_len, &pubkey, SECP256K1_EC_UNCOMPRESSED);
+}

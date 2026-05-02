@@ -32,6 +32,7 @@ module Haskoin.Crypto
     -- * Recoverable / message signing
   , derivePubKeyCompressed
   , derivePubKeyUncompressed
+  , decompressPubKey
   , signCompact
   , recoverCompact
   , messageMagic
@@ -154,6 +155,13 @@ foreign import ccall unsafe "haskoin_ecdsa_recover_compact"
                           -> Ptr CUChar  -- output (33 or 65)
                           -> Ptr CSize   -- out length
                           -> IO CInt
+
+-- | FFI binding for compressed-to-uncompressed pubkey decompression.
+-- Used by ScriptCompression decoder for tags 0x04/0x05.
+foreign import ccall unsafe "haskoin_ec_pubkey_decompress"
+  c_ec_pubkey_decompress :: Ptr CUChar  -- compressed33
+                         -> Ptr CUChar  -- out65
+                         -> IO CInt
 
 --------------------------------------------------------------------------------
 -- Hashing Functions
@@ -448,6 +456,27 @@ derivePubKeyRaw compressedFlag bufLen (SecKey skBytes)
                 bs <- BS.packCStringLen (castPtr outPtr, fromIntegral actualLen)
                 return (Just bs)
               else return Nothing
+
+-- | Recover the full uncompressed (65-byte) form of a 33-byte compressed
+-- public key.  The input must start with 0x02 or 0x03 and contain a valid
+-- X coordinate on the secp256k1 curve.  Returns 'Nothing' if the X
+-- coordinate is not on the curve, mirroring libsecp256k1's parse failure.
+--
+-- Used by 'getCompressedScript' (Storage) to inflate Core's
+-- ScriptCompression tags 0x04/0x05 (uncompressed-P2PK) back into the
+-- 65-byte serialized pubkey form.
+--
+-- Reference: bitcoin-core/src/compressor.cpp DecompressScript.
+decompressPubKey :: ByteString -> Maybe ByteString
+decompressPubKey compressed33
+  | BS.length compressed33 /= 33 = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen compressed33 $ \(inPtr, _) ->
+        allocaArray 65 $ \outPtr -> do
+          ok <- c_ec_pubkey_decompress (castPtr inPtr) outPtr
+          if ok == 1
+            then Just <$> BS.packCStringLen (castPtr outPtr, 65)
+            else return Nothing
 
 -- | Produce a 65-byte compact recoverable ECDSA signature over @msghash@.
 -- The header byte encodes the recovery id and whether the public key is
