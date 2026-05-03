@@ -2003,6 +2003,80 @@ main = hspec $ do
           tx = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
       coinbaseHeight tx `shouldBe` Nothing
 
+  describe "IsFinalTx (Core ContextualCheckBlock parity)" $ do
+    -- Helpers
+    let nullOp   = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+        seqFinal = 0xffffffff :: Word32
+        seqNonFinal = 0 :: Word32
+        makeTxWith lockTime seqs =
+          Tx 1
+             (map (\s -> TxIn nullOp BS.empty s) seqs)
+             [TxOut 1000 BS.empty]
+             (map (const []) seqs)
+             lockTime
+        -- threshold: height-based vs time-based boundary
+        threshold = 500_000_000 :: Word32
+
+    it "zero locktime is always final" $ do
+      let tx = makeTxWith 0 [seqNonFinal]
+      isFinalTxCheck tx 1000 900_000_001 `shouldBe` True
+
+    it "height-based locktime satisfied (lockTime < blockHeight)" $ do
+      let tx = makeTxWith 100 [seqNonFinal]
+      isFinalTxCheck tx 101 900_000_001 `shouldBe` True
+
+    it "height-based locktime not satisfied, non-SEQUENCE_FINAL => non-final" $ do
+      let tx = makeTxWith 200 [seqNonFinal]
+      isFinalTxCheck tx 100 900_000_001 `shouldBe` False
+
+    it "SEQUENCE_FINAL on all inputs overrides unsatisfied locktime" $ do
+      let tx = makeTxWith 999_999_999 [seqFinal]
+      isFinalTxCheck tx 100 900_000_001 `shouldBe` True
+
+    it "mixed inputs: one non-SEQUENCE_FINAL => non-final" $ do
+      let tx = makeTxWith 500 [seqFinal, seqNonFinal]
+      isFinalTxCheck tx 100 900_000_001 `shouldBe` False
+
+    it "time-based locktime satisfied (lockTime < MTP)" $ do
+      let tx = makeTxWith (threshold + 1) [seqNonFinal]
+      isFinalTxCheck tx 100 (threshold + 2) `shouldBe` True
+
+    it "time-based locktime not satisfied, non-SEQUENCE_FINAL => non-final" $ do
+      let tx = makeTxWith (threshold + 2) [seqNonFinal]
+      isFinalTxCheck tx 100 (threshold + 1) `shouldBe` False
+
+    it "validateFullBlock rejects block containing a non-final tx" $ do
+      -- Build a minimal regtest block where a non-coinbase tx has
+      -- lockTime=500 but block height is 100 and sequence is not SEQUENCE_FINAL.
+      -- validateFullBlock should return Left "bad-txns-nonfinal".
+      let prevH    = BlockHash (Hash256 (BS.replicate 32 0))
+          cbOp     = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          -- Coinbase height 100: script = 0x01 0x64
+          cbIn     = TxIn cbOp (BS.pack [0x01, 0x64]) seqFinal
+          coinbase = Tx 1 [cbIn] [TxOut 5000000000 BS.empty] [[]] 0
+          -- Non-final tx: locktime=500, block height=100, non-SEQUENCE_FINAL seq
+          nonFinalIn = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0)
+                            BS.empty seqNonFinal
+          nonFinalTx = Tx 1 [nonFinalIn] [TxOut 1000 BS.empty] [[]] 500
+          txns     = [coinbase, nonFinalTx]
+          -- Compute the real merkle root so the block passes check 3
+          realMerkle = computeMerkleRoot (map computeTxId txns)
+          blkHdr   = BlockHeader 1 prevH realMerkle 0 0 0
+          block    = Block blkHdr txns
+          cs = ChainState
+                { csHeight     = 99   -- next block = 100
+                , csBestBlock  = prevH
+                , csChainWork  = 0
+                , csMedianTime = 0    -- MTP=0, CSV not active on regtest h=100
+                , csFlags      = consensusFlagsAtHeight regtest 100
+                }
+          utxoMap = mempty
+      -- Should be rejected for non-final tx (bad-txns-nonfinal check is step 6,
+      -- after merkle/coinbase/weight/BIP34 checks all pass)
+      case validateFullBlock regtest cs False block utxoMap of
+        Left err -> err `shouldContain` "bad-txns-nonfinal"
+        Right () -> expectationFailure "Expected block to be rejected as non-final"
+
   describe "Block weight (BIP-141)" $ do
     it "calculates weight for block without witness data" $ do
       let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
