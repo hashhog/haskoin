@@ -263,7 +263,7 @@ data ScriptVerifyFlag
   | VerifyDiscourageUpgradableWitnessProgram  -- ^ Fail on unknown witness versions (policy)
   | VerifyDiscourageUpgradableNops            -- ^ Fail on upgradable NOPs (policy)
   | VerifyDiscourageOpSuccess                 -- ^ Fail on OP_SUCCESS opcodes (policy)
-  | VerifyConstScriptcode                    -- ^ OP_CODESEPARATOR forbidden in witness v0
+  | VerifyConstScriptcode                    -- ^ OP_CODESEPARATOR forbidden in BASE (legacy, non-witness) scripts
   | VerifyStrictEncoding                     -- ^ BIP-62: Strict signature/pubkey encoding
   | VerifyLowS                              -- ^ BIP-62: Low-S signatures
   | VerifySigPushOnly                        -- ^ BIP-62: scriptSig must be push-only
@@ -1132,7 +1132,8 @@ data ScriptEnv = ScriptEnv
   , seInputIdx     :: !Int             -- ^ Input index being verified
   , seAmount       :: !Word64          -- ^ Amount being spent (for SegWit sighash)
   , seOpCount      :: !Int             -- ^ Opcode count (limit: 201)
-  , seCodeSepPos   :: !Word32          -- ^ Position after last OP_CODESEPARATOR (0xFFFFFFFF = none)
+  , seCodeSepPos   :: !Word32          -- ^ Byte position after last OP_CODESEPARATOR (0xFFFFFFFF = none, for legacy scriptCode slicing)
+  , seCodeSepOpPos :: !Word32          -- ^ 0-based opcode INDEX of last OP_CODESEPARATOR (0xFFFFFFFF = none, for BIP-341 tapscript sigmsg)
   , seScriptCode   :: !ByteString      -- ^ Script being executed (for sighash)
   , seWitness      :: ![ByteString]    -- ^ Witness stack for SegWit
   , seIsWitness    :: !Bool            -- ^ Are we executing witness script?
@@ -1172,7 +1173,8 @@ initScriptEnvWithFlags tx idx amount scriptCode flags = ScriptEnv
   , seInputIdx = idx
   , seAmount = amount
   , seOpCount = 0
-  , seCodeSepPos = 0xFFFFFFFF  -- Initialize to -1 as per Bitcoin Core
+  , seCodeSepPos   = 0xFFFFFFFF  -- Initialize to -1 as per Bitcoin Core (byte position)
+  , seCodeSepOpPos = 0xFFFFFFFF  -- Initialize to -1 as per Bitcoin Core (opcode index)
   , seScriptCode = scriptCode
   , seWitness = if idx < length (txWitness tx) then txWitness tx !! idx else []
   , seIsWitness = False
@@ -1764,14 +1766,12 @@ execHash256 env = do
 -- in CHECKSIG.
 execCodeSeparator :: ScriptEnv -> Either String ScriptEnv
 execCodeSeparator env =
-  -- In witness v0, OP_CODESEPARATOR is forbidden if CONST_SCRIPTCODE is set
-  -- (In tapscript, OP_CODESEPARATOR is valid and updates codesep_pos)
-  if seIsWitness env && hasFlag (seFlags env) VerifyConstScriptcode
-    then Left "OP_CODESEPARATOR in witness v0 script"
-    else
-      -- Position tracking is handled in evalWithPosition
-      -- This just returns success
-      Right env
+  -- CONST_SCRIPTCODE check is handled in evalWithPosition (above the fExec gate),
+  -- mirroring Bitcoin Core interpreter.cpp:474-476 where the check fires before
+  -- the fExec gate (line 478). The handler itself only needs to return success;
+  -- seCodeSepPos and seCodeSepOpPos are updated by evalWithPosition before execOp
+  -- is called, so the env already has the correct values when we get here.
+  Right env
 
 -- | Consume one tapscript validation-weight unit (50) from the env's
 -- m_validation_weight_left counter. Mirrors Core's interpreter.cpp:362,
@@ -1868,7 +1868,7 @@ verifyTapscriptSchnorr env sigBytesRaw pubkey32 = do
     Left "Tapscript checksig: per-input prevouts missing in env"
   let sp = TS.TapscriptContext
              { TS.tapleafHash = tlh
-             , TS.codesepPos = seCodeSepPos env
+             , TS.codesepPos = seCodeSepOpPos env  -- BIP-341: commit opcode INDEX, not byte position
              }
   sighash <- case TS.computeTaprootSighash (seTx env) (seInputIdx env)
                     prevouts ht (seTaprootAnnex env) (Just sp) of
@@ -2309,25 +2309,37 @@ evalScriptWithStack stack (Script ops) env = do
   -- Check script size limit (10000 bytes)
   let scriptBytes = encodeScriptOps ops
   when (BS.length scriptBytes > 10000) $ Left "Script size exceeds 10000 bytes"
-  evalWithPosition ops 0 (env { seStack = stack })
+  evalWithPosition ops 0 0 (env { seStack = stack })
   where
-    -- Evaluate ops while tracking byte position
-    evalWithPosition :: [ScriptOp] -> Int -> ScriptEnv -> Either String ScriptEnv
-    evalWithPosition [] _ e = Right e
-    evalWithPosition (op:rest) pos e = do
-      -- For OP_CODESEPARATOR, update the position before executing
+    -- Evaluate ops while tracking byte position and opcode index
+    -- opPos: 0-based opcode index (incremented for every opcode, including pushdata)
+    evalWithPosition :: [ScriptOp] -> Int -> Word32 -> ScriptEnv -> Either String ScriptEnv
+    evalWithPosition [] _ _ e = Right e
+    evalWithPosition (op:rest) pos opPos e = do
+      -- CONST_SCRIPTCODE check fires ABOVE the fExec gate (even in unexecuted branches)
+      -- Bitcoin Core interpreter.cpp:474-476: checks before the fExec check at line 478
+      -- Only applies to BASE (non-witness, non-tapscript) sigversion
+      when (op == OP_CODESEPARATOR
+            && not (seIsWitness e)
+            && not (seIsTapscript e)
+            && hasFlag (seFlags e) VerifyConstScriptcode) $
+        Left "OP_CODESEPARATOR in legacy script with CONST_SCRIPTCODE"
+      -- For OP_CODESEPARATOR, update both byte position and opcode index before executing
       let opSize = opByteSize op
           -- Position after this opcode
           nextPos = pos + opSize
-          -- Update seCodeSepPos if this is OP_CODESEPARATOR
+          -- Update seCodeSepPos (byte position, for legacy scriptCode slicing) and
+          -- seCodeSepOpPos (opcode index, for BIP-341 tapscript sigmsg)
           e' = case op of
                  OP_CODESEPARATOR
                    | isExecuting e ->  -- Only update when actually executing
-                       e { seCodeSepPos = fromIntegral nextPos }
+                       e { seCodeSepPos   = fromIntegral nextPos
+                         , seCodeSepOpPos = opPos
+                         }
                  _ -> e
       -- Execute the opcode
       e'' <- execOp op e'
-      evalWithPosition rest nextPos e''
+      evalWithPosition rest nextPos (opPos + 1) e''
 
 -- | Main script evaluation (without flags, for backward compatibility)
 evalScript :: Tx -> Int -> Word64 -> Script -> Script -> Either String Bool
