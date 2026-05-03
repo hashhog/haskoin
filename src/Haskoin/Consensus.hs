@@ -73,6 +73,8 @@ module Haskoin.Consensus
     -- * Coinbase
   , isCoinbase
   , coinbaseHeight
+  , encodeBip34Height
+  , validateCoinbaseHeightConsensus
     -- * Block Metrics
   , blockWeight
   , blockBaseSize
@@ -1753,6 +1755,37 @@ coinbaseHeight tx
           withIndex = zip [0..] bytes
       in foldr (\(i, b) acc -> acc .|. (fromIntegral b `shiftL` (8 * i))) 0 withIndex
 
+-- | Build the canonical BIP-34 byte encoding for a block height.
+-- Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448):
+--   height == 0  → OP_0 (0x00), single byte
+--   1..16        → OP_1..OP_16 (0x51..0x60), single byte
+--   otherwise    → length-prefixed sign-magnitude CScriptNum
+encodeBip34Height :: Word32 -> ByteString
+encodeBip34Height 0 = BS.singleton 0x00
+encodeBip34Height h | h >= 1 && h <= 16 = BS.singleton (0x50 + fromIntegral h)
+encodeBip34Height h =
+  let le = encodeLeBytes h
+      -- If high bit of last byte is set, append zero sign byte
+      le' = if BS.last le .&. 0x80 /= 0 then BS.snoc le 0x00 else le
+  in BS.cons (fromIntegral (BS.length le')) le'
+  where
+    encodeLeBytes :: Word32 -> ByteString
+    encodeLeBytes 0 = BS.empty
+    encodeLeBytes n = BS.cons (fromIntegral (n .&. 0xff)) (encodeLeBytes (n `shiftR` 8))
+
+-- | Consensus gate for BIP-34 coinbase height.
+-- Performs byte-exact PREFIX match against the canonical encoding of height,
+-- matching Bitcoin Core's ContextualCheckBlock (validation.cpp:4151-4159).
+-- The lenient 'coinbaseHeight' decoder is intentionally NOT used here.
+validateCoinbaseHeightConsensus :: Word32 -> Tx -> Bool
+validateCoinbaseHeightConsensus height tx
+  | not (isCoinbase tx) = False
+  | otherwise =
+      let expect = encodeBip34Height height
+          sig    = txInScript (head (txInputs tx))
+          n      = BS.length expect
+      in BS.length sig >= n && BS.take n sig == expect
+
 --------------------------------------------------------------------------------
 -- Block Weight Calculation (BIP-141)
 --------------------------------------------------------------------------------
@@ -2112,11 +2145,15 @@ validateFullBlock net cs skipScripts block utxoMap = do
   when (flagSegWit flags && blockWeight block > maxBlockWeight) $
     Left "Block exceeds maximum weight"
 
-  -- 5. BIP-34: coinbase must contain height
+  -- 5. BIP-34: coinbase scriptSig must start with byte-exact canonical encoding
+  -- of the block height. Bitcoin Core validation.cpp:4151-4159:
+  --   CScript expect = CScript() << nHeight;
+  --   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+  -- Using validateCoinbaseHeightConsensus (strict byte-prefix) rather than
+  -- coinbaseHeight (lenient value-decoder) to match Core parity exactly.
   when (flagBIP34 flags) $
-    case coinbaseHeight (head txns) of
-      Nothing -> Left "Coinbase missing height (BIP-34)"
-      Just h  -> unless (h == height) $ Left "Coinbase height mismatch"
+    unless (validateCoinbaseHeightConsensus height (head txns)) $
+      Left "bad-cb-height"
 
   -- 6. IsFinalTx: every transaction must be final at this block height/time.
   -- Reference: Bitcoin Core ContextualCheckBlock (validation.cpp:4146).
