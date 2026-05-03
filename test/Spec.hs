@@ -1477,6 +1477,100 @@ main = hspec $ do
           []      -> expectationFailure "Stack should have result"
         Left err -> expectationFailure $ "Legacy CHECKSIG should not error here: " ++ err
 
+  -- Tapscript-specific gating of MAX_SCRIPT_SIZE (10,000 B) and
+  -- MAX_OPS_PER_SCRIPT (201). Bitcoin Core interpreter.cpp:428 + 450-455
+  -- restrict both checks to BASE / WITNESS_V0 sigversions; tapscripts
+  -- (SigVersion::TAPSCRIPT) are exempt. Real-world ordinals inscriptions
+  -- routinely exceed both limits.
+  describe "Tapscript gating of SCRIPT_SIZE / MAX_OPS_PER_SCRIPT (BIP-342)" $ do
+    let blankTx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0xffffffff] [] [[]] 0
+
+    -- The terminating OP_1 ensures the stack ends non-empty so the
+    -- caller's cleanstack check doesn't shadow the size/ops check.
+    it "P0-1: tapscript >10,000 bytes succeeds (size gate exempt)" $ do
+      -- Build an 11,000-byte tapscript: 11,000 OP_NOP + a final OP_1.
+      let bigOps     = replicate 11000 OP_NOP ++ [OP_1]
+          encodedLen = BS.length (encodeScriptOps bigOps)
+      encodedLen `shouldSatisfy` (> 10000)
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seSpentAmounts = [0]
+                  , seSpentScripts = [BS.empty]
+                  , seTapleafHash  = Just (BS.replicate 32 0)
+                  , seValidationWeightLeft = 1000000
+                  , seValidationWeightInit = True
+                  , seStack = []
+                  }
+      -- evalScriptWithStack is the entry point that previously enforced the
+      -- 10000-byte cap unconditionally. With the BIP-342 gate it must
+      -- accept tapscript regardless of size.
+      case evalScriptWithStack [] (Script bigOps) env of
+        Right _ -> return ()
+        Left err -> expectationFailure $ "tapscript >10kB rejected: " ++ err
+
+    it "P0-1: legacy script >10,000 bytes still rejected (size gate active)" $ do
+      -- Same script body, but seIsTapscript = False — the gate must still
+      -- fire on legacy / witness-v0 evaluation.
+      let bigOps = replicate 11000 OP_NOP ++ [OP_1]
+          env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = False
+                  , seStack = []
+                  }
+      case evalScriptWithStack [] (Script bigOps) env of
+        Left msg | "10000 bytes" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $ "Expected size error, got: " ++ other
+        Right _    -> expectationFailure "Legacy script >10kB must be rejected"
+
+    it "P0-2: tapscript with 250 OP_NOP opcodes succeeds (op-count exempt)" $ do
+      -- 250 OP_NOPs > 201 limit. With BIP-342 gating, the counter is dead
+      -- in tapscript and the script must succeed.
+      let manyOps = replicate 250 OP_NOP ++ [OP_1]
+          env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seSpentAmounts = [0]
+                  , seSpentScripts = [BS.empty]
+                  , seTapleafHash  = Just (BS.replicate 32 0)
+                  , seValidationWeightLeft = 1000000
+                  , seValidationWeightInit = True
+                  , seStack = []
+                  }
+      case evalScriptWithStack [] (Script manyOps) env of
+        Right _ -> return ()
+        Left err -> expectationFailure $ "tapscript with 250 ops rejected: " ++ err
+
+    it "P0-2: legacy script with 250 OP_NOPs still rejected" $ do
+      -- Same script, seIsTapscript=False — incOpCount must trip at op 202.
+      let manyOps = replicate 250 OP_NOP ++ [OP_1]
+          env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = False
+                  , seStack = []
+                  }
+      case evalScriptWithStack [] (Script manyOps) env of
+        Left msg | "Opcode limit" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $ "Expected op-limit error, got: " ++ other
+        Right _    -> expectationFailure "Legacy script >201 ops must be rejected"
+
+    it "incOpCount is a no-op when seIsTapscript = True" $ do
+      -- Spot-check the helper directly: even at 200 ops, another bump in
+      -- tapscript mode must NOT cross the legacy 201-cap.
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seOpCount     = 200
+                  }
+      case incOpCount env of
+        Right env' -> seOpCount env' `shouldBe` 200  -- unchanged
+        Left err   -> expectationFailure $ "incOpCount tapscript no-op: " ++ err
+
+    it "incOpCount still trips at 201 for legacy" $ do
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = False
+                  , seOpCount     = 201
+                  }
+      case incOpCount env of
+        Left msg | "Opcode limit" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $ "Expected op-limit error, got: " ++ other
+        Right _    -> expectationFailure "Legacy 202nd op must be rejected"
+
   describe "isPushOnly and push only scripts" $ do
     it "returns True for empty script" $ do
       isPushOnly (Script []) `shouldBe` True
