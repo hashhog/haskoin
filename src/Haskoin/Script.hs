@@ -86,6 +86,8 @@ module Haskoin.Script
   , execCheckSigAdd
   , compactSizeLen
   , getSerializeSizeOfWitnessStack
+  , evalScriptWithStack
+  , incOpCount
   ) where
 
 import Data.ByteString (ByteString)
@@ -1221,13 +1223,23 @@ popN n env
       let (items, rest) = splitAt n (seStack env)
       in Right (items, env { seStack = rest })
 
--- | Increment op count and check limit
+-- | Increment op count and check limit (MAX_OPS_PER_SCRIPT = 201).
+--
+-- BIP-342 / Core parity: the 201-opcode-per-script limit applies to BASE
+-- (legacy) and WITNESS_V0 sigversions only. Tapscript (witness v1, leaf
+-- version 0xc0) is NOT subject to this counter — large ordinals
+-- inscriptions routinely exceed it. Bitcoin Core gates the counter
+-- increment at @interpreter.cpp:450-455@ on
+-- @sigversion == BASE || sigversion == WITNESS_V0@.
 incOpCount :: ScriptEnv -> Either String ScriptEnv
-incOpCount env =
-  let newCount = seOpCount env + 1
-  in if newCount > 201
-     then Left "Opcode limit exceeded"
-     else Right env { seOpCount = newCount }
+incOpCount env
+  -- Tapscript leaves: counter is dead; Core does not increment at all.
+  | seIsTapscript env = Right env
+  | otherwise =
+      let newCount = seOpCount env + 1
+      in if newCount > 201
+         then Left "Opcode limit exceeded"
+         else Right env { seOpCount = newCount }
 
 -- | Check stack size limit
 checkStackSize :: ScriptEnv -> Either String ScriptEnv
@@ -2304,11 +2316,18 @@ isTapscriptSuccess op =
 
 -- | Evaluate a script with given initial stack
 -- Tracks byte position for OP_CODESEPARATOR handling
+--
+-- BIP-342 / Core parity: MAX_SCRIPT_SIZE (10,000 bytes) only applies to
+-- BASE (legacy) and WITNESS_V0 sigversions. Tapscripts (witness v1
+-- script-path, leaf version 0xc0) are explicitly excluded by Core
+-- (interpreter.cpp:428: @sigversion == BASE || sigversion == WITNESS_V0@).
+-- Large ordinals inscriptions routinely run >100 KB of tapscript bytes.
 evalScriptWithStack :: ScriptStack -> Script -> ScriptEnv -> Either String ScriptEnv
 evalScriptWithStack stack (Script ops) env = do
-  -- Check script size limit (10000 bytes)
-  let scriptBytes = encodeScriptOps ops
-  when (BS.length scriptBytes > 10000) $ Left "Script size exceeds 10000 bytes"
+  -- Check script size limit (10000 bytes) — legacy / witness-v0 only.
+  unless (seIsTapscript env) $ do
+    let scriptBytes = encodeScriptOps ops
+    when (BS.length scriptBytes > 10000) $ Left "Script size exceeds 10000 bytes"
   evalWithPosition ops 0 0 (env { seStack = stack })
   where
     -- Evaluate ops while tracking byte position and opcode index
