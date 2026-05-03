@@ -231,7 +231,11 @@ import Data.Maybe (isJust)
 import System.IO (Handle, IOMode(..), hSeek, SeekMode(..), hClose, hFileSize,
                   hSetFileSize, openBinaryFile, hFlush)
 import System.FilePath ((</>))
-import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile)
+import System.Directory (createDirectoryIfMissing, doesFileExist, removeFile,
+                         renameFile)
+import qualified System.Posix.IO as PosixIO
+import qualified System.Posix.Unistd as PosixUnistd
+import qualified Control.Exception as Exc
 import Text.Printf (printf)
 import Control.Concurrent.STM
 import qualified Crypto.Hash as Hash
@@ -2581,12 +2585,25 @@ collectAllCoins cache = do
 -- On-disk @PrefixUTXO@ values are full Core-format 'Coin's (varint @code@
 -- + 'TxOut'), so the per-coin @height@ and @isCoinbase@ metadata round-
 -- trips faithfully into the snapshot's per-coin record.
+--
+-- Atomic write protocol: bytes go to @<path>.incomplete@, the fd is
+-- fsynced via @fileSynchronise@, then renamed to @<path>@. Mirrors
+-- Bitcoin Core's flow in @rpc\/blockchain.cpp::dumptxoutset@
+-- (@temppath = path + ".incomplete"@; write; fsync; rename). On any
+-- failure the temp is best-effort deleted so a crashed dump never
+-- leaves a torn @<path>@ behind — only the @.incomplete@ artifact,
+-- which can be cleaned up out-of-band.
 dumpTxOutSetFromDB :: HaskoinDB
                    -> FilePath
                    -> Word32                 -- ^ network magic (little-endian)
                    -> BlockHash              -- ^ current chain tip
                    -> IO (Either String Word64)
 dumpTxOutSetFromDB db path networkMagic tipHash = do
+  let tmpPath = path <> ".incomplete"
+      cleanupTemp = Exc.handle
+        (\(_ :: IOException) -> pure ())
+        (do exists <- doesFileExist tmpPath
+            when exists (removeFile tmpPath))
   result <- try $ do
     coinsRef <- newIORef ([] :: [SnapshotCoin])
     countRef <- newIORef (0 :: Word64)
@@ -2609,10 +2626,32 @@ dumpTxOutSetFromDB db path networkMagic tipHash = do
           , smCoinsCount = cnt
           }
         bytes = encode metadata <> serializeCoins coins
-    BS.writeFile path bytes
+    -- Open the .incomplete temp, write all bytes, fsync, close, rename.
+    -- The bracket-style structure ensures the handle is closed even if
+    -- an exception fires partway through (e.g. ENOSPC on hPutStr).
+    Exc.bracketOnError
+      (openBinaryFile tmpPath WriteMode)
+      (\h -> hClose h >> cleanupTemp)
+      (\h -> do
+         BS.hPut h bytes
+         hFlush h
+         -- Durability barrier: hand the underlying fd to fsync()
+         -- before the atomic rename. Without this, a power loss
+         -- between rename and dirty-page flush could leave <path>
+         -- visible with zero-length / torn contents.
+         fd <- PosixIO.handleToFd h
+         -- handleToFd consumes the Handle's ownership of the fd, so
+         -- subsequent hClose on h is a no-op and we close via
+         -- closeFd instead.
+         PosixUnistd.fileSynchronise fd
+         PosixIO.closeFd fd)
+    -- Atomic rename: temp -> final. After this point the snapshot
+    -- file is visible to any concurrent reader.
+    renameFile tmpPath path
     return cnt
   case result of
-    Left (e :: IOException) ->
+    Left (e :: IOException) -> do
+      cleanupTemp
       return $ Left $ "Failed to write snapshot: " ++ show e
     Right n -> return $ Right n
 
