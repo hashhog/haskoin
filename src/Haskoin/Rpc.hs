@@ -125,7 +125,7 @@ import Network.HTTP.Types (status200, status400, status401, status404, status405
                            status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch, bracket, mask_, handle)
+import Control.Exception (try, SomeException, catch, bracket, bracket_, mask_, handle)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified System.ZMQ4 as ZMQ
 import Data.IORef
@@ -153,7 +153,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
-import System.Directory (removeFile)
+import System.Directory (doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
@@ -271,6 +271,15 @@ data RpcServer = RpcServer
   , rsStartTime      :: !Int64                  -- ^ Server start time (POSIX seconds)
   , rsCookieFile     :: !FilePath               -- ^ Path to the .cookie file
   , rsCookiePassword :: !Text                   -- ^ Cookie password (__cookie__ auth)
+  , rsBlockSubmissionPaused :: !(TVar Bool)
+    -- ^ NetworkDisable flag: when True, 'handleSubmitBlock' (and any
+    -- P2P block-handler callsite that consults this flag) refuses new
+    -- blocks. Set during 'handleDumpTxOutSet's rewind→dump→replay
+    -- dance to mirror Bitcoin Core's NetworkDisable RAII guard around
+    -- TemporaryRollback in @rpc/blockchain.cpp::dumptxoutset@. Peers
+    -- stay connected; only block acceptance is gated. TVar so the
+    -- P2P block-receive path can read without contending with the
+    -- chain-write lock.
   }
 
 -- | Get current time, using mock time if set (for regtest testing)
@@ -465,7 +474,11 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr = do
   cookiePass <- generateCookiePassword
   let cookiePath = rpcDataDir config </> ".cookie"
   writeCookieFile cookiePath cookiePass
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass
+  -- NetworkDisable flag (mirrors Core's NetworkDisable RAII around
+  -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset). Initialised
+  -- to False; flipped True only inside the rollback dance.
+  pauseVar <- newTVarIO False
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar
   -- Use combined app to handle both RPC and REST endpoints
   tid <- forkIO $ run (rpcPort config) (combinedApp server)
   atomically $ writeTVar threadVar (Just tid)
@@ -1931,6 +1944,19 @@ buildWitnessCommitmentScript bt
 -- | Submit a mined block
 handleSubmitBlock :: RpcServer -> Value -> IO RpcResponse
 handleSubmitBlock server params = do
+  -- NetworkDisable gate: refuse submissions while a `dumptxoutset
+  -- rollback` rewind→dump→replay dance is in progress. Mirrors
+  -- Bitcoin Core's NetworkDisable RAII around TemporaryRollback in
+  -- rpc/blockchain.cpp::dumptxoutset.
+  paused <- readTVarIO (rsBlockSubmissionPaused server)
+  if paused
+    then return $ RpcResponse
+           (toJSON ("rejected: block submission paused (dumptxoutset rollback in progress)" :: Text))
+           Null Null
+    else handleSubmitBlockUnpaused server params
+
+handleSubmitBlockUnpaused :: RpcServer -> Value -> IO RpcResponse
+handleSubmitBlockUnpaused server params = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing block hex") Null
@@ -4629,44 +4655,58 @@ handleDumpTxOutSet server params = do
     Left msg -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams msg) Null
     Right (path, target) -> do
-      let net   = rsNetwork server
-          magic = netMagic net
-          hc    = rsHeaderChain server
-      tip       <- readTVarIO (hcTip hc)
-      entries   <- readTVarIO (hcEntries hc)
-      byHeight  <- readTVarIO (hcByHeight hc)
-      case resolveDumpTarget net entries byHeight tip target of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams err) Null
-        Right (baseHeight, baseHash) ->
-          if baseHash == ceHash tip
-             then doDump path magic baseHeight baseHash "tip"
-             else do
-               -- Pruned-mode pre-check. Mirrors Bitcoin Core
-               -- rpc/blockchain.cpp:dumptxoutset:
-               --   if (IsPruneMode() &&
-               --       target_index->nHeight <
-               --       m_blockman.GetFirstBlock()->nHeight)
-               --       throw "Block height N not available (pruned data).
-               --              Use a height after M.";
-               -- haskoin's `isBlockPruned` checks file existence + size,
-               -- so it answers the "do we still have data for this hash?"
-               -- question directly. Fail fast before disconnect_block
-               -- hits a pruned block file.
-               prunedHere <- case rsBlockStore server of
-                 Nothing -> return False
-                 Just blockStore -> isBlockPruned blockStore baseHash
-               if prunedHere
-                  then return $ RpcResponse Null
-                    (toJSON $ RpcError rpcMiscError
-                      (T.pack ("Block height "
-                               <> show baseHeight
-                               <> " not available (pruned data). "
-                               <> "Use a height closer to the current tip."))) Null
-                  else doRollbackDump
-                         net path magic
-                         baseHeight baseHash
-                         tip entries
+      -- Refuse to overwrite an existing destination — matches Core's
+      -- "<path> already exists. If you are sure this is what you want,
+      -- move it out of the way first." guard in
+      -- rpc/blockchain.cpp::dumptxoutset. Probe BEFORE any chain-state
+      -- mutation so a name collision cannot leave the chain stuck in a
+      -- half-rolled-back state.
+      pathExists <- doesFileExist path
+      if pathExists
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            (T.pack (path <>
+              " already exists. If you are sure this is what you want, "
+              <> "move it out of the way first."))) Null
+        else do
+          let net   = rsNetwork server
+              magic = netMagic net
+              hc    = rsHeaderChain server
+          tip       <- readTVarIO (hcTip hc)
+          entries   <- readTVarIO (hcEntries hc)
+          byHeight  <- readTVarIO (hcByHeight hc)
+          case resolveDumpTarget net entries byHeight tip target of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams err) Null
+            Right (baseHeight, baseHash) ->
+              if baseHash == ceHash tip
+                 then doDump path magic baseHeight baseHash "tip"
+                 else do
+                   -- Pruned-mode pre-check. Mirrors Bitcoin Core
+                   -- rpc/blockchain.cpp:dumptxoutset:
+                   --   if (IsPruneMode() &&
+                   --       target_index->nHeight <
+                   --       m_blockman.GetFirstBlock()->nHeight)
+                   --       throw "Block height N not available (pruned data).
+                   --              Use a height after M.";
+                   -- haskoin's `isBlockPruned` checks file existence + size,
+                   -- so it answers the "do we still have data for this hash?"
+                   -- question directly. Fail fast before disconnect_block
+                   -- hits a pruned block file.
+                   prunedHere <- case rsBlockStore server of
+                     Nothing -> return False
+                     Just blockStore -> isBlockPruned blockStore baseHash
+                   if prunedHere
+                      then return $ RpcResponse Null
+                        (toJSON $ RpcError rpcMiscError
+                          (T.pack ("Block height "
+                                   <> show baseHeight
+                                   <> " not available (pruned data). "
+                                   <> "Use a height closer to the current tip."))) Null
+                      else doRollbackDump
+                             net path magic
+                             baseHeight baseHash
+                             tip entries
   where
     doDump path magic baseHeight baseHash status = do
       result <- dumpTxOutSetFromDB (rsDB server) path magic baseHash
@@ -4708,6 +4748,17 @@ handleDumpTxOutSet server params = do
 
     doRollbackDump net path magic baseHeight baseHash tip entries = do
       let db = rsDB server
+      -- NetworkDisable RAII via Control.Exception.bracket_. Mirrors
+      -- Bitcoin Core's NetworkDisable wrapper around TemporaryRollback
+      -- in rpc/blockchain.cpp::dumptxoutset. Pause inbound block
+      -- acceptance for the duration of the rewind→dump→replay dance
+      -- and restore on every exit path (success, error, exception).
+      bracket_
+        (atomically $ writeTVar (rsBlockSubmissionPaused server) True)
+        (atomically $ writeTVar (rsBlockSubmissionPaused server) False)
+        (doRollbackDumpInner db net path magic baseHeight baseHash tip entries)
+
+    doRollbackDumpInner db net path magic baseHeight baseHash tip entries = do
       case buildRewindPath entries tip baseHash of
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInternalError

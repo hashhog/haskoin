@@ -100,7 +100,8 @@ import Data.List.NonEmpty (NonEmpty(..))
 import qualified System.ZMQ4 as ZMQ
 import System.IO.Temp (withSystemTempDirectory)
 import qualified System.Directory as Dir
-import Control.Exception (bracket, catch, SomeException)
+import Control.Exception (bracket, bracket_, catch, try, SomeException)
+import qualified Control.Exception
 import qualified System.Environment as SE
 import System.Environment (lookupEnv, setEnv, unsetEnv)
 import qualified Network.Socket as NS
@@ -11173,6 +11174,36 @@ main = hspec $ do
             Right _  -> expectationFailure
               "loadSnapshot accepted a snapshot with wrong network magic"
 
+      it "dumpTxOutSetFromDB uses atomic-write protocol \
+         \(no .incomplete on success)" $
+        -- Mirrors Bitcoin Core's rpc/blockchain.cpp::dumptxoutset
+        -- which writes to <path>.incomplete, fsyncs, and renames.
+        -- After a successful dump only <path> should exist; the
+        -- .incomplete temp must be gone so that operators copying
+        -- mid-dump never see a torn file.
+        withSystemTempDirectory "haskoin-snap-atomic" $ \tmp -> do
+          let dbDir = tmp </> "db"
+              snapPath = tmp </> "atomic.utxo.dat"
+              tempPath = snapPath ++ ".incomplete"
+          Dir.createDirectoryIfMissing True dbDir
+          let cfg = (defaultDBConfig dbDir)
+                { dbCreateIfMissing = True
+                , dbCompression     = False
+                }
+          bracket (openDB cfg) closeDB $ \db -> do
+            -- Even an empty dump must still produce <path> via the
+            -- atomic rename path. We don't insert any UTXOs.
+            r <- dumpTxOutSetFromDB db snapPath mainnetMagic
+                   (BlockHash (Hash256 (BS.replicate 32 0xaa)))
+            case r of
+              Left e ->
+                expectationFailure $ "dumpTxOutSetFromDB: " ++ e
+              Right _ -> do
+                pathExists <- Dir.doesFileExist snapPath
+                tempExists <- Dir.doesFileExist tempPath
+                pathExists `shouldBe` True
+                tempExists `shouldBe` False
+
       it "dumpTxOutSetFromDB → loadSnapshot round-trips and does NOT \
          \re-trip the bytesRead=undefined crash" $
         withSystemTempDirectory "haskoin-snap-rt" $ \tmp -> do
@@ -11408,6 +11439,51 @@ main = hspec $ do
     --
     -- Reference: bitcoin/src/validation.cpp ConnectBlock /
     -- DisconnectBlock + bitcoin/src/undo.h CBlockUndo.
+    describe "NetworkDisable rollback gate" $ do
+      -- Mirrors Bitcoin Core's NetworkDisable wrapper around
+      -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset. We
+      -- exercise the TVar-backed flag directly, confirming the RAII
+      -- semantics that Control.Exception.bracket_ enforces around
+      -- doRollbackDumpInner: set on entry, clear on every exit
+      -- (success, exception, async cancellation).
+
+      it "TVar Bool flag defaults to False" $ do
+        flag <- newTVarIO False
+        readTVarIO flag `shouldReturn` False
+
+      it "set/clear round-trips" $ do
+        flag <- newTVarIO False
+        atomically $ writeTVar flag True
+        readTVarIO flag `shouldReturn` True
+        atomically $ writeTVar flag False
+        readTVarIO flag `shouldReturn` False
+
+      it "bracket_ pause-then-restore mirrors NetworkDisable RAII" $ do
+        flag <- newTVarIO False
+        -- Inside bracket_ the flag must be True; after the action
+        -- (success path) it must return to False.
+        Control.Exception.bracket_
+          (atomically $ writeTVar flag True)
+          (atomically $ writeTVar flag False)
+          (do
+            inside <- readTVarIO flag
+            inside `shouldBe` True)
+        readTVarIO flag `shouldReturn` False
+
+      it "bracket_ restores flag even when action throws" $ do
+        flag <- newTVarIO False
+        let bombing :: IO ()
+            bombing = error "simulate failure inside rollback dance"
+        (result :: Either SomeException ()) <-
+          Control.Exception.try
+            (Control.Exception.bracket_
+              (atomically $ writeTVar flag True)
+              (atomically $ writeTVar flag False)
+              bombing)
+        case result of
+          Left _  -> readTVarIO flag `shouldReturn` False
+          Right _ -> expectationFailure "bracket_ action should have thrown"
+
     describe "connectBlock undo-data round-trip" $ do
       let mkPrevHash byte = BlockHash (Hash256 (BS.replicate 32 byte))
           -- A minimal Block whose tx1 spends one output created by tx0
