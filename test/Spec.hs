@@ -1269,11 +1269,16 @@ main = hspec $ do
     -- proof. Schnorr verify itself is exercised in the existing Tapscript
     -- code paths (verifySchnorr / verifyTapscriptSchnorr).
     let blankTx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0xffffffff] [] [[]] 0
+        -- Validation-weight budget: tests below want enough budget to NOT
+        -- trip the BIP-342 weight gate, so we seed a generous default. The
+        -- weight-budget tests at the bottom of this describe override it.
         baseEnv = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
                     { seIsTapscript = True
                     , seSpentAmounts = [0]
                     , seSpentScripts = [BS.empty]
                     , seTapleafHash  = Just (BS.replicate 32 0)
+                    , seValidationWeightLeft = 10000
+                    , seValidationWeightInit = True
                     }
 
     it "encodes 0xBA round-trip" $ do
@@ -1365,6 +1370,111 @@ main = hspec $ do
             (top:_) -> top `shouldBe` encodeScriptNum 8  -- 7 + 1
             []      -> expectationFailure "Stack should have result on top"
         Left err -> expectationFailure $ "Unexpected failure: " ++ err
+
+  describe "Tapscript validation-weight budget (BIP-342 / interpreter.cpp:362)" $ do
+    -- The DoS-protection counter limits non-empty CHECKSIG/CHECKSIGADD/
+    -- CHECKSIGVERIFY operations to (witness_serialized_size + 50) / 50.
+    -- Empty signatures do NOT consume budget. Unknown-pubkey-type
+    -- forward-compat success DOES consume budget (Core comment:
+    -- "Passing with an upgradable public key version is also counted").
+    let blankTx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0xffffffff] [] [[]] 0
+
+    it "compactSizeLen / getSerializeSizeOfWitnessStack match Core" $ do
+      -- 1 item of 64 bytes: compact_size(1)=1, item_prefix(64)=1, item=64
+      compactSizeLen 0     `shouldBe` 1
+      compactSizeLen 0xfc  `shouldBe` 1
+      compactSizeLen 0xfd  `shouldBe` 3
+      compactSizeLen 0xffff `shouldBe` 3
+      compactSizeLen 0x10000 `shouldBe` 5
+      getSerializeSizeOfWitnessStack [] `shouldBe` 1
+      getSerializeSizeOfWitnessStack [BS.replicate 64 0x00] `shouldBe` (1 + 1 + 64)
+      getSerializeSizeOfWitnessStack [BS.replicate 100 0x00, BS.replicate 33 0x00]
+        `shouldBe` (1 + (1 + 100) + (1 + 33))
+
+    it "exhausted budget → TAPSCRIPT_VALIDATION_WEIGHT (CHECKSIGADD)" $ do
+      -- Budget = 49: non-empty sig forces -50, going negative → error.
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seSpentAmounts = [0]
+                  , seSpentScripts = [BS.empty]
+                  , seTapleafHash  = Just (BS.replicate 32 0)
+                  , seValidationWeightLeft = 49
+                  , seValidationWeightInit = True
+                  , seStack = [BS.replicate 33 0x02, encodeScriptNum 0, BS.replicate 64 0x42]
+                  }
+      case execCheckSigAdd env of
+        Left msg | "TAPSCRIPT_VALIDATION_WEIGHT" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $ "Expected TAPSCRIPT_VALIDATION_WEIGHT, got: " ++ other
+        Right _    -> expectationFailure "Should have failed with budget exhausted"
+
+    it "budget remaining → success (forward-compat path)" $ do
+      -- Budget = 50: exactly one non-empty sig fits, remainder = 0.
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seSpentAmounts = [0]
+                  , seSpentScripts = [BS.empty]
+                  , seTapleafHash  = Just (BS.replicate 32 0)
+                  , seValidationWeightLeft = 50
+                  , seValidationWeightInit = True
+                  , seStack = [BS.replicate 33 0x02, encodeScriptNum 0, BS.replicate 64 0x42]
+                  }
+      case execCheckSigAdd env of
+        Right env' -> seValidationWeightLeft env' `shouldBe` 0
+        Left err -> expectationFailure $ "Unexpected failure with sufficient budget: " ++ err
+
+    it "empty sig consumes NO budget (CHECKSIGADD)" $ do
+      -- Even with budget = 0, empty sig must NOT trip the weight gate.
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seSpentAmounts = [0]
+                  , seSpentScripts = [BS.empty]
+                  , seTapleafHash  = Just (BS.replicate 32 0)
+                  , seValidationWeightLeft = 0
+                  , seValidationWeightInit = True
+                  , seStack = [BS.replicate 33 0x02, encodeScriptNum 9, BS.empty]
+                  }
+      case execCheckSigAdd env of
+        Right env' -> do
+          seValidationWeightLeft env' `shouldBe` 0
+          case seStack env' of
+            (top:_) -> top `shouldBe` encodeScriptNum 9
+            [] -> expectationFailure "Stack should have result"
+        Left err -> expectationFailure $ "Empty sig must not consume budget: " ++ err
+
+    it "exhausted budget → TAPSCRIPT_VALIDATION_WEIGHT (CHECKSIG, unknown pubkey)" $ do
+      -- Same gate fires on the OP_CHECKSIG path with an unknown pubkey type.
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = True
+                  , seSpentAmounts = [0]
+                  , seSpentScripts = [BS.empty]
+                  , seTapleafHash  = Just (BS.replicate 32 0)
+                  , seValidationWeightLeft = 0
+                  , seValidationWeightInit = True
+                  , seStack = [BS.replicate 33 0x02, BS.replicate 64 0x42]
+                  }
+      case execCheckSig env of
+        Left msg | "TAPSCRIPT_VALIDATION_WEIGHT" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $ "Expected TAPSCRIPT_VALIDATION_WEIGHT, got: " ++ other
+        Right _    -> expectationFailure "Should have failed with budget exhausted"
+
+    it "legacy CHECKSIG (non-tapscript) is unaffected by budget" $ do
+      -- seIsTapscript = False, weight uninitialized: legacy code path must
+      -- not reference the budget at all.
+      let env = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                  { seIsTapscript = False
+                  , seValidationWeightLeft = 0
+                  , seValidationWeightInit = False
+                  -- Empty pubkey + empty sig → legacy CHECKSIG pushes false
+                  -- (this is enough to confirm the legacy branch did not
+                  -- trip the weight gate; signature crypto is exercised
+                  -- elsewhere).
+                  , seStack = [BS.empty, BS.empty]
+                  }
+      case execCheckSig env of
+        Right env' -> case seStack env' of
+          (top:_) -> top `shouldBe` BS.empty   -- false
+          []      -> expectationFailure "Stack should have result"
+        Left err -> expectationFailure $ "Legacy CHECKSIG should not error here: " ++ err
 
   describe "isPushOnly and push only scripts" $ do
     it "returns True for empty script" $ do

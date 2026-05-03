@@ -82,7 +82,10 @@ module Haskoin.Script
     -- without going through full witness-v1 verification. Not a stable API.
   , ScriptEnv(..)
   , initScriptEnvWithFlags
+  , execCheckSig
   , execCheckSigAdd
+  , compactSizeLen
+  , getSerializeSizeOfWitnessStack
   ) where
 
 import Data.ByteString (ByteString)
@@ -1141,6 +1144,18 @@ data ScriptEnv = ScriptEnv
   , seSpentScripts :: ![ByteString]    -- ^ per-input scriptPubKeys (for sha_scriptpubkeys)
   , seTapleafHash  :: !(Maybe ByteString) -- ^ tapleaf hash for ext_flag=1 sighash
   , seTaprootAnnex :: !(Maybe ByteString) -- ^ witness annex (with leading 0x50)
+    -- BIP-342 tapscript validation-weight budget. Mirrors Core's
+    -- ScriptExecutionData::m_validation_weight_left (interpreter.cpp:362).
+    -- Initialized at the tapscript entry point to
+    --   GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET (50)
+    -- and decremented by VALIDATION_WEIGHT_PER_SIGOP_PASSED (50) on every
+    -- OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKSIGADD whose signature is
+    -- non-empty (whether or not the schnorr check actually succeeds).
+    -- A negative budget aborts with TAPSCRIPT_VALIDATION_WEIGHT.
+    -- 'seValidationWeightInit' guards against budget tracking firing in
+    -- legacy / SegWit-v0 contexts where the budget is not initialized.
+  , seValidationWeightLeft :: !Int
+  , seValidationWeightInit :: !Bool
   } deriving (Show)
 
 -- | Initialize script environment
@@ -1167,6 +1182,8 @@ initScriptEnvWithFlags tx idx amount scriptCode flags = ScriptEnv
   , seSpentScripts = []
   , seTapleafHash  = Nothing
   , seTaprootAnnex = Nothing
+  , seValidationWeightLeft = 0
+  , seValidationWeightInit = False
   }
 
 -- | Result of script evaluation
@@ -1756,6 +1773,29 @@ execCodeSeparator env =
       -- This just returns success
       Right env
 
+-- | Consume one tapscript validation-weight unit (50) from the env's
+-- m_validation_weight_left counter. Mirrors Core's interpreter.cpp:362,
+-- where each non-empty CHECKSIG / CHECKSIGVERIFY / CHECKSIGADD that
+-- "passes" the !sig.empty() gate decrements the budget by 50, and a
+-- negative result aborts with TAPSCRIPT_VALIDATION_WEIGHT.
+--
+-- Per Core's comment: \"Passing with an upgradable public key version
+-- is also counted.\" — i.e. the deduction fires before the pubkey is
+-- inspected, on every non-empty-signature path through CHECKSIG.
+--
+-- Caller must only invoke this on the tapscript path with a non-empty
+-- signature; the assert on m_validation_weight_left_init is mirrored
+-- here as a defensive check.
+consumeValidationWeight :: ScriptEnv -> Either String ScriptEnv
+consumeValidationWeight env
+  | not (seValidationWeightInit env) =
+      Left "TAPSCRIPT_VALIDATION_WEIGHT: budget not initialized"
+  | otherwise =
+      let new = seValidationWeightLeft env - 50
+      in if new < 0
+         then Left "TAPSCRIPT_VALIDATION_WEIGHT"
+         else Right env { seValidationWeightLeft = new }
+
 -- | Execute OP_CHECKSIG
 -- IMPORTANT: Pop pubkey first (top of stack), then signature
 -- BIP-146 NULLFAIL: If sig check fails and NULLFAIL flag is set,
@@ -1777,6 +1817,13 @@ execCheckSig env = do
   -- BIP-342: Tapscript CHECKSIG rules
   if seIsTapscript env''
     then do
+      -- BIP-342 validation-weight budget: decrement BEFORE pubkey
+      -- inspection, only when the signature is non-empty. Matches Core's
+      -- success = !sig.empty() gate at interpreter.cpp:357-366. Empty
+      -- sigs do not consume budget.
+      env''' <- if BS.null sigBytes
+                  then Right env''
+                  else consumeValidationWeight env''
       -- Empty pubkey is an error in tapscript
       when (BS.null pubkeyBytes) $
         Left "TAPSCRIPT_EMPTY_PUBKEY"
@@ -1786,15 +1833,15 @@ execCheckSig env = do
           -- Unknown pubkey type: if sig is non-empty, push true; if empty, push false
           -- (BIP-342 soft-fork-safe forward compatibility)
           if BS.null sigBytes
-            then Right $ pushStack stackFalse env''
-            else Right $ pushStack stackTrue env''
+            then Right $ pushStack stackFalse env'''
+            else Right $ pushStack stackTrue env'''
         else
           -- 32-byte pubkey: BIP-340 Schnorr signature verification with
           -- BIP-341 ext_flag=1 sighash (tapleaf_hash + codesep_pos).
           if BS.null sigBytes
-            then Right $ pushStack stackFalse env''
-            else case verifyTapscriptSchnorr env'' sigBytes pubkeyBytes of
-              Right True  -> Right $ pushStack stackTrue env''
+            then Right $ pushStack stackFalse env'''
+            else case verifyTapscriptSchnorr env''' sigBytes pubkeyBytes of
+              Right True  -> Right $ pushStack stackTrue env'''
               Right False -> Left "Tapscript Schnorr verify failed (NULLFAIL)"
               Left err    -> Left err
     else execCheckSigLegacy env'' pubkeyBytes sigBytes
@@ -1950,6 +1997,14 @@ execCheckSigAdd env = do
   when (num > maxBound - 1) $
     Left "OP_CHECKSIGADD: num overflow"
 
+  -- BIP-342 validation-weight budget: decrement BEFORE pubkey inspection,
+  -- only when the signature is non-empty. Matches Core's success =
+  -- !sig.empty() gate at interpreter.cpp:357-366 (which CHECKSIGADD
+  -- shares via EvalChecksigTapscript). Empty sigs do not consume budget.
+  env3w <- if BS.null sigBytes
+             then Right env3
+             else consumeValidationWeight env3
+
   -- Verify the signature in tapscript context. Empty sig short-circuits to
   -- success = False (no Schnorr verify performed). Other failures (bad sig
   -- length, missing prevouts, etc.) propagate as errors and abort the script.
@@ -1969,14 +2024,14 @@ execCheckSigAdd env = do
             -- Unknown pubkey type with non-empty sig: forward-compat success
             -- (matches OP_CHECKSIG path for non-32-byte tapscript pubkeys).
             Right True
-          else case verifyTapscriptSchnorr env3 sigBytes pubkeyBytes of
+          else case verifyTapscriptSchnorr env3w sigBytes pubkeyBytes of
             Right True  -> Right True
             Right False -> Left "Tapscript Schnorr verify failed (NULLFAIL)"
             Left err    -> Left err
 
   -- Push num + (success ? 1 : 0).
   let result = num + (if success then 1 else 0)
-  Right $ pushStack (encodeScriptNum result) env3
+  Right $ pushStack (encodeScriptNum result) env3w
 
 -- | Parse sighash byte to SigHashType
 parseSigHashByte :: Word8 -> SigHashType
@@ -2678,6 +2733,12 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
               -- Decode and evaluate the tapscript
               tapscript <- decodeScript tapscriptBytes
 
+              -- BIP-342 validation-weight budget (interpreter.cpp:1981):
+              --   GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET
+              -- where 'witness.stack' is the ORIGINAL pre-pop witness stack
+              -- (annex INCLUDED, control block + script INCLUDED, args INCLUDED).
+              let validationWeightLeft =
+                    getSerializeSizeOfWitnessStack witness + 50
               let env = (initScriptEnvWithFlags tx idx amount tapscriptBytes flags)
                         { seIsWitness = True
                         , seIsTapscript = True
@@ -2686,6 +2747,8 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
                         , seSpentScripts = spentScripts
                         , seTapleafHash  = Just tapleafHashBytes
                         , seTaprootAnnex = annex
+                        , seValidationWeightLeft = validationWeightLeft
+                        , seValidationWeightInit = True
                         }
 
               -- Evaluate tapscript with the witness stack (reversed for wire order)
@@ -2729,6 +2792,30 @@ walkMerklePath = foldl' step
 serVarBytesPrefix :: ByteString -> ByteString
 serVarBytesPrefix bs =
   runPut (putVarInt (fromIntegral (BS.length bs)) >> putByteString bs)
+
+-- | Compute the on-the-wire serialized size of a Bitcoin compact-size
+-- (variable-integer) encoding for the given non-negative value.
+-- Mirrors @GetSizeOfCompactSize@ in Core's serialize.h:
+--   <  0xfd            -> 1 byte
+--   <= 0xffff          -> 3 bytes (0xfd || u16)
+--   <= 0xffffffff      -> 5 bytes (0xfe || u32)
+--   else               -> 9 bytes (0xff || u64)
+compactSizeLen :: Int -> Int
+compactSizeLen n
+  | n < 0xfd        = 1
+  | n <= 0xffff     = 3
+  | n <= 0xffffffff = 5
+  | otherwise       = 9
+
+-- | Compute the serialized size of a witness stack (vector of
+-- byte-vectors) the way Core's @::GetSerializeSize(witness.stack)@
+-- computes it: a compact-size count, followed by, for each stack item,
+-- a compact-size length prefix and the item bytes themselves.
+-- Used to seed the BIP-342 tapscript validation-weight budget.
+getSerializeSizeOfWitnessStack :: [ByteString] -> Int
+getSerializeSizeOfWitnessStack items =
+  compactSizeLen (length items)
+  + sum [compactSizeLen (BS.length it) + BS.length it | it <- items]
 
 -- | Verify SegWit script (entry point, without flags, for backward compatibility)
 verifySegWitScript :: Tx -> Int -> ByteString -> Word64 -> Either String Bool
