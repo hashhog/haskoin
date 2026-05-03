@@ -49,6 +49,8 @@ module Haskoin.Rpc
   , parseRestFormat
   , maxRestHeadersResults
   , maxGetUtxosOutpoints
+    -- * BIP-22 result string mapping
+  , bip22ResultString
     -- * Internal helpers (exported for testing)
   , deploymentInfoForEntry
   , softforksFromEntry
@@ -145,8 +147,8 @@ import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
 import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
-import Data.Char (chr)
-import Data.List (foldl')
+import Data.Char (chr, toLower)
+import Data.List (foldl', isInfixOf)
 import Text.Printf (printf)
 import qualified Data.Vector as V
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -1941,6 +1943,84 @@ buildWitnessCommitmentScript bt
       -- For now, return empty and let miner compute it
       BS.empty
 
+-- | Map an internal block-validation error string to a canonical BIP-22
+-- submitblock result string.
+--
+-- BIP-22: https://github.com/bitcoin/bips/blob/master/bip-0022.mediawiki
+-- Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
+--
+-- Consensus rejections go in the JSON-RPC *result* field as short ASCII
+-- strings, NOT as JSON-RPC error objects.
+bip22ResultString :: String -> String
+bip22ResultString err
+  -- Already-canonical strings pass through unchanged
+  | err `elem` ["duplicate", "inconclusive", "duplicate-invalid",
+                "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
+                "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
+                "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
+                "mandatory-script-verify-flag-failed",
+                "bad-txns-inputs-missingorspent"] = err
+
+  -- PoW / difficulty (from validateFullBlock / submitBlock)
+  | "does not meet proof of work" `isInfixOf` s = "high-hash"
+  | "proof of work check failed" `isInfixOf` s  = "high-hash"
+  | "incorrect difficulty target" `isInfixOf` s  = "high-hash"
+
+  -- Merkle root
+  | "merkle root mismatch" `isInfixOf` s         = "bad-txnmrklroot"
+
+  -- Witness commitment (BIP141)
+  | "witness commitment mismatch" `isInfixOf` s  = "bad-witness-merkle-match"
+  | "witness commitment" `isInfixOf` s           = "bad-witness-merkle-match"
+
+  -- Coinbase value / subsidy
+  | "coinbase value exceeds" `isInfixOf` s       = "bad-cb-amount"
+  | "coinbase amount" `isInfixOf` s              = "bad-cb-amount"
+  | "subsidy" `isInfixOf` s                      = "bad-cb-amount"
+
+  -- Sigops limit
+  | "sigop" `isInfixOf` s                        = "bad-blk-sigops"
+
+  -- Block weight / size
+  | "exceeds maximum weight" `isInfixOf` s       = "bad-blk-length"
+
+  -- BIP34 coinbase height (already canonical in validateFullBlock)
+  | "bad-cb-height" `isInfixOf` s               = "bad-cb-height"
+
+  -- Non-final transactions (already canonical in validateFullBlock)
+  | "bad-txns-nonfinal" `isInfixOf` s           = "bad-txns-nonfinal"
+  | "sequence lock" `isInfixOf` s               = "bad-txns-nonfinal"
+
+  -- Duplicate transactions
+  | "duplicate inputs" `isInfixOf` s            = "bad-txns-duplicate"
+  | "duplicate transaction" `isInfixOf` s       = "bad-txns-duplicate"
+
+  -- Missing inputs / UTXO
+  | "missing utxo" `isInfixOf` s                = "bad-txns-inputs-missingorspent"
+  | "missing input" `isInfixOf` s               = "bad-txns-inputs-missingorspent"
+
+  -- Script verification failures
+  | "script verify failed" `isInfixOf` s        = "mandatory-script-verify-flag-failed"
+  | "script verification failed" `isInfixOf` s  = "mandatory-script-verify-flag-failed"
+  | "checksig failed" `isInfixOf` s             = "mandatory-script-verify-flag-failed"
+  | "tapscript" `isInfixOf` s                   = "mandatory-script-verify-flag-failed"
+
+  -- Timestamp errors
+  | "timestamp not after median" `isInfixOf` s  = "time-too-old"
+  | "too far in the future" `isInfixOf` s       = "time-too-new"
+
+  -- Block validation failed wrapper (submitBlock adds this prefix)
+  | ("block validation failed:" :: String) `isInfixOf` s =
+      bip22ResultString (drop (length ("block validation failed: " :: String)) err)
+
+  -- Previous / unknown block
+  | "unknown previous block" `isInfixOf` s      = "inconclusive"
+  | "prev" `isInfixOf` s && "not found" `isInfixOf` s = "inconclusive"
+
+  | otherwise = "rejected"
+  where
+    s = map toLower err
+
 -- | Submit a mined block
 handleSubmitBlock :: RpcServer -> Value -> IO RpcResponse
 handleSubmitBlock server params = do
@@ -1951,7 +2031,7 @@ handleSubmitBlock server params = do
   paused <- readTVarIO (rsBlockSubmissionPaused server)
   if paused
     then return $ RpcResponse
-           (toJSON ("rejected: block submission paused (dumptxoutset rollback in progress)" :: Text))
+           (toJSON ("rejected" :: Text))
            Null Null
     else handleSubmitBlockUnpaused server params
 
@@ -1973,7 +2053,12 @@ handleSubmitBlockUnpaused server params = do
                           (rsHeaderChain server) (rsUTXOCache server)
                           (rsPeerMgr server) block
               case result of
-                Left err -> return $ RpcResponse (toJSON err) Null Null
+                Left err ->
+                  -- Map internal error strings to canonical BIP-22 result strings.
+                  -- BIP-22: rejection reason goes in the result field as a plain
+                  -- string, not as a JSON-RPC error object.
+                  let bip22 = T.pack $ bip22ResultString err
+                  in return $ RpcResponse (toJSON bip22) Null Null
                 Right () -> return $ RpcResponse Null Null Null
 
 -- | Get mining-related information
