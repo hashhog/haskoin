@@ -58,6 +58,10 @@ module Haskoin.Consensus
   , computeMerkleRoot
     -- * AssumeValid
   , shouldSkipScripts
+    -- * Transaction Finality
+  , isFinalTxCheck
+  , locktimeThresholdConsensus
+  , sequenceFinalConsensus
     -- * Full Block Validation
   , validateFullBlock
   , validateFullBlockWithSigCache
@@ -2028,6 +2032,39 @@ countTxSigops utxoMap tx =
             Left _  -> 0
 
 --------------------------------------------------------------------------------
+-- Transaction Finality (IsFinalTx)
+--------------------------------------------------------------------------------
+
+-- | LOCKTIME_THRESHOLD: locktimes >= this value are UNIX timestamps;
+-- values below are interpreted as block heights.
+-- Reference: Bitcoin Core consensus/tx_check.cpp
+locktimeThresholdConsensus :: Word32
+locktimeThresholdConsensus = 500000000
+
+-- | SEQUENCE_FINAL: when all inputs carry this sequence, nLockTime is ignored.
+sequenceFinalConsensus :: Word32
+sequenceFinalConsensus = 0xFFFFFFFF
+
+-- | Check if a transaction is final at the given block height and time.
+-- A transaction is final if:
+--   1. nLockTime == 0, OR
+--   2. nLockTime < threshold (satisfied by height or time), OR
+--   3. All inputs have nSequence == 0xFFFFFFFF (SEQUENCE_FINAL)
+--
+-- This matches Bitcoin Core's IsFinalTx() in src/consensus/tx_check.cpp.
+-- Called from validateFullBlock to implement ContextualCheckBlock parity.
+isFinalTxCheck :: Tx -> Word32 -> Word32 -> Bool
+isFinalTxCheck tx blockHeight blockTime
+  | txLockTime tx == 0 = True
+  | isLockTimeSatisfied = True
+  | otherwise = all (\inp -> txInSequence inp == sequenceFinalConsensus) (txInputs tx)
+  where
+    lockTime = txLockTime tx
+    isLockTimeSatisfied
+      | lockTime < locktimeThresholdConsensus = lockTime < blockHeight
+      | otherwise                             = lockTime < blockTime
+
+--------------------------------------------------------------------------------
 -- Full Block Validation
 --------------------------------------------------------------------------------
 
@@ -2079,26 +2116,38 @@ validateFullBlock net cs skipScripts block utxoMap = do
       Nothing -> Left "Coinbase missing height (BIP-34)"
       Just h  -> unless (h == height) $ Left "Coinbase height mismatch"
 
-  -- 6. Validate all transactions and compute total fees.
+  -- 6. IsFinalTx: every transaction must be final at this block height/time.
+  -- Reference: Bitcoin Core ContextualCheckBlock (validation.cpp:4146).
+  -- nLockTimeCutoff = MTP of prev block when CSV is active (BIP-113), else
+  -- block timestamp. Note: this check applies even when skipScripts=True
+  -- (assumevalid only bypasses script evaluation, not structural consensus rules).
+  let csvActive = height >= netCSVHeight net
+      lockTimeCutoff = if csvActive then csMedianTime cs else bhTimestamp header
+  mapM_ (\tx ->
+    unless (isFinalTxCheck tx height lockTimeCutoff) $
+      Left "bad-txns-nonfinal"
+    ) txns
+
+  -- 7. Validate all transactions and compute total fees.
   -- skipScripts=True means per-input script evaluation is bypassed for this
   -- block (assumevalid ancestor path).  All other checks still run.
   -- KNOWN PITFALL: Intra-block spending - txs can spend outputs from earlier txs
   -- We update UTXO set during validation, not after
   totalFees <- validateBlockTransactions flags skipScripts txns utxoMap
 
-  -- 7. Coinbase value must not exceed reward + fees
+  -- 8. Coinbase value must not exceed reward + fees
   let maxCoinbase = blockReward height + totalFees
       coinbaseValue = sum $ map txOutValue (txOutputs (head txns))
   when (coinbaseValue > maxCoinbase) $
     Left "Coinbase value exceeds allowed amount"
 
-  -- 8. Check sigop cost limit (BIP-141 weight-based counting)
+  -- 9. Check sigop cost limit (BIP-141 weight-based counting)
   -- Legacy/P2SH sigops cost WITNESS_SCALE_FACTOR (4) each, witness sigops cost 1 each
   let SigOpCost totalSigOpCost = getBlockSigOpCost block utxoMap flags
   when (totalSigOpCost > maxBlockSigOpsCost) $
     Left "Block exceeds sigop cost limit"
 
-  -- 9. SegWit witness commitment validation
+  -- 10. SegWit witness commitment validation
   when (flagSegWit flags) $ validateWitnessCommitment block
 
   Right ()
