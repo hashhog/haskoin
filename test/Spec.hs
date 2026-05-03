@@ -1257,6 +1257,115 @@ main = hspec $ do
           dummyTx = Tx 1 [] [] [] 0
       evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
 
+  describe "OP_CHECKSIGADD (BIP-342, opcode 0xBA)" $ do
+    -- BIP-342 reference:
+    --   stack (bottom→top) = sig num pubkey
+    --   pop order: pubkey, num, sig
+    --   push: num + (success ? 1 : 0)
+    --
+    -- We exercise the opcode through the (test-only) execCheckSigAdd entry
+    -- point so we can pin down the BAD_OPCODE / stack-size / counter
+    -- semantics without standing up a full BIP-341 control-block + merkle
+    -- proof. Schnorr verify itself is exercised in the existing Tapscript
+    -- code paths (verifySchnorr / verifyTapscriptSchnorr).
+    let blankTx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0xffffffff] [] [[]] 0
+        baseEnv = (initScriptEnvWithFlags blankTx 0 0 BS.empty emptyFlags)
+                    { seIsTapscript = True
+                    , seSpentAmounts = [0]
+                    , seSpentScripts = [BS.empty]
+                    , seTapleafHash  = Just (BS.replicate 32 0)
+                    }
+
+    it "encodes 0xBA round-trip" $ do
+      let bs = encodeScript (Script [OP_CHECKSIGADD])
+      bs `shouldBe` BS.singleton 0xba
+      decodeScript bs `shouldBe` Right (Script [OP_CHECKSIGADD])
+
+    it "compileMiniscript multi_a uses OP_CHECKSIGADD (was placeholder OP_NOP1)" $ do
+      let pk1 = BS.replicate 32 0x01
+          pk2 = BS.replicate 32 0x02
+          ms  = MsMultiA 2 [pk1, pk2]
+          Script ops = compileMiniscript ContextTapscript ms
+      -- expect: <pk1> CHECKSIG <pk2> CHECKSIGADD <2> NUMEQUAL
+      ops `shouldBe`
+        [ OP_PUSHDATA pk1 OPCODE
+        , OP_CHECKSIG
+        , OP_PUSHDATA pk2 OPCODE
+        , OP_CHECKSIGADD
+        , OP_2
+        , OP_NUMEQUAL
+        ]
+
+    it "rejects OP_CHECKSIGADD outside Tapscript (BAD_OPCODE) via evalScript" $ do
+      -- evalScript runs in legacy (seIsTapscript = False) so 0xBA must fail.
+      let scriptSig    = Script []
+          scriptPubKey = Script
+            [ OP_PUSHDATA (BS.replicate 32 0x02) OPCODE  -- sig
+            , OP_0                                        -- num
+            , OP_PUSHDATA (BS.replicate 32 0x03) OPCODE  -- pubkey
+            , OP_CHECKSIGADD
+            ]
+          dummyTx = Tx 1 [] [] [] 0
+      case evalScript dummyTx 0 0 scriptSig scriptPubKey of
+        Left msg | "Tapscript" `T.isInfixOf` T.pack msg
+                || "BAD_OPCODE" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $
+          "Expected BAD_OPCODE rejection, got: " ++ other
+        Right _    -> expectationFailure
+          "OP_CHECKSIGADD must fail in legacy scripts"
+
+    it "fails on stack underflow (< 3 items)" $ do
+      -- Only 2 items: should fail with INVALID_STACK_OPERATION analogue.
+      let env = baseEnv { seStack = [BS.singleton 0x07, BS.empty] }
+      case execCheckSigAdd env of
+        Left _  -> return ()
+        Right _ -> expectationFailure "Expected stack underflow on 2-item stack"
+
+    it "empty sig + num=0 → push 0 (no Schnorr verify, success=false)" $ do
+      -- Tapscript stack (bottom→top): sig num pubkey
+      -- so seStack (top first) = [pubkey, num, sig]
+      let pubkey = BS.replicate 32 0x03
+          env    = baseEnv { seStack = [pubkey, encodeScriptNum 0, BS.empty] }
+      case execCheckSigAdd env of
+        Right env' ->
+          -- Top of stack is the result num + 0 = 0 → encoded as empty (BS.empty).
+          case seStack env' of
+            (top:_) -> do
+              top `shouldBe` BS.empty  -- 0 in script-num encoding
+            [] -> expectationFailure "Stack should have result on top"
+        Left err -> expectationFailure $ "Unexpected failure: " ++ err
+
+    it "empty sig + num=5 → push 5 (success=false, num unchanged)" $ do
+      let pubkey = BS.replicate 32 0x03
+          env    = baseEnv { seStack = [pubkey, encodeScriptNum 5, BS.empty] }
+      case execCheckSigAdd env of
+        Right env' ->
+          case seStack env' of
+            (top:_) -> top `shouldBe` encodeScriptNum 5
+            []      -> expectationFailure "Stack should have result on top"
+        Left err -> expectationFailure $ "Unexpected failure: " ++ err
+
+    it "empty pubkey is TAPSCRIPT_EMPTY_PUBKEY (always, regardless of sig)" $ do
+      -- Even with empty sig, an empty pubkey must hard-fail in tapscript.
+      let env = baseEnv { seStack = [BS.empty, encodeScriptNum 0, BS.empty] }
+      case execCheckSigAdd env of
+        Left msg | "EMPTY_PUBKEY" `T.isInfixOf` T.pack msg -> return ()
+        Left other -> expectationFailure $ "Expected EMPTY_PUBKEY, got: " ++ other
+        Right _    -> expectationFailure "Empty pubkey must hard-fail in tapscript"
+
+    it "non-empty sig + non-32-byte pubkey → success (forward-compat), num+1" $ do
+      -- Unknown pubkey types in tapscript are forward-compatible (BIP-342):
+      -- if sig is non-empty, the success counter increments unconditionally.
+      let pubkey = BS.replicate 33 0x02  -- 33 bytes (compressed legacy form)
+          sig    = BS.replicate 64 0x42  -- non-empty Schnorr-shaped sig
+          env    = baseEnv { seStack = [pubkey, encodeScriptNum 7, sig] }
+      case execCheckSigAdd env of
+        Right env' ->
+          case seStack env' of
+            (top:_) -> top `shouldBe` encodeScriptNum 8  -- 7 + 1
+            []      -> expectationFailure "Stack should have result on top"
+        Left err -> expectationFailure $ "Unexpected failure: " ++ err
+
   describe "isPushOnly and push only scripts" $ do
     it "returns True for empty script" $ do
       isPushOnly (Script []) `shouldBe` True

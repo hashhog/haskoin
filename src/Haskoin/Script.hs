@@ -76,6 +76,13 @@ module Haskoin.Script
   , dissatisfyMiniscript
   , parseMiniscript
   , miniscriptToText
+    -- * Internal (test-only) entry points for BIP-342 / Tapscript
+    -- These are exposed so the test suite can construct a Tapscript
+    -- 'ScriptEnv' directly and exercise opcode handlers (e.g. CHECKSIGADD)
+    -- without going through full witness-v1 verification. Not a stable API.
+  , ScriptEnv(..)
+  , initScriptEnvWithFlags
+  , execCheckSigAdd
   ) where
 
 import Data.ByteString (ByteString)
@@ -218,6 +225,8 @@ data ScriptOp
   | OP_NOP8                -- ^ 0xb7
   | OP_NOP9                -- ^ 0xb8
   | OP_NOP10               -- ^ 0xb9
+  -- Tapscript (BIP-342)
+  | OP_CHECKSIGADD         -- ^ 0xba (Tapscript only; OP_SUCCESS in non-tapscript? No: per BIP-342, 0xba is allocated to CHECKSIGADD and is a forbidden opcode in legacy/witness-v0)
   -- Invalid
   | OP_INVALIDOPCODE !Word8
   deriving (Show, Eq, Generic)
@@ -486,6 +495,7 @@ decodeScript bs = runGet parseOps bs
         0xb7 -> return OP_NOP8
         0xb8 -> return OP_NOP9
         0xb9 -> return OP_NOP10
+        0xba -> return OP_CHECKSIGADD
         _    -> return $ OP_INVALIDOPCODE byte
 
 --------------------------------------------------------------------------------
@@ -612,6 +622,7 @@ putOp op = case op of
   OP_NOP8 -> putWord8 0xb7
   OP_NOP9 -> putWord8 0xb8
   OP_NOP10 -> putWord8 0xb9
+  OP_CHECKSIGADD -> putWord8 0xba
   OP_INVALIDOPCODE b -> putWord8 b
 
 -- | Encode push data with specified encoding type
@@ -1331,6 +1342,7 @@ execOp op env
       OP_CHECKSIGVERIFY -> incOpCount env >>= execCheckSigVerify
       OP_CHECKMULTISIG -> incOpCount env >>= execCheckMultiSig
       OP_CHECKMULTISIGVERIFY -> incOpCount env >>= execCheckMultiSigVerify
+      OP_CHECKSIGADD -> incOpCount env >>= execCheckSigAdd
 
       -- Locktime
       OP_NOP1 -> incOpCount env >>= checkDiscourageNop
@@ -1894,6 +1906,77 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
 
 execCheckSigVerify :: ScriptEnv -> Either String ScriptEnv
 execCheckSigVerify env = execCheckSig env >>= execVerify
+
+-- | Execute OP_CHECKSIGADD (BIP-342, opcode 0xBA, Tapscript only).
+--
+-- Stack (bottom → top): @sig num pubkey@.
+-- Pop order is pubkey, num, sig. The result @num + (success ? 1 : 0)@ is pushed.
+--
+-- This opcode is forbidden outside Tapscript (legacy / witness-v0): in those
+-- contexts it must fail with SCRIPT_ERR_BAD_OPCODE.
+--
+-- Reference: bitcoin-core/src/script/interpreter.cpp ~L1086-L1116
+--
+-- Tapscript Schnorr verification reuses 'verifyTapscriptSchnorr' so the
+-- semantics for empty sig (skip verify, success=false) and 32-byte/other
+-- pubkey forms match OP_CHECKSIG.
+execCheckSigAdd :: ScriptEnv -> Either String ScriptEnv
+execCheckSigAdd env = do
+  -- BIP-342: OP_CHECKSIGADD is only valid in Tapscript (witness v1 script-path).
+  -- In legacy/witness-v0 it must be a hard error (SCRIPT_ERR_BAD_OPCODE).
+  unless (seIsTapscript env) $
+    Left "OP_CHECKSIGADD only valid in Tapscript (BAD_OPCODE)"
+
+  -- Stack-size check: need at least 3 items (sig, num, pubkey).
+  when (length (seStack env) < 3) $
+    Left "OP_CHECKSIGADD: invalid stack operation"
+
+  -- Pop pubkey (top), num, sig in that order.
+  (pubkeyBytes, env1) <- popStack env
+  (numBytes, env2)    <- popStack env1
+  (sigBytes, env3)    <- popStack env2
+
+  -- Decode num as a script number. Tapscript permits up to 4-byte script
+  -- numbers (Int32 range), and BIP-342 calls for a 4-byte CScriptNum here
+  -- with the standard MINIMALDATA gating, identical to other arithmetic
+  -- opcodes in the interpreter.
+  num <- decodeScriptNum (hasFlag (seFlags env) VerifyMinimalData) numBytes
+
+  -- Bitcoin Core checks: num > INT64_MAX - 1 || num < INT64_MIN, but since
+  -- decodeScriptNum returns Int64 already constrained to a 4-byte CScriptNum
+  -- (|n| < 2^31), we can never overflow. Still, guard explicitly to mirror
+  -- the Core consensus error and to satisfy a future relaxation of the
+  -- decoder bounds.
+  when (num > maxBound - 1) $
+    Left "OP_CHECKSIGADD: num overflow"
+
+  -- Verify the signature in tapscript context. Empty sig short-circuits to
+  -- success = False (no Schnorr verify performed). Other failures (bad sig
+  -- length, missing prevouts, etc.) propagate as errors and abort the script.
+  success <- if BS.null sigBytes
+    then
+      -- Empty pubkey is still an error in tapscript even if sig is empty
+      -- (matches OP_CHECKSIG's TAPSCRIPT_EMPTY_PUBKEY rule).
+      if BS.null pubkeyBytes
+        then Left "TAPSCRIPT_EMPTY_PUBKEY"
+        else Right False
+    else
+      -- Non-empty signature: verify per tapscript rules.
+      if BS.null pubkeyBytes
+        then Left "TAPSCRIPT_EMPTY_PUBKEY"
+        else if BS.length pubkeyBytes /= 32
+          then
+            -- Unknown pubkey type with non-empty sig: forward-compat success
+            -- (matches OP_CHECKSIG path for non-32-byte tapscript pubkeys).
+            Right True
+          else case verifyTapscriptSchnorr env3 sigBytes pubkeyBytes of
+            Right True  -> Right True
+            Right False -> Left "Tapscript Schnorr verify failed (NULLFAIL)"
+            Left err    -> Left err
+
+  -- Push num + (success ? 1 : 0).
+  let result = num + (if success then 1 else 0)
+  Right $ pushStack (encodeScriptNum result) env3
 
 -- | Parse sighash byte to SigHashType
 parseSigHashByte :: Word8 -> SigHashType
@@ -3437,8 +3520,8 @@ compileOps ctx verify ms = case ms of
         [pushNum (fromIntegral k)] ++
         if verify then [OP_NUMEQUALVERIFY] else [OP_NUMEQUAL]
     where
-      -- OP_CHECKSIGADD is only in Tapscript (0xBA)
-      opChecksigAdd = OP_NOP1  -- Placeholder: 0xBA in real Tapscript
+      -- OP_CHECKSIGADD (0xBA), Tapscript-only (BIP-342)
+      opChecksigAdd = OP_CHECKSIGADD
 
   MsSortedMultiA k pks ->
     compileOps ctx verify (MsMultiA k (sortPubKeys pks))
