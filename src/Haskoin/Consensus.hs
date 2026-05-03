@@ -1270,28 +1270,31 @@ data ChainState = ChainState
   , csFlags         :: !ConsensusFlags
   } deriving (Show, Generic)
 
--- | Consensus flags indicating which BIPs are active
+-- | Consensus flags indicating which BIPs are active.
+-- Only MANDATORY_SCRIPT_VERIFY_FLAGS are represented here (Bitcoin Core
+-- policy/policy.h:105-111): P2SH, DERSIG, NULLDUMMY, CLTV, CSV, WITNESS,
+-- TAPROOT.  Policy-only flags (NULLFAIL, LOW_S, CLEANSTACK, etc.) must NOT
+-- appear in the block-connect script-verify flag computer.
 data ConsensusFlags = ConsensusFlags
   { flagBIP34       :: !Bool    -- ^ Block height in coinbase
   , flagBIP65       :: !Bool    -- ^ OP_CHECKLOCKTIMEVERIFY
   , flagBIP66       :: !Bool    -- ^ Strict DER signatures
   , flagSegWit      :: !Bool    -- ^ Segregated Witness
   , flagTaproot     :: !Bool    -- ^ Taproot
-  , flagNullDummy   :: !Bool    -- ^ NULLDUMMY (BIP-147)
-  , flagNullFail    :: !Bool    -- ^ NULLFAIL (BIP-146): failed sig checks must have empty sig
+  , flagNullDummy   :: !Bool    -- ^ NULLDUMMY (BIP-147) — consensus (Core MANDATORY set)
   } deriving (Show, Generic)
 
--- | Compute consensus flags for a given height based on network rules
--- BIP-146 NULLFAIL is activated at the same height as SegWit (481824 mainnet)
+-- | Compute consensus flags for a given height based on network rules.
+-- NULLFAIL (BIP-146) is intentionally excluded: it is a
+-- STANDARD_SCRIPT_VERIFY_FLAG (policy only) per Core policy/policy.h:125.
 consensusFlagsAtHeight :: Network -> Word32 -> ConsensusFlags
 consensusFlagsAtHeight net h = ConsensusFlags
-  { flagBIP34   = h >= netBIP34Height net
-  , flagBIP65   = h >= netBIP65Height net
-  , flagBIP66   = h >= netBIP66Height net
-  , flagSegWit  = h >= netSegwitHeight net
+  { flagBIP34     = h >= netBIP34Height net
+  , flagBIP65     = h >= netBIP65Height net
+  , flagBIP66     = h >= netBIP66Height net
+  , flagSegWit    = h >= netSegwitHeight net
   , flagNullDummy = h >= netSegwitHeight net
-  , flagNullFail = h >= netSegwitHeight net  -- BIP-146: activated with SegWit
-  , flagTaproot = h >= netTaprootHeight net
+  , flagTaproot   = h >= netTaprootHeight net
   }
 
 -- | Convert ConsensusFlags to ScriptFlags for script verification.
@@ -1305,7 +1308,6 @@ consensusFlagsToScriptFlags cf = flagSet $ concat
   , [VerifyCheckSequenceVerify | flagSegWit cf]  -- CSV activated with SegWit
   , [VerifyWitness | flagSegWit cf]
   , [VerifyNullDummy | flagNullDummy cf]
-  , [VerifyNullFail | flagNullFail cf]
   , [VerifyTaproot | flagTaproot cf]
   ]
 
@@ -2193,7 +2195,6 @@ consensusFlagsToWord32 cf =
   .|. (if flagSegWit cf then 8 else 0)
   .|. (if flagTaproot cf then 16 else 0)
   .|. (if flagNullDummy cf then 32 else 0)
-  .|. (if flagNullFail cf then 64 else 0)
 
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
