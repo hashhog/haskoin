@@ -2137,6 +2137,13 @@ validateFullBlock net cs skipScripts block utxoMap = do
   unless (isCoinbase (head txns)) $ Left "First transaction is not coinbase"
   when (any isCoinbase (tail txns)) $ Left "Multiple coinbase transactions"
 
+  -- 2a. Run context-free validation on the coinbase (CheckTransaction analog).
+  -- validateBlockTransactions processes tail txns only (skipping coinbase), so
+  -- the coinbase scriptSig 2..100 byte range check (Core "bad-cb-length") would
+  -- never fire without this explicit call.
+  -- Bitcoin Core: consensus/tx_check.cpp CheckTransaction "bad-cb-length"
+  validateTransaction (head txns)
+
   -- 3. Verify merkle root
   let computedRoot = computeMerkleRoot (map computeTxId txns)
   unless (computedRoot == bhMerkleRoot header) $ Left "Merkle root mismatch"

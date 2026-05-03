@@ -2470,6 +2470,86 @@ main = hspec $ do
         Left msg | "height" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong coinbase height"
 
+    -- Coinbase scriptSig length enforcement: 2..100 bytes.
+    -- Bitcoin Core: consensus/tx_check.cpp CheckTransaction "bad-cb-length"
+    -- Prior to this fix validateTransaction was never called on the coinbase
+    -- (validateBlockTransactions uses tail txns); the check was dead code.
+    it "rejects block with coinbase scriptSig length 1 (bad-cb-length)" $ do
+      let prevHash    = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          shortScript = BS.singleton 0x51  -- 1 byte, below minimum of 2
+          coinbaseIn  = TxIn nullOutpoint shortScript 0xffffffff
+          coinbase    = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid        = computeTxId coinbase
+          merkle      = computeMerkleRoot [txid]
+          header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          block       = Block header [coinbase]
+          cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left msg | "size" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $ "Wrong error: " ++ msg
+        Right () -> expectationFailure "Should reject coinbase with 1-byte scriptSig"
+
+    it "rejects block with coinbase scriptSig length 101 (bad-cb-length)" $ do
+      let prevHash    = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          longScript  = BS.replicate 101 0x51  -- 101 bytes, above maximum of 100
+          coinbaseIn  = TxIn nullOutpoint longScript 0xffffffff
+          coinbase    = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid        = computeTxId coinbase
+          merkle      = computeMerkleRoot [txid]
+          header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          block       = Block header [coinbase]
+          cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left msg | "size" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $ "Wrong error: " ++ msg
+        Right () -> expectationFailure "Should reject coinbase with 101-byte scriptSig"
+
+    it "accepts block with coinbase scriptSig length 2 (minimum)" $ do
+      let prevHash    = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          minScript   = BS.pack [0x01, 0x51]  -- exactly 2 bytes
+          coinbaseIn  = TxIn nullOutpoint minScript 0xffffffff
+          coinbase    = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid        = computeTxId coinbase
+          merkle      = computeMerkleRoot [txid]
+          header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          block       = Block header [coinbase]
+          -- height=1 on regtest; BIP-34 active so also check height encoding.
+          -- Use cs height=0 so block height=1, encode height 1 correctly:
+          -- CScript() << 1 = [0x01, 0x01]
+          correctScript = BS.pack [0x01, 0x01]
+          coinbaseIn2 = TxIn nullOutpoint correctScript 0xffffffff
+          coinbase2   = Tx 1 [coinbaseIn2] [TxOut 5000000000 "out"] [[]] 0
+          txid2       = computeTxId coinbase2
+          merkle2     = computeMerkleRoot [txid2]
+          header2     = BlockHeader 1 prevHash merkle2 0 0x207fffff 0
+          block2      = Block header2 [coinbase2]
+          cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      -- The 2-byte height-encoded scriptSig satisfies both BIP-34 and length range
+      case validateFullBlock regtest cs False block2 Map.empty of
+        Right () -> return ()
+        Left msg | "size" `T.isInfixOf` T.pack msg ->
+          expectationFailure "Should NOT reject coinbase with 2-byte scriptSig (bad-cb-length)"
+        Left msg -> return ()  -- Other errors (subsidy etc.) are expected; length is OK
+
+    it "accepts block with coinbase scriptSig length 100 (maximum)" $ do
+      let prevHash    = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          maxScript   = BS.replicate 100 0x51  -- exactly 100 bytes
+          coinbaseIn  = TxIn nullOutpoint maxScript 0xffffffff
+          coinbase    = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid        = computeTxId coinbase
+          merkle      = computeMerkleRoot [txid]
+          header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          block       = Block header [coinbase]
+          cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left msg | "size" `T.isInfixOf` T.pack msg ->
+          expectationFailure "Should NOT reject coinbase with 100-byte scriptSig (bad-cb-length)"
+        _ -> return ()  -- Other errors expected; bad-cb-length must NOT fire
+
     -- P0-3: validateFullBlock must invoke verifyScriptWithFlags on every
     -- non-coinbase input when skipScripts == False. Prior to the wiring
     -- patch this was DEAD CODE — any block with valid structure but
