@@ -4641,10 +4641,32 @@ handleDumpTxOutSet server params = do
         Right (baseHeight, baseHash) ->
           if baseHash == ceHash tip
              then doDump path magic baseHeight baseHash "tip"
-             else doRollbackDump
-                    net path magic
-                    baseHeight baseHash
-                    tip entries
+             else do
+               -- Pruned-mode pre-check. Mirrors Bitcoin Core
+               -- rpc/blockchain.cpp:dumptxoutset:
+               --   if (IsPruneMode() &&
+               --       target_index->nHeight <
+               --       m_blockman.GetFirstBlock()->nHeight)
+               --       throw "Block height N not available (pruned data).
+               --              Use a height after M.";
+               -- haskoin's `isBlockPruned` checks file existence + size,
+               -- so it answers the "do we still have data for this hash?"
+               -- question directly. Fail fast before disconnect_block
+               -- hits a pruned block file.
+               prunedHere <- case rsBlockStore server of
+                 Nothing -> return False
+                 Just blockStore -> isBlockPruned blockStore baseHash
+               if prunedHere
+                  then return $ RpcResponse Null
+                    (toJSON $ RpcError rpcMiscError
+                      (T.pack ("Block height "
+                               <> show baseHeight
+                               <> " not available (pruned data). "
+                               <> "Use a height closer to the current tip."))) Null
+                  else doRollbackDump
+                         net path magic
+                         baseHeight baseHash
+                         tip entries
   where
     doDump path magic baseHeight baseHash status = do
       result <- dumpTxOutSetFromDB (rsDB server) path magic baseHash
