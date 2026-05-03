@@ -2265,31 +2265,52 @@ validateBlockTransactions flags skipScripts txns initialUtxoMap = do
 -- When 'skipScripts' is True the per-input script loop is not executed;
 -- all other structural and value checks still run (matching Bitcoin Core
 -- behaviour under assumevalid).
+--
+-- Bitcoin Core reference: @validation.cpp ConnectBlock → CheckInputScripts
+-- → VerifyScript@. The 'flags' argument is mapped to 'ScriptFlags' via
+-- 'consensusFlagsToScriptFlags' (MANDATORY set: P2SH, DERSIG, NULLDUMMY,
+-- CLTV, CSV, WITNESS, TAPROOT). 'spentAmounts' / 'spentScripts' are the
+-- prevout amount/scriptPubKey lists required by BIP-341 sighash for
+-- Taproot inputs.
 validateSingleTx :: ConsensusFlags -> Bool -> Map OutPoint TxOut -> Tx
                  -> Either String Word64
-validateSingleTx _flags _skipScripts utxoMap tx = do
+validateSingleTx flags skipScripts utxoMap tx = do
   -- First, run context-free validation (structure checks always run)
   validateTransaction tx
 
-  -- Then validate inputs exist in UTXO set and compute values
-  inputValues <- forM (txInputs tx) $ \inp ->
+  -- Then validate inputs exist in UTXO set and collect prev TxOuts.
+  -- Resolve all prevouts up-front so we can build the per-tx
+  -- spentAmounts / spentScripts lists required for BIP-341 sighash.
+  prevOuts <- forM (txInputs tx) $ \inp ->
     case Map.lookup (txInPrevOutput inp) utxoMap of
-      Nothing -> Left $ "Missing UTXO: " ++ show (txInPrevOutput inp)
-      Just prevOut -> Right (txOutValue prevOut)
+      Nothing      -> Left $ "Missing UTXO: " ++ show (txInPrevOutput inp)
+      Just prevOut -> Right prevOut
 
-  let totalIn  = sum inputValues
-      totalOut = sum $ map txOutValue (txOutputs tx)
+  let inputValues = map txOutValue prevOuts
+      totalIn     = sum inputValues
+      totalOut    = sum $ map txOutValue (txOutputs tx)
 
   -- Inputs must cover outputs (always checked, even under assumevalid)
   when (totalIn < totalOut) $ Left "Outputs exceed inputs"
 
   -- Script / signature verification:
   -- When skipScripts is True (assumevalid ancestor path) we skip this step,
-  -- matching Bitcoin Core's ConnectBlock behaviour.
-  -- When False (or when script verifier is wired in), verify each input here.
-  -- NOTE: Full secp256k1-backed script verification is a future milestone;
-  -- the gate below is in place so the assumevalid path is correctly wired.
-  -- (Haskoin.Script.verifyScriptWithFlags is available for when it is needed.)
+  -- matching Bitcoin Core's ConnectBlock behaviour. Otherwise, every input's
+  -- scriptSig + witness must satisfy its scriptPubKey under the consensus
+  -- ScriptFlags for this height.
+  unless skipScripts $ do
+    let scriptFlags  = consensusFlagsToScriptFlags flags
+        spentAmounts = inputValues
+        spentScripts = map txOutScript prevOuts
+    forM_ (zip [0..] prevOuts) $ \(idx, prevOut) ->
+      case verifyScriptWithFlags scriptFlags tx idx
+             (txOutScript prevOut) (txOutValue prevOut)
+             spentAmounts spentScripts of
+        Left err    -> Left $ "script verify failed (input " ++ show idx
+                            ++ "): " ++ err
+        Right False -> Left $ "script verify failed (input " ++ show idx
+                            ++ "): script returned false"
+        Right True  -> Right ()
 
   return (totalIn - totalOut)
 
