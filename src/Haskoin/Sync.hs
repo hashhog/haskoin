@@ -45,6 +45,7 @@ module Haskoin.Sync
   , downloadWorker
   , blockProcessor
   , buildUTXOMap
+  , checkBIP30
   , flushTBQueueN
   , commitmentHash
   ) where
@@ -70,7 +71,7 @@ import Network.Socket (SockAddr)
 import System.Random (randomRIO)
 
 import Haskoin.Types
-import Haskoin.Crypto (computeBlockHash, sha256)
+import Haskoin.Crypto (computeBlockHash, sha256, computeTxId)
 import Haskoin.Consensus
 import Haskoin.Storage
 import Haskoin.Network
@@ -378,7 +379,16 @@ blockProcessor bd = forever $ do
                       skipScripts = shouldSkipScripts bh nextHeight blockTs
                                       (bdNetwork bd) blockEntries bestHdr
 
-                  case validateFullBlock (bdNetwork bd) cs skipScripts block utxoTxOutMap of
+                  -- BIP-30: reject block if any tx would overwrite an existing UTXO.
+                  -- Must run before validateFullBlock so a duplicate-tx block
+                  -- is caught before its outputs are added to the UTXO set.
+                  -- Reference: Bitcoin Core ConnectBlock / IsBIP30Repeat().
+                  bip30Result <- checkBIP30 (bdDB bd) (bdNetwork bd) nextHeight block
+                  validationResult <- case bip30Result of
+                    Left bip30Err -> return (Left bip30Err)
+                    Right () -> return $ validateFullBlock (bdNetwork bd) cs skipScripts block utxoTxOutMap
+
+                  case validationResult of
                     Left err -> do
                       putStrLn $ "Block validation failed at height "
                                  ++ show nextHeight ++ ": " ++ err
@@ -450,6 +460,47 @@ buildUTXOMap bd block = do
     return (op, mCoin)
 
   return $ Map.fromList [(op, c) | (op, Just c) <- utxos]
+
+-- | BIP-30: reject a block that would overwrite an existing unspent output.
+--
+-- Bitcoin Core enforces BIP-30 in ConnectBlock (validation.cpp ~2467).
+-- Two mainnet blocks are permanently exempt: h=91842 and h=91880.
+-- They predate BIP-30 and intentionally duplicate earlier coinbase txids.
+-- After BIP-34 activation (h >= netBIP34Height), coinbase heights are
+-- unique by construction so duplicates are practically impossible; skip
+-- the check up to h=1,983,702.  After that BIP-34 modular arithmetic
+-- begins repeating pre-BIP34 heights, so re-enable the check.
+-- Reference: Bitcoin Core IsBIP30Repeat() + ConnectBlock validation.cpp.
+--
+-- Returns 'Left "bad-txns-BIP30: ..."' if any output of 'block' already
+-- exists as a UTXO in the database.
+checkBIP30 :: HaskoinDB -> Network -> Word32 -> Block -> IO (Either String ())
+checkBIP30 db net height block
+  | height == 91842 || height == 91880 = return (Right ())
+  | height >= netBIP34Height net && height < bip34ImpliesBIP30Limit = return (Right ())
+  | otherwise = go (blockTxns block)
+  where
+    bip34ImpliesBIP30Limit :: Word32
+    bip34ImpliesBIP30Limit = 1983702
+
+    go [] = return (Right ())
+    go (tx:txs) = do
+      let txid = computeTxId tx
+          vouts = [0 .. fromIntegral (length (txOutputs tx) - 1)]
+      result <- checkTxOutputs txid vouts
+      case result of
+        Left err -> return (Left err)
+        Right () -> go txs
+
+    checkTxOutputs _ [] = return (Right ())
+    checkTxOutputs txid (vout:vouts) = do
+      let op = OutPoint txid vout
+      mUtxo <- getUTXO db op
+      case mUtxo of
+        Just _ ->
+          return $ Left $
+            "bad-txns-BIP30: tried to overwrite transaction"
+        Nothing -> checkTxOutputs txid vouts
 
 --------------------------------------------------------------------------------
 -- Block Message Handling
