@@ -12387,6 +12387,91 @@ main = hspec $ do
           Left "Assumeutxo height in snapshot metadata not recognized \
                \(840001) - refusing to load snapshot"
 
+  -- BIP-22 submitblock result string mapping (must come before 'where' below)
+  -- Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
+  describe "bip22ResultString" $ do
+    it "empty string → 'rejected' catch-all" $
+      bip22ResultString "" `shouldBe` "rejected"
+
+    it "already-canonical 'high-hash' passes through" $
+      bip22ResultString "high-hash" `shouldBe` "high-hash"
+
+    it "already-canonical 'duplicate' passes through" $
+      bip22ResultString "duplicate" `shouldBe` "duplicate"
+
+    it "already-canonical 'inconclusive' passes through" $
+      bip22ResultString "inconclusive" `shouldBe` "inconclusive"
+
+    it "already-canonical 'bad-txnmrklroot' passes through" $
+      bip22ResultString "bad-txnmrklroot" `shouldBe` "bad-txnmrklroot"
+
+    it "already-canonical 'bad-witness-merkle-match' passes through" $
+      bip22ResultString "bad-witness-merkle-match" `shouldBe` "bad-witness-merkle-match"
+
+    it "already-canonical 'bad-cb-height' passes through" $
+      bip22ResultString "bad-cb-height" `shouldBe` "bad-cb-height"
+
+    it "already-canonical 'bad-txns-nonfinal' passes through" $
+      bip22ResultString "bad-txns-nonfinal" `shouldBe` "bad-txns-nonfinal"
+
+    it "'Block does not meet proof of work target' maps to high-hash" $
+      bip22ResultString "Block does not meet proof of work target"
+        `shouldBe` "high-hash"
+
+    it "'Proof of work check failed' maps to high-hash" $
+      bip22ResultString "Proof of work check failed" `shouldBe` "high-hash"
+
+    it "'Incorrect difficulty target' maps to high-hash" $
+      bip22ResultString "Incorrect difficulty target" `shouldBe` "high-hash"
+
+    it "'Merkle root mismatch' maps to bad-txnmrklroot" $
+      bip22ResultString "Merkle root mismatch" `shouldBe` "bad-txnmrklroot"
+
+    it "'Witness commitment mismatch' maps to bad-witness-merkle-match" $
+      bip22ResultString "Witness commitment mismatch"
+        `shouldBe` "bad-witness-merkle-match"
+
+    it "'Coinbase value exceeds allowed amount' maps to bad-cb-amount" $
+      bip22ResultString "Coinbase value exceeds allowed amount"
+        `shouldBe` "bad-cb-amount"
+
+    it "'Block exceeds sigop cost limit' maps to bad-blk-sigops" $
+      bip22ResultString "Block exceeds sigop cost limit"
+        `shouldBe` "bad-blk-sigops"
+
+    it "'Duplicate inputs' maps to bad-txns-duplicate" $
+      bip22ResultString "Duplicate inputs" `shouldBe` "bad-txns-duplicate"
+
+    it "'Missing UTXO: ...' maps to bad-txns-inputs-missingorspent" $
+      bip22ResultString "Missing UTXO: outpoint:0"
+        `shouldBe` "bad-txns-inputs-missingorspent"
+
+    it "'script verify failed (input 0)' maps to mandatory-script-verify-flag-failed" $
+      bip22ResultString "script verify failed (input 0)"
+        `shouldBe` "mandatory-script-verify-flag-failed"
+
+    it "'Timestamp not after median time past' maps to time-too-old" $
+      bip22ResultString "Timestamp not after median time past"
+        `shouldBe` "time-too-old"
+
+    it "'Block validation failed: Merkle root mismatch' strips prefix and maps" $
+      bip22ResultString "Block validation failed: Merkle root mismatch"
+        `shouldBe` "bad-txnmrklroot"
+
+    it "'Block validation failed: bad-cb-height' strips prefix correctly" $
+      bip22ResultString "Block validation failed: bad-cb-height"
+        `shouldBe` "bad-cb-height"
+
+    it "'Unknown previous block: ...' maps to inconclusive" $
+      bip22ResultString "Unknown previous block: deadbeef..."
+        `shouldBe` "inconclusive"
+
+    it "unknown error maps to rejected catch-all" $
+      bip22ResultString "some totally unexpected error" `shouldBe` "rejected"
+
+    it "ENOENT-style error maps to rejected catch-all" $
+      bip22ResultString "ENOENT" `shouldBe` "rejected"
+
   where
     sampleTx = Tx
       { txVersion = 1
