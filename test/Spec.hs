@@ -12472,6 +12472,93 @@ main = hspec $ do
     it "ENOENT-style error maps to rejected catch-all" $
       bip22ResultString "ENOENT" `shouldBe` "rejected"
 
+  -- BIP-30: duplicate UTXO rejection
+  -- Reference: Bitcoin Core ConnectBlock / IsBIP30Repeat() validation.cpp.
+  describe "checkBIP30: duplicate UTXO rejection" $ do
+
+    -- Helper: build a minimal transaction and compute its txid.
+    let minimalTx = Tx
+          { txVersion  = 1
+          , txInputs   = [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                                 (BS.pack [0x51, 0x00]) 0xFFFFFFFF ]
+          , txOutputs  = [ TxOut 5000000000 (BS.singleton 0x51) ]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        minimalBlock txns = Block
+          (BlockHeader 1
+            (BlockHash (Hash256 (BS.replicate 32 0)))
+            (Hash256 (BS.replicate 32 0))
+            1700000000 0x207fffff 0)
+          txns
+
+    it "height 91842 is exempt even with a pre-existing UTXO (mainnet)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          result <- checkBIP30 db mainnet 91842 (minimalBlock [minimalTx])
+          result `shouldBe` Right ()
+
+    it "height 91880 is exempt even with a pre-existing UTXO (mainnet)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          result <- checkBIP30 db mainnet 91880 (minimalBlock [minimalTx])
+          result `shouldBe` Right ()
+
+    it "height 91843 enforces BIP-30 when UTXO pre-exists (mainnet)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          result <- checkBIP30 db mainnet 91843 (minimalBlock [minimalTx])
+          result `shouldSatisfy` \r -> case r of
+            Left _  -> True   -- any Left means BIP-30 fired
+            Right () -> False
+
+    it "height 91843 passes BIP-30 when no UTXO pre-exists (mainnet)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          result <- checkBIP30 db mainnet 91843 (minimalBlock [minimalTx])
+          result `shouldBe` Right ()
+
+    it "wrong exception heights 91722 and 91812 are NOT exempt (mainnet)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          forM_ [91722, 91812 :: Word32] $ \h -> do
+            result <- checkBIP30 db mainnet h (minimalBlock [minimalTx])
+            result `shouldSatisfy` \r -> case r of
+              Left _  -> True   -- BIP-30 must fire at old wrong heights
+              Right () -> False
+
+    it "post-BIP34 height 228000 skips BIP-30 check (mainnet BIP34 active)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          -- mainnet netBIP34Height = 227931; h=228000 is above that and below 1983702
+          result <- checkBIP30 db mainnet 228000 (minimalBlock [minimalTx])
+          result `shouldBe` Right ()
+
+    it "regtest height 100 skips BIP-30 (netBIP34Height=1, BIP-34 immediately active)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          -- regtest: BIP34 active from block 1, so BIP-30 skipped for h in [1, 1983701]
+          result <- checkBIP30 db regtest 100 (minimalBlock [minimalTx])
+          result `shouldBe` Right ()
+
   where
     sampleTx = Tx
       { txVersion = 1
