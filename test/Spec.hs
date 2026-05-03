@@ -2470,6 +2470,90 @@ main = hspec $ do
         Left msg | "height" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong coinbase height"
 
+    -- P0-3: validateFullBlock must invoke verifyScriptWithFlags on every
+    -- non-coinbase input when skipScripts == False. Prior to the wiring
+    -- patch this was DEAD CODE — any block with valid structure but
+    -- garbage scripts was accepted. The fix routes inputs through
+    -- Script.verifyScriptWithFlags via consensusFlagsToScriptFlags.
+    it "P0-3: rejects block whose tx has invalid scriptSig under skipScripts=False" $ do
+      let prevH    = BlockHash (Hash256 (BS.replicate 32 0))
+          cbOp     = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          -- BIP-34 height encoding for height 100 (our next block)
+          cbIn     = TxIn cbOp (BS.pack [0x01, 0x64]) 0xffffffff
+          coinbase = Tx 1 [cbIn] [TxOut 5000000000 BS.empty] [[]] 0
+          -- Non-coinbase tx spending a fake UTXO. scriptSig is garbage; the
+          -- prev scriptPubKey is OP_CHECKSIG, which expects a real sig+pubkey
+          -- pair on the stack. With garbage in, the verifier MUST fail.
+          prevTxid     = TxId (Hash256 (BS.replicate 32 0xaa))
+          prevOutpoint = OutPoint prevTxid 0
+          -- scriptSig pushes two random 32-byte blobs (impostor sig + pubkey).
+          -- With OP_CHECKSIG these will not validate.
+          fakeSig    = BS.replicate 71 0xab
+          fakePubkey = BS.replicate 33 0x02
+          scriptSigBytes = encodeScript $ Script
+            [ OP_PUSHDATA fakeSig    OPCODE
+            , OP_PUSHDATA fakePubkey OPCODE
+            ]
+          spendingIn  = TxIn prevOutpoint scriptSigBytes 0xffffffff
+          spendingTx  = Tx 1 [spendingIn] [TxOut 1000 BS.empty] [[]] 0
+          txns        = [coinbase, spendingTx]
+          realMerkle  = computeMerkleRoot (map computeTxId txns)
+          blkHdr      = BlockHeader 1 prevH realMerkle 0 0 0
+          block       = Block blkHdr txns
+          cs = ChainState
+                { csHeight     = 99
+                , csBestBlock  = prevH
+                , csChainWork  = 0
+                , csMedianTime = 0
+                , csFlags      = consensusFlagsAtHeight regtest 100
+                }
+          -- The prevout backing spendingTx: scriptPubKey = OP_CHECKSIG.
+          prevTxOut   = TxOut 1000 (encodeScript (Script [OP_CHECKSIG]))
+          utxoMap     = Map.singleton prevOutpoint prevTxOut
+      -- skipScripts = False: must reject (script verify failure).
+      case validateFullBlock regtest cs False block utxoMap of
+        Left err | "script verify failed" `T.isInfixOf` T.pack err -> return ()
+        Left other ->
+          expectationFailure $ "Expected script-verify rejection, got: " ++ other
+        Right () ->
+          expectationFailure "validateFullBlock must reject invalid-sig block"
+
+    it "P0-3: same block is accepted under skipScripts=True (assumevalid path)" $ do
+      -- Same construction, but skipScripts=True bypasses the per-input
+      -- script loop. All structural / value checks still pass, so the
+      -- block must validate. This proves the gate, not just the wiring.
+      let prevH    = BlockHash (Hash256 (BS.replicate 32 0))
+          cbOp     = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          cbIn     = TxIn cbOp (BS.pack [0x01, 0x64]) 0xffffffff
+          coinbase = Tx 1 [cbIn] [TxOut 5000000000 BS.empty] [[]] 0
+          prevTxid     = TxId (Hash256 (BS.replicate 32 0xaa))
+          prevOutpoint = OutPoint prevTxid 0
+          fakeSig    = BS.replicate 71 0xab
+          fakePubkey = BS.replicate 33 0x02
+          scriptSigBytes = encodeScript $ Script
+            [ OP_PUSHDATA fakeSig    OPCODE
+            , OP_PUSHDATA fakePubkey OPCODE
+            ]
+          spendingIn  = TxIn prevOutpoint scriptSigBytes 0xffffffff
+          spendingTx  = Tx 1 [spendingIn] [TxOut 1000 BS.empty] [[]] 0
+          txns        = [coinbase, spendingTx]
+          realMerkle  = computeMerkleRoot (map computeTxId txns)
+          blkHdr      = BlockHeader 1 prevH realMerkle 0 0 0
+          block       = Block blkHdr txns
+          cs = ChainState
+                { csHeight     = 99
+                , csBestBlock  = prevH
+                , csChainWork  = 0
+                , csMedianTime = 0
+                , csFlags      = consensusFlagsAtHeight regtest 100
+                }
+          prevTxOut = TxOut 1000 (encodeScript (Script [OP_CHECKSIG]))
+          utxoMap   = Map.singleton prevOutpoint prevTxOut
+      case validateFullBlock regtest cs True block utxoMap of
+        Right () -> return ()
+        Left err -> expectationFailure $
+          "validateFullBlock with skipScripts=True must accept (got: " ++ err ++ ")"
+
   -- ---------------------------------------------------------------------------
   -- shouldSkipScripts: 7-case matrix
   --
