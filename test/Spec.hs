@@ -2003,6 +2003,52 @@ main = hspec $ do
           tx = Tx 1 [txin] [TxOut 5000000000 "out"] [[]] 0
       coinbaseHeight tx `shouldBe` Nothing
 
+  describe "encodeBip34Height canonical encoder (Core script.h:433-448)" $ do
+    it "height 0 → OP_0 (0x00)" $
+      encodeBip34Height 0 `shouldBe` BS.pack [0x00]
+    it "height 1 → OP_1 (0x51)" $
+      encodeBip34Height 1 `shouldBe` BS.pack [0x51]
+    it "height 16 → OP_16 (0x60)" $
+      encodeBip34Height 16 `shouldBe` BS.pack [0x60]
+    it "height 17 → 1-byte push (0x01 0x11)" $
+      encodeBip34Height 17 `shouldBe` BS.pack [0x01, 0x11]
+    it "height 127 → no sign pad (0x01 0x7f)" $
+      encodeBip34Height 127 `shouldBe` BS.pack [0x01, 0x7f]
+    it "height 128 → sign pad at 0x80 (0x02 0x80 0x00)" $
+      encodeBip34Height 128 `shouldBe` BS.pack [0x02, 0x80, 0x00]
+    it "height 32768 → sign pad at 0x8000 (0x03 0x00 0x80 0x00)" $
+      encodeBip34Height 32768 `shouldBe` BS.pack [0x03, 0x00, 0x80, 0x00]
+    it "height 500000 (0x07A120 LE)" $
+      encodeBip34Height 500000 `shouldBe` BS.pack [0x03, 0x20, 0xa1, 0x07]
+
+  describe "validateCoinbaseHeightConsensus byte-prefix (Core ContextualCheckBlock parity)" $ do
+    let nullOp = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+        makeCb sig = Tx 1 [TxIn nullOp (BS.pack sig) 0xffffffff]
+                          [TxOut 5000000000 (BS.pack [])] [[]] 0
+
+    it "canonical OP_1 accepted for height 1" $
+      validateCoinbaseHeightConsensus 1 (makeCb [0x51, 0x00]) `shouldBe` True
+    it "canonical OP_16 accepted for height 16" $
+      validateCoinbaseHeightConsensus 16 (makeCb [0x60, 0x00]) `shouldBe` True
+    it "canonical sign-pad accepted for height 128" $
+      validateCoinbaseHeightConsensus 128 (makeCb [0x02, 0x80, 0x00]) `shouldBe` True
+    it "canonical sign-pad accepted for height 32768" $
+      validateCoinbaseHeightConsensus 32768 (makeCb [0x03, 0x00, 0x80, 0x00]) `shouldBe` True
+    it "extra bytes after canonical prefix are OK (prefix match)" $
+      validateCoinbaseHeightConsensus 16 (makeCb [0x60, 0xde, 0xad]) `shouldBe` True
+    it "REJECT: length-prefixed [0x01,0x01] for height 1 (must be OP_1)" $
+      validateCoinbaseHeightConsensus 1 (makeCb [0x01, 0x01]) `shouldBe` False
+    it "REJECT: length-prefixed [0x01,0x10] for height 16 (must be OP_16)" $
+      validateCoinbaseHeightConsensus 16 (makeCb [0x01, 0x10]) `shouldBe` False
+    it "REJECT: zero-padded encoding for height 100" $
+      validateCoinbaseHeightConsensus 100 (makeCb [0x02, 0x64, 0x00]) `shouldBe` False
+    it "REJECT: missing sign byte for height 128 ([0x01,0x80] → non-canonical)" $
+      validateCoinbaseHeightConsensus 128 (makeCb [0x01, 0x80]) `shouldBe` False
+    it "REJECT: OP_PUSHDATA1 prefix" $
+      validateCoinbaseHeightConsensus 1 (makeCb [0x4c, 0x01, 0x01]) `shouldBe` False
+    it "REJECT: wrong height (height 100 vs script for 200)" $
+      validateCoinbaseHeightConsensus 100 (makeCb [0x01, 0xc8]) `shouldBe` False
+
   describe "IsFinalTx (Core ContextualCheckBlock parity)" $ do
     -- Helpers
     let nullOp   = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
