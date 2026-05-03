@@ -360,14 +360,20 @@ blockProcessor bd = forever $ do
                   utxoMap <- buildUTXOMap bd block
                   let utxoTxOutMap = fmap coinTxOut utxoMap
 
-                  let cs = ChainState currentHeight bh 0 0
+                  -- Read header chain entries first so we can compute MTP
+                  -- for the previous block (needed for BIP-113 locktime cutoff).
+                  blockEntries <- readTVarIO (hcEntries (bdHeaderChain bd))
+                  bestHdr      <- readTVarIO (hcTip (bdHeaderChain bd))
+
+                  -- Median Time Past of the previous block (bh = prev block hash).
+                  -- BIP-113: when CSV is active, nLockTimeCutoff = MTP of prev block.
+                  let prevMTP = medianTimePast blockEntries bh
+                      cs = ChainState currentHeight bh 0 prevMTP
                             (consensusFlagsAtHeight (bdNetwork bd) nextHeight)
 
                   -- Compute the assumevalid skip decision using the real
                   -- ancestor-check semantics (Bitcoin Core v28.0 equivalent).
                   -- All six conditions are evaluated inside shouldSkipScripts.
-                  blockEntries <- readTVarIO (hcEntries (bdHeaderChain bd))
-                  bestHdr      <- readTVarIO (hcTip (bdHeaderChain bd))
                   let blockTs    = bhTimestamp (blockHeader block)
                       skipScripts = shouldSkipScripts bh nextHeight blockTs
                                       (bdNetwork bd) blockEntries bestHdr
