@@ -2162,7 +2162,15 @@ validateFullBlock net cs skipScripts block utxoMap = do
     unless (validateCoinbaseHeightConsensus height (head txns)) $
       Left "bad-cb-height"
 
-  -- 6. IsFinalTx: every transaction must be final at this block height/time.
+  -- 6. BIP-113 / Core ContextualCheckBlockHeader (validation.cpp:4092):
+  -- block timestamp must be strictly greater than the median-time-past
+  -- of the previous 11 blocks. csMedianTime is the MTP of the current tip
+  -- (set from ceMedianTime in submitBlock / connectBlock callers).
+  -- Reference: bitcoin-core/src/validation.cpp:4092
+  when (height > 0 && bhTimestamp header <= csMedianTime cs) $
+    Left "timestamp not after median time past"
+
+  -- 7. IsFinalTx: every transaction must be final at this block height/time.
   -- Reference: Bitcoin Core ContextualCheckBlock (validation.cpp:4146).
   -- nLockTimeCutoff = MTP of prev block when CSV is active (BIP-113), else
   -- block timestamp. Note: this check applies even when skipScripts=True
