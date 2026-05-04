@@ -2004,6 +2004,8 @@ bip22ResultString err
 
   -- Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
   | "negative value" `isInfixOf` s              = "bad-txns-vout-negative"
+  -- Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
+  | "exceeds max_money" `isInfixOf` s           = "bad-txns-vout-toolarge"
 
   -- Script verification failures
   | "script verify failed" `isInfixOf` s        = "mandatory-script-verify-flag-failed"
