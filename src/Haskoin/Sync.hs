@@ -355,10 +355,9 @@ blockProcessor bd = forever $ do
                   -- Build UTXO map for this block's inputs (full Coin
                   -- metadata; needed by connectBlock so the BlockUndo
                   -- record carries height + coinbase flag for each
-                  -- spent prevout). validateFullBlock only consumes
-                  -- the TxOut projection.
+                  -- spent prevout, and by validateFullBlock for BIP-68
+                  -- SequenceLocks which requires per-coin heights).
                   utxoMap <- buildUTXOMap bd block
-                  let utxoTxOutMap = fmap coinTxOut utxoMap
 
                   -- Read header chain entries first so we can compute MTP
                   -- for the previous block (needed for BIP-113 locktime cutoff).
@@ -383,7 +382,7 @@ blockProcessor bd = forever $ do
                   -- guard) then validateFullBlock (all other consensus checks) so
                   -- that both the IBD arm and submitBlock share identical coverage.
                   -- Reference: Bitcoin Core ConnectBlock / IsBIP30Repeat().
-                  validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs skipScripts block utxoTxOutMap
+                  validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs skipScripts block utxoMap
 
                   case validationResult of
                     Left err -> do
