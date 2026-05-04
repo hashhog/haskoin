@@ -1197,6 +1197,15 @@ validateTransaction tx = do
   when (null $ txOutputs tx) $
     Left "Transaction has no outputs"
 
+  -- Check each output value is non-negative and within range.
+  -- txOutValue is Word64 (unsigned), but Bitcoin's wire format is int64 (signed).
+  -- A negative wire value has its high bit set; we must check this before the
+  -- upper-bound test to produce the correct BIP-22 rejection string.
+  -- Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction order.
+  forM_ (txOutputs tx) $ \out ->
+    when (fromIntegral (txOutValue out) < (0 :: Int64)) $
+      Left "Transaction output has negative value"
+
   -- Check total output value doesn't overflow or exceed max money
   let totalOut = sum $ map txOutValue (txOutputs tx)
   when (totalOut > maxMoney) $
