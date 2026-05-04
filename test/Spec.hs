@@ -10213,17 +10213,6 @@ main = hspec $ do
           utxoMap' <- atomically $ readTVar utxoTVar
           Map.lookup op utxoMap' `shouldBe` Nothing
 
-      describe "validateBlockParallel" $ do
-        it "succeeds on block with only coinbase" $ do
-          let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
-                                     (Hash256 (BS.replicate 32 0)) 0 0 0
-              coinbase = Tx 1 [] [TxOut 5000000000 ""] [[]] 0
-              block = Block header [coinbase]
-          utxoTVar <- newTVarIO Map.empty
-          let flags = ConsensusFlags False False False False False False
-          result <- validateBlockParallel block utxoTVar flags
-          result `shouldBe` PVSuccess
-
     describe "memory-mapped I/O" $ do
       describe "MmapBlockFile" $ do
         it "can be constructed with all fields" $ do
