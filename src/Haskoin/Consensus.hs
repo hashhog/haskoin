@@ -53,7 +53,6 @@ module Haskoin.Consensus
   , genesisBlock
   , genesisBlockHeader
     -- * Validation
-  , validateBlockHeader
   , validateTransaction
   , computeMerkleRoot
     -- * AssumeValid
@@ -65,7 +64,6 @@ module Haskoin.Consensus
     -- * Full Block Validation
   , validateFullBlock
   , validateFullBlockIO
-  , validateFullBlockWithSigCache
   , validateBlockTransactions
   , checkBIP30
   , ChainState(..)
@@ -85,6 +83,9 @@ module Haskoin.Consensus
   , txTotalSize
   , varIntSize
   , checkBlockWeight
+    -- NOTE(wave-33b dead-symbol audit): checkBlockWeight is test-only; the live
+    -- weight check is inline in connectBlock. Fixes for BIP-141 weight rules
+    -- belong in connectBlock / validateFullBlockIO, NOT here.
     -- * Sigop Counting
   , SigOpCost(..)
   , maxBlockSigOpsCost
@@ -1155,31 +1156,6 @@ computeMerkleRoot txids =
 -- Block Header Validation
 --------------------------------------------------------------------------------
 
--- | Validate a block header (context-free checks)
--- Does NOT validate:
---   - Timestamp against network time (requires current time)
---   - Previous block hash (requires chain state)
---   - Merkle root (requires full block)
-validateBlockHeader :: Network -> BlockHeader -> Word32 -> Either String ()
-validateBlockHeader net header height = do
-  -- Check proof of work
-  unless (checkProofOfWork header (netPowLimit net)) $
-    Left "Block does not meet proof of work target"
-
-  -- Check version (BIP-34: version >= 2 after certain height)
-  when (height >= netBIP34Height net && bhVersion header < 2) $
-    Left "Block version too low (BIP-34 requires version >= 2)"
-
-  -- Check version (BIP-66: version >= 3 after certain height)
-  when (height >= netBIP66Height net && bhVersion header < 3) $
-    Left "Block version too low (BIP-66 requires version >= 3)"
-
-  -- Check version (BIP-65: version >= 4 after certain height)
-  when (height >= netBIP65Height net && bhVersion header < 4) $
-    Left "Block version too low (BIP-65 requires version >= 4)"
-
-  Right ()
-
 --------------------------------------------------------------------------------
 -- Transaction Validation
 --------------------------------------------------------------------------------
@@ -1864,6 +1840,10 @@ varIntSize n
 -- | Check if a block's weight is within the consensus limit.
 -- Returns True if the block weight is valid, False otherwise.
 -- BIP-141 defines maxBlockWeight = 4,000,000 weight units.
+--
+-- DEAD CODE (wave-33b ledger): test-only callers (Spec.hs:2251).
+-- The live weight check is inline in 'connectBlock'.
+-- BIP-141 weight rule fixes belong in 'connectBlock', NOT here.
 checkBlockWeight :: Block -> Bool
 checkBlockWeight block = blockWeight block <= maxBlockWeight
 
@@ -2220,38 +2200,6 @@ validateFullBlock net cs skipScripts block utxoMap = do
 
   Right ()
 
--- | Validate a full block with signature cache integration.
---
--- Same as 'validateFullBlock' but uses callback functions to check/insert
--- into a signature verification cache. Successfully verified scripts
--- are inserted into the cache for future lookups.
---
--- This provides significant speedup during:
---   - Reorgs (re-validating transactions already seen)
---   - Mempool->block transitions (transactions pre-validated in mempool)
---
--- The cache key is (txid bytes, input_index, flag_bits).
-validateFullBlockWithSigCache :: Network -> ChainState -> Bool -> Block -> Map OutPoint TxOut
-                             -> (ByteString -> Word32 -> Word32 -> IO Bool)    -- ^ lookupCache
-                             -> (ByteString -> Word32 -> Word32 -> IO ())      -- ^ insertCache
-                             -> IO (Either String ())
-validateFullBlockWithSigCache net cs skipScripts block utxoMap lookupCache insertCache = do
-  -- Run the core validation (context-free + contextual checks)
-  case validateFullBlock net cs skipScripts block utxoMap of
-    Left err -> return (Left err)
-    Right () -> do
-      -- After successful validation, cache the script verification results
-      -- for all non-coinbase transaction inputs
-      let txns = blockTxns block
-          flags = consensusFlagsAtHeight net (csHeight cs + 1)
-          flagBits = consensusFlagsToWord32 flags
-      forM_ (drop 1 txns) $ \tx -> do
-        let txid = computeTxId tx
-            txidBs = case txid of TxId (Hash256 bs) -> bs
-        forM_ (zip [0..] (txInputs tx)) $ \(idx, _inp) -> do
-          insertCache txidBs (fromIntegral idx) flagBits
-      return (Right ())
-
 -- | BIP-30: Reject a block if any of its transactions would overwrite an existing
 -- unspent transaction output in the UTXO set.
 --
@@ -2557,6 +2505,12 @@ connectBlock db _net block height spentUtxos = do
   writeBatch db (WriteBatch ops)
 
 -- | Disconnect a block from the chain state.
+--
+-- NOTE(wave-33b dead-symbol audit): the audit initially flagged this as
+-- dead. It is NOT dead — Rpc.hs:4944 (disconnectChainTo) calls it during
+-- invalidateblock reorg. The live reorg path also goes through 'unapplyBlock'
+-- (Consensus.hs reorg loop). Fixes for disconnect/reorg logic belong in BOTH
+-- 'unapplyBlock' (UTXO cache) AND 'disconnectBlock' (RPC reorg helper).
 --
 -- Restores the UTXO set to its state before this block was connected:
 --   1. Re-add UTXOs the block spent (read from undo data).
