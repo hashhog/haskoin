@@ -1958,7 +1958,7 @@ bip22ResultString err
                 "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
                 "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
                 "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
-                "mandatory-script-verify-flag-failed",
+                "block-script-verify-flag-failed",
                 "bad-txns-inputs-missingorspent"] = err
 
   -- PoW / difficulty (from validateFullBlock / submitBlock)
@@ -2007,11 +2007,16 @@ bip22ResultString err
   -- Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
   | "exceeds max_money" `isInfixOf` s           = "bad-txns-vout-toolarge"
 
-  -- Script verification failures
-  | "script verify failed" `isInfixOf` s        = "mandatory-script-verify-flag-failed"
-  | "script verification failed" `isInfixOf` s  = "mandatory-script-verify-flag-failed"
-  | "checksig failed" `isInfixOf` s             = "mandatory-script-verify-flag-failed"
-  | "tapscript" `isInfixOf` s                   = "mandatory-script-verify-flag-failed"
+  -- Script verification failures at connect-block stage.
+  -- Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
+  -- Covers disabled opcodes (OP_CAT is disabled / Disabled opcode encountered),
+  -- signature failures, tapscript errors, etc.
+  | "script verify failed" `isInfixOf` s        = "block-script-verify-flag-failed"
+  | "script verification failed" `isInfixOf` s  = "block-script-verify-flag-failed"
+  | "checksig failed" `isInfixOf` s             = "block-script-verify-flag-failed"
+  | "tapscript" `isInfixOf` s                   = "block-script-verify-flag-failed"
+  | "disabled opcode" `isInfixOf` s             = "block-script-verify-flag-failed"
+  | "is disabled" `isInfixOf` s                 = "block-script-verify-flag-failed"
 
   -- Timestamp errors
   | "timestamp not after median" `isInfixOf` s  = "time-too-old"
