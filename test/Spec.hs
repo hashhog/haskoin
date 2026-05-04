@@ -12446,9 +12446,17 @@ main = hspec $ do
       bip22ResultString "Missing UTXO: outpoint:0"
         `shouldBe` "bad-txns-inputs-missingorspent"
 
-    it "'script verify failed (input 0)' maps to mandatory-script-verify-flag-failed" $
+    it "'script verify failed (input 0)' maps to block-script-verify-flag-failed" $
       bip22ResultString "script verify failed (input 0)"
-        `shouldBe` "mandatory-script-verify-flag-failed"
+        `shouldBe` "block-script-verify-flag-failed"
+
+    it "'Disabled opcode encountered' maps to block-script-verify-flag-failed" $
+      bip22ResultString "Disabled opcode encountered"
+        `shouldBe` "block-script-verify-flag-failed"
+
+    it "'OP_CAT is disabled' maps to block-script-verify-flag-failed" $
+      bip22ResultString "OP_CAT is disabled"
+        `shouldBe` "block-script-verify-flag-failed"
 
     it "'Timestamp not after median time past' maps to time-too-old" $
       bip22ResultString "Timestamp not after median time past"
