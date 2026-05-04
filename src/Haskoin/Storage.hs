@@ -2682,17 +2682,21 @@ serializeCoins coins =
          put (VarInt (fromIntegral $ outPointIndex scOutPoint))
          putCoreCoin scCoin
   where
-    -- Group consecutive entries with the same txid together so we
-    -- preserve input ordering (matches Core's cursor-driven order).
-    -- Entries with the same txid that are not adjacent get merged into
-    -- one group; otherwise we'd violate the format invariant that each
-    -- txid appears at most once.
+    -- Group entries by txid and sort vouts ascending within each group,
+    -- matching Bitcoin Core's cursor-driven order (std::map<uint32_t, Coin>
+    -- iterates vout-ascending within each txid group).
+    -- Reference: bitcoin-core/src/rpc/blockchain.cpp write_coins_to_file
+    -- (coins is a std::vector built from a std::map<uint32_t,Coin> which is
+    -- vout-ascending by construction).
     groupByTxid :: [SnapshotCoin] -> [(TxId, [SnapshotCoin])]
     groupByTxid xs =
       let m :: Map TxId [SnapshotCoin]
           m = foldr (\sc -> Map.insertWith (++) (outPointHash (scOutPoint sc)) [sc])
                     Map.empty xs
-      in Map.toList m
+          sortGroup scoins =
+            L.sortBy (\a b -> compare (outPointIndex (scOutPoint a))
+                                      (outPointIndex (scOutPoint b))) scoins
+      in map (\(txid, scoins) -> (txid, sortGroup scoins)) (Map.toList m)
 
 -- | Serialize one (vout, Coin) pair using the Core on-disk encoding.
 -- Caller is responsible for emitting the surrounding txid group header.
