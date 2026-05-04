@@ -1202,9 +1202,12 @@ validateTransaction tx = do
   -- A negative wire value has its high bit set; we must check this before the
   -- upper-bound test to produce the correct BIP-22 rejection string.
   -- Mirrors Bitcoin Core consensus/tx_check.cpp::CheckTransaction order.
-  forM_ (txOutputs tx) $ \out ->
+  forM_ (txOutputs tx) $ \out -> do
     when (fromIntegral (txOutValue out) < (0 :: Int64)) $
       Left "Transaction output has negative value"
+    -- Per-output upper-bound check (consensus/tx_check.cpp::CheckTransaction — Core parity)
+    when (txOutValue out > maxMoney) $
+      Left "Transaction output value exceeds MAX_MONEY"
 
   -- Check total output value doesn't overflow or exceed max money
   let totalOut = sum $ map txOutValue (txOutputs tx)
