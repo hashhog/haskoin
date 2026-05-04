@@ -2002,6 +2002,9 @@ bip22ResultString err
   | "missing utxo" `isInfixOf` s                = "bad-txns-inputs-missingorspent"
   | "missing input" `isInfixOf` s               = "bad-txns-inputs-missingorspent"
 
+  -- Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+  | "negative value" `isInfixOf` s              = "bad-txns-vout-negative"
+
   -- Script verification failures
   | "script verify failed" `isInfixOf` s        = "mandatory-script-verify-flag-failed"
   | "script verification failed" `isInfixOf` s  = "mandatory-script-verify-flag-failed"
