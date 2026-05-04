@@ -1973,6 +1973,9 @@ bip22ResultString err
   | "witness commitment mismatch" `isInfixOf` s  = "bad-witness-merkle-match"
   | "witness commitment" `isInfixOf` s           = "bad-witness-merkle-match"
 
+  -- Coinbase scriptSig length (consensus/tx_check.cpp "bad-cb-length"; 2..100 bytes)
+  | "coinbase scriptsig size out of range" `isInfixOf` s = "bad-cb-length"
+
   -- Coinbase value / subsidy
   | "coinbase value exceeds" `isInfixOf` s       = "bad-cb-amount"
   | "coinbase amount" `isInfixOf` s              = "bad-cb-amount"
