@@ -64,8 +64,10 @@ module Haskoin.Consensus
   , sequenceFinalConsensus
     -- * Full Block Validation
   , validateFullBlock
+  , validateFullBlockIO
   , validateFullBlockWithSigCache
   , validateBlockTransactions
+  , checkBIP30
   , ChainState(..)
   , ConsensusFlags(..)
   , consensusFlagsAtHeight
@@ -213,7 +215,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO,
-                        putUndoData, getUndoData, getUndoDataVerified, getBlock,
+                        putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO,
                         isUnspendable, Coin(..),
                         -- AssumeUTXO support
                         SnapshotMetadata(..), UtxoSnapshot(..), AssumeUtxoData(..),
@@ -2249,6 +2251,70 @@ validateFullBlockWithSigCache net cs skipScripts block utxoMap lookupCache inser
         forM_ (zip [0..] (txInputs tx)) $ \(idx, _inp) -> do
           insertCache txidBs (fromIntegral idx) flagBits
       return (Right ())
+
+-- | BIP-30: Reject a block if any of its transactions would overwrite an existing
+-- unspent transaction output in the UTXO set.
+--
+-- This check must run BEFORE the block's outputs are added to the UTXO set
+-- (i.e., before 'connectBlock'/'applyBlock').
+--
+-- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
+-- Mainnet exemptions: blocks 91842 and 91880 are grandfathered.
+-- BIP-34 implication: once BIP-34 is active, coinbase txids are guaranteed
+-- unique (height is encoded in the scriptSig), so BIP-30 violations are
+-- impossible up to height 1,983,702 where the BIP-34 implication is no longer
+-- guaranteed (a future miner could re-grind an old coinbase hash).
+checkBIP30 :: HaskoinDB -> Network -> Word32 -> Block -> IO (Either String ())
+checkBIP30 db net height block
+  | height == 91842 || height == 91880 = return (Right ())
+  | height >= netBIP34Height net && height < bip34ImpliesBIP30Limit = return (Right ())
+  | otherwise = go (blockTxns block)
+  where
+    bip34ImpliesBIP30Limit :: Word32
+    bip34ImpliesBIP30Limit = 1983702
+
+    go [] = return (Right ())
+    go (tx:txs) = do
+      let txid = computeTxId tx
+          vouts = [0 .. fromIntegral (length (txOutputs tx) - 1)]
+      result <- checkTxOutputs txid vouts
+      case result of
+        Left err -> return (Left err)
+        Right () -> go txs
+
+    checkTxOutputs _ [] = return (Right ())
+    checkTxOutputs txid (vout:vouts) = do
+      let op = OutPoint txid vout
+      mUtxo <- getUTXO db op
+      case mUtxo of
+        Just _ ->
+          return $ Left $
+            "bad-txns-BIP30: tried to overwrite transaction"
+        Nothing -> checkTxOutputs txid vouts
+
+-- | Validate a full block with BIP-30 enforcement.
+--
+-- This is the canonical block-validation entry point for both the IBD path
+-- (Sync.hs) and the RPC submitblock path (BlockTemplate.hs).  It sequences:
+--
+--   1. 'checkBIP30'       — UTXO-set duplicate-txid guard (requires DB, IO)
+--   2. 'validateFullBlock' — all context-free + contextual checks (pure)
+--
+-- By routing both paths through this single function, BIP-30 cannot be missed
+-- on either arm.  The structural alternative (passing HaskoinDB into the pure
+-- 'validateFullBlock') would require making that function monadic, bloating its
+-- signature and every caller.  This IO wrapper achieves the same invariant with
+-- minimal churn.
+--
+-- Reference: Bitcoin Core ConnectBlock() order — IsBIP30Repeat() fires before
+-- any UTXO mutation at validation.cpp.
+validateFullBlockIO :: HaskoinDB -> Network -> ChainState -> Bool -> Block
+                   -> Map OutPoint TxOut -> IO (Either String ())
+validateFullBlockIO db net cs skipScripts block utxoMap = do
+  bip30Result <- checkBIP30 db net (csHeight cs + 1) block
+  case bip30Result of
+    Left err -> return (Left err)
+    Right () -> return $ validateFullBlock net cs skipScripts block utxoMap
 
 -- | Convert ConsensusFlags to a Word32 for use as a cache key.
 consensusFlagsToWord32 :: ConsensusFlags -> Word32

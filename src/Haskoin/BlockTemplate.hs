@@ -61,7 +61,7 @@ import qualified Data.Serialize as S
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
-import Haskoin.Consensus (Network(..), validateFullBlock, blockReward,
+import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, blockReward,
                            maxBlockWeight, maxBlockSigops, maxBlockSigOpsCost,
                            witnessScaleFactor,
                            txBaseSize, txTotalSize, difficultyAdjustment,
@@ -445,8 +445,14 @@ submitBlock net db hc cache pm block = do
         , csFlags = consensusFlagsAtHeight net height
         }
 
-  -- Validate the block (always verify scripts for locally minted blocks)
-  case validateFullBlock net cs False block utxoTxOutMap of
+  -- Validate the block (always verify scripts for locally minted blocks).
+  -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard, requires
+  -- DB IO) followed by the pure 'validateFullBlock' checks, ensuring submitBlock
+  -- and the IBD path share identical BIP-30 enforcement.
+  -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
+  -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs:386.
+  validationResult <- validateFullBlockIO db net cs False block utxoTxOutMap
+  case validationResult of
     Left err -> return $ Left $ "Block validation failed: " ++ err
     Right () -> do
       -- Apply block to in-memory UTXO cache (drives maturity check + builds
