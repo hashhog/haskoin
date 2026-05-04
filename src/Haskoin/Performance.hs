@@ -41,7 +41,6 @@ module Haskoin.Performance
   , parallelVerifyECDSA
   , VerifyTask(..)
     -- * Parallel Block Validation
-  , validateBlockParallel
   , validateTxChunk
   , chunkTransactions
   , ParallelValidationResult(..)
@@ -74,7 +73,6 @@ module Haskoin.Performance
   , detectSHANI
   , detectAVX2
     -- * Strict Processing
-  , processBlockStrict
   , computeTxFeeStrict
     -- * Socket Optimization
   , optimizeSocket
@@ -307,37 +305,6 @@ data ParallelValidationResult
   deriving (Show, Eq, Generic)
 
 instance NFData ParallelValidationResult
-
--- | Validate a block's transactions in parallel.
---
--- Splits transactions into chunks based on CPU capabilities and validates
--- each chunk concurrently. UTXO lookups use a thread-safe TVar.
---
--- This achieves near-linear speedup on multi-core machines for CPU-bound
--- script verification. The bottleneck shifts to UTXO cache contention.
---
--- Target: 2x+ speedup on 4+ core machines.
-validateBlockParallel :: Block
-                      -> TVar (Map OutPoint TxOut)
-                      -> ConsensusFlags
-                      -> IO ParallelValidationResult
-validateBlockParallel block utxoTVar flags = do
-  let txns = blockTxns block
-      -- Skip coinbase (index 0)
-      nonCoinbase = zip [1..] (drop 1 txns)
-      -- Split into chunks, one per capability
-      numChunks = max 1 numCapabilities
-      chunks = chunkTransactions numChunks nonCoinbase
-  -- Validate chunks in parallel
-  results <- forConcurrently chunks $ \chunk ->
-    validateTxChunk chunk utxoTVar flags
-  -- Combine results, return first failure
-  return $ case filter isFailure results of
-    []          -> PVSuccess
-    (failure:_) -> failure
-  where
-    isFailure PVSuccess = False
-    isFailure _         = True
 
 -- | Split transactions into N approximately equal chunks.
 chunkTransactions :: Int -> [(Int, Tx)] -> [[(Int, Tx)]]
@@ -697,21 +664,6 @@ logMetrics nm = do
 --------------------------------------------------------------------------------
 -- Strict Block Processing
 --------------------------------------------------------------------------------
-
--- | Process a block with strict evaluation to prevent space leaks.
---
--- Uses bang patterns to force evaluation of intermediate results,
--- preventing lazy thunks from accumulating during block processing.
-processBlockStrict :: Block -> Map OutPoint TxOut -> Either String Word64
-processBlockStrict block utxoMap =
-  let !txns = blockTxns block
-      !nonCoinbase = case txns of
-        [] -> []
-        (_:rest) -> rest
-      !fees = map (computeTxFeeStrict utxoMap) nonCoinbase
-  in case sequence fees of
-       Left err -> Left err
-       Right feeList -> Right $! sum feeList
 
 -- | Compute transaction fee with strict evaluation.
 --
