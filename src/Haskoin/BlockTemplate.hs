@@ -431,10 +431,9 @@ submitBlock net db hc cache pm block = do
 
   -- Build UTXO map for validation. We carry full Core-format
   -- 'Coin' (TxOut + height + coinbase flag) so 'connectBlock' can
-  -- record byte-identical undo entries; 'validateFullBlock' only
-  -- needs the TxOut projection.
+  -- record byte-identical undo entries, and so validateFullBlock can
+  -- perform BIP-68 SequenceLocks checks (which require per-coin heights).
   utxoMap <- buildBlockUTXOMap cache block
-  let utxoTxOutMap = fmap coinTxOut utxoMap
 
   -- Build chain state for validation
   let cs = ChainState
@@ -451,7 +450,7 @@ submitBlock net db hc cache pm block = do
   -- and the IBD path share identical BIP-30 enforcement.
   -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
   -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs:386.
-  validationResult <- validateFullBlockIO db net cs False block utxoTxOutMap
+  validationResult <- validateFullBlockIO db net cs False block utxoMap
   case validationResult of
     Left err -> return $ Left $ "Block validation failed: " ++ err
     Right () -> do

@@ -2588,8 +2588,12 @@ main = hspec $ do
                 , csFlags      = consensusFlagsAtHeight regtest 100
                 }
           -- The prevout backing spendingTx: scriptPubKey = OP_CHECKSIG.
+          -- validateFullBlock now accepts Map OutPoint Coin (needed for BIP-68
+          -- SequenceLocks height lookup). Wrap TxOut in a Coin; height=99 and
+          -- coinbase=False (inputs have SEQUENCE_FINAL so BIP-68 is a no-op here).
           prevTxOut   = TxOut 1000 (encodeScript (Script [OP_CHECKSIG]))
-          utxoMap     = Map.singleton prevOutpoint prevTxOut
+          prevCoin    = Coin prevTxOut 99 False
+          utxoMap     = Map.singleton prevOutpoint prevCoin
       -- skipScripts = False: must reject (script verify failure).
       case validateFullBlock regtest cs False block utxoMap of
         Left err | "script verify failed" `T.isInfixOf` T.pack err -> return ()
@@ -2628,7 +2632,8 @@ main = hspec $ do
                 , csFlags      = consensusFlagsAtHeight regtest 100
                 }
           prevTxOut = TxOut 1000 (encodeScript (Script [OP_CHECKSIG]))
-          utxoMap   = Map.singleton prevOutpoint prevTxOut
+          prevCoin  = Coin prevTxOut 99 False
+          utxoMap   = Map.singleton prevOutpoint prevCoin
       case validateFullBlock regtest cs True block utxoMap of
         Right () -> return ()
         Left err -> expectationFailure $

@@ -2106,15 +2106,17 @@ isFinalTxCheck tx blockHeight blockTime
 -- root, coinbase validity, block weight, sigop counts, PoW) still run;
 -- only the per-input script evaluation step is skipped — exactly as in
 -- Bitcoin Core's assumevalid implementation.
-validateFullBlock :: Network -> ChainState -> Bool -> Block -> Map OutPoint TxOut
+validateFullBlock :: Network -> ChainState -> Bool -> Block -> Map OutPoint Coin
                  -> Either String ()
-validateFullBlock net cs skipScripts block utxoMap = do
+validateFullBlock net cs skipScripts block utxoCoinMap = do
   let height = csHeight cs + 1
       flags = consensusFlagsAtHeight net height
       header = blockHeader block
       txns = blockTxns block
       blockHash = computeBlockHash header
       checkpoints = buildCheckpoints net
+      -- TxOut-only view for validateBlockTransactions (script checking).
+      utxoMap = fmap coinTxOut utxoCoinMap
 
   -- 0. Verify checkpoint (if one exists at this height)
   case verifyCheckpoint checkpoints height blockHash of
@@ -2176,7 +2178,62 @@ validateFullBlock net cs skipScripts block utxoMap = do
       Left "bad-txns-nonfinal"
     ) txns
 
-  -- 7. Validate all transactions and compute total fees.
+  -- 7b. BIP-68 SequenceLocks: check relative lock-times for every non-coinbase
+  --     transaction BEFORE script verification.
+  --     Reference: Bitcoin Core validation.cpp ConnectBlock() ~line 2549:
+  --       prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+  --       if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex))
+  --         state.Invalid(..., "bad-txns-nonfinal", ...)
+  --     Core fires this BEFORE CheckInputScripts (script-eval) so that the
+  --     rejection is bad-txns-nonfinal, not block-script-verify-flag-failed.
+  --     Ordering fix: clearbit/camlcoin/haskoin all had this after script-eval.
+  when csvActive $ do
+    -- Process transactions in order, accumulating intra-block output heights
+    -- so that same-block spends (height = current block height = 0 confirmations)
+    -- are handled correctly.  Same-block prevouts are NOT in utxoCoinMap (which
+    -- only covers the pre-block chainstate), so we fall back to height for them.
+    let prevBlockMTP = csMedianTime cs
+        go :: Map OutPoint Word32 -> [Tx] -> Either String ()
+        go _ [] = Right ()
+        go intrablockHeights (tx:rest)
+          | isCoinbase tx = do
+              -- Add coinbase outputs to intra-block map (height = current block)
+              let txid = computeTxId tx
+                  newOuts = Map.fromList
+                    [ (OutPoint txid (fromIntegral i), height)
+                    | i <- [0 .. length (txOutputs tx) - 1]
+                    ]
+              go (Map.union newOuts intrablockHeights) rest
+          | otherwise = do
+              -- Build prevHeights and prevMTPs for BIP-68 check.
+              -- For each input: look up in utxoCoinMap first (external UTXO),
+              -- then intrablockHeights (same-block output), default to height
+              -- (safe fallback: 0 effective confirmations triggers lock if > 0).
+              let prevHeightsAndMTPs = map (\inp ->
+                    let op = txInPrevOutput inp
+                        (h, mtp) = case Map.lookup op utxoCoinMap of
+                          Just coin -> (coinHeight coin, prevBlockMTP)
+                          Nothing   -> case Map.lookup op intrablockHeights of
+                            Just ih  -> (ih, prevBlockMTP)
+                            Nothing  -> (height, prevBlockMTP) -- missing UTXO: fail elsewhere
+                    in (h, mtp)
+                    ) (txInputs tx)
+                  prevHeights = map fst prevHeightsAndMTPs
+                  prevMTPs    = map snd prevHeightsAndMTPs
+                  enforceBIP68 = bip68Active net height
+                  lock = calculateSequenceLocks tx prevHeights prevMTPs enforceBIP68
+              unless (checkSequenceLocks height prevBlockMTP lock) $
+                Left "bad-txns-nonfinal"
+              -- Add this tx's outputs to intra-block height map.
+              let txid = computeTxId tx
+                  newOuts = Map.fromList
+                    [ (OutPoint txid (fromIntegral i), height)
+                    | i <- [0 .. length (txOutputs tx) - 1]
+                    ]
+              go (Map.union newOuts intrablockHeights) rest
+    go Map.empty txns
+
+  -- 8. Validate all transactions and compute total fees.
   -- skipScripts=True means per-input script evaluation is bypassed for this
   -- block (assumevalid ancestor path).  All other checks still run.
   -- KNOWN PITFALL: Intra-block spending - txs can spend outputs from earlier txs
@@ -2257,12 +2314,12 @@ checkBIP30 db net height block
 -- Reference: Bitcoin Core ConnectBlock() order — IsBIP30Repeat() fires before
 -- any UTXO mutation at validation.cpp.
 validateFullBlockIO :: HaskoinDB -> Network -> ChainState -> Bool -> Block
-                   -> Map OutPoint TxOut -> IO (Either String ())
-validateFullBlockIO db net cs skipScripts block utxoMap = do
+                   -> Map OutPoint Coin -> IO (Either String ())
+validateFullBlockIO db net cs skipScripts block utxoCoinMap = do
   bip30Result <- checkBIP30 db net (csHeight cs + 1) block
   case bip30Result of
     Left err -> return (Left err)
-    Right () -> return $ validateFullBlock net cs skipScripts block utxoMap
+    Right () -> return $ validateFullBlock net cs skipScripts block utxoCoinMap
 
 -- | Convert ConsensusFlags to a Word32 for use as a cache key.
 consensusFlagsToWord32 :: ConsensusFlags -> Word32
