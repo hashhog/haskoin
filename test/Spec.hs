@@ -4431,7 +4431,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0
           -- parent: one output at vout=0
           let parentOut = TxOut 50000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x55)
               parentTx  = Tx 2 [] [parentOut] [[]] 0
@@ -4458,7 +4458,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0
           let leafTx = Tx 2 [] [TxOut 1000 BS.empty] [[]] 0
               leafTxId = computeTxId leafTx
               leafEntry = (mkTestEntry leafTxId 100 50)
@@ -10729,7 +10729,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0
           let entry = MempoolEntry
                 { meTransaction = tx
                 , meTxId = expectedTxid
