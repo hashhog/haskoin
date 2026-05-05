@@ -2014,6 +2014,12 @@ bip22ResultString err
   -- Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
   | "exceeds max_money" `isInfixOf` s           = "bad-txns-vout-toolarge"
 
+  -- Non-coinbase tx where sum(inputs) < sum(outputs).
+  -- Core consensus/tx_verify.cpp::CheckTxInputs:
+  --   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+  -- Consensus.hs checkTxInputs returns Left "Outputs exceed inputs".
+  | "outputs exceed inputs" `isInfixOf` s       = "bad-txns-in-belowout"
+
   -- Script verification failures at connect-block stage.
   -- Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
   -- Covers disabled opcodes (OP_CAT is disabled / Disabled opcode encountered),
