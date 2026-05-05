@@ -74,6 +74,9 @@ module Haskoin.Rpc
   , parseDumpTxOutSetParams
   , latestAvailableSnapshotHeight
   , resolveDumpTarget
+    -- * loadtxoutset RPC gate (exported for testing)
+  , handleLoadTxOutSet
+  , loadTxOutSetGateMessage
     -- * ZMQ Notifications
   , ZmqTopic(..)
   , ZmqConfig(..)
@@ -4513,91 +4516,62 @@ handleImportMempool server params = do
 -- AssumeUTXO RPC Handlers
 --------------------------------------------------------------------------------
 
--- | Load a UTXO snapshot from a file for fast initial sync (AssumeUTXO).
--- Reference: Bitcoin Core's loadtxoutset RPC (rpc/blockchain.cpp) and
--- 'PopulateAndValidateSnapshot' in validation.cpp.
+-- | The @loadtxoutset@ RPC. Refused with @rpcInternalError@ in this
+-- build.
 --
--- Core-strict guard ported here:
+-- Background (cross-impl audit 2026-05-05,
+-- @CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md@):
+-- the previous handler validated the snapshot's network magic +
+-- version + on-disk shape via 'loadSnapshot', then walked the
+-- whitelist and content-hash checks, and reported @coins_loaded@
+-- pulled from the file's metadata header — but it NEVER called
+-- 'loadSnapshotIntoLegacyUTXO' (the persistence step that actually
+-- writes UTXOs to RocksDB and pins the best-block pointer). The CLI
+-- path (@app\/Main.hs@, lines 558-573) calls both
+-- 'loadSnapshot' AND 'loadSnapshotIntoLegacyUTXO' in sequence; the
+-- RPC was a no-op that lied to the operator: the response said the
+-- snapshot loaded, but @gettxoutsetinfo@ would still return zero
+-- UTXOs and the chain tip would still be at genesis.
 --
---   1. The snapshot's @base_blockhash@ must resolve to a known
---      'ChainEntry' in the header chain. If not, refuse with the same
---      "Did not find snapshot start blockheader %s" message Core uses.
+-- Wiring 'loadSnapshotIntoLegacyUTXO' in-handler is also not enough:
+-- the running daemon's 'PeerManager' / 'BlockStore' / header chain
+-- were initialised at boot from the pre-load chainstate and have no
+-- in-handler refresh path. The CLI is the only entry point that runs
+-- BEFORE those components start.
 --
---   2. The resolved height must appear in 'netAssumeUtxo' (the
---      'm_assumeutxo_data' map in Core). If not, refuse with the
---      canonical
---      "Assumeutxo height in snapshot metadata not recognized (%d)
---       - refusing to load snapshot"
---      message — see 'checkAssumeutxoWhitelist' /
---      'assumeutxoWhitelistError'.
+-- Fix is option (B) from rustoshi @1d0a325@ / hotbuns @e355cd7@ /
+-- blockbrew + clearbit + nimrod (cross-impl wave 2026-05-05): refuse
+-- the RPC at the gate, leave the datadir untouched, point the
+-- operator at the @--load-snapshot@ CLI flag. Same JSON-RPC error
+-- code Bitcoin Core uses in
+-- @bitcoin-core\/src\/rpc\/blockchain.cpp::loadtxoutset@ when
+-- @ActivateSnapshot@ cannot proceed (@RPC_INTERNAL_ERROR@ / @-32603@).
 --
--- Without these guards a malicious or misconfigured snapshot could be
--- loaded against an arbitrary base block, since 'loadSnapshot' itself
--- only validates magic + version + on-disk shape.
+-- The gate fires before any file I\/O so a refused call leaves the
+-- datadir untouched.
 --
 -- Params: [path]
--- Returns: { "coins_loaded": <count>, "tip_hash": "<hash>" }
 handleLoadTxOutSet :: RpcServer -> Value -> IO RpcResponse
-handleLoadTxOutSet server params = do
+handleLoadTxOutSet _server params =
+  -- Validate parameter shape only; never call 'loadSnapshot' or any
+  -- persistence step.
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Usage: loadtxoutset \"path\"") Null
-    Just pathText -> do
-      let path = T.unpack pathText
-          net = rsNetwork server
-          magic = netMagic net
-      result <- loadSnapshot path magic
-      case result of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInternalError (T.pack err)) Null
-        Right snapshot -> do
-          let metadata = usMetadata snapshot
-              coinsCount = smCoinsCount metadata
-              baseHash   = smBaseBlockHash metadata
-          -- Step 1: resolve base blockhash → height via the header chain.
-          entries <- readTVarIO (hcEntries (rsHeaderChain server))
-          case Map.lookup baseHash entries of
-            Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInternalError
-                (T.pack ("Did not find snapshot start blockheader "
-                         ++ show baseHash))) Null
-            Just entry ->
-              -- Step 2: that height must be whitelisted in netAssumeUtxo.
-              case checkAssumeutxoWhitelist net (ceHeight entry) of
-                Left err -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcInternalError (T.pack err)) Null
-                Right () ->
-                  -- Step 3: strict hash validation per
-                  -- bitcoin-core/src/validation.cpp:5912-5914
-                  -- ('PopulateAndValidateSnapshot'). Recompute Core's
-                  -- HASH_SERIALIZED over the loaded coin set and compare
-                  -- against the whitelisted 'audHashSerialized' for this
-                  -- block hash. Refusal here means the snapshot file's
-                  -- contents do not match the chainparams commitment, so
-                  -- we must not load it (that is also Core's behaviour).
-                  case assumeUtxoForBlockHash net baseHash of
-                    Nothing -> return $ RpcResponse Null
-                      (toJSON $ RpcError rpcInternalError
-                        (T.pack ("loadtxoutset: no assumeutxo data for "
-                                 ++ show baseHash))) Null
-                    Just params ->
-                      let audData = AssumeUtxoData
-                            { audHeight = aupHeight params
-                            , audHashSerialized = aupHashSerialized params
-                            , audChainTxCount = aupChainTxCount params
-                            , audBlockHash = aupBlockHash params
-                            }
-                      in case verifySnapshot snapshot audData of
-                           Left vErr -> return $ RpcResponse Null
-                             (toJSON $ RpcError rpcInternalError
-                               (T.pack ("Bad snapshot content hash: " ++ vErr))) Null
-                           Right () ->
-                             return $ RpcResponse
-                               (object [ "coins_loaded" .= coinsCount
-                                       , "tip_hash"     .= show baseHash
-                                       , "base_height"  .= ceHeight entry
-                                       ])
-                               Null Null
+    Just _pathText -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInternalError loadTxOutSetGateMessage) Null
+
+-- | The error message returned by the refused @loadtxoutset@ RPC.
+-- Exposed as a top-level binding so tests can pin the wording without
+-- a copy-paste drift hazard.
+loadTxOutSetGateMessage :: T.Text
+loadTxOutSetGateMessage =
+  "loadtxoutset RPC is disabled in this build because the live daemon "
+  <> "cannot atomically activate a UTXO snapshot once the header-sync "
+  <> "and block-download components have started. Use the CLI flag "
+  <> "--load-snapshot=<path> at startup instead — that path imports "
+  <> "the snapshot, pins the chain tip, and writes the block index "
+  <> "before any P2P/sync components are constructed."
 
 -- | What snapshot height the @dumptxoutset@ RPC has been asked to
 -- produce. Mirrors Bitcoin Core's three modes from
