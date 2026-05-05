@@ -1082,6 +1082,26 @@ handleGetBlock server params = do
                       entries <- readTVarIO (hcEntries (rsHeaderChain server))
                       let mEntry = Map.lookup bh entries
                           txids = map computeTxId (blockTxns block)
+                          blockBits = bhBits (blockHeader block)
+                          -- Build coinbase_tx from first transaction (Core 27+ field)
+                          coinbaseTxVal = case blockTxns block of
+                            [] -> Null
+                            (cb:_) ->
+                              let cbInp = case txInputs cb of { (i:_) -> Just i; [] -> Nothing }
+                                  scriptHex = maybe "" (TE.decodeUtf8 . B16.encode . txInScript) cbInp
+                                  seqNum    = maybe (maxBound :: Word32) txInSequence cbInp
+                                  -- First witness item for the coinbase (if any)
+                                  witHex    = case txWitness cb of
+                                    (ws:_) | not (null ws) ->
+                                      Just $ TE.decodeUtf8 $ B16.encode (head ws)
+                                    _ -> Nothing
+                                  baseFields = [ "version"  .= txVersion cb
+                                               , "locktime" .= txLockTime cb
+                                               , "sequence" .= seqNum
+                                               , "coinbase" .= scriptHex
+                                               ]
+                              in object $ baseFields ++
+                                   maybe [] (\w -> ["witness" .= w]) witHex
                           result = object $ catMaybes
                             [ Just $ "hash" .= showHash bh
                             , Just $ "confirmations" .= (1 :: Int)
@@ -1092,9 +1112,12 @@ handleGetBlock server params = do
                             , Just $ "tx" .= map (showHash . blockHashFromTxId) txids
                             , Just $ "time" .= bhTimestamp (blockHeader block)
                             , Just $ "nonce" .= bhNonce (blockHeader block)
-                            , Just $ "bits" .= showBits (bhBits (blockHeader block))
-                            , Just $ "difficulty" .= getDifficulty (bhBits (blockHeader block))
+                            , Just $ "bits" .= showBits blockBits
+                            , Just $ "target" .= showHex64 (bitsToTarget blockBits)
+                            , Just $ "difficulty" .= getDifficulty blockBits
+                            , fmap (\e -> "chainwork" .= showHex (ceChainWork e)) mEntry
                             , Just $ "previousblockhash" .= showHash (bhPrevBlock (blockHeader block))
+                            , Just $ "coinbase_tx" .= coinbaseTxVal
                             ]
                       return $ RpcResponse result Null Null
 
@@ -1730,30 +1753,44 @@ handleGetPeerInfo server = do
             , if services .&. 1024 /= 0 then Just "NETWORK_LIMITED" else Nothing
             ]
           isInbound = piInbound info
+          pingTime = fromMaybe (0 :: Double) (piPingLatency info)
       in object
-      [ "id"              .= (idx :: Int)
-      , "addr"            .= show addr
-      , "network"         .= ("ipv4" :: Text)
-      , "services"        .= (T.pack $ printf "%016x" services)
-      , "servicesnames"   .= serviceNames
-      , "relaytxes"       .= piRelay info
-      , "lastsend"        .= piLastSeen info
-      , "lastrecv"        .= piLastSeen info
-      , "bytessent"       .= piBytesSent info
-      , "bytesrecv"       .= piBytesRecv info
-      , "conntime"        .= piConnectedAt info
-      , "timeoffset"      .= piTimeOffset info
-      , "pingtime"        .= fromMaybe (0 :: Double) (piPingLatency info)
-      , "version"         .= maybe (0 :: Int32) vVersion (piVersion info)
-      , "subver"          .= maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info)
-      , "inbound"         .= isInbound
-      , "bip152_hb_to"    .= False
-      , "bip152_hb_from"  .= False
-      , "startingheight"  .= piStartHeight info
-      , "synced_headers"  .= (-1 :: Int)
-      , "synced_blocks"   .= (-1 :: Int)
-      , "inflight"        .= ([] :: [Int])
-      , "connection_type" .= (if isInbound then "inbound" :: Text else "outbound-full-relay")
+      [ "id"                      .= (idx :: Int)
+      , "addr"                    .= show addr
+      , "network"                 .= ("ipv4" :: Text)
+      , "services"                .= (T.pack $ printf "%016x" services)
+      , "servicesnames"           .= serviceNames
+      , "relaytxes"               .= piRelay info
+      , "lastsend"                .= piLastSeen info
+      , "lastrecv"                .= piLastSeen info
+      , "last_transaction"        .= (0 :: Int)
+      , "last_block"              .= (0 :: Int)
+      , "bytessent"               .= piBytesSent info
+      , "bytesrecv"               .= piBytesRecv info
+      , "conntime"                .= piConnectedAt info
+      , "timeoffset"              .= piTimeOffset info
+      , "pingtime"                .= pingTime
+      , "minping"                 .= pingTime
+      , "version"                 .= maybe (0 :: Int32) vVersion (piVersion info)
+      , "subver"                  .= maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info)
+      , "inbound"                 .= isInbound
+      , "bip152_hb_to"            .= False
+      , "bip152_hb_from"          .= False
+      , "startingheight"          .= piStartHeight info
+      , "presynced_headers"       .= (-1 :: Int)
+      , "synced_headers"          .= (-1 :: Int)
+      , "synced_blocks"           .= (-1 :: Int)
+      , "inflight"                .= ([] :: [Int])
+      , "addr_relay_enabled"      .= True
+      , "addr_processed"          .= (0 :: Int)
+      , "addr_rate_limited"       .= (0 :: Int)
+      , "permissions"             .= ([] :: [Text])
+      , "minfeefilter"            .= (0 :: Double)
+      , "bytessent_per_msg"       .= object []
+      , "bytesrecv_per_msg"       .= object []
+      , "connection_type"         .= (if isInbound then "inbound" :: Text else "outbound-full-relay")
+      , "transport_protocol_type" .= ("v1" :: Text)
+      , "session_id"              .= ("" :: Text)
       ]
 
 -- | Get the number of connected peers
@@ -2091,11 +2128,28 @@ handleSubmitBlockUnpaused server params = do
 handleGetMiningInfo :: RpcServer -> IO RpcResponse
 handleGetMiningInfo server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
-  let result = object
+  (pooledTxCount, _) <- getMempoolSize (rsMempool server)
+  let tipBits  = bhBits (ceHeader tip)
+      bitsHex  = showBits tipBits
+      targetHex = showHex64 (bitsToTarget tipBits)
+      diff      = getDifficulty tipBits
+      nextH     = ceHeight tip + 1
+      result = object
         [ "blocks"        .= ceHeight tip
-        , "difficulty"    .= getDifficulty (bhBits (ceHeader tip))
+        , "bits"          .= bitsHex
+        , "difficulty"    .= diff
+        , "target"        .= targetHex
+        , "blockmintxfee" .= (0.00001000 :: Double)
         , "networkhashps" .= (0 :: Double)
+        , "pooledtx"      .= pooledTxCount
         , "chain"         .= netName (rsNetwork server)
+        , "next"          .= object
+            [ "height"     .= nextH
+            , "bits"       .= bitsHex
+            , "difficulty" .= diff
+            , "target"     .= targetHex
+            ]
+        , "warnings"      .= ("" :: Text)
         ]
   return $ RpcResponse result Null Null
 
@@ -5019,6 +5073,10 @@ showHex n = T.pack $ showHex' n ""
 -- | Display difficulty bits in hex
 showBits :: Word32 -> Text
 showBits bits = T.pack $ printf "%08x" bits
+
+-- | Convert an Integer to 64-char zero-padded lowercase hex (Core target format)
+showHex64 :: Integer -> Text
+showHex64 n = T.pack $ printf "%064x" n
 
 -- | Calculate difficulty from compact bits format
 getDifficulty :: Word32 -> Double
