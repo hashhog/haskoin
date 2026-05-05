@@ -132,7 +132,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
-import Data.List (sortBy, foldl')
+import Data.List (sortBy, foldl', sort)
 import Data.Ord (comparing, Down(..))
 import Data.Maybe (mapMaybe, catMaybes)
 import qualified Data.Map.Strict as Map
@@ -149,7 +149,9 @@ import Data.Serialize (encode)
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeWtxid)
 import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
-                           txBaseSize, txTotalSize, coinbaseMaturity)
+                           txBaseSize, txTotalSize, coinbaseMaturity,
+                           isFinalTxCheck, calculateSequenceLocks,
+                           checkSequenceLocks, bip68Active)
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
@@ -271,6 +273,9 @@ data MempoolError
   | ErrClusterLimitExceeded !Int !Int              -- ^ (actual_size, max_size)
   -- Relay-policy / standardness (Bitcoin Core IsStandardTx)
   | ErrNonStandard !String                         -- ^ short reason tag (e.g. "tx-size", "scriptpubkey")
+  -- Locktime / sequence-lock policy (Bitcoin Core MemPoolAccept::PreChecks)
+  | ErrNonFinal !String           -- ^ nLockTime not satisfied at tip+1 (BIP-113 IsFinalTx)
+  | ErrSeqLockNotSatisfied        -- ^ BIP-68 relative locktime not satisfied at tip+1
   deriving (Show, Eq, Generic)
 
 instance NFData MempoolError
@@ -451,7 +456,14 @@ data Mempool = Mempool
   , mpNetwork    :: !Network
     -- ^ Network configuration
   , mpHeight     :: !(TVar Word32)
-    -- ^ Current chain height
+    -- ^ Current chain height (tip height; mempool checks against tip+1)
+  , mpMTP        :: !(TVar Word32)
+    -- ^ Median Time Past of the current tip (BIP-113).
+    -- Derived from mpRecentTimestamps; updated in blockConnected/blockDisconnected.
+    -- Used by IsFinalTx at mempool admit.
+  , mpRecentTimestamps :: !(TVar [Word32])
+    -- ^ Ring of the last ≤11 block timestamps (newest first).
+    -- Maintained by blockConnected/blockDisconnected for MTP computation.
   , mpFeeDeltas  :: !(TVar (Map TxId Int64))
     -- ^ Prioritisetransaction fee deltas (in satoshis); persisted in
     -- mempool.dat alongside transactions.
@@ -460,9 +472,12 @@ data Mempool = Mempool
     -- relayed to a peer. Persisted in mempool.dat.
   }
 
--- | Create a new empty mempool
-newMempool :: Network -> UTXOCache -> MempoolConfig -> Word32 -> IO Mempool
-newMempool net cache config height = Mempool
+-- | Create a new empty mempool.
+-- 'height' is the current chain tip height; 'mtp' is the Median Time Past
+-- of the current tip (used for BIP-113 IsFinalTx at mempool admit).
+-- Pass 0 for both on a fresh node; they are updated via blockConnected.
+newMempool :: Network -> UTXOCache -> MempoolConfig -> Word32 -> Word32 -> IO Mempool
+newMempool net cache config height mtp = Mempool
   <$> newTVarIO Map.empty
   <*> newTVarIO Map.empty
   <*> newTVarIO Map.empty
@@ -472,6 +487,8 @@ newMempool net cache config height = Mempool
   <*> newTVarIO 0
   <*> pure net
   <*> newTVarIO height
+  <*> newTVarIO mtp
+  <*> newTVarIO []         -- mpRecentTimestamps: empty until blocks connect
   <*> newTVarIO Map.empty
   <*> newTVarIO Set.empty
 
@@ -507,17 +524,37 @@ addTransactionInner mp tx txid = do
       case Std.checkStandardTx tx of
         Left stdErr -> return $ Left (ErrNonStandard (renderStdReason stdErr))
         Right () -> do
+          -- 2c. IsFinalTx (BIP-113): reject non-final transactions at mempool
+          -- admit.  Mempool holds txs for the *next* block, so check against
+          -- tipHeight+1 and the MTP of the current tip per BIP-113.
+          -- Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
+          -- (validation.cpp:819).
+          height <- readTVarIO (mpHeight mp)
+          mtp    <- readTVarIO (mpMTP mp)
+          let nextHeight = height + 1
+          if not (isFinalTxCheck tx nextHeight mtp)
+            then return $ Left (ErrNonFinal "non-final")
+            else do
+              -- 2d. BIP-68 sequence locks: reject txs whose relative-locktime
+              -- constraints are not satisfied at the next block.  Uses per-input
+              -- coin heights from the UTXO set (unconfirmed mempool parents get
+              -- synthetic height = tipHeight+1 as Bitcoin Core does).
+              -- Mirrors Bitcoin Core MemPoolAccept::PreChecks →
+              -- CheckSequenceLocksAtTip (validation.cpp:887).
+              seqLockResult <- checkSeqLocksAtTip mp tx height mtp
+              case seqLockResult of
+                Left err -> return $ Left err
+                Right () -> do
+                  -- 3. Check for conflicts first (before resolving inputs)
+                  conflicts <- getConflicts mp tx
 
-          -- 3. Check for conflicts first (before resolving inputs)
-          conflicts <- getConflicts mp tx
-
-          if null conflicts
-            -- No conflicts: proceed with normal addition
-            then addTransactionNoConflicts mp tx txid
-            -- Has conflicts: attempt RBF replacement
-            else if mpcRBFEnabled (mpConfig mp)
-              then addTransactionWithReplacement mp tx txid conflicts
-              else return $ Left (ErrInputSpentInMempool (head conflicts))
+                  if null conflicts
+                    -- No conflicts: proceed with normal addition
+                    then addTransactionNoConflicts mp tx txid
+                    -- Has conflicts: attempt RBF replacement
+                    else if mpcRBFEnabled (mpConfig mp)
+                      then addTransactionWithReplacement mp tx txid conflicts
+                      else return $ Left (ErrInputSpentInMempool (head conflicts))
 
 -- | Add a transaction with no conflicts (normal case)
 addTransactionNoConflicts :: Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
@@ -1237,15 +1274,28 @@ blockConnected mp block = do
     unless (Set.null $ Set.intersection txSpends spentByBlock) $
       removeWithDescendants mp txid
 
-  -- Update chain height
-  atomically $ modifyTVar' (mpHeight mp) (+ 1)
+  -- Update chain height and MTP (BIP-113).
+  -- Prepend the new block's timestamp to the rolling window (capped at 11),
+  -- then recompute the median so that IsFinalTx at mempool admit uses the
+  -- correct MTP of the new tip, matching Bitcoin Core's CheckFinalTxAtTip.
+  let ts = bhTimestamp (blockHeader block)
+  atomically $ do
+    modifyTVar' (mpHeight mp) (+ 1)
+    modifyTVar' (mpRecentTimestamps mp) (\old -> take 11 (ts : old))
+    timestamps <- readTVar (mpRecentTimestamps mp)
+    writeTVar (mpMTP mp) (computeMTPFromList timestamps)
 
 -- | Handle a disconnected block (during reorg)
 -- Re-adds transactions from the disconnected block back to mempool
 blockDisconnected :: Mempool -> Block -> IO ()
 blockDisconnected mp block = do
-  -- Decrease chain height
-  atomically $ modifyTVar' (mpHeight mp) (subtract 1)
+  -- Decrease chain height and drop the disconnected block's timestamp from
+  -- the MTP window. We drop the head (most-recent) and recompute.
+  atomically $ do
+    modifyTVar' (mpHeight mp) (subtract 1)
+    modifyTVar' (mpRecentTimestamps mp) safeDropHead
+    timestamps <- readTVar (mpRecentTimestamps mp)
+    writeTVar (mpMTP mp) (computeMTPFromList timestamps)
 
   -- Re-add non-coinbase transactions
   -- (they may fail validation if inputs are now missing)
@@ -1253,6 +1303,51 @@ blockDisconnected mp block = do
     void $ addTransaction mp tx
   where
     void = fmap (const ())
+
+-- | Check BIP-68 sequence locks for mempool admission.
+-- For each input, fetch the coin height from the UTXO set (unconfirmed mempool
+-- parents get synthetic height tipHeight+1 and MTP mtp, matching Bitcoin
+-- Core's CalculateLockPointsAtTip convention for chained unconfirmed txs).
+-- Returns Right () if all locks are satisfied, Left err otherwise.
+-- Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckSequenceLocksAtTip
+-- (validation.cpp:887).
+checkSeqLocksAtTip :: Mempool -> Tx -> Word32 -> Word32 -> IO (Either MempoolError ())
+checkSeqLocksAtTip mp tx tipHeight mtp = do
+  let enforce = bip68Active (mpNetwork mp) (tipHeight + 1)
+  if not enforce
+    then return (Right ())
+    else do
+      -- Collect per-input coin heights and MTPs.
+      -- UTXOs in the confirmed set: use their confirmed height.
+      -- UTXOs from unconfirmed mempool parents: use tipHeight+1 (synthetic).
+      heightMTPs <- forM (txInputs tx) $ \inp -> do
+        let op = txInPrevOutput inp
+        mUtxo <- lookupUTXO (mpUTXOCache mp) op
+        case mUtxo of
+          Just entry -> return (ueHeight entry, mtp)
+          Nothing -> do
+            -- Mempool parent or unknown — use tipHeight+1 as Bitcoin Core does
+            return (tipHeight + 1, mtp)
+      let (prevHeights, prevMTPs) = unzip heightMTPs
+          lock = calculateSequenceLocks tx prevHeights prevMTPs True
+      if checkSequenceLocks (tipHeight + 1) mtp lock
+        then return (Right ())
+        else return (Left ErrSeqLockNotSatisfied)
+
+-- | Compute Median Time Past from a list of block timestamps (newest first).
+-- Takes the median of the first ≤11 entries — matches Bitcoin Core's
+-- GetMedianTimePast() in primitives/block.h.
+computeMTPFromList :: [Word32] -> Word32
+computeMTPFromList [] = 0
+computeMTPFromList ts =
+  let window = take 11 ts
+      sorted = sort window
+  in sorted !! (length sorted `div` 2)
+
+-- | Drop the first element of a list, or return [] if already empty.
+safeDropHead :: [a] -> [a]
+safeDropHead []     = []
+safeDropHead (_:xs) = xs
 
 --------------------------------------------------------------------------------
 -- Eviction
