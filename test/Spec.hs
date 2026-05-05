@@ -85,7 +85,7 @@ import Haskoin.Rpc
 import Haskoin.Index
 import qualified Haskoin.MuHash as MuHash
 import qualified Haskoin.Daemon as Daemon
-import Data.Aeson (Value(..), Object, Array, object, (.=))
+import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
 import Data.Scientific (Scientific)
@@ -12380,6 +12380,82 @@ main = hspec $ do
         checkAssumeutxoWhitelist mainnet 840001 `shouldBe`
           Left "Assumeutxo height in snapshot metadata not recognized \
                \(840001) - refusing to load snapshot"
+
+    -- ------------------------------------------------------------------
+    -- loadtxoutset RPC gate (cross-impl audit 2026-05-05).
+    --
+    -- The pre-fix handler validated the snapshot file but never called
+    -- 'loadSnapshotIntoLegacyUTXO' (the persistence step that the CLI
+    -- path runs after 'loadSnapshot'), and reported 'coins_loaded'
+    -- pulled from the file's metadata header. The RPC was a no-op that
+    -- LIED to the operator. Fixed by refusing the RPC at the gate per
+    -- rustoshi 1d0a325 / hotbuns e355cd7 / blockbrew + clearbit + nimrod.
+    --
+    -- The handler ignores its 'RpcServer' argument (the gate fires
+    -- before any server-state read), so we can pass 'undefined' here
+    -- without a full server fixture — same justification the
+    -- 'checkAssumeutxoWhitelist' suite above uses for testing the
+    -- policy function directly.
+    -- ------------------------------------------------------------------
+    describe "loadtxoutset RPC gate" $ do
+      it "refuses with rpcInternalError and points at --load-snapshot" $ do
+        resp <- handleLoadTxOutSet undefined
+                  (toJSON ["/some/snapshot.dat" :: T.Text])
+        let err = resError resp
+        -- result must be Null (refusal)
+        resResult resp `shouldBe` Null
+        -- error.code must be -32603 (rpcInternalError)
+        case err of
+          Object km -> do
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcInternalError)
+            -- error.message must direct the operator at the CLI flag
+            case KM.lookup "message" km of
+              Just (String t) ->
+                ("--load-snapshot" `T.isInfixOf` t) `shouldBe` True
+              other ->
+                expectationFailure
+                  ("expected error.message :: Text, got " ++ show other)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "gate fires before any file I/O (non-existent path)" $ do
+        -- Pre-fix code would have called 'loadSnapshot' which opens
+        -- the path on disk. With a non-existent path the previous
+        -- behaviour was an OSError-flavoured message; the gate must
+        -- short-circuit to the canonical refusal regardless.
+        resp <- handleLoadTxOutSet undefined
+                  (toJSON ["/definitely/does/not/exist.dat" :: T.Text])
+        case resError resp of
+          Object km ->
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcInternalError)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "still rejects malformed params before the gate" $ do
+        -- Empty params array → rpcInvalidParams (-32602), NOT
+        -- rpcInternalError. Param-validation comes before the gate.
+        resp <- handleLoadTxOutSet undefined (toJSON ([] :: [T.Text]))
+        case resError resp of
+          Object km ->
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcInvalidParams)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "gate message matches the exported 'loadTxOutSetGateMessage'" $ do
+        resp <- handleLoadTxOutSet undefined
+                  (toJSON ["/some/snapshot.dat" :: T.Text])
+        case resError resp of
+          Object km -> case KM.lookup "message" km of
+            Just (String t) -> t `shouldBe` loadTxOutSetGateMessage
+            other ->
+              expectationFailure
+                ("expected error.message :: Text, got " ++ show other)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
 
   -- BIP-22 submitblock result string mapping (must come before 'where' below)
   -- Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
