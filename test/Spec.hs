@@ -7718,6 +7718,54 @@ main = hspec $ do
           maxPrunable = tipHeight - minBlocksToKeep
       (pruneHeight > maxPrunable) `shouldBe` False
 
+    -- ----------------------------------------------------------------
+    -- pruneblockchain RPC gate (audit
+    -- CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md, Bug 4).
+    --
+    -- Pre-fix: handler accepted requests whenever a BlockStore was
+    -- attached. With --prune off, a non-pruned node could be tricked
+    -- into deleting block files via RPC.
+    --
+    -- Core (rpc/blockchain.cpp::pruneblockchain) refuses with
+    -- RPC_MISC_ERROR + the exact message
+    -- "Cannot prune blocks because node is not in prune mode."
+    -- when fPruneMode is false. Post-fix mirrors that.
+    -- ----------------------------------------------------------------
+    describe "prune-mode gate (Bug 4)" $ do
+      it "exports the exact Core refusal message" $ do
+        pruneblockchainNotEnabledMsg
+          `shouldBe` "Cannot prune blocks because node is not in prune mode."
+
+      it "refusal response uses RPC_MISC_ERROR (-1)" $ do
+        let resp = pruneblockchainNotEnabledResponse
+        resResult resp `shouldBe` Null
+        case resError resp of
+          Object km ->
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcMiscError)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "refusal response surfaces the canonical Core message" $ do
+        let resp = pruneblockchainNotEnabledResponse
+        case resError resp of
+          Object km -> case KM.lookup "message" km of
+            Just (String t) -> t `shouldBe` pruneblockchainNotEnabledMsg
+            other ->
+              expectationFailure
+                ("expected error.message :: Text, got " ++ show other)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "refusal message exactly matches Bitcoin Core's string" $ do
+        -- Pin the exact bytes; Core's rpc/blockchain.cpp uses this
+        -- string verbatim. If anyone adjusts the wording, this test
+        -- fires so the change is intentional.
+        let coreMsg :: T.Text
+            coreMsg = "Cannot prune blocks because node is not in prune mode."
+        pruneblockchainNotEnabledMsg `shouldBe` coreMsg
+
   ---------------------------------------------------------------------------
   -- Block Index Tests (txindex, blockfilterindex, coinstatsindex)
   ---------------------------------------------------------------------------

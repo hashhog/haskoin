@@ -661,7 +661,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , rpcPassword = noRpcPass
           , rpcDataDir  = dataDir
           }
-    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing
+    -- Plumb the --prune flag into the RPC server so 'pruneblockchain'
+    -- can refuse calls when prune mode is off (Core parity; audit
+    -- 2026-05-05 Bug 4).
+    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing noPrune
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
 
     -- Periodic chainstate flush.
