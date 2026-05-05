@@ -12457,6 +12457,96 @@ main = hspec $ do
             expectationFailure
               ("expected error :: Object, got " ++ show other)
 
+    -- ------------------------------------------------------------------
+    -- importdescriptors RPC gate (cross-impl lying-RPC audit 2026-05-05).
+    --
+    -- The pre-fix handler walked the requests array, parsed each
+    -- descriptor via 'parseDescriptor', and returned
+    -- {"success": true, "warnings": []} per descriptor without ever
+    -- storing it in the wallet DB, deriving addresses, or scanning the
+    -- chain. Operators got a successful JSON-RPC response; nothing
+    -- actually landed. Fixed by refusing the RPC at the gate per
+    -- rustoshi 1d0a325 / hotbuns e355cd7 / clearbit + nimrod (lying-RPC
+    -- mirror wave 2026-05-05). Returns rpcWalletError (-4) instead of
+    -- rpcInternalError because the gap is a wallet-feature gap, not a
+    -- chainstate-activation issue.
+    --
+    -- The handler ignores its 'RpcServer' argument (the gate fires
+    -- before any server-state read), so we can pass 'undefined' here
+    -- without a full server fixture — same justification the
+    -- 'handleLoadTxOutSet' suite above uses.
+    -- ------------------------------------------------------------------
+    describe "importdescriptors RPC gate" $ do
+      it "refuses with rpcWalletError and surfaces 'not implemented'" $ do
+        -- A well-formed requests array with one descriptor object.
+        -- Pre-fix code would have parsed the descriptor and returned
+        -- [{"success": true, "warnings": []}].
+        let req = toJSON [object [ "desc"
+                  .= ("wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)" :: T.Text) ]]
+        resp <- handleImportDescriptors undefined req
+        let err = resError resp
+        -- result must be Null (refusal)
+        resResult resp `shouldBe` Null
+        -- error.code must be -4 (rpcWalletError)
+        case err of
+          Object km -> do
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcWalletError)
+            -- error.message must surface the impl gap
+            case KM.lookup "message" km of
+              Just (String t) ->
+                ("importdescriptors not implemented" `T.isInfixOf` t)
+                  `shouldBe` True
+              other ->
+                expectationFailure
+                  ("expected error.message :: Text, got " ++ show other)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "gate fires before any descriptor parse" $ do
+        -- Pre-fix code would have called 'parseDescriptor' on
+        -- "obviously-not-a-descriptor" and returned a per-element error
+        -- object with rpcInvalidParams. Post-fix the gate must
+        -- short-circuit to the canonical refusal regardless.
+        let req = toJSON [object
+                    [ "desc" .= ("obviously-not-a-descriptor" :: T.Text) ]]
+        resp <- handleImportDescriptors undefined req
+        case resError resp of
+          Object km ->
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcWalletError)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+        -- Result must be Null, NOT a per-element results array (which
+        -- the pre-fix handler always returned).
+        resResult resp `shouldBe` Null
+
+      it "still rejects malformed params before the gate" $ do
+        -- Non-array params → rpcInvalidParams (-32602), NOT
+        -- rpcWalletError. Param-validation comes before the gate.
+        resp <- handleImportDescriptors undefined
+                  (toJSON ("not-an-array" :: T.Text))
+        case resError resp of
+          Object km ->
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcInvalidParams)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
+      it "gate message matches the exported 'importDescriptorsGateMessage'" $ do
+        let req = toJSON [object [ "desc"
+                  .= ("wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)" :: T.Text) ]]
+        resp <- handleImportDescriptors undefined req
+        case resError resp of
+          Object km -> case KM.lookup "message" km of
+            Just (String t) -> t `shouldBe` importDescriptorsGateMessage
+            other ->
+              expectationFailure
+                ("expected error.message :: Text, got " ++ show other)
+          other ->
+            expectationFailure
+              ("expected error :: Object, got " ++ show other)
+
   -- BIP-22 submitblock result string mapping (must come before 'where' below)
   -- Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
   describe "bip22ResultString" $ do
