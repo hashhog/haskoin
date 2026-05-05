@@ -573,7 +573,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                   ++ " UTXO(s); best-block pinned to snapshot base."
 
     -- Initialize mempool
-    mp <- newMempool net cache defaultMempoolConfig 0
+    mp <- newMempool net cache defaultMempoolConfig 0 0
 
     -- Load mempool.dat (Core-format), if present. We use a 14-day
     -- expiry (matches Bitcoin Core's DEFAULT_MEMPOOL_EXPIRY_HOURS = 336).
