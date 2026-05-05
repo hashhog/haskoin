@@ -184,7 +184,10 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          dumpTxOutSetFromDB,
                          AssumeUtxoData(..), verifySnapshot,
                          buildSpentUtxoMapFromDB,
-                         getUndoData)
+                         getUndoData,
+                         getUTXOCount, getBlockHeight,
+                         iterateWithPrefix, KeyPrefix(..), Coin(..),
+                         SnapshotCoin(..), computeUtxoMuHash)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
@@ -811,6 +814,13 @@ handleRpcRequest server req = do
     -- AssumeUTXO RPCs
     "loadtxoutset"         -> handleLoadTxOutSet server params
     "dumptxoutset"         -> handleDumpTxOutSet server params
+
+    -- W47B: UTXO set / mining stats / proof RPCs
+    "gettxoutsetinfo"      -> handleGetTxOutSetInfo server
+    "getnetworkhashps"     -> handleGetNetworkHashPS server params
+    "gettxoutproof"        -> handleGetTxOutProof server params
+    "verifytxoutproof"     -> handleVerifyTxOutProof server params
+    "getrpcinfo"           -> handleGetRpcInfo server
 
     -- Control RPCs
     "help"                 -> handleHelp server params
@@ -6246,6 +6256,378 @@ combinedApp server req respond = do
   if BS.isPrefixOf "/rest/" path
     then restApp server req respond
     else rpcApp server req respond
+
+--------------------------------------------------------------------------------
+-- W47B: gettxoutsetinfo / getnetworkhashps / gettxoutproof / verifytxoutproof
+--        / getrpcinfo
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp + merkleblock.cpp
+--------------------------------------------------------------------------------
+
+-- | Core CalcTreeWidth: height 0 = leaves (nTx), height nHeight = root (1).
+w47bTreeWidth :: Int -> Int -> Int
+w47bTreeWidth nTx height = (nTx + (1 `shiftL` height) - 1) `div` (1 `shiftL` height)
+
+-- | Core CalcHash: height 0 returns txids[pos]; higher heights hash children.
+-- Returns raw 32-byte ByteString.
+w47bCalcHash :: [ByteString] -> Int -> Int -> Int -> ByteString
+w47bCalcHash txids nTx height pos
+  | height == 0 = txids !! pos
+  | otherwise   =
+      let left     = w47bCalcHash txids nTx (height - 1) (pos * 2)
+          rightPos = pos * 2 + 1
+          right
+            | rightPos < w47bTreeWidth nTx (height - 1) =
+                w47bCalcHash txids nTx (height - 1) rightPos
+            | otherwise = left
+          Hash256 h = doubleSHA256 (left <> right)
+      in h
+
+-- | Core TraverseAndBuild: emit bits and hashes for the partial merkle tree.
+-- Returns (hashes, bits) arrays.
+w47bBuild :: [ByteString]  -- txids (raw 32-byte LE)
+          -> Int            -- nTx
+          -> [Bool]         -- matchFlags (length nTx, 0-based)
+          -> Int            -- height
+          -> Int            -- pos
+          -> ([ByteString], [Bool])
+w47bBuild txids nTx matchFlags height pos =
+  let lo = pos `shiftL` height
+      hi = min (((pos + 1) `shiftL` height)) nTx
+      parentMatch = any (matchFlags !!) [lo .. hi - 1]
+  in if height == 0 || not parentMatch
+     then ( [w47bCalcHash txids nTx height pos], [parentMatch] )
+     else let (lh, lb) = w47bBuild txids nTx matchFlags (height - 1) (pos * 2)
+              rightPos = pos * 2 + 1
+              (rh, rb)
+                | rightPos < w47bTreeWidth nTx (height - 1) =
+                    w47bBuild txids nTx matchFlags (height - 1) rightPos
+                | otherwise = ([], [])
+          in (lh <> rh, [parentMatch] <> lb <> rb)
+
+-- | Pack bits LSB-first into bytes.
+w47bBitsToBytes :: [Bool] -> ByteString
+w47bBitsToBytes bits =
+  let chunks = chunksOf8 bits
+      toByte bs = foldl' (\acc (i, b) -> if b then acc .|. (1 `shiftL` i) else acc) 0 (zip [0..] bs)
+      chunksOf8 [] = []
+      chunksOf8 xs = take 8 xs : chunksOf8 (drop 8 xs)
+  in BS.pack (map toByte chunks)
+
+-- | Encode uint32 little-endian.
+w47bLE32 :: Word32 -> ByteString
+w47bLE32 n = BS.pack [ fromIntegral (n .&. 0xFF)
+                      , fromIntegral ((n `shiftR` 8) .&. 0xFF)
+                      , fromIntegral ((n `shiftR` 16) .&. 0xFF)
+                      , fromIntegral ((n `shiftR` 24) .&. 0xFF)
+                      ]
+
+-- | Encode Bitcoin varint.
+w47bVarInt :: Int -> ByteString
+w47bVarInt n
+  | n < 0xFD = BS.singleton (fromIntegral n)
+  | n <= 0xFFFF = BS.pack [0xFD, fromIntegral (n .&. 0xFF), fromIntegral ((n `shiftR` 8) .&. 0xFF)]
+  | otherwise   = BS.pack [0xFE
+                           , fromIntegral (n .&. 0xFF)
+                           , fromIntegral ((n `shiftR` 8) .&. 0xFF)
+                           , fromIntegral ((n `shiftR` 16) .&. 0xFF)
+                           , fromIntegral ((n `shiftR` 24) .&. 0xFF)]
+
+-- | Read Bitcoin varint from ByteString; returns (value, rest).
+w47bReadVarInt :: ByteString -> Maybe (Int, ByteString)
+w47bReadVarInt bs
+  | BS.null bs = Nothing
+  | otherwise =
+      let b = BS.head bs
+          rest = BS.tail bs
+      in case b of
+        0xFD | BS.length rest >= 2 ->
+          let lo = fromIntegral (BS.index rest 0)
+              hi = fromIntegral (BS.index rest 1)
+          in Just (lo + hi * 256, BS.drop 2 rest)
+        0xFE | BS.length rest >= 4 ->
+          let b0 = fromIntegral (BS.index rest 0)
+              b1 = fromIntegral (BS.index rest 1)
+              b2 = fromIntegral (BS.index rest 2)
+              b3 = fromIntegral (BS.index rest 3)
+          in Just (b0 + b1*256 + b2*65536 + b3*16777216, BS.drop 4 rest)
+        _ | b < 0xFD -> Just (fromIntegral b, rest)
+        _ -> Nothing
+
+-- | Core TraverseAndExtract: parse partial merkle tree; returns
+-- (root_hash_bytes, matched_txid_bytes_list) or Left error.
+w47bExtract :: [ByteString]  -- hashes array
+            -> [Bool]        -- bits array
+            -> Int           -- nTx
+            -> Int           -- height
+            -> Int           -- pos
+            -> IORef Int     -- bit position
+            -> IORef Int     -- hash position
+            -> IO (Either String (ByteString, [ByteString]))
+w47bExtract hashes bits nTx height pos bitRef hashRef = do
+  bp <- readIORef bitRef
+  if bp >= length bits
+    then return (Left "overread bits")
+    else do
+      let parentMatch = bits !! bp
+      writeIORef bitRef (bp + 1)
+      if height == 0 || not parentMatch
+        then do
+          hp <- readIORef hashRef
+          if hp >= length hashes
+            then return (Left "overread hashes")
+            else do
+              writeIORef hashRef (hp + 1)
+              let h = hashes !! hp
+                  matched = if height == 0 && parentMatch && pos < nTx then [h] else []
+              return (Right (h, matched))
+        else do
+          -- recurse left
+          leftResult <- w47bExtract hashes bits nTx (height - 1) (pos * 2) bitRef hashRef
+          case leftResult of
+            Left e -> return (Left e)
+            Right (leftH, leftMatched) -> do
+              let rightPos = pos * 2 + 1
+              if rightPos < w47bTreeWidth nTx (height - 1)
+                then do
+                  rightResult <- w47bExtract hashes bits nTx (height - 1) rightPos bitRef hashRef
+                  case rightResult of
+                    Left e -> return (Left e)
+                    Right (rightH, rightMatched) -> do
+                      let Hash256 root = doubleSHA256 (leftH <> rightH)
+                      return (Right (root, leftMatched <> rightMatched))
+                else do
+                  let Hash256 root = doubleSHA256 (leftH <> leftH)
+                  return (Right (root, leftMatched))
+
+-- | gettxoutsetinfo: count UTXOs, sum values, return tip info.
+handleGetTxOutSetInfo :: RpcServer -> IO RpcResponse
+handleGetTxOutSetInfo server = do
+  tip       <- readTVarIO (hcTip (rsHeaderChain server))
+  let tipH    = ceHeight tip
+  -- count and sum UTXO set
+  countRef  <- newIORef (0 :: Int)
+  sumRef    <- newIORef (0 :: Word64)
+  bogosizeRef <- newIORef (0 :: Int)
+  coinsRef  <- newIORef ([] :: [SnapshotCoin])
+  iterateWithPrefix (rsDB server) PrefixUTXO $ \key val -> do
+    let opBytes = BS.drop 1 key
+    case (S.decode opBytes :: Either String OutPoint, S.decode val :: Either String Coin) of
+      (Right op, Right coin) -> do
+        modifyIORef' countRef (+1)
+        modifyIORef' sumRef   (+ txOutValue (coinTxOut coin))
+        modifyIORef' bogosizeRef (+ (32 + 4 + 1 + 8 + BS.length (txOutScript (coinTxOut coin))))
+        modifyIORef' coinsRef (SnapshotCoin op coin :)
+        return True
+      _ -> return True
+  n        <- readIORef countRef
+  totalSat <- readIORef sumRef
+  bogo     <- readIORef bogosizeRef
+  coins    <- readIORef coinsRef
+  let Hash256 muHashBS = computeUtxoMuHash coins
+      muHashHex = TE.decodeUtf8 $ B16.encode muHashBS
+  let result = object
+        [ "height"            .= tipH
+        , "bestblock"         .= showHash (ceHash tip)
+        , "txouts"            .= n
+        , "bogosize"          .= bogo
+        , "hash_serialized_3" .= muHashHex
+        , "total_amount"      .= (fromIntegral totalSat / 1e8 :: Double)
+        ]
+  return $ RpcResponse result Null Null
+
+-- | getnetworkhashps: estimate network hash rate over sliding window.
+handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
+handleGetNetworkHashPS server params = do
+  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  let defaultNBlocks = 120 :: Int
+      nblocks = case extractParam params 0 :: Maybe Int of
+        Just n | n > 0 -> n
+        Just 0 -> fromIntegral (ceHeight tip)  -- nblocks=0 means "since genesis"
+        _      -> defaultNBlocks
+      reqHeight = case extractParam params 1 :: Maybe Int of
+        Just h | h >= 0 -> min h (fromIntegral (ceHeight tip))
+        _               -> fromIntegral (ceHeight tip)
+  if reqHeight < 1
+    then return $ RpcResponse (toJSON (0 :: Int)) Null Null
+    else do
+      let startH = fromIntegral $ max 0 (reqHeight - nblocks)
+          endH   = fromIntegral reqHeight
+      mTopHash <- getBlockHeight (rsDB server) endH
+      mBotHash <- getBlockHeight (rsDB server) startH
+      case (mTopHash, mBotHash) of
+        (Just topHash, Just botHash) -> do
+          mTopHdr <- getBlockHeader (rsDB server) topHash
+          mBotHdr <- getBlockHeader (rsDB server) botHash
+          case (mTopHdr, mBotHdr) of
+            (Just topHdr, Just botHdr) -> do
+              let timeDiff = fromIntegral (bhTimestamp topHdr) - fromIntegral (bhTimestamp botHdr) :: Integer
+              if timeDiff <= 0
+                then return $ RpcResponse (toJSON (0 :: Int)) Null Null
+                else do
+                  -- Get chainwork from in-memory header chain entries
+                  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+                  let lookupWork bh = maybe 0 ceChainWork (Map.lookup bh entries)
+                      workTop  = lookupWork topHash
+                      workBot  = lookupWork botHash
+                      workDiff = workTop - workBot
+                  let hashps = if workDiff > 0
+                        then workDiff `div` timeDiff
+                        else fromIntegral (endH - fromIntegral startH) * 4294967296 `div` timeDiff
+                  return $ RpcResponse (toJSON (fromIntegral hashps :: Double)) Null Null
+            _ -> return $ RpcResponse (toJSON (0 :: Int)) Null Null
+        _ -> return $ RpcResponse (toJSON (0 :: Int)) Null Null
+
+-- | gettxoutproof: produce a CMerkleBlock hex for txids in a block.
+handleGetTxOutProof :: RpcServer -> Value -> IO RpcResponse
+handleGetTxOutProof server params = do
+  let mkErr msg = return $ RpcResponse Null
+        (toJSON $ RpcError rpcMiscError msg) Null
+      mkInvalidParams msg = return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams msg) Null
+  -- params[0]: [txids], params[1]: optional blockhash
+  let mtxidList = case params of
+        Array arr | not (V.null arr) ->
+          case V.head arr of
+            Array txArr -> Just (V.toList txArr)
+            _ -> Nothing
+        _ -> Nothing
+  case mtxidList of
+    Nothing -> mkInvalidParams "gettxoutproof requires [{txids}, blockhash?]"
+    Just txidVals -> do
+      let parseTxid v = case v of
+            String t | T.length t == 64 -> parseHash t
+            _ -> Nothing
+          mtxids = mapM parseTxid txidVals
+      case mtxids of
+        Nothing -> mkInvalidParams "Invalid txid in list"
+        Just txids | null txids -> mkInvalidParams "txids list is empty"
+        Just txids -> do
+          -- params[1]: blockhash (required; lunarblock pattern)
+          let mblockhashTxt = case params of
+                Array arr | V.length arr >= 2 -> case arr V.! 1 of
+                  String t | T.length t == 64 -> Just t
+                  _ -> Nothing
+                _ -> Nothing
+          case mblockhashTxt >>= parseHash of
+            Nothing -> mkErr "Transaction not yet in block index. Use blockhash parameter."
+            Just bh -> do
+              mBlock <- getBlock (rsDB server) bh
+              case mBlock of
+                Nothing -> mkErr ("Block not found: " <> showHash bh)
+                Just block -> do
+                  -- Collect txid raw bytes (little-endian) for the block
+                  let allTxIds = map computeTxId (blockTxns block)
+                      n = length allTxIds
+                      -- raw 32-byte LE from TxId
+                      rawTxIds = map (\(TxId (Hash256 bs)) -> bs) allTxIds
+                      -- build a set of wanted hashes (internal LE form)
+                      wantedSet = Set.fromList
+                        [ let BlockHash (Hash256 bs) = bh' in bs | bh' <- txids ]
+                      -- matchFlags: 0-based, True if txid is wanted
+                      matchFlags = [ Set.member raw wantedSet | raw <- rawTxIds ]
+                      foundCount = length (filter id matchFlags)
+                  if foundCount /= length txids
+                    then mkErr "Transaction not in block"
+                    else do
+                      -- compute tree height
+                      let nHeight = ceiling (logBase 2 (fromIntegral (max 1 n) :: Double)) :: Int
+                          safeHeight = if (1 `shiftL` nHeight) < n then nHeight + 1 else nHeight
+                      let (hashes, bits) = w47bBuild rawTxIds n matchFlags safeHeight 0
+                          flagBytes = w47bBitsToBytes bits
+                          headerBS  = S.encode (blockHeader block)
+                          wire = headerBS
+                            <> w47bLE32 (fromIntegral n)
+                            <> w47bVarInt (length hashes)
+                            <> BS.concat hashes
+                            <> w47bVarInt (BS.length flagBytes)
+                            <> flagBytes
+                      return $ RpcResponse (toJSON (TE.decodeUtf8 (B16.encode wire))) Null Null
+
+-- | verifytxoutproof: verify a CMerkleBlock hex, return matched txids.
+handleVerifyTxOutProof :: RpcServer -> Value -> IO RpcResponse
+handleVerifyTxOutProof server params = do
+  let mkErr msg = return $ RpcResponse Null
+        (toJSON $ RpcError rpcMiscError msg) Null
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "verifytxoutproof requires a hex string") Null
+    Just hexTxt -> do
+      let hexBS = TE.encodeUtf8 hexTxt
+      case B16.decode hexBS of
+        Left _ -> mkErr "Invalid hex string"
+        Right raw -> do
+          if BS.length raw < 84  -- 80 header + 4 nTx minimum
+            then mkErr "Proof too short"
+            else do
+              let headerBS = BS.take 80 raw
+                  rest0    = BS.drop 80 raw
+              -- parse nTx
+              let nTx = fromIntegral (BS.index rest0 0)
+                          + fromIntegral (BS.index rest0 1) * 256
+                          + fromIntegral (BS.index rest0 2) * 65536
+                          + fromIntegral (BS.index rest0 3) * 16777216 :: Int
+                  rest1 = BS.drop 4 rest0
+              if nTx == 0
+                then return $ RpcResponse (toJSON ([] :: [Text])) Null Null
+                else do
+                  -- parse hash_count varint + hashes
+                  case w47bReadVarInt rest1 of
+                    Nothing -> mkErr "Truncated: missing hash count"
+                    Just (hashCount, rest2) -> do
+                      if BS.length rest2 < hashCount * 32
+                        then mkErr "Truncated: missing hashes"
+                        else do
+                          let hashes = [ BS.take 32 (BS.drop (i*32) rest2) | i <- [0..hashCount-1] ]
+                              rest3  = BS.drop (hashCount * 32) rest2
+                          case w47bReadVarInt rest3 of
+                            Nothing -> mkErr "Truncated: missing flag byte count"
+                            Just (flagByteCount, rest4) -> do
+                              if BS.length rest4 < flagByteCount
+                                then mkErr "Truncated: missing flag bytes"
+                                else do
+                                  let flagBytes = BS.take flagByteCount rest4
+                                      -- unpack bits LSB-first
+                                      bits = concatMap
+                                        (\b -> [ testBit b i | i <- [0..7] ])
+                                        (BS.unpack flagBytes)
+                                  -- compute tree height
+                                  let nHeight = ceiling (logBase 2 (fromIntegral (max 1 nTx) :: Double)) :: Int
+                                      safeHeight = if (1 `shiftL` nHeight) < nTx then nHeight + 1 else nHeight
+                                  bitRef  <- newIORef 0
+                                  hashRef <- newIORef 0
+                                  result <- w47bExtract hashes bits nTx safeHeight 0 bitRef hashRef
+                                  case result of
+                                    Left e -> mkErr ("Invalid proof: " <> T.pack e)
+                                    Right (rootBS, matchedRaw) -> do
+                                      -- Verify merkle root against header
+                                      -- bhMerkleRoot is at bytes 36-67 of the header
+                                      case S.decode headerBS :: Either String BlockHeader of
+                                        Left _ -> mkErr "Invalid block header"
+                                        Right hdr -> do
+                                          let Hash256 storedRoot = bhMerkleRoot hdr
+                                          if rootBS /= storedRoot
+                                            then mkErr "Merkle root mismatch"
+                                            else do
+                                              -- verify block is in our chain
+                                              let bh = computeBlockHash hdr
+                                              mStoredHdr <- getBlockHeader (rsDB server) bh
+                                              case mStoredHdr of
+                                                Nothing -> mkErr $ "Block " <> showHash bh <> " not found in chain"
+                                                Just _ -> do
+                                                  -- return matched txids as display hex (reversed)
+                                                  let matchedHexes = map
+                                                        (\bs -> showHash (BlockHash (Hash256 bs)))
+                                                        matchedRaw
+                                                  return $ RpcResponse (toJSON matchedHexes) Null Null
+
+-- | getrpcinfo: stub returning active_commands and logpath.
+handleGetRpcInfo :: RpcServer -> IO RpcResponse
+handleGetRpcInfo _server = do
+  let result = object
+        [ "active_commands" .= ([] :: [Value])
+        , "logpath"         .= ("" :: Text)
+        ]
+  return $ RpcResponse result Null Null
 
 --------------------------------------------------------------------------------
 -- ZMQ Notifications
