@@ -2388,6 +2388,7 @@ data PeerManagerConfig = PeerManagerConfig
   , pmcConnectTimeout   :: !Int        -- ^ Connection timeout in seconds (default 5)
   , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
   , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default False, matches Core's DEFAULT_PEERBLOOMFILTERS)
+  , pmcPruneMode        :: !Bool       -- ^ BIP-159: advertise NODE_NETWORK_LIMITED (1<<10) when prune mode is on (default False, mirrors Core's `IsPruneMode()` gate in init.cpp)
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -2403,6 +2404,7 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcConnectTimeout   = 5
   , pmcDataDir          = "."
   , pmcPeerBloomFilters = False    -- Bitcoin Core default (DEFAULT_PEERBLOOMFILTERS=false, net_processing.h:44)
+  , pmcPruneMode        = False    -- BIP-159 NODE_NETWORK_LIMITED off by default; flipped on when --prune is set
   }
 
 --------------------------------------------------------------------------------
@@ -2672,9 +2674,15 @@ tryConnectWithType pm addr blockRelayOnly = do
   unless discouraged $ do
     let net = pmNetwork pm
         baseFlags = [nodeNetwork, nodeWitness]
-        flags = if pmcPeerBloomFilters (pmConfig pm)
-                  then nodeBloom : baseFlags
-                  else baseFlags
+        bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
+                      then nodeBloom : baseFlags
+                      else baseFlags
+        -- BIP-159: signal limited-archive serving when prune mode is on.
+        -- Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in
+        -- the auto-prune case (the node still has the recent-288 window).
+        flags = if pmcPruneMode (pmConfig pm)
+                  then nodeNetworkLimited : bloomFlags
+                  else bloomFlags
         config = PeerConfig
           { pcfgNetwork     = net
           , pcfgServices    = combineServices flags
@@ -2898,9 +2906,14 @@ startInboundListener pm port = do
       -- Perform inbound handshake (receive version first, then send ours)
       let net = pmNetwork pm
           baseFlagsIn = [nodeNetwork, nodeWitness]
-          flagsIn = if pmcPeerBloomFilters (pmConfig pm)
-                      then nodeBloom : baseFlagsIn
-                      else baseFlagsIn
+          bloomFlagsIn = if pmcPeerBloomFilters (pmConfig pm)
+                           then nodeBloom : baseFlagsIn
+                           else baseFlagsIn
+          -- BIP-159: same gate as outbound; advertise NODE_NETWORK_LIMITED
+          -- iff prune mode is on.
+          flagsIn = if pmcPruneMode (pmConfig pm)
+                      then nodeNetworkLimited : bloomFlagsIn
+                      else bloomFlagsIn
           config = PeerConfig
             { pcfgNetwork     = net
             , pcfgServices    = combineServices flagsIn

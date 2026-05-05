@@ -622,11 +622,17 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Start header sync
     hs <- startHeaderSync net hc
 
-    -- Start peer manager with sync-aware message handler
+    -- Start peer manager with sync-aware message handler.
+    -- BIP-159: --prune (a switch in this build) flips on
+    -- NODE_NETWORK_LIMITED in the version handshake so peers know we
+    -- only serve the recent ~288-block window.  The wire-protocol gate
+    -- is correct regardless of whether the prune subsystem itself is
+    -- live -- consistent with Core's `IsPruneMode()` semantics.
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
+          , pmcPruneMode   = noPrune
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
