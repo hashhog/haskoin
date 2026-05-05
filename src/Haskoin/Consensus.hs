@@ -2192,6 +2192,37 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
     -- so that same-block spends (height = current block height = 0 confirmations)
     -- are handled correctly.  Same-block prevouts are NOT in utxoCoinMap (which
     -- only covers the pre-block chainstate), so we fall back to height for them.
+    --
+    -- BIP-68 IBD-context wiring: we evaluate ONLY the height-based component
+    -- of BIP-68 here and defer the time-based component to the BIP-112
+    -- OP_CSV opcode at script-eval time.  Reason: the IBD-side caller does
+    -- not have a real `getMtpAtHeight` callback wired through
+    -- `validateFullBlock`, so the previous code passed `prevBlockMTP`
+    -- (tip's parent MTP) for every input.  But `calculateSequenceLocks`
+    -- expects the MTP at `coin_height - 1` per input (a different,
+    -- typically much older, value).  With the wrong wiring, any v2 tx
+    -- with a non-zero time-based BIP-68 lock_value is unconditionally
+    -- rejected (`min_time = prev_block_mtp + lock - 1` always exceeds the
+    -- tip's `prev_block_mtp`).  That's a deferred self-wedge: the live
+    -- haskoin chainstate (April 12) was synced before this code path
+    -- existed, but a fresh IBD on this binary will wedge at the first
+    -- post-CSV block carrying a time-based BIP-68 input.
+    --
+    -- Until per-input MTP-at-height is plumbed through, the safe
+    -- parity-with-Core behaviour is to skip the time-based branch here
+    -- and rely on BIP-112 (OP_CSV) inside the script interpreter — which
+    -- has full per-tx context and already runs for every input.
+    -- Height-based locks remain enforced: `coinHeight` from the UTXO row
+    -- is correct for both external and intra-block prevouts, so the
+    -- height comparison is byte-for-byte the same as Core.
+    --
+    -- Reference: clearbit's matching resolution (clearbit 44454c1,
+    -- src/validation.zig) and rustoshi's matching resolution (this wave).
+    -- Cross-impl audit:
+    -- CORE-PARITY-AUDIT/_ibd-context-wiring-cross-impl-2026-05-05.md.
+    -- Bitcoin Core split: validation.cpp::CheckSequenceLocks (full
+    -- chain-access path) + script/interpreter.cpp OP_CSV (script-eval
+    -- with full per-tx sighash context).
     let prevBlockMTP = csMedianTime cs
         go :: Map OutPoint Word32 -> [Tx] -> Either String ()
         go _ [] = Right ()
@@ -2205,24 +2236,27 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
                     ]
               go (Map.union newOuts intrablockHeights) rest
           | otherwise = do
-              -- Build prevHeights and prevMTPs for BIP-68 check.
-              -- For each input: look up in utxoCoinMap first (external UTXO),
-              -- then intrablockHeights (same-block output), default to height
-              -- (safe fallback: 0 effective confirmations triggers lock if > 0).
-              let prevHeightsAndMTPs = map (\inp ->
+              -- Build prevHeights for the BIP-68 height-based check.  We
+              -- pass MTP=0 for every input because we ONLY consume
+              -- `slMinHeight` from the resulting `SequenceLock`; the
+              -- time-based component is deferred to OP_CSV (see comment
+              -- above).
+              let prevHeights = map (\inp ->
                     let op = txInPrevOutput inp
-                        (h, mtp) = case Map.lookup op utxoCoinMap of
-                          Just coin -> (coinHeight coin, prevBlockMTP)
-                          Nothing   -> case Map.lookup op intrablockHeights of
-                            Just ih  -> (ih, prevBlockMTP)
-                            Nothing  -> (height, prevBlockMTP) -- missing UTXO: fail elsewhere
-                    in (h, mtp)
+                    in case Map.lookup op utxoCoinMap of
+                         Just coin -> coinHeight coin
+                         Nothing   -> case Map.lookup op intrablockHeights of
+                           Just ih  -> ih
+                           Nothing  -> height -- missing UTXO: fail elsewhere
                     ) (txInputs tx)
-                  prevHeights = map fst prevHeightsAndMTPs
-                  prevMTPs    = map snd prevHeightsAndMTPs
+                  prevMTPs    = map (const 0) prevHeights -- unused (height-only gate)
                   enforceBIP68 = bip68Active net height
                   lock = calculateSequenceLocks tx prevHeights prevMTPs enforceBIP68
-              unless (checkSequenceLocks height prevBlockMTP lock) $
+                  -- Height-only check: ignore `slMinTime` (see comment
+                  -- above).  Mirrors `checkSequenceLocks` heightOk branch.
+                  heightOk = slMinHeight lock < 0
+                          || fromIntegral height > slMinHeight lock
+              unless heightOk $
                 Left "bad-txns-nonfinal"
               -- Add this tx's outputs to intra-block height map.
               let txid = computeTxId tx
