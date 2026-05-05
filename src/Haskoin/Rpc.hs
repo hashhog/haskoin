@@ -2002,6 +2002,13 @@ bip22ResultString err
   | "missing utxo" `isInfixOf` s                = "bad-txns-inputs-missingorspent"
   | "missing input" `isInfixOf` s               = "bad-txns-inputs-missingorspent"
 
+  -- Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+  -- Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase").
+  -- Consensus.hs checkTxInputs returns Left "Coinbase not yet mature".
+  | "coinbase not yet mature" `isInfixOf` s     = "bad-txns-premature-spend-of-coinbase"
+  | "immature coinbase" `isInfixOf` s           = "bad-txns-premature-spend-of-coinbase"
+  | "premature spend" `isInfixOf` s             = "bad-txns-premature-spend-of-coinbase"
+
   -- Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
   | "negative value" `isInfixOf` s              = "bad-txns-vout-negative"
   -- Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
