@@ -106,6 +106,14 @@ module Haskoin.Rpc
   , rpcWalletNotSpecified
   , rpcWalletAlreadyLoaded
   , rpcWalletAlreadyExists
+  , rpcWalletError
+    -- * importdescriptors RPC gate (exported for testing)
+  , handleImportDescriptors
+  , importDescriptorsGateMessage
+    -- * pruneblockchain RPC gate (exported for testing)
+  , handlePruneBlockchain
+  , pruneblockchainNotEnabledMsg
+  , pruneblockchainNotEnabledResponse
   ) where
 
 import Data.Aeson
@@ -288,6 +296,15 @@ data RpcServer = RpcServer
     -- stay connected; only block acceptance is gated. TVar so the
     -- P2P block-receive path can read without contending with the
     -- chain-write lock.
+  , rsPruneEnabled   :: !Bool
+    -- ^ Mirrors Bitcoin Core's @fPruneMode@ (init.cpp). Set at startup
+    -- from the @--prune@ flag. The 'handlePruneBlockchain' RPC must
+    -- refuse calls when this is False, with the exact Core error
+    -- message ("Cannot prune blocks because node is not in prune
+    -- mode") and code (RPC_MISC_ERROR). See
+    -- bitcoin-core/src/rpc/blockchain.cpp pruneblockchain.
+    -- Audit: CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
+    -- (Bug 4).
   }
 
 -- | Get current time, using mock time if set (for regtest testing)
@@ -436,6 +453,14 @@ rpcWalletWrongEncState = -15
 rpcWalletEncryptionFailed :: Int
 rpcWalletEncryptionFailed = -16
 
+-- | Generic wallet RPC error (error code -4, mirrors Bitcoin Core's
+--   @RPC_WALLET_ERROR@ from @bitcoin-core/src/rpc/protocol.h@). Used by
+--   the @importdescriptors@ refusal gate (cross-impl audit
+--   2026-05-05) to signal "wallet RPC the impl can't honour" without
+--   conflating with @rpcInternalError@.
+rpcWalletError :: Int
+rpcWalletError = -4
+
 -- | Maximum @walletpassphrase@ unlock duration in seconds (~3.17 years).
 --   Matches Bitcoin Core's @MAX_SLEEP_TIME@ in wallet/rpc/encrypt.cpp.
 walletPassphraseMaxSleepTime :: Int
@@ -473,8 +498,10 @@ writeCookieFile cookiePath cookiePass = do
 -- Handles both JSON-RPC (POST requests) and REST API (GET /rest/* requests)
 startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
                -> Mempool -> FeeEstimator -> UTXOCache -> Network
-               -> Maybe BlockStore -> Maybe WalletManager -> IO RpcServer
-startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr = do
+               -> Maybe BlockStore -> Maybe WalletManager
+               -> Bool  -- ^ pruneEnabled (mirrors Core fPruneMode)
+               -> IO RpcServer
+startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneEnabled = do
   threadVar <- newTVarIO Nothing
   mockTimeVar <- newTVarIO Nothing  -- No mock time by default
   startTime <- round <$> getPOSIXTime
@@ -486,7 +513,7 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr = do
   -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset). Initialised
   -- to False; flipped True only inside the rollback dance.
   pauseVar <- newTVarIO False
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar pruneEnabled
   -- Use combined app to handle both RPC and REST endpoints
   tid <- forkIO $ run (rpcPort config) (combinedApp server)
   atomically $ writeTVar threadVar (Just tid)
@@ -1216,27 +1243,52 @@ handleGetDifficulty server = do
 -- Error codes:
 --   -1: Cannot prune blocks (e.g., pruning not enabled, height too high)
 --
--- Reference: Bitcoin Core's pruneblockchain RPC
+-- Reference: Bitcoin Core's pruneblockchain RPC.
+--
+-- Prune-mode gate (audit
+-- @CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md@ Bug 4):
+-- Core refuses with @RPC_MISC_ERROR@ + the exact message
+-- "Cannot prune blocks because node is not in prune mode" when
+-- @fPruneMode@ is false (rpc/blockchain.cpp::pruneblockchain).
+-- Previously this handler accepted requests whenever a 'BlockStore'
+-- was attached, regardless of whether the operator had enabled
+-- pruning, so a non-pruned node could be tricked into deleting block
+-- files via RPC. Gate on 'rsPruneEnabled' first to mirror Core.
+pruneblockchainNotEnabledMsg :: Text
+pruneblockchainNotEnabledMsg =
+  "Cannot prune blocks because node is not in prune mode."
+
+-- | Pure refusal response for pruneblockchain when prune mode is off.
+-- Exposed so the gate can be tested without constructing a full
+-- 'RpcServer'. Mirrors Core's @RPC_MISC_ERROR@ + exact message string.
+pruneblockchainNotEnabledResponse :: RpcResponse
+pruneblockchainNotEnabledResponse =
+  RpcResponse Null
+    (toJSON $ RpcError rpcMiscError pruneblockchainNotEnabledMsg) Null
+
 handlePruneBlockchain :: RpcServer -> Value -> IO RpcResponse
-handlePruneBlockchain server params = do
-  case rsBlockStore server of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcMiscError "Pruning is not enabled (block store not available)") Null
-    Just blockStore -> do
-      case extractParam params 0 :: Maybe Word32 of
+handlePruneBlockchain server params
+  | not (rsPruneEnabled server) =
+      return pruneblockchainNotEnabledResponse
+  | otherwise = do
+      case rsBlockStore server of
         Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
-        Just targetHeight -> do
-          tip <- readTVarIO (hcTip (rsHeaderChain server))
-          let tipHeight = ceHeight tip
-          result <- pruneBlockchain blockStore tipHeight targetHeight
-          case result of
-            Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-            Right numPruned -> do
-              -- Return the height that was actually pruned to
-              -- (the target height or lower if some files couldn't be pruned)
-              return $ RpcResponse (toJSON targetHeight) Null Null
+          (toJSON $ RpcError rpcMiscError pruneblockchainNotEnabledMsg) Null
+        Just blockStore -> do
+          case extractParam params 0 :: Maybe Word32 of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
+            Just targetHeight -> do
+              tip <- readTVarIO (hcTip (rsHeaderChain server))
+              let tipHeight = ceHeight tip
+              result <- pruneBlockchain blockStore tipHeight targetHeight
+              case result of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                Right _numPruned -> do
+                  -- Return the height that was actually pruned to
+                  -- (the target height or lower if some files couldn't be pruned)
+                  return $ RpcResponse (toJSON targetHeight) Null Null
 
 -- | Invalidate a block and all its descendants
 -- Reference: bitcoin/src/rpc/blockchain.cpp invalidateblock
@@ -2562,91 +2614,76 @@ handleGetInfo server = do
 -- Descriptor RPC Handlers (BIP-380-386)
 --------------------------------------------------------------------------------
 
--- | Import descriptors into the wallet.
--- Reference: Bitcoin Core's importdescriptors RPC
--- Parameters:
---   Array of descriptor objects, each with:
---     - desc (string, required): The output descriptor
---     - active (boolean, optional): Set descriptor as active for new addresses
---     - range (int or [int, int], optional): Range of indices for ranged descriptors
---     - next_index (int, optional): Next unused index
---     - timestamp (int|"now", optional): Creation time of keys
---     - internal (boolean, optional): Whether this is an internal/change descriptor
---     - label (string, optional): Label for the descriptor
--- Returns:
---   Array of result objects with success/error status
+-- | The @importdescriptors@ RPC. Refused with @rpcWalletError@ in this
+-- build.
+--
+-- Background (cross-impl lying-RPC audit 2026-05-05,
+-- @CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md@): the previous
+-- handler walked the @requests@ array, parsed each descriptor via
+-- 'parseDescriptor', and returned @{"success": true, "warnings": []}@
+-- per descriptor without ever storing the descriptor in the wallet
+-- database, deriving addresses, or scanning the blockchain. The
+-- pre-fix code self-documented the gap at L2624-2628:
+--
+-- @
+--   -- In a full implementation, we would:
+--   -- 1. Store the descriptor in the wallet database
+--   -- 2. Derive addresses based on range
+--   -- 3. Scan the blockchain for matching UTXOs
+--   -- For now, we validate and acknowledge the import
+-- @
+--
+-- Operators got a successful JSON-RPC response; nothing actually
+-- landed in the wallet. Same lying-RPC pattern as the haskoin
+-- @loadtxoutset@ bug closed earlier today (rustoshi @1d0a325@ /
+-- hotbuns @e355cd7@ / clearbit @c8866ef@ / nimrod @64a856d@ wave from
+-- this morning).
+--
+-- Wiring real descriptor-wallet support (descriptor → address
+-- derivation → wallet DB write → blockchain rescan) is a multi-day
+-- project and out of scope. Mirror-gate is the fix; the real
+-- implementation is a follow-up.
+--
+-- Fix is option (B) from the @loadtxoutset@ wave: refuse the RPC at
+-- the gate, leave the wallet untouched, return @rpcWalletError@ (-4)
+-- — Core's @RPC_WALLET_ERROR@ from
+-- @bitcoin-core\/src\/rpc\/protocol.h@. That's the appropriate code
+-- for "wallet RPC the impl can't honour" vs the more generic
+-- @rpcInternalError@ we used for @loadtxoutset@ (where the gap was a
+-- chainstate-activation issue, not a wallet feature).
+--
+-- The gate fires AFTER cheap parameter-shape validation (so malformed
+-- params still get @rpcInvalidParams@) but BEFORE any wallet state
+-- read or write. The handler ignores its 'RpcServer' argument now (the
+-- gate closes before any server-state read), so tests can call it
+-- with @undefined@ — same justification the existing
+-- 'handleLoadTxOutSet' tests use.
+--
+-- 'handleImportDescriptors' and the new 'importDescriptorsGateMessage'
+-- constant are both exported (under "importdescriptors RPC gate
+-- (exported for testing)") so the test can pin the wording without
+-- copy-paste drift.
 handleImportDescriptors :: RpcServer -> Value -> IO RpcResponse
-handleImportDescriptors _server params = do
+handleImportDescriptors _server params =
+  -- Validate parameter shape only; never call 'parseDescriptor' or any
+  -- wallet-state read/write.
   case params of
-    Array arr -> do
-      results <- mapM processDescriptorImport (V.toList arr)
-      return $ RpcResponse (toJSON results) Null Null
+    Array _ -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletError importDescriptorsGateMessage) Null
     _ -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Expected array of descriptor objects") Null
-  where
-    processDescriptorImport :: Value -> IO Value
-    processDescriptorImport val = case val of
-      Object obj -> do
-        let mDesc = KM.lookup "desc" obj >>= getString
-            mRange = KM.lookup "range" obj
-            mActive = KM.lookup "active" obj >>= getBool
-            mInternal = KM.lookup "internal" obj >>= getBool
-            mLabel = KM.lookup "label" obj >>= getString
-        case mDesc of
-          Nothing -> return $ object
-            [ "success" .= False
-            , "error" .= object
-                [ "code" .= rpcInvalidParams
-                , "message" .= ("Missing 'desc' field" :: Text)
-                ]
-            ]
-          Just descText -> case parseDescriptor descText of
-            Left err -> return $ object
-              [ "success" .= False
-              , "error" .= object
-                  [ "code" .= rpcInvalidParams
-                  , "message" .= T.pack (show err)
-                  ]
-              ]
-            Right desc -> do
-              -- In a full implementation, we would:
-              -- 1. Store the descriptor in the wallet database
-              -- 2. Derive addresses based on range
-              -- 3. Scan the blockchain for matching UTXOs
-              -- For now, we validate and acknowledge the import
-              let isRanged = isRangeDescriptor desc
-                  rangeInfo = case mRange of
-                    Just (Number n) -> Just (0, floor n :: Int)
-                    Just (Array rv) | V.length rv == 2 ->
-                      case (V.head rv, V.last rv) of
-                        (Number start, Number end) ->
-                          Just (floor start, floor end)
-                        _ -> Nothing
-                    _ -> if isRanged then Just (0, 999) else Nothing
-                  -- Derive some addresses for testing
-                  derivedAddrs = case rangeInfo of
-                    Just (start, end) ->
-                      deriveAddresses desc [start..min end (start + 10)]
-                    Nothing -> deriveAddresses desc [0]
-              return $ object
-                [ "success" .= True
-                , "warnings" .= ([] :: [Text])
-                ]
-      _ -> return $ object
-        [ "success" .= False
-        , "error" .= object
-            [ "code" .= rpcInvalidParams
-            , "message" .= ("Expected object" :: Text)
-            ]
-        ]
+      (toJSON $ RpcError rpcInvalidParams ("Expected array of descriptor objects" :: Text)) Null
 
-    getString :: Value -> Maybe Text
-    getString (String t) = Just t
-    getString _ = Nothing
-
-    getBool :: Value -> Maybe Bool
-    getBool (Bool b) = Just b
-    getBool _ = Nothing
+-- | The error message returned by the refused @importdescriptors@ RPC.
+-- Exposed as a top-level binding so tests can pin the wording without
+-- a copy-paste drift hazard.
+importDescriptorsGateMessage :: Text
+importDescriptorsGateMessage =
+  "importdescriptors not implemented in haskoin; descriptor-wallet "
+  <> "support is not wired (no descriptor→address derivation, no "
+  <> "wallet DB write, no blockchain rescan). The pre-fix handler "
+  <> "returned success without persisting anything. Operator-managed "
+  <> "key import via `importprivkey` / `importaddress` is the "
+  <> "supported path until descriptor wallets are wired end-to-end."
 
 -- | List imported descriptors.
 -- Reference: Bitcoin Core's listdescriptors RPC
