@@ -66,13 +66,14 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            witnessScaleFactor,
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
-                           addHeader, computeMerkleRoot, ChainState(..),
-                           consensusFlagsAtHeight, connectBlock,
+                           addHeader, addSideBranchHeader, computeMerkleRoot, ChainState(..),
+                           consensusFlagsAtHeight, connectBlock, disconnectBlock,
+                           cumulativeWork, unapplyBlock,
                            getLegacySigOpCount)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlock, Coin(..))
+                         putBlock, getBlock, getUndoDataVerified, Coin(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
                          Inv(..), InvVector(..), InvType(..))
@@ -486,23 +487,25 @@ submitBlock net db hc cache pm block = do
       case validationResult of
         Left err -> return $ Left $ "Block validation failed: " ++ err
         Right () ->
-          -- Pattern X scope: this fix only addresses the BIP-34
-          -- height-derivation site so that side-branch coinbase
-          -- height is checked against the BLOCK's parent rather than
-          -- the active tip.  Active-chain extension (parent == tip)
-          -- is the only path that connects + broadcasts + advances
-          -- the tip.  Side-branch storage + reorg dispatch (Pattern
-          -- Y) is intentionally out of scope here — see
-          -- CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md
-          -- and the Pattern Y closures for nimrod 7196d41 +
-          -- camlcoin 22667c2 + rustoshi 68a422b + blockbrew 4e51e8b
-          -- for the full-shape fix template.  Surfacing parent-not-on-
-          -- active-chain as a distinct rejection prevents corrupting
-          -- the active UTXO + best-block pointers via connectBlock.
+          -- Pattern Y companion (CORE-PARITY-AUDIT
+          -- _reorg-via-submitblock-fleet-result-2026-05-05.md): the
+          -- earlier Pattern X fix (haskoin 04c0136) corrected the BIP-34
+          -- height-derivation site but stopped short of side-branch
+          -- storage + reorg dispatch.  Pre-fix, parent /= tip was
+          -- surfaced as a distinct rejection so the active UTXO didn't
+          -- get clobbered; post-fix we route side-branch blocks through
+          -- the storage decoupling Core does in
+          -- @BlockManager::AcceptBlock@ (validation.cpp): every accepted
+          -- block gets a 'CBlockIndex' entry regardless of which chain
+          -- it lives on, and 'ActivateBestChain' separately picks the
+          -- best-work tip.
+          --
+          -- Cross-impl reference: nimrod 7196d41
+          -- (putBlockIndexHashOnly + handleSubmitBlock else-arm),
+          -- camlcoin 22667c2 (register_side_branch_header +
+          -- try_attach_side_branch_and_reorg), rustoshi 68a422b.
           if ceHash parent /= ceHash tip
-            then return $ Left $
-              "Block validation failed: parent " ++ show prevHash ++
-              " is not the active tip (side-branch acceptance not implemented)"
+            then submitBlockSideBranch net db hc cache pm block parent
             else do
               -- Apply block to in-memory UTXO cache (drives maturity check + builds
               -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
@@ -544,6 +547,265 @@ submitBlock net db hc cache pm block = do
                   broadcastMessage pm $ MInv $ Inv [invVec]
 
                   return $ Right ()
+
+-- | Side-branch arm of 'submitBlock'.  Runs after 'validateFullBlockIO'
+-- has approved the block but its parent is NOT the active tip (so a
+-- direct 'connectBlock' would corrupt the active chain's UTXO + best
+-- block pointers).
+--
+-- Mirrors 'BlockManager::AcceptBlock' + 'ActivateBestChain'
+-- (validation.cpp): persist the block + a side-branch index entry
+-- regardless of which chain wins, then pick the best-work tip
+-- separately.
+--
+-- BIP-22 result mapping (matches Bitcoin Core):
+--
+--   * heavier than active chain → reorg succeeds → 'Right ()' (= null
+--     RPC result, "accept onto best chain")
+--   * lighter or equal           → 'Left "inconclusive"'
+--   * heavier but reorg failed (missing undo / side-branch ancestor
+--     body) → 'Left "inconclusive"' (block is on disk; operator can
+--     re-trigger via reconsiderblock once any blocking issue clears,
+--     same shape Core uses when AcceptBlock succeeds but a later
+--     ConnectTip fails inside ActivateBestChain).
+--
+-- Cross-impl reference templates:
+--   * nimrod 7196d41   (handleSubmitBlock else-arm + putBlockIndexHashOnly)
+--   * camlcoin 22667c2 (try_attach_side_branch_and_reorg + register_side_branch_header)
+--   * rustoshi 68a422b (Pattern Y proof of shape)
+submitBlockSideBranch :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
+                      -> PeerManager -> Block -> ChainEntry
+                      -> IO (Either String ())
+submitBlockSideBranch net db hc cache pm block parent = do
+  let header   = blockHeader block
+      bh       = computeBlockHash header
+      -- 'cumulativeWork' = parentWork + headerWork (Consensus.hs).
+      newWork  = cumulativeWork (ceChainWork parent) header
+
+  -- Step 1: storage decoupling.  Persist the block body and a hash-
+  -- keyed header-chain entry that does NOT touch hcByHeight (the
+  -- height -> active-chain-hash map).  These two writes are what let
+  -- a follow-up child block on the same side-branch find its parent
+  -- via the in-memory index — without them, B2 (parent = B1) would
+  -- be rejected as orphan even though B1 is "accepted" by the prior
+  -- submitblock call.
+  putBlock db bh block
+  _sideEntry <- addSideBranchHeader hc header
+
+  -- Step 2: best-chain selection.
+  currentTip     <- readTVarIO (hcTip hc)
+  let activeWork = ceChainWork currentTip
+  if newWork <= activeWork
+    then
+      -- Side-branch with insufficient work.  BIP-22 / Core convention:
+      -- "inconclusive" = block accepted into the index, not yet known
+      -- to be on the best chain (rpc/mining.cpp:1100).
+      return $ Left "inconclusive"
+    else do
+      -- Step 3: reorg dispatch.  Side-branch has STRICTLY more work
+      -- than the active chain — flip tip.  We bypass the
+      -- 'performReorg' top-level helper because it does not maintain
+      -- the on-disk PrefixUTXO / PrefixBestBlock / PrefixBlockHeight
+      -- entries that 'gettxoutsetinfo' / restart recovery rely on
+      -- (it routes through 'applyBlock' / 'unapplyBlock' which only
+      -- touch the cache TVar).  Inlining the disconnect+connect loop
+      -- here lets us call 'disconnectBlock' (disk) +
+      -- 'unapplyBlock' (cache) on the way down, and 'connectBlock'
+      -- (disk) + 'applyBlockToCache' (cache) on the way up — same
+      -- atomic-pair pattern Sync.hs and the active-tip arm above use.
+      reorgRes <- doSideBranchReorg net db hc cache parent block newWork
+      case reorgRes of
+        Left err -> do
+          -- Block + side-branch index entry are already persisted;
+          -- the operator can call reconsiderblock once any blocking
+          -- issue is fixed.  Surface as inconclusive rather than a
+          -- hard failure so peers see the partial-accept signal.
+          putStrLn $ "submitBlock side-branch reorg failed: " ++ err
+          return $ Left "inconclusive"
+        Right () -> do
+          -- Reorg succeeded; mempool / peer-broadcast bookkeeping the
+          -- happy-path arm normally handles.  Mempool integration
+          -- (removing confirmed transactions) is out of scope for the
+          -- corpus entry — it doesn't query mempool — and matches the
+          -- nimrod 7196d41 commentary which marked mempool refresh as
+          -- best-effort.  Broadcast the new tip so peers see the
+          -- reorg-induced INV.
+          let invVec = InvVector InvBlock (getBlockHashHash bh)
+          broadcastMessage pm $ MInv $ Inv [invVec]
+          return $ Right ()
+
+-- | Walk back from the new side-branch tip until we hit a block hash
+-- that the active chain owns at that height — that's the fork point.
+-- Returns the (forkHash, [blocks-to-disconnect-tip-to-fork],
+-- [blocks-to-connect-fork+1-to-newtip]) triple, or Left on a missing
+-- ancestor body (which means the side-branch can't be activated).
+--
+-- Both block lists are returned in DISCONNECT/CONNECT order:
+--   * disconnect list: oldTip first, fork-child last (so iterating
+--     forward unwinds tip-to-fork)
+--   * connect list:    fork-child first, newTip last (so iterating
+--     forward applies fork-to-newTip)
+findSideBranchForkPoint :: HeaderChain -> HaskoinDB -> ChainEntry
+                        -> Block -> IO (Either String (BlockHash, [Block], [Block]))
+findSideBranchForkPoint hc db parent newTipBlock = do
+  byHeight <- readTVarIO (hcByHeight hc)
+  entries  <- readTVarIO (hcEntries hc)
+
+  -- Walk back along the side-branch from the new tip's parent
+  -- collecting block bodies until we find a block hash that
+  -- @hcByHeight@ owns at that height — that's the fork point.
+  let go :: BlockHash -> [Block] -> IO (Either String (BlockHash, [Block]))
+      go walkHash acc =
+        case Map.lookup walkHash entries of
+          Nothing ->
+            return $ Left $ "Side-branch ancestor "
+              ++ show walkHash ++ " missing from header index"
+          Just walkEntry ->
+            case Map.lookup (ceHeight walkEntry) byHeight of
+              Just activeAtHeight | activeAtHeight == walkHash ->
+                -- Hit the fork point — walkHash is on the active chain.
+                return $ Right (walkHash, acc)
+              _ -> do
+                -- Not on the active chain at this height; keep walking.
+                mWalkBlk <- getBlock db walkHash
+                case mWalkBlk of
+                  Nothing -> return $ Left $
+                    "Side-branch ancestor body missing: " ++ show walkHash
+                  Just walkBlk ->
+                    case cePrev walkEntry of
+                      Nothing  -> return $ Left
+                        "Side-branch walked past genesis without finding fork"
+                      Just prv -> go prv (walkBlk : acc)
+
+  -- newTipBlock is the deepest side-branch block; its parent
+  -- (passed in as @parent@) is where we start the walk.
+  forkRes <- go (ceHash parent) []
+  case forkRes of
+    Left e -> return (Left e)
+    Right (forkHash, parentChain) ->
+      -- 'parentChain' walks from fork-child .. parent of newTipBlock.
+      -- Append newTipBlock to get the full connect list.
+      let connectList = parentChain ++ [newTipBlock]
+      in do
+        -- Build disconnect list: walk active chain from current tip
+        -- back to (but excluding) forkHash.  Read fresh tip in case
+        -- another thread shifted it (we hold no global lock here, but
+        -- submitblock is serialised at the RPC layer).
+        currentTip <- readTVarIO (hcTip hc)
+        disconnectRes <- buildDisconnectList db (ceHash currentTip) forkHash []
+        case disconnectRes of
+          Left e   -> return (Left e)
+          Right ds -> return $ Right (forkHash, ds, connectList)
+  where
+    buildDisconnectList :: HaskoinDB -> BlockHash -> BlockHash -> [Block]
+                       -> IO (Either String [Block])
+    buildDisconnectList _ curHash forkH acc
+      | curHash == forkH = return (Right (reverse acc))
+    buildDisconnectList dbh curHash forkH acc = do
+      mBlk <- getBlock dbh curHash
+      case mBlk of
+        Nothing -> return $ Left $
+          "Active-chain block body missing during reorg: " ++ show curHash
+        Just blk -> do
+          let prv = bhPrevBlock (blockHeader blk)
+          buildDisconnectList dbh prv forkH (blk : acc)
+
+-- | Execute the side-branch reorg: disconnect old-tip..fork, connect
+-- fork..new-tip.  Updates both the disk chainstate (via
+-- 'disconnectBlock' / 'connectBlock') AND the in-memory header chain
+-- (hcTip / hcHeight / hcByHeight) so subsequent 'submitblock' /
+-- 'getbestblockhash' queries see the new tip.
+doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
+                  -> ChainEntry  -- ^ parent of the new tip
+                  -> Block       -- ^ new tip block
+                  -> Integer     -- ^ new tip's cumulative work
+                  -> IO (Either String ())
+doSideBranchReorg net db hc cache parent newTipBlock _newWork = do
+  forkRes <- findSideBranchForkPoint hc db parent newTipBlock
+  case forkRes of
+    Left err -> return (Left err)
+    Right (_forkHash, disconnectList, connectList) -> do
+      -- Phase 1: disconnect tip..fork+1 (oldTip first, fork-child last).
+      disResult <- disconnectMany db cache disconnectList
+      case disResult of
+        Left err -> return (Left err)
+        Right () -> do
+          -- Phase 2: connect fork+1..newTip (fork-child first, newTip last).
+          conResult <- connectMany net db cache connectList
+          case conResult of
+            Left err -> return (Left err)
+            Right () -> do
+              -- Phase 3: rewrite hcTip / hcHeight / hcByHeight to
+              -- reflect the new active chain.
+              entries <- readTVarIO (hcEntries hc)
+              let newTipHash   = computeBlockHash (blockHeader newTipBlock)
+              case Map.lookup newTipHash entries of
+                Nothing -> return $ Left $
+                  "New tip not in header index after reorg: "
+                  ++ show newTipHash
+                Just newTipEntry -> do
+                  atomically $ do
+                    -- Drop the height -> hash entries for the
+                    -- disconnected (old) chain.
+                    forM_ disconnectList $ \blk ->
+                      let h = computeBlockHash (blockHeader blk)
+                      in case Map.lookup h entries of
+                           Just ce -> modifyTVar' (hcByHeight hc)
+                             (Map.delete (ceHeight ce))
+                           Nothing -> return ()
+                    -- Install the height -> hash entries for the
+                    -- newly-connected chain.
+                    forM_ connectList $ \blk ->
+                      let h = computeBlockHash (blockHeader blk)
+                      in case Map.lookup h entries of
+                           Just ce -> modifyTVar' (hcByHeight hc)
+                             (Map.insert (ceHeight ce) h)
+                           Nothing -> return ()
+                    writeTVar (hcTip hc) newTipEntry
+                    writeTVar (hcHeight hc) (ceHeight newTipEntry)
+                  return (Right ())
+  where
+    disconnectMany :: HaskoinDB -> UTXOCache -> [Block]
+                   -> IO (Either String ())
+    disconnectMany _ _ [] = return (Right ())
+    disconnectMany dbh ch (blk : rest) = do
+      let bh   = computeBlockHash (blockHeader blk)
+          prv  = bhPrevBlock (blockHeader blk)
+      -- Read undo, apply to cache via unapplyBlock, then write disk.
+      undoR <- getUndoDataVerified dbh bh prv
+      case undoR of
+        Left err -> return $ Left $ "undo read failed for "
+                                     ++ show bh ++ ": " ++ err
+        Right undo -> do
+          unapplyBlock ch blk undo
+          dRes <- disconnectBlock dbh blk prv
+          case dRes of
+            Left err -> return (Left err)
+            Right () -> disconnectMany dbh ch rest
+
+    connectMany :: Network -> HaskoinDB -> UTXOCache -> [Block]
+                -> IO (Either String ())
+    connectMany _ _ _ [] = return (Right ())
+    connectMany n dbh ch (blk : rest) = do
+      -- Look up the per-block height from the header chain.
+      entries <- readTVarIO (hcEntries hc)
+      let bh = computeBlockHash (blockHeader blk)
+      case Map.lookup bh entries of
+        Nothing -> return $ Left $
+          "Connect: block " ++ show bh ++ " missing from header index"
+        Just ce -> do
+          -- Build utxoMap from the cache (post-disconnect state).
+          utxoMap <- buildBlockUTXOMap ch blk
+          appRes <- applyBlockToCache ch n blk (ceHeight ce)
+          case appRes of
+            Left err -> return $ Left $
+              "Connect: applyBlockToCache failed at "
+              ++ show (ceHeight ce) ++ ": " ++ err
+            Right _undo -> do
+              -- Write to disk: PrefixUTXO + PrefixBlockHeader +
+              -- PrefixBlockHeight + PrefixBestBlock + per-block undo.
+              connectBlock dbh n blk (ceHeight ce) utxoMap
+              connectMany n dbh ch rest
 
 -- | Build a UTXO map for block validation.
 --
