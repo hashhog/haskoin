@@ -6452,6 +6452,7 @@ main = hspec $ do
             , piFeeFilterSent = 0
             , piNextFeeFilterSend = 0
             , piBlockOnly = False
+            , piUnconnectingHeaders = 0
             }
       piWantsHeaders info `shouldBe` False
       -- Toggle the flag (mirrors the inbound MSendHeaders handler in
@@ -6611,6 +6612,7 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
+            , piUnconnectingHeaders = 0
               , piTimeOffset = 0
               }
         piBanScore info `shouldBe` 0
@@ -6639,6 +6641,7 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
+            , piUnconnectingHeaders = 0
               , piTimeOffset = 0
               }
         piState info `shouldBe` PeerBanned
@@ -6918,6 +6921,7 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
+            , piUnconnectingHeaders = 0
               , piTimeOffset = 0
               }
             candidate = peerToEvictionCandidate addr info
@@ -13585,6 +13589,33 @@ main = hspec $ do
 
     it "default ban threshold is 100 (matches Bitcoin Core)" $
       defaultBanThreshold `shouldBe` 100
+
+  describe "DoS hardening: MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 counter" $ do
+    -- Reference: bitcoin-core/src/net_processing.cpp
+    --   MAX_NUM_UNCONNECTING_HEADERS_MSGS / nUnconnectingHeaders state
+    --   machine.  haskoin pre-fix unconditionally fired
+    --   `misbehaving pm addr NonContinuousHeaders` (=100, instant ban)
+    --   on every header batch with one or more rejected-by-parent
+    --   headers.  Pattern B closure from
+    --   CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+    --   (extended to Part-2 impls) tolerates up to 10 transient
+    --   unconnecting batches per peer before banning.
+
+    it "constant matches Core (= 10)" $
+      maxNumUnconnectingHeadersMsgs `shouldBe` 10
+
+    it "noteUnconnectingHeaders against an unknown peer is a safe no-op (returns False)" $ do
+      -- Build a PeerManager with no peers in the map; the counter
+      -- helper must NOT crash and must NOT return the threshold-
+      -- exceeded signal.  This guards the post-disconnect race where
+      -- a header message races a peer-removal.
+      pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+      let addr = SockAddrInet 8333 0x04030201
+      exceeded <- noteUnconnectingHeaders pm addr
+      exceeded `shouldBe` False
+      n <- getUnconnectingHeadersCount pm addr
+      n `shouldBe` 0
+      stopPeerManager pm
 
   describe "DoS hardening: setban / listbanned / clearbanned (Job 3)" $ do
     -- Reference: bitcoin-core/src/rpc/net.cpp setban / listbanned / clearbanned
