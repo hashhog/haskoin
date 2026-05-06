@@ -2,6 +2,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE NumericUnderscores #-}
 
 -- | JSON-RPC Server and REST API
 --
@@ -207,7 +208,9 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          Message(..), Inv(..), InvVector(..), InvType(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, hasService, ServiceFlag(..),
-                         disconnectPeer, addNodeConnect, sockAddrToHostPort)
+                         disconnectPeer, addNodeConnect, sockAddrToHostPort,
+                         banPeer, getBanList, clearExpiredBans,
+                         saveBanList, loadBanList)
 import Network.Socket (SockAddr(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
@@ -517,6 +520,15 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneEnabl
   -- to False; flipped True only inside the rollback dance.
   pauseVar <- newTVarIO False
   let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar pruneEnabled
+  -- Restore persisted banlist at startup (best-effort; absence is fine on
+  -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
+  -- which loads banlist.json on boot.
+  let bnPath = rpcDataDir config </> defaultBanlistFilename
+  loaded <- loadBanList pm bnPath `catch`
+    (\(e :: SomeException) -> return (Left (show e)))
+  case loaded of
+    Right n | n > 0 -> putStrLn $ "Loaded " ++ show n ++ " ban entries from " ++ bnPath
+    _              -> return ()
   -- Use combined app to handle both RPC and REST endpoints
   tid <- forkIO $ run (rpcPort config) (combinedApp server)
   atomically $ writeTVar threadVar (Just tid)
@@ -837,6 +849,12 @@ handleRpcRequest server req = do
 
     -- Network RPCs (new)
     "disconnectnode"       -> handleDisconnectNode server params
+
+    -- Ban management RPCs (DoS / operator-mitigation)
+    -- Reference: bitcoin-core/src/rpc/net.cpp setban / listbanned / clearbanned
+    "setban"               -> handleSetBan server params
+    "listbanned"           -> handleListBanned server
+    "clearbanned"          -> handleClearBanned server
 
     -- Wallet RPCs (new)
     "getnewaddress"        -> handleGetNewAddress server params
@@ -3763,6 +3781,194 @@ handleDisconnectNode server params = do
 -- | Error code for node not connected (-29 in Bitcoin Core)
 rpcClientNodeNotConnected :: Int
 rpcClientNodeNotConnected = -29
+
+--------------------------------------------------------------------------------
+-- setban / listbanned / clearbanned RPC Handlers (DoS mitigation)
+--------------------------------------------------------------------------------
+-- Reference: bitcoin-core/src/rpc/net.cpp setban / listbanned / clearbanned.
+-- Operators rely on these to drop a misbehaving peer manually when the
+-- automatic Misbehaving threshold is too lax (or when they want to ban
+-- an entire subnet).  haskoin's underlying ban-list is the same map that
+-- the automatic 'misbehaving' path in Haskoin.Network writes to, so manual
+-- + automatic bans live in the same datastructure and persist together.
+
+-- | Default banlist filename, mirroring Bitcoin Core's @banlist.json@.
+defaultBanlistFilename :: FilePath
+defaultBanlistFilename = "banlist.json"
+
+-- | Compute the on-disk banlist path from the configured datadir.
+banlistPath :: RpcServer -> FilePath
+banlistPath server = rpcDataDir (rsConfig server) </> defaultBanlistFilename
+
+-- | Default Bitcoin Core ban duration: 24 hours (86400s).
+defaultBanDuration :: Int64
+defaultBanDuration = 86_400
+
+-- | Parse a "host" / "host:port" / "host/cidr" subnet specifier into a
+-- list of 'SockAddr' candidates.  haskoin's ban map is keyed on the
+-- exact 'SockAddr' value, so we expand to all currently-connected peers
+-- that match the subnet (mirrors Core's behavior for CIDR subnets).
+-- Returns the parsed addresses + a sentinel 'SockAddrInet' built from
+-- the bare host+port if no live peer matches (so that future inbound
+-- connections from that exact address are blocked).
+parseBanSubnet :: String -> Int -> Maybe SockAddr
+parseBanSubnet subnetStr port =
+  -- Strip optional /cidr suffix (haskoin currently stores per-address
+  -- bans, not subnets, so we ban the network address only).
+  let host = takeWhile (/= '/') subnetStr
+  in case parseIPv4 host of
+       Just w -> Just (SockAddrInet (fromIntegral port) w)
+       Nothing -> Nothing
+  where
+    parseIPv4 :: String -> Maybe Word32
+    parseIPv4 s =
+      case mapM readMaybe (splitOnChar '.' s) of
+        Just [b1, b2, b3, b4] | all (\b -> b >= 0 && b <= 255) [b1, b2, b3, b4] ->
+          Just $ fromIntegral b1
+               + fromIntegral b2 * 0x100
+               + fromIntegral b3 * 0x10000
+               + fromIntegral b4 * 0x1000000
+        _ -> Nothing
+      where
+        readMaybe :: String -> Maybe Int
+        readMaybe str = case reads str of
+          [(n, "")] -> Just n
+          _         -> Nothing
+    splitOnChar :: Char -> String -> [String]
+    splitOnChar _ [] = [""]
+    splitOnChar c (x:xs)
+      | c == x    = "" : splitOnChar c xs
+      | otherwise = let (h:t) = splitOnChar c xs in (x:h) : t
+
+-- | setban "subnet" "command" ( bantime ) ( absolute )
+-- command: "add" | "remove"
+-- bantime: seconds (relative) or unix timestamp (if absolute=true);
+-- 0 means use the default 24h.
+-- Reference: bitcoin-core/src/rpc/net.cpp setban.
+handleSetBan :: RpcServer -> Value -> IO RpcResponse
+handleSetBan server params = do
+  let mSubnet  = extractParamText params 0
+      mCommand = extractParamText params 1
+      mBanTime = extractParam     params 2 :: Maybe Int64
+      mAbs     = extractParam     params 3 :: Maybe Bool
+
+  case (mSubnet, mCommand) of
+    (Just subnet, Just command) | not (T.null subnet) -> do
+      let subnetStr = T.unpack subnet
+          cmdStr    = T.toLower command
+          -- Default to mainnet P2P port 8333; ban-list keys are SockAddr,
+          -- so the port matters.  We try the configured P2P port if
+          -- known, but fall back to 0 (haskoin matches by address+port,
+          -- but operators can also pass "host:port" inline).
+          (host, port) = case break (== ':') subnetStr of
+                           (h, ':':p) -> case reads p :: [(Int, String)] of
+                                           [(pn, "")] -> (h, pn)
+                                           _          -> (subnetStr, 0)
+                           _          -> (subnetStr, 0)
+      case parseBanSubnet host port of
+        Nothing ->
+          return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams
+              ("Invalid IP/Subnet: " <> T.pack host)) Null
+        Just sockAddr ->
+          case cmdStr of
+            "add" -> do
+              now <- round <$> getPOSIXTime :: IO Int64
+              let durationSeconds = fromMaybe defaultBanDuration mBanTime
+                  durationFinal   = if durationSeconds == 0
+                                      then defaultBanDuration
+                                      else durationSeconds
+                  expiry = if fromMaybe False mAbs
+                             then durationFinal      -- absolute unix ts
+                             else now + durationFinal
+              -- Refuse duplicate bans (Core matches this behavior)
+              banned <- getBanList (rsPeerMgr server)
+              if Map.member sockAddr banned
+                then return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError "IP/Subnet already banned") Null
+                else do
+                  -- Insert into ban map directly so we control the expiry.
+                  atomically $ modifyTVar' (pmBannedAddrs (rsPeerMgr server))
+                    (Map.insert sockAddr expiry)
+                  -- Also disconnect any currently-connected peer at this address.
+                  peers <- readTVarIO (pmPeers (rsPeerMgr server))
+                  case Map.lookup sockAddr peers of
+                    Just pc -> do
+                      disconnectPeer pc
+                      atomically $ modifyTVar' (pmPeers (rsPeerMgr server))
+                        (Map.delete sockAddr)
+                    Nothing -> return ()
+                  -- Persist (best effort).  Failure to write is logged
+                  -- but does not fail the RPC: the in-memory ban is
+                  -- still effective for the running daemon.
+                  saveBanList (rsPeerMgr server) (banlistPath server)
+                    `catch` (\(e :: SomeException) ->
+                      putStrLn $ "setban: persist failed: " ++ show e)
+                  return $ RpcResponse Null Null Null
+            "remove" -> do
+              banned <- getBanList (rsPeerMgr server)
+              if Map.member sockAddr banned
+                then do
+                  atomically $ modifyTVar' (pmBannedAddrs (rsPeerMgr server))
+                    (Map.delete sockAddr)
+                  saveBanList (rsPeerMgr server) (banlistPath server)
+                    `catch` (\(e :: SomeException) ->
+                      putStrLn $ "setban: persist failed: " ++ show e)
+                  return $ RpcResponse Null Null Null
+                else
+                  return $ RpcResponse Null
+                    (toJSON $ RpcError rpcMiscError
+                      "Error: Unban failed. Requested address/subnet was not previously manually banned.") Null
+            _ ->
+              return $ RpcResponse Null
+                (toJSON $ RpcError rpcInvalidParams
+                  ("Invalid command: must be 'add' or 'remove', got: " <> command)) Null
+    _ ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams
+          "setban requires (subnet, command, [bantime], [absolute])") Null
+
+-- | listbanned — return the current banlist as a JSON array.
+-- Reference: bitcoin-core/src/rpc/net.cpp listbanned.
+-- Each entry: { "address": "ip:port", "banned_until": unix_ts,
+--               "ban_created": <approx>, "ban_reason": "manually added" }
+handleListBanned :: RpcServer -> IO RpcResponse
+handleListBanned server = do
+  -- Drop expired bans first so the operator never sees stale entries.
+  void $ clearExpiredBans (rsPeerMgr server)
+  banned <- getBanList (rsPeerMgr server)
+  now <- round <$> getPOSIXTime :: IO Int64
+  let entries = [ object
+                    [ "address"      .= T.pack (showSockAddr sa)
+                    , "banned_until" .= expiry
+                    , "ban_duration" .= max (expiry - now) 0
+                    , "time_remaining" .= max (expiry - now) 0
+                    , "ban_reason"   .= ("manually added" :: Text)
+                    ]
+                | (sa, expiry) <- Map.toList banned
+                ]
+  return $ RpcResponse (toJSON entries) Null Null
+  where
+    showSockAddr :: SockAddr -> String
+    showSockAddr (SockAddrInet port hostAddr) =
+      let a = fromIntegral hostAddr :: Word32
+          b1 = a .&. 0xff
+          b2 = (a `div` 0x100) .&. 0xff
+          b3 = (a `div` 0x10000) .&. 0xff
+          b4 = (a `div` 0x1000000) .&. 0xff
+      in show b1 ++ "." ++ show b2 ++ "." ++ show b3 ++ "." ++ show b4
+                 ++ ":" ++ show port
+    showSockAddr sa = show sa
+
+-- | clearbanned — remove all entries from the banlist.
+-- Reference: bitcoin-core/src/rpc/net.cpp clearbanned.
+handleClearBanned :: RpcServer -> IO RpcResponse
+handleClearBanned server = do
+  atomically $ writeTVar (pmBannedAddrs (rsPeerMgr server)) Map.empty
+  saveBanList (rsPeerMgr server) (banlistPath server)
+    `catch` (\(e :: SomeException) ->
+      putStrLn $ "clearbanned: persist failed: " ++ show e)
+  return $ RpcResponse Null Null Null
 
 --------------------------------------------------------------------------------
 -- Wallet: Get New Address RPC Handler
