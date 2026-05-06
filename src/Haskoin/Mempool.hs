@@ -59,6 +59,7 @@ module Haskoin.Mempool
   , maxReplacementEvictions
   , incrementalRelayFeePerKvb
   , checkNoConflictSpending
+  , checkNoNewUnconfirmedInputs
     -- * Package Relay (BIP-331)
   , TxPackage(..)
   , PackageError(..)
@@ -265,6 +266,7 @@ data MempoolError
   | ErrRBFTooManyReplacements !Int !Int            -- ^ (eviction_count, max_allowed) - Rule 5
   | ErrRBFInsufficientRelayFee !Word64 !Word64     -- ^ (additional_fee, required) - Rule 4
   | ErrRBFSpendingConflict !TxId                   -- ^ Replacement tx spends conflicting tx
+  | ErrRBFNewUnconfirmedInput !TxId                -- ^ (parent_txid) - Rule 2: replacement adds new unconfirmed input
   -- v3/TRUC policy errors (BIP 431)
   | ErrTrucViolation !TrucError                    -- ^ TRUC policy violation
   -- Ephemeral anchor errors
@@ -316,6 +318,12 @@ data RbfError
       }
   | RbfSpendingConflict
       { rbfConflictTxId :: !TxId
+      }
+  -- BIP-125 Rule 2: replacement may not introduce new unconfirmed inputs
+  -- (i.e. inputs that were not present in the conflicting txs being replaced
+  -- and are themselves not yet confirmed).
+  | RbfNewUnconfirmedInput
+      { rbfNewParentTxId :: !TxId
       }
   deriving (Show, Eq, Generic)
 
@@ -1190,6 +1198,48 @@ checkNoConflictSpending tx conflictTxIds = do
     [] -> Right ()
     (txid:_) -> Left $ RbfSpendingConflict txid
 
+-- | BIP-125 Rule 2: replacement may not introduce *new* unconfirmed inputs.
+--
+-- The replacement transaction may only spend inputs that are either
+-- (a) already confirmed (i.e. not currently in the mempool), or
+-- (b) outpoints that were already being spent by one of the transactions
+--     being replaced (the @oldUnconfirmedSpends@ set, populated by the
+--     caller from the to-be-evicted entries).
+--
+-- This prevents an attacker from juggling unconfirmed parents in a
+-- replacement to side-step the joint replacement-fee accounting that
+-- Bitcoin Core enforces in legacy BIP-125 mode. Mirrors the legacy check
+-- documented in @bitcoin-core/src/wallet/feebumper.cpp@ ("We cannot source
+-- new unconfirmed inputs (bip125 rule 2)") and the per-impl reference
+-- implementations in @lunarblock/src/mempool.lua@ and
+-- @ouroboros/src/ouroboros/mempool.py@.
+--
+-- Parameters:
+--
+-- * The replacement transaction.
+-- * The set of @TxId@s currently in the mempool (for "is unconfirmed?" check).
+-- * The set of outpoints that the conflicting (to-evict) txs already spent.
+--
+-- Returns @Right ()@ on success, or @Left (RbfNewUnconfirmedInput parent)@
+-- with the offending parent txid.
+checkNoNewUnconfirmedInputs :: Tx
+                            -> Set TxId          -- ^ Mempool txid set (currently unconfirmed)
+                            -> Set OutPoint      -- ^ Outpoints already being spent by conflicts
+                            -> Either RbfError ()
+checkNoNewUnconfirmedInputs tx mempoolTxIds oldUnconfirmedSpends =
+  let go [] = Right ()
+      go (inp:rest) =
+        let op       = txInPrevOutput inp
+            parent   = outPointHash op
+            -- Confirmed inputs are always fine (parent not in mempool).
+            isUnconfirmed = Set.member parent mempoolTxIds
+            -- Already-known spends (i.e. spent by a tx being replaced) are fine.
+            wasKnown      = Set.member op oldUnconfirmedSpends
+        in if isUnconfirmed && not wasKnown
+             then Left $ RbfNewUnconfirmedInput parent
+             else go rest
+  in go (txInputs tx)
+
 -- | Remove all conflicting transactions and their descendants
 -- This is called after successful replacement validation
 removeConflicts :: Set TxId -> Mempool -> IO ()
@@ -1230,22 +1280,42 @@ attemptReplacement mp tx _txid conflictTxIds newFee newVsize newFeeRate = do
       return $ Left $ ErrRBFSpendingConflict txid
     Left _ -> return $ Left $ ErrRBFSpendingConflict (head conflictTxIds)
     Right () -> do
-      -- Apply RBF rules
-      case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
-        Left (RbfInsufficientAbsoluteFee newF reqF) ->
-          return $ Left $ ErrRBFInsufficientAbsoluteFee newF reqF
-        Left (RbfInsufficientFeeRate newR minR) ->
-          return $ Left $ ErrRBFInsufficientFeeRate newR minR
-        Left (RbfTooManyEvictions count maxC) ->
-          return $ Left $ ErrRBFTooManyReplacements count maxC
-        Left (RbfInsufficientRelayFee addF reqF) ->
-          return $ Left $ ErrRBFInsufficientRelayFee addF reqF
-        Left (RbfSpendingConflict txid) ->
-          return $ Left $ ErrRBFSpendingConflict txid
-        Right () -> do
-          -- Remove all conflicting transactions and descendants
-          removeConflicts conflictSet mp
-          return $ Right ()
+      -- BIP-125 Rule 2: no new unconfirmed inputs.
+      -- Build the set of outpoints already spent by the to-be-evicted txs
+      -- (direct conflicts + their descendants), and the set of currently-in-
+      -- mempool txids. Inputs that point to a confirmed tx (not in
+      -- @mempoolTxIds@) or to an outpoint already in @oldSpends@ are fine.
+      let mempoolTxIds = Map.keysSet entries
+          oldSpends    = Set.fromList
+            [ txInPrevOutput inp
+            | e <- allEvictions
+            , inp <- txInputs (meTransaction e)
+            ]
+      case checkNoNewUnconfirmedInputs tx mempoolTxIds oldSpends of
+        Left (RbfNewUnconfirmedInput parent) ->
+          return $ Left $ ErrRBFNewUnconfirmedInput parent
+        Left _ ->
+          -- Defensive: checkNoNewUnconfirmedInputs only returns RbfNewUnconfirmedInput.
+          return $ Left $ ErrRBFNewUnconfirmedInput (head conflictTxIds)
+        Right () ->
+          -- Apply RBF rules 3, 3a, 4, 5
+          case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
+            Left (RbfInsufficientAbsoluteFee newF reqF) ->
+              return $ Left $ ErrRBFInsufficientAbsoluteFee newF reqF
+            Left (RbfInsufficientFeeRate newR minR) ->
+              return $ Left $ ErrRBFInsufficientFeeRate newR minR
+            Left (RbfTooManyEvictions count maxC) ->
+              return $ Left $ ErrRBFTooManyReplacements count maxC
+            Left (RbfInsufficientRelayFee addF reqF) ->
+              return $ Left $ ErrRBFInsufficientRelayFee addF reqF
+            Left (RbfSpendingConflict txid) ->
+              return $ Left $ ErrRBFSpendingConflict txid
+            Left (RbfNewUnconfirmedInput parent) ->
+              return $ Left $ ErrRBFNewUnconfirmedInput parent
+            Right () -> do
+              -- Remove all conflicting transactions and descendants
+              removeConflicts conflictSet mp
+              return $ Right ()
 
 --------------------------------------------------------------------------------
 -- Block Connection/Disconnection
