@@ -7,6 +7,7 @@ module Main where
 import Test.Hspec
 import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Serialize (encode, decode, runPut, runGet, putWord32le)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -121,19 +122,44 @@ hexDecode bs = case B16.decode bs of
   Left _ -> error "invalid hex"
 
 -- Helper: Generate a chain of headers for testing
+--
+-- For regtest (or any network with @netPowNoRetargeting = True@), each
+-- generated header is /mined/ — the nonce is iterated until the
+-- header hash satisfies the regtest pow-limit target (0x207fffff,
+-- ~hundreds of nonces in the worst case).  This is required so that
+-- Sync.runPresync's per-header 'checkProofOfWork' gate accepts the
+-- generated chain (Wave-A / header-sync DoS audit, 2026-05-06: presync
+-- now mirrors Bitcoin Core's headerssync.cpp 'CheckProofOfWork' on
+-- every header).  For non-regtest networks we leave the nonce at @n@
+-- (real-difficulty mining is impractical from a unit test).
 generateChainHeaders :: Network -> BlockHash -> Int -> [BlockHeader]
 generateChainHeaders _ _ 0 = []
 generateChainHeaders net prevHash n =
-  let header = BlockHeader 1 prevHash
+  let bits     = if netPowNoRetargeting net then 0x207fffff else 0x1d00ffff
+      template nonce = BlockHeader 1 prevHash
                           (Hash256 (BS.pack [fromIntegral n, 0, 0, 0, 0, 0, 0, 0,
                                              0, 0, 0, 0, 0, 0, 0, 0,
                                              0, 0, 0, 0, 0, 0, 0, 0,
                                              0, 0, 0, 0, 0, 0, 0, 0]))
                           (fromIntegral n * 1000)
-                          (if netPowNoRetargeting net then 0x207fffff else 0x1d00ffff)
-                          (fromIntegral n)
+                          bits
+                          nonce
+      header
+        | netPowNoRetargeting net =
+            head [ template k | k <- [0..]
+                              , checkProofOfWork (template k) (netPowLimit net) ]
+        | otherwise = template (fromIntegral n)
       newHash = computeBlockHash header
   in header : generateChainHeaders net newHash (n - 1)
+
+-- | Mine a header for the regtest network: iterate the nonce until
+-- the header satisfies @checkProofOfWork@ at the regtest pow-limit
+-- (0x207fffff).  Used by presync / addHeader tests that need a
+-- "valid" header without standing up a full block-mining pipeline.
+mineRegtestHeader :: BlockHeader -> BlockHeader
+mineRegtestHeader base =
+  head [ base { bhNonce = k } | k <- [0..]
+                              , checkProofOfWork (base { bhNonce = k }) (netPowLimit regtest) ]
 
 -- Helper: Check if substring is in string
 isInfixOf :: String -> String -> Bool
@@ -5980,10 +6006,12 @@ main = hspec $ do
         let genesisHash = computeBlockHash (blockHeader $ netGenesisBlock regtest)
         -- Use a large minimum work so presync doesn't immediately transition to redownload
         peer <- initHeaderSyncPeer regtest genesisHash (2^(128::Int))
-        -- Create a header that chains to genesis
-        let header = BlockHeader 1 genesisHash
+        -- Create a (mined) header that chains to genesis.  PoW gate is
+        -- enforced inside runPresync (Wave-A 2026-05-06), so this
+        -- header now needs a nonce that meets the regtest target.
+        let header = mineRegtestHeader (BlockHeader 1 genesisHash
                                 (Hash256 (BS.replicate 32 0xaa))
-                                1000 0x207fffff 12345
+                                1000 0x207fffff 0)
         result <- atomically $ processPresyncHeaders peer [header]
         case result of
           Right (Presync pd, []) -> do
@@ -5996,12 +6024,15 @@ main = hspec $ do
         let genesisHash = computeBlockHash (blockHeader $ netGenesisBlock regtest)
         -- Use a large minimum work so presync doesn't immediately transition to redownload
         peer <- initHeaderSyncPeer regtest genesisHash (2^(128::Int))
-        -- First add a connecting header
-        let header1 = BlockHeader 1 genesisHash
+        -- First add a (mined) connecting header so the chain has state.
+        let header1 = mineRegtestHeader (BlockHeader 1 genesisHash
                                  (Hash256 (BS.replicate 32 0xaa))
-                                 1000 0x207fffff 12345
+                                 1000 0x207fffff 0)
         _ <- atomically $ processPresyncHeaders peer [header1]
-        -- Now try a non-connecting header (wrong prevBlock)
+        -- Now try a non-connecting header (wrong prevBlock).  The
+        -- connectivity check runs BEFORE the PoW check inside
+        -- runPresync, so this rejection is unaffected by Wave-A's new
+        -- per-header PoW gate — we still expect "connect" in the error.
         let wrongPrev = BlockHash (Hash256 (BS.replicate 32 0xff))
             badHeader = BlockHeader 1 wrongPrev
                                    (Hash256 (BS.replicate 32 0xbb))
@@ -6153,6 +6184,122 @@ main = hspec $ do
       it "maxHeadersPerMessage is 2000" $ do
         maxHeadersPerMessage `shouldBe` 2000
 
+  -- Wave-A header-sync DoS hardening (CORE-PARITY-AUDIT
+  -- _header-sync-dos-cross-impl-audit-2026-05-06-part2.md, haskoin
+  -- findings).  Three jobs land here as separate hspec cases:
+  --   1. addHeader rejects timestamps > now + 7200    (Job 1)
+  --   2. runPresync rejects forged-PoW headers        (Job 2)
+  --   3. PeerInfo carries piWantsHeaders field        (Job 3)
+  describe "Wave-A header-sync DoS hardening" $ do
+    it "addHeader rejects header with timestamp > now + 7200 (time-too-new)" $ do
+      -- Job 1: future-time gate.  A header that is otherwise valid
+      -- (mined PoW + chains to genesis) but whose timestamp is
+      -- @now + 1 day@ must be rejected with "time-too-new".  Without
+      -- the gate this header would be permanently inserted into the
+      -- in-memory header chain, polluting hcEntries.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+      now <- (round <$> getPOSIXTime) :: IO Word32
+      let dayAhead = now + 86_400
+          -- Mine a header whose timestamp is +24h.  Regtest has
+          -- 0x207fffff (easiest target) so a few hundred nonces is
+          -- enough.
+          futureHdr = mineRegtestHeader $
+            BlockHeader 1 genesisHash
+                        (Hash256 (BS.replicate 32 0x55))
+                        dayAhead 0x207fffff 0
+      result <- addHeader regtest hc futureHdr
+      case result of
+        Left err -> err `shouldSatisfy` ("time-too-new" `DL.isInfixOf`)
+        Right _  -> expectationFailure
+          "addHeader accepted a header 24h in the future (time-too-new gate missing)"
+
+    it "addHeader accepts header with timestamp at the +2h boundary" $ do
+      -- Companion: the gate is +7200s (>, not >=).  A header at
+      -- exactly @now + 7200@ should still be accepted; one at
+      -- @now + 7201@ would fall through to the rejection branch.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+      now <- (round <$> getPOSIXTime) :: IO Word32
+      let okAhead = now + 7200  -- exactly the boundary
+          okHdr = mineRegtestHeader $
+            BlockHeader 1 genesisHash
+                        (Hash256 (BS.replicate 32 0x66))
+                        okAhead 0x207fffff 0
+      result <- addHeader regtest hc okHdr
+      case result of
+        Right _  -> return ()
+        Left err -> expectationFailure $
+          "addHeader rejected header at +2h boundary: " ++ err
+
+    it "runPresync rejects header with insufficient PoW" $ do
+      -- Job 2: presync PoW gate.  The header has a valid claimed
+      -- @bits@ value (passes the bits-range sanity check) but a
+      -- nonce that does NOT meet the regtest target — the actual
+      -- hash exceeds the claimed target.  Without the per-header
+      -- 'checkProofOfWork' call inside @runPresync@, the attacker
+      -- accumulates fake "work" via the @headerWork@ helper (which
+      -- only inspects @bits@) and pushes the state machine to
+      -- REDOWNLOAD with bogus commitments.
+      let genesisHash = computeBlockHash (blockHeader $ netGenesisBlock regtest)
+      peer <- initHeaderSyncPeer regtest genesisHash (2^(128::Int))
+      -- Search for a nonce whose hash does NOT meet the target.
+      -- With 0x207fffff (easiest regtest target) this is harder, but
+      -- exists — try a sweep of nonces and pick one that fails.
+      let mkHdr n = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0xab))
+                                1700000000 0x207fffff n
+          forgedHdr = head [ mkHdr n | n <- [0..]
+                                     , not (checkProofOfWork (mkHdr n) (netPowLimit regtest)) ]
+      result <- atomically $ processPresyncHeaders peer [forgedHdr]
+      case result of
+        Left err -> err `shouldSatisfy` (\e -> "PoW" `DL.isInfixOf` e
+                                          || "pow" `DL.isInfixOf` e
+                                          || "presync" `DL.isInfixOf` e)
+        Right _  -> expectationFailure
+          "runPresync accepted a forged-PoW header (per-header CheckProofOfWork gate missing)"
+
+    it "PeerInfo carries piWantsHeaders flag (BIP-130 receive-side)" $ do
+      -- Job 3: BIP-130 piWantsHeaders field is wired through
+      -- PeerInfo.  Pre-fix the inbound 'sendheaders' message was a
+      -- no-op (Main.hs MSendHeaders -> return ()) and the announce
+      -- path always used MInv.  This test sanity-checks the data
+      -- model; the announce-path wiring is exercised live via
+      -- announceTip in app/Main.hs (no IO test for it because the
+      -- helper depends on PeerManager + a live network stack).
+      let info = PeerInfo
+            { piAddress = SockAddrInet 8333 0
+            , piVersion = Nothing
+            , piState = PeerConnected
+            , piServices = 0
+            , piStartHeight = 0
+            , piRelay = True
+            , piLastSeen = 0
+            , piLastPing = Nothing
+            , piPingLatency = Nothing
+            , piBanScore = 0
+            , piBytesSent = 0
+            , piBytesRecv = 0
+            , piMsgsSent = 0
+            , piMsgsRecv = 0
+            , piConnectedAt = 0
+            , piTimeOffset = 0
+            , piInbound = False
+            , piWantsAddrV2 = False
+            , piWantsHeaders = False
+            , piFeeFilterReceived = 0
+            , piFeeFilterSent = 0
+            , piNextFeeFilterSend = 0
+            , piBlockOnly = False
+            }
+      piWantsHeaders info `shouldBe` False
+      -- Toggle the flag (mirrors the inbound MSendHeaders handler in
+      -- app/Main.hs) and verify the read-back.
+      let info' = info { piWantsHeaders = True }
+      piWantsHeaders info' `shouldBe` True
+
   --------------------------------------------------------------------------------
   -- Misbehavior Scoring Tests (Phase 14)
   --------------------------------------------------------------------------------
@@ -6300,6 +6447,7 @@ main = hspec $ do
               , piConnectedAt = 0
               , piInbound = False
               , piWantsAddrV2 = False
+              , piWantsHeaders = False
               , piFeeFilterReceived = 0
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
@@ -6327,6 +6475,7 @@ main = hspec $ do
               , piConnectedAt = 0
               , piInbound = False
               , piWantsAddrV2 = False
+              , piWantsHeaders = False
               , piFeeFilterReceived = 0
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
@@ -6605,6 +6754,7 @@ main = hspec $ do
               , piConnectedAt = 1700000000
               , piInbound = True
               , piWantsAddrV2 = False
+              , piWantsHeaders = False
               , piFeeFilterReceived = 0
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0

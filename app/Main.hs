@@ -951,6 +951,34 @@ getConnectedPeerList pm = do
       peerInfo <- readTVarIO (pcInfo pc)
       return (piState peerInfo == PeerConnected)
 
+-- | Announce a newly-connected block to all connected peers, honouring
+-- BIP-130 'sendheaders' per-peer preference.
+--
+-- Peers that previously sent us @sendheaders@ ('piWantsHeaders' set)
+-- receive the actual 'BlockHeader' via an 'MHeaders' message; everyone
+-- else receives the legacy 'MInv' announcement.  Mirrors Bitcoin Core's
+-- @PeerManagerImpl::SendMessages@ tip-announcement branch
+-- (net_processing.cpp) and the camlcoin
+-- @Peer_manager.announce_block@ reference (lib/peer_manager.ml:1219).
+--
+-- Pre-fix this function did not exist: the new-block path called
+-- @broadcastMessage pm (MInv (Inv [invVec]))@ unconditionally, so the
+-- 'piWantsHeaders' flag was dead code.  See header-sync DoS audit
+-- 'CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part2.md'
+-- (haskoin Pattern A finding).
+announceTip :: PeerManager -> BlockHeader -> BlockHash -> IO ()
+announceTip pm header bh = do
+  peers <- readTVarIO (pmPeers pm)
+  let invVec = InvVector InvBlock (getBlockHashHash bh)
+      invMsg = MInv (Inv [invVec])
+      headersMsg = MHeaders (Headers [header])
+  forM_ (Map.elems peers) $ \pc -> do
+    info <- readTVarIO (pcInfo pc)
+    when (piState info == PeerConnected) $ do
+      let msg = if piWantsHeaders info then headersMsg else invMsg
+      sendMessage pc msg
+        `catch` (\(_ :: SomeException) -> return ())
+
 -- | Request blocks for a range of heights from the header chain
 -- Batches requests in groups of 16 to avoid overwhelming peers
 requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> IO ()
@@ -1144,10 +1172,12 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         -- Remove confirmed txs from mempool and clear rejection filter
         blockConnected mp block
         writeIORef recentlyRejectedRef Set.empty
-        -- Broadcast the block inv to other peers so it propagates
+        -- Announce the new tip honouring BIP-130 sendheaders preference:
+        -- peers that requested 'sendheaders' get an MHeaders, the rest
+        -- get the legacy MInv.  Reference: announceTip helper +
+        -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
         pm <- readIORef pmRef
-        let invVec = InvVector InvBlock (getBlockHashHash bh)
-        broadcastMessage pm $ MInv $ Inv [invVec]
+        announceTip pm (blockHeader block) bh
         -- After connecting a new block from a peer, request headers
         -- to discover any further blocks we might be missing.
         connPeers <- getConnectedPeerList pm
@@ -1418,7 +1448,18 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
 
   MPong _ -> return ()
   MVerAck -> return ()
-  MSendHeaders -> return ()
+  MSendHeaders -> do
+    -- BIP-130: peer is requesting headers-first announcements.  Record
+    -- the preference on the peer record so 'announceTip' below routes
+    -- new tips through 'MHeaders' instead of 'MInv' for this peer.
+    -- Reference: bitcoin-core/src/net_processing.cpp NetMsgType::SENDHEADERS
+    -- — sets 'm_peer_state.m_prefers_headers' for the peer.
+    pm <- readIORef pmRef
+    peerMap <- readTVarIO (pmPeers pm)
+    case Map.lookup addr peerMap of
+      Just pc -> atomically $ modifyTVar' (pcInfo pc) $ \i ->
+        i { piWantsHeaders = True }
+      Nothing -> return ()
   MSendCmpct _ -> return ()
   MWtxidRelay -> return ()
 

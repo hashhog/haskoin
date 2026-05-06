@@ -1664,6 +1664,14 @@ data PeerInfo = PeerInfo
   , piTimeOffset         :: !Int64             -- ^ Clock-skew: peer version timestamp - our unix time at handshake (seconds)
   , piInbound            :: !Bool              -- ^ True if peer connected to us
   , piWantsAddrV2        :: !Bool              -- ^ True if peer sent sendaddrv2 (BIP155)
+    -- | BIP-130: True iff the peer sent us @sendheaders@ during the
+    -- post-handshake feature negotiation.  When set, we announce new
+    -- tips to this peer via @headers@ (Pattern A) instead of @inv@.
+    -- Bitcoin Core honours the flag in
+    -- @PeerManagerImpl::SendMessages@ — peers that asked for
+    -- header-first announcements get the actual block header so they
+    -- can drop redundant getheaders round-trips.
+  , piWantsHeaders       :: !Bool
     -- BIP133 Feefilter fields
   , piFeeFilterReceived  :: !Word64            -- ^ Fee filter received from peer (sat/kvB)
   , piFeeFilterSent      :: !Word64            -- ^ Fee filter we sent to peer (sat/kvB)
@@ -1751,6 +1759,7 @@ connectPeer config host port = do
               , piTimeOffset         = 0
               , piInbound            = False
               , piWantsAddrV2        = False
+              , piWantsHeaders       = False
               , piFeeFilterReceived  = 0
               , piFeeFilterSent      = 0
               , piNextFeeFilterSend  = 0
@@ -2990,6 +2999,7 @@ startInboundListener pm port = do
             , piTimeOffset    = 0
             , piInbound       = True
             , piWantsAddrV2   = False
+            , piWantsHeaders  = False
             , piFeeFilterReceived = 0
             , piFeeFilterSent     = 0
             , piNextFeeFilterSend = 0
@@ -8418,6 +8428,7 @@ createPeerConnectionFromSocket config sock _host = do
           , piTimeOffset    = 0
           , piInbound       = False
           , piWantsAddrV2   = True  -- Tor/I2P peers want ADDRv2
+          , piWantsHeaders  = False
           , piFeeFilterReceived = 0
           , piFeeFilterSent     = 0
           , piNextFeeFilterSend = 0
