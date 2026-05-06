@@ -7,7 +7,7 @@ module Main where
 import Test.Hspec
 import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_)
-import Data.Serialize (encode, decode, runPut, runGet)
+import Data.Serialize (encode, decode, runPut, runGet, putWord32le)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
@@ -86,6 +86,7 @@ import Haskoin.Index
 import qualified Haskoin.MuHash as MuHash
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
+import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
 import Data.Scientific (Scientific)
@@ -13164,6 +13165,151 @@ main = hspec $ do
         -- B1 is on the active chain at h=111, tip at 113.
         computeBlockRestConfirmations (Just (hB1, 111)) 113 byHeightPostReorg
           `shouldBe` 3
+
+  describe "DoS hardening: wire-decode caps (Job 2)" $ do
+    -- Reference: bitcoin-core/src/net_processing.cpp
+    --   MAX_INV_SZ = 50000, MAX_HEADERS_RESULTS = 2000, MAX_ADDR_TO_SEND = 1000.
+    -- Pre-fix the Inv / Headers / Addr Serialize instances called
+    -- replicateM (peer-supplied count) without bounds, allowing a 5-byte
+    -- attacker payload to allocate gigabytes.  Fix: pre-cap the varint.
+
+    describe "Inv decoder rejects oversized counts" $ do
+      it "decodes a 50_000-element inv message (at-cap, accepted)" $ do
+        let invMsg = Inv (replicate 50000 (InvVector InvTx (Hash256 (BS.replicate 32 0x11))))
+            wire   = encode invMsg
+        case (decode wire :: Either String Inv) of
+          Right (Inv vs) -> length vs `shouldBe` 50000
+          Left err       -> expectationFailure $ "at-cap inv rejected: " ++ err
+
+      it "rejects a 50_001-element inv message (over-cap)" $ do
+        -- Forge a wire-format inv with varint count = 50001.  We don't
+        -- need a real payload; the parser must reject before allocating.
+        let varint  = runPut (putVarInt (50001 :: Word64))
+            wire    = varint  -- truncated; cap rejects before reading payload
+        case (decode wire :: Either String Inv) of
+          Right _   -> expectationFailure "over-cap inv was accepted!"
+          Left err  -> err `shouldContain` "exceeds wire-decode cap"
+
+      it "rejects a 1_000_000_000-element inv message (DoS-class varint)" $ do
+        -- Reproduces the audit's 0xFEFFFFFFFF reproducer at smaller scale.
+        let varint = runPut (putVarInt (1_000_000_000 :: Word64))
+            wire   = varint
+        case (decode wire :: Either String Inv) of
+          Right _  -> expectationFailure "DoS-sized inv was accepted!"
+          Left err -> err `shouldContain` "exceeds wire-decode cap"
+
+    describe "Headers decoder rejects oversized counts" $ do
+      it "rejects a 2_001-element headers message (over-cap)" $ do
+        let varint = runPut (putVarInt (2001 :: Word64))
+            wire   = varint
+        case (decode wire :: Either String Headers) of
+          Right _  -> expectationFailure "over-cap headers was accepted!"
+          Left err -> err `shouldContain` "exceeds wire-decode cap"
+
+      it "rejects a 1_000_000_000-element headers message" $ do
+        let varint = runPut (putVarInt (1_000_000_000 :: Word64))
+            wire   = varint
+        case (decode wire :: Either String Headers) of
+          Right _  -> expectationFailure "DoS-sized headers was accepted!"
+          Left err -> err `shouldContain` "exceeds wire-decode cap"
+
+    describe "Addr / AddrV2 decoders reject oversized counts" $ do
+      it "rejects a 1_001-element addr message (over-cap)" $ do
+        let varint = runPut (putVarInt (1001 :: Word64))
+            wire   = varint
+        case (decode wire :: Either String Haskoin.Network.Addr) of
+          Right _  -> expectationFailure "over-cap addr was accepted!"
+          Left err -> err `shouldContain` "exceeds wire-decode cap"
+
+      it "rejects a 100_000-element addrv2 message (DoS-class)" $ do
+        let varint = runPut (putVarInt (100000 :: Word64))
+            wire   = varint
+        case (decode wire :: Either String AddrV2Msg) of
+          Right _  -> expectationFailure "over-cap addrv2 was accepted!"
+          Left err -> err `shouldContain` "exceeds wire-decode cap"
+
+    describe "GetHeaders / GetBlocks locator caps" $ do
+      it "rejects a 102-entry getheaders locator (locator cap = 101)" $ do
+        let body = runPut $ do
+              putWord32le (70016 :: Word32)             -- version
+              putVarInt   (102 :: Word64)               -- bogus locator count
+            -- truncated payload; cap rejects before allocation
+        case (decode body :: Either String GetHeaders) of
+          Right _  -> expectationFailure "over-cap locator was accepted!"
+          Left err -> err `shouldContain` "exceeds wire-decode cap"
+
+      it "accepts a 101-entry getheaders locator (at cap)" $ do
+        let zeroH = BlockHash (Hash256 (BS.replicate 32 0))
+            ghMsg = GetHeaders 70016 (replicate 101 zeroH) zeroH
+            wire  = encode ghMsg
+        case (decode wire :: Either String GetHeaders) of
+          Right (GetHeaders _ ls _) -> length ls `shouldBe` 101
+          Left err                  -> expectationFailure $ "at-cap locator rejected: " ++ err
+
+  describe "DoS hardening: misbehavior wire-up (Job 1)" $ do
+    -- Reference: bitcoin-core/src/net_processing.cpp Misbehaving() — pre-2021
+    -- Core accumulated a numeric ban score per peer and dropped+banned at
+    -- threshold.  haskoin's score-tracker was complete but had zero callers
+    -- before this fix.
+
+    it "misbehaviorScore covers all defined reasons with positive values" $ do
+      -- Sanity: every constructor returns a positive ban score.
+      let reasons =
+            [ InvalidBlockHeader, InvalidBlock, InvalidTransaction
+            , MalformedMessage, WrongNetworkMagic, UnsolicitedMessage
+            , TooManyAddrMessages, TooLargeInvMessage, TooLargeAddrMessage
+            , TooLargeHeadersMessage, InvalidCompactBlock, NonContinuousHeaders
+            , ChecksumMismatch, PayloadTooLarge, DuplicateVersion
+            , HeadersDontConnect, BlockDownloadStall, UnrequestedData
+            ]
+      forM_ reasons $ \r ->
+        misbehaviorScore r `shouldSatisfy` (> 0)
+
+    it "TooLargeInvMessage scores 20 (matches Core protocol-violation tier)" $
+      misbehaviorScore TooLargeInvMessage `shouldBe` 20
+
+    it "InvalidBlock scores 100 (immediate-ban tier)" $
+      misbehaviorScore InvalidBlock `shouldBe` 100
+
+    it "MalformedMessage scores 10 (parse-error tier)" $
+      misbehaviorScore MalformedMessage `shouldBe` 10
+
+    it "default ban threshold is 100 (matches Bitcoin Core)" $
+      defaultBanThreshold `shouldBe` 100
+
+  describe "DoS hardening: setban / listbanned / clearbanned (Job 3)" $ do
+    -- Reference: bitcoin-core/src/rpc/net.cpp setban / listbanned / clearbanned
+    -- The handlers operate on the same in-memory ban map that the
+    -- automatic 'misbehaving' path writes to, so manual + automatic
+    -- bans share durability.
+
+    it "BanEntry roundtrip JSON encodes and decodes to itself" $ do
+      let be = BanEntry { beAddress = "192.168.1.42"
+                        , bePort    = 8333
+                        , beExpiry  = 1700000000 }
+          wire = Aeson.encode be
+      case Aeson.decode wire :: Maybe BanEntry of
+        Just be' -> do
+          beAddress be' `shouldBe` beAddress be
+          bePort    be' `shouldBe` bePort    be
+          beExpiry  be' `shouldBe` beExpiry  be
+        Nothing  -> expectationFailure "BanEntry JSON roundtrip failed"
+
+    it "sockAddrToBanEntry / banEntryToSockAddr roundtrip IPv4" $ do
+      -- 1.2.3.4:8333 -- exact byte ordering matters
+      let port  = 8333
+          host  = 1 + 2 * 0x100 + 3 * 0x10000 + 4 * 0x1000000 :: Word32
+          orig  = SockAddrInet port host
+          expiry = 1700000000 :: Int64
+      case sockAddrToBanEntry orig expiry of
+        Nothing -> expectationFailure "sockAddrToBanEntry returned Nothing"
+        Just be ->
+          case banEntryToSockAddr be of
+            Just (SockAddrInet p h) -> do
+              p `shouldBe` port
+              h `shouldBe` host
+            Just other -> expectationFailure $ "wrong SockAddr type: " ++ show other
+            Nothing    -> expectationFailure "banEntryToSockAddr returned Nothing"
 
   where
     sampleTx = Tx

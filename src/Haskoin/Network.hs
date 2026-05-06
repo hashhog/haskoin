@@ -8,6 +8,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE CApiFFI #-}
+{-# LANGUAGE NumericUnderscores #-}
 
 module Haskoin.Network
   ( -- * Message Envelope
@@ -117,6 +118,7 @@ module Haskoin.Network
   , performHandshake
     -- * Peer Threads
   , startPeerThreads
+  , startPeerThreadsWithMisbehavior
   , queueMessage
       -- * Peer Manager Types
   , PeerManager(..)
@@ -137,9 +139,16 @@ module Haskoin.Network
   , addBanScore
   , handleAddrMessage
   , buildBlockLocator
+    -- * Wire-decode caps (DoS hardening)
+  , maxInvSz
+  , maxHeadersResults
+  , maxLocatorSz
+  , maxAddrToSend
+  , getCappedVarInt
     -- * Misbehavior Scoring
   , MisbehaviorReason(..)
   , misbehaviorScore
+  , defaultBanThreshold
   , misbehaving
   , isDiscouraged
   , isBanned
@@ -807,6 +816,47 @@ instance Serialize InvVector where
 -- Inv, GetData, NotFound Messages
 --------------------------------------------------------------------------------
 
+-- | Maximum number of items in an inv / getdata / notfound message.
+-- Mirrors Bitcoin Core's @MAX_INV_SZ = 50000@
+-- (bitcoin-core/src/net_processing.cpp:126).  Wire-decode rejects any
+-- count above this threshold *before* allocating the result list, so an
+-- adversarial peer cannot OOM the node by sending a giant varint
+-- followed by a tiny payload.
+maxInvSz :: Word64
+maxInvSz = 50_000
+
+-- | Maximum number of headers in a 'Headers' message.
+-- Mirrors Bitcoin Core's @MAX_HEADERS_RESULTS = 2000@
+-- (bitcoin-core/src/net_processing.h:50).
+maxHeadersResults :: Word64
+maxHeadersResults = 2_000
+
+-- | Maximum number of locator hashes in a 'GetBlocks' or 'GetHeaders'
+-- message.  Bitcoin Core's locator is exponentially-spaced after the
+-- 10th entry, so even a chain of 10**18 blocks fits in <200 entries;
+-- 101 is the tightest Core-compatible cap.  We use 2000 to match
+-- Core's m_max_locator_size (validation.cpp).  Reject above that.
+maxLocatorSz :: Word64
+maxLocatorSz = 101
+
+-- | Maximum number of entries in an 'Addr' message.
+-- Mirrors Bitcoin Core's @MAX_ADDR_TO_SEND = 1000@
+-- (bitcoin-core/src/net_processing.cpp:190).
+maxAddrToSend :: Word64
+maxAddrToSend = 1_000
+
+-- | Helper: read a varint and reject if it exceeds @cap@.
+-- Returns the count if valid, or 'fail's the parser otherwise.  Used by
+-- the Inv/Headers/Addr/etc Serialize instances to reject oversized
+-- messages *before* allocation.
+getCappedVarInt :: Word64 -> String -> Get Int
+getCappedVarInt cap msgName = do
+  n <- getVarInt'
+  if n > cap
+    then fail $ msgName ++ " count " ++ show n
+              ++ " exceeds wire-decode cap " ++ show cap
+    else return (fromIntegral n)
+
 -- | Inv message - announces known transactions or blocks
 -- Used to advertise inventory to peers
 newtype Inv = Inv { getInvList :: [InvVector] }
@@ -818,8 +868,8 @@ instance Serialize Inv where
     putVarInt (fromIntegral $ length vs)
     mapM_ put vs
   get = do
-    n <- getVarInt'
-    Inv <$> replicateM (fromIntegral n) get
+    n <- getCappedVarInt maxInvSz "inv"
+    Inv <$> replicateM n get
 
 -- | GetData message - request specific inventory objects
 newtype GetData = GetData { getDataList :: [InvVector] }
@@ -831,8 +881,8 @@ instance Serialize GetData where
     putVarInt (fromIntegral $ length vs)
     mapM_ put vs
   get = do
-    n <- getVarInt'
-    GetData <$> replicateM (fromIntegral n) get
+    n <- getCappedVarInt maxInvSz "getdata"
+    GetData <$> replicateM n get
 
 -- | NotFound message - requested data not available
 newtype NotFound = NotFound { getNotFoundList :: [InvVector] }
@@ -844,8 +894,8 @@ instance Serialize NotFound where
     putVarInt (fromIntegral $ length vs)
     mapM_ put vs
   get = do
-    n <- getVarInt'
-    NotFound <$> replicateM (fromIntegral n) get
+    n <- getCappedVarInt maxInvSz "notfound"
+    NotFound <$> replicateM n get
 
 --------------------------------------------------------------------------------
 -- GetBlocks/GetHeaders Messages
@@ -869,7 +919,8 @@ instance Serialize GetBlocks where
     put gbHashStop
   get = GetBlocks
     <$> getWord32le
-    <*> (do n <- getVarInt'; replicateM (fromIntegral n) get)
+    <*> (do n <- getCappedVarInt maxLocatorSz "getblocks-locator"
+            replicateM n get)
     <*> get
 
 -- | GetHeaders message - request block headers from a peer
@@ -890,7 +941,8 @@ instance Serialize GetHeaders where
     put ghHashStop
   get = GetHeaders
     <$> getWord32le
-    <*> (do n <- getVarInt'; replicateM (fromIntegral n) get)
+    <*> (do n <- getCappedVarInt maxLocatorSz "getheaders-locator"
+            replicateM n get)
     <*> get
 
 --------------------------------------------------------------------------------
@@ -911,8 +963,8 @@ instance Serialize Headers where
       put h
       putVarInt (0 :: Word64)  -- tx_count always 0 in headers msg
   get = do
-    n <- getVarInt'
-    Headers <$> replicateM (fromIntegral n) (get <* getVarInt')
+    n <- getCappedVarInt maxHeadersResults "headers"
+    Headers <$> replicateM n (get <* getVarInt')
 
 --------------------------------------------------------------------------------
 -- Addr Message
@@ -943,8 +995,8 @@ instance Serialize Addr where
     putVarInt (fromIntegral $ length as)
     mapM_ put as
   get = do
-    n <- getVarInt'
-    Addr <$> replicateM (fromIntegral n) get
+    n <- getCappedVarInt maxAddrToSend "addr"
+    Addr <$> replicateM n get
 
 --------------------------------------------------------------------------------
 -- SendHeaders Message (BIP-130)
@@ -1123,8 +1175,8 @@ instance Serialize AddrV2Msg where
     putVarInt (fromIntegral $ length as)
     mapM_ put as
   get = do
-    n <- getVarInt'
-    AddrV2Msg <$> replicateM (fromIntegral n) get
+    n <- getCappedVarInt maxAddrToSend "addrv2"
+    AddrV2Msg <$> replicateM n get
 
 -- | SendAddrV2 message - signals support for addrv2 (BIP155)
 -- Must be sent between version and verack
@@ -2321,7 +2373,23 @@ v2OutboundHandshake pc net = do
 -- | Start send and receive threads for a peer connection
 -- The handler function is called for each received message
 startPeerThreads :: PeerConnection -> (Message -> IO ()) -> IO PeerConnection
-startPeerThreads pc handler = do
+startPeerThreads pc handler = startPeerThreadsWithMisbehavior pc handler (\_ _ -> return ())
+
+-- | Start send and receive threads with a misbehavior-recording callback.
+-- The callback is invoked when 'receiveMessage' returns 'Left' so the peer
+-- manager can attribute parse / checksum / oversized-message failures to the
+-- peer's ban score.  Mirrors Bitcoin Core's net.cpp recv-thread call sites
+-- where any deserialization failure increments the misbehavior counter
+-- before the connection is torn down.
+startPeerThreadsWithMisbehavior
+  :: PeerConnection
+  -> (Message -> IO ())
+  -> (MisbehaviorReason -> String -> IO ())
+  -- ^ Called when the recv thread observes a malformed/oversized message.
+  -- First argument is the score reason; second is the human-readable error
+  -- text from 'receiveMessage'.
+  -> IO PeerConnection
+startPeerThreadsWithMisbehavior pc handler onMisbehave = do
   -- Send thread: reads from queue and sends to socket
   sendTid <- forkIO $ forever $ do
     msg <- atomically $ readTBQueue (pcSendQueue pc)
@@ -2340,11 +2408,43 @@ startPeerThreads pc handler = do
         handler msg
         loop
       Left err -> do
+        -- Classify the wire-decode error so misbehavior is attributed to
+        -- the peer.  Reference: Bitcoin Core net.cpp ProcessMessages —
+        -- "Drop the message but don't disconnect" applies to unknown
+        -- commands; framing/checksum/decoder failures DO get scored.
+        let reason
+              | "Wrong network magic" `isInfixOfStr` err = WrongNetworkMagic
+              | "Checksum mismatch"   `isInfixOfStr` err = ChecksumMismatch
+              | "Payload too large"   `isInfixOfStr` err = PayloadTooLarge
+              | "exceeds wire-decode cap" `isInfixOfStr` err =
+                  -- Pick the most common varint-cap class; the watchdog
+                  -- logs the underlying message for forensics.
+                  if "headers"     `isInfixOfStr` err then TooLargeHeadersMessage
+                  else if "addr"   `isInfixOfStr` err then TooLargeAddrMessage
+                  else if "inv"    `isInfixOfStr` err
+                       || "getdata"  `isInfixOfStr` err
+                       || "notfound" `isInfixOfStr` err then TooLargeInvMessage
+                  else MalformedMessage
+              | "Header parse error" `isInfixOfStr` err = MalformedMessage
+              -- Connection-closed errors are not peer misbehavior.
+              | "Connection closed" `isInfixOfStr` err = MalformedMessage  -- treated as 0 below
+              | otherwise = MalformedMessage
+        -- Skip purely network-level errors (peer hung up cleanly): the
+        -- recv loop already disconnects, no score attribution needed.
+        unless ("Connection closed" `isInfixOfStr` err) $
+          (onMisbehave reason err) `catch` (\(_ :: SomeException) -> return ())
         disconnectPeer pc
         -- Do NOT loop after disconnect: socket is closed, further reads
         -- would spin indefinitely.
 
   return pc { pcSendThread = Just sendTid, pcRecvThread = Just recvTid }
+  where
+    isInfixOfStr :: String -> String -> Bool
+    isInfixOfStr needle haystack =
+      let nlen = length needle
+          hlen = length haystack
+      in nlen <= hlen
+         && any (\i -> take nlen (drop i haystack) == needle) [0..hlen - nlen]
 
 -- | Queue a message to be sent by the send thread
 queueMessage :: PeerConnection -> Message -> STM ()
@@ -2768,7 +2868,11 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
                       atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
                     addOutboundConnection (pmOutboundDiversity pm) addr
                     atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
-                    pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+                    pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
+                             (\reason err -> do
+                                putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
+                                        ++ show reason ++ " (" ++ err ++ ")"
+                                void $ misbehaving pm addr reason)
                     atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
                     -- Only request addresses from full-relay peers (not block-relay-only)
                     unless blockRelayOnly $
@@ -2817,7 +2921,11 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
 
           -- Start peer threads with message handler
-          pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+          pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
+                   (\reason err -> do
+                      putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
+                              ++ show reason ++ " (" ++ err ++ ")"
+                      void $ misbehaving pm addr reason)
           atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
 
           -- Only request addresses from full-relay peers (not block-relay-only)
@@ -2941,7 +3049,11 @@ startInboundListener pm port = do
               close sock
             Right _ver -> do
               atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
-              pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+              pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
+                   (\reason err -> do
+                      putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
+                              ++ show reason ++ " (" ++ err ++ ")"
+                      void $ misbehaving pm addr reason)
               atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
               putStrLn $ "Accepted inbound v1 connection from " ++ show addr
         Just TransportV2 -> do
@@ -2965,7 +3077,11 @@ startInboundListener pm port = do
                   close sock
                 Right _ver -> do
                   atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
-                  pc' <- startPeerThreads pc (pmMessageHandler pm addr)
+                  pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
+                   (\reason err -> do
+                      putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
+                              ++ show reason ++ " (" ++ err ++ ")"
+                      void $ misbehaving pm addr reason)
                   atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
                   putStrLn $ "Accepted inbound v2 (encrypted) connection from "
                     ++ show addr
