@@ -114,6 +114,9 @@ module Haskoin.Rpc
   , handlePruneBlockchain
   , pruneblockchainNotEnabledMsg
   , pruneblockchainNotEnabledResponse
+    -- * Confirmations helpers (exported for testing — Pattern C1)
+  , computeTxConfirmations
+  , computeBlockRestConfirmations
   ) where
 
 import Data.Aeson
@@ -5148,6 +5151,51 @@ txToJSON tx txid = object
           ]
       ]
 
+-- | Compute @confirmations@ for a tx whose block is @entryHash@ at height
+-- @entryHeight@, given the tip at @tipHeight@ and the active-chain
+-- height-to-hash index @byHeight@.
+--
+-- Pattern C1: returns 0 (Bitcoin Core's @rpc/rawtransaction.cpp::TxToJSON@
+-- convention) when the entry's block is not on the active chain (i.e. has
+-- been disconnected by reorg).  Pre-fix, haskoin reported a positive
+-- height-difference even for disconnected blocks, which is the canonical
+-- Pattern C1 stale-confirmations bug.
+--
+-- Reference: @bitcoin-core/src/rpc/rawtransaction.cpp@:
+--
+-- > if (tip->GetAncestor(blockindex->nHeight) == blockindex)
+-- >     confirmations = ActiveChain().Height() - blockindex->nHeight + 1;
+-- > else
+-- >     confirmations = 0;
+--
+-- See findings:
+-- @CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md@.
+computeTxConfirmations
+  :: BlockHash               -- ^ Entry's blockhash
+  -> Word32                  -- ^ Entry's stored height
+  -> Word32                  -- ^ Active-chain tip height
+  -> Map Word32 BlockHash    -- ^ Active-chain height -> hash index (hcByHeight)
+  -> Int
+computeTxConfirmations entryHash entryHeight tipHeight byHeight =
+  if Map.lookup entryHeight byHeight == Just entryHash
+    then fromIntegral tipHeight - fromIntegral entryHeight + 1
+    else 0
+
+-- | Compute @confirmations@ for the REST @/rest/block/<hash>.json@ handler.
+-- Uses @-1@ for blocks not on the active chain, mirroring Bitcoin Core's
+-- @rpc/blockchain.cpp::blockToJSON@ via @ComputeBlockHashFromHeight@.  The
+-- @-1@ convention indicates "block exists but is on a side branch".
+computeBlockRestConfirmations
+  :: Maybe (BlockHash, Word32)  -- ^ The block's @(hash, stored height)@
+  -> Word32                     -- ^ Active-chain tip height
+  -> Map Word32 BlockHash       -- ^ Active-chain height -> hash index
+  -> Int
+computeBlockRestConfirmations Nothing _ _ = -1
+computeBlockRestConfirmations (Just (entryHash, entryHeight)) tipHeight byHeight =
+  if Map.lookup entryHeight byHeight == Just entryHash
+    then fromIntegral tipHeight - fromIntegral entryHeight + 1
+    else -1
+
 -- | Convert a transaction to verbose JSON with blockchain context
 -- Includes: txid, hash (wtxid), size, vsize, weight, version, locktime,
 -- vin, vout, hex, and optionally blockhash, confirmations, blocktime
@@ -5181,11 +5229,13 @@ txToVerboseJSON server tx txid mBlockHash = do
     Just blockHash -> do
       entries <- readTVarIO (hcEntries (rsHeaderChain server))
       tip <- readTVarIO (hcTip (rsHeaderChain server))
+      byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
       let mEntry = Map.lookup blockHash entries
       case mEntry of
         Nothing -> return [ "blockhash" .= showHash blockHash ]
         Just entry -> do
-          let confirmations = ceHeight tip - ceHeight entry + 1
+          let confirmations = computeTxConfirmations
+                                blockHash (ceHeight entry) (ceHeight tip) byHeight
               blockTime = bhTimestamp (ceHeader entry)
           return
             [ "blockhash"      .= showHash blockHash
@@ -5664,6 +5714,7 @@ handleRestBlock server pathPart includeTxDetails = do
                     RestJson -> do
                       entries <- readTVarIO (hcEntries (rsHeaderChain server))
                       tip <- readTVarIO (hcTip (rsHeaderChain server))
+                      byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
                       let mEntry = Map.lookup bh entries
                           txData = if includeTxDetails
                             then map (\tx -> object
@@ -5672,9 +5723,11 @@ handleRestBlock server pathPart includeTxDetails = do
                                    , "vsize" .= calculateVSize tx
                                    ]) (blockTxns block)
                             else map (toJSON . showHash . blockHashFromTxId . computeTxId) (blockTxns block)
+                          mEntryHash = fmap (\e -> (bh, ceHeight e)) mEntry
                           jsonResult = object $ catMaybes
                             [ Just $ "hash" .= showHash bh
-                            , Just $ "confirmations" .= confirmations mEntry (ceHeight tip)
+                            , Just $ "confirmations" .=
+                                computeBlockRestConfirmations mEntryHash (ceHeight tip) byHeight
                             , Just $ "size" .= BS.length blockBytes
                             , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
                             , Just $ "version" .= bhVersion (blockHeader block)
@@ -5693,11 +5746,6 @@ handleRestBlock server pathPart includeTxDetails = do
 
                     RestUndefined ->
                       return $ restError 404 "output format not found"
-  where
-    confirmations :: Maybe ChainEntry -> Word32 -> Int
-    confirmations Nothing _ = -1
-    confirmations (Just entry) tipHeight =
-      fromIntegral tipHeight - fromIntegral (ceHeight entry) + 1
 
 --------------------------------------------------------------------------------
 -- REST Transaction Handler
