@@ -3519,6 +3519,149 @@ main = hspec $ do
       ancestor <- getAncestor hc (ceHash tip) 100
       ancestor `shouldBe` Nothing
 
+  -- Pattern Y companion (CORE-PARITY-AUDIT
+  -- _reorg-via-submitblock-fleet-result-2026-05-05.md): the
+  -- side-branch-aware addHeader / addSideBranchHeader split is the
+  -- haskoin counterpart of nimrod 7196d41's putBlockIndexHashOnly +
+  -- camlcoin 22667c2's register_side_branch_header.  These tests
+  -- guard against the "hcByHeight clobber" failure mode that the
+  -- corpus entry tools/diff-test-corpus/regression/reorg-via-submitblock
+  -- surfaced.
+  describe "Header Chain side-branch storage (Pattern Y)" $ do
+    it "addHeader preserves hcByHeight when work <= current tip" $ do
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          mineH base = head $ filter
+            (\h -> checkProofOfWork h (netPowLimit regtest))
+            [ base { bhNonce = n } | n <- [0..] ]
+
+          -- A1: extends genesis (active chain).
+          a1Base = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0x11))
+                                1700000000 0x207fffff 0
+          a1 = mineH a1Base
+          a1Hash = computeBlockHash a1
+
+      _ <- addHeader regtest hc a1
+      tip1 <- getChainTip hc
+      ceHash tip1 `shouldBe` a1Hash
+
+      -- B1 also extends genesis with a different nonce/merkle (sibling
+      -- of A1 — same height, ties on work).  Pre-fix this entry would
+      -- overwrite hcByHeight[1] = b1Hash, clobbering the active-chain
+      -- pointer at height 1.  Post-fix, hcByHeight[1] stays = a1Hash
+      -- because B1's work is not strictly greater than A1's (tie).
+      let b1Base = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0x22))
+                                1700000600 0x207fffff 0
+          b1 = mineH b1Base
+          b1Hash = computeBlockHash b1
+      _ <- addHeader regtest hc b1
+
+      byHeightAfter <- readTVarIO (hcByHeight hc)
+      Map.lookup 1 byHeightAfter `shouldBe` Just a1Hash
+
+      -- Both entries are in hcEntries (storage decoupling).
+      entries <- readTVarIO (hcEntries hc)
+      Map.member a1Hash entries `shouldBe` True
+      Map.member b1Hash entries `shouldBe` True
+
+      tip2 <- getChainTip hc
+      ceHash tip2 `shouldBe` a1Hash
+
+    it "addSideBranchHeader stores hash entry but preserves height index" $ do
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          mineH base = head $ filter
+            (\h -> checkProofOfWork h (netPowLimit regtest))
+            [ base { bhNonce = n } | n <- [0..] ]
+
+          -- Active chain: A1 extends genesis.
+          a1Base = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0x33))
+                                1700000000 0x207fffff 0
+          a1 = mineH a1Base
+          a1Hash = computeBlockHash a1
+      _ <- addHeader regtest hc a1
+
+      -- B1 (side-branch sibling of A1) inserted via the side-branch
+      -- helper.  Mirrors nimrod's putBlockIndexHashOnly: hash entry
+      -- is stored, but hcByHeight is not touched.
+      let b1Base = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0x44))
+                                1700000600 0x207fffff 0
+          b1 = mineH b1Base
+          b1Hash = computeBlockHash b1
+      sideRes <- addSideBranchHeader hc b1
+      case sideRes of
+        Right ce -> do
+          ceHash ce `shouldBe` b1Hash
+          ceHeight ce `shouldBe` 1
+        Left err -> expectationFailure $ "addSideBranchHeader: " ++ err
+
+      -- B1 in entries (so a follow-up child can find its parent), but
+      -- hcByHeight[1] still points to the active chain's A1.
+      entries <- readTVarIO (hcEntries hc)
+      Map.member b1Hash entries `shouldBe` True
+      byHeight <- readTVarIO (hcByHeight hc)
+      Map.lookup 1 byHeight `shouldBe` Just a1Hash
+
+      -- Tip unchanged.
+      tip <- getChainTip hc
+      ceHash tip `shouldBe` a1Hash
+
+    it "addSideBranchHeader rejects when parent is missing (orphan)" $ do
+      hc <- initHeaderChain regtest
+      let unknownParent = BlockHash (Hash256 (BS.replicate 32 0x99))
+          orphanHdr = BlockHeader 1 unknownParent
+                                  (Hash256 (BS.replicate 32 0x55))
+                                  1700000000 0x207fffff 0
+      result <- addSideBranchHeader hc orphanHdr
+      case result of
+        Left _  -> return ()
+        Right _ -> expectationFailure
+          "addSideBranchHeader should reject when parent is not in index"
+
+    it "side-branch B2 (parent = B1) finds B1 via hash lookup" $ do
+      -- Exact failure shape the diff-test-corpus reorg-via-submitblock
+      -- entry surfaced: B1 is stored as a side-branch sibling of A1,
+      -- then B2 (parent = B1) is submitted.  Without addSideBranchHeader
+      -- the lookup of bhPrevBlock B2 in hcEntries would return Nothing
+      -- and B2 would be rejected as orphan.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          mineH base = head $ filter
+            (\h -> checkProofOfWork h (netPowLimit regtest))
+            [ base { bhNonce = n } | n <- [0..] ]
+
+          a1Base = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0xaa))
+                                1700000000 0x207fffff 0
+          a1 = mineH a1Base
+      _ <- addHeader regtest hc a1
+
+      let b1Base = BlockHeader 1 genesisHash
+                                (Hash256 (BS.replicate 32 0xbb))
+                                1700000600 0x207fffff 0
+          b1 = mineH b1Base
+          b1Hash = computeBlockHash b1
+      _ <- addSideBranchHeader hc b1
+
+      let b2Base = BlockHeader 1 b1Hash
+                                (Hash256 (BS.replicate 32 0xcc))
+                                1700001200 0x207fffff 0
+          b2 = mineH b2Base
+      result <- addSideBranchHeader hc b2
+      case result of
+        Right ce -> do
+          ceHeight ce `shouldBe` 2
+          cePrev ce `shouldBe` Just b1Hash
+        Left err -> expectationFailure $
+          "B2 should find B1 via hash-keyed lookup: " ++ err
+
   describe "Header chain persistence (restart recovery)" $ do
     it "headers survive DB close/reopen and can rebuild the chain" $ do
       withSystemTempDirectory "haskoin-restart-test" $ \tmpDir -> do
