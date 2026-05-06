@@ -13098,6 +13098,73 @@ main = hspec $ do
           result <- checkBIP30 db regtest 100 (minimalBlock [minimalTx])
           result `shouldBe` Right ()
 
+  -- Pattern C1: stale-confirmations after reorg.
+  -- Reference: bitcoin-core/src/rpc/rawtransaction.cpp::TxToJSON
+  --            bitcoin-core/src/rpc/blockchain.cpp::ComputeBlockHashFromHeight
+  -- Findings:  CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md
+  -- Corpus:    tools/diff-test-corpus/regression/txindex-revert-on-reorg/ (153c60c)
+  describe "Confirmations on disconnected blocks (Pattern C1)" $ do
+    let -- Synthetic blockhashes — opaque tags, no PoW required.
+        hA1 = BlockHash (Hash256 (BS.replicate 32 0xA1))
+        hA2 = BlockHash (Hash256 (BS.replicate 32 0xA2))
+        hB1 = BlockHash (Hash256 (BS.replicate 32 0xB1))
+        hB2 = BlockHash (Hash256 (BS.replicate 32 0xB2))
+        hB3 = BlockHash (Hash256 (BS.replicate 32 0xB3))
+        -- After A1+A2 disconnect and B1+B2+B3 connect, the active-chain
+        -- byHeight map points at B's blocks at heights 111-113.  A1's tag
+        -- and height (111) are still in the (out-of-band) entries map but
+        -- height-111 resolves to hB1 on the active chain.
+        byHeightPostReorg = Map.fromList
+          [ (111, hB1)
+          , (112, hB2)
+          , (113, hB3)
+          ]
+        -- Pre-reorg snapshot: tip is hA2 at h=112, byHeight has A's blocks.
+        byHeightPreReorg = Map.fromList
+          [ (111, hA1)
+          , (112, hA2)
+          ]
+
+    describe "computeTxConfirmations (getrawtransaction)" $ do
+      it "returns positive confirmations for a tx whose block IS on the active chain" $ do
+        -- Pre-reorg: A1.coinbase is in A1 @ h=111, tip is A2 @ h=112.
+        computeTxConfirmations hA1 111 112 byHeightPreReorg `shouldBe` 2
+
+      it "returns 0 for a tx whose block is NOT on the active chain (Pattern C1)" $ do
+        -- Post-reorg: A1's stored height is 111 but byHeight[111] = hB1.
+        -- Tip is hB3 at h=113.  Pre-fix this returned 3 (= 113 - 111 + 1).
+        computeTxConfirmations hA1 111 113 byHeightPostReorg `shouldBe` 0
+
+      it "returns 0 even when tip height equals entry height (rare 1-block disconnect)" $ do
+        -- Edge case: 1-block reorg.  A1 at h=111 disconnected, B1 connected
+        -- at h=111 = new tip.  Pre-fix: confirmations = 1 for A1 (looks
+        -- canonical).  Post-fix: 0.
+        let byHeight1 = Map.fromList [(111, hB1)]
+        computeTxConfirmations hA1 111 111 byHeight1 `shouldBe` 0
+
+      it "returns 1 for the tip block on the active chain" $ do
+        -- A1 is the tip itself: h=111, tipHeight=111.
+        computeTxConfirmations hA1 111 111 byHeightPreReorg `shouldBe` 1
+
+      it "returns 0 when entry height is absent from the active-chain index" $ do
+        -- Defensive: byHeight has no entry for h=111.  Treat as off-chain.
+        computeTxConfirmations hA1 111 112 (Map.fromList [(112, hA2)]) `shouldBe` 0
+
+    describe "computeBlockRestConfirmations (REST /rest/block)" $ do
+      it "returns -1 when the entry is missing from hcEntries" $ do
+        -- Mirrors Core's blockToJSON when ComputeBlockHashFromHeight fails.
+        computeBlockRestConfirmations Nothing 113 byHeightPostReorg `shouldBe` (-1)
+
+      it "returns -1 for a block on a side branch (Pattern C1)" $ do
+        -- A1 disconnected by reorg: stored height 111, byHeight[111] = hB1.
+        computeBlockRestConfirmations (Just (hA1, 111)) 113 byHeightPostReorg
+          `shouldBe` (-1)
+
+      it "returns positive confirmations for a block on the active chain" $ do
+        -- B1 is on the active chain at h=111, tip at 113.
+        computeBlockRestConfirmations (Just (hB1, 111)) 113 byHeightPostReorg
+          `shouldBe` 3
+
   where
     sampleTx = Tx
       { txVersion = 1
