@@ -424,76 +424,126 @@ submitBlock :: Network         -- ^ Network configuration
             -> IO (Either String ())
 submitBlock net db hc cache pm block = do
   let bh = computeBlockHash (blockHeader block)
+      header = blockHeader block
+      prevHash = bhPrevBlock header
 
-  -- Get current chain state for validation
+  -- Pattern X fix (CORE-PARITY-AUDIT
+  -- _reorg-via-submitblock-fleet-result-2026-05-05.md):
+  -- Derive the block's height from its OWN parent in the in-memory block
+  -- index, NOT from the active chain tip.  Bitcoin Core's
+  -- ContextualCheckBlockHeader (validation.cpp) uses
+  -- @pindexPrev->nHeight + 1@ where @pindexPrev@ is the parent in the
+  -- block index — for a side-branch block this is NOT the active tip.
+  --
+  -- Pre-fix: BIP-34 derived @height = ceHeight tip + 1@ which equalled
+  -- the active tip's next height, so a side-branch block whose coinbase
+  -- correctly encoded its own (smaller) height was rejected with
+  -- bad-cb-height.  Surfaced by the corpus entry
+  -- @tools/diff-test-corpus/regression/reorg-via-submitblock@: when B1
+  -- (parent = base@h=110) is submitted while the active tip is A2@h=112,
+  -- the active-tip-relative arithmetic gave height=113 and the B1
+  -- coinbase encoded h=111 — bad-cb-height.
+  --
+  -- Cross-impl reference: camlcoin 22667c2, rustoshi 68a422b.
+  entries <- readTVarIO (hcEntries hc)
   tip <- readTVarIO (hcTip hc)
-  let height = ceHeight tip + 1
+  case Map.lookup prevHash entries of
+    Nothing -> return $ Left $
+      "Block validation failed: parent " ++ show prevHash ++
+      " not in block index"
+    Just parent -> do
+      let height = ceHeight parent + 1
+          -- MTP at the BLOCK's parent (BIP-113), not the active tip.
+          parentMTP = medianTimePast entries prevHash
+          parentChainWork = ceChainWork parent
+          parentHash = ceHash parent
 
-  -- Build UTXO map for validation. We carry full Core-format
-  -- 'Coin' (TxOut + height + coinbase flag) so 'connectBlock' can
-  -- record byte-identical undo entries, and so validateFullBlock can
-  -- perform BIP-68 SequenceLocks checks (which require per-coin heights).
-  utxoMap <- buildBlockUTXOMap cache block
+      -- Build UTXO map for validation. We carry full Core-format
+      -- 'Coin' (TxOut + height + coinbase flag) so 'connectBlock' can
+      -- record byte-identical undo entries, and so validateFullBlock can
+      -- perform BIP-68 SequenceLocks checks (which require per-coin heights).
+      utxoMap <- buildBlockUTXOMap cache block
 
-  -- Build chain state for validation
-  let cs = ChainState
-        { csHeight = ceHeight tip
-        , csBestBlock = ceHash tip
-        , csChainWork = ceChainWork tip
-        , csMedianTime = ceMedianTime tip
-        , csFlags = consensusFlagsAtHeight net height
-        }
+      -- Build chain state for validation, anchored on the BLOCK's
+      -- parent (not the active tip).  csHeight carries the parent's
+      -- height per the existing convention (validateFullBlock derives
+      -- @height = csHeight cs + 1@; checkBIP30 uses the same arithmetic).
+      let cs = ChainState
+            { csHeight = ceHeight parent
+            , csBestBlock = parentHash
+            , csChainWork = parentChainWork
+            , csMedianTime = parentMTP
+            , csFlags = consensusFlagsAtHeight net height
+            }
 
-  -- Validate the block (always verify scripts for locally minted blocks).
-  -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard, requires
-  -- DB IO) followed by the pure 'validateFullBlock' checks, ensuring submitBlock
-  -- and the IBD path share identical BIP-30 enforcement.
-  -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
-  -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs:386.
-  validationResult <- validateFullBlockIO db net cs False block utxoMap
-  case validationResult of
-    Left err -> return $ Left $ "Block validation failed: " ++ err
-    Right () -> do
-      -- Apply block to in-memory UTXO cache (drives maturity check + builds
-      -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
-      -- spend an output created earlier in the same session without round-
-      -- tripping through disk.
-      undoResult <- applyBlockToCache cache net block height
-      case undoResult of
-        Left err -> return $ Left err
-        Right _undo -> do
-          -- Persist UTXOs + undo data + header + height + best-block in a
-          -- single atomic write batch via 'connectBlock' (the same path
-          -- IBD uses; see 'Sync.connectBlock' wiring). This is the FIX
-          -- for dumptxoutset emitting a 0-coin snapshot: 'applyBlockToCache'
-          -- only mutates STM TVars and never reaches RocksDB, so the
-          -- legacy PrefixUTXO keyspace stayed empty unless a periodic
-          -- 'flushCache' ran. dumptxoutset iterates PrefixUTXO directly,
-          -- so it saw nothing. Routing through connectBlock writes
-          -- Core-format Coins to PrefixUTXO immediately, which is also
-          -- the on-disk format 'getUTXOCoin' / 'dumpTxOutSetFromDB'
-          -- expect. The Coin map carries height/coinbase metadata so the
-          -- per-block undo record round-trips through 'disconnectBlock'.
-          --
-          -- connectBlock also handles per-block undo data (so we drop the
-          -- separate 'putUndoData'), block-index keys (so we drop
-          -- 'putBlockHeader' / 'putBlockHeight'), and best-block pointer.
-          -- The only thing left for us is the full block body and the
-          -- in-memory header chain update.
-          connectBlock db net block height utxoMap
+      -- Validate the block (always verify scripts for locally minted blocks).
+      -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard, requires
+      -- DB IO) followed by the pure 'validateFullBlock' checks, ensuring submitBlock
+      -- and the IBD path share identical BIP-30 enforcement.
+      -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
+      -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs:386.
+      validationResult <- validateFullBlockIO db net cs False block utxoMap
+      case validationResult of
+        Left err -> return $ Left $ "Block validation failed: " ++ err
+        Right () ->
+          -- Pattern X scope: this fix only addresses the BIP-34
+          -- height-derivation site so that side-branch coinbase
+          -- height is checked against the BLOCK's parent rather than
+          -- the active tip.  Active-chain extension (parent == tip)
+          -- is the only path that connects + broadcasts + advances
+          -- the tip.  Side-branch storage + reorg dispatch (Pattern
+          -- Y) is intentionally out of scope here — see
+          -- CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md
+          -- and the Pattern Y closures for nimrod 7196d41 +
+          -- camlcoin 22667c2 + rustoshi 68a422b + blockbrew 4e51e8b
+          -- for the full-shape fix template.  Surfacing parent-not-on-
+          -- active-chain as a distinct rejection prevents corrupting
+          -- the active UTXO + best-block pointers via connectBlock.
+          if ceHash parent /= ceHash tip
+            then return $ Left $
+              "Block validation failed: parent " ++ show prevHash ++
+              " is not the active tip (side-branch acceptance not implemented)"
+            else do
+              -- Apply block to in-memory UTXO cache (drives maturity check + builds
+              -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
+              -- spend an output created earlier in the same session without round-
+              -- tripping through disk.
+              undoResult <- applyBlockToCache cache net block height
+              case undoResult of
+                Left err -> return $ Left err
+                Right _undo -> do
+                  -- Persist UTXOs + undo data + header + height + best-block in a
+                  -- single atomic write batch via 'connectBlock' (the same path
+                  -- IBD uses; see 'Sync.connectBlock' wiring). This is the FIX
+                  -- for dumptxoutset emitting a 0-coin snapshot: 'applyBlockToCache'
+                  -- only mutates STM TVars and never reaches RocksDB, so the
+                  -- legacy PrefixUTXO keyspace stayed empty unless a periodic
+                  -- 'flushCache' ran. dumptxoutset iterates PrefixUTXO directly,
+                  -- so it saw nothing. Routing through connectBlock writes
+                  -- Core-format Coins to PrefixUTXO immediately, which is also
+                  -- the on-disk format 'getUTXOCoin' / 'dumpTxOutSetFromDB'
+                  -- expect. The Coin map carries height/coinbase metadata so the
+                  -- per-block undo record round-trips through 'disconnectBlock'.
+                  --
+                  -- connectBlock also handles per-block undo data (so we drop the
+                  -- separate 'putUndoData'), block-index keys (so we drop
+                  -- 'putBlockHeader' / 'putBlockHeight'), and best-block pointer.
+                  -- The only thing left for us is the full block body and the
+                  -- in-memory header chain update.
+                  connectBlock db net block height utxoMap
 
-          -- Persist the full block body (separate keyspace from headers
-          -- so that getblock can return raw bytes).
-          putBlock db bh block
+                  -- Persist the full block body (separate keyspace from headers
+                  -- so that getblock can return raw bytes).
+                  putBlock db bh block
 
-          -- Add header to chain (in-memory index + tip update)
-          void $ addHeader net hc (blockHeader block)
+                  -- Add header to chain (in-memory index + tip update)
+                  void $ addHeader net hc (blockHeader block)
 
-          -- Broadcast to peers
-          let invVec = InvVector InvBlock (getBlockHashHash bh)
-          broadcastMessage pm $ MInv $ Inv [invVec]
+                  -- Broadcast to peers
+                  let invVec = InvVector InvBlock (getBlockHashHash bh)
+                  broadcastMessage pm $ MInv $ Inv [invVec]
 
-          return $ Right ()
+                  return $ Right ()
 
 -- | Build a UTXO map for block validation.
 --
