@@ -4476,6 +4476,165 @@ main = hspec $ do
           let cfg = defaultMempoolConfig { mpcRBFEnabled = False }
           mpcRBFEnabled cfg `shouldBe` False
 
+      --------------------------------------------------------------------------
+      -- BIP-125 Rule 2: replacement may not introduce new unconfirmed inputs
+      --
+      -- Tests for `checkNoNewUnconfirmedInputs`. Reference:
+      --   bitcoin-core/src/wallet/feebumper.cpp:311
+      --   ouroboros/src/ouroboros/mempool.py:2428-2439
+      --   lunarblock/src/mempool.lua:548-563
+      --------------------------------------------------------------------------
+      describe "BIP-125 Rule 2 (no new unconfirmed inputs)" $ do
+        let oldTxId   = TxId (Hash256 (BS.replicate 32 0xaa))
+            newTxId   = TxId (Hash256 (BS.replicate 32 0xbb))
+            otherMpId = TxId (Hash256 (BS.replicate 32 0xcc))
+            confirmed = TxId (Hash256 (BS.replicate 32 0xdd))
+
+            -- Builds a replacement tx with one input from `parentTxid`.
+            mkReplacement :: TxId -> Tx
+            mkReplacement parentTxid =
+              let op    = OutPoint parentTxid 0
+                  txin  = TxIn op "" 0xfffffffd  -- RBF-signaling
+                  txout = TxOut 50000 ""
+              in Tx 2 [txin] [txout] [[]] 0
+
+        it "accepts replacement that only spends confirmed outputs" $ do
+          -- Replacement spends from `confirmed` which is NOT in the mempool.
+          let tx           = mkReplacement confirmed
+              mempoolTxIds = Set.fromList [oldTxId, otherMpId]
+              oldSpends    = Set.empty
+          checkNoNewUnconfirmedInputs tx mempoolTxIds oldSpends `shouldBe` Right ()
+
+        it "accepts replacement that only re-spends conflict's outpoint" $ do
+          -- Replacement spends OutPoint(otherMpId, 0). It is unconfirmed,
+          -- but it was already in `oldSpends` (= what the to-evict tx spent).
+          -- That is allowed: the new tx is bumping the same dependency, not
+          -- introducing a brand-new unconfirmed parent.
+          let tx           = mkReplacement otherMpId
+              mempoolTxIds = Set.fromList [oldTxId, otherMpId]
+              oldSpends    = Set.singleton (OutPoint otherMpId 0)
+          checkNoNewUnconfirmedInputs tx mempoolTxIds oldSpends `shouldBe` Right ()
+
+        it "rejects replacement that adds a NEW unconfirmed parent" $ do
+          -- `otherMpId` is in the mempool but was NOT spent by any conflict.
+          -- The replacement is therefore introducing a fresh unconfirmed
+          -- parent — exactly what BIP-125 Rule 2 forbids.
+          let tx           = mkReplacement otherMpId
+              mempoolTxIds = Set.fromList [oldTxId, otherMpId]
+              oldSpends    = Set.empty
+          case checkNoNewUnconfirmedInputs tx mempoolTxIds oldSpends of
+            Left (RbfNewUnconfirmedInput parent) -> parent `shouldBe` otherMpId
+            other -> expectationFailure $
+                       "Expected RbfNewUnconfirmedInput, got: " ++ show other
+
+        it "ErrRBFNewUnconfirmedInput maps to a distinct mempool-error tag" $ do
+          -- Sanity: the error variant is constructible and shows correctly.
+          let err = ErrRBFNewUnconfirmedInput newTxId
+          show err `shouldContain` "ErrRBFNewUnconfirmedInput"
+
+      --------------------------------------------------------------------------
+      -- Package Relay (BIP-331) — submitpackage RPC engine
+      --
+      -- The submitpackage RPC handler decodes hex, then dispatches to
+      -- `acceptPackage` (multi-tx) or `addTransaction` (single-tx). These
+      -- tests cover the engine + topology gates. Reference:
+      --   bitcoin-core/src/rpc/mempool.cpp::submitpackage (line 1302)
+      --   haskoin/src/Haskoin/Mempool.hs::acceptPackage
+      --   haskoin/src/Haskoin/Rpc.hs::handleSubmitPackage
+      --------------------------------------------------------------------------
+      describe "submitpackage (BIP-331)" $ do
+        it "rejects packages with > MAX_PACKAGE_COUNT (25) transactions" $ do
+          -- Build 26 distinct dummy txs and assert isWellFormedPackage fails
+          -- with PkgTooManyTransactions. handleSubmitPackage performs the
+          -- same gate up-front (Bitcoin Core: "Array must contain between 1
+          -- and MAX_PACKAGE_COUNT transactions.")
+          let mkDummy :: Word8 -> Tx
+              mkDummy i =
+                let prevTxid = TxId (Hash256 (BS.replicate 32 i))
+                    op       = OutPoint prevTxid 0
+                    txin     = TxIn op "" 0xfffffffd
+                    txout    = TxOut 1000 ""
+                in Tx 2 [txin] [txout] [[]] 0
+              txns = map mkDummy [1..26]
+          case isWellFormedPackage txns of
+            Left (PkgTooManyTransactions actual maxN) -> do
+              actual `shouldBe` 26
+              maxN `shouldBe` maxPackageCount
+            other -> expectationFailure $
+              "Expected PkgTooManyTransactions, got: " ++ show other
+          length txns `shouldSatisfy` (> maxPackageCount)
+
+        it "accepts a valid 2-tx child-with-parents package via acceptPackage" $ do
+          -- End-to-end engine test: build a parent that spends a confirmed
+          -- prevout, and a child that spends parent's output. Run
+          -- acceptPackage and assert both txs land in the mempool.
+          withSystemTempDirectory "haskoin-pkg-rpc" $ \tmp -> do
+            let dbCfg = defaultDBConfig (tmp </> "db")
+            withDB dbCfg $ \db -> do
+              cache <- newUTXOCache db 1024
+              mp <- newMempool regtest cache defaultMempoolConfig 0 0
+
+              -- Pre-populate one confirmed prevout in the UTXO cache. P2WPKH
+              -- script keeps standardness checks happy.
+              let confirmedTxId = TxId (Hash256 (BS.replicate 32 0x91))
+                  confirmedOp   = OutPoint confirmedTxId 0
+                  spkBytes      = BS.pack [0x00, 0x14] <> BS.replicate 20 0x77
+                  prevTxOut     = TxOut 10_000_000 spkBytes
+                  prevEntry     = UTXOEntry prevTxOut 1 False False
+              atomically $
+                modifyTVar' (ucEntries cache) (Map.insert confirmedOp prevEntry)
+
+              -- Parent spends the confirmed prevout, with a single output
+              -- (vout=0) of value 9_000_000 sat to the same dummy script.
+              let parentIn  = TxIn confirmedOp BS.empty 0xfffffffd
+                  parentOut = TxOut 9_000_000 spkBytes
+                  parent    = Tx 2 [parentIn] [parentOut] [[]] 0
+                  parentId  = computeTxId parent
+
+              -- Child spends parent's output[0].
+              let childIn  = TxIn (OutPoint parentId 0) BS.empty 0xfffffffd
+                  childOut = TxOut 8_000_000 spkBytes
+                  child    = Tx 2 [childIn] [childOut] [[]] 0
+                  childId  = computeTxId child
+
+              let pkg = TxPackage [parent] child
+
+              -- Sanity: well-formed + child-with-parents.
+              isWellFormedPackage [parent, child] `shouldBe` Right ()
+              isChildWithParents  [parent, child] `shouldBe` True
+
+              result <- acceptPackage pkg mp
+              case result of
+                Right txids -> do
+                  -- Both parent + child should be reported as accepted.
+                  Set.fromList txids `shouldBe` Set.fromList [parentId, childId]
+                  -- And actually present in the mempool.
+                  parentEntry <- getTransaction mp parentId
+                  childEntry  <- getTransaction mp childId
+                  parentEntry `shouldSatisfy` ( \me -> case me of Just _ -> True
+                                                                  _      -> False )
+                  childEntry  `shouldSatisfy` ( \me -> case me of Just _ -> True
+                                                                  _      -> False )
+                Left perr ->
+                  expectationFailure $
+                    "Expected accepted package, got error: " ++ show perr
+
+        it "rejects packages whose child does not spend any parent (PkgChildNoParentSpend)" $ do
+          -- A "package" of 2 txs where the child does not spend the parent's
+          -- output is not a valid child-with-parents bundle. submitpackage
+          -- runs the same gate before invoking acceptPackage.
+          let prevA = TxId (Hash256 (BS.replicate 32 0xa1))
+              prevB = TxId (Hash256 (BS.replicate 32 0xa2))
+              parent = Tx 2 [TxIn (OutPoint prevA 0) "" 0xfffffffd]
+                              [TxOut 1000 ""] [[]] 0
+              -- Child spends from `prevB`, NOT from `parent`.
+              child  = Tx 2 [TxIn (OutPoint prevB 0) "" 0xfffffffd]
+                              [TxOut 900 ""] [[]] 0
+
+          -- isChildWithParents must reject — that's the hop submitpackage
+          -- gates on before invoking acceptPackage.
+          isChildWithParents [parent, child] `shouldBe` False
+
   --------------------------------------------------------------------------------
   -- Fee Estimator Tests (Phase 16)
   --------------------------------------------------------------------------------

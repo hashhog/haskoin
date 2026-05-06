@@ -218,7 +218,10 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          getMempoolSize, FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
-                         isRbfReplaceable)
+                         isRbfReplaceable,
+                         -- Package relay (BIP-331) — submitpackage RPC
+                         TxPackage(..), maxPackageCount, acceptPackage,
+                         isWellFormedPackage, isChildWithParents)
 import qualified Haskoin.Mempool.Persist as MPP
 import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..),
                               estimateRawFee, RawFeeEstimate(..), RawBucketRange(..))
@@ -836,6 +839,7 @@ handleRpcRequest server req = do
 
     -- Mempool RPCs (new)
     "testmempoolaccept"    -> handleTestMempoolAccept server params
+    "submitpackage"        -> handleSubmitPackage server params
     "getmempoolentry"      -> handleGetMempoolEntry server params
     "getmempoolancestors"  -> handleGetMempoolAncestors server params
     "getmempooldescendants"-> handleGetMempoolDescendants server params
@@ -1619,8 +1623,20 @@ mempoolErrorToRpcResponse err = RpcResponse Null (toJSON rpcErr) Null
           ("RBF fee too low: " <> T.pack (show newFee) <>
            " < required " <> T.pack (show oldFee) <> " satoshis")
 
+      ErrRBFNewUnconfirmedInput parent ->
+        RpcError rpcVerifyRejected
+          ("Replacement adds new unconfirmed input (BIP-125 Rule 2). Parent: " <>
+           showHash (BlockHash (getTxIdHash parent)))
+
       ErrMempoolFull ->
         RpcError rpcVerifyRejected "Mempool is full"
+
+      _ ->
+        -- Fallback for any MempoolError variant not explicitly mapped above
+        -- (e.g. ErrRBFInsufficient*, ErrTrucViolation, ErrEphemeralViolation,
+        -- ErrClusterLimitExceeded, ErrNonStandard, ErrNonFinal,
+        -- ErrSeqLockNotSatisfied). Keeps the dispatch total.
+        RpcError rpcVerifyRejected (T.pack (show err))
 
 -- | Broadcast a transaction to all connected peers via inv trickling
 -- Uses the trickling mechanism for privacy (batches inv messages)
@@ -3422,9 +3438,230 @@ handleTestMempoolAccept server params = do
       ErrRBFTooManyReplacements _ _ -> "too-many-potential-replacements"
       ErrRBFInsufficientRelayFee _ _ -> "insufficient-fee"
       ErrRBFSpendingConflict _ -> "txn-mempool-conflict"
+      ErrRBFNewUnconfirmedInput _ -> "replacement-adds-unconfirmed"
       ErrTrucViolation _ -> "non-standard"
       ErrEphemeralViolation _ -> "dust"
       ErrClusterLimitExceeded _ _ -> "too-long-mempool-chain"
+
+--------------------------------------------------------------------------------
+-- Mempool Submit Package RPC Handler (BIP-331)
+--------------------------------------------------------------------------------
+
+-- | Submit a package of raw transactions to the local mempool.
+--
+-- Reference: Bitcoin Core's @submitpackage@ RPC (@src/rpc/mempool.cpp@,
+-- @ProcessNewPackage@). The package is parsed, validated as a child-with-
+-- parents bundle (last entry must be the child, prior entries are direct
+-- parents), and submitted atomically to the mempool. On failure the mempool
+-- is unchanged (best-effort: any tx that managed to land before the failure
+-- is rolled back).
+--
+-- Parameters:
+--
+-- * @package@ (required): array of hex-encoded raw transactions, ≤25.
+-- * @maxfeerate@ (optional, BTC/kvB, default 0.10): per-tx feerate cap.
+--
+-- Returns:
+--
+-- @
+-- {
+--   "package_msg":         "success" | "<error tag>",
+--   "tx-results":          { "<wtxid>": {txid, vsize?, fees?, error?}, ... },
+--   "replaced-transactions": []   // RBF replacement out of scope for now
+-- }
+-- @
+handleSubmitPackage :: RpcServer -> Value -> IO RpcResponse
+handleSubmitPackage server params =
+  case extractParamArray params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams
+         "Missing package parameter (array of raw tx hex)") Null
+    Just rawArr -> do
+      let rawList   = V.toList rawArr
+          rawCount  = length rawList
+      -- Bitcoin Core: array must contain between 1 and MAX_PACKAGE_COUNT.
+      if rawCount == 0 || rawCount > maxPackageCount
+        then return $ RpcResponse Null
+               (toJSON $ RpcError rpcInvalidParams
+                  (T.pack $ "Array must contain between 1 and "
+                            ++ show maxPackageCount ++ " transactions."))
+               Null
+        else do
+          -- Per-tx maxfeerate (default 0.10 BTC/kvB == 10000 sat/vB).
+          let maxFeeRateSatPerVB = case extractParam params 1 :: Maybe Double of
+                Just rate
+                  | rate <= 0 -> 0  -- 0 = no cap
+                  | otherwise -> rate * 100000  -- BTC/kvB -> sat/vB
+                Nothing -> 10000.0
+
+          -- Decode all transactions up front.
+          decoded <- forM rawList $ \v -> case v of
+            String hexTx -> case B16.decode (TE.encodeUtf8 hexTx) of
+              Left e -> return $ Left ("TX decode failed: " ++ e)
+              Right bytes -> case decodeTxWithFallback bytes of
+                Left e -> return $ Left ("TX decode failed: " ++ e)
+                Right tx -> return $ Right tx
+            _ -> return $ Left "TX decode failed: not a hex string"
+
+          case sequence decoded of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError (T.pack err)) Null
+            Right txns -> submitPackageTxns server txns maxFeeRateSatPerVB
+
+-- | Run package validation + atomic admission and build the JSON result.
+--
+-- The single-tx case is folded into the same code path so callers can submit
+-- a self-contained tx with no unconfirmed parents, matching Bitcoin Core.
+submitPackageTxns :: RpcServer -> [Tx] -> Double -> IO RpcResponse
+submitPackageTxns server txns maxFeeRateSatPerVB = do
+  let mp           = rsMempool server
+      pkgWtxids    = map computeWtxId txns
+
+      -- Build the per-wtxid skeleton.
+      skel         = [ (wtxid, computeTxId tx) | (tx, wtxid) <- zip txns pkgWtxids ]
+
+      -- "package-not-validated" sentinel for txs that never get individually
+      -- inspected when a top-level (package-wide) error short-circuits.
+      packageNotValidated :: Value
+      packageNotValidated = String "package-not-validated"
+
+      mkAbortResults :: Value -> [Value]
+      mkAbortResults reason =
+        [ object
+            [ "wtxid" .= showHash (BlockHash (getTxIdHash wtxid))
+            , "txid"  .= showHash (BlockHash (getTxIdHash txid))
+            , "error" .= reason
+            ]
+        | (wtxid, txid) <- skel
+        ]
+
+      buildAbortResponse :: Text -> Value -> RpcResponse
+      buildAbortResponse pkgMsg reason = RpcResponse
+        (object
+          [ "package_msg"          .= pkgMsg
+          , "tx-results"           .= mkAbortResults reason
+          , "replaced-transactions" .= ([] :: [Text])
+          ])
+        Null Null
+
+  case txns of
+    [] -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams "Empty package") Null
+
+    [singleTx] -> do
+      -- Single-tx package: just run normal addTransaction, then maxfeerate
+      -- check (mirrors sendrawtransaction). No package-topology check.
+      let txid = computeTxId singleTx
+      mExisting <- getTransaction mp txid
+      case mExisting of
+        Just existing ->
+          -- Already in mempool: report wtxid match, no error.
+          return $ buildSuccessResponse [(singleTx, txid, computeWtxId singleTx, Just existing)]
+        Nothing -> do
+          result <- addTransaction mp singleTx
+          case result of
+            Left err -> do
+              let reason = String (T.pack (show err))
+              return $ buildAbortResponse "transaction failed" reason
+            Right _txid -> do
+              mEntry <- getTransaction mp txid
+              case mEntry of
+                Nothing ->
+                  -- Shouldn't happen — fallback to bare success.
+                  return $ buildSuccessResponse [(singleTx, txid, computeWtxId singleTx, Nothing)]
+                Just entry -> do
+                  let vsize       = meSize entry
+                      fee         = meFee entry
+                      actualSatPerVB = if vsize > 0
+                                       then fromIntegral fee / fromIntegral vsize
+                                       else 0 :: Double
+                  if maxFeeRateSatPerVB > 0 && actualSatPerVB > maxFeeRateSatPerVB
+                    then do
+                      removeTransaction mp txid
+                      return $ buildAbortResponse "max-fee-exceeded"
+                        (String (T.pack ("Fee exceeds maximum (" ++ show actualSatPerVB
+                                          ++ " > " ++ show maxFeeRateSatPerVB ++ " sat/vB)")))
+                    else
+                      return $ buildSuccessResponse
+                        [(singleTx, txid, computeWtxId singleTx, Just entry)]
+
+    multi -> do
+      -- Multi-tx package: must be child-with-parents (last = child).
+      case isWellFormedPackage multi of
+        Left perr ->
+          return $ buildAbortResponse "package topology disallowed"
+                                      (String (T.pack (show perr)))
+        Right () ->
+          if not (isChildWithParents multi)
+            then return $ buildAbortResponse
+                            "package topology disallowed"
+                            (String "package topology disallowed: not child-with-parents")
+            else do
+              -- Drive the existing acceptPackage engine (parents init, child last).
+              let parents = init multi
+                  child   = last multi
+                  pkg     = TxPackage parents child
+              acceptResult <- acceptPackage pkg mp
+              case acceptResult of
+                Left perr -> do
+                  -- Roll back any tx that may have landed already (defensive:
+                  -- acceptPackage is meant to be atomic, but if it added some
+                  -- parents then failed on the child we want a clean state).
+                  forM_ multi $ \tx -> do
+                    let txid = computeTxId tx
+                    mEntry <- getTransaction mp txid
+                    case mEntry of
+                      Just _  -> removeTransaction mp txid
+                      Nothing -> return ()
+                  return $ buildAbortResponse "package validation failed"
+                                              (String (T.pack (show perr)))
+                Right _txids -> do
+                  -- Per-tx maxfeerate check on each accepted tx.
+                  entries <- forM multi $ \tx -> do
+                    let txid = computeTxId tx
+                    me <- getTransaction mp txid
+                    return (tx, txid, computeWtxId tx, me)
+                  let exceedsCap (_, _, _, Nothing) = False
+                      exceedsCap (_, _, _, Just e) =
+                        let v   = meSize e
+                            f   = meFee e
+                            satPerVB = if v > 0
+                                        then fromIntegral f / fromIntegral v
+                                        else 0 :: Double
+                        in maxFeeRateSatPerVB > 0 && satPerVB > maxFeeRateSatPerVB
+                  if any exceedsCap entries
+                    then do
+                      forM_ entries $ \(_, txid, _, _) -> removeTransaction mp txid
+                      return $ buildAbortResponse "max-fee-exceeded"
+                        (String "One or more package txs exceed maxfeerate")
+                    else
+                      return $ buildSuccessResponse entries
+  where
+    -- Build the success response from a list of (tx, txid, wtxid, maybe entry).
+    buildSuccessResponse :: [(Tx, TxId, TxId, Maybe MempoolEntry)] -> RpcResponse
+    buildSuccessResponse entries =
+      let txResults =
+            [ object $
+                [ "wtxid" .= showHash (BlockHash (getTxIdHash wtxid))
+                , "txid"  .= showHash (BlockHash (getTxIdHash txid))
+                ] ++
+                case mEntry of
+                  Nothing -> []
+                  Just e  ->
+                    [ "vsize" .= meSize e
+                    , "fees"  .= object
+                        [ "base" .= (fromIntegral (meFee e) / 100000000.0 :: Double)
+                        ]
+                    ]
+            | (_tx, txid, wtxid, mEntry) <- entries
+            ]
+      in RpcResponse
+           (object
+              [ "package_msg"           .= ("success" :: Text)
+              , "tx-results"            .= txResults
+              , "replaced-transactions" .= ([] :: [Text])
+              ])
+           Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool Entry RPC Handler
@@ -4229,6 +4466,7 @@ allRpcCommands =
   , "getmempoolinfo"
   , "getrawmempool ( verbose mempool_sequence )"
   , "testmempoolaccept [\"rawtx\",...] ( maxfeerate )"
+  , "submitpackage [\"rawtx\",...] ( maxfeerate )"
   , ""
   , "== Mining =="
   , "getblocktemplate ( \"template_request\" )"
@@ -4302,6 +4540,8 @@ getCommandHelp cmd = case T.toLower cmd of
     "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. hexstring    (string, required) the hex-encoded script\n\nResult:\n{\n  \"asm\": \"asm\",      (string) Script public key\n  \"type\": \"type\",    (string) The output type\n  \"address\": \"addr\", (string) bitcoin address\n  \"p2sh\": \"addr\",    (string) address of P2SH script wrapping this script\n  \"segwit\": {...}    (object) segwit wrapper info\n}"
   "testmempoolaccept" ->
     "testmempoolaccept [\"rawtx\",...] ( maxfeerate )\n\nReturns result of mempool acceptance tests indicating if raw transaction would be accepted by mempool."
+  "submitpackage" ->
+    "submitpackage [\"rawtx\",...] ( maxfeerate )\n\nSubmit a package of raw transactions (hex-encoded) to local mempool. The package must be topologically sorted with the child as the last element. Up to MAX_PACKAGE_COUNT (25) transactions. Returns {package_msg, tx-results, replaced-transactions}."
   "getmempoolentry" ->
     "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction."
   "disconnectnode" ->
