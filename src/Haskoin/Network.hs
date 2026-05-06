@@ -150,6 +150,10 @@ module Haskoin.Network
   , misbehaviorScore
   , defaultBanThreshold
   , misbehaving
+  , maxNumUnconnectingHeadersMsgs
+  , noteUnconnectingHeaders
+  , resetUnconnectingHeaders
+  , getUnconnectingHeadersCount
   , isDiscouraged
   , isBanned
   , getBanList
@@ -1677,6 +1681,18 @@ data PeerInfo = PeerInfo
   , piFeeFilterSent      :: !Word64            -- ^ Fee filter we sent to peer (sat/kvB)
   , piNextFeeFilterSend  :: !Int64             -- ^ Timestamp for next feefilter send (microseconds)
   , piBlockOnly          :: !Bool              -- ^ True if block-relay-only connection
+    -- | Per-peer counter of consecutive unconnecting-headers messages.
+    -- Mirrors Bitcoin Core's @nUnconnectingHeaders@ accounting in
+    -- @net_processing.cpp::ProcessHeadersMessage@.  Incremented when a
+    -- @headers@ batch fails to connect to our chain; reset on any
+    -- successful connecting batch.  When the count would exceed
+    -- 'maxNumUnconnectingHeadersMsgs' (=10) the caller misbehaves the
+    -- peer with 'NonContinuousHeaders' (=100, instant ban).  Pre-fix,
+    -- haskoin instant-banned on the FIRST orphan via
+    -- @misbehaving pm addr NonContinuousHeaders@.  See
+    -- @CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md@
+    -- (Pattern B), extended to Part-2 impls.
+  , piUnconnectingHeaders :: !Int
   } deriving (Show, Generic)
 
 instance NFData PeerInfo
@@ -1764,6 +1780,7 @@ connectPeer config host port = do
               , piFeeFilterSent      = 0
               , piNextFeeFilterSend  = 0
               , piBlockOnly          = False
+              , piUnconnectingHeaders = 0
               }
         infoVar <- newTVarIO info
         sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
@@ -3004,6 +3021,7 @@ startInboundListener pm port = do
             , piFeeFilterSent     = 0
             , piNextFeeFilterSend = 0
             , piBlockOnly     = False
+            , piUnconnectingHeaders = 0
             }
       infoVar <- newTVarIO info
       sendQ <- newTBQueueIO 100
@@ -3153,6 +3171,54 @@ addBanScore pm addr score _reason = do
     Nothing -> return ()
     Just pc -> atomically $ modifyTVar' (pcInfo pc) $ \i ->
       i { piBanScore = piBanScore i + score }
+
+-- | Bitcoin Core's @MAX_NUM_UNCONNECTING_HEADERS_MSGS@ from
+-- @net_processing.cpp@.  A peer is allowed up to this many successive
+-- unconnecting-headers messages before being misbehavior-scored
+-- (instant ban via 'NonContinuousHeaders').  Tolerating up to 10
+-- transient unlinked batches mirrors Core and avoids banning honest
+-- peers caught in a brief reorg.
+maxNumUnconnectingHeadersMsgs :: Int
+maxNumUnconnectingHeadersMsgs = 10
+
+-- | Bump the per-peer unconnecting-headers counter; return whether
+-- the new count has exceeded 'maxNumUnconnectingHeadersMsgs' (caller
+-- MUST escalate to 'misbehaving' with 'NonContinuousHeaders').
+-- Mirrors Bitcoin Core's @nUnconnectingHeaders++@ in
+-- @ProcessHeadersMessage@.  If the peer is unknown to the manager
+-- (already disconnected) returns 'False' without changing any state.
+noteUnconnectingHeaders :: PeerManager -> SockAddr -> IO Bool
+noteUnconnectingHeaders pm addr = do
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return False
+    Just pc -> atomically $ do
+      info <- readTVar (pcInfo pc)
+      let next = piUnconnectingHeaders info + 1
+      writeTVar (pcInfo pc)
+        info { piUnconnectingHeaders = next }
+      return (next > maxNumUnconnectingHeadersMsgs)
+
+-- | Reset the per-peer unconnecting-headers counter.  Called on every
+-- successful connecting headers batch (Core's
+-- @nUnconnectingHeaders = 0@ in the success path of
+-- @ProcessHeadersMessage@) and after a threshold-exceeded ban so the
+-- counter doesn't survive reconnects.
+resetUnconnectingHeaders :: PeerManager -> SockAddr -> IO ()
+resetUnconnectingHeaders pm addr = do
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return ()
+    Just pc -> atomically $ modifyTVar' (pcInfo pc) $ \i ->
+      i { piUnconnectingHeaders = 0 }
+
+-- | Read the per-peer unconnecting-headers counter (used by tests).
+getUnconnectingHeadersCount :: PeerManager -> SockAddr -> IO Int
+getUnconnectingHeadersCount pm addr = do
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return 0
+    Just pc -> piUnconnectingHeaders <$> readTVarIO (pcInfo pc)
 
 --------------------------------------------------------------------------------
 -- Misbehavior Scoring API
@@ -8433,6 +8499,7 @@ createPeerConnectionFromSocket config sock _host = do
           , piFeeFilterSent     = 0
           , piNextFeeFilterSend = 0
           , piBlockOnly     = False
+          , piUnconnectingHeaders = 0
           }
     infoVar <- newTVarIO info
     sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)

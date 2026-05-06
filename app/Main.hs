@@ -1069,10 +1069,37 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
     -- bitcoin-core/src/net_processing.cpp ProcessHeadersMessage —
     -- non-continuous batches are scored 100 (immediate ban); each
     -- invalid PoW header is also 100.
+    --
+    -- Bad PoW remains an immediate-ban offense.  Non-continuous
+    -- (unconnecting) headers, however, must follow Core's
+    -- MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 counter — a single
+    -- transient reorg should not cause a +100 ban.  Pre-fix, this
+    -- branch unconditionally fired NonContinuousHeaders=100 on the
+    -- first batch with any rejected-by-parent header; see
+    -- CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+    -- (Pattern B), extended to Part-2 impls.
     when (badPow > 0) $
       void $ misbehaving pmRefVal addr InvalidBlockHeader
-    when (badConn > 0) $
-      void $ misbehaving pmRefVal addr NonContinuousHeaders
+    when (badConn > 0) $ do
+      exceeded <- noteUnconnectingHeaders pmRefVal addr
+      if exceeded
+        then do
+          putStrLn $ "Peer " ++ show addr
+                  ++ " exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS="
+                  ++ show maxNumUnconnectingHeadersMsgs
+                  ++ ", banning"
+          void $ misbehaving pmRefVal addr NonContinuousHeaders
+          resetUnconnectingHeaders pmRefVal addr
+        else do
+          n <- getUnconnectingHeadersCount pmRefVal addr
+          putStrLn $ "Unconnecting headers from " ++ show addr
+                  ++ " (count=" ++ show n
+                  ++ "/" ++ show maxNumUnconnectingHeadersMsgs
+                  ++ "), tolerating per Core parity"
+    -- A successful connecting batch resets the unconnecting-headers
+    -- counter (mirrors Core's nUnconnectingHeaders = 0).
+    when (added > 0 && badConn == 0) $
+      resetUnconnectingHeaders pmRefVal addr
     -- If we got a full batch (2000), request more headers immediately
     when (added >= 2000) $ do
       tip <- getChainTip hc
