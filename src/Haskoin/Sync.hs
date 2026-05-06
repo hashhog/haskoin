@@ -636,6 +636,17 @@ runPresync salt net pd (h:hs) = do
       let bits = bhBits h
       if bits == 0 || bits > 0x207fffff  -- Max regtest difficulty
         then Left "presync: invalid difficulty bits"
+      -- Per-header proof-of-work check.  Without this gate a peer can
+      -- accumulate fake "work" by sending headers whose claimed @bits@
+      -- look reasonable but whose actual hash exceeds the target — the
+      -- 'headerWork' below accumulates from claimed @bits@, not from
+      -- the verified hash.  Once @pdCumulativeWork >= pdMinimumWork@
+      -- the state machine transitions to REDOWNLOAD with bogus
+      -- commitments.  Reference: bitcoin-core/src/headerssync.cpp
+      -- 'HeadersSyncState::ProcessNextHeaders' (calls
+      -- @CheckProofOfWork@ on every header).
+      else if not (checkProofOfWork h (netPowLimit net))
+        then Left "presync: invalid PoW"
         else do
           -- Calculate work for this header
           let work = headerWork h

@@ -29,6 +29,7 @@ module Haskoin.Consensus
   , maxPubkeysPerMultisig
   , maxBlockHeaderSize
   , witnessScaleFactor
+  , maxFutureBlockTime
     -- * Difficulty
   , difficultyAdjustmentInterval
   , targetSpacing
@@ -201,6 +202,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Exception (try, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
 
@@ -466,6 +468,19 @@ maxBlockHeaderSize = 80
 -- | Witness scale factor (non-witness data counts 4x)
 witnessScaleFactor :: Int
 witnessScaleFactor = 4
+
+-- | +2 hours future-time gate for header acceptance.
+--
+-- Reference: bitcoin-core/src/consensus/consensus.h
+-- @MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60 = 7200@.  A header whose
+-- timestamp exceeds @now + MAX_FUTURE_BLOCK_TIME@ is rejected by
+-- 'addHeader' as @time-too-new@ and the peer is misbehaving.
+-- Anti-DoS: without this gate a peer can announce a header chain whose
+-- timestamps are far in the future (the timestamps are internally
+-- consistent so MTP + difficulty checks all pass), which inflates
+-- 'hcEntries' until manually pruned.
+maxFutureBlockTime :: Word32
+maxFutureBlockTime = 7200
 
 --------------------------------------------------------------------------------
 -- BIP68 Sequence Lock Constants
@@ -2848,11 +2863,24 @@ initHeaderChain net = do
 
 -- | Add a header to the chain after validation.
 -- Returns Left with error message on failure, Right with entry on success.
+--
+-- Validation order mirrors Bitcoin Core's
+-- 'ContextualCheckBlockHeader' (validation.cpp): PoW (context-free),
+-- MTP, +2h future-time gate ('MAX_FUTURE_BLOCK_TIME'), difficulty
+-- transition, checkpoint.  The future-time gate is anti-DoS: without it
+-- a peer can announce a header chain whose timestamps are far in the
+-- future, which passes PoW + MTP + difficulty (the timestamps are
+-- consistent with each other) and pollutes 'hcEntries' until manually
+-- pruned.  Reference: bitcoin-core/src/validation.cpp
+-- 'ContextualCheckBlockHeader' "block-time-too-new".
 addHeader :: Network -> HeaderChain -> BlockHeader -> IO (Either String ChainEntry)
 addHeader net hc header = do
   let hash = computeBlockHash header
       prevHash = bhPrevBlock header
   entries <- readTVarIO (hcEntries hc)
+  -- Wall-clock for the +2h future-time gate.  Read once per header so
+  -- batch-acceptance does not see a sliding cutoff inside one call.
+  now <- (round <$> getPOSIXTime) :: IO Word32
 
   -- Check if already known
   case Map.lookup hash entries of
@@ -2871,6 +2899,14 @@ addHeader net hc header = do
             let mtp = medianTimePast entries prevHash
             if bhTimestamp header <= mtp
               then return $ Left "Timestamp not after median time past"
+            else if bhTimestamp header > now + maxFutureBlockTime
+              -- +2h future-time gate (BIP-0113 / Core
+              -- 'MAX_FUTURE_BLOCK_TIME').  Header timestamp must not
+              -- exceed our adjusted-network time + 2 hours, otherwise
+              -- it's rejected as 'time-too-new'.  A peer who keeps
+              -- sending such headers is misbehaving and the caller
+              -- should ban / disconnect them.
+              then return $ Left "Block timestamp too far in the future (time-too-new)"
               else do
                 -- Validate difficulty (skip on testnet if min-diff blocks allowed)
                 let expectedBits = difficultyAdjustment net entries parent
