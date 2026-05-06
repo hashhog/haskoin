@@ -26,6 +26,7 @@ import Control.Exception (bracket, catch, SomeException)
 import Data.Word (Word32, Word64)
 import Data.Int (Int32)
 import Data.IORef
+import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.ByteString as BS
@@ -983,6 +984,18 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (chunk, rest) = splitAt n xs in chunk : chunksOf n rest
 
+-- | Case-insensitive infix substring check used by message-handler
+-- misbehavior classifiers.  Lower-cases both sides before
+-- 'Data.List.isInfixOf' so error strings like "Invalid PoW",
+-- "invalid pow", or "INVALID-POW" all match.
+infixOfStr :: String -> String -> Bool
+infixOfStr needle haystack =
+  L.isInfixOf (map toLowerSafe needle) (map toLowerSafe haystack)
+  where
+    toLowerSafe c
+      | c >= 'A' && c <= 'Z' = toEnum (fromEnum c + 32)
+      | otherwise            = c
+
 -- | Sync-aware message handler
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
@@ -998,7 +1011,11 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
     putStrLn $ "Received " ++ show (length hdrs) ++ " headers"
     -- Bypass presync/redownload state machine and add headers directly
     -- to the chain. The anti-DoS presync is overkill for our environment.
-    added <- foldM (\count hdr -> do
+    -- Track header rejection reasons so we can attribute misbehavior:
+    -- "Block header has no valid parent" -> NonContinuousHeaders
+    -- "Invalid proof of work" -> InvalidBlockHeader
+    pmRefVal <- readIORef pmRef
+    (added, badPow, badConn) <- foldM (\(count, pow, conn) hdr -> do
         result <- addHeader net hc hdr
         case result of
             Right entry -> do
@@ -1008,10 +1025,26 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
                   h  = ceHeight entry
               putBlockHeader db bh hdr
               putBlockHeight db h bh
-              return (count + 1)
-            Left _  -> return count
-        ) (0 :: Int) hdrs
+              return (count + 1, pow, conn)
+            Left err
+              | "proof of work" `infixOfStr` err
+                || "PoW"          `infixOfStr` err
+                  -> return (count, pow + 1 :: Int, conn)
+              | "parent"          `infixOfStr` err
+                || "previous"       `infixOfStr` err
+                || "not connected"  `infixOfStr` err
+                  -> return (count, pow, conn + 1 :: Int)
+              | otherwise -> return (count, pow, conn)
+        ) (0 :: Int, 0 :: Int, 0 :: Int) hdrs
     putStrLn $ "Added " ++ show added ++ " of " ++ show (length hdrs) ++ " headers"
+    -- Attribute misbehavior for any rejected headers.  Reference:
+    -- bitcoin-core/src/net_processing.cpp ProcessHeadersMessage —
+    -- non-continuous batches are scored 100 (immediate ban); each
+    -- invalid PoW header is also 100.
+    when (badPow > 0) $
+      void $ misbehaving pmRefVal addr InvalidBlockHeader
+    when (badConn > 0) $
+      void $ misbehaving pmRefVal addr NonContinuousHeaders
     -- If we got a full batch (2000), request more headers immediately
     when (added >= 2000) $ do
       tip <- getChainTip hc
@@ -1064,6 +1097,12 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         isIBD <- readIORef ibdModeRef
         unless isIBD $
           putStrLn $ "Block header rejected: " ++ err
+        -- Attribute misbehavior: block whose header fails consensus
+        -- validation (bad PoW, etc) is an immediate-ban offense.
+        -- Reference: bitcoin-core/src/net_processing.cpp
+        -- BlockChecked — invalid blocks score 100.
+        pm <- readIORef pmRef
+        void $ misbehaving pm addr InvalidBlock
       Right entry -> do
         let height = ceHeight entry
         -- Look up spent UTXOs so connectBlock writes undo data atomically.
@@ -1072,8 +1111,13 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
               connectBlock db net block height spent
               putBlockHeight db height bh
               putBestBlockHash db bh
-        result `catch` (\(e :: SomeException) ->
-          putStrLn $ "ERROR connecting block " ++ show height ++ ": " ++ show e)
+        result `catch` (\(e :: SomeException) -> do
+          putStrLn $ "ERROR connecting block " ++ show height ++ ": " ++ show e
+          -- Block-validation failures are immediate-ban offenses in Core.
+          -- Reference: bitcoin-core/src/net_processing.cpp:3388
+          -- CheckBlock failure -> Misbehaving(100, "bad-block")
+          pm <- readIORef pmRef
+          void $ misbehaving pm addr InvalidBlock)
         when (height `mod` 500 == 0) $
           putStrLn $ "Connected block at height " ++ show height
         -- Advance the next-block pointer past this height
@@ -1126,11 +1170,22 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         pm <- readIORef pmRef
         let invVec = InvVector InvWitnessTx (getTxIdHash txid)
         broadcastMessage pm (MInv (Inv [invVec]))
-      Left _err -> do
+      Left err -> do
         -- Add to recently-rejected filter
         rejected <- readIORef recentlyRejectedRef
         when (Set.size rejected < 50000) $
           writeIORef recentlyRejectedRef (Set.insert txid rejected)
+        -- Attribute misbehavior on consensus-invalid txs.  We deliberately
+        -- skip soft / policy-only rejections (mempool full, fee too low,
+        -- duplicate) — those are honest peer behavior.  Reference:
+        -- bitcoin-core/src/net_processing.cpp:3045 — only state.IsInvalid
+        -- (consensus failure) increments the score, not policy rejects.
+        let errStr = show err
+        when ("consensus" `infixOfStr` errStr
+             || "invalid"       `infixOfStr` errStr
+             || "bad-"          `infixOfStr` errStr) $ do
+          pm <- readIORef pmRef
+          void $ misbehaving pm addr InvalidTransaction
 
   MGetData (GetData ivs) -> do
     pm <- readIORef pmRef
@@ -1310,6 +1365,10 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
       Left err -> do
         putStrLn $ "Compact block " ++ show bh ++ " init failed: " ++ err
         pm <- readIORef pmRef
+        -- Bad compact-block reconstruction is a Core ban offense.
+        -- Reference: bitcoin-core/src/net_processing.cpp:3700 —
+        -- "non-continuous-headers" for cmpctblock with bogus parent.
+        void $ misbehaving pm addr InvalidCompactBlock
         let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
         requestFromPeer pm addr (MGetData (GetData [iv]))
           `catch` (\(_ :: SomeException) -> return ())
