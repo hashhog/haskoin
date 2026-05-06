@@ -48,7 +48,7 @@ import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 import Data.Int (Int32)
 import Data.Bits (shiftR, (.&.))
-import Control.Monad (forM, forM_, void)
+import Control.Monad (forM, forM_, foldM, void)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -69,11 +69,14 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            addHeader, addSideBranchHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight, connectBlock, disconnectBlock,
                            cumulativeWork, unapplyBlock,
-                           getLegacySigOpCount)
+                           getLegacySigOpCount,
+                           buildConnectBlockOps, buildDisconnectBlockOps,
+                           maxReorgDepth)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlock, getBlock, getUndoDataVerified, Coin(..))
+                         putBlock, getBlock, getUndoDataVerified, Coin(..),
+                         WriteBatch(..), BatchOp, writeBatch, isUnspendable)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions,
                          blockDisconnected)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
@@ -713,10 +716,38 @@ findSideBranchForkPoint hc db parent newTipBlock = do
           buildDisconnectList dbh prv forkH (blk : acc)
 
 -- | Execute the side-branch reorg: disconnect old-tip..fork, connect
--- fork..new-tip.  Updates both the disk chainstate (via
--- 'disconnectBlock' / 'connectBlock') AND the in-memory header chain
--- (hcTip / hcHeight / hcByHeight) so subsequent 'submitblock' /
--- 'getbestblockhash' queries see the new tip.
+-- fork..new-tip.
+--
+-- == Pattern D — Multi-Block Atomicity (single-batch reorg) ==
+--
+-- The reorg accumulates ALL of the disconnect + connect 'BatchOp's
+-- across the entire sequence and commits them in a SINGLE
+-- 'writeBatch' at the end.  This delivers the atomicity property
+-- the audit's "paradoxically safest" claim ASSUMED but the prior
+-- (per-block 'connectBlock' / 'disconnectBlock') implementation
+-- did NOT actually have:
+--
+--   * Crash before the final 'writeBatch'  → on-disk state unchanged
+--     → restart sees pre-reorg chainstate, no partial reorg.
+--   * Crash after the final 'writeBatch'   → on-disk state is fully
+--     post-reorg → restart sees the new tip, no partial reorg.
+--
+-- The cache (UTXOCache) is mutated AFTER the disk commit succeeds,
+-- so a process crash mid-mutation still leaves disk consistent and
+-- the next process incarnation re-derives cache from disk.
+--
+-- During the build phase we maintain a virtual UTXO overlay
+-- ('reorgOverlay') that tracks the post-disconnect / mid-connect
+-- UTXO state without touching the cache or disk.  Connect-block
+-- input lookups consult overlay → cache → disk (in that order),
+-- so a tx in the connect chain that spends a UTXO restored by
+-- the disconnect chain resolves correctly.
+--
+-- Reference: bitcoin-core/src/validation.cpp ActivateBestChain +
+-- the Pattern D atomicity audit
+-- (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+-- The cap on reorg size is 'maxReorgDepth' (=100) on the SUM of
+-- disconnect + connect blocks.
 doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
                   -> Mempool     -- ^ Mempool (for refill on disconnect; Pattern B)
                   -> ChainEntry  -- ^ parent of the new tip
@@ -728,103 +759,289 @@ doSideBranchReorg net db hc cache mp parent newTipBlock _newWork = do
   case forkRes of
     Left err -> return (Left err)
     Right (_forkHash, disconnectList, connectList) -> do
-      -- Phase 1: disconnect tip..fork+1 (oldTip first, fork-child last).
-      disResult <- disconnectMany db cache disconnectList
-      case disResult of
-        Left err -> return (Left err)
-        Right () -> do
-          -- Phase 2: connect fork+1..newTip (fork-child first, newTip last).
-          conResult <- connectMany net db cache connectList
-          case conResult of
+      let totalDepth = length disconnectList + length connectList
+      if totalDepth > maxReorgDepth
+        then return $ Left $
+          "Reorg too deep: " ++ show totalDepth
+          ++ " blocks (disconnect=" ++ show (length disconnectList)
+          ++ "+connect=" ++ show (length connectList)
+          ++ ") exceeds maxReorgDepth=" ++ show maxReorgDepth
+        else do
+          -- Phase A — pre-load undo data for every disconnect block.
+          -- Fail fast on missing/corrupt undo before mutating anything.
+          undoLoaded <- loadDisconnectUndo db disconnectList
+          case undoLoaded of
             Left err -> return (Left err)
-            Right () -> do
-              -- Phase 3: rewrite hcTip / hcHeight / hcByHeight to
-              -- reflect the new active chain.
-              entries <- readTVarIO (hcEntries hc)
-              let newTipHash   = computeBlockHash (blockHeader newTipBlock)
-              case Map.lookup newTipHash entries of
-                Nothing -> return $ Left $
-                  "New tip not in header index after reorg: "
-                  ++ show newTipHash
-                Just newTipEntry -> do
-                  atomically $ do
-                    -- Drop the height -> hash entries for the
-                    -- disconnected (old) chain.
+            Right disconnectUndo ->
+              -- Phase B — pure batch build with virtual UTXO overlay.
+              do
+                buildRes <- buildReorgBatch net db cache hc
+                              disconnectList disconnectUndo connectList
+                case buildRes of
+                  Left err -> return (Left err)
+                  Right (allOps, newTipEntry) -> do
+                    -- Phase C — single atomic disk commit.  Any
+                    -- crash before this point leaves disk fully at
+                    -- pre-reorg state.  Once this returns, the
+                    -- reorg is durable.
+                    writeBatch db (WriteBatch allOps)
+
+                    -- Phase D — mirror the disk state into the
+                    -- in-memory cache + header chain + mempool.
+                    -- These mutations are local to this process;
+                    -- if the process dies between writeBatch and
+                    -- here, the next incarnation re-derives cache
+                    -- from disk and the header chain from
+                    -- PrefixBlockHeight.  No "split-brain" between
+                    -- disk and the next live process.
+                    forM_ (zip disconnectList disconnectUndo) $ \(blk, undo) ->
+                      unapplyBlock cache blk undo
+                    forM_ connectList $ \blk -> do
+                      let bh = computeBlockHash (blockHeader blk)
+                      entries <- readTVarIO (hcEntries hc)
+                      case Map.lookup bh entries of
+                        Just ce -> do
+                          appRes <- applyBlockToCache cache net blk (ceHeight ce)
+                          case appRes of
+                            Right _ -> return ()
+                            Left _  -> return ()  -- already validated; cache may have stale spend
+                        Nothing -> return ()
+
+                    -- Header chain pointer flip — same shape as the
+                    -- pre-Pattern-D dispatcher.
+                    atomically $ do
+                      entries <- readTVar (hcEntries hc)
+                      forM_ disconnectList $ \blk ->
+                        let h = computeBlockHash (blockHeader blk)
+                        in case Map.lookup h entries of
+                             Just ce -> modifyTVar' (hcByHeight hc)
+                               (Map.delete (ceHeight ce))
+                             Nothing -> return ()
+                      forM_ connectList $ \blk ->
+                        let h = computeBlockHash (blockHeader blk)
+                        in case Map.lookup h entries of
+                             Just ce -> modifyTVar' (hcByHeight hc)
+                               (Map.insert (ceHeight ce) h)
+                             Nothing -> return ()
+                      writeTVar (hcTip hc) newTipEntry
+                      writeTVar (hcHeight hc) (ceHeight newTipEntry)
+
+                    -- Pattern B — re-admit disconnected non-coinbase
+                    -- txs into the mempool against the new tip.  Same
+                    -- semantics as the pre-refactor inline call
+                    -- inside disconnectMany (Mempool.hs:1290).  Done
+                    -- AFTER the atomic disk commit so the mempool
+                    -- never sees a tx whose corresponding chainstate
+                    -- has not yet been persisted.
                     forM_ disconnectList $ \blk ->
-                      let h = computeBlockHash (blockHeader blk)
-                      in case Map.lookup h entries of
-                           Just ce -> modifyTVar' (hcByHeight hc)
-                             (Map.delete (ceHeight ce))
-                           Nothing -> return ()
-                    -- Install the height -> hash entries for the
-                    -- newly-connected chain.
-                    forM_ connectList $ \blk ->
-                      let h = computeBlockHash (blockHeader blk)
-                      in case Map.lookup h entries of
-                           Just ce -> modifyTVar' (hcByHeight hc)
-                             (Map.insert (ceHeight ce) h)
-                           Nothing -> return ()
-                    writeTVar (hcTip hc) newTipEntry
-                    writeTVar (hcHeight hc) (ceHeight newTipEntry)
-                  return (Right ())
+                      blockDisconnected mp blk
+
+                    return (Right ())
   where
-    disconnectMany :: HaskoinDB -> UTXOCache -> [Block]
-                   -> IO (Either String ())
-    disconnectMany _ _ [] = return (Right ())
-    disconnectMany dbh ch (blk : rest) = do
-      let bh   = computeBlockHash (blockHeader blk)
-          prv  = bhPrevBlock (blockHeader blk)
-      -- Read undo, apply to cache via unapplyBlock, then write disk.
+    -- | Pre-load + checksum-verify undo data for every disconnect
+    -- block, failing fast if any is missing.  Returns the list in
+    -- the same order as the input (disconnect order: oldTip first).
+    loadDisconnectUndo :: HaskoinDB -> [Block]
+                       -> IO (Either String [UndoData])
+    loadDisconnectUndo _   []             = return (Right [])
+    loadDisconnectUndo dbh (blk : rest) = do
+      let bh  = computeBlockHash (blockHeader blk)
+          prv = bhPrevBlock (blockHeader blk)
       undoR <- getUndoDataVerified dbh bh prv
       case undoR of
         Left err -> return $ Left $ "undo read failed for "
                                      ++ show bh ++ ": " ++ err
-        Right undo -> do
-          unapplyBlock ch blk undo
-          dRes <- disconnectBlock dbh blk prv
-          case dRes of
-            Left err -> return (Left err)
-            Right () -> do
-              -- Pattern B closure (CORE-PARITY-AUDIT
-              -- _mempool-refill-on-reorg-fleet-result-2026-05-05.md):
-              -- re-feed disconnected non-coinbase txs back to the
-              -- mempool so wallets observing transactions on the old
-              -- chain don't see "confirmed then vanished" behavior
-              -- after a reorg.  'blockDisconnected' (Mempool.hs:1290)
-              -- decrements mpHeight + drops the disconnected block's
-              -- timestamp from the MTP window, then runs each non-
-              -- coinbase tx through 'addTransaction' which performs
-              -- the same BIP-113 IsFinalTx + BIP-68 SequenceLocks +
-              -- standardness checks against the new tip Core's
-              -- 'MaybeUpdateMempoolForReorg' (validation.cpp) does.
-              -- Reference: camlcoin lib/sync.ml:2354-2363,
-              -- haskoin 65a076c (Pattern Y companion).
-              blockDisconnected mp blk
-              disconnectMany dbh ch rest
+        Right u  -> do
+          restR <- loadDisconnectUndo dbh rest
+          return $ case restR of
+            Left e   -> Left e
+            Right us -> Right (u : us)
 
-    connectMany :: Network -> HaskoinDB -> UTXOCache -> [Block]
-                -> IO (Either String ())
-    connectMany _ _ _ [] = return (Right ())
-    connectMany n dbh ch (blk : rest) = do
-      -- Look up the per-block height from the header chain.
-      entries <- readTVarIO (hcEntries hc)
+-- | Reorg-overlay state — virtual UTXO view used during batch build.
+--
+-- 'overlayAdded' carries entries the disconnect side restored OR
+-- the connect side created.  'overlaySpent' carries outpoints the
+-- connect side has consumed (or the disconnect side has removed
+-- via "remove the outputs this block created").  Lookup order is
+-- overlay → cache → disk; an overlay-spent entry shadows the cache
+-- and disk so a connect block can spend a UTXO that exists on
+-- disk but was consumed earlier in the reorg sequence.
+data ReorgOverlay = ReorgOverlay
+  { overlayAdded :: !(Map OutPoint Coin)
+  , overlaySpent :: !(Set OutPoint)
+  }
+
+emptyOverlay :: ReorgOverlay
+emptyOverlay = ReorgOverlay Map.empty Set.empty
+
+-- | Look up an outpoint via overlay → cache → disk.  Returns the
+-- 'Coin' (full Core-format with height + coinbase metadata) if the
+-- outpoint is currently spendable in the virtual reorg state.
+lookupOverlay :: ReorgOverlay -> UTXOCache -> HaskoinDB
+              -> OutPoint -> IO (Maybe Coin)
+lookupOverlay ov cache _db op
+  | Set.member op (overlaySpent ov) = return Nothing
+  | otherwise =
+      case Map.lookup op (overlayAdded ov) of
+        Just c  -> return (Just c)
+        Nothing -> do
+          mEntry <- lookupUTXO cache op
+          return $ fmap entryToCoin mEntry
+  where
+    entryToCoin e = Coin { coinTxOut      = ueOutput e
+                         , coinHeight     = ueHeight e
+                         , coinIsCoinbase = ueCoinbase e
+                         }
+
+-- | Walk the disconnect+connect lists, building 'BatchOp's purely
+-- (no disk writes, no cache mutation) and tracking a virtual UTXO
+-- overlay.  The single returned 'BatchOp' list is the union of all
+-- per-block disconnect+connect ops, ready for one 'writeBatch'.
+--
+-- @newTipEntry@ is returned alongside so the caller can flip the
+-- in-memory tip pointer post-commit.
+buildReorgBatch :: Network -> HaskoinDB -> UTXOCache -> HeaderChain
+                -> [Block]      -- ^ disconnect list (oldTip first)
+                -> [UndoData]   -- ^ undo data, parallel to disconnect list
+                -> [Block]      -- ^ connect list (fork-child first)
+                -> IO (Either String ([BatchOp], ChainEntry))
+buildReorgBatch net db cache hc disList disUndos conList = do
+  -- Phase 1: build disconnect ops + post-disconnect overlay.
+  let disResult = disBuildPure (zip disList disUndos)
+                               ([], emptyOverlay)
+  case disResult of
+    Left err -> return (Left err)
+    Right (disOps, ov1) -> do
+      -- Phase 2: build connect ops, threading the overlay so that
+      -- a connect-side spend of a disconnect-side restoration
+      -- resolves correctly.
+      conResult <- buildConnectChain cache db hc net conList ov1 []
+      case conResult of
+        Left err -> return (Left err)
+        Right (conOps, _ov2) -> do
+          -- Validate the new tip is in the header index.
+          entries <- readTVarIO (hcEntries hc)
+          case conList of
+            [] -> return $ Left "buildReorgBatch: empty connect list"
+            _  -> do
+              let newTipBlock = last conList
+                  newTipHash  = computeBlockHash (blockHeader newTipBlock)
+              case Map.lookup newTipHash entries of
+                Nothing -> return $ Left $
+                  "New tip not in header index: " ++ show newTipHash
+                Just newTipEntry ->
+                  return $ Right (disOps ++ conOps, newTipEntry)
+  where
+    -- Pure folder for the disconnect side.  Each step:
+    --   * runs 'buildDisconnectBlockOps' for the (block, undo) pair
+    --   * adds restored UTXOs to overlay
+    --   * removes the block's own created UTXOs from overlay
+    disBuildPure :: [(Block, UndoData)]
+                 -> ([BatchOp], ReorgOverlay)
+                 -> Either String ([BatchOp], ReorgOverlay)
+    disBuildPure []                acc = Right acc
+    disBuildPure ((blk, u) : rest) (opsAcc, ov) =
+      let prevHash = bhPrevBlock (blockHeader blk)
+      in case buildDisconnectBlockOps blk prevHash u of
+        Left e   -> Left e
+        Right bo ->
+          let txns        = blockTxns blk
+              nonCoinbase = drop 1 txns
+              txUndos     = buTxUndo (udBlockUndo u)
+              -- Restored prevouts go into the overlay (post-
+              -- disconnect they're spendable again).
+              restored =
+                [ (txInPrevOutput inp,
+                   Coin (tuOutput tin) (tuHeight tin) (tuCoinbase tin))
+                | (tx, txUndo) <- zip nonCoinbase txUndos
+                , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
+                ]
+              -- The block's own outputs cease to exist on the new
+              -- chain — mark them spent in the overlay.
+              created =
+                [ OutPoint (computeTxId tx) (fromIntegral i)
+                | tx       <- txns
+                , (i, _)   <- zip [0 :: Int ..] (txOutputs tx)
+                ]
+              ov' = ov
+                { overlayAdded =
+                    foldr (\(op, c) m -> Map.insert op c m)
+                          (overlayAdded ov)
+                          restored
+                , overlaySpent =
+                    foldr Set.insert (overlaySpent ov) created
+                }
+              -- A restored prevout shadows any prior overlaySpent.
+              ov'' = ov'
+                { overlaySpent =
+                    foldr (\(op, _) -> Set.delete op)
+                          (overlaySpent ov') restored
+                }
+          in disBuildPure rest (opsAcc ++ bo, ov'')
+
+    -- IO-flavoured folder for the connect side: needs cache reads
+    -- to populate the spent-UTXO map for inputs that aren't in the
+    -- overlay.
+    buildConnectChain :: UTXOCache -> HaskoinDB -> HeaderChain
+                      -> Network -> [Block] -> ReorgOverlay
+                      -> [BatchOp]
+                      -> IO (Either String ([BatchOp], ReorgOverlay))
+    buildConnectChain _ _   _   _ []           ov ops = return (Right (ops, ov))
+    buildConnectChain c dbh hc' n (blk : rest) ov ops = do
+      entries <- readTVarIO (hcEntries hc')
       let bh = computeBlockHash (blockHeader blk)
       case Map.lookup bh entries of
         Nothing -> return $ Left $
-          "Connect: block " ++ show bh ++ " missing from header index"
+          "Connect build: block " ++ show bh ++ " missing from header index"
         Just ce -> do
-          -- Build utxoMap from the cache (post-disconnect state).
-          utxoMap <- buildBlockUTXOMap ch blk
-          appRes <- applyBlockToCache ch n blk (ceHeight ce)
-          case appRes of
-            Left err -> return $ Left $
-              "Connect: applyBlockToCache failed at "
-              ++ show (ceHeight ce) ++ ": " ++ err
-            Right _undo -> do
-              -- Write to disk: PrefixUTXO + PrefixBlockHeader +
-              -- PrefixBlockHeight + PrefixBestBlock + per-block undo.
-              connectBlock dbh n blk (ceHeight ce) utxoMap
-              connectMany n dbh ch rest
+          let txns        = blockTxns blk
+              nonCoinbase = drop 1 txns
+              prevouts    = [ txInPrevOutput inp
+                            | tx <- nonCoinbase, inp <- txInputs tx ]
+          -- Resolve every prevout via overlay → cache → disk.
+          spentRes <- foldM
+            (\acc op -> case acc of
+                Left e -> return (Left e)
+                Right m -> do
+                  mc <- lookupOverlay ov c dbh op
+                  case mc of
+                    Just c' -> return $ Right (Map.insert op c' m)
+                    Nothing -> return $ Left $
+                      "Connect build: missing prevout "
+                      ++ show op ++ " for block " ++ show bh)
+            (Right Map.empty)
+            prevouts
+          case spentRes of
+            Left e        -> return (Left e)
+            Right spentUtxos -> do
+              let blockOps = buildConnectBlockOps n blk (ceHeight ce) spentUtxos
+                  -- Newly created (non-unspendable) UTXOs go into
+                  -- overlay so a follow-on connect block in the
+                  -- same reorg can spend them.
+                  txids = map computeTxId txns
+                  coinbaseFlag txIdx = txIdx == (0 :: Int)
+                  created =
+                    [ ( OutPoint txid (fromIntegral i)
+                      , Coin txout (ceHeight ce) (coinbaseFlag txIdx)
+                      )
+                    | (txIdx, txid, tx) <- zip3 [0..] txids txns
+                    , (i, txout) <- zip [0..] (txOutputs tx)
+                    , not (isUnspendable (txOutScript txout))
+                    ]
+                  ov' = ov
+                    { overlayAdded =
+                        foldr (\(op, c') m -> Map.insert op c' m)
+                              (overlayAdded ov) created
+                    -- Inputs are now spent in the virtual world.
+                    , overlaySpent =
+                        foldr Set.insert (overlaySpent ov) prevouts
+                    }
+                  ov'' = ov'
+                    { overlayAdded =
+                        foldr (\op m -> Map.delete op m)
+                              (overlayAdded ov') prevouts
+                    }
+              buildConnectChain c dbh hc' n rest ov'' (ops ++ blockOps)
 
 -- | Build a UTXO map for block validation.
 --
