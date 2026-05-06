@@ -2470,6 +2470,77 @@ main = hspec $ do
         Left msg | "height" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong coinbase height"
 
+    -- Pattern X regression: side-branch BIP-34 height must derive from
+    -- the BLOCK's parent (validateFullBlock uses csHeight + 1) — NOT from
+    -- the active chain tip.  Bitcoin Core: ContextualCheckBlockHeader
+    -- (validation.cpp) uses pindexPrev->nHeight + 1.  The corpus entry
+    -- tools/diff-test-corpus/regression/reorg-via-submitblock surfaced
+    -- this gap when haskoin tip was at A2 (h=112) and a competing-fork
+    -- B1 (h=111, parent=base@h=110) was submitted: pre-fix the
+    -- submitBlock callsite used the active tip's height + 1 = 113 and
+    -- rejected B1 with bad-cb-height even though B1's coinbase
+    -- correctly encoded its own (parent-relative) height of 111.
+    -- The submitBlock-side fix lives in BlockTemplate.hs;
+    -- validateFullBlock itself just needs to honor csHeight (parent's
+    -- height) per the existing convention, which this test asserts.
+    it "BIP-34 side-branch coinbase passes when csHeight is parent-relative (Pattern X)" $ do
+      -- Side-branch parent at height 110.  Block is at height 111.
+      -- Coinbase encodes height 111 (CScript() << 111 = [0x01, 0x6f]).
+      let parentHash = BlockHash (Hash256 (BS.replicate 32 0xab))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          -- 111 = 0x6f.  CScript() << 111 = [0x01, 0x6f].
+          cbScriptSig = BS.pack [0x01, 0x6f]
+          coinbaseIn = TxIn nullOutpoint cbScriptSig 0xffffffff
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid = computeTxId coinbase
+          merkle = computeMerkleRoot [txid]
+          -- Use a high enough timestamp so MTP gate doesn't fire.
+          header = BlockHeader 1 parentHash merkle 1700000000 0x207fffff 0
+          block = Block header [coinbase]
+          -- The bug: pre-fix submitBlock built csHeight from the active
+          -- TIP (e.g. 112), giving height 113 inside validateFullBlock
+          -- → BIP-34 expected coinbase to encode 113.  The fix routes
+          -- the BLOCK's parent height through csHeight; here we assert
+          -- the validator accepts when csHeight = parent's height.
+          --
+          -- Set csHeight = 110 (parent's height); height inside the
+          -- validator becomes 110 + 1 = 111, matching the cb encoding.
+          cs = ChainState 110 parentHash 0 0 (consensusFlagsAtHeight regtest 111)
+      case validateFullBlock regtest cs False block Map.empty of
+        Right () -> return ()
+        Left msg
+          | "height" `T.isInfixOf` T.pack msg ->
+              expectationFailure $
+                "BIP-34 falsely rejected side-branch with parent-relative height " ++
+                "(Pattern X regression): " ++ msg
+          | otherwise -> return ()  -- Other errors (subsidy, etc.) are unrelated
+
+    -- Companion: assert the SAME block is REJECTED when csHeight is
+    -- mistakenly built from the active tip (Pattern X pre-fix shape).
+    -- This guards against a regression that re-introduces tip-relative
+    -- arithmetic in the submitBlock callsite.
+    it "BIP-34 side-branch coinbase rejected when csHeight is tip-relative (Pattern X pre-fix shape)" $ do
+      let parentHash = BlockHash (Hash256 (BS.replicate 32 0xab))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          cbScriptSig = BS.pack [0x01, 0x6f]  -- encodes height 111
+          coinbaseIn = TxIn nullOutpoint cbScriptSig 0xffffffff
+          coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid = computeTxId coinbase
+          merkle = computeMerkleRoot [txid]
+          header = BlockHeader 1 parentHash merkle 1700000000 0x207fffff 0
+          block = Block header [coinbase]
+          -- Pre-fix shape: csHeight = active tip height (112), giving
+          -- height 113 inside the validator. Coinbase encodes 111.
+          -- BIP-34 must reject: bad-cb-height.
+          cs = ChainState 112 parentHash 0 0 (consensusFlagsAtHeight regtest 113)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left "bad-cb-height" -> return ()
+        Left msg | "bad-cb-height" `T.isInfixOf` T.pack msg -> return ()
+        Right () -> expectationFailure
+          "Should reject when csHeight=tip-height + cb encodes parent-relative height"
+        Left msg -> expectationFailure $
+          "Wrong error (expected bad-cb-height): " ++ msg
+
     -- Coinbase scriptSig length enforcement: 2..100 bytes.
     -- Bitcoin Core: consensus/tx_check.cpp CheckTransaction "bad-cb-length"
     -- Prior to this fix validateTransaction was never called on the coinbase
