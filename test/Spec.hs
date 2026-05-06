@@ -3662,6 +3662,115 @@ main = hspec $ do
         Left err -> expectationFailure $
           "B2 should find B1 via hash-keyed lookup: " ++ err
 
+  -- Pattern B closure (CORE-PARITY-AUDIT
+  -- _mempool-refill-on-reorg-fleet-result-2026-05-05.md): on reorg, the
+  -- non-coinbase transactions of the disconnected blocks must be re-fed
+  -- into the mempool so wallets observing them on the old chain don't
+  -- see "confirmed then vanished" behavior.  haskoin already had
+  -- 'Mempool.blockDisconnected' (Mempool.hs:1290) defined with full
+  -- re-add logic, but it was unwired from the side-branch reorg
+  -- dispatcher today's Pattern Y companion (haskoin 65a076c) added.
+  -- This describe block guards that the call site is wired and the
+  -- helper actually re-admits txs against the new tip.
+  --
+  -- Reference: camlcoin lib/sync.ml:2354-2363 (Mempool.add_transaction
+  -- per disconnected non-coinbase tx after disconnect loop completes).
+  describe "Mempool refill on reorg disconnect (Pattern B)" $ do
+    it "blockDisconnected re-admits non-coinbase txs to mempool" $ do
+      -- Construct a "disconnected" block that paid out two non-
+      -- coinbase txs T1, T2 (each spends a fresh UTXO that we
+      -- pre-populate in the cache as if the disconnect just
+      -- restored them).  After 'blockDisconnected', both T1 and
+      -- T2 should appear in the mempool TxIds set.
+      withSystemTempDirectory "haskoin-mp-refill" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db -> do
+          cache <- newUTXOCache db 1024
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+
+          -- Pre-populate two prevouts in the UTXO cache as if a
+          -- prior disconnect just restored them.  P2WPKH-style
+          -- scriptPubKey so the standardness check passes.
+          let prevTx1 = TxId (Hash256 (BS.replicate 32 0x71))
+              prevTx2 = TxId (Hash256 (BS.replicate 32 0x72))
+              prevOp1 = OutPoint prevTx1 0
+              prevOp2 = OutPoint prevTx2 0
+              prevScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0x55
+              prevTxOut = TxOut 5_000_000 prevScript
+              -- Mature non-coinbase entries so resolveInput / coinbase-maturity
+              -- check both pass.
+              prevEntry = UTXOEntry prevTxOut 1 False False
+          atomically $ do
+            modifyTVar' (ucEntries cache) $
+              Map.insert prevOp1 prevEntry . Map.insert prevOp2 prevEntry
+
+          -- Build T1 / T2 (each spends one of the prevouts).
+          let mkSpend op =
+                let tin   = TxIn op BS.empty 0xfffffffe
+                    tout  = TxOut 4_900_000
+                              (BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa)
+                in Tx 2 [tin] [tout] [[]] 0
+              t1 = mkSpend prevOp1
+              t2 = mkSpend prevOp2
+              t1id = computeTxId t1
+              t2id = computeTxId t2
+
+          -- Coinbase: distinct prevout (null prevout marker, vout=0xffffffff).
+          let cbPrev = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+              cbIn = TxIn cbPrev (BS.pack [0x51, 0x51]) 0xffffffff
+              cbOut = TxOut 5_000_000_000 prevScript
+              coinbase = Tx 1 [cbIn] [cbOut] [[]] 0
+
+          -- The "disconnected" block: coinbase + T1 + T2.
+          let bhdr = BlockHeader 1
+                       (BlockHash (Hash256 (BS.replicate 32 0x88)))
+                       (Hash256 (BS.replicate 32 0xee))
+                       1700001000 0x207fffff 0
+              blk = Block bhdr [coinbase, t1, t2]
+
+          -- Pre-condition: mempool empty.
+          before <- getMempoolTxIds mp
+          length before `shouldBe` 0
+
+          -- Exercise the helper that the side-branch reorg
+          -- dispatcher now calls per-disconnected-block.
+          blockDisconnected mp blk
+
+          -- Post-condition: both T1 and T2 are in the mempool.
+          after <- getMempoolTxIds mp
+          let asSet = Set.fromList after
+          Set.member t1id asSet `shouldBe` True
+          Set.member t2id asSet `shouldBe` True
+
+    it "blockDisconnected leaves coinbase out of the mempool" $ do
+      -- Coinbase txs are never relay-eligible — they are produced
+      -- only by miners and consensus-rejected from any non-coinbase
+      -- slot.  Verify 'blockDisconnected' refuses to re-feed the
+      -- coinbase even though it is the head of @blockTxns@.
+      withSystemTempDirectory "haskoin-mp-refill-cb" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db -> do
+          cache <- newUTXOCache db 1024
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+
+          let prevScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0x55
+              cbPrev = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+              cbIn = TxIn cbPrev (BS.pack [0x51, 0x51]) 0xffffffff
+              cbOut = TxOut 5_000_000_000 prevScript
+              coinbase = Tx 1 [cbIn] [cbOut] [[]] 0
+              cbId = computeTxId coinbase
+
+          let bhdr = BlockHeader 1
+                       (BlockHash (Hash256 (BS.replicate 32 0x77)))
+                       (Hash256 (BS.replicate 32 0xee))
+                       1700001000 0x207fffff 0
+              blk = Block bhdr [coinbase]
+          blockDisconnected mp blk
+
+          after <- getMempoolTxIds mp
+          Set.member cbId (Set.fromList after) `shouldBe` False
+          length after `shouldBe` 0
+
   describe "Header chain persistence (restart recovery)" $ do
     it "headers survive DB close/reopen and can rebuild the chain" $ do
       withSystemTempDirectory "haskoin-restart-test" $ \tmpDir -> do

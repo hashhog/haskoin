@@ -74,7 +74,8 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
                          putBlock, getBlock, getUndoDataVerified, Coin(..))
-import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions)
+import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions,
+                         blockDisconnected)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
                          Inv(..), InvVector(..), InvType(..))
 
@@ -421,9 +422,10 @@ submitBlock :: Network         -- ^ Network configuration
             -> HeaderChain     -- ^ Header chain
             -> UTXOCache       -- ^ UTXO cache
             -> PeerManager     -- ^ Peer manager for broadcasting
+            -> Mempool         -- ^ Mempool (for refill on side-branch reorg)
             -> Block           -- ^ The mined block
             -> IO (Either String ())
-submitBlock net db hc cache pm block = do
+submitBlock net db hc cache pm mp block = do
   let bh = computeBlockHash (blockHeader block)
       header = blockHeader block
       prevHash = bhPrevBlock header
@@ -505,7 +507,7 @@ submitBlock net db hc cache pm block = do
           -- camlcoin 22667c2 (register_side_branch_header +
           -- try_attach_side_branch_and_reorg), rustoshi 68a422b.
           if ceHash parent /= ceHash tip
-            then submitBlockSideBranch net db hc cache pm block parent
+            then submitBlockSideBranch net db hc cache pm mp block parent
             else do
               -- Apply block to in-memory UTXO cache (drives maturity check + builds
               -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
@@ -574,9 +576,9 @@ submitBlock net db hc cache pm block = do
 --   * camlcoin 22667c2 (try_attach_side_branch_and_reorg + register_side_branch_header)
 --   * rustoshi 68a422b (Pattern Y proof of shape)
 submitBlockSideBranch :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
-                      -> PeerManager -> Block -> ChainEntry
+                      -> PeerManager -> Mempool -> Block -> ChainEntry
                       -> IO (Either String ())
-submitBlockSideBranch net db hc cache pm block parent = do
+submitBlockSideBranch net db hc cache pm mp block parent = do
   let header   = blockHeader block
       bh       = computeBlockHash header
       -- 'cumulativeWork' = parentWork + headerWork (Consensus.hs).
@@ -613,7 +615,7 @@ submitBlockSideBranch net db hc cache pm block parent = do
       -- 'unapplyBlock' (cache) on the way down, and 'connectBlock'
       -- (disk) + 'applyBlockToCache' (cache) on the way up — same
       -- atomic-pair pattern Sync.hs and the active-tip arm above use.
-      reorgRes <- doSideBranchReorg net db hc cache parent block newWork
+      reorgRes <- doSideBranchReorg net db hc cache mp parent block newWork
       case reorgRes of
         Left err -> do
           -- Block + side-branch index entry are already persisted;
@@ -716,11 +718,12 @@ findSideBranchForkPoint hc db parent newTipBlock = do
 -- (hcTip / hcHeight / hcByHeight) so subsequent 'submitblock' /
 -- 'getbestblockhash' queries see the new tip.
 doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
+                  -> Mempool     -- ^ Mempool (for refill on disconnect; Pattern B)
                   -> ChainEntry  -- ^ parent of the new tip
                   -> Block       -- ^ new tip block
                   -> Integer     -- ^ new tip's cumulative work
                   -> IO (Either String ())
-doSideBranchReorg net db hc cache parent newTipBlock _newWork = do
+doSideBranchReorg net db hc cache mp parent newTipBlock _newWork = do
   forkRes <- findSideBranchForkPoint hc db parent newTipBlock
   case forkRes of
     Left err -> return (Left err)
@@ -781,7 +784,23 @@ doSideBranchReorg net db hc cache parent newTipBlock _newWork = do
           dRes <- disconnectBlock dbh blk prv
           case dRes of
             Left err -> return (Left err)
-            Right () -> disconnectMany dbh ch rest
+            Right () -> do
+              -- Pattern B closure (CORE-PARITY-AUDIT
+              -- _mempool-refill-on-reorg-fleet-result-2026-05-05.md):
+              -- re-feed disconnected non-coinbase txs back to the
+              -- mempool so wallets observing transactions on the old
+              -- chain don't see "confirmed then vanished" behavior
+              -- after a reorg.  'blockDisconnected' (Mempool.hs:1290)
+              -- decrements mpHeight + drops the disconnected block's
+              -- timestamp from the MTP window, then runs each non-
+              -- coinbase tx through 'addTransaction' which performs
+              -- the same BIP-113 IsFinalTx + BIP-68 SequenceLocks +
+              -- standardness checks against the new tip Core's
+              -- 'MaybeUpdateMempoolForReorg' (validation.cpp) does.
+              -- Reference: camlcoin lib/sync.ml:2354-2363,
+              -- haskoin 65a076c (Pattern Y companion).
+              blockDisconnected mp blk
+              disconnectMany dbh ch rest
 
     connectMany :: Network -> HaskoinDB -> UTXOCache -> [Block]
                 -> IO (Either String ())
