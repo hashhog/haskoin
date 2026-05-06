@@ -51,6 +51,9 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          -- Pruning support
                          PruneConfig(..), defaultPruneConfig, minPruneTarget,
                          minBlocksToKeep, findFilesToPrune, calculateCurrentUsage,
+                         pruneTargetManual, parsePruneArg,
+                         pruneConfigEnabled, pruneConfigManual,
+                         pruneConfigAutoTarget,
                          -- Header persistence (for restart tests)
                          putBlockHeader, getBlockHeader,
                          putBlockHeight, getBlockHeight,
@@ -8421,6 +8424,81 @@ main = hspec $ do
       it "allows custom prune target above minimum" $ do
         let cfg = PruneConfig (Just $ 600 * 1024 * 1024) 288
         pcPruneTarget cfg `shouldBe` Just (600 * 1024 * 1024)
+
+    -- ----------------------------------------------------------------
+    -- parsePruneArg + companion classifiers (CLI -> PruneConfig wiring)
+    --
+    -- Mirrors Bitcoin Core's @ApplyArgsManOptions@ (init.cpp /
+    -- node/blockmanager_args.cpp).  Wired into haskoin's @--prune=N@
+    -- CLI flag at app/Main.hs.  Audit: prune-cross-impl 2026-05-05
+    -- "haskoin: --prune is Bool switch, never reaches PruneConfig".
+    -- ----------------------------------------------------------------
+    describe "parsePruneArg" $ do
+      it "0 disables pruning" $ do
+        case parsePruneArg 0 of
+          Right cfg -> do
+            pcPruneTarget cfg `shouldBe` Nothing
+            pruneConfigEnabled cfg `shouldBe` False
+            pruneConfigManual cfg `shouldBe` False
+            pruneConfigAutoTarget cfg `shouldBe` Nothing
+          Left e -> expectationFailure $ "expected Right, got Left " ++ show e
+
+      it "1 selects manual mode (PRUNE_TARGET_MANUAL)" $ do
+        case parsePruneArg 1 of
+          Right cfg -> do
+            pcPruneTarget cfg `shouldBe` Just pruneTargetManual
+            pruneConfigEnabled cfg `shouldBe` True
+            pruneConfigManual cfg `shouldBe` True
+            -- Auto-prune target must be Nothing in manual mode so the
+            -- post-block-connect trigger short-circuits.
+            pruneConfigAutoTarget cfg `shouldBe` Nothing
+          Left e -> expectationFailure $ "expected Right, got Left " ++ show e
+
+      it "549 (just below minimum) is rejected with Core's wording" $ do
+        case parsePruneArg 549 of
+          Left e ->
+            e `shouldBe`
+              "Prune configured below the minimum of 550 MiB.  Please use a higher number."
+          Right _ -> expectationFailure "expected Left, got Right"
+
+      it "550 (minimum) enables auto-prune at exactly 550 MiB" $ do
+        case parsePruneArg 550 of
+          Right cfg -> do
+            pcPruneTarget cfg `shouldBe` Just (550 * 1024 * 1024)
+            pruneConfigEnabled cfg `shouldBe` True
+            pruneConfigManual cfg `shouldBe` False
+            pruneConfigAutoTarget cfg `shouldBe` Just (550 * 1024 * 1024)
+          Left e -> expectationFailure $ "expected Right, got Left " ++ show e
+
+      it "1000 (typical) enables auto-prune at 1000 MiB" $ do
+        case parsePruneArg 1000 of
+          Right cfg -> do
+            pcPruneTarget cfg `shouldBe` Just (1000 * 1024 * 1024)
+            pruneConfigAutoTarget cfg `shouldBe` Just (1000 * 1024 * 1024)
+          Left e -> expectationFailure $ "expected Right, got Left " ++ show e
+
+      it "negative values are rejected with Core's wording" $ do
+        case parsePruneArg (-1) of
+          Left e ->
+            e `shouldBe` "Prune cannot be configured with a negative value."
+          Right _ -> expectationFailure "expected Left, got Right"
+
+      it "manual mode + auto target are mutually exclusive" $ do
+        -- pruneConfigManual / pruneConfigAutoTarget must partition the
+        -- enabled configs cleanly: any enabled cfg is exactly one of
+        -- (manual, auto).  Disabled cfgs are neither.
+        let cases = [0, 1, 550, 2048]
+        forM_ cases $ \n -> case parsePruneArg n of
+          Right cfg -> do
+            let manual = pruneConfigManual cfg
+                auto   = case pruneConfigAutoTarget cfg of
+                           Just _  -> True
+                           Nothing -> False
+                enabled = pruneConfigEnabled cfg
+            -- Manual XOR auto when enabled; both False when disabled
+            (manual && auto) `shouldBe` False
+            (enabled && not (manual || auto)) `shouldBe` False
+          Left _ -> return ()  -- Skip rejected inputs
 
     describe "findFilesToPrune" $ do
       it "returns empty list when below target" $ do

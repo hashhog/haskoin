@@ -195,6 +195,10 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
+                         PruneConfig(..), defaultPruneConfig,
+                         pruneConfigEnabled, pruneConfigManual,
+                         pruneConfigAutoTarget, pruneTargetManual,
+                         calculateCurrentUsage,
                          loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..),
                          dumpTxOutSetFromDB,
                          AssumeUtxoData(..), verifySnapshot,
@@ -305,16 +309,31 @@ data RpcServer = RpcServer
     -- stay connected; only block acceptance is gated. TVar so the
     -- P2P block-receive path can read without contending with the
     -- chain-write lock.
-  , rsPruneEnabled   :: !Bool
-    -- ^ Mirrors Bitcoin Core's @fPruneMode@ (init.cpp). Set at startup
-    -- from the @--prune@ flag. The 'handlePruneBlockchain' RPC must
-    -- refuse calls when this is False, with the exact Core error
-    -- message ("Cannot prune blocks because node is not in prune
-    -- mode") and code (RPC_MISC_ERROR). See
-    -- bitcoin-core/src/rpc/blockchain.cpp pruneblockchain.
-    -- Audit: CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
-    -- (Bug 4).
+  , rsPruneConfig    :: !PruneConfig
+    -- ^ Active pruning configuration.  Mirrors Bitcoin Core's
+    -- @fPruneMode@ + @nPruneTarget@ pair (init.cpp /
+    -- node/blockmanager_args.cpp).  Set at startup from the parsed
+    -- @-prune=N@ argument:
+    --
+    --   * @defaultPruneConfig@           when @-prune=0@ (off)
+    --   * @pcPruneTarget=Just maxBound@  when @-prune=1@ (manual)
+    --   * @pcPruneTarget=Just (N*MiB)@   when @-prune=N>=550@ (auto)
+    --
+    -- The 'handlePruneBlockchain' RPC refuses with @RPC_MISC_ERROR@ +
+    -- the exact Core message ("Cannot prune blocks because node is
+    -- not in prune mode.") whenever 'pruneConfigEnabled' is False.
+    -- The 'handleGetBlockchainInfo' RPC reports @pruned@,
+    -- @pruneheight@, and @automatic_pruning@ from this field.
+    -- Reference: bitcoin-core/src/rpc/blockchain.cpp pruneblockchain
+    -- and getblockchaininfo.
+    -- Audit: CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md.
   }
+
+-- | Back-compat accessor: True iff prune mode is on (manual or auto).
+-- Most callers only need the boolean gate; the full 'PruneConfig' is
+-- read directly via 'rsPruneConfig'.
+rsPruneEnabled :: RpcServer -> Bool
+rsPruneEnabled = pruneConfigEnabled . rsPruneConfig
 
 -- | Get current time, using mock time if set (for regtest testing)
 getCurrentTime :: RpcServer -> IO Word32
@@ -508,9 +527,9 @@ writeCookieFile cookiePath cookiePass = do
 startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
                -> Mempool -> FeeEstimator -> UTXOCache -> Network
                -> Maybe BlockStore -> Maybe WalletManager
-               -> Bool  -- ^ pruneEnabled (mirrors Core fPruneMode)
+               -> PruneConfig  -- ^ Parsed -prune=N config (mirrors Core fPruneMode + nPruneTarget)
                -> IO RpcServer
-startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneEnabled = do
+startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg = do
   threadVar <- newTVarIO Nothing
   mockTimeVar <- newTVarIO Nothing  -- No mock time by default
   startTime <- round <$> getPOSIXTime
@@ -522,7 +541,7 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneEnabl
   -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset). Initialised
   -- to False; flipped True only inside the rollback dance.
   pauseVar <- newTVarIO False
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar pruneEnabled
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar pruneCfg
   -- Restore persisted banlist at startup (best-effort; absence is fine on
   -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
   -- which loads banlist.json on boot.
@@ -915,7 +934,27 @@ handleGetBlockchainInfo server = do
       -- Soft-fork state: always sourced from the shared softforksFromEntry
       -- helper so getblockchaininfo and getdeploymentinfo cannot disagree.
       sforks = softforksFromEntry (rsNetwork server) tip
-  let result = object
+  -- Pruning fields (Bitcoin Core parity).  Reference:
+  -- bitcoin-core/src/rpc/blockchain.cpp getblockchaininfo emits
+  --   "pruned"            : whether prune mode is enabled
+  --   "pruneheight"       : height of the earliest still-stored block
+  --                         (only when pruned)
+  --   "automatic_pruning" : whether auto-prune (vs manual) is on
+  --                         (only when pruned)
+  --   "prune_target_size" : target size in bytes (only when auto)
+  -- We pin "size_on_disk" + "pruneheight" to honest values when a
+  -- BlockStore is wired; otherwise fall back to 0 / earliest known.
+  let pruneCfg  = rsPruneConfig server
+      pruneOn   = pruneConfigEnabled pruneCfg
+      autoMode  = case pruneConfigAutoTarget pruneCfg of
+                    Just _  -> True
+                    Nothing -> False
+  sizeOnDisk <- case rsBlockStore server of
+    Just bs -> do
+      fileInfos <- readIORef (bsFileInfos bs)
+      return (calculateCurrentUsage fileInfos)
+    Nothing -> return 0
+  let baseFields =
         [ "chain"                .= netName (rsNetwork server)
         , "blocks"               .= ceHeight tip
         , "headers"              .= ceHeight tip
@@ -928,11 +967,24 @@ handleGetBlockchainInfo server = do
         , "verificationprogress" .= progress
         , "initialblockdownload" .= isIBD
         , "chainwork"            .= showHex (ceChainWork tip)
-        , "size_on_disk"         .= (0 :: Int)
-        , "pruned"               .= False
+        , "size_on_disk"         .= sizeOnDisk
+        , "pruned"               .= pruneOn
         , "softforks"            .= sforks
         , "warnings"             .= ([] :: [Text])
         ]
+      pruneFields
+        | not pruneOn = []
+        | otherwise =
+            [ "automatic_pruning" .= autoMode
+            -- Best-effort prune height: 0 until the first prune fires
+            -- (haskoin doesn't yet expose the per-block-file min height
+            -- on the live datadir; on RocksDB-only storage no actual
+            -- pruning has happened).  Reported for shape parity.
+            , "pruneheight"       .= (0 :: Word32)
+            ] ++ case pruneConfigAutoTarget pruneCfg of
+                   Just t  -> [ "prune_target_size" .= t ]
+                   Nothing -> []
+      result = object (baseFields ++ pruneFields)
   return $ RpcResponse result Null Null
 
 -- | Pure helper: build the full getdeploymentinfo result for a given

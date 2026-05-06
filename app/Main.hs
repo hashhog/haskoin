@@ -33,6 +33,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Serialize (decode)
+import Data.Bits (shiftR, (.&.))
 import qualified Network.Wai as Wai
 import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.HTTP.Types as HTTP
@@ -75,7 +76,16 @@ data NodeOptions = NodeOptions
   , noRpcPass    :: !Text
   , noMaxPeers   :: !Int
   , noConnect    :: ![String]
-  , noPrune      :: !Bool
+  , noPrune      :: !Int
+    -- ^ Bitcoin Core @-prune=N@ semantics (init.cpp /
+    -- node/blockmanager_args.cpp):
+    --   * 0     : pruning disabled (default)
+    --   * 1     : manual pruning (auto-prune off; only via
+    --             @pruneblockchain@ RPC)
+    --   * >=550 : auto-prune at N MiB target
+    --   * <0    : rejected at startup
+    --   * 2..549: rejected at startup (below 550 MiB minimum)
+    -- Parsed via 'parsePruneArg' into a 'PruneConfig'.
   , noDbCache    :: !Int
   , noListen     :: !Bool
   , noListenPort :: !Int
@@ -139,7 +149,10 @@ parseNodeOptions = NodeOptions
   <*> strOption (long "rpcpassword" <> value "haskoin" <> help "RPC password")
   <*> option auto (long "maxpeers" <> value 125 <> help "Max peer connections")
   <*> many (strOption (long "connect" <> help "Peer to connect to"))
-  <*> switch (long "prune" <> help "Enable pruning")
+  <*> option auto (long "prune" <> value 0 <> metavar "N"
+        <> help "Pruning: 0=off (default), 1=manual (RPC only), \
+                \>=550=auto-prune at N MiB. Mirrors Bitcoin Core's \
+                \-prune=N (init.cpp).")
   <*> option auto (long "dbcache" <> value 450 <> help "DB cache in MB")
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
@@ -336,8 +349,8 @@ applyConfigOverlay cm n = n
   , noMaxPeers   = if noMaxPeers n == 125
                      then Daemon.configLookupInt "maxpeers" 125 cm
                      else noMaxPeers n
-  , noPrune      = if not (noPrune n)
-                     then Daemon.configLookupBool "prune" False cm
+  , noPrune      = if noPrune n == 0
+                     then Daemon.configLookupInt "prune" 0 cm
                      else noPrune n
   , noDbCache    = if noDbCache n == 450
                      then Daemon.configLookupInt "dbcache" 450 cm
@@ -391,6 +404,20 @@ applyConfigOverlay cm n = n
       (h, [])      -> [h]
       (h, _ : rest) -> h : wordsBy p rest
 
+-- | Encode the network's @netMagic@ Word32 as the 4 little-endian
+-- bytes that @newBlockStore@ stores for blk-file framing.  This
+-- mirrors the same conversion done in 'netMagicBytes' inside
+-- 'Haskoin.Network'; we re-implement it here to avoid widening that
+-- module's export list (the helper is only needed at startup).
+netMagicBytesLE :: Network -> BS.ByteString
+netMagicBytesLE net =
+  let m = netMagic net
+      b0 = fromIntegral (m .&. 0xff)
+      b1 = fromIntegral ((m `shiftR` 8) .&. 0xff)
+      b2 = fromIntegral ((m `shiftR` 16) .&. 0xff)
+      b3 = fromIntegral ((m `shiftR` 24) .&. 0xff)
+  in BS.pack [b0, b1, b2, b3]
+
 -- | Concatenate debug-flag tokens with commas so the daemon-side
 -- parser can split on ','. Tolerates duplicates.
 concatPlus :: [String] -> String
@@ -436,6 +463,27 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
 
   putStrLn $ "Starting Haskoin on " ++ netName net
   putStrLn $ "Data directory: " ++ dataDir
+
+  -- 2b. Parse --prune=N (Bitcoin Core init.cpp /
+  --     node/blockmanager_args.cpp semantics).  Reject negative and
+  --     2..549 values up front so misconfiguration fails fast before
+  --     we touch the DB.
+  pruneCfg <- case parsePruneArg noPrune of
+    Left err -> do
+      putStrLn $ "FATAL: " ++ err
+      exitWith (ExitFailure 1)
+    Right cfg -> do
+      case pcPruneTarget cfg of
+        Nothing -> return ()
+        Just t
+          | t == pruneTargetManual ->
+              putStrLn "Pruning: manual mode (auto-prune off; \
+                       \pruneblockchain RPC armed)"
+          | otherwise ->
+              putStrLn $ "Pruning: auto-prune target = "
+                      ++ show (t `div` (1024 * 1024)) ++ " MiB"
+      return cfg
+  let pruneOn = pruneConfigEnabled pruneCfg
 
   -- Open database
   let dbConfig = (defaultDBConfig (dataDir </> "chainstate"))
@@ -623,8 +671,23 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Start header sync
     hs <- startHeaderSync net hc
 
+    -- Initialise BlockStore IFF pruning is enabled.  Most haskoin
+    -- block I/O still flows through RocksDB, so the BlockStore is
+    -- not on the hot path; we only create it when prune RPC /
+    -- auto-prune triggers need it.  newBlockStore is idempotent —
+    -- re-running on an existing blocks/ dir loads the persisted
+    -- file-info index from RocksDB.
+    let blocksDir = dataDir </> "blocks"
+    mBlockStore <- if pruneOn
+      then do
+        bs <- newBlockStore blocksDir (netMagicBytesLE net) db
+        putStrLn $ "BlockStore initialised at " ++ blocksDir
+                ++ " (prune subsystem armed)"
+        return (Just bs)
+      else return Nothing
+
     -- Start peer manager with sync-aware message handler.
-    -- BIP-159: --prune (a switch in this build) flips on
+    -- BIP-159: --prune (any non-zero value) flips on
     -- NODE_NETWORK_LIMITED in the version handshake so peers know we
     -- only serve the recent ~288-block window.  The wire-protocol gate
     -- is correct regardless of whether the prune subsystem itself is
@@ -633,11 +696,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
-          , pmcPruneMode   = noPrune
+          , pmcPruneMode   = pruneOn
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef addr msg
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore addr msg
         `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
@@ -668,10 +731,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , rpcPassword = noRpcPass
           , rpcDataDir  = dataDir
           }
-    -- Plumb the --prune flag into the RPC server so 'pruneblockchain'
-    -- can refuse calls when prune mode is off (Core parity; audit
-    -- 2026-05-05 Bug 4).
-    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net Nothing Nothing noPrune
+    -- Plumb the parsed --prune=N config into the RPC server.  The
+    -- 'pruneblockchain' RPC refuses calls when prune mode is off
+    -- (Core parity; audit 2026-05-05 Bug 4); 'getblockchaininfo'
+    -- reports pruned/automatic_pruning/prune_target_size from this
+    -- config; the BlockStore is required for the manual RPC path.
+    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore Nothing pruneCfg
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
 
     -- Periodic chainstate flush.
@@ -1030,8 +1095,9 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> IORef PeerManager -> IORef Word32 -> IORef Word32
                    -> IORef Bool -> IORef (Set.Set TxId)
                    -> IORef Word32 -> IORef Integer
+                   -> PruneConfig -> Maybe BlockStore
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -1196,6 +1262,23 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           writeIORef blocksSinceFlushRef 0
           nowE <- round <$> getPOSIXTime
           writeIORef lastFlushEpochRef nowE
+          -- Auto-prune trigger.  Mirrors Bitcoin Core's
+          -- @FlushStateToDisk -> PruneBlockFiles@ branch in
+          -- bitcoin-core/src/validation.cpp: pruning fires only on a
+          -- flush boundary (not every block), only when prune mode is
+          -- on and the target is finite (not manual / disabled).
+          -- Best-effort; pruning errors must never abort the block
+          -- connection or the flush path.
+          case mBlockStore of
+            Just bs -> do
+              n <- autoPruneIfNeeded bs height pruneCfg
+                     `catch` (\(e :: SomeException) -> do
+                                putStrLn $ "auto-prune error: " ++ show e
+                                return 0)
+              when (n > 0) $
+                putStrLn $ "auto-prune: pruned " ++ show n
+                        ++ " block file(s) at height=" ++ show height
+            Nothing -> return ()
         -- Remove confirmed txs from mempool and clear rejection filter
         blockConnected mp block
         writeIORef recentlyRejectedRef Set.empty
@@ -1434,7 +1517,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           then case fillPartialBlock pdb [] of
             Right block -> do
               putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef addr (MBlock block)
+              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore addr (MBlock block)
             Left err -> do
               putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
               pm <- readIORef pmRef
