@@ -2179,7 +2179,7 @@ handleSubmitBlockUnpaused server params = do
             Right block -> do
               result <- submitBlock (rsNetwork server) (rsDB server)
                           (rsHeaderChain server) (rsUTXOCache server)
-                          (rsPeerMgr server) block
+                          (rsPeerMgr server) (rsMempool server) block
               case result of
                 Left err ->
                   -- Map internal error strings to canonical BIP-22 result strings.
@@ -2429,7 +2429,7 @@ generateSingleBlock server scriptPubKey specificTxs = do
           bh = computeBlockHash validHeader
 
       -- Validate and connect the block
-      result <- submitBlock net db hc cache pm block
+      result <- submitBlock net db hc cache pm (rsMempool server) block
       case result of
         Left err -> return $ Left err
         Right () -> return $ Right bh
