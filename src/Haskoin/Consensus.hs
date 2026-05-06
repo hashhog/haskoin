@@ -102,6 +102,10 @@ module Haskoin.Consensus
     -- * Block Connection (Legacy)
   , connectBlock
   , disconnectBlock
+    -- * Pure Batch Builders (Pattern D — multi-block atomicity)
+  , buildConnectBlockOps
+  , buildDisconnectBlockOps
+  , maxReorgDepth
     -- * UTXO Cache Block Operations
   , applyBlock
   , unapplyBlock
@@ -2678,6 +2682,147 @@ disconnectBlock db block prevHash = do
                 [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
           writeBatch db (WriteBatch (restoreOps ++ removeOps ++ bestBlockOp))
           return (Right ())
+
+--------------------------------------------------------------------------------
+-- Pure Batch Builders — Pattern D Multi-Block Atomicity
+--------------------------------------------------------------------------------
+
+-- | Maximum number of blocks that can be reorganised in a single
+-- side-branch reorg.  Mirrors Core's @MAX_REORG_DEPTH@-equivalent
+-- guard in @ActivateBestChain@ + the cross-impl cap landed in
+-- nimrod / camlcoin / rustoshi during the 2026-05 Pattern D wave.
+--
+-- The cap is enforced on the SUM of the disconnect + connect lists:
+-- a 50-block disconnect followed by a 60-block connect would be
+-- rejected at 110 > 100.  Reorgs deeper than this surface as
+-- "inconclusive" and require operator intervention
+-- (@reconsiderblock@) — same shape Core uses when @ActivateBestChain@
+-- bails on an oversized reorg.
+maxReorgDepth :: Int
+maxReorgDepth = 100
+
+-- | Pure batch-op builder for a connect-block step.  Computes the
+-- exact same RocksDB ops 'connectBlock' would write, but returns
+-- them instead of invoking 'writeBatch'.  The companion 'BlockUndo'
+-- record is included in the ops (PrefixUndo entry).
+--
+-- Caller responsibilities:
+--   * @spentUtxos@ MUST contain a 'Coin' entry for every non-coinbase
+--     prevout this block consumes (Core-format height + coinbase
+--     metadata, sourced post-disconnect from a virtual overlay so
+--     mid-reorg consistency holds).
+--   * The block must already have passed full validation
+--     ('validateFullBlockIO').
+--
+-- This is the building block for multi-block atomicity in
+-- 'doSideBranchReorg': accumulate ops across the entire reorg
+-- sequence and commit ONCE at the end.  Crash before the final
+-- commit → on-disk state is unchanged → restart sees pre-reorg
+-- chainstate, no partial reorg.
+--
+-- Reference: bitcoin-core/src/validation.cpp ConnectBlock +
+-- Pattern D atomicity audit
+-- (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+buildConnectBlockOps :: Network -> Block -> Word32
+                     -> Map OutPoint Coin
+                     -> [BatchOp]
+buildConnectBlockOps _net block height spentUtxos =
+  let bh = computeBlockHash (blockHeader block)
+      prevHash = bhPrevBlock (blockHeader block)
+      txns = blockTxns block
+      txids = map computeTxId txns
+      mkTxInUndo inp = case Map.lookup (txInPrevOutput inp) spentUtxos of
+        Just c  -> Just (TxInUndo (coinTxOut c)
+                                  (coinHeight c)
+                                  (coinIsCoinbase c))
+        Nothing -> Nothing
+      mkTxUndo tx = TxUndo
+        { tuPrevOutputs = mapMaybe mkTxInUndo (txInputs tx) }
+      blockUndo = BlockUndo
+        { buTxUndo = map mkTxUndo (drop 1 txns)
+        }
+      undoData = mkUndoData bh height prevHash blockUndo
+      undoKey  = BS.cons 0x10 (encode bh)
+      coinbaseFlag txIdx = txIdx == (0 :: Int)
+  in concat
+       [ -- New UTXOs (skip provably-unspendable; same filter as
+         -- 'connectBlock').
+         [ BatchPut (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
+                    (encode (Coin { coinTxOut = txout
+                                  , coinHeight = height
+                                  , coinIsCoinbase = coinbaseFlag txIdx }))
+         | (txIdx, txid, tx) <- zip3 [0..] txids txns
+         , (i, txout) <- zip [0..] (txOutputs tx)
+         , not (isUnspendable (txOutScript txout))
+         ]
+       , -- Spent UTXOs (skip coinbase).
+         [ BatchDelete (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
+         | tx <- drop 1 txns
+         , inp <- txInputs tx
+         ]
+       , -- Per-block undo data (same key format as 'connectBlock').
+         [ BatchPut undoKey (encode undoData) ]
+       , -- Transaction index entries.
+         [ BatchPut (makeKey PrefixTxIndex (encode txid))
+                    (encode (TxLocation bh (fromIntegral i)))
+         | (i, txid) <- zip [0..] txids
+         ]
+       , -- Chain state pointers (PrefixBestBlock + headers + height).
+         [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
+         , BatchPut (makeKey PrefixBlockHeader (encode bh))
+                    (encode (blockHeader block))
+         , BatchPut (makeKey PrefixBlockHeight (encode (toBE32 height)))
+                    (encode bh)
+         ]
+       ]
+
+-- | Pure batch-op builder for a disconnect-block step.  Computes the
+-- exact same RocksDB ops 'disconnectBlock' would write, but returns
+-- them instead of invoking 'writeBatch'.
+--
+-- Caller responsibilities:
+--   * @undoData@ must already be loaded + checksum-verified
+--     ('getUndoDataVerified').
+--   * The /sanity/ check (TxUndo count == non-coinbase tx count)
+--     is performed here and surfaces as 'Left' on mismatch.
+--
+-- Returns 'Right [BatchOp]' on success or 'Left err' on undo-shape
+-- mismatch.  The caller accumulates the ops into a single
+-- 'WriteBatch' for the multi-block reorg.
+--
+-- Reference: bitcoin-core/src/validation.cpp DisconnectBlock + the
+-- Pattern D atomicity audit (single-batch reorg).
+buildDisconnectBlockOps :: Block -> BlockHash -> UndoData
+                        -> Either String [BatchOp]
+buildDisconnectBlockOps block prevHash undoData =
+  let txns = blockTxns block
+      txUndos = buTxUndo (udBlockUndo undoData)
+      nonCoinbase = drop 1 txns
+  in if length txUndos /= length nonCoinbase
+     then Left $
+       "buildDisconnectBlockOps: undo data has "
+       <> show (length txUndos)
+       <> " TxUndo entries, but block has "
+       <> show (length nonCoinbase)
+       <> " non-coinbase txs"
+     else
+       let txids = map computeTxId txns
+           restoreOps =
+             [ BatchPut (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
+                        (encode (Coin { coinTxOut = tuOutput tin
+                                      , coinHeight = tuHeight tin
+                                      , coinIsCoinbase = tuCoinbase tin }))
+             | (tx, txUndo) <- zip nonCoinbase txUndos
+             , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
+             ]
+           removeOps =
+             [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
+             | (txid, tx) <- zip txids txns
+             , (i, _) <- zip [0..] (txOutputs tx)
+             ]
+           bestBlockOp =
+             [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
+       in Right (restoreOps ++ removeOps ++ bestBlockOp)
 
 --------------------------------------------------------------------------------
 -- Header Chain Types
