@@ -736,7 +736,14 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- (Core parity; audit 2026-05-05 Bug 4); 'getblockchaininfo'
     -- reports pruned/automatic_pruning/prune_target_size from this
     -- config; the BlockStore is required for the manual RPC path.
-    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore Nothing pruneCfg
+    --
+    -- Wire a WalletManager so the createwallet/loadwallet/unloadwallet/
+    -- listwallets/getwalletinfo/getbalance RPCs land in real code instead
+    -- of the previous lying-stub handlers (Cat-H Part-2 audit
+    -- 2026-05-06: Rpc.hs:3124-3152 returned 200 OK + empty bodies).
+    -- The manager owns its wallet directory under {datadir}/wallets/.
+    walletMgr <- newWalletManager (dataDir </> "wallets") net
+    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore (Just walletMgr) pruneCfg
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
 
     -- Periodic chainstate flush.

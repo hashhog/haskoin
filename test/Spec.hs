@@ -13893,6 +13893,73 @@ main = hspec $ do
             Just other -> expectationFailure $ "wrong SockAddr type: " ++ show other
             Nothing    -> expectationFailure "banEntryToSockAddr returned Nothing"
 
+  -- Multi-wallet management: closes Cat-H Part-2 P0 (Rpc.hs:3124-3152
+  -- previously returned 200 OK + empty body for createwallet, loadwallet,
+  -- unloadwallet, listwallets, getwalletinfo, getbalance even though
+  -- WalletManager existed in Wallet.hs).  Tests exercise the
+  -- WalletManager directly to avoid spinning up a full RPC server.
+  describe "WalletManager (Cat-H Part-2 P0 wallet wave)" $ do
+    it "createManagedWallet adds the wallet and listManagedWallets reflects it" $ do
+      withSystemTempDirectory "haskoin-walletmgr-create" $ \tmp -> do
+        wm <- newWalletManager tmp regtest
+        before <- listManagedWallets wm
+        before `shouldBe` []
+        result <- createManagedWallet wm "alice" False False
+        case result of
+          Left err  -> expectationFailure $ "createManagedWallet failed: " ++ T.unpack err
+          Right _ws -> do
+            after <- listManagedWallets wm
+            after `shouldBe` ["alice"]
+            -- Default wallet is the only one loaded
+            (mDefault, count) <- getDefaultWallet wm
+            count `shouldBe` 1
+            case mDefault of
+              Just _  -> return ()
+              Nothing -> expectationFailure "getDefaultWallet returned Nothing after create"
+
+    it "loadManagedWallet on a missing wallet name returns Left (wallet-not-found)" $ do
+      withSystemTempDirectory "haskoin-walletmgr-load-missing" $ \tmp -> do
+        wm <- newWalletManager tmp regtest
+        result <- loadManagedWallet wm "does-not-exist"
+        case result of
+          Left err -> err `shouldSatisfy` ("not found" `T.isInfixOf`)
+          Right _  -> expectationFailure "loadManagedWallet should fail for missing wallet"
+
+    it "unloadManagedWallet removes the wallet from listManagedWallets" $ do
+      withSystemTempDirectory "haskoin-walletmgr-unload" $ \tmp -> do
+        wm <- newWalletManager tmp regtest
+        _ <- createManagedWallet wm "bob" False False
+        loaded <- listManagedWallets wm
+        loaded `shouldBe` ["bob"]
+        unload <- unloadManagedWallet wm "bob"
+        case unload of
+          Left err -> expectationFailure $ "unloadManagedWallet failed: " ++ T.unpack err
+          Right () -> do
+            after <- listManagedWallets wm
+            after `shouldBe` []
+            (mDefault, count) <- getDefaultWallet wm
+            count `shouldBe` 0
+            case mDefault of
+              Nothing -> return ()
+              Just _  -> expectationFailure "getDefaultWallet should be Nothing post-unload"
+
+  describe "walletcreatefundedpsbt routing (Cat-H Part-2 wave)" $ do
+    -- The handler delegates the heavy lifting to Wallet.hs's
+    -- 'selectCoinsWithHeight'.  We don't have access to the dispatcher
+    -- in-process without a full RPC server, so we exercise the
+    -- coin-selector directly to confirm the "no UTXOs => insufficient
+    -- funds" failure mode that the handler maps to RPC error -1.
+    it "selectCoinsWithHeight returns Insufficient funds against a fresh wallet" $ do
+      let cfg = WalletConfig regtest 20 ""
+      (_mnemonic, w) <- createWallet cfg
+      -- Use the wallet's own bech32 receive address (descriptor-derived).
+      addr <- getReceiveAddressAt w 0
+      let outs = [WalletTxOutput addr 100_000]
+      result <- selectCoinsWithHeight w outs (FeeRate 1000) 0
+      case result of
+        Left err -> err `shouldSatisfy` ("nsufficient" `isInfixOf`)
+        Right _  -> expectationFailure "selectCoinsWithHeight should fail with no UTXOs"
+
   where
     sampleTx = Tx
       { txVersion = 1
