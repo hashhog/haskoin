@@ -160,6 +160,12 @@ module Haskoin.Storage
   , defaultPruneConfig
   , minPruneTarget
   , minBlocksToKeep
+  , pruneTargetManual
+  , parsePruneArg
+  , pruneConfigEnabled
+  , pruneConfigManual
+  , pruneConfigAutoTarget
+  , autoPruneIfNeeded
   , findFilesToPrune
   , pruneOneBlockFile
   , calculateCurrentUsage
@@ -2135,6 +2141,100 @@ defaultPruneConfig = PruneConfig
   { pcPruneTarget = Nothing
   , pcMinBlocksToKeep = minBlocksToKeep
   }
+
+-- | Sentinel target for manual pruning mode. Mirrors Bitcoin Core's
+-- @BlockManager::PRUNE_TARGET_MANUAL = numeric_limits<uint64_t>::max()@
+-- (bitcoin-core/src/node/blockstorage.h:408). When @pcPruneTarget@ is
+-- this value the auto-prune trigger is suppressed and pruning happens
+-- only via the @pruneblockchain@ RPC.
+pruneTargetManual :: Int64
+pruneTargetManual = maxBound
+
+-- | Parse the @-prune=N@ command-line argument with Bitcoin Core
+-- semantics. Mirrors @ApplyArgsManOptions@ in
+-- @bitcoin-core/src/node/blockmanager_args.cpp@:
+--
+-- @
+--   * N == 0       -> pruning disabled (defaultPruneConfig)
+--   * N == 1       -> manual pruning (PRUNE_TARGET_MANUAL,
+--                     auto-prune off; pruneblockchain RPC armed)
+--   * N \< 0       -> error: "Prune cannot be configured with a
+--                     negative value."
+--   * 2 <= N \< 550 -> error: below MIN_DISK_SPACE_FOR_BLOCK_FILES
+--                     (550 MiB)
+--   * N >= 550     -> auto-prune at N MiB
+-- @
+--
+-- Returns 'Right' with a fully-populated 'PruneConfig' on success, or
+-- 'Left' with the exact Core wording on failure.
+parsePruneArg :: Int -> Either String PruneConfig
+parsePruneArg n
+  | n < 0 =
+      Left "Prune cannot be configured with a negative value."
+  | n == 0 =
+      Right defaultPruneConfig
+  | n == 1 =
+      Right defaultPruneConfig
+        { pcPruneTarget = Just pruneTargetManual }
+  | n < minPruneTargetMiB =
+      Left $ "Prune configured below the minimum of "
+          ++ show minPruneTargetMiB
+          ++ " MiB.  Please use a higher number."
+  | otherwise =
+      Right defaultPruneConfig
+        { pcPruneTarget =
+            Just (fromIntegral n * 1024 * 1024) }
+  where
+    -- 550 MiB, expressed in MiB so the comparison matches Core's
+    -- check on the raw -prune=<MiB> argument before scaling.
+    minPruneTargetMiB :: Int
+    minPruneTargetMiB = 550
+
+-- | True iff pruning is enabled in any mode (manual or auto).
+-- Mirrors Bitcoin Core's @fPruneMode@ (init.cpp), which is set to true
+-- as soon as @nPruneTarget != 0@.
+pruneConfigEnabled :: PruneConfig -> Bool
+pruneConfigEnabled cfg = case pcPruneTarget cfg of
+  Nothing -> False
+  Just _  -> True
+
+-- | True iff pruning is in manual mode (@-prune=1@).  Auto-prune is
+-- suppressed in this mode; pruning happens only via the
+-- @pruneblockchain@ RPC.  Mirrors Core's
+-- @BlockManager::IsPruningManual()@.
+pruneConfigManual :: PruneConfig -> Bool
+pruneConfigManual cfg = case pcPruneTarget cfg of
+  Just t | t == pruneTargetManual -> True
+  _                               -> False
+
+-- | Extract the auto-prune target in bytes, if and only if pruning is
+-- enabled in auto mode (i.e. not disabled and not manual).  Returns
+-- 'Nothing' for @disabled@ and @manual@ so the post-block-connect
+-- trigger can pattern-match on it directly.
+pruneConfigAutoTarget :: PruneConfig -> Maybe Int64
+pruneConfigAutoTarget cfg = case pcPruneTarget cfg of
+  Just t | t /= pruneTargetManual -> Just t
+  _                               -> Nothing
+
+-- | Post-block-connect auto-prune trigger.  Called from the IBD /
+-- live-tip block handler; no-op unless 'PruneConfig' has a finite
+-- (non-manual) target AND current on-disk usage exceeds it.  Mirrors
+-- the @FlushStateToDisk@ branch in @bitcoin-core/src/validation.cpp@
+-- that calls @PruneBlockFiles@ when @fPruneMode && !fReindex@.
+--
+-- Returns the number of files actually pruned (zero on the disabled
+-- and manual paths, and on the common "below target" fast path).
+-- Errors are caught and reported to stderr; pruning is best-effort
+-- and must never abort block connection.
+autoPruneIfNeeded :: BlockStore -> Word32 -> PruneConfig -> IO Int
+autoPruneIfNeeded store tipHeight cfg =
+  case pruneConfigAutoTarget cfg of
+    Nothing     -> return 0  -- disabled or manual
+    Just target -> do
+      fileInfos <- readIORef (bsFileInfos store)
+      let toPrune = findFilesToPrune tipHeight target fileInfos
+      forM_ toPrune (pruneOneBlockFile store)
+      return (length toPrune)
 
 -- | Format a rev (undo) file path: rev{nnnnn}.dat
 revFilePath :: FilePath -> Int -> FilePath
