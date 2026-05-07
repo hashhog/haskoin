@@ -165,18 +165,24 @@ module Haskoin.Wallet
     -- * Sign-side primitives (exposed for tests / advanced callers)
   , signWithKey
   , signWithKeyTaproot
+  , signWithKeyTapscript
   , derivePubKeyFromPrivate
   , computeLegacySighash
   , computeSegwitSighash
   , computeSegwitSighashFromProgram
   , computeSegwitSighashScriptCode
   , computeTaprootKeyPathSighash
+  , computeTaprootScriptPathSighash
   , isP2PKHScript
   , isP2WPKHScript
   , isP2WSHScript
   , isP2SHScript
   , isP2TRScript
   , getP2TRProgram
+    -- * Tapscript single-leaf wallet integration (W18)
+  , tapscriptLeafScriptPsbtKey
+  , tapscriptControlBlockPsbtKey
+  , isSingleKeyOpChecksigTapscript
     -- * PSBT Utilities
   , decodePsbt
   , encodePsbt
@@ -2692,6 +2698,7 @@ signInput xkey tx prevouts inputIdx pinp
             shType = maybe 0x01 id (piSighashType pinp)
         in if canSign pubKeyHash script || canSignWrapped pubKeyHash script pinp
               || canSignTaproot xkey script pinp
+              || canSignTapscript xkey script pinp
            then addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
            else pinp
 
@@ -2789,6 +2796,38 @@ canSignTaproot xkey script _pinp
       in case mTweaked of
            Just (k, _) -> k == outputKey
            Nothing     -> False
+  | otherwise = False
+
+-- | Phase 4 / W18: can we sign for a Taproot script-path (tapscript) spend
+-- with the given key?  We require:
+--
+--   * The prevout is a P2TR script.
+--   * 'piUnknown' carries both the leaf script (under
+--     'tapscriptLeafScriptPsbtKey') and the control block (under
+--     'tapscriptControlBlockPsbtKey').
+--   * The leaf script is a single-key OP_CHECKSIG tapscript whose pubkey
+--     matches our x-only internal key.
+--   * The control block decodes, has BIP-342 leaf version 0xc0, and its
+--     embedded internal pubkey matches ours.  (We do not currently check
+--     the Merkle path commits to the on-chain output key — that would
+--     require recomputing the tweak for every leaf in a MAST tree, which
+--     is exactly the scope we deferred.  Single-leaf trees pass naturally
+--     because the path is empty.)
+--
+-- Multi-leaf MAST, multisig predicates, OP_CHECKSIGADD, BIP-371 fields,
+-- and ANNEX handling are explicitly out of scope.  See 'addSignature'
+-- for the corresponding "not yet implemented" branches.
+canSignTapscript :: ExtendedKey -> ByteString -> PsbtInput -> Bool
+canSignTapscript xkey script pinp
+  | isP2TRScript script
+  , Just leafScript  <- Map.lookup tapscriptLeafScriptPsbtKey   (piUnknown pinp)
+  , Just cbBytes     <- Map.lookup tapscriptControlBlockPsbtKey (piUnknown pinp)
+  , Just cb          <- TS.decodeControlBlock cbBytes
+  , TS.cbLeafVersion cb == TS.tapscriptLeafVersion
+  , let SecKey sk = ekKey xkey
+  , Just internalX <- xonlyPubkeyFromSeckey sk
+  , TS.cbInternalPubkey cb == internalX
+  = isSingleKeyOpChecksigTapscript leafScript internalX
   | otherwise = False
 
 -- | Check if script is P2PKH
@@ -2908,6 +2947,35 @@ addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
       let sighash   = computeSegwitSighashScriptCode tx inputIdx wScript value shType
           signature = signWithKey xkey sighash shType
       in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
+  -- Phase 4 (W18): bare-P2TR script-path (tapscript, BIP-341 + BIP-342),
+  -- single-leaf single-key OP_CHECKSIG.  Detection is gated on
+  -- 'canSignTapscript' having confirmed the PSBT carries the leaf script
+  -- and control block, and the embedded internal key matches ours.
+  -- The signature is computed over the BIP-341 *script-path* sighash
+  -- (extra fields: tapleaf hash, key_version=0, codesep_pos sentinel),
+  -- and BIP-342 redefines OP_CHECKSIG to verify under the *plain* x-only
+  -- key pushed inside the script — so we sign with the raw seckey, not
+  -- the BIP-341-tweaked seckey.  Witness item is stored in
+  -- 'piPartialSigs' keyed by our internal pubkey so the finalizer can
+  -- pair it with the leaf script + control block from 'piUnknown'.
+  | isP2TRScript script
+  , Just leafScript <- Map.lookup tapscriptLeafScriptPsbtKey   (piUnknown pinp)
+  , Just _cbBytes   <- Map.lookup tapscriptControlBlockPsbtKey (piUnknown pinp) =
+      let prevoutsTS = TS.TaprootPrevouts
+            { TS.taprootAmounts = map fst prevouts
+            , TS.taprootScripts = map snd prevouts
+            }
+          taprootHashType = if shType == 0x01 && piSighashType pinp == Nothing
+                              then 0x00
+                              else fromIntegral (shType .&. 0xff) :: Word8
+      in case computeTaprootScriptPathSighash
+                  tx inputIdx prevoutsTS taprootHashType
+                  TS.tapscriptLeafVersion leafScript
+                  TS.defaultCodesepPos Nothing of
+           Left _  -> pinp  -- malformed prevouts; leave the input unsigned
+           Right sighash ->
+             let witnessSig = signWithKeyTapscript xkey sighash taprootHashType
+             in pinp { piPartialSigs = Map.insert pubKey witnessSig (piPartialSigs pinp) }
   -- Phase 5 (W16): bare-P2TR key-path (BIP-341 + BIP-86).  Witness item
   -- is the Schnorr signature alone; the finalizer writes it directly
   -- and the @piPartialSigs@ map keys the entry by our *internal* pubkey
@@ -2936,10 +3004,13 @@ addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
              let witnessItem = signWithKeyTaproot xkey sighash taprootHashType Nothing
              in pinp { piPartialSigs = Map.insert pubKey witnessItem (piPartialSigs pinp) }
   | otherwise =
-      -- TODO(haskoin-wallet-phase-5): tapscript script-path,
-      -- bare-witness multisig P2WSH and P2SH-P2WSH multi-key paths
-      -- (Combiner state expansion).
-      error "addSignature: unsupported script type (tapscript / multisig still TODO)"
+      -- W18 closed single-leaf single-key OP_CHECKSIG tapscript.  Still
+      -- deferred:
+      --   * Multi-leaf MAST trees (different leaf, deeper Merkle path)
+      --   * In-script multisig (CHECKSIGADD / multi-pk OP_CHECKSIG predicates)
+      --   * Bare-witness multisig P2WSH and P2SH-P2WSH multi-key paths
+      --     (Combiner state expansion)
+      error "addSignature: unsupported script type (multi-leaf MAST / in-script multisig / multi-key P2WSH still TODO)"
 
 -- | Compute legacy sighash
 computeLegacySighash :: Tx -> Int -> ByteString -> Word32 -> Hash256
@@ -3093,6 +3164,127 @@ signWithKeyTaproot xkey (Hash256 msg32) hashType mMerkleRoot =
   in if hashType == 0x00
        then sig64
        else sig64 `BS.snoc` hashType
+
+--------------------------------------------------------------------------------
+-- Phase 4 / W18 — Tapscript script-path (BIP-342) signing primitives.
+--
+-- Scope: single-leaf single-key OP_CHECKSIG tapscript spends only.  This is
+-- the BIP-342 analog of P2WPKH inside a Taproot leaf: the leaf script is
+-- @<32-byte-x-only-pubkey> OP_CHECKSIG@, the witness is
+-- @[sig, script, control_block]@, and the signature verifies under the
+-- *plain* x-only key pushed inside the script (NOT the tweaked output key).
+--
+-- Out of scope (explicit "not yet implemented" branches; separate waves):
+--   * Multi-leaf MAST trees (Merkle path > depth 0 in the control block —
+--     decode is supported, sign-side leaf-selection is not).
+--   * In-script multisig (multi-key OP_CHECKSIG / OP_CHECKSIGADD predicates).
+--   * OP_CHECKSIGADD (BIP-342 1-of-N / N-of-M).
+--   * ANNEX handling (witness item with leading 0x50; spec is final but no
+--     standardness rules around it have shipped on mainnet).
+--   * OP_CODESEPARATOR mid-script (would bump @codesep_pos@; the W18 wallet
+--     always uses the sentinel 0xFFFFFFFF since haskoin's interpreter does
+--     not surface non-default codesep_pos to the sign path).
+--   * BIP-371 PSBT taproot fields (PSBT_IN_TAP_LEAF_SCRIPT,
+--     PSBT_IN_TAP_INTERNAL_KEY, PSBT_IN_TAP_MERKLE_ROOT, etc.) — for the
+--     wallet round-trip we use 'piUnknown' magic keys
+--     'tapscriptLeafScriptPsbtKey' and 'tapscriptControlBlockPsbtKey'.
+--     Mapping these to the canonical BIP-371 keytypes is a follow-up.
+--------------------------------------------------------------------------------
+
+-- | Compute the BIP-341 *script-path* sighash for a tapscript spend.
+--
+-- Same as 'computeTaprootKeyPathSighash' except the BIP-341 preimage adds
+-- the script-path extension fields:
+--
+--   * 32-byte tapleaf hash (computed from leaf version + script bytes)
+--   * 1-byte key_version (always 0 today; reserved for future SF)
+--   * 4-byte LE codesep_pos (0xFFFFFFFF = no OP_CODESEPARATOR seen)
+--
+-- and the spend_type byte is 0x02 (script-path, no annex) instead of 0x00.
+-- Mirrors @bitcoin-core/src/script/interpreter.cpp::SignatureHashSchnorr@
+-- with @SIGVERSION_TAPSCRIPT@.
+--
+-- Reference: BIP-342 / @bitcoin-core/src/script/interpreter.cpp::SignatureHashSchnorr@.
+computeTaprootScriptPathSighash
+  :: Tx
+  -> Int
+  -> TS.TaprootPrevouts
+  -> Word8                       -- ^ hash_type (0x00 SIGHASH_DEFAULT default)
+  -> Word8                       -- ^ leaf version (0xc0 for current tapscript)
+  -> ByteString                  -- ^ leaf script bytes
+  -> Word32                      -- ^ codesep_pos (use 'TS.defaultCodesepPos' / 0xFFFFFFFF if no CODESEPARATOR)
+  -> Maybe ByteString            -- ^ optional annex (with leading 0x50)
+  -> Either TS.TaprootSighashError Hash256
+computeTaprootScriptPathSighash tx idx prevouts hashType leafVersion script csp annex =
+  let leafHash = TS.tapleafHashWith leafVersion script
+      ctx      = TS.TapscriptContext
+        { TS.tapleafHash = leafHash
+        , TS.codesepPos  = csp
+        }
+  in Hash256 <$> TS.computeTaprootSighash tx idx prevouts hashType annex (Just ctx)
+
+-- | Sign a 32-byte BIP-341 *script-path* sighash and return the wire-format
+-- witness signature item for a tapscript OP_CHECKSIG spend.
+--
+-- Crucially, BIP-342 redefines OP_CHECKSIG inside tapscript: the signature
+-- is verified under the *plain* x-only public key pushed by the script
+-- (NOT the tweaked output key).  So unlike 'signWithKeyTaproot', this
+-- primitive does NOT apply any tweak — it Schnorr-signs the raw seckey.
+--
+-- Hashtype byte append rule is identical to key-path:
+--   * @hashType == 0x00@ (SIGHASH_DEFAULT) → 64-byte witness item
+--   * @hashType != 0x00@                   → 65-byte witness item (sig64 ‖ ht)
+--
+-- Throws 'error' on malformed seckey / signing failure (programmer bug,
+-- never happens for a well-formed BIP-32 derived key with valid sighash).
+--
+-- Reference: bitcoin-core/src/key.cpp KeyPair::SignSchnorr +
+--            bitcoin-core/src/script/sign.cpp CreateSchnorrSig.
+signWithKeyTapscript
+  :: ExtendedKey
+  -> Hash256                 -- ^ BIP-341 script-path sighash
+  -> Word8                   -- ^ hash_type (0x00 default)
+  -> ByteString              -- ^ 64- or 65-byte witness signature item
+signWithKeyTapscript xkey (Hash256 msg32) hashType =
+  let SecKey skBytes = ekKey xkey
+      sig64 = case signSchnorr skBytes msg32 of
+        Just s  -> s
+        Nothing -> error "signWithKeyTapscript: Schnorr sign failed"
+  in if hashType == 0x00
+       then sig64
+       else sig64 `BS.snoc` hashType
+
+-- | Magic 'piUnknown' key used to carry a tapscript leaf script through
+-- a haskoin PSBT input pending BIP-371 PSBT_IN_TAP_LEAF_SCRIPT support.
+--
+-- This is haskoin-internal: external PSBTs using BIP-371 keytypes will
+-- need a translation step.  The key is intentionally implausible-as-an-
+-- external key (single byte 0xff is reserved by BIP-174 as proprietary),
+-- chosen so a real BIP-174 parser will round-trip it as opaque
+-- proprietary data without semantic interpretation.
+tapscriptLeafScriptPsbtKey :: ByteString
+tapscriptLeafScriptPsbtKey = BS.pack [0xff, 0x74, 0x6c, 0x73]  -- 0xff "tls"
+
+-- | Magic 'piUnknown' key used to carry a tapscript control block through
+-- a haskoin PSBT input pending BIP-371 PSBT_IN_TAP_LEAF_SCRIPT support.
+-- See 'tapscriptLeafScriptPsbtKey' note on the keyspace.
+tapscriptControlBlockPsbtKey :: ByteString
+tapscriptControlBlockPsbtKey = BS.pack [0xff, 0x74, 0x63, 0x62]  -- 0xff "tcb"
+
+-- | Recognise a single-key OP_CHECKSIG tapscript: @<0x20> <pk:32> <0xac>@,
+-- 34 bytes total, where the pushed pubkey matches the given x-only key.
+--
+-- This is BIP-342's analog of P2WPKH inside a tapleaf: a 1-of-1 single-key
+-- spending policy with no further predicates.  More complex tapscripts
+-- (multisig, hashlock+timelock combos, MuSig2 aggregations, etc.) are
+-- explicitly out of scope for the W18 wave.
+isSingleKeyOpChecksigTapscript :: ByteString -> ByteString -> Bool
+isSingleKeyOpChecksigTapscript script pkXOnly =
+  BS.length script == 34 &&
+  BS.length pkXOnly == 32 &&
+  BS.index  script 0  == 0x20 &&  -- push 32 bytes
+  BS.take   32 (BS.drop 1 script) == pkXOnly &&
+  BS.index  script 33 == 0xac     -- OP_CHECKSIG
 
 --------------------------------------------------------------------------------
 -- PSBT Role: Combiner
@@ -3252,6 +3444,21 @@ finalizeForScript script sigs pinp
                 ]
           in clearSigningFields $ pinp { piFinalScriptSig = Just scriptSig }
         _ -> pinp
+  -- Phase 4 (W18): bare P2TR script-path (tapscript) single-leaf
+  -- single-key OP_CHECKSIG.  Witness stack is [sig, leaf_script, control_block].
+  -- The leaf script and control block come from 'piUnknown' under the
+  -- W18 magic keys (BIP-371 PSBT taproot field translation is a
+  -- separate wave).  The control block as decoded must round-trip to
+  -- the same bytes (BIP-341 byte 0 packs leafVersion + parity), so we
+  -- emit the original PSBT bytes verbatim.
+  | isP2TRScript script
+  , Just leafScript <- Map.lookup tapscriptLeafScriptPsbtKey   (piUnknown pinp)
+  , Just cbBytes    <- Map.lookup tapscriptControlBlockPsbtKey (piUnknown pinp) =
+      case sigs of
+        [(_, sig)] ->
+          let witness = [sig, leafScript, cbBytes]
+          in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
+        _ -> pinp
   -- Phase 5 (W16): bare P2TR key-path.  Witness stack is just [sig],
   -- no pubkey (the on-chain output key is the witness program itself,
   -- and the verifier rebuilds its identity from the sig + sighash).
@@ -3263,7 +3470,7 @@ finalizeForScript script sigs pinp
           let witness = [sig]
           in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
         _ -> pinp
-  -- TODO: tapscript script-path, multi-key P2WSH.
+  -- TODO: multi-leaf tapscript MAST, in-script multisig, multi-key P2WSH.
   | otherwise = pinp
 
 -- | Encode push data for scriptSig
