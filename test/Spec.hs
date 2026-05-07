@@ -5783,6 +5783,14 @@ main = hspec $ do
       let path = parseDerivationPath "m/0/1/2"
       path `shouldBe` Just [0, 1, 2]
 
+    it "bip44Mainnet builds full m/44'/0'/acct'/chg/idx path" $ do
+      bip44Mainnet 0 0 0 `shouldBe`
+        [0x80000000 .|. 44, 0x80000000 .|. 0, 0x80000000 .|. 0, 0, 0]
+      bip84Mainnet 0 1 7 `shouldBe`
+        [0x80000000 .|. 84, 0x80000000 .|. 0, 0x80000000 .|. 0, 1, 7]
+      bip86Mainnet 1 0 0 `shouldBe`
+        [0x80000000 .|. 86, 0x80000000 .|. 0, 0x80000000 .|. 1, 0, 0]
+
   -- BIP-32 published test vectors:
   --   <https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#test-vectors>
   -- We exercise Test Vector 1 (seed = 000102030405060708090a0b0c0d0e0f).
@@ -5901,6 +5909,71 @@ main = hspec $ do
       let bad = Mnemonic (replicate 11 "abandon" ++ ["zoo"])
       validateMnemonic bad      `shouldBe` False
       mnemonicToEntropy bad     `shouldBe` Nothing
+
+  -- BIP-86 derivation vector — Wallet integration top-to-bottom:
+  --   mnemonic → master → m/86'/0'/0'/0/0 → x-only pubkey → P2TR address.
+  -- Reference vector from BIP-86:
+  --   <https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki#test-vectors>
+  describe "BIP-86 Wallet integration" $ do
+    let bip86Mnem :: Mnemonic
+        bip86Mnem = Mnemonic (T.words "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+
+    it "validates the canonical BIP-86 mnemonic" $
+      validateMnemonic bip86Mnem `shouldBe` True
+
+    it "importMnemonic accepts a valid mnemonic" $ do
+      let cfg = WalletConfig mainnet 20 ""
+      r <- importMnemonic cfg bip86Mnem
+      case r of
+        Right _ -> pure ()
+        Left e  -> expectationFailure ("importMnemonic rejected valid mnemonic: " ++ e)
+
+    it "importMnemonic rejects a corrupted mnemonic" $ do
+      let cfg = WalletConfig mainnet 20 ""
+          bad = Mnemonic (replicate 11 "abandon" ++ ["zoo"])
+      r <- importMnemonic cfg bad
+      case r of
+        Left _  -> pure ()
+        Right _ -> expectationFailure "importMnemonic accepted invalid mnemonic"
+
+    it "deriveSigningKey at m/86'/0'/0'/0/0 matches BIP-86 vector pubkey" $ do
+      -- BIP-86 §test-vectors: account 0, first receiving address
+      -- internal_key (32-byte x-only):
+      --   cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115
+      -- output_key (taproot-tweaked 32-byte x-only):
+      --   a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c
+      let cfg = WalletConfig mainnet 20 ""
+      Right w <- importMnemonic cfg bip86Mnem
+      case deriveSigningKey w (bip86Mainnet 0 0 0) of
+        Left e  -> expectationFailure ("deriveSigningKey failed: " ++ e)
+        Right (SecKey sk) -> do
+          BS.length sk `shouldBe` 32
+          -- Internal x-only pubkey (uncompressed-then-strip):
+          case xonlyPubkeyFromSeckey sk of
+            Just xonly ->
+              B16.encode xonly `shouldBe`
+                "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+            Nothing -> expectationFailure "xonlyPubkeyFromSeckey returned Nothing"
+
+    it "P2TR address at BIP-86 m/86'/0'/0'/0/0 matches the spec vector" $ do
+      let cfg = WalletConfig mainnet 20 ""
+      Right w <- importMnemonic cfg bip86Mnem
+      case deriveSigningKey w (bip86Mainnet 0 0 0) of
+        Left _ -> expectationFailure "derive failed"
+        Right (SecKey sk) ->
+          case xonlyPubkeyFromSeckey sk of
+            Nothing -> expectationFailure "xonly derive failed"
+            Just internalXOnly -> do
+              -- BIP-86 tweak (no script tree): t = HtapTweak(internal_xonly)
+              let tweak  = bip86TapTweakHash internalXOnly
+                  output = case xonlyPubkeyTweakAdd internalXOnly tweak of
+                    Just (out, _parity) -> out
+                    Nothing             -> BS.empty
+              BS.length output `shouldBe` 32
+              B16.encode output `shouldBe`
+                "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
+              addressToText (TaprootAddress (Hash256 output))
+                `shouldBe` "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"
 
   describe "Wallet" $ do
     it "createWallet generates new mnemonic and wallet" $ do
