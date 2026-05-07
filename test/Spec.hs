@@ -5096,6 +5096,112 @@ main = hspec $ do
           BS.length expected `shouldBe` 65
         _ -> expectationFailure "uncompressed signMessage failed"
 
+  -- Phase 1 of the haskoin ECDSA wiring plan
+  -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
+  -- Cover the freshly-wired sign-side primitives end-to-end:
+  --   * Crypto.derivePubKey now calls libsecp256k1 (was an `error` shim).
+  --   * Wallet.derivePubKeyFromPrivate routes through it (was sha256(sk)).
+  --   * Crypto.signMsg / signMsgMaybe produce a real DER ECDSA signature
+  --     with low-R grind (was an `error` shim).
+  --   * Wallet.signWithKey emits DER || sighash byte for the legacy
+  --     P2PKH spend path (was a 72-byte zero placeholder).
+  --
+  -- The contract we exercise here is the BIP-66 strict-DER + low-S +
+  -- defined-hashtype gate from `script/interpreter.cpp`, plus a verify
+  -- round-trip via the existing FFI binding `verifyMsgLax` (which is
+  -- the same primitive the consensus interpreter uses for ECDSA
+  -- signatures inside CHECKSIG).
+  describe "ECDSA legacy sign path (Phase 1: P2PKH)" $ do
+    -- Deterministic test vector: secret key = 0x01..0x01 (32 bytes).
+    -- Same key used by the signmessage tests above so we know the
+    -- libsecp pubkey-derive path is exercised in lockstep.
+    let testSk      = SecKey (BS.replicate 32 0x01)
+        testHash    = Hash256 (sha256 (TE.encodeUtf8 (T.pack "haskoin Phase 1 sighash")))
+        sigHashAll' = 0x01 :: Word32
+
+    it "derivePubKey is no longer the sha256(sk) stub" $ do
+      -- Pre-fix this returned PubKeyCompressed (prefix ++ take 32 (sha256 sk)).
+      -- We assert the modern output matches the FFI-backed derivation.
+      let fromPrim   = derivePubKeyCompressed testSk
+          fromExport = derivePubKey testSk
+      case fromPrim of
+        Nothing -> expectationFailure "derivePubKeyCompressed: Nothing"
+        Just bs -> fromExport `shouldBe` PubKeyCompressed bs
+
+    it "signMsgMaybe yields a parseable DER signature" $ do
+      case signMsgMaybe testSk testHash of
+        Nothing -> expectationFailure "signMsgMaybe: Nothing on a fresh seckey"
+        Just (Sig der) -> do
+          -- DER framing: 0x30 <total-len> 0x02 ... 0x02 ...
+          BS.head der `shouldBe` 0x30
+          -- libsecp's DER output for a 32-byte hash + 32-byte seckey is in
+          -- [70..72] bytes after low-R grind (occasionally 71, never > 72).
+          (BS.length der >= 64 && BS.length der <= 72) `shouldBe` True
+
+    it "low-R grind: top bit of R is clear (matches Core wallet)" $ do
+      case signMsgMaybe testSk testHash of
+        Nothing -> expectationFailure "signMsgMaybe: Nothing"
+        Just (Sig der) -> do
+          -- DER layout: 0x30 lenT 0x02 lenR R[lenR] ...
+          let rLen   = fromIntegral (BS.index der 3) :: Int
+              rStart = 4
+              rByte0 = BS.index der rStart
+              -- If R has a leading 0x00 (signed-int padding), R itself is
+              -- the byte after the pad.
+              rTopByte = if rByte0 == 0x00 && rLen > 1
+                         then BS.index der (rStart + 1)
+                         else rByte0
+          (rTopByte .&. 0x80) `shouldBe` 0
+
+    it "signWithKey output verifies under the derived pubkey (CHECKSIG path)" $ do
+      let xkey = ExtendedKey
+            { ekKey       = testSk
+            , ekChainCode = BS.replicate 32 0x00
+            , ekDepth     = 0
+            , ekParentFP  = 0
+            , ekIndex     = 0
+            }
+          spendSig = signWithKey xkey testHash sigHashAll'
+          pubKey   = derivePubKeyFromPrivate testSk
+      -- Wire format: DER || sighash byte.  The interpreter strips the
+      -- last byte before passing the bytes to `secp256k1_ecdsa_verify`.
+      BS.last spendSig `shouldBe` 0x01
+      let der = BS.init spendSig
+      verifyMsgLax pubKey (Sig der) testHash `shouldBe` True
+
+    it "signWithKey output passes BIP-66 strict-DER + low-S gates" $ do
+      let xkey = ExtendedKey
+            { ekKey       = testSk
+            , ekChainCode = BS.replicate 32 0x00
+            , ekDepth     = 0
+            , ekParentFP  = 0
+            , ekIndex     = 0
+            }
+          spendSig = signWithKey xkey testHash sigHashAll'
+      -- These three checks are exactly the gates Core applies in
+      -- script/interpreter.cpp `CheckSignatureEncoding`:
+      --   * IsValidSignatureEncoding (BIP-66 strict DER)
+      --   * IsLowDERSignature        (BIP-62 low-S)
+      --   * IsDefinedHashtypeSignature
+      isValidDERSignature spendSig    `shouldBe` True
+      isLowDERSignature   spendSig    `shouldBe` True
+      isDefinedSigHashType (BS.last spendSig) `shouldBe` True
+
+    it "tampered sighash no longer verifies (sanity)" $ do
+      let xkey = ExtendedKey
+            { ekKey       = testSk
+            , ekChainCode = BS.replicate 32 0x00
+            , ekDepth     = 0
+            , ekParentFP  = 0
+            , ekIndex     = 0
+            }
+          Hash256 hb       = testHash
+          tamperedHash     = Hash256 (BS.cons (BS.head hb `xor` 0x01) (BS.tail hb))
+          spendSig         = signWithKey xkey testHash sigHashAll'
+          pubKey           = derivePubKeyFromPrivate testSk
+          der              = BS.init spendSig
+      verifyMsgLax pubKey (Sig der) tamperedHash `shouldBe` False
+
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,
   -- insert both into the mempool indexes by hand (the real validation path
