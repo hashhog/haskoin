@@ -22,6 +22,7 @@ module Haskoin.Crypto
     -- * Signatures
   , Sig(..)
   , signMsg
+  , signMsgMaybe
   , verifyMsg
   , verifyMsgLax
   , serializeSigDER
@@ -100,7 +101,7 @@ import Foreign.C.Types (CUChar, CSize(..), CInt(..))
 import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (allocaArray)
-import Foreign.Storable (peek)
+import Foreign.Storable (peek, poke)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), Wtxid(..), BlockHash(..),
                       Tx(..), TxIn(..), TxOut(..), BlockHeader(..), OutPoint(..),
@@ -162,6 +163,17 @@ foreign import ccall unsafe "haskoin_ec_pubkey_decompress"
   c_ec_pubkey_decompress :: Ptr CUChar  -- compressed33
                          -> Ptr CUChar  -- out65
                          -> IO CInt
+
+-- | FFI binding for ECDSA DER-encoded signing (transaction-spend path).
+-- Wraps libsecp256k1's @secp256k1_ecdsa_sign@ + DER serialize, with an
+-- optional low-R grind that matches Core's @CKey::Sign@.
+foreign import ccall unsafe "haskoin_ecdsa_sign_der"
+  c_ecdsa_sign_der :: Ptr CUChar    -- seckey32
+                   -> Ptr CUChar    -- msghash32
+                   -> CInt          -- grind flag (0/1)
+                   -> Ptr CUChar    -- output buffer (>=72 bytes)
+                   -> Ptr CSize     -- in: capacity, out: written length
+                   -> IO CInt
 
 --------------------------------------------------------------------------------
 -- Hashing Functions
@@ -303,10 +315,49 @@ parsePubKey bs
 newtype Sig = Sig { getSigBytes :: ByteString }
   deriving (Show, Eq, Generic)
 
--- | Sign a message hash with a secret key
--- Placeholder - requires secp256k1 FFI for production use
+-- | Sign a 32-byte message hash with a 32-byte secret key, returning a
+-- DER-encoded ECDSA signature WITHOUT the trailing sighash byte.
+--
+-- Backed by libsecp256k1 via 'c_ecdsa_sign_der'.  Uses RFC-6979
+-- deterministic-k and grinds for low-R, matching Core's
+-- @CKey::Sign(hash, sig, /*grind=*/true)@ (`bitcoin-core/src/key.cpp:209-235`).
+-- The C wrapper self-verifies the produced signature before returning,
+-- so a 'Sig' coming out of this function is guaranteed to verify under
+-- the corresponding pubkey.
+--
+-- Throws via 'error' on a malformed or out-of-range seckey, mirroring
+-- the existing total signature.  Callers that can recover from a bad
+-- seckey should use 'signMsgMaybe'.
 signMsg :: SecKey -> Hash256 -> Sig
-signMsg _sk _hash = error "signMsg: requires secp256k1 FFI"
+signMsg sk hash = case signMsgMaybe sk hash of
+  Just s  -> s
+  Nothing -> error "signMsg: invalid secp256k1 secret key"
+
+-- | Total variant of 'signMsg'.  Returns 'Nothing' on any failure
+-- (invalid seckey, self-verify mismatch).  This is the right primitive
+-- for the wallet sign path, which should silently skip an input rather
+-- than abort the whole tx.
+signMsgMaybe :: SecKey -> Hash256 -> Maybe Sig
+signMsgMaybe (SecKey skBytes) (Hash256 hashBytes)
+  | BS.length skBytes /= 32 = Nothing
+  | BS.length hashBytes /= 32 = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen skBytes $ \(skPtr, _) ->
+        BS.useAsCStringLen hashBytes $ \(hashPtr, _) ->
+          allocaArray 72 $ \outPtr ->
+            alloca $ \lenPtr -> do
+              -- Tell the C side our buffer capacity.
+              poke lenPtr 72
+              ok <- c_ecdsa_sign_der
+                      (castPtr skPtr) (castPtr hashPtr)
+                      1 {- grind for low-R, matches Core's wallet -}
+                      outPtr lenPtr
+              if ok == 1
+                then do
+                  actualLen <- peek lenPtr
+                  bs <- BS.packCStringLen (castPtr outPtr, fromIntegral actualLen)
+                  return (Just (Sig bs))
+                else return Nothing
 
 -- | Verify a signature against a public key and message hash (strict DER).
 -- Uses the same lax path since strict DER is a subset.

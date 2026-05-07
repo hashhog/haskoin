@@ -2299,16 +2299,32 @@ getP2WPKHHash s
   | isP2WPKHScript s = Just $ Hash160 (BS.take 20 (BS.drop 2 s))
   | otherwise = Nothing
 
--- | Add a signature to the input
+-- | Add a signature to the input.
+--
+-- Phase 1 of the ECDSA-wiring plan only implements the legacy P2PKH
+-- spend path; segwit-v0 (P2WPKH / P2WSH / P2SH-P2WPKH) and taproot
+-- key-path are deferred to Phase 4 / Phase 5 (see
+-- @CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md@).
+-- Hitting one of those scripts at PSBT-sign time is currently a hard
+-- error rather than the previous silent 72-byte-zero placeholder, so a
+-- caller cannot accidentally broadcast an "almost signed" tx with a
+-- bogus partial sig.
 addSignature :: ExtendedKey -> PubKey -> Tx -> Int -> ByteString -> Word64 -> Word32 -> PsbtInput -> PsbtInput
-addSignature xkey pubKey tx inputIdx script value shType pinp =
-  -- Compute sighash based on script type
-  let sighash = if isP2WPKHScript script
-                then computeSegwitSighash tx inputIdx script value shType
-                else computeLegacySighash tx inputIdx script shType
-      -- Sign with private key (placeholder - needs secp256k1)
-      signature = signWithKey xkey sighash shType
-  in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
+addSignature xkey pubKey tx inputIdx script value shType pinp
+  | isP2PKHScript script =
+      let sighash   = computeLegacySighash tx inputIdx script shType
+          signature = signWithKey xkey sighash shType
+      in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
+  | isP2WPKHScript script =
+      -- TODO(haskoin-wallet-phase-4): P2WPKH (BIP-143) signing.  Sighash
+      -- plumbing already byte-exact via 'computeSegwitSighash'; what's
+      -- missing is the witness-stack finalization in 'finalizeForScript'.
+      let _sighash   = computeSegwitSighash tx inputIdx script value shType
+          _signature = signWithKey xkey _sighash shType
+      in error "addSignature: P2WPKH signing not yet implemented (Phase 4)"
+  | otherwise =
+      -- TODO(haskoin-wallet-phase-4/5): P2WSH, P2SH-P2WPKH, P2TR.
+      error "addSignature: only P2PKH signing implemented in Phase 1"
 
 -- | Compute legacy sighash
 computeLegacySighash :: Tx -> Int -> ByteString -> Word32 -> Hash256
@@ -2331,15 +2347,28 @@ computeSegwitSighash tx inputIdx script value shType =
       scriptCode = BS.pack [0x76, 0xa9, 0x14] <> pkh <> BS.pack [0x88, 0xac]
   in txSigHashSegWit tx inputIdx scriptCode value shTypeFlag
 
--- | Sign a hash with the extended key (placeholder)
+-- | Sign a 32-byte sighash with the extended key's private scalar and
+-- return the wire-format spend-side ECDSA signature: DER-encoded
+-- @secp256k1_ecdsa_sign@ output WITH the sighash-type byte appended,
+-- as specified by @CreateSig@ in @bitcoin-core/src/script/sign.cpp@.
+--
+-- Backed by the libsecp256k1 FFI binding 'Crypto.signMsgMaybe' (see
+-- @cbits/secp256k1_compat.c haskoin_ecdsa_sign_der@), which uses
+-- RFC-6979 deterministic-k and grinds for low-R, exactly matching
+-- @CKey::Sign(hash, sig, /*grind=*/true)@ in
+-- @bitcoin-core/src/key.cpp:209-235@.  Internal self-verify guarantees
+-- the returned bytes verify under the corresponding pubkey before they
+-- ever leave this function.
+--
+-- Throws 'error' on a malformed seckey; this is a programmer error
+-- (callers should have validated 'ekKey' on construction) and not a
+-- recoverable runtime condition.  For a recoverable variant, see the
+-- 'signMsgMaybe' primitive directly.
 signWithKey :: ExtendedKey -> Hash256 -> Word32 -> ByteString
-signWithKey _xkey _hash _shType =
-  -- Placeholder - actual signing requires secp256k1
-  -- In production, this would:
-  -- 1. Sign the hash with ekKey using ECDSA
-  -- 2. DER-encode the signature
-  -- 3. Append the sighash type byte
-  BS.replicate 72 0x00  -- Dummy 72-byte signature
+signWithKey xkey hash shType =
+  let Sig derBytes = signMsg (ekKey xkey) hash
+      hashTypeByte = fromIntegral (shType .&. 0xff) :: Word8
+  in derBytes `BS.snoc` hashTypeByte
 
 --------------------------------------------------------------------------------
 -- PSBT Role: Combiner
