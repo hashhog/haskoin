@@ -8226,6 +8226,81 @@ main = hspec $ do
             outpoints = filter (not . T.null) $ T.splitOn "/" pathPart
         length outpoints `shouldBe` 3
 
+    --------------------------------------------------------------------
+    -- REST opt-in flag (-rest) — Bitcoin Core parity
+    -- Reference: bitcoin-core/src/init.cpp:153 DEFAULT_REST_ENABLE = false
+    -- Audit: CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
+    --        (R7 / Pattern P4): haskoin previously bound REST always-on.
+    --------------------------------------------------------------------
+    describe "REST opt-in flag (-rest)" $ do
+      it "defaultRpcConfig has REST disabled by default (matches Core)" $ do
+        rpcRestEnabled defaultRpcConfig `shouldBe` False
+
+      it "rpcRestEnabled is a record field on RpcConfig" $ do
+        -- Sanity check that we can flip the flag positively.
+        let cfg = defaultRpcConfig { rpcRestEnabled = True }
+        rpcRestEnabled cfg `shouldBe` True
+
+      it "flipping rpcRestEnabled does not affect other defaults" $ do
+        let cfg = defaultRpcConfig { rpcRestEnabled = True }
+        rpcPort cfg `shouldBe` rpcPort defaultRpcConfig
+        rpcUser cfg `shouldBe` rpcUser defaultRpcConfig
+        rpcHost cfg `shouldBe` rpcHost defaultRpcConfig
+
+    --------------------------------------------------------------------
+    -- REST blockfilter / blockfilterheaders (BIP-157/158)
+    -- Reference: bitcoin-core/src/rest.cpp rest_block_filter
+    --                                       rest_filter_header
+    -- Audit: same as above, R8 (P2 fleet-wide) — endpoint missing.
+    --------------------------------------------------------------------
+    describe "REST blockfilter handlers" $ do
+      it "parseFilterTypeName accepts 'basic' (case-insensitive)" $ do
+        parseFilterTypeName "basic"  `shouldBe` Just BasicBlockFilter
+        parseFilterTypeName "BASIC"  `shouldBe` Just BasicBlockFilter
+        parseFilterTypeName "Basic"  `shouldBe` Just BasicBlockFilter
+
+      it "parseFilterTypeName rejects unknown filter types" $ do
+        parseFilterTypeName "extended" `shouldBe` Nothing
+        parseFilterTypeName ""         `shouldBe` Nothing
+        parseFilterTypeName "neutrino" `shouldBe` Nothing
+
+      it "blockfilter path-prefix detection works" $ do
+        let p = "/rest/blockfilter/basic/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.hex"
+        T.isPrefixOf "/rest/blockfilter/" p `shouldBe` True
+        -- And does not collide with the headers prefix.
+        T.isPrefixOf "/rest/blockfilterheaders/" p `shouldBe` False
+
+      it "blockfilterheaders path-prefix detection works" $ do
+        let p = "/rest/blockfilterheaders/basic/5/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.bin"
+        T.isPrefixOf "/rest/blockfilterheaders/" p `shouldBe` True
+
+      it "blockfilter URI shape is <filtertype>/<hash>" $ do
+        -- Same parser pattern as Core's SplitString(param, '/').
+        let pathPart = "basic/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.json"
+            (param, fmt) = parseRestFormat pathPart
+            parts = T.splitOn "/" param
+        length parts `shouldBe` 2
+        head parts `shouldBe` "basic"
+        fmt `shouldBe` RestJson
+
+      it "blockfilterheaders URI accepts deprecated 3-segment form" $ do
+        -- /rest/blockfilterheaders/<filtertype>/<count>/<hash>
+        let pathPart = "basic/10/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.bin"
+            (param, fmt) = parseRestFormat pathPart
+            parts = T.splitOn "/" param
+        length parts `shouldBe` 3
+        head parts `shouldBe` "basic"
+        parts !! 1 `shouldBe` "10"
+        fmt `shouldBe` RestBinary
+
+      it "blockfilterheaders URI accepts modern 2-segment form" $ do
+        -- /rest/blockfilterheaders/<filtertype>/<hash>?count=<n>
+        let pathPart = "basic/000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f.hex"
+            (param, fmt) = parseRestFormat pathPart
+            parts = T.splitOn "/" param
+        length parts `shouldBe` 2
+        fmt `shouldBe` RestHex
+
   describe "broadcast mechanism" $ do
     it "InvVector uses InvWitnessTx type for transactions" $ do
       let txid = TxId (Hash256 (BS.replicate 32 0xaa))

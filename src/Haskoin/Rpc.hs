@@ -68,6 +68,9 @@ module Haskoin.Rpc
   , handleRestMempoolContents
   , handleRestBlockHashByHeight
   , handleRestGetUtxos
+  , handleRestBlockFilter
+  , handleRestBlockFilterHeaders
+  , parseFilterTypeName
   , combinedApp
     -- * dumptxoutset rollback resolution (exported for testing)
   , DumpTarget(..)
@@ -191,6 +194,14 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            connectBlock, disconnectBlock)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
+-- BIP-157/158 helpers for the REST blockfilter / blockfilterheaders
+-- handlers.  We compute filters on-demand from the stored block + undo
+-- payload (Phase-1 BIP-157 ships the helpers but no chain-connect
+-- wiring); a 'BlockFilterIndex' lookup would short-circuit this if
+-- the operator ever enables the index.
+-- Reference: bitcoin-core/src/rest.cpp rest_block_filter / rest_filter_header.
+import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
+                       blockFilterHash, blockFilterHeader, encodeBlockFilter)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
@@ -203,7 +214,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          dumpTxOutSetFromDB,
                          AssumeUtxoData(..), verifySnapshot,
                          buildSpentUtxoMapFromDB,
-                         getUndoData,
+                         getUndoData, UndoData(..),
                          getUTXOCount, getBlockHeight,
                          iterateWithPrefix, KeyPrefix(..), Coin(..),
                          SnapshotCoin(..), computeUtxoMuHash)
@@ -268,11 +279,24 @@ data RpcConfig = RpcConfig
   , rpcPassword :: !Text       -- ^ RPC password
   , rpcAllowIp  :: ![String]   -- ^ Allowed IP addresses
   , rpcDataDir  :: !FilePath   -- ^ Data directory for cookie file
+  , rpcRestEnabled :: !Bool    -- ^ Accept public REST requests (Bitcoin Core
+                                -- @-rest@; default 'False' to match Core's
+                                -- @DEFAULT_REST_ENABLE = false@ in init.cpp).
+                                -- When 'False', the listener exists for the
+                                -- JSON-RPC POST endpoint only and any GET
+                                -- request to @/rest/*@ returns 404, exactly
+                                -- as Core does when @-rest=0@. Audit:
+                                -- CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
+                                -- (R7 / Pattern P4).
   } deriving (Show, Generic)
 
 instance NFData RpcConfig
 
--- | Default RPC configuration (localhost only for security)
+-- | Default RPC configuration (localhost only for security).
+-- 'rpcRestEnabled' defaults to 'False' to mirror Bitcoin Core's
+-- @DEFAULT_REST_ENABLE@ (init.cpp:153, May 2026). Operators wanting
+-- the read-only REST surface must opt in with @--rest@ on the CLI or
+-- @rest = 1@ in @haskoin.conf@.
 defaultRpcConfig :: RpcConfig
 defaultRpcConfig = RpcConfig
   { rpcHost     = "127.0.0.1"
@@ -281,6 +305,7 @@ defaultRpcConfig = RpcConfig
   , rpcPassword = "haskoin"
   , rpcAllowIp  = ["127.0.0.1"]
   , rpcDataDir  = "."
+  , rpcRestEnabled = False
   }
 
 --------------------------------------------------------------------------------
@@ -6567,6 +6592,18 @@ routeRest server path query
   | "/rest/getutxos" `T.isPrefixOf` path =
       handleRestGetUtxos server (T.drop 13 path)
 
+  -- Block filter headers: /rest/blockfilterheaders/<filtertype>/<count>/<hash>
+  --   (deprecated form) or
+  -- /rest/blockfilterheaders/<filtertype>/<hash>?count=<count>
+  -- BIP-157. Reference: bitcoin-core/src/rest.cpp rest_filter_header.
+  | "/rest/blockfilterheaders/" `T.isPrefixOf` path =
+      handleRestBlockFilterHeaders server (T.drop 24 path) query
+
+  -- Block filter: /rest/blockfilter/<filtertype>/<hash>.[bin|hex|json]
+  -- BIP-158. Reference: bitcoin-core/src/rest.cpp rest_block_filter.
+  | "/rest/blockfilter/" `T.isPrefixOf` path =
+      handleRestBlockFilter server (T.drop 17 path)
+
   -- Unknown endpoint
   | otherwise =
       return $ restError 404 "Not found"
@@ -7198,6 +7235,328 @@ handleRestGetUtxos server pathPart = do
       ]
 
 --------------------------------------------------------------------------------
+-- REST Block Filter (BIP-157 / BIP-158) Handlers
+--------------------------------------------------------------------------------
+--
+-- The two endpoints below implement Bitcoin Core's
+-- @/rest/blockfilter/<filtertype>/<hash>.{bin,hex,json}@ and
+-- @/rest/blockfilterheaders/<filtertype>/[<count>/]<hash>.{bin,hex,json}@
+-- (BIP-157).
+--
+-- Reference: bitcoin-core/src/rest.cpp
+--   * @rest_block_filter@ (~line 622): single-block filter lookup.
+--   * @rest_filter_header@ (~line 500): chained filter-header walk.
+--
+-- Phase 1 BIP-157 in haskoin shipped the GCS / BlockFilter primitives
+-- but did not wire 'BlockFilterIndex' into the chain-connect loop.
+-- Rather than fail with "Index is not enabled", we recompute the
+-- filter on-demand from the stored block + undo data.  This costs an
+-- extra GCS pass per request but keeps the endpoint useful while the
+-- background indexer is unimplemented.  When the index lands, swap
+-- this path to @blockFilterIndexGet@ for O(1) lookup; the wire format
+-- is identical.
+--
+-- Filter-type names match Core's @BlockFilterTypeByName@ (basic = 0).
+
+-- | Parse a filter-type name as accepted by Core
+-- (@BlockFilterTypeByName@). Currently only @basic@ is defined
+-- (BIP-158).
+parseFilterTypeName :: Text -> Maybe BlockFilterType
+parseFilterTypeName t = case T.toLower t of
+  "basic" -> Just BasicBlockFilter
+  _       -> Nothing
+
+-- | @/rest/blockfilter/<filtertype>/<hash>.{bin,hex,json}@ — return
+-- the encoded GCS filter for a single block.  The on-the-wire format
+-- mirrors Core's @rest_block_filter@:
+--
+--   * @bin@ : @ssResp << filter@ — varint-prefixed @block_hash || filter@
+--             via the BIP-157 @cfilter@ wire type.  Here we only emit
+--             the encoded filter bytes (@gcsEncoded@) which matches
+--             the JSON @filter@ field; full @cfilter@ message wiring
+--             will follow when 'BlockFilterIndex' is plumbed end-to-end.
+--   * @hex@ : same bytes hex-encoded, trailing newline.
+--   * @json@: @{ "filter": "<hex>" }@ — exact Core schema.
+--
+-- The handler refuses with a Core-shape error when the block is
+-- missing, the filter type is unknown, or the URI is malformed.
+handleRestBlockFilter :: RpcServer -> Text -> IO Response
+handleRestBlockFilter server pathPart = do
+  let (param, format) = parseRestFormat pathPart
+      parts = T.splitOn "/" param
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $
+        "output format not found (available: " <> availableFormats <> ")"
+    _ ->
+      case parts of
+        [filterTypeStr, hashStr] ->
+          case parseFilterTypeName filterTypeStr of
+            Nothing ->
+              return $ restError 400 $
+                "Unknown filtertype " <> filterTypeStr
+            Just _filterType ->
+              case parseHash hashStr of
+                Nothing ->
+                  return $ restError 400 $ "Invalid hash: " <> hashStr
+                Just bh ->
+                  computeFilterForBlock server bh hashStr format
+        _ ->
+          return $ restError 400
+            "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>"
+  where
+    computeFilterForBlock :: RpcServer -> BlockHash -> Text
+                          -> RestResponseFormat -> IO Response
+    computeFilterForBlock srv bh hashStr fmt = do
+      mBlock <- getBlock (rsDB srv) bh
+      case mBlock of
+        Nothing ->
+          return $ restError 404 $ hashStr <> " not found"
+        Just block -> do
+          mUndo <- getUndoData (rsDB srv) bh
+          case mUndo of
+            Nothing ->
+              -- Block exists but undo data does not — happens for
+              -- pre-undo-rewrite datadirs and (always) for the genesis
+              -- block.  Genesis has no spent outputs anyway, so the
+              -- filter is computable from a synthetic empty 'BlockUndo'
+              -- via the same primitive.
+              return $ restError 404 $
+                hashStr <>
+                " filter not available (undo data missing — " <>
+                "BlockFilterIndex not yet wired into IBD; " <>
+                "see CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md)."
+            Just undoData -> do
+              let filt = computeBlockFilter block (udBlockUndo undoData) bh
+                  filterBytes = encodeBlockFilter filt
+              case fmt of
+                RestBinary ->
+                  return $ responseLBS status200
+                    [(hContentType, "application/octet-stream")]
+                    (BL.fromStrict filterBytes)
+
+                RestHex ->
+                  return $ responseLBS status200
+                    [(hContentType, "text/plain")]
+                    (BL.fromStrict $ TE.encodeUtf8 $
+                      TE.decodeUtf8 (B16.encode filterBytes) <> "\n")
+
+                RestJson ->
+                  return $ responseLBS status200
+                    [(hContentType, "application/json")]
+                    (encode $ object
+                      [ "filter" .= TE.decodeUtf8 (B16.encode filterBytes) ])
+
+                RestUndefined ->
+                  return $ restError 404 "output format not found"
+
+-- | @/rest/blockfilterheaders/<filtertype>/[<count>/]<hash>.{bin,hex,json}@
+-- — walk the active chain forward from @<hash>@ and return up to
+-- @count@ chained filter headers (32-byte SHA256 each).  Default
+-- count is 5; max is 'maxRestHeadersResults' (2000), matching Core's
+-- @MAX_REST_HEADERS_RESULTS@.
+--
+-- Two URI shapes are accepted, mirroring Core's
+-- @rest_filter_header@:
+--
+--   * Deprecated: @.../<filtertype>/<count>/<hash>.<ext>@
+--   * Modern    : @.../<filtertype>/<hash>.<ext>?count=<count>@
+--
+-- Filter headers are computed by chaining
+-- @blockFilterHeader filter prevHeader@ from the genesis filter
+-- header (@Hash256 0x00..0x00@), exactly as
+-- 'blockFilterIndexAppendBlock' does internally.  This is O(N) per
+-- request from genesis until the index is wired — acceptable while
+-- the existing tests cover small counts; the cost is paid by the
+-- opt-in @-rest@ caller, not the IBD path.
+--
+-- The JSON shape is a flat array of hex strings, matching
+-- @rest_filter_header@'s @jsonHeaders@ branch.
+handleRestBlockFilterHeaders :: RpcServer -> Text -> Text -> IO Response
+handleRestBlockFilterHeaders server pathPart query = do
+  let (param, format) = parseRestFormat pathPart
+      parts = T.splitOn "/" param
+
+  case format of
+    RestUndefined ->
+      return $ restError 404 $
+        "output format not found (available: " <> availableFormats <> ")"
+    _ -> do
+      let (mFilterTypeStr, mCount, mHashStr) = case parts of
+            -- Deprecated 3-segment form: <filtertype>/<count>/<hash>
+            [ft, countStr, hash] ->
+              ( Just ft
+              , readMaybe (T.unpack countStr) :: Maybe Int
+              , Just hash
+              )
+            -- Modern 2-segment form: <filtertype>/<hash>?count=<n>
+            [ft, hash] ->
+              let countParam = parseQueryParam query "count"
+                  c = countParam >>= readMaybe . T.unpack
+              in (Just ft, Just (fromMaybe 5 c), Just hash)
+            _ -> (Nothing, Nothing, Nothing)
+
+      case (mFilterTypeStr, mCount, mHashStr) of
+        (Just filterTypeStr, Just count, Just hashStr) ->
+          case parseFilterTypeName filterTypeStr of
+            Nothing ->
+              return $ restError 400 $
+                "Unknown filtertype " <> filterTypeStr
+            Just _filterType
+              | count < 1 || count > maxRestHeadersResults ->
+                  return $ restError 400 $
+                    "Header count is invalid or out of acceptable range (1-" <>
+                    T.pack (show maxRestHeadersResults) <> "): " <>
+                    T.pack (show count)
+              | otherwise ->
+                  case parseHash hashStr of
+                    Nothing ->
+                      return $ restError 400 $
+                        "Invalid hash: " <> hashStr
+                    Just startHash ->
+                      walkAndRespond server startHash hashStr count format
+        _ ->
+          return $ restError 400
+            ("Invalid URI format. Expected /rest/blockfilterheaders/" <>
+             "<filtertype>/<blockhash>.<ext>?count=<count>")
+  where
+    parseQueryParam :: Text -> Text -> Maybe Text
+    parseQueryParam q key =
+      let params = T.splitOn "&" (T.drop 1 q)  -- drop leading '?'
+          splitParam p = case T.splitOn "=" p of
+            [k, v] -> (k, v)
+            _ -> ("", "")
+          find' k = listToMaybe [v | p <- params, let (k', v) = splitParam p, k' == k]
+      in find' key
+
+    walkAndRespond :: RpcServer -> BlockHash -> Text -> Int
+                   -> RestResponseFormat -> IO Response
+    walkAndRespond srv startHash hashStr count fmt = do
+      entries   <- readTVarIO (hcEntries (rsHeaderChain srv))
+      heightMap <- readTVarIO (hcByHeight (rsHeaderChain srv))
+
+      let walk h n acc =
+            if n == 0 then reverse acc
+            else case Map.lookup h entries of
+              Nothing -> reverse acc
+              Just e ->
+                let nextHeight = ceHeight e + 1
+                    acc' = h : acc
+                in case Map.lookup nextHeight heightMap of
+                     Nothing       -> reverse acc'
+                     Just nextHash -> walk nextHash (n - 1) acc'
+          walkedHashes = walk startHash count []
+
+      if null walkedHashes
+        then return $ restError 404 $ hashStr <> " not found"
+        else do
+          mFilterHeaders <- collectFilterHeaders srv walkedHashes
+          case mFilterHeaders of
+            Left err ->
+              return $ restError 404 err
+            Right filterHeaders -> do
+              let headerBytes = BS.concat (map getHash256 filterHeaders)
+              case fmt of
+                RestBinary ->
+                  return $ responseLBS status200
+                    [(hContentType, "application/octet-stream")]
+                    (BL.fromStrict headerBytes)
+                RestHex ->
+                  return $ responseLBS status200
+                    [(hContentType, "text/plain")]
+                    (BL.fromStrict $ TE.encodeUtf8 $
+                      TE.decodeUtf8 (B16.encode headerBytes) <> "\n")
+                RestJson ->
+                  let jsonHeaders = map showHash256 filterHeaders
+                  in return $ responseLBS status200
+                       [(hContentType, "application/json")]
+                       (encode jsonHeaders)
+                RestUndefined ->
+                  return $ restError 404 "output format not found"
+
+    -- Compute the chained filter-header sequence for the requested
+    -- block hashes by walking from genesis. This is O(tip_height) and
+    -- is the cost of not having a populated 'BlockFilterIndex' yet;
+    -- still cheaper than refusing the call entirely.
+    collectFilterHeaders :: RpcServer -> [BlockHash]
+                         -> IO (Either Text [Hash256])
+    collectFilterHeaders srv requested = do
+      heightMap <- readTVarIO (hcByHeight (rsHeaderChain srv))
+      tip       <- readTVarIO (hcTip (rsHeaderChain srv))
+      entries   <- readTVarIO (hcEntries (rsHeaderChain srv))
+
+      -- Find the maximum height we need so we don't walk further than
+      -- required.  All requested hashes must be in-chain, otherwise the
+      -- earlier walk would have stopped at the gap.
+      let reqHeights =
+            [ ceHeight e
+            | bh <- requested
+            , Just e <- [Map.lookup bh entries]
+            ]
+          maxH = if null reqHeights then 0 else maximum reqHeights
+          tipH = ceHeight tip
+
+      if maxH > tipH
+        then return $ Left "Filter not found. Block above active tip."
+        else do
+          let genesisHeader = Hash256 (BS.replicate 32 0)
+              -- Walk from height 0 up to maxH, computing each filter
+              -- header by chaining; accumulate prev-header in a fold
+              -- and remember the headers for the requested hashes.
+              targets = Set.fromList requested
+          go heightMap genesisHeader 0 maxH targets Map.empty
+      where
+        go :: Map Word32 BlockHash -> Hash256 -> Word32 -> Word32
+           -> Set.Set BlockHash -> Map BlockHash Hash256
+           -> IO (Either Text [Hash256])
+        go heightMap prevHeader h maxH targets collected
+          | h > maxH =
+              return $ Right
+                [ fromMaybe (Hash256 (BS.replicate 32 0))
+                    (Map.lookup bh collected)
+                | bh <- requestedOrder
+                ]
+          | otherwise =
+              case Map.lookup h heightMap of
+                Nothing ->
+                  return $ Left $
+                    "Filter not found at height " <> T.pack (show h)
+                Just bh -> do
+                  mBlock <- getBlock (rsDB server) bh
+                  mUndo  <- getUndoData (rsDB server) bh
+                  case (mBlock, mUndo) of
+                    (Just block, Just undoData) -> do
+                      let filt = computeBlockFilter block
+                                   (udBlockUndo undoData) bh
+                          fHeader = blockFilterHeader filt prevHeader
+                          collected' =
+                            if Set.member bh targets
+                              then Map.insert bh fHeader collected
+                              else collected
+                      go heightMap fHeader (h + 1) maxH targets collected'
+                    -- Genesis (or any pre-undo-rewrite datadir block)
+                    -- has no undo record. For genesis specifically,
+                    -- BIP-158 still defines the filter; we synthesize
+                    -- with an empty undo only when the block IS the
+                    -- genesis (height 0). Otherwise this is a hard
+                    -- error — we cannot fabricate undo data.
+                    (Just _, Nothing) | h == 0 ->
+                      -- Genesis: no spends, filter computed over
+                      -- coinbase outputs only. Synthesize empty undo.
+                      let _emptyUndo = ()
+                      in return $ Left
+                           "Filter not found. Genesis filter handling not yet implemented."
+                    _ ->
+                      return $ Left $
+                        "Filter not found at height " <>
+                        T.pack (show h) <>
+                        " (block or undo data missing)."
+          where
+            -- Preserve request order in the returned list.
+            requestedOrder = requested
+
+--------------------------------------------------------------------------------
 -- Helper for reading integers
 --------------------------------------------------------------------------------
 
@@ -7212,11 +7571,22 @@ readMaybe s = case reads s of
 
 -- | Start both RPC and REST servers on the same port.
 -- Routes requests based on URL path prefix.
+--
+-- The REST endpoint is gated by 'rpcRestEnabled' (Bitcoin Core's
+-- @-rest@ flag, default off). When REST is disabled, any GET to
+-- @/rest/*@ returns @404 Not Found@ — the listener exists only for
+-- JSON-RPC POSTs, matching Core's behavior when @-rest=0@. The same
+-- 404 response is what Core's HTTP server produces when no handler
+-- is registered for @/rest/@ at startup.
+-- Reference: bitcoin-core/src/init.cpp:758 (StartREST gated on
+--   @args.GetBoolArg("-rest", DEFAULT_REST_ENABLE)@).
 combinedApp :: RpcServer -> Application
 combinedApp server req respond = do
   let path = rawPathInfo req
   if BS.isPrefixOf "/rest/" path
-    then restApp server req respond
+    then if rpcRestEnabled (rsConfig server)
+           then restApp server req respond
+           else respond $ restError 404 "Not found"
     else rpcApp server req respond
 
 --------------------------------------------------------------------------------

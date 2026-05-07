@@ -102,6 +102,15 @@ data NodeOptions = NodeOptions
   , noReindex            :: !Bool -- ^ -reindex: full block-index rebuild (TODO: partial impl, see below)
   , noReindexChainstate  :: !Bool -- ^ -reindex-chainstate: wipe + replay UTXO set from existing block-index
   , noLoadSnapshot       :: !(Maybe FilePath) -- ^ --load-snapshot=<path>: import a Core-format UTXO snapshot before starting peer/RPC threads
+  , noEnableRest         :: !Bool
+    -- ^ @-rest@: accept public REST GET requests on the RPC port.
+    -- Defaults to 'False' to match Bitcoin Core's
+    -- @DEFAULT_REST_ENABLE = false@ (init.cpp:153). When 'False' the
+    -- listener still serves JSON-RPC POSTs but @/rest/*@ returns 404,
+    -- matching Core's @-rest=0@ behavior. Cross-impl audit:
+    -- CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
+    -- (R7 / Pattern P4) called this out as a P3 over-exposure on
+    -- haskoin where REST was always-on.
   } deriving (Show)
 
 data WalletCommand
@@ -191,6 +200,14 @@ parseNodeOptions = NodeOptions
                 \Equivalent to invoking the loadtxoutset RPC at \
                 \startup, useful when the node has not yet started \
                 \listening on RPC."))
+  <*> switch (long "rest"
+        <> help "Accept public REST GET requests on the RPC port \
+                \(Bitcoin Core -rest, default off). When enabled, \
+                \read-only /rest/block, /rest/tx, /rest/headers, \
+                \/rest/blockfilter, /rest/blockfilterheaders, etc. \
+                \are served alongside JSON-RPC. When disabled (default), \
+                \any GET to /rest/* returns 404, matching Core's \
+                \DEFAULT_REST_ENABLE = false (init.cpp:153).")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -391,6 +408,9 @@ applyConfigOverlay cm n = n
   , noLoadSnapshot = case noLoadSnapshot n of
                      Just _  -> noLoadSnapshot n
                      Nothing -> Daemon.configLookup "load-snapshot" cm
+  , noEnableRest = if not (noEnableRest n)
+                     then Daemon.configLookupBool "rest" False cm
+                     else noEnableRest n
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
@@ -730,6 +750,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , rpcUser     = noRpcUser
           , rpcPassword = noRpcPass
           , rpcDataDir  = dataDir
+          , rpcRestEnabled = noEnableRest
+          -- ^ Bitcoin Core @-rest@ (default off). REST stays gated
+          --   behind the explicit @--rest@ flag (or @rest = 1@ in
+          --   haskoin.conf); audit
+          --   CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
+          --   flagged the previous always-on listener as a P3
+          --   over-exposure.
           }
     -- Plumb the parsed --prune=N config into the RPC server.  The
     -- 'pruneblockchain' RPC refuses calls when prune mode is off
@@ -745,6 +772,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     walletMgr <- newWalletManager (dataDir </> "wallets") net
     rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore (Just walletMgr) pruneCfg
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
+            ++ (if noEnableRest then " (REST enabled)" else " (REST disabled)")
 
     -- Periodic chainstate flush.
     -- Bitcoin Core's FlushStateToDisk flushes on a wall-clock interval
