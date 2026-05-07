@@ -137,6 +137,9 @@ module Haskoin.Wallet
   , combinePsbts
   , finalizePsbt
   , extractTransaction
+    -- * Sign-side primitives (exposed for tests / advanced callers)
+  , signWithKey
+  , derivePubKeyFromPrivate
     -- * PSBT Utilities
   , decodePsbt
   , encodePsbt
