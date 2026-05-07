@@ -69,6 +69,8 @@ module Haskoin.Crypto
     -- * Address encoding
   , base58Check
   , base58CheckDecode
+  , encodeBase58
+  , decodeBase58
   , bech32Encode
   , bech32Decode
   , bech32mEncode

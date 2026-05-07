@@ -5783,6 +5783,75 @@ main = hspec $ do
       let path = parseDerivationPath "m/0/1/2"
       path `shouldBe` Just [0, 1, 2]
 
+  -- BIP-32 published test vectors:
+  --   <https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#test-vectors>
+  -- We exercise Test Vector 1 (seed = 000102030405060708090a0b0c0d0e0f).
+  describe "BIP-32 Vectors (Test Vector 1)" $ do
+    let bip32Tv1Seed :: ByteString
+        bip32Tv1Seed = case B16.decode "000102030405060708090a0b0c0d0e0f" of
+          Right b -> b
+          Left _  -> BS.empty
+
+        bip32Tv1XprvM    = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi" :: T.Text
+        bip32Tv1XpubM    = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8" :: T.Text
+        bip32Tv1XprvM0H  = "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7" :: T.Text
+        bip32Tv1XprvM0H1 = "xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs" :: T.Text
+
+    it "encodes master xprv at chain m" $ do
+      let m = masterKey bip32Tv1Seed
+      encodeExtKey mainnet m `shouldBe` bip32Tv1XprvM
+
+    it "encodes master xpub at chain m" $ do
+      let m  = masterKey bip32Tv1Seed
+          xp = toExtendedPubKey m
+      encodeExtPubKey mainnet xp `shouldBe` bip32Tv1XpubM
+
+    it "derives m/0' (hardened) to BIP-32 vector xprv" $ do
+      let m   = masterKey bip32Tv1Seed
+          mH  = deriveHardened m 0
+      encodeExtKey mainnet mH `shouldBe` bip32Tv1XprvM0H
+
+    it "derives m/0'/1 (mixed) via derivePathPriv" $ do
+      let m   = masterKey bip32Tv1Seed
+          path = [0x80000000, 1]   -- 0' then 1
+      case derivePathPriv m path of
+        Just ek -> encodeExtKey mainnet ek `shouldBe` bip32Tv1XprvM0H1
+        Nothing -> expectationFailure "derivePathPriv returned Nothing on TV1 m/0'/1"
+
+    it "round-trips xprv encode/decode" $ do
+      let m = masterKey bip32Tv1Seed
+          encoded = encodeExtKey mainnet m
+      case decodeExtKey encoded of
+        Just (_, decoded) -> do
+          ekChainCode decoded `shouldBe` ekChainCode m
+          getSecKey (ekKey decoded) `shouldBe` getSecKey (ekKey m)
+          ekDepth decoded     `shouldBe` ekDepth m
+          ekParentFP decoded  `shouldBe` ekParentFP m
+          ekIndex decoded     `shouldBe` ekIndex m
+        Nothing -> expectationFailure "decodeExtKey failed on freshly-encoded master"
+
+    it "round-trips xpub encode/decode" $ do
+      let xp = toExtendedPubKey (masterKey bip32Tv1Seed)
+          encoded = encodeExtPubKey mainnet xp
+      case decodeExtPubKey encoded of
+        Just (_, decoded) -> do
+          epkChainCode decoded `shouldBe` epkChainCode xp
+          epkDepth decoded     `shouldBe` epkDepth xp
+        Nothing -> expectationFailure "decodeExtPubKey failed on freshly-encoded xpub"
+
+    it "decodes 'tprv' to a testnet network sentinel" $ do
+      let m       = masterKey bip32Tv1Seed
+          encoded = encodeExtKey testnet3 m
+      T.take 4 encoded `shouldBe` "tprv"
+      case decodeExtKey encoded of
+        Just (net, _) -> netName net `shouldBe` "testnet3"
+        Nothing       -> expectationFailure "decodeExtKey failed on tprv encoding"
+
+    it "rejects garbage with bad checksum" $ do
+      case decodeExtKey "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHX" of
+        Nothing -> pure ()
+        Just _  -> expectationFailure "decodeExtKey accepted bad checksum"
+
   describe "Wallet" $ do
     it "createWallet generates new mnemonic and wallet" $ do
       let config = WalletConfig mainnet 20 ""
