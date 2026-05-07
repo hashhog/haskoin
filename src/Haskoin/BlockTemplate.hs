@@ -75,8 +75,10 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlock, getBlock, getUndoDataVerified, Coin(..),
+                         putBlock, getBlock, getUndoData, getUndoDataVerified, Coin(..),
                          WriteBatch(..), BatchOp, writeBatch, isUnspendable)
+import Haskoin.Index (IndexManager, indexManagerConnectBlock,
+                       indexManagerDisconnectBlock)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions,
                          blockDisconnected)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
@@ -426,9 +428,13 @@ submitBlock :: Network         -- ^ Network configuration
             -> UTXOCache       -- ^ UTXO cache
             -> PeerManager     -- ^ Peer manager for broadcasting
             -> Mempool         -- ^ Mempool (for refill on side-branch reorg)
+            -> Maybe IndexManager
+               -- ^ Secondary indexes (txindex / blockfilterindex /
+               -- coinstatsindex). Mirrored on every successful
+               -- 'connectBlock' / disconnect during a reorg.
             -> Block           -- ^ The mined block
             -> IO (Either String ())
-submitBlock net db hc cache pm mp block = do
+submitBlock net db hc cache pm mp mIdxMgr block = do
   let bh = computeBlockHash (blockHeader block)
       header = blockHeader block
       prevHash = bhPrevBlock header
@@ -510,7 +516,7 @@ submitBlock net db hc cache pm mp block = do
           -- camlcoin 22667c2 (register_side_branch_header +
           -- try_attach_side_branch_and_reorg), rustoshi 68a422b.
           if ceHash parent /= ceHash tip
-            then submitBlockSideBranch net db hc cache pm mp block parent
+            then submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
             else do
               -- Apply block to in-memory UTXO cache (drives maturity check + builds
               -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
@@ -539,6 +545,22 @@ submitBlock net db hc cache pm mp block = do
                   -- The only thing left for us is the full block body and the
                   -- in-memory header chain update.
                   connectBlock db net block height utxoMap
+
+                  -- Mirror the connect into any opted-in secondary
+                  -- indexes.  Read the freshly-persisted undo record
+                  -- back from disk so the BlockFilterIndex sees the
+                  -- exact bytes 'disconnectBlock' would; this keeps
+                  -- the GCS filter byte-for-byte compatible with
+                  -- Bitcoin Core's blockfilterindex.cpp output.
+                  case mIdxMgr of
+                    Nothing -> return ()
+                    Just im -> do
+                      mUndo <- getUndoData db bh
+                      case mUndo of
+                        Just undoData ->
+                          indexManagerConnectBlock im block
+                            (udBlockUndo undoData) bh height
+                        Nothing -> return ()
 
                   -- Persist the full block body (separate keyspace from headers
                   -- so that getblock can return raw bytes).
@@ -579,9 +601,10 @@ submitBlock net db hc cache pm mp block = do
 --   * camlcoin 22667c2 (try_attach_side_branch_and_reorg + register_side_branch_header)
 --   * rustoshi 68a422b (Pattern Y proof of shape)
 submitBlockSideBranch :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
-                      -> PeerManager -> Mempool -> Block -> ChainEntry
+                      -> PeerManager -> Mempool -> Maybe IndexManager
+                      -> Block -> ChainEntry
                       -> IO (Either String ())
-submitBlockSideBranch net db hc cache pm mp block parent = do
+submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
   let header   = blockHeader block
       bh       = computeBlockHash header
       -- 'cumulativeWork' = parentWork + headerWork (Consensus.hs).
@@ -618,7 +641,7 @@ submitBlockSideBranch net db hc cache pm mp block parent = do
       -- 'unapplyBlock' (cache) on the way down, and 'connectBlock'
       -- (disk) + 'applyBlockToCache' (cache) on the way up — same
       -- atomic-pair pattern Sync.hs and the active-tip arm above use.
-      reorgRes <- doSideBranchReorg net db hc cache mp parent block newWork
+      reorgRes <- doSideBranchReorg net db hc cache mp mIdxMgr parent block newWork
       case reorgRes of
         Left err -> do
           -- Block + side-branch index entry are already persisted;
@@ -750,11 +773,15 @@ findSideBranchForkPoint hc db parent newTipBlock = do
 -- disconnect + connect blocks.
 doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
                   -> Mempool     -- ^ Mempool (for refill on disconnect; Pattern B)
+                  -> Maybe IndexManager
+                                 -- ^ Optional secondary indexes; mirrored
+                                 --   block-by-block during the reorg so the
+                                 --   BlockFilterIndex tracks the active chain.
                   -> ChainEntry  -- ^ parent of the new tip
                   -> Block       -- ^ new tip block
                   -> Integer     -- ^ new tip's cumulative work
                   -> IO (Either String ())
-doSideBranchReorg net db hc cache mp parent newTipBlock _newWork = do
+doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
   forkRes <- findSideBranchForkPoint hc db parent newTipBlock
   case forkRes of
     Left err -> return (Left err)
@@ -835,6 +862,42 @@ doSideBranchReorg net db hc cache mp parent newTipBlock _newWork = do
                     -- has not yet been persisted.
                     forM_ disconnectList $ \blk ->
                       blockDisconnected mp blk
+
+                    -- Mirror the reorg into any opted-in secondary
+                    -- indexes.  Disconnect-side first (delete entries
+                    -- top-down so the in-memory chain pointer rewinds
+                    -- to the fork point), then connect-side (append
+                    -- entries bottom-up so each new entry chains off
+                    -- the previous).  The IndexManager is intolerant
+                    -- of out-of-order appends: doing this in the
+                    -- wrong order produces a filter header that
+                    -- doesn't match Core's chained recompute.
+                    case mIdxMgr of
+                      Nothing -> return ()
+                      Just im -> do
+                        -- Disconnect: oldTip first → fork-child last,
+                        -- which matches @disconnectList@'s order.
+                        forM_ disconnectList $ \blk -> do
+                          let bh = computeBlockHash (blockHeader blk)
+                          entries <- readTVarIO (hcEntries hc)
+                          case Map.lookup bh entries of
+                            Just ce ->
+                              indexManagerDisconnectBlock im (ceHeight ce)
+                            Nothing -> return ()
+                        -- Connect: fork-child first → newTip last,
+                        -- which matches @connectList@'s order.
+                        forM_ connectList $ \blk -> do
+                          let bh = computeBlockHash (blockHeader blk)
+                          entries <- readTVarIO (hcEntries hc)
+                          case Map.lookup bh entries of
+                            Just ce -> do
+                              mUndo <- getUndoData db bh
+                              case mUndo of
+                                Just u ->
+                                  indexManagerConnectBlock im blk
+                                    (udBlockUndo u) bh (ceHeight ce)
+                                Nothing -> return ()
+                            Nothing -> return ()
 
                     return (Right ())
   where
