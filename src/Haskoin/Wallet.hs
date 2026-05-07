@@ -50,6 +50,8 @@ module Haskoin.Wallet
   , mnemonicToSeed
   , validateMnemonic
   , bip39WordList
+  , entropyToMnemonic
+  , mnemonicToEntropy
     -- * BIP-32 Key Derivation
   , ExtendedKey(..)
   , ExtendedPubKey(..)
@@ -308,19 +310,30 @@ mnemonicToSeed (Mnemonic words') passphrase =
 
 -- | PBKDF2 with HMAC-SHA512.
 -- Standard key derivation function per RFC 8018.
+--
+-- Per RFC 2898 §5.2, for each output block i in @[1..L/hLen]@:
+--
+-- > U_1 = PRF(P, S || INT(i))
+-- > U_j = PRF(P, U_{j-1})         for j = 2..c
+-- > T_i = U_1 XOR U_2 XOR … XOR U_c
+--
+-- Concretely: build the chain of U values lazily, then XOR-fold them.
+-- The earlier implementation's recursion accidentally collapsed every
+-- iteration after the first to all-zeros, which silently produced bogus
+-- BIP-39 seeds (mnemonicToSeed never had a vector test until W17).
 pbkdf2SHA512 :: ByteString -> ByteString -> Int -> Int -> ByteString
 pbkdf2SHA512 password salt iterations keyLen =
   let blocks = (keyLen + 63) `div` 64  -- SHA-512 produces 64 bytes
       f blockNum =
         let -- U_1 = PRF(Password, Salt || INT_32_BE(i))
             u1 = hmacSHA512 password (BS.append salt (encodeWord32BE blockNum))
-            -- U_n = PRF(Password, U_{n-1})
-            -- Result = U_1 XOR U_2 XOR ... XOR U_c
-            go prev 1 = prev
-            go prev n =
-              let next = hmacSHA512 password prev
-              in BS.pack (BS.zipWith xor next (go next (n - 1)))
-        in go u1 iterations
+            -- Iteratively: u <- HMAC(password, u); accumulate XOR.
+            step (acc, u) _ =
+              let nxt = hmacSHA512 password u
+                  acc' = BS.pack (BS.zipWith xor acc nxt)
+              in (acc', nxt)
+            (final, _) = foldl' step (u1, u1) [2 .. iterations]
+        in final
   in BS.take keyLen $ BS.concat $ map f [1..fromIntegral blocks]
 
 -- | Encode a Word32 as 4 bytes big-endian.
@@ -790,6 +803,58 @@ base58CheckRawDecode txt
                  Hash256 d  = doubleSHA256 payload
                  expCheck   = BS.take 4 d
              in if gotCheck == expCheck then Just payload else Nothing
+
+--------------------------------------------------------------------------------
+-- BIP-39 entropy round-trip
+--------------------------------------------------------------------------------
+-- The existing 'generateMnemonic' synthesises fresh entropy and emits a
+-- mnemonic.  These two helpers expose the raw entropy↔mnemonic mapping
+-- so callers can:
+--   * import an externally-supplied mnemonic and recover its entropy
+--     (used by recovery flows + BIP-39 vector tests)
+--   * deterministically construct a mnemonic from known entropy
+--     (used by BIP-39 vector tests)
+--
+-- Reference: BIP-39 §"From mnemonic to seed" + §"Generating the
+-- mnemonic" — <https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki>
+
+-- | Convert raw entropy bytes to a mnemonic phrase.  Entropy length must
+-- be one of 16/20/24/28/32 bytes (128/160/192/224/256 bits).
+entropyToMnemonic :: ByteString -> Maybe Mnemonic
+entropyToMnemonic ent
+  | BS.length ent `notElem` [16, 20, 24, 28, 32] = Nothing
+  | otherwise =
+      let strength     = BS.length ent * 8
+          checksumBits = strength `div` 32
+          allBits      = bytesToBits ent ++ take checksumBits (bytesToBits (sha256 ent))
+          groups       = splitEvery 11 allBits
+          indices      = map bitsToInt groups
+          ws           = map (bip39WordList !!) indices
+      in Just (Mnemonic ws)
+
+-- | Convert a mnemonic back to entropy.  Returns 'Nothing' on any of:
+--   * word count not in {12,15,18,21,24}
+--   * any word missing from the BIP-39 English wordlist
+--   * checksum mismatch
+mnemonicToEntropy :: Mnemonic -> Maybe ByteString
+mnemonicToEntropy m@(Mnemonic ws)
+  | not (validateMnemonic m) = Nothing
+  | otherwise =
+      let indices       = map (\w -> wordIndex w) ws
+          bits          = concatMap (intToBits 11) indices
+          totalBits     = length ws * 11
+          checksumBits  = totalBits `div` 33
+          entropyBits   = totalBits - checksumBits
+          (entropyPart, _) = splitAt entropyBits bits
+          entropyBytes  = BS.pack $ map (fromIntegral . bitsToInt) (splitEvery 8 entropyPart)
+      in Just entropyBytes
+  where
+    -- Reuses the same lookup as 'verifyMnemonicChecksum'.
+    wordIndex :: Text -> Int
+    wordIndex w = go 0 bip39WordList
+      where
+        go _ [] = 0
+        go n (x:xs) = if x == w then n else go (n+1) xs
 
 --------------------------------------------------------------------------------
 -- BIP-44/84 Derivation Paths

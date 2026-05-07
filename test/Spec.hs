@@ -5852,6 +5852,56 @@ main = hspec $ do
         Nothing -> pure ()
         Just _  -> expectationFailure "decodeExtKey accepted bad checksum"
 
+  -- BIP-39 vectors from
+  --   <https://github.com/trezor/python-mnemonic/blob/master/vectors.json>
+  -- Passphrase is "TREZOR" for every entry.
+  describe "BIP-39 Vectors (English, passphrase=TREZOR)" $ do
+    let mkHex h = case B16.decode h of
+          Right b -> b
+          Left _  -> BS.empty
+
+        -- (entropy, expected-mnemonic, expected-seed-hex)
+        vecs =
+          [ ( "00000000000000000000000000000000"
+            , "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+            , "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04"
+            )
+          , ( "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
+            , "legal winner thank year wave sausage worth useful legal winner thank yellow"
+            , "2e8905819b8723fe2c1d161860e5ee1830318dbf49a83bd451cfb8440c28bd6fa457fe1296106559a3c80937a1c1069be3a3a5bd381ee6260e8d9739fce1f607"
+            )
+          , ( "8080808080808080808080808080808080808080808080808080808080808080"
+            , "letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic avoid letter advice cage absurd amount doctor acoustic bless"
+            , "c0c519bd0e91a2ed54357d9d1ebef6f5af218a153624cf4f2da911a0ed8f7a09e2ef61af0aca007096df430022f7a2b6fb91661a9589097069720d015e4e982f"
+            )
+          ]
+
+    forM_ (zip [(1 :: Int)..] vecs) $ \(i, (entHex, expMnem, expSeedHex)) -> do
+      let ent     = mkHex entHex
+          expSeed = mkHex expSeedHex
+          mnem    = T.words expMnem
+
+      it ("vector #" ++ show i ++ " entropyToMnemonic round-trip") $
+        case entropyToMnemonic ent of
+          Just (Mnemonic ws) -> T.unwords ws `shouldBe` expMnem
+          Nothing            -> expectationFailure "entropyToMnemonic returned Nothing"
+
+      it ("vector #" ++ show i ++ " mnemonicToEntropy recovers entropy") $
+        mnemonicToEntropy (Mnemonic mnem) `shouldBe` Just ent
+
+      it ("vector #" ++ show i ++ " mnemonicToSeed (passphrase=TREZOR)") $
+        mnemonicToSeed (Mnemonic mnem) "TREZOR" `shouldBe` expSeed
+
+      it ("vector #" ++ show i ++ " validateMnemonic passes") $
+        validateMnemonic (Mnemonic mnem) `shouldBe` True
+
+    it "rejects mnemonic with corrupted checksum" $ do
+      -- Replace the last word ("about") with another valid word ("zoo").
+      -- That changes the trailing checksum bits and must fail validation.
+      let bad = Mnemonic (replicate 11 "abandon" ++ ["zoo"])
+      validateMnemonic bad      `shouldBe` False
+      mnemonicToEntropy bad     `shouldBe` Nothing
+
   describe "Wallet" $ do
     it "createWallet generates new mnemonic and wallet" $ do
       let config = WalletConfig mainnet 20 ""
