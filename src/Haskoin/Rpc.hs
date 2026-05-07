@@ -221,7 +221,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          getUndoData, UndoData(..),
                          getUTXOCount, getBlockHeight,
                          iterateWithPrefix, KeyPrefix(..), Coin(..),
-                         SnapshotCoin(..), computeUtxoMuHash)
+                         SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
@@ -939,7 +939,7 @@ handleRpcRequest server req = do
     "dumptxoutset"         -> handleDumpTxOutSet server params
 
     -- W47B: UTXO set / mining stats / proof RPCs
-    "gettxoutsetinfo"      -> handleGetTxOutSetInfo server
+    "gettxoutsetinfo"      -> handleGetTxOutSetInfo server params
     "getnetworkhashps"     -> handleGetNetworkHashPS server params
     "gettxoutproof"        -> handleGetTxOutProof server params
     "verifytxoutproof"     -> handleVerifyTxOutProof server params
@@ -7828,40 +7828,82 @@ w47bExtract hashes bits nTx height pos bitRef hashRef = do
                   return (Right (root, leftMatched))
 
 -- | gettxoutsetinfo: count UTXOs, sum values, return tip info.
-handleGetTxOutSetInfo :: RpcServer -> IO RpcResponse
-handleGetTxOutSetInfo server = do
-  tip       <- readTVarIO (hcTip (rsHeaderChain server))
-  let tipH    = ceHeight tip
-  -- count and sum UTXO set
-  countRef  <- newIORef (0 :: Int)
-  sumRef    <- newIORef (0 :: Word64)
-  bogosizeRef <- newIORef (0 :: Int)
-  coinsRef  <- newIORef ([] :: [SnapshotCoin])
-  iterateWithPrefix (rsDB server) PrefixUTXO $ \key val -> do
-    let opBytes = BS.drop 1 key
-    case (S.decode opBytes :: Either String OutPoint, S.decode val :: Either String Coin) of
-      (Right op, Right coin) -> do
-        modifyIORef' countRef (+1)
-        modifyIORef' sumRef   (+ txOutValue (coinTxOut coin))
-        modifyIORef' bogosizeRef (+ (32 + 4 + 1 + 8 + BS.length (txOutScript (coinTxOut coin))))
-        modifyIORef' coinsRef (SnapshotCoin op coin :)
-        return True
-      _ -> return True
-  n        <- readIORef countRef
-  totalSat <- readIORef sumRef
-  bogo     <- readIORef bogosizeRef
-  coins    <- readIORef coinsRef
-  let Hash256 muHashBS = computeUtxoMuHash coins
-      muHashHex = TE.decodeUtf8 $ B16.encode muHashBS
-  let result = object
-        [ "height"            .= tipH
-        , "bestblock"         .= showHash (ceHash tip)
-        , "txouts"            .= n
-        , "bogosize"          .= bogo
-        , "hash_serialized_3" .= muHashHex
-        , "total_amount"      .= (fromIntegral totalSat / 1e8 :: Double)
-        ]
-  return $ RpcResponse result Null Null
+--
+-- Per Core (rpc/blockchain.cpp::gettxoutsetinfo + kernel/coinstats.cpp),
+-- the optional first arg is the @hash_type@:
+--
+--   - @"hash_serialized_3"@ (default): SHA256d stream over each
+--     (outpoint, code=(height<<1)|coinbase, txOut) record in
+--     (txid, vout) ascending order. Result emitted under the
+--     @hash_serialized_3@ field.
+--   - @"muhash"@: MuHash3072 over the same per-coin records;
+--     order-independent. Result emitted under the @muhash@ field.
+--   - @"none"@: skip the hash; neither field present.
+--
+-- Pre-2026-05-07 this handler always returned a MuHash digest under the
+-- @hash_serialized_3@ key, which broke the cross-impl diff-test
+-- agreement (W9 reorg-via-submitblock: haskoin reported
+-- @43ff1c0d…@ where Core / blockbrew / hotbuns reported
+-- @8031d5b7…@). Both digests were over the same UTXO set; only the
+-- algorithm differed. The fix wires up the algorithm switch and uses
+-- @computeUtxoHash@ (HASH_SERIALIZED) for the default mode.
+handleGetTxOutSetInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetTxOutSetInfo server params = do
+  let hashType = case extractParam params 0 :: Maybe Text of
+        Just t  -> T.unpack t
+        Nothing -> "hash_serialized_3"
+  case hashType of
+    "hash_serialized_3" -> compute True False
+    "muhash"            -> compute False True
+    "none"              -> compute False False
+    other               -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams
+        (T.pack ("'" ++ other ++ "' is not a valid hash_type"))) Null
+  where
+    compute wantSerialized wantMuHash = do
+      tip       <- readTVarIO (hcTip (rsHeaderChain server))
+      let tipH    = ceHeight tip
+      countRef  <- newIORef (0 :: Int)
+      sumRef    <- newIORef (0 :: Word64)
+      bogosizeRef <- newIORef (0 :: Int)
+      coinsRef  <- newIORef ([] :: [SnapshotCoin])
+      iterateWithPrefix (rsDB server) PrefixUTXO $ \key val -> do
+        let opBytes = BS.drop 1 key
+        case (S.decode opBytes :: Either String OutPoint, S.decode val :: Either String Coin) of
+          (Right op, Right coin) -> do
+            modifyIORef' countRef (+1)
+            modifyIORef' sumRef   (+ txOutValue (coinTxOut coin))
+            modifyIORef' bogosizeRef (+ (32 + 4 + 1 + 8 + BS.length (txOutScript (coinTxOut coin))))
+            modifyIORef' coinsRef (SnapshotCoin op coin :)
+            return True
+          _ -> return True
+      n        <- readIORef countRef
+      totalSat <- readIORef sumRef
+      bogo     <- readIORef bogosizeRef
+      coins    <- readIORef coinsRef
+      let baseFields =
+            [ "height"            .= tipH
+            , "bestblock"         .= showHash (ceHash tip)
+            , "txouts"            .= n
+            , "bogosize"          .= bogo
+            , "total_amount"      .= (fromIntegral totalSat / 1e8 :: Double)
+            ]
+          -- Core's @uint256::GetHex()@ emits the 32 bytes in reverse
+          -- order on the wire, so @hash_serialized_3@ / @muhash@ in the
+          -- RPC response use display-byte-order. Match that with
+          -- 'showHash256'; the W9 diff-test caught a haskoin emission
+          -- in internal byte-order which mis-flagged the post-reorg
+          -- UTXO state as divergent.
+          serializedField =
+            if wantSerialized
+              then [ "hash_serialized_3" .= showHash256 (computeUtxoHash coins) ]
+              else []
+          muHashField =
+            if wantMuHash
+              then [ "muhash" .= showHash256 (computeUtxoMuHash coins) ]
+              else []
+      let result = object (baseFields ++ serializedField ++ muHashField)
+      return $ RpcResponse result Null Null
 
 -- | getnetworkhashps: estimate network hash rate over sliding window.
 handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
