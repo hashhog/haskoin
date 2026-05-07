@@ -498,15 +498,17 @@ addPublicKeyPoint :: ByteString -> PubKey -> PubKey
 addPublicKeyPoint _scalar pk = pk  -- Placeholder - needs secp256k1 implementation
 
 -- | Derive public key from private key.
--- Placeholder that returns a dummy compressed public key.
--- In production, this requires secp256k1 EC multiplication.
+--
+-- Routes through 'Haskoin.Crypto.derivePubKey', which is FFI-backed by
+-- libsecp256k1 (`secp256k1_ec_pubkey_create`).  Prior to this fix this
+-- function returned `sha256(sk)` shaped to look like a compressed key,
+-- which produced unspendable addresses for every wallet path that
+-- exercised it (BIP-32 child derivation, address generation,
+-- fingerprinting).  See
+-- @CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md@
+-- §2.5 / §3 for the historical context.
 derivePubKeyFromPrivate :: SecKey -> PubKey
-derivePubKeyFromPrivate (SecKey sk) =
-  -- This is a placeholder - actual implementation needs secp256k1
-  -- For now, we create a deterministic but invalid public key
-  let h = sha256 sk
-      prefix = if BS.last h `testBit` 0 then 0x03 else 0x02
-  in PubKeyCompressed (BS.cons prefix (BS.take 32 h))
+derivePubKeyFromPrivate = derivePubKey
 
 -- | Compute key fingerprint (first 4 bytes of HASH160).
 computeFingerprint :: ByteString -> Word32
