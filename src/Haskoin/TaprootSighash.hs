@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 -- | BIP-341 Taproot signature hash computation.
 --
 -- Reference: <https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki>
@@ -24,6 +25,14 @@ module Haskoin.TaprootSighash
     -- * Sighash entry points
   , computeTaprootSighash
   , buildSigMsg
+    -- * BIP-342 tapscript primitives
+  , tapscriptLeafVersion
+  , defaultCodesepPos
+  , tapleafHashWith
+    -- * BIP-341 control block (script-path)
+  , ControlBlock(..)
+  , encodeControlBlock
+  , decodeControlBlock
   ) where
 
 import Data.Bits ((.&.), (.|.), complement)
@@ -202,3 +211,114 @@ serTxOut TxOut{txOutValue = v, txOutScript = s} =
 
 serVarBytes :: ByteString -> ByteString
 serVarBytes bs = runPut (putVarInt (fromIntegral (BS.length bs)) >> putByteString bs)
+
+------------------------------------------------------------------------------
+-- BIP-342 tapscript primitives
+------------------------------------------------------------------------------
+
+-- | The currently-defined BIP-342 tapscript leaf version (0xc0).
+--
+-- Other even leaf versions are reserved by BIP-341 for future soft forks
+-- (the low bit is reserved for the parity flag in the control block);
+-- only 0xc0 is currently interpreted as tapscript.
+tapscriptLeafVersion :: Word8
+tapscriptLeafVersion = 0xc0
+
+-- | Sentinel "no OP_CODESEPARATOR has executed" value for the BIP-341
+-- script-path sighash extension @codesep_pos@ field (4-byte LE).
+--
+-- See @bitcoin-core/src/script/interpreter.cpp::SignatureHashSchnorr@:
+--   @codeseparator_pos = 0xFFFFFFFF@ unless OP_CODESEPARATOR has executed
+--   in the current tapscript leaf, in which case it is the byte offset
+--   of the most recent CODESEPARATOR.  haskoin's interpreter currently
+--   does not surface a non-default value via the sign path; leave at
+--   sentinel for the wallet wave (W18).
+defaultCodesepPos :: Word32
+defaultCodesepPos = 0xFFFFFFFF
+
+-- | BIP-341 TapLeaf hash:
+--
+--   @tagged_hash("TapLeaf", leaf_version || compactsize(script) || script)@
+--
+-- Mirrors @bitcoin-core/src/script/interpreter.cpp::ComputeTapleafHash@ +
+-- haskoin's own verifier-side computation in
+-- @Haskoin.Script.verifySegWitScriptWithFlags@ (script-path branch).
+-- W13's CompactSize audit (haskoin commit log) verified this encoding
+-- handles all four size classes (<0xfd, u16, u32, u64).
+tapleafHashWith
+  :: Word8         -- ^ leaf version (0xc0 for tapscript)
+  -> ByteString    -- ^ leaf script bytes
+  -> ByteString    -- ^ 32-byte tagged hash
+tapleafHashWith leafVersion script =
+  taggedHash "TapLeaf"
+    (BS.singleton leafVersion <> serVarBytes script)
+
+------------------------------------------------------------------------------
+-- BIP-341 control block (witness item N for tapscript script-path spends)
+------------------------------------------------------------------------------
+
+-- | BIP-341 control block describing how the tapleaf is embedded in the
+-- output Taproot tree.
+--
+-- Wire format (1 + 32 + 32k bytes, k = Merkle path depth):
+--
+--   * byte 0:           @(leafVersion .&. 0xfe) .|. parity@
+--   * bytes 1..33:      32-byte x-only internal pubkey
+--   * bytes 33..:       k × 32-byte sibling hashes (Merkle path)
+--
+-- See @bitcoin-core/src/script/interpreter.cpp ExecuteWitnessScript@ +
+-- @bitcoin-core/src/script/script.h TAPROOT_CONTROL_*@.  For BIP-86 keypath
+-- spends there is no control block (it's a key-path spend); this type
+-- is exclusively for script-path spends.
+data ControlBlock = ControlBlock
+  { cbLeafVersion    :: !Word8       -- ^ leaf version, low bit MUST be 0 (it is overwritten by parity)
+  , cbInternalPubkey :: !ByteString  -- ^ 32-byte x-only internal pubkey
+  , cbParity         :: !Word8       -- ^ 0 or 1 — parity of internal-pubkey-tweaked output Y
+  , cbMerklePath     :: ![ByteString] -- ^ list of 32-byte sibling hashes (depth k, may be empty for single-leaf)
+  } deriving (Show, Eq)
+
+-- | Serialise a 'ControlBlock' to its on-the-wire byte form.
+--
+-- Returns the canonical byte sequence the verifier sees as witness item
+-- N.  Length is always @33 + 32 * length cbMerklePath@.
+--
+-- Pre-conditions (caller's responsibility; this encoder is total over its
+-- inputs but garbage-in-garbage-out for invalid lengths):
+--   * @cbInternalPubkey@ is exactly 32 bytes
+--   * each entry of @cbMerklePath@ is exactly 32 bytes
+--   * @cbParity@ is 0 or 1 (only the low bit is consulted; higher bits
+--     would corrupt @leaf_version@ on round-trip)
+encodeControlBlock :: ControlBlock -> ByteString
+encodeControlBlock ControlBlock{..} =
+  let byte0 = (cbLeafVersion .&. 0xfe) .|. (cbParity .&. 0x01)
+  in BS.concat (BS.singleton byte0 : cbInternalPubkey : cbMerklePath)
+
+-- | Decode the on-the-wire form of a 'ControlBlock'.
+--
+-- Returns 'Nothing' if the input is shorter than 33 bytes or its length
+-- past byte 33 is not a multiple of 32.  Mirrors the structural validation
+-- @bitcoin-core/src/script/interpreter.cpp@ performs before walking the
+-- Merkle path.  The returned 'cbLeafVersion' has its low bit cleared and
+-- the parity is stored separately in 'cbParity'; @encode . decode@ is the
+-- identity over byte strings whose byte-0 low bit equals their parity.
+decodeControlBlock :: ByteString -> Maybe ControlBlock
+decodeControlBlock bs
+  | BS.length bs < 33 = Nothing
+  | (BS.length bs - 33) `mod` 32 /= 0 = Nothing
+  | otherwise =
+      let b0      = BS.head bs
+          leafV   = b0 .&. 0xfe
+          parity  = b0 .&. 0x01
+          ikey    = BS.take 32 (BS.drop 1 bs)
+          rest    = BS.drop 33 bs
+          chunks  = chunkN 32 rest
+      in Just ControlBlock
+           { cbLeafVersion    = leafV
+           , cbInternalPubkey = ikey
+           , cbParity         = parity
+           , cbMerklePath     = chunks
+           }
+  where
+    chunkN n b
+      | BS.null b = []
+      | otherwise = BS.take n b : chunkN n (BS.drop n b)

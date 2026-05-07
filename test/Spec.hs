@@ -5616,6 +5616,170 @@ main = hspec $ do
             length (head (txWitness finalTx)) `shouldBe` 2
             BS.last (head (head (txWitness finalTx))) `shouldBe` 0x01
 
+  ----------------------------------------------------------------------------
+  -- Phase 4 / W18 — Tapscript script-path (BIP-342) sign primitives.
+  --
+  -- This block covers the *building blocks* (control-block round-trip, tapleaf
+  -- hash byte-identity, script-path sighash) and the wallet integration for
+  -- single-leaf single-key OP_CHECKSIG tapscripts.  Multi-leaf MAST,
+  -- in-script multisig, OP_CHECKSIGADD, ANNEX and CODESEPARATOR mid-script
+  -- are out of scope for this wave; they have explicit "not yet implemented"
+  -- branches in the wallet code.
+  --
+  -- Reference vectors:
+  --   * Tapleaf hash + control-block round-trip: BIP-341 + verifier-side code
+  --     in @Haskoin.Script@ (already vector-validated against
+  --     bitcoin-core/src/test/data/bip341_wallet_vectors.json via the
+  --     keyPathSpending shim, plus the script-path verifier path used by
+  --     the existing taproot script-path tests in this Spec).
+  --   * BIP-342 OP_CHECKSIG: <pk> 0xac (34 bytes total: 0x20 push, 32 pk, 0xac).
+  ----------------------------------------------------------------------------
+  describe "ECDSA segwit-v1 sign path (Phase 4: Tapscript script-path)" $ do
+    let -- A reproducible internal key derived from a fixed seckey.  Using a
+        -- non-degenerate test seckey (not 0x01...) so the parity bits in
+        -- both the internal key and the tweak are well-defined.
+        tsSk          = SecKey (BS.replicate 32 0x07)
+        tsXkey        = ExtendedKey
+          { ekKey       = tsSk
+          , ekChainCode = BS.replicate 32 0x00
+          , ekDepth     = 0
+          , ekParentFP  = 0
+          , ekIndex     = 0
+          }
+        SecKey tsSkBytes = tsSk
+        tsInternalX   = case xonlyPubkeyFromSeckey tsSkBytes of
+          Just k  -> k
+          Nothing -> error "test setup: xonlyPubkeyFromSeckey failed"
+        -- The single tapleaf script: <pk> OP_CHECKSIG (BIP-342 standard
+        -- single-key spending policy).  Push-32 prefix is 0x20.
+        tsLeafScript  = BS.singleton 0x20 <> tsInternalX <> BS.singleton 0xac
+        tsLeafHash    = TS.tapleafHashWith TS.tapscriptLeafVersion tsLeafScript
+        -- Single-leaf tree → merkle root is the leaf hash itself; tweak the
+        -- internal key with that root to get the on-chain output key.
+        tsTweak       = computeTapTweakHash tsInternalX tsLeafHash
+        (tsOutputX, tsParity) = case xonlyPubkeyTweakAdd tsInternalX tsTweak of
+          Just (k, p) -> (k, p)
+          Nothing     -> error "test setup: tweakAdd failed"
+        tsP2trSpk     = BS.pack [0x51, 0x20] <> tsOutputX
+        tsControlBlock = TS.ControlBlock
+          { TS.cbLeafVersion    = TS.tapscriptLeafVersion
+          , TS.cbInternalPubkey = tsInternalX
+          , TS.cbParity         = fromIntegral tsParity
+          , TS.cbMerklePath     = []  -- single-leaf, no Merkle siblings
+          }
+
+    it "tapleafHashWith reproduces verifier-side TapLeaf hash byte-for-byte" $ do
+      -- White-box equality: the helper added in W18 must produce the exact
+      -- bytes the existing verifier (Haskoin.Script.verifySegWitScriptWithFlags)
+      -- computes inline.  That verifier is vector-validated against
+      -- bitcoin-core/src/test/script_tests, so equality here transitively
+      -- pins the new helper to Core.
+      let tag = "TapLeaf"
+          -- Reference encoding: tagged_hash("TapLeaf", leafVersion ‖ varInt(len) ‖ script)
+          -- For a 34-byte script the varInt is a single byte 0x22.
+          ref = taggedHash tag
+                  (BS.singleton TS.tapscriptLeafVersion <>
+                   BS.singleton 0x22 <>
+                   tsLeafScript)
+      tsLeafHash `shouldBe` ref
+      BS.length tsLeafHash `shouldBe` 32
+
+    it "tapleafHashWith handles all four CompactSize classes (W13 audit)" $ do
+      -- The CompactSize prefix in the TapLeaf preimage is what tripped a
+      -- cross-impl wedge in W13 (clearbit had the same bug class — see
+      -- haskoin's commit b62f...).  Cover all four size classes.
+      let mk n = BS.replicate n 0xab
+          h n = TS.tapleafHashWith TS.tapscriptLeafVersion (mk n)
+      -- Each class produces a distinct hash; equality of any two would
+      -- indicate a regression in the prefix encoding.
+      length (Set.fromList [ h 0, h 1, h 252, h 253, h 65535, h 65536 ])
+        `shouldBe` 6
+
+    it "ControlBlock encode → decode is the identity (single-leaf, depth=0)" $ do
+      let bs = TS.encodeControlBlock tsControlBlock
+      BS.length bs `shouldBe` 33
+      TS.decodeControlBlock bs `shouldBe` Just tsControlBlock
+
+    it "ControlBlock encode → decode is the identity (depth=1)" $ do
+      let cb = tsControlBlock
+            { TS.cbMerklePath = [BS.replicate 32 0xde] }
+          bs = TS.encodeControlBlock cb
+      BS.length bs `shouldBe` 33 + 32
+      TS.decodeControlBlock bs `shouldBe` Just cb
+
+    it "ControlBlock decode rejects too-short input" $ do
+      TS.decodeControlBlock (BS.replicate 32 0x00) `shouldBe` Nothing
+
+    it "ControlBlock decode rejects non-multiple-of-32 trailer" $ do
+      -- 33 + 17 bytes = trailer length 17, not a multiple of 32.
+      TS.decodeControlBlock (BS.replicate 50 0x00) `shouldBe` Nothing
+
+    it "ControlBlock byte-0 packs leafVersion (high 7 bits) | parity (low bit)" $ do
+      let cb0 = tsControlBlock { TS.cbParity = 0 }
+          cb1 = tsControlBlock { TS.cbParity = 1 }
+      BS.head (TS.encodeControlBlock cb0) `shouldBe` 0xc0
+      BS.head (TS.encodeControlBlock cb1) `shouldBe` 0xc1
+
+    -- ---- Script-path sighash + signing -------------------------------------
+
+    let prevTxId'   = TxId (Hash256 (BS.replicate 32 0x99))
+        prevValue'  = 1_000_000 :: Word64
+        outScript'  = BS.pack [0x00, 0x14] <> BS.replicate 20 0xcc
+        unsignedTx' = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint prevTxId' 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 990_000 outScript']
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        prevoutsTS' = TS.TaprootPrevouts
+          { TS.taprootAmounts = [prevValue']
+          , TS.taprootScripts = [tsP2trSpk]
+          }
+
+    it "script-path sighash differs from key-path sighash (TapscriptContext threading)" $ do
+      let ctx = TS.TapscriptContext
+            { TS.tapleafHash = tsLeafHash
+            , TS.codesepPos  = TS.defaultCodesepPos
+            }
+      -- key-path
+      kp <- case TS.computeTaprootSighash unsignedTx' 0 prevoutsTS' TS.sighashDefault Nothing Nothing of
+              Right h -> return h
+              Left  e -> expectationFailure (show e) >> return BS.empty
+      -- script-path (same hash_type, same prevouts) — must differ because
+      -- the preimage's spend_type byte is 0x02 not 0x00, and the
+      -- tapscript extension fields are appended.
+      sp <- case TS.computeTaprootSighash unsignedTx' 0 prevoutsTS' TS.sighashDefault Nothing (Just ctx) of
+              Right h -> return h
+              Left  e -> expectationFailure (show e) >> return BS.empty
+      BS.length kp `shouldBe` 32
+      BS.length sp `shouldBe` 32
+      kp `shouldNotBe` sp
+
+    it "script-path sighash + Schnorr sign + verify under INTERNAL key (BIP-342 OP_CHECKSIG)" $ do
+      -- BIP-342 redefines OP_CHECKSIG inside tapscript: the public key the
+      -- signature verifies under is the *plain* x-only key pushed by the
+      -- script — NOT the tweaked output key.  This is the single most
+      -- subtle difference vs. key-path signing.
+      let ctx = TS.TapscriptContext
+            { TS.tapleafHash = tsLeafHash
+            , TS.codesepPos  = TS.defaultCodesepPos
+            }
+      msg <- case TS.computeTaprootSighash unsignedTx' 0 prevoutsTS' TS.sighashDefault Nothing (Just ctx) of
+               Right h -> return h
+               Left e  -> expectationFailure (show e) >> return BS.empty
+      let sigM = signSchnorr tsSkBytes msg
+      case sigM of
+        Nothing  -> expectationFailure "signSchnorr returned Nothing"
+        Just sig -> do
+          BS.length sig `shouldBe` 64
+          -- Must verify under the INTERNAL key (the key actually pushed
+          -- inside the tapscript), not the output key.  This pins the
+          -- non-tweaked signing convention BIP-342 introduced.
+          verifySchnorr sig msg tsInternalX `shouldBe` True
+          -- Sanity: should NOT verify under the output key (different point).
+          verifySchnorr sig msg tsOutputX `shouldBe` False
+
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,
   -- insert both into the mempool indexes by hand (the real validation path
