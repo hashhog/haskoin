@@ -74,6 +74,7 @@ import Haskoin.Crypto (computeBlockHash, sha256, computeTxId)
 import Haskoin.Consensus
 import Haskoin.Storage
 import Haskoin.Network
+import Haskoin.Index (IndexManager, indexManagerConnectBlock)
 
 --------------------------------------------------------------------------------
 -- Types
@@ -101,6 +102,15 @@ data BlockDownloader = BlockDownloader
   , bdPerPeerMax    :: !Int                -- ^ Max blocks per peer (default 16)
   , bdBaseTimeout   :: !(TVar Int64)       -- ^ Base timeout in seconds (adaptive)
   , bdFlushCounter  :: !(TVar Word32)      -- ^ Blocks since last UTXO flush
+  , bdIndexMgr      :: !(Maybe IndexManager)
+    -- ^ Optional secondary-index manager (txindex /
+    -- blockfilterindex / coinstatsindex). When 'Just', every
+    -- successful 'connectBlock' is mirrored into the enabled
+    -- indexes via 'indexManagerConnectBlock'. 'Nothing' is the
+    -- default for nodes that don't opt in to any index, mirroring
+    -- Bitcoin Core's @-blockfilterindex=0@ default.
+    -- Reference: bitcoin-core/src/index/blockfilterindex.cpp
+    -- BlockFilterIndex::CustomAppend.
   }
 
 -- | A pending block request
@@ -131,8 +141,13 @@ data IBDState
 --   - One download worker per connected peer
 --   - A block processing thread for validation/connection
 --   - A download scheduler for managing requests
-startIBD :: Network -> HaskoinDB -> HeaderChain -> PeerManager -> IO BlockDownloader
-startIBD net db hc pm = do
+startIBD :: Network -> HaskoinDB -> HeaderChain -> PeerManager
+         -> Maybe IndexManager
+            -- ^ Secondary indexes opted in via CLI ('--blockfilterindex'
+            -- etc).  'Nothing' = run plain IBD; 'Just' = mirror every
+            -- 'connectBlock' into the enabled indexes.
+         -> IO BlockDownloader
+startIBD net db hc pm mIdxMgr = do
   -- Initialize the downloader state
   pendingVar <- newTVarIO Map.empty
   downloadQ <- newTBQueueIO 1024
@@ -159,6 +174,7 @@ startIBD net db hc pm = do
         , bdPerPeerMax = 16          -- Max 16 blocks per peer
         , bdBaseTimeout = timeoutVar
         , bdFlushCounter = flushVar
+        , bdIndexMgr = mIdxMgr
         }
 
   -- Start download workers (one per connected peer)
@@ -400,6 +416,26 @@ blockProcessor bd = forever $ do
                       -- Without this, dumptxoutset rollback can't
                       -- rewind: see handleDumpTxOutSet in Rpc.hs.
                       connectBlock (bdDB bd) (bdNetwork bd) block nextHeight utxoMap
+
+                      -- Mirror the connect into any opted-in
+                      -- secondary indexes (txindex / blockfilterindex
+                      -- / coinstatsindex).  We read the undo record
+                      -- back from disk (cheap point-lookup; the same
+                      -- writeBatch above just put it there) so the
+                      -- BlockFilterIndex sees byte-identical
+                      -- 'BlockUndo' to what 'disconnectBlock' would
+                      -- replay — keeps the filter byte-for-byte
+                      -- compatible with Core's blockfilterindex.cpp
+                      -- CustomAppend output.
+                      case bdIndexMgr bd of
+                        Nothing -> return ()
+                        Just im -> do
+                          mUndo <- getUndoData (bdDB bd) bh
+                          case mUndo of
+                            Just undoData ->
+                              indexManagerConnectBlock im block
+                                (udBlockUndo undoData) bh nextHeight
+                            Nothing -> return ()
 
                       atomically $ do
                         writeTVar (bdCurrentHeight bd) nextHeight

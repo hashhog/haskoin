@@ -50,6 +50,11 @@ import Haskoin.Mempool
 import qualified Haskoin.Mempool.Persist as MPP
 import Haskoin.FeeEstimator
 import Haskoin.Wallet
+import Haskoin.Index (IndexManager(..), IndexConfig(..),
+                       defaultIndexConfig, newIndexManager,
+                       indexManagerInitFromDB, indexManagerBackfill,
+                       indexManagerConnectBlock,
+                       blockFilterIndexTipHeight)
 
 --------------------------------------------------------------------------------
 -- CLI Data Types
@@ -111,6 +116,19 @@ data NodeOptions = NodeOptions
     -- CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
     -- (R7 / Pattern P4) called this out as a P3 over-exposure on
     -- haskoin where REST was always-on.
+  , noBlockFilterIndex   :: !Bool
+    -- ^ @-blockfilterindex=basic@: maintain a BIP-157/158 GCS-filter
+    -- index over the active chain.  When 'True', every successful
+    -- 'connectBlock' (IBD path + submitBlock path + reorg path)
+    -- mirrors a per-block @BlockFilterEntry@ into a RocksDB column
+    -- ('F'-prefix) keyed by height, and the chained filter-header
+    -- pointer is persisted under the 'f'-prefix meta record so a
+    -- restart resumes without recomputing.  When 'False' (default,
+    -- Bitcoin Core parity), no index is maintained and the REST
+    -- @/rest/blockfilter@ / @/rest/blockfilterheaders@ endpoints
+    -- recompute from stored block + undo data — O(tip_height) per
+    -- request from genesis.  Reference:
+    -- bitcoin-core/src/index/blockfilterindex.cpp.
   } deriving (Show)
 
 data WalletCommand
@@ -208,6 +226,16 @@ parseNodeOptions = NodeOptions
                 \are served alongside JSON-RPC. When disabled (default), \
                 \any GET to /rest/* returns 404, matching Core's \
                 \DEFAULT_REST_ENABLE = false (init.cpp:153).")
+  <*> switch (long "blockfilterindex"
+        <> help "Maintain a BIP-157/158 basic block filter index \
+                \(Bitcoin Core -blockfilterindex=basic, default off). \
+                \When enabled, every connected block contributes a \
+                \GCS filter + chained filter-header to a RocksDB \
+                \index keyed by height; the /rest/blockfilter and \
+                \/rest/blockfilterheaders REST endpoints fast-path \
+                \through this index in O(1)/O(count). On startup \
+                \haskoin backfills any gap between the index tip \
+                \and the chain tip before opening the network port.")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -411,6 +439,14 @@ applyConfigOverlay cm n = n
   , noEnableRest = if not (noEnableRest n)
                      then Daemon.configLookupBool "rest" False cm
                      else noEnableRest n
+  -- @blockfilterindex = 1@ in haskoin.conf flips on the BIP-157/158
+  -- basic filter index just like the CLI flag does.  Bitcoin Core
+  -- accepts both @-blockfilterindex=basic@ and @-blockfilterindex=1@;
+  -- haskoin only ships the basic filter type today, so a boolean
+  -- conf entry is sufficient.
+  , noBlockFilterIndex = if not (noBlockFilterIndex n)
+                          then Daemon.configLookupBool "blockfilterindex" False cm
+                          else noBlockFilterIndex n
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
@@ -706,6 +742,61 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         return (Just bs)
       else return Nothing
 
+    -- Initialise secondary indexes (BIP-157/158 blockfilterindex,
+    -- and the existing txindex / coinstatsindex stubs) iff the
+    -- operator opted in via @--blockfilterindex@ (or
+    -- @blockfilterindex = 1@ in haskoin.conf).  We:
+    --
+    --   1. Build the IndexManager and load any persisted in-memory
+    --      state from the F/f keyspaces ('indexManagerInitFromDB').
+    --   2. Walk forward from the index's last-known height + 1 to
+    --      the chain's current best height, populating any gap.
+    --      This is what closes the deferred scope in commit
+    --      e8068bcd: REST handlers no longer have to recompute from
+    --      genesis on every call once the backfill completes.
+    --   3. Hand the manager to the peer-message handler + RPC server
+    --      so live IBD / submitBlock / reorg keep the index in sync.
+    --
+    -- Reference: bitcoin-core/src/index/blockfilterindex.cpp
+    -- BlockFilterIndex::CustomInit + BlockFilterIndex::Sync.  The
+    -- @Maybe IndexManager@ is plumbed through every connect/reorg
+    -- callsite as an opt-in null instead of a global, so the
+    -- non-indexed default case stays a single 'Nothing' branch with
+    -- zero overhead per block.
+    mIdxMgr <- if noBlockFilterIndex
+      then do
+        let idxConfig = defaultIndexConfig { icBlockFilterIndex = True }
+        im <- newIndexManager db idxConfig
+        indexManagerInitFromDB im
+        -- Backfill from index tip to chain tip. We capture the
+        -- pre-backfill height so the operator log line is accurate
+        -- regardless of whether init read genesis or a populated
+        -- meta record. Empty index → start at 1; populated → resume
+        -- at last+1.
+        startTip <- maybe (return 0) (\bf -> fromMaybe 0 <$> blockFilterIndexTipHeight bf)
+                          (imBlockFilterIndex im)
+        bestH <- readTVarIO (hcHeight hc)
+        when (bestH > startTip) $
+          putStrLn $ "BlockFilterIndex: backfilling from height "
+                  ++ show (startTip + 1) ++ " to " ++ show bestH
+        let getBlockData h = do
+              mHash <- getBlockHeight db h
+              case mHash of
+                Nothing -> return Nothing
+                Just bh -> do
+                  mBlk <- getBlock db bh
+                  mUndo <- getUndoData db bh
+                  case (mBlk, mUndo) of
+                    (Just blk, Just u) ->
+                      return $ Just (blk, udBlockUndo u, bh)
+                    _ -> return Nothing
+        finalH <- indexManagerBackfill im getBlockData bestH
+        when (bestH > startTip) $
+          putStrLn $ "BlockFilterIndex: backfill complete, indexed up to "
+                  ++ show finalH
+        return (Just im)
+      else return Nothing
+
     -- Start peer manager with sync-aware message handler.
     -- BIP-159: --prune (any non-zero value) flips on
     -- NODE_NETWORK_LIMITED in the version handshake so peers know we
@@ -720,7 +811,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore addr msg
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr addr msg
         `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
@@ -770,7 +861,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- 2026-05-06: Rpc.hs:3124-3152 returned 200 OK + empty bodies).
     -- The manager owns its wallet directory under {datadir}/wallets/.
     walletMgr <- newWalletManager (dataDir </> "wallets") net
-    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore (Just walletMgr) pruneCfg
+    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore (Just walletMgr) pruneCfg mIdxMgr
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
             ++ (if noEnableRest then " (REST enabled)" else " (REST disabled)")
 
@@ -1131,8 +1222,15 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> IORef Bool -> IORef (Set.Set TxId)
                    -> IORef Word32 -> IORef Integer
                    -> PruneConfig -> Maybe BlockStore
+                   -> Maybe IndexManager
+                      -- ^ Optional secondary-index manager.  When
+                      -- 'Just', every successful 'connectBlock'
+                      -- inside 'MBlock' is mirrored into the
+                      -- enabled indexes (txindex /
+                      -- blockfilterindex / coinstatsindex) so the
+                      -- index tracks the chain in real time.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore addr msg = case msg of
+syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -1267,6 +1365,24 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
               connectBlock db net block height spent
               putBlockHeight db height bh
               putBestBlockHash db bh
+              -- Mirror the connect into any opted-in secondary
+              -- indexes (txindex / blockfilterindex /
+              -- coinstatsindex).  We read the freshly-persisted undo
+              -- record back from disk so the BlockFilterIndex sees
+              -- the byte-identical 'BlockUndo' that
+              -- 'disconnectBlock' would replay — keeping the GCS
+              -- filter byte-for-byte compatible with Bitcoin Core's
+              -- blockfilterindex.cpp::CustomAppend output.
+              -- Reference: bitcoin-core/src/index/blockfilterindex.cpp.
+              case mIdxMgr of
+                Nothing -> return ()
+                Just im -> do
+                  mUndo <- getUndoData db bh
+                  case mUndo of
+                    Just undoData ->
+                      indexManagerConnectBlock im block
+                        (udBlockUndo undoData) bh height
+                    Nothing -> return ()
         result `catch` (\(e :: SomeException) -> do
           putStrLn $ "ERROR connecting block " ++ show height ++ ": " ++ show e
           -- Block-validation failures are immediate-ban offenses in Core.
@@ -1552,7 +1668,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           then case fillPartialBlock pdb [] of
             Right block -> do
               putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore addr (MBlock block)
+              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr addr (MBlock block)
             Left err -> do
               putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
               pm <- readIORef pmRef

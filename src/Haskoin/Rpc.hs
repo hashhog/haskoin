@@ -201,7 +201,11 @@ import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
 -- the operator ever enables the index.
 -- Reference: bitcoin-core/src/rest.cpp rest_block_filter / rest_filter_header.
 import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
-                       blockFilterHash, blockFilterHeader, encodeBlockFilter)
+                       blockFilterHash, blockFilterHeader, encodeBlockFilter,
+                       IndexManager(..), BlockFilterEntry(..),
+                       BlockFilterIndexDB(..),
+                       blockFilterIndexGet, blockFilterIndexTipHeight,
+                       blockFilterIndexLastHeader)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
@@ -338,6 +342,16 @@ data RpcServer = RpcServer
     -- stay connected; only block acceptance is gated. TVar so the
     -- P2P block-receive path can read without contending with the
     -- chain-write lock.
+  , rsIndexMgr       :: !(Maybe IndexManager)
+    -- ^ Optional secondary-index manager (txindex /
+    -- blockfilterindex / coinstatsindex).  Plumbed in from 'Main.hs'
+    -- when the operator passes @--blockfilterindex@ etc.; @Nothing@
+    -- otherwise.  The submitBlock RPC and the regtest miner mirror
+    -- their successful 'connectBlock' / reorg into this manager so
+    -- the index tracks the chain in real time.  REST blockfilter
+    -- handlers consult this field to fast-path reads (O(1) by
+    -- height) when the index is populated, falling back to
+    -- on-demand recompute otherwise.
   , rsPruneConfig    :: !PruneConfig
     -- ^ Active pruning configuration.  Mirrors Bitcoin Core's
     -- @fPruneMode@ + @nPruneTarget@ pair (init.cpp /
@@ -557,8 +571,13 @@ startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
                -> Mempool -> FeeEstimator -> UTXOCache -> Network
                -> Maybe BlockStore -> Maybe WalletManager
                -> PruneConfig  -- ^ Parsed -prune=N config (mirrors Core fPruneMode + nPruneTarget)
+               -> Maybe IndexManager
+                  -- ^ Optional secondary-index manager.  When 'Just',
+                  -- submitBlock + the regtest miner mirror connects /
+                  -- reorgs into the indexes; REST blockfilter
+                  -- handlers fast-path through @blockFilterIndexGet@.
                -> IO RpcServer
-startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg = do
+startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg mIdxMgr = do
   threadVar <- newTVarIO Nothing
   mockTimeVar <- newTVarIO Nothing  -- No mock time by default
   startTime <- round <$> getPOSIXTime
@@ -570,7 +589,7 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg =
   -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset). Initialised
   -- to False; flipped True only inside the rollback dance.
   pauseVar <- newTVarIO False
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar pruneCfg
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg
   -- Restore persisted banlist at startup (best-effort; absence is fine on
   -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
   -- which loads banlist.json on boot.
@@ -2298,7 +2317,8 @@ handleSubmitBlockUnpaused server params = do
             Right block -> do
               result <- submitBlock (rsNetwork server) (rsDB server)
                           (rsHeaderChain server) (rsUTXOCache server)
-                          (rsPeerMgr server) (rsMempool server) block
+                          (rsPeerMgr server) (rsMempool server)
+                          (rsIndexMgr server) block
               case result of
                 Left err ->
                   -- Map internal error strings to canonical BIP-22 result strings.
@@ -2548,7 +2568,8 @@ generateSingleBlock server scriptPubKey specificTxs = do
           bh = computeBlockHash validHeader
 
       -- Validate and connect the block
-      result <- submitBlock net db hc cache pm (rsMempool server) block
+      result <- submitBlock net db hc cache pm (rsMempool server)
+                  (rsIndexMgr server) block
       case result of
         Left err -> return $ Left err
         Right () -> return $ Right bh
@@ -7309,47 +7330,77 @@ handleRestBlockFilter server pathPart = do
     computeFilterForBlock :: RpcServer -> BlockHash -> Text
                           -> RestResponseFormat -> IO Response
     computeFilterForBlock srv bh hashStr fmt = do
-      mBlock <- getBlock (rsDB srv) bh
-      case mBlock of
-        Nothing ->
-          return $ restError 404 $ hashStr <> " not found"
-        Just block -> do
-          mUndo <- getUndoData (rsDB srv) bh
-          case mUndo of
+      -- Fast path: when the BlockFilterIndex is enabled and has a
+      -- per-height entry for this block, return the persisted bytes
+      -- directly (O(1) point lookup).  Slow path: recompute from
+      -- block + undo data.  Both paths produce byte-identical
+      -- output; the index just amortizes the cost.
+      mFilterBytes <- tryFilterIndex srv bh
+      case mFilterBytes of
+        Just filterBytes ->
+          return $ encodeFilterResponse fmt filterBytes
+        Nothing -> do
+          mBlock <- getBlock (rsDB srv) bh
+          case mBlock of
             Nothing ->
-              -- Block exists but undo data does not — happens for
-              -- pre-undo-rewrite datadirs and (always) for the genesis
-              -- block.  Genesis has no spent outputs anyway, so the
-              -- filter is computable from a synthetic empty 'BlockUndo'
-              -- via the same primitive.
-              return $ restError 404 $
-                hashStr <>
-                " filter not available (undo data missing — " <>
-                "BlockFilterIndex not yet wired into IBD; " <>
-                "see CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md)."
-            Just undoData -> do
-              let filt = computeBlockFilter block (udBlockUndo undoData) bh
-                  filterBytes = encodeBlockFilter filt
-              case fmt of
-                RestBinary ->
-                  return $ responseLBS status200
-                    [(hContentType, "application/octet-stream")]
-                    (BL.fromStrict filterBytes)
+              return $ restError 404 $ hashStr <> " not found"
+            Just block -> do
+              mUndo <- getUndoData (rsDB srv) bh
+              case mUndo of
+                Nothing ->
+                  -- Block exists but undo data does not — happens for
+                  -- pre-undo-rewrite datadirs and (always) for the genesis
+                  -- block.  Genesis has no spent outputs anyway, so the
+                  -- filter is computable from a synthetic empty 'BlockUndo'
+                  -- via the same primitive.
+                  return $ restError 404 $
+                    hashStr <>
+                    " filter not available (undo data missing — " <>
+                    "block predates the BIP-157 index wiring; " <>
+                    "re-IBD or enable --blockfilterindex on next start)."
+                Just undoData -> do
+                  let filt = computeBlockFilter block (udBlockUndo undoData) bh
+                      filterBytes = encodeBlockFilter filt
+                  return $ encodeFilterResponse fmt filterBytes
 
-                RestHex ->
-                  return $ responseLBS status200
-                    [(hContentType, "text/plain")]
-                    (BL.fromStrict $ TE.encodeUtf8 $
-                      TE.decodeUtf8 (B16.encode filterBytes) <> "\n")
+    -- | Look up the stored filter bytes by block hash via the
+    -- BlockFilterIndex.  Returns 'Nothing' when the index is
+    -- disabled, the block is unknown to the header chain, or the
+    -- block's height is past the index's current sync tip (the
+    -- caller should fall back to on-demand recompute in that case
+    -- — same byte output, just slower).
+    tryFilterIndex :: RpcServer -> BlockHash -> IO (Maybe ByteString)
+    tryFilterIndex srv bh = case rsIndexMgr srv >>= imBlockFilterIndex of
+      Nothing -> return Nothing
+      Just bfIdx -> do
+        entries <- readTVarIO (hcEntries (rsHeaderChain srv))
+        case Map.lookup bh entries of
+          Nothing -> return Nothing
+          Just ce -> do
+            mEntry <- blockFilterIndexGet bfIdx (ceHeight ce)
+            return $ fmap bfeEncoded mEntry
 
-                RestJson ->
-                  return $ responseLBS status200
-                    [(hContentType, "application/json")]
-                    (encode $ object
-                      [ "filter" .= TE.decodeUtf8 (B16.encode filterBytes) ])
-
-                RestUndefined ->
-                  return $ restError 404 "output format not found"
+    -- | Format the filter bytes per the requested REST extension.
+    -- Shared by the fast/slow paths so a code change can't drift
+    -- between them.
+    encodeFilterResponse :: RestResponseFormat -> ByteString -> Response
+    encodeFilterResponse fmt filterBytes = case fmt of
+      RestBinary ->
+        responseLBS status200
+          [(hContentType, "application/octet-stream")]
+          (BL.fromStrict filterBytes)
+      RestHex ->
+        responseLBS status200
+          [(hContentType, "text/plain")]
+          (BL.fromStrict $ TE.encodeUtf8 $
+            TE.decodeUtf8 (B16.encode filterBytes) <> "\n")
+      RestJson ->
+        responseLBS status200
+          [(hContentType, "application/json")]
+          (encode $ object
+            [ "filter" .= TE.decodeUtf8 (B16.encode filterBytes) ])
+      RestUndefined ->
+        restError 404 "output format not found"
 
 -- | @/rest/blockfilterheaders/<filtertype>/[<count>/]<hash>.{bin,hex,json}@
 -- — walk the active chain forward from @<hash>@ and return up to
@@ -7476,12 +7527,57 @@ handleRestBlockFilterHeaders server pathPart query = do
                   return $ restError 404 "output format not found"
 
     -- Compute the chained filter-header sequence for the requested
-    -- block hashes by walking from genesis. This is O(tip_height) and
-    -- is the cost of not having a populated 'BlockFilterIndex' yet;
-    -- still cheaper than refusing the call entirely.
+    -- block hashes.
+    --
+    -- Fast path: the BlockFilterIndex is enabled and every requested
+    -- block's height is within the index's sync window.  Each
+    -- @filter_header@ is a single point lookup (@blockFilterIndexGet@
+    -- by height); total cost is O(count).
+    --
+    -- Slow path: index disabled or any requested block is past the
+    -- index tip.  Walk from genesis, recompute each filter via
+    -- @computeBlockFilter@, chain headers as
+    -- @blockFilterIndexAppendBlock@ does internally.  This is
+    -- O(tip_height); the cost is paid by the opt-in @-rest@ caller,
+    -- not the IBD path.
     collectFilterHeaders :: RpcServer -> [BlockHash]
                          -> IO (Either Text [Hash256])
     collectFilterHeaders srv requested = do
+      indexHit <- tryIndexHeaders srv requested
+      case indexHit of
+        Just hs -> return $ Right hs
+        Nothing -> collectFilterHeadersWalk srv requested
+
+    -- | Try to satisfy a filter-header walk entirely from the
+    -- BlockFilterIndex.  Returns 'Just' the per-block headers in
+    -- request order on success, or 'Nothing' to signal the caller
+    -- should fall back to the from-genesis walk.
+    tryIndexHeaders :: RpcServer -> [BlockHash] -> IO (Maybe [Hash256])
+    tryIndexHeaders srv requested =
+      case rsIndexMgr srv >>= imBlockFilterIndex of
+        Nothing -> return Nothing
+        Just bfIdx -> do
+          entries <- readTVarIO (hcEntries (rsHeaderChain srv))
+          let mHeights =
+                traverse (\bh -> ceHeight <$> Map.lookup bh entries) requested
+          case mHeights of
+            Nothing -> return Nothing
+            Just heights -> do
+              mTip <- blockFilterIndexTipHeight bfIdx
+              case mTip of
+                Nothing -> return Nothing
+                Just tipH
+                  | any (> tipH) heights -> return Nothing
+                  | otherwise -> do
+                      mEntries <- mapM (blockFilterIndexGet bfIdx) heights
+                      return $ traverse (fmap bfeFilterHeader) mEntries
+
+    -- | Original genesis-walk implementation.  Kept verbatim for the
+    -- slow path so a stale-index condition still produces correct
+    -- output.
+    collectFilterHeadersWalk :: RpcServer -> [BlockHash]
+                             -> IO (Either Text [Hash256])
+    collectFilterHeadersWalk srv requested = do
       heightMap <- readTVarIO (hcByHeight (rsHeaderChain srv))
       tip       <- readTVarIO (hcTip (rsHeaderChain srv))
       entries   <- readTVarIO (hcEntries (rsHeaderChain srv))

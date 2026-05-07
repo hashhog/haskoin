@@ -61,9 +61,13 @@ module Haskoin.Index
   , BlockFilterIndexDB(..)
   , BlockFilterEntry(..)
   , newBlockFilterIndexDB
+  , loadBlockFilterIndexState
   , blockFilterIndexPut
   , blockFilterIndexGet
+  , blockFilterIndexDelete
   , blockFilterIndexAppendBlock
+  , blockFilterIndexTipHeight
+  , blockFilterIndexLastHeader
     -- * CoinStatsIndex
   , CoinStats(..)
   , CoinStatsEntry(..)
@@ -79,8 +83,11 @@ module Haskoin.Index
   , IndexManager(..)
   , defaultIndexConfig
   , newIndexManager
+  , indexManagerInitFromDB
+  , indexManagerBackfill
   , indexManagerSync
   , indexManagerConnectBlock
+  , indexManagerDisconnectBlock
     -- * SipHash
   , SipHashKey(..)
   , sipHash128
@@ -850,51 +857,160 @@ data BlockFilterIndexDB = BlockFilterIndexDB
   { bfiDB         :: !HaskoinDB
   , bfiPrefix     :: !Word8         -- ^ Key prefix for filter by height
   , bfiLastHeader :: !(IORef Hash256)  -- ^ Last filter header (for chaining)
+  , bfiTipHeight  :: !(IORef (Maybe BlockHeight))
+    -- ^ Highest height with a populated entry, or 'Nothing' for empty.
+    -- Updated transactionally with 'bfiLastHeader' inside
+    -- 'blockFilterIndexAppendBlock' / 'blockFilterIndexDelete'.  A
+    -- startup call to 'loadBlockFilterIndexState' seeds this from the
+    -- on-disk meta record so a restart doesn't recompute filters
+    -- already present in the index.  Reference:
+    -- bitcoin-core/src/index/blockfilterindex.cpp m_next_sync_block.
   }
 
--- | BlockFilterIndex key prefix
+-- | BlockFilterIndex key prefix.
+--
+-- @0x46@ ('F') keys per-height @BlockFilterEntry@ records;
+-- @0x66@ ('f') keys a single meta record persisting the highest
+-- indexed height + the chained filter header at that height. The meta
+-- record is what 'loadBlockFilterIndexState' reads to resume on
+-- startup; without it we'd have to scan the entire @0x46@ keyspace.
 prefixBlockFilter :: Word8
 prefixBlockFilter = 0x46  -- 'F'
 
--- | Create a new BlockFilterIndex database
+prefixBlockFilterMeta :: Word8
+prefixBlockFilterMeta = 0x66  -- 'f'
+
+-- | Persisted meta record: (tip height, chained filter header at that
+-- height). Read once at startup to seed the in-memory IORefs.
+data BlockFilterIndexMeta = BlockFilterIndexMeta
+  { bfimTipHeight :: !BlockHeight
+  , bfimLastHeader :: !Hash256
+  } deriving (Show, Eq, Generic)
+
+instance Serialize BlockFilterIndexMeta where
+  put BlockFilterIndexMeta{..} = do
+    putWord32le bfimTipHeight
+    put bfimLastHeader
+  get = BlockFilterIndexMeta <$> getWord32le <*> get
+
+-- | Create a new BlockFilterIndex database. Always returns the
+-- @genesis filter header = 0x00..0x00@ + @tipHeight = Nothing@. Call
+-- 'loadBlockFilterIndexState' immediately after to pick up state from
+-- a previous run; that two-step constructor + load split keeps the
+-- pure tests fast (no DB iteration when not needed) while letting the
+-- live node resume cleanly.
 newBlockFilterIndexDB :: HaskoinDB -> IO BlockFilterIndexDB
 newBlockFilterIndexDB db = do
   lastHeaderRef <- newIORef (Hash256 (BS.replicate 32 0))  -- Genesis filter header
+  tipRef <- newIORef Nothing
   return BlockFilterIndexDB
     { bfiDB = db
     , bfiPrefix = prefixBlockFilter
     , bfiLastHeader = lastHeaderRef
+    , bfiTipHeight = tipRef
     }
 
--- | Put a block filter entry
+-- | Big-endian Word32 encoder used by the index key encoding.
+-- Big-endian gives RocksDB iterators ascending-by-height order, which
+-- matches Core's blockfilterindex on-disk layout (DB_FILTER_HASH).
+bfiToBE32 :: Word32 -> ByteString
+bfiToBE32 w = BS.pack
+  [ fromIntegral ((w `shiftR` 24) .&. 0xff)
+  , fromIntegral ((w `shiftR` 16) .&. 0xff)
+  , fromIntegral ((w `shiftR` 8) .&. 0xff)
+  , fromIntegral (w .&. 0xff)
+  ]
+
+-- | Recover (tipHeight, lastHeader) from disk on startup.
+--
+-- Strategy: read the meta record under @0x66@. If absent (fresh
+-- datadir, or an older datadir from before this commit), seed both
+-- IORefs to genesis and let 'indexManagerBackfill' re-derive from
+-- block 1 forward. The caller is expected to invoke
+-- 'indexManagerBackfill' next; this loader only handles the
+-- already-persisted side.
+--
+-- Reference: bitcoin-core/src/index/blockfilterindex.cpp
+-- BlockFilterIndex::CustomInit reads m_db's filter header at the
+-- best block + 1 to seed its in-memory state.  The meta-record
+-- approach here is functionally equivalent but uses one cheap
+-- point-lookup instead of a positional walk.
+loadBlockFilterIndexState :: BlockFilterIndexDB -> IO ()
+loadBlockFilterIndexState BlockFilterIndexDB{..} = do
+  let metaKey = BS.singleton prefixBlockFilterMeta
+  mval <- R.get (dbHandle bfiDB) (dbReadOpts bfiDB) metaKey
+  case mval >>= either (const Nothing) Just . decode of
+    Just BlockFilterIndexMeta{..} -> do
+      writeIORef bfiLastHeader bfimLastHeader
+      writeIORef bfiTipHeight (Just bfimTipHeight)
+    Nothing -> do
+      writeIORef bfiLastHeader (Hash256 (BS.replicate 32 0))
+      writeIORef bfiTipHeight Nothing
+
+-- | Put a block filter entry. Updates the in-memory chain-tip
+-- (@bfiLastHeader@, @bfiTipHeight@) AND the on-disk meta record so a
+-- crash doesn't lose the chain pointer. The two writes are not
+-- batched today (RocksDB.put is independently durable), which means a
+-- crash between them produces a duplicate filter on the next
+-- 'indexManagerBackfill' — idempotent because the per-height entry
+-- is keyed by height. Splitting into a single batch is a follow-up
+-- micro-optimization; the correctness invariant is preserved either
+-- way.
 blockFilterIndexPut :: BlockFilterIndexDB -> BlockHeight -> BlockFilterEntry -> IO ()
 blockFilterIndexPut BlockFilterIndexDB{..} height entry = do
-  let key = BS.cons bfiPrefix (toBE32 height)
+  let key = BS.cons bfiPrefix (bfiToBE32 height)
+      metaKey = BS.singleton prefixBlockFilterMeta
+      meta = BlockFilterIndexMeta height (bfeFilterHeader entry)
   R.put (dbHandle bfiDB) (dbWriteOpts bfiDB) key (encode entry)
+  R.put (dbHandle bfiDB) (dbWriteOpts bfiDB) metaKey (encode meta)
   writeIORef bfiLastHeader (bfeFilterHeader entry)
-  where
-    toBE32 w = BS.pack
-      [ fromIntegral ((w `shiftR` 24) .&. 0xff)
-      , fromIntegral ((w `shiftR` 16) .&. 0xff)
-      , fromIntegral ((w `shiftR` 8) .&. 0xff)
-      , fromIntegral (w .&. 0xff)
-      ]
+  writeIORef bfiTipHeight (Just height)
 
 -- | Get a block filter entry
 blockFilterIndexGet :: BlockFilterIndexDB -> BlockHeight -> IO (Maybe BlockFilterEntry)
 blockFilterIndexGet BlockFilterIndexDB{..} height = do
-  let key = BS.cons bfiPrefix (toBE32 height)
+  let key = BS.cons bfiPrefix (bfiToBE32 height)
   mval <- R.get (dbHandle bfiDB) (dbReadOpts bfiDB) key
   return $ mval >>= either (const Nothing) Just . decode
-  where
-    toBE32 w = BS.pack
-      [ fromIntegral ((w `shiftR` 24) .&. 0xff)
-      , fromIntegral ((w `shiftR` 16) .&. 0xff)
-      , fromIntegral ((w `shiftR` 8) .&. 0xff)
-      , fromIntegral (w .&. 0xff)
-      ]
 
--- | Append a block filter to the index
+-- | Delete the entry at @height@. Used by reorg to undo a connected
+-- block from the filter index. After deleting, we read the entry at
+-- @height-1@ (if any) and rewind the in-memory chain pointer to it;
+-- if @height-1@ is absent the index becomes empty and we reset to
+-- the genesis filter header, exactly mirroring
+-- bitcoin-core/src/index/blockfilterindex.cpp::CustomRewind.
+blockFilterIndexDelete :: BlockFilterIndexDB -> BlockHeight -> IO ()
+blockFilterIndexDelete db@BlockFilterIndexDB{..} height = do
+  let key = BS.cons bfiPrefix (bfiToBE32 height)
+      metaKey = BS.singleton prefixBlockFilterMeta
+  R.delete (dbHandle bfiDB) (dbWriteOpts bfiDB) key
+  if height == 0
+    then do
+      R.delete (dbHandle bfiDB) (dbWriteOpts bfiDB) metaKey
+      writeIORef bfiLastHeader (Hash256 (BS.replicate 32 0))
+      writeIORef bfiTipHeight Nothing
+    else do
+      mPrev <- blockFilterIndexGet db (height - 1)
+      case mPrev of
+        Just prev -> do
+          let meta = BlockFilterIndexMeta (height - 1) (bfeFilterHeader prev)
+          R.put (dbHandle bfiDB) (dbWriteOpts bfiDB) metaKey (encode meta)
+          writeIORef bfiLastHeader (bfeFilterHeader prev)
+          writeIORef bfiTipHeight (Just (height - 1))
+        Nothing -> do
+          R.delete (dbHandle bfiDB) (dbWriteOpts bfiDB) metaKey
+          writeIORef bfiLastHeader (Hash256 (BS.replicate 32 0))
+          writeIORef bfiTipHeight Nothing
+
+-- | Append a block filter to the index, chaining its header off of
+-- the index's current tip header. Caller is responsible for
+-- monotonic ordering — passing @height@ that is not exactly
+-- @tipHeight + 1@ corrupts the chain (the entry is still written but
+-- 'bfeFilterHeader' will not match what a fresh recompute would
+-- produce). The IBD path in 'Sync.hs' and the submitBlock path in
+-- 'BlockTemplate.hs' both call this strictly in order; the reorg
+-- path in 'doSideBranchReorg' deletes from tip downward before
+-- re-appending, so monotonicity is preserved across reorgs as well.
 blockFilterIndexAppendBlock :: BlockFilterIndexDB -> Block -> BlockUndo -> BlockHash -> BlockHeight -> IO ()
 blockFilterIndexAppendBlock db block undo blockHash height = do
   prevHeader <- readIORef (bfiLastHeader db)
@@ -903,6 +1019,18 @@ blockFilterIndexAppendBlock db block undo blockHash height = do
       filterHeader = blockFilterHeader blockFilter prevHeader
       entry = BlockFilterEntry filterHash filterHeader (encodeBlockFilter blockFilter)
   blockFilterIndexPut db height entry
+
+-- | Read the in-memory tip height (highest indexed height, or
+-- 'Nothing' for empty).
+blockFilterIndexTipHeight :: BlockFilterIndexDB -> IO (Maybe BlockHeight)
+blockFilterIndexTipHeight = readIORef . bfiTipHeight
+
+-- | Read the in-memory chain pointer (@filter_header@ at the tip
+-- height, or @0x00..0x00@ for empty). Used by callers that need to
+-- chain a follow-on header (e.g. on-the-fly recompute when an entry
+-- past the index tip is requested).
+blockFilterIndexLastHeader :: BlockFilterIndexDB -> IO Hash256
+blockFilterIndexLastHeader = readIORef . bfiLastHeader
 
 --------------------------------------------------------------------------------
 -- CoinStatsIndex Database
@@ -1191,3 +1319,84 @@ indexManagerConnectBlock im block undo blockHash height = do
   case imCoinStatsIndex im of
     Nothing -> return ()
     Just csIdx -> coinStatsIndexAppendBlock csIdx block undo blockHash height
+
+  -- Update the manager's tracked sync height. This makes
+  -- 'imSyncHeight' the canonical "indexes are caught up to here"
+  -- pointer, used by 'indexManagerBackfill' to figure out where to
+  -- resume on the next startup or when a new tip arrives via the
+  -- normal IBD path.
+  writeIORef (imSyncHeight im) height
+
+-- | Reverse a previously-connected block from the BlockFilterIndex.
+-- Today only the filter index needs disconnect handling — TxIndex
+-- entries are intentionally orphan-tolerant (Core leaves stale
+-- TxIndex entries for forked-out blocks; reads are idempotent
+-- because the active-chain pointer is checked separately), and
+-- CoinStatsIndex is recomputed wholesale rather than reverted.
+-- Reference: bitcoin-core/src/index/blockfilterindex.cpp
+-- BlockFilterIndex::CustomRewind.
+indexManagerDisconnectBlock :: IndexManager -> BlockHeight -> IO ()
+indexManagerDisconnectBlock im height = do
+  case imBlockFilterIndex im of
+    Nothing -> return ()
+    Just bfIdx -> blockFilterIndexDelete bfIdx height
+  -- Pull imSyncHeight back to (height - 1) so a subsequent
+  -- 'indexManagerBackfill' resumes from the correct point. Using
+  -- saturating subtraction so disconnecting genesis (an
+  -- impossible-but-defensive case) doesn't underflow.
+  modifyIORef' (imSyncHeight im) $ \h ->
+    if h >= height && height > 0 then height - 1 else 0
+
+-- | Initialise per-index in-memory state from disk. This must be
+-- called immediately after 'newIndexManager' on every startup so the
+-- index doesn't recompute filters that are already on disk.
+--
+-- Today only the BlockFilterIndex carries persistable in-memory
+-- state (its chained @filter_header@ pointer + tip-height). Other
+-- indexes either have no in-memory state ('TxIndex') or rebuild
+-- their accumulator in 'indexManagerBackfill' ('CoinStatsIndex').
+indexManagerInitFromDB :: IndexManager -> IO ()
+indexManagerInitFromDB im = do
+  case imBlockFilterIndex im of
+    Nothing -> return ()
+    Just bfIdx -> do
+      loadBlockFilterIndexState bfIdx
+      mTip <- blockFilterIndexTipHeight bfIdx
+      case mTip of
+        Just h  -> writeIORef (imSyncHeight im) h
+        Nothing -> writeIORef (imSyncHeight im) 0
+
+-- | Walk the active chain forward from @imSyncHeight + 1@ to
+-- @bestHeight@ and populate every enabled index. Used at startup
+-- when an opt-in index flag is enabled but the on-disk index is
+-- stale (or empty) — for example, a node that ran for two days with
+-- the flag off and then enables it.
+--
+-- The @getBlockData@ callback returns the block + undo + hash for a
+-- given height, exactly as 'indexManagerSync' does; passing a
+-- callback (rather than calling 'getBlock' / 'getUndoData' here)
+-- keeps "Haskoin.Index" decoupled from "Haskoin.Storage".
+--
+-- Returns the height the index is now caught up to (== bestHeight
+-- on success; less if a block or undo record was missing — common
+-- for block 0, where genesis has no undo data).
+--
+-- Reference: bitcoin-core/src/index/base.cpp BaseIndex::Sync — same
+-- pattern, walk last-indexed → tip and call CustomAppend per block.
+indexManagerBackfill :: IndexManager
+                     -> (BlockHeight -> IO (Maybe (Block, BlockUndo, BlockHash)))
+                     -> BlockHeight
+                     -> IO BlockHeight
+indexManagerBackfill im getBlockData bestHeight = do
+  start <- readIORef (imSyncHeight im)
+  let from = if start == 0 then 1 else start + 1
+  let go h
+        | h > bestHeight = return (max start (h - 1))
+        | otherwise = do
+            mData <- getBlockData h
+            case mData of
+              Nothing -> return (h - 1)  -- gap; stop and let live sync resume
+              Just (block, undo, blockHash) -> do
+                indexManagerConnectBlock im block undo blockHash h
+                go (h + 1)
+  go from
