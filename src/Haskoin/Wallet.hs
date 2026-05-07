@@ -58,7 +58,19 @@ module Haskoin.Wallet
   , derivePublic
   , deriveHardened
   , derivePath
+  , derivePathPriv
+  , deriveChildPriv
   , toExtendedPubKey
+    -- * BIP-32 Extended Key Serialization
+  , encodeExtKey
+  , decodeExtKey
+  , encodeExtPubKey
+  , decodeExtPubKey
+  , XKeyVersion(..)
+  , xprvVersion
+  , xpubVersion
+  , tprvVersion
+  , tpubVersion
     -- * BIP-44/49/84/86 Paths
   , defaultDerivationPath
   , bip44Path
@@ -216,6 +228,7 @@ import qualified Haskoin.TaprootSighash as TS
 import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encodeScript)
 import Haskoin.Mempool (FeeRate(..))
 import Haskoin.Consensus (Network(..), coinbaseMaturity)
+import qualified Haskoin.Consensus
 
 -- For wallet encryption
 import Crypto.Cipher.AES (AES256)
@@ -552,6 +565,231 @@ integerToBS32 n =
       go x = fromIntegral (x `mod` 256) : go (x `div` 256)
       padded = replicate (32 - length bytes) 0 ++ bytes
   in BS.pack padded
+
+-- | The order of the secp256k1 curve.  Used in BIP-32 child-key validity
+-- checks (a freshly-derived child seckey is valid iff
+-- @0 < k_child < n@; the spec says fail and bump the index otherwise).
+secp256k1Order :: Integer
+secp256k1Order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+-- | 'Maybe'-returning child-private derivation.  Returns 'Nothing' on the
+-- vanishingly-rare invalid-child case (BIP-32: @IL >= n@ or
+-- @k_child == 0@).  Hardened children use @i >= 0x80000000@.
+--
+-- This is the canonical BIP-32 CKD_priv predicate; 'derivePrivate' /
+-- 'deriveHardened' are the partial variants that 'error' instead.
+deriveChildPriv :: ExtendedKey -> Word32 -> Maybe ExtendedKey
+deriveChildPriv parent index =
+  let isHardened = index >= 0x80000000
+      dat = if isHardened
+              then BS.cons 0x00 (getSecKey (ekKey parent)) `BS.append` encodeWord32BE' index
+              else let pubBytes = serializePubKeyCompressed (derivePubKeyFromPrivate (ekKey parent))
+                   in BS.append pubBytes (encodeWord32BE' index)
+      hmacResult = hmacSHA512 (ekChainCode parent) dat
+      (il, ir) = BS.splitAt 32 hmacResult
+      ilInt = bsToIntegerBE il
+      parentInt = bsToIntegerBE (getSecKey (ekKey parent))
+      childInt = (ilInt + parentInt) `mod` secp256k1Order
+      childKey = integerToBS32 childInt
+      pubBytesParent = serializePubKeyCompressed (derivePubKeyFromPrivate (ekKey parent))
+      fingerprint = computeFingerprint pubBytesParent
+  in if ilInt >= secp256k1Order || childInt == 0
+       then Nothing
+       else Just $ ExtendedKey
+              { ekKey = SecKey childKey
+              , ekChainCode = ir
+              , ekDepth = ekDepth parent + 1
+              , ekParentFP = fingerprint
+              , ekIndex = index
+              }
+
+-- | Fold 'deriveChildPriv' across a path, short-circuiting on the rare
+-- invalid-child case.  Use this when you need a total signature; the
+-- partial 'derivePath' is retained for backwards-compat with existing
+-- callers that already short-circuit on 'error'.
+derivePathPriv :: ExtendedKey -> [Word32] -> Maybe ExtendedKey
+derivePathPriv = foldM deriveChildPriv
+
+--------------------------------------------------------------------------------
+-- BIP-32 Extended Key Serialization
+--------------------------------------------------------------------------------
+-- Reference:
+--   BIP-32 §"Serialization format"
+--     <https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki>
+--   bitcoin-core/src/key.cpp: CExtKey::Encode / CExtKey::Decode
+--   bitcoin-core/src/chainparams.cpp: base58Prefixes for EXT_*_KEY
+--
+-- 78-byte payload + 4-byte base58check tail:
+--   4  bytes  version            (0x0488ADE4 xprv / 0x0488B21E xpub /
+--                                 0x04358394 tprv / 0x043587CF tpub)
+--   1  byte   depth
+--   4  bytes  parent fingerprint (BE)
+--   4  bytes  child number       (BE; high bit set ⇒ hardened)
+--   32 bytes  chain code
+--   33 bytes  key
+--             - xprv/tprv: 0x00 || ser256(k)
+--             - xpub/tpub: ser_compressed(K)
+
+-- | The four well-known BIP-32 version prefixes.
+data XKeyVersion = XPrvMain | XPubMain | XPrvTest | XPubTest
+  deriving (Show, Eq, Generic)
+
+instance NFData XKeyVersion
+
+xprvVersion :: Word32
+xprvVersion = 0x0488ADE4
+
+xpubVersion :: Word32
+xpubVersion = 0x0488B21E
+
+tprvVersion :: Word32
+tprvVersion = 0x04358394
+
+tpubVersion :: Word32
+tpubVersion = 0x043587CF
+
+-- | True for Bitcoin mainnet (per 'Haskoin.Consensus.mainnet' / netName).
+isMainnetVersion :: Network -> Bool
+isMainnetVersion net = case netName net of
+  "main"    -> True
+  "mainnet" -> True
+  _         -> False
+
+-- | Encode a BIP-32 extended private key to its base58check string
+-- (`xprv...` for mainnet, `tprv...` otherwise).
+encodeExtKey :: Network -> ExtendedKey -> Text
+encodeExtKey net ek =
+  let version = if isMainnetVersion net then xprvVersion else tprvVersion
+      keyData = BS.cons 0x00 (getSecKey (ekKey ek))
+      payload = serializeExtKeyPayload version (ekDepth ek) (ekParentFP ek)
+                                                (ekIndex ek) (ekChainCode ek) keyData
+  in base58CheckRaw payload
+
+-- | Decode an extended private key.  Returns 'Nothing' on:
+--   * non-78-byte payload after base58check
+--   * unknown version prefix
+--   * malformed checksum
+--   * non-zero leading byte on the key data (xpub data instead of xprv)
+decodeExtKey :: Text -> Maybe (Network, ExtendedKey)
+decodeExtKey txt = do
+  payload <- base58CheckRawDecode txt
+  if BS.length payload /= 78 then Nothing else do
+    let version    = decodeWord32BE (BS.take 4 payload)
+        depth      = BS.index payload 4
+        parentFP   = decodeWord32BE (BS.take 4 (BS.drop 5 payload))
+        childNum   = decodeWord32BE (BS.take 4 (BS.drop 9 payload))
+        chainCode  = BS.take 32 (BS.drop 13 payload)
+        keyData    = BS.take 33 (BS.drop 45 payload)
+    net <- case () of
+      _ | version == xprvVersion -> Just mainnetForExt
+        | version == tprvVersion -> Just testnetForExt
+        | otherwise              -> Nothing
+    -- xprv: 0x00 || k32
+    if BS.head keyData /= 0x00
+      then Nothing
+      else Just (net, ExtendedKey
+        { ekKey       = SecKey (BS.tail keyData)
+        , ekChainCode = chainCode
+        , ekDepth     = depth
+        , ekParentFP  = parentFP
+        , ekIndex     = childNum
+        })
+
+-- | Encode a BIP-32 extended public key to its base58check string
+-- (`xpub...` for mainnet, `tpub...` otherwise).
+encodeExtPubKey :: Network -> ExtendedPubKey -> Text
+encodeExtPubKey net epk =
+  let version = if isMainnetVersion net then xpubVersion else tpubVersion
+      keyData = serializePubKeyCompressed (epkKey epk)
+      payload = serializeExtKeyPayload version (epkDepth epk) (epkParentFP epk)
+                                                (epkIndex epk) (epkChainCode epk) keyData
+  in base58CheckRaw payload
+
+-- | Decode an extended public key.
+decodeExtPubKey :: Text -> Maybe (Network, ExtendedPubKey)
+decodeExtPubKey txt = do
+  payload <- base58CheckRawDecode txt
+  if BS.length payload /= 78 then Nothing else do
+    let version   = decodeWord32BE (BS.take 4 payload)
+        depth     = BS.index payload 4
+        parentFP  = decodeWord32BE (BS.take 4 (BS.drop 5 payload))
+        childNum  = decodeWord32BE (BS.take 4 (BS.drop 9 payload))
+        chainCode = BS.take 32 (BS.drop 13 payload)
+        keyData   = BS.take 33 (BS.drop 45 payload)
+    net <- case () of
+      _ | version == xpubVersion -> Just mainnetForExt
+        | version == tpubVersion -> Just testnetForExt
+        | otherwise              -> Nothing
+    pk <- parsePubKey keyData
+    Just (net, ExtendedPubKey
+      { epkKey       = pk
+      , epkChainCode = chainCode
+      , epkDepth     = depth
+      , epkParentFP  = parentFP
+      , epkIndex     = childNum
+      })
+
+-- | Sentinel networks returned by the decoder.  The caller can match on
+-- 'netName' (`"main"` vs `"testnet3"`); for full Network records the
+-- caller should re-derive from their configuration.
+mainnetForExt :: Network
+mainnetForExt = Haskoin.Consensus.mainnet
+
+testnetForExt :: Network
+testnetForExt = Haskoin.Consensus.testnet3
+
+-- | Helper: assemble the 78-byte extended-key payload.
+serializeExtKeyPayload
+  :: Word32      -- ^ version
+  -> Word8       -- ^ depth
+  -> Word32      -- ^ parent fingerprint
+  -> Word32      -- ^ child number
+  -> ByteString  -- ^ chain code (32)
+  -> ByteString  -- ^ key data (33)
+  -> ByteString
+serializeExtKeyPayload version depth parentFP childNum chainCode keyData =
+  BS.concat
+    [ encodeWord32BE' version
+    , BS.singleton depth
+    , encodeWord32BE' parentFP
+    , encodeWord32BE' childNum
+    , chainCode
+    , keyData
+    ]
+
+-- | Variant of 'base58Check' that accepts a multi-byte version prefix
+-- (BIP-32 uses 4-byte versions, the existing 'base58Check' takes a single
+-- 'Word8').  Implements: payload || dsha256(payload)[:4] → base58.
+base58CheckRaw :: ByteString -> Text
+base58CheckRaw payload =
+  let Hash256 d = doubleSHA256 payload
+      checksum = BS.take 4 d
+      full = BS.append payload checksum
+      leadingZeros = BS.length $ BS.takeWhile (== 0) full
+      encoded = encodeBase58 full
+      prefix = T.replicate leadingZeros (T.singleton '1')
+  in T.append prefix encoded
+
+-- | Inverse of 'base58CheckRaw'.  Returns the payload (without the
+-- 4-byte checksum) on success, 'Nothing' on checksum mismatch or empty
+-- input.
+base58CheckRawDecode :: Text -> Maybe ByteString
+base58CheckRawDecode txt
+  | T.null txt = Nothing
+  | otherwise =
+      let (ones, rest) = T.span (== '1') txt
+          leadingZeros = T.length ones
+          decoded = decodeBase58 rest
+          withZeros = BS.append (BS.replicate leadingZeros 0) decoded
+      in if BS.length withZeros < 5
+           then Nothing
+           else
+             let payloadLen = BS.length withZeros - 4
+                 payload    = BS.take payloadLen withZeros
+                 gotCheck   = BS.drop payloadLen withZeros
+                 Hash256 d  = doubleSHA256 payload
+                 expCheck   = BS.take 4 d
+             in if gotCheck == expCheck then Just payload else Nothing
 
 --------------------------------------------------------------------------------
 -- BIP-44/84 Derivation Paths
