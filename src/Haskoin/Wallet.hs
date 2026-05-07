@@ -79,7 +79,18 @@ module Haskoin.Wallet
   , bip49Path
   , bip84Path
   , bip86Path
+  , bip44FullPath
+  , bip49FullPath
+  , bip84FullPath
+  , bip86FullPath
+  , bip44Mainnet
+  , bip49Mainnet
+  , bip84Mainnet
+  , bip86Mainnet
   , parseDerivationPath
+    -- * BIP-44 helpers / wallet integration
+  , importMnemonic
+  , deriveSigningKey
     -- * Address Types
   , AddressType(..)
   , getNewAddress
@@ -883,6 +894,98 @@ bip86Path account = [0x80000000 .|. 86, 0x80000000 .|. 0, 0x80000000 .|. account
 -- | Default derivation path: BIP-84 account 0.
 defaultDerivationPath :: [Word32]
 defaultDerivationPath = bip84Path 0
+
+-- | Full BIP-44 path: m/44'/coin'/account'/change/index
+bip44FullPath
+  :: Word32  -- ^ coin_type (0 = mainnet, 1 = testnet)
+  -> Word32  -- ^ account
+  -> Word32  -- ^ change   (0 = receive, 1 = change)
+  -> Word32  -- ^ index
+  -> [Word32]
+bip44FullPath coin acct chg idx =
+  [ 0x80000000 .|. 44
+  , 0x80000000 .|. coin
+  , 0x80000000 .|. acct
+  , chg
+  , idx
+  ]
+
+-- | Full BIP-49 path: m/49'/coin'/account'/change/index (P2SH-P2WPKH).
+bip49FullPath :: Word32 -> Word32 -> Word32 -> Word32 -> [Word32]
+bip49FullPath coin acct chg idx =
+  [ 0x80000000 .|. 49
+  , 0x80000000 .|. coin
+  , 0x80000000 .|. acct
+  , chg
+  , idx
+  ]
+
+-- | Full BIP-84 path: m/84'/coin'/account'/change/index (native P2WPKH).
+bip84FullPath :: Word32 -> Word32 -> Word32 -> Word32 -> [Word32]
+bip84FullPath coin acct chg idx =
+  [ 0x80000000 .|. 84
+  , 0x80000000 .|. coin
+  , 0x80000000 .|. acct
+  , chg
+  , idx
+  ]
+
+-- | Full BIP-86 path: m/86'/coin'/account'/change/index (Taproot).
+bip86FullPath :: Word32 -> Word32 -> Word32 -> Word32 -> [Word32]
+bip86FullPath coin acct chg idx =
+  [ 0x80000000 .|. 86
+  , 0x80000000 .|. coin
+  , 0x80000000 .|. acct
+  , chg
+  , idx
+  ]
+
+-- | Convenience: BIP-44 mainnet path m/44'/0'/account'/change/index.
+bip44Mainnet :: Word32 -> Word32 -> Word32 -> [Word32]
+bip44Mainnet = bip44FullPath 0
+
+-- | Convenience: BIP-49 mainnet path m/49'/0'/account'/change/index.
+bip49Mainnet :: Word32 -> Word32 -> Word32 -> [Word32]
+bip49Mainnet = bip49FullPath 0
+
+-- | Convenience: BIP-84 mainnet path m/84'/0'/account'/change/index.
+bip84Mainnet :: Word32 -> Word32 -> Word32 -> [Word32]
+bip84Mainnet = bip84FullPath 0
+
+-- | Convenience: BIP-86 mainnet path m/86'/0'/account'/change/index
+-- (Taproot key-path).
+bip86Mainnet :: Word32 -> Word32 -> Word32 -> [Word32]
+bip86Mainnet = bip86FullPath 0
+
+--------------------------------------------------------------------------------
+-- BIP-44 wallet integration helpers
+--------------------------------------------------------------------------------
+
+-- | Import an existing mnemonic + passphrase into a freshly-loaded
+-- 'Wallet' on the supplied network.  Thin wrapper around 'loadWallet' +
+-- 'validateMnemonic'.
+--
+-- Validation includes BIP-39 checksum + word-count + dictionary
+-- membership; an invalid mnemonic returns 'Left' rather than silently
+-- producing a "wallet" full of unspendable addresses.
+importMnemonic
+  :: WalletConfig
+  -> Mnemonic
+  -> IO (Either String Wallet)
+importMnemonic config m
+  | not (validateMnemonic m) = pure (Left "invalid mnemonic (checksum / word count / dictionary)")
+  | otherwise = Right <$> loadWallet config m
+
+-- | Derive a 32-byte signing key at a given BIP-32 path from a wallet's
+-- master key.  The supplied path is interpreted in the BIP-32 form where
+-- @i >= 0x80000000@ marks a hardened component.
+--
+-- Returns 'Left' on the (extremely rare) BIP-32 invalid-child case.
+deriveSigningKey :: Wallet -> [Word32] -> Either String SecKey
+deriveSigningKey w path =
+  case derivePathPriv (walletMasterKey w) path of
+    Just ek -> Right (ekKey ek)
+    Nothing -> Left "BIP-32 derivation failed (invalid child key)"
 
 --------------------------------------------------------------------------------
 -- Address Types
