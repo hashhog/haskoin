@@ -140,6 +140,14 @@ module Haskoin.Wallet
     -- * Sign-side primitives (exposed for tests / advanced callers)
   , signWithKey
   , derivePubKeyFromPrivate
+  , computeLegacySighash
+  , computeSegwitSighash
+  , computeSegwitSighashFromProgram
+  , computeSegwitSighashScriptCode
+  , isP2PKHScript
+  , isP2WPKHScript
+  , isP2WSHScript
+  , isP2SHScript
     -- * PSBT Utilities
   , decodePsbt
   , encodePsbt
@@ -2225,7 +2233,13 @@ signPsbt xkey psbt =
   where
     tx = pgTx (psbtGlobal psbt)
 
--- | Sign a single input if we have the key
+-- | Sign a single input if we have the key.
+--
+-- Phase 2 (W15) extends the dispatcher to recognise wrapped script
+-- types (P2SH-P2WPKH / P2SH-P2WSH) and bare P2WSH single-key spends.
+-- For those, the matchable hash lives in the PSBT-supplied
+-- 'piRedeemScript' / 'piWitnessScript' rather than in the prevout
+-- scriptPubKey, so we have to consult the PSBT input metadata.
 signInput :: ExtendedKey -> Tx -> Int -> PsbtInput -> PsbtInput
 signInput xkey tx inputIdx pinp
   -- Already finalized, skip
@@ -2241,7 +2255,7 @@ signInput xkey tx inputIdx pinp
             value = txOutValue utxo
             -- Determine sighash type (default to SIGHASH_ALL)
             shType = maybe 0x01 id (piSighashType pinp)
-        in if canSign pubKeyHash script
+        in if canSign pubKeyHash script || canSignWrapped pubKeyHash script pinp
            then addSignature xkey pubKey tx inputIdx script value shType pinp
            else pinp
 
@@ -2268,12 +2282,51 @@ getInputUtxo pinp =
       Nothing -> Nothing
       Just prevTx -> Nothing  -- Would need outpoint index
 
--- | Check if we can sign for this script with our key
+-- | Check if we can sign for this script with our key.
+--
+-- For bare scripts (P2PKH / P2WPKH) the keyhash must match the program
+-- directly.  For wrapped scripts (P2SH-P2WPKH / P2SH-P2WSH) the
+-- 'piRedeemScript' / 'piWitnessScript' carry the inner program; the
+-- caller's 'canSignWrapped' helper handles those.  See 'signInput' for
+-- the dispatcher.
 canSign :: Hash160 -> ByteString -> Bool
 canSign pubKeyHash script
   | isP2PKHScript script = getP2PKHHash script == Just pubKeyHash
   | isP2WPKHScript script = getP2WPKHHash script == Just pubKeyHash
   | otherwise = False
+
+-- | Check if we can sign a wrapped (P2SH or P2WSH) input given the
+-- PSBT-supplied redeemScript / witnessScript.  Single-key P2WSH means
+-- the witnessScript is "<33-byte pubkey> OP_CHECKSIG".
+canSignWrapped :: Hash160 -> ByteString -> PsbtInput -> Bool
+canSignWrapped pubKeyHash script pinp
+  -- P2SH-P2WPKH: redeemScript = OP_0 <20-byte pkh>, must match our hash.
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WPKHScript redeem
+  = getP2WPKHHash redeem == Just pubKeyHash
+  -- P2SH-P2WSH single-key: redeemScript = OP_0 <32-byte sha256(witnessScript)>;
+  -- witnessScript itself is "<33-byte pubkey> OP_CHECKSIG".
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WSHScript redeem
+  , Just wScript <- piWitnessScript pinp
+  = isWitnessScriptSingleKey pubKeyHash wScript
+  -- Bare P2WSH single-key.
+  | isP2WSHScript script
+  , Just wScript <- piWitnessScript pinp
+  = isWitnessScriptSingleKey pubKeyHash wScript
+  | otherwise = False
+
+-- | Recognise a "<33-byte compressed pubkey> OP_CHECKSIG" witnessScript
+-- whose pubkey hashes to the given Hash160.  Layout is
+-- @0x21 <pk:33> 0xac@ (35 bytes total).
+isWitnessScriptSingleKey :: Hash160 -> ByteString -> Bool
+isWitnessScriptSingleKey pubKeyHash wScript =
+  BS.length wScript == 35 &&
+  BS.index wScript 0 == 0x21 &&
+  BS.index wScript 34 == 0xac &&
+  hash160 (BS.take 33 (BS.drop 1 wScript)) == pubKeyHash
 
 -- | Check if script is P2PKH
 isP2PKHScript :: ByteString -> Bool
@@ -2290,6 +2343,21 @@ isP2WPKHScript s = BS.length s == 22 &&
   BS.index s 0 == 0x00 &&  -- OP_0
   BS.index s 1 == 0x14     -- Push 20 bytes
 
+-- | Check if script is P2WSH (BIP-141 witness-v0 32-byte program).
+-- Layout: OP_0 0x20 <32-byte sha256(witnessScript)>.
+isP2WSHScript :: ByteString -> Bool
+isP2WSHScript s = BS.length s == 34 &&
+  BS.index s 0 == 0x00 &&  -- OP_0
+  BS.index s 1 == 0x20     -- Push 32 bytes
+
+-- | Check if script is P2SH (BIP-13/16). Layout:
+-- OP_HASH160 0x14 <20-byte hash160(redeemScript)> OP_EQUAL.
+isP2SHScript :: ByteString -> Bool
+isP2SHScript s = BS.length s == 23 &&
+  BS.index s 0 == 0xa9 &&  -- OP_HASH160
+  BS.index s 1 == 0x14 &&  -- Push 20 bytes
+  BS.index s 22 == 0x87    -- OP_EQUAL
+
 -- | Extract P2PKH hash from script
 getP2PKHHash :: ByteString -> Maybe Hash160
 getP2PKHHash s
@@ -2304,30 +2372,69 @@ getP2WPKHHash s
 
 -- | Add a signature to the input.
 --
--- Phase 1 of the ECDSA-wiring plan only implements the legacy P2PKH
--- spend path; segwit-v0 (P2WPKH / P2WSH / P2SH-P2WPKH) and taproot
--- key-path are deferred to Phase 4 / Phase 5 (see
--- @CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md@).
--- Hitting one of those scripts at PSBT-sign time is currently a hard
--- error rather than the previous silent 72-byte-zero placeholder, so a
--- caller cannot accidentally broadcast an "almost signed" tx with a
--- bogus partial sig.
+-- Phase 1 wired the legacy P2PKH spend path; Phase 2 (W15) extends this
+-- to segwit-v0 spends: bare P2WPKH (BIP-141 + BIP-143) plus the wrapped
+-- P2SH-P2WPKH (BIP-49).  Taproot key-path remains deferred to Phase 5.
+--
+-- Dispatch order matters.  Inputs that pay to bare P2WPKH carry their
+-- 0x0014... witness program directly in 'piWitnessUtxo'; inputs that
+-- pay to wrapped P2SH-P2WPKH carry an 0xa914... P2SH script in
+-- 'piWitnessUtxo' (or in the prevTxOut) and an 0x0014... redeemScript
+-- in 'piRedeemScript'.  We detect the wrap by looking at
+-- 'piRedeemScript' before falling through to the bare-P2WPKH branch,
+-- because the spend-side sighash (BIP-143) is identical in either
+-- case once the implicit-script scriptCode is computed.
+--
+-- Reference: @bitcoin-core/src/script/sign.cpp::SignStep@ +
+-- @CreateSig@ pair (BASE for P2PKH, WITNESS_V0 for the rest).
 addSignature :: ExtendedKey -> PubKey -> Tx -> Int -> ByteString -> Word64 -> Word32 -> PsbtInput -> PsbtInput
 addSignature xkey pubKey tx inputIdx script value shType pinp
+  -- P2SH-P2WPKH wrap (BIP-49): scriptPubKey is P2SH; redeemScript is the
+  -- P2WPKH program.  Sign as P2WPKH using the redeemScript-derived
+  -- scriptCode, then finalize will write both the scriptSig (push of the
+  -- redeemScript) and the witness stack.
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WPKHScript redeem =
+      let sighash   = computeSegwitSighashFromProgram tx inputIdx redeem value shType
+          signature = signWithKey xkey sighash shType
+      in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
+  -- P2SH-P2WSH wrap: P2SH redeemScript = 0x0020<32-byte witnessScript-hash>;
+  -- the witnessScript itself is in 'piWitnessScript' and used as the
+  -- BIP-143 scriptCode verbatim.
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WSHScript redeem
+  , Just wScript <- piWitnessScript pinp =
+      let sighash   = computeSegwitSighashScriptCode tx inputIdx wScript value shType
+          signature = signWithKey xkey sighash shType
+      in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
   | isP2PKHScript script =
       let sighash   = computeLegacySighash tx inputIdx script shType
           signature = signWithKey xkey sighash shType
       in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
   | isP2WPKHScript script =
-      -- TODO(haskoin-wallet-phase-4): P2WPKH (BIP-143) signing.  Sighash
-      -- plumbing already byte-exact via 'computeSegwitSighash'; what's
-      -- missing is the witness-stack finalization in 'finalizeForScript'.
-      let _sighash   = computeSegwitSighash tx inputIdx script value shType
-          _signature = signWithKey xkey _sighash shType
-      in error "addSignature: P2WPKH signing not yet implemented (Phase 4)"
+      -- BIP-143 scriptCode for a P2WPKH spend is the *implicit* legacy
+      -- P2PKH program: 0x76 0xa9 0x14 <20-byte pubkey-hash> 0x88 0xac.
+      -- 'computeSegwitSighash' already builds it from the witness program.
+      let sighash   = computeSegwitSighash tx inputIdx script value shType
+          signature = signWithKey xkey sighash shType
+      in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
+  | isP2WSHScript script
+  , Just wScript <- piWitnessScript pinp =
+      -- BIP-143 §"Witness program of version 0": for P2WSH the scriptCode
+      -- is the witnessScript itself, used verbatim (no implicit-script
+      -- transform).  The wallet must have populated 'piWitnessScript'
+      -- via the PSBT updater chain before we get here.
+      let sighash   = computeSegwitSighashScriptCode tx inputIdx wScript value shType
+          signature = signWithKey xkey sighash shType
+      in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
   | otherwise =
-      -- TODO(haskoin-wallet-phase-4/5): P2WSH, P2SH-P2WPKH, P2TR.
-      error "addSignature: only P2PKH signing implemented in Phase 1"
+      -- TODO(haskoin-wallet-phase-5): P2TR key-path signing (Schnorr +
+      -- BIP-341 sighash).  Bare-witness multisig P2WSH and P2SH-P2WSH
+      -- multi-key paths are exercised by the same sighash above; the
+      -- finalizer just needs additional Combiner state.
+      error "addSignature: unsupported script type (P2TR/multisig still TODO Phase 5)"
 
 -- | Compute legacy sighash
 computeLegacySighash :: Tx -> Int -> ByteString -> Word32 -> Hash256
@@ -2338,7 +2445,15 @@ computeLegacySighash tx inputIdx script shType =
                                (shType .&. 0x80 /= 0)
   in txSigHash tx inputIdx script shType shTypeFlag
 
--- | Compute segwit v0 sighash (BIP-143)
+-- | Compute segwit v0 sighash (BIP-143) for a bare P2WPKH spend.
+--
+-- The input @script@ is the witness program @0x00 0x14 <20-byte pkh>@.
+-- BIP-143 Step 6 specifies that for a v0 P2WPKH the @scriptCode@
+-- inserted into the preimage is the *implicit* P2PKH script
+-- @OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_CHECKSIG@; the wallet
+-- never sees that as an actual scriptPubKey on chain.  This rebuild
+-- step is what makes wrapped P2SH-P2WPKH share the same code path
+-- (see 'computeSegwitSighashFromProgram').
 computeSegwitSighash :: Tx -> Int -> ByteString -> Word64 -> Word32 -> Hash256
 computeSegwitSighash tx inputIdx script value shType =
   let shTypeFlag = SigHashType (shType .&. 0x1f == 0x01)
@@ -2348,6 +2463,25 @@ computeSegwitSighash tx inputIdx script value shType =
       -- For P2WPKH, scriptCode is: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
       pkh = BS.take 20 (BS.drop 2 script)
       scriptCode = BS.pack [0x76, 0xa9, 0x14] <> pkh <> BS.pack [0x88, 0xac]
+  in txSigHashSegWit tx inputIdx scriptCode value shTypeFlag
+
+-- | BIP-143 sighash for a P2SH-P2WPKH spend.  Identical to
+-- 'computeSegwitSighash' except the caller hands us the *redeemScript*
+-- (the 22-byte witness program lifted out of the P2SH wrap) rather
+-- than a scriptPubKey.  Same scriptCode rebuild applies.
+computeSegwitSighashFromProgram :: Tx -> Int -> ByteString -> Word64 -> Word32 -> Hash256
+computeSegwitSighashFromProgram = computeSegwitSighash
+
+-- | BIP-143 sighash for a P2WSH spend (and the wrapped P2SH-P2WSH
+-- case).  The @scriptCode@ in the preimage is the witnessScript
+-- itself, taken verbatim — no implicit-script transform.  See
+-- BIP-143 §"Witness program of version 0" bullet 3.
+computeSegwitSighashScriptCode :: Tx -> Int -> ByteString -> Word64 -> Word32 -> Hash256
+computeSegwitSighashScriptCode tx inputIdx scriptCode value shType =
+  let shTypeFlag = SigHashType (shType .&. 0x1f == 0x01)
+                               (shType .&. 0x1f == 0x02)
+                               (shType .&. 0x1f == 0x03)
+                               (shType .&. 0x80 /= 0)
   in txSigHashSegWit tx inputIdx scriptCode value shTypeFlag
 
 -- | Sign a 32-byte sighash with the extended key's private scalar and
@@ -2464,14 +2598,61 @@ finalizeInput pinp
         in finalizeForScript script sigs pinp
       _ -> pinp  -- Cannot finalize
 
--- | Finalize input based on script type
+-- | Finalize input based on script type.
+--
+-- Phase 2 (W15) covers segwit-v0:
+--   * Bare P2WPKH:           witness = [sig, pubkey]; scriptSig empty.
+--   * Bare P2WSH single-key: witness = [sig, witnessScript].
+--   * Wrapped P2SH-P2WPKH:   witness = [sig, pubkey];
+--                            scriptSig = push(redeemScript).
+--   * Wrapped P2SH-P2WSH:    witness = [sig, witnessScript];
+--                            scriptSig = push(redeemScript).
+-- For the wrapped cases we read 'piRedeemScript' / 'piWitnessScript'
+-- from the PSBT input rather than parsing them out of the output
+-- script.  Multi-key P2WSH falls through to "cannot finalize" today —
+-- the BIP-143 sighash machinery is the same, only the witness layout
+-- differs and that needs Combiner state we don't track yet.
 finalizeForScript :: ByteString -> [(PubKey, ByteString)] -> PsbtInput -> PsbtInput
 finalizeForScript script sigs pinp
-  -- P2WPKH: witness = [signature, pubkey]
+  -- P2SH wrap: figure out which inner program the redeemScript carries.
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WPKHScript redeem =
+      case sigs of
+        [(pk, sig)] ->
+          let witness   = [sig, serializePubKeyCompressed pk]
+              scriptSig = encodePushData' redeem
+          in clearSigningFields $ pinp
+             { piFinalScriptSig     = Just scriptSig
+             , piFinalScriptWitness = Just witness
+             }
+        _ -> pinp
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WSHScript redeem
+  , Just wScript <- piWitnessScript pinp =
+      case sigs of
+        [(_, sig)] ->
+          let witness   = [sig, wScript]
+              scriptSig = encodePushData' redeem
+          in clearSigningFields $ pinp
+             { piFinalScriptSig     = Just scriptSig
+             , piFinalScriptWitness = Just witness
+             }
+        _ -> pinp
+  -- Bare P2WPKH: witness = [signature, pubkey]
   | isP2WPKHScript script =
       case sigs of
         [(pk, sig)] ->
           let witness = [sig, serializePubKeyCompressed pk]
+          in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
+        _ -> pinp
+  -- Bare P2WSH single-key: witness = [signature, witnessScript]
+  | isP2WSHScript script
+  , Just wScript <- piWitnessScript pinp =
+      case sigs of
+        [(_, sig)] ->
+          let witness = [sig, wScript]
           in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
         _ -> pinp
   -- P2PKH: scriptSig = <sig> <pubkey>
@@ -2484,7 +2665,7 @@ finalizeForScript script sigs pinp
                 ]
           in clearSigningFields $ pinp { piFinalScriptSig = Just scriptSig }
         _ -> pinp
-  -- TODO: Handle P2SH, P2WSH, multisig, etc.
+  -- TODO(haskoin-wallet-phase-5): P2TR key-path, multi-key P2WSH.
   | otherwise = pinp
 
 -- | Encode push data for scriptSig

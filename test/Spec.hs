@@ -5202,6 +5202,167 @@ main = hspec $ do
           der              = BS.init spendSig
       verifyMsgLax pubKey (Sig der) tamperedHash `shouldBe` False
 
+  -- Phase 2 of the haskoin ECDSA wiring plan
+  -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
+  -- Wires the segwit-v0 (BIP-141 + BIP-143) spend-side signing path:
+  -- bare P2WPKH, bare P2WSH single-key, and the wrapped P2SH-P2WPKH /
+  -- P2SH-P2WSH variants.  Pre-Phase-2 these all hit
+  -- `addSignature: ... not yet implemented`; post-Phase-2 the PSBT
+  -- Signer + Finalizer + Extractor chain produces a fully-witnessed
+  -- transaction that verifies under libsecp via 'verifyMsgLax' on the
+  -- BIP-143 sighash.
+  describe "ECDSA segwit-v0 sign path (Phase 2)" $ do
+    let testSk    = SecKey (BS.replicate 32 0x02)
+        xkey      = ExtendedKey
+          { ekKey       = testSk
+          , ekChainCode = BS.replicate 32 0x00
+          , ekDepth     = 0
+          , ekParentFP  = 0
+          , ekIndex     = 0
+          }
+        pubKey    = derivePubKeyFromPrivate testSk
+        pubKeyBS  = serializePubKeyCompressed pubKey
+        Hash160 pkh20 = hash160 pubKeyBS
+        -- Witness programs / scripts derived from the test pubkey.
+        p2wpkhSpk    = BS.pack [0x00, 0x14] <> pkh20            -- bare scriptPubKey
+        wScriptOne   = BS.cons 0x21 pubKeyBS `BS.snoc` 0xac     -- <pk> CHECKSIG
+        wsh          = sha256 wScriptOne                         -- 32-byte sha256
+        p2wshSpk     = BS.pack [0x00, 0x20] <> wsh
+        Hash160 redH = hash160 p2wpkhSpk
+        p2shP2wpkhSpk = BS.pack [0xa9, 0x14] <> redH <> BS.pack [0x87]
+        Hash160 redH2 = hash160 p2wshSpk
+        p2shP2wshSpk  = BS.pack [0xa9, 0x14] <> redH2 <> BS.pack [0x87]
+        -- A throwaway prevout for spending.
+        prevTxId   = TxId (Hash256 (BS.replicate 32 0x11))
+        prevValue  = 50_000 :: Word64
+        outScript  = BS.pack [0x00, 0x14] <> BS.replicate 20 0x99   -- arbitrary P2WPKH dest
+        unsignedTx :: Tx
+        unsignedTx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint prevTxId 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 49_000 outScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+    it "signs a bare P2WPKH spend that verifies via the BIP-143 sighash" $ do
+      let tx        = unsignedTx
+          sighash   = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x01
+          spendSig  = signWithKey xkey sighash 0x01
+          der       = BS.init spendSig
+      BS.last spendSig `shouldBe` 0x01
+      verifyMsgLax pubKey (Sig der) sighash `shouldBe` True
+      isValidDERSignature spendSig    `shouldBe` True
+      isLowDERSignature   spendSig    `shouldBe` True
+      isDefinedSigHashType (BS.last spendSig) `shouldBe` True
+
+    it "P2WPKH PSBT round-trip: signPsbt + finalizePsbt + extractTransaction" $ do
+      let tx        = unsignedTx
+          inp0      = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut prevValue p2wpkhSpk)
+            , piSighashType = Just 0x01
+            }
+          psbt      = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed    = signPsbt xkey psbt
+      -- After signing the partial sig is keyed by our pubkey
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      case finalizePsbt signed of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- ScriptSig empty for native segwit; witness has [sig, pubkey]
+            txInScript (head (txInputs finalTx)) `shouldBe` BS.empty
+            length (head (txWitness finalTx))    `shouldBe` 2
+            BS.last (head (head (txWitness finalTx))) `shouldBe` 0x01
+            -- The witness signature verifies under our pubkey for the
+            -- BIP-143 sighash we (the signer) computed.
+            let sighash = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x01
+                der     = BS.init (head (head (txWitness finalTx)))
+            verifyMsgLax pubKey (Sig der) sighash `shouldBe` True
+
+    it "P2WSH single-key PSBT round-trip" $ do
+      let tx        = unsignedTx
+          inp0      = emptyPsbtInput
+            { piWitnessUtxo   = Just (TxOut prevValue p2wshSpk)
+            , piWitnessScript = Just wScriptOne
+            , piSighashType   = Just 0x01
+            }
+          psbt      = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed    = signPsbt xkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      case finalizePsbt signed of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- Witness = [sig, witnessScript]; scriptSig empty.
+            txInScript (head (txInputs finalTx)) `shouldBe` BS.empty
+            head (txWitness finalTx) !! 1 `shouldBe` wScriptOne
+            -- Sig under BIP-143 with scriptCode = witnessScript.
+            let sighash = computeSegwitSighashScriptCode tx 0 wScriptOne prevValue 0x01
+                der     = BS.init (head (head (txWitness finalTx)))
+            verifyMsgLax pubKey (Sig der) sighash `shouldBe` True
+
+    it "P2SH-P2WPKH wrapped PSBT round-trip" $ do
+      let tx        = unsignedTx
+          inp0      = emptyPsbtInput
+            { piWitnessUtxo  = Just (TxOut prevValue p2shP2wpkhSpk)
+            , piRedeemScript = Just p2wpkhSpk     -- inner program
+            , piSighashType  = Just 0x01
+            }
+          psbt      = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed    = signPsbt xkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      case finalizePsbt signed of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- scriptSig = push(redeemScript); witness = [sig, pubkey]
+            let ssExpected = BS.cons (fromIntegral (BS.length p2wpkhSpk)) p2wpkhSpk
+            txInScript (head (txInputs finalTx)) `shouldBe` ssExpected
+            length (head (txWitness finalTx))    `shouldBe` 2
+            head (txWitness finalTx) !! 1       `shouldBe` pubKeyBS
+            -- Sig under BIP-143 using the inner-program-derived scriptCode
+            -- (same shape as bare P2WPKH).
+            let sighash = computeSegwitSighashFromProgram tx 0 p2wpkhSpk prevValue 0x01
+                der     = BS.init (head (head (txWitness finalTx)))
+            verifyMsgLax pubKey (Sig der) sighash `shouldBe` True
+
+    it "P2SH-P2WSH wrapped PSBT round-trip" $ do
+      let tx        = unsignedTx
+          inp0      = emptyPsbtInput
+            { piWitnessUtxo   = Just (TxOut prevValue p2shP2wshSpk)
+            , piRedeemScript  = Just p2wshSpk    -- inner OP_0 0x20 <wsh>
+            , piWitnessScript = Just wScriptOne
+            , piSighashType   = Just 0x01
+            }
+          psbt      = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed    = signPsbt xkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      case finalizePsbt signed of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            let ssExpected = BS.cons (fromIntegral (BS.length p2wshSpk)) p2wshSpk
+            txInScript (head (txInputs finalTx)) `shouldBe` ssExpected
+            head (txWitness finalTx) !! 1 `shouldBe` wScriptOne
+            let sighash = computeSegwitSighashScriptCode tx 0 wScriptOne prevValue 0x01
+                der     = BS.init (head (head (txWitness finalTx)))
+            verifyMsgLax pubKey (Sig der) sighash `shouldBe` True
+
+    it "bare-P2WPKH sighash differs across SIGHASH_ALL vs SIGHASH_NONE" $ do
+      -- Quick smoke-test that the BIP-143 hash flag dispatch wires through
+      -- 'computeSegwitSighash' (the segwit-side analog of the Phase-1
+      -- legacy tampered-hash test). SIGHASH_ALL commits to all outputs;
+      -- SIGHASH_NONE does not, so the preimage and the hash differ.
+      let tx        = unsignedTx
+          shAll     = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x01
+          shNone    = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x02
+      shAll `shouldNotBe` shNone
+
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,
   -- insert both into the mempool indexes by hand (the real validation path
