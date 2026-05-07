@@ -13,6 +13,7 @@
 #include <secp256k1_recovery.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 /* ---- Deprecated API shims ------------------------------------------------ */
 
@@ -550,4 +551,102 @@ int haskoin_ec_pubkey_decompress(
 
     return secp256k1_ec_pubkey_serialize(
         ctx, out65, &out_len, &pubkey, SECP256K1_EC_UNCOMPRESSED);
+}
+
+/* ---- ECDSA DER signing (transaction-spend path) ------------------------- */
+
+/*
+ * Helper: little-endian 32-bit write into the extra-entropy buffer.  Mirrors
+ * Core's WriteLE32 used in CKey::Sign.
+ */
+static void write_le32(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)(v & 0xff);
+    p[1] = (unsigned char)((v >> 8)  & 0xff);
+    p[2] = (unsigned char)((v >> 16) & 0xff);
+    p[3] = (unsigned char)((v >> 24) & 0xff);
+}
+
+/*
+ * Test whether an ECDSA signature has a "low R" value (top bit of R clear).
+ * Mirrors Bitcoin Core's SigHasLowR (key.cpp).  Operates on the DER-encoded
+ * compact form of the signature.
+ */
+static int sig_has_low_r(
+    const secp256k1_context *ctx,
+    const secp256k1_ecdsa_signature *sig
+) {
+    unsigned char compact[64];
+    secp256k1_ecdsa_signature_serialize_compact(ctx, compact, sig);
+    /* compact layout: [R(32) || S(32)].  R is "low" iff its top bit is 0. */
+    return (compact[0] & 0x80) == 0;
+}
+
+/*
+ * Produce a DER-encoded ECDSA signature with RFC-6979 deterministic-k.
+ *
+ * This mirrors Bitcoin Core's CKey::Sign (src/key.cpp:209-235):
+ *   - RFC-6979 deterministic nonce.
+ *   - Optional low-R grind: bump 32-bit LE counter in extra_entropy until
+ *     the resulting R has its top bit clear.  When grind=1, this matches
+ *     Core's wallet output byte-for-byte.
+ *   - Self-verify before returning (defense-in-depth).
+ *
+ * Inputs:
+ *   seckey32   : 32-byte secret key (must be a valid scalar in [1, n-1]).
+ *   msghash32  : 32-byte message digest (sighash).
+ *   grind      : non-zero to grind for low-R (matches Core's wallet default).
+ *   out_buf    : output buffer.  Must be at least 72 bytes (max DER length
+ *                for a non-low-R signature; low-R can shrink to ~70-71).
+ *   out_len    : in: capacity of out_buf; out: actual DER length written.
+ *
+ * Returns 1 on success (out_buf filled, *out_len set), 0 on failure
+ * (e.g. invalid seckey, self-verify mismatch).
+ */
+int haskoin_ecdsa_sign_der(
+    const unsigned char *seckey32,
+    const unsigned char *msghash32,
+    int grind,
+    unsigned char *out_buf,
+    size_t *out_len
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_ecdsa_signature sig;
+    unsigned char extra_entropy[32] = {0};
+    uint32_t counter = 0;
+    int ret;
+
+    if (!ctx) return 0;
+    if (!seckey32 || !msghash32 || !out_buf || !out_len) return 0;
+
+    ret = secp256k1_ecdsa_sign(
+        ctx, &sig, msghash32, seckey32,
+        secp256k1_nonce_function_rfc6979, NULL);
+    if (!ret) return 0;
+
+    /* Grind for low R.  Counter starts at 0 and is bumped on each retry,
+     * matching key.cpp's increment-then-write order (`++counter`). */
+    while (grind && !sig_has_low_r(ctx, &sig)) {
+        counter++;
+        write_le32(extra_entropy, counter);
+        ret = secp256k1_ecdsa_sign(
+            ctx, &sig, msghash32, seckey32,
+            secp256k1_nonce_function_rfc6979, extra_entropy);
+        if (!ret) return 0;
+    }
+
+    /* Serialize as DER. */
+    if (!secp256k1_ecdsa_signature_serialize_der(ctx, out_buf, out_len, &sig)) {
+        return 0;
+    }
+
+    /* Self-verify: derive the pubkey we just signed under and check the
+     * signature roundtrips.  Catches RAM-corruption / library-mismatch
+     * regressions before the bad bytes leak into a tx. */
+    {
+        secp256k1_pubkey pk;
+        if (!secp256k1_ec_pubkey_create(ctx, &pk, seckey32)) return 0;
+        if (!secp256k1_ecdsa_verify(ctx, &sig, msghash32, &pk)) return 0;
+    }
+
+    return 1;
 }
