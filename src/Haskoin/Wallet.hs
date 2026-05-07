@@ -2232,11 +2232,28 @@ updatePsbt lookupUtxo psbt =
 -- | Sign a PSBT with an extended key.
 -- This is the Signer role in BIP-174.
 -- Adds partial signatures for inputs that match the key.
+--
+-- Phase 5 / W16 extends the per-input loop to gather every input's
+-- prevout (amount + scriptPubKey) up-front, since BIP-341 §"Common
+-- signature message" requires the Taproot key-path sighash to commit
+-- to *all* inputs' prevouts, not just the one being signed.  Inputs
+-- whose @piWitnessUtxo@ is missing fall back to their on-tx scriptSig
+-- bytes (rare but possible for legacy-only PSBTs); the BIP-341 sighash
+-- check below will fail loudly if any P2TR input is missing prevout
+-- data, which is the right failure mode.
 signPsbt :: ExtendedKey -> Psbt -> Psbt
 signPsbt xkey psbt =
-  psbt { psbtInputs = zipWith (signInput xkey tx) [0..] (psbtInputs psbt) }
+  let prevouts = map collectPrevout (psbtInputs psbt)
+  in psbt { psbtInputs = zipWith (signInput xkey tx prevouts) [0..] (psbtInputs psbt) }
   where
     tx = pgTx (psbtGlobal psbt)
+    -- For Taproot key-path signing we need (amount, scriptPubKey) per
+    -- input.  piWitnessUtxo is the canonical PSBT carrier; non-witness
+    -- inputs would not be Taproot anyway, so a placeholder is harmless
+    -- (it will never feed the BIP-341 preimage).
+    collectPrevout pinp = case piWitnessUtxo pinp of
+      Just (TxOut v s) -> (v, s)
+      Nothing          -> (0, BS.empty)
 
 -- | Sign a single input if we have the key.
 --
@@ -2245,8 +2262,12 @@ signPsbt xkey psbt =
 -- For those, the matchable hash lives in the PSBT-supplied
 -- 'piRedeemScript' / 'piWitnessScript' rather than in the prevout
 -- scriptPubKey, so we have to consult the PSBT input metadata.
-signInput :: ExtendedKey -> Tx -> Int -> PsbtInput -> PsbtInput
-signInput xkey tx inputIdx pinp
+--
+-- Phase 5 (W16) adds bare-P2TR key-path: the @prevouts@ list is the
+-- full per-input (amount, scriptPubKey) context required by the
+-- BIP-341 sighash, gathered once up-front in 'signPsbt'.
+signInput :: ExtendedKey -> Tx -> [(Word64, ByteString)] -> Int -> PsbtInput -> PsbtInput
+signInput xkey tx prevouts inputIdx pinp
   -- Already finalized, skip
   | isInputFinalized pinp = pinp
   -- Try to sign
@@ -2258,10 +2279,14 @@ signInput xkey tx inputIdx pinp
             pubKeyHash = hash160 pubKeyBytes
             script = txOutScript utxo
             value = txOutValue utxo
-            -- Determine sighash type (default to SIGHASH_ALL)
+            -- Determine sighash type (default to SIGHASH_ALL).  The Taproot
+            -- branch in addSignature interprets 0x01 (= explicit
+            -- SIGHASH_ALL) and treats the SIGHASH_DEFAULT (0x00) case
+            -- separately when the PSBT explicitly stores it.
             shType = maybe 0x01 id (piSighashType pinp)
         in if canSign pubKeyHash script || canSignWrapped pubKeyHash script pinp
-           then addSignature xkey pubKey tx inputIdx script value shType pinp
+              || canSignTaproot xkey script pinp
+           then addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
            else pinp
 
 -- | Check if an input is already finalized
@@ -2332,6 +2357,33 @@ isWitnessScriptSingleKey pubKeyHash wScript =
   BS.index wScript 0 == 0x21 &&
   BS.index wScript 34 == 0xac &&
   hash160 (BS.take 33 (BS.drop 1 wScript)) == pubKeyHash
+
+-- | Phase 5 (W16): can we sign for a Taproot key-path output with the
+-- given key?  The on-chain script is @OP_1 0x20 <output_xonly>@ where
+-- @output_xonly@ is the BIP-341-tweaked key derived from our internal
+-- key + the optional BIP-371 merkle_root.
+--
+-- For BIP-86 (single-key, no script tree) we recompute the tweak from
+-- our seckey and check the resulting tweaked key matches the on-chain
+-- output key.  For descriptors with a script tree the merkle_root would
+-- come from `piTaprootMerkleRoot` (PSBT_IN_TAP_MERKLE_ROOT, BIP-371) —
+-- not yet stored in `PsbtInput`, so this commit handles only the
+-- BIP-86 path.  Tapscript spends are out of scope (Phase 9).
+canSignTaproot :: ExtendedKey -> ByteString -> PsbtInput -> Bool
+canSignTaproot xkey script _pinp
+  | isP2TRScript script
+  , Just outputKey <- getP2TRProgram script =
+      let SecKey sk     = ekKey xkey
+          mInternalX    = xonlyPubkeyFromSeckey sk
+          tweak mInt    = bip86TapTweakHash <$> mInt
+          mTweaked      = do
+            iX <- mInternalX
+            t  <- tweak (Just iX)
+            xonlyPubkeyTweakAdd iX t
+      in case mTweaked of
+           Just (k, _) -> k == outputKey
+           Nothing     -> False
+  | otherwise = False
 
 -- | Check if script is P2PKH
 isP2PKHScript :: ByteString -> Bool
@@ -2408,8 +2460,8 @@ getP2WPKHHash s
 --
 -- Reference: @bitcoin-core/src/script/sign.cpp::SignStep@ +
 -- @CreateSig@ pair (BASE for P2PKH, WITNESS_V0 for the rest).
-addSignature :: ExtendedKey -> PubKey -> Tx -> Int -> ByteString -> Word64 -> Word32 -> PsbtInput -> PsbtInput
-addSignature xkey pubKey tx inputIdx script value shType pinp
+addSignature :: ExtendedKey -> PubKey -> Tx -> [(Word64, ByteString)] -> Int -> ByteString -> Word64 -> Word32 -> PsbtInput -> PsbtInput
+addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
   -- P2SH-P2WPKH wrap (BIP-49): scriptPubKey is P2SH; redeemScript is the
   -- P2WPKH program.  Sign as P2WPKH using the redeemScript-derived
   -- scriptCode, then finalize will write both the scriptSig (push of the
@@ -2450,12 +2502,38 @@ addSignature xkey pubKey tx inputIdx script value shType pinp
       let sighash   = computeSegwitSighashScriptCode tx inputIdx wScript value shType
           signature = signWithKey xkey sighash shType
       in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
+  -- Phase 5 (W16): bare-P2TR key-path (BIP-341 + BIP-86).  Witness item
+  -- is the Schnorr signature alone; the finalizer writes it directly
+  -- and the @piPartialSigs@ map keys the entry by our *internal* pubkey
+  -- so the Combiner / Finalizer can find it later.  Tapscript spends
+  -- and merkle_root-bearing key-paths (BIP-371 PSBT_IN_TAP_MERKLE_ROOT)
+  -- remain deferred; they need new PsbtInput fields.
+  | isP2TRScript script =
+      let prevoutsTS = TS.TaprootPrevouts
+            { TS.taprootAmounts = map fst prevouts
+            , TS.taprootScripts = map snd prevouts
+            }
+          -- BIP-341 hash type: SIGHASH_DEFAULT (0x00) is the wallet
+          -- default for Taproot — see CreateSchnorrSig in Core's
+          -- script/sign.cpp.  An explicit SIGHASH_ALL (0x01) in the
+          -- PSBT is also valid; this branch passes whatever the PSBT
+          -- carries.  We coerce 0x01 (the segwit-v0 default that
+          -- 'signInput' falls back to when no piSighashType is set)
+          -- to 0x00 here, since for Taproot the natural "no override"
+          -- behavior is SIGHASH_DEFAULT.
+          taprootHashType = if shType == 0x01 && piSighashType pinp == Nothing
+                              then 0x00
+                              else fromIntegral (shType .&. 0xff) :: Word8
+      in case computeTaprootKeyPathSighash tx inputIdx prevoutsTS taprootHashType Nothing of
+           Left _  -> pinp  -- malformed prevouts; leave the input unsigned
+           Right sighash ->
+             let witnessItem = signWithKeyTaproot xkey sighash taprootHashType Nothing
+             in pinp { piPartialSigs = Map.insert pubKey witnessItem (piPartialSigs pinp) }
   | otherwise =
-      -- TODO(haskoin-wallet-phase-5): P2TR key-path signing (Schnorr +
-      -- BIP-341 sighash).  Bare-witness multisig P2WSH and P2SH-P2WSH
-      -- multi-key paths are exercised by the same sighash above; the
-      -- finalizer just needs additional Combiner state.
-      error "addSignature: unsupported script type (P2TR/multisig still TODO Phase 5)"
+      -- TODO(haskoin-wallet-phase-5): tapscript script-path,
+      -- bare-witness multisig P2WSH and P2SH-P2WSH multi-key paths
+      -- (Combiner state expansion).
+      error "addSignature: unsupported script type (tapscript / multisig still TODO)"
 
 -- | Compute legacy sighash
 computeLegacySighash :: Tx -> Int -> ByteString -> Word32 -> Hash256
@@ -2768,7 +2846,18 @@ finalizeForScript script sigs pinp
                 ]
           in clearSigningFields $ pinp { piFinalScriptSig = Just scriptSig }
         _ -> pinp
-  -- TODO(haskoin-wallet-phase-5): P2TR key-path, multi-key P2WSH.
+  -- Phase 5 (W16): bare P2TR key-path.  Witness stack is just [sig],
+  -- no pubkey (the on-chain output key is the witness program itself,
+  -- and the verifier rebuilds its identity from the sig + sighash).
+  -- scriptSig is empty for native segwit.  See
+  -- bitcoin-core/src/script/sign.cpp ProduceSignature WITNESS_V1_TAPROOT.
+  | isP2TRScript script =
+      case sigs of
+        [(_, sig)] ->
+          let witness = [sig]
+          in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
+        _ -> pinp
+  -- TODO: tapscript script-path, multi-key P2WSH.
   | otherwise = pinp
 
 -- | Encode push data for scriptSig
