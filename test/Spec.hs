@@ -5543,6 +5543,79 @@ main = hspec $ do
           wallet64      = signWithKeyTaproot xkey sighash 0x00 Nothing
       wallet64 `shouldBe` rawSig
 
+    -- ---- BIP-86 PSBT round-trip: signPsbt + finalizePsbt + extractTransaction
+    --
+    -- This is the integration check that mirrors the Phase-2 (segwit-v0)
+    -- PSBT round-trip tests: build a 1-input PSBT for a P2TR prevout,
+    -- run it through signPsbt → finalizePsbt → extractTransaction, and
+    -- verify the extracted tx has a single 64-byte witness item that
+    -- BIP-340-verifies under the on-chain output key.
+
+    it "P2TR BIP-86 PSBT round-trip: signPsbt → finalizePsbt → extractTransaction" $ do
+      let inp0      = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut prevValue' p2trSpk)
+              -- Default sighash-type omitted — Phase-5 dispatcher sees the
+              -- segwit-v0 fallback (0x01) and rewrites it to SIGHASH_DEFAULT
+              -- (0x00) for Taproot, matching Core's wallet behavior.
+            }
+          psbt      = (emptyPsbt unsignedTrTx) { psbtInputs = [inp0] }
+          signed    = signPsbt xkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      case finalizePsbt signed of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- Bare segwit: scriptSig empty, witness has [sig] only.
+            txInScript (head (txInputs finalTx)) `shouldBe` BS.empty
+            length (head (txWitness finalTx))    `shouldBe` 1
+            BS.length (head (head (txWitness finalTx))) `shouldBe` 64
+            -- Cross-check: the witness item BIP-340 verifies under the
+            -- *tweaked output key* over the *recomputed* BIP-341 sighash.
+            let prevoutsTS = TS.TaprootPrevouts
+                  { TS.taprootAmounts = [prevValue']
+                  , TS.taprootScripts = [p2trSpk]
+                  }
+            sighash <- case computeTaprootKeyPathSighash unsignedTrTx 0 prevoutsTS TS.sighashDefault Nothing of
+              Left e -> expectationFailure (show e) >> return (Hash256 BS.empty)
+              Right h -> return h
+            let Hash256 msg32 = sighash
+                witnessItem   = head (head (txWitness finalTx))
+            verifySchnorr witnessItem msg32 outputXOnly `shouldBe` True
+
+    it "Phase-2 segwit-v0 still passes through (regression check)" $ do
+      -- Phase-5 changed the addSignature signature (added prevouts list),
+      -- which renamed/extended every existing branch.  This smoke-test
+      -- pins the segwit-v0 wrappers (P2WPKH path) end-to-end through
+      -- the new dispatcher to make sure we didn't accidentally rot
+      -- Phase-2's PSBT round-trip while wiring P2TR.
+      let p2sk        = SecKey (BS.replicate 32 0x02)
+          xkey'       = ExtendedKey
+            { ekKey = p2sk, ekChainCode = BS.replicate 32 0x00
+            , ekDepth = 0, ekParentFP = 0, ekIndex = 0 }
+          pubKey'     = derivePubKeyFromPrivate p2sk
+          pubKeyBS'   = serializePubKeyCompressed pubKey'
+          Hash160 pk20 = hash160 pubKeyBS'
+          p2wpkhSpk2   = BS.pack [0x00, 0x14] <> pk20
+          tx2          = Tx { txVersion = 2
+                            , txInputs  = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x88))) 0) BS.empty 0xfffffffd]
+                            , txOutputs = [TxOut 49_000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0xbb)]
+                            , txWitness  = [[]]
+                            , txLockTime = 0 }
+          inp02        = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut 50_000 p2wpkhSpk2)
+            , piSighashType = Just 0x01 }
+          psbt2        = (emptyPsbt tx2) { psbtInputs = [inp02] }
+          signed2      = signPsbt xkey' psbt2
+      Map.size (piPartialSigs (head (psbtInputs signed2))) `shouldBe` 1
+      case finalizePsbt signed2 of
+        Left e -> expectationFailure ("finalizePsbt regression: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction regression: " ++ e)
+          Right finalTx -> do
+            length (head (txWitness finalTx)) `shouldBe` 2
+            BS.last (head (head (txWitness finalTx))) `shouldBe` 0x01
+
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,
   -- insert both into the mempool indexes by hand (the real validation path
