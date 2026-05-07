@@ -9188,6 +9188,140 @@ main = hspec $ do
             result <- blockFilterIndexGet bfIdx 999
             result `shouldBe` Nothing
 
+    -- BIP-157 chain-connect-path wiring: append a few blocks via the
+    -- public 'blockFilterIndexAppendBlock', then assert the chained
+    -- filter-header / tip-height invariants the REST handler relies
+    -- on. These tests exercise the same code path the live IBD +
+    -- submitBlock + reorg sites hit.
+    describe "blockFilterIndexAppendBlock chaining" $ do
+      it "chains filter headers across consecutive appends" $ do
+        withSystemTempDirectory "bfindex_chain" $ \tmpDir -> do
+          let dbPath = tmpDir </> "chain.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            bfIdx <- newBlockFilterIndexDB db
+            -- Build two trivial blocks (height 1 + 2). Genesis-style
+            -- coinbase only — empty undo records — is enough to
+            -- exercise the filter chain since only the per-block
+            -- block-hash + the in-memory chain pointer matter for
+            -- the BIP-157 header recurrence.
+            let mkBlock seed =
+                  let script = BS.pack [0x76, 0xa9, 0x14]
+                              <> BS.replicate 20 seed
+                              <> BS.pack [0x88, 0xac]
+                      txout  = TxOut 5000000000 script
+                      tx     = Tx 1 [] [txout] [] 0
+                  in Block
+                       (BlockHeader 1
+                          (BlockHash (Hash256 (BS.replicate 32 0)))
+                          (Hash256 (BS.replicate 32 0))
+                          0 0 (fromIntegral seed))
+                       [tx]
+                bh1 = BlockHash (Hash256 (BS.replicate 32 0xaa))
+                bh2 = BlockHash (Hash256 (BS.replicate 32 0xbb))
+            blockFilterIndexAppendBlock bfIdx (mkBlock 0x01) (BlockUndo []) bh1 1
+            blockFilterIndexAppendBlock bfIdx (mkBlock 0x02) (BlockUndo []) bh2 2
+            tipH <- blockFilterIndexTipHeight bfIdx
+            tipH `shouldBe` Just 2
+            Just e1 <- blockFilterIndexGet bfIdx 1
+            Just e2 <- blockFilterIndexGet bfIdx 2
+            -- The header at height 2 must equal
+            -- SHA256(filter_hash_2 || filter_header_1) — i.e. it
+            -- must NOT be the genesis-anchored header that would
+            -- arise if the chain pointer didn't advance.
+            bfeFilterHeader e1 `shouldNotBe` Hash256 (BS.replicate 32 0)
+            bfeFilterHeader e2 `shouldNotBe` bfeFilterHeader e1
+            -- The exposed last-header IORef must equal the tip
+            -- entry's filter header (so a follow-on append would
+            -- chain off the right value).
+            lastH <- blockFilterIndexLastHeader bfIdx
+            lastH `shouldBe` bfeFilterHeader e2
+
+      it "loadBlockFilterIndexState resumes after a fresh handle" $ do
+        withSystemTempDirectory "bfindex_resume" $ \tmpDir -> do
+          let dbPath = tmpDir </> "resume.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            bfIdx <- newBlockFilterIndexDB db
+            let mkBlock seed =
+                  let script = BS.pack [0x76, 0xa9, 0x14]
+                              <> BS.replicate 20 seed
+                              <> BS.pack [0x88, 0xac]
+                      txout  = TxOut 5000000000 script
+                      tx     = Tx 1 [] [txout] [] 0
+                  in Block
+                       (BlockHeader 1
+                          (BlockHash (Hash256 (BS.replicate 32 0)))
+                          (Hash256 (BS.replicate 32 0))
+                          0 0 (fromIntegral seed))
+                       [tx]
+                bh1 = BlockHash (Hash256 (BS.replicate 32 0x11))
+                bh2 = BlockHash (Hash256 (BS.replicate 32 0x22))
+                bh3 = BlockHash (Hash256 (BS.replicate 32 0x33))
+            blockFilterIndexAppendBlock bfIdx (mkBlock 0x01) (BlockUndo []) bh1 10
+            blockFilterIndexAppendBlock bfIdx (mkBlock 0x02) (BlockUndo []) bh2 11
+            tipBefore <- blockFilterIndexTipHeight bfIdx
+            headerBefore <- blockFilterIndexLastHeader bfIdx
+            -- Simulate a process restart: drop the in-memory IORefs
+            -- (build a fresh handle) and reload state from disk via
+            -- 'loadBlockFilterIndexState'. The resumed state must be
+            -- byte-identical to what the original handle held, and a
+            -- subsequent append must chain off it (NOT genesis).
+            bfIdx' <- newBlockFilterIndexDB db
+            tipFresh <- blockFilterIndexTipHeight bfIdx'
+            tipFresh `shouldBe` Nothing  -- before load, in-memory is empty
+            loadBlockFilterIndexState bfIdx'
+            tipReloaded <- blockFilterIndexTipHeight bfIdx'
+            headerReloaded <- blockFilterIndexLastHeader bfIdx'
+            tipReloaded `shouldBe` tipBefore
+            headerReloaded `shouldBe` headerBefore
+            blockFilterIndexAppendBlock bfIdx' (mkBlock 0x03) (BlockUndo []) bh3 12
+            Just e3 <- blockFilterIndexGet bfIdx' 12
+            -- Header at h=12 must chain off the persisted h=11
+            -- header (NOT off genesis 0x00..0x00).
+            bfeFilterHeader e3 `shouldNotBe` Hash256 (BS.replicate 32 0)
+            bfeFilterHeader e3 `shouldNotBe` headerReloaded
+
+    describe "blockFilterIndexDelete (reorg disconnect)" $ do
+      it "rewinds tip + chain pointer to the previous height" $ do
+        withSystemTempDirectory "bfindex_rewind" $ \tmpDir -> do
+          let dbPath = tmpDir </> "rewind.db"
+              config = defaultDBConfig dbPath
+          withDB config $ \db -> do
+            bfIdx <- newBlockFilterIndexDB db
+            let mkBlock seed =
+                  let script = BS.pack [0x76, 0xa9, 0x14]
+                              <> BS.replicate 20 seed
+                              <> BS.pack [0x88, 0xac]
+                      txout  = TxOut 5000000000 script
+                      tx     = Tx 1 [] [txout] [] 0
+                  in Block
+                       (BlockHeader 1
+                          (BlockHash (Hash256 (BS.replicate 32 0)))
+                          (Hash256 (BS.replicate 32 0))
+                          0 0 (fromIntegral seed))
+                       [tx]
+                bh100 = BlockHash (Hash256 (BS.replicate 32 0x77))
+                bh101 = BlockHash (Hash256 (BS.replicate 32 0x78))
+            blockFilterIndexAppendBlock bfIdx (mkBlock 0x10) (BlockUndo []) bh100 100
+            blockFilterIndexAppendBlock bfIdx (mkBlock 0x11) (BlockUndo []) bh101 101
+            Just e100 <- blockFilterIndexGet bfIdx 100
+            blockFilterIndexDelete bfIdx 101
+            -- Entry at 101 should be gone; tip pointer back to 100.
+            r101 <- blockFilterIndexGet bfIdx 101
+            r101 `shouldBe` Nothing
+            tipH <- blockFilterIndexTipHeight bfIdx
+            tipH `shouldBe` Just 100
+            lastH <- blockFilterIndexLastHeader bfIdx
+            lastH `shouldBe` bfeFilterHeader e100
+            -- A fresh handle reading from disk must agree.
+            bfIdx2 <- newBlockFilterIndexDB db
+            loadBlockFilterIndexState bfIdx2
+            tip2 <- blockFilterIndexTipHeight bfIdx2
+            last2 <- blockFilterIndexLastHeader bfIdx2
+            tip2 `shouldBe` Just 100
+            last2 `shouldBe` bfeFilterHeader e100
+
   describe "CoinStatsIndex" $ do
     describe "CoinStats serialization" $ do
       it "roundtrips correctly" $ do
