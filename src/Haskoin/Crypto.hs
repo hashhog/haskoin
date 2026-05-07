@@ -256,13 +256,19 @@ data PubKey
 
 instance NFData PubKey
 
--- | Derive public key from secret key
--- Uses secp256k1 curve: y^2 = x^3 + 7 (mod p)
--- p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
--- This is a placeholder - requires secp256k1 FFI for production use
+-- | Derive the compressed public key for a 32-byte secret key.
+--
+-- Backed by libsecp256k1 via the existing @derivePubKeyCompressed@ FFI
+-- wrapper (`c_ec_pubkey_create`), which itself wraps Core's
+-- `secp256k1_ec_pubkey_create`.  Calls 'error' on a malformed seckey
+-- (zero, out of range, etc.); callers that can recover from a bad
+-- seckey should use 'derivePubKeyCompressed' directly.
+--
+-- Reference: @bitcoin-core/src/key.cpp@ `CKey::GetPubKey`.
 derivePubKey :: SecKey -> PubKey
-derivePubKey (SecKey _sk) =
-  error "derivePubKey: requires secp256k1 FFI or pure implementation"
+derivePubKey sk = case derivePubKeyCompressed sk of
+  Just bs -> PubKeyCompressed bs
+  Nothing -> error "derivePubKey: invalid secp256k1 secret key"
 
 -- | Serialize public key in compressed format (33 bytes)
 serializePubKeyCompressed :: PubKey -> ByteString
