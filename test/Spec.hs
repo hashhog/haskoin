@@ -5780,6 +5780,107 @@ main = hspec $ do
           -- Sanity: should NOT verify under the output key (different point).
           verifySchnorr sig msg tsOutputX `shouldBe` False
 
+  ----------------------------------------------------------------------------
+  -- Tapscript wallet-side integration (W18 commit 3) — single-leaf single-key.
+  --
+  -- The PSBT-side wiring uses 'piUnknown' to carry the tapleaf script and
+  -- control block, since BIP-371 PSBT taproot fields (PSBT_IN_TAP_LEAF_SCRIPT,
+  -- PSBT_IN_TAP_INTERNAL_KEY, PSBT_IN_TAP_MERKLE_ROOT) are not yet stored in
+  -- 'PsbtInput'.  The dispatcher recognises the magic key
+  -- 'tapscriptLeafScriptPsbtKey' and the single-leaf control block;
+  -- multi-leaf (MAST) and BIP-371 fields are deferred (see addSignature TODO).
+  ----------------------------------------------------------------------------
+  describe "ECDSA segwit-v1 sign path (Phase 4: Tapscript wallet integration)" $ do
+    let tsSk          = SecKey (BS.replicate 32 0x07)
+        tsXkey        = ExtendedKey
+          { ekKey       = tsSk
+          , ekChainCode = BS.replicate 32 0x00
+          , ekDepth     = 0
+          , ekParentFP  = 0
+          , ekIndex     = 0
+          }
+        SecKey tsSkBytes = tsSk
+        tsInternalX   = case xonlyPubkeyFromSeckey tsSkBytes of
+          Just k  -> k
+          Nothing -> error "test setup: xonlyPubkeyFromSeckey failed"
+        tsLeafScript  = BS.singleton 0x20 <> tsInternalX <> BS.singleton 0xac
+        tsLeafHash    = TS.tapleafHashWith TS.tapscriptLeafVersion tsLeafScript
+        tsTweak       = computeTapTweakHash tsInternalX tsLeafHash
+        (tsOutputX, tsParity) = case xonlyPubkeyTweakAdd tsInternalX tsTweak of
+          Just (k, p) -> (k, p)
+          Nothing     -> error "test setup: tweakAdd failed"
+        tsP2trSpk     = BS.pack [0x51, 0x20] <> tsOutputX
+        tsControlBlock = TS.ControlBlock
+          { TS.cbLeafVersion    = TS.tapscriptLeafVersion
+          , TS.cbInternalPubkey = tsInternalX
+          , TS.cbParity         = fromIntegral tsParity
+          , TS.cbMerklePath     = []
+          }
+        tsPrevTxId    = TxId (Hash256 (BS.replicate 32 0xa1))
+        tsPrevValue   = 800_000 :: Word64
+        tsOutScript   = BS.pack [0x00, 0x14] <> BS.replicate 20 0xee
+        tsUnsignedTx  = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint tsPrevTxId 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 790_000 tsOutScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+    it "tapscript single-leaf PSBT round-trip: signPsbt → finalizePsbt → extract" $ do
+      let inp0 = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut tsPrevValue tsP2trSpk)
+            , piUnknown     = Map.fromList
+                [ (tapscriptLeafScriptPsbtKey, tsLeafScript)
+                , (tapscriptControlBlockPsbtKey, TS.encodeControlBlock tsControlBlock)
+                ]
+            }
+          psbt   = (emptyPsbt tsUnsignedTx) { psbtInputs = [inp0] }
+          signed = signPsbt tsXkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      case finalizePsbt signed of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- Bare segwit: empty scriptSig.  Witness stack: [sig, script, control].
+            txInScript (head (txInputs finalTx)) `shouldBe` BS.empty
+            length (head (txWitness finalTx))    `shouldBe` 3
+            let [sig, scr, ctrl] = head (txWitness finalTx)
+            BS.length sig  `shouldBe` 64
+            scr            `shouldBe` tsLeafScript
+            ctrl           `shouldBe` TS.encodeControlBlock tsControlBlock
+
+    it "extracted tapscript witness: signature verifies under internal key (BIP-342)" $ do
+      -- Re-sign through the wallet path, then re-derive the script-path
+      -- sighash by hand and confirm libsecp accepts the witness signature
+      -- under the internal key (NOT the output key — BIP-342 OP_CHECKSIG
+      -- subtlety).
+      let inp0 = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut tsPrevValue tsP2trSpk)
+            , piUnknown     = Map.fromList
+                [ (tapscriptLeafScriptPsbtKey, tsLeafScript)
+                , (tapscriptControlBlockPsbtKey, TS.encodeControlBlock tsControlBlock)
+                ]
+            }
+          psbt   = (emptyPsbt tsUnsignedTx) { psbtInputs = [inp0] }
+          signed = signPsbt tsXkey psbt
+      finalTx <- case finalizePsbt signed >>= extractTransaction of
+        Left e  -> expectationFailure e >> error "unreachable"
+        Right t -> return t
+      let sig = head (head (txWitness finalTx))
+          ctx = TS.TapscriptContext
+            { TS.tapleafHash = tsLeafHash
+            , TS.codesepPos  = TS.defaultCodesepPos
+            }
+          prevouts = TS.TaprootPrevouts
+            { TS.taprootAmounts = [tsPrevValue]
+            , TS.taprootScripts = [tsP2trSpk]
+            }
+      case TS.computeTaprootSighash tsUnsignedTx 0 prevouts TS.sighashDefault Nothing (Just ctx) of
+        Left e    -> expectationFailure (show e)
+        Right msg -> verifySchnorr sig msg tsInternalX `shouldBe` True
+
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,
   -- insert both into the mempool indexes by hand (the real validation path
