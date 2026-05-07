@@ -650,3 +650,148 @@ int haskoin_ecdsa_sign_der(
 
     return 1;
 }
+
+/* ---- BIP-340 Schnorr signing (Taproot key-path) ------------------------- */
+
+/*
+ * Produce a 64-byte BIP-340 Schnorr signature over a 32-byte message digest,
+ * matching @KeyPair::SignSchnorr@ in @bitcoin-core/src/key.cpp@ which itself
+ * wraps @secp256k1_schnorrsig_sign32@.
+ *
+ * The signing key is a 32-byte secret scalar; the signing primitive
+ * internally lifts it into a @secp256k1_keypair@ via
+ * @secp256k1_keypair_create@, which negates the seckey if its associated
+ * x-only pubkey has odd y-parity (the BIP-340 sign-side normalization).
+ *
+ * Inputs:
+ *   seckey32   : 32-byte secret key (must be a valid scalar in [1, n-1]).
+ *                For Taproot key-path spends this is the *output* (tweaked)
+ *                seckey, not the internal key — see @haskoin_taproot_tweak_seckey@.
+ *   msg32      : 32-byte message digest (e.g. the BIP-341 sighash).
+ *   aux_rand32 : 32-byte aux-randomness, or NULL.  Core's @CreateSchnorrSig@
+ *                passes @uint256{}@ (all zeros) for byte-identity with the
+ *                wallet's tx-hex output (`bitcoin-core/src/script/sign.cpp:88`).
+ *                BIP-340 explicitly permits NULL == all-zeros; libsecp will
+ *                substitute zeros internally.  Production callers can pass
+ *                fresh randomness for the BIP-340 hardening recommendation.
+ *   out_sig64  : 64-byte output buffer.
+ *
+ * Returns 1 on success (out_sig64 filled), 0 on failure (e.g. invalid seckey).
+ *
+ * Reference: @bitcoin-core/src/secp256k1/src/modules/schnorrsig/main_impl.h
+ * secp256k1_schnorrsig_sign32@.
+ */
+int haskoin_schnorrsig_sign(
+    const unsigned char *seckey32,
+    const unsigned char *msg32,
+    const unsigned char *aux_rand32,
+    unsigned char *out_sig64
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_keypair keypair;
+
+    if (!ctx) return 0;
+    if (!seckey32 || !msg32 || !out_sig64) return 0;
+
+    if (!secp256k1_keypair_create(ctx, &keypair, seckey32)) {
+        return 0;
+    }
+
+    /* aux_rand32 == NULL is BIP-340 spec-equivalent to all-zeros, which is
+     * exactly what Core's CreateSchnorrSig passes via @uint256{}@. */
+    if (!secp256k1_schnorrsig_sign32(ctx, out_sig64, msg32, &keypair, aux_rand32)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ---- BIP-341 key-path Taproot tweak (seckey side) ----------------------- */
+
+/*
+ * Apply a precomputed 32-byte BIP-341 tweak to a 32-byte secret key, returning
+ * the tweaked seckey suitable for direct use with @haskoin_schnorrsig_sign@.
+ *
+ * Per @KeyPair::Create@ in @bitcoin-core/src/key.cpp@, the algorithm is:
+ *   1. Lift seckey into a keypair (negates seckey internally if its x-only
+ *      pubkey has odd y-parity — the BIP-340 sign-side normalization).
+ *   2. Apply @secp256k1_keypair_xonly_tweak_add@: keypair' = keypair + t·G
+ *      using libsecp's curve operations (handles the tweak-overflow case
+ *      and the conditional negation when t·G's parity flips the output).
+ *   3. Extract the tweaked seckey via @secp256k1_keypair_sec@.
+ *
+ * The TapTweak hash itself is computed Haskell-side via 'computeTapTweakHash'
+ * in @Crypto.hs@, which calls into the existing 'taggedHash' BIP-340 helper.
+ * We do *not* recompute it inside libsecp because the public secp256k1.h
+ * headers do not expose @secp256k1_sha256_*@; the BIP-340 tagged-hash
+ * primitive is byte-identical regardless of which SHA-256 implementation
+ * computes it.
+ *
+ * Inputs:
+ *   seckey32     : 32-byte internal secret key.
+ *   tweak32      : 32-byte BIP-341 tweak — typically
+ *                    @TaggedHash("TapTweak", P [|| merkle_root])@,
+ *                  with @P@ the x-only pubkey of @seckey32@.  For BIP-86
+ *                  single-key key-path spends (no script tree), the tweak
+ *                  is @TaggedHash("TapTweak", P)@.
+ *   out_seckey32 : 32-byte output buffer for the tweaked seckey.
+ *
+ * Returns 1 on success, 0 on failure (e.g. invalid seckey, tweak >= n).
+ */
+int haskoin_taproot_tweak_seckey(
+    const unsigned char *seckey32,
+    const unsigned char *tweak32,
+    unsigned char *out_seckey32
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_keypair keypair;
+
+    if (!ctx) return 0;
+    if (!seckey32 || !tweak32 || !out_seckey32) return 0;
+
+    if (!secp256k1_keypair_create(ctx, &keypair, seckey32)) {
+        return 0;
+    }
+
+    if (!secp256k1_keypair_xonly_tweak_add(ctx, &keypair, tweak32)) {
+        return 0;
+    }
+
+    if (!secp256k1_keypair_sec(ctx, out_seckey32, &keypair)) {
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
+ * Convenience: derive the x-only pubkey (32 bytes) of a 32-byte seckey.
+ * Wraps @secp256k1_keypair_create@ + @secp256k1_keypair_xonly_pub@ +
+ * @secp256k1_xonly_pubkey_serialize@.  This is the @P@ that goes into the
+ * TapTweak preimage, taking care of the BIP-340 even-y normalization
+ * implicitly via the keypair construction.
+ *
+ * Returns 1 on success (out_xonly32 filled), 0 on failure.
+ */
+int haskoin_xonly_pubkey_from_seckey(
+    const unsigned char *seckey32,
+    unsigned char *out_xonly32
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+    secp256k1_keypair keypair;
+    secp256k1_xonly_pubkey xonly;
+
+    if (!ctx) return 0;
+    if (!seckey32 || !out_xonly32) return 0;
+
+    if (!secp256k1_keypair_create(ctx, &keypair, seckey32)) {
+        return 0;
+    }
+    if (!secp256k1_keypair_xonly_pub(ctx, &xonly, NULL, &keypair)) {
+        return 0;
+    }
+    if (!secp256k1_xonly_pubkey_serialize(ctx, out_xonly32, &xonly)) {
+        return 0;
+    }
+    return 1;
+}

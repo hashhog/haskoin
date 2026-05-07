@@ -76,6 +76,13 @@ module Haskoin.Crypto
   , taggedHash
   , xonlyPubkeyTweakAdd
   , verifySchnorr
+    -- * Taproot signing (BIP-340 / BIP-341)
+  , signSchnorr
+  , signSchnorrAux
+  , taprootTweakSeckey
+  , xonlyPubkeyFromSeckey
+  , computeTapTweakHash
+  , bip86TapTweakHash
   ) where
 
 import qualified Crypto.Hash as H
@@ -98,7 +105,7 @@ import GHC.Generics (Generic)
 
 import System.IO.Unsafe (unsafePerformIO)
 import Foreign.C.Types (CUChar, CSize(..), CInt(..))
-import Foreign.Ptr (Ptr, castPtr)
+import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Storable (peek, poke)
@@ -175,6 +182,40 @@ foreign import ccall unsafe "haskoin_ecdsa_sign_der"
                    -> Ptr CSize     -- in: capacity, out: written length
                    -> IO CInt
 
+-- | FFI binding for BIP-340 Schnorr signing (Taproot key-path /
+-- tapscript OP_CHECKSIG).  Wraps @secp256k1_keypair_create@ +
+-- @secp256k1_schnorrsig_sign32@ from
+-- @bitcoin-core/src/secp256k1/include/secp256k1_schnorrsig.h@.
+--
+-- The aux-rand pointer may be 'nullPtr' for the default all-zeros aux
+-- that Core's @CreateSchnorrSig@ uses for byte-identity with wallet output.
+foreign import ccall unsafe "haskoin_schnorrsig_sign"
+  c_schnorrsig_sign :: Ptr CUChar  -- seckey32
+                    -> Ptr CUChar  -- msg32
+                    -> Ptr CUChar  -- aux_rand32 or NULL
+                    -> Ptr CUChar  -- out_sig64
+                    -> IO CInt
+
+-- | FFI binding for the BIP-341 key-path seckey tweak.  Wraps
+-- @secp256k1_keypair_create@ + @secp256k1_keypair_xonly_tweak_add@ +
+-- @secp256k1_keypair_sec@.  The 32-byte tweak is computed Haskell-side
+-- via 'computeTapTweakHash' (libsecp's public headers don't expose its
+-- internal SHA-256, so we hash on the Haskell side and only do the curve
+-- arithmetic in C).
+foreign import ccall unsafe "haskoin_taproot_tweak_seckey"
+  c_taproot_tweak_seckey :: Ptr CUChar  -- seckey32
+                         -> Ptr CUChar  -- tweak32
+                         -> Ptr CUChar  -- out_seckey32
+                         -> IO CInt
+
+-- | FFI binding for x-only pubkey extraction from a seckey, including
+-- the BIP-340 even-y normalization.  Used to produce the x-only key
+-- @P@ that goes into the TapTweak preimage.
+foreign import ccall unsafe "haskoin_xonly_pubkey_from_seckey"
+  c_xonly_pubkey_from_seckey :: Ptr CUChar  -- seckey32
+                             -> Ptr CUChar  -- out_xonly32
+                             -> IO CInt
+
 --------------------------------------------------------------------------------
 -- Hashing Functions
 --------------------------------------------------------------------------------
@@ -242,6 +283,104 @@ verifySchnorr sig msg pubkey
           BS.useAsCStringLen pubkey $ \(pkPtr, _) -> do
             r <- c_schnorrsig_verify (castPtr sigPtr) (castPtr msgPtr) (castPtr pkPtr)
             return (r == 1)
+
+-- | Produce a 64-byte BIP-340 Schnorr signature with all-zeros aux-rand.
+--
+-- This matches Bitcoin Core's @CreateSchnorrSig@ in
+-- @bitcoin-core/src/script/sign.cpp@, which passes @uint256{}@ for the
+-- aux argument so that the output is byte-identical to whatever the wallet
+-- emits for the same (seckey, msg).  Production callers that prefer the
+-- BIP-340 hardening recommendation should use 'signSchnorrAux' with fresh
+-- 32-byte randomness instead.
+--
+-- For Taproot key-path spends, @seckey@ here is the *tweaked* output
+-- seckey, not the internal key — see 'taprootTweakSeckey'.
+--
+-- Returns 'Nothing' on a malformed seckey or libsecp internal failure.
+signSchnorr :: ByteString -> ByteString -> Maybe ByteString
+signSchnorr seckey msg = signSchnorrAux seckey msg Nothing
+
+-- | 'signSchnorr' with caller-supplied 32-byte aux-randomness.  Pass
+-- 'Nothing' for the all-zeros (deterministic) form that matches Core's
+-- wallet byte-identity, or 'Just rand' for BIP-340-hardened output.
+signSchnorrAux :: ByteString -> ByteString -> Maybe ByteString -> Maybe ByteString
+signSchnorrAux seckey msg mAux
+  | BS.length seckey /= 32 = Nothing
+  | BS.length msg    /= 32 = Nothing
+  | maybe False ((/= 32) . BS.length) mAux = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen seckey $ \(skPtr, _) ->
+        BS.useAsCStringLen msg $ \(msgPtr, _) ->
+          allocaArray 64 $ \outPtr -> do
+            ok <- case mAux of
+              Nothing  ->
+                c_schnorrsig_sign
+                  (castPtr skPtr) (castPtr msgPtr)
+                  (nullPtr) outPtr
+              Just aux ->
+                BS.useAsCStringLen aux $ \(auxPtr, _) ->
+                  c_schnorrsig_sign
+                    (castPtr skPtr) (castPtr msgPtr)
+                    (castPtr auxPtr) outPtr
+            if ok == 1
+              then Just <$> BS.packCStringLen (castPtr outPtr, 64)
+              else return Nothing
+
+-- | Apply a 32-byte BIP-341 tweak to a 32-byte secret key.  Returns the
+-- tweaked seckey ready to feed directly into 'signSchnorr' for a
+-- Taproot key-path spend.
+--
+-- Note: the tweak itself is computed by 'computeTapTweakHash'
+-- (or 'bip86TapTweakHash' for the empty-merkle-root BIP-86 case);
+-- this function only does the curve arithmetic.  Internally it lifts
+-- the seckey into a @secp256k1_keypair@, which performs the BIP-340
+-- even-y normalization, then calls @secp256k1_keypair_xonly_tweak_add@.
+--
+-- Returns 'Nothing' on invalid seckey or tweak >= curve order.
+taprootTweakSeckey :: ByteString -> ByteString -> Maybe ByteString
+taprootTweakSeckey seckey tweak
+  | BS.length seckey /= 32 = Nothing
+  | BS.length tweak  /= 32 = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen seckey $ \(skPtr, _) ->
+        BS.useAsCStringLen tweak $ \(twPtr, _) ->
+          allocaArray 32 $ \outPtr -> do
+            ok <- c_taproot_tweak_seckey
+                    (castPtr skPtr) (castPtr twPtr) outPtr
+            if ok == 1
+              then Just <$> BS.packCStringLen (castPtr outPtr, 32)
+              else return Nothing
+
+-- | Derive the 32-byte x-only public key (BIP-340) for a 32-byte seckey.
+-- Includes the implicit even-y normalization (the seckey's pubkey is
+-- the keypair-x-only-pub, not the raw pubkey).  This is the @P@ that
+-- goes into the BIP-341 TapTweak preimage.
+xonlyPubkeyFromSeckey :: ByteString -> Maybe ByteString
+xonlyPubkeyFromSeckey seckey
+  | BS.length seckey /= 32 = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen seckey $ \(skPtr, _) ->
+        allocaArray 32 $ \outPtr -> do
+          ok <- c_xonly_pubkey_from_seckey (castPtr skPtr) outPtr
+          if ok == 1
+            then Just <$> BS.packCStringLen (castPtr outPtr, 32)
+            else return Nothing
+
+-- | Compute the BIP-341 TapTweak hash:
+--   @t = TaggedHash("TapTweak", internal_xonly_pubkey || merkle_root)@.
+--
+-- For BIP-86 single-key-path spends (no script tree) the merkle_root is
+-- empty — see 'bip86TapTweakHash' for the convenience wrapper.
+--
+-- Reference: @bitcoin-core/src/key.cpp ComputeTapTweakHash@.
+computeTapTweakHash :: ByteString -> ByteString -> ByteString
+computeTapTweakHash internalXOnly merkleRoot =
+  taggedHash "TapTweak" (internalXOnly <> merkleRoot)
+
+-- | BIP-86 (single-key, key-path-only) TapTweak hash.  Equivalent to
+-- @computeTapTweakHash internal_xonly mempty@.
+bip86TapTweakHash :: ByteString -> ByteString
+bip86TapTweakHash internalXOnly = computeTapTweakHash internalXOnly BS.empty
 
 -- | HMAC-SHA512, used for BIP-32 key derivation
 hmacSHA512 :: ByteString -> ByteString -> ByteString
