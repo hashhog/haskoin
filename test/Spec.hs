@@ -84,6 +84,7 @@ import qualified Haskoin.Mempool.Persist as MPP
 import qualified Haskoin.Policy.Standard as Std
 import Haskoin.FeeEstimator
 import Haskoin.Wallet hiding ((<|>), Addr)
+import qualified Haskoin.TaprootSighash as TS
 import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
@@ -5362,6 +5363,185 @@ main = hspec $ do
           shAll     = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x01
           shNone    = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x02
       shAll `shouldNotBe` shNone
+
+  -- Phase 5 of the haskoin ECDSA wiring plan
+  -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
+  -- BIP-340 / BIP-341 sign-side primitives.  These tests exercise the
+  -- newly-added Schnorr + TapTweak FFI directly (commit 1 of W16), plus
+  -- the wallet's high-level signWithKeyTaproot helper (commit 3).
+  --
+  -- The BIP-340 vector here is canonical libsecp test vector 0:
+  --   sk        = 32 zero bytes followed by 0x03      (i.e. sk = 3)
+  --   msg       = 32 zero bytes
+  --   aux_rand  = 32 zero bytes
+  --   pk_xonly  = F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9
+  --   sig       = E907831F80848D1069A5371B4024 10364BDF1C5F8307B0084C55F1CE2DCA8215
+  --               25F66A4A85EA8B71E482A74F382D 2CE5EBEEE8FDB2172F477DF4900D310536C0
+  -- (See bitcoin-core/src/secp256k1/src/modules/schnorrsig/tests_impl.h
+  -- "Test vector 0".)
+  describe "ECDSA segwit-v1 sign path (Phase 5: Taproot key-path)" $ do
+    let bip340Sk    = BS.pack (replicate 31 0x00 ++ [0x03])
+        bip340Msg   = BS.replicate 32 0x00
+        bip340Aux   = BS.replicate 32 0x00
+        bip340PkX   = BS.pack
+          [ 0xF9, 0x30, 0x8A, 0x01, 0x92, 0x58, 0xC3, 0x10
+          , 0x49, 0x34, 0x4F, 0x85, 0xF8, 0x9D, 0x52, 0x29
+          , 0xB5, 0x31, 0xC8, 0x45, 0x83, 0x6F, 0x99, 0xB0
+          , 0x86, 0x01, 0xF1, 0x13, 0xBC, 0xE0, 0x36, 0xF9
+          ]
+        bip340Sig   = BS.pack
+          [ 0xE9, 0x07, 0x83, 0x1F, 0x80, 0x84, 0x8D, 0x10
+          , 0x69, 0xA5, 0x37, 0x1B, 0x40, 0x24, 0x10, 0x36
+          , 0x4B, 0xDF, 0x1C, 0x5F, 0x83, 0x07, 0xB0, 0x08
+          , 0x4C, 0x55, 0xF1, 0xCE, 0x2D, 0xCA, 0x82, 0x15
+          , 0x25, 0xF6, 0x6A, 0x4A, 0x85, 0xEA, 0x8B, 0x71
+          , 0xE4, 0x82, 0xA7, 0x4F, 0x38, 0x2D, 0x2C, 0xE5
+          , 0xEB, 0xEE, 0xE8, 0xFD, 0xB2, 0x17, 0x2F, 0x47
+          , 0x7D, 0xF4, 0x90, 0x0D, 0x31, 0x05, 0x36, 0xC0
+          ]
+
+    it "BIP-340 vector 0: sign(sk=3, msg=0, aux=0) → matches canonical sig" $ do
+      -- Direct FFI: deterministic Schnorr with all-zeros aux must match the
+      -- secp256k1 test-vector byte-for-byte.  This is the strongest possible
+      -- correctness check: any drift in nonce derivation, tagged-hash, or
+      -- aux-mixing would fail this exact-equality check.
+      case signSchnorrAux bip340Sk bip340Msg (Just bip340Aux) of
+        Nothing  -> expectationFailure "signSchnorrAux: Nothing on canonical vector 0 inputs"
+        Just sig -> sig `shouldBe` bip340Sig
+
+    it "BIP-340 vector 0: signSchnorr (NULL aux) is identical to all-zeros aux" $ do
+      -- Per BIP-340 §"Default Signing", aux=NULL is spec-equivalent to
+      -- aux=zeros.  Core's CreateSchnorrSig passes uint256{} for byte-identity
+      -- with the wallet output, and 'signSchnorr' passes NULL through to libsecp;
+      -- both routes must produce the same sig.
+      let nullAux = signSchnorr     bip340Sk bip340Msg
+          zeroAux = signSchnorrAux  bip340Sk bip340Msg (Just bip340Aux)
+      nullAux `shouldBe` zeroAux
+      nullAux `shouldBe` Just bip340Sig
+
+    it "BIP-340 vector 0: round-trip verify under verifySchnorr" $ do
+      -- Closes the loop: sign → libsecp's strict verifier must accept.
+      -- Same primitive a Bitcoin Core taproot validator would invoke.
+      case signSchnorr bip340Sk bip340Msg of
+        Nothing  -> expectationFailure "signSchnorr: Nothing"
+        Just sig -> verifySchnorr sig bip340Msg bip340PkX `shouldBe` True
+
+    it "x-only pubkey from seckey matches BIP-340 vector 0 pk" $ do
+      -- The published BIP-340 pk_xonly is derived by the same even-y
+      -- normalization that 'xonlyPubkeyFromSeckey' applies.
+      xonlyPubkeyFromSeckey bip340Sk `shouldBe` Just bip340PkX
+
+    it "tampered msg no longer verifies (sanity)" $ do
+      case signSchnorr bip340Sk bip340Msg of
+        Nothing  -> expectationFailure "signSchnorr: Nothing"
+        Just sig -> do
+          let tamperedMsg = BS.cons 0x01 (BS.tail bip340Msg)
+          verifySchnorr sig tamperedMsg bip340PkX `shouldBe` False
+
+    -- ---- BIP-86 single-key Taproot key-path round-trip ---------------------
+
+    -- Build a minimal regtest-style 1-input/1-output tx whose sole input
+    -- spends a P2TR output keyed to our test seckey, and verify that
+    -- signWithKeyTaproot produces a 64-byte witness item that
+    -- libsecp's BIP-340 verifier accepts under the *tweaked output key*.
+    --
+    -- This is the same shape Core's `signrawtransactionwithwallet` would
+    -- produce for a BIP-86 (no script tree) descriptor wallet.
+    let testSk   = SecKey (BS.replicate 32 0x05)
+        xkey     = ExtendedKey
+          { ekKey       = testSk
+          , ekChainCode = BS.replicate 32 0x00
+          , ekDepth     = 0
+          , ekParentFP  = 0
+          , ekIndex     = 0
+          }
+        SecKey skBytes = testSk
+        internalXOnly  = case xonlyPubkeyFromSeckey skBytes of
+          Just k  -> k
+          Nothing -> error "test setup: xonlyPubkeyFromSeckey failed"
+        bip86Tweak     = bip86TapTweakHash internalXOnly
+        outputXOnly    = case xonlyPubkeyTweakAdd internalXOnly bip86Tweak of
+          Just (k, _) -> k
+          Nothing     -> error "test setup: xonlyPubkeyTweakAdd failed"
+        p2trSpk        = BS.pack [0x51, 0x20] <> outputXOnly
+        prevTxId'      = TxId (Hash256 (BS.replicate 32 0x77))
+        prevValue'     = 1_000_000 :: Word64
+        outScriptDest  = BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa
+        unsignedTrTx   = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint prevTxId' 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 990_000 outScriptDest]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        prevouts       = TS.TaprootPrevouts
+          { TS.taprootAmounts = [prevValue']
+          , TS.taprootScripts = [p2trSpk]
+          }
+
+    it "P2TR scriptPubKey detection: isP2TRScript / getP2TRProgram" $ do
+      isP2TRScript p2trSpk      `shouldBe` True
+      isP2TRScript (BS.replicate 22 0x00 <> BS.pack [0x00, 0x00]) `shouldBe` False
+      getP2TRProgram p2trSpk    `shouldBe` Just outputXOnly
+
+    it "BIP-86 P2TR key-path: signWithKeyTaproot witness verifies under output key" $ do
+      sighash <- case computeTaprootKeyPathSighash unsignedTrTx 0 prevouts TS.sighashDefault Nothing of
+        Left e -> expectationFailure ("computeTaprootKeyPathSighash: " ++ show e) >> return (Hash256 BS.empty)
+        Right h -> return h
+      let witnessItem = signWithKeyTaproot xkey sighash 0x00 Nothing
+      -- SIGHASH_DEFAULT → 64 bytes, no trailing hashtype.
+      BS.length witnessItem `shouldBe` 64
+      -- The signature verifies under the on-chain *tweaked output key*
+      -- (not the internal key).  This is exactly what Core's tapscript
+      -- interpreter checks via `secp256k1_schnorrsig_verify` for a key-path
+      -- spend (`bitcoin-core/src/script/interpreter.cpp ExecuteWitnessScript`).
+      let Hash256 msg32 = sighash
+      verifySchnorr witnessItem msg32 outputXOnly `shouldBe` True
+
+    it "SIGHASH_DEFAULT vs SIGHASH_ALL: 64-byte vs 65-byte witness items" $ do
+      -- Per BIP-341 + bitcoin-core/src/script/sign.cpp:88-101 CreateSchnorrSig:
+      -- the wire encoding suppresses the hashtype byte iff hashType == 0x00
+      -- (SIGHASH_DEFAULT), distinguishing an explicit SIGHASH_ALL (0x01) from
+      -- the default-meaning-all 0x00.  This is the only encoding distinction
+      -- between the two; the interpreter rejects a 65-byte sig with trailing
+      -- 0x00, and rejects a 64-byte sig as anything other than DEFAULT.
+      shDefault <- case computeTaprootKeyPathSighash unsignedTrTx 0 prevouts TS.sighashDefault Nothing of
+        Left e -> expectationFailure (show e) >> return (Hash256 BS.empty)
+        Right h -> return h
+      shAll <- case computeTaprootKeyPathSighash unsignedTrTx 0 prevouts TS.sighashAll Nothing of
+        Left e -> expectationFailure (show e) >> return (Hash256 BS.empty)
+        Right h -> return h
+      -- BIP-341 §"hash_type" makes SIGHASH_DEFAULT preimage byte = 0x00 and
+      -- SIGHASH_ALL preimage byte = 0x01, so the two sighashes differ even
+      -- though both "commit to all outputs" semantically.
+      shDefault `shouldNotBe` shAll
+      let wDefault = signWithKeyTaproot xkey shDefault 0x00 Nothing
+          wAll     = signWithKeyTaproot xkey shAll     0x01 Nothing
+      BS.length wDefault `shouldBe` 64
+      BS.length wAll     `shouldBe` 65
+      BS.last wAll       `shouldBe` 0x01
+      -- Both should still verify under the same output key (just over different sighashes).
+      let Hash256 m1 = shDefault
+          Hash256 m2 = shAll
+      verifySchnorr wDefault m1 outputXOnly `shouldBe` True
+      verifySchnorr (BS.init wAll) m2 outputXOnly `shouldBe` True
+
+    it "BIP-86 tweaked seckey + signSchnorr matches signWithKeyTaproot" $ do
+      -- White-box equivalence: signWithKeyTaproot is by construction
+      -- 'taprootTweakSeckey + signSchnorr', with the BIP-86 empty-merkle-root
+      -- tweak.  This pins the high-level wrapper against the primitives.
+      sighash <- case computeTaprootKeyPathSighash unsignedTrTx 0 prevouts TS.sighashDefault Nothing of
+        Left e -> expectationFailure (show e) >> return (Hash256 BS.empty)
+        Right h -> return h
+      let Hash256 msg32 = sighash
+          tweakedSk     = case taprootTweakSeckey skBytes bip86Tweak of
+            Just s -> s
+            Nothing -> error "tweak failed"
+          rawSig        = case signSchnorr tweakedSk msg32 of
+            Just s -> s
+            Nothing -> error "schnorr failed"
+          wallet64      = signWithKeyTaproot xkey sighash 0x00 Nothing
+      wallet64 `shouldBe` rawSig
 
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,

@@ -139,15 +139,19 @@ module Haskoin.Wallet
   , extractTransaction
     -- * Sign-side primitives (exposed for tests / advanced callers)
   , signWithKey
+  , signWithKeyTaproot
   , derivePubKeyFromPrivate
   , computeLegacySighash
   , computeSegwitSighash
   , computeSegwitSighashFromProgram
   , computeSegwitSighashScriptCode
+  , computeTaprootKeyPathSighash
   , isP2PKHScript
   , isP2WPKHScript
   , isP2WSHScript
   , isP2SHScript
+  , isP2TRScript
+  , getP2TRProgram
     -- * PSBT Utilities
   , decodePsbt
   , encodePsbt
@@ -208,6 +212,7 @@ import System.FilePath ((</>))
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
                        TxIn(..), TxOut(..), Tx(..), putVarInt, getVarInt', putVarBytes, getVarBytes)
 import Haskoin.Crypto
+import qualified Haskoin.TaprootSighash as TS
 import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encodeScript)
 import Haskoin.Mempool (FeeRate(..))
 import Haskoin.Consensus (Network(..), coinbaseMaturity)
@@ -2358,6 +2363,22 @@ isP2SHScript s = BS.length s == 23 &&
   BS.index s 1 == 0x14 &&  -- Push 20 bytes
   BS.index s 22 == 0x87    -- OP_EQUAL
 
+-- | Check if script is a P2TR (BIP-341 segwit-v1) output script.
+-- Layout: @OP_1 0x20 <32-byte x-only output key>@ (34 bytes total).
+-- This is the on-chain "tweaked output key" form (post-tweak); the
+-- internal key (and merkle root, if any) live in the PSBT Taproot
+-- input fields per BIP-371.
+isP2TRScript :: ByteString -> Bool
+isP2TRScript s = BS.length s == 34 &&
+  BS.index s 0 == 0x51 &&  -- OP_1
+  BS.index s 1 == 0x20     -- Push 32 bytes
+
+-- | Extract the 32-byte x-only output key from a P2TR scriptPubKey.
+getP2TRProgram :: ByteString -> Maybe ByteString
+getP2TRProgram s
+  | isP2TRScript s = Just (BS.take 32 (BS.drop 2 s))
+  | otherwise = Nothing
+
 -- | Extract P2PKH hash from script
 getP2PKHHash :: ByteString -> Maybe Hash160
 getP2PKHHash s
@@ -2484,6 +2505,35 @@ computeSegwitSighashScriptCode tx inputIdx scriptCode value shType =
                                (shType .&. 0x80 /= 0)
   in txSigHashSegWit tx inputIdx scriptCode value shTypeFlag
 
+-- | Compute the BIP-341 Taproot key-path sighash.
+--
+-- The caller supplies the full per-input prevout context
+-- (@TaprootPrevouts {amounts, scripts}@) — BIP-341 §"Common signature
+-- message" §"Per-input sigs" requires committing to *every* input's
+-- amount and scriptPubKey, not just the one being signed.  Inside a
+-- PSBT this comes from each input's @piWitnessUtxo@.
+--
+-- For the canonical BIP-86 single-key-path case (no script tree, no
+-- annex), pass:
+--   * @hashType  = 0x00@ (SIGHASH_DEFAULT)
+--   * @annex     = Nothing@
+--   * @scriptPath = Nothing@
+--
+-- Returns 'Left' if the inputs are inconsistent (length mismatch,
+-- index out of range, invalid hashtype byte) — see
+-- 'TaprootSighash.TaprootSighashError' for the error variants.
+--
+-- Reference: @bitcoin-core/src/script/interpreter.cpp SignatureHashSchnorr@.
+computeTaprootKeyPathSighash
+  :: Tx
+  -> Int
+  -> TS.TaprootPrevouts
+  -> Word8                       -- ^ hash_type (0x00 SIGHASH_DEFAULT for BIP-86)
+  -> Maybe ByteString            -- ^ optional annex
+  -> Either TS.TaprootSighashError Hash256
+computeTaprootKeyPathSighash tx idx prevouts hashType annex =
+  Hash256 <$> TS.computeTaprootSighash tx idx prevouts hashType annex Nothing
+
 -- | Sign a 32-byte sighash with the extended key's private scalar and
 -- return the wire-format spend-side ECDSA signature: DER-encoded
 -- @secp256k1_ecdsa_sign@ output WITH the sighash-type byte appended,
@@ -2506,6 +2556,59 @@ signWithKey xkey hash shType =
   let Sig derBytes = signMsg (ekKey xkey) hash
       hashTypeByte = fromIntegral (shType .&. 0xff) :: Word8
   in derBytes `BS.snoc` hashTypeByte
+
+-- | Sign a 32-byte BIP-341 Taproot key-path sighash and return the
+-- wire-format witness item.
+--
+-- The internal key inside @xkey@ is BIP-341-tweaked (with the optional
+-- BIP-371 merkle_root, or all-zeros for BIP-86 single-key spends), the
+-- result is signed via BIP-340 Schnorr with all-zeros aux-rand to match
+-- Core's `CreateSchnorrSig` byte-identity, and the produced 64-byte
+-- signature is suffixed with the sighash byte iff non-zero (per
+-- @bitcoin-core/src/script/sign.cpp:88-101@):
+--
+--   * @hashType == 0x00@ (SIGHASH_DEFAULT) → 64-byte witness item
+--   * @hashType != 0x00@                   → 65-byte witness item
+--     (sig64 ‖ hashType)
+--
+-- The BIP-341 spec collapses SIGHASH_DEFAULT into SIGHASH_ALL for the
+-- preimage, but the *encoded* witness item omits the byte for size
+-- savings and forces the strictest interpretation.  See
+-- @bitcoin-core/src/script/interpreter.cpp:1820-1836@.
+--
+-- Throws 'error' on malformed seckey / tweak overflow (programmer bug,
+-- never happens for a well-formed BIP-32 derived key).
+--
+-- Reference: bitcoin-core/src/key.cpp KeyPair::Create + KeyPair::SignSchnorr,
+--            bitcoin-core/src/script/sign.cpp CreateSchnorrSig.
+signWithKeyTaproot
+  :: ExtendedKey
+  -> Hash256                 -- ^ BIP-341 sighash (output of 'computeTaprootKeyPathSighash')
+  -> Word8                   -- ^ hash_type (0x00 default for BIP-86)
+  -> Maybe ByteString        -- ^ optional 32-byte BIP-371 merkle_root (Nothing = BIP-86)
+  -> ByteString
+signWithKeyTaproot xkey (Hash256 msg32) hashType mMerkleRoot =
+  let SecKey skBytes = ekKey xkey
+      -- Step 1: derive the *internal* x-only key for the TapTweak preimage.
+      internalXOnly = case xonlyPubkeyFromSeckey skBytes of
+        Just k  -> k
+        Nothing -> error "signWithKeyTaproot: invalid internal seckey"
+      -- Step 2: compute the BIP-341 tweak.
+      merkleRoot = fromMaybe BS.empty mMerkleRoot
+      tweak      = computeTapTweakHash internalXOnly merkleRoot
+      -- Step 3: tweak the seckey on the curve.
+      tweakedSk  = case taprootTweakSeckey skBytes tweak of
+        Just s  -> s
+        Nothing -> error "signWithKeyTaproot: tweak failed"
+      -- Step 4: BIP-340 Schnorr sign with all-zeros aux (Core byte-identity).
+      sig64      = case signSchnorr tweakedSk msg32 of
+        Just s  -> s
+        Nothing -> error "signWithKeyTaproot: Schnorr sign failed"
+  -- Step 5: BIP-341 sighash-byte append rule — only non-default hashtypes
+  -- carry a trailing byte.  Missing byte means SIGHASH_DEFAULT.
+  in if hashType == 0x00
+       then sig64
+       else sig64 `BS.snoc` hashType
 
 --------------------------------------------------------------------------------
 -- PSBT Role: Combiner
