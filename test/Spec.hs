@@ -8,7 +8,8 @@ import Test.Hspec
 import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Data.Serialize (encode, decode, runPut, runGet, putWord32le)
+import Data.Serialize (encode, decode, runPut, runGet, putWord32le, put)
+import Data.Serialize.Put (putByteString, putWord8)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
@@ -10916,6 +10917,106 @@ main = hspec $ do
           Right psbt -> do
             length (psbtInputs psbt) `shouldBe` 2
             length (psbtOutputs psbt) `shouldBe` 2
+
+    --------------------------------------------------------------------------
+    -- W34-E PSBT decoder strictness
+    --
+    -- Memory-VERIFIED W33-haskoin found four lossiness sites that silently
+    -- dropped or truncated malformed input. We now fail loud on each so a
+    -- malformed producer can never silently corrupt a Combiner round-trip.
+    --------------------------------------------------------------------------
+    describe "W34-E parseKeyPath strictness" $ do
+      it "rejects keypath shorter than 4 bytes (length 3)" $ do
+        let bs3 = BS.pack [0x01, 0x02, 0x03]
+        case parseKeyPath bs3 of
+          Left err ->
+            -- Expect informative error
+            ("too short" `T.isInfixOf` T.pack err) `shouldBe` True
+          Right kp ->
+            expectationFailure $
+              "parseKeyPath should reject 3-byte input, got " ++ show kp
+
+      it "rejects keypath whose length is not a multiple of 4 (length 5)" $ do
+        let bs5 = BS.pack [0x11, 0x22, 0x33, 0x44, 0x55]
+        case parseKeyPath bs5 of
+          Left err ->
+            ("multiple of 4" `T.isInfixOf` T.pack err) `shouldBe` True
+          Right kp ->
+            expectationFailure $
+              "parseKeyPath should reject 5-byte input, got " ++ show kp
+
+      it "still accepts a well-formed keypath (4 + 4 = 8 bytes)" $ do
+        -- Sanity: positive case still works after the rewrite
+        let bs8 = runPut (putWord32le 0xdeadbeef >> putWord32le 0x8000002c)
+        case parseKeyPath bs8 of
+          Right kp -> do
+            kpFingerprint kp `shouldBe` 0xdeadbeef
+            kpPath kp `shouldBe` [0x8000002c]
+          Left err ->
+            expectationFailure $ "parseKeyPath rejected valid 8B input: " ++ err
+
+    describe "W34-E PSBT input map strictness" $ do
+      -- Helper: build a 1-input/1-output dummy unsigned tx (matches the
+      -- mkTestTx used elsewhere in this describe block).
+      let dummyTx =
+            let prevTxId = TxId (Hash256 (BS.replicate 32 0xaa))
+                txin = TxIn (OutPoint prevTxId 0) BS.empty 0xffffffff
+                txout = TxOut 50000 (hexDecode "001476a914000000000000000000000000000000000000000088ac")
+            in Tx 2 [txin] [txout] [[]] 0
+
+      -- Helper: encode a key-value record (varint(len)+bytes for both).
+      let putKv k v = do
+            putVarInt (fromIntegral (BS.length k))
+            putByteString k
+            putVarInt (fromIntegral (BS.length v))
+            putByteString v
+
+      -- Helper: assemble a PSBT with a single input map crafted from `inputBody`.
+      -- `inputBody` is the raw key-value records of the input map (no terminator).
+      let buildPsbt inputBody = runPut $ do
+            putByteString (BS.pack [0x70, 0x73, 0x62, 0x74, 0xff])  -- magic
+            -- global: PSBT_GLOBAL_UNSIGNED_TX
+            let txBytes = runPut $ do
+                  putWord32le (fromIntegral (txVersion dummyTx))
+                  putVarInt (fromIntegral (length (txInputs dummyTx)))
+                  mapM_ put (txInputs dummyTx)
+                  putVarInt (fromIntegral (length (txOutputs dummyTx)))
+                  mapM_ put (txOutputs dummyTx)
+                  putWord32le (txLockTime dummyTx)
+            putKv (BS.singleton 0x00) txBytes
+            putWord8 0x00                  -- end of global
+            putByteString inputBody         -- crafted input map body
+            putWord8 0x00                  -- end of input
+            -- output map: empty
+            putWord8 0x00                  -- end of output
+
+      it "rejects PARTIAL_SIG (key 0x02) with invalid pubkey in keyData" $ do
+        -- 0x02 + 33 bogus bytes that don't start with 0x02/0x03 and aren't a
+        -- valid uncompressed pubkey. parsePubKey returns Nothing → fail.
+        let bogusKey = BS.cons 0x02 (BS.replicate 33 0xff)  -- 0xff prefix is invalid
+            sigVal  = BS.replicate 71 0xaa                  -- placeholder signature bytes
+            inputBody = runPut (putKv bogusKey sigVal)
+            psbtBytes = buildPsbt inputBody
+        case decodePsbt psbtBytes of
+          Left _err -> return ()  -- expected
+          Right _   ->
+            expectationFailure
+              "decodePsbt should reject PARTIAL_SIG with malformed pubkey key"
+
+      it "rejects FINAL_SCRIPTWITNESS (key 0x08) with malformed witness bytes" $ do
+        -- A varint count of 5 followed by zero bytes — getVarBytes will fail
+        -- partway through reading the items, which used to be silently
+        -- swallowed and replaced with [].
+        let malformedWitness = BS.pack [0x05]  -- claims 5 stack items, then EOF
+            keyByte = BS.singleton 0x08
+            inputBody = runPut (putKv keyByte malformedWitness)
+            psbtBytes = buildPsbt inputBody
+        case decodePsbt psbtBytes of
+          Left _err -> return ()  -- expected
+          Right p   ->
+            expectationFailure $
+              "decodePsbt should reject malformed FINAL_SCRIPTWITNESS, got: "
+                ++ show (piFinalScriptWitness <$> psbtInputs p)
 
   --------------------------------------------------------------------------------
   -- Output Descriptors (BIP-380-386)
