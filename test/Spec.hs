@@ -6044,6 +6044,292 @@ main = hspec $ do
         Left e    -> expectationFailure (show e)
         Right msg -> verifySchnorr sig msg tsInternalX `shouldBe` True
 
+  ----------------------------------------------------------------------------
+  -- W41 — PSBT NON_WITNESS_UTXO consistency (Bug A1 + Bug A2 / CVE-2020-14199)
+  --
+  -- Pre-W41 the PSBT decoder accepted any prev-tx in 'piNonWitnessUtxo'
+  -- without checking that its txid matched the input's prevout txid
+  -- (Bug A1), and the Signer trusted 'piWitnessUtxo' as the sole amount
+  -- oracle even when 'piNonWitnessUtxo' was also supplied with a
+  -- conflicting amount (Bug A2 / CVE-2020-14199).  W41 wires both
+  -- checks: 'verifyNonWitnessUtxoTxid' at decoder + signer, and
+  -- 'verifyInputUtxoConsistency' as the cross-check between the two
+  -- carriers.  Forged inputs are dropped (no partial sig added),
+  -- mirroring the W31 fail-quiet pattern.
+  --
+  -- Reference: bitcoin-core/src/psbt.cpp PSBTInput::IsSane.
+  ----------------------------------------------------------------------------
+  describe "W41 PSBT NON_WITNESS_UTXO consistency (Bug A1 + Bug A2)" $ do
+    let testSk    = SecKey (BS.replicate 32 0x02)
+        xkey      = ExtendedKey
+          { ekKey       = testSk
+          , ekChainCode = BS.replicate 32 0x00
+          , ekDepth     = 0
+          , ekParentFP  = 0
+          , ekIndex     = 0
+          }
+        pubKey    = derivePubKeyFromPrivate testSk
+        pubKeyBS  = serializePubKeyCompressed pubKey
+        Hash160 pkh20 = hash160 pubKeyBS
+        p2wpkhSpk = BS.pack [0x00, 0x14] <> pkh20
+        -- Build a real prev-tx that pays our P2WPKH at vout=0.
+        prevTx :: Tx
+        prevTx = Tx
+          { txVersion  = 2
+          , txInputs   =
+              [ TxIn
+                  (OutPoint (TxId (Hash256 (BS.replicate 32 0xaa))) 0)
+                  BS.empty
+                  0xffffffff
+              ]
+          , txOutputs  = [TxOut 70_000 p2wpkhSpk]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        prevTxId = computeTxId prevTx
+        -- An *unrelated* prev-tx (different inputs → different txid)
+        -- whose vout=0 also pays our P2WPKH but with a wildly different
+        -- amount.  Used as the forged NON_WITNESS_UTXO oracle.
+        forgedPrevTx :: Tx
+        forgedPrevTx = Tx
+          { txVersion  = 2
+          , txInputs   =
+              [ TxIn
+                  (OutPoint (TxId (Hash256 (BS.replicate 32 0xbb))) 0)
+                  BS.empty
+                  0xffffffff
+              ]
+          , txOutputs  = [TxOut 999_999_999 p2wpkhSpk]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        -- Sanity: the two prev-txs have asymmetric txids (no palindrome
+        -- shortcut for the test's commitment check).
+        forgedPrevTxId = computeTxId forgedPrevTx
+        outScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0x99
+        unsignedTx :: Tx
+        unsignedTx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint prevTxId 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 60_000 outScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+    it "W41-A1 sanity: prev-tx and forged prev-tx have distinct txids (asymmetric)" $ do
+      -- Guards against a fixture-side palindrome where a transposed-byte
+      -- forgery would happen to hash to the same id; the W41 check would
+      -- pass spuriously.
+      prevTxId `shouldNotBe` forgedPrevTxId
+
+    it "W41-A1 verifyNonWitnessUtxoTxid: matching txid → Right" $ do
+      verifyNonWitnessUtxoTxid prevTx prevTxId `shouldBe` Right ()
+
+    it "W41-A1 verifyNonWitnessUtxoTxid: mismatched txid → Left" $ do
+      case verifyNonWitnessUtxoTxid forgedPrevTx prevTxId of
+        Left _   -> pure ()
+        Right () -> expectationFailure
+                      "verifyNonWitnessUtxoTxid accepted a forged prev-tx"
+
+    it "W41-A2 negative: signPsbt rejects forged WITNESS_UTXO amount (CVE-2020-14199)" $ do
+      -- The attack: producer ships an honest piNonWitnessUtxo (which
+      -- the wallet *can* recompute the amount from) plus a forged
+      -- piWitnessUtxo whose amount is inflated.  Pre-W41 the Signer
+      -- would compute BIP-143 sighash under the inflated value and
+      -- emit a usable signature; post-W41 the cross-check trips and
+      -- the input is left unsigned.
+      let forgedWitnessUtxo = TxOut 999_999_999 p2wpkhSpk
+          inp0 = emptyPsbtInput
+            { piWitnessUtxo    = Just forgedWitnessUtxo
+            , piNonWitnessUtxo = Just prevTx           -- honest, txid commits
+            , piSighashType    = Just 0x01
+            }
+          psbt   = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+          signed = signPsbt xkey psbt
+      -- Signer must refuse: no partial sig added.
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 0
+      -- And the top-level pre-flight must surface the explicit
+      -- amount-mismatch error.
+      case verifyPsbtUtxoConsistency psbt of
+        Left err
+          | "amount mismatch" `isInfixOf` err -> pure ()
+          | "scriptPubKey mismatch" `isInfixOf` err -> pure ()
+        Left other -> expectationFailure
+                        ("verifyPsbtUtxoConsistency: unexpected error: " ++ other)
+        Right ()   -> expectationFailure
+                        "verifyPsbtUtxoConsistency missed an A2 amount mismatch"
+
+    it "W41-A1 negative: signPsbt rejects forged piNonWitnessUtxo (txid mismatch)" $ do
+      -- The attack: producer ships piNonWitnessUtxo whose txid does
+      -- NOT commit to the prevout; wallet must not consult it for
+      -- amount or sign over it.  Pre-W41 the Signer never read
+      -- piNonWitnessUtxo's amount anyway (stub branch returned
+      -- Nothing), but the decoder accepted the forged prev-tx and a
+      -- caller using verifyPsbtUtxoConsistency would have missed it.
+      let inp0 = emptyPsbtInput
+            { piNonWitnessUtxo = Just forgedPrevTx
+            , piSighashType    = Just 0x01
+            }
+          psbt = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+      case verifyPsbtUtxoConsistency psbt of
+        Left err
+          | "txid mismatch" `isInfixOf` err -> pure ()
+        Left other -> expectationFailure
+                        ("verifyPsbtUtxoConsistency: unexpected error: " ++ other)
+        Right ()   -> expectationFailure
+                        "verifyPsbtUtxoConsistency missed an A1 txid mismatch"
+      -- Defense-in-depth: signPsbt also leaves the input unsigned.
+      Map.size (piPartialSigs (head (psbtInputs (signPsbt xkey psbt))))
+        `shouldBe` 0
+
+    it "W41-A1 decoder: getPsbt rejects encoded PSBT with forged NON_WITNESS_UTXO" $ do
+      -- End-to-end byte-level proof that the decoder, not just the
+      -- post-decode validator, rejects the forgery.  Build a valid
+      -- PSBT shell whose input map carries a NON_WITNESS_UTXO whose
+      -- txid does NOT match the prevout, then run it through
+      -- decodePsbt and assert it errors with the W41 prefix.
+      let inp0 = emptyPsbtInput
+            { piNonWitnessUtxo = Just forgedPrevTx
+            , piSighashType    = Just 0x01
+            }
+          psbt   = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+          bytes  = encodePsbt psbt
+      case decodePsbt bytes of
+        Right _  -> expectationFailure
+                      "decodePsbt accepted a PSBT with forged NON_WITNESS_UTXO"
+        Left err
+          | "NON_WITNESS_UTXO" `isInfixOf` err -> pure ()
+          | otherwise -> expectationFailure
+                           ("decodePsbt error did not name NON_WITNESS_UTXO: " ++ err)
+
+    it "W41 positive: honest PSBT with both UTXO carriers still signs and matches" $ do
+      -- Make sure the gates are not over-zealous: a producer that
+      -- supplies piNonWitnessUtxo (honest, txid commits) AND
+      -- piWitnessUtxo (matching amount + scriptPubKey from the
+      -- prev-tx output) must still sign cleanly.
+      let honestWitnessUtxo = TxOut 70_000 p2wpkhSpk  -- mirrors prevTx vout 0
+          inp0 = emptyPsbtInput
+            { piWitnessUtxo    = Just honestWitnessUtxo
+            , piNonWitnessUtxo = Just prevTx
+            , piSighashType    = Just 0x01
+            }
+          psbt   = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+      verifyPsbtUtxoConsistency psbt `shouldBe` Right ()
+      let signed = signPsbt xkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+
+  ----------------------------------------------------------------------------
+  -- W41 — Tapscript control-block Merkle / parity verification (W40-D)
+  --
+  -- Pre-W41 'canSignTapscript' parsed the leaf script + control block
+  -- and checked the embedded internal pubkey, but it never recomputed
+  -- the BIP-341 Taproot commitment Q' = P + tweak(merkleRoot) and
+  -- compared to the on-chain output key, and it never compared
+  -- 'cbParity' to the actual parity of Q'.  An attacker could ship a
+  -- control block with a forged Merkle path or flipped parity and the
+  -- wallet would still sign — the script-path verifier would later
+  -- reject on chain, but by then the wallet has emitted a signature
+  -- under a leaf the user never authorised.
+  --
+  -- W41 wires 'verifyTaprootCommitment' and gates 'canSignTapscript'
+  -- on it.  Reference: bitcoin-core/src/script/interpreter.cpp
+  -- VerifyTaprootCommitment.
+  ----------------------------------------------------------------------------
+  describe "W41 Tapscript control-block Merkle / parity verification" $ do
+    let tsSk          = SecKey (BS.replicate 32 0x07)
+        tsXkey        = ExtendedKey
+          { ekKey       = tsSk
+          , ekChainCode = BS.replicate 32 0x00
+          , ekDepth     = 0
+          , ekParentFP  = 0
+          , ekIndex     = 0
+          }
+        SecKey tsSkBytes = tsSk
+        tsInternalX   = case xonlyPubkeyFromSeckey tsSkBytes of
+          Just k  -> k
+          Nothing -> error "test setup: xonlyPubkeyFromSeckey failed"
+        tsLeafScript  = BS.singleton 0x20 <> tsInternalX <> BS.singleton 0xac
+        tsLeafHash    = TS.tapleafHashWith TS.tapscriptLeafVersion tsLeafScript
+        tsTweak       = computeTapTweakHash tsInternalX tsLeafHash
+        (tsOutputX, tsParity) = case xonlyPubkeyTweakAdd tsInternalX tsTweak of
+          Just (k, p) -> (k, p)
+          Nothing     -> error "test setup: tweakAdd failed"
+        tsP2trSpk     = BS.pack [0x51, 0x20] <> tsOutputX
+        tsControlBlock = TS.ControlBlock
+          { TS.cbLeafVersion    = TS.tapscriptLeafVersion
+          , TS.cbInternalPubkey = tsInternalX
+          , TS.cbParity         = fromIntegral tsParity
+          , TS.cbMerklePath     = []
+          }
+        tsPrevTxId    = TxId (Hash256 (BS.replicate 32 0xa1))
+        tsPrevValue   = 800_000 :: Word64
+        tsOutScript   = BS.pack [0x00, 0x14] <> BS.replicate 20 0xee
+        tsUnsignedTx  = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint tsPrevTxId 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 790_000 tsOutScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+    it "W41-D positive: legitimate single-leaf tapscript still signs" $ do
+      -- Sanity backstop for the W41 gate.  A single-leaf tree (empty
+      -- Merkle path) with the correct parity must continue to sign
+      -- via the existing W18 wallet path; otherwise we've over-tightened
+      -- the gate and broken every tapscript-spending wallet.
+      let inp0 = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut tsPrevValue tsP2trSpk)
+            , piUnknown     = Map.fromList
+                [ (tapscriptLeafScriptPsbtKey, tsLeafScript)
+                , (tapscriptControlBlockPsbtKey, TS.encodeControlBlock tsControlBlock)
+                ]
+            }
+          psbt   = (emptyPsbt tsUnsignedTx) { psbtInputs = [inp0] }
+          signed = signPsbt tsXkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+      verifyTaprootCommitment tsControlBlock tsLeafScript tsOutputX
+        `shouldBe` True
+
+    it "W41-D negative: forged Merkle-path control block → no signature" $ do
+      -- The attack: append a 32-byte sibling to the control block.
+      -- 'decodeControlBlock' accepts it (length is 33 + 32 = 65, a
+      -- valid depth-1 path), the embedded internal pubkey still
+      -- matches ours, and pre-W41 the wallet would sign.  Post-W41
+      -- the recomputed merkle_root is TapBranch(leafHash, sibling)
+      -- != leafHash, so the tweak differs and Q' != tsOutputX.
+      let forgedSibling = BS.replicate 32 0xde
+          forgedCb = tsControlBlock { TS.cbMerklePath = [forgedSibling] }
+          inp0 = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut tsPrevValue tsP2trSpk)
+            , piUnknown     = Map.fromList
+                [ (tapscriptLeafScriptPsbtKey, tsLeafScript)
+                , (tapscriptControlBlockPsbtKey, TS.encodeControlBlock forgedCb)
+                ]
+            }
+          psbt   = (emptyPsbt tsUnsignedTx) { psbtInputs = [inp0] }
+          signed = signPsbt tsXkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 0
+      verifyTaprootCommitment forgedCb tsLeafScript tsOutputX
+        `shouldBe` False
+
+    it "W41-D negative: forged parity bit → no signature" $ do
+      -- Flip the parity bit in the control block.  Pre-W41 nothing
+      -- consumed cbParity; post-W41 it must equal Q'.parity.
+      let flippedParity = if TS.cbParity tsControlBlock == 0 then 1 else 0
+          forgedCb = tsControlBlock { TS.cbParity = flippedParity }
+          inp0 = emptyPsbtInput
+            { piWitnessUtxo = Just (TxOut tsPrevValue tsP2trSpk)
+            , piUnknown     = Map.fromList
+                [ (tapscriptLeafScriptPsbtKey, tsLeafScript)
+                , (tapscriptControlBlockPsbtKey, TS.encodeControlBlock forgedCb)
+                ]
+            }
+          psbt   = (emptyPsbt tsUnsignedTx) { psbtInputs = [inp0] }
+          signed = signPsbt tsXkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 0
+      verifyTaprootCommitment forgedCb tsLeafScript tsOutputX
+        `shouldBe` False
+
   -- Direct test of the mempool primitive that backs getmempooldescendants.
   -- We construct a parent tx with one output and a child tx that spends it,
   -- insert both into the mempool indexes by hand (the real validation path

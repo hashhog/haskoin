@@ -188,6 +188,13 @@ module Haskoin.Wallet
   , tapscriptLeafScriptPsbtKey
   , tapscriptControlBlockPsbtKey
   , isSingleKeyOpChecksigTapscript
+  , verifyTaprootCommitment
+    -- * PSBT consistency validators (W41 — Bug A1 + Bug A2 / CVE-2020-14199)
+  , verifyNonWitnessUtxoTxid
+  , verifyInputUtxoConsistency
+  , verifyPsbtUtxoConsistency
+  , extractNonWitnessTxOut
+  , getInputUtxoFor
     -- * PSBT Utilities
   , decodePsbt
   , encodePsbt
@@ -2479,9 +2486,14 @@ getPsbt = do
     fail "Invalid PSBT magic bytes"
   -- Parse global map
   global <- getGlobalMap
-  -- Parse input maps (one per input in tx)
-  let numInputs = length $ txInputs $ pgTx global
-  inputs <- replicateM numInputs getInputMap
+  -- Parse input maps (one per input in tx).  W41 (Bug A1): each input map
+  -- is parsed in the context of its corresponding global-tx prevout
+  -- @OutPoint@, so the decoder can reject a @PSBT_IN_NON_WITNESS_UTXO@
+  -- whose txid does not match the prevout's txid.  See
+  -- 'verifyNonWitnessUtxoTxid' for the per-tx check; this is a hard
+  -- decoder failure (PSBT spec / Core 'PSBTInput::IsSane').
+  let inputPrevouts = map txInPrevOutput (txInputs (pgTx global))
+  inputs <- mapM getInputMapFor inputPrevouts
   -- Parse output maps (one per output in tx)
   let numOutputs = length $ txOutputs $ pgTx global
   outputs <- replicateM numOutputs getOutputMap
@@ -2520,10 +2532,29 @@ getGlobalMap = go Nothing Map.empty Nothing Map.empty
                 Right v -> go mTx xpubs (Just v) unknown
             _ -> go mTx xpubs mVersion (Map.insert key value unknown)
 
--- | Parse input map
+-- | Parse input map.  Compatibility wrapper: callers that don't have the
+-- corresponding global-tx prevout will skip the W41 NON_WITNESS_UTXO
+-- txid check.  Production code (the top-level 'getPsbt') always uses
+-- 'getInputMapFor' so the decoder can enforce the BIP-174 / Core
+-- @PSBTInput::IsSane@ txid commitment.
 getInputMap :: Get PsbtInput
-getInputMap = go emptyPsbtInput
+getInputMap = getInputMapFor (OutPoint (TxId (Hash256 (BS.replicate 32 0x00))) 0xffffffff)
+
+-- | Parse input map in the context of the global-tx prevout it
+-- corresponds to.  W41 (Bug A1): when a @PSBT_IN_NON_WITNESS_UTXO@
+-- (key type 0x00) decodes to a transaction, its txid MUST equal the
+-- prevout's txid; otherwise the producer is lying about which UTXO
+-- the input is spending.  This is the check Core enforces in
+-- @bitcoin-core/src/psbt.cpp PSBTInput::IsSane@.  We treat it as a
+-- hard decoder failure so the rest of the wallet can rely on the
+-- invariant.  The sentinel @OutPoint (TxId 0x00..00) 0xffffffff@
+-- (used by the legacy 'getInputMap' wrapper) bypasses the check; it
+-- is only used by callers that don't have the global tx in hand.
+getInputMapFor :: OutPoint -> Get PsbtInput
+getInputMapFor expectedOp = go emptyPsbtInput
   where
+    sentinel = OutPoint (TxId (Hash256 (BS.replicate 32 0x00))) 0xffffffff
+    isSentinel = expectedOp == sentinel
     go inp = do
       keyLen <- getVarInt'
       if keyLen == 0
@@ -2535,8 +2566,19 @@ getInputMap = go emptyPsbtInput
               keyData = BS.tail key
           case keyType of
             0x00 -> case decode value of  -- NON_WITNESS_UTXO
-              Left _ -> go inp
-              Right tx -> go inp { piNonWitnessUtxo = Just tx }
+              -- W34-E: malformed non-witness-utxo bytes are a strict
+              -- decoder failure (matches the 0x02 / 0x06 / 0x08 lines).
+              Left err -> fail $ "PSBT: malformed NON_WITNESS_UTXO: " ++ err
+              Right tx ->
+                -- W41 (Bug A1): txid commitment.  The decoder fails
+                -- loudly so a forged PSBT cannot be silently accepted
+                -- and then later mis-signed; Core's PSBTInput::IsSane
+                -- has the same check.
+                if isSentinel
+                  then go inp { piNonWitnessUtxo = Just tx }
+                  else case verifyNonWitnessUtxoTxid tx (outPointHash expectedOp) of
+                    Left err -> fail $ "PSBT: NON_WITNESS_UTXO " ++ err
+                    Right () -> go inp { piNonWitnessUtxo = Just tx }
             0x01 -> case decode value of  -- WITNESS_UTXO
               Left _ -> go inp
               Right utxo -> go inp { piWitnessUtxo = Just utxo }
@@ -2682,6 +2724,103 @@ updatePsbt lookupUtxo psbt =
 -- PSBT Role: Signer
 --------------------------------------------------------------------------------
 
+-- | W41 (Bug A1): verify that a 'PSBT_IN_NON_WITNESS_UTXO'-supplied
+-- transaction actually hashes to the expected prevout txid.  Returns
+-- @Right ()@ on match, @Left err@ on mismatch (the error message is
+-- intended to be embedded into a parent decoder / signer error).
+--
+-- BIP-174 §"NON_WITNESS_UTXO" requires the producer to supply the full
+-- previous transaction; the consumer (Signer / Finalizer) is then
+-- expected to read @value@ + @scriptPubKey@ out of it for the input
+-- being spent.  Without a txid commitment a malicious producer can
+-- ship an arbitrary transaction and steer the wallet into signing
+-- under attacker-chosen amount + scriptPubKey (CVE-2020-14199 family;
+-- the non-witness analog of the W31 P2WSH commitment gate).
+--
+-- Reference: @bitcoin-core/src/psbt.cpp PSBTInput::IsSane@.
+verifyNonWitnessUtxoTxid :: Tx -> TxId -> Either String ()
+verifyNonWitnessUtxoTxid prevTx expectedTxId =
+  let TxId (Hash256 actualBs)   = computeTxId prevTx
+      TxId (Hash256 expectedBs) = expectedTxId
+  in if actualBs == expectedBs
+       then Right ()
+       else Left $ "txid mismatch: expected "
+                ++ hexShort expectedBs ++ " got " ++ hexShort actualBs
+  where
+    hexShort bs =
+      let h = concatMap toHex (BS.unpack (BS.take 8 bs))
+      in h ++ "..."
+    toHex b = let (q, r) = b `divMod` 16
+              in [hexDigit (fromIntegral q), hexDigit (fromIntegral r)]
+    hexDigit n
+      | n < 10 = toEnum (fromEnum '0' + n)
+      | otherwise = toEnum (fromEnum 'a' + n - 10)
+
+-- | W41 (Bug A2 / CVE-2020-14199): when a PSBT input carries BOTH
+-- @piWitnessUtxo@ and @piNonWitnessUtxo@, the (value, scriptPubKey)
+-- must agree.  The Signer otherwise has two oracles for the prevout's
+-- @value@; @piWitnessUtxo@ is canonical for segwit, but a forged
+-- @piWitnessUtxo@ (which the verifier never re-derives from the
+-- prev-tx) lets an attacker inflate the signed amount.
+--
+-- This validator pulls the @TxOut@ at the prevout's index out of
+-- @piNonWitnessUtxo@ (when both present) and asserts it equals the
+-- @piWitnessUtxo at .  The W41 'getInputUtxo' rewrite uses the same
+-- index lookup; both call 'extractNonWitnessTxOut'.
+verifyInputUtxoConsistency :: OutPoint -> PsbtInput -> Either String ()
+verifyInputUtxoConsistency op pinp = do
+  -- A1: NON_WITNESS_UTXO txid must commit to prevout txid.
+  case piNonWitnessUtxo pinp of
+    Just prevTx ->
+      verifyNonWitnessUtxoTxid prevTx (outPointHash op)
+    Nothing -> Right ()
+  -- A2: when both UTXO carriers are present, their (value, script) MUST agree.
+  case (piWitnessUtxo pinp, piNonWitnessUtxo pinp) of
+    (Just wUtxo, Just prevTx) ->
+      case extractNonWitnessTxOut prevTx (outPointIndex op) of
+        Nothing ->
+          Left $ "NON_WITNESS_UTXO output index "
+              ++ show (outPointIndex op) ++ " out of range"
+        Just nwUtxo
+          | txOutValue  wUtxo /= txOutValue  nwUtxo ->
+              Left $ "WITNESS_UTXO / NON_WITNESS_UTXO amount mismatch: "
+                  ++ show (txOutValue wUtxo) ++ " vs " ++ show (txOutValue nwUtxo)
+          | txOutScript wUtxo /= txOutScript nwUtxo ->
+              Left "WITNESS_UTXO / NON_WITNESS_UTXO scriptPubKey mismatch"
+          | otherwise -> Right ()
+    _ -> Right ()
+
+-- | Walk the @piNonWitnessUtxo@ into the requested output.  Returns
+-- 'Nothing' if the index is out of range; the caller should treat that
+-- as a signing failure.
+extractNonWitnessTxOut :: Tx -> Word32 -> Maybe TxOut
+extractNonWitnessTxOut prevTx idx =
+  let outs = txOutputs prevTx
+      i    = fromIntegral idx
+  in if i < 0 || i >= length outs
+       then Nothing
+       else Just (outs !! i)
+
+-- | W41 top-level pre-flight validator: walks every input and runs
+-- 'verifyInputUtxoConsistency'.  Surfaces the first mismatch as
+-- @Left "input N: <reason>"@.  Production callers can use this to
+-- reject a PSBT before invoking 'signPsbt'; 'signPsbt' itself runs the
+-- same per-input check on the way through (defense-in-depth — even if
+-- a caller skips the pre-flight, mis-validating inputs are quietly
+-- left unsigned).
+verifyPsbtUtxoConsistency :: Psbt -> Either String ()
+verifyPsbtUtxoConsistency psbt =
+  let tx       = pgTx (psbtGlobal psbt)
+      inputs   = psbtInputs psbt
+      txInsList = txInputs tx
+      step (i, txin, pinp) =
+        case verifyInputUtxoConsistency (txInPrevOutput txin) pinp of
+          Right () -> Right ()
+          Left err -> Left $ "input " ++ show i ++ ": " ++ err
+  in if length inputs /= length txInsList
+       then Left "PSBT input map count != global tx input count"
+       else mapM_ step (zip3 [0 :: Int ..] txInsList inputs)
+
 -- | Sign a PSBT with an extended key.
 -- This is the Signer role in BIP-174.
 -- Adds partial signatures for inputs that match the key.
@@ -2694,19 +2833,64 @@ updatePsbt lookupUtxo psbt =
 -- bytes (rare but possible for legacy-only PSBTs); the BIP-341 sighash
 -- check below will fail loudly if any P2TR input is missing prevout
 -- data, which is the right failure mode.
+--
+-- W41 hardening (Bug A1 + Bug A2 / CVE-2020-14199): the per-input
+-- loop now consults 'verifyInputUtxoConsistency' for each input.  If
+-- the input's @piNonWitnessUtxo@ does not commit to the prevout's
+-- txid, OR if both UTXO carriers disagree on (value, scriptPubKey),
+-- the input is left unsigned.  This mirrors the W31 fail-quiet pattern
+-- in 'canSignWrapped' — the input never gets a partial sig under a
+-- forged amount oracle, which is the byte the attacker is trying to
+-- get the wallet to sign over.
 signPsbt :: ExtendedKey -> Psbt -> Psbt
 signPsbt xkey psbt =
-  let prevouts = map collectPrevout (psbtInputs psbt)
-  in psbt { psbtInputs = zipWith (signInput xkey tx prevouts) [0..] (psbtInputs psbt) }
+  let prevouts = zipWith collectPrevout txInsList (psbtInputs psbt)
+  in psbt { psbtInputs =
+              zipWith3 (signInputWithPrevout xkey tx prevouts)
+                       [0..]
+                       txInsList
+                       (psbtInputs psbt)
+          }
   where
-    tx = pgTx (psbtGlobal psbt)
+    tx        = pgTx (psbtGlobal psbt)
+    txInsList = txInputs tx
     -- For Taproot key-path signing we need (amount, scriptPubKey) per
     -- input.  piWitnessUtxo is the canonical PSBT carrier; non-witness
     -- inputs would not be Taproot anyway, so a placeholder is harmless
     -- (it will never feed the BIP-341 preimage).
-    collectPrevout pinp = case piWitnessUtxo pinp of
+    collectPrevout txin pinp = case piWitnessUtxo pinp of
       Just (TxOut v s) -> (v, s)
-      Nothing          -> (0, BS.empty)
+      Nothing          ->
+        -- W41 (Bug A2 NonWitness branch): fall back to the
+        -- prev-tx output IF the txid matches (otherwise the
+        -- non-witness data is forged and we must not feed it
+        -- into the Taproot prevouts vector).
+        case piNonWitnessUtxo pinp of
+          Just prevTx
+            | Right () <- verifyNonWitnessUtxoTxid prevTx
+                            (outPointHash (txInPrevOutput txin)) ->
+                case extractNonWitnessTxOut prevTx
+                       (outPointIndex (txInPrevOutput txin)) of
+                  Just (TxOut v s) -> (v, s)
+                  Nothing          -> (0, BS.empty)
+          _ -> (0, BS.empty)
+
+-- | W41 wrapper around 'signInput' that gates per-input on
+-- 'verifyInputUtxoConsistency'.  An input that fails the gate is
+-- returned unchanged (no partial sig) — matching the W31 fail-quiet
+-- precedent for forged commitment inputs.
+signInputWithPrevout
+  :: ExtendedKey
+  -> Tx
+  -> [(Word64, ByteString)]
+  -> Int
+  -> TxIn
+  -> PsbtInput
+  -> PsbtInput
+signInputWithPrevout xkey tx prevouts inputIdx txin pinp =
+  case verifyInputUtxoConsistency (txInPrevOutput txin) pinp of
+    Left _   -> pinp  -- forged amount / txid oracle; refuse to sign
+    Right () -> signInput xkey tx prevouts inputIdx pinp
 
 -- | Sign a single input if we have the key.
 --
@@ -2723,8 +2907,16 @@ signInput :: ExtendedKey -> Tx -> [(Word64, ByteString)] -> Int -> PsbtInput -> 
 signInput xkey tx prevouts inputIdx pinp
   -- Already finalized, skip
   | isInputFinalized pinp = pinp
-  -- Try to sign
-  | otherwise = case getInputUtxo pinp of
+  -- Try to sign.  W41 (Bug A2): when the input is non-witness-only the
+  -- @piNonWitnessUtxo@ branch of 'getInputUtxoFor' walks into the
+  -- prev-tx's output at the prevout's index.  This requires the
+  -- caller's @inputIdx@ to be in range for @tx@; if it isn't we
+  -- have nothing to do anyway.
+  | inputIdx < 0 || inputIdx >= length (txInputs tx) = pinp
+  | otherwise =
+      let txin = txInputs tx !! inputIdx
+          op   = txInPrevOutput txin
+      in case getInputUtxoFor op pinp of
       Nothing -> pinp  -- No UTXO info
       Just utxo ->
         let pubKey = derivePubKeyFromPrivate (ekKey xkey)
@@ -2754,17 +2946,39 @@ isInputFinalized pinp =
         Just _ -> True
         Nothing -> False
 
--- | Get UTXO from input (witness or non-witness)
+-- | Get UTXO from input (witness or non-witness).  Pre-W41 the
+-- non-witness branch was a stub returning 'Nothing' (the caller did
+-- not supply the outpoint index).  W41 wires the index-aware
+-- 'getInputUtxoFor'; this no-arg form remains for callers that don't
+-- have the prevout in hand and falls back to @piWitnessUtxo@ only.
 getInputUtxo :: PsbtInput -> Maybe TxOut
-getInputUtxo pinp =
-  piWitnessUtxo pinp <|> getNonWitnessUtxo pinp
-  where
-    (<|>) Nothing b = b
-    (<|>) a _ = a
+getInputUtxo pinp = piWitnessUtxo pinp
 
-    getNonWitnessUtxo p = case piNonWitnessUtxo p of
-      Nothing -> Nothing
-      Just prevTx -> Nothing  -- Would need outpoint index
+-- | W41 (Bug A2 NonWitness branch): index-aware UTXO lookup.
+--
+-- Lookup order:
+--   1. @piWitnessUtxo@ if present (canonical for segwit).
+--   2. Otherwise, walk @piNonWitnessUtxo@ into its
+--      @outPointIndex op@-th output, but ONLY after asserting
+--      'verifyNonWitnessUtxoTxid' (Bug A1).  A forged @piNonWitnessUtxo@
+--      whose txid does not commit to the prevout returns 'Nothing'
+--      here, which the caller treats as "no UTXO info" — same as the
+--      pre-W41 stub but now selectively, not unconditionally.
+--
+-- When BOTH carriers are present, we still return @piWitnessUtxo@
+-- (canonical), and 'verifyInputUtxoConsistency' separately enforces
+-- they agree.  That keeps the dispatcher in 'signInput' on the same
+-- (value, script) tuple as before for segwit inputs.
+getInputUtxoFor :: OutPoint -> PsbtInput -> Maybe TxOut
+getInputUtxoFor op pinp =
+  case piWitnessUtxo pinp of
+    Just utxo -> Just utxo
+    Nothing   -> case piNonWitnessUtxo pinp of
+      Nothing     -> Nothing
+      Just prevTx ->
+        case verifyNonWitnessUtxoTxid prevTx (outPointHash op) of
+          Left _   -> Nothing  -- forged non-witness oracle; refuse
+          Right () -> extractNonWitnessTxOut prevTx (outPointIndex op)
 
 -- | Check if we can sign for this script with our key.
 --
@@ -2863,18 +3077,29 @@ canSignTaproot xkey script _pinp
 --   * The leaf script is a single-key OP_CHECKSIG tapscript whose pubkey
 --     matches our x-only internal key.
 --   * The control block decodes, has BIP-342 leaf version 0xc0, and its
---     embedded internal pubkey matches ours.  (We do not currently check
---     the Merkle path commits to the on-chain output key — that would
---     require recomputing the tweak for every leaf in a MAST tree, which
---     is exactly the scope we deferred.  Single-leaf trees pass naturally
---     because the path is empty.)
+--     embedded internal pubkey matches ours.
+--   * W41 (W40-D fix): the BIP-341 Taproot commitment from
+--     @internal_pubkey + merkleRoot@ recomputes to the on-chain output
+--     key (x-only equality AND parity bit equality).  Pre-W41 the W18
+--     comment claimed "single-leaf trees pass naturally because the
+--     path is empty" — that was wrong, because 'decodeControlBlock'
+--     accepts arbitrary trailing 32-byte chunks (any depth) and the
+--     wallet never re-derived the output key.  An attacker could ship
+--     a control block whose Merkle path was forged to make the leaf
+--     they want signed look like it lives in some unrelated tree.
+--     The on-chain @output_key@ is the single ground-truth pin: if
+--     the @internal_key + tweak(merkleRoot)@ does not equal it, we
+--     refuse to sign.
 --
 -- Multi-leaf MAST, multisig predicates, OP_CHECKSIGADD, BIP-371 fields,
 -- and ANNEX handling are explicitly out of scope.  See 'addSignature'
 -- for the corresponding "not yet implemented" branches.
+--
+-- Reference: @bitcoin-core/src/script/interpreter.cpp VerifyTaprootCommitment@.
 canSignTapscript :: ExtendedKey -> ByteString -> PsbtInput -> Bool
 canSignTapscript xkey script pinp
   | isP2TRScript script
+  , Just outputKey   <- getP2TRProgram script
   , Just leafScript  <- Map.lookup tapscriptLeafScriptPsbtKey   (piUnknown pinp)
   , Just cbBytes     <- Map.lookup tapscriptControlBlockPsbtKey (piUnknown pinp)
   , Just cb          <- TS.decodeControlBlock cbBytes
@@ -2882,8 +3107,58 @@ canSignTapscript xkey script pinp
   , let SecKey sk = ekKey xkey
   , Just internalX <- xonlyPubkeyFromSeckey sk
   , TS.cbInternalPubkey cb == internalX
-  = isSingleKeyOpChecksigTapscript leafScript internalX
+  , isSingleKeyOpChecksigTapscript leafScript internalX
+  = verifyTaprootCommitment cb leafScript outputKey
   | otherwise = False
+
+-- | W41 (W40-D fix): verify that walking the BIP-341 Merkle path in the
+-- control block, then BIP-341-tweaking the internal pubkey with the
+-- resulting root, reproduces the on-chain output key (x-only equality
+-- AND parity bit).
+--
+-- Algorithm (mirrors @bitcoin-core/src/script/interpreter.cpp
+-- VerifyTaprootCommitment@):
+--
+--   1. Compute @tapleaf_hash = tagged_hash("TapLeaf",
+--          leafVersion || compactSize(script) || script)@.
+--   2. Walk @cbMerklePath@ as 32-byte sibling chunks; at each step,
+--      lexicographically-order the (current, sibling) pair and hash
+--      under @tagged_hash("TapBranch", lo || hi)@.  An empty path
+--      means @merkleRoot = tapleaf_hash@.
+--   3. Compute @tweak = tagged_hash("TapTweak", internalKey || merkleRoot)@.
+--   4. Compute @(Q'_x, Q'_parity) = xonlyPubkeyTweakAdd(internalKey, tweak)@.
+--   5. Assert @Q'_x == on_chain_output_key@ AND
+--             @Q'_parity == cbParity@.
+--
+-- The parity check is what closes the second half of the W40-D gap:
+-- 'decodeControlBlock' parses @cbParity@ but pre-W41 nothing
+-- consumed it, so a control block whose low bit was flipped would
+-- still produce a signature (the script-path verifier would later
+-- reject it on chain, but the wallet would have already signed under
+-- the wrong (internal_key, output_key) pairing).
+verifyTaprootCommitment :: TS.ControlBlock -> ByteString -> ByteString -> Bool
+verifyTaprootCommitment cb leafScript outputKey =
+  let leafHash   = TS.tapleafHashWith (TS.cbLeafVersion cb) leafScript
+      merkleRoot = walkMerklePath leafHash (TS.cbMerklePath cb)
+      tweak      = computeTapTweakHash (TS.cbInternalPubkey cb) merkleRoot
+  in case xonlyPubkeyTweakAdd (TS.cbInternalPubkey cb) tweak of
+       Nothing            -> False
+       Just (qx, qParity) ->
+         qx == outputKey
+         && fromIntegral qParity == TS.cbParity cb
+  where
+    -- BIP-341 §"Constructing and spending Taproot outputs":
+    -- TapBranch(child, sibling) with lexicographic ordering of the
+    -- two 32-byte hashes.  Sibling chunks shorter / longer than 32
+    -- bytes would have already been rejected by 'decodeControlBlock',
+    -- but we treat anything off-spec defensively (return a bogus
+    -- root, which the tweak comparison will then reject).
+    walkMerklePath cur [] = cur
+    walkMerklePath cur (sib:rest)
+      | BS.length sib /= 32 = BS.replicate 32 0xff  -- defensive sentinel
+      | otherwise =
+          let (lo, hi) = if cur <= sib then (cur, sib) else (sib, cur)
+          in walkMerklePath (taggedHash "TapBranch" (lo <> hi)) rest
 
 -- | Check if script is P2PKH
 isP2PKHScript :: ByteString -> Bool
