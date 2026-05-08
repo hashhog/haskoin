@@ -193,6 +193,9 @@ module Haskoin.Wallet
   , encodePsbt
   , isPsbtFinalized
   , getPsbtFee
+    -- * PSBT decoder primitives (W34-E: exposed for strictness regression tests)
+  , parseKeyPath
+  , parseWitnessStack
     -- * Output Descriptors (BIP-380-386)
   , Descriptor(..)
   , KeyExpr(..)
@@ -2505,8 +2508,12 @@ getGlobalMap = go Nothing Map.empty Nothing Map.empty
                 Left err -> fail $ "Failed to parse unsigned tx: " ++ err
                 Right tx -> go (Just tx) xpubs mVersion unknown
             0x01 -> do  -- PSBT_GLOBAL_XPUB
-              let keypath = parseKeyPath value
-              go mTx (Map.insert keyData keypath xpubs) mVersion unknown
+              -- W34-E: fail loud on malformed keypath rather than
+              -- inserting KeyPath 0 [] and breaking byte-identity.
+              case parseKeyPath value of
+                Left err -> fail err
+                Right keypath ->
+                  go mTx (Map.insert keyData keypath xpubs) mVersion unknown
             0xfb -> do  -- PSBT_GLOBAL_VERSION
               case runGet getWord32le value of
                 Left _ -> fail "Invalid PSBT version"
@@ -2534,7 +2541,10 @@ getInputMap = go emptyPsbtInput
               Left _ -> go inp
               Right utxo -> go inp { piWitnessUtxo = Just utxo }
             0x02 -> case parsePubKey keyData of  -- PARTIAL_SIG
-              Nothing -> go inp
+              -- W34-E: STRICT — invalid pubkey in a 0x02 key indicates a
+              -- malformed producer; surface it instead of silently dropping
+              -- the partial signature (PSBT-spec / Core-parity behavior).
+              Nothing -> fail "PSBT: invalid pubkey in PARTIAL_SIG (0x02) key"
               Just pk -> go inp { piPartialSigs = Map.insert pk value (piPartialSigs inp) }
             0x03 -> case runGet getWord32le value of  -- SIGHASH_TYPE
               Left _ -> go inp
@@ -2542,10 +2552,17 @@ getInputMap = go emptyPsbtInput
             0x04 -> go inp { piRedeemScript = Just value }  -- REDEEM_SCRIPT
             0x05 -> go inp { piWitnessScript = Just value }  -- WITNESS_SCRIPT
             0x06 -> case parsePubKey keyData of  -- BIP32_DERIVATION
-              Nothing -> go inp
-              Just pk -> go inp { piBip32Derivation = Map.insert pk (parseKeyPath value) (piBip32Derivation inp) }
+              -- W34-E: STRICT — invalid pubkey in a 0x06 key is malformed.
+              Nothing -> fail "PSBT: invalid pubkey in BIP32_DERIVATION (0x06) key"
+              Just pk -> case parseKeyPath value of
+                Left err -> fail err
+                Right kp -> go inp { piBip32Derivation = Map.insert pk kp (piBip32Derivation inp) }
             0x07 -> go inp { piFinalScriptSig = Just value }  -- FINAL_SCRIPTSIG
-            0x08 -> go inp { piFinalScriptWitness = Just (parseWitnessStack value) }  -- FINAL_SCRIPTWITNESS
+            0x08 -> case parseWitnessStack value of  -- FINAL_SCRIPTWITNESS
+              -- W34-E: fail loud on malformed witness rather than emitting
+              -- a zero-count witness on the encode side.
+              Left err -> fail err
+              Right ws -> go inp { piFinalScriptWitness = Just ws }
             _ -> go inp { piUnknown = Map.insert key value (piUnknown inp) }
 
 -- | Parse output map
@@ -2565,31 +2582,50 @@ getOutputMap = go emptyPsbtOutput
             0x00 -> go out { poRedeemScript = Just value }  -- REDEEM_SCRIPT
             0x01 -> go out { poWitnessScript = Just value }  -- WITNESS_SCRIPT
             0x02 -> case parsePubKey keyData of  -- BIP32_DERIVATION
-              Nothing -> go out
-              Just pk -> go out { poBip32Derivation = Map.insert pk (parseKeyPath value) (poBip32Derivation out) }
+              -- W34-E: STRICT — see input-map note for 0x06.
+              Nothing -> fail "PSBT: invalid pubkey in output BIP32_DERIVATION (0x02) key"
+              Just pk -> case parseKeyPath value of
+                Left err -> fail err
+                Right kp -> go out { poBip32Derivation = Map.insert pk kp (poBip32Derivation out) }
             _ -> go out { poUnknown = Map.insert key value (poUnknown out) }
 
--- | Parse a keypath from bytes
-parseKeyPath :: ByteString -> KeyPath
+-- | Parse a keypath from bytes.
+--
+-- W34-E (PSBT decoder strictness): previously this returned
+-- @KeyPath 0 []@ for any input shorter than 4 bytes and silently
+-- truncated trailing bytes that were not a multiple of 4. That broke
+-- byte-identity round-trip and could silently drop derivation paths
+-- on malformed PSBTs. We now fail loudly and let the parent 'Get'
+-- monad propagate the error.
+parseKeyPath :: ByteString -> Either String KeyPath
 parseKeyPath bs
-  | BS.length bs < 4 = KeyPath 0 []
+  | BS.length bs < 4 =
+      Left "PSBT: keypath bytes too short (need >= 4 for fingerprint)"
+  | BS.length bs `mod` 4 /= 0 =
+      Left "PSBT: keypath not multiple of 4 bytes"
   | otherwise =
       let fp = runGetPartial getWord32le (BS.take 4 bs)
           pathBytes = BS.drop 4 bs
           pathLen = BS.length pathBytes `div` 4
           path = map (\i -> runGetPartial getWord32le (BS.take 4 (BS.drop (i * 4) pathBytes)))
                      [0 .. pathLen - 1]
-      in KeyPath fp path
+      in Right (KeyPath fp path)
   where
     runGetPartial g b = case runGet g b of
       Left _ -> 0
       Right v -> v
 
--- | Parse a witness stack from bytes
-parseWitnessStack :: ByteString -> [ByteString]
+-- | Parse a witness stack from bytes.
+--
+-- W34-E (PSBT decoder strictness): previously a malformed witness was
+-- silently coerced to @[]@, which the encoder would then re-emit as a
+-- zero-count witness — destroying byte-identity round-trip and quietly
+-- dropping the original (malformed-but-present) data. We now propagate
+-- the underlying 'Get' failure.
+parseWitnessStack :: ByteString -> Either String [ByteString]
 parseWitnessStack bs = case runGet getStack bs of
-  Left _ -> []
-  Right items -> items
+  Left err -> Left ("PSBT: malformed FINAL_SCRIPTWITNESS: " ++ err)
+  Right items -> Right items
   where
     getStack = do
       count <- getVarInt'
