@@ -5450,6 +5450,82 @@ main = hspec $ do
       p2wshCommits p2wshSpk forgedWScript `shouldBe` False
       p2wshCommits p2wshSpk wScriptOne   `shouldBe` True
 
+    -- W32-A: 'finalizeForScript' commitment gates.
+    --
+    -- W31 prevented 'addSignature' from ever producing a partial sig
+    -- under a forged 'piRedeemScript' / 'piWitnessScript'.  The
+    -- finalizer was therefore safe-by-construction inside our own
+    -- Signer flow.  But a Combiner-supplied PSBT could plant such a
+    -- partial sig directly into 'piPartialSigs' (combinePsbts does
+    -- 'Map.union' across PSBTs and trusts whatever upstream supplied),
+    -- and the pre-W32 finalizer would have happily assembled a
+    -- malformed transaction whose scriptSig pushed the forged redeem
+    -- and whose witness presented the forged witnessScript.
+    --
+    -- W32-A mirrors the W31 commitment gates into 'finalizeForScript':
+    -- on a P2SH-P2WPKH / P2SH-P2WSH / bare-P2WSH branch where the
+    -- supplied redeem/witnessScript does not commit to the on-chain
+    -- script, the finalizer leaves the input unchanged so
+    -- 'isInputFinalized' stays False; 'finalizePsbt' surfaces an
+    -- explicit @FinalizeCommitmentMismatch@ error.
+    it "W32-A negative: finalizePsbt rejects forged P2SH-P2WPKH redeemScript" $ do
+      -- Build a redeem that is a structurally-valid P2WPKH program
+      -- but whose 20-byte payload does not match redH (the commitment
+      -- baked into p2shP2wpkhSpk).  Then plant a 72-byte placeholder
+      -- partial sig directly into piPartialSigs, simulating the
+      -- Combiner-supplied threat: pre-W32 the finalizer would have
+      -- assembled a transaction whose scriptSig pushed the forged
+      -- redeem.
+      let forgedPkh    = BS.replicate 20 0x55
+          forgedRedeem = BS.pack [0x00, 0x14] <> forgedPkh
+          plantedSig   = BS.replicate 71 0xab `BS.snoc` 0x01  -- DER-shaped + SIGHASH_ALL
+          tx           = unsignedTx
+          inp0         = emptyPsbtInput
+            { piWitnessUtxo  = Just (TxOut prevValue p2shP2wpkhSpk)
+            , piRedeemScript = Just forgedRedeem
+            , piPartialSigs  = Map.singleton pubKey plantedSig
+            , piSighashType  = Just 0x01
+            }
+          psbt         = (emptyPsbt tx) { psbtInputs = [inp0] }
+      case finalizePsbt psbt of
+        Right _ -> expectationFailure
+                     "finalizePsbt accepted a forged P2SH-P2WPKH redeemScript at the finalizer step"
+        Left e  -> do
+          -- Error must be the explicit W32-A commitment-mismatch path,
+          -- not the generic "cannot finalize" string.
+          ("FinalizeCommitmentMismatch" `isInfixOf` e) `shouldBe` True
+      -- And critically, the input's final fields must remain empty —
+      -- no scriptSig, no witness — so even a caller that ignored the
+      -- Left would not get a malformed transaction back.
+      let inp' = head (psbtInputs psbt)
+      piFinalScriptSig     inp' `shouldBe` Nothing
+      piFinalScriptWitness inp' `shouldBe` Nothing
+
+    it "W32-A negative: finalizePsbt rejects forged bare-P2WSH witnessScript" $ do
+      -- Same shape: forge a witnessScript whose sha256 does not match
+      -- wsh (the commitment baked into p2wshSpk), then plant a
+      -- partial sig.  Pre-W32 the finalizer would have emitted a
+      -- witness stack [sig, forgedWScript].
+      let bogusPubKey   = BS.replicate 33 0x77
+          forgedWScript = BS.cons 0x21 bogusPubKey `BS.snoc` 0xac
+          plantedSig    = BS.replicate 71 0xcd `BS.snoc` 0x01
+          tx            = unsignedTx
+          inp0          = emptyPsbtInput
+            { piWitnessUtxo   = Just (TxOut prevValue p2wshSpk)
+            , piWitnessScript = Just forgedWScript
+            , piPartialSigs   = Map.singleton pubKey plantedSig
+            , piSighashType   = Just 0x01
+            }
+          psbt          = (emptyPsbt tx) { psbtInputs = [inp0] }
+      case finalizePsbt psbt of
+        Right _ -> expectationFailure
+                     "finalizePsbt accepted a forged P2WSH witnessScript at the finalizer step"
+        Left e  ->
+          ("FinalizeCommitmentMismatch" `isInfixOf` e) `shouldBe` True
+      let inp' = head (psbtInputs psbt)
+      piFinalScriptSig     inp' `shouldBe` Nothing
+      piFinalScriptWitness inp' `shouldBe` Nothing
+
   -- Phase 5 of the haskoin ECDSA wiring plan
   -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
   -- BIP-340 / BIP-341 sign-side primitives.  These tests exercise the
