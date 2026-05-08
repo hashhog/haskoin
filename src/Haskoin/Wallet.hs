@@ -179,6 +179,11 @@ module Haskoin.Wallet
   , isP2SHScript
   , isP2TRScript
   , getP2TRProgram
+    -- * BIP-16 / BIP-141 commitment helpers (W31)
+  , getP2SHHash
+  , getP2WSHHash
+  , p2shCommits
+  , p2wshCommits
     -- * Tapscript single-leaf wallet integration (W18)
   , tapscriptLeafScriptPsbtKey
   , tapscriptControlBlockPsbtKey
@@ -2741,24 +2746,38 @@ canSign pubKeyHash script
 -- | Check if we can sign a wrapped (P2SH or P2WSH) input given the
 -- PSBT-supplied redeemScript / witnessScript.  Single-key P2WSH means
 -- the witnessScript is "<33-byte pubkey> OP_CHECKSIG".
+--
+-- W31 hardening: every branch validates that the PSBT-supplied inner
+-- script(s) commit to the on-chain @scriptPubKey@ (BIP-16 hash160
+-- and / or BIP-141 sha256).  A forged @piRedeemScript@ /
+-- @piWitnessScript@ that does not commit cannot make this function
+-- return @True@ — preventing the Signer from being lured into
+-- signing under an attacker-chosen @scriptCode@.
 canSignWrapped :: Hash160 -> ByteString -> PsbtInput -> Bool
 canSignWrapped pubKeyHash script pinp
-  -- P2SH-P2WPKH: redeemScript = OP_0 <20-byte pkh>, must match our hash.
+  -- P2SH-P2WPKH: redeemScript = OP_0 <20-byte pkh>, must match our hash
+  -- AND must hash160 to the P2SH commitment.
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
   , isP2WPKHScript redeem
-  = getP2WPKHHash redeem == Just pubKeyHash
+  = p2shCommits script redeem
+    && getP2WPKHHash redeem == Just pubKeyHash
   -- P2SH-P2WSH single-key: redeemScript = OP_0 <32-byte sha256(witnessScript)>;
   -- witnessScript itself is "<33-byte pubkey> OP_CHECKSIG".
+  -- Both BIP-16 (script→redeem) and BIP-141 (redeem→wScript)
+  -- commitments must verify.
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
   , isP2WSHScript redeem
   , Just wScript <- piWitnessScript pinp
-  = isWitnessScriptSingleKey pubKeyHash wScript
-  -- Bare P2WSH single-key.
+  = p2shCommits script redeem
+    && p2wshCommits redeem wScript
+    && isWitnessScriptSingleKey pubKeyHash wScript
+  -- Bare P2WSH single-key.  BIP-141 commitment script→wScript must verify.
   | isP2WSHScript script
   , Just wScript <- piWitnessScript pinp
-  = isWitnessScriptSingleKey pubKeyHash wScript
+  = p2wshCommits script wScript
+    && isWitnessScriptSingleKey pubKeyHash wScript
   | otherwise = False
 
 -- | Recognise a "<33-byte compressed pubkey> OP_CHECKSIG" witnessScript
@@ -2888,6 +2907,50 @@ getP2WPKHHash s
   | isP2WPKHScript s = Just $ Hash160 (BS.take 20 (BS.drop 2 s))
   | otherwise = Nothing
 
+-- | Extract the 20-byte @hash160(redeemScript)@ commitment from a P2SH
+-- @scriptPubKey@.  Layout: @OP_HASH160 0x14 <hash20> OP_EQUAL@.
+getP2SHHash :: ByteString -> Maybe Hash160
+getP2SHHash s
+  | isP2SHScript s = Just $ Hash160 (BS.take 20 (BS.drop 2 s))
+  | otherwise = Nothing
+
+-- | Extract the 32-byte @sha256(witnessScript)@ commitment from a
+-- bare P2WSH @scriptPubKey@ or from a P2SH-P2WSH redeemScript.
+-- Layout (both): @OP_0 0x20 <hash32>@.
+getP2WSHHash :: ByteString -> Maybe ByteString
+getP2WSHHash s
+  | isP2WSHScript s = Just (BS.take 32 (BS.drop 2 s))
+  | otherwise = Nothing
+
+-- | BIP-16 commitment check: does @redeem@ match the 20-byte
+-- @hash160@ embedded in the P2SH @scriptPubKey@?
+--
+-- This is the gate Bitcoin Core enforces in
+-- @bitcoin-core/src/script/interpreter.cpp::EvalScript@ when the
+-- P2SH-evaluation flag fires.  Without it, a PSBT-supplied
+-- @piRedeemScript@ would be accepted verbatim — letting an attacker
+-- ship a forged redeem program that pretends to be ours and steers
+-- the wallet into signing under the wrong scriptCode.
+p2shCommits :: ByteString -> ByteString -> Bool
+p2shCommits script redeem =
+  case getP2SHHash script of
+    Just (Hash160 expected) -> expected == getHash160 (hash160 redeem)
+    Nothing                 -> False
+
+-- | BIP-141 commitment check: does @wScript@ match the 32-byte
+-- @sha256@ embedded in a P2WSH witness program (whether bare in a
+-- @scriptPubKey@ or wrapped inside a P2SH-P2WSH redeemScript)?
+--
+-- Without this check a PSBT-supplied @piWitnessScript@ could carry
+-- arbitrary bytes; the Signer would then compute the BIP-143 sighash
+-- under the forged @scriptCode@ and emit a signature usable for a
+-- transaction the user did not authorise.
+p2wshCommits :: ByteString -> ByteString -> Bool
+p2wshCommits witnessProgram wScript =
+  case getP2WSHHash witnessProgram of
+    Just expected -> expected == sha256 wScript
+    Nothing       -> False
+
 -- | Add a signature to the input.
 --
 -- Phase 1 wired the legacy P2PKH spend path; Phase 2 (W15) extends this
@@ -2911,19 +2974,27 @@ addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
   -- P2WPKH program.  Sign as P2WPKH using the redeemScript-derived
   -- scriptCode, then finalize will write both the scriptSig (push of the
   -- redeemScript) and the witness stack.
+  -- W31 hardening: BIP-16 commits redeem to scriptPubKey.  Without this
+  -- gate, a forged piRedeemScript would be accepted verbatim and the
+  -- Signer would emit a sig under attacker-chosen scriptCode.
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
-  , isP2WPKHScript redeem =
+  , isP2WPKHScript redeem
+  , p2shCommits script redeem =
       let sighash   = computeSegwitSighashFromProgram tx inputIdx redeem value shType
           signature = signWithKey xkey sighash shType
       in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
   -- P2SH-P2WSH wrap: P2SH redeemScript = 0x0020<32-byte witnessScript-hash>;
   -- the witnessScript itself is in 'piWitnessScript' and used as the
   -- BIP-143 scriptCode verbatim.
+  -- W31 hardening: both BIP-16 (script→redeem) and BIP-141
+  -- (redeem→wScript) commitments must verify.
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
   , isP2WSHScript redeem
-  , Just wScript <- piWitnessScript pinp =
+  , Just wScript <- piWitnessScript pinp
+  , p2shCommits script redeem
+  , p2wshCommits redeem wScript =
       let sighash   = computeSegwitSighashScriptCode tx inputIdx wScript value shType
           signature = signWithKey xkey sighash shType
       in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
@@ -2939,7 +3010,11 @@ addSignature xkey pubKey tx prevouts inputIdx script value shType pinp
           signature = signWithKey xkey sighash shType
       in pinp { piPartialSigs = Map.insert pubKey signature (piPartialSigs pinp) }
   | isP2WSHScript script
-  , Just wScript <- piWitnessScript pinp =
+  , Just wScript <- piWitnessScript pinp
+  -- W31 hardening: BIP-141 commits wScript to scriptPubKey.  Without
+  -- this, a forged piWitnessScript would be used verbatim as the
+  -- BIP-143 scriptCode.
+  , p2wshCommits script wScript =
       -- BIP-143 §"Witness program of version 0": for P2WSH the scriptCode
       -- is the witnessScript itself, used verbatim (no implicit-script
       -- transform).  The wallet must have populated 'piWitnessScript'

@@ -5364,6 +5364,92 @@ main = hspec $ do
           shNone    = computeSegwitSighash tx 0 p2wpkhSpk prevValue 0x02
       shAll `shouldNotBe` shNone
 
+    -- W31: P2SH / P2WSH commitment checks.
+    --
+    -- Pre-W31, 'canSignWrapped' and 'addSignature' accepted the
+    -- PSBT-supplied 'piRedeemScript' / 'piWitnessScript' verbatim,
+    -- without verifying it committed to the on-chain scriptPubKey
+    -- (BIP-16 hash160 for P2SH, BIP-141 sha256 for P2WSH).  An
+    -- attacker-supplied PSBT could therefore steer the Signer into
+    -- producing a BIP-143 sighash under an attacker-chosen scriptCode.
+    -- W31 wires those commitments and adds three regressions:
+    --   1. positive: an honestly-built P2SH-P2WPKH PSBT still signs;
+    --   2. negative: a P2SH PSBT whose redeem does NOT hash to the
+    --      script's commitment is rejected (no partial sig added);
+    --   3. negative: a bare-P2WSH PSBT whose witnessScript does NOT
+    --      sha256 to the script's commitment is rejected.
+    it "W31 positive: honest P2SH-P2WPKH still signs after commitment gate" $ do
+      let tx        = unsignedTx
+          inp0      = emptyPsbtInput
+            { piWitnessUtxo  = Just (TxOut prevValue p2shP2wpkhSpk)
+            , piRedeemScript = Just p2wpkhSpk     -- inner program; commits.
+            , piSighashType  = Just 0x01
+            }
+          psbt      = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed    = signPsbt xkey psbt
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 1
+
+    it "W31 negative: P2SH-P2WPKH with forged redeemScript is rejected" $ do
+      -- Build a redeemScript whose 20-byte payload is NOT pkh20 (so it
+      -- does not hash160 to redH inside p2shP2wpkhSpk).  The forged
+      -- redeem is structurally a valid P2WPKH witness program (so the
+      -- shape predicates still match), but it does not commit to the
+      -- on-chain P2SH script.
+      let forgedPkh   = BS.replicate 20 0x55
+          forgedRedeem = BS.pack [0x00, 0x14] <> forgedPkh
+          tx          = unsignedTx
+          inp0        = emptyPsbtInput
+            { piWitnessUtxo  = Just (TxOut prevValue p2shP2wpkhSpk)
+            , piRedeemScript = Just forgedRedeem
+            , piSighashType  = Just 0x01
+            }
+          psbt        = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed      = signPsbt xkey psbt
+      -- canSignWrapped must reject (no partial sig added); finalizePsbt
+      -- must therefore not produce a final transaction.
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 0
+      case finalizePsbt signed of
+        Left _   -> pure ()
+        Right _  -> expectationFailure
+                      "finalizePsbt accepted a forged P2SH-P2WPKH redeemScript"
+
+    it "W31 negative: bare P2WSH with forged witnessScript is rejected" $ do
+      -- Build a witnessScript whose first byte is 0x21 (push-33) and
+      -- last is 0xac (OP_CHECKSIG), with our pubkey in the middle —
+      -- so 'isWitnessScriptSingleKey' would still match — but its
+      -- sha256 does NOT equal `wsh` (the commitment baked into
+      -- p2wshSpk).  We achieve the divergence by appending a
+      -- meaningless trailing byte AFTER the OP_CHECKSIG so the
+      -- buffer is 36 bytes (length predicate also changes).  To keep
+      -- the wallet's single-key recogniser firing we instead flip a
+      -- single byte of the pubkey: hash160 of that altered pubkey
+      -- will differ, but we want to demonstrate the SHA256
+      -- commitment gate, so the cleanest approach is a fresh
+      -- 35-byte script with a different key entirely.  That key's
+      -- hash160 differs, so canSignWrapped already rejects on the
+      -- single-key path; to isolate the SHA256 commitment we
+      -- additionally re-target the on-chain scriptPubKey to commit
+      -- to the forged script and confirm the gate would fail when
+      -- presented under the *original* p2wshSpk.
+      let bogusPubKey  = BS.replicate 33 0x77
+          forgedWScript = BS.cons 0x21 bogusPubKey `BS.snoc` 0xac
+          tx           = unsignedTx
+          -- prevout still pays to p2wshSpk (commits to wsh, not
+          -- sha256(forgedWScript)).
+          inp0         = emptyPsbtInput
+            { piWitnessUtxo   = Just (TxOut prevValue p2wshSpk)
+            , piWitnessScript = Just forgedWScript
+            , piSighashType   = Just 0x01
+            }
+          psbt         = (emptyPsbt tx) { psbtInputs = [inp0] }
+          signed       = signPsbt xkey psbt
+      -- canSignWrapped must reject; no partial sig.
+      Map.size (piPartialSigs (head (psbtInputs signed))) `shouldBe` 0
+      -- And the W31 helper must explicitly say the forged script
+      -- does not commit, even setting aside the single-key recogniser.
+      p2wshCommits p2wshSpk forgedWScript `shouldBe` False
+      p2wshCommits p2wshSpk wScriptOne   `shouldBe` True
+
   -- Phase 5 of the haskoin ECDSA wiring plan
   -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
   -- BIP-340 / BIP-341 sign-side primitives.  These tests exercise the
