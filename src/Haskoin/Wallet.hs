@@ -3432,13 +3432,60 @@ combineOutputs a b = PsbtOutput
 -- | Finalize a PSBT by constructing final scriptSig/witness.
 -- This is the Finalizer role in BIP-174.
 -- Returns the finalized PSBT or an error if not all inputs can be finalized.
+--
+-- W32-A hardening: the per-input finalizer 'finalizeForScript' now
+-- enforces the same BIP-16 / BIP-141 commitment gates that W31 wired
+-- into 'canSignWrapped' and 'addSignature'.  An attacker-supplied
+-- (Combiner-supplied) PSBT carrying a partial signature under a
+-- forged 'piRedeemScript' or 'piWitnessScript' is dropped here:
+-- the input is left without 'piFinalScriptSig' / 'piFinalScriptWitness',
+-- which trips 'isInputFinalized' and surfaces as
+-- @FinalizeCommitmentMismatch at index N@ in the error string.
 finalizePsbt :: Psbt -> Either String Psbt
 finalizePsbt psbt =
   let finalizedInputs = map finalizeInput (psbtInputs psbt)
-      errors = [i | (i, inp) <- zip [0..] finalizedInputs, not (isInputFinalized inp)]
+      indexed         = zip [0 :: Int ..] (zip (psbtInputs psbt) finalizedInputs)
+      errors          = [i | (i, (_, inp)) <- indexed, not (isInputFinalized inp)]
+      mismatches      = [ i | (i, (orig, _)) <- indexed
+                            , not (isInputFinalized (finalizedInputs !! i))
+                            , inputHasCommitmentMismatch orig
+                            ]
   in if null errors
      then Right psbt { psbtInputs = finalizedInputs }
-     else Left $ "Could not finalize inputs: " ++ show errors
+     else Left $ case mismatches of
+       []   -> "Could not finalize inputs: " ++ show errors
+       _    -> "FinalizeCommitmentMismatch at index "
+            ++ show mismatches
+            ++ " (other unfinalized inputs: "
+            ++ show [i | i <- errors, i `notElem` mismatches] ++ ")"
+
+-- | True when the input's PSBT-supplied @piRedeemScript@ /
+-- @piWitnessScript@ does not commit to the output script under
+-- BIP-16 (P2SH hash160) or BIP-141 (P2WSH sha256).  Used by
+-- 'finalizePsbt' to surface a more explicit error than the generic
+-- "could not finalize" — this is the W32-A finalizer companion to
+-- the W31 gates in 'canSignWrapped' + 'addSignature'.
+inputHasCommitmentMismatch :: PsbtInput -> Bool
+inputHasCommitmentMismatch pinp =
+  case getInputUtxo pinp of
+    Nothing   -> False
+    Just utxo ->
+      let script = txOutScript utxo
+      in case piRedeemScript pinp of
+           Just redeem
+             | isP2SHScript script
+             , isP2WPKHScript redeem
+             -> not (p2shCommits script redeem)
+             | isP2SHScript script
+             , isP2WSHScript redeem
+             , Just wScript <- piWitnessScript pinp
+             -> not (p2shCommits script redeem
+                     && p2wshCommits redeem wScript)
+           _ -> case piWitnessScript pinp of
+                  Just wScript
+                    | isP2WSHScript script
+                    -> not (p2wshCommits script wScript)
+                  _ -> False
 
 -- | Finalize a single input
 finalizeInput :: PsbtInput -> PsbtInput
@@ -3466,12 +3513,27 @@ finalizeInput pinp
 -- script.  Multi-key P2WSH falls through to "cannot finalize" today —
 -- the BIP-143 sighash machinery is the same, only the witness layout
 -- differs and that needs Combiner state we don't track yet.
+--
+-- W32-A hardening: the wrapped P2SH-P2WPKH, P2SH-P2WSH and bare
+-- P2WSH branches additionally gate on 'p2shCommits' / 'p2wshCommits',
+-- mirroring the W31 commitment checks in 'canSignWrapped' and
+-- 'addSignature'.  W31 already prevents 'addSignature' from ever
+-- producing a partial sig under a forged redeem/witnessScript, but
+-- a Combiner-supplied PSBT could plant such a sig directly into
+-- 'piPartialSigs'.  Without these gates 'finalizeForScript' would
+-- happily assemble a malformed transaction whose scriptSig pushes
+-- the forged redeemScript and whose witness presents the forged
+-- witnessScript — accepting attacker-controlled scriptCode at the
+-- finalizer step.  On mismatch we leave 'pinp' untouched so
+-- 'isInputFinalized' stays False; 'finalizePsbt' then surfaces an
+-- explicit @FinalizeCommitmentMismatch@ error.
 finalizeForScript :: ByteString -> [(PubKey, ByteString)] -> PsbtInput -> PsbtInput
 finalizeForScript script sigs pinp
   -- P2SH wrap: figure out which inner program the redeemScript carries.
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
-  , isP2WPKHScript redeem =
+  , isP2WPKHScript redeem
+  , p2shCommits script redeem =
       case sigs of
         [(pk, sig)] ->
           let witness   = [sig, serializePubKeyCompressed pk]
@@ -3484,7 +3546,9 @@ finalizeForScript script sigs pinp
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
   , isP2WSHScript redeem
-  , Just wScript <- piWitnessScript pinp =
+  , Just wScript <- piWitnessScript pinp
+  , p2shCommits script redeem
+  , p2wshCommits redeem wScript =
       case sigs of
         [(_, sig)] ->
           let witness   = [sig, wScript]
@@ -3503,7 +3567,8 @@ finalizeForScript script sigs pinp
         _ -> pinp
   -- Bare P2WSH single-key: witness = [signature, witnessScript]
   | isP2WSHScript script
-  , Just wScript <- piWitnessScript pinp =
+  , Just wScript <- piWitnessScript pinp
+  , p2wshCommits script wScript =
       case sigs of
         [(_, sig)] ->
           let witness = [sig, wScript]
