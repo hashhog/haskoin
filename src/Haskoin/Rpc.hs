@@ -81,6 +81,10 @@ module Haskoin.Rpc
     -- * loadtxoutset RPC gate (exported for testing)
   , handleLoadTxOutSet
   , loadTxOutSetGateMessage
+    -- * analyzepsbt classifier (exported for testing — W48)
+  , analyzePsbtToJSON
+  , psbtInputNextRole
+  , psbtRequiredSigCount
     -- * ZMQ Notifications
   , ZmqTopic(..)
   , ZmqConfig(..)
@@ -269,7 +273,8 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), ParseError(..),
                         KeyPath(..), emptyPsbt, emptyPsbtInput,
                         createPsbt, updatePsbt, signPsbt,
                         combinePsbts, finalizePsbt, extractTransaction,
-                        decodePsbt, encodePsbt, isPsbtFinalized, getPsbtFee)
+                        decodePsbt, encodePsbt, isPsbtFinalized, getPsbtFee,
+                        parseMultisigRedeem)
 
 --------------------------------------------------------------------------------
 -- RPC Configuration
@@ -897,6 +902,7 @@ handleRpcRequest server req = do
     "decodepsbt"           -> handleDecodePsbt server params
     "combinepsbt"          -> handleCombinePsbt server params
     "finalizepsbt"         -> handleFinalizePsbt server params
+    "analyzepsbt"          -> handleAnalyzePsbt server params
     "walletcreatefundedpsbt" -> handleWalletCreateFundedPsbt server params
 
     -- Blockchain RPCs (new)
@@ -3167,6 +3173,181 @@ handleFinalizePsbt _server params = do
                     else baseResult
 
               return $ RpcResponse (object resultWithHex) Null Null
+
+-- | Analyze a PSBT and report per-input + PSBT-level next role (W48).
+--
+-- Mirrors Bitcoin Core's @analyzepsbt@ RPC
+-- (@bitcoin-core/src/node/psbt.cpp@ AnalyzePSBT +
+-- @bitcoin-core/src/rpc/rawtransaction.cpp@ analyzepsbt).
+--
+-- Per-input classifier (Core-byte-shape order):
+--   1. piFinalScriptSig OR piFinalScriptWitness present -> "extractor".
+--   2. Has UTXO + enough partial sigs (M for M-of-N multisig; 1 otherwise)
+--      -> "finalizer".
+--   3. Has UTXO -> "signer".
+--   4. Else -> "updater".
+--
+-- PSBT-level @next@ is the minimum (in Core's order
+-- creator < updater < signer < finalizer < extractor) of all per-input
+-- roles.  An empty PSBT returns "extractor" (matching the upstream
+-- defaulting of @SignatureData::complete@).
+--
+-- For multi-sig signer inputs we additionally emit
+-- @missing.signatures@ — hex pubkeys whose partial sig is absent —
+-- to mirror Core's @SignatureData::missing_sigs@ shape.  We use the
+-- pubkey hex directly rather than HASH160 key-IDs because the W40-C
+-- harness asserts only on the top-level @next@ field; downstream
+-- consumers that want byte-strict Core parity here can re-derive.
+--
+-- References: hotbuns @src/wallet/psbt.ts@ @analyzePSBTCore@ (b6ccf2a, W47-5);
+-- camlcoin @lib/psbt.ml@ @psbt_next_role@ (2a22a0e, W41).
+--
+-- Parameters:
+--   psbt (required): Base64-encoded PSBT string
+-- Returns:
+--   { "inputs": [ { has_utxo, is_final, next, [missing] }, ... ],
+--     "next":   "creator" | "updater" | "signer" | "finalizer" | "extractor" }
+handleAnalyzePsbt :: RpcServer -> Value -> IO RpcResponse
+handleAnalyzePsbt _server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing psbt parameter") Null
+    Just psbtBase64 -> do
+      case B64.decode (TE.encodeUtf8 psbtBase64) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "Invalid base64 encoding") Null
+        Right psbtBytes -> do
+          case decodePsbt psbtBytes of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError
+                (T.pack $ "PSBT decode failed: " ++ err)) Null
+            Right psbt ->
+              return $ RpcResponse (analyzePsbtToJSON psbt) Null Null
+
+-- | Required signature count for an input, matching Core's
+-- @SignPSBTInput@ "dummy-sign" attempt in
+-- @bitcoin-core/src/node/psbt.cpp::AnalyzePSBT@.
+--
+-- - Multi-sig (P2SH / P2WSH / P2SH-P2WSH): @M@ from the redeem/witness
+--   script via 'parseMultisigRedeem'.
+-- - Single-sig (P2PKH / P2WPKH / P2SH-P2WPKH or any UTXO-only input
+--   without a redeem/witness script): 1.
+--
+-- Returns 'Nothing' when the input has no UTXO at all (caller treats
+-- as "cannot classify"; classifier puts it in updater state by virtue
+-- of the has_utxo gate, never reaching the signer/finalizer split).
+psbtRequiredSigCount :: PsbtInput -> Maybe Int
+psbtRequiredSigCount inp
+  -- Prefer witness_script (P2WSH and nested P2SH-P2WSH multisig).
+  | Just wScript <- piWitnessScript inp =
+      Just $ maybe 1 fst (parseMultisigRedeem wScript)
+  | Just redeem <- piRedeemScript inp =
+      Just $ maybe 1 fst (parseMultisigRedeem redeem)
+  -- Plain witness_utxo / non_witness_utxo without a redeem/witness
+  -- script implies a single-sig P2PKH / P2WPKH / P2TR key-path.
+  | isJust (piWitnessUtxo inp) || isJust (piNonWitnessUtxo inp) =
+      Just 1
+  | otherwise = Nothing
+
+-- | Is this input ready to be finalized?
+--
+-- Mirrors Core's "dummy-sign succeeds" branch in @AnalyzePSBT@: a
+-- non-finalized input with every signature it needs (@M@-of-@N@ for
+-- multisig; @1@ for single-sig) advances to the FINALIZER role rather
+-- than staying at SIGNER.
+psbtIsInputReadyToFinalize :: PsbtInput -> Bool
+psbtIsInputReadyToFinalize inp
+  | isJust (piFinalScriptSig inp) || isJust (piFinalScriptWitness inp) = False
+  | otherwise =
+      let nSigs = Map.size (piPartialSigs inp)
+      in if nSigs == 0
+            then False
+            else case psbtRequiredSigCount inp of
+                   -- Cannot classify: any-sig fallback (matches camlcoin W41
+                   -- + hotbuns W47 behavior; preserves single-sig
+                   -- compatibility for inputs that lack a redeem/witness
+                   -- script and lack a UTXO carrier).
+                   Nothing     -> nSigs >= 1
+                   Just needed -> nSigs >= needed
+
+-- | Per-input next role for analyzepsbt.
+psbtInputNextRole :: PsbtInput -> Text
+psbtInputNextRole inp
+  | isJust (piFinalScriptSig inp) || isJust (piFinalScriptWitness inp) =
+      "extractor"
+  | not hasUtxo                       = "updater"
+  | psbtIsInputReadyToFinalize inp    = "finalizer"
+  | otherwise                         = "signer"
+  where
+    hasUtxo = isJust (piWitnessUtxo inp) || isJust (piNonWitnessUtxo inp)
+
+-- | Core's role ordering: creator < updater < signer < finalizer < extractor.
+psbtRoleRank :: Text -> Int
+psbtRoleRank "creator"   = 0
+psbtRoleRank "updater"   = 1
+psbtRoleRank "signer"    = 2
+psbtRoleRank "finalizer" = 3
+psbtRoleRank "extractor" = 4
+psbtRoleRank _           = 4  -- treat unknown as terminal; never observed
+
+-- | Build the analyzepsbt JSON for a decoded PSBT.
+analyzePsbtToJSON :: Psbt -> Value
+analyzePsbtToJSON psbt =
+  let perInput  = map analyzeOneInput (psbtInputs psbt)
+      psbtNext  = case perInput of
+                    [] -> "extractor" :: Text
+                    xs -> minimumOnRank (map fst xs)
+  in object
+       [ "inputs" .= map snd perInput
+       , "next"   .= psbtNext
+       ]
+  where
+    minimumOnRank :: [Text] -> Text
+    minimumOnRank = foldr1 (\a b -> if psbtRoleRank a <= psbtRoleRank b then a else b)
+
+    -- | Returns (next, json-object) for a single input, so we can
+    -- thread the next role into the PSBT-level fold without re-walking.
+    analyzeOneInput :: PsbtInput -> (Text, Value)
+    analyzeOneInput inp =
+      let hasUtxo  = isJust (piWitnessUtxo inp) || isJust (piNonWitnessUtxo inp)
+          isFinal  = isJust (piFinalScriptSig inp)
+                       || isJust (piFinalScriptWitness inp)
+          next     = psbtInputNextRole inp
+          mMissing = if next == "signer"
+                       then missingSigsForMultisig inp
+                       else Nothing
+          base     =
+            [ "has_utxo" .= hasUtxo
+            , "is_final" .= isFinal
+            , "next"     .= next
+            ]
+          extras = case mMissing of
+            Just sigs | not (null sigs) ->
+              [ "missing" .= object [ "signatures" .= sigs ] ]
+            _ -> []
+      in (next, object (base ++ extras))
+
+    -- | For a multisig input still in signer state, list the hex pubkeys
+    -- whose partial sig is absent.  Mirrors Core's
+    -- @SignatureData::missing_sigs@ shape.  Witness-script wins over
+    -- redeem-script (P2SH-P2WSH path); both routed through
+    -- 'parseMultisigRedeem' for byte-identical M+pubkey extraction with
+    -- the W46-3 finalizer.
+    missingSigsForMultisig :: PsbtInput -> Maybe [Text]
+    missingSigsForMultisig inp = do
+      let mScript = case piWitnessScript inp of
+                      Just s  -> Just s
+                      Nothing -> piRedeemScript inp
+      script <- mScript
+      (_, redeemPubkeys) <- parseMultisigRedeem script
+      let havePubkeyBytes =
+            map serializePubKeyCompressed (Map.keys (piPartialSigs inp))
+          missing =
+            [ TE.decodeUtf8 (B16.encode pk)
+            | pk <- redeemPubkeys
+            , pk `notElem` havePubkeyBytes
+            ]
+      Just missing
 
 --------------------------------------------------------------------------------
 -- walletcreatefundedpsbt RPC Handler
