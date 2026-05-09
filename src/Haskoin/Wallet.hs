@@ -200,6 +200,7 @@ module Haskoin.Wallet
   , encodePsbt
   , isPsbtFinalized
   , getPsbtFee
+  , parseMultisigRedeem
     -- * PSBT decoder primitives (W34-E: exposed for strictness regression tests)
   , parseKeyPath
   , parseWitnessStack

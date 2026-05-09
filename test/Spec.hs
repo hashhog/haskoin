@@ -15994,6 +15994,125 @@ main = hspec $ do
           -- First bip32_derivation record on the wire == raw-smaller pubkey.
           firstPubKey `shouldBe` serializePubKeyCompressed pkRawSmall
 
+  -- W48: analyzepsbt RPC handler.  Mirrors hotbuns W47-5 (commit b6ccf2a)
+  -- + camlcoin W41 (commit 2a22a0e), implementing Bitcoin Core's
+  -- bitcoin-core/src/node/psbt.cpp::AnalyzePSBT.  Three regressions:
+  --  1. Per-input next-role classifier matches Core's role-rank ordering.
+  --  2. PSBT-level next is the MIN of per-input roles.
+  --  3. Multisig signer inputs emit missing.signatures = absent pubkeys.
+  describe "analyzepsbt per-input next-role classifier (W48)" $ do
+    let mkPubKey :: Word8 -> ByteString -> PubKey
+        mkPubKey tag body =
+          case parsePubKey (BS.cons tag body) of
+            Just pk -> pk
+            Nothing -> error "mkPubKey: invariant violated"
+
+        -- Throwaway 1-input transaction.
+        prevTxId   = TxId (Hash256 (BS.replicate 32 0x11))
+        unsignedTx :: Tx
+        unsignedTx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint prevTxId 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 49_000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x99)]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+        -- Build a bare 2-of-3 CHECKMULTISIG redeemScript:
+        --   OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+        mkMultisigRedeem :: Int -> [PubKey] -> ByteString
+        mkMultisigRedeem m pks =
+          let mByte = fromIntegral (0x50 + m) :: Word8
+              nByte = fromIntegral (0x50 + length pks) :: Word8
+              pushPk pk =
+                let bs = serializePubKeyCompressed pk
+                in BS.cons (fromIntegral (BS.length bs)) bs
+          in BS.concat ([BS.singleton mByte] ++ map pushPk pks ++ [BS.pack [nByte, 0xae]])
+
+        dummyUtxo :: TxOut
+        dummyUtxo = TxOut 50_000 (BS.pack [0xa9, 0x14] <> BS.replicate 20 0x55 <> BS.pack [0x87])
+
+    it "classifies updater (no UTXO) / signer (UTXO, no sigs) / extractor (final)" $ do
+      let inpUpdater  = emptyPsbtInput
+          inpSigner   = emptyPsbtInput { piWitnessUtxo = Just dummyUtxo }
+          inpFinal    = emptyPsbtInput
+            { piWitnessUtxo = Just dummyUtxo
+            , piFinalScriptSig = Just (BS.pack [0x47, 0x30])
+            }
+      psbtInputNextRole inpUpdater  `shouldBe` ("updater"   :: T.Text)
+      psbtInputNextRole inpSigner   `shouldBe` ("signer"    :: T.Text)
+      psbtInputNextRole inpFinal    `shouldBe` ("extractor" :: T.Text)
+
+    it "advances to finalizer once enough partial sigs are collected (2-of-3)" $ do
+      let pk1   = mkPubKey 0x02 (BS.replicate 32 0xaa)
+          pk2   = mkPubKey 0x03 (BS.replicate 32 0xbb)
+          pk3   = mkPubKey 0x02 (BS.replicate 32 0xcc)
+          sig   = BS.replicate 71 0xab `BS.snoc` 0x01
+          redeem = mkMultisigRedeem 2 [pk1, pk2, pk3]
+          -- Only 1 of the 2 required sigs: still SIGNER.
+          inpOneSig = emptyPsbtInput
+            { piWitnessUtxo  = Just dummyUtxo
+            , piRedeemScript = Just redeem
+            , piPartialSigs  = Map.fromList [(pk1, sig)]
+            }
+          -- Both required sigs present: FINALIZER.
+          inpTwoSigs = inpOneSig
+            { piPartialSigs = Map.fromList [(pk1, sig), (pk2, sig)]
+            }
+      psbtRequiredSigCount inpOneSig  `shouldBe` Just 2
+      psbtInputNextRole inpOneSig     `shouldBe` ("signer"    :: T.Text)
+      psbtInputNextRole inpTwoSigs    `shouldBe` ("finalizer" :: T.Text)
+
+      -- PSBT-level next = MIN over per-input roles.  Mixing the two inputs
+      -- must yield "signer" (rank 2) — the weaker of {signer, finalizer}.
+      let psbt = (emptyPsbt unsignedTx)
+            { psbtInputs = [inpOneSig, inpTwoSigs] }
+          j = analyzePsbtToJSON psbt
+      case j of
+        Aeson.Object km -> case KM.lookup "next" km of
+          Just (Aeson.String s) -> s `shouldBe` ("signer" :: T.Text)
+          _ -> expectationFailure "analyzePsbtToJSON: missing string `next`"
+        _ -> expectationFailure "analyzePsbtToJSON: result not an object"
+
+    it "emits missing.signatures = absent pubkeys for multisig signer state" $ do
+      let pk1   = mkPubKey 0x02 (BS.replicate 32 0xaa)
+          pk2   = mkPubKey 0x03 (BS.replicate 32 0xbb)
+          pk3   = mkPubKey 0x02 (BS.replicate 32 0xcc)
+          sig   = BS.replicate 71 0xab `BS.snoc` 0x01
+          redeem = mkMultisigRedeem 2 [pk1, pk2, pk3]
+          -- Only pk2 has a partial sig; analyzepsbt should report pk1 + pk3
+          -- (in redeemScript order) as missing.
+          inp = emptyPsbtInput
+            { piWitnessUtxo  = Just dummyUtxo
+            , piRedeemScript = Just redeem
+            , piPartialSigs  = Map.fromList [(pk2, sig)]
+            }
+          psbt = (emptyPsbt unsignedTx) { psbtInputs = [inp] }
+          j = analyzePsbtToJSON psbt
+      -- Expected hex pubkeys (redeemScript pk1 + pk3, in redeem order).
+      let expectedMissing =
+            [ TE.decodeUtf8 (B16.encode (serializePubKeyCompressed pk1))
+            , TE.decodeUtf8 (B16.encode (serializePubKeyCompressed pk3))
+            ]
+      case j of
+        Aeson.Object km -> case KM.lookup "inputs" km of
+          Just (Aeson.Array v) | V.length v == 1 ->
+            case V.head v of
+              Aeson.Object inpKM -> do
+                case KM.lookup "next" inpKM of
+                  Just (Aeson.String s) -> s `shouldBe` ("signer" :: T.Text)
+                  _ -> expectationFailure "input missing string `next`"
+                case KM.lookup "missing" inpKM of
+                  Just (Aeson.Object mKM) ->
+                    case KM.lookup "signatures" mKM of
+                      Just (Aeson.Array sigsV) ->
+                        [s | Aeson.String s <- V.toList sigsV] `shouldBe` expectedMissing
+                      _ -> expectationFailure "missing.signatures absent"
+                  _ -> expectationFailure "input missing.signatures absent"
+              _ -> expectationFailure "input not an object"
+          _ -> expectationFailure "inputs is not a 1-element array"
+        _ -> expectationFailure "analyzePsbtToJSON: result not an object"
+
   describe "walletcreatefundedpsbt routing (Cat-H Part-2 wave)" $ do
     -- The handler delegates the heavy lifting to Wallet.hs's
     -- 'selectCoinsWithHeight'.  We don't have access to the dispatcher
