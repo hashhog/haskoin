@@ -4215,12 +4215,27 @@ handleGetChainTips server = do
 -- Script Decode RPC Handler
 --------------------------------------------------------------------------------
 
--- | Decode a hex-encoded script
--- Reference: Bitcoin Core's decodescript RPC (rawtransaction.cpp)
--- Parameters:
---   hexstring (required): The hex-encoded script
--- Returns:
---   Object with asm, type, p2sh, segwit addresses
+-- | Decode a hex-encoded script.
+-- Reference: Bitcoin Core's decodescript RPC (rawtransaction.cpp).
+--
+-- Shape: {asm, desc, address?, type, p2sh?, segwit?}
+-- CRITICAL: top-level has NO hex field (ScriptToUniv include_hex=false).
+-- Inner segwit object HAS hex (ScriptToUniv include_hex=true).
+--
+-- can_wrap types (Core): pubkey, pubkeyhash, multisig, nonstandard,
+--   witness_v0_keyhash, witness_v0_scripthash
+--   PLUS: HasValidOps AND NOT IsUnspendable (OP_RETURN prefix) AND no OP_CHECKSIGADD.
+--
+-- can_wrap_P2WSH types: pubkey (compressed), pubkeyhash, nonstandard, multisig (compressed).
+--   witness_v0_keyhash and witness_v0_scripthash are excluded (already segwit).
+--
+-- Segwit wrap construction:
+--   PUBKEY    -> P2WPKH(Hash160(pubkey))
+--   PUBKEYHASH -> P2WPKH(raw 20-byte hash from script)
+--   Others    -> P2WSH(SHA256(script))
+--
+-- Uses the Encoding/streaming path (rawJsonResult) so that toEncoding
+-- (RpcResponse) emits the result verbatim without Aeson value-normalisation.
 handleDecodeScript :: RpcServer -> Value -> IO RpcResponse
 handleDecodeScript server params = do
   case extractParamText params 0 of
@@ -4231,100 +4246,126 @@ handleDecodeScript server params = do
         Left _ -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Invalid hex encoding") Null
         Right scriptBytes -> do
-          let mScript = decodeScript scriptBytes
-              scriptType = case mScript of
+          let net        = rsNetwork server
+              scriptType = case decodeScript scriptBytes of
+                             Right s -> classifyOutput s
+                             Left _  -> NonStandard
+              typeStr    = scriptTypeToString scriptType
+              asmStr     = scriptToAsmPartial scriptBytes
+              hexStr'    = TE.decodeUtf8 (B16.encode scriptBytes)
+              mAddress   = scriptToAddress net scriptBytes scriptType
+              -- Suppress address for pubkey/multisig/nulldata/nonstandard (Core rule).
+              suppressAddr = case scriptType of
+                P2PK _         -> True
+                P2MultiSig _ _ -> True
+                OpReturn _     -> True
+                NonStandard    -> True
+                _              -> False
+              -- desc: rawtr(KEY)#csum for P2TR, addr(addr)#csum if addressable,
+              --        raw(hex)#csum otherwise. Mirrors psbtSpkEnc descStr.
+              descStr = case scriptType of
+                P2TR (Hash256 h) ->
+                  let xonly   = TE.decodeUtf8 (B16.encode h)
+                      rawtrD  = "rawtr(" <> xonly <> ")"
+                  in fromMaybe rawtrD (addDescriptorChecksum rawtrD)
+                _ -> case mAddress of
+                  Just addr | not suppressAddr ->
+                    fromMaybe ("addr(" <> addr <> ")") $
+                      addDescriptorChecksum ("addr(" <> addr <> ")")
+                  _ ->
+                    fromMaybe ("raw(" <> hexStr' <> ")") $
+                      addDescriptorChecksum ("raw(" <> hexStr' <> ")")
+              -- IsUnspendable: starts with OP_RETURN (0x6a).
+              isUnspendable = not (BS.null scriptBytes) && BS.index scriptBytes 0 == 0x6a
+              -- can_wrap: Core includes pubkey/pubkeyhash/multisig/nonstandard/
+              --   witness_v0_keyhash/witness_v0_scripthash, but only if not
+              --   unspendable and no OP_CHECKSIGADD (0xba) in raw bytes.
+              canWrap = case scriptType of
+                P2SH _   -> False
+                P2TR _   -> False
+                P2A      -> False
+                OpReturn _ -> False
+                _ -> not isUnspendable && not (hasChecksigAdd scriptBytes)
+              -- can_wrap_P2WSH: pubkey/pubkeyhash/nonstandard/multisig only.
+              -- witness_v0_keyhash and witness_v0_scripthash are already segwit.
+              canWrapP2WSH = canWrap && case scriptType of
+                P2PK pk        -> BS.length pk == 33  -- compressed only
+                P2MultiSig _ pks -> all (\pk -> BS.length pk == 33) pks
+                P2PKH _        -> True
+                NonStandard    -> True
+                _              -> False
+              -- Compute P2SH wrap address for script.
+              p2shWrapAddr = base58Check (netScriptPrefix net)
+                               (getHash160 (Hash160 (BS.take 20 (doHash160 scriptBytes))))
+              -- Build the segwit witness script and its type/address.
+              (segwitScript, segwitMAddr) = case scriptType of
+                P2PKH (Hash160 h) ->
+                  -- P2WPKH from the raw 20-byte pubkey hash in the script.
+                  let ws = BS.pack [0x00, 0x14] <> h
+                  in (ws, scriptToAddress net ws (P2WPKH (Hash160 h)))
+                P2PK pk ->
+                  -- P2WPKH from Hash160(pubkey).
+                  let h  = BS.take 20 (doHash160 pk)
+                      ws = BS.pack [0x00, 0x14] <> h
+                  in (ws, scriptToAddress net ws (P2WPKH (Hash160 h)))
+                _ ->
+                  -- P2WSH from SHA256(script).
+                  let h  = doSHA256 scriptBytes
+                      ws = BS.pack [0x00, 0x20] <> h
+                  in (ws, scriptToAddress net ws (P2WSH (Hash256 h)))
+              segwitP2SHAddr = base58Check (netScriptPrefix net)
+                                 (getHash160 (Hash160 (BS.take 20 (doHash160 segwitScript))))
+              -- Segwit inner object Encoding (WITH hex, WITH desc).
+              -- Field order: asm, desc, hex, address?, type, p2sh-segwit
+              -- (matches Core's ScriptToUniv include_hex=true insertion order).
+              segwitScriptType = case decodeScript segwitScript of
                 Right s -> classifyOutput s
-                Left _ -> NonStandard
-              typeStr = scriptTypeToString scriptType
-              asmStr = scriptToAsm scriptBytes
-
-          -- Build base result
-          let baseFields =
-                [ "asm"  .= asmStr
-                , "type" .= typeStr
-                ]
-
-          -- Add address if one exists
-          let mAddress = scriptToAddress (rsNetwork server) scriptBytes scriptType
-              fieldsWithAddr = case mAddress of
-                Just addr -> baseFields ++ ["address" .= addr]
-                Nothing -> baseFields
-
-          -- Add P2SH address (wrap this script in P2SH)
-          let p2shFields = case canWrapP2SH scriptType scriptBytes of
-                True ->
-                  let p2shAddr = computeP2SHAddress (rsNetwork server) scriptBytes
-                  in fieldsWithAddr ++ ["p2sh" .= p2shAddr]
-                False -> fieldsWithAddr
-
-          -- Add SegWit info if wrappable
-          let segwitFields = case canWrapSegWit scriptType scriptBytes of
-                True ->
-                  let segwitInfo = computeSegWitInfo (rsNetwork server) scriptBytes scriptType
-                  in p2shFields ++ ["segwit" .= segwitInfo]
-                False -> p2shFields
-
-          return $ RpcResponse (object segwitFields) Null Null
+                Left _  -> NonStandard
+              segwitTypeStr  = scriptTypeToString segwitScriptType
+              segwitAsmStr   = scriptToAsmPartial segwitScript
+              segwitHexStr   = TE.decodeUtf8 (B16.encode segwitScript)
+              segwitDescStr  = case segwitMAddr of
+                Just addr ->
+                  fromMaybe ("addr(" <> addr <> ")") $
+                    addDescriptorChecksum ("addr(" <> addr <> ")")
+                Nothing ->
+                  fromMaybe ("raw(" <> segwitHexStr <> ")") $
+                    addDescriptorChecksum ("raw(" <> segwitHexStr <> ")")
+              segwitEnc = pairs $
+                pair "asm"  (text segwitAsmStr) <>
+                pair "desc" (text segwitDescStr) <>
+                pair "hex"  (text segwitHexStr) <>
+                ( case segwitMAddr of
+                    Just a  -> pair "address" (text a)
+                    Nothing -> mempty ) <>
+                pair "type" (text segwitTypeStr) <>
+                pair "p2sh-segwit" (text segwitP2SHAddr)
+              -- Top-level Encoding.
+              -- Field order: asm, desc, address?, type, p2sh?, segwit?
+              -- (matches Core's ScriptToUniv include_hex=false + decodescript additions).
+              topEnc = pairs $
+                pair "asm"  (text asmStr) <>
+                pair "desc" (text descStr) <>
+                ( if suppressAddr then mempty
+                  else case mAddress of
+                    Just a  -> pair "address" (text a)
+                    Nothing -> mempty ) <>
+                pair "type" (text typeStr) <>
+                ( if canWrap
+                  then pair "p2sh" (text p2shWrapAddr)
+                  else mempty ) <>
+                ( if canWrapP2WSH
+                  then pair "segwit" segwitEnc
+                  else mempty )
+          let rawBs = encodingToLazyByteString topEnc
+          return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    -- Check if script can be wrapped in P2SH
-    canWrapP2SH :: ScriptType -> ByteString -> Bool
-    canWrapP2SH st _bytes = case st of
-      P2SH _ -> False  -- Don't wrap P2SH in P2SH
-      P2WPKH _ -> False
-      P2WSH _ -> False
-      P2TR _ -> False
-      OpReturn _ -> False
-      _ -> True
+    -- | Check if script bytes contain OP_CHECKSIGADD (0xba).
+    -- Reference: Bitcoin Core decodescript can_wrap loop.
+    hasChecksigAdd :: ByteString -> Bool
+    hasChecksigAdd bs = 0xba `BS.elem` bs
 
-    -- Check if script can be wrapped in P2WSH
-    canWrapSegWit :: ScriptType -> ByteString -> Bool
-    canWrapSegWit st _bytes = case st of
-      P2SH _ -> False
-      P2WPKH _ -> False
-      P2WSH _ -> False
-      P2TR _ -> False
-      OpReturn _ -> False
-      _ -> True
-
-    -- Compute P2SH address for a script
-    computeP2SHAddress :: Network -> ByteString -> Text
-    computeP2SHAddress net scriptBytes =
-      let scriptHash = hash160 scriptBytes
-      in base58Check (netScriptPrefix net) (getHash160 scriptHash)
-
-    -- Compute SegWit wrapper info
-    computeSegWitInfo :: Network -> ByteString -> ScriptType -> Value
-    computeSegWitInfo net scriptBytes scriptType =
-      let -- For P2PKH, create P2WPKH (if it has a pubkey hash)
-          -- For others, create P2WSH
-          (segwitScript, segwitType, segwitAddr) = case scriptType of
-            P2PKH h ->
-              -- Convert to P2WPKH
-              let witnessScript = BS.pack [0x00, 0x14] <> getHash160 h
-                  addr = bech32Encode (netBech32Prefix net) 0 (getHash160 h)
-              in (witnessScript, "witness_v0_keyhash" :: Text, addr)
-            _ ->
-              -- Create P2WSH
-              let witnessHash = sha256 scriptBytes
-                  witnessScript = BS.pack [0x00, 0x20] <> getHash256 witnessHash
-                  addr = bech32Encode (netBech32Prefix net) 0 (getHash256 witnessHash)
-              in (witnessScript, "witness_v0_scripthash" :: Text, addr)
-          -- P2SH-SegWit address
-          p2shSegwitAddr = computeP2SHAddress net segwitScript
-      in object
-        [ "asm"         .= scriptToAsm segwitScript
-        , "hex"         .= TE.decodeUtf8 (B16.encode segwitScript)
-        , "type"        .= segwitType
-        , "address"     .= segwitAddr
-        , "p2sh-segwit" .= p2shSegwitAddr
-        ]
-
-    hash160 :: ByteString -> Hash160
-    hash160 = Hash160 . BS.take 20 . doHash160
-
-    sha256 :: ByteString -> Hash256
-    sha256 = Hash256 . doSHA256
-
+    -- | Hash160 = RIPEMD160(SHA256(bs)).
     doHash160 :: ByteString -> ByteString
     doHash160 bs = doRIPEMD160 (doSHA256 bs)
 
@@ -4340,9 +4381,6 @@ handleDecodeScript server params = do
 
     getHash160 :: Hash160 -> ByteString
     getHash160 (Hash160 bs) = bs
-
-    getHash256 :: Hash256 -> ByteString
-    getHash256 (Hash256 bs) = bs
 
 --------------------------------------------------------------------------------
 -- Mempool Test Accept RPC Handler
@@ -6965,6 +7003,205 @@ scriptToAsm scriptBytes =
       OP_NOP9 -> "OP_NOP9"
       OP_NOP10 -> "OP_NOP10"
       OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
+
+-- | ASM emitter that handles truncated push data by emitting literal "[error]".
+-- Reference: Bitcoin Core ScriptToAsmStr (core_io.cpp) — walks raw bytes and
+-- emits "[error]" when a push opcode claims more bytes than are available.
+-- This fixes the case where decodeScript fails entirely (returning Left) for
+-- a partially-valid script such as:
+--   OP_RETURN <32-byte-push> <0x09 claiming 9 bytes but only 3 remain>
+-- Without this function, scriptToAsm falls back to hex-encoding the full script.
+-- With this function we get: "OP_RETURN <hex32> [error]" — Core-identical.
+scriptToAsmPartial :: ByteString -> Text
+scriptToAsmPartial scriptBytes =
+  case decodeScript scriptBytes of
+    -- Full parse succeeded — use the existing high-level emitter.
+    Right (Script ops) -> T.intercalate " " $ map opToAsmPart ops
+    -- Partial / failed parse — walk bytes and emit [error] at truncation point.
+    Left _ -> T.intercalate " " $ walkBytes scriptBytes
+  where
+    -- Reuse the same opcode-to-text table as scriptToAsm.
+    opToAsmPart :: ScriptOp -> Text
+    opToAsmPart op = case op of
+      OP_0 -> "0"
+      OP_PUSHDATA bs _ -> TE.decodeUtf8 $ B16.encode bs
+      OP_1NEGATE -> "-1"
+      OP_RESERVED -> "OP_RESERVED"
+      OP_1 -> "1" ; OP_2 -> "2" ; OP_3 -> "3" ; OP_4 -> "4"
+      OP_5 -> "5" ; OP_6 -> "6" ; OP_7 -> "7" ; OP_8 -> "8"
+      OP_9 -> "9" ; OP_10 -> "10" ; OP_11 -> "11" ; OP_12 -> "12"
+      OP_13 -> "13" ; OP_14 -> "14" ; OP_15 -> "15" ; OP_16 -> "16"
+      OP_NOP -> "OP_NOP" ; OP_VER -> "OP_VER"
+      OP_IF -> "OP_IF" ; OP_NOTIF -> "OP_NOTIF"
+      OP_VERIF -> "OP_VERIF" ; OP_VERNOTIF -> "OP_VERNOTIF"
+      OP_ELSE -> "OP_ELSE" ; OP_ENDIF -> "OP_ENDIF"
+      OP_VERIFY -> "OP_VERIFY" ; OP_RETURN -> "OP_RETURN"
+      OP_TOALTSTACK -> "OP_TOALTSTACK" ; OP_FROMALTSTACK -> "OP_FROMALTSTACK"
+      OP_2DROP -> "OP_2DROP" ; OP_2DUP -> "OP_2DUP" ; OP_3DUP -> "OP_3DUP"
+      OP_2OVER -> "OP_2OVER" ; OP_2ROT -> "OP_2ROT" ; OP_2SWAP -> "OP_2SWAP"
+      OP_IFDUP -> "OP_IFDUP" ; OP_DEPTH -> "OP_DEPTH" ; OP_DROP -> "OP_DROP"
+      OP_DUP -> "OP_DUP" ; OP_NIP -> "OP_NIP" ; OP_OVER -> "OP_OVER"
+      OP_PICK -> "OP_PICK" ; OP_ROLL -> "OP_ROLL" ; OP_ROT -> "OP_ROT"
+      OP_SWAP -> "OP_SWAP" ; OP_TUCK -> "OP_TUCK"
+      OP_CAT -> "OP_CAT" ; OP_SUBSTR -> "OP_SUBSTR"
+      OP_LEFT -> "OP_LEFT" ; OP_RIGHT -> "OP_RIGHT" ; OP_SIZE -> "OP_SIZE"
+      OP_INVERT -> "OP_INVERT" ; OP_AND -> "OP_AND" ; OP_OR -> "OP_OR"
+      OP_XOR -> "OP_XOR" ; OP_EQUAL -> "OP_EQUAL" ; OP_EQUALVERIFY -> "OP_EQUALVERIFY"
+      OP_RESERVED1 -> "OP_RESERVED1" ; OP_RESERVED2 -> "OP_RESERVED2"
+      OP_1ADD -> "OP_1ADD" ; OP_1SUB -> "OP_1SUB"
+      OP_2MUL -> "OP_2MUL" ; OP_2DIV -> "OP_2DIV"
+      OP_NEGATE -> "OP_NEGATE" ; OP_ABS -> "OP_ABS"
+      OP_NOT -> "OP_NOT" ; OP_0NOTEQUAL -> "OP_0NOTEQUAL"
+      OP_ADD -> "OP_ADD" ; OP_SUB -> "OP_SUB" ; OP_MUL -> "OP_MUL"
+      OP_DIV -> "OP_DIV" ; OP_MOD -> "OP_MOD"
+      OP_LSHIFT -> "OP_LSHIFT" ; OP_RSHIFT -> "OP_RSHIFT"
+      OP_BOOLAND -> "OP_BOOLAND" ; OP_BOOLOR -> "OP_BOOLOR"
+      OP_NUMEQUAL -> "OP_NUMEQUAL" ; OP_NUMEQUALVERIFY -> "OP_NUMEQUALVERIFY"
+      OP_NUMNOTEQUAL -> "OP_NUMNOTEQUAL"
+      OP_LESSTHAN -> "OP_LESSTHAN" ; OP_GREATERTHAN -> "OP_GREATERTHAN"
+      OP_LESSTHANOREQUAL -> "OP_LESSTHANOREQUAL"
+      OP_GREATERTHANOREQUAL -> "OP_GREATERTHANOREQUAL"
+      OP_MIN -> "OP_MIN" ; OP_MAX -> "OP_MAX" ; OP_WITHIN -> "OP_WITHIN"
+      OP_RIPEMD160 -> "OP_RIPEMD160" ; OP_SHA1 -> "OP_SHA1"
+      OP_SHA256 -> "OP_SHA256" ; OP_HASH160 -> "OP_HASH160"
+      OP_HASH256 -> "OP_HASH256" ; OP_CODESEPARATOR -> "OP_CODESEPARATOR"
+      OP_CHECKSIG -> "OP_CHECKSIG" ; OP_CHECKSIGVERIFY -> "OP_CHECKSIGVERIFY"
+      OP_CHECKMULTISIG -> "OP_CHECKMULTISIG"
+      OP_CHECKMULTISIGVERIFY -> "OP_CHECKMULTISIGVERIFY"
+      OP_NOP1 -> "OP_NOP1"
+      OP_CHECKLOCKTIMEVERIFY -> "OP_CHECKLOCKTIMEVERIFY"
+      OP_CHECKSEQUENCEVERIFY -> "OP_CHECKSEQUENCEVERIFY"
+      OP_NOP4 -> "OP_NOP4" ; OP_NOP5 -> "OP_NOP5" ; OP_NOP6 -> "OP_NOP6"
+      OP_NOP7 -> "OP_NOP7" ; OP_NOP8 -> "OP_NOP8" ; OP_NOP9 -> "OP_NOP9"
+      OP_NOP10 -> "OP_NOP10"
+      OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
+
+    -- Walk raw bytes, accumulating ASM tokens.
+    -- Mirrors Core's ScriptToAsmStr byte-level loop.
+    walkBytes :: ByteString -> [Text]
+    walkBytes bs
+      | BS.null bs = []
+      | otherwise  =
+          let op = BS.index bs 0
+              rest = BS.drop 1 bs
+          in if op == 0x00
+             -- OP_0
+             then "0" : walkBytes rest
+             else if op >= 0x01 && op <= 0x4b
+             -- Direct push: n bytes
+             then let n = fromIntegral op
+                  in if BS.length rest < n
+                     then ["[error]"]   -- truncated
+                     else let dat = BS.take n rest
+                          in TE.decodeUtf8 (B16.encode dat) : walkBytes (BS.drop n rest)
+             else case op of
+               0x4c -> -- OP_PUSHDATA1: 1-byte length
+                 if BS.null rest
+                 then ["[error]"]
+                 else let n = fromIntegral (BS.index rest 0)
+                          rest2 = BS.drop 1 rest
+                      in if BS.length rest2 < n
+                         then ["[error]"]
+                         else TE.decodeUtf8 (B16.encode (BS.take n rest2))
+                              : walkBytes (BS.drop n rest2)
+               0x4d -> -- OP_PUSHDATA2: 2-byte LE length
+                 if BS.length rest < 2
+                 then ["[error]"]
+                 else let n = fromIntegral (BS.index rest 0)
+                                + fromIntegral (BS.index rest 1) * 256 :: Int
+                          rest2 = BS.drop 2 rest
+                      in if BS.length rest2 < n
+                         then ["[error]"]
+                         else TE.decodeUtf8 (B16.encode (BS.take n rest2))
+                              : walkBytes (BS.drop n rest2)
+               0x4e -> -- OP_PUSHDATA4: 4-byte LE length
+                 if BS.length rest < 4
+                 then ["[error]"]
+                 else let n = fromIntegral (BS.index rest 0)
+                                + fromIntegral (BS.index rest 1) * 256
+                                + fromIntegral (BS.index rest 2) * 65536
+                                + fromIntegral (BS.index rest 3) * 16777216 :: Int
+                          rest2 = BS.drop 4 rest
+                      in if BS.length rest2 < n
+                         then ["[error]"]
+                         else TE.decodeUtf8 (B16.encode (BS.take n rest2))
+                              : walkBytes (BS.drop n rest2)
+               0x4f -> "-1" : walkBytes rest    -- OP_1NEGATE
+               0x50 -> "OP_RESERVED" : walkBytes rest
+               0x51 -> "1"  : walkBytes rest ; 0x52 -> "2"  : walkBytes rest
+               0x53 -> "3"  : walkBytes rest ; 0x54 -> "4"  : walkBytes rest
+               0x55 -> "5"  : walkBytes rest ; 0x56 -> "6"  : walkBytes rest
+               0x57 -> "7"  : walkBytes rest ; 0x58 -> "8"  : walkBytes rest
+               0x59 -> "9"  : walkBytes rest ; 0x5a -> "10" : walkBytes rest
+               0x5b -> "11" : walkBytes rest ; 0x5c -> "12" : walkBytes rest
+               0x5d -> "13" : walkBytes rest ; 0x5e -> "14" : walkBytes rest
+               0x5f -> "15" : walkBytes rest ; 0x60 -> "16" : walkBytes rest
+               0x61 -> "OP_NOP" : walkBytes rest
+               0x62 -> "OP_VER" : walkBytes rest
+               0x63 -> "OP_IF" : walkBytes rest
+               0x64 -> "OP_NOTIF" : walkBytes rest
+               0x65 -> "OP_VERIF" : walkBytes rest
+               0x66 -> "OP_VERNOTIF" : walkBytes rest
+               0x67 -> "OP_ELSE" : walkBytes rest
+               0x68 -> "OP_ENDIF" : walkBytes rest
+               0x69 -> "OP_VERIFY" : walkBytes rest
+               0x6a -> "OP_RETURN" : walkBytes rest
+               0x6b -> "OP_TOALTSTACK" : walkBytes rest
+               0x6c -> "OP_FROMALTSTACK" : walkBytes rest
+               0x6d -> "OP_2DROP" : walkBytes rest
+               0x6e -> "OP_2DUP" : walkBytes rest
+               0x6f -> "OP_3DUP" : walkBytes rest
+               0x70 -> "OP_2OVER" : walkBytes rest
+               0x71 -> "OP_2ROT" : walkBytes rest
+               0x72 -> "OP_2SWAP" : walkBytes rest
+               0x73 -> "OP_IFDUP" : walkBytes rest
+               0x74 -> "OP_DEPTH" : walkBytes rest
+               0x75 -> "OP_DROP" : walkBytes rest
+               0x76 -> "OP_DUP" : walkBytes rest
+               0x77 -> "OP_NIP" : walkBytes rest
+               0x78 -> "OP_OVER" : walkBytes rest
+               0x79 -> "OP_PICK" : walkBytes rest
+               0x7a -> "OP_ROLL" : walkBytes rest
+               0x7b -> "OP_ROT" : walkBytes rest
+               0x7c -> "OP_SWAP" : walkBytes rest
+               0x7d -> "OP_TUCK" : walkBytes rest
+               0x87 -> "OP_EQUAL" : walkBytes rest
+               0x88 -> "OP_EQUALVERIFY" : walkBytes rest
+               0x89 -> "OP_RESERVED1" : walkBytes rest
+               0x8a -> "OP_RESERVED2" : walkBytes rest
+               0x8b -> "OP_1ADD" : walkBytes rest
+               0x8c -> "OP_1SUB" : walkBytes rest
+               0x8f -> "OP_NEGATE" : walkBytes rest
+               0x90 -> "OP_ABS" : walkBytes rest
+               0x91 -> "OP_NOT" : walkBytes rest
+               0x92 -> "OP_0NOTEQUAL" : walkBytes rest
+               0x93 -> "OP_ADD" : walkBytes rest
+               0x94 -> "OP_SUB" : walkBytes rest
+               0x9a -> "OP_BOOLAND" : walkBytes rest
+               0x9b -> "OP_BOOLOR" : walkBytes rest
+               0x9c -> "OP_NUMEQUAL" : walkBytes rest
+               0x9d -> "OP_NUMEQUALVERIFY" : walkBytes rest
+               0x9e -> "OP_NUMNOTEQUAL" : walkBytes rest
+               0x9f -> "OP_LESSTHAN" : walkBytes rest
+               0xa0 -> "OP_GREATERTHAN" : walkBytes rest
+               0xa1 -> "OP_LESSTHANOREQUAL" : walkBytes rest
+               0xa2 -> "OP_GREATERTHANOREQUAL" : walkBytes rest
+               0xa3 -> "OP_MIN" : walkBytes rest
+               0xa4 -> "OP_MAX" : walkBytes rest
+               0xa5 -> "OP_WITHIN" : walkBytes rest
+               0xa6 -> "OP_RIPEMD160" : walkBytes rest
+               0xa7 -> "OP_SHA1" : walkBytes rest
+               0xa8 -> "OP_SHA256" : walkBytes rest
+               0xa9 -> "OP_HASH160" : walkBytes rest
+               0xaa -> "OP_HASH256" : walkBytes rest
+               0xab -> "OP_CODESEPARATOR" : walkBytes rest
+               0xac -> "OP_CHECKSIG" : walkBytes rest
+               0xad -> "OP_CHECKSIGVERIFY" : walkBytes rest
+               0xae -> "OP_CHECKMULTISIG" : walkBytes rest
+               0xaf -> "OP_CHECKMULTISIGVERIFY" : walkBytes rest
+               0xb1 -> "OP_CHECKLOCKTIMEVERIFY" : walkBytes rest
+               0xb2 -> "OP_CHECKSEQUENCEVERIFY" : walkBytes rest
+               _    -> T.pack (printf "OP_UNKNOWN[%d]" (fromIntegral op :: Int)) : walkBytes rest
 
 -- | Map a sighash byte to its text label.
 -- Reference: bitcoin-core/src/core_io.cpp SighashToStr.
