@@ -15798,6 +15798,202 @@ main = hspec $ do
               Nothing -> return ()
               Just _  -> expectationFailure "getDefaultWallet should be Nothing post-unload"
 
+  -- W47: PSBT encoder gate + canonical sort-key.  Mirrors blockbrew W45
+  -- (commit e000f9b) and beamchain W46-2 (commit e8f04a0).  Three
+  -- regression cases: encoder must drop producer fields once the input
+  -- is finalized; partial_sigs must be emitted in HASH160(pubkey) order
+  -- (Core's std::map<CKeyID, SigPair>); bip32_derivation must stay in
+  -- raw-pubkey order (Core's std::map<CPubKey, ...>).
+  describe "PSBT encoder gate + canonical sort-key (W47)" $ do
+    -- Helper: build a structurally-valid compressed PubKey from a 32-byte
+    -- payload + tag byte.  We don't need the key to be on-curve for the
+    -- encoder/decoder round-trip -- 'parsePubKey' is structural and the
+    -- serializer only re-emits the bytes.
+    let mkPubKey :: Word8 -> ByteString -> PubKey
+        mkPubKey tag body =
+          case parsePubKey (BS.cons tag body) of
+            Just pk -> pk
+            Nothing -> error "mkPubKey: invariant violated"
+
+        -- A throwaway 1-input transaction.
+        prevTxId   = TxId (Hash256 (BS.replicate 32 0x11))
+        unsignedTx :: Tx
+        unsignedTx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn (OutPoint prevTxId 0) BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 49_000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x99)]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+    it "encoder gate: finalized input drops partial_sigs / scripts / bip32" $ do
+      -- An input that is finalized AND still carries producer fields in
+      -- its in-memory representation (e.g. because a Combiner re-merged a
+      -- finalized PSBT with an upstream still-signing partial -- the
+      -- W43-1 / Core psbt.h:313 threat model).  The encoder MUST NOT
+      -- emit any producer field once piFinalScriptSig is set.
+      let pk1     = mkPubKey 0x02 (BS.replicate 32 0xaa)
+          pk2     = mkPubKey 0x03 (BS.replicate 32 0xbb)
+          sig1    = BS.replicate 71 0xab `BS.snoc` 0x01
+          sig2    = BS.replicate 71 0xcd `BS.snoc` 0x01
+          finSig  = BS.pack [0x47, 0x30, 0x44]  -- 3-byte sentinel; meaning irrelevant
+          finWit  = [BS.replicate 71 0xee `BS.snoc` 0x01,
+                     serializePubKeyCompressed pk1]
+          inp0    = emptyPsbtInput
+            { piPartialSigs       = Map.fromList [(pk1, sig1), (pk2, sig2)]
+            , piSighashType       = Just 0x01
+            , piRedeemScript      = Just (BS.pack [0xde, 0xad, 0xbe, 0xef])
+            , piWitnessScript     = Just (BS.pack [0xca, 0xfe, 0xba, 0xbe])
+            , piBip32Derivation   = Map.fromList
+                [(pk1, KeyPath 0x12345678 [0x80000000, 1, 2])]
+            , piFinalScriptSig    = Just finSig
+            , piFinalScriptWitness = Just finWit
+            }
+          psbt    = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+          wire'   = encodePsbt psbt
+      -- Producer-field type bytes (in PSBT_IN_* type space) MUST NOT
+      -- appear as a 1-byte key in the input map.  We grep the wire bytes
+      -- for the canonical key prefix `\x01\x02` (varlen-1 + type 0x02
+      -- PSBT_IN_PARTIAL_SIG header) -- this 2-byte sequence is what
+      -- 'putKeyValue' emits when the key payload is the 1-byte type
+      -- followed immediately by the pubkey body (the actual key is
+      -- 1+33 = 34 bytes, varlen-encoded as 0x22, so the partial-sig
+      -- KEY-VALUE record begins with 0x22 0x02 ...).  Build the exact
+      -- prefixes per type and search for them.
+      let partialSigKey   = BS.pack [0x22, 0x02]        -- varlen 34, type 0x02
+          sighashTypeKey  = BS.pack [0x01, 0x03]        -- varlen 1, type 0x03
+          redeemKey       = BS.pack [0x01, 0x04]        -- varlen 1, type 0x04
+          witnessKey      = BS.pack [0x01, 0x05]        -- varlen 1, type 0x05
+          bip32Key        = BS.pack [0x22, 0x06]        -- varlen 34, type 0x06
+          contains haystack needle =
+            any (\i -> BS.take (BS.length needle) (BS.drop i haystack) == needle)
+                [0 .. BS.length haystack - BS.length needle]
+      contains wire' partialSigKey  `shouldBe` False
+      contains wire' sighashTypeKey `shouldBe` False
+      contains wire' redeemKey      `shouldBe` False
+      contains wire' witnessKey     `shouldBe` False
+      contains wire' bip32Key       `shouldBe` False
+      -- Round-trip: decode + re-encode must be a fixed point now that
+      -- the producer fields are stripped from the wire.
+      case decodePsbt wire' of
+        Left err -> expectationFailure ("decodePsbt: " ++ err)
+        Right p2 -> do
+          let inp' = head (psbtInputs p2)
+          piPartialSigs     inp' `shouldBe` Map.empty
+          piSighashType     inp' `shouldBe` Nothing
+          piRedeemScript    inp' `shouldBe` Nothing
+          piWitnessScript   inp' `shouldBe` Nothing
+          piBip32Derivation inp' `shouldBe` Map.empty
+          piFinalScriptSig  inp' `shouldBe` Just finSig
+          piFinalScriptWitness inp' `shouldBe` Just finWit
+
+    it "partial_sigs: emitted in HASH160(pubkey) order, not raw-pubkey order" $ do
+      -- Pick a pubkey pair whose raw-byte order DISAGREES with their
+      -- HASH160(pubkey) order, so the test would silently pass vacuously
+      -- on the old encoder if we'd picked a pair where the two orders
+      -- coincide (W46-4 ouroboros lesson).
+      --
+      -- We brute-force a pair: enumerate body bodies, hash, and pick the
+      -- first pair where raw < raw' but hash160 raw > hash160 raw'.
+      let candidates =
+            [ mkPubKey 0x02 (BS.pack (replicate 31 0x00 ++ [n]))
+            | n <- [0 .. 255 :: Word8]
+            ]
+          pickPair [] = Nothing
+          pickPair (x:xs) =
+            case [ (x, y)
+                 | y <- xs
+                 , let xb = serializePubKeyCompressed x
+                       yb = serializePubKeyCompressed y
+                       hx = getHash160 (hash160 xb)
+                       hy = getHash160 (hash160 yb)
+                   -- raw order says (x, y); hash160 order says (y, x)
+                 , xb < yb
+                 , hx > hy
+                 ]
+              of
+                ((a, b) : _) -> Just (a, b)
+                []           -> pickPair xs
+      case pickPair candidates of
+        Nothing -> expectationFailure
+                     "could not find an asymmetric pubkey pair (raw vs HASH160 order)"
+        Just (pkRawSmall, pkRawLarge) -> do
+          let pkHashSmall = pkRawLarge   -- by construction: hash160(rawLarge) < hash160(rawSmall)
+              sigSmall  = BS.replicate 71 0xa1 `BS.snoc` 0x01
+              sigLarge  = BS.replicate 71 0xb2 `BS.snoc` 0x01
+              -- Use a non-finalized input so the encoder gate lets the
+              -- partial_sigs through.
+              inp0 = emptyPsbtInput
+                { piPartialSigs = Map.fromList
+                    [ (pkRawSmall, if pkRawSmall == pkHashSmall then sigSmall else sigLarge)
+                    , (pkRawLarge, if pkRawLarge == pkHashSmall then sigSmall else sigLarge)
+                    ]
+                }
+              psbt = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+              wire' = encodePsbt psbt
+              -- Locate the FIRST partial_sig record; its 33-byte pubkey
+              -- payload starts at offset 2 of the record (varlen 0x22,
+              -- type 0x02, then pubkey).
+              partialSigKey = BS.pack [0x22, 0x02]
+              firstIdx =
+                head
+                  [ i
+                  | i <- [0 .. BS.length wire' - BS.length partialSigKey]
+                  , BS.take (BS.length partialSigKey) (BS.drop i wire') == partialSigKey
+                  ]
+              firstPubKey = BS.take 33 (BS.drop (firstIdx + 2) wire')
+          -- The first partial_sig record on the wire MUST be the one
+          -- whose pubkey hashes to the smaller HASH160 -- regardless of
+          -- which raw-pubkey is smaller.
+          firstPubKey `shouldBe` serializePubKeyCompressed pkHashSmall
+
+    it "bip32_derivation: emitted in raw-pubkey order (matches Core std::map<CPubKey>)" $ do
+      -- Same fixture shape as the partial_sigs test, but we assert the
+      -- OPPOSITE invariant: bip32_derivation order MUST follow raw
+      -- pubkey bytes (Core uses `std::map<CPubKey, KeyOriginInfo>`).
+      let candidates =
+            [ mkPubKey 0x02 (BS.pack (replicate 31 0x00 ++ [n]))
+            | n <- [0 .. 255 :: Word8]
+            ]
+          pickPair [] = Nothing
+          pickPair (x:xs) =
+            case [ (x, y)
+                 | y <- xs
+                 , let xb = serializePubKeyCompressed x
+                       yb = serializePubKeyCompressed y
+                       hx = getHash160 (hash160 xb)
+                       hy = getHash160 (hash160 yb)
+                 , xb < yb
+                 , hx > hy
+                 ]
+              of
+                ((a, b) : _) -> Just (a, b)
+                []           -> pickPair xs
+      case pickPair candidates of
+        Nothing -> expectationFailure
+                     "could not find an asymmetric pubkey pair (raw vs HASH160 order)"
+        Just (pkRawSmall, pkRawLarge) -> do
+          let kp1 = KeyPath 0x12345678 [0x80000000 + 0, 1, 0]
+              kp2 = KeyPath 0xdeadbeef [0x80000000 + 1, 0, 7]
+              inp0 = emptyPsbtInput
+                { piBip32Derivation = Map.fromList
+                    [ (pkRawSmall, kp1)
+                    , (pkRawLarge, kp2)
+                    ]
+                }
+              psbt = (emptyPsbt unsignedTx) { psbtInputs = [inp0] }
+              wire' = encodePsbt psbt
+              bip32Key = BS.pack [0x22, 0x06]   -- varlen 34, type 0x06
+              firstIdx =
+                head
+                  [ i
+                  | i <- [0 .. BS.length wire' - BS.length bip32Key]
+                  , BS.take (BS.length bip32Key) (BS.drop i wire') == bip32Key
+                  ]
+              firstPubKey = BS.take 33 (BS.drop (firstIdx + 2) wire')
+          -- First bip32_derivation record on the wire == raw-smaller pubkey.
+          firstPubKey `shouldBe` serializePubKeyCompressed pkRawSmall
+
   describe "walletcreatefundedpsbt routing (Cat-H Part-2 wave)" $ do
     -- The handler delegates the heavy lifting to Wallet.hs's
     -- 'selectCoinsWithHeight'.  We don't have access to the dispatcher
