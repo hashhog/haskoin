@@ -130,9 +130,10 @@ data StandardError
   | StdScriptPubKey !Int
     -- ^ "scriptpubkey" — output script not a known standard pattern
   | StdDataCarrierTooLarge !Int !Int
-    -- ^ "datacarrier" — OP_RETURN data > MAX_OP_RETURN_RELAY (size, max)
-  | StdMultipleOpReturns !Int
-    -- ^ "multi-op-return" — more than one OP_RETURN output in tx (count)
+    -- ^ "datacarrier" — cumulative OP_RETURN bytes exceed MAX_OP_RETURN_RELAY
+    --   (cumulative_size, max). Core uses a shared budget across all
+    --   OP_RETURN outputs per-tx, not a per-output cap; multiple OP_RETURN
+    --   outputs are allowed as long as the total fits.
   | StdBareMultisig
     -- ^ "bare-multisig" — bare multisig output (without -permitbaremultisig)
   | StdDust !Int
@@ -151,7 +152,6 @@ stdReasonTag = \case
   StdScriptSigNotPushOnly {}  -> "scriptsig-not-pushonly"
   StdScriptPubKey {}          -> "scriptpubkey"
   StdDataCarrierTooLarge {}   -> "datacarrier"
-  StdMultipleOpReturns {}     -> "multi-op-return"
   StdBareMultisig             -> "bare-multisig"
   StdDust {}                  -> "dust"
 
@@ -284,14 +284,17 @@ checkStandardTx tx = do
   let inputs = zip [0..] (txInputs tx)
   mapM_ checkInput inputs
 
-  -- 5. each output's scriptPubKey must be standard; bound OP_RETURN data;
-  --    count OP_RETURNs.
+  -- 5. each output's scriptPubKey must be standard; enforce the cumulative
+  --    OP_RETURN data-carrier budget (Bitcoin Core IsStandardTx).
+  --
+  --    Core policy (policy.cpp:137-155): initialise datacarrier_bytes_left =
+  --    MAX_OP_RETURN_RELAY; for each NULL_DATA output deduct its total script
+  --    size from the budget and reject ("datacarrier") if it would go
+  --    negative. Multiple OP_RETURN outputs are explicitly allowed as long as
+  --    the sum of their script sizes fits in the budget. There is NO
+  --    "multi-op-return" reject in Bitcoin Core.
   let outputs = zip [0..] (txOutputs tx)
-  carriers <- countOpReturnsAndCheck outputs
-
-  if carriers > 1
-    then Left (StdMultipleOpReturns carriers)
-    else Right ()
+  checkOutputsWithBudget outputs
 
   -- 6. dust budget
   let dustCount = length [ () | o <- txOutputs tx, isDust o dustRelayTxFee ]
@@ -314,20 +317,25 @@ checkStandardTx tx = do
             then Right ()
             else Left (StdScriptSigNotPushOnly idx)
 
-    -- Walk outputs, classify each scriptPubKey, enforce data-carrier
-    -- budget on OP_RETURN entries, and count them so we can reject
-    -- multi-OP_RETURN transactions per Core's relay policy.
-    countOpReturnsAndCheck :: [(Int, TxOut)] -> Either StandardError Int
-    countOpReturnsAndCheck = go 0
+    -- Walk outputs, classify each scriptPubKey, and enforce the cumulative
+    -- OP_RETURN data-carrier budget. Mirrors Bitcoin Core policy.cpp:137-155:
+    --   unsigned int datacarrier_bytes_left = max_datacarrier_bytes.value_or(0);
+    --   for each NULL_DATA output:
+    --     if (size > datacarrier_bytes_left) → reject "datacarrier"
+    --     datacarrier_bytes_left -= size;
+    -- Multiple OP_RETURN outputs are allowed; only the cumulative byte sum is
+    -- capped. Non-OP_RETURN non-standard outputs are rejected "scriptpubkey".
+    checkOutputsWithBudget :: [(Int, TxOut)] -> Either StandardError ()
+    checkOutputsWithBudget = go maxOpReturnRelay
       where
-        go !n [] = Right n
-        go !n ((idx, out):rest) =
+        go !_budget [] = Right ()
+        go !budget ((idx, out):rest) =
           case isStandardScriptPubKey (txOutScript out) of
             Nothing -> Left (StdScriptPubKey idx)
             Just t -> case t of
               OpReturn _ -> do
                 let !sz = BS.length (txOutScript out)
-                if sz > maxOpReturnRelay
-                  then Left (StdDataCarrierTooLarge sz maxOpReturnRelay)
-                  else go (n + 1) rest
-              _ -> go n rest
+                if sz > budget
+                  then Left (StdDataCarrierTooLarge (maxOpReturnRelay - budget + sz) maxOpReturnRelay)
+                  else go (budget - sz) rest
+              _ -> go budget rest
