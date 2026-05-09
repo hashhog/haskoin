@@ -3840,6 +3840,37 @@ finalizeInput pinp
 -- explicit @FinalizeCommitmentMismatch@ error.
 finalizeForScript :: ByteString -> [(PubKey, ByteString)] -> PsbtInput -> PsbtInput
 finalizeForScript script sigs pinp
+  -- W46: P2SH-P2WSH multisig.  Match BEFORE the single-sig P2SH-P2WSH
+  -- branch below so that 2+ collected sigs route through the multisig
+  -- assembler.  The single-sig branch's `_ -> pinp` would otherwise
+  -- short-circuit and the multisig case never finalize.
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , isP2WSHScript redeem
+  , Just wScript <- piWitnessScript pinp
+  , p2shCommits script redeem
+  , p2wshCommits redeem wScript
+  , Just (m, redeemPubkeys) <- parseMultisigRedeem wScript =
+      case orderedMultisigSigs m redeemPubkeys (piPartialSigs pinp) of
+        Just orderedSigs ->
+          let witness   = [BS.empty] ++ orderedSigs ++ [wScript]
+              scriptSig = encodePushData' redeem
+          in clearSigningFields $ pinp
+             { piFinalScriptSig     = Just scriptSig
+             , piFinalScriptWitness = Just witness
+             }
+        Nothing -> pinp
+  -- W46: native P2WSH multisig.  Match BEFORE the single-sig P2WSH
+  -- branch below for the same reason as P2SH-P2WSH above.
+  | isP2WSHScript script
+  , Just wScript <- piWitnessScript pinp
+  , p2wshCommits script wScript
+  , Just (m, redeemPubkeys) <- parseMultisigRedeem wScript =
+      case orderedMultisigSigs m redeemPubkeys (piPartialSigs pinp) of
+        Just orderedSigs ->
+          let witness = [BS.empty] ++ orderedSigs ++ [wScript]
+          in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
+        Nothing -> pinp
   -- P2SH wrap: figure out which inner program the redeemScript carries.
   | isP2SHScript script
   , Just redeem <- piRedeemScript pinp
@@ -3921,8 +3952,117 @@ finalizeForScript script sigs pinp
           let witness = [sig]
           in clearSigningFields $ pinp { piFinalScriptWitness = Just witness }
         _ -> pinp
-  -- TODO: multi-leaf tapscript MAST, in-script multisig, multi-key P2WSH.
+  -- W46 multisig finalize: Legacy P2SH-multisig.
+  -- redeemScript is `m <pk1> ... <pkn> n OP_CHECKMULTISIG`; assemble
+  -- scriptSig = OP_0 sig1 ... sigM PUSH(redeemScript) where sigs appear
+  -- in script-pubkey (redeemScript) order, not piPartialSigs Map order.
+  -- This branch sits below the single-sig P2SH-P2WPKH / P2SH-P2WSH wrap
+  -- branches above because their redeem-script predicates (isP2WPKHScript
+  -- / isP2WSHScript) are stricter and disjoint with parseMultisigRedeem,
+  -- so the order is unambiguous.
+  -- Reference: bitcoin-core/src/script/sign.cpp ProduceSignature, the
+  -- TxoutType::MULTISIG branch which calls SignStep with SIGVERSION_BASE.
+  | isP2SHScript script
+  , Just redeem <- piRedeemScript pinp
+  , p2shCommits script redeem
+  , Just (m, redeemPubkeys) <- parseMultisigRedeem redeem =
+      case orderedMultisigSigs m redeemPubkeys (piPartialSigs pinp) of
+        Just orderedSigs ->
+          let scriptSig = BS.concat $
+                  [BS.singleton 0x00]            -- OP_0 dummy (BIP-11 off-by-one)
+               ++ map encodePushData' orderedSigs
+               ++ [encodePushData' redeem]
+          in clearSigningFields $ pinp
+             { piFinalScriptSig = Just scriptSig
+             }
+        Nothing -> pinp
+  -- TODO: multi-leaf tapscript MAST.
   | otherwise = pinp
+
+-- | W46: Parse a bare multisig redeemScript / witnessScript.
+--
+-- Layout (BIP-11): @OP_m <pk1> ... <pkn> OP_n OP_CHECKMULTISIG@ where
+-- @OP_m@ / @OP_n@ are small-number opcodes (@OP_1@..@OP_16@).  Each
+-- pubkey push is a direct OPCODE push (33-byte compressed = @0x21
+-- <33b>@; 65-byte uncompressed = @0x41 <65b>@).
+--
+-- Returns @Just (m, [pubkeyBytes])@ on a clean parse, @Nothing@ on
+-- any structural mismatch (wrong opcode, wrong push length, wrong
+-- M/N relation, trailing bytes, etc.) so that finalize falls through
+-- to the safe "leave unchanged" branch.
+--
+-- Reference: bitcoin-core/src/script/standard.cpp@MatchMultisig.
+parseMultisigRedeem :: ByteString -> Maybe (Int, [ByteString])
+parseMultisigRedeem bs
+  | BS.length bs < 4 = Nothing
+  | otherwise = do
+      let b0 = BS.index bs 0
+      m <- smallNumByte b0
+      (pubkeys, rest) <- takePubkeys (BS.drop 1 bs)
+      case BS.unpack (BS.take 2 rest) of
+        [nByte, 0xae] -> do
+          n <- smallNumByte nByte
+          if BS.length rest == 2
+             && length pubkeys == n
+             && m >= 1 && m <= n
+             && n >= 1 && n <= 20
+            then Just (m, pubkeys)
+            else Nothing
+        _ -> Nothing
+  where
+    smallNumByte :: Word8 -> Maybe Int
+    smallNumByte b
+      | b >= 0x51 && b <= 0x60 = Just (fromIntegral b - 0x50)
+      | otherwise              = Nothing
+    takePubkeys :: ByteString -> Maybe ([ByteString], ByteString)
+    takePubkeys input
+      | BS.null input = Just ([], input)
+      | otherwise =
+          let pushLen = BS.index input 0
+          in case pushLen of
+               0x21
+                 | BS.length input >= 1 + 33 -> do
+                     let pk = BS.take 33 (BS.drop 1 input)
+                         rem' = BS.drop (1 + 33) input
+                     (rest, final) <- takePubkeys rem'
+                     Just (pk : rest, final)
+                 | otherwise -> Nothing
+               0x41
+                 | BS.length input >= 1 + 65 -> do
+                     let pk = BS.take 65 (BS.drop 1 input)
+                         rem' = BS.drop (1 + 65) input
+                     (rest, final) <- takePubkeys rem'
+                     Just (pk : rest, final)
+                 | otherwise -> Nothing
+               _ -> Just ([], input)
+
+-- | W46: Order a partial-sig map by redeemScript pubkey order and pick
+-- the first @m@ signatures.
+--
+-- 'piPartialSigs' is an unordered @Map PubKey ByteString@ keyed by the
+-- 33-byte compressed pubkey; OP_CHECKMULTISIG verifies sigs in
+-- script-pubkey order, popping each unmatched pubkey, so the assembled
+-- scriptSig / witness stack must list sigs in that same order.
+--
+-- Returns @Just (sig1..sigM)@ when at least @m@ of the redeemScript's
+-- pubkeys have a partial sig; @Nothing@ otherwise (e.g. only @m-1@
+-- sigs collected — leave the input unfinalized so the Combiner can
+-- pick up more).
+orderedMultisigSigs
+  :: Int            -- ^ M (signatures required)
+  -> [ByteString]   -- ^ pubkeys in redeemScript order (33 or 65 bytes)
+  -> Map PubKey ByteString
+  -> Maybe [ByteString]
+orderedMultisigSigs m redeemPubkeys partialSigs =
+  let sigByBytes :: Map ByteString ByteString
+      sigByBytes = Map.fromList
+        [ (serializePubKeyCompressed pk, sig)
+        | (pk, sig) <- Map.toList partialSigs
+        ]
+      collected = mapMaybe (`Map.lookup` sigByBytes) redeemPubkeys
+  in if length collected >= m
+       then Just (take m collected)
+       else Nothing
 
 -- | Encode push data for scriptSig
 encodePushData' :: ByteString -> ByteString
