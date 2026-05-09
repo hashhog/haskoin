@@ -236,7 +236,7 @@ import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
 import Data.Bits ((.&.), (.|.), shiftL, shiftR, testBit, xor)
 import Data.Serialize (Serialize(..), Get, Put, encode, decode, runPut, runGet,
-                        putWord32be, putWord32le, getWord32le, putWord8, getWord8,
+                        putWord32be, putWord32le, getWord32le, getWord32be, putWord8, getWord8,
                         putByteString, getBytes, remaining, lookAhead, skip)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -2272,6 +2272,16 @@ data PsbtInput = PsbtInput
   , piBip32Derivation  :: !(Map PubKey KeyPath)         -- ^ pubkey -> keypath
   , piFinalScriptSig   :: !(Maybe ByteString)           -- ^ Final scriptSig
   , piFinalScriptWitness :: !(Maybe [ByteString])       -- ^ Final witness stack
+  -- BIP-371 Taproot fields (input-side)
+  , piTapKeySig        :: !(Maybe ByteString)           -- ^ PSBT_IN_TAP_KEY_SIG (0x13)
+  , piTapScriptSigs    :: !(Map (ByteString, ByteString) ByteString)
+                                                        -- ^ (xonly,leaf_hash)->sig (0x14)
+  , piTapLeafScripts   :: !(Map (ByteString, Int) (Set ByteString))
+                                                        -- ^ (script,leaf_ver)->control_blocks (0x15)
+  , piTapBip32Derivation :: !(Map ByteString (Set ByteString, KeyPath))
+                                                        -- ^ xonly->(leaf_hashes,keypath) (0x16)
+  , piTapInternalKey   :: !(Maybe ByteString)           -- ^ PSBT_IN_TAP_INTERNAL_KEY (0x17)
+  , piTapMerkleRoot    :: !(Maybe ByteString)           -- ^ PSBT_IN_TAP_MERKLE_ROOT (0x18)
   , piUnknown          :: !(Map ByteString ByteString)  -- ^ Unknown key-value pairs
   } deriving (Show, Eq, Generic)
 
@@ -2283,6 +2293,13 @@ data PsbtOutput = PsbtOutput
   { poRedeemScript    :: !(Maybe ByteString)           -- ^ P2SH redeem script
   , poWitnessScript   :: !(Maybe ByteString)           -- ^ P2WSH witness script
   , poBip32Derivation :: !(Map PubKey KeyPath)         -- ^ pubkey -> keypath
+  -- BIP-371 Taproot fields (output-side)
+  , poTapInternalKey  :: !(Maybe ByteString)           -- ^ PSBT_OUT_TAP_INTERNAL_KEY (0x05)
+  , poTapTree         :: ![(Word8, Word8, ByteString)] -- ^ (depth,leaf_ver,script) triples (0x06)
+  , poTapBip32Derivation :: !(Map ByteString (Set ByteString, KeyPath))
+                                                       -- ^ xonly->(leaf_hashes,keypath) (0x07)
+  , poMuSig2Participants :: !(Map ByteString [ByteString])
+                                                       -- ^ agg_pubkey->participants (0x08)
   , poUnknown         :: !(Map ByteString ByteString)  -- ^ Unknown key-value pairs
   } deriving (Show, Eq, Generic)
 
@@ -2315,6 +2332,12 @@ emptyPsbtInput = PsbtInput
   , piBip32Derivation = Map.empty
   , piFinalScriptSig = Nothing
   , piFinalScriptWitness = Nothing
+  , piTapKeySig = Nothing
+  , piTapScriptSigs = Map.empty
+  , piTapLeafScripts = Map.empty
+  , piTapBip32Derivation = Map.empty
+  , piTapInternalKey = Nothing
+  , piTapMerkleRoot = Nothing
   , piUnknown = Map.empty
   }
 
@@ -2324,6 +2347,10 @@ emptyPsbtOutput = PsbtOutput
   { poRedeemScript = Nothing
   , poWitnessScript = Nothing
   , poBip32Derivation = Map.empty
+  , poTapInternalKey = Nothing
+  , poTapTree = []
+  , poTapBip32Derivation = Map.empty
+  , poMuSig2Participants = Map.empty
   , poUnknown = Map.empty
   }
 
@@ -2491,10 +2518,12 @@ putKeyValue key value = do
   putVarBytes value
 
 -- | Serialize a keypath
+-- Fingerprint is emitted as big-endian (raw network bytes, matching Core).
+-- Path indices are little-endian (BIP-32 standard).
 serializeKeyPath :: KeyPath -> ByteString
 serializeKeyPath KeyPath{..} =
   runPut $ do
-    putWord32le kpFingerprint
+    putWord32be kpFingerprint
     mapM_ putWord32le kpPath
 
 -- | Serialize transaction without witness (for PSBT global)
@@ -2650,6 +2679,34 @@ getInputMapFor expectedOp = go emptyPsbtInput
               -- a zero-count witness on the encode side.
               Left err -> fail err
               Right ws -> go inp { piFinalScriptWitness = Just ws }
+            -- BIP-371 Taproot input fields
+            0x13 -> go inp { piTapKeySig = Just value }  -- PSBT_IN_TAP_KEY_SIG
+            0x14 -> do  -- PSBT_IN_TAP_SCRIPT_SIG: key = type(1) + xonly(32) + leaf_hash(32)
+              if BS.length keyData /= 64
+                then go inp  -- malformed, skip
+                else let xonly    = BS.take 32 keyData
+                         leafHash = BS.drop 32 keyData
+                         sigs'    = Map.insert (xonly, leafHash) value (piTapScriptSigs inp)
+                     in go inp { piTapScriptSigs = sigs' }
+            0x15 -> do  -- PSBT_IN_TAP_LEAF_SCRIPT: key = type(1) + control_block; value = script + leaf_ver
+              if BS.null value
+                then go inp  -- malformed, skip
+                else let leafVer = fromIntegral (BS.last value)
+                         script  = BS.init value
+                         cb      = keyData  -- the control block bytes
+                         leaf    = (script, leafVer)
+                         ls'     = Map.insertWith Set.union leaf (Set.singleton cb) (piTapLeafScripts inp)
+                     in go inp { piTapLeafScripts = ls' }
+            0x16 -> do  -- PSBT_IN_TAP_BIP32_DERIVATION: key = type(1) + xonly(32)
+              if BS.length keyData /= 32
+                then go inp  -- malformed, skip
+                else case parseTapBip32Value value of
+                  Left _ -> go inp  -- malformed value, skip
+                  Right (leafHashes, kp) ->
+                    let td' = Map.insert keyData (leafHashes, kp) (piTapBip32Derivation inp)
+                    in go inp { piTapBip32Derivation = td' }
+            0x17 -> go inp { piTapInternalKey = Just value }  -- PSBT_IN_TAP_INTERNAL_KEY
+            0x18 -> go inp { piTapMerkleRoot = Just value }   -- PSBT_IN_TAP_MERKLE_ROOT
             _ -> go inp { piUnknown = Map.insert key value (piUnknown inp) }
 
 -- | Parse output map
@@ -2674,6 +2731,25 @@ getOutputMap = go emptyPsbtOutput
               Just pk -> case parseKeyPath value of
                 Left err -> fail err
                 Right kp -> go out { poBip32Derivation = Map.insert pk kp (poBip32Derivation out) }
+            -- BIP-371 Taproot output fields
+            0x05 -> go out { poTapInternalKey = Just value }  -- PSBT_OUT_TAP_INTERNAL_KEY
+            0x06 -> case parsePsbtTapTree value of  -- PSBT_OUT_TAP_TREE
+              Left _ -> go out  -- malformed, skip
+              Right triples -> go out { poTapTree = triples }
+            0x07 -> do  -- PSBT_OUT_TAP_BIP32_DERIVATION: key = type(1) + xonly(32)
+              if BS.length keyData /= 32
+                then go out  -- malformed, skip
+                else case parseTapBip32Value value of
+                  Left _ -> go out  -- malformed, skip
+                  Right (leafHashes, kp) ->
+                    let td' = Map.insert keyData (leafHashes, kp) (poTapBip32Derivation out)
+                    in go out { poTapBip32Derivation = td' }
+            0x08 -> do  -- PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: key = type(1) + agg_pubkey(33)
+              if BS.length keyData /= 33
+                then go out  -- malformed, skip
+                else let parts = parseMuSig2Participants value
+                         mp'   = Map.insert keyData parts (poMuSig2Participants out)
+                     in go out { poMuSig2Participants = mp' }
             _ -> go out { poUnknown = Map.insert key value (poUnknown out) }
 
 -- | Parse a keypath from bytes.
@@ -2691,7 +2767,9 @@ parseKeyPath bs
   | BS.length bs `mod` 4 /= 0 =
       Left "PSBT: keypath not multiple of 4 bytes"
   | otherwise =
-      let fp = runGetPartial getWord32le (BS.take 4 bs)
+      -- Fingerprint is 4 raw bytes read as big-endian (matching Core's ReadBE32 in output).
+      -- Path indices are little-endian Word32 (standard BIP-32 serialization).
+      let fp = runGetPartial getWord32be (BS.take 4 bs)
           pathBytes = BS.drop 4 bs
           pathLen = BS.length pathBytes `div` 4
           path = map (\i -> runGetPartial getWord32le (BS.take 4 (BS.drop (i * 4) pathBytes)))
@@ -2717,6 +2795,48 @@ parseWitnessStack bs = case runGet getStack bs of
     getStack = do
       count <- getVarInt'
       replicateM (fromIntegral count) getVarBytes
+
+-- | Parse a BIP-371 TAP_BIP32_DERIVATION value.
+-- Value format: compact_size(leaf_count) + leaf_hashes(32*n) + fingerprint(4) + path_indices
+-- Reference: bitcoin-core/src/psbt.h PSBT_IN_TAP_BIP32_DERIVATION / PSBT_OUT_TAP_BIP32_DERIVATION.
+parseTapBip32Value :: ByteString -> Either String (Set ByteString, KeyPath)
+parseTapBip32Value bs = runGet go bs
+  where
+    go = do
+      leafCount <- getVarInt'
+      leafHashes <- replicateM (fromIntegral leafCount) (getBytes 32)
+      rest <- remaining
+      kpBytes <- getBytes rest
+      case parseKeyPath kpBytes of
+        Left err -> fail err
+        Right kp -> return (Set.fromList leafHashes, kp)
+
+-- | Parse a BIP-371 PSBT_OUT_TAP_TREE value.
+-- Value format: repeated { depth(1) + leaf_ver(1) + compact_size(len) + script(len) }
+-- Reference: bitcoin-core/src/psbt.h PSBT_OUT_TAP_TREE case.
+parsePsbtTapTree :: ByteString -> Either String [(Word8, Word8, ByteString)]
+parsePsbtTapTree bs = runGet go bs
+  where
+    go = do
+      rem0 <- remaining
+      if rem0 == 0
+        then return []
+        else do
+          depth   <- getWord8
+          leafVer <- getWord8
+          script  <- getVarBytes
+          rest    <- go
+          return ((depth, leafVer, script) : rest)
+
+-- | Parse MuSig2 participant pubkeys from a PSBT_MUSIG2_PARTICIPANT_PUBKEYS value.
+-- Value format: repeated 33-byte compressed pubkeys.
+-- Reference: bitcoin-core/src/psbt.h DeserializeMuSig2ParticipantPubkeys.
+parseMuSig2Participants :: ByteString -> [ByteString]
+parseMuSig2Participants bs = go bs
+  where
+    go b
+      | BS.length b >= 33 = BS.take 33 b : go (BS.drop 33 b)
+      | otherwise         = []
 
 --------------------------------------------------------------------------------
 -- PSBT Role: Creator
@@ -3763,6 +3883,12 @@ combineInputs a b = PsbtInput
   , piBip32Derivation = Map.union (piBip32Derivation a) (piBip32Derivation b)
   , piFinalScriptSig = piFinalScriptSig a <|> piFinalScriptSig b
   , piFinalScriptWitness = piFinalScriptWitness a <|> piFinalScriptWitness b
+  , piTapKeySig = piTapKeySig a <|> piTapKeySig b
+  , piTapScriptSigs = Map.union (piTapScriptSigs a) (piTapScriptSigs b)
+  , piTapLeafScripts = Map.unionWith Set.union (piTapLeafScripts a) (piTapLeafScripts b)
+  , piTapBip32Derivation = Map.union (piTapBip32Derivation a) (piTapBip32Derivation b)
+  , piTapInternalKey = piTapInternalKey a <|> piTapInternalKey b
+  , piTapMerkleRoot = piTapMerkleRoot a <|> piTapMerkleRoot b
   , piUnknown = Map.union (piUnknown a) (piUnknown b)
   }
   where
@@ -3775,6 +3901,10 @@ combineOutputs a b = PsbtOutput
   { poRedeemScript = poRedeemScript a <|> poRedeemScript b
   , poWitnessScript = poWitnessScript a <|> poWitnessScript b
   , poBip32Derivation = Map.union (poBip32Derivation a) (poBip32Derivation b)
+  , poTapInternalKey = poTapInternalKey a <|> poTapInternalKey b
+  , poTapTree = if null (poTapTree a) then poTapTree b else poTapTree a
+  , poTapBip32Derivation = Map.union (poTapBip32Derivation a) (poTapBip32Derivation b)
+  , poMuSig2Participants = Map.union (poMuSig2Participants a) (poMuSig2Participants b)
   , poUnknown = Map.union (poUnknown a) (poUnknown b)
   }
   where
