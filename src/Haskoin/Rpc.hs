@@ -1778,7 +1778,7 @@ broadcastTxToPeers server txid feeRate = do
 
 -- | Decode a raw transaction without submitting
 handleDecodeRawTransaction :: RpcServer -> Value -> IO RpcResponse
-handleDecodeRawTransaction _server params = do
+handleDecodeRawTransaction server params = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing transaction hex") Null
@@ -1791,8 +1791,10 @@ handleDecodeRawTransaction _server params = do
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError (T.pack $ "TX decode error: " ++ err)) Null
             Right tx -> do
-              let txid = computeTxId tx
-              return $ RpcResponse (txToJSON tx txid) Null Null
+              let net    = rsNetwork server
+                  rawEnc = decodeRawTxEnc net tx
+                  rawBs  = encodingToLazyByteString rawEnc
+              return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool RPC Handlers
@@ -6963,6 +6965,116 @@ scriptToAsm scriptBytes =
       OP_NOP9 -> "OP_NOP9"
       OP_NOP10 -> "OP_NOP10"
       OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
+
+-- | Map a sighash byte to its text label.
+-- Reference: bitcoin-core/src/core_io.cpp SighashToStr.
+sighashToTextTop :: Word32 -> Text
+sighashToTextTop 0x01 = "ALL"
+sighashToTextTop 0x02 = "NONE"
+sighashToTextTop 0x03 = "SINGLE"
+sighashToTextTop 0x81 = "ALL|ANYONECANPAY"
+sighashToTextTop 0x82 = "NONE|ANYONECANPAY"
+sighashToTextTop 0x83 = "SINGLE|ANYONECANPAY"
+sighashToTextTop n    = T.pack $ printf "0x%02x" n
+
+-- | Validate DER signature encoding (including trailing sighash byte).
+-- Reference: bitcoin-core/src/script/interpreter.cpp IsValidSignatureEncoding.
+isValidDerSigTop :: ByteString -> Bool
+isValidDerSigTop vch
+  | n < 9 || n > 73               = False
+  | BS.index vch 0 /= 0x30        = False
+  | BS.index vch 1 /= fromIntegral (n - 3) = False
+  | BS.index vch 2 /= 0x02        = False
+  | lenR == 0                      = False
+  | 5 + lenR >= n                  = False
+  | BS.index vch 4 .&. 0x80 /= 0  = False
+  | lenR > 1 && BS.index vch 4 == 0x00 &&
+    BS.index vch 5 .&. 0x80 == 0  = False
+  | BS.index vch (lenR + 4) /= 0x02 = False
+  | lenS == 0                      = False
+  | BS.index vch (lenR + 6) .&. 0x80 /= 0 = False
+  | lenS > 1 && BS.index vch (lenR + 6) == 0x00 &&
+    BS.index vch (lenR + 7) .&. 0x80 == 0 = False
+  | lenR + lenS + 7 /= n          = False
+  | otherwise                      = True
+  where
+    n    = BS.length vch
+    lenR = fromIntegral (BS.index vch 3)
+    lenS = fromIntegral (BS.index vch (lenR + 5))
+
+-- | Disassemble a scriptSig with sighash-type decoding.
+-- Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr(fAttemptSighashDecode=true).
+scriptToAsmSighashDecodeTop :: ByteString -> Text
+scriptToAsmSighashDecodeTop scriptBytes =
+  case decodeScript scriptBytes of
+    Left _             -> scriptToAsm scriptBytes
+    Right (Script ops) -> T.intercalate " " (map opToAsmSH ops)
+  where
+    opToAsmSH :: ScriptOp -> Text
+    opToAsmSH (OP_PUSHDATA bs _)
+      | BS.length bs > 4 =
+          let shByte  = BS.last bs
+              payload = BS.init bs
+              label   = sighashToTextTop (fromIntegral shByte)
+              suffix  = if T.null label || not (isValidDerSigTop bs)
+                          then ""
+                          else "[" <> label <> "]"
+              hexPart = if T.null suffix
+                          then TE.decodeUtf8 (B16.encode bs)
+                          else TE.decodeUtf8 (B16.encode payload)
+          in hexPart <> suffix
+      | otherwise = TE.decodeUtf8 (B16.encode bs)
+    opToAsmSH op = scriptToAsm (encodeScriptOps [op])
+
+-- | Build a vin Encoding entry for decoderawtransaction.
+-- Coinbase inputs emit {coinbase, sequence, txinwitness?}.
+-- Non-coinbase inputs emit {txid, vout, scriptSig:{asm,hex}, txinwitness?, sequence}.
+-- Reference: bitcoin-core/src/core_io.cpp TxToUniv (fAttemptSighashDecode=true).
+decodeRawVinEnc :: Tx -> Int -> AE.Encoding
+decodeRawVinEnc tx idx =
+  let inp       = txInputs tx !! idx
+      witness   = if idx < length (txWitness tx) then txWitness tx !! idx else []
+      isCoinbase = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+  in if isCoinbase
+     then pairs $
+       pair "coinbase"    (text (TE.decodeUtf8 (B16.encode (txInScript inp)))) <>
+       pair "sequence"    (AE.word32 (txInSequence inp)) <>
+       ( if null witness then mempty
+         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) )
+     else pairs $
+       pair "txid"      (text (showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp)))))) <>
+       pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput inp))) <>
+       pair "scriptSig" (pairs (pair "asm" (text (scriptToAsmSighashDecodeTop (txInScript inp))) <>
+                                pair "hex" (text (TE.decodeUtf8 (B16.encode (txInScript inp)))))) <>
+       ( if null witness then mempty
+         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) ) <>
+       pair "sequence"  (AE.word32 (txInSequence inp))
+
+-- | Build the top-level Encoding for decoderawtransaction.
+-- Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}.
+-- No "hex" field (Core's include_hex=false in rawtransaction.cpp:443).
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp decoderawtransaction
+--            → TxToUniv(tx, block_hash=uint256(), entry, include_hex=false).
+decodeRawTxEnc :: Network -> Tx -> AE.Encoding
+decodeRawTxEnc net tx =
+  let txid     = computeTxId tx
+      wtxid    = computeWtxId tx
+      txidHex  = showHash (BlockHash (getTxIdHash txid))
+      wtxidHex = showHash (BlockHash (getTxIdHash wtxid))
+      baseSize = txBaseSize tx
+      totSize  = txTotalSize tx
+      wt       = baseSize * (witnessScaleFactor - 1) + totSize
+      vsize    = (wt + witnessScaleFactor - 1) `div` witnessScaleFactor
+  in pairs $
+       pair "txid"     (text txidHex) <>
+       pair "hash"     (text wtxidHex) <>
+       pair "version"  (AE.int (fromIntegral (txVersion tx))) <>
+       pair "size"     (AE.int totSize) <>
+       pair "vsize"    (AE.int vsize) <>
+       pair "weight"   (AE.int wt) <>
+       pair "locktime" (AE.word32 (txLockTime tx)) <>
+       pair "vin"      (AE.list id (map (decodeRawVinEnc tx) [0 .. length (txInputs tx) - 1])) <>
+       pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx)))
 
 -- | Convert ScriptType to string for JSON output
 scriptTypeToString :: ScriptType -> Text
