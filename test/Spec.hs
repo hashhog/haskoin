@@ -5527,6 +5527,126 @@ main = hspec $ do
       piFinalScriptSig     inp' `shouldBe` Nothing
       piFinalScriptWitness inp' `shouldBe` Nothing
 
+    -- W46 multisig finalize regressions.
+    --
+    -- W41 (commit c34ad35) wired single-sig finalize for P2SH / P2WSH /
+    -- P2SH-P2WSH; the multi-sig case was a no-op `_ -> pinp` so multi-input
+    -- PSBTs that needed multisig assembly stayed unfinalized and
+    -- 'finalizePsbt' returned 'Could not finalize inputs ...'.  W46 wires
+    -- in-script multisig via 'parseMultisigRedeem' + 'orderedMultisigSigs'.
+    --
+    -- The fixture below uses a 2-of-2 multisig with two distinct pubkeys
+    -- (sk=0x02 — the segwit-section's xkey/pubKey — and sk=0x09).  Each
+    -- regression seeds 'piPartialSigs' in REVERSE pubkey order so the
+    -- ordering helper is exercised: the assembled scriptSig / witness
+    -- stack must list sigs in script-pubkey (redeem) order.
+    --
+    -- Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature →
+    -- TxoutType::MULTISIG branch.
+    let testSk2   = SecKey (BS.replicate 32 0x09)
+        pubKey2   = derivePubKeyFromPrivate testSk2
+        pubKeyBS2 = serializePubKeyCompressed pubKey2
+        -- 2-of-2 multisig: OP_2 <pk1> <pk2> OP_2 OP_CHECKMULTISIG.
+        -- pubKeyBS = sk=0x02 (pk1, the W41 single-sig pubkey),
+        -- pubKeyBS2 = sk=0x09 (pk2).  We pin the order in the redeem
+        -- script and verify the finalizer respects it.
+        msRedeem  = BS.concat
+          [ BS.singleton 0x52                        -- OP_2 (m)
+          , BS.cons 0x21 pubKeyBS                    -- push pk1 (33 bytes)
+          , BS.cons 0x21 pubKeyBS2                   -- push pk2 (33 bytes)
+          , BS.singleton 0x52                        -- OP_2 (n)
+          , BS.singleton 0xae                        -- OP_CHECKMULTISIG
+          ]
+        Hash160 msRedeemH = hash160 msRedeem
+        msP2shSpk = BS.pack [0xa9, 0x14] <> msRedeemH <> BS.pack [0x87]
+        msWsh     = sha256 msRedeem                  -- 32-byte sha256
+        msP2wshSpk = BS.pack [0x00, 0x20] <> msWsh
+        -- P2SH-P2WSH wrapper: outer scriptPubKey is P2SH whose
+        -- redeemScript is the P2WSH program (OP_0 0x20 <wsh>).
+        Hash160 msInnerH = hash160 msP2wshSpk
+        msP2shP2wshSpk = BS.pack [0xa9, 0x14] <> msInnerH <> BS.pack [0x87]
+        -- Throwaway "looks like a sig" payloads.  We exercise the
+        -- finalizer's assembly logic, not the on-chain interpreter,
+        -- so any DER||sighash-byte blob suffices and we don't need
+        -- libsecp here.  Make them clearly distinguishable so the
+        -- ordering assertion is unambiguous.
+        sigA      = BS.replicate 71 0xaa `BS.snoc` 0x01    -- belongs to pk1
+        sigB      = BS.replicate 71 0xbb `BS.snoc` 0x01    -- belongs to pk2
+        -- IMPORTANT: insert in REVERSE pubkey order — pk2 first, pk1 second.
+        -- Map.fromList sorts by key (PubKey Ord), but the finalizer must
+        -- not rely on Map iteration order; the assembled order must
+        -- mirror the redeemScript pubkey order regardless of insert order.
+        partialSigsRev = Map.fromList
+          [ (pubKey2, sigB)
+          , (pubKey,  sigA)
+          ]
+
+    it "W46: legacy P2SH-multisig finalizes in script-pubkey order" $ do
+      let tx       = unsignedTx
+          inp0     = emptyPsbtInput
+            { piWitnessUtxo  = Just (TxOut prevValue msP2shSpk)
+            , piRedeemScript = Just msRedeem
+            , piPartialSigs  = partialSigsRev
+            , piSighashType  = Just 0x01
+            }
+          psbt     = (emptyPsbt tx) { psbtInputs = [inp0] }
+      case finalizePsbt psbt of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- Expected scriptSig: OP_0 <sigA> <sigB> PUSH(redeemScript).
+            let expected = BS.concat
+                  [ BS.singleton 0x00                -- OP_0 dummy
+                  , BS.cons (fromIntegral (BS.length sigA)) sigA
+                  , BS.cons (fromIntegral (BS.length sigB)) sigB
+                  , BS.cons (fromIntegral (BS.length msRedeem)) msRedeem
+                  ]
+            txInScript (head (txInputs finalTx)) `shouldBe` expected
+            -- Native P2SH spends: empty witness for this input.
+            head (txWitness finalTx) `shouldBe` []
+
+    it "W46: native P2WSH-multisig finalizes in script-pubkey order" $ do
+      let tx       = unsignedTx
+          inp0     = emptyPsbtInput
+            { piWitnessUtxo   = Just (TxOut prevValue msP2wshSpk)
+            , piWitnessScript = Just msRedeem
+            , piPartialSigs   = partialSigsRev
+            , piSighashType   = Just 0x01
+            }
+          psbt     = (emptyPsbt tx) { psbtInputs = [inp0] }
+      case finalizePsbt psbt of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- BIP-141 P2WSH multisig stack: [<empty>, sigA, sigB, witnessScript].
+            txInScript (head (txInputs finalTx)) `shouldBe` BS.empty
+            head (txWitness finalTx) `shouldBe`
+              [BS.empty, sigA, sigB, msRedeem]
+
+    it "W46: P2SH-P2WSH-multisig finalizes (outer scriptSig + inner witness)" $ do
+      let tx       = unsignedTx
+          inp0     = emptyPsbtInput
+            { piWitnessUtxo   = Just (TxOut prevValue msP2shP2wshSpk)
+            , piRedeemScript  = Just msP2wshSpk      -- inner OP_0 0x20 <wsh>
+            , piWitnessScript = Just msRedeem
+            , piPartialSigs   = partialSigsRev
+            , piSighashType   = Just 0x01
+            }
+          psbt     = (emptyPsbt tx) { psbtInputs = [inp0] }
+      case finalizePsbt psbt of
+        Left e   -> expectationFailure ("finalizePsbt: " ++ e)
+        Right fp -> case extractTransaction fp of
+          Left e -> expectationFailure ("extractTransaction: " ++ e)
+          Right finalTx -> do
+            -- Outer: scriptSig = PUSH(redeemScript = P2WSH program).
+            let ssExpected = BS.cons (fromIntegral (BS.length msP2wshSpk)) msP2wshSpk
+            txInScript (head (txInputs finalTx)) `shouldBe` ssExpected
+            -- Inner: same witness as bare P2WSH multisig.
+            head (txWitness finalTx) `shouldBe`
+              [BS.empty, sigA, sigB, msRedeem]
+
   -- Phase 5 of the haskoin ECDSA wiring plan
   -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
   -- BIP-340 / BIP-341 sign-side primitives.  These tests exercise the
