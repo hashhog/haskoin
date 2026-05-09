@@ -3065,10 +3065,11 @@ psbtSpkEnc net script =
        pair "type" (text typeStr)
 
 -- | Build a PSBT tx-level vin Encoding entry.
--- Emits { "txid", "vout", "scriptSig": {"asm","hex"}, "sequence" }.
+-- Emits { "txid", "vout", "scriptSig": {"asm","hex"}, "txinwitness"?, "sequence" }.
 -- Reference: bitcoin-core/src/core_io.cpp TxToUniv.
-psbtVinEnc :: TxIn -> AE.Encoding
-psbtVinEnc inp =
+-- The witness stack (second element of the pair) is emitted only when non-empty.
+psbtVinEnc :: (TxIn, [ByteString]) -> AE.Encoding
+psbtVinEnc (inp, witness) =
   let txidHex = showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp))))
       vout    = outPointIndex (txInPrevOutput inp)
       sig     = txInScript inp
@@ -3079,6 +3080,8 @@ psbtVinEnc inp =
        pair "txid"      (text txidHex) <>
        pair "vout"      (AE.word32 vout) <>
        pair "scriptSig" (pairs (pair "asm" (text asmStr) <> pair "hex" (text hexStr))) <>
+       ( if null witness then mempty
+         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) ) <>
        pair "sequence"  (AE.word32 seqNum)
 
 -- | Build a PSBT tx-level vout Encoding entry.
@@ -3112,8 +3115,11 @@ psbtTxEnc net tx =
        pair "vsize"    (AE.int vsize) <>
        pair "weight"   (AE.int wt) <>
        pair "locktime" (AE.word32 (txLockTime tx)) <>
-       pair "vin"      (AE.list id (map psbtVinEnc (txInputs tx))) <>
+       pair "vin"      (AE.list id (map psbtVinEnc (zip (txInputs tx) witnesses))) <>
        pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx)))
+  where
+    -- Pad witness list with empty stacks so every input has one.
+    witnesses = txWitness tx ++ repeat []
 
 -- | Decode a PSBT and return detailed information.
 -- Reference: Bitcoin Core's decodepsbt RPC
@@ -3199,8 +3205,9 @@ psbtToEncoding net psbt =
            else pair "bip32_derivs"
                   (AE.list id (map bip32DerivEnc (Map.toList (piBip32Derivation inp)))) ) <>
          ( case piFinalScriptSig inp of
-             Just fs -> pair "final_scriptsig"
-                          (pairs (pair "hex" (text (TE.decodeUtf8 (B16.encode fs)))))
+             Just fs -> pair "final_scriptSig"
+                          (pairs (pair "asm" (text (scriptToAsmSighashDecode fs)) <>
+                                  pair "hex" (text (TE.decodeUtf8 (B16.encode fs)))))
              Nothing -> mempty ) <>
          ( case piFinalScriptWitness inp of
              Just fw -> pair "final_scriptwitness"
@@ -3230,8 +3237,17 @@ psbtToEncoding net psbt =
       pair "signature" (text (TE.decodeUtf8 (B16.encode sig)))
 
     scriptEncObj :: ByteString -> AE.Encoding
-    scriptEncObj s = pairs $
-      pair "hex" (text (TE.decodeUtf8 (B16.encode s)))
+    scriptEncObj s =
+      let asmStr  = scriptToAsm s
+          hexStr  = TE.decodeUtf8 (B16.encode s)
+          sType   = case decodeScript s of
+                      Right scr -> classifyOutput scr
+                      Left _    -> NonStandard
+          typeStr = scriptTypeToString sType
+      in pairs $
+           pair "asm"  (text asmStr) <>
+           pair "hex"  (text hexStr) <>
+           pair "type" (text typeStr)
 
     bip32DerivEnc :: (PubKey, KeyPath) -> AE.Encoding
     bip32DerivEnc (pk, kp) = pairs $
@@ -3256,6 +3272,70 @@ psbtToEncoding net psbt =
     sighashToText 0x82 = "NONE|ANYONECANPAY"
     sighashToText 0x83 = "SINGLE|ANYONECANPAY"
     sighashToText n    = T.pack $ printf "0x%02x" n
+
+    -- | Check whether a byte string looks like a valid DER-encoded signature
+    -- (including the trailing sighash byte).  Mirrors
+    -- bitcoin-core/src/script/interpreter.cpp IsValidSignatureEncoding.
+    -- Used by scriptToAsmSighashDecode to decide whether to strip the last
+    -- byte and append "[ALL]" / "[SINGLE]" etc.
+    isValidDerSigEncoding :: ByteString -> Bool
+    isValidDerSigEncoding vch
+      | n < 9 || n > 73               = False
+      | BS.index vch 0 /= 0x30        = False
+      | BS.index vch 1 /= fromIntegral (n - 3) = False
+      | BS.index vch 2 /= 0x02        = False
+      | lenR == 0                      = False
+      | 5 + lenR >= n                  = False  -- ensures index safety
+      | BS.index vch 4 .&. 0x80 /= 0  = False  -- R must not be negative
+      | lenR > 1 && BS.index vch 4 == 0x00 &&
+        BS.index vch 5 .&. 0x80 == 0  = False  -- R no excess zero padding
+      | BS.index vch (lenR + 4) /= 0x02 = False
+      | lenS == 0                      = False
+      | BS.index vch (lenR + 6) .&. 0x80 /= 0 = False  -- S must not be negative
+      | lenS > 1 && BS.index vch (lenR + 6) == 0x00 &&
+        BS.index vch (lenR + 7) .&. 0x80 == 0 = False  -- S no excess zero padding
+      | lenR + lenS + 7 /= n          = False
+      | otherwise                      = True
+      where
+        n    = BS.length vch
+        lenR = fromIntegral (BS.index vch 3)
+        lenS = fromIntegral (BS.index vch (lenR + 5))
+
+    -- | Disassemble a script with sighash-type decoding enabled.
+    -- Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr(..., fAttemptSighashDecode=true).
+    --
+    -- For every OP_PUSHDATA operand whose length > 4:
+    --   1. If isValidDerSigEncoding passes, strip the last byte (the sighash
+    --      byte), look it up in sighashToText, and append "[TYPE]" suffix if
+    --      the label is non-empty (i.e. a known sighash type).
+    --   2. Emit the remaining bytes as lowercase hex + optional suffix.
+    -- Operands of length <= 4 are emitted as plain hex (same as non-decode path).
+    -- Non-push opcodes delegate to scriptToAsm via single-op re-encode.
+    scriptToAsmSighashDecode :: ByteString -> Text
+    scriptToAsmSighashDecode scriptBytes =
+      case decodeScript scriptBytes of
+        Left _             -> scriptToAsm scriptBytes  -- fall back on parse error
+        Right (Script ops) -> T.intercalate " " (map opToAsmSH ops)
+      where
+        opToAsmSH :: ScriptOp -> Text
+        opToAsmSH (OP_PUSHDATA bs _)
+          | BS.length bs > 4 =
+              let shByte  = BS.last bs
+                  payload = BS.init bs
+                  label   = sighashToText (fromIntegral shByte)
+                  suffix  = if T.null label || not (isValidDerSigEncoding bs)
+                              then ""
+                              else "[" <> label <> "]"
+                  hexPart = if T.null suffix
+                              then TE.decodeUtf8 (B16.encode bs)
+                              else TE.decodeUtf8 (B16.encode payload)
+              in hexPart <> suffix
+          | otherwise =
+              -- Small push (1-4 bytes): emit as hex (same as scriptToAsm)
+              TE.decodeUtf8 (B16.encode bs)
+        opToAsmSH op =
+          -- Non-push opcodes: re-encode as single-op script and call scriptToAsm.
+          scriptToAsm (encodeScriptOps [op])
 
 -- | Legacy psbtToJSON: kept for use by analyzepsbt and other callers that
 -- build Value-based responses and do not need byte-exact BTC formatting.

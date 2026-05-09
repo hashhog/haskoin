@@ -4210,8 +4210,11 @@ isPsbtFinalized psbt = all isInputFinalized (psbtInputs psbt)
 -- Requires UTXO information for all inputs.
 getPsbtFee :: Psbt -> Maybe Word64
 getPsbtFee psbt = do
-  -- Sum input values
-  inputValues <- mapM getInputValue (psbtInputs psbt)
+  -- Sum input values; pair each PSBT input with its tx input's outpoint so
+  -- that getInputUtxoFor can index into non_witness_utxo when needed.
+  let txIns   = txInputs (pgTx (psbtGlobal psbt))
+      inPairs = zip txIns (psbtInputs psbt)
+  inputValues <- mapM getInputValue inPairs
   let totalIn = sum inputValues
   -- Sum output values
   let totalOut = sum $ map txOutValue (txOutputs $ pgTx $ psbtGlobal psbt)
@@ -4220,8 +4223,9 @@ getPsbtFee psbt = do
     then Just (totalIn - totalOut)
     else Nothing
   where
-    getInputValue :: PsbtInput -> Maybe Word64
-    getInputValue pinp = txOutValue <$> getInputUtxo pinp
+    getInputValue :: (TxIn, PsbtInput) -> Maybe Word64
+    getInputValue (txIn, pinp) =
+      txOutValue <$> getInputUtxoFor (txInPrevOutput txIn) pinp
 
 --------------------------------------------------------------------------------
 -- Output Descriptors (BIP-380-386)
