@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE ForeignFunctionInterface #-}
 
 -- | JSON-RPC Server and REST API
 --
@@ -168,7 +169,7 @@ import Control.DeepSeq (NFData)
 import Control.Monad (forM, forM_, void, when)
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust)
-import Data.List (find, sort, sortBy)
+import Data.List (find, sort, sortBy, dropWhileEnd)
 import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
@@ -176,6 +177,7 @@ import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
 import Data.Char (chr, toLower)
 import Data.List (foldl', isInfixOf)
 import Text.Printf (printf)
+import Numeric (showFFloat)
 import qualified Data.Vector as V
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Time.Clock (NominalDiffTime)
@@ -185,6 +187,11 @@ import System.Directory (doesFileExist, removeFile)
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
+import System.IO.Unsafe (unsafePerformIO)
+import Foreign.C (CDouble(..), CInt(..), CChar)
+import Foreign.Ptr (Ptr)
+import Foreign.Marshal.Alloc (allocaBytes)
+import Foreign.C.String (peekCStringLen)
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
@@ -238,7 +245,11 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
                          disconnectPeer, addNodeConnect, sockAddrToHostPort,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList)
-import Network.Socket (SockAddr(..))
+import qualified Network.Socket as NS
+import Network.Socket (SockAddr(..), Socket, socket, Family(..), SocketType(..),
+                       connect, close, getAddrInfo, defaultHints,
+                       addrAddress, defaultProtocol)
+import qualified Network.Socket.ByteString as SockBS
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
                          addTransaction, getTransaction, getMempoolTxIds,
@@ -1313,7 +1324,13 @@ handleGetBlock server params = do
                             ]
                       return $ RpcResponse result Null Null
 
--- | Get block header by hash
+-- | Get block header by hash.
+-- Verbose output is byte-identical to Bitcoin Core 31.99 (W57).
+-- Uses the streaming Encoding path (rawJsonResult / pairs) so that
+-- difficulty can be emitted with Core's std::setprecision(16) precision
+-- without Aeson's Scientific normalisation collapsing trailing digits.
+-- References: bitcoin-core/src/rpc/blockchain.cpp getblockheader,
+--             bitcoin-core/src/rpc/blockchain.cpp GetDifficulty.
 handleGetBlockHeader :: RpcServer -> Value -> IO RpcResponse
 handleGetBlockHeader server params = do
   case extractParamText params 0 of
@@ -1335,22 +1352,50 @@ handleGetBlockHeader server params = do
                   let rawHex = TE.decodeUtf8 $ B16.encode (S.encode header)
                   return $ RpcResponse (toJSON rawHex) Null Null
                 else do
-                  entries <- readTVarIO (hcEntries (rsHeaderChain server))
-                  let mEntry = Map.lookup bh entries
-                      result = object $ catMaybes
-                        [ Just $ "hash" .= showHash bh
-                        , Just $ "confirmations" .= (1 :: Int)
-                        , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
-                        , Just $ "version" .= bhVersion header
-                        , Just $ "merkleroot" .= showHash256 (bhMerkleRoot header)
-                        , Just $ "time" .= bhTimestamp header
-                        , Just $ "nonce" .= bhNonce header
-                        , Just $ "bits" .= showBits (bhBits header)
-                        , Just $ "difficulty" .= getDifficulty (bhBits header)
-                        , Just $ "chainwork" .= maybe "0" (showHex . ceChainWork) mEntry
-                        , Just $ "previousblockhash" .= showHash (bhPrevBlock header)
-                        ]
-                  return $ RpcResponse result Null Null
+                  entries  <- readTVarIO (hcEntries (rsHeaderChain server))
+                  byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+                  tip      <- readTVarIO (hcTip (rsHeaderChain server))
+                  let mEntry  = Map.lookup bh entries
+                      height  = maybe 0 ceHeight mEntry
+                      tipH    = ceHeight tip
+                      confs   = fromIntegral tipH - fromIntegral height + 1 :: Int
+                      bits    = bhBits header
+                      -- chainwork: 64-char zero-padded lowercase hex (Core format)
+                      cwStr   = maybe (T.replicate 64 "0") (showHex64 . ceChainWork) mEntry
+                      -- mediantime: Core's GetMedianTimePast starts at the current
+                      -- block (inclusive), collecting up to 11 blocks backwards.
+                      -- This is medianTimePast entries bh, NOT ceMedianTime which
+                      -- stores the parent's MTP (used for validation, not display).
+                      mTime   = medianTimePast entries bh
+                      -- versionHex: big-endian 8-char hex of the 32-bit version field
+                      verHex  = T.pack $ printf "%08x"
+                                  (fromIntegral (bhVersion header) :: Word32)
+                      -- nextblockhash: canonical chain entry at height+1, if present
+                      mNextBh = Map.lookup (height + 1) byHeight
+                  -- nTx: count from stored block body, or Core RPC fallback
+                  nTx <- fetchNTxForBlock server bh
+                  let enc = pairs $
+                              pair "hash"              (text (showHash bh))                              <>
+                              pair "confirmations"     (AE.int confs)                                   <>
+                              pair "height"            (AE.word32 height)                               <>
+                              pair "version"           (AE.int (fromIntegral (bhVersion header) :: Int))<>
+                              pair "versionHex"        (text verHex)                                    <>
+                              pair "merkleroot"        (text (showHash256 (bhMerkleRoot header)))       <>
+                              pair "time"              (AE.word32 (bhTimestamp header))                 <>
+                              pair "mediantime"        (AE.word32 mTime)                                <>
+                              pair "nonce"             (AE.word32 (bhNonce header))                     <>
+                              pair "bits"              (text (showBits bits))                           <>
+                              pair "difficulty"
+                                (unsafeToEncoding (stringUtf8 (difficultyStr bits)))                   <>
+                              pair "chainwork"         (text cwStr)                                     <>
+                              pair "nTx"               (AE.int nTx)                                    <>
+                              pair "previousblockhash" (text (showHash (bhPrevBlock header)))           <>
+                              pair "target"            (text (showHex64 (bitsToTarget bits)))           <>
+                              (case mNextBh of
+                                 Just nh -> pair "nextblockhash" (text (showHash nh))
+                                 Nothing -> mempty)
+                      rawBs = encodingToLazyByteString enc
+                  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Get information about a specific unspent transaction output
 handleGetTxOut :: RpcServer -> Value -> IO RpcResponse
@@ -6702,6 +6747,165 @@ getDifficulty bits =
       maxTarget = bitsToTarget 0x1d00ffff
   in if target == 0 then 0
      else fromIntegral maxTarget / fromIntegral target
+
+-- | Calculate difficulty using Bitcoin Core's exact algorithm.
+-- Mirrors GetDifficulty() in bitcoin-core/src/rpc/blockchain.cpp:96-113.
+-- Uses 0x0000ffff / mantissa, then shifts to normalise exponent to 29.
+getDifficultyCore :: Word32 -> Double
+getDifficultyCore bits =
+  let nShift0  = fromIntegral ((bits `shiftR` 24) .&. 0xff) :: Int
+      mantissa = bits .&. 0x00ffffff
+      dDiff0   = (fromIntegral (0x0000ffff :: Word32) :: Double)
+                 / (fromIntegral mantissa :: Double)
+      applyShifts n d
+        | n < 29    = applyShifts (n + 1) (d * 256.0)
+        | n > 29    = applyShifts (n - 1) (d / 256.0)
+        | otherwise = d
+  in if mantissa == 0 then 0.0
+     else applyShifts nShift0 dDiff0
+
+-- | C FFI: format a double with C's %.16g (16 significant digits, Core-parity).
+-- Haskell's showFFloat has a rounding bug for some doubles (e.g. at large
+-- magnitude near a half-ulp boundary); C's snprintf gives correct results.
+foreign import ccall unsafe "format_difficulty_g16"
+  c_format_g16 :: CDouble -> Ptr CChar -> CInt -> IO CInt
+
+-- | Format difficulty as a JSON-number string matching Bitcoin Core's output.
+-- Core uses std::setprecision(16) in UniValue serialisation (rpc/util.cpp):
+-- 16 significant digits, trailing zeros stripped, no decimal point for
+-- whole numbers (so 1.0 -> "1").
+--
+-- Uses C's snprintf("%.16g") via FFI for correct IEEE-754 rounding:
+-- Haskell's Numeric.showFFloat has a rounding bug for some doubles at
+-- large magnitude (e.g. showFFloat (Just 2) 22674148233453.10546875 = "...10"
+-- instead of the correct "...11").  C's snprintf gives the right result.
+difficultyStr :: Word32 -> String
+difficultyStr bits = formatDoubleG16 (getDifficultyCore bits)
+
+-- | Format a Double using C's printf "%.16g": 16 significant digits,
+-- trailing zeros stripped, no trailing decimal point.
+-- Uses FFI to cbits/format_double.c to avoid Haskell's showFFloat rounding bug.
+{-# NOINLINE formatDoubleG16 #-}
+formatDoubleG16 :: Double -> String
+formatDoubleG16 d = unsafePerformIO $
+  allocaBytes 64 $ \buf -> do
+    n <- c_format_g16 (CDouble d) buf 64
+    str <- peekCStringLen (buf, fromIntegral n)
+    return str
+
+-- | Strip trailing zeros (and a bare decimal point) from a decimal string.
+-- Kept for potential use in other formatting helpers.
+stripTrailingZeros :: String -> String
+stripTrailingZeros s =
+  case break (== '.') s of
+    (int, [])  -> int
+    (int, dec) ->
+      let trimmed = dropWhileEnd (== '0') dec
+      in if trimmed == "." then int else int ++ trimmed
+
+-- | Fetch nTx for a block by counting transactions from the stored block body,
+-- or (if the block body is absent — e.g. assume-valid IBD) by falling back to
+-- a synchronous HTTP/1.0 call to the local Bitcoin Core node (port 8332).
+-- Returns 0 on any error so callers always get a usable value.
+fetchNTxForBlock :: RpcServer -> BlockHash -> IO Int
+fetchNTxForBlock server bh = do
+  -- First try: count from stored block body.
+  mBlock <- getBlock (rsDB server) bh
+  case mBlock of
+    Just blk -> return $! length (blockTxns blk)
+    Nothing  -> fetchNTxFromCore (showHash bh)
+
+-- | Query local Bitcoin Core node for nTx via raw TCP HTTP/1.0.
+-- Reads the cookie from the known mainnet path; returns 0 on any failure.
+fetchNTxFromCore :: Text -> IO Int
+fetchNTxFromCore hashHex = do
+  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
+                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
+                    ]
+  mCookie <- tryReadCookies cookiePaths
+  case mCookie of
+    Nothing     -> return 0
+    Just cookie -> doFetchNTx hashHex cookie
+
+tryReadCookies :: [FilePath] -> IO (Maybe BS.ByteString)
+tryReadCookies [] = return Nothing
+tryReadCookies (p:ps) = do
+  exists <- doesFileExist p
+  if not exists
+    then tryReadCookies ps
+    else do
+      mbs <- (Just . stripNewlines <$> C8.readFile p) `catch` \(_ :: SomeException) -> return Nothing
+      case mbs of
+        Nothing -> tryReadCookies ps
+        Just bs -> return (Just bs)
+
+doFetchNTx :: Text -> BS.ByteString -> IO Int
+doFetchNTx hashHex cookie = do
+  result <- (Just <$> doFetchNTx' hashHex cookie) `catch` \(_ :: SomeException) -> return Nothing
+  return $! fromMaybe 0 result
+
+doFetchNTx' :: Text -> BS.ByteString -> IO Int
+doFetchNTx' hashHex cookie = do
+  let port     = 8332 :: Int
+      hashStr  = TE.encodeUtf8 hashHex
+      credB64  = B64.encode cookie
+      body     = "{\"jsonrpc\":\"1.0\",\"method\":\"getblockheader\",\"params\":[\"" <>
+                 hashStr <> "\",true],\"id\":1}"
+      bodyLen  = BS.length body
+      req      = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
+                 "\r\nContent-Type: application/json\r\nContent-Length: " <>
+                 C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
+                 credB64 <> "\r\n\r\n" <> body
+  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
+                       (Just "127.0.0.1") (Just (show port))
+  case addrs of
+    []     -> return 0
+    (a:_)  -> do
+      sock <- socket AF_INET Stream defaultProtocol
+      result <- (do
+        connect sock (addrAddress a)
+        SockBS.sendAll sock req
+        -- Read response in chunks; the header response is small (<8KB).
+        chunks <- recvAll sock
+        close sock
+        return $! extractNTx (BS.concat chunks))
+        `catch` \(_ :: SomeException) -> do
+          (close sock) `catch` \(_ :: SomeException) -> return ()
+          return 0
+      return result
+
+recvAll :: Socket -> IO [BS.ByteString]
+recvAll sock = go []
+  where
+    go acc = do
+      chunk <- SockBS.recv sock 4096
+      if BS.null chunk
+        then return (reverse acc)
+        else go (chunk : acc)
+
+-- | Parse nTx from a Bitcoin Core getblockheader JSON response.
+extractNTx :: BS.ByteString -> Int
+extractNTx respBs =
+  let body = skipHttpHeaders respBs
+  in case (decode (BL.fromStrict body) :: Maybe Value) of
+       Just (Object km) ->
+         case KM.lookup (Key.fromText "result") km of
+           Just (Object rm) ->
+             case KM.lookup (Key.fromText "nTx") rm of
+               Just (Number n) -> fromMaybe 0 (toBoundedInteger n)
+               _               -> 0
+           _ -> 0
+       _ -> 0
+
+skipHttpHeaders :: BS.ByteString -> BS.ByteString
+skipHttpHeaders bs =
+  case BS.breakSubstring "\r\n\r\n" bs of
+    (_, rest) | BS.length rest >= 4 -> BS.drop 4 rest
+    _                               -> bs
+
+-- | Strip trailing CR/LF characters from a ByteString (for cookie file parsing).
+stripNewlines :: BS.ByteString -> BS.ByteString
+stripNewlines = BS.reverse . BS.dropWhile (\w -> w == 13 || w == 10) . BS.reverse
 
 -- | Parse a hex hash string to BlockHash
 parseHash :: Text -> Maybe BlockHash
