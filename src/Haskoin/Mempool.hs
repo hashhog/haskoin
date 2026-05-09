@@ -2888,6 +2888,5 @@ renderStdReason e = case e of
   Std.StdScriptSigNotPushOnly {} -> "scriptsig-not-pushonly"
   Std.StdScriptPubKey {}         -> "scriptpubkey"
   Std.StdDataCarrierTooLarge {}  -> "datacarrier"
-  Std.StdMultipleOpReturns {}    -> "multi-op-return"
   Std.StdBareMultisig            -> "bare-multisig"
   Std.StdDust {}                 -> "dust"

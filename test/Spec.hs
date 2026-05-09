@@ -13619,18 +13619,73 @@ main = hspec $ do
         other -> expectationFailure
           ("expected StdTxWeight, got " ++ show other)
 
-    it "rejects two OP_RETURN outputs" $ do
-      -- OP_RETURN <empty data>
-      let opReturn = BS.pack [0x6a]
+    -- W58-9 regression tests: OP_RETURN policy Core-parity
+    --
+    -- Bitcoin Core policy.cpp:137-155 uses a CUMULATIVE datacarrier_bytes_left
+    -- budget (= MAX_OP_RETURN_RELAY = 100_000).  Multiple OP_RETURN outputs
+    -- are allowed as long as sum(scriptPubKey.size()) <= budget.  There is NO
+    -- "multi-op-return" reject in Core.
+
+    it "accepts two small OP_RETURN outputs (Core: cumulative budget, no multi-op-return)" $ do
+      -- Two bare OP_RETURN scripts (1 byte each); combined = 2 bytes << 100_000 budget.
+      -- Bitcoin Core accepts this; haskoin previously rejected with the
+      -- (erroneous) StdMultipleOpReturns constructor.
+      let opReturn = BS.pack [0x6a]  -- bare OP_RETURN, 1 byte
           prev = TxId (Hash256 (BS.replicate 32 0x77))
-          tin = TxIn (OutPoint prev 0) "" 0xffffffff
-          tx = Tx 1 [tin]
-                  [TxOut 0 opReturn, TxOut 0 opReturn]
-                  [[]] 0
+          tin  = TxIn (OutPoint prev 0) (BS.replicate 32 0x51) 0xffffffff
+          tx   = Tx 1 [tin]
+                   [TxOut 0 opReturn, TxOut 0 opReturn]
+                   [[]] 0
+      Std.checkStandardTx tx `shouldBe` Right ()
+
+    it "rejects OP_RETURN with truncated push (6a09deadbeef → nonstandard scriptpubkey)" $ do
+      -- 0x6a 0x09 claims 9-byte push but only 4 bytes follow — parse fails.
+      -- Core: IsPushOnly() fails on truncated push → TxoutType::NONSTANDARD.
+      -- haskoin: decodeScript returns Left → isStandardScriptPubKey = Nothing
+      --          → StdScriptPubKey.
+      let truncatedOpReturn = BS.pack [0x6a, 0x09, 0xde, 0xad, 0xbe, 0xef]
+          prev = TxId (Hash256 (BS.replicate 32 0x78))
+          tin  = TxIn (OutPoint prev 0) (BS.replicate 32 0x51) 0xffffffff
+          tx   = Tx 1 [tin] [TxOut 0 truncatedOpReturn] [[]] 0
       case Std.checkStandardTx tx of
-        Left (Std.StdMultipleOpReturns 2) -> return ()
+        Left (Std.StdScriptPubKey _) -> return ()
         other -> expectationFailure
-          ("expected StdMultipleOpReturns, got " ++ show other)
+          ("expected StdScriptPubKey for truncated OP_RETURN, got " ++ show other)
+
+    it "accepts valid 4-byte OP_RETURN (6a04deadbeef)" $ do
+      -- 0x6a 0x04 <4 bytes> — well-formed push, 6 bytes total, within budget.
+      let validOpReturn = BS.pack [0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]
+          prev = TxId (Hash256 (BS.replicate 32 0x79))
+          tin  = TxIn (OutPoint prev 0) (BS.replicate 32 0x51) 0xffffffff
+          tx   = Tx 1 [tin] [TxOut 0 validOpReturn] [[]] 0
+      Std.checkStandardTx tx `shouldBe` Right ()
+
+    it "accepts large-but-valid OP_RETURN within MAX_OP_RETURN_RELAY budget" $ do
+      -- Build an OP_RETURN script with a 10_000-byte payload, well within the
+      -- 100_000-byte budget, and also well within the tx weight cap.
+      -- script = 0x6a + OP_PUSHDATA2 <2-byte LE len> <9997 bytes data>
+      -- = 1 + 1 + 2 + 9997 = 10_001 bytes.  Total tx weight ~ 40_000 < 400_000.
+      let dataSize = 9997
+          dataPart = BS.replicate dataSize 0xbb
+          -- OP_PUSHDATA2 = 0x4d, then 2-byte LE length
+          lo = fromIntegral (dataSize .&. 0xff)
+          hi = fromIntegral ((dataSize `div` 256) .&. 0xff)
+          bigOpReturn = BS.concat [BS.pack [0x6a, 0x4d, lo, hi], dataPart]
+          prev = TxId (Hash256 (BS.replicate 32 0x7a))
+          tin  = TxIn (OutPoint prev 0) (BS.replicate 32 0x51) 0xffffffff
+          tx   = Tx 1 [tin] [TxOut 0 bigOpReturn] [[]] 0
+      BS.length bigOpReturn `shouldBe` 10_001
+      Std.checkStandardTx tx `shouldBe` Right ()
+
+    it "exposes maxOpReturnRelay = 100_000 (Core MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / 4)" $
+      -- Core: static const unsigned int MAX_OP_RETURN_RELAY =
+      --         MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 400_000 / 4.
+      -- This is the cumulative per-tx OP_RETURN byte budget.  Note:
+      -- MAX_OP_RETURN_RELAY equals the maximum non-witness bytes in a standard
+      -- tx, so in practice the weight check (step 2) will fire before the
+      -- datacarrier budget check (step 5) for any non-witness tx that exceeds
+      -- the budget.  The budget logic is still correct and mirrors Core exactly.
+      Std.maxOpReturnRelay `shouldBe` 100_000
 
     it "exposes maxStandardTxWeight = 400_000" $
       Std.maxStandardTxWeight `shouldBe` 400_000
