@@ -168,7 +168,7 @@ import Control.DeepSeq (NFData)
 import Control.Monad (forM, forM_, void, when)
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust)
-import Data.List (find, sort)
+import Data.List (find, sort, sortBy)
 import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
@@ -3046,14 +3046,21 @@ psbtSpkEnc net script =
         OpReturn _  -> True
         NonStandard -> True
         _           -> False
-      -- BIP-380 descriptor: addr(<address>)#<csum> or raw(<hex>)#<csum>
-      descStr = case mAddress of
-        Just addr | not suppressAddr ->
-          fromMaybe ("addr(" <> addr <> ")") $
-            addDescriptorChecksum ("addr(" <> addr <> ")")
-        _ ->
-          fromMaybe ("raw(" <> hexStr <> ")") $
-            addDescriptorChecksum ("raw(" <> hexStr <> ")")
+      -- BIP-380 descriptor: rawtr(KEY)#csum for P2TR, addr(<address>)#<csum> or raw(<hex>)#<csum>
+      descStr = case scriptType of
+        P2TR (Hash256 h) ->
+          -- Core uses rawtr(X-ONLY-KEY)#CHECKSUM when spending data is unavailable.
+          -- Reference: bitcoin-core/src/script/descriptor.cpp InferDescriptor line 2796.
+          let xonlyHex = TE.decodeUtf8 (B16.encode h)
+              rawtrDesc = "rawtr(" <> xonlyHex <> ")"
+          in fromMaybe rawtrDesc (addDescriptorChecksum rawtrDesc)
+        _ -> case mAddress of
+          Just addr | not suppressAddr ->
+            fromMaybe ("addr(" <> addr <> ")") $
+              addDescriptorChecksum ("addr(" <> addr <> ")")
+          _ ->
+            fromMaybe ("raw(" <> hexStr <> ")") $
+              addDescriptorChecksum ("raw(" <> hexStr <> ")")
   in pairs $
        pair "asm"  (text asmStr) <>
        pair "desc" (text descStr) <>
@@ -3212,6 +3219,25 @@ psbtToEncoding net psbt =
          ( case piFinalScriptWitness inp of
              Just fw -> pair "final_scriptwitness"
                           (AE.list text (map (TE.decodeUtf8 . B16.encode) fw))
+             Nothing -> mempty ) <>
+         -- BIP-371 Taproot input fields (emitted only when non-empty)
+         ( case piTapKeySig inp of
+             Just sig -> pair "taproot_key_path_sig" (text (TE.decodeUtf8 (B16.encode sig)))
+             Nothing  -> mempty ) <>
+         ( if Map.null (piTapScriptSigs inp) then mempty
+           else pair "taproot_script_path_sigs"
+                  (AE.list id (map tapScriptSigEnc (Map.toAscList (piTapScriptSigs inp)))) ) <>
+         ( if Map.null (piTapLeafScripts inp) then mempty
+           else pair "taproot_scripts"
+                  (AE.list id (map tapLeafScriptEnc (Map.toAscList (piTapLeafScripts inp)))) ) <>
+         ( if Map.null (piTapBip32Derivation inp) then mempty
+           else pair "taproot_bip32_derivs"
+                  (AE.list id (map tapBip32Enc (Map.toAscList (piTapBip32Derivation inp)))) ) <>
+         ( case piTapInternalKey inp of
+             Just k  -> pair "taproot_internal_key" (text (TE.decodeUtf8 (B16.encode k)))
+             Nothing -> mempty ) <>
+         ( case piTapMerkleRoot inp of
+             Just r  -> pair "taproot_merkle_root" (text (TE.decodeUtf8 (B16.encode r)))
              Nothing -> mempty )
 
     psbtOutputEnc :: PsbtOutput -> AE.Encoding
@@ -3224,7 +3250,20 @@ psbtToEncoding net psbt =
              Nothing -> mempty ) <>
          ( if Map.null (poBip32Derivation out) then mempty
            else pair "bip32_derivs"
-                  (AE.list id (map bip32DerivEnc (Map.toList (poBip32Derivation out)))) )
+                  (AE.list id (map bip32DerivEnc (Map.toList (poBip32Derivation out)))) ) <>
+         -- BIP-371 Taproot output fields
+         ( case poTapInternalKey out of
+             Just k  -> pair "taproot_internal_key" (text (TE.decodeUtf8 (B16.encode k)))
+             Nothing -> mempty ) <>
+         ( if null (poTapTree out) then mempty
+           else pair "taproot_tree"
+                  (AE.list id (map tapTreeElemEnc (poTapTree out))) ) <>
+         ( if Map.null (poTapBip32Derivation out) then mempty
+           else pair "taproot_bip32_derivs"
+                  (AE.list id (map tapBip32Enc (Map.toAscList (poTapBip32Derivation out)))) ) <>
+         ( if Map.null (poMuSig2Participants out) then mempty
+           else pair "musig2_participant_pubkeys"
+                  (AE.list id (map muSig2Enc (Map.toAscList (poMuSig2Participants out)))) )
 
     utxoEnc :: TxOut -> AE.Encoding
     utxoEnc txout = pairs $
@@ -3255,13 +3294,54 @@ psbtToEncoding net psbt =
       pair "master_fingerprint"   (text (T.pack (printf "%08x" (kpFingerprint kp)))) <>
       pair "path"                 (text (encKeyPath kp))
 
+    -- | Encode a BIP-371 taproot_script_path_sigs entry.
+    -- Core key: xonly(32) + leaf_hash(32); Core emits pubkey, leaf_hash, sig.
+    tapScriptSigEnc :: ((ByteString, ByteString), ByteString) -> AE.Encoding
+    tapScriptSigEnc ((xonly, leafHash), sig) = pairs $
+      pair "pubkey"    (text (TE.decodeUtf8 (B16.encode xonly))) <>
+      pair "leaf_hash" (text (TE.decodeUtf8 (B16.encode leafHash))) <>
+      pair "sig"       (text (TE.decodeUtf8 (B16.encode sig)))
+
+    -- | Encode a BIP-371 taproot_scripts entry.
+    -- Core: { script, leaf_ver, control_blocks[] }.
+    -- m_tap_scripts is std::map<pair<script,leaf_ver>, set<control_block>>.
+    tapLeafScriptEnc :: ((ByteString, Int), Set.Set ByteString) -> AE.Encoding
+    tapLeafScriptEnc ((script, leafVer), cbs) = pairs $
+      pair "script"         (text (TE.decodeUtf8 (B16.encode script))) <>
+      pair "leaf_ver"       (AE.int leafVer) <>
+      pair "control_blocks" (AE.list (text . TE.decodeUtf8 . B16.encode) (Set.toAscList cbs))
+
+    -- | Encode a BIP-371 taproot_bip32_derivs entry (input or output side).
+    -- Core: xonly pubkey, master_fingerprint, path, leaf_hashes[].
+    -- Core stores in std::map<XOnlyPubKey,...> which is lex order by xonly bytes.
+    tapBip32Enc :: (ByteString, (Set.Set ByteString, KeyPath)) -> AE.Encoding
+    tapBip32Enc (xonly, (leafHashes, kp)) = pairs $
+      pair "pubkey"             (text (TE.decodeUtf8 (B16.encode xonly))) <>
+      pair "master_fingerprint" (text (T.pack (printf "%08x" (kpFingerprint kp)))) <>
+      pair "path"               (text (encKeyPath kp)) <>
+      pair "leaf_hashes"        (AE.list (text . TE.decodeUtf8 . B16.encode) (Set.toAscList leafHashes))
+
+    -- | Encode a BIP-371 PSBT_OUT_TAP_TREE element.
+    tapTreeElemEnc :: (Word8, Word8, ByteString) -> AE.Encoding
+    tapTreeElemEnc (depth, leafVer, script) = pairs $
+      pair "depth"    (AE.int (fromIntegral depth :: Int)) <>
+      pair "leaf_ver" (AE.int (fromIntegral leafVer :: Int)) <>
+      pair "script"   (text (TE.decodeUtf8 (B16.encode script)))
+
+    -- | Encode a BIP-371 musig2_participant_pubkeys entry (output side).
+    -- Core sorts by aggregate_pubkey (std::map<CPubKey,...> lex order).
+    muSig2Enc :: (ByteString, [ByteString]) -> AE.Encoding
+    muSig2Enc (aggKey, parts) = pairs $
+      pair "aggregate_pubkey"   (text (TE.decodeUtf8 (B16.encode aggKey))) <>
+      pair "participant_pubkeys" (AE.list (text . TE.decodeUtf8 . B16.encode) parts)
+
     encKeyPath :: KeyPath -> Text
     encKeyPath kp =
       T.intercalate "/" ("m" : map encIndex (kpPath kp))
 
     encIndex :: Word32 -> Text
     encIndex idx
-      | idx >= 0x80000000 = T.pack (show (idx .&. 0x7fffffff)) <> "'"
+      | idx >= 0x80000000 = T.pack (show (idx .&. 0x7fffffff)) <> "h"
       | otherwise = T.pack (show idx)
 
     sighashToText :: Word32 -> Text
