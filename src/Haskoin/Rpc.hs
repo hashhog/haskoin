@@ -129,6 +129,10 @@ module Haskoin.Rpc
 
 import Data.Aeson
 import Data.Aeson.Types (Parser, Result(..))
+import Data.Aeson.Encoding (unsafeToEncoding, pairs, encodingToLazyByteString,
+                             text, pair, list, int, null_, word32)
+import qualified Data.Aeson.Encoding as AE
+import Data.ByteString.Builder (stringUtf8, lazyByteString)
 import Data.Scientific (toBoundedInteger)
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
@@ -427,6 +431,22 @@ instance ToJSON RpcResponse where
     , "error"  .= resError
     , "id"     .= resId
     ]
+  -- Override toEncoding so that encode :: RpcResponse -> LBS uses raw bytes
+  -- when resResult is a sentinel-wrapped pre-encoded JSON blob.
+  -- The sentinel is a String value starting with rawResultMagic; the
+  -- payload after the prefix is the pre-encoded JSON, UTF-8 decoded from
+  -- the original ByteString (valid for all well-formed JSON output since
+  -- JSON is ASCII-clean except for escaped strings).
+  toEncoding RpcResponse{..} =
+    pairs $
+      AE.pair "result" (encodeResult resResult) <>
+      AE.pair "error"  (toEncoding resError) <>
+      AE.pair "id"     (toEncoding resId)
+    where
+      encodeResult (String t) | T.isPrefixOf rawResultMagic t =
+        let payload = T.drop (T.length rawResultMagic) t
+        in unsafeToEncoding (lazyByteString (BL.fromStrict (TE.encodeUtf8 payload)))
+      encodeResult v = toEncoding v
 
 -- | JSON-RPC error
 data RpcError = RpcError
@@ -2972,6 +2992,129 @@ parseOutputs = fmap concat . mapM parseOneOutput
       | otherwise = bs
       where len = BS.length bs
 
+-- | Magic prefix for pre-encoded JSON blobs stored in resResult.
+-- When toEncoding (RpcResponse) encounters a String value starting with this
+-- prefix, it strips the prefix and emits the remainder as raw (unquoted) JSON
+-- bytes, bypassing Aeson's Value round-trip which would normalise Scientific
+-- numbers (e.g. collapsing 1.00000000 → 1.0).
+-- Reference: W52 decodepsbt byte-identity fix.
+rawResultMagic :: T.Text
+rawResultMagic = "__RAWJSON__:"
+
+-- | Wrap pre-encoded JSON bytes as a sentinel Value for RpcResponse.resResult.
+-- The bytes must be a valid JSON value (object, array, string, number, …).
+-- toEncoding (RpcResponse) recognises this sentinel and emits the payload
+-- verbatim into the output stream.
+rawJsonResult :: BL.ByteString -> Value
+rawJsonResult bs = String (rawResultMagic <> TE.decodeUtf8 (BL.toStrict bs))
+
+-- | Format satoshis as Bitcoin Core's ValueFromAmount (core_io.cpp:285):
+-- "%s%d.%08d" — always 8 fractional digits, no scientific notation.
+-- Reference: bitcoin-core/src/core_io.cpp ValueFromAmount.
+formatBtcSats :: Int64 -> String
+formatBtcSats sats =
+  let neg     = sats < 0
+      absSats = if neg then -sats else sats
+      whole   = absSats `div` 100_000_000
+      frac    = absSats `mod` 100_000_000
+      sign    = if neg then "-" else ""
+      fracStr = replicate (8 - length (show frac)) '0' ++ show frac
+  in sign ++ show whole ++ "." ++ fracStr
+
+-- | Aeson Encoding for a satoshi amount in Core's fixed-decimal form.
+-- Emits raw bytes (e.g. 1.00000000, 0.99999699) — NOT quoted.
+btcAmountEnc :: Int64 -> AE.Encoding
+btcAmountEnc sats = unsafeToEncoding (stringUtf8 (formatBtcSats sats))
+
+-- | Build a Core-parity scriptPubKey Encoding object:
+-- { "asm": "...", "desc": "...", "hex": "...", "address": "...", "type": "..." }
+-- "address" is suppressed for pubkey/multisig/nulldata/nonstandard (Core rule).
+-- Reference: bitcoin-core/src/core_io.cpp ScriptPubKeyToUniv.
+psbtSpkEnc :: Network -> ByteString -> AE.Encoding
+psbtSpkEnc net script =
+  let scriptType = case decodeScript script of
+        Right s -> classifyOutput s
+        Left _  -> NonStandard
+      typeStr  = scriptTypeToString scriptType
+      asmStr   = scriptToAsm script
+      hexStr   = TE.decodeUtf8 (B16.encode script)
+      mAddress = scriptToAddress net script scriptType
+      -- Core suppresses "address" for pubkey / multisig / nulldata / nonstandard
+      suppressAddr = case scriptType of
+        P2PK _      -> True
+        P2MultiSig _ _ -> True
+        OpReturn _  -> True
+        NonStandard -> True
+        _           -> False
+      -- BIP-380 descriptor: addr(<address>)#<csum> or raw(<hex>)#<csum>
+      descStr = case mAddress of
+        Just addr | not suppressAddr ->
+          fromMaybe ("addr(" <> addr <> ")") $
+            addDescriptorChecksum ("addr(" <> addr <> ")")
+        _ ->
+          fromMaybe ("raw(" <> hexStr <> ")") $
+            addDescriptorChecksum ("raw(" <> hexStr <> ")")
+  in pairs $
+       pair "asm"  (text asmStr) <>
+       pair "desc" (text descStr) <>
+       pair "hex"  (text hexStr) <>
+       ( case mAddress of
+           Just addr | not suppressAddr -> pair "address" (text addr)
+           _                            -> mempty
+       ) <>
+       pair "type" (text typeStr)
+
+-- | Build a PSBT tx-level vin Encoding entry.
+-- Emits { "txid", "vout", "scriptSig": {"asm","hex"}, "sequence" }.
+-- Reference: bitcoin-core/src/core_io.cpp TxToUniv.
+psbtVinEnc :: TxIn -> AE.Encoding
+psbtVinEnc inp =
+  let txidHex = showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp))))
+      vout    = outPointIndex (txInPrevOutput inp)
+      sig     = txInScript inp
+      asmStr  = scriptToAsm sig
+      hexStr  = TE.decodeUtf8 (B16.encode sig)
+      seqNum  = txInSequence inp
+  in pairs $
+       pair "txid"      (text txidHex) <>
+       pair "vout"      (AE.word32 vout) <>
+       pair "scriptSig" (pairs (pair "asm" (text asmStr) <> pair "hex" (text hexStr))) <>
+       pair "sequence"  (AE.word32 seqNum)
+
+-- | Build a PSBT tx-level vout Encoding entry.
+-- Emits { "value": X.YYYYYYYY, "n", "scriptPubKey": {...} }.
+-- Reference: bitcoin-core/src/core_io.cpp TxToUniv.
+psbtVoutEnc :: Network -> Int -> TxOut -> AE.Encoding
+psbtVoutEnc net n out =
+  pairs $
+    pair "value"       (btcAmountEnc (fromIntegral (txOutValue out))) <>
+    pair "n"           (AE.int n) <>
+    pair "scriptPubKey" (psbtSpkEnc net (txOutScript out))
+
+-- | Build the top-level "tx" Encoding for decodepsbt.
+-- Includes txid, hash (wtxid), version, size, vsize, weight, locktime, vin, vout.
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp decodepsbt TxToUniv call.
+psbtTxEnc :: Network -> Tx -> AE.Encoding
+psbtTxEnc net tx =
+  let txid    = computeTxId tx
+      wtxid   = computeWtxId tx
+      txidHex = showHash (BlockHash (getTxIdHash txid))
+      wtxidHex = showHash (BlockHash (getTxIdHash wtxid))
+      baseSize = txBaseSize tx
+      totSize  = txTotalSize tx
+      wt       = baseSize * (witnessScaleFactor - 1) + totSize
+      vsize    = (wt + witnessScaleFactor - 1) `div` witnessScaleFactor
+  in pairs $
+       pair "txid"     (text txidHex) <>
+       pair "hash"     (text wtxidHex) <>
+       pair "version"  (AE.int (fromIntegral (txVersion tx))) <>
+       pair "size"     (AE.int totSize) <>
+       pair "vsize"    (AE.int vsize) <>
+       pair "weight"   (AE.int wt) <>
+       pair "locktime" (AE.word32 (txLockTime tx)) <>
+       pair "vin"      (AE.list id (map psbtVinEnc (txInputs tx))) <>
+       pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx)))
+
 -- | Decode a PSBT and return detailed information.
 -- Reference: Bitcoin Core's decodepsbt RPC
 -- Parameters:
@@ -2979,7 +3122,7 @@ parseOutputs = fmap concat . mapM parseOneOutput
 -- Returns:
 --   JSON object with tx details, input info, output info, fee
 handleDecodePsbt :: RpcServer -> Value -> IO RpcResponse
-handleDecodePsbt _server params = do
+handleDecodePsbt server params = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing psbt parameter") Null
@@ -2992,10 +3135,130 @@ handleDecodePsbt _server params = do
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcDeserializationError (T.pack $ "PSBT decode failed: " ++ err)) Null
             Right psbt -> do
-              let result = psbtToJSON psbt
-              return $ RpcResponse result Null Null
+              let net    = rsNetwork server
+                  rawEnc = psbtToEncoding net psbt
+                  rawBs  = encodingToLazyByteString rawEnc
+              return $ RpcResponse (rawJsonResult rawBs) Null Null
 
--- | Convert PSBT to detailed JSON representation
+-- | Convert PSBT to a Core-byte-parity Aeson Encoding.
+-- Uses the Encoding (streaming) path throughout so that BTC amounts can be
+-- emitted as fixed 8-decimal literals (e.g. "1.00000000") without being
+-- normalised by Aeson's Scientific value type (which would collapse them to
+-- "1.0"). The result is stored as a pre-encoded blob in resResult via
+-- rawJsonResult / rawResultMagic so that toEncoding (RpcResponse) can inject
+-- it verbatim into the wire bytes.
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp decodepsbt.
+psbtToEncoding :: Network -> Psbt -> AE.Encoding
+psbtToEncoding net psbt =
+  let tx      = pgTx (psbtGlobal psbt)
+      mFee    = getPsbtFee psbt
+      xpubs   = Map.toList (pgXpubs (psbtGlobal psbt))
+      ver     = fromMaybe 0 (pgVersion (psbtGlobal psbt))
+      inputs  = psbtInputs psbt
+      outputs = psbtOutputs psbt
+  in pairs $
+       pair "tx"          (psbtTxEnc net tx) <>
+       pair "global_xpubs" (AE.list id (map xpubEnc xpubs)) <>
+       pair "psbt_version" (AE.word32 ver) <>
+       pair "proprietary" (AE.list id []) <>
+       pair "unknown"     (pairs mempty) <>
+       pair "inputs"      (AE.list id (map psbtInputEnc inputs)) <>
+       pair "outputs"     (AE.list id (map psbtOutputEnc outputs)) <>
+       ( case mFee of
+           Just fee -> pair "fee" (btcAmountEnc (fromIntegral fee))
+           Nothing  -> mempty
+       )
+  where
+    xpubEnc :: (ByteString, KeyPath) -> AE.Encoding
+    xpubEnc (xpub, keypath) = pairs $
+      pair "xpub"               (text (TE.decodeUtf8 (B16.encode xpub))) <>
+      pair "master_fingerprint" (text (T.pack (printf "%08x" (kpFingerprint keypath)))) <>
+      pair "path"               (text (encKeyPath keypath))
+
+    psbtInputEnc :: PsbtInput -> AE.Encoding
+    psbtInputEnc inp = pairs $
+         ( case piWitnessUtxo inp of
+             Just utxo -> pair "witness_utxo" (utxoEnc utxo)
+             Nothing   -> mempty ) <>
+         ( case piNonWitnessUtxo inp of
+             Just tx' -> pair "non_witness_utxo" (psbtTxEnc net tx')
+             Nothing  -> mempty ) <>
+         ( if Map.null (piPartialSigs inp) then mempty
+           else pair "partial_signatures"
+                  (AE.list id (map partialSigEnc (Map.toList (piPartialSigs inp)))) ) <>
+         ( case piSighashType inp of
+             Just st -> pair "sighash" (text (sighashToText st))
+             Nothing -> mempty ) <>
+         ( case piRedeemScript inp of
+             Just rs -> pair "redeem_script" (scriptEncObj rs)
+             Nothing -> mempty ) <>
+         ( case piWitnessScript inp of
+             Just ws -> pair "witness_script" (scriptEncObj ws)
+             Nothing -> mempty ) <>
+         ( if Map.null (piBip32Derivation inp) then mempty
+           else pair "bip32_derivs"
+                  (AE.list id (map bip32DerivEnc (Map.toList (piBip32Derivation inp)))) ) <>
+         ( case piFinalScriptSig inp of
+             Just fs -> pair "final_scriptsig"
+                          (pairs (pair "hex" (text (TE.decodeUtf8 (B16.encode fs)))))
+             Nothing -> mempty ) <>
+         ( case piFinalScriptWitness inp of
+             Just fw -> pair "final_scriptwitness"
+                          (AE.list text (map (TE.decodeUtf8 . B16.encode) fw))
+             Nothing -> mempty )
+
+    psbtOutputEnc :: PsbtOutput -> AE.Encoding
+    psbtOutputEnc out = pairs $
+         ( case poRedeemScript out of
+             Just rs -> pair "redeem_script" (scriptEncObj rs)
+             Nothing -> mempty ) <>
+         ( case poWitnessScript out of
+             Just ws -> pair "witness_script" (scriptEncObj ws)
+             Nothing -> mempty ) <>
+         ( if Map.null (poBip32Derivation out) then mempty
+           else pair "bip32_derivs"
+                  (AE.list id (map bip32DerivEnc (Map.toList (poBip32Derivation out)))) )
+
+    utxoEnc :: TxOut -> AE.Encoding
+    utxoEnc txout = pairs $
+      pair "amount"      (btcAmountEnc (fromIntegral (txOutValue txout))) <>
+      pair "scriptPubKey" (psbtSpkEnc net (txOutScript txout))
+
+    partialSigEnc :: (PubKey, ByteString) -> AE.Encoding
+    partialSigEnc (pk, sig) = pairs $
+      pair "pubkey"    (text (TE.decodeUtf8 (B16.encode (serializePubKeyCompressed pk)))) <>
+      pair "signature" (text (TE.decodeUtf8 (B16.encode sig)))
+
+    scriptEncObj :: ByteString -> AE.Encoding
+    scriptEncObj s = pairs $
+      pair "hex" (text (TE.decodeUtf8 (B16.encode s)))
+
+    bip32DerivEnc :: (PubKey, KeyPath) -> AE.Encoding
+    bip32DerivEnc (pk, kp) = pairs $
+      pair "pubkey"               (text (TE.decodeUtf8 (B16.encode (serializePubKeyCompressed pk)))) <>
+      pair "master_fingerprint"   (text (T.pack (printf "%08x" (kpFingerprint kp)))) <>
+      pair "path"                 (text (encKeyPath kp))
+
+    encKeyPath :: KeyPath -> Text
+    encKeyPath kp =
+      T.intercalate "/" ("m" : map encIndex (kpPath kp))
+
+    encIndex :: Word32 -> Text
+    encIndex idx
+      | idx >= 0x80000000 = T.pack (show (idx .&. 0x7fffffff)) <> "'"
+      | otherwise = T.pack (show idx)
+
+    sighashToText :: Word32 -> Text
+    sighashToText 0x01 = "ALL"
+    sighashToText 0x02 = "NONE"
+    sighashToText 0x03 = "SINGLE"
+    sighashToText 0x81 = "ALL|ANYONECANPAY"
+    sighashToText 0x82 = "NONE|ANYONECANPAY"
+    sighashToText 0x83 = "SINGLE|ANYONECANPAY"
+    sighashToText n    = T.pack $ printf "0x%02x" n
+
+-- | Legacy psbtToJSON: kept for use by analyzepsbt and other callers that
+-- build Value-based responses and do not need byte-exact BTC formatting.
 psbtToJSON :: Psbt -> Value
 psbtToJSON psbt =
   let tx = pgTx (psbtGlobal psbt)
