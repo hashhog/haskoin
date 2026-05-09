@@ -251,7 +251,7 @@ import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Char (isSpace, isDigit, isHexDigit, digitToInt, ord)
-import Data.Maybe (listToMaybe, mapMaybe, fromMaybe)
+import Data.Maybe (listToMaybe, mapMaybe, fromMaybe, isJust)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory)
 import System.FilePath ((</>))
 
@@ -2380,9 +2380,38 @@ putGlobalMap PsbtGlobal{..} = do
   forM_ (Map.toList pgUnknown) $ \(k, v) ->
     putKeyValue k v
 
--- | Serialize input map
+-- | Serialize input map.
+--
+-- W47 encoder gate + canonical sort-key (mirrors blockbrew W45 commit
+-- e000f9b and beamchain W46-2 commit e8f04a0):
+--
+--   * Encoder gate.  When an input is finalized (either 'piFinalScriptSig'
+--     or 'piFinalScriptWitness' is 'Just'), the producer-only fields
+--     (PSBT_IN_PARTIAL_SIG 0x02, PSBT_IN_SIGHASH_TYPE 0x03,
+--     PSBT_IN_REDEEM_SCRIPT 0x04, PSBT_IN_WITNESS_SCRIPT 0x05,
+--     PSBT_IN_BIP32_DERIVATION 0x06) MUST NOT be emitted to the wire.
+--     This mirrors @bitcoin-core/src/psbt.h:313@'s
+--     @if (final_script_sig.empty() && final_script_witness.IsNull())@
+--     gate around the producer-field emit block.  @clearSigningFields@
+--     also strips them from the in-memory representation, but the gate
+--     here is the byte-level invariant: a Combiner that re-merges a
+--     finalized PSBT with a still-signing partial would otherwise leak
+--     producer fields back onto the wire.
+--
+--   * Canonical sort-key.  Within an input map, key-value pairs MUST be
+--     emitted in canonical key order (BIP-174).  Bitcoin Core stores
+--     'piPartialSigs' in @std::map<CKeyID, SigPair>@
+--     (@bitcoin-core/src/psbt.h:270@) where 'CKeyID' is the 20-byte
+--     HASH160 of the pubkey, and serializes in @std::map@ iteration
+--     order — i.e. by HASH160(pubkey), NOT raw pubkey bytes.  Sorting by
+--     raw pubkey bytes (the default 'Ord PubKey' on a 'Map PubKey ...')
+--     only matched Core when raw-pubkey order coincided with HASH160
+--     order; for any pubkey set where the two orders disagree the wire
+--     bytes diverge.  'piBip32Derivation' is intentionally LEFT in raw
+--     pubkey order because Core keys it on @std::map<CPubKey, ...>@.
 putInputMap :: PsbtInput -> Put
 putInputMap PsbtInput{..} = do
+  let isFinalized = isJust piFinalScriptSig || isJust piFinalScriptWitness
   -- PSBT_IN_NON_WITNESS_UTXO (0x00)
   case piNonWitnessUtxo of
     Just tx -> putKeyValue (BS.singleton 0x00) (encode tx)
@@ -2391,24 +2420,39 @@ putInputMap PsbtInput{..} = do
   case piWitnessUtxo of
     Just utxo -> putKeyValue (BS.singleton 0x01) (encode utxo)
     Nothing -> return ()
-  -- PSBT_IN_PARTIAL_SIG (0x02) for each signature
-  forM_ (Map.toList piPartialSigs) $ \(pk, sig) ->
-    putKeyValue (BS.cons 0x02 (serializePubKeyCompressed pk)) sig
-  -- PSBT_IN_SIGHASH_TYPE (0x03)
-  case piSighashType of
-    Just st -> putKeyValue (BS.singleton 0x03) (runPut $ putWord32le st)
-    Nothing -> return ()
-  -- PSBT_IN_REDEEM_SCRIPT (0x04)
-  case piRedeemScript of
-    Just rs -> putKeyValue (BS.singleton 0x04) rs
-    Nothing -> return ()
-  -- PSBT_IN_WITNESS_SCRIPT (0x05)
-  case piWitnessScript of
-    Just ws -> putKeyValue (BS.singleton 0x05) ws
-    Nothing -> return ()
-  -- PSBT_IN_BIP32_DERIVATION (0x06) for each path
-  forM_ (Map.toList piBip32Derivation) $ \(pk, keypath) ->
-    putKeyValue (BS.cons 0x06 (serializePubKeyCompressed pk)) (serializeKeyPath keypath)
+  -- W47 encoder gate: producer fields (0x02 / 0x03 / 0x04 / 0x05 / 0x06)
+  -- are skipped once the input is finalized.  Mirrors psbt.h:313.
+  when (not isFinalized) $ do
+    -- PSBT_IN_PARTIAL_SIG (0x02) for each signature.
+    -- W47: sort by HASH160(pubkey) to match Core's std::map<CKeyID, ...>
+    -- iteration order (psbt.h:270).
+    let sortedPartialSigs =
+          sortBy
+            (\(pkA, _) (pkB, _) ->
+              compare
+                (getHash160 (hash160 (serializePubKeyCompressed pkA)))
+                (getHash160 (hash160 (serializePubKeyCompressed pkB))))
+            (Map.toList piPartialSigs)
+    forM_ sortedPartialSigs $ \(pk, sig) ->
+      putKeyValue (BS.cons 0x02 (serializePubKeyCompressed pk)) sig
+    -- PSBT_IN_SIGHASH_TYPE (0x03)
+    case piSighashType of
+      Just st -> putKeyValue (BS.singleton 0x03) (runPut $ putWord32le st)
+      Nothing -> return ()
+    -- PSBT_IN_REDEEM_SCRIPT (0x04)
+    case piRedeemScript of
+      Just rs -> putKeyValue (BS.singleton 0x04) rs
+      Nothing -> return ()
+    -- PSBT_IN_WITNESS_SCRIPT (0x05)
+    case piWitnessScript of
+      Just ws -> putKeyValue (BS.singleton 0x05) ws
+      Nothing -> return ()
+    -- PSBT_IN_BIP32_DERIVATION (0x06) for each path.
+    -- Core keys this map on `std::map<CPubKey, ...>` (psbt.h:271+) — raw
+    -- pubkey ordering, which the default `Ord PubKey` already provides
+    -- via Map.toList.
+    forM_ (Map.toList piBip32Derivation) $ \(pk, keypath) ->
+      putKeyValue (BS.cons 0x06 (serializePubKeyCompressed pk)) (serializeKeyPath keypath)
   -- PSBT_IN_FINAL_SCRIPTSIG (0x07)
   case piFinalScriptSig of
     Just fs -> putKeyValue (BS.singleton 0x07) fs
@@ -3754,7 +3798,18 @@ combineOutputs a b = PsbtOutput
 -- @FinalizeCommitmentMismatch at index N@ in the error string.
 finalizePsbt :: Psbt -> Either String Psbt
 finalizePsbt psbt =
-  let finalizedInputs = map finalizeInput (psbtInputs psbt)
+  -- W47: pair each input with its outpoint from the unsigned tx so we
+  -- can route legacy (non-witness) P2SH inputs through the index-aware
+  -- 'getInputUtxoFor'.  The pre-W47 finalizer used the no-arg
+  -- 'getInputUtxo' inside 'finalizeInput', which only consults
+  -- 'piWitnessUtxo' — so legacy P2SH-multisig inputs whose only UTXO
+  -- carrier was 'piNonWitnessUtxo' silently failed to finalize, even
+  -- after the W46-3 multisig branches landed.  This was the second
+  -- divergence reported by tools/psbt-multi-input-test.sh T3 / T4.
+  let outpoints = map txInPrevOutput (txInputs (pgTx (psbtGlobal psbt)))
+      paddedOps = outpoints ++ repeat (OutPoint (TxId (Hash256 (BS.replicate 32 0x00))) 0)
+      pairs     = zip paddedOps (psbtInputs psbt)
+      finalizedInputs = map (uncurry finalizeInputAt) pairs
       indexed         = zip [0 :: Int ..] (zip (psbtInputs psbt) finalizedInputs)
       errors          = [i | (i, (_, inp)) <- indexed, not (isInputFinalized inp)]
       mismatches      = [ i | (i, (orig, _)) <- indexed
@@ -3798,13 +3853,39 @@ inputHasCommitmentMismatch pinp =
                     -> not (p2wshCommits script wScript)
                   _ -> False
 
--- | Finalize a single input
+-- | Finalize a single input.
+--
+-- The no-arg variant only consults 'piWitnessUtxo' via 'getInputUtxo', so
+-- legacy (non-witness) P2SH inputs whose UTXO is carried in
+-- 'piNonWitnessUtxo' fall through to "cannot finalize".  Prefer
+-- 'finalizeInputAt' when the outpoint is known (which 'finalizePsbt'
+-- always has via the unsigned tx).  Kept exported because external
+-- callers may construct a 'PsbtInput' in isolation.
 finalizeInput :: PsbtInput -> PsbtInput
 finalizeInput pinp
   -- Already finalized
   | isInputFinalized pinp = pinp
   -- Try to finalize based on available data
   | otherwise = case (getInputUtxo pinp, Map.toList (piPartialSigs pinp)) of
+      (Just utxo, sigs@(_:_)) ->
+        let script = txOutScript utxo
+        in finalizeForScript script sigs pinp
+      _ -> pinp  -- Cannot finalize
+
+-- | W47: index-aware single-input finalizer used by 'finalizePsbt'.
+--
+-- Routes through the W41 'getInputUtxoFor' so that legacy P2SH inputs
+-- (whose UTXO carrier is 'piNonWitnessUtxo') resolve their output
+-- script and reach 'finalizeForScript'.  Without this, the W46-3
+-- multisig branches in 'finalizeForScript' were unreachable for legacy
+-- P2SH-multisig inputs, which surfaced as T3 / T4 byte-divergence on
+-- tools/psbt-multi-input-test.sh.
+--
+-- Mirrors the segwit-aware 'finalizeInput' for the no-outpoint case.
+finalizeInputAt :: OutPoint -> PsbtInput -> PsbtInput
+finalizeInputAt op pinp
+  | isInputFinalized pinp = pinp
+  | otherwise = case (getInputUtxoFor op pinp, Map.toList (piPartialSigs pinp)) of
       (Just utxo, sigs@(_:_)) ->
         let script = txOutScript utxo
         in finalizeForScript script sigs pinp
