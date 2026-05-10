@@ -16,7 +16,10 @@ module Haskoin.Policy.Standard
   ( -- * Top-level checks
     isStandardTx
   , checkStandardTx
+  , checkStandardTxWith
   , StandardError(..)
+  , WitnessStandardError(..)
+  , checkWitnessStandard
     -- * Constants (Bitcoin Core defaults)
   , maxStandardTxWeight
   , txMinStandardVersion
@@ -26,6 +29,10 @@ module Haskoin.Policy.Standard
   , dustRelayTxFee
   , maxDustOutputsPerTx
   , maxStandardP2WSHScriptSize
+  , maxStandardP2WSHStackItems
+  , maxStandardP2WSHStackItemSize
+  , maxStandardTapscriptStackItemSize
+  , annexTag
   , minStandardTxNonWitnessSize
   , witnessScaleFactor'
     -- * Sub-checks
@@ -35,19 +42,24 @@ module Haskoin.Policy.Standard
   , txWeight
   ) where
 
+import Control.Monad (when)
+import Data.Bits ((.&.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Int (Int32)
-import Data.Word (Word64)
+import Data.Word (Word8, Word64)
 import Data.Serialize (encode)
 
 import Haskoin.Types
   ( Tx(..)
   , TxIn(..)
   , TxOut(..)
+  , Hash160(..)
+  , Hash256(..)
   )
 import Haskoin.Script
   ( Script(..)
+  , ScriptOp(..)
   , ScriptType(..)
   , classifyOutput
   , decodeScript
@@ -100,6 +112,26 @@ maxDustOutputsPerTx = 1
 maxStandardP2WSHScriptSize :: Int
 maxStandardP2WSHScriptSize = 3600
 
+-- | Maximum number of witness stack items in a standard P2WSH script.
+-- Core: @MAX_STANDARD_P2WSH_STACK_ITEMS = 100@.
+maxStandardP2WSHStackItems :: Int
+maxStandardP2WSHStackItems = 100
+
+-- | Maximum size in bytes of each witness stack item in a standard P2WSH script.
+-- Core: @MAX_STANDARD_P2WSH_STACK_ITEM_SIZE = 80@.
+maxStandardP2WSHStackItemSize :: Int
+maxStandardP2WSHStackItemSize = 80
+
+-- | Maximum size in bytes of each witness stack item in a standard tapscript spend.
+-- Core: @MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE = 80@.
+maxStandardTapscriptStackItemSize :: Int
+maxStandardTapscriptStackItemSize = 80
+
+-- | BIP-341 annex tag: first byte of the annex element.
+-- Core: @ANNEX_TAG = 0x50@.
+annexTag :: Word8
+annexTag = 0x50
+
 -- | Smallest non-witness serialised tx that we'll relay.
 -- Core: @MIN_STANDARD_TX_NONWITNESS_SIZE = 65@.
 minStandardTxNonWitnessSize :: Int
@@ -138,6 +170,31 @@ data StandardError
     -- ^ "bare-multisig" — bare multisig output (without -permitbaremultisig)
   | StdDust !Int
     -- ^ "dust" — too many dust outputs (count)
+  deriving (Show, Eq)
+
+-- | Reasons a witness fails IsWitnessStandard checks.
+-- Mirrors @IsWitnessStandard@ in bitcoin-core/src/policy/policy.cpp:265.
+data WitnessStandardError
+  = WitnessNonWitnessProgram !Int
+    -- ^ Input has witness but spending script is not a witness program.
+  | WitnessP2AStuffed !Int
+    -- ^ P2A input has witness data (witness stuffing). Core rejects these.
+  | WitnessP2WSHScriptTooLarge !Int !Int
+    -- ^ P2WSH witness script exceeds MAX_STANDARD_P2WSH_SCRIPT_SIZE.
+    --   (input_idx, script_size)
+  | WitnessP2WSHTooManyStackItems !Int !Int
+    -- ^ P2WSH witness has more than MAX_STANDARD_P2WSH_STACK_ITEMS items
+    --   (not counting the script itself). (input_idx, count)
+  | WitnessP2WSHStackItemTooLarge !Int !Int
+    -- ^ A P2WSH witness stack item exceeds MAX_STANDARD_P2WSH_STACK_ITEM_SIZE.
+    --   (input_idx, item_size)
+  | WitnessTaprootAnnex !Int
+    -- ^ Taproot spend has an annex (nonstandard, BIP-341 §Annexes).
+  | WitnessTaprootScriptStackItemTooLarge !Int !Int
+    -- ^ Tapscript (leaf version 0xc0) stack item exceeds
+    --   MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE. (input_idx, item_size)
+  | WitnessTaprootEmptyStack !Int
+    -- ^ Taproot spend has 0 witness items (already invalid by consensus).
   deriving (Show, Eq)
 
 -- | Render a 'StandardError' to the same short tag Core writes to its
@@ -255,11 +312,19 @@ isStandardTx tx = case checkStandardTx tx of
 --   * dust_relay_fee = DUST_RELAY_TX_FEE (3000 sat/kvB)
 --
 -- The version, tx-weight, scriptSig-pushonly, scriptPubKey-standard,
--- OP_RETURN-budget, multiple-OP_RETURN, and dust checks are all
--- enforced. Coinbase transactions are assumed never to enter this path
+-- OP_RETURN-budget, bare-multisig, and dust checks are all enforced.
+-- Coinbase transactions are assumed never to enter this path
 -- (Core only calls IsStandardTx on non-coinbase candidates).
 checkStandardTx :: Tx -> Either StandardError ()
-checkStandardTx tx = do
+checkStandardTx = checkStandardTxWith True
+
+-- | Full-parameter variant of 'checkStandardTx'. Exposed for callers that
+-- need non-default policy knobs (e.g. @-permitbaremultisig=0@).
+--
+--   * @permitBareMultisig@ — when False, bare m-of-n CHECKMULTISIG outputs
+--     are rejected with "bare-multisig".  Core default: True.
+checkStandardTxWith :: Bool -> Tx -> Either StandardError ()
+checkStandardTxWith permitBareMultisig tx = do
   -- 1. version range
   let v = txVersion tx
   if v < txMinStandardVersion || v > txMaxStandardVersion
@@ -318,11 +383,14 @@ checkStandardTx tx = do
             else Left (StdScriptSigNotPushOnly idx)
 
     -- Walk outputs, classify each scriptPubKey, and enforce the cumulative
-    -- OP_RETURN data-carrier budget. Mirrors Bitcoin Core policy.cpp:137-155:
+    -- OP_RETURN data-carrier budget, and bare-multisig policy.
+    -- Mirrors Bitcoin Core policy.cpp:137-155:
     --   unsigned int datacarrier_bytes_left = max_datacarrier_bytes.value_or(0);
     --   for each NULL_DATA output:
     --     if (size > datacarrier_bytes_left) → reject "datacarrier"
     --     datacarrier_bytes_left -= size;
+    --   for MULTISIG output (when !permit_bare_multisig):
+    --     → reject "bare-multisig"
     -- Multiple OP_RETURN outputs are allowed; only the cumulative byte sum is
     -- capped. Non-OP_RETURN non-standard outputs are rejected "scriptpubkey".
     checkOutputsWithBudget :: [(Int, TxOut)] -> Either StandardError ()
@@ -338,4 +406,204 @@ checkStandardTx tx = do
                 if sz > budget
                   then Left (StdDataCarrierTooLarge (maxOpReturnRelay - budget + sz) maxOpReturnRelay)
                   else go (budget - sz) rest
+              -- Bare m-of-n multisig: reject unless -permitbaremultisig (Core default: True).
+              -- Core: policy.cpp:152-155:
+              --   } else if ((whichType == TxoutType::MULTISIG) && (!permit_bare_multisig)) {
+              --       reason = "bare-multisig"; return false; }
+              P2MultiSig _ _ ->
+                if permitBareMultisig
+                  then go budget rest
+                  else Left StdBareMultisig
               _ -> go budget rest
+
+--------------------------------------------------------------------------------
+-- IsWitnessStandard
+--------------------------------------------------------------------------------
+
+-- | Check witness standardness for a transaction, given prevout scripts.
+--
+-- Mirrors @IsWitnessStandard@ in bitcoin-core/src/policy/policy.cpp:265.
+-- Must be called after 'checkStandardTx' (which guarantees scriptSigs are
+-- push-only, making P2SH redeemScript extraction here safe).
+--
+-- Parameters:
+--   * @tx@ — the transaction to check
+--   * @prevScripts@ — one prevout scriptPubKey per input (same order as vin)
+--   * @witness@ — one witness stack per input (same order as vin); use
+--                 @txWitness tx@ from 'Haskoin.Types.Tx'
+--
+-- Returns 'Right ()' if the witness is standard, or 'Left' the first
+-- 'WitnessStandardError' found.
+checkWitnessStandard
+  :: Tx
+  -> [ByteString]      -- ^ prevout scriptPubKey per input (vin order)
+  -> [[ByteString]]    -- ^ witness stack per input (vin order)
+  -> Either WitnessStandardError ()
+checkWitnessStandard tx prevScripts witness =
+  mapM_ checkOne (zip3 [0..] prevScripts witness)
+  where
+    checkOne :: (Int, ByteString, [ByteString]) -> Either WitnessStandardError ()
+    checkOne (idx, prevSpk, witStack) = do
+      -- Inputs with an empty witness are fine; nothing to check.
+      if null witStack
+        then return ()
+        else do
+          -- Determine the effective spending script. For P2SH we unwrap
+          -- the redeemScript from the scriptSig stack, matching Core's
+          -- EvalScript call in IsWitnessStandard.
+          let (effScript, isP2SH) = resolveEffectiveScript prevSpk (txInputs tx !! idx)
+
+          -- Resolve the witness program from the effective script.
+          case resolveWitnessProgram effScript of
+            Nothing ->
+              -- Non-witness program with witness data: reject.
+              -- Core: "Non-witness program must not be associated with any witness"
+              Left (WitnessNonWitnessProgram idx)
+            Just (wver, wprog) ->
+              checkWitnessProgram idx wver wprog witStack isP2SH
+
+    -- Extract (effectiveScript, isP2SH). For a P2SH prevout we take the
+    -- last push of scriptSig as the redeemScript (Core does the same with
+    -- EvalScript on SCRIPT_VERIFY_NONE). On EvalScript failure or an
+    -- empty stack we fall through to the raw prevout (which will then
+    -- fail the witness-program check, matching Core's "return false").
+    resolveEffectiveScript :: ByteString -> TxIn -> (ByteString, Bool)
+    resolveEffectiveScript prevSpk txin =
+      case decodeScript prevSpk of
+        Right sc | isP2SHScript sc ->
+          -- Try to extract the redeemScript from scriptSig pushes.
+          case extractLastPush (txInScript txin) of
+            Just rs -> (rs, True)
+            Nothing -> (prevSpk, False)
+        _ -> (prevSpk, False)
+
+    -- Check if a decoded Script is P2SH.
+    isP2SHScript :: Script -> Bool
+    isP2SHScript sc = case classifyOutput sc of
+      P2SH _ -> True
+      _       -> False
+
+    -- Extract the last push from a scriptSig (the redeemScript in P2SH).
+    -- Returns Nothing when the scriptSig is empty or malformed.
+    extractLastPush :: ByteString -> Maybe ByteString
+    extractLastPush scriptSigBytes =
+      case decodeScript scriptSigBytes of
+        Left _  -> Nothing
+        Right sc -> extractLastPushFromScript sc
+
+    extractLastPushFromScript :: Script -> Maybe ByteString
+    extractLastPushFromScript (Script ops) =
+      case mapM extractPushData ops of
+        Nothing   -> Nothing
+        Just []   -> Nothing
+        Just pushes -> Just (last pushes)
+
+    extractPushData :: ScriptOp -> Maybe ByteString
+    extractPushData (OP_PUSHDATA d _) = Just d
+    extractPushData OP_0              = Just BS.empty
+    extractPushData _                 = Nothing
+
+    -- Identify a witness program: returns (version, program) on success.
+    -- Mirrors CScript::IsWitnessProgram in Core.
+    resolveWitnessProgram :: ByteString -> Maybe (Int, ByteString)
+    resolveWitnessProgram spk =
+      case decodeScript spk of
+        Left _ -> Nothing
+        Right sc -> case classifyOutput sc of
+          P2WPKH (Hash160 h) -> Just (0, h)
+          P2WSH  (Hash256 h) -> Just (0, h)
+          P2TR   (Hash256 h) -> Just (1, h)
+          P2A               -> Just (1, p2aProgram)
+          _                  -> Nothing
+
+    -- The P2A witness program bytes (OP_1 <0x4e73>).
+    p2aProgram :: ByteString
+    p2aProgram = BS.pack [0x4e, 0x73]
+
+    -- Main per-input witness check.
+    checkWitnessProgram
+      :: Int -> Int -> ByteString -> [ByteString] -> Bool
+      -> Either WitnessStandardError ()
+    checkWitnessProgram idx wver wprog witStack _isP2SH = do
+      -- P2A: witness stuffing is nonstandard.
+      -- Core: if (prevScript.IsPayToAnchor()) return false;
+      if wver == 1 && wprog == BS.pack [0x4e, 0x73]
+        then Left (WitnessP2AStuffed idx)
+        else return ()
+
+      case (wver, BS.length wprog) of
+        -- P2WSH (version 0, 32-byte program)
+        (0, 32) -> checkP2WSHWitness idx witStack
+        -- P2TR (version 1, 32-byte program), not P2SH-wrapped
+        (1, 32) -> checkTaprootWitness idx witStack
+        -- Everything else (P2WPKH, unknown versions): no stack-level limits.
+        _       -> return ()
+
+    -- P2WSH witness checks.
+    -- Core policy.cpp:309-319:
+    --   witnessScript size ≤ MAX_STANDARD_P2WSH_SCRIPT_SIZE (3600)
+    --   stack items (excluding script) ≤ MAX_STANDARD_P2WSH_STACK_ITEMS (100)
+    --   each stack item ≤ MAX_STANDARD_P2WSH_STACK_ITEM_SIZE (80) bytes
+    checkP2WSHWitness :: Int -> [ByteString] -> Either WitnessStandardError ()
+    checkP2WSHWitness idx witStack = do
+      -- The witness script is the last element.
+      let witnessScript = last witStack
+          stackItems    = init witStack   -- all but the script
+      -- Script size limit.
+      when (BS.length witnessScript > maxStandardP2WSHScriptSize) $
+        Left (WitnessP2WSHScriptTooLarge idx (BS.length witnessScript))
+      -- Stack item count limit.
+      when (length stackItems > maxStandardP2WSHStackItems) $
+        Left (WitnessP2WSHTooManyStackItems idx (length stackItems))
+      -- Per-item size limit.
+      mapM_ (\item ->
+        when (BS.length item > maxStandardP2WSHStackItemSize) $
+          Left (WitnessP2WSHStackItemTooLarge idx (BS.length item))
+        ) stackItems
+
+    -- Taproot witness checks.
+    -- Core policy.cpp:324-349.
+    checkTaprootWitness :: Int -> [ByteString] -> Either WitnessStandardError ()
+    checkTaprootWitness idx witStack = do
+      let stack = witStack
+      -- Strip optional annex (last element whose first byte == ANNEX_TAG).
+      let (strippedStack, hasAnnex) = stripAnnex stack
+      -- Annex is nonstandard.
+      when hasAnnex $
+        Left (WitnessTaprootAnnex idx)
+      case length strippedStack of
+        0 ->
+          -- 0 stack elements: invalid by consensus (policy can flag it).
+          Left (WitnessTaprootEmptyStack idx)
+        1 ->
+          -- Key-path spend: no additional policy limits.
+          return ()
+        _ -> do
+          -- Script-path spend: check tapscript stack items.
+          -- Core: control_block = pop, script = pop, remaining = stack.
+          -- strippedStack is [item0 .. itemN-2, script, control_block].
+          let controlBlock   = last strippedStack
+              withoutControl = init strippedStack
+              _script        = last withoutControl
+              scriptItems    = init withoutControl
+          -- Empty control block is invalid.
+          when (BS.null controlBlock) $
+            Left (WitnessTaprootEmptyStack idx)
+          -- Leaf version 0xc0 = Tapscript (BIP-342).
+          -- TAPROOT_LEAF_MASK = 0xfe, TAPROOT_LEAF_TAPSCRIPT = 0xc0.
+          let leafVersion = BS.head controlBlock .&. 0xfe
+          when (leafVersion == 0xc0) $
+            mapM_ (\item ->
+              when (BS.length item > maxStandardTapscriptStackItemSize) $
+                Left (WitnessTaprootScriptStackItemTooLarge idx (BS.length item))
+              ) scriptItems
+
+    -- If the last element is an annex (non-empty, first byte == annexTag),
+    -- return (stack without annex, True), else (stack, False).
+    stripAnnex :: [ByteString] -> ([ByteString], Bool)
+    stripAnnex [] = ([], False)
+    stripAnnex stk =
+      let top = last stk
+      in if not (BS.null top) && BS.head top == annexTag && length stk >= 2
+           then (init stk, True)
+           else (stk, False)
