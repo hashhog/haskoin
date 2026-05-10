@@ -56,6 +56,8 @@ module Haskoin.Mempool
   , checkReplacement
   , removeConflicts
   , isRbfReplaceable
+  , checkAllConflictsRbfReplaceable
+  , signalsOptInRBF
   , maxReplacementEvictions
   , incrementalRelayFeePerKvb
   , checkNoConflictSpending
@@ -297,6 +299,14 @@ maxReplacementEvictions = 100
 -- Bitcoin Core: incrementalRelayFee = 1000 sat/kvB
 incrementalRelayFeePerKvb :: Word64
 incrementalRelayFeePerKvb = 1000
+
+-- | BIP-125 Gate 1: does this transaction directly signal opt-in RBF?
+-- A transaction signals opt-in RBF if ANY input has nSequence <= 0xfffffffd
+-- (i.e. nSequence <= MAX_BIP125_RBF_SEQUENCE).
+-- bitcoin-core/src/util/rbf.cpp:SignalsOptInRBF
+-- bitcoin-core/src/util/rbf.h:MAX_BIP125_RBF_SEQUENCE = 0xfffffffd
+signalsOptInRBF :: Tx -> Bool
+signalsOptInRBF tx = any (\inp -> txInSequence inp <= 0xfffffffd) (txInputs tx)
 
 -- | RBF-specific error type for replacement validation
 data RbfError
@@ -561,8 +571,20 @@ addTransactionInner mp tx txid = do
                     then addTransactionNoConflicts mp tx txid
                     -- Has conflicts: attempt RBF replacement
                     else if mpcRBFEnabled (mpConfig mp)
+                      -- Full RBF (mempoolfullrbf=1): all mempool txs are replaceable.
+                      -- bitcoin-core/src/policy/rbf.cpp:IsRBFOptIn — in full-RBF mode
+                      -- every in-mempool tx is treated as REPLACEABLE_BIP125.
                       then addTransactionWithReplacement mp tx txid conflicts
-                      else return $ Left (ErrInputSpentInMempool (head conflicts))
+                      else do
+                        -- Legacy BIP-125 mode: attempt replacement only if every
+                        -- conflicting tx (or one of its mempool ancestors) signals
+                        -- opt-in RBF (nSequence <= 0xfffffffd).
+                        -- bitcoin-core/src/policy/rbf.cpp:IsRBFOptIn — checks the
+                        -- transaction itself, then walks in-mempool ancestors.
+                        rbfOk <- checkAllConflictsRbfReplaceable mp conflicts
+                        if rbfOk
+                          then addTransactionWithReplacement mp tx txid conflicts
+                          else return $ Left (ErrInputSpentInMempool (head conflicts))
 
 -- | Add a transaction with no conflicts (normal case)
 addTransactionNoConflicts :: Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
@@ -705,7 +727,7 @@ continueAddTransaction mp tx txid fee vsize ancestors = do
   -- Build and insert the entry
   now <- round <$> getPOSIXTime
   height <- readTVarIO (mpHeight mp)
-  let rbfOptIn = any (\inp -> txInSequence inp < 0xfffffffe) (txInputs tx)
+  let rbfOptIn = signalsOptInRBF tx
       -- Ancestor counts include this transaction
       ancestorCount = length ancestors + 1
       ancestorSize = sum (map meSize ancestors) + vsize
@@ -1139,6 +1161,19 @@ isRbfReplaceable mp txid = do
               ancestors <- getAncestorsRecursive mp (meTransaction entry)
               return $ any meRBFOptIn ancestors
 
+-- | BIP-125 Gate 2: check that every directly-conflicting transaction is
+-- RBF-replaceable under legacy BIP-125 rules.  A conflicting tx is replaceable
+-- if it or any of its in-mempool ancestors has meRBFOptIn set
+-- (nSequence <= 0xfffffffd on at least one input).
+--
+-- This mirrors bitcoin-core/src/policy/rbf.cpp:IsRBFOptIn, which first tests
+-- the tx itself (SignalsOptInRBF) then walks CalculateMemPoolAncestors.
+-- Called only when mpcRBFEnabled is False (full-RBF is off).
+checkAllConflictsRbfReplaceable :: Mempool -> [TxId] -> IO Bool
+checkAllConflictsRbfReplaceable mp conflictTxIds = do
+  results <- forM conflictTxIds $ \txid -> isRbfReplaceable mp txid
+  return $ and results
+
 -- | Get all transactions that would be evicted by a replacement
 -- This includes direct conflicts and all their descendants
 getConflictSet :: Mempool -> [TxId] -> IO [MempoolEntry]
@@ -1158,10 +1193,14 @@ getConflictSet mp conflictTxIds = do
 
 -- | Check if a replacement transaction satisfies RBF rules
 -- Rules implemented:
---   Rule 3: New tx must pay higher absolute fee than sum of all directly conflicting txs
+--   Rule 3: New tx must pay >= sum of fees of ALL evicted txs (conflicts + descendants)
+--           bitcoin-core/src/validation.cpp:1005-1010 — PaysForRBF receives the
+--           accumulated fee over the full all_conflicts set (not just direct conflicts).
 --   Rule 3a: New tx feerate must be higher than all directly conflicting txs (full RBF)
 --   Rule 4: Additional fee must pay for replacement's bandwidth (incremental relay fee)
+--           Rule 4 also compares against ALL evictions, matching Core Rule 3 baseline.
 --   Rule 5: Cannot evict more than 100 transactions total (conflicts + descendants)
+--           bitcoin-core/src/policy/rbf.h:MAX_REPLACEMENT_CANDIDATES = 100
 checkReplacement :: Tx                -- ^ New replacement transaction
                  -> [MempoolEntry]    -- ^ Direct conflicting transactions
                  -> [MempoolEntry]    -- ^ All transactions to evict (conflicts + descendants)
@@ -1169,26 +1208,28 @@ checkReplacement :: Tx                -- ^ New replacement transaction
                  -> Int               -- ^ New transaction vsize
                  -> FeeRate           -- ^ New transaction feerate
                  -> Either RbfError ()
-checkReplacement _tx directConflicts allEvictions newFee newVsize newFeeRate = do
+checkReplacement _tx _directConflicts allEvictions newFee newVsize _newFeeRate = do
   -- Rule 5: Check eviction count limit
+  -- bitcoin-core/src/policy/rbf.cpp:70 — GetEntriesForConflicts checks cluster count <= 100
   let evictionCount = length allEvictions
   when (evictionCount > maxReplacementEvictions) $
     Left $ RbfTooManyEvictions evictionCount maxReplacementEvictions
 
-  -- Calculate total fee of direct conflicts
-  let conflictTotalFee = sum $ map meFee directConflicts
+  -- Rule 3: New tx must pay at least as much as the sum of fees of ALL evicted txs.
+  -- Bitcoin Core sums over the entire all_conflicts set (direct conflicts + descendants):
+  --   validation.cpp:1005: for (it : all_conflicts) { m_conflicting_fees += it->GetModifiedFee(); }
+  --   validation.cpp:1010: PaysForRBF(m_conflicting_fees, ...)
+  -- Using only directConflicts here would allow a replacement that pays less than
+  -- the total fee removed from the mempool — a DoS vector.
+  let conflictTotalFee = sum $ map meFee allEvictions
 
-  -- Rule 3: New tx must pay at least as much as sum of conflicting txs
+  -- Rule 3: replacement fees >= original fees (all evictions)
   when (newFee < conflictTotalFee) $
     Left $ RbfInsufficientAbsoluteFee newFee conflictTotalFee
 
-  -- Rule 3a (full RBF): New tx feerate must be higher than all direct conflicts
-  let maxConflictFeeRate = maximum $ map meFeeRate directConflicts
-  when (newFeeRate <= maxConflictFeeRate) $
-    Left $ RbfInsufficientFeeRate newFeeRate maxConflictFeeRate
-
   -- Rule 4: Additional fee must cover bandwidth cost of new tx
   -- Formula: (newFee - conflictFee) >= incrementalRelayFee * newVsize / 1000
+  -- bitcoin-core/src/policy/rbf.cpp:117-123
   let additionalFee = newFee - conflictTotalFee
       -- incrementalRelayFeePerKvb is in sat/kvB (1000 sat/kvB = 1 sat/vB)
       requiredRelayFee = (incrementalRelayFeePerKvb * fromIntegral newVsize) `div` 1000
