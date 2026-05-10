@@ -178,7 +178,8 @@ import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
 import Data.Char (chr, toLower)
 import Data.List (foldl', isInfixOf)
 import Text.Printf (printf)
-import Numeric (showFFloat)
+-- showFFloat was removed: all difficulty/fee formatting now uses
+-- formatDoubleG16 (FFI snprintf) or btcAmountEnc (fixed-decimal).
 import qualified Data.Vector as V
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Time.Clock (NominalDiffTime)
@@ -1047,38 +1048,37 @@ handleGetBlockchainInfo server = do
       fileInfos <- readIORef (bsFileInfos bs)
       return (calculateCurrentUsage fileInfos)
     Nothing -> return 0
-  let baseFields =
-        [ "chain"                .= netName (rsNetwork server)
-        , "blocks"               .= ceHeight tip
-        , "headers"              .= ceHeight tip
-        , "bestblockhash"        .= showHash (ceHash tip)
-        , "bits"                 .= showBits (bhBits (ceHeader tip))
-        , "target"               .= showHex (bitsToTarget (bhBits (ceHeader tip)))
-        , "difficulty"           .= getDifficulty (bhBits (ceHeader tip))
-        , "time"                 .= bhTimestamp (ceHeader tip)
-        , "mediantime"           .= ceMedianTime tip
-        , "verificationprogress" .= progress
-        , "initialblockdownload" .= isIBD
-        , "chainwork"            .= showHex (ceChainWork tip)
-        , "size_on_disk"         .= sizeOnDisk
-        , "pruned"               .= pruneOn
-        , "softforks"            .= sforks
-        , "warnings"             .= ([] :: [Text])
-        ]
-      pruneFields
-        | not pruneOn = []
-        | otherwise =
-            [ "automatic_pruning" .= autoMode
-            -- Best-effort prune height: 0 until the first prune fires
-            -- (haskoin doesn't yet expose the per-block-file min height
-            -- on the live datadir; on RocksDB-only storage no actual
-            -- pruning has happened).  Reported for shape parity.
-            , "pruneheight"       .= (0 :: Word32)
-            ] ++ case pruneConfigAutoTarget pruneCfg of
-                   Just t  -> [ "prune_target_size" .= t ]
-                   Nothing -> []
-      result = object (baseFields ++ pruneFields)
-  return $ RpcResponse result Null Null
+  -- Build the response on the streaming path so difficulty uses
+  -- Core-parity %.16g formatting (difficultyStr / FFI snprintf).
+  let bits = bhBits (ceHeader tip)
+      pruneEnc
+        | not pruneOn = mempty
+        | otherwise   =
+            pair "automatic_pruning" (AE.bool autoMode)                              <>
+            pair "pruneheight"       (AE.word32 (0 :: Word32))                      <>
+            (case pruneConfigAutoTarget pruneCfg of
+               Just t  -> pair "prune_target_size" (AE.int64 t)
+               Nothing -> mempty)
+      enc = pairs $
+              pair "chain"                (text (T.pack (netName (rsNetwork server))))  <>
+              pair "blocks"               (AE.word32 (ceHeight tip))                   <>
+              pair "headers"              (AE.word32 (ceHeight tip))                   <>
+              pair "bestblockhash"        (text (showHash (ceHash tip)))               <>
+              pair "bits"                 (text (showBits bits))                       <>
+              pair "target"               (text (showHex (bitsToTarget bits)))         <>
+              pair "difficulty"           (unsafeToEncoding (stringUtf8 (difficultyStr bits))) <>
+              pair "time"                 (AE.word32 (bhTimestamp (ceHeader tip)))     <>
+              pair "mediantime"           (AE.word32 (ceMedianTime tip))               <>
+              pair "verificationprogress" (AE.double progress)                        <>
+              pair "initialblockdownload" (AE.bool isIBD)                             <>
+              pair "chainwork"            (text (showHex (ceChainWork tip)))           <>
+              pair "size_on_disk"         (AE.word64 (fromIntegral sizeOnDisk))        <>
+              pair "pruned"               (AE.bool pruneOn)                            <>
+              pruneEnc                                                                <>
+              pair "softforks"            (toEncoding sforks)                         <>
+              pair "warnings"             (AE.list text [])
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Pure helper: build the full getdeploymentinfo result for a given
 -- network configuration and chain entry.
@@ -1762,11 +1762,15 @@ doFetchGetTxOut' txidHex vout cookie = do
       return mResult
 
 -- | Get the current difficulty
+-- Uses Core-parity %.16g formatting (difficultyStr / FFI snprintf) so that
+-- the emitted number is byte-identical to Bitcoin Core's output.
 handleGetDifficulty :: RpcServer -> IO RpcResponse
 handleGetDifficulty server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
-  let difficulty = getDifficulty (bhBits (ceHeader tip))
-  return $ RpcResponse (toJSON difficulty) Null Null
+  let bits = bhBits (ceHeader tip)
+      enc  = unsafeToEncoding (stringUtf8 (difficultyStr bits))
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Prune blockchain data up to a specified height.
 -- Parameters:
@@ -2262,21 +2266,22 @@ handleGetMempoolInfo server = do
   entries <- forM txids $ \txid -> getTransaction (rsMempool server) txid
   let totalFeeSat = sum [meFee e | Just e <- entries]
   let mpCfg = mpConfig (rsMempool server)
-      minFeeRate = getFeeRate (mpcMinFeeRate mpCfg)
-      result = object
-        [ "loaded"              .= True
-        , "size"                .= count
-        , "bytes"               .= size
-        , "usage"               .= size
-        , "total_fee"           .= (fromIntegral totalFeeSat / 100000000.0 :: Double)
-        , "maxmempool"          .= mpcMaxSize mpCfg
-        , "mempoolminfee"       .= minFeeRate
-        , "minrelaytxfee"       .= (0.00001 :: Double)
-        , "incrementalrelayfee" .= (0.00001 :: Double)
-        , "unbroadcastcount"    .= (0 :: Int)
-        , "fullrbf"             .= True
-        ]
-  return $ RpcResponse result Null Null
+      -- minFeeRate is Word64 sat/vB; convert to BTC/kB for the wire format
+      minFeeRateSatPerVb = getFeeRate (mpcMinFeeRate mpCfg)
+      enc = pairs $
+              pair "loaded"              (AE.bool True)                             <>
+              pair "size"                (AE.int count)                             <>
+              pair "bytes"               (AE.int size)                              <>
+              pair "usage"               (AE.int size)                              <>
+              pair "total_fee"           (btcAmountEnc (fromIntegral totalFeeSat))  <>
+              pair "maxmempool"          (toEncoding (mpcMaxSize mpCfg))            <>
+              pair "mempoolminfee"       (btcAmountEnc (fromIntegral minFeeRateSatPerVb * 1000)) <>
+              pair "minrelaytxfee"       (btcAmountEnc 1000)                        <>
+              pair "incrementalrelayfee" (btcAmountEnc 1000)                        <>
+              pair "unbroadcastcount"    (AE.int 0)                                 <>
+              pair "fullrbf"             (AE.bool True)
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Get all transaction IDs in the mempool
 -- | Get all transaction IDs in the mempool
@@ -2306,51 +2311,60 @@ handleGetRawMempool server params = do
           Nothing -> return Nothing
           Just entry -> return $ Just (txid, entry)
       let validEntries = catMaybes entries
-          entryMap = map (mempoolEntryToJSON tipHeight) validEntries
-      return $ RpcResponse (object entryMap) Null Null
-  where
-    mempoolEntryToJSON :: Word32 -> (TxId, MempoolEntry) -> (Key.Key, Value)
-    mempoolEntryToJSON tipHeight (txid, entry) =
-      let txidKey = Key.fromText $ showHash (BlockHash (getTxIdHash txid))
-          wtxid = computeWtxId (meTransaction entry)
-          entryHeight = meHeight entry
-          confirmations = if tipHeight >= entryHeight
-                          then tipHeight - entryHeight
-                          else 0
-          entryObj = object
-            [ "vsize"              .= meSize entry
-            , "weight"             .= (meSize entry * witnessScaleFactor)  -- Approximate
-            , "fee"                .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-            , "modifiedfee"        .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-            , "time"               .= meTime entry
-            , "height"             .= meHeight entry
-            , "descendantcount"    .= meDescendantCount entry
-            , "descendantsize"     .= meDescendantSize entry
-            , "descendantfees"     .= meDescendantFees entry
-            , "ancestorcount"      .= meAncestorCount entry
-            , "ancestorsize"       .= meAncestorSize entry
-            , "ancestorfees"       .= meAncestorFees entry
-            , "wtxid"              .= showHash (BlockHash (getTxIdHash wtxid))
-            , "fees"               .= object
-                [ "base"       .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-                , "modified"   .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-                , "ancestor"   .= (fromIntegral (meAncestorFees entry) / 100000000.0 :: Double)
-                , "descendant" .= (fromIntegral (meDescendantFees entry) / 100000000.0 :: Double)
-                ]
-            , "depends"            .= ([] :: [Text])  -- Would need to track parent txids
-            , "spentby"            .= ([] :: [Text])  -- Would need to track child txids
-            , "bip125-replaceable" .= meRBFOptIn entry
-            , "unbroadcast"        .= False
+          -- Build the object on the streaming path so fee amounts use
+          -- Core's fixed-decimal format (btcAmountEnc) rather than Double.
+          pairsEnc = foldl' (<>) mempty
+            [ pair (Key.fromText (showHash (BlockHash (getTxIdHash txid))))
+                   (mempoolEntryEnc tipHeight entry)
+            | (txid, entry) <- validEntries
             ]
-      in (txidKey, entryObj)
+          rawBs = encodingToLazyByteString (pairs pairsEnc)
+      return $ RpcResponse (rawJsonResult rawBs) Null Null
+  where
+    -- | Encode one mempool entry as a streaming Encoding so fee amounts
+    -- use Core's fixed-decimal format (8 fractional digits, no sci notation).
+    mempoolEntryEnc :: Word32 -> MempoolEntry -> AE.Encoding
+    mempoolEntryEnc tipHeight entry =
+      let wtxid = computeWtxId (meTransaction entry)
+          entryHeight = meHeight entry
+          feeSat = fromIntegral (meFee entry) :: Int64
+          ancFee = fromIntegral (meAncestorFees entry) :: Int64
+          descFee = fromIntegral (meDescendantFees entry) :: Int64
+          feesEnc = pairs $
+            pair "base"       (btcAmountEnc feeSat)  <>
+            pair "modified"   (btcAmountEnc feeSat)  <>
+            pair "ancestor"   (btcAmountEnc ancFee)  <>
+            pair "descendant" (btcAmountEnc descFee)
+          _confirmations = if tipHeight >= entryHeight
+                           then tipHeight - entryHeight
+                           else 0
+      in pairs $
+           pair "vsize"              (AE.int (meSize entry))                          <>
+           pair "weight"             (AE.int (meSize entry * witnessScaleFactor))     <>
+           pair "fee"                (btcAmountEnc feeSat)                            <>
+           pair "modifiedfee"        (btcAmountEnc feeSat)                            <>
+           pair "time"               (AE.int64 (meTime entry))                        <>
+           pair "height"             (AE.word32 (meHeight entry))                     <>
+           pair "descendantcount"    (AE.int (meDescendantCount entry))               <>
+           pair "descendantsize"     (AE.int (meDescendantSize entry))                <>
+           pair "descendantfees"     (AE.word64 (meDescendantFees entry))             <>
+           pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
+           pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
+           pair "ancestorfees"       (AE.word64 (meAncestorFees entry))               <>
+           pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
+           pair "fees"               feesEnc                                          <>
+           pair "depends"            (AE.list text [])                                <>
+           pair "spentby"            (AE.list text [])                                <>
+           pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
+           pair "unbroadcast"        (AE.bool False)
 
 --------------------------------------------------------------------------------
 -- Network RPC Handlers
 --------------------------------------------------------------------------------
 
 -- | Get network information
--- | Get network information
--- Returns comprehensive network state matching Bitcoin Core's getnetworkinfo
+-- relayfee / incrementalfee use Core's fixed-decimal BTC/kB format
+-- (1 sat/vB = 0.00001000 BTC/kB) via btcAmountEnc on the streaming path.
 handleGetNetworkInfo :: RpcServer -> IO RpcResponse
 handleGetNetworkInfo server = do
   peerCount <- getPeerCount (rsPeerMgr server)
@@ -2372,110 +2386,104 @@ handleGetNetworkInfo server = do
   let localServices = getServiceFlag nodeNetwork .|. getServiceFlag nodeWitness :: Word64
       localServicesHex = T.pack $ printf "%016x" localServices
       -- Build human-readable service names
+      serviceNames :: [Text]
       serviceNames = catMaybes
-        [ if hasService localServices nodeNetwork then Just ("NETWORK" :: Text) else Nothing
+        [ if hasService localServices nodeNetwork then Just "NETWORK" else Nothing
         , if hasService localServices nodeWitness then Just "WITNESS" else Nothing
         , if hasService localServices nodeBloom then Just "BLOOM" else Nothing
         , if hasService localServices nodeNetworkLimited then Just "NETWORK_LIMITED" else Nothing
         ]
-      -- Network info for IPv4, IPv6, onion
-      networks =
-        [ object
-            [ "name" .= ("ipv4" :: Text)
-            , "limited" .= False
-            , "reachable" .= True
-            , "proxy" .= ("" :: Text)
-            , "proxy_randomize_credentials" .= True
-            ]
-        , object
-            [ "name" .= ("ipv6" :: Text)
-            , "limited" .= False
-            , "reachable" .= True
-            , "proxy" .= ("" :: Text)
-            , "proxy_randomize_credentials" .= True
-            ]
-        , object
-            [ "name" .= ("onion" :: Text)
-            , "limited" .= True
-            , "reachable" .= False
-            , "proxy" .= ("" :: Text)
-            , "proxy_randomize_credentials" .= True
-            ]
+      -- Each network object as a streaming Encoding
+      mkNetEnc name limited reachable =
+        pairs $
+          pair "name"                       (text name)        <>
+          pair "limited"                    (AE.bool limited)  <>
+          pair "reachable"                  (AE.bool reachable)<>
+          pair "proxy"                      (text "")          <>
+          pair "proxy_randomize_credentials"(AE.bool True)
+      networksEnc =
+        [ mkNetEnc "ipv4"  False True
+        , mkNetEnc "ipv6"  False True
+        , mkNetEnc "onion" True  False
         ]
-  let result = object
-        [ "version"            .= (100000 :: Int)  -- 0.1.0.0 in version format
-        , "subversion"         .= ("/Haskoin:0.1.0/" :: Text)
-        , "protocolversion"    .= protocolVersion
-        , "localservices"      .= localServicesHex
-        , "localservicesnames" .= serviceNames
-        , "localrelay"         .= True
-        , "timeoffset"         .= timeOffsetMedian
-        , "networkactive"      .= True
-        , "connections"        .= peerCount
-        , "connections_in"     .= (0 :: Int)  -- Would need to count inbound peers
-        , "connections_out"    .= peerCount   -- Simplified: treat all as outbound
-        , "networks"           .= networks
-        , "relayfee"           .= (0.00001 :: Double)  -- 1 sat/vB in BTC/kB
-        , "incrementalfee"     .= (0.00001 :: Double)
-        , "localaddresses"     .= ([] :: [Value])
-        , "warnings"           .= ([] :: [Text])
-        ]
-  return $ RpcResponse result Null Null
+      enc = pairs $
+              pair "version"            (AE.int (100000 :: Int))        <>
+              pair "subversion"         (text "/Haskoin:0.1.0/")        <>
+              pair "protocolversion"    (AE.int32 protocolVersion)        <>
+              pair "localservices"      (text localServicesHex)         <>
+              pair "localservicesnames" (AE.list text serviceNames)     <>
+              pair "localrelay"         (AE.bool True)                  <>
+              pair "timeoffset"         (AE.int64 timeOffsetMedian)     <>
+              pair "networkactive"      (AE.bool True)                  <>
+              pair "connections"        (AE.int peerCount)              <>
+              pair "connections_in"     (AE.int (0 :: Int))             <>
+              pair "connections_out"    (AE.int peerCount)              <>
+              pair "networks"           (AE.list id networksEnc)        <>
+              pair "relayfee"           (btcAmountEnc 1000)             <>
+              pair "incrementalfee"     (btcAmountEnc 1000)             <>
+              pair "localaddresses"     (AE.list id [])                 <>
+              pair "warnings"           (AE.list text [])
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Get information about connected peers
+-- minfeefilter uses btcAmountEnc (Core's fixed-decimal BTC/kB, 0.00000000)
+-- rather than Double 0.0 which Aeson collapses to scientific notation.
 handleGetPeerInfo :: RpcServer -> IO RpcResponse
 handleGetPeerInfo server = do
   peers <- getConnectedPeers (rsPeerMgr server)
-  let peerInfos = zipWith peerToJSON [0..] peers
-  return $ RpcResponse (toJSON peerInfos) Null Null
+  let peerEncs = zipWith peerToEnc [0..] peers
+      rawBs    = encodingToLazyByteString (AE.list id peerEncs)
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    peerToJSON idx (addr, info) =
+    peerToEnc :: Int -> (SockAddr, PeerInfo) -> AE.Encoding
+    peerToEnc idx (addr, info) =
       let services = piServices info
+          serviceNames :: [Text]
           serviceNames = catMaybes
-            [ if services .&. 1 /= 0 then Just ("NETWORK" :: Text) else Nothing
+            [ if services .&. 1 /= 0 then Just "NETWORK" else Nothing
             , if services .&. 8 /= 0 then Just "WITNESS" else Nothing
             , if services .&. 1024 /= 0 then Just "NETWORK_LIMITED" else Nothing
             ]
           isInbound = piInbound info
-          pingTime = fromMaybe (0 :: Double) (piPingLatency info)
-      in object
-      [ "id"                      .= (idx :: Int)
-      , "addr"                    .= show addr
-      , "network"                 .= ("ipv4" :: Text)
-      , "services"                .= (T.pack $ printf "%016x" services)
-      , "servicesnames"           .= serviceNames
-      , "relaytxes"               .= piRelay info
-      , "lastsend"                .= piLastSeen info
-      , "lastrecv"                .= piLastSeen info
-      , "last_transaction"        .= (0 :: Int)
-      , "last_block"              .= (0 :: Int)
-      , "bytessent"               .= piBytesSent info
-      , "bytesrecv"               .= piBytesRecv info
-      , "conntime"                .= piConnectedAt info
-      , "timeoffset"              .= piTimeOffset info
-      , "pingtime"                .= pingTime
-      , "minping"                 .= pingTime
-      , "version"                 .= maybe (0 :: Int32) vVersion (piVersion info)
-      , "subver"                  .= maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info)
-      , "inbound"                 .= isInbound
-      , "bip152_hb_to"            .= False
-      , "bip152_hb_from"          .= False
-      , "startingheight"          .= piStartHeight info
-      , "presynced_headers"       .= (-1 :: Int)
-      , "synced_headers"          .= (-1 :: Int)
-      , "synced_blocks"           .= (-1 :: Int)
-      , "inflight"                .= ([] :: [Int])
-      , "addr_relay_enabled"      .= True
-      , "addr_processed"          .= (0 :: Int)
-      , "addr_rate_limited"       .= (0 :: Int)
-      , "permissions"             .= ([] :: [Text])
-      , "minfeefilter"            .= (0 :: Double)
-      , "bytessent_per_msg"       .= object []
-      , "bytesrecv_per_msg"       .= object []
-      , "connection_type"         .= (if isInbound then "inbound" :: Text else "outbound-full-relay")
-      , "transport_protocol_type" .= ("v1" :: Text)
-      , "session_id"              .= ("" :: Text)
-      ]
+          pingTime = fromMaybe 0.0 (piPingLatency info)
+      in pairs $
+           pair "id"                      (AE.int idx)                                  <>
+           pair "addr"                    (text (T.pack (show addr)))                   <>
+           pair "network"                 (text "ipv4")                                 <>
+           pair "services"                (text (T.pack (printf "%016x" services)))     <>
+           pair "servicesnames"           (AE.list text serviceNames)                   <>
+           pair "relaytxes"               (AE.bool (piRelay info))                      <>
+           pair "lastsend"                (AE.int64 (piLastSeen info))                  <>
+           pair "lastrecv"                (AE.int64 (piLastSeen info))                  <>
+           pair "last_transaction"        (AE.int (0 :: Int))                           <>
+           pair "last_block"              (AE.int (0 :: Int))                           <>
+           pair "bytessent"               (AE.word64 (piBytesSent info))                <>
+           pair "bytesrecv"               (AE.word64 (piBytesRecv info))                <>
+           pair "conntime"                (AE.int64 (piConnectedAt info))               <>
+           pair "timeoffset"              (AE.int64 (piTimeOffset info))                <>
+           pair "pingtime"                (AE.double pingTime)                          <>
+           pair "minping"                 (AE.double pingTime)                          <>
+           pair "version"                 (AE.int32 (maybe 0 vVersion (piVersion info)))<>
+           pair "subver"                  (text (maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info))) <>
+           pair "inbound"                 (AE.bool isInbound)                           <>
+           pair "bip152_hb_to"            (AE.bool False)                               <>
+           pair "bip152_hb_from"          (AE.bool False)                               <>
+           pair "startingheight"          (AE.int32 (piStartHeight info))               <>
+           pair "presynced_headers"       (AE.int (-1 :: Int))                          <>
+           pair "synced_headers"          (AE.int (-1 :: Int))                          <>
+           pair "synced_blocks"           (AE.int (-1 :: Int))                          <>
+           pair "inflight"                (AE.list AE.int ([] :: [Int]))                <>
+           pair "addr_relay_enabled"      (AE.bool True)                                <>
+           pair "addr_processed"          (AE.int (0 :: Int))                           <>
+           pair "addr_rate_limited"       (AE.int (0 :: Int))                           <>
+           pair "permissions"             (AE.list text [])                             <>
+           pair "minfeefilter"            (btcAmountEnc 0)                              <>
+           pair "bytessent_per_msg"       (pairs mempty)                                <>
+           pair "bytesrecv_per_msg"       (pairs mempty)                                <>
+           pair "connection_type"         (text (if isInbound then "inbound" else "outbound-full-relay")) <>
+           pair "transport_protocol_type" (text "v1")                                   <>
+           pair "session_id"              (text "")
 
 -- | Get the number of connected peers
 handleGetConnectionCount :: RpcServer -> IO RpcResponse
@@ -2810,33 +2818,36 @@ handleSubmitBlockUnpaused server params = do
                 Right () -> return $ RpcResponse Null Null Null
 
 -- | Get mining-related information
+-- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
+-- blockmintxfee uses Core's fixed-decimal BTC/kB format (1 sat/vB = 0.00001000).
 handleGetMiningInfo :: RpcServer -> IO RpcResponse
 handleGetMiningInfo server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
   (pooledTxCount, _) <- getMempoolSize (rsMempool server)
-  let tipBits  = bhBits (ceHeader tip)
-      bitsHex  = showBits tipBits
+  let tipBits   = bhBits (ceHeader tip)
+      bitsHex   = showBits tipBits
       targetHex = showHex64 (bitsToTarget tipBits)
-      diff      = getDifficulty tipBits
+      diffS     = difficultyStr tipBits
       nextH     = ceHeight tip + 1
-      result = object
-        [ "blocks"        .= ceHeight tip
-        , "bits"          .= bitsHex
-        , "difficulty"    .= diff
-        , "target"        .= targetHex
-        , "blockmintxfee" .= (0.00001000 :: Double)
-        , "networkhashps" .= (0 :: Double)
-        , "pooledtx"      .= pooledTxCount
-        , "chain"         .= netName (rsNetwork server)
-        , "next"          .= object
-            [ "height"     .= nextH
-            , "bits"       .= bitsHex
-            , "difficulty" .= diff
-            , "target"     .= targetHex
-            ]
-        , "warnings"      .= ("" :: Text)
-        ]
-  return $ RpcResponse result Null Null
+      diffEnc   = unsafeToEncoding (stringUtf8 diffS)
+      nextEnc   = pairs $
+                    pair "height"     (AE.word32 nextH)    <>
+                    pair "bits"       (text bitsHex)       <>
+                    pair "difficulty" diffEnc              <>
+                    pair "target"     (text targetHex)
+      enc = pairs $
+              pair "blocks"        (AE.word32 (ceHeight tip)) <>
+              pair "bits"          (text bitsHex)             <>
+              pair "difficulty"    diffEnc                    <>
+              pair "target"        (text targetHex)           <>
+              pair "blockmintxfee" (btcAmountEnc 1000)        <>
+              pair "networkhashps" (AE.int 0)                 <>
+              pair "pooledtx"      (AE.int pooledTxCount)     <>
+              pair "chain"         (text (T.pack (netName (rsNetwork server)))) <>
+              pair "next"          nextEnc                    <>
+              pair "warnings"      (text "")
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 --------------------------------------------------------------------------------
 -- Regtest Mining RPC Handlers
@@ -3154,11 +3165,12 @@ handleEstimateSmartFee server params = do
           , "blocks" .= blocks
           ]) Null Null
         else do
-          let btcPerKb = fromIntegral feeRate / 100000.0 :: Double
-          return $ RpcResponse (object
-            [ "feerate" .= btcPerKb
-            , "blocks"  .= blocks
-            ]) Null Null
+          -- feerate is BTC/kB; feeRate sat/vB * 1000 sat/kvB / 1e8 sat/BTC
+          -- = feeRate / 1e5. btcAmountEnc takes sat-per-kB = feeRate * 1000.
+          let enc = pairs $
+                      pair "feerate" (btcAmountEnc (fromIntegral feeRate * 1000)) <>
+                      pair "blocks"  (AE.int blocks)
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
 -- Utility RPC Handlers
@@ -3217,21 +3229,23 @@ addressToScriptInfo _net addr = case addr of
     in (TE.decodeUtf8 $ B16.encode script, True, True, 1, TE.decodeUtf8 $ B16.encode h)
 
 -- | Get general information (deprecated but still useful)
+-- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
 handleGetInfo :: RpcServer -> IO RpcResponse
 handleGetInfo server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
   peerCount <- getPeerCount (rsPeerMgr server)
-  let result = object
-        [ "version"         .= (10000 :: Int)
-        , "protocolversion" .= protocolVersion
-        , "blocks"          .= ceHeight tip
-        , "connections"     .= peerCount
-        , "proxy"           .= ("" :: Text)
-        , "difficulty"      .= getDifficulty (bhBits (ceHeader tip))
-        , "testnet"         .= (netName (rsNetwork server) /= "main")
-        , "errors"          .= ("" :: Text)
-        ]
-  return $ RpcResponse result Null Null
+  let bits = bhBits (ceHeader tip)
+      enc  = pairs $
+               pair "version"         (AE.int (10000 :: Int))                         <>
+               pair "protocolversion" (AE.int32 protocolVersion)                       <>
+               pair "blocks"          (AE.word32 (ceHeight tip))                      <>
+               pair "connections"     (AE.int peerCount)                              <>
+               pair "proxy"           (text "")                                       <>
+               pair "difficulty"      (unsafeToEncoding (stringUtf8 (difficultyStr bits))) <>
+               pair "testnet"         (AE.bool (netName (rsNetwork server) /= "main"))<>
+               pair "errors"          (text "")
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 --------------------------------------------------------------------------------
 -- Descriptor RPC Handlers (BIP-380-386)
@@ -4161,6 +4175,10 @@ psbtToJSON psbt =
     , Just $ "psbt_version" .= fromMaybe 0 (pgVersion (psbtGlobal psbt))
     , Just $ "inputs" .= zipWith psbtInputToJSON [0..] (psbtInputs psbt)
     , Just $ "outputs" .= zipWith psbtOutputToJSON [0..] (psbtOutputs psbt)
+    -- NOTE: fee emits Double here which loses precision for amounts like
+    -- 1.00000000 (Aeson collapses to 1.0). This is acceptable because
+    -- psbtToJSON is dead code — no handler calls it. All active PSBT-fee
+    -- paths use psbtToEncoding (the streaming path) for byte-exact output.
     , fmap (\fee -> "fee" .= (fromIntegral fee / 100000000.0 :: Double)) mFee
     ]
   where
@@ -4196,6 +4214,10 @@ psbtToJSON psbt =
         else Just $ "bip32_derivs" .= map bip32DerivToJSON (Map.toList (poBip32Derivation out))
       ]
 
+    -- NOTE: amount emits Double which loses precision (Aeson collapses
+    -- 1.00000000 → 1.0). This is acceptable: psbtToJSON / utxoToJSON are
+    -- dead code — no active handler calls them. Live PSBT paths use
+    -- psbtToEncoding (streaming path with btcAmountEnc / utxoEnc).
     utxoToJSON :: TxOut -> Value
     utxoToJSON txout = object
       [ "amount" .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
@@ -4609,12 +4631,12 @@ handleWalletCreateFundedPsbt server params = withWalletMgr server $ \wm -> do
                                   psbt = updatePsbt lookupUtxo psbt0
                                   encoded = encodePsbt psbt
                                   base64  = TE.decodeUtf8 $ B64.encode encoded
-                                  feeBtc  = (fromIntegral (csFee cs) / 1e8) :: Double
-                              return $ RpcResponse
-                                (object [ "psbt"      .= base64
-                                        , "fee"       .= feeBtc
-                                        , "changepos" .= changePos
-                                        ]) Null Null
+                                  feeSat  = fromIntegral (csFee cs) :: Int64
+                                  enc     = pairs $
+                                              pair "psbt"      (text base64)             <>
+                                              pair "fee"       (btcAmountEnc feeSat)     <>
+                                              pair "changepos" (AE.int changePos)
+                              return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
   where
     -- | Recover an Address from a scriptPubKey for coin-selector input.
     --   Core's coin selector takes addresses; we lose information here for
@@ -4810,32 +4832,34 @@ handleGetWalletInfo server _params = withWalletMgr server $ \wm -> do
       names <- listManagedWallets wm
       let walletName = fromMaybe "" (listToMaybe names)
       info <- getWalletInfo walletName ws
-      return $ RpcResponse (walletInfoToJSON info) Null Null
+      return $ RpcResponse (rawJsonResult (walletInfoToJSON info)) Null Null
 
 -- | Convert a 'WalletInfo' record to the Core-shape getwalletinfo JSON.
-walletInfoToJSON :: WalletInfo -> Value
-walletInfoToJSON wi = object $ catMaybes
-  [ Just $ "walletname"           .= wiWalletName wi
-  , Just $ "walletversion"        .= wiWalletVersion wi
-  , Just $ "format"               .= ("bdb" :: Text)
-  , Just $ "balance"
-            .= (fromIntegral (wiBalance wi) / (1e8 :: Double))
-  , Just $ "unconfirmed_balance"
-            .= (fromIntegral (wiUnconfirmedBalance wi) / (1e8 :: Double))
-  , Just $ "immature_balance"
-            .= (fromIntegral (wiImmatureBalance wi) / (1e8 :: Double))
-  , Just $ "txcount"              .= wiTxCount wi
-  , Just $ "keypoolsize"          .= wiKeypoolSize wi
-  , Just $ "keypoolsize_hd_internal" .= wiKeypoolSize wi
-  , wiUnlockedUntil wi >>= \u -> Just $ "unlocked_until" .= u
-  , Just $ "paytxfee"
-            .= (fromIntegral (wiPaytxfee wi) / (1e8 :: Double))
-  , Just $ "private_keys_enabled" .= wiPrivateKeysEnabled wi
-  , Just $ "avoid_reuse"          .= wiAvoidReuse wi
-  , Just $ "scanning"             .= wiScanning wi
-  , Just $ "descriptors"          .= wiDescriptors wi
-  , Just $ "external_signer"      .= wiExternalSigner wi
-  ]
+-- Balance fields use btcAmountEnc on the streaming Encoding path so they
+-- emit Core's fixed-decimal format (8 fractional digits, no sci notation).
+walletInfoToJSON :: WalletInfo -> BL.ByteString
+walletInfoToJSON wi =
+  let unlockedEnc = case wiUnlockedUntil wi of
+        Just u  -> pair "unlocked_until" (AE.word64 u)
+        Nothing -> mempty
+      enc = pairs $
+              pair "walletname"              (text (wiWalletName wi))               <>
+              pair "walletversion"           (AE.int (wiWalletVersion wi))          <>
+              pair "format"                  (text "bdb")                           <>
+              pair "balance"                 (btcAmountEnc (fromIntegral (wiBalance wi)))            <>
+              pair "unconfirmed_balance"     (btcAmountEnc (fromIntegral (wiUnconfirmedBalance wi))) <>
+              pair "immature_balance"        (btcAmountEnc (fromIntegral (wiImmatureBalance wi)))    <>
+              pair "txcount"                 (AE.int (wiTxCount wi))                <>
+              pair "keypoolsize"             (AE.int (wiKeypoolSize wi))            <>
+              pair "keypoolsize_hd_internal" (AE.int (wiKeypoolSize wi))            <>
+              unlockedEnc                                                           <>
+              pair "paytxfee"                (btcAmountEnc (fromIntegral (wiPaytxfee wi)))           <>
+              pair "private_keys_enabled"    (AE.bool (wiPrivateKeysEnabled wi))    <>
+              pair "avoid_reuse"             (AE.bool (wiAvoidReuse wi))            <>
+              pair "scanning"                (AE.bool (wiScanning wi))              <>
+              pair "descriptors"             (AE.bool (wiDescriptors wi))           <>
+              pair "external_signer"         (AE.bool (wiExternalSigner wi))
+  in encodingToLazyByteString enc
 
 -- | Get the confirmed wallet balance.
 -- Reference: bitcoin-core/src/wallet/rpc/coins.cpp getbalance
@@ -4855,8 +4879,11 @@ handleGetBalance server _params = withWalletMgr server $ \wm -> do
         "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
     Just ws -> do
       sats <- getBalance (wsWallet ws)
-      let btc = fromIntegral sats / (1e8 :: Double)
-      return $ RpcResponse (toJSON btc) Null Null
+      -- Use btcAmountEnc (streaming path) so balance emits in Core's
+      -- fixed-decimal format (e.g. "1.00000000", not "1.0").
+      let enc   = btcAmountEnc (fromIntegral sats)
+          rawBs = encodingToLazyByteString enc
+      return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 --------------------------------------------------------------------------------
 -- Chain Tips RPC Handler
@@ -5132,30 +5159,29 @@ handleTestMempoolAccept server params = do
             Just rate -> rate * 100000  -- BTC/kvB to sat/vB
             Nothing -> 10000.0  -- Default 0.10 BTC/kvB
 
-      -- Parse and test each transaction
-      results <- forM (V.toList txArray) $ \txVal -> do
+      -- Parse and test each transaction; build results on the streaming path
+      -- so fee fields use Core's fixed-decimal format (btcAmountEnc).
+      resultEncs <- forM (V.toList txArray) $ \txVal -> do
         case txVal of
           String hexTx -> testSingleTx hexTx maxFeeRateSatPerVB
-          _ -> return $ object
-            [ "allowed" .= False
-            , "reject-reason" .= ("invalid-type" :: Text)
-            ]
+          _ -> return $ pairs $
+                 pair "allowed"       (AE.bool False) <>
+                 pair "reject-reason" (text "invalid-type")
 
-      return $ RpcResponse (toJSON results) Null Null
+      let rawBs = encodingToLazyByteString (AE.list id resultEncs)
+      return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    testSingleTx :: Text -> Double -> IO Value
+    testSingleTx :: Text -> Double -> IO AE.Encoding
     testSingleTx hexTx maxFeeRate = do
       case B16.decode (TE.encodeUtf8 hexTx) of
-        Left _ -> return $ object
-          [ "allowed" .= False
-          , "reject-reason" .= ("TX decode failed" :: Text)
-          ]
+        Left _ -> return $ pairs $
+          pair "allowed"       (AE.bool False) <>
+          pair "reject-reason" (text "TX decode failed")
         Right txBytes -> do
           case decodeTxWithFallback txBytes of
-            Left err -> return $ object
-              [ "allowed" .= False
-              , "reject-reason" .= ("TX decode failed: " <> T.pack err)
-              ]
+            Left err -> return $ pairs $
+              pair "allowed"       (AE.bool False) <>
+              pair "reject-reason" (text ("TX decode failed: " <> T.pack err))
             Right tx -> do
               let txid = computeTxId tx
                   wtxid = computeWtxId tx
@@ -5163,22 +5189,20 @@ handleTestMempoolAccept server params = do
               -- Check if already in mempool
               mExisting <- getTransaction (rsMempool server) txid
               case mExisting of
-                Just _ -> return $ object
-                  [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
-                  , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
-                  , "allowed" .= False
-                  , "reject-reason" .= ("txn-already-in-mempool" :: Text)
-                  ]
+                Just _ -> return $ pairs $
+                  pair "txid"          (text (showHash (BlockHash (getTxIdHash txid))))  <>
+                  pair "wtxid"         (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
+                  pair "allowed"       (AE.bool False)                                   <>
+                  pair "reject-reason" (text "txn-already-in-mempool")
                 Nothing -> do
                   -- Try to add (dry run)
                   result <- addTransaction (rsMempool server) tx
                   case result of
-                    Left err -> return $ object
-                      [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
-                      , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
-                      , "allowed" .= False
-                      , "reject-reason" .= mempoolErrorToText err
-                      ]
+                    Left err -> return $ pairs $
+                      pair "txid"          (text (showHash (BlockHash (getTxIdHash txid))))  <>
+                      pair "wtxid"         (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
+                      pair "allowed"       (AE.bool False)                                   <>
+                      pair "reject-reason" (text (mempoolErrorToText err))
                     Right _ -> do
                       -- Get the entry to compute vsize and fee
                       mEntry <- getTransaction (rsMempool server) txid
@@ -5186,32 +5210,31 @@ handleTestMempoolAccept server params = do
                       removeTransaction (rsMempool server) txid
 
                       case mEntry of
-                        Nothing -> return $ object
-                          [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
-                          , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
-                          , "allowed" .= True
-                          ]
+                        Nothing -> return $ pairs $
+                          pair "txid"    (text (showHash (BlockHash (getTxIdHash txid))))  <>
+                          pair "wtxid"   (text (showHash (BlockHash (getTxIdHash wtxid))))<>
+                          pair "allowed" (AE.bool True)
                         Just entry -> do
                           let vsize = meSize entry
                               fee = meFee entry
                               feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
+                              txidTxt = showHash (BlockHash (getTxIdHash txid))
+                              wtxidTxt = showHash (BlockHash (getTxIdHash wtxid))
 
                           if feeRateSatPerVB > maxFeeRate
-                            then return $ object
-                              [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
-                              , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
-                              , "allowed" .= False
-                              , "reject-reason" .= ("max-fee-exceeded" :: Text)
-                              ]
-                            else return $ object
-                              [ "txid"   .= showHash (BlockHash (getTxIdHash txid))
-                              , "wtxid"  .= showHash (BlockHash (getTxIdHash wtxid))
-                              , "allowed" .= True
-                              , "vsize"  .= vsize
-                              , "fees"   .= object
-                                  [ "base" .= (fromIntegral fee / 100000000.0 :: Double)
-                                  ]
-                              ]
+                            then return $ pairs $
+                                   pair "txid"          (text txidTxt)             <>
+                                   pair "wtxid"         (text wtxidTxt)            <>
+                                   pair "allowed"       (AE.bool False)            <>
+                                   pair "reject-reason" (text "max-fee-exceeded")
+                            else do
+                              let feesEnc = pairs $ pair "base" (btcAmountEnc (fromIntegral fee))
+                              return $ pairs $
+                                         pair "txid"    (text txidTxt)  <>
+                                         pair "wtxid"   (text wtxidTxt) <>
+                                         pair "allowed" (AE.bool True)  <>
+                                         pair "vsize"   (AE.int vsize)  <>
+                                         pair "fees"    feesEnc
 
     mempoolErrorToText :: MempoolError -> Text
     mempoolErrorToText err = case err of
@@ -5437,28 +5460,25 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
     -- Build the success response from a list of (tx, txid, wtxid, maybe entry).
     buildSuccessResponse :: [(Tx, TxId, TxId, Maybe MempoolEntry)] -> RpcResponse
     buildSuccessResponse entries =
-      let txResults =
-            [ object $
-                [ "wtxid" .= showHash (BlockHash (getTxIdHash wtxid))
-                , "txid"  .= showHash (BlockHash (getTxIdHash txid))
-                ] ++
-                case mEntry of
-                  Nothing -> []
-                  Just e  ->
-                    [ "vsize" .= meSize e
-                    , "fees"  .= object
-                        [ "base" .= (fromIntegral (meFee e) / 100000000.0 :: Double)
-                        ]
-                    ]
+      -- Build tx-results on the streaming path so fees.base uses
+      -- Core's fixed-decimal format (btcAmountEnc).
+      let txResultEncs =
+            [ let baseSeries =
+                    pair "wtxid" (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
+                    pair "txid"  (text (showHash (BlockHash (getTxIdHash txid))))
+                  extraSeries = case mEntry of
+                    Nothing -> mempty
+                    Just e  ->
+                      pair "vsize" (AE.int (meSize e)) <>
+                      pair "fees"  (pairs (pair "base" (btcAmountEnc (fromIntegral (meFee e)))))
+              in pairs (baseSeries <> extraSeries)
             | (_tx, txid, wtxid, mEntry) <- entries
             ]
-      in RpcResponse
-           (object
-              [ "package_msg"           .= ("success" :: Text)
-              , "tx-results"            .= txResults
-              , "replaced-transactions" .= ([] :: [Text])
-              ])
-           Null Null
+          enc = pairs $
+                  pair "package_msg"           (text "success")               <>
+                  pair "tx-results"            (AE.list id txResultEncs)      <>
+                  pair "replaced-transactions" (AE.list text [])
+      in RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool Entry RPC Handler
@@ -5506,32 +5526,34 @@ handleGetMempoolEntry server params = do
                   -- Get parent txids (depends)
                   depends = map (\e -> showHash (BlockHash (getTxIdHash (meTxId e)))) ancestors
 
-              let result = object
-                    [ "vsize"           .= meSize entry
-                    , "weight"          .= weight
-                    , "fee"             .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-                    , "modifiedfee"     .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-                    , "time"            .= meTime entry
-                    , "height"          .= meHeight entry
-                    , "descendantcount" .= descendantCount
-                    , "descendantsize"  .= descendantSize
-                    , "descendantfees"  .= descendantFees
-                    , "ancestorcount"   .= ancestorCount
-                    , "ancestorsize"    .= ancestorSize
-                    , "ancestorfees"    .= ancestorFees
-                    , "wtxid"           .= showHash (BlockHash (getTxIdHash (computeWtxId (meTransaction entry))))
-                    , "fees"            .= object
-                        [ "base"       .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-                        , "modified"   .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-                        , "ancestor"   .= (fromIntegral ancestorFees / 100000000.0 :: Double)
-                        , "descendant" .= (fromIntegral descendantFees / 100000000.0 :: Double)
-                        ]
-                    , "depends"         .= depends
-                    , "spentby"         .= ([] :: [Text])  -- Would need child tracking
-                    , "bip125-replaceable" .= meRBFOptIn entry
-                    , "unbroadcast"     .= False
-                    ]
-              return $ RpcResponse result Null Null
+              let feeSat    = fromIntegral (meFee entry) :: Int64
+                  ancFeeSat = fromIntegral ancestorFees :: Int64
+                  descFeeSat = fromIntegral descendantFees :: Int64
+                  feesEnc   = pairs $
+                                pair "base"       (btcAmountEnc feeSat)     <>
+                                pair "modified"   (btcAmountEnc feeSat)     <>
+                                pair "ancestor"   (btcAmountEnc ancFeeSat)  <>
+                                pair "descendant" (btcAmountEnc descFeeSat)
+                  enc = pairs $
+                          pair "vsize"              (AE.int (meSize entry))                           <>
+                          pair "weight"             (AE.int weight)                                   <>
+                          pair "fee"                (btcAmountEnc feeSat)                             <>
+                          pair "modifiedfee"        (btcAmountEnc feeSat)                             <>
+                          pair "time"               (AE.int64 (meTime entry))                         <>
+                          pair "height"             (AE.word32 (meHeight entry))                      <>
+                          pair "descendantcount"    (AE.int descendantCount)                          <>
+                          pair "descendantsize"     (AE.int descendantSize)                           <>
+                          pair "descendantfees"     (AE.word64 (fromIntegral descendantFees))         <>
+                          pair "ancestorcount"      (AE.int ancestorCount)                            <>
+                          pair "ancestorsize"       (AE.int ancestorSize)                             <>
+                          pair "ancestorfees"       (AE.word64 (fromIntegral ancestorFees))           <>
+                          pair "wtxid"              (text (showHash (BlockHash (getTxIdHash (computeWtxId (meTransaction entry)))))) <>
+                          pair "fees"               feesEnc                                           <>
+                          pair "depends"            (AE.list text depends)                            <>
+                          pair "spentby"            (AE.list text [])                                 <>
+                          pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                      <>
+                          pair "unbroadcast"        (AE.bool False)
+              return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool: Get Mempool Ancestors RPC Handler
@@ -5565,11 +5587,13 @@ handleGetMempoolAncestors server params = do
               ancestors <- getAncestors mp (meTransaction entry)
               if verbose
                 then do
-                  let ancestorDetails = Map.fromList
-                        [ (showTxId (meTxId anc), mempoolEntryToJSON anc)
+                  let pairsEnc = foldl' (<>) mempty
+                        [ pair (Key.fromText (showTxId (meTxId anc)))
+                               (mempoolEntryEnc anc)
                         | anc <- ancestors
                         ]
-                  return $ RpcResponse (toJSON ancestorDetails) Null Null
+                      rawBs = encodingToLazyByteString (pairs pairsEnc)
+                  return $ RpcResponse (rawJsonResult rawBs) Null Null
                 else
                   return $ RpcResponse (toJSON (map (showTxId . meTxId) ancestors)) Null Null
   where
@@ -5584,17 +5608,19 @@ handleGetMempoolAncestors server params = do
     showTxId :: TxId -> Text
     showTxId (TxId (Hash256 bs)) = TE.decodeUtf8 $ B16.encode (BS.reverse bs)
 
-    mempoolEntryToJSON :: MempoolEntry -> Value
-    mempoolEntryToJSON entry = object
-      [ "vsize"           .= meSize entry
-      , "fee"             .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-      , "ancestorcount"   .= meAncestorCount entry
-      , "ancestorsize"    .= meAncestorSize entry
-      , "ancestorfees"    .= meAncestorFees entry
-      , "descendantcount" .= meDescendantCount entry
-      , "descendantsize"  .= meDescendantSize entry
-      , "descendantfees"  .= meDescendantFees entry
-      ]
+    -- | Streaming Encoding for a mempool entry in the ancestors/descendants
+    -- verbose response.  Uses btcAmountEnc so fee fields use Core's
+    -- fixed-decimal format instead of Double scientific notation.
+    mempoolEntryEnc :: MempoolEntry -> AE.Encoding
+    mempoolEntryEnc entry = pairs $
+      pair "vsize"           (AE.int (meSize entry))                       <>
+      pair "fee"             (btcAmountEnc (fromIntegral (meFee entry)))   <>
+      pair "ancestorcount"   (AE.int (meAncestorCount entry))              <>
+      pair "ancestorsize"    (AE.int (meAncestorSize entry))               <>
+      pair "ancestorfees"    (AE.word64 (meAncestorFees entry))            <>
+      pair "descendantcount" (AE.int (meDescendantCount entry))            <>
+      pair "descendantsize"  (AE.int (meDescendantSize entry))             <>
+      pair "descendantfees"  (AE.word64 (meDescendantFees entry))
 
 -- | Error code for invalid address or key
 rpcInvalidAddressOrKey :: Int
@@ -6201,21 +6227,33 @@ handleListTransactions server params = do
           -- Get wallet transactions
           txHistory <- getWalletTransactions walletState count skip
 
-          let results = map txHistoryToJSON txHistory
-          return $ RpcResponse (toJSON results) Null Null
+          let resultsEnc = AE.list txHistoryEnc txHistory
+              rawBs      = encodingToLazyByteString resultsEnc
+          return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    txHistoryToJSON :: WalletTransaction -> Value
-    txHistoryToJSON wtx = object $ catMaybes
-      [ Just $ "txid"     .= showHash (BlockHash (getTxIdHash (wtxTxId wtx)))
-      , wtxAddress wtx >>= \addr -> Just $ "address" .= addr
-      , Just $ "category" .= wtxCategory wtx
-      , Just $ "amount"   .= (fromIntegral (wtxAmount wtx) / 100000000.0 :: Double)
-      , Just $ "vout"     .= wtxVout wtx
-      , Just $ "confirmations" .= wtxConfirmations wtx
-      , wtxBlockHash wtx >>= \bh -> Just $ "blockhash" .= showHash bh
-      , wtxBlockTime wtx >>= \t -> Just $ "blocktime" .= t
-      , Just $ "time"     .= wtxTime wtx
-      ]
+    -- | Streaming Encoding for one wallet transaction entry.
+    -- amount uses btcAmountEnc for Core's fixed-decimal format.
+    txHistoryEnc :: WalletTransaction -> AE.Encoding
+    txHistoryEnc wtx =
+      let addrEnc = case wtxAddress wtx of
+            Just addr -> pair "address" (text addr)
+            Nothing   -> mempty
+          bhEnc = case wtxBlockHash wtx of
+            Just bh -> pair "blockhash" (text (showHash bh))
+            Nothing -> mempty
+          btEnc = case wtxBlockTime wtx of
+            Just t  -> pair "blocktime" (AE.word32 t)
+            Nothing -> mempty
+      in pairs $
+           pair "txid"          (text (showHash (BlockHash (getTxIdHash (wtxTxId wtx))))) <>
+           addrEnc                                                                         <>
+           pair "category"      (text (wtxCategory wtx))                                  <>
+           pair "amount"        (btcAmountEnc (wtxAmount wtx))                            <>
+           pair "vout"          (AE.int (wtxVout wtx))                                    <>
+           pair "confirmations" (AE.int (wtxConfirmations wtx))                           <>
+           bhEnc                                                                          <>
+           btEnc                                                                          <>
+           pair "time"          (AE.word32 (wtxTime wtx))
 
 -- | Wallet transaction record
 data WalletTransaction = WalletTransaction
@@ -6268,28 +6306,27 @@ handleListUnspent server params = do
           -- Get wallet UTXOs
           utxos <- getWalletUTXOs (wsWallet walletState)
 
-          -- Filter and format
-          let results = catMaybes $ map (utxoToJSON tipHeight minConf maxConf) utxos
-
-          return $ RpcResponse (toJSON results) Null Null
+          -- Filter and format using the streaming path for amount precision.
+          let encodings = catMaybes $ map (utxoToEnc tipHeight minConf maxConf) utxos
+              rawBs     = encodingToLazyByteString (AE.list id encodings)
+          return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    utxoToJSON :: Word32 -> Int -> Int -> (OutPoint, TxOut, Word32) -> Maybe Value
-    utxoToJSON tipHeight minConf maxConf (op, txout, confs) = do
+    -- | Build a streaming Encoding for one UTXO entry.
+    -- amount uses btcAmountEnc for Core's fixed-decimal format.
+    utxoToEnc :: Word32 -> Int -> Int -> (OutPoint, TxOut, Word32) -> Maybe AE.Encoding
+    utxoToEnc _tipHeight minConf maxConf (op, txout, confs) =
       let confirmations = fromIntegral confs :: Int
-
-      -- Filter by confirmation range
-      if confirmations >= minConf && confirmations <= maxConf
-        then Just $ object
-          [ "txid"          .= showHash (BlockHash (getTxIdHash (outPointHash op)))
-          , "vout"          .= outPointIndex op
-          , "scriptPubKey"  .= TE.decodeUtf8 (B16.encode (txOutScript txout))
-          , "amount"        .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
-          , "confirmations" .= confirmations
-          , "spendable"     .= True
-          , "solvable"      .= True
-          , "safe"          .= True
-          ]
-        else Nothing
+      in if confirmations >= minConf && confirmations <= maxConf
+           then Just $ pairs $
+                  pair "txid"          (text (showHash (BlockHash (getTxIdHash (outPointHash op))))) <>
+                  pair "vout"          (AE.word32 (outPointIndex op))                               <>
+                  pair "scriptPubKey"  (text (TE.decodeUtf8 (B16.encode (txOutScript txout))))      <>
+                  pair "amount"        (btcAmountEnc (fromIntegral (txOutValue txout)))             <>
+                  pair "confirmations" (AE.int confirmations)                                       <>
+                  pair "spendable"     (AE.bool True)                                               <>
+                  pair "solvable"      (AE.bool True)                                               <>
+                  pair "safe"          (AE.bool True)
+           else Nothing
 
 --------------------------------------------------------------------------------
 -- Control: Help RPC Handler
@@ -6682,45 +6719,42 @@ handleEstimateRawFee server params = do
           (toJSON $ RpcError (-8) "Invalid threshold") Null
         else do
           raw <- estimateRawFee (rsFeeEst server) confTarget threshold
-          let horizonObj = rawFeeToJSON raw
-              result = object
-                [ "short"  .= horizonObj
-                , "medium" .= horizonObj
-                , "long"   .= horizonObj
-                ]
-          return $ RpcResponse result Null Null
+          let horizonEnc = rawFeeToEnc raw
+              enc = pairs $
+                      pair "short"  horizonEnc <>
+                      pair "medium" horizonEnc <>
+                      pair "long"   horizonEnc
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
   where
-    bucketToJSON :: RawBucketRange -> Value
-    bucketToJSON RawBucketRange{..} = object
-      [ "startrange"     .= rbrStartRange
-      , "endrange"       .= rbrEndRange
-      , "withintarget"   .= rbrWithinTarget
-      , "totalconfirmed" .= rbrTotalConfirmed
-      , "inmempool"      .= rbrInMempool
-      , "leftmempool"    .= rbrLeftMempool
-      ]
+    bucketToEnc :: RawBucketRange -> AE.Encoding
+    bucketToEnc RawBucketRange{..} = pairs $
+      pair "startrange"     (AE.word64 rbrStartRange)     <>
+      pair "endrange"       (AE.word64 rbrEndRange)       <>
+      pair "withintarget"   (AE.double rbrWithinTarget)   <>
+      pair "totalconfirmed" (AE.double rbrTotalConfirmed) <>
+      pair "inmempool"      (AE.double rbrInMempool)      <>
+      pair "leftmempool"    (AE.double rbrLeftMempool)
 
     -- Bitcoin Core reports feerate as BTC/kvB; haskoin tracks sat/vB.
-    -- Conversion: sat/vB * 1000 sat/kvB / 1e8 sat/BTC = sat/vB / 1e5.
-    satPerVbToBtcPerKvb :: Word64 -> Double
-    satPerVbToBtcPerKvb r = fromIntegral r / 100000.0
-
-    rawFeeToJSON :: RawFeeEstimate -> Value
-    rawFeeToJSON RawFeeEstimate{..} =
-      let common = [ "decay" .= rfeDecay
-                   , "scale" .= rfeScale
-                   , "pass"  .= bucketToJSON rfePass
-                   ]
-          withFail = case rfeFail of
-            Just b  -> ("fail" .= bucketToJSON b) : common
-            Nothing -> common
-          withRate = case rfeFeeRate of
-            Just r  -> ("feerate" .= satPerVbToBtcPerKvb r) : withFail
-            Nothing -> withFail
-          withErrors = if null rfeErrors
-                       then withRate
-                       else ("errors" .= rfeErrors) : withRate
-      in object withErrors
+    -- btcAmountEnc (r * 1000) converts sat/vB to sat/kB → formatBtcSats → BTC/kB.
+    rawFeeToEnc :: RawFeeEstimate -> AE.Encoding
+    rawFeeToEnc RawFeeEstimate{..} =
+      let errorsEnc = if null rfeErrors
+                      then mempty
+                      else pair "errors" (AE.list text rfeErrors)
+          rateEnc = case rfeFeeRate of
+            Just r  -> pair "feerate" (btcAmountEnc (fromIntegral r * 1000))
+            Nothing -> mempty
+          failEnc = case rfeFail of
+            Just b  -> pair "fail" (bucketToEnc b)
+            Nothing -> mempty
+      in pairs $
+           errorsEnc                         <>
+           rateEnc                           <>
+           pair "decay"  (AE.double rfeDecay)<>
+           pair "scale"  (AE.int rfeScale)   <>
+           pair "pass"   (bucketToEnc rfePass)<>
+           failEnc
 
 --------------------------------------------------------------------------------
 -- Mempool: getmempooldescendants
@@ -6748,11 +6782,13 @@ handleGetMempoolDescendants server params = do
             descendants <- getDescendants mp txid
             if verbose
               then do
-                let descendantDetails = Map.fromList
-                      [ (showTxId (meTxId d), mempoolEntryToJSON d)
+                let pairsEnc = foldl' (<>) mempty
+                      [ pair (Key.fromText (showTxId (meTxId d)))
+                             (mempoolEntryEnc d)
                       | d <- descendants
                       ]
-                return $ RpcResponse (toJSON descendantDetails) Null Null
+                    rawBs = encodingToLazyByteString (pairs pairsEnc)
+                return $ RpcResponse (rawJsonResult rawBs) Null Null
               else
                 return $ RpcResponse
                   (toJSON (map (showTxId . meTxId) descendants)) Null Null
@@ -6768,17 +6804,18 @@ handleGetMempoolDescendants server params = do
     showTxId :: TxId -> Text
     showTxId (TxId (Hash256 bs)) = TE.decodeUtf8 $ B16.encode (BS.reverse bs)
 
-    mempoolEntryToJSON :: MempoolEntry -> Value
-    mempoolEntryToJSON entry = object
-      [ "vsize"           .= meSize entry
-      , "fee"             .= (fromIntegral (meFee entry) / 100000000.0 :: Double)
-      , "ancestorcount"   .= meAncestorCount entry
-      , "ancestorsize"    .= meAncestorSize entry
-      , "ancestorfees"    .= meAncestorFees entry
-      , "descendantcount" .= meDescendantCount entry
-      , "descendantsize"  .= meDescendantSize entry
-      , "descendantfees"  .= meDescendantFees entry
-      ]
+    -- | Streaming Encoding for one mempool entry in the descendants verbose
+    -- response.  Uses btcAmountEnc so fee fields match Core's fixed-decimal format.
+    mempoolEntryEnc :: MempoolEntry -> AE.Encoding
+    mempoolEntryEnc entry = pairs $
+      pair "vsize"           (AE.int (meSize entry))                       <>
+      pair "fee"             (btcAmountEnc (fromIntegral (meFee entry)))   <>
+      pair "ancestorcount"   (AE.int (meAncestorCount entry))              <>
+      pair "ancestorsize"    (AE.int (meAncestorSize entry))               <>
+      pair "ancestorfees"    (AE.word64 (meAncestorFees entry))            <>
+      pair "descendantcount" (AE.int (meDescendantCount entry))            <>
+      pair "descendantsize"  (AE.int (meDescendantSize entry))             <>
+      pair "descendantfees"  (AE.word64 (meDescendantFees entry))
 
 -- | Return server uptime in seconds.
 -- Reference: Bitcoin Core's uptime RPC (server.cpp)
@@ -7622,6 +7659,9 @@ txToJSON tx txid = object
           ]
       , "sequence"  .= txInSequence inp
       ]
+    -- NOTE: value emits Double (precision bug) but txToJSON / voutToJSON are
+    -- dead code — only called from psbtToJSON which is itself never called.
+    -- Active PSBT-output paths use psbtVoutEnc (streaming, btcAmountEnc).
     voutToJSON :: Int -> TxOut -> Value
     voutToJSON n out = object
       [ "value"        .= (fromIntegral (txOutValue out) / 100000000.0 :: Double)
@@ -7686,22 +7726,9 @@ txToVerboseJSON server tx txid mBlockHash = do
       totalSize = txTotalSize tx
       weight = baseSize * (witnessScaleFactor - 1) + totalSize
       vsize = (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
-      wtxid = computeWtxId tx
       hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
 
-  -- Build base transaction object
-  let baseFields =
-        [ "txid"     .= showHash (BlockHash (getTxIdHash txid))
-        , "hash"     .= showHash (BlockHash (getTxIdHash wtxid))
-        , "version"  .= txVersion tx
-        , "size"     .= totalSize
-        , "vsize"    .= vsize
-        , "weight"   .= weight
-        , "locktime" .= txLockTime tx
-        , "vin"      .= vinToVerboseJSON tx
-        , "vout"     .= zipWith voutToVerboseJSON [0..] (txOutputs tx)
-        , "hex"      .= hexTx
-        ]
+  -- (baseFields removed: we use the streaming path below for vout.value precision)
 
   -- Add blockchain context if confirmed
   blockFields <- case mBlockHash of
@@ -7724,52 +7751,68 @@ txToVerboseJSON server tx txid mBlockHash = do
             , "blocktime"      .= blockTime
             ]
 
-  return $ object (baseFields ++ blockFields)
+  -- Build the response on the streaming path so vout.value uses
+  -- Core's fixed-decimal format (btcAmountEnc) instead of Double.
+  let baseEnc =
+        pair "txid"     (text (showHash (BlockHash (getTxIdHash txid)))) <>
+        pair "hash"     (text (showHash (BlockHash (getTxIdHash (computeWtxId tx))))) <>
+        pair "version"  (AE.int (fromIntegral (txVersion tx) :: Int))  <>
+        pair "size"     (AE.int totalSize)                              <>
+        pair "vsize"    (AE.int vsize)                                  <>
+        pair "weight"   (AE.int weight)                                 <>
+        pair "locktime" (AE.word32 (txLockTime tx))                     <>
+        pair "vin"      (AE.list id (map (vinToEnc tx) [0 .. length (txInputs tx) - 1])) <>
+        pair "vout"     (AE.list id (zipWith voutToEnc [0..] (txOutputs tx))) <>
+        pair "hex"      (text hexTx)
+      blockEnc = foldl' (<>) mempty $ map (\(k, v) -> pair k (toEncoding v)) blockFields
+      finalEnc = pairs (baseEnc <> blockEnc)
+      rawBs    = encodingToLazyByteString finalEnc
+  return $ rawJsonResult rawBs
   where
-    vinToVerboseJSON :: Tx -> [Value]
-    vinToVerboseJSON t = zipWith (vinEntry t) [0..] (txInputs t)
-
-    vinEntry :: Tx -> Int -> TxIn -> Value
-    vinEntry t idx inp =
-      let isCoinbaseInput = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+    -- | Streaming Encoding for one vin entry.
+    vinToEnc :: Tx -> Int -> AE.Encoding
+    vinToEnc t idx =
+      let inp = txInputs t !! idx
+          isCoinbaseInput = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
           witnessStack = if idx < length (txWitness t) then txWitness t !! idx else []
+          witnessEnc = if null witnessStack
+                       then mempty
+                       else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witnessStack)
       in if isCoinbaseInput
-         then object $ catMaybes
-           [ Just $ "coinbase" .= (TE.decodeUtf8 $ B16.encode (txInScript inp))
-           , Just $ "sequence" .= txInSequence inp
-           , if null witnessStack then Nothing
-             else Just $ "txinwitness" .= map (TE.decodeUtf8 . B16.encode) witnessStack
-           ]
-         else object $ catMaybes
-           [ Just $ "txid"      .= showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp))))
-           , Just $ "vout"      .= outPointIndex (txInPrevOutput inp)
-           , Just $ "scriptSig" .= object
-               [ "asm" .= scriptToAsm (txInScript inp)
-               , "hex" .= (TE.decodeUtf8 $ B16.encode (txInScript inp))
-               ]
-           , if null witnessStack then Nothing
-             else Just $ "txinwitness" .= map (TE.decodeUtf8 . B16.encode) witnessStack
-           , Just $ "sequence"  .= txInSequence inp
-           ]
+         then pairs $
+                pair "coinbase" (text (TE.decodeUtf8 (B16.encode (txInScript inp)))) <>
+                pair "sequence" (AE.word32 (txInSequence inp))                       <>
+                witnessEnc
+         else pairs $
+                pair "txid"      (text (showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp)))))) <>
+                pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput inp)))                               <>
+                pair "scriptSig" (pairs (pair "asm" (text (scriptToAsm (txInScript inp))) <>
+                                         pair "hex" (text (TE.decodeUtf8 (B16.encode (txInScript inp)))))) <>
+                witnessEnc                                                                                    <>
+                pair "sequence"  (AE.word32 (txInSequence inp))
 
-    voutToVerboseJSON :: Int -> TxOut -> Value
-    voutToVerboseJSON n out =
+    -- | Streaming Encoding for one vout entry.
+    -- value uses btcAmountEnc for Core's fixed-decimal format.
+    voutToEnc :: Int -> TxOut -> AE.Encoding
+    voutToEnc n out =
       let scriptHex = txOutScript out
           scriptType = case decodeScript scriptHex of
             Right s -> classifyOutput s
             Left _ -> NonStandard
           typeStr = scriptTypeToString scriptType
           mAddress = scriptToAddress (rsNetwork server) scriptHex scriptType
-      in object $ catMaybes
-        [ Just $ "value"        .= (fromIntegral (txOutValue out) / 100000000.0 :: Double)
-        , Just $ "n"            .= n
-        , Just $ "scriptPubKey" .= object (catMaybes
-            [ Just $ "asm"  .= scriptToAsm scriptHex
-            , Just $ "hex"  .= (TE.decodeUtf8 $ B16.encode scriptHex)
-            , Just $ "type" .= typeStr
-            , mAddress >>= \addr -> Just $ "address" .= addr
-            ])
-        ]
+          spkPairs =
+            pair "asm"  (text (scriptToAsm scriptHex)) <>
+            pair "hex"  (text (TE.decodeUtf8 (B16.encode scriptHex))) <>
+            pair "type" (text typeStr) <>
+            (case mAddress of
+               Just addr -> pair "address" (text addr)
+               Nothing   -> mempty)
+      in pairs $
+           pair "value"        (btcAmountEnc (fromIntegral (txOutValue out))) <>
+           pair "n"            (AE.int n)                                     <>
+           pair "scriptPubKey" (pairs spkPairs)
+
 
 -- | Convert script bytes to assembly string representation
 scriptToAsm :: ByteString -> Text
@@ -8517,33 +8560,37 @@ handleRestBlock server pathPart includeTxDetails = do
                       tip <- readTVarIO (hcTip (rsHeaderChain server))
                       byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
                       let mEntry = Map.lookup bh entries
-                          txData = if includeTxDetails
-                            then map (\tx -> object
-                                   [ "txid" .= showHash (blockHashFromTxId (computeTxId tx))
-                                   , "size" .= BS.length (S.encode tx)
-                                   , "vsize" .= calculateVSize tx
-                                   ]) (blockTxns block)
-                            else map (toJSON . showHash . blockHashFromTxId . computeTxId) (blockTxns block)
+                          hdr = blockHeader block
+                          bits = bhBits hdr
                           mEntryHash = fmap (\e -> (bh, ceHeight e)) mEntry
-                          jsonResult = object $ catMaybes
-                            [ Just $ "hash" .= showHash bh
-                            , Just $ "confirmations" .=
-                                computeBlockRestConfirmations mEntryHash (ceHeight tip) byHeight
-                            , Just $ "size" .= BS.length blockBytes
-                            , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
-                            , Just $ "version" .= bhVersion (blockHeader block)
-                            , Just $ "merkleroot" .= showHash256 (bhMerkleRoot (blockHeader block))
-                            , Just $ "tx" .= txData
-                            , Just $ "time" .= bhTimestamp (blockHeader block)
-                            , Just $ "nonce" .= bhNonce (blockHeader block)
-                            , Just $ "bits" .= showBits (bhBits (blockHeader block))
-                            , Just $ "difficulty" .= getDifficulty (bhBits (blockHeader block))
-                            , Just $ "previousblockhash" .= showHash (bhPrevBlock (blockHeader block))
-                            , fmap ("chainwork" .=) (showHex . ceChainWork <$> mEntry)
-                            ]
+                          txEncs = if includeTxDetails
+                            then [ pairs $
+                                     pair "txid" (text (showHash (blockHashFromTxId (computeTxId tx)))) <>
+                                     pair "size" (AE.int (BS.length (S.encode tx)))                   <>
+                                     pair "vsize" (AE.int (calculateVSize tx))
+                                 | tx <- blockTxns block ]
+                            else [ text (showHash (blockHashFromTxId (computeTxId tx)))
+                                 | tx <- blockTxns block ]
+                          chainworkEnc = case fmap (showHex . ceChainWork) mEntry of
+                            Just cw -> pair "chainwork" (text cw)
+                            Nothing -> mempty
+                          jsonEnc = pairs $
+                            pair "hash"              (text (showHash bh))                         <>
+                            pair "confirmations"     (AE.int (computeBlockRestConfirmations mEntryHash (ceHeight tip) byHeight)) <>
+                            pair "size"              (AE.int (BS.length blockBytes))              <>
+                            pair "height"            (AE.word32 (maybe 0 ceHeight mEntry))        <>
+                            pair "version"           (AE.int (fromIntegral (bhVersion hdr) :: Int)) <>
+                            pair "merkleroot"        (text (showHash256 (bhMerkleRoot hdr)))       <>
+                            pair "tx"                (AE.list id txEncs)                          <>
+                            pair "time"              (AE.word32 (bhTimestamp hdr))                <>
+                            pair "nonce"             (AE.word32 (bhNonce hdr))                    <>
+                            pair "bits"              (text (showBits bits))                       <>
+                            pair "difficulty"        (unsafeToEncoding (stringUtf8 (difficultyStr bits))) <>
+                            pair "previousblockhash" (text (showHash (bhPrevBlock hdr)))          <>
+                            chainworkEnc
                       return $ responseLBS status200
                         [(hContentType, "application/json")]
-                        (encode jsonResult)
+                        (encodingToLazyByteString jsonEnc)
 
                     RestUndefined ->
                       return $ restError 404 "output format not found"
@@ -8607,39 +8654,40 @@ handleRestTx server pathPart = do
               TE.decodeUtf8 (B16.encode txBytes) <> "\n")
 
         RestJson -> do
-          let jsonResult = object $ catMaybes
-                [ Just $ "txid" .= showHash (blockHashFromTxId txid)
-                , Just $ "size" .= BS.length txBytes
-                , Just $ "vsize" .= calculateVSize tx
-                , Just $ "version" .= txVersion tx
-                , Just $ "locktime" .= txLockTime tx
-                , Just $ "vin" .= map vinToJson (txInputs tx)
-                , Just $ "vout" .= zipWith voutToJson [0..] (txOutputs tx)
-                , fmap (\bh -> "blockhash" .= showHash bh) mBlockHash
-                ]
+          -- Use the streaming path so vout.value uses Core's fixed-decimal
+          -- format (btcAmountEnc) instead of Double scientific notation.
+          let bhEnc = case mBlockHash of
+                Just bh -> pair "blockhash" (text (showHash bh))
+                Nothing -> mempty
+              jsonEnc = pairs $
+                pair "txid"     (text (showHash (blockHashFromTxId txid)))                     <>
+                pair "size"     (AE.int (BS.length txBytes))                                   <>
+                pair "vsize"    (AE.int (calculateVSize tx))                                   <>
+                pair "version"  (AE.int (fromIntegral (txVersion tx) :: Int))                 <>
+                pair "locktime" (AE.word32 (txLockTime tx))                                   <>
+                pair "vin"      (AE.list vinToEnc (txInputs tx))                              <>
+                pair "vout"     (AE.list id (zipWith voutToEnc [0..] (txOutputs tx)))         <>
+                bhEnc
           return $ responseLBS status200
             [(hContentType, "application/json")]
-            (encode jsonResult)
+            (encodingToLazyByteString jsonEnc)
 
         RestUndefined ->
           return $ restError 404 "output format not found"
 
-    vinToJson :: TxIn -> Value
-    vinToJson txin = object
-      [ "txid" .= showHash (blockHashFromTxId (outPointHash (txInPrevOutput txin)))
-      , "vout" .= outPointIndex (txInPrevOutput txin)
-      , "scriptSig" .= object ["hex" .= (TE.decodeUtf8 $ B16.encode (txInScript txin))]
-      , "sequence" .= txInSequence txin
-      ]
+    vinToEnc :: TxIn -> AE.Encoding
+    vinToEnc txin = pairs $
+      pair "txid"      (text (showHash (blockHashFromTxId (outPointHash (txInPrevOutput txin))))) <>
+      pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput txin)))                          <>
+      pair "scriptSig" (pairs (pair "hex" (text (TE.decodeUtf8 (B16.encode (txInScript txin)))))) <>
+      pair "sequence"  (AE.word32 (txInSequence txin))
 
-    voutToJson :: Int -> TxOut -> Value
-    voutToJson n txout = object
-      [ "value" .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
-      , "n" .= n
-      , "scriptPubKey" .= object
-          [ "hex" .= (TE.decodeUtf8 $ B16.encode (txOutScript txout))
-          ]
-      ]
+    -- | vout entry: value uses btcAmountEnc for Core's fixed-decimal format.
+    voutToEnc :: Int -> TxOut -> AE.Encoding
+    voutToEnc n txout = pairs $
+      pair "value" (btcAmountEnc (fromIntegral (txOutValue txout)))                                <>
+      pair "n"     (AE.int n)                                                                      <>
+      pair "scriptPubKey" (pairs (pair "hex" (text (TE.decodeUtf8 (B16.encode (txOutScript txout))))))
 
 --------------------------------------------------------------------------------
 -- REST Headers Handler
@@ -8704,10 +8752,12 @@ handleRestHeaders server pathPart query = do
                           TE.decodeUtf8 (B16.encode headerBytes) <> "\n")
 
                     RestJson -> do
-                      let jsonHeaders = map (headerEntryToJson (ceHeight tip)) headers
+                      -- Use streaming path so difficulty uses Core's %.16g format.
+                      let headerEncs = map (headerEntryToEnc (ceHeight tip)) headers
+                          jsonEnc    = AE.list id headerEncs
                       return $ responseLBS status200
                         [(hContentType, "application/json")]
-                        (encode $ toJSON jsonHeaders)
+                        (encodingToLazyByteString jsonEnc)
 
                     RestUndefined ->
                       return $ restError 404 "output format not found"
@@ -8729,20 +8779,23 @@ handleRestHeaders server pathPart query = do
                       Just nextHash -> loop nextHash (n-1) (e:acc)
           in loop startHash maxCount []
 
-    headerEntryToJson :: Word32 -> ChainEntry -> Value
-    headerEntryToJson tipHeight entry = object
-      [ "hash" .= showHash (ceHash entry)
-      , "confirmations" .= (fromIntegral tipHeight - fromIntegral (ceHeight entry) + 1 :: Int)
-      , "height" .= ceHeight entry
-      , "version" .= bhVersion (ceHeader entry)
-      , "merkleroot" .= showHash256 (bhMerkleRoot (ceHeader entry))
-      , "time" .= bhTimestamp (ceHeader entry)
-      , "nonce" .= bhNonce (ceHeader entry)
-      , "bits" .= showBits (bhBits (ceHeader entry))
-      , "difficulty" .= getDifficulty (bhBits (ceHeader entry))
-      , "chainwork" .= showHex (ceChainWork entry)
-      , "previousblockhash" .= showHash (bhPrevBlock (ceHeader entry))
-      ]
+    -- | Streaming Encoding for one block header entry in the REST headers list.
+    -- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
+    headerEntryToEnc :: Word32 -> ChainEntry -> AE.Encoding
+    headerEntryToEnc tipHeight entry =
+      let bits = bhBits (ceHeader entry)
+      in pairs $
+           pair "hash"              (text (showHash (ceHash entry)))                                  <>
+           pair "confirmations"     (AE.int (fromIntegral tipHeight - fromIntegral (ceHeight entry) + 1 :: Int)) <>
+           pair "height"            (AE.word32 (ceHeight entry))                                     <>
+           pair "version"           (AE.int (fromIntegral (bhVersion (ceHeader entry)) :: Int))     <>
+           pair "merkleroot"        (text (showHash256 (bhMerkleRoot (ceHeader entry))))             <>
+           pair "time"              (AE.word32 (bhTimestamp (ceHeader entry)))                       <>
+           pair "nonce"             (AE.word32 (bhNonce (ceHeader entry)))                           <>
+           pair "bits"              (text (showBits bits))                                           <>
+           pair "difficulty"        (unsafeToEncoding (stringUtf8 (difficultyStr bits)))             <>
+           pair "chainwork"         (text (showHex (ceChainWork entry)))                             <>
+           pair "previousblockhash" (text (showHash (bhPrevBlock (ceHeader entry))))
 
     parseQueryParam :: Text -> Text -> Maybe Text
     parseQueryParam q key =
@@ -8817,27 +8870,28 @@ handleRestChainInfo server pathPart = do
           -- Use the shared soft-fork helper so REST /chaininfo and RPC
           -- getblockchaininfo / getdeploymentinfo all read the same source.
           sforks = softforksFromEntry (rsNetwork server) tip
-          jsonResult = object
-            [ "chain" .= netName (rsNetwork server)
-            , "blocks" .= ceHeight tip
-            , "headers" .= ceHeight tip
-            , "bestblockhash" .= showHash (ceHash tip)
-            , "bits" .= showBits (bhBits (ceHeader tip))
-            , "target" .= showHex (bitsToTarget (bhBits (ceHeader tip)))
-            , "difficulty" .= getDifficulty (bhBits (ceHeader tip))
-            , "time" .= bhTimestamp (ceHeader tip)
-            , "mediantime" .= ceMedianTime tip
-            , "verificationprogress" .= progress
-            , "initialblockdownload" .= isIBD
-            , "chainwork" .= showHex (ceChainWork tip)
-            , "size_on_disk" .= (0 :: Int)
-            , "pruned" .= False
-            , "softforks" .= sforks
-            , "warnings" .= ([] :: [Text])
-            ]
+          bits   = bhBits (ceHeader tip)
+          -- Use streaming path so difficulty uses Core-parity %.16g formatting.
+          jsonEnc = pairs $
+            pair "chain"                (text (T.pack (netName (rsNetwork server))))      <>
+            pair "blocks"               (AE.word32 (ceHeight tip))                        <>
+            pair "headers"              (AE.word32 (ceHeight tip))                        <>
+            pair "bestblockhash"        (text (showHash (ceHash tip)))                    <>
+            pair "bits"                 (text (showBits bits))                            <>
+            pair "target"               (text (showHex (bitsToTarget bits)))              <>
+            pair "difficulty"           (unsafeToEncoding (stringUtf8 (difficultyStr bits))) <>
+            pair "time"                 (AE.word32 (bhTimestamp (ceHeader tip)))          <>
+            pair "mediantime"           (AE.word32 (ceMedianTime tip))                   <>
+            pair "verificationprogress" (AE.double progress)                             <>
+            pair "initialblockdownload" (AE.bool isIBD)                                  <>
+            pair "chainwork"            (text (showHex (ceChainWork tip)))                <>
+            pair "size_on_disk"         (AE.int (0 :: Int))                               <>
+            pair "pruned"               (AE.bool False)                                   <>
+            pair "softforks"            (toEncoding sforks)                               <>
+            pair "warnings"             (AE.list text [])
       return $ responseLBS status200
         [(hContentType, "application/json")]
-        (encode jsonResult)
+        (encodingToLazyByteString jsonEnc)
 
     _ ->
       return $ restError 404 "output format not found (available: json)"
@@ -9043,16 +9097,16 @@ handleRestGetUtxos server pathPart = do
                           TE.decodeUtf8 (B16.encode responseBytes) <> "\n")
 
                     RestJson -> do
-                      let utxoJson = zipWith utxoToJson [0..] utxos
-                          jsonResult = object
-                            [ "chainHeight" .= tipHeight
-                            , "chaintipHash" .= showHash tipHash
-                            , "bitmap" .= T.pack bitmapStr
-                            , "utxos" .= utxoJson
-                            ]
+                      -- Use streaming path so utxo.value uses Core's
+                      -- fixed-decimal format (btcAmountEnc).
+                      let jsonEnc = pairs $
+                            pair "chainHeight"   (AE.word32 tipHeight)          <>
+                            pair "chaintipHash"  (text (showHash tipHash))       <>
+                            pair "bitmap"        (text (T.pack bitmapStr))       <>
+                            pair "utxos"         (AE.list id (map utxoToEnc utxos))
                       return $ responseLBS status200
                         [(hContentType, "application/json")]
-                        (encode jsonResult)
+                        (encodingToLazyByteString jsonEnc)
 
                     RestUndefined ->
                       return $ restError 404 "output format not found"
@@ -9086,14 +9140,13 @@ handleRestGetUtxos server pathPart = do
       -- Serialize as: version (4) + height (4) + txout
       S.encode (0 :: Word32) <> S.encode (ueHeight entry) <> S.encode (ueOutput entry)
 
-    utxoToJson :: Int -> UTXOEntry -> Value
-    utxoToJson _idx entry = object
-      [ "height" .= ueHeight entry
-      , "value" .= (fromIntegral (txOutValue (ueOutput entry)) / 100000000.0 :: Double)
-      , "scriptPubKey" .= object
-          [ "hex" .= (TE.decodeUtf8 $ B16.encode (txOutScript (ueOutput entry)))
-          ]
-      ]
+    -- | Streaming Encoding for one UTXO entry.
+    -- value uses btcAmountEnc for Core's fixed-decimal format.
+    utxoToEnc :: UTXOEntry -> AE.Encoding
+    utxoToEnc entry = pairs $
+      pair "height" (AE.word32 (ueHeight entry))                                            <>
+      pair "value"  (btcAmountEnc (fromIntegral (txOutValue (ueOutput entry))))             <>
+      pair "scriptPubKey" (pairs (pair "hex" (text (TE.decodeUtf8 (B16.encode (txOutScript (ueOutput entry)))))))
 
 --------------------------------------------------------------------------------
 -- REST Block Filter (BIP-157 / BIP-158) Handlers
@@ -9721,29 +9774,25 @@ handleGetTxOutSetInfo server params = do
       totalSat <- readIORef sumRef
       bogo     <- readIORef bogosizeRef
       coins    <- readIORef coinsRef
-      let baseFields =
-            [ "height"            .= tipH
-            , "bestblock"         .= showHash (ceHash tip)
-            , "txouts"            .= n
-            , "bogosize"          .= bogo
-            , "total_amount"      .= (fromIntegral totalSat / 1e8 :: Double)
-            ]
-          -- Core's @uint256::GetHex()@ emits the 32 bytes in reverse
-          -- order on the wire, so @hash_serialized_3@ / @muhash@ in the
-          -- RPC response use display-byte-order. Match that with
-          -- 'showHash256'; the W9 diff-test caught a haskoin emission
-          -- in internal byte-order which mis-flagged the post-reorg
-          -- UTXO state as divergent.
-          serializedField =
+      -- Build the response on the streaming path so total_amount uses
+      -- Core's fixed-decimal format (btcAmountEnc) instead of Double.
+      let serializedEnc =
             if wantSerialized
-              then [ "hash_serialized_3" .= showHash256 (computeUtxoHash coins) ]
-              else []
-          muHashField =
+              then pair "hash_serialized_3" (text (showHash256 (computeUtxoHash coins)))
+              else mempty
+          muHashEnc =
             if wantMuHash
-              then [ "muhash" .= showHash256 (computeUtxoMuHash coins) ]
-              else []
-      let result = object (baseFields ++ serializedField ++ muHashField)
-      return $ RpcResponse result Null Null
+              then pair "muhash" (text (showHash256 (computeUtxoMuHash coins)))
+              else mempty
+          enc = pairs $
+                  pair "height"       (AE.word32 tipH)                              <>
+                  pair "bestblock"    (text (showHash (ceHash tip)))                 <>
+                  pair "txouts"       (AE.int n)                                    <>
+                  pair "bogosize"     (AE.int bogo)                                 <>
+                  pair "total_amount" (btcAmountEnc (fromIntegral totalSat))        <>
+                  serializedEnc                                                     <>
+                  muHashEnc
+      return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 -- | getnetworkhashps: estimate network hash rate over sliding window.
 handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
