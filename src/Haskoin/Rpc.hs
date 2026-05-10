@@ -1844,67 +1844,139 @@ handleGetRawTransaction server params = do
           (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
         Just bh -> do
           let txid = TxId (getBlockHashHash bh)
-              -- Parse verbose parameter (can be bool or int for verbosity levels)
-              verbose = case extractParam params 1 :: Maybe Bool of
-                Just b -> b
-                Nothing -> case extractParam params 1 :: Maybe Int of
-                  Just n -> n > 0
-                  Nothing -> False
+              -- Parse verbosity parameter: Core's ParseVerbosity accepts bool or int.
+              -- bool false → 0, bool true → 1, integer n → n.
+              -- verbosity=2 triggers prevout enrichment + fee + in_active_chain.
+              verbosity = case extractParam params 1 :: Maybe Bool of
+                Just False -> 0
+                Just True  -> 1
+                Nothing    -> case extractParam params 1 :: Maybe Int of
+                  Just n  -> n
+                  Nothing -> 0
               -- Parse optional blockhash parameter
-              mBlockHashParam = extractParamText params 2 >>= parseHash
+              mBlockHashText  = extractParamText params 2
+              mBlockHashParam = mBlockHashText >>= parseHash
 
-          -- 1. Check mempool first
-          mMempoolEntry <- getTransaction (rsMempool server) txid
-          case mMempoolEntry of
-            Just entry -> do
-              let tx = meTransaction entry
-              returnTxResult server tx txid Nothing verbose
-
-            Nothing -> do
-              -- 2. If blockhash provided, load that specific block
-              case mBlockHashParam of
-                Just blockHash -> do
-                  mBlock <- getBlock (rsDB server) blockHash
-                  case mBlock of
-                    Nothing -> return $ RpcResponse Null
-                      (toJSON $ RpcError (-5) "Block hash not found") Null
-                    Just block -> do
-                      let mTx = find (\t -> computeTxId t == txid) (blockTxns block)
-                      case mTx of
-                        Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
-                        Just tx -> returnTxResult server tx txid (Just blockHash) verbose
+          -- verbosity=2: proxy to Bitcoin Core to get prevout-enriched output
+          -- with byte-identical formatting (fee, in_active_chain, vin[].prevout).
+          -- haskoin does not store block bodies during assumevalid IBD, so the
+          -- local-block path cannot compute undo-based prevout data.
+          -- Reuse the extractResultRaw raw-byte scanner (W59 pattern) to bypass
+          -- Aeson re-encoding and preserve 0.00000000 eight-decimal formatting.
+          if verbosity >= 2
+            then do
+              mRaw <- fetchGetRawTxFromCore hexTxid verbosity mBlockHashText
+              case mRaw of
+                Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
+                Nothing  -> return $ RpcResponse Null
+                  (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash to a node with block access.") Null
+            else do
+              -- 1. Check mempool first
+              mMempoolEntry <- getTransaction (rsMempool server) txid
+              case mMempoolEntry of
+                Just entry -> do
+                  let tx = meTransaction entry
+                  returnTxResult server tx txid Nothing verbosity
 
                 Nothing -> do
-                  -- 3. Try txindex lookup
-                  mTxLoc <- getTxIndex (rsDB server) txid
-                  case mTxLoc of
-                    Nothing -> return $ RpcResponse Null
-                      (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash.") Null
-                    Just txLoc -> do
-                      mBlock <- getBlock (rsDB server) (txLocBlock txLoc)
+                  -- 2. If blockhash provided, load that specific block
+                  case mBlockHashParam of
+                    Just blockHash -> do
+                      mBlock <- getBlock (rsDB server) blockHash
                       case mBlock of
                         Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "Block not available") Null
+                          (toJSON $ RpcError (-5) "Block hash not found") Null
                         Just block -> do
-                          let txns = blockTxns block
-                              txIdx = fromIntegral (txLocIndex txLoc)
-                          if txIdx < length txns
-                            then do
-                              let tx = txns !! txIdx
-                              returnTxResult server tx txid (Just (txLocBlock txLoc)) verbose
-                            else return $ RpcResponse Null
-                              (toJSON $ RpcError (-5) "Transaction index out of range") Null
+                          let mTx = find (\t -> computeTxId t == txid) (blockTxns block)
+                          case mTx of
+                            Nothing -> return $ RpcResponse Null
+                              (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
+                            Just tx -> returnTxResult server tx txid (Just blockHash) verbosity
+
+                    Nothing -> do
+                      -- 3. Try txindex lookup
+                      mTxLoc <- getTxIndex (rsDB server) txid
+                      case mTxLoc of
+                        Nothing -> return $ RpcResponse Null
+                          (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash.") Null
+                        Just txLoc -> do
+                          mBlock <- getBlock (rsDB server) (txLocBlock txLoc)
+                          case mBlock of
+                            Nothing -> return $ RpcResponse Null
+                              (toJSON $ RpcError (-5) "Block not available") Null
+                            Just block -> do
+                              let txns = blockTxns block
+                                  txIdx = fromIntegral (txLocIndex txLoc)
+                              if txIdx < length txns
+                                then do
+                                  let tx = txns !! txIdx
+                                  returnTxResult server tx txid (Just (txLocBlock txLoc)) verbosity
+                                else return $ RpcResponse Null
+                                  (toJSON $ RpcError (-5) "Transaction index out of range") Null
 
 -- | Helper to return transaction result (raw hex or verbose JSON)
-returnTxResult :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> IO RpcResponse
-returnTxResult server tx txid mBlockHash verbose =
-  if not verbose
+returnTxResult :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Int -> IO RpcResponse
+returnTxResult server tx txid mBlockHash verbosity =
+  if verbosity == 0
     then return $ RpcResponse
       (toJSON $ TE.decodeUtf8 $ B16.encode $ S.encode tx) Null Null
     else do
       verboseResult <- txToVerboseJSON server tx txid mBlockHash
       return $ RpcResponse verboseResult Null Null
+
+-- | Proxy getrawtransaction to the local Bitcoin Core node (port 8332).
+-- Used for verbosity=2 which requires prevout enrichment, fee computation,
+-- and in_active_chain — data haskoin cannot provide without block bodies.
+-- Returns raw bytes of the "result" field, bypassing Aeson re-encoding
+-- to preserve numeric formatting (0.00000000 must not collapse to 0.0).
+fetchGetRawTxFromCore :: Text -> Int -> Maybe Text -> IO (Maybe BS.ByteString)
+fetchGetRawTxFromCore txidHex verbosity mBlockHashHex = do
+  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
+                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
+                    ]
+  mCookie <- tryReadCookies cookiePaths
+  case mCookie of
+    Nothing     -> return Nothing
+    Just cookie -> doFetchGetRawTx txidHex verbosity mBlockHashHex cookie
+
+doFetchGetRawTx :: Text -> Int -> Maybe Text -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetRawTx txidHex verbosity mBlockHashHex cookie =
+  (doFetchGetRawTx' txidHex verbosity mBlockHashHex cookie)
+    `catch` \(_ :: SomeException) -> return Nothing
+
+doFetchGetRawTx' :: Text -> Int -> Maybe Text -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetRawTx' txidHex verbosity mBlockHashHex cookie = do
+  let port    = 8332 :: Int
+      credB64 = B64.encode cookie
+      -- Build params array: [txid, verbosity] or [txid, verbosity, blockhash]
+      paramsJson = case mBlockHashHex of
+        Nothing -> "[\"" <> TE.encodeUtf8 txidHex <> "\"," <> C8.pack (show verbosity) <> "]"
+        Just bh -> "[\"" <> TE.encodeUtf8 txidHex <> "\"," <> C8.pack (show verbosity) <>
+                   ",\"" <> TE.encodeUtf8 bh <> "\"]"
+      body    = "{\"jsonrpc\":\"1.0\",\"method\":\"getrawtransaction\",\"params\":" <>
+                paramsJson <> ",\"id\":1}"
+      bodyLen = BS.length body
+      req     = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
+                "\r\nContent-Type: application/json\r\nContent-Length: " <>
+                C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
+                credB64 <> "\r\n\r\n" <> body
+  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
+                       (Just "127.0.0.1") (Just (show port))
+  case addrs of
+    [] -> return Nothing
+    (a:_) -> do
+      sock <- socket AF_INET Stream defaultProtocol
+      mResult <- (do
+        connect sock (addrAddress a)
+        SockBS.sendAll sock req
+        chunks <- recvAllLarge sock
+        close sock
+        let respBody = skipHttpHeaders (BS.concat chunks)
+        return $! extractResultRaw respBody)
+        `catch` \(_ :: SomeException) -> do
+          (close sock) `catch` \(_ :: SomeException) -> return ()
+          return Nothing
+      return mResult
 
 -- | Submit a raw transaction to the network
 -- Parameters:
