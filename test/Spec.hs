@@ -2899,6 +2899,120 @@ main = hspec $ do
       -- P2PKH has 1 OP_CHECKSIG
       countScriptSigops script False `shouldBe` 1
 
+    -- W74: accurate multisig counting edge cases
+    it "OP_CHECKMULTISIG with no preceding opcode counts as 20 (accurate, no lastOp)" $ do
+      -- Script: OP_CHECKMULTISIG with nothing before it.
+      -- Core: lastOpcode = OP_INVALIDOPCODE (not in OP_1..OP_16) → n += 20.
+      let script = Script [OP_CHECKMULTISIG]
+      countScriptSigops script True `shouldBe` 20
+
+    it "OP_CHECKMULTISIG with preceding OP_PUSHDATA counts as 20 (accurate, push not OP_N)" $ do
+      -- Core: lastOpcode is OP_PUSHDATA (> OP_16), not in range → n += 20.
+      let script = Script [OP_PUSHDATA "some_data" OPCODE, OP_CHECKMULTISIG]
+      countScriptSigops script True `shouldBe` 20
+
+    it "OP_CHECKMULTISIG with preceding OP_0 counts as 0 (accurate)" $ do
+      -- OP_0 is in the small-num range; Core: DecodeOP_N(OP_0) = 0.
+      let script = Script [OP_0, OP_CHECKMULTISIG]
+      countScriptSigops script True `shouldBe` 0
+
+    it "OP_CHECKMULTISIG with preceding OP_16 counts as 16 (accurate)" $ do
+      let script = Script [OP_16, OP_CHECKMULTISIG]
+      countScriptSigops script True `shouldBe` 16
+
+    it "OP_CHECKMULTISIGVERIFY counts like OP_CHECKMULTISIG" $ do
+      let script = Script [OP_3, OP_CHECKMULTISIGVERIFY]
+      countScriptSigops script True `shouldBe` 3
+
+    it "mixed CHECKSIG and CHECKMULTISIG accumulate" $ do
+      -- 2× OP_CHECKSIG + 1× OP_CHECKMULTISIG(inaccurate=20) = 22
+      let script = Script [OP_CHECKSIG, OP_CHECKSIGVERIFY, OP_CHECKMULTISIG]
+      countScriptSigops script False `shouldBe` 22
+
+  -- W74: getTransactionSigOpCost — full cost accounting
+  describe "W74 getTransactionSigOpCost" $ do
+    let flags = consensusFlagsAtHeight mainnet 800000  -- post-SegWit mainnet
+
+    it "legacy P2PK tx: 1 CHECKSIG in scriptPubKey × 4 = 4" $ do
+      -- Output with OP_CHECKSIG; scriptSig and inputs have 0 sigops.
+      let dummyTxId = TxId (Hash256 (BS.replicate 32 0xaa))
+          prevOp    = OutPoint dummyTxId 0
+          txin      = TxIn prevOp BS.empty 0xffffffff
+          spk       = encodeScript $ Script [OP_CHECKSIG]
+          txout     = TxOut 50000000 spk
+          tx        = Tx 1 [txin] [txout] [[]] 0
+          SigOpCost cost = getTransactionSigOpCost tx Map.empty flags
+      cost `shouldBe` 4  -- 1 sigop × WITNESS_SCALE_FACTOR(4)
+
+    it "legacy tx with 2 CHECKSIG outputs: cost = 2 × 4 = 8" $ do
+      let dummyTxId = TxId (Hash256 (BS.replicate 32 0xbb))
+          prevOp    = OutPoint dummyTxId 0
+          txin      = TxIn prevOp BS.empty 0xffffffff
+          spk       = encodeScript $ Script [OP_CHECKSIG]
+          txout     = TxOut 25000000 spk
+          tx        = Tx 1 [txin] [txout, txout] [[]] 0
+          SigOpCost cost = getTransactionSigOpCost tx Map.empty flags
+      cost `shouldBe` 8
+
+    it "coinbase tx: only legacy cost counted, no P2SH/witness" $ do
+      -- Coinbase: no prevout lookup, no P2SH/witness sigops.
+      let coinbaseIn = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff)
+                            (BS.pack [0x01, 0x00]) 0xffffffff  -- minimal scriptSig
+          spk       = encodeScript $ Script [OP_CHECKSIG]
+          txout     = TxOut 625000000 spk
+          tx        = Tx 1 [coinbaseIn] [txout] [[]] 0
+          SigOpCost cost = getTransactionSigOpCost tx Map.empty flags
+      -- 1 CHECKSIG in scriptPubKey × 4 = 4; coinbase skips P2SH+witness
+      cost `shouldBe` 4
+
+    it "P2WPKH input: witness sigop cost = 1 (not scaled)" $ do
+      -- P2WPKH output is spent: witness sigop = 1 (unscaled).
+      -- P2WPKH scriptPubKey = OP_0 <20-byte-hash> (witness version 0, 20-byte program).
+      let prevSpk   = encodeScript $ Script
+                        [OP_0, OP_PUSHDATA (BS.replicate 20 0xcc) OPCODE]
+          prevOut   = TxOut 100000 prevSpk
+          dummyTxId = TxId (Hash256 (BS.replicate 32 0xdd))
+          outpoint  = OutPoint dummyTxId 0
+          txin      = TxIn outpoint BS.empty 0xffffffff
+          tx        = Tx 1 [txin] [TxOut 99000 BS.empty] [[BS.empty, BS.empty]] 0
+          utxoMap   = Map.singleton outpoint prevOut
+          -- P2WPKH prevout → witness sigop = 1 (no ×4)
+          SigOpCost cost = getTransactionSigOpCost tx utxoMap flags
+      -- Legacy: 0 CHECKSIG in scriptSig/scriptPubKey × 4 = 0
+      -- P2SH: not P2SH prevout → 0
+      -- Witness P2WPKH: 1 (unscaled)
+      cost `shouldBe` 1
+
+  -- W74: MAX_STANDARD_TX_SIGOPS_COST = 16,000 constant
+  describe "W74 maxStandardTxSigOpsCost constant" $ do
+    it "equals MAX_BLOCK_SIGOPS_COST / 5 = 16000" $ do
+      Std.maxStandardTxSigOpsCost `shouldBe` 16000
+
+    it "is 1/5 of maxBlockSigOpsCost" $ do
+      Std.maxStandardTxSigOpsCost `shouldBe` maxBlockSigOpsCost `div` 5
+
+  -- W74: getLegacySigOpCount — inaccurate counting gate
+  describe "W74 getLegacySigOpCount" $ do
+    it "counts CHECKSIG in scriptSig (inaccurate)" $ do
+      -- scriptSig with OP_CHECKSIG counts 1 sigop (unusual but valid for testing)
+      let spk    = BS.empty  -- no prevout
+          -- Make a tx with a CHECKSIG in the scriptSig
+          scriptSigWithChecksig = encodeScript $ Script [OP_CHECKSIG]
+          txin   = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                        scriptSigWithChecksig 0xffffffff
+          txout  = TxOut 0 BS.empty
+          tx     = Tx 1 [txin] [txout] [] 0
+      getLegacySigOpCount tx `shouldBe` 1
+
+    it "counts CHECKMULTISIG in scriptPubKey as 20 (inaccurate)" $ do
+      let txin  = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                       BS.empty 0xffffffff
+          spk   = encodeScript $ Script [OP_2, OP_CHECKMULTISIG]
+          txout = TxOut 0 spk
+          tx    = Tx 1 [txin] [txout] [] 0
+      -- Inaccurate: OP_CHECKMULTISIG always = 20 regardless of preceding OP_2
+      getLegacySigOpCount tx `shouldBe` 20
+
   -- Regression: BlockTemplate must enforce MAX_BLOCK_SIGOPS_COST = 80,000.
   -- Cat I mining audit (PARITY-MATRIX.md commit c830524) found that the
   -- selection loop ignored sigOpsLimit even though the template advertised

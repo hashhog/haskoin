@@ -154,11 +154,14 @@ import Haskoin.Crypto (computeTxId, computeWtxid)
 import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            txBaseSize, txTotalSize, coinbaseMaturity,
                            isFinalTxCheck, calculateSequenceLocks,
-                           checkSequenceLocks, bip68Active)
+                           checkSequenceLocks, bip68Active,
+                           getTransactionSigOpCost, consensusFlagsAtHeight,
+                           SigOpCost(..))
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
 import qualified Haskoin.Policy.Standard as Std
+import Haskoin.Policy.Standard (maxStandardTxSigOpsCost)
 
 --------------------------------------------------------------------------------
 -- Fee Rate
@@ -688,51 +691,67 @@ finalizeTransaction mp tx txid inputPairs = do
             Left wsErr -> return $ Left (ErrNonStandard (renderWitnessStdReason wsErr))
             Right () -> do
 
-              -- Verify scripts
-              scriptResult <- verifyAllScripts mp tx inputMap
-              case scriptResult of
-                Left err -> return $ Left err
-                Right () -> do
+              -- MAX_STANDARD_TX_SIGOPS_COST check (Bitcoin Core validation.cpp:908,941-943).
+              -- GetTransactionSigOpCost counts legacy (×4) + P2SH (×4) + witness (×1).
+              -- Transactions exceeding 16,000 sigop-cost units are rejected as
+              -- non-standard ("bad-txns-too-many-sigops").
+              -- Reference: bitcoin-core/src/policy/policy.h:44 + validation.cpp:941.
+              tipHeight <- readTVarIO (mpHeight mp)
+              let sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipHeight + 1)
+                  SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
+              if txSigOpCost > maxStandardTxSigOpsCost
+                then return $ Left (ErrNonStandard "bad-txns-too-many-sigops")
+                else do
 
-                  -- Check ancestor/descendant limits
-                  ancestorResult <- checkAncestorLimits mp tx vsize
-                  case ancestorResult of
-                    Left err -> return $ Left err
-                    Right ancestors -> do
+                -- Verify scripts
+                scriptResult <- verifyAllScripts mp tx inputMap
+                case scriptResult of
+                  Left err -> return $ Left err
+                  Right () -> do
 
-                      -- Check TRUC (v3) policy
-                      trucResult <- checkTrucPolicy tx vsize mp
-                      case trucResult of
-                        Left trucErr@(TrucSiblingExists parentId siblingId) -> do
-                          -- Sibling eviction opportunity - try to evict existing child
-                          mParent <- getTransaction mp parentId
-                          case mParent of
-                            Just parent -> do
-                              evictResult <- attemptSiblingEviction tx fee vsize parent mp
-                              case evictResult of
-                                Left _ -> return $ Left (ErrTrucViolation trucErr)
-                                Right () ->
-                                  -- Sibling evicted, continue with addition
-                                  continueAddTransaction mp tx txid fee vsize ancestors
-                            Nothing -> return $ Left (ErrTrucViolation trucErr)
-                        Left trucErr -> return $ Left (ErrTrucViolation trucErr)
-                        Right _ ->
-                          -- TRUC check passed (or tx is not v3), continue
-                          continueAddTransaction mp tx txid fee vsize ancestors
+                    -- Check ancestor/descendant limits
+                    ancestorResult <- checkAncestorLimits mp tx vsize
+                    case ancestorResult of
+                      Left err -> return $ Left err
+                      Right ancestors -> do
+
+                        -- Check TRUC (v3) policy
+                        trucResult <- checkTrucPolicy tx vsize mp
+                        case trucResult of
+                          Left trucErr@(TrucSiblingExists parentId siblingId) -> do
+                            -- Sibling eviction opportunity - try to evict existing child
+                            mParent <- getTransaction mp parentId
+                            case mParent of
+                              Just parent -> do
+                                evictResult <- attemptSiblingEviction tx fee vsize parent mp
+                                case evictResult of
+                                  Left _ -> return $ Left (ErrTrucViolation trucErr)
+                                  Right () ->
+                                    -- Sibling evicted, continue with addition
+                                    continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
+                              Nothing -> return $ Left (ErrTrucViolation trucErr)
+                          Left trucErr -> return $ Left (ErrTrucViolation trucErr)
+                          Right _ ->
+                            -- TRUC check passed (or tx is not v3), continue
+                            continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
 
 -- | Continue adding a transaction after all checks pass
-continueAddTransaction :: Mempool -> Tx -> TxId -> Word64 -> Int -> [MempoolEntry] -> IO (Either MempoolError TxId)
-continueAddTransaction mp tx txid fee vsize ancestors = do
+continueAddTransaction :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO (Either MempoolError TxId)
+continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
   let feeRate = calculateFeeRate fee vsize
   -- Build and insert the entry
   now <- round <$> getPOSIXTime
   height <- readTVarIO (mpHeight mp)
   let rbfOptIn = signalsOptInRBF tx
-      -- Ancestor counts include this transaction
+      -- Ancestor counts include this transaction (self is included in all ancestor_ fields)
       ancestorCount = length ancestors + 1
       ancestorSize = sum (map meSize ancestors) + vsize
       ancestorFees = sum (map meFee ancestors) + fee
-      ancestorSigOps = sum (map meAncestorSigOps ancestors)
+      -- meAncestorSigOps accumulates ancestors' own sigop costs plus self.
+      -- Each ancestor's meAncestorSigOps already includes that ancestor's
+      -- own sigop cost; we add only self's cost to avoid double-counting.
+      -- Reference: Bitcoin Core CTxMemPool nAncestorSigOpCost tracking.
+      ancestorSigOps = sum (map meAncestorSigOps ancestors) + txSigOpCost
       wtxid = computeWtxid tx
       entry = MempoolEntry
         { meTransaction = tx
@@ -1906,7 +1925,11 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
           ancestorCount = length ancestors + 1
           ancestorSize = sum (map meSize ancestors) + vsize
           ancestorFees = sum (map meFee ancestors) + fee
-          ancestorSigOps = sum (map meAncestorSigOps ancestors)
+          -- Include self's own sigop cost (matches Core ancestor sigop accumulation).
+          inputMap = Map.fromList inputPairs
+          sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
+          SigOpCost selfSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
+          ancestorSigOps = sum (map meAncestorSigOps ancestors) + selfSigOpCost
           wtxid = computeWtxid tx
           entry = MempoolEntry
             { meTransaction = tx
