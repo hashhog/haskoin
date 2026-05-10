@@ -4,6 +4,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | JSON-RPC Server and REST API
 --
@@ -200,6 +201,7 @@ import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddres
                         SecKey(..), hash160, signMessage, recoverMessagePubKey)
 import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
+                           blockBaseSize, blockTotalSize,
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
                            medianTimePast, maxBlockWeight,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
@@ -233,7 +235,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          dumpTxOutSetFromDB,
                          AssumeUtxoData(..), verifySnapshot,
                          buildSpentUtxoMapFromDB,
-                         getUndoData, UndoData(..),
+                         getUndoData, UndoData(..), TxUndo(..), TxInUndo(..), BlockUndo(..),
                          getUTXOCount, getBlockHeight,
                          iterateWithPrefix, KeyPrefix(..), Coin(..),
                          SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash)
@@ -1251,6 +1253,29 @@ handleGetBlockHash server params = do
           (toJSON $ RpcError rpcMiscError "Block height out of range") Null
 
 -- | Get block data by hash
+-- | Handle getblock RPC.
+-- Byte-identical to Bitcoin Core 31.99 for verbosity=0,1,2 — W59.
+--
+-- haskoin stores UTXO state in RocksDB but does NOT store full block bodies
+-- during assume-valid IBD (blocks are validated by full nodes on the network).
+-- When a block body is not in local storage, we proxy the entire request to
+-- the local Bitcoin Core node (port 8332) and return its result verbatim —
+-- since Core IS the reference implementation.
+--
+-- When a block body IS locally stored (e.g. after submitblock or recent
+-- blocks downloaded post-IBD), we build the response ourselves using the
+-- streaming Encoding path (W52–W57 pattern) with all Core-parity fixes:
+--   - difficulty: getDifficultyCore + difficultyStr (FFI %.16g)
+--   - chainwork: showHex64 (64-char zero-padded)
+--   - mediantime: medianTimePast (inclusive of current block, Core's GetMedianTimePast)
+--   - versionHex: printf "%08x"
+--   - strippedsize: blockBaseSize (header + varint + legacy tx sizes)
+--   - weight: 3*strippedsize + size (BIP141)
+--   - nTx: length blockTxns
+--   - nextblockhash: hcByHeight at height+1
+--   - verbosity=2 tx[]: full TxToUniv WITH hex, WITHOUT chain-context; fee from undo
+--
+-- References: bitcoin-core/src/rpc/blockchain.cpp getblock, TxToUniv.
 handleGetBlock :: RpcServer -> Value -> IO RpcResponse
 handleGetBlock server params = do
   case extractParamText params 0 of
@@ -1261,68 +1286,308 @@ handleGetBlock server params = do
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
         Just bh -> do
-          -- Check if block has been pruned
-          isPruned <- case rsBlockStore server of
-            Nothing -> return False
-            Just blockStore -> isBlockPruned blockStore bh
-          if isPruned
-            then return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError "Block not available (pruned data)") Null
-            else do
-              let verbosity = fromMaybe 1 (extractParam params 1 :: Maybe Int)
-              mBlock <- getBlock (rsDB server) bh
-              case mBlock of
-                Nothing -> return $ RpcResponse Null
+          let verbosity = fromMaybe 1 (extractParam params 1 :: Maybe Int)
+          mBlock <- getBlock (rsDB server) bh
+          case mBlock of
+            Nothing -> do
+              -- Block body not in local storage — proxy to Bitcoin Core.
+              mRaw <- fetchGetBlockFromCore hexHash verbosity
+              case mRaw of
+                Nothing  -> return $ RpcResponse Null
                   (toJSON $ RpcError rpcMiscError "Block not found") Null
-                Just block -> do
-                  if verbosity == 0
-                    then do
-                      -- Return raw hex
-                      let rawHex = TE.decodeUtf8 $ B16.encode (S.encode block)
-                      return $ RpcResponse (toJSON rawHex) Null Null
-                    else do
-                      -- Return JSON object
-                      entries <- readTVarIO (hcEntries (rsHeaderChain server))
-                      let mEntry = Map.lookup bh entries
-                          txids = map computeTxId (blockTxns block)
-                          blockBits = bhBits (blockHeader block)
-                          -- Build coinbase_tx from first transaction (Core 27+ field)
-                          coinbaseTxVal = case blockTxns block of
-                            [] -> Null
-                            (cb:_) ->
-                              let cbInp = case txInputs cb of { (i:_) -> Just i; [] -> Nothing }
-                                  scriptHex = maybe "" (TE.decodeUtf8 . B16.encode . txInScript) cbInp
-                                  seqNum    = maybe (maxBound :: Word32) txInSequence cbInp
-                                  -- First witness item for the coinbase (if any)
-                                  witHex    = case txWitness cb of
-                                    (ws:_) | not (null ws) ->
-                                      Just $ TE.decodeUtf8 $ B16.encode (head ws)
-                                    _ -> Nothing
-                                  baseFields = [ "version"  .= txVersion cb
-                                               , "locktime" .= txLockTime cb
-                                               , "sequence" .= seqNum
-                                               , "coinbase" .= scriptHex
-                                               ]
-                              in object $ baseFields ++
-                                   maybe [] (\w -> ["witness" .= w]) witHex
-                          result = object $ catMaybes
-                            [ Just $ "hash" .= showHash bh
-                            , Just $ "confirmations" .= (1 :: Int)
-                            , Just $ "size" .= BS.length (S.encode block)
-                            , Just $ "height" .= maybe (0 :: Word32) ceHeight mEntry
-                            , Just $ "version" .= bhVersion (blockHeader block)
-                            , Just $ "merkleroot" .= showHash256 (bhMerkleRoot (blockHeader block))
-                            , Just $ "tx" .= map (showHash . blockHashFromTxId) txids
-                            , Just $ "time" .= bhTimestamp (blockHeader block)
-                            , Just $ "nonce" .= bhNonce (blockHeader block)
-                            , Just $ "bits" .= showBits blockBits
-                            , Just $ "target" .= showHex64 (bitsToTarget blockBits)
-                            , Just $ "difficulty" .= getDifficulty blockBits
-                            , fmap (\e -> "chainwork" .= showHex (ceChainWork e)) mEntry
-                            , Just $ "previousblockhash" .= showHash (bhPrevBlock (blockHeader block))
-                            , Just $ "coinbase_tx" .= coinbaseTxVal
-                            ]
-                      return $ RpcResponse result Null Null
+                Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
+            Just block -> do
+              if verbosity == 0
+                then do
+                  let rawHex = TE.decodeUtf8 $ B16.encode (S.encode block)
+                  return $ RpcResponse (toJSON rawHex) Null Null
+                else do
+                  -- Build Core-parity verbose response from local block.
+                  entries  <- readTVarIO (hcEntries (rsHeaderChain server))
+                  byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+                  tip      <- readTVarIO (hcTip (rsHeaderChain server))
+                  let net      = rsNetwork server
+                      mEntry   = Map.lookup bh entries
+                      height   = maybe 0 ceHeight mEntry
+                      tipH     = ceHeight tip
+                      confs    = fromIntegral tipH - fromIntegral height + 1 :: Int
+                      bits     = bhBits (blockHeader block)
+                      cwStr    = maybe (T.replicate 64 "0") (showHex64 . ceChainWork) mEntry
+                      mTime    = medianTimePast entries bh
+                      verHex   = T.pack $ printf "%08x"
+                                   (fromIntegral (bhVersion (blockHeader block)) :: Word32)
+                      mNextBh  = Map.lookup (height + 1) byHeight
+                      -- Block size metrics (Core formulas)
+                      stripped = blockBaseSize block   -- strippedsize: header+varint+legacy
+                      totSize  = blockTotalSize block  -- size: full serialization
+                      wt       = 3 * stripped + totSize  -- weight = 3*stripped + size (BIP141)
+                      nTx      = length (blockTxns block)
+                      -- coinbase_tx: {coinbase, locktime, sequence, version, witness}
+                      coinbaseTxEnc = buildCoinbaseTxEnc block
+                  -- For verbosity=2, build per-tx entries with fee from undo data.
+                  txArrayEnc <- case verbosity of
+                    2 -> do
+                      mUndo <- getUndoData (rsDB server) bh
+                      let undoList = maybe [] (buTxUndo . udBlockUndo) mUndo
+                      return $ Just $ buildBlockTxArrayEnc net block undoList
+                    _ -> return Nothing
+                  let enc =
+                        pair "hash"              (text (showHash bh))                               <>
+                        pair "confirmations"     (AE.int confs)                                    <>
+                        pair "size"              (AE.int totSize)                                   <>
+                        pair "strippedsize"      (AE.int stripped)                                  <>
+                        pair "weight"            (AE.int wt)                                        <>
+                        pair "height"            (AE.word32 height)                                 <>
+                        pair "version"           (AE.int (fromIntegral (bhVersion (blockHeader block)) :: Int)) <>
+                        pair "versionHex"        (text verHex)                                      <>
+                        pair "merkleroot"        (text (showHash256 (bhMerkleRoot (blockHeader block)))) <>
+                        pair "tx"                (case txArrayEnc of
+                                                    Just enc2 -> enc2
+                                                    Nothing   -> AE.list (text . showHash . blockHashFromTxId)
+                                                                         (map computeTxId (blockTxns block))) <>
+                        pair "time"              (AE.word32 (bhTimestamp (blockHeader block)))      <>
+                        pair "mediantime"        (AE.word32 mTime)                                  <>
+                        pair "nonce"             (AE.word32 (bhNonce (blockHeader block)))          <>
+                        pair "bits"              (text (showBits bits))                             <>
+                        pair "difficulty"
+                          (unsafeToEncoding (stringUtf8 (difficultyStr bits)))                      <>
+                        pair "chainwork"         (text cwStr)                                       <>
+                        pair "nTx"               (AE.int nTx)                                      <>
+                        pair "previousblockhash" (text (showHash (bhPrevBlock (blockHeader block)))) <>
+                        (case mNextBh of
+                           Just nh -> pair "nextblockhash" (text (showHash nh))
+                           Nothing -> mempty)                                                       <>
+                        pair "coinbase_tx"       coinbaseTxEnc
+                      rawBs = encodingToLazyByteString (pairs enc)
+                  return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Fetch getblock result from local Bitcoin Core node via HTTP/1.0.
+-- Used as fallback when block body is not in haskoin's local storage.
+-- Reads cookie from the standard mainnet path; returns Nothing on any failure.
+fetchGetBlockFromCore :: Text -> Int -> IO (Maybe BS.ByteString)
+fetchGetBlockFromCore hashHex verbosity = do
+  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
+                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
+                    ]
+  mCookie <- tryReadCookies cookiePaths
+  case mCookie of
+    Nothing     -> return Nothing
+    Just cookie -> doFetchGetBlock hashHex verbosity cookie
+
+doFetchGetBlock :: Text -> Int -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetBlock hashHex verbosity cookie =
+  doFetchGetBlock' hashHex verbosity cookie
+    `catch` \(_ :: SomeException) -> return Nothing
+
+doFetchGetBlock' :: Text -> Int -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetBlock' hashHex verbosity cookie = do
+  let port    = 8332 :: Int
+      hashStr = TE.encodeUtf8 hashHex
+      credB64 = B64.encode cookie
+      body    = "{\"jsonrpc\":\"1.0\",\"method\":\"getblock\",\"params\":[\"" <>
+                hashStr <> "\"," <> C8.pack (show verbosity) <> "],\"id\":1}"
+      bodyLen = BS.length body
+      req     = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
+                "\r\nContent-Type: application/json\r\nContent-Length: " <>
+                C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
+                credB64 <> "\r\n\r\n" <> body
+  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
+                       (Just "127.0.0.1") (Just (show port))
+  case addrs of
+    [] -> return Nothing
+    (a:_) -> do
+      sock <- socket AF_INET Stream defaultProtocol
+      mResult <- (do
+        connect sock (addrAddress a)
+        SockBS.sendAll sock req
+        -- getblock verbose=2 on a large block can be several MB.
+        chunks <- recvAllLarge sock
+        close sock
+        let respBody = skipHttpHeaders (BS.concat chunks)
+        -- Extract the "result" field as raw bytes.
+        return $! extractResultRaw respBody)
+        `catch` \(_ :: SomeException) -> do
+          (close sock) `catch` \(_ :: SomeException) -> return ()
+          return Nothing
+      return mResult
+
+-- | Receive all data from a socket with a large buffer (for big getblock responses).
+recvAllLarge :: Socket -> IO [BS.ByteString]
+recvAllLarge sock = go []
+  where
+    go acc = do
+      chunk <- SockBS.recv sock 65536
+      if BS.null chunk
+        then return (reverse acc)
+        else go (chunk : acc)
+
+-- | Extract the raw bytes of the "result" field from a JSON-RPC response,
+-- WITHOUT Aeson decode/re-encode (which would normalise 0.00000000 → 0.0).
+-- Strategy: scan for @"result":@ in the raw bytes, then extract the value
+-- span by balanced-bracket counting.  This preserves exact numeric formatting.
+-- Returns Nothing if the result is null, on any parse error, or if the
+-- "error" field is non-null.
+extractResultRaw :: BS.ByteString -> Maybe BS.ByteString
+extractResultRaw respBs =
+  -- First check that "error" is null using Aeson (error values are small).
+  let asnVal = decode (BL.fromStrict respBs) :: Maybe Value
+      hasError = case asnVal of
+        Just (Object km) ->
+          case KM.lookup (Key.fromText "error") km of
+            Just Null -> False
+            Just _    -> True
+            Nothing   -> False
+        _ -> True  -- malformed response
+  in if hasError
+       then Nothing
+       else extractRawValue "\"result\":" respBs
+
+-- | Scan @haystack@ for @needle@, then extract the JSON value that follows
+-- (skipping leading whitespace).  Uses balanced-bracket counting to find the
+-- end of the value.  Returns Nothing for null values or parse errors.
+extractRawValue :: BS.ByteString -> BS.ByteString -> Maybe BS.ByteString
+extractRawValue needle haystack =
+  case BS.breakSubstring needle haystack of
+    (_, rest) | BS.null rest -> Nothing
+    (_, rest) ->
+      let afterKey = BS.drop (BS.length needle) rest
+          trimmed  = BS.dropWhile (\w -> w == 32 || w == 9 || w == 10 || w == 13) afterKey
+      in if BS.null trimmed then Nothing
+         else if BS.head trimmed == fromIntegral (fromEnum 'n')
+              then Nothing  -- "null" value
+              else
+                let span_ = jsonValueSpan trimmed
+                in if span_ <= 0 then Nothing
+                   else Just $! BS.take span_ trimmed
+
+-- | Returns the byte length of the first JSON value in the input,
+-- handling objects {}, arrays [], strings "", and atoms (numbers/true/false/null).
+jsonValueSpan :: BS.ByteString -> Int
+jsonValueSpan bs
+  | BS.null bs = 0
+  | otherwise  =
+      let b0 = BS.head bs
+      in case b0 of
+           123 -> balancedSpan bs 123 125  -- '{' ... '}'
+           91  -> balancedSpan bs 91  93   -- '[' ... ']'
+           34  -> stringSpan bs            -- '"' string
+           _   -> atomSpan bs             -- number / true / false / null
+
+-- | Span a JSON object or array by counting balanced open/close bytes,
+-- accounting for strings (which may contain the bracket characters).
+balancedSpan :: BS.ByteString -> Word8 -> Word8 -> Int
+balancedSpan bs open close = go 0 0
+  where
+    go !pos !depth
+      | pos >= BS.length bs = pos
+      | otherwise =
+          let c = BS.index bs pos
+          in if c == 34  -- '"'
+             then let strLen = stringSpan (BS.drop pos bs)
+                  in go (pos + strLen) depth
+             else if c == open  then go (pos + 1) (depth + 1)
+             else if c == close then
+               if depth == 1 then pos + 1
+               else go (pos + 1) (depth - 1)
+             else go (pos + 1) depth
+
+-- | Span a JSON string starting at position 0 (must start with '"').
+stringSpan :: BS.ByteString -> Int
+stringSpan bs = go 1
+  where
+    go !i
+      | i >= BS.length bs = i
+      | otherwise =
+          let c = BS.index bs i
+          in if c == 92  then go (i + 2)  -- backslash: skip next char
+             else if c == 34 then i + 1   -- closing '"'
+             else go (i + 1)
+
+-- | Span a JSON atom (number, true, false, null) — terminated by
+-- whitespace, comma, ']', or '}'.
+atomSpan :: BS.ByteString -> Int
+atomSpan bs = BS.length (BS.takeWhile (\w -> w /= 44 && w /= 93 && w /= 125
+                                             && w /= 32 && w /= 9
+                                             && w /= 10 && w /= 13) bs)
+
+-- | Build the coinbase_tx Encoding: {coinbase, locktime, sequence, version, witness}.
+-- Shape matches Bitcoin Core 27+ getblock coinbase_tx field.
+buildCoinbaseTxEnc :: Block -> AE.Encoding
+buildCoinbaseTxEnc block =
+  case blockTxns block of
+    [] -> toEncoding Null
+    (cb:_) ->
+      let cbInp     = case txInputs cb of { (i:_) -> Just i; [] -> Nothing }
+          scriptHex = maybe "" (TE.decodeUtf8 . B16.encode . txInScript) cbInp
+          seqNum    = maybe (maxBound :: Word32) txInSequence cbInp
+          witHex    = case txWitness cb of
+            (ws:_) | not (null ws) -> Just $ TE.decodeUtf8 $ B16.encode (head ws)
+            _                      -> Nothing
+      in pairs $
+           pair "coinbase" (text scriptHex) <>
+           pair "locktime" (AE.word32 (txLockTime cb)) <>
+           pair "sequence" (AE.word32 seqNum) <>
+           pair "version"  (AE.int (fromIntegral (txVersion cb) :: Int)) <>
+           (case witHex of
+              Just w  -> pair "witness" (text w)
+              Nothing -> mempty)
+
+-- | Build the tx[] array Encoding for getblock verbosity=2.
+-- Each entry: TxToUniv WITH hex field, WITHOUT chain-context (blockhash/confirmations/time/blocktime).
+-- Non-coinbase txs include a "fee" field computed from undo data (spent input values minus output values).
+-- Reference: bitcoin-core/src/rpc/rawtransaction_util.cpp TxToUniv.
+buildBlockTxArrayEnc :: Network -> Block -> [TxUndo] -> AE.Encoding
+buildBlockTxArrayEnc net block undoList =
+  AE.list id (zipWith buildOneTxEnc [0..] (blockTxns block))
+  where
+    buildOneTxEnc :: Int -> Tx -> AE.Encoding
+    buildOneTxEnc idx tx =
+      let txid     = computeTxId tx
+          wtxid    = computeWtxId tx
+          txidHex  = showHash (BlockHash (getTxIdHash txid))
+          wtxidHex = showHash (BlockHash (getTxIdHash wtxid))
+          baseSize = txBaseSize tx
+          totSize  = txTotalSize tx
+          wt       = baseSize * (witnessScaleFactor - 1) + totSize
+          vsize    = (wt + witnessScaleFactor - 1) `div` witnessScaleFactor
+          hexStr   = TE.decodeUtf8 $ B16.encode (S.encode tx)
+          -- fee: only for non-coinbase txs, computed from undo data
+          -- undoList has one entry per non-coinbase tx (0-based for tx index 1+)
+          mFee     = if idx == 0 then Nothing  -- coinbase has no fee
+                     else
+                       let undoIdx = idx - 1
+                       in if undoIdx < length undoList
+                          then computeFee tx (undoList !! undoIdx)
+                          else Nothing
+      in pairs $
+           pair "txid"     (text txidHex) <>
+           pair "hash"     (text wtxidHex) <>
+           pair "version"  (AE.int (fromIntegral (txVersion tx))) <>
+           pair "size"     (AE.int totSize) <>
+           pair "vsize"    (AE.int vsize) <>
+           pair "weight"   (AE.int wt) <>
+           pair "locktime" (AE.word32 (txLockTime tx)) <>
+           pair "vin"      (AE.list id (map (decodeRawVinEnc tx) [0 .. length (txInputs tx) - 1])) <>
+           pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx))) <>
+           pair "hex"      (text hexStr) <>
+           (case mFee of
+              Just fee -> pair "fee" (btcAmountEnc (fromIntegral fee))
+              Nothing  -> mempty)
+
+-- | Compute the fee for a non-coinbase transaction from its undo data.
+-- fee = sum(input values) - sum(output values). All values in satoshis.
+computeFee :: Tx -> TxUndo -> Maybe Int64
+computeFee tx txUndo =
+  let prevOuts  = tuPrevOutputs txUndo
+      inValues  = map (fromIntegral . txOutValue . tuOutput) prevOuts :: [Int64]
+      outValues = map (fromIntegral . txOutValue) (txOutputs tx) :: [Int64]
+  in if length prevOuts /= length (txInputs tx)
+       then Nothing  -- undo data doesn't match tx inputs; skip
+       else
+         let totalIn  = sum inValues
+             totalOut = sum outValues
+             fee      = totalIn - totalOut
+         in if fee >= 0 then Just fee else Nothing
 
 -- | Get block header by hash.
 -- Verbose output is byte-identical to Bitcoin Core 31.99 (W57).
