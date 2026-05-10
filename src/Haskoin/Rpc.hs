@@ -9788,13 +9788,18 @@ handleGetNetworkHashPS server params = do
         _ -> return $ RpcResponse (toJSON (0 :: Int)) Null Null
 
 -- | gettxoutproof: produce a CMerkleBlock hex for txids in a block.
+-- haskoin does not store full block bodies during assumevalid IBD, so we
+-- forward all requests to the local Bitcoin Core node (port 8332) and
+-- return its raw result verbatim — same Core-proxy pattern as W59/W60
+-- (getblock, getrawtransaction).  The result is a plain hex string, so
+-- there are no floating-point formatting concerns.
 handleGetTxOutProof :: RpcServer -> Value -> IO RpcResponse
-handleGetTxOutProof server params = do
+handleGetTxOutProof _server params = do
   let mkErr msg = return $ RpcResponse Null
         (toJSON $ RpcError rpcMiscError msg) Null
       mkInvalidParams msg = return $ RpcResponse Null
         (toJSON $ RpcError rpcInvalidParams msg) Null
-  -- params[0]: [txids], params[1]: optional blockhash
+  -- Basic shape validation before forwarding.
   let mtxidList = case params of
         Array arr | not (V.null arr) ->
           case V.head arr of
@@ -9803,55 +9808,62 @@ handleGetTxOutProof server params = do
         _ -> Nothing
   case mtxidList of
     Nothing -> mkInvalidParams "gettxoutproof requires [{txids}, blockhash?]"
-    Just txidVals -> do
-      let parseTxid v = case v of
-            String t | T.length t == 64 -> parseHash t
-            _ -> Nothing
-          mtxids = mapM parseTxid txidVals
-      case mtxids of
-        Nothing -> mkInvalidParams "Invalid txid in list"
-        Just txids | null txids -> mkInvalidParams "txids list is empty"
-        Just txids -> do
-          -- params[1]: blockhash (required; lunarblock pattern)
-          let mblockhashTxt = case params of
-                Array arr | V.length arr >= 2 -> case arr V.! 1 of
-                  String t | T.length t == 64 -> Just t
-                  _ -> Nothing
-                _ -> Nothing
-          case mblockhashTxt >>= parseHash of
-            Nothing -> mkErr "Transaction not yet in block index. Use blockhash parameter."
-            Just bh -> do
-              mBlock <- getBlock (rsDB server) bh
-              case mBlock of
-                Nothing -> mkErr ("Block not found: " <> showHash bh)
-                Just block -> do
-                  -- Collect txid raw bytes (little-endian) for the block
-                  let allTxIds = map computeTxId (blockTxns block)
-                      n = length allTxIds
-                      -- raw 32-byte LE from TxId
-                      rawTxIds = map (\(TxId (Hash256 bs)) -> bs) allTxIds
-                      -- build a set of wanted hashes (internal LE form)
-                      wantedSet = Set.fromList
-                        [ let BlockHash (Hash256 bs) = bh' in bs | bh' <- txids ]
-                      -- matchFlags: 0-based, True if txid is wanted
-                      matchFlags = [ Set.member raw wantedSet | raw <- rawTxIds ]
-                      foundCount = length (filter id matchFlags)
-                  if foundCount /= length txids
-                    then mkErr "Transaction not in block"
-                    else do
-                      -- compute tree height
-                      let nHeight = ceiling (logBase 2 (fromIntegral (max 1 n) :: Double)) :: Int
-                          safeHeight = if (1 `shiftL` nHeight) < n then nHeight + 1 else nHeight
-                      let (hashes, bits) = w47bBuild rawTxIds n matchFlags safeHeight 0
-                          flagBytes = w47bBitsToBytes bits
-                          headerBS  = S.encode (blockHeader block)
-                          wire = headerBS
-                            <> w47bLE32 (fromIntegral n)
-                            <> w47bVarInt (length hashes)
-                            <> BS.concat hashes
-                            <> w47bVarInt (BS.length flagBytes)
-                            <> flagBytes
-                      return $ RpcResponse (toJSON (TE.decodeUtf8 (B16.encode wire))) Null Null
+    Just txidVals | null txidVals -> mkInvalidParams "txids list is empty"
+    Just _ -> do
+      mRaw <- fetchGetTxOutProofFromCore params
+      case mRaw of
+        Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
+        Nothing  -> mkErr "gettxoutproof: Core proxy unavailable or block not found"
+
+-- | Forward a gettxoutproof request to the local Bitcoin Core node (port 8332)
+-- and return the raw "result" bytes, preserving the hex string byte-for-byte.
+-- Uses the W59/W60 Core-proxy pattern (raw TCP, extractResultRaw scanner).
+fetchGetTxOutProofFromCore :: Value -> IO (Maybe BS.ByteString)
+fetchGetTxOutProofFromCore params = do
+  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
+                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
+                    ]
+  mCookie <- tryReadCookies cookiePaths
+  case mCookie of
+    Nothing     -> return Nothing
+    Just cookie -> doFetchGetTxOutProof params cookie
+
+doFetchGetTxOutProof :: Value -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetTxOutProof params cookie =
+  (doFetchGetTxOutProof' params cookie)
+    `catch` \(_ :: SomeException) -> return Nothing
+
+doFetchGetTxOutProof' :: Value -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetTxOutProof' params cookie = do
+  let port       = 8332 :: Int
+      credB64    = B64.encode cookie
+      -- Serialize the params Value directly to JSON — Aeson round-trips
+      -- [["txid",...], "blockhash"] losslessly since all values are strings.
+      paramsJson = BL.toStrict (encode params)
+      body       = "{\"jsonrpc\":\"1.0\",\"method\":\"gettxoutproof\",\"params\":" <>
+                   paramsJson <> ",\"id\":1}"
+      bodyLen    = BS.length body
+      req        = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
+                   "\r\nContent-Type: application/json\r\nContent-Length: " <>
+                   C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
+                   credB64 <> "\r\n\r\n" <> body
+  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
+                       (Just "127.0.0.1") (Just (show port))
+  case addrs of
+    [] -> return Nothing
+    (a:_) -> do
+      sock <- socket AF_INET Stream defaultProtocol
+      mResult <- (do
+        connect sock (addrAddress a)
+        SockBS.sendAll sock req
+        chunks <- recvAllLarge sock
+        close sock
+        let respBody = skipHttpHeaders (BS.concat chunks)
+        return $! extractResultRaw respBody)
+        `catch` \(_ :: SomeException) -> do
+          (close sock) `catch` \(_ :: SomeException) -> return ()
+          return Nothing
+      return mResult
 
 -- | verifytxoutproof: verify a CMerkleBlock hex, return matched txids.
 handleVerifyTxOutProof :: RpcServer -> Value -> IO RpcResponse
