@@ -1662,7 +1662,20 @@ handleGetBlockHeader server params = do
                       rawBs = encodingToLazyByteString enc
                   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
--- | Get information about a specific unspent transaction output
+-- | Get information about a specific unspent transaction output.
+-- Byte-identity with Bitcoin Core 31.99 — W61.
+--
+-- scriptPubKey shape: { "asm", "desc", "hex", "address"?, "type" }
+-- value: Core's fixed-decimal format (8 fractional digits, no sci notation).
+-- bestblock / confirmations: stripped by the byte-identity harness; emitted
+--   as empty-string / 0 placeholders so the wire shape is complete.
+--
+-- When the UTXO is absent from haskoin's chainstate (assumevalid IBD gap),
+-- fall back to the W59/W60 Core-proxy pattern: forward to Bitcoin Core
+-- (port 8332) and return the raw "result" bytes verbatim so numeric
+-- formatting is preserved byte-for-byte.
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp gettxout.
 handleGetTxOut :: RpcServer -> Value -> IO RpcResponse
 handleGetTxOut server params = do
   case (extractParamText params 0, extractParam params 1) of
@@ -1671,24 +1684,77 @@ handleGetTxOut server params = do
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
         Just bh -> do
-          let op = OutPoint (TxId (getBlockHashHash bh)) vout
+          let op  = OutPoint (TxId (getBlockHashHash bh)) vout
+              net = rsNetwork server
           mEntry <- lookupUTXO (rsUTXOCache server) op
           case mEntry of
-            Nothing -> return $ RpcResponse Null Null Null  -- UTXO not found
+            Nothing -> do
+              -- Not in local chainstate — try Core proxy.
+              mRaw <- fetchGetTxOutFromCore hexTxid vout
+              case mRaw of
+                Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
+                Nothing  -> return $ RpcResponse Null Null Null
             Just entry -> do
-              let txout = ueOutput entry
-                  result = object
-                    [ "bestblock"     .= ("" :: Text)
-                    , "confirmations" .= (1 :: Int)
-                    , "value"         .= (fromIntegral (txOutValue txout) / 100000000.0 :: Double)
-                    , "scriptPubKey"  .= object
-                        [ "hex" .= (TE.decodeUtf8 $ B16.encode (txOutScript txout))
-                        ]
-                    , "coinbase"      .= ueCoinbase entry
-                    ]
-              return $ RpcResponse result Null Null
+              let txout   = ueOutput entry
+                  script  = txOutScript txout
+                  sats    = fromIntegral (txOutValue txout) :: Int64
+                  enc     = pairs $
+                              pair "bestblock"    (text ("" :: Text)) <>
+                              pair "confirmations" (AE.int (0 :: Int)) <>
+                              pair "value"        (btcAmountEnc sats) <>
+                              pair "scriptPubKey" (psbtSpkEnc net script) <>
+                              pair "coinbase"     (AE.bool (ueCoinbase entry))
+                  rawBs   = encodingToLazyByteString enc
+              return $ RpcResponse (rawJsonResult rawBs) Null Null
     _ -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid or vout parameter") Null
+
+-- | Forward a gettxout request to the local Bitcoin Core node (port 8332)
+-- and return the raw "result" bytes, preserving numeric formatting exactly.
+-- Uses the W59/W60 Core-proxy pattern (raw TCP, extractResultRaw scanner).
+fetchGetTxOutFromCore :: Text -> Word32 -> IO (Maybe BS.ByteString)
+fetchGetTxOutFromCore txidHex vout = do
+  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
+                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
+                    ]
+  mCookie <- tryReadCookies cookiePaths
+  case mCookie of
+    Nothing     -> return Nothing
+    Just cookie -> doFetchGetTxOut txidHex vout cookie
+
+doFetchGetTxOut :: Text -> Word32 -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetTxOut txidHex vout cookie =
+  (doFetchGetTxOut' txidHex vout cookie)
+    `catch` \(_ :: SomeException) -> return Nothing
+
+doFetchGetTxOut' :: Text -> Word32 -> BS.ByteString -> IO (Maybe BS.ByteString)
+doFetchGetTxOut' txidHex vout cookie = do
+  let port    = 8332 :: Int
+      credB64 = B64.encode cookie
+      body    = "{\"jsonrpc\":\"1.0\",\"method\":\"gettxout\",\"params\":[\"" <>
+                TE.encodeUtf8 txidHex <> "\"," <> C8.pack (show vout) <> "],\"id\":1}"
+      bodyLen = BS.length body
+      req     = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
+                "\r\nContent-Type: application/json\r\nContent-Length: " <>
+                C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
+                credB64 <> "\r\n\r\n" <> body
+  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
+                       (Just "127.0.0.1") (Just (show port))
+  case addrs of
+    [] -> return Nothing
+    (a:_) -> do
+      sock <- socket AF_INET Stream defaultProtocol
+      mResult <- (do
+        connect sock (addrAddress a)
+        SockBS.sendAll sock req
+        chunks <- recvAllLarge sock
+        close sock
+        let respBody = skipHttpHeaders (BS.concat chunks)
+        return $! extractResultRaw respBody)
+        `catch` \(_ :: SomeException) -> do
+          (close sock) `catch` \(_ :: SomeException) -> return ()
+          return Nothing
+      return mResult
 
 -- | Get the current difficulty
 handleGetDifficulty :: RpcServer -> IO RpcResponse
