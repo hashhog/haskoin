@@ -198,7 +198,8 @@ import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
                         Address(..), PubKey(..), serializePubKeyCompressed,
                         base58Check, bech32Encode, bech32mEncode,
-                        SecKey(..), hash160, signMessage, recoverMessagePubKey)
+                        SecKey(..), hash160, signMessage, recoverMessagePubKey,
+                        addressToText)
 import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
                            blockBaseSize, blockTotalSize,
@@ -918,6 +919,7 @@ handleRpcRequest server req = do
 
     -- Wallet descriptor RPCs
     "getdescriptorinfo"    -> handleGetDescriptorInfo params
+    "deriveaddresses"      -> handleDeriveAddresses params
     "importdescriptors"    -> handleImportDescriptors server params
     "listdescriptors"      -> handleListDescriptors server params
 
@@ -3327,6 +3329,72 @@ descriptorHasPrivateKeys desc = case desc of
     tapTreeHasPrivate :: TapTree -> Bool
     tapTreeHasPrivate (TapLeaf d)      = descriptorHasPrivateKeys d
     tapTreeHasPrivate (TapBranch l r)  = tapTreeHasPrivate l || tapTreeHasPrivate r
+
+-- | The @deriveaddresses@ RPC (BIP-380).
+--
+-- Derives one or more addresses from an output descriptor.
+-- Non-ranged descriptors return a single-element array.
+-- Ranged descriptors require a [begin,end] range argument.
+-- The descriptor MUST include a valid checksum.
+--
+-- Address derivation per descriptor type:
+--   addr(X)        -> embedded address verbatim
+--   pkh(KEY)       -> Hash160(compressed-pubkey) -> base58check P2PKH
+--   wpkh(KEY)      -> Hash160(compressed-pubkey) -> bech32 v0
+--   sh(wpkh(KEY))  -> P2WPKH-script Hash160      -> base58check P2SH
+--   rawtr(XONLY)   -> OP_1 <32-byte>              -> bech32m v1 (no tweak, BIP-386)
+--
+-- Reference: bitcoin-core/src/rpc/misc.cpp deriveaddresses
+handleDeriveAddresses :: Value -> IO RpcResponse
+handleDeriveAddresses params = do
+  let mDesc = extractParamText params 0
+  case mDesc of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams ("Missing required argument: descriptor" :: Text)) Null
+    Just descText -> do
+      -- Core errors if the checksum is absent.
+      let hasChecksum = T.any (== '#') descText
+      if not hasChecksum
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcMiscError ("Missing checksum" :: Text)) Null
+        else case parseDescriptor descText of
+          Left err -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams (T.pack $ "Invalid descriptor: " ++ show err)) Null
+          Right desc ->
+            if isRangeDescriptor desc
+              then
+                -- Range param: second positional arg, either N or [begin,end]
+                case parseRangeParam params of
+                  Left rangeErr -> return $ RpcResponse Null
+                    (toJSON $ RpcError rpcInvalidParams rangeErr) Null
+                  Right (lo, hi) -> do
+                    let indices = [lo..hi]
+                        addrs   = deriveAddresses desc indices
+                        result  = toJSON (map addressToText addrs)
+                    return $ RpcResponse result Null Null
+              else do
+                -- Non-ranged: single element
+                let addrs  = deriveAddresses desc []
+                    result = toJSON (map addressToText addrs)
+                return $ RpcResponse result Null Null
+  where
+    -- Parse range param: N (meaning [0,N]) or [begin,end].
+    -- Core interprets a bare integer N as range [0,N].
+    parseRangeParam :: Value -> Either Text (Int, Int)
+    parseRangeParam p =
+      case p of
+        Array arr | V.length arr >= 2 ->
+          case arr V.! 1 of
+            Number n ->
+              let hi = round n :: Int
+              in Right (0, hi)
+            Array inner | V.length inner >= 2 ->
+              case (inner V.! 0, inner V.! 1) of
+                (Number lo, Number hi) ->
+                  Right (round lo, round hi)
+                _ -> Left "Range must be [begin,end] integers"
+            _ -> Left "Invalid range argument"
+        _ -> Left "Ranged descriptor requires a range argument"
 
 -- | The @importdescriptors@ RPC. Refused with @rpcWalletError@ in this
 -- build.
