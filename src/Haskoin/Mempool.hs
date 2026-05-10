@@ -657,37 +657,46 @@ finalizeTransaction mp tx txid inputPairs = do
         then return $ Left (ErrFeeBelowMinimum feeRate (mpcMinFeeRate (mpConfig mp)))
         else do
 
-          -- Verify scripts
-          scriptResult <- verifyAllScripts mp tx inputMap
-          case scriptResult of
-            Left err -> return $ Left err
+          -- IsWitnessStandard: check P2WSH stack limits, tapscript annex,
+          -- and witness-stuffing on P2A. Mirrors Bitcoin Core
+          -- validation.cpp:904 → IsWitnessStandard(tx, m_view).
+          let prevScripts = map (txOutScript . snd) inputPairs
+              witStacks   = txWitness tx
+          case Std.checkWitnessStandard tx prevScripts witStacks of
+            Left wsErr -> return $ Left (ErrNonStandard (renderWitnessStdReason wsErr))
             Right () -> do
 
-              -- Check ancestor/descendant limits
-              ancestorResult <- checkAncestorLimits mp tx vsize
-              case ancestorResult of
+              -- Verify scripts
+              scriptResult <- verifyAllScripts mp tx inputMap
+              case scriptResult of
                 Left err -> return $ Left err
-                Right ancestors -> do
+                Right () -> do
 
-                  -- Check TRUC (v3) policy
-                  trucResult <- checkTrucPolicy tx vsize mp
-                  case trucResult of
-                    Left trucErr@(TrucSiblingExists parentId siblingId) -> do
-                      -- Sibling eviction opportunity - try to evict existing child
-                      mParent <- getTransaction mp parentId
-                      case mParent of
-                        Just parent -> do
-                          evictResult <- attemptSiblingEviction tx fee vsize parent mp
-                          case evictResult of
-                            Left _ -> return $ Left (ErrTrucViolation trucErr)
-                            Right () ->
-                              -- Sibling evicted, continue with addition
-                              continueAddTransaction mp tx txid fee vsize ancestors
-                        Nothing -> return $ Left (ErrTrucViolation trucErr)
-                    Left trucErr -> return $ Left (ErrTrucViolation trucErr)
-                    Right _ ->
-                      -- TRUC check passed (or tx is not v3), continue
-                      continueAddTransaction mp tx txid fee vsize ancestors
+                  -- Check ancestor/descendant limits
+                  ancestorResult <- checkAncestorLimits mp tx vsize
+                  case ancestorResult of
+                    Left err -> return $ Left err
+                    Right ancestors -> do
+
+                      -- Check TRUC (v3) policy
+                      trucResult <- checkTrucPolicy tx vsize mp
+                      case trucResult of
+                        Left trucErr@(TrucSiblingExists parentId siblingId) -> do
+                          -- Sibling eviction opportunity - try to evict existing child
+                          mParent <- getTransaction mp parentId
+                          case mParent of
+                            Just parent -> do
+                              evictResult <- attemptSiblingEviction tx fee vsize parent mp
+                              case evictResult of
+                                Left _ -> return $ Left (ErrTrucViolation trucErr)
+                                Right () ->
+                                  -- Sibling evicted, continue with addition
+                                  continueAddTransaction mp tx txid fee vsize ancestors
+                            Nothing -> return $ Left (ErrTrucViolation trucErr)
+                        Left trucErr -> return $ Left (ErrTrucViolation trucErr)
+                        Right _ ->
+                          -- TRUC check passed (or tx is not v3), continue
+                          continueAddTransaction mp tx txid fee vsize ancestors
 
 -- | Continue adding a transaction after all checks pass
 continueAddTransaction :: Mempool -> Tx -> TxId -> Word64 -> Int -> [MempoolEntry] -> IO (Either MempoolError TxId)
@@ -2890,3 +2899,9 @@ renderStdReason e = case e of
   Std.StdDataCarrierTooLarge {}  -> "datacarrier"
   Std.StdBareMultisig            -> "bare-multisig"
   Std.StdDust {}                 -> "dust"
+
+-- | Render a 'WitnessStandardError' as a Bitcoin Core reason tag.
+-- Core uses "bad-witness-nonstandard" for all IsWitnessStandard failures
+-- (validation.cpp:905).
+renderWitnessStdReason :: Std.WitnessStandardError -> String
+renderWitnessStdReason _ = "bad-witness-nonstandard"
