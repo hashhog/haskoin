@@ -4400,6 +4400,7 @@ data Descriptor
   | Wsh !Descriptor                        -- ^ wsh(SCRIPT) - P2WSH (native SegWit)
   | Multi !Int ![KeyExpr]                  -- ^ multi(k, KEY, KEY, ...) - k-of-n multisig
   | SortedMulti !Int ![KeyExpr]            -- ^ sortedmulti(k, KEY, ...) - sorted multisig
+  | Rawtr !KeyExpr                         -- ^ rawtr(KEY) - BIP-386: x-only key, no taproot tweak
   | Tr !KeyExpr !(Maybe TapTree)           -- ^ tr(KEY) or tr(KEY, TREE) - Taproot
   | Addr !Address                          -- ^ addr(ADDRESS) - literal address
   | Raw !ByteString                        -- ^ raw(HEX) - raw script
@@ -4554,6 +4555,7 @@ parseDescriptorExpr st = do
     "wsh"         -> parseWsh st2
     "multi"       -> parseMulti False st2
     "sortedmulti" -> parseMulti True st2
+    "rawtr"       -> parseRawtr st2
     "tr"          -> parseTr st2
     "addr"        -> parseAddr st2
     "raw"         -> parseRaw st2
@@ -4594,6 +4596,14 @@ parseWsh st = do
   (inner, st1) <- parseDescriptorExpr st
   (_, st2) <- expectChar ')' st1
   return (Wsh inner, st2)
+
+-- | Parse rawtr(KEY) — BIP-386: x-only pubkey output key without taproot tweak.
+-- Reference: Bitcoin Core src/script/descriptor.cpp RawTRDescriptor.
+parseRawtr :: Parser Descriptor
+parseRawtr st = do
+  (key, st1) <- parseKeyExpr st
+  (_, st2) <- expectChar ')' st1
+  return (Rawtr key, st2)
 
 -- | Parse multi(k, KEY, KEY, ...) or sortedmulti(...).
 parseMulti :: Bool -> Parser Descriptor
@@ -4940,6 +4950,7 @@ descriptorToText desc = case desc of
                   T.intercalate "," (map keyExprToText keys) <> ")"
   SortedMulti k keys -> "sortedmulti(" <> T.pack (show k) <> "," <>
                         T.intercalate "," (map keyExprToText keys) <> ")"
+  Rawtr key -> "rawtr(" <> keyExprToXOnlyText key <> ")"
   Tr key Nothing -> "tr(" <> keyExprToText key <> ")"
   Tr key (Just tree) -> "tr(" <> keyExprToText key <> "," <>
                         tapTreeToText tree <> ")"
@@ -4958,6 +4969,16 @@ keyExprToText key = case key of
   KeyWIF sk -> wifEncode sk
   KeyOrigin fp path inner ->
     "[" <> hexEncode' fp <> pathToText path <> "]" <> keyExprToText inner
+
+-- | Convert a key expression to x-only (32-byte) hex text, for use in rawtr().
+-- BIP-386: rawtr() emits the x-only pubkey without the leading parity byte.
+keyExprToXOnlyText :: KeyExpr -> Text
+keyExprToXOnlyText key = case key of
+  KeyLiteral pk -> hexEncode' (BS.drop 1 (serializePubKeyCompressed pk))
+  KeyOrigin fp path inner ->
+    "[" <> hexEncode' fp <> pathToText path <> "]" <> keyExprToXOnlyText inner
+  -- For xpub/xprv/WIF, fall back to compressed form (range descriptors rarely used with rawtr)
+  other -> keyExprToText other
 
 -- | Convert a derivation path to text.
 pathToText :: [Word32] -> Text
@@ -4995,6 +5016,7 @@ isRangeDescriptor desc = case desc of
   Wsh inner -> isRangeDescriptor inner
   Multi _ keys -> any isRangeKey keys
   SortedMulti _ keys -> any isRangeKey keys
+  Rawtr key -> isRangeKey key
   Tr key tree -> isRangeKey key || maybe False isRangeTree tree
   Addr _ -> False
   Raw _ -> False
@@ -5055,6 +5077,10 @@ deriveScriptsAt desc idx = case desc of
   SortedMulti k keys ->
     let pks = sortOn serializePubKeyCompressed $ map (`deriveKeyExpr` idx) keys
     in [encodeMultisig k pks]
+  Rawtr key ->
+    -- BIP-386: x-only pubkey IS the output key, no taproot tweak.
+    let pk = deriveKeyExpr key idx
+    in [encodeScript (encodeP2TR (xOnlyPubKey pk))]
   Tr key _ ->
     let pk = deriveKeyExpr key idx
         -- Simplified: just output spend key (no script path)
