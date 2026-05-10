@@ -198,7 +198,8 @@ import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
                         Address(..), PubKey(..), serializePubKeyCompressed,
                         base58Check, bech32Encode, bech32mEncode,
-                        SecKey(..), hash160, signMessage, recoverMessagePubKey,
+                        SecKey(..), hash160, sha256, parsePubKey,
+                        signMessage, recoverMessagePubKey,
                         addressToText)
 import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
@@ -920,6 +921,7 @@ handleRpcRequest server req = do
     -- Wallet descriptor RPCs
     "getdescriptorinfo"    -> handleGetDescriptorInfo params
     "deriveaddresses"      -> handleDeriveAddresses params
+    "createmultisig"       -> handleCreateMultisig params
     "importdescriptors"    -> handleImportDescriptors server params
     "listdescriptors"      -> handleListDescriptors server params
 
@@ -3395,6 +3397,118 @@ handleDeriveAddresses params = do
                 _ -> Left "Range must be [begin,end] integers"
             _ -> Left "Invalid range argument"
         _ -> Left "Ranged descriptor requires a range argument"
+
+-- | The @createmultisig@ RPC.
+--
+-- Creates a multisig address from M and N compressed public keys.
+-- Supports three output types:
+--   "legacy"     (default) — sh(multi(M,...))       P2SH  base58check
+--   "bech32"               — wsh(multi(M,...))       P2WSH bech32 v0
+--   "p2sh-segwit"          — sh(wsh(multi(M,...)))   P2SH-of-P2WSH base58check
+--
+-- Returns: { address, redeemScript, descriptor }
+-- The redeemScript is always the raw OP_M <pk>... OP_N OP_CHECKMULTISIG bytes.
+--
+-- Reference: bitcoin-core/src/rpc/misc.cpp createmultisig
+handleCreateMultisig :: Value -> IO RpcResponse
+handleCreateMultisig params = do
+  -- param 0: nrequired (integer)
+  let mNreq = extractParam params 0 :: Maybe Int
+  case mNreq of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams ("nrequired must be an integer" :: Text)) Null
+    Just nRequired -> do
+      -- param 1: pubkeys (array of hex strings)
+      let mPkArr = extractParamArray params 1
+      case mPkArr of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams ("keys must be a JSON array" :: Text)) Null
+        Just pkArr -> do
+          -- Parse each pubkey hex → ByteString → PubKey
+          let pkList = V.toList pkArr
+              nKeys  = length pkList
+          -- Validate n
+          if nKeys == 0 || nKeys > 20
+            then return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams
+                (T.pack $ "Number of keys out of range [1,20]: " ++ show nKeys)) Null
+            else if nRequired < 1 || nRequired > nKeys
+              then return $ RpcResponse Null
+                (toJSON $ RpcError rpcInvalidParams
+                  (T.pack $ "nrequired out of range: " ++ show nRequired)) Null
+              else do
+                -- Parse each pubkey
+                let parsedPks = map parsePkFromValue pkList
+                case sequence parsedPks of
+                  Left err -> return $ RpcResponse Null
+                    (toJSON $ RpcError rpcInvalidParams err) Null
+                  Right pks -> do
+                    -- param 2: address_type (optional, default "legacy")
+                    let addrType = fromMaybe "legacy" (extractParamText params 2)
+                    if addrType `notElem` (["legacy","bech32","p2sh-segwit"] :: [Text])
+                      then return $ RpcResponse Null
+                        (toJSON $ RpcError rpcInvalidParams
+                          (T.pack $ "Invalid address_type: " ++ T.unpack addrType)) Null
+                      else do
+                        -- Build inner multi() descriptor with KeyLiteral entries
+                        let keyExprs   = map KeyLiteral pks
+                            multiDesc  = Multi nRequired keyExprs
+                            -- redeemScript = raw multisig scriptPubKey from Multi
+                            rScripts   = deriveScripts multiDesc 0
+                        case rScripts of
+                          [] -> return $ RpcResponse Null
+                            (toJSON $ RpcError rpcInternalError
+                              ("Failed to derive redeemScript" :: Text)) Null
+                          (redeemScript : _) -> do
+                            let rsHex = TE.decodeUtf8 $ B16.encode redeemScript
+                            -- Build address + descriptor text depending on addrType
+                            let (addr, descText) = case addrType of
+                                  "bech32" ->
+                                    -- wsh(multi(M,...)) — P2WSH bech32
+                                    let wshHash = sha256 redeemScript
+                                        a = bech32Encode "bc" 0 wshHash
+                                        d = "wsh(" <> descriptorToText multiDesc <> ")"
+                                    in (a, d)
+                                  "p2sh-segwit" ->
+                                    -- sh(wsh(multi(M,...))) — P2SH wrapping P2WSH script
+                                    let wshHash   = sha256 redeemScript
+                                        -- P2WSH scriptPubKey: OP_0 <32-byte sha256>
+                                        wshScript = BS.concat [BS.pack [0x00, 0x20], wshHash]
+                                        Hash160 h160 = hash160 wshScript
+                                        a = base58Check 0x05 h160
+                                        d = "sh(wsh(" <> descriptorToText multiDesc <> "))"
+                                    in (a, d)
+                                  _ ->
+                                    -- "legacy" — sh(multi(M,...)) — P2SH base58check
+                                    let Hash160 h160 = hash160 redeemScript
+                                        a = base58Check 0x05 h160
+                                        d = "sh(" <> descriptorToText multiDesc <> ")"
+                                    in (a, d)
+                            -- Append BIP-380 checksum to descriptor
+                            let descriptor = case addDescriptorChecksum descText of
+                                               Just d  -> d
+                                               Nothing -> descText
+                            let result = object
+                                  [ "address"      .= addr
+                                  , "redeemScript" .= rsHex
+                                  , "descriptor"   .= descriptor
+                                  ]
+                            return $ RpcResponse result Null Null
+  where
+    -- Parse a JSON Value as a compressed pubkey hex string → PubKey
+    parsePkFromValue :: Value -> Either Text PubKey
+    parsePkFromValue v = case v of
+      String hexStr -> do
+        let hexBS = TE.encodeUtf8 hexStr
+        case B16.decode hexBS of
+          Left  _  -> Left $ "Invalid hex pubkey: " <> hexStr
+          Right bs ->
+            case parsePubKey bs of
+              Nothing -> Left $ "Invalid or uncompressed pubkey: " <> hexStr
+              Just pk -> case pk of
+                PubKeyCompressed _ -> Right pk
+                _                  -> Left $ "pubkey must be compressed (33 bytes): " <> hexStr
+      _ -> Left "pubkey must be a hex string"
 
 -- | The @importdescriptors@ RPC. Refused with @rpcWalletError@ in this
 -- build.
