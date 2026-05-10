@@ -3170,7 +3170,9 @@ handleValidateAddress server params = do
     Just addr ->
       case textToAddress addr of
         Nothing -> return $ RpcResponse (object
-          [ "isvalid" .= False
+          [ "isvalid"         .= False
+          , "error"           .= ("Invalid or unsupported Segwit (Bech32) or Base58 encoding." :: Text)
+          , "error_locations" .= ([] :: [Value])
           ]) Null Null
         Just address -> do
           let (scriptPubKey, isScript, isWitness, witnessVersion, witnessProgram) =
@@ -3205,9 +3207,9 @@ addressToScriptInfo _net addr = case addr of
     let script = BS.pack [0x00, 0x20] <> h
     in (TE.decodeUtf8 $ B16.encode script, True, True, 0, TE.decodeUtf8 $ B16.encode h)
   TaprootAddress (Hash256 h) ->
-    -- P2TR: OP_1 <32 bytes>
+    -- P2TR: OP_1 <32 bytes>; witness_program is 32 bytes > 20, so isscript=true
     let script = BS.pack [0x51, 0x20] <> h
-    in (TE.decodeUtf8 $ B16.encode script, False, True, 1, TE.decodeUtf8 $ B16.encode h)
+    in (TE.decodeUtf8 $ B16.encode script, True, True, 1, TE.decodeUtf8 $ B16.encode h)
 
 -- | Get general information (deprecated but still useful)
 handleGetInfo :: RpcServer -> IO RpcResponse
