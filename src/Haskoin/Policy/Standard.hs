@@ -22,6 +22,7 @@ module Haskoin.Policy.Standard
   , checkWitnessStandard
     -- * Constants (Bitcoin Core defaults)
   , maxStandardTxWeight
+  , maxStandardTxSigOpsCost
   , txMinStandardVersion
   , txMaxStandardVersion
   , maxStandardScriptSigSize
@@ -77,6 +78,15 @@ import Haskoin.Consensus (witnessScaleFactor, txBaseSize, txTotalSize)
 -- @MAX_STANDARD_TX_WEIGHT = 400_000@ in bitcoin-core/src/policy/policy.h:38.
 maxStandardTxWeight :: Int
 maxStandardTxWeight = 400_000
+
+-- | Maximum sigop cost for a single transaction to be accepted into the mempool.
+-- @MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5 = 16_000@.
+-- Reference: bitcoin-core/src/policy/policy.h:44.
+-- Bitcoin Core validation.cpp:941-943: "bad-txns-too-many-sigops".
+-- Legacy and P2SH sigops count as WITNESS_SCALE_FACTOR (4) each;
+-- witness sigops count as 1 each.
+maxStandardTxSigOpsCost :: Int
+maxStandardTxSigOpsCost = 16_000
 
 -- | Minimum standard tx version. Core: @TX_MIN_STANDARD_VERSION = 1@.
 txMinStandardVersion :: Int32
