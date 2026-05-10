@@ -4529,15 +4529,26 @@ main = hspec $ do
               result = checkReplacement dummyTx [conflict] [conflict] 2000 200 (FeeRate 10000)
           result `shouldBe` Right ()
 
-        it "Rule 3a: rejects replacement with lower feerate" $ do
+        -- Rule 3a (standalone feerate gate) was a haskoin-internal non-Core
+        -- check. Bitcoin Core 27+ replaced it with ImprovesFeerateDiagram
+        -- (Gate 8, deferred). It has been removed from checkReplacement so
+        -- that we match Core's PaysForRBF semantics exactly. A replacement
+        -- that beats Rule 3 (absolute fee) and Rule 4 (relay bandwidth) but
+        -- has a lower feerate than the conflict is now accepted by
+        -- checkReplacement; the feerate diagram check (Gate 8) is the
+        -- correct place to enforce economic improvement.
+        it "Rule 3a (removed): replacement with lower feerate passes checkReplacement (feerate diagram gate deferred)" $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
               conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
-              -- New tx has 1100 sat fee (> 1000) but lower feerate
-              -- FeeRate 2500 < FeeRate 5000
-              result = checkReplacement dummyTx [conflict] [conflict] 1100 440 (FeeRate 2500)
-          case result of
-            Left (RbfInsufficientFeeRate _ _) -> return ()
-            _ -> expectationFailure "Expected RbfInsufficientFeeRate error"
+              -- New tx: fee 1100 (> 1000 = all-evictions total), vsize 440
+              -- Additional fee = 100, required relay = 440*1000/1000 = 440 > 100 → Rule 4 fails
+              -- Use vsize=200 so additional=100, required=200 → also fails Rule 4.
+              -- Use a case that actually passes both Rule 3 + Rule 4:
+              -- fee=1500, vsize=200: additional=500 >= 200 → passes.
+              result = checkReplacement dummyTx [conflict] [conflict] 1500 200 (FeeRate 2500)
+          -- With the old Rule 3a this would have failed (FeeRate 2500 < FeeRate 5000).
+          -- Now it passes because checkReplacement no longer enforces a feerate gate.
+          result `shouldBe` Right ()
 
         it "Rule 4: rejects when additional fee < relay fee for bandwidth" $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
@@ -4577,12 +4588,137 @@ main = hspec $ do
           let mkEntry i = mkMockEntry (TxId (Hash256 (BS.pack (replicate 32 i)))) 100 100 (FeeRate 1000)
               evictions = map mkEntry [1..100]
               conflicts = take 1 evictions
-              -- Total conflict fee = 100 * 100 = 10000
+              -- Total all-evictions fee = 100 * 100 = 10000
               -- New fee = 50000 (much higher)
               -- Additional = 50000 - 10000 = 40000
               -- Required relay = 200 * 1000 / 1000 = 200
               result = checkReplacement dummyTx conflicts evictions 50000 200 (FeeRate 250000)
           result `shouldBe` Right ()
+
+      -- W73 BIP-125 audit: Rule #3 must use ALL evicted tx fees (not just direct
+      -- conflicts). Core sums over the full all_conflicts set including descendants:
+      --   validation.cpp:1005-1007: for (it : all_conflicts) { conflicting_fees += fee; }
+      --   validation.cpp:1010: PaysForRBF(conflicting_fees, replacement_fees, ...)
+      describe "Rule 3 fee accounting (W73 Bug A fix: all evictions, not just direct conflicts)" $ do
+        let mkMockEntryW73 :: TxId -> Word64 -> Int -> FeeRate -> MempoolEntry
+            mkMockEntryW73 txid fee size feeRate =
+              let txhash = TxId (Hash256 (BS.replicate 32 0x00))
+                  op = OutPoint txhash 0
+                  txin = TxIn op "" 0xffffffff
+                  txout = TxOut (100000 - fee) ""
+                  tx = Tx 2 [txin] [txout] [[]] 0
+              in MempoolEntry
+                   { meTransaction = tx
+                   , meTxId = txid
+                   , meWtxid = computeWtxid tx
+                   , meFee = fee
+                   , meFeeRate = feeRate
+                   , meSize = size
+                   , meTime = 0
+                   , meHeight = 0
+                   , meAncestorCount = 1
+                   , meAncestorSize = size
+                   , meAncestorFees = fee
+                   , meAncestorSigOps = 0
+                   , meDescendantCount = 1
+                   , meDescendantSize = size
+                   , meDescendantFees = fee
+                   , meRBFOptIn = True
+                   }
+            dummyTxW73 :: Tx
+            dummyTxW73 =
+              let txhash = TxId (Hash256 (BS.replicate 32 0x00))
+                  op = OutPoint txhash 0
+                  txin = TxIn op "" 0xffffffff
+                  txout = TxOut 50000 ""
+              in Tx 2 [txin] [txout] [[]] 0
+
+        it "Rule 3: rejects replacement that exceeds direct-conflict fee but falls short of total eviction fee" $ do
+          let mkEntry i fee = mkMockEntryW73 (TxId (Hash256 (BS.pack (replicate 32 i)))) fee 100 (FeeRate 1000)
+              -- Direct conflict: 500 sat fee
+              directConflict = mkEntry 0x01 500
+              -- Descendant of conflict: 800 sat fee
+              descendant     = mkEntry 0x02 800
+              -- allEvictions = direct + descendant, total fee = 1300
+              -- New tx pays 600 (> direct 500, but < total 1300) → must reject
+              result = checkReplacement dummyTxW73 [directConflict] [directConflict, descendant] 600 200 (FeeRate 3000)
+          case result of
+            Left (RbfInsufficientAbsoluteFee newF reqF) -> do
+              newF `shouldBe` 600
+              reqF `shouldBe` 1300  -- sum of ALL evictions
+            _ -> expectationFailure "Expected RbfInsufficientAbsoluteFee (total eviction fee)"
+
+        it "Rule 3: accepts replacement that covers total eviction fee (direct + descendants)" $ do
+          let mkEntry i fee = mkMockEntryW73 (TxId (Hash256 (BS.pack (replicate 32 i)))) fee 100 (FeeRate 1000)
+              directConflict = mkEntry 0x01 500
+              descendant1    = mkEntry 0x02 300
+              descendant2    = mkEntry 0x03 200
+              -- Total eviction fee = 500 + 300 + 200 = 1000
+              -- New fee = 1200 (>= 1000), vsize 200
+              -- Additional = 200, required relay = 200 sat
+              -- 200 >= 200 → passes Rule 4
+              result = checkReplacement dummyTxW73 [directConflict] [directConflict, descendant1, descendant2] 1200 200 (FeeRate 6000)
+          result `shouldBe` Right ()
+
+        it "Rule 4: additional fee computed against total eviction fee baseline (all evictions)" $ do
+          -- With the fix, Rule 4 additional = newFee - sum(allEvictions fees).
+          -- If we had only subtracted directConflict fee, additional would be larger
+          -- and Rule 4 might pass incorrectly.
+          let mkEntry i fee = mkMockEntryW73 (TxId (Hash256 (BS.pack (replicate 32 i)))) fee 100 (FeeRate 1000)
+              directConflict = mkEntry 0x01 500
+              descendant     = mkEntry 0x02 600
+              -- allEvictions total fee = 1100
+              -- New fee = 1101, vsize = 2000 vB
+              -- additional = 1101 - 1100 = 1
+              -- requiredRelay = 2000 * 1000 / 1000 = 2000 → fails Rule 4
+              result = checkReplacement dummyTxW73 [directConflict] [directConflict, descendant] 1101 2000 (FeeRate 550)
+          case result of
+            Left (RbfInsufficientRelayFee addF reqF) -> do
+              addF `shouldBe` 1
+              reqF `shouldBe` 2000
+            _ -> expectationFailure "Expected RbfInsufficientRelayFee (baseline from all evictions)"
+
+      -- W73 BIP-125 audit: Gate 1 — signalsOptInRBF is a pure function
+      -- mirroring bitcoin-core/src/util/rbf.cpp:SignalsOptInRBF.
+      describe "signalsOptInRBF (W73 Bug B fix: extracted pure function)" $ do
+        let mkTx seqNum =
+              let prevTxid = TxId (Hash256 (BS.replicate 32 0x00))
+                  op       = OutPoint prevTxid 0
+                  txin     = TxIn op BS.empty seqNum
+                  txout    = TxOut 50000 BS.empty
+              in Tx 2 [txin] [txout] [[]] 0
+
+        it "MAX_BIP125_RBF_SEQUENCE (0xfffffffd) signals opt-in" $
+          signalsOptInRBF (mkTx 0xfffffffd) `shouldBe` True
+
+        it "0x00000000 signals opt-in (well below threshold)" $
+          signalsOptInRBF (mkTx 0x00000000) `shouldBe` True
+
+        it "0xfffffffe does NOT signal opt-in (SEQUENCE_FINAL-1, lock-time only)" $
+          signalsOptInRBF (mkTx 0xfffffffe) `shouldBe` False
+
+        it "0xffffffff (SEQUENCE_FINAL) does NOT signal opt-in" $
+          signalsOptInRBF (mkTx 0xffffffff) `shouldBe` False
+
+        it "signals opt-in when ANY input is <= 0xfffffffd (multi-input)" $ do
+          let prevTxid = TxId (Hash256 (BS.replicate 32 0x00))
+              op       = OutPoint prevTxid 0
+              -- First input: non-signaling
+              txin1    = TxIn op BS.empty 0xffffffff
+              -- Second input: signaling
+              txin2    = TxIn op BS.empty 0xfffffffd
+              txout    = TxOut 50000 BS.empty
+              tx       = Tx 2 [txin1, txin2] [txout] [[]] 0
+          signalsOptInRBF tx `shouldBe` True
+
+        it "does NOT signal opt-in when ALL inputs are > 0xfffffffd" $ do
+          let prevTxid = TxId (Hash256 (BS.replicate 32 0x00))
+              op       = OutPoint prevTxid 0
+              txin1    = TxIn op BS.empty 0xffffffff
+              txin2    = TxIn op BS.empty 0xfffffffe
+              txout    = TxOut 50000 BS.empty
+              tx       = Tx 2 [txin1, txin2] [txout] [[]] 0
+          signalsOptInRBF tx `shouldBe` False
 
       describe "checkNoConflictSpending" $ do
         it "rejects tx that spends conflicting tx output" $ do
