@@ -267,7 +267,7 @@ import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode
                               estimateRawFee, RawFeeEstimate(..), RawBucketRange(..))
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
-import Haskoin.Wallet (Descriptor(..), KeyExpr(..), ParseError(..),
+import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         parseDescriptor, descriptorToText, deriveAddresses,
                         deriveScripts, descriptorChecksum, addDescriptorChecksum,
                         validateDescriptorChecksum, isRangeDescriptor,
@@ -917,6 +917,7 @@ handleRpcRequest server req = do
     "getinfo"              -> handleGetInfo server
 
     -- Wallet descriptor RPCs
+    "getdescriptorinfo"    -> handleGetDescriptorInfo params
     "importdescriptors"    -> handleImportDescriptors server params
     "listdescriptors"      -> handleListDescriptors server params
 
@@ -3231,6 +3232,101 @@ handleGetInfo server = do
 --------------------------------------------------------------------------------
 -- Descriptor RPC Handlers (BIP-380-386)
 --------------------------------------------------------------------------------
+
+-- | The @getdescriptorinfo@ RPC (BIP-380).
+--
+-- Returns parsed information about an output descriptor: canonical form with
+-- checksum, the 8-char BIP-380 checksum, whether the descriptor is ranged,
+-- whether it is solvable (has enough information to spend), and whether it
+-- contains embedded private keys.
+--
+-- issolvable semantics (Core DescriptorImpl::IsSolvable()):
+--   addr() and raw() override to false; all other descriptor types return true.
+--
+-- hasprivatekeys semantics (Core HavePrivateKeys()):
+--   True only when a WIF private key is embedded in the descriptor.
+--
+-- Reference: bitcoin-core/src/rpc/misc.cpp getdescriptorinfo
+handleGetDescriptorInfo :: Value -> IO RpcResponse
+handleGetDescriptorInfo params =
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams ("Missing required argument: descriptor" :: Text)) Null
+    Just descText ->
+      case parseDescriptor descText of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams (T.pack $ "Invalid descriptor: " ++ show err)) Null
+        Right desc -> do
+          -- Canonical form = descriptorToText without checksum, then append checksum.
+          let baseText = descriptorToText desc
+              canonical = case addDescriptorChecksum baseText of
+                            Just c  -> c
+                            Nothing -> baseText  -- fallback (should never happen)
+              checksum  = T.drop 1 (T.dropWhile (/= '#') canonical)  -- everything after '#'
+              isrange   = isRangeDescriptor desc
+              solvable  = descriptorIsSolvable desc
+              hasPriv   = descriptorHasPrivateKeys desc
+          let result = object
+                [ "descriptor"    .= canonical
+                , "checksum"      .= checksum
+                , "isrange"       .= isrange
+                , "issolvable"    .= solvable
+                , "hasprivatekeys" .= hasPriv
+                ]
+          return $ RpcResponse result Null Null
+
+-- | BIP-380 solvability rule.
+-- Core: addr() and raw() descriptors are not solvable (no script knowledge).
+-- All other types (pk, pkh, wpkh, sh, wsh, multi, sortedmulti, rawtr, tr, combo)
+-- are solvable.  Reference: bitcoin-core/src/script/descriptor.cpp
+-- DescriptorImpl::IsSolvable() — the base class returns true; only
+-- AddressDescriptor and RawDescriptor override to return false.
+--
+-- We match only the solvable types to avoid ambiguity with Network.Socket.Raw.
+descriptorIsSolvable :: Descriptor -> Bool
+descriptorIsSolvable desc = case desc of
+  Pk _           -> True
+  Pkh _          -> True
+  Wpkh _         -> True
+  Sh _           -> True
+  Wsh _          -> True
+  Multi _ _      -> True
+  SortedMulti _ _ -> True
+  Rawtr _        -> True
+  Tr _ _         -> True
+  Combo _        -> True
+  Addr _         -> False
+  _              -> False   -- Raw _ (and any future unsolvable type)
+
+-- | Return True if the descriptor embeds at least one WIF private key.
+-- Core: HavePrivateKeys() recurses into key args and sub-descriptors and
+-- returns true iff any key is a private key.
+-- Reference: bitcoin-core/src/script/descriptor.cpp HavePrivateKeys()
+descriptorHasPrivateKeys :: Descriptor -> Bool
+descriptorHasPrivateKeys desc = case desc of
+  Pk key           -> keyHasPrivate key
+  Pkh key          -> keyHasPrivate key
+  Wpkh key         -> keyHasPrivate key
+  Rawtr key        -> keyHasPrivate key
+  Tr key tree      -> keyHasPrivate key || maybe False tapTreeHasPrivate tree
+  Combo key        -> keyHasPrivate key
+  Sh inner         -> descriptorHasPrivateKeys inner
+  Wsh inner        -> descriptorHasPrivateKeys inner
+  Multi _ keys     -> any keyHasPrivate keys
+  SortedMulti _ keys -> any keyHasPrivate keys
+  Addr _           -> False
+  _                -> False  -- Raw _ and any future key-less types
+  where
+    keyHasPrivate :: KeyExpr -> Bool
+    keyHasPrivate k = case k of
+      KeyWIF _            -> True
+      KeyXPriv _ _ _      -> True
+      KeyOrigin _ _ inner -> keyHasPrivate inner
+      _                   -> False
+
+    tapTreeHasPrivate :: TapTree -> Bool
+    tapTreeHasPrivate (TapLeaf d)      = descriptorHasPrivateKeys d
+    tapTreeHasPrivate (TapBranch l r)  = tapTreeHasPrivate l || tapTreeHasPrivate r
 
 -- | The @importdescriptors@ RPC. Refused with @rpcWalletError@ in this
 -- build.
