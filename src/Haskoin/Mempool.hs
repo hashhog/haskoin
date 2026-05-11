@@ -83,6 +83,7 @@ module Haskoin.Mempool
   , trucChildMaxVsize
   , isV3
   , checkTrucPolicy
+  , checkVersionInheritance
   , getMempoolParent
   , getMempoolChildren
   , attemptSiblingEviction
@@ -2043,14 +2044,18 @@ getMempoolChildren mp txid = do
 
 -- | Check TRUC (v3) transaction policy rules.
 --
--- TRUC rules enforced:
--- 1. A v3 tx must be at most TRUC_MAX_VSIZE (10,000 vbytes)
--- 2. A v3 tx can have at most 1 unconfirmed ancestor (parent)
--- 3. A v3 tx can have at most 1 unconfirmed descendant (child)
--- 4. A v3 child (has unconfirmed parent) must be at most TRUC_CHILD_MAX_VSIZE (1,000 vbytes)
--- 5. A v3 tx cannot spend from non-v3 unconfirmed txs
--- 6. A non-v3 tx cannot spend from v3 unconfirmed txs
--- 7. v3 transactions are implicitly RBF-enabled
+-- Mirrors Bitcoin Core's SingleTRUCChecks (policy/truc_policy.cpp).
+-- Gate order matches Core exactly:
+--   (a) Version inheritance: v3↔non-v3 mixing is always forbidden (checked first
+--       for all txs, before any size/count gates).
+--   Then for v3 only:
+--   1. A v3 tx must be at most TRUC_MAX_VSIZE (10,000 vbytes)
+--   2a. Direct mempool parent count: mempool_parents + 1 <= TRUC_ANCESTOR_LIMIT
+--   2b. Parent's own ancestor depth: parent.ancestorCount + 1 <= TRUC_ANCESTOR_LIMIT
+--       (Core line: pool.GetAncestorCount(mempool_parents[0]) + 1 > TRUC_ANCESTOR_LIMIT)
+--   4. A v3 child must be at most TRUC_CHILD_MAX_VSIZE (1,000 vbytes)
+--   3. Descendant limit: parent.descendantCount + 1 <= TRUC_DESCENDANT_LIMIT
+--      (sibling eviction may apply when parent has exactly one existing child)
 --
 -- Returns Right () if all checks pass, or Left TrucError with the violation.
 -- Also returns a Maybe MempoolEntry for potential sibling eviction.
@@ -2062,81 +2067,100 @@ checkTrucPolicy :: Tx
 checkTrucPolicy tx vsize mp = do
   let txid = computeTxId tx
 
-  -- Get mempool parents of this transaction
+  -- Get mempool parents of this transaction (deduped by txid via Set)
   entries <- readTVarIO (mpEntries mp)
   let parentTxIds = Set.fromList $ map (outPointHash . txInPrevOutput) (txInputs tx)
       mempoolParents = mapMaybe (`Map.lookup` entries) (Set.toList parentTxIds)
 
-  if isV3 tx
-    then checkV3Transaction tx txid vsize mempoolParents mp
-    else checkNonV3Transaction tx txid mempoolParents
+  -- Gate (a): version inheritance check — applies to ALL transactions, checked
+  -- first before any size/count gates (Core truc_policy.cpp:178-191).
+  case checkVersionInheritance tx txid mempoolParents of
+    Left err -> return $ Left err
+    Right () ->
+      if isV3 tx
+        then checkV3Transaction tx txid vsize mempoolParents mp
+        else return $ Right Nothing  -- Non-v3 tx passed inheritance check; no further TRUC gates
 
--- | Check rules specific to v3 transactions
+-- | Check that TRUC version inheritance rules hold for any transaction.
+-- Core checks these FIRST, before size or ancestor-count gates.
+-- Rule: v3 tx cannot spend non-v3 unconfirmed parent, and vice-versa.
+checkVersionInheritance :: Tx -> TxId -> [MempoolEntry] -> Either TrucError ()
+checkVersionInheritance tx txid parents =
+  case filter versionMismatch parents of
+    [] -> Right ()
+    (badParent:_)
+      | isV3 tx   -> Left $ TrucV3SpendingNonV3 txid (meTxId badParent)
+      | otherwise  -> Left $ TrucNonV3SpendingV3 txid (meTxId badParent)
+  where
+    -- A parent is a mismatch if it is the opposite TRUC version to tx.
+    versionMismatch p = isV3 tx /= isV3 (meTransaction p)
+
+-- | Check rules specific to v3 transactions (called after inheritance gate passes).
+-- Gate order mirrors Core SingleTRUCChecks (truc_policy.cpp:200-259):
+--   1. vsize <= TRUC_MAX_VSIZE
+--   2a. mempool_parents + 1 <= TRUC_ANCESTOR_LIMIT
+--   2b. parent.ancestorCount + 1 <= TRUC_ANCESTOR_LIMIT  (MISSING before this fix)
+--   4. vsize <= TRUC_CHILD_MAX_VSIZE  (only when has parent)
+--   3. parent.descendantCount + 1 <= TRUC_DESCENDANT_LIMIT
 checkV3Transaction :: Tx
                    -> TxId
                    -> Int
                    -> [MempoolEntry]  -- ^ Mempool parents
                    -> Mempool
                    -> IO (Either TrucError (Maybe MempoolEntry))
-checkV3Transaction tx txid vsize mempoolParents mp = do
-  -- Rule 1: v3 tx must be within TRUC_MAX_VSIZE
+checkV3Transaction _tx txid vsize mempoolParents mp = do
+  -- Rule 1: v3 tx must be within TRUC_MAX_VSIZE (Core line 200-204)
   if fromIntegral vsize > trucMaxVsize
     then return $ Left $ TrucTooLarge (fromIntegral vsize) trucMaxVsize
     else do
-      -- Rule 2: v3 tx can have at most 1 unconfirmed ancestor
-      -- TRUC_ANCESTOR_LIMIT = 2 includes self, so max 1 parent
+      -- Rule 2a: direct mempool parent count (Core line 207-211)
+      -- TRUC_ANCESTOR_LIMIT = 2 includes self, so max 1 direct parent
       if length mempoolParents + 1 > trucAncestorLimit
         then return $ Left $ TrucTooManyAncestors (length mempoolParents + 1) trucAncestorLimit
         else case mempoolParents of
           [] -> return $ Right Nothing  -- No unconfirmed parents, all checks pass
-          [parent] -> checkV3WithParent tx txid vsize parent mp
+          [parent] -> checkV3WithParent txid vsize parent mp
           _ -> return $ Left $ TrucTooManyAncestors (length mempoolParents + 1) trucAncestorLimit
 
--- | Check rules for a v3 transaction that has an unconfirmed parent
-checkV3WithParent :: Tx
-                  -> TxId
+-- | Check rules for a v3 transaction that has exactly one unconfirmed parent.
+-- At this point version inheritance has already been verified (parent is v3).
+checkV3WithParent :: TxId
                   -> Int
-                  -> MempoolEntry  -- ^ The single mempool parent
+                  -> MempoolEntry  -- ^ The single mempool parent (already known to be v3)
                   -> Mempool
                   -> IO (Either TrucError (Maybe MempoolEntry))
-checkV3WithParent _tx txid vsize parent mp = do
-  let parentTx = meTransaction parent
-      parentTxId = meTxId parent
+checkV3WithParent txid vsize parent mp = do
+  let parentTxId = meTxId parent
 
-  -- Rule 5: v3 tx cannot spend from non-v3 unconfirmed tx
-  if not (isV3 parentTx)
-    then return $ Left $ TrucV3SpendingNonV3 txid parentTxId
+  -- Rule 2b: parent's own ancestor depth (Core line 217-221).
+  -- If the parent itself has an ancestor, adding this tx would create a
+  -- 3-generation chain (grandparent→parent→this), violating TRUC_ANCESTOR_LIMIT=2.
+  -- Core: pool.GetAncestorCount(mempool_parents[0]) + 1 > TRUC_ANCESTOR_LIMIT
+  -- meAncestorCount includes self: a root tx has meAncestorCount=1, so
+  -- parent.meAncestorCount + 1 > 2  ↔  parent.meAncestorCount > 1  ↔  parent has ancestor.
+  if meAncestorCount parent + 1 > trucAncestorLimit
+    then return $ Left $ TrucTooManyAncestors (meAncestorCount parent + 1) trucAncestorLimit
     else do
-      -- Rule 4: v3 child must be within TRUC_CHILD_MAX_VSIZE
+      -- Rule 4: v3 child must be within TRUC_CHILD_MAX_VSIZE (Core line 223-227)
       if fromIntegral vsize > trucChildMaxVsize
         then return $ Left $ TrucChildTooLarge (fromIntegral vsize) trucChildMaxVsize
         else do
-          -- Rule 3: Check parent doesn't already have a child (descendant limit)
-          -- Parent's descendant count includes itself, so if > 1, it has children
+          -- Rule 3: check parent's descendant count (Core line 229-258).
+          -- Parent's descendant count includes itself; > 1 means it already has a child.
           existingChildren <- getMempoolChildren mp parentTxId
           case existingChildren of
             [] -> return $ Right Nothing  -- No existing children, all good
             [existingChild] ->
-              -- Parent already has a child. This is a sibling eviction opportunity.
-              -- Return the sibling so caller can decide whether to evict.
-              if meDescendantCount parent == 2
+              -- Parent already has one child. Sibling eviction is possible when:
+              --   parent.descendantCount == 2  (exactly one existing child)
+              --   sibling.ancestorCount == 2   (sibling has no children of its own)
+              -- (Core: consider_sibling_eviction condition, lines 249-250)
+              if meDescendantCount parent == 2 && meAncestorCount existingChild == 2
                 then return $ Left $ TrucSiblingExists parentTxId (meTxId existingChild)
                 else return $ Left $ TrucTooManyDescendants (meDescendantCount parent + 1) trucDescendantLimit
             _ ->
-              -- Multiple children already exist (shouldn't happen with v3, but handle it)
+              -- Multiple children already exist (reorg edge case with v3)
               return $ Left $ TrucTooManyDescendants (meDescendantCount parent + 1) trucDescendantLimit
-
--- | Check rules for non-v3 transactions (they can't spend v3 unconfirmed outputs)
-checkNonV3Transaction :: Tx
-                      -> TxId
-                      -> [MempoolEntry]  -- ^ Mempool parents
-                      -> IO (Either TrucError (Maybe MempoolEntry))
-checkNonV3Transaction tx txid mempoolParents = do
-  -- Rule 6: non-v3 tx cannot spend from v3 unconfirmed tx
-  let v3Parents = filter (isV3 . meTransaction) mempoolParents
-  case v3Parents of
-    [] -> return $ Right Nothing  -- No v3 parents, all good
-    (v3Parent:_) -> return $ Left $ TrucNonV3SpendingV3 txid (meTxId v3Parent)
 
 -- | Attempt sibling eviction for a v3 transaction.
 --
@@ -2166,8 +2190,7 @@ attemptSiblingEviction newTx newFee newVsize parent mp = do
           -- Sibling eviction is allowed!
           -- For v3, we use a relaxed RBF rule: the new child doesn't need to
           -- pay higher total fees, just enough to cover its own relay cost.
-          let siblingFee = meFee sibling
-              -- The new tx must pay at least the incremental relay fee
+          let -- The new tx must pay at least the incremental relay fee
               requiredFee = (incrementalRelayFeePerKvb * fromIntegral newVsize) `div` 1000
 
           if newFee >= requiredFee

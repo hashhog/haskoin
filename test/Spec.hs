@@ -11751,6 +11751,366 @@ main = hspec $ do
             c `shouldBe` childId
             p `shouldBe` parentId
 
+    -- -----------------------------------------------------------------------
+    -- W78 BIP-431 behavioral gate tests
+    -- These test checkTrucPolicy and checkVersionInheritance directly using
+    -- hand-crafted mempool entries (no DB / UTXO resolution needed).
+    -- -----------------------------------------------------------------------
+
+    describe "W78 checkVersionInheritance gate (Core truc_policy.cpp:178-191)" $ do
+
+      it "passes when v3 tx has no parents" $ do
+        let txid  = TxId (Hash256 (BS.replicate 32 0x10))
+            tx    = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0
+        checkVersionInheritance tx txid [] `shouldBe` Right ()
+
+      it "passes when non-v3 tx has no parents" $ do
+        let txid = TxId (Hash256 (BS.replicate 32 0x11))
+            tx   = Tx 2 [] [TxOut 50000 BS.empty] [[]] 0
+        checkVersionInheritance tx txid [] `shouldBe` Right ()
+
+      it "passes when v3 tx has a v3 parent" $ do
+        let parentTxId = TxId (Hash256 (BS.replicate 32 0x20))
+            parentTx   = Tx 3 [] [TxOut 60000 BS.empty] [[]] 0
+            parentEntry = (mkTestEntry parentTxId 1000 200) { meTransaction = parentTx }
+            txid        = TxId (Hash256 (BS.replicate 32 0x21))
+            tx          = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0
+        checkVersionInheritance tx txid [parentEntry] `shouldBe` Right ()
+
+      it "passes when non-v3 tx has a non-v3 parent" $ do
+        let parentTxId = TxId (Hash256 (BS.replicate 32 0x22))
+            parentTx   = Tx 2 [] [TxOut 60000 BS.empty] [[]] 0
+            parentEntry = (mkTestEntry parentTxId 1000 200) { meTransaction = parentTx }
+            txid        = TxId (Hash256 (BS.replicate 32 0x23))
+            tx          = Tx 2 [] [TxOut 50000 BS.empty] [[]] 0
+        checkVersionInheritance tx txid [parentEntry] `shouldBe` Right ()
+
+      it "rejects v3 tx spending non-v3 unconfirmed parent (gate 5)" $ do
+        -- Core: ptx->version == TRUC_VERSION && entry->GetTx().version != TRUC_VERSION
+        let parentTxId  = TxId (Hash256 (BS.replicate 32 0x30))
+            parentTx    = Tx 2 [] [TxOut 60000 BS.empty] [[]] 0   -- non-v3 parent
+            parentEntry = (mkTestEntry parentTxId 1000 200) { meTransaction = parentTx }
+            txid        = TxId (Hash256 (BS.replicate 32 0x31))
+            tx          = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0   -- v3 child
+        checkVersionInheritance tx txid [parentEntry]
+          `shouldBe` Left (TrucV3SpendingNonV3 txid parentTxId)
+
+      it "rejects non-v3 tx spending v3 unconfirmed parent (gate 6)" $ do
+        -- Core: ptx->version != TRUC_VERSION && entry->GetTx().version == TRUC_VERSION
+        let parentTxId  = TxId (Hash256 (BS.replicate 32 0x40))
+            parentTx    = Tx 3 [] [TxOut 60000 BS.empty] [[]] 0   -- v3 parent
+            parentEntry = (mkTestEntry parentTxId 1000 200) { meTransaction = parentTx }
+            txid        = TxId (Hash256 (BS.replicate 32 0x41))
+            tx          = Tx 2 [] [TxOut 50000 BS.empty] [[]] 0   -- non-v3 child
+        checkVersionInheritance tx txid [parentEntry]
+          `shouldBe` Left (TrucNonV3SpendingV3 txid parentTxId)
+
+      it "version inheritance is checked before size gate (gate order)" $ do
+        -- Core checks version first; a v3 tx spending non-v3 should fail
+        -- inheritance even if the tx is also oversized.
+        -- checkVersionInheritance is a pure check independent of vsize.
+        let parentTxId  = TxId (Hash256 (BS.replicate 32 0x50))
+            parentTx    = Tx 2 [] [TxOut 1_000_000 BS.empty] [[]] 0
+            parentEntry = (mkTestEntry parentTxId 1000 200) { meTransaction = parentTx }
+            txid        = TxId (Hash256 (BS.replicate 32 0x51))
+            tx          = Tx 3 [] [TxOut 500_000 BS.empty] [[]] 0
+        -- inheritance fails regardless of vsize
+        checkVersionInheritance tx txid [parentEntry]
+          `shouldBe` Left (TrucV3SpendingNonV3 txid parentTxId)
+
+    describe "W78 checkTrucPolicy gate tests (via mempool)" $ do
+
+      it "gate 1: v3 tx exceeding TRUC_MAX_VSIZE=10000 is rejected" $ do
+        withSystemTempDirectory "haskoin-truc-g1" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let txid = TxId (Hash256 (BS.replicate 32 0x60))
+                tx   = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0
+            result <- checkTrucPolicy tx 10001 mp
+            case result of
+              Left (TrucTooLarge 10001 10000) -> return ()
+              other -> expectationFailure $ "Expected Left (TrucTooLarge 10001 10000), got: " ++ show other
+
+      it "gate 1: v3 tx exactly at TRUC_MAX_VSIZE=10000 passes size gate" $ do
+        withSystemTempDirectory "haskoin-truc-g1b" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let tx = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0
+            result <- checkTrucPolicy tx 10000 mp
+            -- No parents, no descendant issue → passes all gates
+            case result of
+              Right Nothing -> return ()
+              other -> expectationFailure $
+                "Expected Right Nothing (size OK, no parents), got: " ++ show other
+
+      it "gate 2a: v3 tx with 2+ direct parents is rejected (ancestor limit)" $ do
+        -- mempool_parents.size() + 1 > TRUC_ANCESTOR_LIMIT (2) → 2 parents = 3 total
+        withSystemTempDirectory "haskoin-truc-g2a" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            -- Inject two v3 parent entries directly into the mempool index
+            let p1id  = TxId (Hash256 (BS.replicate 32 0x70))
+                p1tx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x11)] [[]] 0
+                p1ent = (mkTestEntry p1id 1000 200)
+                          { meTransaction = p1tx, meAncestorCount = 1, meDescendantCount = 1 }
+                p2id  = TxId (Hash256 (BS.replicate 32 0x71))
+                p2tx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x12)] [[]] 0
+                p2ent = (mkTestEntry p2id 1000 200)
+                          { meTransaction = p2tx, meAncestorCount = 1, meDescendantCount = 1 }
+                -- child spends both parents
+                op1   = OutPoint p1id 0
+                op2   = OutPoint p2id 0
+                txin1 = TxIn op1 BS.empty 0xfffffffe
+                txin2 = TxIn op2 BS.empty 0xfffffffe
+                tx    = Tx 3 [txin1, txin2] [TxOut 50000 BS.empty] [[],[]] 0
+            -- Only inject the parent entries; mpByOutpoint is NOT populated for
+            -- the new tx's inputs — checkTrucPolicy finds parents via mpEntries.
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert p1id p1ent . Map.insert p2id p2ent)
+            result <- checkTrucPolicy tx 500 mp
+            case result of
+              Left (TrucTooManyAncestors cnt mx) -> do
+                cnt `shouldBe` 3
+                mx  `shouldBe` 2
+              other -> expectationFailure $ "Expected TrucTooManyAncestors, got: " ++ show other
+
+      it "gate 2b: v3 child of v3 grandchild rejected (parent has ancestor)" $ do
+        -- Core line 217: pool.GetAncestorCount(mempool_parents[0]) + 1 > TRUC_ANCESTOR_LIMIT
+        -- parent.meAncestorCount = 2 (parent has a grandparent) → 2 + 1 = 3 > 2 → reject
+        withSystemTempDirectory "haskoin-truc-g2b" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId  = TxId (Hash256 (BS.replicate 32 0x80))
+                parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x33)] [[]] 0
+                -- meAncestorCount=2 means the parent itself has 1 ancestor (grandparent)
+                parentEnt = (mkTestEntry parentId 1000 200)
+                              { meTransaction = parentTx
+                              , meAncestorCount = 2   -- parent + grandparent
+                              , meDescendantCount = 1
+                              }
+                op    = OutPoint parentId 0
+                txin  = TxIn op BS.empty 0xfffffffe
+                tx    = Tx 3 [txin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert parentId parentEnt)
+            result <- checkTrucPolicy tx 500 mp
+            case result of
+              Left (TrucTooManyAncestors cnt mx) -> do
+                -- parent.meAncestorCount(2) + 1 = 3 > 2
+                cnt `shouldBe` 3
+                mx  `shouldBe` 2
+              other -> expectationFailure $
+                "Expected TrucTooManyAncestors (gate 2b was missing before W78 fix), got: " ++ show other
+
+      it "gate 2b: v3 child of root v3 parent passes depth check" $ do
+        -- parent.meAncestorCount=1 (root, no grandparent) → 1 + 1 = 2 <= 2 → pass
+        withSystemTempDirectory "haskoin-truc-g2b-pass" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId  = TxId (Hash256 (BS.replicate 32 0x81))
+                parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x44)] [[]] 0
+                parentEnt = (mkTestEntry parentId 1000 200)
+                              { meTransaction = parentTx
+                              , meAncestorCount = 1   -- root: no grandparent
+                              , meDescendantCount = 1
+                              }
+                op   = OutPoint parentId 0
+                txin = TxIn op BS.empty 0xfffffffe
+                tx   = Tx 3 [txin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert parentId parentEnt)
+            result <- checkTrucPolicy tx 500 mp
+            -- No sibling, no error → Right Nothing
+            case result of
+              Right Nothing -> return ()
+              other -> expectationFailure $
+                "Expected Right Nothing (root parent, depth OK), got: " ++ show other
+
+      it "gate 4: v3 child exceeding TRUC_CHILD_MAX_VSIZE=1000 is rejected" $ do
+        withSystemTempDirectory "haskoin-truc-g4" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId  = TxId (Hash256 (BS.replicate 32 0x82))
+                parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x55)] [[]] 0
+                parentEnt = (mkTestEntry parentId 1000 200)
+                              { meTransaction = parentTx
+                              , meAncestorCount = 1
+                              , meDescendantCount = 1
+                              }
+                op   = OutPoint parentId 0
+                txin = TxIn op BS.empty 0xfffffffe
+                tx   = Tx 3 [txin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert parentId parentEnt)
+            result <- checkTrucPolicy tx 1001 mp
+            case result of
+              Left (TrucChildTooLarge 1001 1000) -> return ()
+              other -> expectationFailure $ "Expected Left (TrucChildTooLarge 1001 1000), got: " ++ show other
+
+      it "gate 4: v3 child exactly at TRUC_CHILD_MAX_VSIZE=1000 passes" $ do
+        withSystemTempDirectory "haskoin-truc-g4b" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId  = TxId (Hash256 (BS.replicate 32 0x83))
+                parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x66)] [[]] 0
+                parentEnt = (mkTestEntry parentId 1000 200)
+                              { meTransaction = parentTx
+                              , meAncestorCount = 1
+                              , meDescendantCount = 1
+                              }
+                op   = OutPoint parentId 0
+                txin = TxIn op BS.empty 0xfffffffe
+                tx   = Tx 3 [txin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert parentId parentEnt)
+            result <- checkTrucPolicy tx 1000 mp
+            case result of
+              Right Nothing -> return ()
+              other -> expectationFailure $
+                "Expected Right Nothing (child at exactly 1000 vbytes), got: " ++ show other
+
+      it "gate 3: v3 child rejected when parent has existing child (sibling eviction)" $ do
+        -- Parent already has one child (meDescendantCount=2), sibling.meAncestorCount=2
+        -- → TrucSiblingExists (eviction may be attempted by caller)
+        withSystemTempDirectory "haskoin-truc-g3" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId   = TxId (Hash256 (BS.replicate 32 0x90))
+                parentTx   = Tx 3 [] [ TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x77)
+                                     , TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x78) ] [[]] 0
+                -- parent has 1 existing child → descendantCount=2
+                parentEnt  = (mkTestEntry parentId 1000 200)
+                               { meTransaction    = parentTx
+                               , meAncestorCount  = 1
+                               , meDescendantCount = 2   -- self + existing child
+                               }
+                siblingId   = TxId (Hash256 (BS.replicate 32 0x91))
+                siblingTx   = Tx 3 [TxIn (OutPoint parentId 0) BS.empty 0xfffffffe]
+                                    [TxOut 55000 BS.empty] [[]] 0
+                -- sibling: ancestor count=2 (parent+self), no children of its own
+                siblingEnt  = (mkTestEntry siblingId 800 150)
+                               { meTransaction    = siblingTx
+                               , meAncestorCount  = 2
+                               , meDescendantCount = 1
+                               }
+                -- New tx spends vout 1 of parent (different from sibling's vout 0)
+                newOp  = OutPoint parentId 1
+                newTxin = TxIn newOp BS.empty 0xfffffffe
+                tx     = Tx 3 [newTxin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $ do
+              modifyTVar' (mpEntries mp)
+                (Map.insert parentId parentEnt . Map.insert siblingId siblingEnt)
+              -- Register the sibling's spend of vout=0
+              modifyTVar' (mpByOutpoint mp)
+                (Map.insert (OutPoint parentId 0) siblingId)
+            result <- checkTrucPolicy tx 500 mp
+            case result of
+              Left (TrucSiblingExists pid sid) -> do
+                pid `shouldBe` parentId
+                sid `shouldBe` siblingId
+              other -> expectationFailure $
+                "Expected TrucSiblingExists, got: " ++ show other
+
+      it "gate 3: sibling eviction NOT offered when sibling has descendants" $ do
+        -- sibling.meAncestorCount > 2 means sibling itself has an ancestor,
+        -- which violates the consider_sibling_eviction precondition in Core.
+        withSystemTempDirectory "haskoin-truc-g3b" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId   = TxId (Hash256 (BS.replicate 32 0xa0))
+                parentTx   = Tx 3 [] [ TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x88)
+                                     , TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x89)] [[]] 0
+                parentEnt  = (mkTestEntry parentId 1000 200)
+                               { meTransaction    = parentTx
+                               , meAncestorCount  = 1
+                               , meDescendantCount = 2
+                               }
+                siblingId  = TxId (Hash256 (BS.replicate 32 0xa1))
+                siblingTx  = Tx 3 [TxIn (OutPoint parentId 0) BS.empty 0xfffffffe]
+                                   [TxOut 55000 BS.empty] [[]] 0
+                -- meAncestorCount=3 = sibling has a grandparent too (edge reorg case)
+                -- → consider_sibling_eviction is false → TrucTooManyDescendants
+                siblingEnt = (mkTestEntry siblingId 800 150)
+                               { meTransaction    = siblingTx
+                               , meAncestorCount  = 3   -- more than 2 → not evictable
+                               , meDescendantCount = 1
+                               }
+                newOp   = OutPoint parentId 1
+                newTxin = TxIn newOp BS.empty 0xfffffffe
+                tx      = Tx 3 [newTxin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $ do
+              modifyTVar' (mpEntries mp)
+                (Map.insert parentId parentEnt . Map.insert siblingId siblingEnt)
+              modifyTVar' (mpByOutpoint mp)
+                (Map.insert (OutPoint parentId 0) siblingId)
+            result <- checkTrucPolicy tx 500 mp
+            case result of
+              Left (TrucTooManyDescendants cnt mx) -> do
+                cnt `shouldBe` 3
+                mx  `shouldBe` 2
+              other -> expectationFailure $
+                "Expected TrucTooManyDescendants (sibling not evictable), got: " ++ show other
+
+      it "non-v3 tx with v3 mempool parent is rejected by inheritance gate" $ do
+        withSystemTempDirectory "haskoin-truc-nonv3-v3parent" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId  = TxId (Hash256 (BS.replicate 32 0xb0))
+                parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x99)] [[]] 0
+                parentEnt = (mkTestEntry parentId 1000 200)
+                              { meTransaction = parentTx, meAncestorCount = 1, meDescendantCount = 1 }
+                op    = OutPoint parentId 0
+                txin  = TxIn op BS.empty 0xfffffffe
+                tx    = Tx 2 [txin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert parentId parentEnt)
+            result <- checkTrucPolicy tx 500 mp
+            case result of
+              Left (TrucNonV3SpendingV3 _ pid) -> pid `shouldBe` parentId
+              other -> expectationFailure $
+                "Expected TrucNonV3SpendingV3, got: " ++ show other
+
+      it "non-v3 tx with only non-v3 parents passes TRUC checks" $ do
+        withSystemTempDirectory "haskoin-truc-nonv3-nonv3parent" $ \tmp -> do
+          let cfg = defaultDBConfig (tmp </> "db")
+          withDB cfg $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            let parentId  = TxId (Hash256 (BS.replicate 32 0xb1))
+                parentTx  = Tx 2 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa)] [[]] 0
+                parentEnt = (mkTestEntry parentId 1000 200)
+                              { meTransaction = parentTx, meAncestorCount = 1, meDescendantCount = 1 }
+                op   = OutPoint parentId 0
+                txin = TxIn op BS.empty 0xfffffffe
+                tx   = Tx 2 [txin] [TxOut 50000 BS.empty] [[]] 0
+            atomically $
+              modifyTVar' (mpEntries mp) (Map.insert parentId parentEnt)
+            result <- checkTrucPolicy tx 500 mp
+            case result of
+              Right Nothing -> return ()
+              other -> expectationFailure $
+                "Expected Right Nothing (non-v3 tx, non-v3 parent), got: " ++ show other
+
   -- =========================================================================
   -- Phase 37: PSBT (Partially Signed Bitcoin Transactions) Tests
   -- =========================================================================
