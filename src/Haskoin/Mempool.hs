@@ -29,6 +29,7 @@ module Haskoin.Mempool
     -- * Fee Calculations
   , calculateFeeRate
   , calculateVSize
+  , calculateAdjustedVSize
     -- * Mempool Creation
   , newMempool
     -- * Transaction Operations
@@ -162,7 +163,8 @@ import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
 import qualified Haskoin.Policy.Standard as Std
-import Haskoin.Policy.Standard (maxStandardTxSigOpsCost)
+import Haskoin.Policy.Standard (maxStandardTxSigOpsCost, defaultBytesPerSigop,
+                                getSigOpsAdjustedWeight)
 
 --------------------------------------------------------------------------------
 -- Fee Rate
@@ -180,13 +182,30 @@ calculateFeeRate fee vsize
   | vsize <= 0 = FeeRate 0
   | otherwise  = FeeRate ((fee * 1000) `div` fromIntegral vsize)
 
--- | Calculate virtual size from transaction
+-- | Calculate virtual size from transaction weight (no sigop adjustment).
+-- @vsize = ceil(weight / 4) = (weight + 3) \`div\` 4@.
+-- Use 'calculateAdjustedVSize' when the sigop cost is known (fee-rate storage).
 calculateVSize :: Tx -> Int
 calculateVSize tx =
   let base = txBaseSize tx
       total = txTotalSize tx
       weight = base * (witnessScaleFactor - 1) + total
   in (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
+
+-- | Sigop-adjusted virtual size.
+-- Mirrors @GetVirtualTransactionSize(weight, sigopCost, bytesPerSigop)@ in Core.
+-- If the sigop cost inflates the effective weight beyond the raw BIP-141 weight,
+-- the higher value is used for the vsize stored in 'meSize' and used for
+-- fee-rate comparison.
+--
+-- Reference: bitcoin-core/src/policy/policy.cpp:395-402.
+calculateAdjustedVSize :: Tx -> Int -> Int
+calculateAdjustedVSize tx sigopCost =
+  let base   = txBaseSize tx
+      total  = txTotalSize tx
+      weight = base * (witnessScaleFactor - 1) + total
+      adj    = getSigOpsAdjustedWeight weight sigopCost defaultBytesPerSigop
+  in (adj + witnessScaleFactor - 1) `div` witnessScaleFactor
 
 --------------------------------------------------------------------------------
 -- Mempool Configuration
@@ -739,14 +758,21 @@ finalizeTransaction mp tx txid inputPairs = do
 -- | Continue adding a transaction after all checks pass
 continueAddTransaction :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO (Either MempoolError TxId)
 continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
-  let feeRate = calculateFeeRate fee vsize
+  -- Sigop-adjusted virtual size: if sigops inflate the effective weight beyond
+  -- the raw BIP-141 weight, use the larger value for fee-rate and entry size.
+  -- Mirrors GetVirtualTransactionSize(tx, nSigOpCost, m_opts.m_bytes_per_sigop)
+  -- in bitcoin-core/src/policy/policy.cpp:400-403.
+  -- The unadjusted `vsize` (weight-only) was used for the min-relay-fee gate;
+  -- the adjusted `adjVsize` is what Core stores and uses for fee-rate comparisons.
+  let adjVsize = calculateAdjustedVSize tx txSigOpCost
+      feeRate = calculateFeeRate fee adjVsize
   -- Build and insert the entry
   now <- round <$> getPOSIXTime
   height <- readTVarIO (mpHeight mp)
   let rbfOptIn = signalsOptInRBF tx
       -- Ancestor counts include this transaction (self is included in all ancestor_ fields)
       ancestorCount = length ancestors + 1
-      ancestorSize = sum (map meSize ancestors) + vsize
+      ancestorSize = sum (map meSize ancestors) + adjVsize
       ancestorFees = sum (map meFee ancestors) + fee
       -- meAncestorSigOps accumulates ancestors' own sigop costs plus self.
       -- Each ancestor's meAncestorSigOps already includes that ancestor's
@@ -760,7 +786,7 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
         , meWtxid = wtxid
         , meFee = fee
         , meFeeRate = feeRate
-        , meSize = vsize
+        , meSize = adjVsize
         , meTime = now
         , meHeight = height
         , meAncestorCount = ancestorCount
@@ -768,7 +794,7 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
         , meAncestorFees = ancestorFees
         , meAncestorSigOps = ancestorSigOps
         , meDescendantCount = 1  -- includes self
-        , meDescendantSize = vsize  -- includes self
+        , meDescendantSize = adjVsize  -- includes self
         , meDescendantFees = fee  -- includes self
         , meRBFOptIn = rbfOptIn
         }
@@ -780,13 +806,13 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
     forM_ (txInputs tx) $ \inp ->
       modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
     modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
-    modifyTVar' (mpSize mp) (+ vsize)
+    modifyTVar' (mpSize mp) (+ adjVsize)
 
   -- Update ancestor entries with new descendant
   atomically $ forM_ ancestors $ \anc ->
     modifyTVar' (mpEntries mp) $ Map.adjust
       (\e -> e { meDescendantCount = meDescendantCount e + 1
-               , meDescendantSize = meDescendantSize e + vsize
+               , meDescendantSize = meDescendantSize e + adjVsize
                , meDescendantFees = meDescendantFees e + fee
                }) (meTxId anc)
 
@@ -1924,16 +1950,19 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
     Right ancestors -> do
       now <- round <$> getPOSIXTime
       height <- readTVarIO (mpHeight mp)
-      let feeRate = calculateFeeRate fee vsize
-          rbfOptIn = any (\inp -> txInSequence inp < 0xfffffffe) (txInputs tx)
+      let rbfOptIn = any (\inp -> txInSequence inp < 0xfffffffe) (txInputs tx)
           ancestorCount = length ancestors + 1
-          ancestorSize = sum (map meSize ancestors) + vsize
           ancestorFees = sum (map meFee ancestors) + fee
           -- Include self's own sigop cost (matches Core ancestor sigop accumulation).
           inputMap = Map.fromList inputPairs
           sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
           SigOpCost selfSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
           ancestorSigOps = sum (map meAncestorSigOps ancestors) + selfSigOpCost
+          -- Sigop-adjusted virtual size (Core parity).
+          -- Reference: bitcoin-core/src/policy/policy.cpp:400-403.
+          adjVsize = calculateAdjustedVSize tx selfSigOpCost
+          feeRate = calculateFeeRate fee adjVsize
+          ancestorSize = sum (map meSize ancestors) + adjVsize
           wtxid = computeWtxid tx
           entry = MempoolEntry
             { meTransaction = tx
@@ -1941,7 +1970,7 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
             , meWtxid = wtxid
             , meFee = fee
             , meFeeRate = feeRate
-            , meSize = vsize
+            , meSize = adjVsize
             , meTime = now
             , meHeight = height
             , meAncestorCount = ancestorCount
@@ -1949,7 +1978,7 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
             , meAncestorFees = ancestorFees
             , meAncestorSigOps = ancestorSigOps
             , meDescendantCount = 1
-            , meDescendantSize = vsize
+            , meDescendantSize = adjVsize
             , meDescendantFees = fee
             , meRBFOptIn = rbfOptIn
             }
@@ -1961,13 +1990,13 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
         forM_ (txInputs tx) $ \inp ->
           modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
         modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
-        modifyTVar' (mpSize mp) (+ vsize)
+        modifyTVar' (mpSize mp) (+ adjVsize)
 
       -- Update ancestor entries with new descendant
       atomically $ forM_ ancestors $ \anc ->
         modifyTVar' (mpEntries mp) $ Map.adjust
           (\e -> e { meDescendantCount = meDescendantCount e + 1
-                   , meDescendantSize = meDescendantSize e + vsize
+                   , meDescendantSize = meDescendantSize e + adjVsize
                    , meDescendantFees = meDescendantFees e + fee
                    }) (meTxId anc)
 

@@ -36,6 +36,11 @@ module Haskoin.Policy.Standard
   , annexTag
   , minStandardTxNonWitnessSize
   , witnessScaleFactor'
+  , defaultBytesPerSigop
+    -- * Weight / vsize helpers
+  , getSigOpsAdjustedWeight
+  , getVirtualTransactionSize
+  , getVirtualTransactionSizeWithSigops
     -- * Sub-checks
   , isStandardScriptPubKey
   , dustThreshold
@@ -150,6 +155,59 @@ minStandardTxNonWitnessSize = 65
 -- | Local copy of the consensus witness scale factor (4) for clarity.
 witnessScaleFactor' :: Int
 witnessScaleFactor' = witnessScaleFactor
+
+-- | Default bytes-per-sigop for virtual-size sigop adjustment.
+-- @DEFAULT_BYTES_PER_SIGOP = 20@.
+-- Reference: bitcoin-core/src/policy/policy.h:50.
+-- Used in 'getSigOpsAdjustedWeight' to compute the sigop-inflated
+-- virtual size that Core uses for mempool fee-rate calculations.
+defaultBytesPerSigop :: Int
+defaultBytesPerSigop = 20
+
+--------------------------------------------------------------------------------
+-- Weight / vsize helpers
+--------------------------------------------------------------------------------
+
+-- | Sigop-adjusted weight.  If the transaction's sigop cost, when
+-- scaled by @bytesPerSigop@, exceeds the raw BIP-141 weight, the
+-- effective weight is inflated to that sigop cost × bytesPerSigop.
+--
+-- @GetSigOpsAdjustedWeight(weight, sigopCost, bytesPerSigop)@
+-- = @max weight (sigopCost * bytesPerSigop)@.
+--
+-- Reference: bitcoin-core/src/policy/policy.cpp:390-393.
+getSigOpsAdjustedWeight :: Int  -- ^ Raw BIP-141 transaction weight
+                        -> Int  -- ^ Transaction sigop cost (scaled)
+                        -> Int  -- ^ Bytes per sigop (default: 20)
+                        -> Int
+getSigOpsAdjustedWeight weight sigopCost bytesPerSigop =
+  max weight (sigopCost * bytesPerSigop)
+
+-- | Virtual transaction size (weight units reinterpreted as bytes),
+-- with optional sigop-cost adjustment.
+--
+-- @GetVirtualTransactionSize(weight, sigopCost, bytesPerSigop)@
+-- = @ceil(getSigOpsAdjustedWeight(weight, sigopCost, bytesPerSigop) / WITNESS_SCALE_FACTOR)@
+-- = @(adjustedWeight + 3) \`div\` 4@.
+--
+-- Reference: bitcoin-core/src/policy/policy.cpp:395-398.
+--
+-- Pass @sigopCost=0, bytesPerSigop=0@ (or use 'getVirtualTransactionSize')
+-- for the no-adjustment path.
+getVirtualTransactionSizeWithSigops :: Int -> Int -> Int -> Int
+getVirtualTransactionSizeWithSigops weight sigopCost bytesPerSigop =
+  (getSigOpsAdjustedWeight weight sigopCost bytesPerSigop + witnessScaleFactor - 1)
+    `div` witnessScaleFactor
+
+-- | Virtual transaction size without sigop adjustment.
+--
+-- Equivalent to @GetVirtualTransactionSize(weight, 0, 0)@ in Core:
+-- @vsize = ceil(weight \/ 4) = (weight + 3) \`div\` 4@.
+--
+-- Reference: bitcoin-core/src/policy/policy.h:186-188.
+getVirtualTransactionSize :: Int -> Int
+getVirtualTransactionSize weight =
+  (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
 
 --------------------------------------------------------------------------------
 -- Errors

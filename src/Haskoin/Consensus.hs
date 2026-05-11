@@ -84,6 +84,8 @@ module Haskoin.Consensus
   , txTotalSize
   , varIntSize
   , checkBlockWeight
+  , minTransactionWeight
+  , minSerializableTransactionWeight
     -- NOTE(wave-33b dead-symbol audit): checkBlockWeight is test-only; the live
     -- weight check is inline in connectBlock. Fixes for BIP-141 weight rules
     -- belong in connectBlock / validateFullBlockIO, NOT here.
@@ -472,6 +474,22 @@ maxBlockHeaderSize = 80
 -- | Witness scale factor (non-witness data counts 4x)
 witnessScaleFactor :: Int
 witnessScaleFactor = 4
+
+-- | Minimum transaction weight for a valid serialised CTransaction.
+-- @MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60 = 240@.
+-- Reference: bitcoin-core/src/consensus/consensus.h:23.
+-- Used as a denominator bound when decoding compact blocks
+-- (blockencodings.cpp, merkleblock.cpp) to bound the maximum
+-- number of transactions a block header can claim.
+minTransactionWeight :: Int
+minTransactionWeight = witnessScaleFactor * 60
+
+-- | Minimum weight of a serializable CTransaction (may be incomplete).
+-- @MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10 = 40@.
+-- Reference: bitcoin-core/src/consensus/consensus.h:24.
+-- Used in compact block pre-fill sanity check (blockencodings.cpp:64).
+minSerializableTransactionWeight :: Int
+minSerializableTransactionWeight = witnessScaleFactor * 10
 
 -- | +2 hours future-time gate for header acceptance.
 --
