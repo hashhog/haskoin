@@ -199,6 +199,7 @@ import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
 import Data.List (nub, sort, sortBy, foldl')
+import Numeric (showHex)
 import Control.Monad (when, unless, forM, forM_, foldM, forever, void)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -227,7 +228,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO,
-                        putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO,
+                        putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO, getBlockHeight,
                         isUnspendable, Coin(..),
                         -- AssumeUTXO support
                         SnapshotMetadata(..), UtxoSnapshot(..), AssumeUtxoData(..),
@@ -257,6 +258,7 @@ data Network = Network
   , netCoinbaseMaturity  :: !Int            -- ^ 100 blocks
   , netGenesisBlock      :: !Block
   , netBIP34Height       :: !Word32
+  , netBIP34Hash         :: !BlockHash   -- ^ Hash of block at BIP34Height (anchor for BIP30 skip)
   , netBIP65Height       :: !Word32
   , netBIP66Height       :: !Word32
   , netCSVHeight         :: !Word32         -- ^ BIP68/112/113 (CSV) activation
@@ -918,6 +920,12 @@ mainnet = Network
   , netCoinbaseMaturity  = 100         -- 100 confirmations
   , netGenesisBlock      = genesisBlock
   , netBIP34Height       = 227931
+  -- Hash of the block at height 227931.  Core uses this as an anchor:
+  -- BIP30 is skipped in the range [BIP34Height, 1983702) only when this
+  -- hash is confirmed in the local chainstate, ensuring BIP30 stays
+  -- enforced on any fork that lacks the canonical BIP34 activation block.
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp line 90.
+  , netBIP34Hash         = hashFromHex "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
   , netBIP65Height       = 388381
   , netBIP66Height       = 363725
   , netCSVHeight         = 419328          -- BIP68/112/113
@@ -1004,6 +1012,8 @@ testnet3 = Network
   , netCoinbaseMaturity  = 100
   , netGenesisBlock      = testnet3GenesisBlock
   , netBIP34Height       = 21111
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp line 213.
+  , netBIP34Hash         = hashFromHex "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
   , netBIP65Height       = 581885
   , netBIP66Height       = 330776
   , netCSVHeight         = 770112          -- BIP68/112/113 on testnet3
@@ -1052,6 +1062,11 @@ testnet4 = Network
   , netCoinbaseMaturity  = 100
   , netGenesisBlock      = testnet4GenesisBlock
   , netBIP34Height       = 1           -- Active from block 1
+  -- Testnet4: BIP34Hash = {} (zero hash) per Core chainparams.cpp line 312.
+  -- With BIP34Height=1 and BIP34Hash=zero, the anchor check always passes
+  -- (no block in the chain has the zero hash), so BIP30 stays enforced
+  -- below height 1983702 as Core intends.
+  , netBIP34Hash         = BlockHash (Hash256 (BS.replicate 32 0))
   , netBIP65Height       = 1
   , netBIP66Height       = 1
   , netCSVHeight         = 1           -- BIP68/112/113 active from block 1
@@ -1138,6 +1153,8 @@ regtest = Network
   , netCoinbaseMaturity  = 100
   , netGenesisBlock      = regtestGenesisBlock
   , netBIP34Height       = 1           -- Active from block 1 (matches Bitcoin Core)
+  -- Regtest: BIP34Hash = {} (zero hash) per Core chainparams.cpp line 537.
+  , netBIP34Hash         = BlockHash (Hash256 (BS.replicate 32 0))
   , netBIP65Height       = 1           -- Active from block 1 (matches Bitcoin Core)
   , netBIP66Height       = 1           -- Active from block 1 (matches Bitcoin Core)
   , netCSVHeight         = 1           -- Active from block 1 (matches Bitcoin Core)
@@ -2180,6 +2197,21 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
   -- Bitcoin Core: consensus/tx_check.cpp CheckTransaction "bad-cb-length"
   validateTransaction (head txns)
 
+  -- 2b. BIP-34/66/65: reject blocks with outdated nVersion.
+  -- Bitcoin Core validation.cpp:4112-4118 (ContextualCheckBlockHeader):
+  --   nVersion < 2 rejected after BIP34 (DEPLOYMENT_HEIGHTINCB) activation.
+  --   nVersion < 3 rejected after BIP66 (DEPLOYMENT_DERSIG) activation.
+  --   nVersion < 4 rejected after BIP65 (DEPLOYMENT_CLTV) activation.
+  -- DeploymentActiveAfter(pindexPrev, ...) = (pindexPrev.height+1) >= activation,
+  -- which maps to `height >= netBIPNNHeight net` in our scheme.
+  let blockVer = bhVersion header
+  when (flagBIP34 flags && blockVer < 2) $
+    Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
+  when (flagBIP66 flags && blockVer < 3) $
+    Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
+  when (flagBIP65 flags && blockVer < 4) $
+    Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
+
   -- 3. Verify merkle root
   let computedRoot = computeMerkleRoot (map computeTxId txns)
   unless (computedRoot == bhMerkleRoot header) $ Left "Merkle root mismatch"
@@ -2347,10 +2379,47 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
 -- impossible up to height 1,983,702 where the BIP-34 implication is no longer
 -- guaranteed (a future miner could re-grind an old coinbase hash).
 checkBIP30 :: HaskoinDB -> Network -> Word32 -> Block -> IO (Either String ())
-checkBIP30 db net height block
-  | height == 91842 || height == 91880 = return (Right ())
-  | height >= netBIP34Height net && height < bip34ImpliesBIP30Limit = return (Right ())
-  | otherwise = go (blockTxns block)
+checkBIP30 db net height block = do
+  -- Gate 1: IsBIP30Repeat — grandfathered duplicate-coinbase blocks.
+  -- Bitcoin Core validation.cpp:6189-6193 (IsBIP30Repeat) checks BOTH height
+  -- AND block hash.  Checking height alone would incorrectly exempt a block at
+  -- the same height on an alternative fork.
+  let bh = computeBlockHash (blockHeader block)
+      bip30Repeat91842 = height == 91842
+                      && bh == hashFromHex "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+      bip30Repeat91880 = height == 91880
+                      && bh == hashFromHex "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721"
+  if bip30Repeat91842 || bip30Repeat91880
+    then return (Right ())
+    else do
+      -- Gate 2: BIP34 hash-anchor skip.
+      -- Once BIP-34 is active AND the block at netBIP34Height has the canonical
+      -- hash (netBIP34Hash), coinbase txids are unique by construction, so BIP30
+      -- cannot be violated in the range [BIP34Height, 1983702).
+      -- Bitcoin Core validation.cpp:2460-2462:
+      --   pindexBIP34height = pindex->pprev->GetAncestor(params.BIP34Height);
+      --   fEnforceBIP30 = fEnforceBIP30 && (!pindexBIP34height ||
+      --     !(pindexBIP34height->GetBlockHash() == params.BIP34Hash));
+      -- We query the stored hash at netBIP34Height from the DB.  If it matches
+      -- netBIP34Hash the anchor is confirmed and BIP30 can be skipped.
+      -- Note: when netBIP34Hash is the zero hash (testnet4/regtest), no stored
+      -- block ever has that hash, so the anchor check always fails and BIP30
+      -- remains enforced — matching Core's behaviour for those networks.
+      bip34AnchorConfirmed <- do
+        let bip34H = netBIP34Height net
+        if height <= bip34H
+          then return False
+          else do
+            mStoredHash <- getBlockHeight db bip34H
+            return $ case mStoredHash of
+              Just storedHash -> storedHash == netBIP34Hash net
+              Nothing         -> False
+      let skipForBIP34 = bip34AnchorConfirmed
+                      && height >= netBIP34Height net
+                      && height < bip34ImpliesBIP30Limit
+      if skipForBIP34
+        then return (Right ())
+        else go (blockTxns block)
   where
     bip34ImpliesBIP30Limit :: Word32
     bip34ImpliesBIP30Limit = 1983702
