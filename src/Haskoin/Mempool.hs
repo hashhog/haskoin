@@ -56,6 +56,11 @@ module Haskoin.Mempool
   , getConflicts
     -- * BIP-68 sequence lock checks
   , checkSeqLocksAtTip
+    -- * Eviction / Expiry
+  , expireOldTransactions
+  , trackPackageRemoved
+  , trimToSize
+  , rollingFeeHalflife
     -- * RBF (Replace-by-Fee)
   , checkReplacement
   , removeConflicts
@@ -225,6 +230,10 @@ data MempoolConfig = MempoolConfig
   , mpcMaxDescendants    :: !Int      -- ^ Max descendant count (default 25)
   , mpcMaxAncestorSize   :: !Int64    -- ^ Max ancestor size in vB (default 101k)
   , mpcMaxDescendantSize :: !Int64    -- ^ Max descendant size in vB (default 101k)
+  , mpcExpiryHours       :: !Int      -- ^ Hours after which unconfirmed txs expire
+                                      --   (default 336 = 14 days).
+                                      --   Bitcoin Core: DEFAULT_MEMPOOL_EXPIRY_HOURS=336
+                                      --   (kernel/mempool_options.h:23).
   } deriving (Show, Generic)
 
 instance NFData MempoolConfig
@@ -240,6 +249,7 @@ defaultMempoolConfig = MempoolConfig
   , mpcMaxDescendants    = 25
   , mpcMaxAncestorSize   = 101000             -- ~101 KB
   , mpcMaxDescendantSize = 101000             -- ~101 KB
+  , mpcExpiryHours       = 336               -- 14 days
   }
 
 --------------------------------------------------------------------------------
@@ -321,11 +331,21 @@ instance NFData MempoolError
 maxReplacementEvictions :: Int
 maxReplacementEvictions = 100
 
--- | Incremental relay fee in sat/kvB (1000 = 1 sat/vB)
+-- | Incremental relay fee in sat/kvB.
 -- This is the minimum fee increase required to pay for replacement bandwidth
--- Bitcoin Core: incrementalRelayFee = 1000 sat/kvB
+-- and also the floor added to evicted fee rates when bumping the rolling minimum.
+-- Bitcoin Core: DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (policy/policy.h:48).
+-- Note: CFeeRate(100) means 100 sat per 1000 bytes = 0.1 sat/vB.
 incrementalRelayFeePerKvb :: Word64
-incrementalRelayFeePerKvb = 1000
+incrementalRelayFeePerKvb = 100
+
+-- | Rolling fee halflife in seconds (12 hours).
+-- Controls how quickly the rolling minimum fee decays toward zero after the
+-- mempool stops being full.  Halved (to 3h or 6h) when pool is less than
+-- half- or quarter-full to speed up decay in light-traffic conditions.
+-- Bitcoin Core: CTxMemPool::ROLLING_FEE_HALFLIFE = 60*60*12 (txmempool.h:212).
+rollingFeeHalflife :: Double
+rollingFeeHalflife = fromIntegral (60 * 60 * 12 :: Int)
 
 -- | BIP-125 Gate 1: does this transaction directly signal opt-in RBF?
 -- A transaction signals opt-in RBF if ANY input has nSequence <= 0xfffffffd
@@ -524,6 +544,23 @@ data Mempool = Mempool
     -- history is unavailable, pass 'noopCoinMtp' (returns 0), which makes all
     -- time-based BIP-68 locks appear trivially satisfied (over-permissive but
     -- correct: the real enforcement is done by OP_CSV at script-eval time).
+    -- Rolling minimum fee state (Bitcoin Core txmempool.h:195-197, 212).
+    -- Together these implement CTxMemPool::GetMinFee / trackPackageRemoved.
+  , mpRollingMinFeeRate :: !(TVar Double)
+    -- ^ Rolling minimum fee rate in sat/kvB (as Double for exponential decay).
+    -- Starts at 0.  Bumped by trackPackageRemoved when we evict due to sizelimit;
+    -- decays exponentially in GetMinFee with halflife ROLLING_FEE_HALFLIFE.
+    -- Bitcoin Core: rollingMinimumFeeRate (txmempool.h:197).
+  , mpBlockSinceLastFeeBump :: !(TVar Bool)
+    -- ^ True after a block is connected; cleared when rollingMinimumFeeRate is
+    -- bumped by an eviction.  Controls decay: if a block has been mined since
+    -- the last eviction-bump the fee has already decayed naturally, so we skip
+    -- the update-time check and decay unconditionally.
+    -- Bitcoin Core: blockSinceLastRollingFeeBump (txmempool.h:196).
+  , mpLastRollingFeeUpdate :: !(TVar Int64)
+    -- ^ Unix timestamp of the last decay calculation.  Initialised to now.
+    -- Updated every time GetMinFee applies a decay step (only if >10s elapsed).
+    -- Bitcoin Core: lastRollingFeeUpdate (txmempool.h:195).
   }
 
 -- | A no-op coin-MTP lookup that returns 0 for every height.
@@ -546,21 +583,26 @@ noopCoinMtp _ = return 0
 -- 'noopCoinMtp' when historical chain MTP data is unavailable.
 newMempool :: Network -> UTXOCache -> MempoolConfig -> Word32 -> Word32
            -> (Word32 -> IO Word32) -> IO Mempool
-newMempool net cache config height mtp getCoinMtp = Mempool
-  <$> newTVarIO Map.empty
-  <*> newTVarIO Map.empty
-  <*> newTVarIO Map.empty
-  <*> newTVarIO Map.empty
-  <*> pure config
-  <*> pure cache
-  <*> newTVarIO 0
-  <*> pure net
-  <*> newTVarIO height
-  <*> newTVarIO mtp
-  <*> newTVarIO []         -- mpRecentTimestamps: empty until blocks connect
-  <*> newTVarIO Map.empty
-  <*> newTVarIO Set.empty
-  <*> pure getCoinMtp
+newMempool net cache config height mtp getCoinMtp = do
+  now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+  Mempool
+    <$> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Map.empty
+    <*> pure config
+    <*> pure cache
+    <*> newTVarIO 0
+    <*> pure net
+    <*> newTVarIO height
+    <*> newTVarIO mtp
+    <*> newTVarIO []         -- mpRecentTimestamps: empty until blocks connect
+    <*> newTVarIO Map.empty
+    <*> newTVarIO Set.empty
+    <*> pure getCoinMtp
+    <*> newTVarIO 0.0        -- mpRollingMinFeeRate: starts at 0
+    <*> newTVarIO False      -- mpBlockSinceLastFeeBump: no block yet
+    <*> newTVarIO now        -- mpLastRollingFeeUpdate: now
 
 --------------------------------------------------------------------------------
 -- Transaction Addition
@@ -1121,16 +1163,18 @@ getMempoolInfo mp = atomically $ do
       minFee = if null entryList then 0 else minimum $ map meFee entryList
   return (Map.size entries, size, totalFees, minFee)
 
--- | Get the minimum fee rate for mempool acceptance (sat/kvB)
--- Returns the configured minimum relay fee rate. When the mempool is full,
--- this could be dynamically increased, but for now we return the static config.
--- The returned value is in sat/1000vB (sat/kvB) for BIP133 feefilter compatibility.
+-- | Get the effective minimum fee rate for mempool acceptance (sat/kvB).
+-- Returns the maximum of:
+--   1. The decayed rolling minimum (bumped by size-limit evictions)
+--   2. The static configured minimum relay fee rate
+-- The returned value is in sat/kvB for BIP133 feefilter compatibility.
+-- Mirrors CTxMemPool::GetMinFee (txmempool.cpp:829-851).
 getMempoolMinFeeRate :: Mempool -> IO Word64
 getMempoolMinFeeRate mp = do
-  -- Get the static min fee rate from config (FeeRate in sat/vB)
+  rollingKvb <- getMempoolMinFeeRateDecayed mp
   let FeeRate minRate = mpcMinFeeRate (mpConfig mp)
-  -- Convert sat/vB to sat/kvB (multiply by 1000) for BIP133 feefilter
-  return (fromIntegral minRate * 1000)
+      staticKvb = fromIntegral minRate * 1000  -- sat/vB → sat/kvB
+  return (max rollingKvb staticKvb)
 
 --------------------------------------------------------------------------------
 -- Ancestor/Descendant Tracking
@@ -1482,6 +1526,11 @@ blockConnected mp block = do
     modifyTVar' (mpRecentTimestamps mp) (\old -> take 11 (ts : old))
     timestamps <- readTVar (mpRecentTimestamps mp)
     writeTVar (mpMTP mp) (computeMTPFromList timestamps)
+    -- Signal that a block has connected.  GetMinFee uses this flag to decide
+    -- whether to apply exponential decay to the rolling minimum fee rate.
+    -- Bitcoin Core: blockSinceLastRollingFeeBump = true (txmempool.cpp set in
+    -- CTxMemPool::AddTransactionsUpdated, called from ConnectBlock).
+    writeTVar (mpBlockSinceLastFeeBump mp) True
 
 -- | Handle a disconnected block (during reorg)
 -- Re-adds transactions from the disconnected block back to mempool
@@ -1562,13 +1611,127 @@ safeDropHead (_:xs) = xs
 -- Eviction
 --------------------------------------------------------------------------------
 
--- | Evict lowest fee-rate transactions when mempool is full
+-- | Bump the rolling minimum fee rate when a package is removed due to
+-- size-limit eviction.  Mirrors CTxMemPool::trackPackageRemoved
+-- (txmempool.cpp:853-859).
+--
+-- If the evicted package's fee rate (already including the incremental relay
+-- fee floor) exceeds the current rolling minimum, we adopt it as the new
+-- minimum and clear the blockSinceLastFeeBump flag so decay does not start
+-- until the next block arrives.
+trackPackageRemoved :: Mempool -> Word64 -> IO ()
+trackPackageRemoved mp evictedFeeRateKvb = do
+  let newRate = fromIntegral evictedFeeRateKvb :: Double
+  atomically $ do
+    cur <- readTVar (mpRollingMinFeeRate mp)
+    when (newRate > cur) $ do
+      writeTVar (mpRollingMinFeeRate mp) newRate
+      writeTVar (mpBlockSinceLastFeeBump mp) False
+
+-- | Get the effective minimum fee rate for mempool acceptance (sat/kvB).
+-- Applies exponential decay to the rolling minimum fee rate and returns the
+-- maximum of the decayed rolling value and the static incremental relay fee.
+-- Mirrors CTxMemPool::GetMinFee (txmempool.cpp:829-851).
+--
+-- Decay formula: rollingMin /= 2^((now - lastUpdate) / halflife)
+-- Halflife is shortened to 1/2 or 1/4 when the pool is below 50%/25% full,
+-- to speed up the decay in light-traffic conditions.
+-- Returns 0 (in sat/kvB) when the rolling min has decayed below half the
+-- incremental relay fee floor (same threshold as Core).
+getMempoolMinFeeRateDecayed :: Mempool -> IO Word64
+getMempoolMinFeeRateDecayed mp = do
+  rolling    <- readTVarIO (mpRollingMinFeeRate mp)
+  blockSince <- readTVarIO (mpBlockSinceLastFeeBump mp)
+  if not blockSince || rolling == 0
+    then return (floor rolling)
+    else do
+      now        <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+      lastUpdate <- readTVarIO (mpLastRollingFeeUpdate mp)
+      if now > lastUpdate + 10
+        then do
+          -- Compute adaptive halflife based on pool fullness
+          poolSize  <- readTVarIO (mpSize mp)
+          let maxSize  = fromIntegral (mpcMaxSize (mpConfig mp)) :: Double
+              poolFrac = fromIntegral poolSize / maxSize
+              halflife
+                | poolFrac < 0.25 = rollingFeeHalflife / 4
+                | poolFrac < 0.50 = rollingFeeHalflife / 2
+                | otherwise       = rollingFeeHalflife
+              elapsed  = fromIntegral (now - lastUpdate) :: Double
+              decayed  = rolling / (2 ** (elapsed / halflife))
+              floorKvb = fromIntegral incrementalRelayFeePerKvb :: Double
+          -- Update state: write decayed rate and timestamp
+          atomically $ do
+            if decayed < floorKvb / 2
+              then do
+                writeTVar (mpRollingMinFeeRate mp) 0.0
+              else
+                writeTVar (mpRollingMinFeeRate mp) decayed
+            writeTVar (mpLastRollingFeeUpdate mp) now
+          -- Return max(decayed, incrementalRelayFee), or 0 if below floor/2
+          if decayed < floorKvb / 2
+            then return 0
+            else return (max (floor decayed) incrementalRelayFeePerKvb)
+        else
+          -- Less than 10s since last update: return current without decaying
+          return (max (floor rolling) incrementalRelayFeePerKvb)
+
+-- | Trim the mempool to the configured size limit by removing the
+-- lowest-feerate transactions, looping until under the limit.
+-- Updates the rolling minimum fee rate via 'trackPackageRemoved' each
+-- iteration.  Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
+trimToSize :: Mempool -> IO ()
+trimToSize mp = loop
+  where
+    sizelimit = mpcMaxSize (mpConfig mp)
+    loop = do
+      totalSize <- readTVarIO (mpSize mp)
+      when (totalSize > sizelimit) $ do
+        feeRateMap <- readTVarIO (mpByFeeRate mp)
+        case Map.lookupMin feeRateMap of
+          Nothing -> return ()  -- pool is empty, nothing to evict
+          Just ((evictedFeeRate, txid), _) -> do
+            -- Evicted fee rate in sat/kvB + incremental relay fee floor
+            -- (mirrors: removed += m_opts.incremental_relay_feerate)
+            let FeeRate fr = evictedFeeRate
+                evictedKvb = fr + incrementalRelayFeePerKvb
+            trackPackageRemoved mp evictedKvb
+            removeWithDescendants mp txid
+            loop  -- keep trimming until under limit
+
+-- | Evict the lowest fee-rate transaction (and its descendants) from the
+-- mempool and bump the rolling minimum fee rate accordingly.
+-- Called from 'finalizeTransaction' when a new entry pushes the pool over
+-- its size limit.
 evictLowestFee :: Mempool -> IO ()
-evictLowestFee mp = do
-  feeRateMap <- readTVarIO (mpByFeeRate mp)
-  case Map.lookupMin feeRateMap of
-    Nothing -> return ()
-    Just ((_, txid), _) -> removeWithDescendants mp txid
+evictLowestFee = trimToSize
+
+-- | Expire transactions that have been in the mempool longer than the
+-- configured expiry window (default 14 days / 336 hours).
+-- Also evicts all descendants of each expired transaction.
+-- Mirrors CTxMemPool::Expire (txmempool.cpp:811-827).
+--
+-- Returns the number of transactions removed (including descendants).
+expireOldTransactions :: Mempool -> IO Int
+expireOldTransactions mp = do
+  now     <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+  let expirySeconds = fromIntegral (mpcExpiryHours (mpConfig mp)) * 3600 :: Int64
+      cutoff        = now - expirySeconds
+  entries <- readTVarIO (mpEntries mp)
+  -- Collect all entries whose admission time predates the cutoff
+  let expired = [ txid
+                | (txid, e) <- Map.toList entries
+                , meTime e < cutoff
+                ]
+  -- Remove each expired entry together with its descendants
+  before <- fmap (Map.size) (readTVarIO (mpEntries mp))
+  forM_ expired $ \txid -> do
+    mEntry <- getTransaction mp txid
+    case mEntry of
+      Nothing -> return ()  -- already removed as a descendant of an earlier expiry
+      Just _  -> removeWithDescendants mp txid
+  after  <- fmap Map.size (readTVarIO (mpEntries mp))
+  return (before - after)
 
 --------------------------------------------------------------------------------
 -- Transaction Selection for Mining

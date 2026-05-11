@@ -5258,13 +5258,172 @@ main = hspec $ do
         let noChildDescendantCount = 1  -- Just self
         noChildDescendantCount `shouldBe` 1
 
+    -- W86 eviction audit tests
+    describe "W86 Eviction / Expiry (Bitcoin Core txmempool.cpp:811-915)" $ do
+      it "default expiry is 336 hours (14 days)" $ do
+        -- Core DEFAULT_MEMPOOL_EXPIRY_HOURS = 336 (kernel/mempool_options.h:23)
+        mpcExpiryHours defaultMempoolConfig `shouldBe` 336
+
+      it "rollingFeeHalflife is 12 hours (43200 seconds)" $ do
+        -- Core ROLLING_FEE_HALFLIFE = 60*60*12 (txmempool.h:212)
+        rollingFeeHalflife `shouldBe` 43200.0
+
+      it "incrementalRelayFeePerKvb is 100 sat/kvB (Core DEFAULT_INCREMENTAL_RELAY_FEE)" $ do
+        -- Core policy/policy.h:48
+        incrementalRelayFeePerKvb `shouldBe` 100
+
+      it "trackPackageRemoved bumps rolling minimum when evicted rate is higher" $ do
+        -- Mirrors CTxMemPool::trackPackageRemoved (txmempool.cpp:853-859)
+        withSystemTempDirectory "haskoin-w86-track" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            -- Initial rolling minimum is 0
+            initial <- readTVarIO (mpRollingMinFeeRate mp)
+            initial `shouldBe` 0.0
+            -- Bump with 500 sat/kvB
+            trackPackageRemoved mp 500
+            after <- readTVarIO (mpRollingMinFeeRate mp)
+            after `shouldBe` 500.0
+            -- blockSinceLastFeeBump should be cleared
+            bsince <- readTVarIO (mpBlockSinceLastFeeBump mp)
+            bsince `shouldBe` False
+
+      it "trackPackageRemoved does not lower rolling minimum" $ do
+        -- If new rate < current rolling min, leave it unchanged
+        withSystemTempDirectory "haskoin-w86-nodecline" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            trackPackageRemoved mp 1000
+            trackPackageRemoved mp 500  -- lower: should be ignored
+            after <- readTVarIO (mpRollingMinFeeRate mp)
+            after `shouldBe` 1000.0
+
+      it "getMempoolMinFeeRate returns static minimum when no evictions" $ do
+        -- With no evictions, rolling min is 0; static min (1 sat/vB = 1000 sat/kvB) wins
+        withSystemTempDirectory "haskoin-w86-staticmin" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            minRate <- getMempoolMinFeeRate mp
+            -- static config is 1 sat/vB = 1000 sat/kvB
+            minRate `shouldBe` 1000
+
+      it "getMempoolMinFeeRate returns rolling minimum when it exceeds static minimum" $ do
+        -- After size-limit eviction, rolling min should raise the bar
+        withSystemTempDirectory "haskoin-w86-rollmin" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            -- Simulate an eviction at 5000 sat/kvB (5 sat/vB)
+            trackPackageRemoved mp 5000
+            -- blockSince=False -> no decay path, returns max(rolling, incremental)
+            minRate <- getMempoolMinFeeRate mp
+            -- max(5000, 100) = 5000, then max(5000, 1000 static) = 5000
+            minRate `shouldBe` 5000
+
+      it "blockConnected sets blockSinceLastFeeBump" $ do
+        -- When a block connects, blockSinceLastFeeBump should become True
+        -- so that GetMinFee will apply exponential decay on next call
+        withSystemTempDirectory "haskoin-w86-blocksince" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            trackPackageRemoved mp 1000
+            -- Initially false (cleared by trackPackageRemoved)
+            bBefore <- readTVarIO (mpBlockSinceLastFeeBump mp)
+            bBefore `shouldBe` False
+            -- Connect a dummy block (coinbase only)
+            let dummyBlockHdr = BlockHeader 0 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                              (Hash256 (BS.replicate 32 0)) 0 0 0
+                cbTxIn        = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff)
+                                     BS.empty 0xffffffff
+                cbTx          = Tx 1 [cbTxIn] [TxOut 5000000000 BS.empty] [[]] 0
+                dummyBlock    = Block dummyBlockHdr [cbTx]
+            blockConnected mp dummyBlock
+            bAfter <- readTVarIO (mpBlockSinceLastFeeBump mp)
+            bAfter `shouldBe` True
+
+      it "expireOldTransactions removes entries older than expiry window" $ do
+        -- Build a mempool with two entries: one fresh, one artificially aged
+        withSystemTempDirectory "haskoin-w86-expire" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+            let expirySeconds = fromIntegral (mpcExpiryHours defaultMempoolConfig) * 3600 :: Int64
+                oldTime       = now - expirySeconds - 1   -- 1 second past the window
+                freshTime     = now - 60                   -- 1 minute ago (fresh)
+                txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+                txid2 = TxId (Hash256 (BS.replicate 32 0x02))
+                mkEntry txid t = MempoolEntry
+                  { meTransaction    = Tx 1 [] [] [[]] 0
+                  , meTxId           = txid
+                  , meWtxid          = Wtxid (Hash256 (BS.replicate 32 0x00))
+                  , meFee            = 1000
+                  , meFeeRate        = FeeRate 10
+                  , meSize           = 100
+                  , meTime           = t
+                  , meHeight         = 0
+                  , meAncestorCount  = 1
+                  , meAncestorSize   = 100
+                  , meAncestorFees   = 1000
+                  , meAncestorSigOps = 0
+                  , meDescendantCount = 1
+                  , meDescendantSize = 100
+                  , meDescendantFees = 1000
+                  , meRBFOptIn       = False
+                  }
+            -- Directly insert entries into the TVar (bypassing full validation for test)
+            atomically $ do
+              modifyTVar' (mpEntries mp) (Map.insert txid1 (mkEntry txid1 oldTime))
+              modifyTVar' (mpEntries mp) (Map.insert txid2 (mkEntry txid2 freshTime))
+            countBefore <- Map.size <$> readTVarIO (mpEntries mp)
+            countBefore `shouldBe` 2
+            removed <- expireOldTransactions mp
+            removed `shouldBe` 1
+            remaining <- Map.keys <$> readTVarIO (mpEntries mp)
+            remaining `shouldBe` [txid2]
+
+      it "expireOldTransactions returns 0 when no entries are expired" $ do
+        withSystemTempDirectory "haskoin-w86-no-expire" $ \tmp -> do
+          withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+            cache <- newUTXOCache db 1024
+            mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
+            -- All entries are fresh (within the window)
+            now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+            let freshTxId = TxId (Hash256 (BS.replicate 32 0x03))
+                freshEntry = MempoolEntry
+                  { meTransaction    = Tx 1 [] [] [[]] 0
+                  , meTxId           = freshTxId
+                  , meWtxid          = Wtxid (Hash256 (BS.replicate 32 0x00))
+                  , meFee            = 500
+                  , meFeeRate        = FeeRate 5
+                  , meSize           = 100
+                  , meTime           = now - 60
+                  , meHeight         = 0
+                  , meAncestorCount  = 1
+                  , meAncestorSize   = 100
+                  , meAncestorFees   = 500
+                  , meAncestorSigOps = 0
+                  , meDescendantCount = 1
+                  , meDescendantSize = 100
+                  , meDescendantFees = 500
+                  , meRBFOptIn       = False
+                  }
+            atomically $ modifyTVar' (mpEntries mp) (Map.insert freshTxId freshEntry)
+            removed <- expireOldTransactions mp
+            removed `shouldBe` 0
+
     describe "Full RBF (Replace-by-Fee)" $ do
       describe "RBF constants" $ do
         it "maxReplacementEvictions is 100" $ do
           maxReplacementEvictions `shouldBe` 100
 
-        it "incrementalRelayFeePerKvb is 1000 sat/kvB" $ do
-          incrementalRelayFeePerKvb `shouldBe` 1000
+        it "incrementalRelayFeePerKvb is 100 sat/kvB" $ do
+          -- Bitcoin Core DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (policy/policy.h:48)
+          incrementalRelayFeePerKvb `shouldBe` 100
 
       describe "RbfError types" $ do
         it "RbfInsufficientAbsoluteFee has correct fields" $ do
@@ -5367,21 +5526,23 @@ main = hspec $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
               conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
               -- New tx: 1001 sat fee (additional = 1), 200 vB
-              -- Required relay fee = 200 * 1000 / 1000 = 200 sat
-              -- 1 < 200 -> fails
+              -- Required relay fee = 200 * 100 / 1000 = 20 sat
+              -- (incrementalRelayFeePerKvb = 100 sat/kvB, Core DEFAULT_INCREMENTAL_RELAY_FEE)
+              -- 1 < 20 -> fails
               result = checkReplacement dummyTx [conflict] [conflict] 1001 200 (FeeRate 5005)
           case result of
             Left (RbfInsufficientRelayFee addF reqF) -> do
               addF `shouldBe` 1
-              reqF `shouldBe` 200
+              reqF `shouldBe` 20
             _ -> expectationFailure "Expected RbfInsufficientRelayFee error"
 
         it "Rule 4: accepts when additional fee covers relay fee" $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
               conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
               -- New tx: 1500 sat fee (additional = 500), 200 vB
-              -- Required relay fee = 200 * 1000 / 1000 = 200 sat
-              -- 500 >= 200 -> passes
+              -- Required relay fee = 200 * 100 / 1000 = 20 sat
+              -- (incrementalRelayFeePerKvb = 100 sat/kvB)
+              -- 500 >= 20 -> passes
               result = checkReplacement dummyTx [conflict] [conflict] 1500 200 (FeeRate 7500)
           result `shouldBe` Right ()
 
@@ -5483,12 +5644,13 @@ main = hspec $ do
               -- allEvictions total fee = 1100
               -- New fee = 1101, vsize = 2000 vB
               -- additional = 1101 - 1100 = 1
-              -- requiredRelay = 2000 * 1000 / 1000 = 2000 → fails Rule 4
+              -- requiredRelay = 2000 * 100 / 1000 = 200 → fails Rule 4
+              -- (incrementalRelayFeePerKvb = 100 sat/kvB, Core DEFAULT_INCREMENTAL_RELAY_FEE)
               result = checkReplacement dummyTxW73 [directConflict] [directConflict, descendant] 1101 2000 (FeeRate 550)
           case result of
             Left (RbfInsufficientRelayFee addF reqF) -> do
               addF `shouldBe` 1
-              reqF `shouldBe` 2000
+              reqF `shouldBe` 200
             _ -> expectationFailure "Expected RbfInsufficientRelayFee (baseline from all evictions)"
 
       -- W73 BIP-125 audit: Gate 1 — signalsOptInRBF is a pure function
@@ -12805,8 +12967,10 @@ main = hspec $ do
         -- It only requires the new tx to pay for its own relay cost
         let vsizeChild = 1000  -- max child size
             requiredFee = (incrementalRelayFeePerKvb * fromIntegral vsizeChild) `div` 1000
-        -- For a 1000 vbyte tx with 1 sat/vB incremental relay fee
-        requiredFee `shouldBe` 1000  -- 1000 satoshis
+        -- For a 1000 vbyte tx with 100 sat/kvB incremental relay fee:
+        -- 100 * 1000 / 1000 = 100 satoshis
+        -- (incrementalRelayFeePerKvb = 100 sat/kvB, Core DEFAULT_INCREMENTAL_RELAY_FEE)
+        requiredFee `shouldBe` 100
 
     describe "v3/non-v3 mixing rules" $ do
       it "v3 cannot spend unconfirmed non-v3" $ do
