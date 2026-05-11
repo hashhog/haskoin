@@ -129,6 +129,7 @@ import qualified Crypto.Hash as Hash
 import qualified Data.ByteArray as BA
 
 import Haskoin.Types
+import Haskoin.Crypto (doubleSHA256)
 import Haskoin.Storage (HaskoinDB(..), BlockUndo(..), TxUndo(..), TxInUndo(..),
                          Coin(..), BlockHeight, integerToBS, bsToInteger)
 import Haskoin.MuHash (MuHash3072(..), Num3072(..),
@@ -434,12 +435,14 @@ data GCSFilter = GCSFilter
 instance NFData GCSFilter
 
 -- | Create an empty GCS filter
+-- Core's empty GCSFilter stores m_encoded = {0x00} (the compact-size for N=0).
+-- Reference: blockfilter.cpp GCSFilter::GCSFilter(const Params& params)
 gcsFilterEmpty :: GCSParams -> GCSFilter
 gcsFilterEmpty params = GCSFilter
   { gcsParams = params
   , gcsN = 0
   , gcsF = 0
-  , gcsEncoded = BS.empty
+  , gcsEncoded = BS.singleton 0x00
   }
 
 -- | Hash an element to range [0, F)
@@ -492,9 +495,12 @@ gcsFilterEncode :: GCSFilter -> ByteString
 gcsFilterEncode = gcsEncoded
 
 -- | Decode a GCS filter
+-- The encoded bytes must include the compact-size N prefix.  An empty
+-- ByteString is rejected (Core would throw ios_base::failure); callers
+-- expecting an empty filter should pass BS.singleton 0x00.
 gcsFilterDecode :: GCSParams -> ByteString -> Either String GCSFilter
 gcsFilterDecode params bs
-  | BS.null bs = Right $ gcsFilterEmpty params
+  | BS.null bs = Left "Empty encoded filter (missing compact-size prefix)"
   | otherwise = do
       -- Read compact size N
       (n, rest) <- decodeCompactSize bs
@@ -625,14 +631,22 @@ data BlockFilter = BlockFilter
 instance NFData BlockFilter
 
 -- | Get elements for a basic block filter
--- From BIP158: outputs' scriptPubKeys (excluding OP_RETURN) + spent outputs' scriptPubKeys
+-- BIP-158 / bitcoin-core/src/blockfilter.cpp BasicFilterElements:
+--   * Output scripts: exclude empty AND OP_RETURN (0x6a prefix)
+--   * Spent output scripts (undo data): exclude only empty, NOT OP_RETURN
+-- The spent-output OP_RETURN exclusion was a bug: Core only excludes
+-- OP_RETURN from new outputs, not from previously-unspent outputs being
+-- consumed.
 blockFilterElements :: Block -> BlockUndo -> [ByteString]
 blockFilterElements block undo =
-  let -- Output scripts from all transactions (excluding OP_RETURN)
-      outputScripts = concatMap txOutputScripts (blockTxns block)
-      -- Spent output scripts from undo data
-      spentScripts = concatMap txSpentScripts (buTxUndo undo)
-  in filter (not . isOpReturn) $ outputScripts ++ spentScripts
+  let -- Output scripts: exclude empty and OP_RETURN
+      outputScripts = filter (not . isOpReturn) $
+                        filter (not . BS.null) $
+                          concatMap txOutputScripts (blockTxns block)
+      -- Spent output scripts: exclude only empty (Core does NOT exclude OP_RETURN here)
+      spentScripts  = filter (not . BS.null) $
+                        concatMap txSpentScripts (buTxUndo undo)
+  in outputScripts ++ spentScripts
   where
     txOutputScripts tx =
       map txOutScript (txOutputs tx)
@@ -640,7 +654,7 @@ blockFilterElements block undo =
     txSpentScripts (TxUndo prevOuts) =
       map (txOutScript . tuOutput) prevOuts
 
-    isOpReturn script = not (BS.null script) && BS.head script == 0x6a
+    isOpReturn script = BS.head script == 0x6a
 
 -- | Compute a block filter
 computeBlockFilter :: Block -> BlockUndo -> BlockHash -> BlockFilter
@@ -656,21 +670,20 @@ computeBlockFilter block undo blockHash =
     , bfFilter = gcsFilter
     }
 
--- | Compute filter hash (single SHA256)
+-- | Compute filter hash (SHA256d — double SHA256)
+-- Reference: bitcoin-core/src/blockfilter.cpp BlockFilter::GetHash()
+--   return Hash(GetEncodedFilter());  where Hash() is CHash256 = SHA256d.
 blockFilterHash :: BlockFilter -> Hash256
-blockFilterHash bf = sha256Single (gcsEncoded (bfFilter bf))
-  where
-    sha256Single bs = Hash256 $ BS.pack $ BA.unpack (Hash.hash bs :: Hash.Digest Hash.SHA256)
+blockFilterHash bf = doubleSHA256 (gcsEncoded (bfFilter bf))
 
--- | Compute filter header
--- header = SHA256(filter_hash || prev_header)
+-- | Compute filter header (SHA256d of filter_hash || prev_header)
+-- Reference: bitcoin-core/src/blockfilter.cpp BlockFilter::ComputeHeader()
+--   return Hash(GetHash(), prev_header);  where Hash() is CHash256 = SHA256d.
 blockFilterHeader :: BlockFilter -> Hash256 -> Hash256
 blockFilterHeader bf prevHeader =
   let filterHash = blockFilterHash bf
       combined = getHash256 filterHash `BS.append` getHash256 prevHeader
-  in sha256Single combined
-  where
-    sha256Single bs = Hash256 $ BS.pack $ BA.unpack (Hash.hash bs :: Hash.Digest Hash.SHA256)
+  in doubleSHA256 combined
 
 -- | Encode a block filter
 encodeBlockFilter :: BlockFilter -> ByteString
