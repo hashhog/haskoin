@@ -99,7 +99,9 @@ module Haskoin.Consensus
   , countScriptSigops
   , getLegacySigOpCount
     -- * Witness Commitment
+  , checkWitnessMalleation
   , validateWitnessCommitment
+  , txHasWitness
   , computeWtxId
     -- * Block Connection (Legacy)
   , connectBlock
@@ -2324,8 +2326,11 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
   when (totalSigOpCost > maxBlockSigOpsCost) $
     Left "Block exceeds sigop cost limit"
 
-  -- 10. SegWit witness commitment validation
-  when (flagSegWit flags) $ validateWitnessCommitment block
+  -- 10. Witness commitment / unexpected-witness validation.
+  -- Core: ContextualCheckBlock calls CheckWitnessMalleation unconditionally
+  -- (validation.cpp:4169) with expect_witness_commitment = segwit_active.
+  -- This means the unexpected-witness check also runs for pre-segwit blocks.
+  checkWitnessMalleation (flagSegWit flags) block
 
   Right ()
 
@@ -2488,38 +2493,79 @@ validateSingleTx flags skipScripts utxoMap tx = do
 -- Witness Commitment Validation
 --------------------------------------------------------------------------------
 
--- | Validate the witness commitment in a SegWit block.
--- The commitment is in a coinbase output with prefix 0x6a24aa21a9ed.
-validateWitnessCommitment :: Block -> Either String ()
-validateWitnessCommitment block = do
-  let coinbase = head (blockTxns block)
-      commitPrefix = BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
-      -- Find outputs with witness commitment pattern
-      commitOutputs = filter (\txo ->
-        BS.length (txOutScript txo) >= 38
-        && BS.isPrefixOf commitPrefix (txOutScript txo)
-        ) (txOutputs coinbase)
-
-  -- If no commitment outputs, that's valid (pre-SegWit style or no witness txs)
-  case commitOutputs of
-    [] -> Right ()
-    _ -> do
-      -- Use the last commitment output (as per BIP-141)
-      let commitOut = last commitOutputs
-          commitment = BS.take 32 (BS.drop 6 (txOutScript commitOut))
-          -- Witness nonce is in the coinbase witness
-          witnessNonce = case txWitness coinbase of
-            (stack:_) | not (null stack) && BS.length (head stack) == 32 -> head stack
-            _ -> BS.replicate 32 0
-          -- Compute witness root from wtxids
-          wtxids = TxId (Hash256 (BS.replicate 32 0))  -- coinbase wtxid is all zeros
+-- | Full witness-malleation check — mirrors Core's CheckWitnessMalleation
+-- (validation.cpp:3870-3916).
+--
+-- When @expectCommitment@ is True (segwit active):
+--   * If a witness-commitment output exists in the coinbase (last match wins):
+--       1. Coinbase vin[0] witness stack must be exactly [32-byte nonce].
+--          Reject: \"bad-witness-nonce-size\" (Core: BLOCK_MUTATED).
+--       2. Compute BlockWitnessMerkleRoot (coinbase wtxid = 0x00..00).
+--       3. Verify SHA256d(witness_root || nonce) == commitment[6..37].
+--          Reject: \"bad-witness-merkle-match\".
+--   * If NO commitment output: fall through to unexpected-witness check.
+-- When @expectCommitment@ is False (pre-segwit) OR no commitment found:
+--   * Any transaction with witness data → reject \"unexpected-witness\".
+--
+-- Reference: Bitcoin Core validation.cpp:3870-3916, consensus/validation.h:147-165.
+checkWitnessMalleation :: Bool -> Block -> Either String ()
+checkWitnessMalleation expectCommitment block
+  | expectCommitment, Just commitOut <- mCommitOut = do
+      -- Gate G3: coinbase vin[0] witness stack must be exactly 1 item of 32 bytes.
+      -- Reference: Core validation.cpp:3880-3885.
+      let coinbaseStack = case txWitness coinbase of
+            (s:_) -> s
+            []    -> []
+      unless (length coinbaseStack == 1 && BS.length (head coinbaseStack) == 32) $
+        Left "bad-witness-nonce-size"
+      let witnessNonce = head coinbaseStack
+          -- Gate G4: BlockWitnessMerkleRoot — coinbase wtxid is all zeros.
+          -- Reference: Core consensus/merkle.cpp:76-85.
+          wtxids = TxId (Hash256 (BS.replicate 32 0))
                    : map computeWtxId (tail (blockTxns block))
           witnessRoot = computeMerkleRoot wtxids
-          -- Expected commitment = SHA256d(witness_root || witness_nonce)
+          -- Gate G5: SHA256d(witness_root || witness_nonce).
+          -- Reference: Core validation.cpp:3892.
           expected = doubleSHA256 (BS.append (getHash256 witnessRoot) witnessNonce)
-
+          -- commitment is bytes [6..37] of the output script.
+          commitment = BS.take 32 (BS.drop 6 (txOutScript commitOut))
+      -- Gate G6: compare.
+      -- Reference: Core validation.cpp:3893.
       unless (Hash256 commitment == expected) $
-        Left "Witness commitment mismatch"
+        Left "bad-witness-merkle-match"
+  | otherwise = do
+      -- Gate G7: no commitment (pre-segwit, or segwit-active but no commitment
+      -- output) — no transaction may carry witness data.
+      -- Reference: Core validation.cpp:3905-3913.
+      when (any txHasWitness (blockTxns block)) $
+        Left "unexpected-witness"
+  where
+    coinbase = head (blockTxns block)
+    commitPrefix = BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+    -- Gate G1/G2: find the LAST coinbase output matching the commitment prefix.
+    -- Minimum size 38 bytes (MINIMUM_WITNESS_COMMITMENT).
+    -- Reference: Core consensus/validation.h:147-165.
+    mCommitOut =
+      let matches = filter (\txo ->
+            BS.length (txOutScript txo) >= 38
+            && BS.isPrefixOf commitPrefix (txOutScript txo)
+            ) (txOutputs coinbase)
+      in if null matches then Nothing else Just (last matches)
+
+-- | True if a transaction has any non-empty witness stack item.
+-- Mirrors Core CTransaction::HasWitness() — any input with a non-empty
+-- scriptWitness.stack counts as having witness data.
+-- Reference: Bitcoin Core primitives/transaction.h HasWitness().
+txHasWitness :: Tx -> Bool
+txHasWitness tx = any (not . null) (txWitness tx)
+
+-- | Validate the witness commitment in a SegWit block.
+-- Kept for backward-compatibility of the exported API; delegates to
+-- 'checkWitnessMalleation' with expectCommitment=True.
+-- NOTE: callers that need the full Core gate set (including unexpected-witness
+-- for the no-commitment case) should call 'checkWitnessMalleation' directly.
+validateWitnessCommitment :: Block -> Either String ()
+validateWitnessCommitment = checkWitnessMalleation True
 
 -- | Compute the witness transaction ID (wtxid).
 -- For coinbase, wtxid is all zeros.
