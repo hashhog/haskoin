@@ -2685,6 +2685,7 @@ bip22ResultString err
   -- Already-canonical strings pass through unchanged
   | err `elem` ["duplicate", "inconclusive", "duplicate-invalid",
                 "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
+                "bad-witness-nonce-size", "unexpected-witness",
                 "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
                 "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
                 "block-script-verify-flag-failed",
@@ -2701,6 +2702,8 @@ bip22ResultString err
   -- Witness commitment (BIP141)
   | "witness commitment mismatch" `isInfixOf` s  = "bad-witness-merkle-match"
   | "witness commitment" `isInfixOf` s           = "bad-witness-merkle-match"
+  | "witness nonce" `isInfixOf` s                = "bad-witness-nonce-size"
+  | "witness reserved value" `isInfixOf` s       = "bad-witness-nonce-size"
 
   -- Coinbase scriptSig length (consensus/tx_check.cpp "bad-cb-length"; 2..100 bytes)
   | "coinbase scriptsig size out of range" `isInfixOf` s = "bad-cb-length"

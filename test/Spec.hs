@@ -2440,6 +2440,268 @@ main = hspec $ do
       -- 4_000_000 < maxBound @Int (9.2e18 on 64-bit) — arithmetic safety check.
       (maxBlockWeight * witnessScaleFactor) `shouldBe` 16_000_000
 
+  -- W77 BIP-141 witness commitment comprehensive audit
+  -- Reference: bitcoin-core/src/validation.cpp:3864-3916,
+  --   consensus/validation.h:147-165, consensus/merkle.cpp:76-85.
+  --
+  -- Tests cover all 12 gates from checkWitnessMalleation /
+  -- GetWitnessCommitmentIndex:
+  --   G1/G2: commitment prefix scan + last-match semantics
+  --   G3: coinbase vin[0] witness stack must be exactly [32-byte nonce]
+  --   G4: BlockWitnessMerkleRoot (coinbase wtxid = 0x00..00)
+  --   G5: SHA256d(witness_root || nonce)
+  --   G6: compare against scriptPubKey[6..37]
+  --   G7: unexpected-witness when no commitment found
+  describe "W77 BIP-141 witness commitment (checkWitnessMalleation)" $ do
+
+    -- Build block pieces for use across tests
+    let -- A minimal witness-commitment script: OP_RETURN 0x24 aa21a9ed <32B>
+        -- bytes [0..5] = 0x6a 0x24 0xaa 0x21 0xa9 0xed, then 32 zero bytes
+        mkCommitScript :: ByteString -> ByteString
+        mkCommitScript hash32 =
+          BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed] <> hash32
+
+        -- Compute the canonical commitment hash for a given witness root and nonce.
+        -- Reference: Core validation.cpp:3892.
+        canonicalCommitment :: ByteString -> ByteString -> ByteString
+        canonicalCommitment witnessRoot32 nonce32 =
+          let Hash256 h = doubleSHA256 (witnessRoot32 <> nonce32)
+          in h
+
+        -- A dummy 32-byte nonce (all 0xAA).
+        nonce :: ByteString
+        nonce = BS.replicate 32 0xaa
+
+        -- The zero witness root for a single-tx (coinbase-only) block.
+        -- BlockWitnessMerkleRoot([0x00..00]) = 0x00..00 (single leaf is itself).
+        zeroRoot :: ByteString
+        zeroRoot = BS.replicate 32 0x00
+
+        -- Commitment for a coinbase-only block with our nonce.
+        validCommitment :: ByteString
+        validCommitment = canonicalCommitment zeroRoot nonce
+
+        -- Outpoint for coinbase input.
+        cbOutpoint :: OutPoint
+        cbOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0x00))) 0xffffffff
+
+        -- A minimal coinbase input with witness stack = [nonce].
+        cbInput :: TxIn
+        cbInput = TxIn cbOutpoint (BS.pack [0x51]) 0xffffffff  -- OP_1 scriptSig
+
+        -- Build a coinbase tx with the given witness stack items for vin[0]
+        -- and the given extra outputs (commitment output appended as last).
+        mkCoinbaseTx :: [[ByteString]] -> [TxOut] -> Tx
+        mkCoinbaseTx witnessStack extraOuts = Tx
+          { txVersion  = 1
+          , txInputs   = [cbInput]
+          , txOutputs  = [TxOut 5000000000 (BS.pack [0x51])] ++ extraOuts
+          , txWitness  = witnessStack
+          , txLockTime = 0
+          }
+
+        -- A coinbase tx with a valid witness commitment output and correct nonce.
+        validCoinbaseTx :: Tx
+        validCoinbaseTx = mkCoinbaseTx
+          [[nonce]]
+          [TxOut 0 (mkCommitScript validCommitment)]
+
+        -- A minimal non-coinbase tx (no witness).
+        dummyTx :: Tx
+        dummyTx = Tx
+          { txVersion  = 1
+          , txInputs   = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0) "" 0xffffffff]
+          , txOutputs  = [TxOut 1000 (BS.pack [0x51])]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+
+        -- A non-coinbase tx WITH witness data.
+        witnessyTx :: Tx
+        witnessyTx = Tx
+          { txVersion  = 1
+          , txInputs   = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0) "" 0xffffffff]
+          , txOutputs  = [TxOut 1000 (BS.pack [0x51])]
+          , txWitness  = [["witness_item"]]
+          , txLockTime = 0
+          }
+
+        dummyHeader :: BlockHeader
+        dummyHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0))) (Hash256 (BS.replicate 32 0)) 0 0 0
+
+    -- Gate G1/G2: commitment prefix scanning — MINIMUM_WITNESS_COMMITMENT = 38
+    it "G1: accepts commitment output of exactly 38 bytes" $ do
+      -- 6 prefix bytes + 32 commitment = 38 = MINIMUM_WITNESS_COMMITMENT
+      let block = Block dummyHeader [validCoinbaseTx]
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    it "G1: ignores output shorter than 38 bytes (not a commitment)" $ do
+      -- A 37-byte script starting with the prefix is NOT a commitment
+      -- (MINIMUM_WITNESS_COMMITMENT = 38).  Without any commitment output,
+      -- the unexpected-witness check runs.  Block has no witness data → OK.
+      -- NOTE: coinbase must have NO witness stack here; otherwise the coinbase
+      -- itself would trigger unexpected-witness.
+      let shortScript = BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed] <> BS.replicate 31 0x00
+          cb = mkCoinbaseTx [[]] [TxOut 0 shortScript]  -- empty witness stack
+          block = Block dummyHeader [cb]
+      -- No commitment found → unexpected-witness check → no witnesses → OK
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    it "G1: ignores output that doesn't start with the magic prefix" $ do
+      -- Wrong prefix byte (0x6b instead of 0x6a).  No commitment found.
+      -- Coinbase has no witness data → unexpected-witness check passes.
+      let wrongPrefix = BS.pack [0x6b, 0x24, 0xaa, 0x21, 0xa9, 0xed] <> BS.replicate 32 0x00
+          cb = mkCoinbaseTx [[]] [TxOut 0 wrongPrefix]  -- empty witness stack
+          block = Block dummyHeader [cb]
+      -- No commitment → no witnesses → OK
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    it "G2: last-match semantics — uses the last commitment output when multiple present" $ do
+      -- First output has wrong commitment, second has correct one.
+      -- Core: GetWitnessCommitmentIndex keeps updating commitpos, so last wins.
+      let wrongHash  = BS.replicate 32 0xff
+          wrongOut   = TxOut 0 (mkCommitScript wrongHash)
+          correctOut = TxOut 0 (mkCommitScript validCommitment)
+          cb = mkCoinbaseTx [[nonce]] [wrongOut, correctOut]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    it "G2: last-match fails when last commitment is wrong (first is correct)" $ do
+      -- Last commitment output has wrong hash → reject, even if first is correct.
+      let wrongHash  = BS.replicate 32 0xff
+          wrongOut   = TxOut 0 (mkCommitScript wrongHash)
+          correctOut = TxOut 0 (mkCommitScript validCommitment)
+          -- Wrong one is last
+          cb = mkCoinbaseTx [[nonce]] [correctOut, wrongOut]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-merkle-match"
+
+    -- Gate G3: coinbase vin[0] witness stack must be exactly [32-byte nonce]
+    it "G3: rejects empty coinbase witness stack (bad-witness-nonce-size)" $ do
+      -- BUG FIXED: old code silently fell back to zero nonce.
+      -- Core: witness_stack.size() != 1 || witness_stack[0].size() != 32 → reject.
+      let cb = mkCoinbaseTx [[]] [TxOut 0 (mkCommitScript validCommitment)]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-nonce-size"
+
+    it "G3: rejects coinbase witness with 2 items (bad-witness-nonce-size)" $ do
+      -- Stack size must be exactly 1.
+      let cb = mkCoinbaseTx [[nonce, nonce]] [TxOut 0 (mkCommitScript validCommitment)]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-nonce-size"
+
+    it "G3: rejects 31-byte nonce (bad-witness-nonce-size)" $ do
+      -- Nonce must be exactly 32 bytes.
+      let shortNonce = BS.replicate 31 0xaa
+          cb = mkCoinbaseTx [[shortNonce]] [TxOut 0 (mkCommitScript validCommitment)]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-nonce-size"
+
+    it "G3: rejects 33-byte nonce (bad-witness-nonce-size)" $ do
+      let longNonce = BS.replicate 33 0xaa
+          cb = mkCoinbaseTx [[longNonce]] [TxOut 0 (mkCommitScript validCommitment)]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-nonce-size"
+
+    it "G3: rejects missing witness (txWitness = []) (bad-witness-nonce-size)" $ do
+      -- txWitness = [] means no input has a witness stack at all.
+      let cb = Tx 1 [cbInput] [TxOut 0 (mkCommitScript validCommitment)] [] 0
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-nonce-size"
+
+    -- Gate G4/G5/G6: commitment hash computation
+    it "G4-G6: valid coinbase-only block (single-tx, zero nonce)" $ do
+      -- For a coinbase-only block: witness merkle root = 0x00..00 (single leaf).
+      -- commitment = SHA256d(0x00..00 || nonce).
+      let zeroNonce = BS.replicate 32 0x00
+          commit    = canonicalCommitment zeroRoot zeroNonce
+          cb = mkCoinbaseTx [[zeroNonce]] [TxOut 0 (mkCommitScript commit)]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    it "G6: rejects wrong commitment hash (bad-witness-merkle-match)" $ do
+      -- Correct nonce but wrong commitment bytes in the script.
+      let wrongHash = BS.replicate 32 0xff
+          cb = mkCoinbaseTx [[nonce]] [TxOut 0 (mkCommitScript wrongHash)]
+          block = Block dummyHeader [cb]
+      checkWitnessMalleation True block `shouldBe` Left "bad-witness-merkle-match"
+
+    it "G4-G6: two-tx block — non-coinbase wtxid flows into witness root" $ do
+      -- The witness merkle root of [0x00..00, wtxid(dummyTx)] must be computed
+      -- and hashed with the nonce to get the correct commitment.
+      let wtxid = computeWtxId dummyTx
+          TxId (Hash256 wtxidBytes) = wtxid
+          -- merkle([0x00..00, wtxidBytes]) = SHA256d(zeroRoot || wtxidBytes)
+          -- (two leaves: no duplication needed)
+          Hash256 witnessRootBytes = doubleSHA256 (zeroRoot <> wtxidBytes)
+          commit = canonicalCommitment witnessRootBytes nonce
+          cb = mkCoinbaseTx [[nonce]] [TxOut 0 (mkCommitScript commit)]
+          block = Block dummyHeader [cb, dummyTx]
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    -- Gate G7: unexpected-witness
+    it "G7 (pre-segwit): rejects block with witness data when expectCommitment=False" $ do
+      -- BUG FIXED: old code never checked unexpected-witness for pre-segwit blocks.
+      -- Any tx with witness data in a pre-segwit block must be rejected.
+      let block = Block dummyHeader [validCoinbaseTx, witnessyTx]
+      checkWitnessMalleation False block `shouldBe` Left "unexpected-witness"
+
+    it "G7 (pre-segwit): accepts block with no witness data when expectCommitment=False" $ do
+      let noWitnessCb = mkCoinbaseTx [[]] []
+          block = Block dummyHeader [noWitnessCb, dummyTx]
+      checkWitnessMalleation False block `shouldBe` Right ()
+
+    it "G7 (segwit, no commitment): rejects witness data when no commitment output" $ do
+      -- BUG FIXED: old validateWitnessCommitment returned Right () when no
+      -- commitment output was found, even if transactions had witness data.
+      -- Core: no commitment → unexpected-witness check for all txs.
+      let noCbCommit = mkCoinbaseTx [[]] []  -- no commitment output
+          block = Block dummyHeader [noCbCommit, witnessyTx]
+      -- expectCommitment=True but no commitment found → unexpected-witness
+      checkWitnessMalleation True block `shouldBe` Left "unexpected-witness"
+
+    it "G7: coinbase witness stack alone counts as unexpected-witness" $ do
+      -- Even the coinbase having a witness stack (with no commitment output)
+      -- triggers unexpected-witness.
+      let noCbCommit = mkCoinbaseTx [[nonce]] []
+          block = Block dummyHeader [noCbCommit]
+      checkWitnessMalleation True block `shouldBe` Left "unexpected-witness"
+
+    it "G7: block with no witness data and no commitment is OK when expectCommitment=True" $ do
+      -- No commitment, no witnesses — this is a valid pre-segwit-style block
+      -- even when segwit is technically active (unusual but Core allows it).
+      let noWitnessCb = mkCoinbaseTx [[]] []
+          block = Block dummyHeader [noWitnessCb, dummyTx]
+      checkWitnessMalleation True block `shouldBe` Right ()
+
+    -- txHasWitness helper
+    it "txHasWitness: False for empty witness list" $ do
+      txHasWitness (mkCoinbaseTx [] []) `shouldBe` False
+
+    it "txHasWitness: False for witness with only empty stacks" $ do
+      txHasWitness (mkCoinbaseTx [[]] []) `shouldBe` False
+
+    it "txHasWitness: True when any stack is non-empty" $ do
+      txHasWitness (mkCoinbaseTx [[nonce]] []) `shouldBe` True
+
+    -- validateWitnessCommitment backward-compat wrapper
+    it "validateWitnessCommitment delegates to checkWitnessMalleation True" $ do
+      -- valid block → Right ()
+      let block = Block dummyHeader [validCoinbaseTx]
+      validateWitnessCommitment block `shouldBe` Right ()
+
+    it "validateWitnessCommitment propagates bad-witness-nonce-size" $ do
+      let cb = mkCoinbaseTx [[]] [TxOut 0 (mkCommitScript validCommitment)]
+          block = Block dummyHeader [cb]
+      validateWitnessCommitment block `shouldBe` Left "bad-witness-nonce-size"
+
+    -- RPC error-string mapping
+    it "bip22ResultString: bad-witness-nonce-size is already canonical" $ do
+      bip22ResultString "bad-witness-nonce-size" `shouldBe` "bad-witness-nonce-size"
+
+    it "bip22ResultString: unexpected-witness is already canonical" $ do
+      bip22ResultString "unexpected-witness" `shouldBe` "unexpected-witness"
+
   describe "Consensus flags" $ do
     it "all flags disabled at height 0 on mainnet" $ do
       let flags = consensusFlagsAtHeight mainnet 0
