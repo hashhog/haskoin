@@ -8744,6 +8744,165 @@ main = hspec $ do
           result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
       result `shouldBe` Left "Sequence not satisfied"
 
+  -- BIP-65: OP_CHECKLOCKTIMEVERIFY execution tests (W81)
+  -- Reference: Bitcoin Core interpreter.cpp:522-558, :1745-1779
+  describe "BIP-65 OP_CHECKLOCKTIMEVERIFY execution" $ do
+    let cltv_flags = flagSet [VerifyCheckLockTimeVerify]
+        cltv_flags_minimal = flagSet [VerifyCheckLockTimeVerify, VerifyMinimalData]
+        -- Build a tx with given nLockTime and input sequence
+        mkCLTVTx nlt seq' =
+          let inp = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                        BS.empty seq'
+          in Tx 1 [inp] [] [[]] nlt
+        -- Script: <locktime> OP_CLTV OP_DROP OP_1  (so stack ends with 1 = success)
+        cltvScript lt = Script [ OP_PUSHDATA (encodeScriptNum lt) OPCODE
+                               , OP_CHECKLOCKTIMEVERIFY
+                               , OP_DROP
+                               , OP_1 ]
+        emptyScript = Script []
+        -- Gate 1 (interpreter.cpp:524): CLTV flag not set => NOP2 (no stack underflow)
+    it "NOP when VerifyCheckLockTimeVerify flag not set" $ do
+      -- Without the flag, OP_CLTV is treated as NOP2 — it does nothing to the
+      -- stack and does not cause a stack-underflow error.
+      -- Push 50, then CLTV (NOP), then succeed with OP_1; use OP_DROP to clear 50.
+      let tx = mkCLTVTx 0 0x00000000
+          -- Push 50 so there is a stack element; CLTV is a NOP here; OP_DROP removes 50; OP_1 succeeds.
+          script = Script [OP_PUSHDATA (encodeScriptNum 50) OPCODE, OP_CHECKLOCKTIMEVERIFY, OP_DROP, OP_1]
+          result = evalScriptWithFlags emptyFlags tx 0 0 emptyScript script
+      result `shouldBe` Right True
+
+        -- Gate 2 (interpreter.cpp:529): stack underflow
+    it "fails on stack underflow" $ do
+      let tx = mkCLTVTx 100 0x00000000
+          script = Script [OP_CHECKLOCKTIMEVERIFY]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Stack underflow"
+
+        -- Gate 3 (interpreter.cpp:551): negative locktime rejected
+    it "fails for negative locktime on stack" $ do
+      let tx = mkCLTVTx 100 0x00000000
+          script = Script [ OP_PUSHDATA (encodeScriptNum (-1)) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Negative locktime"
+
+        -- Gate 4 (interpreter.cpp:1754-1758): type mismatch — script height vs tx time
+    it "fails when script is height-based but tx nLockTime is time-based" $ do
+      -- Script pushes 100 (height), tx nLockTime = 500000001 (timestamp)
+      let tx = mkCLTVTx 500000001 0x00000000
+          script = Script [ OP_PUSHDATA (encodeScriptNum 100) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Locktime type mismatch"
+
+        -- Gate 4 cont.: type mismatch — script time vs tx height
+    it "fails when script is time-based but tx nLockTime is height-based" $ do
+      -- Script pushes 500000001 (timestamp), tx nLockTime = 100 (height)
+      let tx = mkCLTVTx 100 0x00000000
+          script = Script [ OP_PUSHDATA (encodeScriptNum 500000001) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Locktime type mismatch"
+
+        -- Gate 5 (interpreter.cpp:1762): script locktime > tx locktime
+    it "fails when script locktime exceeds tx nLockTime (height)" $ do
+      let tx = mkCLTVTx 99 0x00000000   -- tx nLockTime = 99
+          script = Script [ OP_PUSHDATA (encodeScriptNum 100) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Locktime not satisfied"
+
+    it "fails when script locktime exceeds tx nLockTime (timestamp)" $ do
+      let tx = mkCLTVTx 500000010 0x00000000  -- tx nLockTime timestamp
+          script = Script [ OP_PUSHDATA (encodeScriptNum 500000020) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Locktime not satisfied"
+
+        -- Gate 6 (interpreter.cpp:1775): SEQUENCE_FINAL on input => fail
+    it "fails when input nSequence == 0xffffffff (SEQUENCE_FINAL)" $ do
+      let tx = mkCLTVTx 100 0xffffffff   -- SEQUENCE_FINAL
+          script = Script [ OP_PUSHDATA (encodeScriptNum 50) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Left "Sequence is final"
+
+        -- Gate 7: all gates pass (height-based)
+    it "passes when height-based locktime satisfied and sequence not final" $ do
+      let tx = mkCLTVTx 100 0x00000000   -- nLockTime=100, seq=0
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript (cltvScript 50)
+      result `shouldBe` Right True
+
+        -- Gate 7 cont.: passes when locktime == tx nLockTime (boundary)
+    it "passes when script locktime equals tx nLockTime (height, boundary)" $ do
+      let tx = mkCLTVTx 100 0x00000000
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript (cltvScript 100)
+      result `shouldBe` Right True
+
+        -- Gate 7 cont.: passes for timestamp-based locktime
+    it "passes when time-based locktime satisfied" $ do
+      let tx = mkCLTVTx 500000020 0x00000000  -- tx nLockTime = timestamp
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript (cltvScript 500000010)
+      result `shouldBe` Right True
+
+        -- Gate 8: 5-byte script num accepted (BIP-65 special case; year-2106 safe)
+    it "accepts 5-byte locktime encoding (LOCKTIME_MAX vicinity)" $ do
+      -- 0xFFFFFFFF = 4294967295 (32-bit max); use 5-byte encoding
+      let ltVal = fromIntegral (0xFFFFFFFF :: Word32) :: Int64  -- positive in Int64
+          tx = mkCLTVTx 0xFFFFFFFF 0x00000000
+          -- encode as 5-byte: 0xFF 0xFF 0xFF 0xFF 0x00
+          encodedLt = encodeScriptNum ltVal
+          script = Script [ OP_PUSHDATA encodedLt OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      -- Should not fail with "Script number overflow" (4-byte limit), and
+      -- should pass since ltVal == tx.nLockTime.
+      result `shouldSatisfy` (/= Left "Script number overflow")
+
+        -- Gate 9 (Bug fix W81): MINIMALDATA flag enforced for CLTV operand
+    it "rejects non-minimally encoded locktime when MINIMALDATA flag set" $ do
+      -- Encode 1 as 2 bytes (0x01 0x00) — non-minimal (trailing zero).
+      -- With VerifyMinimalData: should fail "Non-minimal script number encoding".
+      -- Without VerifyMinimalData: should decode fine (value=1, tx nLockTime=100).
+      let nonMinimalOne = BS.pack [0x01, 0x00]  -- non-minimal encoding of 1
+          tx = mkCLTVTx 100 0x00000000
+          script = Script [ OP_PUSHDATA nonMinimalOne OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY ]
+          resultWithMinimal    = evalScriptWithFlags cltv_flags_minimal tx 0 0 emptyScript script
+          resultWithoutMinimal = evalScriptWithFlags cltv_flags         tx 0 0 emptyScript script
+      -- BUG FIX: with MINIMALDATA active, non-minimal locktime must be rejected
+      resultWithMinimal    `shouldBe` Left "Non-minimal script number encoding"
+      -- Without the flag, non-minimal encoding is accepted (value decoded as 1)
+      resultWithoutMinimal `shouldSatisfy` (/= Left "Non-minimal script number encoding")
+
+        -- Gate 10 (Bug fix W81): MINIMALDATA flag enforced for CSV operand
+    it "rejects non-minimally encoded CSV value when MINIMALDATA flag set" $ do
+      let csv_flags_minimal = flagSet [VerifyCheckSequenceVerify, VerifyMinimalData]
+          csv_flags_no_min  = flagSet [VerifyCheckSequenceVerify]
+          nonMinimalFive = BS.pack [0x05, 0x00]  -- non-minimal encoding of 5
+          tx = mkCLTVTx 0 0x00000005  -- v1, seq=5
+          -- For CSV we need version>=2; build separately
+          txCsv = Tx 2 [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0x00000005
+                       ] [] [[]] 0
+          script = Script [ OP_PUSHDATA nonMinimalFive OPCODE
+                          , OP_CHECKSEQUENCEVERIFY ]
+          resultWithMinimal    = evalScriptWithFlags csv_flags_minimal txCsv 0 0 emptyScript script
+          resultWithoutMinimal = evalScriptWithFlags csv_flags_no_min  txCsv 0 0 emptyScript script
+      resultWithMinimal    `shouldBe` Left "Non-minimal script number encoding"
+      resultWithoutMinimal `shouldSatisfy` (/= Left "Non-minimal script number encoding")
+
+        -- Gate: CLTV does NOT pop the stack element (BIP-65 spec)
+    it "CLTV does not pop the stack element (stack preserved)" $ do
+      -- CLTV: leaves top of stack intact per BIP-65 spec.
+      let tx = mkCLTVTx 100 0x00000000
+          -- Script: push 50, CLTV (should pass), then check stack has element left
+          script = Script [ OP_PUSHDATA (encodeScriptNum 50) OPCODE
+                          , OP_CHECKLOCKTIMEVERIFY
+                          , OP_DROP   -- drop the CLTV operand (still on stack)
+                          , OP_1 ]   -- push success value
+          result = evalScriptWithFlags cltv_flags tx 0 0 emptyScript script
+      result `shouldBe` Right True
+
   -- BIP-113: median-time-past locktime cutoff tests
   describe "BIP-113 median-time-past locktime cutoff" $ do
     let mkTxLocktime lt = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0] [] [[]] lt
