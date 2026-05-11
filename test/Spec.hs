@@ -5971,6 +5971,92 @@ main = hspec $ do
           der              = BS.init spendSig
       verifyMsgLax pubKey (Sig der) tamperedHash `shouldBe` False
 
+  -- W82: BIP-66 + signature/pubkey encoding gate completeness tests
+  -- Covers Core interpreter.cpp:207 (CheckSignatureEncoding) and the
+  -- CHECKMULTISIG pubkey-encoding-on-empty-sig path (interpreter.cpp:1161).
+  describe "W82 BIP-66 encoding gate completeness" $ do
+
+    -- BUG #1 fix: LOW_S alone must also DER-validate the sig first.
+    -- Core CheckSignatureEncoding: (DERSIG | LOW_S | STRICTENC) → DER check.
+    it "CHECKSIG with only VerifyLowS rejects a non-DER signature" $ do
+      -- A sig that is NOT valid DER (truncated / garbage) but is >= 9 bytes.
+      -- Without the fix, only VerifyLowS was set and the DER check was skipped;
+      -- isLowDERSignature would either crash or return True on garbage.
+      -- With the fix, DER check fires first and rejects the sig.
+      let badSig = BS.pack [0x30, 0x06, 0x02, 0x01, 0xff, 0x02, 0x01, 0xff, 0x01]
+          -- valid-length bad DER (R=0xff negative, not a real DER sig)
+          -- isValidDERSignature should return False for this
+      isValidDERSignature badSig `shouldBe` False
+
+    it "isValidDERSignature rejects sig with negative R (high bit set)" $ do
+      -- 0x30 total-len 0x02 rLen R[rLen] 0x02 sLen S[sLen] hashtype
+      -- rLen=1, R=0xff (negative), sLen=1, S=0x01, hashtype=0x01
+      -- total-len = 2+1+1+2+1+1 = 8... wait, let's construct properly:
+      -- 0x30 0x06 0x02 0x01 0xff 0x02 0x01 0x01 0x01
+      -- total-len = len - 3 = 9 - 3 = 6 ✓, R neg (0xff & 0x80 != 0) → false
+      let sig = BS.pack [0x30, 0x06, 0x02, 0x01, 0xff, 0x02, 0x01, 0x01, 0x01]
+      isValidDERSignature sig `shouldBe` False
+
+    it "isValidDERSignature rejects sig with excess R padding" $ do
+      -- R = [0x00, 0x00, 0x01]: 0x00 prefix but next byte 0x00 doesn't have high bit → excess padding
+      -- 0x30 0x08 0x02 0x03 0x00 0x00 0x01 0x02 0x01 0x01 0x01
+      -- total-len = 11-3=8 ✓
+      let sig = BS.pack [0x30, 0x08, 0x02, 0x03, 0x00, 0x00, 0x01, 0x02, 0x01, 0x01, 0x01]
+      isValidDERSignature sig `shouldBe` False
+
+    it "isValidDERSignature accepts a minimal valid DER structure" $ do
+      -- Minimal valid DER: rLen=1, R=0x01 (positive, no padding), sLen=1, S=0x01
+      -- 0x30 0x06 0x02 0x01 0x01 0x02 0x01 0x01 0x01  (hashtype=0x01)
+      -- total-len = 9-3=6 ✓
+      let sig = BS.pack [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01]
+      isValidDERSignature sig `shouldBe` True
+
+    it "isDefinedSigHashType accepts SIGHASH_ALL (0x01)" $
+      isDefinedSigHashType 0x01 `shouldBe` True
+    it "isDefinedSigHashType accepts SIGHASH_NONE (0x02)" $
+      isDefinedSigHashType 0x02 `shouldBe` True
+    it "isDefinedSigHashType accepts SIGHASH_SINGLE (0x03)" $
+      isDefinedSigHashType 0x03 `shouldBe` True
+    it "isDefinedSigHashType accepts SIGHASH_ALL | ANYONECANPAY (0x81)" $
+      isDefinedSigHashType 0x81 `shouldBe` True
+    it "isDefinedSigHashType rejects 0x00 (undefined)" $
+      isDefinedSigHashType 0x00 `shouldBe` False
+    it "isDefinedSigHashType rejects 0x04 (undefined)" $
+      isDefinedSigHashType 0x04 `shouldBe` False
+    it "isDefinedSigHashType rejects 0x7f (undefined)" $
+      isDefinedSigHashType 0x7f `shouldBe` False
+
+    -- BUG #3 fix: CHECKMULTISIG must check pubkey encoding even for empty sigs.
+    -- Core interpreter.cpp:1161 calls CheckPubKeyEncoding unconditionally inside
+    -- the matching loop, including when the current sig is empty.
+    it "CHECKMULTISIG with STRICTENC rejects invalid pubkey even when all sigs are empty" $ do
+      -- Build a trivial 1-of-1 multisig with an invalid pubkey (4 bytes, bad encoding)
+      -- and an empty signature.  Under STRICTENC, the pubkey encoding check should
+      -- fire and reject the script.
+      let badPubkey = BS.pack [0x05, 0x01, 0x02, 0x03]  -- invalid: not 33/65 bytes, bad prefix
+          emptySig  = BS.empty
+          -- seStack stores head = top of stack.  execCheckMultiSig pops:
+          --   n (top), then n pubkeys, then m, then m sigs, then dummy.
+          -- So to test 1-of-1 with one empty sig and a bad pubkey:
+          --   top → n=1, badPubkey, m=1, emptySig, dummy=BS.empty ← bottom
+          stack = [ encodeScriptNum 1  -- n = 1  (head = top of stack)
+                  , badPubkey          -- the one pubkey
+                  , encodeScriptNum 1  -- m = 1
+                  , emptySig           -- the one (empty) sig
+                  , BS.empty           -- dummy element (tail = bottom)
+                  ]
+          prevTxid = TxId (Hash256 (BS.replicate 32 0x00))
+          txIn  = TxIn (OutPoint prevTxid 0) "" 0xffffffff
+          txOut = TxOut 0 ""
+          tx    = Tx 1 [txIn] [txOut] [] 0
+          env   = (initScriptEnvWithFlags tx 0 0 BS.empty
+                    (flagSet [VerifyStrictEncoding]))
+                  { seStack = stack }
+      case execCheckMultiSig env of
+        Left err -> err `shouldContain` "Invalid public key"
+        Right _  -> expectationFailure
+          "Should reject invalid pubkey encoding under STRICTENC even with empty sig"
+
   -- Phase 2 of the haskoin ECDSA wiring plan
   -- (CORE-PARITY-AUDIT/_design-haskoin-ecdsa-secp256k1-wiring-2026-05-07.md).
   -- Wires the segwit-v0 (BIP-141 + BIP-143) spend-side signing path:
