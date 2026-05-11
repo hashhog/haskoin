@@ -1775,6 +1775,152 @@ main = hspec $ do
             bits' = targetToBits target
         bits' `shouldBe` bits
 
+    -- W83: Bug 1 — bitsToTarget small-value roundtrip (1-byte and 2-byte targets)
+    -- targetToBits was padding to the LEFT of the 3-byte mantissa field instead
+    -- of left-aligning like Core's GetCompact (arith_uint256.cpp GetCompact).
+    -- Reference: bitcoin-core/src/arith_uint256.cpp GetCompact
+    it "W83: targetToBits roundtrips 1-byte target (value 1)" $ do
+      -- Core: nSize=1, nCompact = 1 << (8*(3-1)) = 0x010000 → 0x01010000
+      let bits = targetToBits 1
+      bitsToTarget bits `shouldBe` 1
+
+    it "W83: targetToBits roundtrips 2-byte target (value 0x0102)" $ do
+      -- Core: nSize=2, nCompact = 0x0102 << (8*(3-2)) = 0x010200 → 0x02010200
+      let bits = targetToBits 0x0102
+      bitsToTarget bits `shouldBe` 0x0102
+
+    it "W83: targetToBits matches Core compact for value 1" $ do
+      -- Core GetCompact for value 1: nSize=1, nCompact=1<<16=0x010000 → 0x01010000
+      -- Previous code produced 0x01000001 (wrong: mantissa byte at LSB not MSB)
+      targetToBits 1 `shouldBe` 0x01010000
+
+    it "W83: targetToBits matches Core compact for 3-byte value 0x7fffff" $ do
+      -- Exponent=3, mantissa=0x7fffff → 0x037fffff (sign bit not set, no adjustment)
+      targetToBits 0x7fffff `shouldBe` 0x037fffff
+
+    it "W83: targetToBits triggers sign-bit adjustment correctly" $ do
+      -- Value 0x800000: nSize=3, initial nCompact=0x800000, sign bit SET.
+      -- Adjust: nCompact >>= 8 → 0x008000, nSize → 4.  Result: 0x04008000.
+      -- Roundtrip: bitsToTarget 0x04008000 → nSize=4, mant=0x8000.
+      --            4>3 → 0x8000 << (8*(4-3)) = 0x800000. Correct.
+      let bits = targetToBits 0x800000
+      bitsToTarget bits `shouldBe` 0x800000
+
+    -- W83: Bug 2 — bitsToTargetFull negative/overflow detection
+    -- Core's DeriveTarget rejects nBits with fNegative or fOverflow.
+    -- Reference: bitcoin-core/src/pow.cpp DeriveTarget lines 155-158
+    it "W83: bitsToTargetFull detects negative flag (0x00800000 set with non-zero mantissa)" $ do
+      -- nBits = 0x03800001: exponent=3, sign-bit set, mantissa=0x000001 (non-zero)
+      -- → isNegative=True, isOverflow=False
+      let (_, isNeg, isOvfl) = bitsToTargetFull 0x03800001
+      isNeg `shouldBe` True
+      isOvfl `shouldBe` False
+
+    it "W83: bitsToTargetFull sign-bit with zero mantissa is NOT negative" $ do
+      -- nBits = 0x03800000: mantissa=0 → sign bit has no meaning, not negative
+      let (_, isNeg, _) = bitsToTargetFull 0x03800000
+      isNeg `shouldBe` False
+
+    it "W83: bitsToTargetFull detects overflow (nSize > 34)" $ do
+      -- nBits = 0x23000001: exponent=0x23=35 > 34, mantissa=1 (non-zero) → overflow
+      let (_, _, isOvfl) = bitsToTargetFull 0x23000001
+      isOvfl `shouldBe` True
+
+    it "W83: bitsToTargetFull detects overflow (nWord > 0xff, nSize = 34)" $ do
+      -- nBits = 0x22010001: exponent=34, mantissa=0x010001 > 0xff → overflow
+      let (_, _, isOvfl) = bitsToTargetFull 0x22010001
+      isOvfl `shouldBe` True
+
+    it "W83: bitsToTargetFull detects overflow (nWord > 0xffff, nSize = 33)" $ do
+      -- nBits = 0x21010001: exponent=33, mantissa=0x010001 > 0xffff → overflow
+      let (_, _, isOvfl) = bitsToTargetFull 0x21010001
+      isOvfl `shouldBe` True
+
+    it "W83: bitsToTarget returns 0 for negative compact" $ do
+      -- Previously returned negate(mantissa) — a negative Integer.
+      -- Now returns 0 (invalid target). Reference: Core DeriveTarget fNegative check.
+      bitsToTarget 0x03800001 `shouldBe` 0
+
+    it "W83: bitsToTarget returns 0 for overflow compact" $ do
+      -- Previously returned a huge number (> powLimit).
+      -- Now returns 0 (invalid target).
+      bitsToTarget 0x23000001 `shouldBe` 0
+
+    -- W83: Bug 3 — checkProofOfWork rejects negative/overflow nBits
+    -- Reference: bitcoin-core/src/pow.cpp DeriveTarget + CheckProofOfWorkImpl
+    it "W83: checkProofOfWork rejects header with negative nBits" $ do
+      -- nBits with sign bit set and non-zero mantissa → DeriveTarget rejects (fNegative)
+      let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                              (Hash256 (BS.replicate 32 0))
+                              0 0x03800001 0   -- negative compact
+      checkProofOfWork header (netPowLimit mainnet) `shouldBe` False
+
+    it "W83: checkProofOfWork rejects header with overflow nBits" $ do
+      -- nBits with exponent > 34 → DeriveTarget rejects (fOverflow)
+      let header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                              (Hash256 (BS.replicate 32 0))
+                              0 0x23000001 0   -- overflow compact
+      checkProofOfWork header (netPowLimit mainnet) `shouldBe` False
+
+    -- W83: Bug 4 — getNextWorkRequired (via calculateNextWorkRequired) uses Int64
+    -- subtraction for timespan, not Word32 (which wraps on timewarp attacks).
+    -- Core: int64_t nActualTimespan = last.time - first.time (signed)
+    -- → negative or very small → clamped to min (302400) → harder difficulty.
+    -- Old code: Word32 wrap → huge value → max-clamp → easier difficulty (WRONG).
+    -- Reference: bitcoin-core/src/pow.cpp line 56
+    it "W83: getNextWorkRequired clamps to min on reversed timestamps (timewarp)" $ do
+      -- pindexFirst has timestamp AFTER pindexLast (simulating timewarp).
+      -- Core: nActualTimespan = 1000000 - 1000001 = -1 → clamped to 302400 (min).
+      -- Old code: Word32: 1000000 - 1000001 wraps to 0xFFFFFFFF (> maxClamp) → max-clamp.
+      -- With min-clamp: new = old * (1209600/4) / 1209600 = old / 4 (harder, smaller target).
+      -- With max-clamp: new = old * (1209600*4) / 1209600 = old * 4 (easier, larger target).
+      let pindexFirst = BlockIndex 0 0x1d00ffff 1000001 1
+                           (BlockHash (Hash256 (BS.replicate 32 0x00))) Nothing
+          -- Build a minimal 2016-block chain: only pindexLast points back to pindexFirst
+          -- via 2015 intermediate blocks all with ts < pindexFirst.ts
+          buildMiddle 0 acc = acc
+          buildMiddle n acc =
+            let h = biHeight acc + 1
+                ts = biTimestamp acc - 1   -- decreasing (also ensures < pindexFirst.ts)
+                bi = BlockIndex h 0x1d00ffff ts 1
+                       (BlockHash (Hash256 (BS.replicate 32 (fromIntegral n)))) (Just acc)
+            in buildMiddle (n-1) bi
+          chain = buildMiddle 2014 pindexFirst   -- 2014 more blocks on top of first
+          pindexLast = BlockIndex 2015 0x1d00ffff 1000000 1
+                         (BlockHash (Hash256 (BS.replicate 32 0xff))) (Just chain)
+          -- Dummy new block header (timestamp doesn't matter at retarget boundary)
+          newHeader = BlockHeader 1 (bhPrevBlock genesisBlockHeader)
+                        (Hash256 (BS.replicate 32 0)) 1000000 0x1d00ffff 0
+          result = getNextWorkRequired mainnet pindexLast newHeader
+          -- min-clamp target = 0x1d00ffff_target * 302400 / 1209600 = target / 4
+          -- This is SMALLER (harder) than original
+          oldTarget = bitsToTarget 0x1d00ffff
+          minClampTarget = (oldTarget * 302400) `div` 1209600
+          maxClampTarget = (oldTarget * 4838400) `div` 1209600
+      -- Result should match min-clamp, not max-clamp
+      bitsToTarget result `shouldSatisfy` (<= minClampTarget * 2)  -- within 2× of min-clamp
+      bitsToTarget result `shouldSatisfy` (< maxClampTarget)       -- definitely not max-clamp
+
+    it "W83: getNextWorkRequired normal 2-week period gives approximately same bits" $ do
+      -- Build a 2016-block chain with exact 2-week spacing.
+      -- actualTimespan ≈ 1209600 → new target ≈ old target.
+      let bits0 = 0x1d00ffff
+          buildChain 0 acc = acc
+          buildChain n acc =
+            let h = biHeight acc + 1
+                ts = biTimestamp acc + 600
+                bi = BlockIndex h bits0 ts 1 (BlockHash (Hash256 (BS.replicate 32 (fromIntegral n)))) (Just acc)
+            in buildChain (n-1) bi
+          genesis = BlockIndex 0 bits0 1231006505 1 (BlockHash (Hash256 (BS.replicate 32 0))) Nothing
+          pindexLast = buildChain 2015 genesis
+          newHeader = BlockHeader 1 (bhPrevBlock genesisBlockHeader)
+                        (Hash256 (BS.replicate 32 0)) (biTimestamp pindexLast + 600) 0x1d00ffff 0
+      -- actualTimespan = 2015 * 600 = 1_209_000, very close to 1_209_600
+      -- new_target = old * 1_209_000 / 1_209_600 ≈ old (slightly harder)
+      let result = getNextWorkRequired mainnet pindexLast newHeader
+      result `shouldSatisfy` (/= 0)
+      bitsToTarget result `shouldSatisfy` (<= netPowLimit mainnet)
+
   describe "Merkle root computation" $ do
     it "single txid returns same hash" $ do
       let txid = TxId (Hash256 (BS.replicate 32 0xab))
