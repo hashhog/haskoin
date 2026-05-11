@@ -166,6 +166,8 @@ module Haskoin.Consensus
   , countSignalingBlocks
   , isVersionBitSignaling
   , computeBlockVersion
+  , computeBlockVersionFromChain
+  , chainEntriesToBlockIndex
   , versionBitsTopBits
   , versionBitsTopMask
   , versionBitsNumBits
@@ -1849,20 +1851,29 @@ biToBlockHash = biHash
 
 -- | Get the height at which the current threshold state started.
 -- This walks backwards through periods to find when the state changed.
+--
+-- Reference: Bitcoin Core versionbits.cpp GetStateSinceHeightFor (lines 157-190).
+-- For ALWAYS_ACTIVE and NEVER_ACTIVE deployments Core returns 0 immediately.
 getStateSinceHeight :: Deployment
                     -> (BlockIndex -> Word32)
                     -> DeploymentCache
                     -> Maybe BlockIndex
                     -> (Word32, DeploymentCache)
-getStateSinceHeight dep getMTP cache mPindexPrev =
-  let (state, cache') = getDeploymentState dep getMTP cache mPindexPrev
-  in case state of
-    Defined -> (0, cache')  -- Genesis is always DEFINED
-    _ -> case mPindexPrev of
-      Nothing -> (0, cache')
-      Just pindexPrev ->
-        let period = depPeriod dep
-        in findStateSince dep getMTP cache' pindexPrev state period
+getStateSinceHeight dep getMTP cache mPindexPrev
+  -- Gate 1: ALWAYS_ACTIVE / NEVER_ACTIVE → return 0 immediately.
+  -- Core versionbits.cpp:158-162:
+  --   if (start_time == ALWAYS_ACTIVE || start_time == NEVER_ACTIVE) return 0;
+  | depStartTime dep == deploymentAlwaysActive = (0, cache)
+  | depStartTime dep == deploymentNeverActive  = (0, cache)
+  | otherwise =
+      let (state, cache') = getDeploymentState dep getMTP cache mPindexPrev
+      in case state of
+        Defined -> (0, cache')  -- Genesis is always DEFINED
+        _ -> case mPindexPrev of
+          Nothing -> (0, cache')
+          Just pindexPrev ->
+            let period = depPeriod dep
+            in findStateSince dep getMTP cache' pindexPrev state period
 
 -- | Walk backwards to find when the state started.
 findStateSince :: Deployment
@@ -1902,6 +1913,61 @@ computeBlockVersion deployments getMTP mPindexPrev =
               _        -> version
         in go newVersion rest ((dep, cache') : acc)
   in go versionBitsTopBits deployments []
+
+-- | Build a 'BlockIndex' linked list from a 'Map BlockHash ChainEntry' tip.
+-- Walks back at most @depth@ entries. Used by 'computeBlockVersionFromChain'.
+-- The chain needs to extend at least one BIP9 period (2016 blocks) for accurate
+-- signalling counts.
+--
+-- We limit the walk to @maxBI@ steps so this is O(maxBI) not O(chain length).
+chainEntriesToBlockIndex :: Map BlockHash ChainEntry  -- ^ All known headers
+                         -> ChainEntry                -- ^ Tip to start from
+                         -> Int                       -- ^ Maximum depth to walk back
+                         -> Maybe BlockIndex
+chainEntriesToBlockIndex entries tip maxDepth = go tip maxDepth
+  where
+    go :: ChainEntry -> Int -> Maybe BlockIndex
+    go ce depth =
+      let prevBI = if depth <= 0
+                   then Nothing
+                   else cePrev ce >>= \ph ->
+                          Map.lookup ph entries >>= \prevCe ->
+                            go prevCe (depth - 1)
+          bi = BlockIndex
+                 { biHeight    = ceHeight ce
+                 , biBits      = bhBits (ceHeader ce)
+                 , biTimestamp = bhTimestamp (ceHeader ce)
+                 , biVersion   = bhVersion (ceHeader ce)
+                 , biHash      = ceHash ce
+                 , biPrev      = prevBI
+                 }
+      in Just bi
+
+-- | Compute the block version for a new block using the chain entry map.
+-- This is the correct entry point for mining code (block template construction).
+-- Sets VERSIONBITS_TOP_BITS (0x20000000) and OR-in bits for every deployment
+-- that is in STARTED or LOCKED_IN state for the block after @tip@.
+--
+-- Reference: Bitcoin Core versionbits.cpp ComputeBlockVersion (lines 265-279).
+computeBlockVersionFromChain :: [(Deployment, DeploymentCache)]  -- ^ Active deployments + caches
+                             -> Map BlockHash ChainEntry          -- ^ Header chain entries
+                             -> ChainEntry                        -- ^ Parent block (tip)
+                             -> (Int32, [(Deployment, DeploymentCache)])
+computeBlockVersionFromChain deployments entries tip =
+  let -- Build a BlockIndex chain deep enough for one BIP9 period.
+      -- BIP9 signals are counted over one retarget period (2016 blocks) so we
+      -- only need to walk back 2016 entries.
+      maxLookback = 2016
+      mBI = chainEntriesToBlockIndex entries tip maxLookback
+      -- MTP function: each BlockIndex node carries ceMedianTime from ChainEntry.
+      -- We use the pre-computed ceMedianTime stored in the chain entries map
+      -- via the biHash → ceMedianTime lookup. For blocks not in the map we
+      -- fall back to biTimestamp (safe: timestamp ≥ MTP by construction).
+      getMTP :: BlockIndex -> Word32
+      getMTP bi = case Map.lookup (biHash bi) entries of
+                    Just ce -> ceMedianTime ce
+                    Nothing -> biTimestamp bi
+  in computeBlockVersion deployments getMTP mBI
 
 --------------------------------------------------------------------------------
 -- Coinbase Detection and BIP-34
