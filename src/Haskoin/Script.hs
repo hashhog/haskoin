@@ -1057,11 +1057,26 @@ decodeScriptNum requireMinimal bs
                        (zip [0..] cleared)
       in Right $ if isNeg then negate val else val
 
--- | Decode script number, allowing larger values for certain operations
+-- | Decode script number, allowing larger values for certain operations.
+-- 'requireMinimal' maps to Bitcoin Core's fRequireMinimal (passed to CScriptNum
+-- constructor) — CLTV and CSV both forward the SCRIPT_VERIFY_MINIMALDATA flag.
+-- Reference: Bitcoin Core interpreter.cpp:546, 574 (CScriptNum(stacktop(-1), fRequireMinimal, 5))
 decodeScriptNumLenient :: Int -> ByteString -> Either String Int64
-decodeScriptNumLenient maxLen bs
+decodeScriptNumLenient maxLen = decodeScriptNumN False maxLen
+
+-- | Generalised script-number decoder: supports both 4-byte (standard) and
+-- 5-byte (CLTV/CSV) limits, and optionally enforces minimal encoding.
+-- This is the function that CLTV and CSV should use so that the
+-- SCRIPT_VERIFY_MINIMALDATA flag is respected — matching Bitcoin Core's
+-- CScriptNum(stacktop(-1), fRequireMinimal, nMaxNumSize) constructor.
+decodeScriptNumN :: Bool -> Int -> ByteString -> Either String Int64
+decodeScriptNumN requireMinimal maxLen bs
   | BS.null bs = Right 0
   | BS.length bs > maxLen = Left "Script number overflow"
+  | requireMinimal && BS.length bs > 0
+    && (BS.last bs .&. 0x7f) == 0
+    && (BS.length bs <= 1 || not (BS.index bs (BS.length bs - 2) `testBit` 7))
+    = Left "Non-minimal script number encoding"
   | otherwise =
       let bytes = BS.unpack bs
           lastByte = last bytes
@@ -2217,8 +2232,11 @@ execCheckLockTimeVerify env = do
   case seStack env of
     [] -> Left "Stack underflow"
     (top:_) -> do
-      -- Allow up to 5 bytes for locktime
-      locktime <- decodeScriptNumLenient 5 top
+      -- Allow up to 5 bytes for locktime (BIP-65 special case, year-2038 safe).
+      -- Enforce minimal encoding when SCRIPT_VERIFY_MINIMALDATA is active —
+      -- matches Bitcoin Core CScriptNum(stacktop(-1), fRequireMinimal, 5).
+      -- Reference: Bitcoin Core interpreter.cpp:546
+      locktime <- decodeScriptNumN (hasFlag (seFlags env) VerifyMinimalData) 5 top
 
       when (locktime < 0) $ Left "Negative locktime"
 
@@ -2246,7 +2264,10 @@ execCheckSequenceVerify env = do
   case seStack env of
     [] -> Left "Stack underflow"
     (top:_) -> do
-      sequence' <- decodeScriptNumLenient 5 top
+      -- Allow up to 5 bytes; enforce minimal encoding when MINIMALDATA is active.
+      -- Matches Bitcoin Core CScriptNum(stacktop(-1), fRequireMinimal, 5).
+      -- Reference: Bitcoin Core interpreter.cpp:574
+      sequence' <- decodeScriptNumN (hasFlag (seFlags env) VerifyMinimalData) 5 top
 
       -- If sequence has disable flag, NOP
       when (sequence' < 0) $ Left "Negative sequence"
