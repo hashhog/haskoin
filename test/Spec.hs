@@ -12541,8 +12541,12 @@ main = hspec $ do
         getFeeRate fr `shouldBe` 0
 
     describe "cluster mempool constants" $ do
-      it "maxClusterSize is 101" $ do
-        maxClusterSize `shouldBe` 101
+      -- W75: Bitcoin Core DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72).
+      -- 101 is DEFAULT_CLUSTER_SIZE_LIMIT_KVB (size in kvB), NOT the count.
+      it "maxClusterSize is 64 (DEFAULT_CLUSTER_LIMIT, policy/policy.h:72)" $ do
+        maxClusterSize `shouldBe` 64
+      it "maxClusterSizeVbytes is 101000 (DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000, mempool_limits.h:22)" $ do
+        maxClusterSizeVbytes `shouldBe` 101000
 
     describe "UnionFind" $ do
       it "creates empty union-find" $ do
@@ -12647,14 +12651,180 @@ main = hspec $ do
         -- At size 50: fee = 500 (linear interpolation)
         interpolate diagram 50 `shouldBe` 500
 
+    -- W75: comprehensive gate-by-gate tests for checkClusterLimit.
+    -- Reference: policy/policy.h:72-74, kernel/mempool_limits.h:20-22.
     describe "ClusterLimitError" $ do
-      it "checkClusterLimit allows small clusters" $ do
+      -- checkClusterLimit now requires a txVsize argument (Bug 2 fix).
+      it "checkClusterLimit allows small clusters (no connections)" $ do
         let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
             entry = mkTestEntry txid1 1000 100
             entries = Map.singleton txid1 entry
             byOutpoint = Map.empty
             tx = mkTestTx  -- No inputs, won't connect
-        checkClusterLimit tx entries byOutpoint `shouldBe` Right ()
+        checkClusterLimit tx entries byOutpoint 250 `shouldBe` Right ()
+
+      -- Gate 5: cluster count limit = 64 (DEFAULT_CLUSTER_LIMIT, policy/policy.h:72)
+      -- To form a real cluster, each entry's Tx must have txInputs referencing the
+      -- prior txid so that buildUnionFind sees parent links and unions them.
+      it "checkClusterLimit rejects when cluster would reach 65 transactions (count gate)" $ do
+        -- Build a chain: tx_1 ← tx_2 ← … ← tx_64 (each spends previous).
+        -- Then a new tx spends tx_64 → joins cluster of 64 → total 65 > 64 → reject.
+        let mkChainTx :: TxId -> Tx
+            mkChainTx parentId = Tx
+              { txVersion = 2
+              , txInputs  = [TxIn (OutPoint parentId 0) "" 0xffffffff]
+              , txOutputs = [TxOut 50000 ""]
+              , txWitness = [[]]
+              , txLockTime = 0
+              }
+            -- tx1 spends a confirmed (not-in-mempool) output
+            tx1 = Tx { txVersion = 2
+                     , txInputs  = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0xff))) 0) "" 0xffffffff]
+                     , txOutputs = [TxOut 50000 ""]
+                     , txWitness = [[]]
+                     , txLockTime = 0
+                     }
+            txid1 = computeTxId tx1
+            -- Forward-build the chain: each step extends from the tip
+            buildChainFwd :: (TxId, [(TxId, Tx)]) -> Int -> (TxId, [(TxId, Tx)])
+            buildChainFwd (tip, acc) 0 = (tip, acc)
+            buildChainFwd (tip, acc) n =
+              let t   = mkChainTx tip
+                  tid = computeTxId t
+              in buildChainFwd (tid, (tid, t) : acc) (n-1)
+            -- Build 63 more txs; chain has 64 total (txid1 is tip 0, then 63 more)
+            (lastTxId64, restReversed) = buildChainFwd (txid1, []) 63
+            chain = (txid1, tx1) : reverse restReversed
+            mkChainEntry :: (TxId, Tx) -> (TxId, MempoolEntry)
+            mkChainEntry (tid, t) = (tid, (mkTestEntry tid 1000 100) { meTransaction = t })
+            existingEntries = Map.fromList (map mkChainEntry chain)
+            byOutpoint = Map.fromList
+              [ (OutPoint parentId 0, childId)
+              | ((parentId, _), (childId, _)) <- zip chain (tail chain)
+              ]
+            -- New tx spends tx_64 → joins the 64-tx cluster → total = 65
+            newTx = Tx { txVersion  = 2
+                       , txInputs   = [TxIn (OutPoint lastTxId64 0) "" 0xffffffff]
+                       , txOutputs  = []
+                       , txWitness  = []
+                       , txLockTime = 0
+                       }
+        -- 64 existing + 1 new = 65 > maxClusterSize (64) → ClusterLimitExceeded
+        case checkClusterLimit newTx existingEntries byOutpoint 250 of
+          Left (ClusterLimitExceeded actual lim) -> do
+            actual `shouldBe` 65
+            lim    `shouldBe` 64
+          Left (ClusterSizeExceeded _ _) ->
+            expectationFailure "Expected ClusterLimitExceeded (count), got ClusterSizeExceeded"
+          Right () ->
+            expectationFailure "Expected ClusterLimitExceeded, got Right ()"
+
+      it "checkClusterLimit allows cluster of exactly 64 transactions (count gate boundary)" $ do
+        -- Chain of 63 existing txs; new tx joins → 64 total = maxClusterSize → allowed.
+        let mkChainTx :: TxId -> Tx
+            mkChainTx parentId = Tx
+              { txVersion = 2
+              , txInputs  = [TxIn (OutPoint parentId 0) "" 0xffffffff]
+              , txOutputs = [TxOut 50000 ""]
+              , txWitness = [[]]
+              , txLockTime = 0
+              }
+            tx1 = Tx { txVersion = 2
+                     , txInputs  = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0xff))) 0) "" 0xffffffff]
+                     , txOutputs = [TxOut 50000 ""]
+                     , txWitness = [[]]
+                     , txLockTime = 0
+                     }
+            txid1 = computeTxId tx1
+            buildChainFwd :: (TxId, [(TxId, Tx)]) -> Int -> (TxId, [(TxId, Tx)])
+            buildChainFwd (tip, acc) 0 = (tip, acc)
+            buildChainFwd (tip, acc) n =
+              let t   = mkChainTx tip
+                  tid = computeTxId t
+              in buildChainFwd (tid, (tid, t) : acc) (n-1)
+            -- 62 more to make 63 total
+            (lastTxId63, restReversed) = buildChainFwd (txid1, []) 62
+            chain = (txid1, tx1) : reverse restReversed
+            mkChainEntry :: (TxId, Tx) -> (TxId, MempoolEntry)
+            mkChainEntry (tid, t) = (tid, (mkTestEntry tid 1000 100) { meTransaction = t })
+            existingEntries = Map.fromList (map mkChainEntry chain)
+            byOutpoint = Map.fromList
+              [ (OutPoint parentId 0, childId)
+              | ((parentId, _), (childId, _)) <- zip chain (tail chain)
+              ]
+            newTx = Tx { txVersion  = 2
+                       , txInputs   = [TxIn (OutPoint lastTxId63 0) "" 0xffffffff]
+                       , txOutputs  = []
+                       , txWitness  = []
+                       , txLockTime = 0
+                       }
+        -- 63 existing + 1 new = 64 = maxClusterSize → allowed
+        checkClusterLimit newTx existingEntries byOutpoint 250 `shouldBe` Right ()
+
+      -- Gate 6: cluster vbytes limit = 101,000 vB (DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000)
+      it "checkClusterLimit rejects when cluster vbytes would exceed 101000 (vbytes gate)" $ do
+        -- One existing tx of 100,800 vB; new tx of 250 vB → total 101,050 > 101,000
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            bigEntry = mkTestEntry txid1 1000 100800
+            entries = Map.singleton txid1 bigEntry
+            -- New tx spends txid1 output 0
+            byOutpoint = Map.singleton (OutPoint txid1 0)
+                           (TxId (Hash256 (BS.replicate 32 0x02)))
+            newTx = Tx { txVersion = 2
+                       , txInputs = [TxIn (OutPoint txid1 0) "" 0xffffffff]
+                       , txOutputs = []
+                       , txWitness = []
+                       , txLockTime = 0
+                       }
+        -- total vbytes = 100800 + 250 = 101050 > maxClusterSizeVbytes (101000)
+        case checkClusterLimit newTx entries byOutpoint 250 of
+          Left (ClusterSizeExceeded actual lim) -> do
+            actual `shouldBe` 101050
+            lim    `shouldBe` 101000
+          Left (ClusterLimitExceeded _ _) ->
+            expectationFailure "Expected ClusterSizeExceeded (vbytes), got ClusterLimitExceeded"
+          Right () ->
+            expectationFailure "Expected ClusterSizeExceeded, got Right ()"
+
+      it "checkClusterLimit allows cluster at exactly 101000 vbytes (vbytes gate boundary)" $ do
+        -- One existing tx of 100,750 vB; new tx of 250 vB → total 101,000 = limit
+        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+            bigEntry = mkTestEntry txid1 1000 100750
+            entries = Map.singleton txid1 bigEntry
+            byOutpoint = Map.singleton (OutPoint txid1 0)
+                           (TxId (Hash256 (BS.replicate 32 0x02)))
+            newTx = Tx { txVersion = 2
+                       , txInputs = [TxIn (OutPoint txid1 0) "" 0xffffffff]
+                       , txOutputs = []
+                       , txWitness = []
+                       , txLockTime = 0
+                       }
+        -- total vbytes = 100750 + 250 = 101000 = maxClusterSizeVbytes → allowed
+        checkClusterLimit newTx entries byOutpoint 250 `shouldBe` Right ()
+
+      -- Ensure the old wrong value 101 is not used as the count limit
+      it "cluster count limit is 64, not 101 (W75: fixed off-by-37 bug)" $ do
+        maxClusterSize `shouldBe` 64
+        -- Confirm it is NOT 101 (that was DEFAULT_CLUSTER_SIZE_LIMIT_KVB, not count)
+        (maxClusterSize /= 101) `shouldBe` True
+
+      -- ClusterSizeExceeded constructor round-trips
+      it "ClusterSizeExceeded carries correct fields" $ do
+        let err = ClusterSizeExceeded 102000 101000
+        case err of
+          ClusterSizeExceeded actual lim -> do
+            actual `shouldBe` 102000
+            lim    `shouldBe` 101000
+          _ -> expectationFailure "Wrong constructor"
+
+      -- ClusterLimitExceeded constructor round-trips (count variant)
+      it "ClusterLimitExceeded carries correct fields" $ do
+        let err = ClusterLimitExceeded 65 64
+        case err of
+          ClusterLimitExceeded actual lim -> do
+            actual `shouldBe` 65
+            lim    `shouldBe` 64
+          _ -> expectationFailure "Wrong constructor"
 
   --------------------------------------------------------------------------------
   -- ZMQ Notification Tests
