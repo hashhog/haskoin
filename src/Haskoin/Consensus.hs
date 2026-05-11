@@ -11,6 +11,8 @@ module Haskoin.Consensus
   , testnet3
   , testnet4
   , regtest
+  , HeaderSyncParams(..)
+  , permittedDifficultyTransition
     -- * AssumeUTXO
   , AssumeUtxoParams(..)
   , assumeUtxoForHeight
@@ -274,9 +276,18 @@ data Network = Network
   , netPowNoRetargeting  :: !Bool           -- ^ No difficulty retargeting (regtest)
   , netEnforceBIP94      :: !Bool           -- ^ BIP94 time warp fix (testnet4)
   , netMinimumChainWork  :: !Integer        -- ^ Anti-DoS: minimum chain work for header sync
+  , netHeaderSyncParams  :: !HeaderSyncParams -- ^ Parameters for PRESYNC/REDOWNLOAD anti-DoS pipeline
   , netAssumeUtxo        :: ![(Word32, AssumeUtxoParams)]  -- ^ AssumeUTXO snapshot parameters
   , netAssumedValid      :: !(Maybe BlockHash)  -- ^ Assume-valid: skip scripts for ancestors of this block
   } deriving (Show)
+
+-- | Parameters for the headers-sync anti-DoS pipeline.
+-- Each network has distinct values tuned to its observed block rate.
+-- Reference: bitcoin-core/src/kernel/chainparams.cpp (HeadersSyncParams field).
+data HeaderSyncParams = HeaderSyncParams
+  { hspCommitmentPeriod    :: !Int   -- ^ Blocks between 1-bit commitments (Core: commitment_period)
+  , hspRedownloadBufferSize :: !Int  -- ^ Min headers buffered before acceptance (Core: redownload_buffer_size)
+  } deriving (Show, Eq)
 
 -- | AssumeUTXO snapshot parameters for a specific block height.
 -- Reference: bitcoin/src/kernel/chainparams.h AssumeutxoData
@@ -807,6 +818,43 @@ calculateNextWorkRequired net pindexLast
       Just prev -> getAncestorBI prev (n - 1)
       Nothing   -> bi  -- At genesis, return it
 
+-- | Check whether a difficulty transition from @oldNBits@ to @newNBits@ at
+-- @height@ is permitted under consensus rules.
+--
+-- Reference: bitcoin-core/src/pow.cpp PermittedDifficultyTransition (lines 89-136).
+--
+-- At a retarget boundary: new target must lie within [oldTarget/4, oldTarget*4]
+-- (clamped to powLimit).
+-- Between retarget boundaries: bits must be identical (except on networks where
+-- min-diff blocks are allowed, in which case any transition is permitted).
+--
+-- Used by the PRESYNC and REDOWNLOAD phases to bound the difficulty change rate,
+-- capping the maximum per-block work an attacker can claim.
+permittedDifficultyTransition :: Network -> Int64 -> Word32 -> Word32 -> Bool
+permittedDifficultyTransition net height oldNBits newNBits
+  -- fPowAllowMinDifficultyBlocks: any transition is ok (testnet)
+  | netAllowMinDiffBlocks net = True
+  -- At a retarget boundary: check 4× bound
+  | height `mod` fromIntegral (netRetargetInterval net) == 0 =
+      let tspan  = fromIntegral (netPowTargetTimespan net) :: Integer
+          minTs  = tspan `div` 4
+          maxTs  = tspan * 4
+          pLim   = netPowLimit net
+          -- Observed new target (from compact)
+          obsNew = bitsToTarget newNBits
+          -- Largest permitted target = oldTarget * 4, clamped to powLimit
+          largestT0 = (bitsToTarget oldNBits * maxTs) `div` tspan
+          largestT  = min pLim largestT0
+          -- Re-compact+expand to match Core's rounding
+          largestR  = bitsToTarget (targetToBits largestT)
+          -- Smallest permitted target = oldTarget / 4, clamped to powLimit
+          smallestT0 = (bitsToTarget oldNBits * minTs) `div` tspan
+          smallestT  = min pLim smallestT0
+          smallestR  = bitsToTarget (targetToBits smallestT)
+      in obsNew <= largestR && obsNew >= smallestR
+  -- Not at boundary: bits must be unchanged
+  | otherwise = oldNBits == newNBits
+
 --------------------------------------------------------------------------------
 -- Block Reward
 --------------------------------------------------------------------------------
@@ -1033,6 +1081,8 @@ mainnet = Network
   , netEnforceBIP94      = False
   -- Mainnet: 0x01128750f82f4c366153a3a030 (from Bitcoin Core)
   , netMinimumChainWork  = 0x01128750f82f4c366153a3a030
+  -- Mainnet headerssync params: bitcoin-core/src/kernel/chainparams.cpp line 193-195
+  , netHeaderSyncParams  = HeaderSyncParams { hspCommitmentPeriod = 641, hspRedownloadBufferSize = 15218 }
   -- AssumeUTXO snapshots (from Bitcoin Core chainparams.cpp)
   , netAssumeUtxo        =
       [ (840000, AssumeUtxoParams
@@ -1103,6 +1153,8 @@ testnet3 = Network
   , netEnforceBIP94      = False
   -- Testnet3: 0x17dde1c649f3708d14b6 (from Bitcoin Core)
   , netMinimumChainWork  = 0x17dde1c649f3708d14b6
+  -- Testnet3 headerssync params: bitcoin-core/src/kernel/chainparams.cpp line ~294-296
+  , netHeaderSyncParams  = HeaderSyncParams { hspCommitmentPeriod = 673, hspRedownloadBufferSize = 14460 }
   -- AssumeUTXO snapshot for testnet3
   , netAssumeUtxo        =
       [ (2500000, AssumeUtxoParams
@@ -1154,6 +1206,8 @@ testnet4 = Network
   , netEnforceBIP94      = True        -- BIP94 time warp fix enabled
   -- Testnet4: 0x9a0fe15d0177d086304 (from Bitcoin Core)
   , netMinimumChainWork  = 0x9a0fe15d0177d086304
+  -- Testnet4 headerssync params: bitcoin-core/src/kernel/chainparams.cpp line ~399-401
+  , netHeaderSyncParams  = HeaderSyncParams { hspCommitmentPeriod = 606, hspRedownloadBufferSize = 16092 }
   -- AssumeUTXO snapshot for testnet4
   , netAssumeUtxo        =
       [ (90000, AssumeUtxoParams
@@ -1239,6 +1293,8 @@ regtest = Network
   , netEnforceBIP94      = False
   -- Regtest: 0 (no minimum, allows testing from scratch)
   , netMinimumChainWork  = 0
+  -- Regtest headerssync params: bitcoin-core/src/kernel/chainparams.cpp line ~516-518
+  , netHeaderSyncParams  = HeaderSyncParams { hspCommitmentPeriod = 620, hspRedownloadBufferSize = 15724 }
   -- AssumeUTXO snapshot for regtest (used in unit tests)
   , netAssumeUtxo        =
       [ (110, AssumeUtxoParams
