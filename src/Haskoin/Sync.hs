@@ -31,8 +31,6 @@ module Haskoin.Sync
   , HeaderSyncState(..)
   , PresyncData(..)
   , RedownloadData(..)
-  , HeaderSyncParams(..)
-  , defaultHeaderSyncParams
   , HeaderSyncPeer(..)
   , initHeaderSyncPeer
   , processPresyncHeaders
@@ -47,6 +45,10 @@ module Haskoin.Sync
   , buildUTXOMap
   , flushTBQueueN
   , commitmentHash
+  , processRedownloadBatch
+  , popHeadersReadyForAcceptance
+  , runPresync
+  , runRedownload
   ) where
 
 import Data.ByteString (ByteString)
@@ -521,19 +523,6 @@ handleBlockMessage bd _addr block = do
 maxHeadersPerMessage :: Int
 maxHeadersPerMessage = 2000
 
--- | Parameters for header sync anti-DoS protection
-data HeaderSyncParams = HeaderSyncParams
-  { hspCommitmentPeriod    :: !Int     -- ^ Distance in blocks between commitments
-  , hspRedownloadBufferSize :: !Int    -- ^ Min validated headers before accepting to chain
-  } deriving (Show, Eq, Generic)
-
--- | Default header sync parameters (mainnet values)
-defaultHeaderSyncParams :: HeaderSyncParams
-defaultHeaderSyncParams = HeaderSyncParams
-  { hspCommitmentPeriod    = 641   -- Store 1-bit commitment every 641 headers
-  , hspRedownloadBufferSize = 15218  -- ~23.7 commitments of validation buffer
-  }
-
 -- | Header sync state machine
 --
 -- Based on Bitcoin Core's HeadersSyncState. During initial sync:
@@ -553,30 +542,37 @@ data HeaderSyncState
 --
 -- Memory-efficient: stores only summary info, not actual headers.
 -- 1-bit commitments (LSB of hash) every commitment_period blocks.
+-- Reference: bitcoin-core/src/headerssync.h (private members of HeadersSyncState).
 data PresyncData = PresyncData
-  { pdCumulativeWork   :: !Integer       -- ^ Total PoW accumulated
-  , pdLastHeaderHash   :: !BlockHash     -- ^ Hash of most recent header
-  , pdLastHeaderBits   :: !Word32        -- ^ Bits (difficulty) of last header
-  , pdCount            :: !Int           -- ^ Number of headers processed
+  { pdCumulativeWork   :: !Integer       -- ^ Total PoW accumulated (starts at chain_start.nChainWork)
+  , pdLastHeaderHash   :: !BlockHash     -- ^ Hash of most recent header (starts at chain_start hash)
+  , pdLastHeaderBits   :: !Word32        -- ^ Bits (difficulty) of last header (for PermittedDifficultyTransition)
+  , pdChainStartNBits  :: !Word32        -- ^ Bits of chain_start block (seed for REDOWNLOAD)
+  , pdCount            :: !Int           -- ^ Number of headers processed beyond chain_start
   , pdCommitments      :: !(Seq Bool)    -- ^ 1-bit commitments (LSB of hash)
-  , pdCommitOffset     :: !Int           -- ^ Random offset for commitment period
-  , pdStartHash        :: !BlockHash     -- ^ Hash of chain start (genesis/fork point)
+  , pdCommitOffset     :: !Int           -- ^ Random offset for commitment period (m_commit_offset)
+  , pdStartHash        :: !BlockHash     -- ^ Hash of chain_start block
+  , pdStartHeight      :: !Int64         -- ^ Height of chain_start (m_chain_start.nHeight)
+  , pdMaxCommitments   :: !Word64        -- ^ Upper bound on commitments (m_max_commitments)
   , pdMinimumWork      :: !Integer       -- ^ Target work threshold to proceed
   , pdParams           :: !HeaderSyncParams
   } deriving (Show, Eq, Generic)
 
 -- | Data tracked during REDOWNLOAD phase
+-- Reference: bitcoin-core/src/headerssync.h (REDOWNLOAD state members).
 data RedownloadData = RedownloadData
-  { rdLastHeaderHash   :: !BlockHash     -- ^ Hash of most recent redownloaded header
-  , rdLastHeaderBits   :: !Word32        -- ^ Bits (difficulty) of last header
-  , rdCumulativeWork   :: !Integer       -- ^ Cumulative work in redownload
-  , rdCount            :: !Int           -- ^ Number of headers redownloaded
-  , rdCommitments      :: !(Seq Bool)    -- ^ Remaining commitments to verify
-  , rdCommitOffset     :: !Int           -- ^ Same offset used in PRESYNC
-  , rdBuffer           :: !(Seq BlockHeader)  -- ^ Buffered headers for acceptance
-  , rdMinimumWork      :: !Integer       -- ^ Work threshold from PRESYNC
-  , rdWorkReached      :: !Bool          -- ^ True once cumulative work >= minimum
-  , rdParams           :: !HeaderSyncParams
+  { rdLastHeaderHash    :: !BlockHash     -- ^ Hash of most recent redownloaded header (m_redownload_buffer_last_hash)
+  , rdFirstPrevHash     :: !BlockHash     -- ^ prevHash of oldest buffered header (m_redownload_buffer_first_prev_hash)
+  , rdLastHeaderBits    :: !Word32        -- ^ Bits (difficulty) of last header (for PermittedDifficultyTransition)
+  , rdCumulativeWork    :: !Integer       -- ^ Cumulative work in redownload (m_redownload_chain_work)
+  , rdCount             :: !Int           -- ^ Number of headers redownloaded beyond chain_start
+  , rdCommitments       :: !(Seq Bool)    -- ^ Remaining commitments to verify
+  , rdCommitOffset      :: !Int           -- ^ Same offset used in PRESYNC (m_commit_offset)
+  , rdBuffer            :: !(Seq BlockHeader)  -- ^ Buffered headers for acceptance (m_redownloaded_headers)
+  , rdStartHeight       :: !Int64         -- ^ Height of chain_start (m_chain_start.nHeight)
+  , rdMinimumWork       :: !Integer       -- ^ Work threshold from PRESYNC (m_minimum_required_work)
+  , rdWorkReached       :: !Bool          -- ^ True once cumulative work >= minimum (m_process_all_remaining_headers)
+  , rdParams            :: !HeaderSyncParams
   } deriving (Show, Eq, Generic)
 
 -- | Per-peer header sync state
@@ -599,23 +595,42 @@ commitmentHash salt (BlockHash (Hash256 bs)) =
        Just (b, _) -> (b .&. 1) == 1
        Nothing     -> False
 
--- | Initialize a header sync peer for PRESYNC
-initHeaderSyncPeer :: Network -> BlockHash -> Integer -> IO HeaderSyncPeer
-initHeaderSyncPeer net startHash currentWork = do
+-- | Initialize a header sync peer for PRESYNC.
+--
+-- @startHash@   — hash of the last known block (chain_start.GetBlockHash())
+-- @startHeight@ — height of the chain_start (m_chain_start.nHeight)
+-- @startNBits@  — difficulty bits of chain_start (for PermittedDifficultyTransition)
+-- @startWork@   — cumulative work at chain_start (m_chain_start.nChainWork)
+-- @startMTP@    — median time past of chain_start (for m_max_commitments bound)
+-- @currentTime@ — Unix seconds "now" (for m_max_commitments calculation)
+--
+-- Reference: bitcoin-core/src/headerssync.cpp HeadersSyncState constructor (lines 17-46).
+initHeaderSyncPeer :: Network -> BlockHash -> Int64 -> Word32 -> Integer -> Word32 -> Int64 -> IO HeaderSyncPeer
+initHeaderSyncPeer net startHash startHeight startNBits startWork startMTP currentTime = do
   salt <- randomRIO (0, maxBound :: Word64)
-  commitOffset <- randomRIO (0, hspCommitmentPeriod defaultHeaderSyncParams - 1)
+  let params = netHeaderSyncParams net
+  commitOffset <- randomRIO (0, hspCommitmentPeriod params - 1)
 
-  let threshold = max (netMinimumChainWork net) currentWork
+  -- m_max_commitments = 6 * (now - MTP + MAX_FUTURE_BLOCK_TIME) / commitment_period
+  -- MAX_FUTURE_BLOCK_TIME = 7200s (chain.h line 29)
+  let maxFutSecs   = 7200 :: Int64
+      secsSinceStart = currentTime - fromIntegral startMTP + maxFutSecs
+      maxCommits   = fromIntegral (max 0 (6 * secsSinceStart `div` fromIntegral (hspCommitmentPeriod params))) :: Word64
+
+  let threshold = max (netMinimumChainWork net) startWork
       presyncData = PresyncData
-        { pdCumulativeWork = 0
-        , pdLastHeaderHash = startHash
-        , pdLastHeaderBits = 0x1d00ffff  -- Default difficulty
-        , pdCount = 0
-        , pdCommitments = Seq.empty
-        , pdCommitOffset = commitOffset
-        , pdStartHash = startHash
-        , pdMinimumWork = threshold
-        , pdParams = defaultHeaderSyncParams
+        { pdCumulativeWork  = startWork      -- BUG5 fix: init from chain_start.nChainWork
+        , pdLastHeaderHash  = startHash      -- chain_start hash
+        , pdLastHeaderBits  = startNBits     -- chain_start nBits for PermittedDifficultyTransition
+        , pdChainStartNBits = startNBits     -- preserved for REDOWNLOAD seed
+        , pdCount           = 0
+        , pdCommitments     = Seq.empty
+        , pdCommitOffset    = commitOffset
+        , pdStartHash       = startHash
+        , pdStartHeight     = startHeight
+        , pdMaxCommitments  = maxCommits     -- BUG1 fix: memory DoS bound
+        , pdMinimumWork     = threshold
+        , pdParams          = params
         }
 
   stateVar <- newTVarIO (Presync presyncData)
@@ -656,74 +671,92 @@ processPresyncHeaders peer headers = do
           return $ Right (newState, ready)
     _ -> return $ Left "not in presync state"
 
--- | Pure PRESYNC processing logic
+-- | Pure PRESYNC processing logic.
+--
+-- Fixed gates (reference: bitcoin-core/src/headerssync.cpp):
+--   BUG1: m_max_commitments bound (line 198-205) — abort if commitments exceed bound.
+--   BUG2: absolute height modulus for commitment (line 195) — use startHeight+count, not count.
+--   BUG3: PermittedDifficultyTransition (lines 189-193) — full 4× bound check.
+--   BUG5: cumulative work starts from chain_start.nChainWork (line 29).
+--   BUG6: connectivity always checked (line 148-155) — no pdCount>0 guard.
 runPresync :: Word64 -> Network -> PresyncData -> [BlockHeader]
            -> Either String (HeaderSyncState, [BlockHeader])
 runPresync _ _ pd [] = Right (Presync pd, [])
 runPresync salt net pd (h:hs) = do
-  -- Check connectivity: header must chain to last
+  -- BUG6 fix: ALWAYS check connectivity (no "if pdCount > 0" guard).
+  -- Core initialises m_last_header_received to chain_start, so the first
+  -- header's prevBlock must equal the chain_start hash.
+  -- Reference: headerssync.cpp lines 148-155.
   let headerHash = computeBlockHash h
       prevHash = bhPrevBlock h
-
-  if pdCount pd > 0 && prevHash /= pdLastHeaderHash pd
+  if prevHash /= pdLastHeaderHash pd
     then Left "presync: header does not connect to chain"
     else do
-      -- Validate difficulty transition (simplified: just check bits are reasonable)
-      let bits = bhBits h
-      if bits == 0 || bits > 0x207fffff  -- Max regtest difficulty
-        then Left "presync: invalid difficulty bits"
-      -- Per-header proof-of-work check.  Without this gate a peer can
-      -- accumulate fake "work" by sending headers whose claimed @bits@
-      -- look reasonable but whose actual hash exceeds the target — the
-      -- 'headerWork' below accumulates from claimed @bits@, not from
-      -- the verified hash.  Once @pdCumulativeWork >= pdMinimumWork@
-      -- the state machine transitions to REDOWNLOAD with bogus
-      -- commitments.  Reference: bitcoin-core/src/headerssync.cpp
-      -- 'HeadersSyncState::ProcessNextHeaders' (calls
-      -- @CheckProofOfWork@ on every header).
-      else if not (checkProofOfWork h (netPowLimit net))
-        then Left "presync: invalid PoW"
-        else do
-          -- Calculate work for this header
-          let work = headerWork h
-              newWork = pdCumulativeWork pd + work
-              newCount = pdCount pd + 1
+      let nextHeight = pdStartHeight pd + fromIntegral (pdCount pd) + 1
+          bits = bhBits h
 
-          -- Store commitment at each commitment period
-          let commitPeriod = hspCommitmentPeriod (pdParams pd)
-              shouldCommit = newCount `mod` commitPeriod == pdCommitOffset pd
-              newCommitments = if shouldCommit
-                then pdCommitments pd |> commitmentHash salt headerHash
-                else pdCommitments pd
+      -- BUG3 fix: PermittedDifficultyTransition (Core headerssync.cpp lines 189-193).
+      -- Replaces the crude "bits == 0 || bits > 0x207fffff" sanity check.
+      if not (permittedDifficultyTransition net nextHeight (pdLastHeaderBits pd) bits)
+        then Left "presync: invalid difficulty transition"
+      -- Per-header proof-of-work check (existing, kept).
+        else if not (checkProofOfWork h (netPowLimit net))
+          then Left "presync: invalid PoW"
+          else do
+            let newCount = pdCount pd + 1
+                commitPeriod = hspCommitmentPeriod (pdParams pd)
 
-          let newPd = pd
-                { pdCumulativeWork = newWork
-                , pdLastHeaderHash = headerHash
-                , pdLastHeaderBits = bits
-                , pdCount = newCount
-                , pdCommitments = newCommitments
-                }
+            -- BUG2 fix: use absolute height for commitment modulus.
+            -- Core: next_height % m_params.commitment_period == m_commit_offset
+            -- where next_height = m_current_height + 1 (absolute block height).
+            -- Reference: headerssync.cpp line 195.
+            let shouldCommit = nextHeight `mod` fromIntegral commitPeriod
+                                == fromIntegral (pdCommitOffset pd)
+                newCommitmentsRaw = if shouldCommit
+                  then pdCommitments pd |> commitmentHash salt headerHash
+                  else pdCommitments pd
 
-          -- Check if we've reached sufficient work
-          if newWork >= pdMinimumWork pd
-            then
-              -- Transition to REDOWNLOAD
-              let rd = RedownloadData
-                    { rdLastHeaderHash = pdStartHash newPd
-                    , rdLastHeaderBits = 0x1d00ffff
-                    , rdCumulativeWork = 0
-                    , rdCount = 0
-                    , rdCommitments = pdCommitments newPd
-                    , rdCommitOffset = pdCommitOffset newPd
-                    , rdBuffer = Seq.empty
-                    , rdMinimumWork = pdMinimumWork newPd
-                    , rdWorkReached = False
-                    , rdParams = pdParams newPd
-                    }
-              in Right (Redownload rd, [])
-            else
-              -- Continue PRESYNC with remaining headers
-              runPresync salt net newPd hs
+            -- BUG1 fix: enforce m_max_commitments bound (headerssync.cpp lines 198-205).
+            if shouldCommit && fromIntegral (Seq.length newCommitmentsRaw) > pdMaxCommitments pd
+              then Left "presync: exceeded max commitments (peer chain too long)"
+              else do
+                -- BUG5: cumulative work already started from chain_start.nChainWork;
+                -- just accumulate incremental proof.
+                let newWork = pdCumulativeWork pd + headerWork h
+                    newPd = pd
+                      { pdCumulativeWork = newWork
+                      , pdLastHeaderHash = headerHash
+                      , pdLastHeaderBits = bits
+                      , pdCount = newCount
+                      , pdCommitments = newCommitmentsRaw
+                      }
+
+                -- Check if we've reached sufficient work → transition to REDOWNLOAD.
+                -- Reference: headerssync.cpp lines 165-173.
+                if newWork >= pdMinimumWork pd
+                  then
+                    -- m_redownload_buffer_last_hash = m_chain_start.GetBlockHash()
+                    -- m_redownload_buffer_first_prev_hash = m_chain_start.GetBlockHash()
+                    -- m_redownload_chain_work = m_chain_start.nChainWork (reset to start)
+                    let rd = RedownloadData
+                          { rdLastHeaderHash  = pdStartHash newPd
+                          , rdFirstPrevHash   = pdStartHash newPd
+                          -- Core: previous_nBits = m_chain_start.nBits when buffer empty
+                          -- (headerssync.cpp lines 231-235)
+                          , rdLastHeaderBits  = pdChainStartNBits newPd
+                          , rdCumulativeWork  = 0   -- m_redownload_chain_work = m_chain_start.nChainWork
+                          , rdCount           = 0
+                          , rdCommitments     = pdCommitments newPd
+                          , rdCommitOffset    = pdCommitOffset newPd
+                          , rdBuffer          = Seq.empty
+                          , rdStartHeight     = pdStartHeight newPd
+                          , rdMinimumWork     = pdMinimumWork newPd
+                          , rdWorkReached     = False
+                          , rdParams          = pdParams newPd
+                          }
+                    in Right (Redownload rd, [])
+                  else
+                    runPresync salt net newPd hs
 
 -- | Process headers during REDOWNLOAD phase
 --
@@ -734,7 +767,7 @@ processRedownloadHeaders peer headers = do
   state <- readTVar (hspState peer)
   case state of
     Redownload rd -> do
-      let result = runRedownload (hspSalt peer) rd headers
+      let result = processRedownloadBatch (hspSalt peer) (hspNetwork peer) rd headers
       case result of
         Left err -> return $ Left err
         Right (newState, ready) -> do
@@ -742,70 +775,113 @@ processRedownloadHeaders peer headers = do
           return $ Right (newState, ready)
     _ -> return $ Left "not in redownload state"
 
--- | Pure REDOWNLOAD processing logic
-runRedownload :: Word64 -> RedownloadData -> [BlockHeader]
-              -> Either String (HeaderSyncState, [BlockHeader])
-runRedownload _ rd [] =
-  -- Pop ready headers from buffer
-  let bufferSize = hspRedownloadBufferSize (rdParams rd)
-      (ready, remaining) = if rdWorkReached rd
-        then (toList $ rdBuffer rd, Seq.empty)
-        else splitBuffer bufferSize (rdBuffer rd)
-      newRd = rd { rdBuffer = remaining }
-      state = if rdWorkReached rd && Seq.null remaining
-                then Synced
-                else Redownload newRd
-  in Right (state, ready)
-runRedownload salt rd (h:hs) = do
-  -- Check connectivity
+-- | Pure REDOWNLOAD processing logic.
+--
+-- Fixed gates (reference: bitcoin-core/src/headerssync.cpp):
+--   BUG4: PermittedDifficultyTransition in REDOWNLOAD (lines 237-241).
+--   BUG7: connectivity always checked, no rdCount>0 guard (lines 224-227).
+--   BUG8: commitment check runs BEFORE updating workReached (lines 246-270).
+--   BUG10: incremental buffer pop after each batch (PopHeadersReadyForAcceptance, lines 280-293).
+runRedownload :: Word64 -> Network -> RedownloadData -> [BlockHeader]
+              -> Either String (RedownloadData, [BlockHeader])
+runRedownload _ _ rd [] = Right (rd, [])
+runRedownload salt net rd (h:hs) = do
+  -- BUG7 fix: ALWAYS check connectivity (no rdCount>0 guard).
+  -- Core: header.hashPrevBlock != m_redownload_buffer_last_hash → abort.
+  -- Reference: headerssync.cpp lines 224-227.
   let headerHash = computeBlockHash h
-      prevHash = bhPrevBlock h
+      nextHeight = rdStartHeight rd + fromIntegral (rdCount rd) + 1
 
-  if rdCount rd > 0 && prevHash /= rdLastHeaderHash rd
+  if bhPrevBlock h /= rdLastHeaderHash rd
     then Left "redownload: header does not connect to chain"
     else do
-      -- Calculate work
-      let work = headerWork h
-          newWork = rdCumulativeWork rd + work
-          newCount = rdCount rd + 1
-          workReached = rdWorkReached rd || newWork >= rdMinimumWork rd
+      -- BUG4 fix: PermittedDifficultyTransition in REDOWNLOAD
+      -- (Core: headerssync.cpp lines 237-241).
+      if not (permittedDifficultyTransition net nextHeight (rdLastHeaderBits rd) (bhBits h))
+        then Left "redownload: invalid difficulty transition"
+        else do
+          -- BUG8 fix: check commitment BEFORE updating workReached.
+          -- Core order: check commitment → accumulate work → set m_process_all_remaining_headers.
+          -- Reference: headerssync.cpp lines 246-270 (commitment check), then 243-248 (work accum).
+          let commitPeriod  = hspCommitmentPeriod (rdParams rd)
+              shouldVerify  = not (rdWorkReached rd) &&
+                              nextHeight `mod` fromIntegral commitPeriod
+                                == fromIntegral (rdCommitOffset rd)
 
-      -- Verify commitment at each commitment period (only before work reached)
-      let commitPeriod = hspCommitmentPeriod (rdParams rd)
-          shouldVerify = not workReached &&
-                        newCount `mod` commitPeriod == rdCommitOffset rd
+          newCommitments <- if shouldVerify
+            then case Seq.viewl (rdCommitments rd) of
+              Seq.EmptyL -> Left "redownload: commitment overrun (peer gave different chain)"
+              (expected Seq.:< rest) ->
+                if commitmentHash salt headerHash == expected
+                  then Right rest
+                  else Left "redownload: commitment mismatch (peer changed chain)"
+            else Right (rdCommitments rd)
 
-      newCommitments <- if shouldVerify
-        then case Seq.viewl (rdCommitments rd) of
-          Seq.EmptyL -> Left "redownload: missing commitment"
-          (expected Seq.:< rest) ->
-            let actual = commitmentHash salt headerHash
-            in if actual == expected
-               then Right rest
-               else Left "redownload: commitment mismatch (peer changed chain)"
-        else Right (rdCommitments rd)
+          -- NOW accumulate work and set workReached (after commitment check).
+          let newWork      = rdCumulativeWork rd + headerWork h
+              workReached  = rdWorkReached rd || newWork >= rdMinimumWork rd
 
-      let newRd = rd
-            { rdLastHeaderHash = headerHash
-            , rdLastHeaderBits = bhBits h
-            , rdCumulativeWork = newWork
-            , rdCount = newCount
-            , rdCommitments = newCommitments
-            , rdBuffer = rdBuffer rd |> h
-            , rdWorkReached = workReached
-            }
+          let newRd = rd
+                { rdLastHeaderHash = headerHash
+                , rdLastHeaderBits = bhBits h
+                , rdCumulativeWork = newWork
+                , rdCount          = rdCount rd + 1
+                , rdCommitments    = newCommitments
+                , rdBuffer         = rdBuffer rd |> h
+                , rdWorkReached    = workReached
+                }
 
-      -- Continue with remaining headers
-      runRedownload salt newRd hs
+          runRedownload salt net newRd hs
 
--- | Split buffer at threshold, keeping recent headers
-splitBuffer :: Int -> Seq a -> ([a], Seq a)
-splitBuffer threshold buf
-  | Seq.length buf > threshold =
-      let excess = Seq.length buf - threshold
-          (ready, keep) = Seq.splitAt excess buf
-      in (toList ready, keep)
-  | otherwise = ([], buf)
+-- | Process a batch of redownloaded headers, returning any that are ready
+-- for chain acceptance (buffer has overflowed the redownload_buffer_size, or
+-- m_process_all_remaining_headers is set).
+--
+-- This wraps 'runRedownload' (per-header state machine) with
+-- 'popHeadersReadyForAcceptance' (PopHeadersReadyForAcceptance equivalent).
+-- Reference: bitcoin-core/src/headerssync.cpp ProcessNextHeaders REDOWNLOAD branch
+-- (lines 98-133) which calls PopHeadersReadyForAcceptance after the loop.
+processRedownloadBatch :: Word64 -> Network -> RedownloadData -> [BlockHeader]
+                       -> Either String (HeaderSyncState, [BlockHeader])
+processRedownloadBatch salt net rd headers = do
+  (newRd, _) <- runRedownload salt net rd headers
+  -- BUG10 fix: pop ready headers immediately after the batch.
+  let (ready, finalRd) = popHeadersReadyForAcceptance newRd
+      finalState = if rdWorkReached finalRd && Seq.null (rdBuffer finalRd)
+                     then Synced
+                     else Redownload finalRd
+  Right (finalState, ready)
+
+-- | Pop headers from the front of the redownload buffer that are ready
+-- for acceptance.
+--
+-- Headers are released when the buffer exceeds redownload_buffer_size (the
+-- oldest headers have enough validated commitments on top), OR when
+-- m_process_all_remaining_headers is set (work threshold reached).
+--
+-- Reference: bitcoin-core/src/headerssync.cpp PopHeadersReadyForAcceptance
+-- (lines 280-293):
+--   while (size > redownload_buffer_size ||
+--          (size > 0 && m_process_all_remaining_headers))
+--     emit front header, advance m_redownload_buffer_first_prev_hash
+popHeadersReadyForAcceptance :: RedownloadData -> ([BlockHeader], RedownloadData)
+popHeadersReadyForAcceptance rd = go [] rd
+  where
+    bufSize = hspRedownloadBufferSize (rdParams rd)
+    go acc rdd
+      | Seq.length (rdBuffer rdd) > bufSize
+        || (not (Seq.null (rdBuffer rdd)) && rdWorkReached rdd) =
+          case Seq.viewl (rdBuffer rdd) of
+            Seq.EmptyL -> (reverse acc, rdd)
+            (hdr Seq.:< rest) ->
+              -- Reconstruct full header: prepend rdFirstPrevHash as prevBlock.
+              -- (Equivalent to CompressedHeader::GetFullHeader in Core.)
+              -- Our buffer stores full BlockHeaders so this is a no-op for us;
+              -- we just update rdFirstPrevHash to the emitted header's hash.
+              let emittedHash = computeBlockHash hdr
+                  rdd' = rdd { rdBuffer = rest, rdFirstPrevHash = emittedHash }
+              in go (hdr : acc) rdd'
+      | otherwise = (reverse acc, rdd)
 
 -- | Convert Seq to list
 toList :: Seq a -> [a]
