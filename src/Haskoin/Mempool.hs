@@ -97,6 +97,7 @@ module Haskoin.Mempool
   , Chunk(..)
   , ClusterState(..)
   , maxClusterSize
+  , maxClusterSizeVbytes
   , findCluster
   , findAllClusters
   , linearize
@@ -885,9 +886,12 @@ checkAncestorLimits mp tx txVsize = do
       ancestorSize = sum (map meSize ancestors) + txVsize
 
   -- First, check the new cluster size limit (replaces ancestor/descendant limits)
-  case checkClusterLimit tx entries byOutpoint of
+  -- Pass txVsize so the vbytes gate is also enforced.
+  case checkClusterLimit tx entries byOutpoint txVsize of
     Left (ClusterLimitExceeded actual maxSize) ->
       return $ Left (ErrClusterLimitExceeded actual maxSize)
+    Left (ClusterSizeExceeded actualVb maxVb) ->
+      return $ Left (ErrClusterLimitExceeded actualVb maxVb)
     Right () -> do
       -- Also check traditional ancestor count limit for backward compatibility
       if ancestorCount > mpcMaxAncestors config
@@ -2155,11 +2159,17 @@ attemptSiblingEviction newTx newFee newVsize parent mp = do
 -- Cluster Mempool
 --------------------------------------------------------------------------------
 
--- | Maximum number of transactions in a cluster.
--- Bitcoin Core: MAX_CLUSTER_COUNT_LIMIT = 101
--- This replaces the old ancestor/descendant limits of 25 each.
+-- | Maximum number of transactions in a cluster (count limit).
+-- Bitcoin Core: DEFAULT_CLUSTER_LIMIT = 64 (policy/policy.h:72)
+-- Note: 101 is the SIZE limit in kvB (DEFAULT_CLUSTER_SIZE_LIMIT_KVB), NOT the count.
 maxClusterSize :: Int
-maxClusterSize = 101
+maxClusterSize = 64
+
+-- | Maximum total virtual size of a cluster in vbytes.
+-- Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101,000 vbytes
+-- (kernel/mempool_limits.h:22: cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000)
+maxClusterSizeVbytes :: Int
+maxClusterSizeVbytes = 101 * 1000
 
 -- | A chunk is a set of transactions with the same aggregate fee rate,
 -- representing an atomic unit for mining selection.
@@ -2306,18 +2316,33 @@ buildUnionFind entries byOutpoint = foldl' addTxRelations initial (Map.toList en
           neighbors = parentIds ++ childIds
       in foldl' (\u n -> ufUnion txid n u) uf neighbors
 
--- | Check if adding a transaction would exceed the cluster size limit.
--- Returns True if the resulting cluster would be too large.
-wouldExceedClusterLimit :: TxId             -- ^ New transaction to add
-                        -> [TxId]           -- ^ TxIds it would connect to (parents + children)
-                        -> UnionFind        -- ^ Current union-find
+-- | Check if adding a transaction would exceed either cluster limit.
+-- Returns True if the resulting cluster would violate the count limit
+-- (DEFAULT_CLUSTER_LIMIT = 64) or the vbytes limit
+-- (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vB).
+-- Reference: policy/policy.h:72-74, kernel/mempool_limits.h:20-22.
+wouldExceedClusterLimit :: TxId                   -- ^ New transaction to add
+                        -> [TxId]                 -- ^ TxIds it would connect to (neighbors)
+                        -> UnionFind              -- ^ Current union-find (for count check)
+                        -> Map TxId MempoolEntry  -- ^ Entries (for vbytes check)
+                        -> Int                    -- ^ Virtual size of the new tx in vbytes
                         -> Bool
-wouldExceedClusterLimit newTxId neighbors uf =
-  let -- Get the sizes of all distinct clusters that would be merged
-      clusterSizes = getDistinctClusterSizes neighbors uf
-      -- Total size would be sum of all clusters plus the new transaction
-      totalSize = sum clusterSizes + 1
-  in totalSize > maxClusterSize
+wouldExceedClusterLimit _newTxId neighbors uf entries txVsize =
+  let -- Count check: distinct clusters merging + 1 for this tx
+      clusterCounts = getDistinctClusterSizes neighbors uf
+      totalCount    = sum clusterCounts + 1
+      -- Vbytes check: find distinct roots and sum vsizes of their members
+      distinctRoots = Set.toList $ Set.fromList
+                        [fst (ufFind n uf) | n <- neighbors]
+      clusterMemberIds = [ txid'
+                         | (txid', _) <- Map.toList entries
+                         , let (root, _) = ufFind txid' uf
+                         , root `elem` distinctRoots
+                         ]
+      totalVbytes = sum [meSize e | txid' <- clusterMemberIds
+                                  , Just e <- [Map.lookup txid' entries]]
+                    + txVsize
+  in totalCount > maxClusterSize || totalVbytes > maxClusterSizeVbytes
 
 -- | Get sizes of distinct clusters from a list of TxIds
 getDistinctClusterSizes :: [TxId] -> UnionFind -> [Int]
@@ -2442,38 +2467,65 @@ checkDiagramReplacement evicted newFee newVsize newFeeRate = do
 -- Cluster Size Limit Error
 --------------------------------------------------------------------------------
 
--- | Error for exceeding cluster size limit
-data ClusterLimitError = ClusterLimitExceeded
-  { cleActualSize :: !Int
-  , cleMaxSize :: !Int
-  } deriving (Show, Eq, Generic)
+-- | Error for exceeding cluster size or count limit.
+-- Bitcoin Core emits "too-large-cluster" for both violations.
+-- (validation.cpp:1343, txmempool.cpp:998-999)
+data ClusterLimitError
+  = ClusterLimitExceeded           -- ^ Cluster would exceed the transaction COUNT limit
+      { cleActualSize :: !Int      -- ^ Resulting cluster size (tx count)
+      , cleMaxSize    :: !Int      -- ^ Limit (DEFAULT_CLUSTER_LIMIT = 64)
+      }
+  | ClusterSizeExceeded            -- ^ Cluster would exceed the vbytes SIZE limit
+      { cleActualVbytes :: !Int    -- ^ Resulting cluster vbytes
+      , cleMaxVbytes    :: !Int    -- ^ Limit (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101000)
+      }
+  deriving (Show, Eq, Generic)
 
 instance NFData ClusterLimitError
 
--- | Check cluster size limit for a new transaction.
--- Returns Left if adding the transaction would exceed the limit.
+-- | Check cluster count and size limits for a new transaction.
+-- Returns Left if adding the transaction would exceed either the count limit
+-- (DEFAULT_CLUSTER_LIMIT = 64) or the vbytes size limit
+-- (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vB).
+-- Reference: kernel/mempool_limits.h, policy/policy.h:72-74,
+--            txmempool.cpp:1072-1079 (CheckMemPoolPolicyLimits → IsOversized).
 checkClusterLimit :: Tx                      -- ^ Transaction being added
                   -> Map TxId MempoolEntry   -- ^ Current mempool entries
                   -> Map OutPoint TxId       -- ^ Outpoint index
+                  -> Int                     -- ^ Virtual size of the new transaction in vbytes
                   -> Either ClusterLimitError ()
-checkClusterLimit tx entries byOutpoint =
+checkClusterLimit tx entries byOutpoint txVsize =
   let txid = computeTxId tx
-      -- Find all mempool transactions this tx connects to
+      -- Find all mempool transactions this tx connects to (parents only — children
+      -- cannot exist yet since this tx is not yet in the pool).
       parentIds = [ parentId
                   | inp <- txInputs tx
                   , let parentId = outPointHash (txInPrevOutput inp)
                   , Map.member parentId entries
                   ]
-      -- Build union-find and check
+      -- Build union-find for cluster membership (count check)
       uf = buildUnionFind entries byOutpoint
-      -- Check if resulting cluster would be too large
   in if null parentIds
-     then Right ()  -- No connections, will be singleton cluster
+     then Right ()  -- No connections, will be singleton cluster — always fine
      else
-       let clusterSizes = getDistinctClusterSizes parentIds uf
-           totalSize = sum clusterSizes + 1
-       in if totalSize > maxClusterSize
-          then Left $ ClusterLimitExceeded totalSize maxClusterSize
+       let -- Count check: sum distinct cluster sizes + 1 for this tx
+           clusterTxCounts = getDistinctClusterSizes parentIds uf
+           totalTxCount    = sum clusterTxCounts + 1
+           -- Vbytes check: sum vsizes of all distinct cluster members + this tx's vsize
+           distinctRoots   = Set.toList $ Set.fromList
+                               [fst (ufFind parentId uf) | parentId <- parentIds]
+           clusterMemberIds = [ txid'
+                               | (txid', _) <- Map.toList entries
+                               , let (root, _) = ufFind txid' uf
+                               , root `elem` distinctRoots
+                               ]
+           totalVbytes = sum [meSize e | txid' <- clusterMemberIds
+                                       , Just e <- [Map.lookup txid' entries]]
+                         + txVsize
+       in if totalTxCount > maxClusterSize
+          then Left $ ClusterLimitExceeded totalTxCount maxClusterSize
+          else if totalVbytes > maxClusterSizeVbytes
+          then Left $ ClusterSizeExceeded totalVbytes maxClusterSizeVbytes
           else Right ()
 
 --------------------------------------------------------------------------------
