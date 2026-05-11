@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Haskoin.Consensus
   ( -- * Network
@@ -199,7 +200,7 @@ import qualified Data.ByteString.Base16 as B16
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
-import Data.List (nub, sort, sortBy, foldl')
+import Data.List (sort, sortBy, foldl')
 import Numeric (showHex)
 import Control.Monad (when, unless, forM, forM_, foldM, forever, void)
 import qualified Data.Map.Strict as Map
@@ -1287,6 +1288,12 @@ validateTransaction tx = do
   when (null $ txOutputs tx) $
     Left "Transaction has no outputs"
 
+  -- Size check: non-witness serialized size * WITNESS_SCALE_FACTOR must not
+  -- exceed MAX_BLOCK_WEIGHT. Mirrors Bitcoin Core consensus/tx_check.cpp:19-21.
+  -- Reference: "bad-txns-oversize" (TX_CONSENSUS)
+  when (txBaseSize tx * witnessScaleFactor > maxBlockWeight) $
+    Left "bad-txns-oversize"
+
   -- Check each output value is non-negative and within range.
   -- txOutValue is Word64 (unsigned), but Bitcoin's wire format is int64 (signed).
   -- A negative wire value has its high bit set; we must check this before the
@@ -1299,15 +1306,25 @@ validateTransaction tx = do
     when (txOutValue out > maxMoney) $
       Left "Transaction output value exceeds MAX_MONEY"
 
-  -- Check total output value doesn't overflow or exceed max money
-  let totalOut = sum $ map txOutValue (txOutputs tx)
-  when (totalOut > maxMoney) $
-    Left "Total output value exceeds max money"
+  -- Check total output value incrementally to catch Word64 wrap-around.
+  -- Core accumulates nValueOut with a per-step MoneyRange guard:
+  --   consensus/tx_check.cpp::CheckTransaction → "bad-txns-txouttotal-toolarge".
+  -- A plain `sum` on Word64 silently wraps; we must replicate Core's running check.
+  let checkTotalOut !acc [] = Right acc
+      checkTotalOut !acc (out:outs) =
+        let acc' = acc + txOutValue out
+        in if acc' > maxMoney
+             then Left "bad-txns-txouttotal-toolarge"
+             else checkTotalOut acc' outs
+  _ <- checkTotalOut 0 (txOutputs tx)
 
-  -- Check for duplicate inputs
+  -- Check for duplicate inputs (CVE-2018-17144).
+  -- Use Data.Set for O(n log n) rather than nub's O(n²).
+  -- Core: consensus/tx_check.cpp::CheckTransaction → "bad-txns-inputs-duplicate".
   let outpoints = map txInPrevOutput (txInputs tx)
-  when (length outpoints /= length (nub outpoints)) $
-    Left "Duplicate inputs"
+      opSet     = Set.fromList outpoints
+  when (Set.size opSet /= length outpoints) $
+    Left "bad-txns-inputs-duplicate"
 
   -- Coinbase checks
   let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
@@ -2545,6 +2562,11 @@ validateBlockTransactions flags skipScripts txns initialUtxoMap = do
   let go :: (Word64, Map OutPoint TxOut) -> Tx -> Either String (Word64, Map OutPoint TxOut)
       go (accFees, utxoMap) tx = do
         fee <- validateSingleTx flags skipScripts utxoMap tx
+        -- Accumulated fee range check mirrors Bitcoin Core validation.cpp::ConnectBlock:
+        --   nFees += txfee; if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
+        let accFees' = accFees + fee
+        when (accFees' > maxMoney) $
+          Left "bad-txns-accumulated-fee-outofrange"
         -- Add outputs from this tx to UTXO map for subsequent txs in block
         let txid = computeTxId tx
             newUtxos = Map.fromList
@@ -2554,7 +2576,7 @@ validateBlockTransactions flags skipScripts txns initialUtxoMap = do
             -- Remove spent outputs
             spentOutpoints = map txInPrevOutput (txInputs tx)
             utxoMap' = foldr Map.delete (Map.union newUtxos utxoMap) spentOutpoints
-        return (accFees + fee, utxoMap')
+        return (accFees', utxoMap')
 
   (totalFees, _) <- foldM go (0, initialUtxoMap) (tail txns)  -- Skip coinbase
   return totalFees
@@ -2585,8 +2607,21 @@ validateSingleTx flags skipScripts utxoMap tx = do
       Nothing      -> Left $ "Missing UTXO: " ++ show (txInPrevOutput inp)
       Just prevOut -> Right prevOut
 
+  -- Validate per-input amounts and accumulate totalIn.
+  -- Bitcoin Core consensus/tx_verify.cpp::CheckTxInputs:
+  --   MoneyRange(coin.out.nValue) + MoneyRange(nValueIn) each iteration
+  --   → "bad-txns-inputvalues-outofrange".
+  -- Word64 wraps silently on overflow; the running-sum check catches it.
+  let checkInputs !acc [] = Right acc
+      checkInputs !acc (out:outs) =
+        let v    = txOutValue out
+            acc' = acc + v
+        in if v > maxMoney || acc' > maxMoney
+             then Left "bad-txns-inputvalues-outofrange"
+             else checkInputs acc' outs
+  totalIn <- checkInputs 0 prevOuts
+
   let inputValues = map txOutValue prevOuts
-      totalIn     = sum inputValues
       totalOut    = sum $ map txOutValue (txOutputs tx)
 
   -- Inputs must cover outputs (always checked, even under assumevalid)
