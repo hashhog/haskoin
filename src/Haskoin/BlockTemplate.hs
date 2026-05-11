@@ -41,6 +41,9 @@ module Haskoin.BlockTemplate
     -- * Sigop Budget Enforcement
   , templateLegacySigOpCost
   , selectWithinSigopBudget
+    -- * Miner constants (exported for testing)
+  , blockReservedWeight
+  , maxSequenceNonFinal
   ) where
 
 import Data.ByteString (ByteString)
@@ -71,7 +74,8 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            cumulativeWork, unapplyBlock,
                            getLegacySigOpCount,
                            buildConnectBlockOps, buildDisconnectBlockOps,
-                           maxReorgDepth)
+                           maxReorgDepth,
+                           encodeBip34Height)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -96,6 +100,18 @@ locktimeThreshold = 500000000
 -- | SEQUENCE_FINAL: if all inputs have this sequence, nLockTime is ignored
 sequenceFinal :: Word32
 sequenceFinal = 0xffffffff
+
+-- | MAX_SEQUENCE_NONFINAL: coinbase input nSequence.  Must be < SEQUENCE_FINAL
+-- so that the coinbase nLockTime is enforced (anti-timewarp).
+-- Bitcoin Core miner.cpp:171 — CTxIn::MAX_SEQUENCE_NONFINAL = 0xfffffffe.
+maxSequenceNonFinal :: Word32
+maxSequenceNonFinal = 0xfffffffe
+
+-- | BLOCK_RESERVED_WEIGHT: weight units reserved for the block header, tx-count
+-- varint, and coinbase transaction.  Bitcoin Core policy/policy.h:27 —
+-- DEFAULT_BLOCK_RESERVED_WEIGHT = 8000.
+blockReservedWeight :: Int
+blockReservedWeight = 8000
 
 --------------------------------------------------------------------------------
 -- Transaction Finality Check
@@ -200,10 +216,13 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
   let candidateHdrForBits = BlockHeader 0 prevHash (Hash256 (BS.replicate 32 0)) curTime 0 0
       expectedBits = difficultyAdjustment net entries tip candidateHdrForBits
 
-  -- Select transactions from mempool (highest ancestor fee rate first)
-  -- Reserve some weight for coinbase (~4000 weight units)
-  let reservedWeight = 4000
-  allEntries <- selectTransactions mp (maxBlockWeight - reservedWeight)
+  -- Select transactions from mempool (highest ancestor fee rate first).
+  -- Reserve DEFAULT_BLOCK_RESERVED_WEIGHT (8000) weight units for the block
+  -- header, tx-count varint, and coinbase transaction.
+  -- Bitcoin Core: policy/policy.h:27 DEFAULT_BLOCK_RESERVED_WEIGHT = 8000;
+  -- BlockAssembler::resetBlock() seeds nBlockWeight with this value so
+  -- transactions can only use (MAX_BLOCK_WEIGHT - 8000) = 3,992,000 weight.
+  allEntries <- selectTransactions mp (maxBlockWeight - blockReservedWeight)
 
   -- Filter out transactions that are not final at this height/time
   -- For block template, use MTP (median time past) as the time threshold
@@ -349,15 +368,22 @@ buildCoinbase :: Word32           -- ^ Block height
               -> ByteString       -- ^ Witness commitment (32 bytes)
               -> Tx
 buildCoinbase height value coinbaseScript extraNonce witnessCommitment =
-  let -- BIP-34: height in coinbase scriptSig
-      heightBytes = encodeHeight height
+  let -- BIP-34: height in coinbase scriptSig.  Use encodeBip34Height (from
+      -- Consensus.hs) which mirrors CScript() << nHeight exactly, including
+      -- the OP_0 encoding for height=0 and OP_1..OP_16 for heights 1-16.
+      heightBytes = encodeBip34Height height
       scriptSig = BS.concat [heightBytes, extraNonce]
 
-      -- Coinbase input with null prevout
+      -- Coinbase input with null prevout.
+      -- nSequence MUST be MAX_SEQUENCE_NONFINAL (0xfffffffe) so that the
+      -- coinbase nLockTime below is actually enforced by IsFinalTx().
+      -- If nSequence == SEQUENCE_FINAL (0xffffffff) the locktime would be
+      -- ignored entirely, defeating the anti-timewarp defence.
+      -- Bitcoin Core: node/miner.cpp:171 — CTxIn::MAX_SEQUENCE_NONFINAL.
       coinbaseInput = TxIn
         { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
         , txInScript = scriptSig
-        , txInSequence = 0xffffffff
+        , txInSequence = maxSequenceNonFinal  -- 0xfffffffe; NOT 0xffffffff
         }
 
       -- Main output: reward + fees to miner's address
@@ -375,25 +401,25 @@ buildCoinbase height value coinbaseScript extraNonce witnessCommitment =
     , txInputs = [coinbaseInput]
     , txOutputs = [mainOutput, witnessOutput]
     , txWitness = [[BS.replicate 32 0]]  -- Witness nonce (32 zeros)
-    , txLockTime = 0
+    -- nLockTime = nHeight - 1 (anti-timewarp, BIP-68/anti-fee-sniping defence).
+    -- With nSequence = 0xfffffffe the locktime IS enforced, meaning this
+    -- coinbase is invalid in any block at height < nHeight.  This prevents a
+    -- miner from back-dating a template coinbase into an earlier block.
+    -- Bitcoin Core: node/miner.cpp:196 — nLockTime = nHeight - 1.
+    -- Guard: for height=0 we keep lockTime=0 (genesis; cannot subtract 1 from 0).
+    , txLockTime = if height > 0 then height - 1 else 0
     }
 
--- | Encode block height as CScriptNum for BIP-34 coinbase
--- Uses minimal push encoding
+-- | Encode block height as CScriptNum for BIP-34 coinbase.
+-- Delegates to 'encodeBip34Height' (Consensus.hs) which mirrors Core's
+-- CScript() << nHeight exactly (including OP_0 for height=0 and OP_1..OP_16
+-- for heights 1-16).  The previous inline implementation diverged at h=0:
+-- it produced a 2-byte \x01\x00 push instead of the canonical single-byte
+-- OP_0 (0x00), so the 'validateCoinbaseHeightConsensus' prefix-check would
+-- have failed for any h=0 coinbase.  Kept for backward-compat / external
+-- callers; new code should import 'encodeBip34Height' directly.
 encodeHeight :: Word32 -> ByteString
-encodeHeight h
-  | h == 0     = BS.pack [1, 0]  -- Push 1 byte of zero
-  | h <= 16    = BS.pack [0x50 + fromIntegral h]  -- OP_1 through OP_16
-  | h <= 0x7f  = BS.pack [1, fromIntegral h]
-  | h <= 0x7fff = BS.pack [2, fromIntegral (h .&. 0xff),
-                              fromIntegral ((h `shiftR` 8) .&. 0xff)]
-  | h <= 0x7fffff = BS.pack [3, fromIntegral (h .&. 0xff),
-                                fromIntegral ((h `shiftR` 8) .&. 0xff),
-                                fromIntegral ((h `shiftR` 16) .&. 0xff)]
-  | otherwise = BS.pack [4, fromIntegral (h .&. 0xff),
-                            fromIntegral ((h `shiftR` 8) .&. 0xff),
-                            fromIntegral ((h `shiftR` 16) .&. 0xff),
-                            fromIntegral ((h `shiftR` 24) .&. 0xff)]
+encodeHeight = encodeBip34Height
 
 --------------------------------------------------------------------------------
 -- Block Assembly

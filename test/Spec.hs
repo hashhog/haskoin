@@ -3807,6 +3807,108 @@ main = hspec $ do
       let tx = Tx 1 [] [] [] 0
       templateLegacySigOpCost tx `shouldBe` 0
 
+  -- W87 miner audit: coinbase nSequence / nLockTime / reservedWeight / encodeHeight
+  -- Reference: bitcoin-core/src/node/miner.cpp:171,196;
+  --            bitcoin-core/src/policy/policy.h:27
+  describe "BlockTemplate W87 miner assembly gates" $ do
+
+    -- Gate 1 — coinbase nSequence = MAX_SEQUENCE_NONFINAL (0xfffffffe)
+    -- Core miner.cpp:171: CTxIn::MAX_SEQUENCE_NONFINAL ensures nLockTime
+    -- is enforced.  0xffffffff (SEQUENCE_FINAL) would let IsFinalTx skip
+    -- the locktime check entirely.
+    it "buildCoinbase: coinbase nSequence is MAX_SEQUENCE_NONFINAL (0xfffffffe)" $ do
+      let cb = buildCoinbase 100 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+          inp = head (txInputs cb)
+      txInSequence inp `shouldBe` 0xfffffffe
+
+    it "buildCoinbase: coinbase nSequence is NOT SEQUENCE_FINAL (0xffffffff)" $ do
+      let cb = buildCoinbase 200 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+          inp = head (txInputs cb)
+      txInSequence inp `shouldNotBe` (0xffffffff :: Word32)
+
+    -- Gate 2 — coinbase nLockTime = nHeight - 1
+    -- Core miner.cpp:196: anti-timewarp defence; coinbase is invalid in
+    -- any block at height < nHeight when nSequence < SEQUENCE_FINAL.
+    it "buildCoinbase: coinbase nLockTime = height - 1" $ do
+      let height = 840000 :: Word32
+          cb = buildCoinbase height 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+      txLockTime cb `shouldBe` (height - 1)
+
+    it "buildCoinbase: coinbase nLockTime = 0 for height=0 (genesis edge)" $ do
+      let cb = buildCoinbase 0 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+      txLockTime cb `shouldBe` 0
+
+    it "buildCoinbase: coinbase nLockTime = 0 for height=1" $ do
+      let cb = buildCoinbase 1 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+      txLockTime cb `shouldBe` 0
+
+    it "buildCoinbase: coinbase nLockTime is non-zero for height > 1" $ do
+      let cb = buildCoinbase 100 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+      txLockTime cb `shouldBe` 99
+
+    -- Gate 2b — nLockTime + nSequence interaction: IsFinalTx with the
+    -- generated coinbase at (height) should return True (it IS final for
+    -- the intended block), and False for (height - 1) (locked out).
+    it "buildCoinbase: coinbase is final at its intended height" $ do
+      let height = 500 :: Word32
+          cb = buildCoinbase height 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+          -- MTP doesn't matter for height-based locktime (lockTime < threshold)
+          mtp = 0 :: Word32
+      isFinalTx cb height mtp `shouldBe` True
+
+    it "buildCoinbase: coinbase is NOT final one block before its intended height" $ do
+      let height = 500 :: Word32
+          cb = buildCoinbase height 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+          mtp = 0 :: Word32
+          prevHeight = height - 1
+      isFinalTx cb prevHeight mtp `shouldBe` False
+
+    -- Gate 3 — blockReservedWeight = 8000
+    -- Core policy/policy.h:27: DEFAULT_BLOCK_RESERVED_WEIGHT = 8000.
+    -- The previous value was 4000 which under-reserved the coinbase weight.
+    it "blockReservedWeight constant is 8000 (Core DEFAULT_BLOCK_RESERVED_WEIGHT)" $ do
+      blockReservedWeight `shouldBe` 8000
+
+    it "maxSequenceNonFinal constant is 0xfffffffe" $ do
+      maxSequenceNonFinal `shouldBe` 0xfffffffe
+
+    -- Gate 4 — encodeHeight is now an alias for encodeBip34Height.
+    -- The old inline copy diverged at h=0: it produced \x01\x00 (push 1
+    -- byte of zero) whereas Core's CScript() << 0 produces \x00 (OP_0).
+    -- validateCoinbaseHeightConsensus does a prefix-match and would reject
+    -- the old encoding.
+    it "encodeHeight h=0 produces OP_0 (0x00), not \\x01\\x00" $ do
+      encodeHeight 0 `shouldBe` BS.singleton 0x00
+
+    it "encodeHeight h=1 produces OP_1 (0x51)" $ do
+      encodeHeight 1 `shouldBe` BS.singleton 0x51
+
+    it "encodeHeight h=16 produces OP_16 (0x60)" $ do
+      encodeHeight 16 `shouldBe` BS.singleton 0x60
+
+    it "encodeHeight h=17 produces length-prefixed 0x01 0x11" $ do
+      encodeHeight 17 `shouldBe` BS.pack [0x01, 0x11]
+
+    it "encodeHeight h=127 produces length-prefixed 0x01 0x7f" $ do
+      encodeHeight 127 `shouldBe` BS.pack [0x01, 0x7f]
+
+    it "encodeHeight h=128 needs sign byte: 0x02 0x80 0x00" $ do
+      -- 128 = 0x80; high bit of 0x80 is set so append sign byte 0x00
+      encodeHeight 128 `shouldBe` BS.pack [0x02, 0x80, 0x00]
+
+    it "encodeHeight matches encodeBip34Height for a range of heights" $ do
+      let heights = [0, 1, 15, 16, 17, 100, 127, 128, 256, 500, 32767, 32768,
+                     100000, 840000, 8388607, 8388608] :: [Word32]
+      mapM_ (\h -> encodeHeight h `shouldBe` encodeBip34Height h) heights
+
+    -- Gate 4b — coinbase produced by buildCoinbase must pass
+    -- validateCoinbaseHeightConsensus (prefix-match gate in Consensus.hs).
+    it "buildCoinbase scriptSig passes validateCoinbaseHeightConsensus" $ do
+      let heights = [1, 16, 17, 100, 840000] :: [Word32]
+      forM_ heights $ \h -> do
+        let cb = buildCoinbase h 5000000000 BS.empty BS.empty (BS.replicate 32 0)
+        validateCoinbaseHeightConsensus h cb `shouldBe` True
+
   describe "ChainState" $ do
     it "can be constructed" $ do
       let bh = BlockHash (Hash256 (BS.replicate 32 0))
