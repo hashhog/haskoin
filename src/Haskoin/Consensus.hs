@@ -36,6 +36,7 @@ module Haskoin.Consensus
   , targetTimespan
   , powLimit
   , bitsToTarget
+  , bitsToTargetFull
   , targetToBits
   , checkProofOfWork
   , getNextWorkRequired
@@ -561,39 +562,76 @@ powLimit = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
 -- Difficulty Target Conversion
 --------------------------------------------------------------------------------
 
--- | Convert compact "bits" format to full target
+-- | Convert compact "bits" format to full target.
+-- Mirrors arith_uint256::SetCompact from Bitcoin Core (arith_uint256.cpp).
+-- Returns (value, isNegative, isOverflow).
+-- Reference: bitcoin-core/src/arith_uint256.cpp SetCompact
+bitsToTargetFull :: Word32 -> (Integer, Bool, Bool)
+bitsToTargetFull bits =
+  let nSize   = fromIntegral (bits `shiftR` 24) :: Int
+      nWord   = fromIntegral (bits .&. 0x007fffff) :: Integer
+      -- Reconstruct the magnitude
+      value   = if nSize <= 3
+                then nWord `shiftR` (8 * (3 - nSize))
+                else nWord `shiftL` (8 * (nSize - 3))
+      -- Negative flag: sign bit set AND mantissa is non-zero
+      isNeg   = nWord /= 0 && (bits .&. 0x00800000) /= 0
+      -- Overflow: nWord != 0 AND (nSize > 34, or nWord > 0xff and nSize > 33,
+      --           or nWord > 0xffff and nSize > 32)
+      -- Reference: bitcoin-core/src/arith_uint256.cpp SetCompact lines 190-192
+      isOvfl  = nWord /= 0 &&
+                  (nSize > 34
+                   || (nWord > 0xff   && nSize > 33)
+                   || (nWord > 0xffff && nSize > 32))
+  in (value, isNeg, isOvfl)
+
+-- | Convert compact "bits" format to full target (unsigned magnitude).
+-- Returns 0 for negative or overflow compact values; callers that need
+-- to distinguish those cases should use 'bitsToTargetFull'.
 -- Format: first byte = exponent (number of bytes), next 3 bytes = significand
 -- target = significand * 2^(8*(exponent-3))
 bitsToTarget :: Word32 -> Integer
 bitsToTarget bits =
-  let exponent' = fromIntegral (bits `shiftR` 24) :: Int
-      mantissa = fromIntegral (bits .&. 0x007fffff) :: Integer
-      negative = bits .&. 0x00800000 /= 0
-      target = if exponent' <= 3
-               then mantissa `shiftR` (8 * (3 - exponent'))
-               else mantissa `shiftL` (8 * (exponent' - 3))
-  in if negative then negate target else target
+  let (value, isNeg, isOvfl) = bitsToTargetFull bits
+  in if isNeg || isOvfl then 0 else value
 
--- | Convert full target to compact "bits" format
+-- | Convert full target to compact "bits" format.
+-- Mirrors arith_uint256::GetCompact from Bitcoin Core (arith_uint256.cpp).
+-- Reference: bitcoin-core/src/arith_uint256.cpp GetCompact
 targetToBits :: Integer -> Word32
 targetToBits target
   | target <= 0 = 0
   | otherwise =
-      let bytes = integerToBytes target
-          len = length bytes
-          -- Get the most significant 3 bytes
-          (sig, expo)
-            | len <= 3 =
-                let padded = replicate (3 - len) 0 ++ bytes
-                in (bytesToWord24 padded, len)
+      -- Count the number of bytes needed (= ceil(bits/8))
+      let nSize0 = byteLength target
+          -- Extract 3-byte mantissa: if value fits in 3 bytes, left-shift
+          -- it into the top of the 3-byte field; otherwise take the top 3 bytes.
+          -- This mirrors Core's GetCompact which left-shifts small values:
+          --   nCompact = GetLow64() << (8 * (3 - nSize))
+          nCompact0 :: Word32
+          nCompact0
+            | nSize0 <= 3 =
+                -- Left-align the value within 3 bytes, matching Core:
+                --   nCompact = low64 << (8*(3 - nSize))
+                fromIntegral (target `shiftL` (8 * (3 - nSize0)))
             | otherwise =
-                (bytesToWord24 (take 3 bytes), len)
-          -- Ensure positive encoding (MSB of significand can't be set)
-          (sig', expo')
-            | sig .&. 0x00800000 /= 0 =
-                (sig `shiftR` 8, expo + 1)
-            | otherwise = (sig, expo)
-      in (fromIntegral expo' `shiftL` 24) .|. fromIntegral sig'
+                -- Right-shift to keep only top 3 bytes
+                fromIntegral (target `shiftR` (8 * (nSize0 - 3)))
+          -- If the sign bit (0x00800000) is set in the 3-byte mantissa,
+          -- we must shift right by one byte and bump the exponent.
+          (nCompact1, nSize1)
+            | nCompact0 .&. 0x00800000 /= 0 = (nCompact0 `shiftR` 8, nSize0 + 1)
+            | otherwise                      = (nCompact0, nSize0)
+      in (fromIntegral nSize1 `shiftL` 24) .|. (nCompact1 .&. 0x007fffff)
+
+-- | Number of bytes required to represent a positive Integer.
+-- Used by targetToBits to compute the compact exponent.
+byteLength :: Integer -> Int
+byteLength 0 = 0
+byteLength n = go n 0
+  where
+    go 0 acc = acc
+    go x acc = go (x `shiftR` 8) (acc + 1)
 
 -- | Convert Integer to list of bytes (big-endian, no leading zeros)
 integerToBytes :: Integer -> [Word8]
@@ -611,16 +649,23 @@ bytesToWord24 [a, b, c] =
   fromIntegral c
 bytesToWord24 _ = 0
 
--- | Verify proof of work for a block header
--- Hash must be <= target and target must be <= powLimit
+-- | Verify proof of work for a block header.
+-- Mirrors Bitcoin Core's DeriveTarget + CheckProofOfWorkImpl (pow.cpp).
+-- Rejects nBits that are negative, overflow, zero, or exceed powLimit.
+-- Reference: bitcoin-core/src/pow.cpp DeriveTarget / CheckProofOfWorkImpl
 checkProofOfWork :: BlockHeader -> Integer -> Bool
 checkProofOfWork header powLimitTarget =
-  let target = bitsToTarget (bhBits header)
+  let nBits = bhBits header
+      (target, isNeg, isOvfl) = bitsToTargetFull nBits
       -- Compute block hash and convert to integer
       headerHash = getHash256 $ getBlockHashHash $ computeBlockHash header
       -- Bitcoin uses little-endian hash comparison, so reverse to big-endian
       hashAsInteger = bsToInteger (BS.reverse headerHash)
-  in target > 0 && target <= powLimitTarget && hashAsInteger <= target
+  -- Gate order matches Core's DeriveTarget:
+  --   fNegative || bnTarget == 0 || fOverflow || bnTarget > pow_limit
+  -- Reference: bitcoin-core/src/pow.cpp lines 155-158
+  in not isNeg && not isOvfl && target /= 0 && target <= powLimitTarget
+     && hashAsInteger <= target
 
 -- | Convert ByteString to Integer (big-endian)
 bsToInteger :: ByteString -> Integer
@@ -703,20 +748,30 @@ calculateNextWorkRequired net pindexLast
   | otherwise =
       let -- Find the first block in this 2016-block period
           -- We want to go back (interval - 1) blocks
-          nHeightFirst = biHeight pindexLast - (netRetargetInterval net - 1)
           pindexFirst = getAncestorBI pindexLast (netRetargetInterval net - 1)
 
           -- Get the old target (either from last or first block for BIP94)
+          -- Reference: bitcoin-core/src/pow.cpp lines 67-76
           oldTarget = if netEnforceBIP94 net
                       then bitsToTarget (biBits pindexFirst)  -- BIP94: use first block
                       else bitsToTarget (biBits pindexLast)   -- Normal: use last block
 
-          -- Calculate actual timespan
-          nActualTimespan = biTimestamp pindexLast - biTimestamp pindexFirst
+          -- Calculate actual timespan using Int64 arithmetic to match Core.
+          -- Core uses int64_t: nActualTimespan = pindexLast->GetBlockTime() - nFirstBlockTime
+          -- This preserves sign for out-of-order / time-warped timestamps.
+          -- Using Word32 subtraction would wrap to a large positive value instead.
+          -- Reference: bitcoin-core/src/pow.cpp line 56
+          nActualTimespan :: Int64
+          nActualTimespan = fromIntegral (biTimestamp pindexLast)
+                          - fromIntegral (biTimestamp pindexFirst)
 
           -- Clamp timespan to [targetTimespan/4, targetTimespan*4]
-          minTimespan = netPowTargetTimespan net `div` 4
-          maxTimespan = netPowTargetTimespan net * 4
+          -- Reference: bitcoin-core/src/pow.cpp lines 57-60
+          minTimespan :: Int64
+          minTimespan = fromIntegral (netPowTargetTimespan net) `div` 4
+          maxTimespan :: Int64
+          maxTimespan = fromIntegral (netPowTargetTimespan net) * 4
+          clampedTimespan :: Int64
           clampedTimespan = max minTimespan (min maxTimespan nActualTimespan)
 
           -- Calculate new target: new = old * actualTime / targetTime
@@ -3056,11 +3111,19 @@ difficultyAdjustment net entries entry
       in case firstHash >>= (`Map.lookup` ents) of
            Nothing -> bhBits (ceHeader lastEntry)  -- Fallback if not found
            Just firstEntry ->
-             let actualTime = bhTimestamp (ceHeader lastEntry)
-                            - bhTimestamp (ceHeader firstEntry)
+             -- Use Int64 arithmetic to match Core's int64_t subtraction.
+             -- Word32 subtraction wraps on time-warped timestamps; Int64 does not.
+             -- Reference: bitcoin-core/src/pow.cpp line 56
+             let actualTime :: Int64
+                 actualTime = fromIntegral (bhTimestamp (ceHeader lastEntry))
+                            - fromIntegral (bhTimestamp (ceHeader firstEntry))
                  -- Clamp to [targetTimespan/4, targetTimespan*4]
-                 minTime = netPowTargetTimespan network `div` 4
-                 maxTime = netPowTargetTimespan network * 4
+                 -- Reference: bitcoin-core/src/pow.cpp lines 57-60
+                 minTime :: Int64
+                 minTime = fromIntegral (netPowTargetTimespan network) `div` 4
+                 maxTime :: Int64
+                 maxTime = fromIntegral (netPowTargetTimespan network) * 4
+                 clampedTime :: Int64
                  clampedTime = max minTime (min maxTime actualTime)
                  -- BIP94: use first block's bits, otherwise use last block's bits
                  oldTarget = if netEnforceBIP94 network
