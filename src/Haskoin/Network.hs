@@ -5231,6 +5231,14 @@ instance Serialize CmpctBlock where
     shortIds <- replicateM (fromIntegral shortIdCount) getShortId
     prefilledCount <- getVarInt'
     prefilled <- replicateM (fromIntegral prefilledCount) get
+    -- Gate 1: total transaction count must not overflow uint16_t (Core blockencodings.h:125)
+    let totalTxCount = shortIdCount + prefilledCount
+    when (totalTxCount > 65535) $
+      fail "cmpctblock: BlockTxCount overflows uint16_t"
+    -- Gate 2: total count must not exceed MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TX_WEIGHT
+    -- = 4_000_000 / 40 = 100_000 (Core blockencodings.cpp:64)
+    when (totalTxCount > 100000) $
+      fail "cmpctblock: BlockTxCount exceeds maximum possible transactions per block"
     return $ CmpctBlock header nonce shortIds prefilled
 
 -- | Put a 6-byte short ID (little-endian)
@@ -5416,76 +5424,144 @@ data CompactBlockState = CompactBlockState
 
 -- | Initialize a partially downloaded block from a compact block message
 -- Returns the partially downloaded block and list of missing indices (if any)
+--
+-- Validation mirrors Bitcoin Core blockencodings.cpp InitData():
+--   - empty block check (Core:62-65)
+--   - total tx count bounds (Core:64-65)
+--   - prefilled index overflow (Core:77-85)
+--   - short-ID collision detection (Core:115-116)
+--   - bucket-size-12 DoS check (Core:110-111)
+--   - duplicate-match clearing (Core:129-136)
 initPartialBlock :: CmpctBlock
-                 -> Map TxId Tx       -- ^ Mempool transactions by TxId
+                 -> Map TxId Tx       -- ^ Mempool transactions (by txid; wtxid recomputed)
                  -> Either String (PartiallyDownloadedBlock, [Int])
 initPartialBlock cb mempoolTxs = do
-  -- Validate compact block
-  when (null (cbPrefilled cb)) $
-    Left "Invalid compact block: no prefilled transactions"
+  let shortIds  = cbShortIds cb
+      prefilled = cbPrefilled cb
+
+  -- Gate A: empty block (Core blockencodings.cpp:62-63)
+  when (null shortIds && null prefilled) $
+    Left "Invalid compact block: no transactions (empty shorttxids and prefilledtxn)"
+
+  let totalTxns = length shortIds + length prefilled
+
+  -- Gate B: total count must not exceed 100_000 (Core:64-65)
+  -- MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT = 4_000_000 / 40
+  when (totalTxns > 100000) $
+    Left "Invalid compact block: too many transactions"
 
   let header = cbHeader cb
-      nonce = cbNonce cb
+      nonce  = cbNonce cb
       sipKey = computeShortIdKey header nonce
-
-      -- Total transaction count
-      totalTxns = length (cbShortIds cb) + length (cbPrefilled cb)
 
       -- Build initial availability map with all slots empty
       emptyMap = Map.fromList [(i, Nothing) | i <- [0..totalTxns-1]]
 
-      -- Insert prefilled transactions at their absolute indices
-      -- The indices in PrefilledTx are relative to previous prefilled tx
-      (_, mapWithPrefilled) = foldl' insertPrefilled (0, emptyMap) (cbPrefilled cb)
+  -- Gate C: insert prefilled transactions, checking index bounds (Core:73-86)
+  mapWithPrefilled <- insertPrefilledTxns prefilled (length shortIds) emptyMap
 
-      -- Build map of short ID -> index for remaining slots
-      shortIdMap = buildShortIdMap (cbShortIds cb) mapWithPrefilled
+  -- Build short-ID -> slot-index map for remaining (non-prefilled) slots
+  let emptySlots = [i | (i, Nothing) <- Map.toList mapWithPrefilled]
+      -- Pair each short ID with its slot index
+      shortIdPairs = zip shortIds emptySlots
 
-      -- Try to fill from mempool
-      (mapWithMempool, mempoolHits) = fillFromMempool sipKey shortIdMap mempoolTxs mapWithPrefilled
+  -- Gate D: detect short-ID collisions (duplicate short IDs) (Core:115-116)
+  let shortIdMapRaw = Map.fromListWith (\_ _ -> -1) shortIdPairs
+  -- After fromListWith, any key that collided gets value -1
+  -- But the canonical check: if size(uniq) != size(input), there was a collision
+  when (Map.size shortIdMapRaw /= length shortIds) $
+    Left "Invalid compact block: short-ID collision detected"
 
-      -- Find missing indices
-      missing = [i | (i, Nothing) <- Map.toList mapWithMempool]
+  -- Gate E: bucket-size-12 DoS check (Core:110-111)
+  -- We simulate bucket distribution: group by (shortId `mod` numBuckets)
+  -- where numBuckets ~ length shortIds (load factor 1.0 assumption)
+  let numBuckets = max 1 (length shortIds)
+      bucketCounts = foldl' (\m sid -> Map.insertWith (+) (sid `mod` fromIntegral numBuckets) (1::Int) m)
+                            Map.empty shortIds
+  when (any (> 12) (Map.elems bucketCounts)) $
+    Left "Compact block short-ID distribution too skewed (possible DoS)"
 
-      pdb = PartiallyDownloadedBlock
+  -- Build a clean short-ID map (no collisions at this point)
+  let shortIdMap = Map.fromList shortIdPairs
+
+  -- Fill from mempool, handling duplicate matches by clearing the slot (Core:129-136)
+  let (mapWithMempool, mempoolHits) = fillFromMempool sipKey shortIdMap mempoolTxs mapWithPrefilled
+
+  -- Find missing indices
+  let missing = [i | (i, Nothing) <- Map.toList mapWithMempool]
+
+  let pdb = PartiallyDownloadedBlock
         { pdbHeader         = header
         , pdbAvailable      = mapWithMempool
         , pdbSipKey         = sipKey
-        , pdbPrefilledCount = length (cbPrefilled cb)
+        , pdbPrefilledCount = length prefilled
         , pdbMempoolCount   = mempoolHits
         , pdbTotalTxns      = totalTxns
         }
 
   return (pdb, missing)
   where
-    insertPrefilled (prevIdx, m) (PrefilledTx relIdx tx) =
-      let absIdx = prevIdx + fromIntegral relIdx
-      in (absIdx + 1, Map.insert absIdx (Just tx) m)
-
-    -- Build map of short ID -> absolute index for slots without prefilled txs
-    buildShortIdMap shortIds available =
-      let emptySlots = [i | (i, Nothing) <- Map.toList available]
-      in Map.fromList $ zip shortIds emptySlots
-
-    -- Try to fill slots from mempool transactions
-    fillFromMempool sipKey shortIdMap mempool available =
-      Map.foldlWithKey' tryFill (available, 0) mempool
+    -- Insert prefilled txns at absolute indices, validating overflow (Core:73-86)
+    insertPrefilledTxns :: [PrefilledTx] -> Int -> Map Int (Maybe Tx)
+                        -> Either String (Map Int (Maybe Tx))
+    insertPrefilledTxns pf numShortIds initMap = go (-1) 0 pf initMap
       where
-        tryFill (avail, hits) txid tx =
-          let wtxid = computeWtxid tx
-              shortId = computeShortId sipKey (getHash256 wtxid)
-          in case Map.lookup shortId shortIdMap of
-               Just idx -> (Map.insert idx (Just tx) avail, hits + 1)
-               Nothing -> (avail, hits)
+        go _lastAbsIdx _prefilledSoFar [] m = Right m
+        go lastAbsIdx prefilledSoFar (PrefilledTx relIdx tx : rest) m = do
+          let absIdx = lastAbsIdx + 1 + fromIntegral relIdx
+          -- Gate C1: absolute index must not overflow uint16_t (Core:78-79)
+          when (absIdx > 65535) $
+            Left "Prefilled transaction index overflows uint16_t"
+          -- Gate C2: index must not skip past available slots (Core:80-85)
+          when (absIdx > numShortIds + prefilledSoFar) $
+            Left "Prefilled transaction index out of range"
+          go absIdx (prefilledSoFar + 1) rest (Map.insert absIdx (Just tx) m)
 
--- | Fill a partially downloaded block with missing transactions
--- Returns the reconstructed block or an error
+    -- Try to fill slots from mempool transactions.
+    -- Uses a 'have_txn' set to detect duplicate matches and clear them (Core:125-136).
+    fillFromMempool :: SipHashKey -> Map ShortTxId Int -> Map TxId Tx
+                    -> Map Int (Maybe Tx)
+                    -> (Map Int (Maybe Tx), Int)
+    fillFromMempool skey shortIdMap mempool available =
+      -- have_txn tracks which slots are already tentatively filled
+      let (avail', hits, _haveTxn) =
+            Map.foldlWithKey' (tryFill skey shortIdMap) (available, 0, Map.empty) mempool
+      in (avail', hits)
+
+    tryFill :: SipHashKey -> Map ShortTxId Int
+            -> (Map Int (Maybe Tx), Int, Map Int ())
+            -> TxId -> Tx
+            -> (Map Int (Maybe Tx), Int, Map Int ())
+    tryFill skey shortIdMap (avail, hits, haveTxn) _txid tx =
+      let wtxid   = computeWtxid tx
+          shortId = computeShortId skey (getHash256 wtxid)
+      in case Map.lookup shortId shortIdMap of
+           Nothing  -> (avail, hits, haveTxn)
+           Just idx ->
+             if Map.member idx haveTxn
+               then
+                 -- Duplicate match: clear the slot and decrement hit count (Core:129-136)
+                 ( Map.insert idx Nothing avail
+                 , hits - 1
+                 , haveTxn  -- keep in haveTxn so further dupes are also cleared
+                 )
+               else
+                 ( Map.insert idx (Just tx) avail
+                 , hits + 1
+                 , Map.insert idx () haveTxn
+                 )
+
+-- | Fill a partially downloaded block with missing transactions.
+-- Returns the reconstructed block or an error.
+--
+-- After filling, verifies the block merkle root matches the header to
+-- guard against short-ID collisions (Core blockencodings.cpp:219-221).
 fillPartialBlock :: PartiallyDownloadedBlock -> [Tx] -> Either String Block
 fillPartialBlock pdb missingTxns = do
   let available = pdbAvailable pdb
       missing = [i | (i, Nothing) <- Map.toList available]
 
-  -- Check we have the right number of missing transactions
+  -- Check we have the right number of missing transactions (Core:200-207)
   when (length missingTxns /= length missing) $
     Left $ "Wrong number of missing transactions: expected "
            ++ show (length missing) ++ ", got " ++ show (length missingTxns)
@@ -5501,9 +5577,46 @@ fillPartialBlock pdb missingTxns = do
   when (length txns /= pdbTotalTxns pdb) $
     Left "Failed to reconstruct all transactions"
 
-  return $ Block (pdbHeader pdb) txns
+  let block = Block (pdbHeader pdb) txns
+
+  -- Verify merkle root to detect short-ID collisions (Core:219-221)
+  -- "Check for possible mutations early now that we have a seemingly good block"
+  let computedRoot = computeMerkleRoot (map computeTxid txns)
+      headerRoot   = bhMerkleRoot (pdbHeader pdb)
+  when (computedRoot /= headerRoot) $
+    Left "Block merkle root mismatch after compact block reconstruction (possible short-ID collision)"
+
+  return block
   where
     insertMissing m (idx, tx) = Map.insert idx (Just tx) m
+
+    -- Compute txid (non-witness hash) for merkle tree
+    computeTxid :: Tx -> Hash256
+    computeTxid tx =
+      -- Strip witness data before hashing (legacy txid = hash of non-witness serialization)
+      let legacyBytes = runPut $ do
+            putWord32le (fromIntegral (txVersion tx))
+            putVarInt (fromIntegral $ length (txInputs tx))
+            mapM_ put (txInputs tx)
+            putVarInt (fromIntegral $ length (txOutputs tx))
+            mapM_ put (txOutputs tx)
+            putWord32le (txLockTime tx)
+      in doubleSHA256 legacyBytes
+
+    -- Compute the merkle root from a list of txids (Hash256 bytes)
+    computeMerkleRoot :: [Hash256] -> Hash256
+    computeMerkleRoot []     = Hash256 (BS.replicate 32 0)
+    computeMerkleRoot [x]    = x
+    computeMerkleRoot hashes = computeMerkleRoot (merkleLevel hashes)
+
+    merkleLevel :: [Hash256] -> [Hash256]
+    merkleLevel []       = []
+    merkleLevel [x]      = [merkleParent x x]  -- duplicate last if odd count
+    merkleLevel (x:y:rest) = merkleParent x y : merkleLevel rest
+
+    merkleParent :: Hash256 -> Hash256 -> Hash256
+    merkleParent (Hash256 l) (Hash256 r) =
+      doubleSHA256 (BS.append l r)
 
 -- | Reconstruct a block from compact block and mempool
 -- This is the main entry point for compact block reconstruction
@@ -5608,9 +5721,13 @@ sipHash128 (SipHashKey k0 k1) msg =
                     (zip [0..7] bytes)
 
     buildFinalBlock leftover totalLen =
-      let padded = leftover `BS.append` BS.replicate (7 - BS.length leftover) 0
+      -- Pad leftover (0-7 bytes) to exactly 8 bytes with zeros, then replace
+      -- the highest byte with the total message length mod 256.
+      -- This matches Core's: m_tmp | (((uint64_t)m_count) << 56)
+      let padded = leftover `BS.append` BS.replicate (8 - BS.length leftover) 0
+          base   = decodeLE64' (BS.take 8 padded)
           lenByte = fromIntegral (totalLen .&. 0xff) `shiftL` 56
-      in decodeLE64' padded .|. lenByte
+      in (base .&. 0x00ffffffffffffff) .|. lenByte
 
     sipRound2 !v0 !v1 !v2 !v3 m =
       let v3' = v3 `xor` m
