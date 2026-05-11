@@ -2702,12 +2702,18 @@ bip22ResultString err
                 "bad-txns-txouttotal-toolarge",
                 "bad-txns-inputvalues-outofrange",
                 "bad-txns-accumulated-fee-outofrange",
-                "bad-txns-fee-outofrange"] = err
+                "bad-txns-fee-outofrange",
+                -- Header contextual errors (Core validation.cpp:4089,4093,4102,4109)
+                "bad-diffbits", "time-too-old", "time-too-new", "time-timewarp-attack"] = err
 
   -- PoW / difficulty (from validateFullBlock / submitBlock)
+  -- "high-hash"  = block hash does not meet claimed target (wrong nonce answer)
+  -- "bad-diffbits" = the nBits field itself is the wrong value for this block
+  -- Reference: bitcoin-core/src/validation.cpp:4088-4089
   | "does not meet proof of work" `isInfixOf` s = "high-hash"
   | "proof of work check failed" `isInfixOf` s  = "high-hash"
-  | "incorrect difficulty target" `isInfixOf` s  = "high-hash"
+  | "bad-diffbits" `isInfixOf` s                = "bad-diffbits"
+  | "incorrect difficulty target" `isInfixOf` s = "bad-diffbits"
 
   -- Merkle root
   | "merkle root mismatch" `isInfixOf` s         = "bad-txnmrklroot"

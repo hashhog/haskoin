@@ -31,6 +31,7 @@ module Haskoin.Consensus
   , maxBlockHeaderSize
   , witnessScaleFactor
   , maxFutureBlockTime
+  , maxTimewarp
     -- * Difficulty
   , difficultyAdjustmentInterval
   , targetSpacing
@@ -134,6 +135,7 @@ module Haskoin.Consensus
   , headerWork
   , cumulativeWork
   , medianTimePast
+  , computeEntryMtp
   , difficultyAdjustment
   , addHeader
   , addSideBranchHeader
@@ -499,7 +501,7 @@ minSerializableTransactionWeight = witnessScaleFactor * 10
 
 -- | +2 hours future-time gate for header acceptance.
 --
--- Reference: bitcoin-core/src/consensus/consensus.h
+-- Reference: bitcoin-core/src/chain.h:29
 -- @MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60 = 7200@.  A header whose
 -- timestamp exceeds @now + MAX_FUTURE_BLOCK_TIME@ is rejected by
 -- 'addHeader' as @time-too-new@ and the peer is misbehaving.
@@ -507,8 +509,22 @@ minSerializableTransactionWeight = witnessScaleFactor * 10
 -- timestamps are far in the future (the timestamps are internally
 -- consistent so MTP + difficulty checks all pass), which inflates
 -- 'hcEntries' until manually pruned.
-maxFutureBlockTime :: Word32
+-- Type is Int64 to match Core's int64_t and avoid Word32 wraparound
+-- when computing @now + maxFutureBlockTime@ near 2106.
+maxFutureBlockTime :: Int64
 maxFutureBlockTime = 7200
+
+-- | Maximum allowed timewarp for difficulty-adjustment boundary blocks (BIP94).
+--
+-- Reference: bitcoin-core/src/consensus/consensus.h:35
+-- @MAX_TIMEWARP = 600@.  On testnet4 (and regtest when enforce_BIP94 is on),
+-- the first block of each 2016-block difficulty-adjustment interval must not
+-- have a timestamp more than 600 seconds (one block target) earlier than
+-- the previous block.  This prevents the time-warp attack described in
+-- https://github.com/bitcoin/bitcoin/pull/15482.
+-- Reference: bitcoin-core/src/validation.cpp:4097-4104
+maxTimewarp :: Int64
+maxTimewarp = 600
 
 --------------------------------------------------------------------------------
 -- BIP68 Sequence Lock Constants
@@ -3097,12 +3113,38 @@ cumulativeWork prevWork header = prevWork + headerWork header
 
 -- | Calculate the median time past for a block.
 -- MTP is the median of the previous 11 block timestamps.
--- Used for locktime validation (BIP-113).
+-- Collects timestamps starting from @blockHash@ itself (inclusive).
+-- Used for locktime validation (BIP-113) and block-header time-too-old gate.
+--
+-- Reference: bitcoin-core/src/chain.h:233-244 (GetMedianTimePast)
 medianTimePast :: Map BlockHash ChainEntry -> BlockHash -> Word32
 medianTimePast entries blockHash =
   let timestamps = collectTimestamps entries blockHash 11
       sorted = sort timestamps
   in if null sorted then 0 else sorted !! (length sorted `div` 2)
+  where
+    collectTimestamps :: Map BlockHash ChainEntry -> BlockHash -> Int -> [Word32]
+    collectTimestamps _ _ 0 = []
+    collectTimestamps ents hash n =
+      case Map.lookup hash ents of
+        Nothing -> []
+        Just ce -> bhTimestamp (ceHeader ce)
+          : maybe [] (\p -> collectTimestamps ents p (n-1)) (cePrev ce)
+
+-- | Compute the MTP of a *new* entry that has not yet been inserted into the
+-- entries map.  Takes the parent hash (to walk ancestors) and the new entry's
+-- own timestamp.  The result is the median of (newTimestamp : up-to-10-ancestors).
+--
+-- This is used by 'addHeader' and 'addSideBranchHeader' to store the correct
+-- 'ceMedianTime' on the new entry so that child blocks can read it directly
+-- without recomputing from the map.
+-- Reference: bitcoin-core/src/chain.h:233-244
+computeEntryMtp :: Map BlockHash ChainEntry -> BlockHash -> Word32 -> Word32
+computeEntryMtp entries parentHash newTimestamp =
+  let ancestors = collectTimestamps entries parentHash 10
+      timestamps = newTimestamp : ancestors
+      sorted = sort timestamps
+  in sorted !! (length sorted `div` 2)
   where
     collectTimestamps :: Map BlockHash ChainEntry -> BlockHash -> Int -> [Word32]
     collectTimestamps _ _ 0 = []
@@ -3125,15 +3167,26 @@ medianTimePast entries blockHash =
 -- - Testnet: 20-minute min-diff rule with walk-back
 -- - Testnet4: BIP94 time warp fix
 -- - Mainnet: standard retargeting every 2016 blocks
-difficultyAdjustment :: Network -> Map BlockHash ChainEntry -> ChainEntry -> Word32
-difficultyAdjustment net entries entry
+-- | Calculate the expected difficulty bits for a new block header.
+-- Takes the parent 'ChainEntry' and the *candidate* header so that the
+-- testnet min-difficulty rule (timestamp > prev + 20 min) can be
+-- evaluated correctly.
+--
+-- Reference: bitcoin-core/src/pow.cpp GetNextWorkRequired()
+difficultyAdjustment :: Network -> Map BlockHash ChainEntry -> ChainEntry -> BlockHeader -> Word32
+difficultyAdjustment net entries entry newHeader
   -- Regtest: no retargeting
   | netPowNoRetargeting net = bhBits (ceHeader entry)
 
   -- Not at retarget boundary
   | (ceHeight entry + 1) `mod` netRetargetInterval net /= 0 =
       if netAllowMinDiffBlocks net
-        then bhBits (ceHeader entry)  -- Min-diff check is done in addHeader
+        -- Testnet: apply the 20-minute min-difficulty rule by consulting
+        -- the new header's timestamp.  This is 'testnetExpectedBits',
+        -- NOT a blanket pass — a header inside the 20-minute window still
+        -- must match the last non-min-diff block's target.
+        -- Reference: bitcoin-core/src/pow.cpp:95-115
+        then testnetExpectedBits net entries entry newHeader
         else bhBits (ceHeader entry)
 
   -- At retarget boundary
@@ -3241,14 +3294,19 @@ initHeaderChain net = do
 -- Returns Left with error message on failure, Right with entry on success.
 --
 -- Validation order mirrors Bitcoin Core's
--- 'ContextualCheckBlockHeader' (validation.cpp): PoW (context-free),
--- MTP, +2h future-time gate ('MAX_FUTURE_BLOCK_TIME'), difficulty
--- transition, checkpoint.  The future-time gate is anti-DoS: without it
--- a peer can announce a header chain whose timestamps are far in the
--- future, which passes PoW + MTP + difficulty (the timestamps are
--- consistent with each other) and pollutes 'hcEntries' until manually
--- pruned.  Reference: bitcoin-core/src/validation.cpp
--- 'ContextualCheckBlockHeader' "block-time-too-new".
+-- 'ContextualCheckBlockHeader' (validation.cpp:4080-4121):
+--  1. PoW check (context-free)
+--  2. Timestamp > MTP of previous 11 blocks (time-too-old)
+--  3. BIP94 timewarp check at difficulty-adjustment boundaries (time-timewarp-attack)
+--  4. Timestamp <= now + 2h (time-too-new, anti-DoS)
+--  5. Difficulty bits match expected target (bad-diffbits)
+--  6. Checkpoint verification
+--
+-- The future-time gate is anti-DoS: without it a peer can announce a
+-- header chain whose timestamps are far in the future, which passes
+-- PoW + MTP + difficulty (the timestamps are internally consistent so
+-- all checks pass), and pollutes 'hcEntries' until manually pruned.
+-- Reference: bitcoin-core/src/validation.cpp:4108-4110.
 addHeader :: Network -> HeaderChain -> BlockHeader -> IO (Either String ChainEntry)
 addHeader net hc header = do
   let hash = computeBlockHash header
@@ -3256,7 +3314,9 @@ addHeader net hc header = do
   entries <- readTVarIO (hcEntries hc)
   -- Wall-clock for the +2h future-time gate.  Read once per header so
   -- batch-acceptance does not see a sliding cutoff inside one call.
-  now <- (round <$> getPOSIXTime) :: IO Word32
+  -- Use Int64 to match Core's int64_t and avoid Word32 overflow near 2106.
+  -- Reference: bitcoin-core/src/chain.h:29 (MAX_FUTURE_BLOCK_TIME is int64_t)
+  now <- (round <$> getPOSIXTime) :: IO Int64
 
   -- Check if already known
   case Map.lookup hash entries of
@@ -3271,28 +3331,41 @@ addHeader net hc header = do
         if not (checkProofOfWork header (netPowLimit net))
           then return $ Left "Proof of work check failed"
           else do
-            -- Validate timestamp > MTP
+            -- Gate 1: Timestamp > MTP of previous 11 blocks (time-too-old).
+            -- Reference: bitcoin-core/src/validation.cpp:4092-4093
             let mtp = medianTimePast entries prevHash
             if bhTimestamp header <= mtp
-              then return $ Left "Timestamp not after median time past"
-            else if bhTimestamp header > now + maxFutureBlockTime
-              -- +2h future-time gate (BIP-0113 / Core
-              -- 'MAX_FUTURE_BLOCK_TIME').  Header timestamp must not
-              -- exceed our adjusted-network time + 2 hours, otherwise
-              -- it's rejected as 'time-too-new'.  A peer who keeps
-              -- sending such headers is misbehaving and the caller
-              -- should ban / disconnect them.
-              then return $ Left "Block timestamp too far in the future (time-too-new)"
+              then return $ Left "time-too-old"
+            -- Gate 2: BIP94 timewarp check at difficulty-adjustment boundaries.
+            -- Only applies when enforce_BIP94 is set (testnet4, regtest w/ BIP94).
+            -- The first block of each 2016-block interval must not have a timestamp
+            -- more than MAX_TIMEWARP (600s) earlier than the previous block.
+            -- Reference: bitcoin-core/src/validation.cpp:4097-4104
+            else if netEnforceBIP94 net
+                    && height `mod` netRetargetInterval net == 0
+                    && (fromIntegral (bhTimestamp header) :: Int64)
+                         < (fromIntegral (bhTimestamp (ceHeader parent)) :: Int64) - maxTimewarp
+              then return $ Left "time-timewarp-attack"
+            -- Gate 3: Timestamp <= now + MAX_FUTURE_BLOCK_TIME (time-too-new).
+            -- Reference: bitcoin-core/src/validation.cpp:4108-4110
+            else if (fromIntegral (bhTimestamp header) :: Int64) > now + maxFutureBlockTime
+              -- +2h future-time gate.  Header timestamp must not exceed our
+              -- adjusted-network time + 2 hours.  A peer who keeps sending such
+              -- headers is misbehaving and the caller should ban / disconnect them.
+              then return $ Left "time-too-new"
               else do
-                -- Validate difficulty (skip on testnet if min-diff blocks allowed)
-                let expectedBits = difficultyAdjustment net entries parent
-                    difficultyOk = bhBits header == expectedBits
-                                || netAllowMinDiffBlocks net
+                -- Gate 4: Difficulty bits match expected target (bad-diffbits).
+                -- For testnet the expected bits from difficultyAdjustment already
+                -- incorporates the 20-minute min-difficulty rule — no additional
+                -- override is needed here.
+                -- Reference: bitcoin-core/src/validation.cpp:4088-4089
+                let expectedBits = difficultyAdjustment net entries parent header
+                    difficultyOk  = bhBits header == expectedBits
 
                 if not difficultyOk
-                  then return $ Left "Incorrect difficulty target"
+                  then return $ Left "bad-diffbits"
                   else do
-                    -- Verify checkpoint (if one exists at this height)
+                    -- Gate 5: Checkpoint verification
                     let checkpoints = buildCheckpoints net
                     case verifyCheckpoint checkpoints height hash of
                       Left (ChainErrCheckpoint h expected actual) ->
@@ -3300,6 +3373,15 @@ addHeader net hc header = do
                                        ": expected " ++ show expected ++ " got " ++ show actual
                       Left err -> return $ Left $ "Checkpoint error: " ++ show err
                       Right () -> do
+                        -- Compute MTP of the new entry itself (inclusive of its own
+                        -- timestamp).  This is the value a child block will use when
+                        -- looking up prevCe.ceMedianTime in connectChain.
+                        -- Pre-fix ceMedianTime stored the *parent's* MTP here, which
+                        -- was one block behind — connectChain saw MTP(grandparent)
+                        -- instead of MTP(parent) and the BIP-113 locktime cutoff was
+                        -- one block stale.
+                        -- Reference: bitcoin-core/src/chain.h:233-244 GetMedianTimePast()
+                        let newEntryMtp = computeEntryMtp entries prevHash (bhTimestamp header)
                         -- Compute metadata
                         let work = cumulativeWork (ceChainWork parent) header
                             entry = ChainEntry
@@ -3309,7 +3391,7 @@ addHeader net hc header = do
                               , ceChainWork = work
                               , cePrev = Just prevHash
                               , ceStatus = StatusHeaderValid
-                              , ceMedianTime = mtp
+                              , ceMedianTime = newEntryMtp
                               }
 
                         -- Insert and potentially update tip atomically.
@@ -3380,11 +3462,11 @@ addSideBranchHeader hc header = do
       Just parent -> do
         let height = ceHeight parent + 1
             work   = cumulativeWork (ceChainWork parent) header
-            -- MTP at the new entry mirrors what 'addHeader' would compute
-            -- (median of the previous 11 timestamps).  Sourced from the
-            -- BLOCK's parent so side-branch siblings get a side-branch MTP
-            -- rather than the active chain's.
-            mtp = medianTimePast entries prevHash
+            -- MTP of the new entry itself (inclusive of its own timestamp).
+            -- Uses computeEntryMtp so that child blocks reading ceMedianTime
+            -- get the correct value rather than the off-by-one parent's MTP.
+            -- Reference: bitcoin-core/src/chain.h:233-244
+            newMtp = computeEntryMtp entries prevHash (bhTimestamp header)
             entry = ChainEntry
               { ceHeader     = header
               , ceHash       = hash
@@ -3392,7 +3474,7 @@ addSideBranchHeader hc header = do
               , ceChainWork  = work
               , cePrev       = Just prevHash
               , ceStatus     = StatusValid -- caller has run validateFullBlockIO
-              , ceMedianTime = mtp
+              , ceMedianTime = newMtp
               }
         atomically $ modifyTVar' (hcEntries hc) (Map.insert hash entry)
         return $ Right entry

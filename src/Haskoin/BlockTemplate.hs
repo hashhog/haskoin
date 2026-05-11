@@ -185,16 +185,20 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
   let height = ceHeight tip + 1
       prevHash = ceHash tip
 
-  -- Calculate difficulty for the new block
+  -- Calculate timestamps first (needed for testnet min-difficulty rule).
   entries <- readTVarIO (hcEntries hc)
-  let expectedBits = difficultyAdjustment net entries tip
-
-  -- Calculate timestamps
   now <- (round :: Double -> Word32) . realToFrac <$> getPOSIXTime
   let mtp = medianTimePast entries prevHash
       minTime = mtp + 1
       maxTime = now + 7200  -- current time + 2 hours
       curTime = max minTime now
+
+  -- Calculate difficulty for the new block.
+  -- For testnet (netAllowMinDiffBlocks) difficultyAdjustment needs the
+  -- candidate timestamp to evaluate the 20-minute min-difficulty rule.
+  -- We use curTime as the representative timestamp.
+  let candidateHdrForBits = BlockHeader 0 prevHash (Hash256 (BS.replicate 32 0)) curTime 0 0
+      expectedBits = difficultyAdjustment net entries tip candidateHdrForBits
 
   -- Select transactions from mempool (highest ancestor fee rate first)
   -- Reserve some weight for coinbase (~4000 weight units)
