@@ -9,7 +9,7 @@ import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Serialize (encode, decode, runPut, runGet, putWord32le, put)
-import Data.Serialize.Put (putByteString, putWord8)
+import Data.Serialize.Put (putByteString, putWord8, putWord64le)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
@@ -12646,6 +12646,44 @@ main = hspec $ do
 
   describe "SipHash" $ do
     describe "sipHash128" $ do
+      -- Reference vectors from the SipHash-2-4 spec paper (Aumasson & Bernstein)
+      -- https://131002.net/siphash/siphash.pdf Appendix A
+      -- Key: 00 01 02 .. 0f (little-endian: k0=0x0706050403020100, k1=0x0f0e0d0c0b0a0908)
+      -- Input: 00 01 02 ... (i-1 bytes), Hash: given in paper
+      it "spec vector: 0-byte input" $ do
+        let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            result = sipHash128 key BS.empty
+        result `shouldBe` 0x726fdb47dd0e0e31
+
+      it "spec vector: 1-byte input (0x00)" $ do
+        let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            result = sipHash128 key (BS.singleton 0x00)
+        result `shouldBe` 0x74f839c593dc67fd
+
+      it "spec vector: 7-byte input (0x00..0x06)" $ do
+        -- 7 bytes = all leftover (no full 8-byte block)
+        -- Core siphash_4_2_testvec[7] = 0xab0200f58b01d137
+        let key  = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            msg  = BS.pack [0x00..0x06]
+            result = sipHash128 key msg
+        result `shouldBe` 0xab0200f58b01d137
+
+      it "spec vector: 8-byte input (0x00..0x07)" $ do
+        -- 8 bytes = exactly one full block, no leftover
+        -- Core siphash_4_2_testvec[8] = 0x93f5f5799a932462
+        let key  = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            msg  = BS.pack [0x00..0x07]
+            result = sipHash128 key msg
+        result `shouldBe` 0x93f5f5799a932462
+
+      it "spec vector: 15-byte input (0x00..0x0e)" $ do
+        -- 15 bytes = one full block + 7-byte leftover
+        -- Core siphash_4_2_testvec[15] = 0xa129ca6149be45e5
+        let key  = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            msg  = BS.pack [0x00..0x0e]
+            result = sipHash128 key msg
+        result `shouldBe` 0xa129ca6149be45e5
+
       it "produces non-zero output for non-empty input" $ do
         let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
             result = sipHash128 key "hello"
@@ -12663,6 +12701,115 @@ main = hspec $ do
             result1 = sipHash128 key1 "test"
             result2 = sipHash128 key2 "test"
         result1 `shouldNotBe` result2
+
+    describe "BIP-152 compact block reconstruction" $ do
+      -- Build a minimal block with two txs: coinbase (prefilled) + one other (short-ID)
+      let buildTx :: Word32 -> Word32 -> Tx
+          buildTx seqNum lockTime = Tx
+            { txVersion  = 1
+            , txInputs   = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff)
+                                 (BS.pack [0x03, 0x00, 0x01, fromIntegral (seqNum `rem` 256)])
+                                 0xffffffff]
+            , txOutputs  = [TxOut 5000000000 (BS.pack [0x51])]  -- OP_1
+            , txWitness  = [[]]
+            , txLockTime = lockTime
+            }
+          coinbase = buildTx 0 0
+          otherTx  = buildTx 1 1
+          -- compute txids using doubleSHA256 on non-witness serialization
+          txHashLE t = let bs = runPut $ do
+                                  putWord32le (fromIntegral (txVersion t))
+                                  putVarInt (fromIntegral $ length (txInputs t))
+                                  mapM_ put (txInputs t)
+                                  putVarInt (fromIntegral $ length (txOutputs t))
+                                  mapM_ put (txOutputs t)
+                                  putWord32le (txLockTime t)
+                       in getHash256 (doubleSHA256 bs)
+          -- compute merkle root
+          merkleParentH l r = doubleSHA256 (BS.append (getHash256 l) (getHash256 r))
+          merkleRoot2 tx0 tx1 = merkleParentH (Hash256 (txHashLE tx0)) (Hash256 (txHashLE tx1))
+          -- cbNonce is the compact block nonce (Word64), distinct from header nonce (Word32)
+          cbNonce64 = 0xdeadbeefcafebabe :: Word64
+          mrk = merkleRoot2 coinbase otherTx
+          -- Block header: bhNonce=0 (header PoW nonce, Word32), not the compact-block nonce
+          blockHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                    mrk 0 0x207fffff (0 :: Word32)
+          sipKey = computeShortIdKey blockHeader cbNonce64
+          wtxidOther = getHash256 (doubleSHA256 (encode otherTx))
+          shortId = computeShortId sipKey wtxidOther
+          cb = CmpctBlock
+            { cbHeader    = blockHeader
+            , cbNonce     = cbNonce64
+            , cbShortIds  = [shortId]
+            , cbPrefilled = [PrefilledTx 0 coinbase]
+            }
+          mempoolMap = Map.fromList [(TxId (Hash256 (txHashLE otherTx)), otherTx)]
+
+      it "reconstructs a 2-tx block from compact block + mempool" $ do
+        case initPartialBlock cb mempoolMap of
+          Left err -> expectationFailure ("initPartialBlock failed: " ++ err)
+          Right (pdb, missing) -> do
+            missing `shouldBe` []
+            case fillPartialBlock pdb [] of
+              Left err  -> expectationFailure ("fillPartialBlock failed: " ++ err)
+              Right blk -> do
+                length (blockTxns blk) `shouldBe` 2
+                blockTxns blk !! 0 `shouldBe` coinbase
+                blockTxns blk !! 1 `shouldBe` otherTx
+
+      it "returns missing indices when mempool is empty" $ do
+        case initPartialBlock cb Map.empty of
+          Left err -> expectationFailure ("initPartialBlock failed: " ++ err)
+          Right (pdb, missing) -> missing `shouldBe` [1]
+
+      it "rejects empty compact block (no short IDs and no prefilled)" $ do
+        let badCb = cb { cbShortIds = [], cbPrefilled = [] }
+        case initPartialBlock badCb Map.empty of
+          Left _  -> return ()  -- expected
+          Right _ -> expectationFailure "should have rejected empty compact block"
+
+      it "rejects compact block exceeding 100_000 total transactions" $ do
+        -- 100_001 short IDs should be rejected
+        let bigCb = cb { cbShortIds = replicate 100001 0, cbPrefilled = [] }
+        case initPartialBlock bigCb Map.empty of
+          Left _  -> return ()  -- expected
+          Right _ -> expectationFailure "should have rejected oversized compact block"
+
+      it "rejects prefilled index overflow (> 65535)" $ do
+        -- relIdx = 65535, previous absIdx = -1, so absIdx = -1+1+65535 = 65535 (OK)
+        -- relIdx = 1, previous absIdx = 65535, so absIdx = 65535+1+1 = 65537 (overflow)
+        let overflowCb = cb
+              { cbShortIds  = []
+              , cbPrefilled = [ PrefilledTx 0     coinbase
+                              , PrefilledTx 65535 otherTx ]
+              }
+        case initPartialBlock overflowCb Map.empty of
+          Left _  -> return ()  -- expected
+          Right _ -> expectationFailure "should have rejected index overflow"
+
+      it "detects short-ID collision" $ do
+        let collisionCb = cb { cbShortIds = [shortId, shortId], cbPrefilled = [PrefilledTx 0 coinbase] }
+        case initPartialBlock collisionCb Map.empty of
+          Left _  -> return ()  -- expected
+          Right _ -> expectationFailure "should have detected short-ID collision"
+
+      it "CmpctBlock serialization round-trips" $ do
+        let encoded = encode cb
+            decoded = decode encoded :: Either String CmpctBlock
+        decoded `shouldBe` Right cb
+
+      it "CmpctBlock deserialization rejects BlockTxCount > 65535" $ do
+        -- Craft a fake serialized cmpctblock with count = 65536
+        let fakePayload = runPut $ do
+              put blockHeader
+              putWord64le cbNonce64
+              -- shortIdCount = 65536: VarInt encoding needs 5-byte form 0xfe 00 00 01 00
+              putWord8 0xfe
+              putWord32le 65536  -- shortIdCount = 65536
+              -- No actual short IDs follow (we just want the count validation)
+        case decode fakePayload :: Either String CmpctBlock of
+          Left _  -> return ()  -- expected: rejected
+          Right _ -> expectationFailure "should have rejected BlockTxCount > 65535"
 
   describe "MuHash3072" $ do
     -- Helper: Core's FromInt(i) is MuHash3072(tmp) where tmp = [i, 0, 0, ..., 0]
