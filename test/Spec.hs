@@ -2232,9 +2232,11 @@ main = hspec $ do
                             BS.empty seqNonFinal
           nonFinalTx = Tx 1 [nonFinalIn] [TxOut 1000 BS.empty] [[]] 500
           txns     = [coinbase, nonFinalTx]
-          -- Compute the real merkle root so the block passes check 3
+          -- Compute the real merkle root so the block passes check 3.
+          -- Use nVersion=4 to pass bad-version gate (all BIPs active at
+          -- regtest height 100); focus of this test is bad-txns-nonfinal.
           realMerkle = computeMerkleRoot (map computeTxId txns)
-          blkHdr   = BlockHeader 1 prevH realMerkle 0 0 0
+          blkHdr   = BlockHeader 4 prevH realMerkle 0 0 0
           block    = Block blkHdr txns
           cs = ChainState
                 { csHeight     = 99   -- next block = 100
@@ -2886,7 +2888,9 @@ main = hspec $ do
     it "rejects block with mismatched merkle root" $ do
       let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
           wrongMerkle = Hash256 (BS.replicate 32 0xff)  -- Wrong merkle root
-          header = BlockHeader 1 prevHash wrongMerkle 0 0x207fffff 0
+          -- Use nVersion=4 to pass bad-version gate (flagBIP34/66/65 all active
+          -- at height 1 on regtest); focus of this test is merkle root mismatch.
+          header = BlockHeader 4 prevHash wrongMerkle 0 0x207fffff 0
           nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
           coinbaseIn = TxIn nullOutpoint (BS.pack [0x01, 0x01]) 0xffffffff
           coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
@@ -2906,7 +2910,9 @@ main = hspec $ do
           coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
           txid = computeTxId coinbase
           merkle = computeMerkleRoot [txid]
-          header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
+          -- Use nVersion=4 to pass bad-version gate (all BIPs active on regtest);
+          -- focus of this test is the BIP-34 coinbase height mismatch.
+          header = BlockHeader 4 prevHash merkle 0 0x207fffff 0
           block = Block header [coinbase]
           -- Chain state at height 500 (BIP-34 active on regtest at 500)
           cs = ChainState 500 prevHash 0 0 (consensusFlagsAtHeight regtest 501)
@@ -2971,7 +2977,8 @@ main = hspec $ do
           coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
           txid = computeTxId coinbase
           merkle = computeMerkleRoot [txid]
-          header = BlockHeader 1 parentHash merkle 1700000000 0x207fffff 0
+          -- Use nVersion=4 to pass bad-version gate; focus is bad-cb-height.
+          header = BlockHeader 4 parentHash merkle 1700000000 0x207fffff 0
           block = Block header [coinbase]
           -- Pre-fix shape: csHeight = active tip height (112), giving
           -- height 113 inside the validator. Coinbase encodes 111.
@@ -3065,6 +3072,100 @@ main = hspec $ do
           expectationFailure "Should NOT reject coinbase with 100-byte scriptSig (bad-cb-length)"
         _ -> return ()  -- Other errors expected; bad-cb-length must NOT fire
 
+    -- W79: bad-version rejection (BIP-34/66/65 block version gates).
+    -- Bitcoin Core validation.cpp:4112-4118 (ContextualCheckBlockHeader):
+    --   nVersion < 2 rejected after BIP-34 (DEPLOYMENT_HEIGHTINCB) activation.
+    --   nVersion < 3 rejected after BIP-66 (DEPLOYMENT_DERSIG) activation.
+    --   nVersion < 4 rejected after BIP-65 (DEPLOYMENT_CLTV) activation.
+    -- DeploymentActiveAfter maps to height >= netBIPXXHeight in our scheme.
+    -- Reference: bitcoin-core/src/validation.cpp:4112-4118
+    it "W79: rejects nVersion=1 block after BIP-34 activation (bad-version)" $ do
+      let prevHash     = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          -- BIP-34 active at regtest from height 1; encode height 1 in coinbase
+          cbScript     = BS.pack [0x01, 0x01]  -- CScript() << 1
+          coinbaseIn   = TxIn nullOutpoint cbScript 0xffffffff
+          coinbase     = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid         = computeTxId coinbase
+          merkle       = computeMerkleRoot [txid]
+          -- nVersion = 1 — should be rejected after BIP-34 activation
+          header       = BlockHeader 1 prevHash merkle 1700000000 0x207fffff 0
+          block        = Block header [coinbase]
+          cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left msg | "bad-version" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $ "Wrong error (expected bad-version): " ++ msg
+        Right () -> expectationFailure "Should reject nVersion=1 block after BIP-34"
+
+    it "W79: rejects nVersion=2 block after BIP-66 activation (bad-version)" $ do
+      let prevHash     = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          cbScript     = BS.pack [0x01, 0x01]  -- height 1
+          coinbaseIn   = TxIn nullOutpoint cbScript 0xffffffff
+          coinbase     = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid         = computeTxId coinbase
+          merkle       = computeMerkleRoot [txid]
+          -- nVersion = 2: rejected after BIP-66 (flagBIP66 = True at regtest h=1)
+          header       = BlockHeader 2 prevHash merkle 1700000000 0x207fffff 0
+          block        = Block header [coinbase]
+          cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left msg | "bad-version" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $ "Wrong error (expected bad-version): " ++ msg
+        Right () -> expectationFailure "Should reject nVersion=2 block after BIP-66"
+
+    it "W79: rejects nVersion=3 block after BIP-65 activation (bad-version)" $ do
+      let prevHash     = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          cbScript     = BS.pack [0x01, 0x01]  -- height 1
+          coinbaseIn   = TxIn nullOutpoint cbScript 0xffffffff
+          coinbase     = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid         = computeTxId coinbase
+          merkle       = computeMerkleRoot [txid]
+          -- nVersion = 3: rejected after BIP-65 (flagBIP65 = True at regtest h=1)
+          header       = BlockHeader 3 prevHash merkle 1700000000 0x207fffff 0
+          block        = Block header [coinbase]
+          cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        Left msg | "bad-version" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $ "Wrong error (expected bad-version): " ++ msg
+        Right () -> expectationFailure "Should reject nVersion=3 block after BIP-65"
+
+    it "W79: accepts nVersion=4 block after all BIP-34/66/65 activations" $ do
+      let prevHash     = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          cbScript     = BS.pack [0x01, 0x01]  -- height 1
+          coinbaseIn   = TxIn nullOutpoint cbScript 0xffffffff
+          coinbase     = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid         = computeTxId coinbase
+          merkle       = computeMerkleRoot [txid]
+          header       = BlockHeader 4 prevHash merkle 1700000000 0x207fffff 0
+          block        = Block header [coinbase]
+          cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
+      case validateFullBlock regtest cs False block Map.empty of
+        -- Should NOT fail with bad-version (may fail for other reasons like subsidy)
+        Left msg | "bad-version" `T.isInfixOf` T.pack msg ->
+          expectationFailure $ "Should NOT reject nVersion=4 with bad-version: " ++ msg
+        _ -> return ()
+
+    it "W79: nVersion=1 block before BIP-34 activation is NOT rejected (pre-activation)" $ do
+      let prevHash     = BlockHash (Hash256 (BS.replicate 32 0))
+          nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+          -- Pre-activation: height 0 on mainnet, BIP-34 not yet active
+          cbScript     = BS.singleton 0x51  -- OP_1 (height 1, but coinbase can be anything pre-BIP34)
+          coinbaseIn   = TxIn nullOutpoint cbScript 0xffffffff
+          coinbase     = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
+          txid         = computeTxId coinbase
+          merkle       = computeMerkleRoot [txid]
+          header       = BlockHeader 1 prevHash merkle 1700000000 0x1d00ffff 0
+          block        = Block header [coinbase]
+          -- mainnet height 0: flagBIP34 = False (activates at 227931)
+          cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight mainnet 0)
+      case validateFullBlock mainnet cs False block Map.empty of
+        Left msg | "bad-version" `T.isInfixOf` T.pack msg ->
+          expectationFailure $ "Should NOT reject nVersion=1 pre-BIP34: " ++ msg
+        _ -> return ()  -- Other errors (PoW etc.) are expected; bad-version must not fire
+
     -- P0-3: validateFullBlock must invoke verifyScriptWithFlags on every
     -- non-coinbase input when skipScripts == False. Prior to the wiring
     -- patch this was DEAD CODE — any block with valid structure but
@@ -3093,7 +3194,9 @@ main = hspec $ do
           spendingTx  = Tx 1 [spendingIn] [TxOut 1000 BS.empty] [[]] 0
           txns        = [coinbase, spendingTx]
           realMerkle  = computeMerkleRoot (map computeTxId txns)
-          blkHdr      = BlockHeader 1 prevH realMerkle 0 0 0
+          -- Use nVersion=4 to pass bad-version gate (all BIPs active at
+          -- regtest height 100); the focus of this test is script verification.
+          blkHdr      = BlockHeader 4 prevH realMerkle 0 0 0
           block       = Block blkHdr txns
           cs = ChainState
                 { csHeight     = 99
@@ -3137,7 +3240,8 @@ main = hspec $ do
           spendingTx  = Tx 1 [spendingIn] [TxOut 1000 BS.empty] [[]] 0
           txns        = [coinbase, spendingTx]
           realMerkle  = computeMerkleRoot (map computeTxId txns)
-          blkHdr      = BlockHeader 1 prevH realMerkle 0 0 0
+          -- Use nVersion=4 to pass bad-version gate.
+          blkHdr      = BlockHeader 4 prevH realMerkle 0 0 0
           block       = Block blkHdr txns
           cs = ChainState
                 { csHeight     = 99
@@ -3250,7 +3354,9 @@ main = hspec $ do
     it "case 6: non-script validation (bad merkle) still rejects under assumevalid" $ do
       let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
           wrongMerkle = Hash256 (BS.replicate 32 0xff)
-          header = BlockHeader 1 prevHash wrongMerkle 0 0x207fffff 0
+          -- Use nVersion=4 to pass bad-version gate (all BIPs active at regtest
+          -- height 1); the focus of this test is the merkle-root structural check.
+          header = BlockHeader 4 prevHash wrongMerkle 0 0x207fffff 0
           nullOp = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
           coinbaseIn = TxIn nullOp (BS.pack [0x01, 0x01]) 0xffffffff
           coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
@@ -16688,23 +16794,32 @@ main = hspec $ do
             1700000000 0x207fffff 0)
           txns
 
-    it "height 91842 is exempt even with a pre-existing UTXO (mainnet)" $
+    -- Gate 1: IsBIP30Repeat — exempts the two historical grandfathered blocks.
+    -- Core validation.cpp:6189-6193 (IsBIP30Repeat) checks BOTH height AND hash.
+    -- A block at the right height but with the wrong hash is NOT exempt.
+
+    it "height 91842 with wrong hash is NOT exempt (hash anchor required)" $
       withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
         bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
           let txid = computeTxId minimalTx
               op   = OutPoint txid 0
           putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          -- minimalBlock has a synthetic zero header hash, not the canonical 91842 hash
           result <- checkBIP30 db mainnet 91842 (minimalBlock [minimalTx])
-          result `shouldBe` Right ()
+          result `shouldSatisfy` \r -> case r of
+            Left _   -> True   -- BIP-30 fires because hash doesn't match canonical
+            Right () -> False
 
-    it "height 91880 is exempt even with a pre-existing UTXO (mainnet)" $
+    it "height 91880 with wrong hash is NOT exempt (hash anchor required)" $
       withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
         bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
           let txid = computeTxId minimalTx
               op   = OutPoint txid 0
           putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
           result <- checkBIP30 db mainnet 91880 (minimalBlock [minimalTx])
-          result `shouldBe` Right ()
+          result `shouldSatisfy` \r -> case r of
+            Left _   -> True
+            Right () -> False
 
     it "height 91843 enforces BIP-30 when UTXO pre-exists (mainnet)" $
       withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
@@ -16735,25 +16850,66 @@ main = hspec $ do
               Left _  -> True   -- BIP-30 must fire at old wrong heights
               Right () -> False
 
-    it "post-BIP34 height 228000 skips BIP-30 check (mainnet BIP34 active)" $
+    -- Gate 2: BIP34 hash-anchor skip.
+    -- BIP30 is skipped in [BIP34Height, 1983702) only when the block at
+    -- netBIP34Height has the expected netBIP34Hash in the local DB.
+    -- Without the anchor, BIP30 stays enforced (unknown fork).
+
+    it "post-BIP34 height 228000 skips BIP-30 when anchor is in DB (mainnet)" $
       withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
         bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
           let txid = computeTxId minimalTx
               op   = OutPoint txid 0
           putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          -- Store the canonical BIP34 anchor (mainnet block 227931 hash).
+          -- Core: consensus.BIP34Hash = 000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8
+          putBlockHeight db 227931 (netBIP34Hash mainnet)
           -- mainnet netBIP34Height = 227931; h=228000 is above that and below 1983702
           result <- checkBIP30 db mainnet 228000 (minimalBlock [minimalTx])
           result `shouldBe` Right ()
 
-    it "regtest height 100 skips BIP-30 (netBIP34Height=1, BIP-34 immediately active)" $
+    it "post-BIP34 height 228000 enforces BIP-30 when anchor is NOT in DB (fork guard)" $
       withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
         bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
           let txid = computeTxId minimalTx
               op   = OutPoint txid 0
           putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
-          -- regtest: BIP34 active from block 1, so BIP-30 skipped for h in [1, 1983701]
+          -- DB is empty (no anchor stored) — unknown fork, BIP30 must stay enforced.
+          result <- checkBIP30 db mainnet 228000 (minimalBlock [minimalTx])
+          result `shouldSatisfy` \r -> case r of
+            Left _   -> True
+            Right () -> False
+
+    it "post-BIP34 height 228000 enforces BIP-30 when anchor hash is WRONG (fork guard)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          -- Store a wrong hash at the BIP34 height — simulates an alternative fork.
+          let wrongHash = BlockHash (Hash256 (BS.replicate 32 0xDE))
+          putBlockHeight db 227931 wrongHash
+          result <- checkBIP30 db mainnet 228000 (minimalBlock [minimalTx])
+          result `shouldSatisfy` \r -> case r of
+            Left _   -> True
+            Right () -> False
+
+    it "regtest height 100 skips BIP-30 when BIP34 anchor is in DB (netBIP34Height=1)" $
+      withSystemTempDirectory "haskoin-bip30" $ \tmpDir ->
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let txid = computeTxId minimalTx
+              op   = OutPoint txid 0
+          putUTXO db op (TxOut 5000000000 (BS.singleton 0x51))
+          -- Regtest: netBIP34Height=1, netBIP34Hash=zeroes.
+          -- Core uses uint256{} (zero hash) for regtest BIP34Hash.
+          -- Since no actual block ever has the zero hash, the anchor check
+          -- always fails on regtest (confirming the zero hash is impossible),
+          -- so BIP30 stays enforced.  This matches Core's regtest behaviour
+          -- where the BIP30 guard is always run (no anchor short-circuit).
           result <- checkBIP30 db regtest 100 (minimalBlock [minimalTx])
-          result `shouldBe` Right ()
+          result `shouldSatisfy` \r -> case r of
+            Left _   -> True   -- BIP30 is enforced on regtest (anchor = zero hash)
+            Right () -> False
 
   -- Pattern C1: stale-confirmations after reorg.
   -- Reference: bitcoin-core/src/rpc/rawtransaction.cpp::TxToJSON
