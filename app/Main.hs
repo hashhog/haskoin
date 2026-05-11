@@ -677,8 +677,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           putStrLn $ "[--load-snapshot] imported " ++ show n
                   ++ " UTXO(s); best-block pinned to snapshot base."
 
-    -- Initialize mempool
-    mp <- newMempool net cache defaultMempoolConfig 0 0
+    -- Initialize mempool.
+    -- Provide a per-input coin-MTP lookup function (BIP-68 time-based locks):
+    -- given a coin-height H, return MTP(max(H-1, 0)).
+    -- Reference: Bitcoin Core tx_verify.cpp:74 — nCoinTime =
+    --   GetAncestor(max(H-1,0))->GetMedianTimePast().
+    let getCoinMtpFromChain coinH = do
+          entries  <- readTVarIO (hcEntries hc)
+          byHeight <- readTVarIO (hcByHeight hc)
+          let targetH = if coinH == 0 then 0 else coinH - 1
+          case Map.lookup targetH byHeight of
+            Just blockHash -> return (medianTimePast entries blockHash)
+            Nothing        -> return 0  -- height not in chain (shouldn't happen)
+    mp <- newMempool net cache defaultMempoolConfig 0 0 getCoinMtpFromChain
 
     -- Load mempool.dat (Core-format), if present. We use a 14-day
     -- expiry (matches Bitcoin Core's DEFAULT_MEMPOOL_EXPIRY_HOURS = 336).

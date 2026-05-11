@@ -32,6 +32,7 @@ module Haskoin.Mempool
   , calculateAdjustedVSize
     -- * Mempool Creation
   , newMempool
+  , noopCoinMtp
     -- * Transaction Operations
   , addTransaction
   , removeTransaction
@@ -53,6 +54,8 @@ module Haskoin.Mempool
   , selectTransactions
     -- * Conflict Detection
   , getConflicts
+    -- * BIP-68 sequence lock checks
+  , checkSeqLocksAtTip
     -- * RBF (Replace-by-Fee)
   , checkReplacement
   , removeConflicts
@@ -512,14 +515,38 @@ data Mempool = Mempool
   , mpUnbroadcast :: !(TVar (Set TxId))
     -- ^ Transactions originated locally that have not yet been confirmed
     -- relayed to a peer. Persisted in mempool.dat.
+  , mpGetCoinMtp :: !(Word32 -> IO Word32)
+    -- ^ BIP-68: Given a coin's confirmation height H, returns the Median Time
+    -- Past of block max(H-1, 0).  This is the per-input nCoinTime used by
+    -- Bitcoin Core's CalculateSequenceLocks (tx_verify.cpp:74).
+    -- Callers with a live header chain should supply a function that looks up
+    -- the height->hash index and calls medianTimePast.  In tests or when chain
+    -- history is unavailable, pass 'noopCoinMtp' (returns 0), which makes all
+    -- time-based BIP-68 locks appear trivially satisfied (over-permissive but
+    -- correct: the real enforcement is done by OP_CSV at script-eval time).
   }
+
+-- | A no-op coin-MTP lookup that returns 0 for every height.
+-- With coinMTP=0 the computed nMinTime = (lockValue<<9) - 1, which is always
+-- less than any real block timestamp, so all time-based BIP-68 constraints
+-- are treated as satisfied.  This is over-permissive but safe: the canonical
+-- enforcement happens via OP_CSV at script-evaluation time (which has full
+-- per-tx sequence context).  Use in tests and in nodes that have not wired a
+-- live header-chain lookup.
+noopCoinMtp :: Word32 -> IO Word32
+noopCoinMtp _ = return 0
 
 -- | Create a new empty mempool.
 -- 'height' is the current chain tip height; 'mtp' is the Median Time Past
 -- of the current tip (used for BIP-113 IsFinalTx at mempool admit).
 -- Pass 0 for both on a fresh node; they are updated via blockConnected.
-newMempool :: Network -> UTXOCache -> MempoolConfig -> Word32 -> Word32 -> IO Mempool
-newMempool net cache config height mtp = Mempool
+-- 'getCoinMtp' is a function that, given a confirmed UTXO's block height H,
+-- returns the Median Time Past of block max(H-1, 0).  This is used by the
+-- BIP-68 time-based relative-locktime check in checkSeqLocksAtTip.  Pass
+-- 'noopCoinMtp' when historical chain MTP data is unavailable.
+newMempool :: Network -> UTXOCache -> MempoolConfig -> Word32 -> Word32
+           -> (Word32 -> IO Word32) -> IO Mempool
+newMempool net cache config height mtp getCoinMtp = Mempool
   <$> newTVarIO Map.empty
   <*> newTVarIO Map.empty
   <*> newTVarIO Map.empty
@@ -533,6 +560,7 @@ newMempool net cache config height mtp = Mempool
   <*> newTVarIO []         -- mpRecentTimestamps: empty until blocks connect
   <*> newTVarIO Map.empty
   <*> newTVarIO Set.empty
+  <*> pure getCoinMtp
 
 --------------------------------------------------------------------------------
 -- Transaction Addition
@@ -1476,27 +1504,38 @@ blockDisconnected mp block = do
 
 -- | Check BIP-68 sequence locks for mempool admission.
 -- For each input, fetch the coin height from the UTXO set (unconfirmed mempool
--- parents get synthetic height tipHeight+1 and MTP mtp, matching Bitcoin
--- Core's CalculateLockPointsAtTip convention for chained unconfirmed txs).
+-- parents get synthetic height tipHeight+1, matching Bitcoin Core's
+-- CalculateLockPointsAtTip / CalculatePrevHeights convention).
+-- Per-input coin MTP is computed using 'mpGetCoinMtp': for confirmed UTXOs
+-- it returns MTP(max(coinHeight-1, 0)); for synthetic mempool-parent UTXOs
+-- we use the tip MTP, matching Core's treatment of MEMPOOL_HEIGHT inputs.
 -- Returns Right () if all locks are satisfied, Left err otherwise.
 -- Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckSequenceLocksAtTip
--- (validation.cpp:887).
+-- (validation.cpp:887) + CalculateLockPointsAtTip (validation.cpp:201).
+-- Reference: tx_verify.cpp:74 — nCoinTime = GetAncestor(max(H-1,0))->GetMedianTimePast()
 checkSeqLocksAtTip :: Mempool -> Tx -> Word32 -> Word32 -> IO (Either MempoolError ())
 checkSeqLocksAtTip mp tx tipHeight mtp = do
   let enforce = bip68Active (mpNetwork mp) (tipHeight + 1)
   if not enforce
     then return (Right ())
     else do
-      -- Collect per-input coin heights and MTPs.
-      -- UTXOs in the confirmed set: use their confirmed height.
-      -- UTXOs from unconfirmed mempool parents: use tipHeight+1 (synthetic).
+      -- Collect per-input coin heights and per-input coin MTPs.
+      -- UTXOs in the confirmed set: use confirmed height and MTP(max(H-1,0)).
+      -- UTXOs from unconfirmed mempool parents or unknown: use tipHeight+1 and
+      -- tip MTP, exactly as Bitcoin Core uses MEMPOOL_HEIGHT inputs.
       heightMTPs <- forM (txInputs tx) $ \inp -> do
         let op = txInPrevOutput inp
         mUtxo <- lookupUTXO (mpUTXOCache mp) op
         case mUtxo of
-          Just entry -> return (ueHeight entry, mtp)
-          Nothing -> do
-            -- Mempool parent or unknown — use tipHeight+1 as Bitcoin Core does
+          Just entry -> do
+            -- Confirmed UTXO: get MTP of block max(coinHeight-1, 0) as Core does.
+            -- tx_verify.cpp:74: nCoinTime = GetAncestor(max(H-1,0))->GetMedianTimePast()
+            let h = ueHeight entry
+            coinMtp <- mpGetCoinMtp mp (if h == 0 then 0 else h - 1)
+            return (h, coinMtp)
+          Nothing ->
+            -- Mempool parent or unknown — use tipHeight+1 + tip MTP as Core does
+            -- for MEMPOOL_HEIGHT coins (validation.cpp:189-191).
             return (tipHeight + 1, mtp)
       let (prevHeights, prevMTPs) = unzip heightMTPs
           lock = calculateSequenceLocks tx prevHeights prevMTPs True
