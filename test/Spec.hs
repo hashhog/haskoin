@@ -12624,6 +12624,119 @@ main = hspec $ do
         -- Headers should be different when prev header changes
         header1 `shouldNotBe` header2
 
+    -- BIP-158 reference vectors from bitcoin-core/src/test/data/blockfilters.json
+    -- These pin the SHA256d hash and header against Core-derived expected values.
+    describe "BIP-158 reference vectors (blockfilters.json)" $ do
+      -- Helper: decode hex to ByteString
+      let hexBS h = case B16.decode (TE.encodeUtf8 (T.pack h)) of
+                      Right bs -> bs
+                      Left e   -> error ("hexBS: " ++ e)
+      -- Helper: decode a 32-byte display-order hex (Bitcoin RPC convention,
+      -- big-endian display) into internal Hash256 (little-endian storage).
+      -- Bitcoin Core displays all hashes byte-reversed, so we reverse here.
+      let hexHash256 h = Hash256 (BS.reverse (hexBS h))
+
+      it "block 0 (genesis): gcsFilterEmpty encodes as 0x00 (compact-size for N=0)" $ do
+        let blockHash = BlockHash (hexHash256 "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943")
+            emptyFilt = gcsFilterEmpty (basicFilterParams blockHash)
+        -- Core's empty filter always has encoded = {0x00}
+        gcsEncoded emptyFilt `shouldBe` BS.singleton 0x00
+
+      it "block 0 (genesis): filter hash is SHA256d of encoded bytes" $ do
+        -- Filter bytes from blockfilters.json: "019dfca8"
+        let filterBytes = hexBS "019dfca8"
+            blockHash   = BlockHash (hexHash256 "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943")
+        -- blockFilterHash = SHA256d(filterBytes)
+        let expectedHash = doubleSHA256 filterBytes
+        -- Reconstruct filter from encoded bytes and check hash matches
+        case decodeBlockFilter BasicBlockFilter blockHash filterBytes of
+          Left err -> expectationFailure ("decodeBlockFilter failed: " ++ err)
+          Right bf -> blockFilterHash bf `shouldBe` expectedHash
+
+      it "block 0 (genesis): filter header chains correctly (SHA256d)" $ do
+        -- From blockfilters.json row 0:
+        --   prev_filter_header = "0000...0000"
+        --   filter_bytes       = "019dfca8"
+        --   expected_header    = "21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750"
+        let filterBytes  = hexBS "019dfca8"
+            blockHash    = BlockHash (hexHash256 "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943")
+            prevHeader   = hexHash256 "0000000000000000000000000000000000000000000000000000000000000000"
+            -- Expected header from blockfilters.json (stored as LE hex in the JSON)
+            expectedHdr  = hexHash256 "21584579b7eb08997773e5aeff3a7f932700042d0ed2a6129012b7d7ae81b750"
+        case decodeBlockFilter BasicBlockFilter blockHash filterBytes of
+          Left err -> expectationFailure ("decodeBlockFilter failed: " ++ err)
+          Right bf -> blockFilterHeader bf prevHeader `shouldBe` expectedHdr
+
+      it "block 2: filter header chains from block 0 header" $ do
+        -- blockfilters.json row 1 (block 2):
+        --   filter_bytes = "0174a170"
+        --   prev_header  = "d7bdac13a59d745b1add0d2ce852f1a0442e8945fc1bf3848d3cbffd88c24fe1"
+        --   expected_hdr = "186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0"
+        let filterBytes  = hexBS "0174a170"
+            blockHash    = BlockHash (hexHash256 "000000006c02c8ea6e4ff69651f7fcde348fb9d557a06e6957b65552002a7820")
+            prevHeader   = hexHash256 "d7bdac13a59d745b1add0d2ce852f1a0442e8945fc1bf3848d3cbffd88c24fe1"
+            expectedHdr  = hexHash256 "186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0"
+        case decodeBlockFilter BasicBlockFilter blockHash filterBytes of
+          Left err -> expectationFailure ("decodeBlockFilter failed: " ++ err)
+          Right bf -> blockFilterHeader bf prevHeader `shouldBe` expectedHdr
+
+      it "block 3: filter header chains from block 2 header" $ do
+        -- blockfilters.json row 2 (block 3):
+        --   filter_bytes = "016cf7a0"
+        --   prev_header  = "186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0"
+        --   expected_hdr = "8d63aadf5ab7257cb6d2316a57b16f517bff1c6388f124ec4c04af1212729d2a"
+        let filterBytes  = hexBS "016cf7a0"
+            blockHash    = BlockHash (hexHash256 "000000008b896e272758da5297bcd98fdc6d97c9b765ecec401e286dc1fdbe10")
+            prevHeader   = hexHash256 "186afd11ef2b5e7e3504f2e8cbf8df28a1fd251fe53d60dff8b1467d1b386cf0"
+            expectedHdr  = hexHash256 "8d63aadf5ab7257cb6d2316a57b16f517bff1c6388f124ec4c04af1212729d2a"
+        case decodeBlockFilter BasicBlockFilter blockHash filterBytes of
+          Left err -> expectationFailure ("decodeBlockFilter failed: " ++ err)
+          Right bf -> blockFilterHeader bf prevHeader `shouldBe` expectedHdr
+
+      it "blockFilterElements: OP_RETURN in spent output IS included in filter" $ do
+        -- BIP-158 / Core: spent outputs (undo data) are included regardless of OP_RETURN.
+        -- Only new output OP_RETURNs are excluded.
+        let opReturnScript = BS.pack [0x6a] <> BS.replicate 10 0xbb  -- OP_RETURN
+            normalScript   = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xaa <> BS.pack [0x88, 0xac]
+            txout          = TxOut 100000 normalScript
+            tx             = Tx 1 [] [txout] [] 0
+            block          = Block (BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                      (Hash256 (BS.replicate 32 0)) 0 0 0) [tx]
+            -- OP_RETURN script is in the undo (spent output), not a new output
+            spentTxin      = TxInUndo (TxOut 0 opReturnScript) 500 False
+            undo           = BlockUndo [TxUndo [spentTxin]]
+            elements       = blockFilterElements block undo
+        -- The OP_RETURN script from the spent output MUST be included
+        opReturnScript `elem` elements `shouldBe` True
+        -- The normal new output script is also included
+        normalScript `elem` elements `shouldBe` True
+
+      it "blockFilterElements: OP_RETURN in new output is NOT included in filter" $ do
+        let opReturnScript = BS.pack [0x6a] <> BS.replicate 10 0xbb  -- OP_RETURN
+            normalScript   = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xaa <> BS.pack [0x88, 0xac]
+            txout1         = TxOut 100000 normalScript
+            txout2         = TxOut 0      opReturnScript
+            tx             = Tx 1 [] [txout1, txout2] [] 0
+            block          = Block (BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                                      (Hash256 (BS.replicate 32 0)) 0 0 0) [tx]
+            undo           = BlockUndo []
+            elements       = blockFilterElements block undo
+        normalScript   `elem` elements `shouldBe` True
+        opReturnScript `elem` elements `shouldBe` False
+
+      it "last empty-data block (block 1414221): empty filter has correct header" $ do
+        -- blockfilters.json row 9 (block 1414221):
+        --   filter_bytes = "00"  (N=0, empty filter)
+        --   prev_header  = "5e5e12d90693c8e936f01847859404c67482439681928353ca1296982042864e"
+        --   expected_hdr = "021e8882ef5a0ed932edeebbecfeda1d7ce528ec7b3daa27641acf1189d7b5dc"
+        let filterBytes  = hexBS "00"
+            blockHash    = BlockHash (hexHash256 "0000000000000027b2b3b3381f114f674f481544ff2be37ae3788d7e078383b1")
+            prevHeader   = hexHash256 "5e5e12d90693c8e936f01847859404c67482439681928353ca1296982042864e"
+            expectedHdr  = hexHash256 "021e8882ef5a0ed932edeebbecfeda1d7ce528ec7b3daa27641acf1189d7b5dc"
+        case decodeBlockFilter BasicBlockFilter blockHash filterBytes of
+          Left err -> expectationFailure ("decodeBlockFilter failed: " ++ err)
+          Right bf -> blockFilterHeader bf prevHeader `shouldBe` expectedHdr
+
   describe "fastRange64" $ do
     it "maps hash to range [0, range)" $ do
       let hash = 0xFFFFFFFFFFFFFFFF :: Word64
