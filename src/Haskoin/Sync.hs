@@ -411,58 +411,68 @@ blockProcessor bd = forever $ do
                       -- TODO: Could try to find alternative chain
 
                     Right () -> do
-                      -- Connect the block. Pass the same utxoMap that
-                      -- validation just consumed so connectBlock can
-                      -- write per-block undo data (TxOuts the block
-                      -- spends) atomically with the UTXO mutation.
-                      -- Without this, dumptxoutset rollback can't
-                      -- rewind: see handleDumpTxOutSet in Rpc.hs.
-                      connectBlock (bdDB bd) (bdNetwork bd) block nextHeight utxoMap
+                      -- W93: route through 'connectBlockAt' so the
+                      -- new G1 (hashPrevBlock == BestBlock) and G19
+                      -- (assert(is_spent)) gates fire as Left values
+                      -- on the IBD path.  Legacy 'connectBlock' would
+                      -- silently fall through these on a fresh DB +
+                      -- test harness; for the live blockProcessor we
+                      -- treat a gate failure as a hard error and bail
+                      -- on this block (mirrors Core's
+                      -- @InvalidBlockFound@ on @ConnectBlock@ failure).
+                      cbResult <- connectBlockAt (bdDB bd) (bdNetwork bd)
+                                                 block nextHeight utxoMap
+                      case cbResult of
+                        Left cbErr -> do
+                          putStrLn $ "connectBlockAt failed at height "
+                                     ++ show nextHeight ++ ": " ++ cbErr
+                          atomically $ modifyTVar' (bdPendingBlocks bd) (Map.delete bh)
 
-                      -- Mirror the connect into any opted-in
-                      -- secondary indexes (txindex / blockfilterindex
-                      -- / coinstatsindex).  We read the undo record
-                      -- back from disk (cheap point-lookup; the same
-                      -- writeBatch above just put it there) so the
-                      -- BlockFilterIndex sees byte-identical
-                      -- 'BlockUndo' to what 'disconnectBlock' would
-                      -- replay — keeps the filter byte-for-byte
-                      -- compatible with Core's blockfilterindex.cpp
-                      -- CustomAppend output.
-                      case bdIndexMgr bd of
-                        Nothing -> return ()
-                        Just im -> do
-                          mUndo <- getUndoData (bdDB bd) bh
-                          case mUndo of
-                            Just undoData ->
-                              indexManagerConnectBlock im block
-                                (udBlockUndo undoData) bh nextHeight
+                        Right () -> do
+                          -- Mirror the connect into any opted-in
+                          -- secondary indexes (txindex / blockfilterindex
+                          -- / coinstatsindex).  We read the undo record
+                          -- back from disk (cheap point-lookup; the same
+                          -- writeBatch above just put it there) so the
+                          -- BlockFilterIndex sees byte-identical
+                          -- 'BlockUndo' to what 'disconnectBlock' would
+                          -- replay — keeps the filter byte-for-byte
+                          -- compatible with Core's blockfilterindex.cpp
+                          -- CustomAppend output.
+                          case bdIndexMgr bd of
                             Nothing -> return ()
+                            Just im -> do
+                              mUndo <- getUndoData (bdDB bd) bh
+                              case mUndo of
+                                Just undoData ->
+                                  indexManagerConnectBlock im block
+                                    (udBlockUndo undoData) bh nextHeight
+                                Nothing -> return ()
 
-                      atomically $ do
-                        writeTVar (bdCurrentHeight bd) nextHeight
-                        modifyTVar' (bdPendingBlocks bd) (Map.delete bh)
+                          atomically $ do
+                            writeTVar (bdCurrentHeight bd) nextHeight
+                            modifyTVar' (bdPendingBlocks bd) (Map.delete bh)
 
-                      -- Decay timeout on success
-                      atomically $ modifyTVar' (bdBaseTimeout bd) $ \t ->
-                        max 5 (t - 1)
+                          -- Decay timeout on success
+                          atomically $ modifyTVar' (bdBaseTimeout bd) $ \t ->
+                            max 5 (t - 1)
 
-                      -- KNOWN PITFALL: UTXO flush interval
-                      -- Flush every ~2000 blocks during IBD
-                      flushCount <- atomically $ do
-                        cnt <- readTVar (bdFlushCounter bd)
-                        let newCnt = cnt + 1
-                        if newCnt >= 2000
-                          then writeTVar (bdFlushCounter bd) 0 >> return newCnt
-                          else writeTVar (bdFlushCounter bd) newCnt >> return newCnt
-                        return newCnt
+                          -- KNOWN PITFALL: UTXO flush interval
+                          -- Flush every ~2000 blocks during IBD
+                          _flushCount <- atomically $ do
+                            cnt <- readTVar (bdFlushCounter bd)
+                            let newCnt = cnt + 1
+                            if newCnt >= 2000
+                              then writeTVar (bdFlushCounter bd) 0 >> return newCnt
+                              else writeTVar (bdFlushCounter bd) newCnt >> return newCnt
+                          return ()
 
-                      -- Note: RocksDB handles flushing internally
-                      -- In production, might want explicit sync here
+                          -- Note: RocksDB handles flushing internally
+                          -- In production, might want explicit sync here
 
-                      -- Log progress
-                      when (nextHeight `mod` 1000 == 0) $
-                        putStrLn $ "Connected block " ++ show nextHeight
+                          -- Log progress
+                          when (nextHeight `mod` 1000 == 0) $
+                            putStrLn $ "Connected block " ++ show nextHeight
 
             _ -> threadDelay (100 * 1000)  -- Block not yet downloaded
 

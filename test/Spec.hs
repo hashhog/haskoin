@@ -68,7 +68,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          deleteUndoData, TxInUndo(..), TxUndo(..),
                          BlockUndo(..),
                          -- UTXO cache (for mempool wtxid test)
-                         UTXOCache(..), newUTXOCache, addUTXO,
+                         UTXOCache(..), newUTXOCache, addUTXO, lookupUTXO,
                          -- AssumeUTXO snapshot
                          SnapshotMetadata(..), SnapshotCoin(..),
                          UtxoSnapshot(..), snapshotMagicBytes,
@@ -18525,6 +18525,266 @@ main = hspec $ do
                   (encode (OutPoint (computeTxId cbTx) 0))) ]
             r <- disconnectBlock db block prev
             r `shouldBe` Right ()  -- UNCLEAN folds into Right () for callers.
+
+    -- ------------------------------------------------------------------
+    -- W93: ConnectBlock + ConnectTip + UpdateCoins gate audit
+    --
+    -- Mirror of the W92 disconnect-side audit, now on the connect path.
+    -- Pins down every gate that 'connectBlockAt' / 'applyBlock' /
+    -- 'applyBlockToCache' must honor, all referenced against
+    -- bitcoin-core/src/validation.cpp:1999-3108.
+    -- ------------------------------------------------------------------
+    describe "W93 ConnectBlock gates (Core validation.cpp:1999-3108)" $ do
+      let mkPrev byte = BlockHash (Hash256 (BS.replicate 32 byte))
+
+      -- Gate G1: hashPrevBlock == GetBestBlock (Core 2333).
+      -- Asserted via 'connectBlockAt' (strict).  Legacy 'connectBlock'
+      -- soft-falls-back; here we verify the strict path surfaces the
+      -- mismatch as 'Left'.
+      it "connectBlockAt returns Left when prevHash != BestBlock (G1)" $
+        withSystemTempDirectory "haskoin-w93-g1" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prevA = mkPrev 0xA0
+                prevB = mkPrev 0xB0  -- mismatches what we'll seed
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 "cb" ] [] 0
+                hdrA  = BlockHeader 1 prevA (Hash256 (BS.replicate 32 0))
+                                    1700000900 0x207fffff 0
+                blockA = Block hdrA [cbTx]
+                hdrB  = BlockHeader 1 prevB (Hash256 (BS.replicate 32 0))
+                                    1700001000 0x207fffff 0
+                blockB = Block hdrB [cbTx]
+            -- First connect lands fine (BestBlock was Nothing).
+            r1 <- connectBlockAt db regtest blockA 300 Map.empty
+            r1 `shouldBe` Right ()
+            -- Now BestBlock = hash(blockA).  Try to connect blockB
+            -- which lists prevHash = prevB (= 0xB0 != hash(blockA)).
+            r2 <- connectBlockAt db regtest blockB 301 Map.empty
+            case r2 of
+              Left _   -> return ()
+              Right () -> expectationFailure $
+                "connectBlockAt must Left on prevHash != BestBlock (G1)"
+
+      -- Gate G2: genesis-block fast-path (Core 2339-2343).
+      it "connectBlockAt skips per-tx loop for the canonical genesis block (G2)" $
+        withSystemTempDirectory "haskoin-w93-g2" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            -- regtest genesis is canonical and must connect at height 0
+            -- against an empty BestBlock with no spentUtxos.
+            let regtestGenesis = netGenesisBlock regtest
+            r <- connectBlockAt db regtest regtestGenesis 0 Map.empty
+            r `shouldBe` Right ()
+            mBest <- getBestBlockHash db
+            mBest `shouldBe` Just (computeBlockHash (blockHeader regtestGenesis))
+
+      -- Gate G19: every non-coinbase input must have a resolvable
+      -- prevout (Core assert(is_spent) in UpdateCoins, validation.cpp:2007).
+      it "connectBlockAt returns Left when a non-coinbase prevout is missing (G19)" $
+        withSystemTempDirectory "haskoin-w93-g19" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrev 0xC0
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 "cb" ] [] 0
+                phantomOp = OutPoint (TxId (Hash256 (BS.replicate 32 0xC1))) 0
+                regTx = Tx 1
+                  [ TxIn phantomOp "" 0xFFFFFFFE ]
+                  [ TxOut 999_000 "out" ] [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001100 0x207fffff 0
+                block = Block hdr [cbTx, regTx]
+            -- phantomOp is NOT in spentUtxos and NOT on disk → G19 trips.
+            r <- connectBlockAt db regtest block 350 Map.empty
+            case r of
+              Left _   -> return ()
+              Right () -> expectationFailure $
+                "connectBlockAt must Left when prevout is missing (G19)"
+
+      -- Gate G19 happy path: same setup but seed the prevout.
+      it "connectBlockAt accepts a block when its prevout is on disk" $
+        withSystemTempDirectory "haskoin-w93-g19-ok" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            let prev = mkPrev 0xC2
+                spentOp = OutPoint (TxId (Hash256 (BS.replicate 32 0xC3))) 0
+                spentTxO = TxOut 1_000_000 "spent"
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 "cb" ] [] 0
+                regTx = Tx 1
+                  [ TxIn spentOp "" 0xFFFFFFFE ]
+                  [ TxOut 999_000 "out" ] [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001200 0x207fffff 0
+                block = Block hdr [cbTx, regTx]
+            putUTXOCoin db spentOp (Coin spentTxO 100 False)
+            sp <- buildSpentUtxoMapFromDB db block
+            r <- connectBlockAt db regtest block 360 sp
+            r `shouldBe` Right ()
+
+      -- Gate G3/G4: applyBlockToCache (and applyBlock) must not add
+      -- IsUnspendable outputs (BIP-141 witness commitment is the
+      -- common case) to the in-memory cache.
+      it "applyBlockToCache filters OP_RETURN coinbase output from the cache (G3)" $
+        withSystemTempDirectory "haskoin-w93-g3" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            cache <- newUTXOCache db 1024
+            let prev = mkPrev 0xD0
+                -- Coinbase carries a regular output + a witness-commitment OP_RETURN
+                -- (we use raw OP_RETURN bytes — isUnspendable detects them).
+                coinbaseOpReturn = BS.pack [0x6a, 0x24] <> BS.replicate 36 0xaa
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 "cb"
+                  , TxOut 0 coinbaseOpReturn ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001300 0x207fffff 0
+                block = Block hdr [cbTx]
+            r <- applyBlockToCache cache regtest block 400
+            case r of
+              Right _ -> return ()
+              Left e  -> expectationFailure $ "applyBlockToCache failed: " <> e
+            -- Spendable output (vout 0) must be in the cache.
+            e0 <- lookupUTXO cache (OutPoint (computeTxId cbTx) 0)
+            case e0 of
+              Just _  -> return ()
+              Nothing -> expectationFailure
+                "vout 0 (spendable) must be added to the cache"
+            -- Unspendable output (vout 1) must NOT be in the cache.
+            e1 <- lookupUTXO cache (OutPoint (computeTxId cbTx) 1)
+            case e1 of
+              Nothing -> return ()
+              Just _  -> expectationFailure
+                "vout 1 (OP_RETURN) must be filtered out (Core AddCoins IsUnspendable skip)"
+
+      -- Gate G6: bad-cb-amount — coinbase pays no more than subsidy + fees
+      -- (Core validation.cpp:2611-2614).
+      it "applyBlockToCache rejects coinbase paying above subsidy (G6)" $
+        withSystemTempDirectory "haskoin-w93-g6" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            cache <- newUTXOCache db 1024
+            let prev = mkPrev 0xE0
+                -- regtest subsidy at height 1 is 50 BTC = 5_000_000_000 sat.
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_600_000_000 "cb-overpay" ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001400 0x207fffff 0
+                block = Block hdr [cbTx]
+            r <- applyBlockToCache cache regtest block 1
+            case r of
+              Left e ->
+                (("bad-cb-amount" `isInfixOf` e) :: Bool) `shouldBe` True
+              Right _ -> expectationFailure
+                "applyBlockToCache must reject coinbase paying > subsidy + fees"
+
+      -- Gate G5: sigop cap (MAX_BLOCK_SIGOPS_COST = 80,000).
+      -- 1001 OP_CHECKMULTISIG × 20 sigops × WITNESS_SCALE_FACTOR (4)
+      -- = 80,080 > 80,000 → reject.
+      it "applyBlockToCache rejects a block whose sigop cost exceeds MAX (G5)" $
+        withSystemTempDirectory "haskoin-w93-g5" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            cache <- newUTXOCache db 1024
+            let prev = mkPrev 0xF0
+                heavyScript = BS.replicate 1001 0xae
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 heavyScript ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001500 0x207fffff 0
+                block = Block hdr [cbTx]
+            r <- applyBlockToCache cache regtest block 1
+            case r of
+              Left e ->
+                ("bad-blk-sigops" `isInfixOf` e :: Bool) `shouldBe` True
+              Right _ -> expectationFailure
+                "applyBlockToCache must reject when sigop cost > 80,000"
+
+      -- Gate G8: nValueIn >= valueOut. A regular tx that pays out
+      -- more than it consumes must produce 'bad-txns-in-belowout'.
+      it "applyBlockToCache rejects a tx paying out more than its inputs (G8)" $
+        withSystemTempDirectory "haskoin-w93-g8" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            cache <- newUTXOCache db 1024
+            let prev = mkPrev 0xF2
+                spentOp = OutPoint (TxId (Hash256 (BS.replicate 32 0xF3))) 0
+                spentTxO = TxOut 100_000 "small"
+            atomically $
+              addUTXO cache spentOp (UTXOEntry spentTxO 0 False False)
+            let cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 "cb" ] [] 0
+                regTx = Tx 1
+                  [ TxIn spentOp "" 0xFFFFFFFE ]
+                  [ TxOut 500_000 "overspend" ] [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001600 0x207fffff 0
+                block = Block hdr [cbTx, regTx]
+            r <- applyBlockToCache cache regtest block 1
+            case r of
+              Left e ->
+                ("bad-txns-in-belowout" `isInfixOf` e :: Bool) `shouldBe` True
+              Right _ -> expectationFailure
+                "applyBlockToCache must reject a tx whose outputs exceed its inputs"
+
+      -- Gate G7: per-input MoneyRange.
+      it "applyBlockToCache rejects a coin with value > MAX_MONEY (G7)" $
+        withSystemTempDirectory "haskoin-w93-g7" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            cache <- newUTXOCache db 1024
+            let prev = mkPrev 0xF4
+                spentOp = OutPoint (TxId (Hash256 (BS.replicate 32 0xF5))) 0
+                spentTxO = TxOut 2_100_000_000_000_001 "huge"
+            atomically $
+              addUTXO cache spentOp (UTXOEntry spentTxO 0 False False)
+            let cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_000_000_000 "cb" ] [] 0
+                regTx = Tx 1
+                  [ TxIn spentOp "" 0xFFFFFFFE ]
+                  [ TxOut 100_000 "out" ] [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001700 0x207fffff 0
+                block = Block hdr [cbTx, regTx]
+            r <- applyBlockToCache cache regtest block 1
+            case r of
+              Left e ->
+                ("bad-txns-inputvalues-outofrange" `isInfixOf` e :: Bool) `shouldBe` True
+              Right _ -> expectationFailure
+                "applyBlockToCache must reject when an input value > MAX_MONEY"
+
+      -- applyBlock parity (Consensus.hs cache path) — same G6 gate.
+      it "applyBlock (Consensus.hs) also rejects bad-cb-amount (G6 parity)" $
+        withSystemTempDirectory "haskoin-w93-applyblock-g6" $ \tmpDir -> do
+          bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+            cache <- newUTXOCache db 1024
+            let prev = mkPrev 0xFA
+                cbTx = Tx 1
+                  [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                          "" 0xFFFFFFFF ]
+                  [ TxOut 5_600_000_000 "cb-overpay" ]
+                  [] 0
+                hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
+                                  1700001800 0x207fffff 0
+                block = Block hdr [cbTx]
+                getMTP _ = return 0
+            r <- applyBlock cache regtest block 1 0 getMTP
+            case r of
+              Left e ->
+                ("bad-cb-amount" `isInfixOf` e :: Bool) `shouldBe` True
+              Right _ -> expectationFailure
+                "applyBlock parity check failed: bad-cb-amount must fire"
 
     -- ------------------------------------------------------------------
     -- connectBlock + dumpTxOutSetFromDB: per-coin Coin metadata

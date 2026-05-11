@@ -26,6 +26,7 @@ module Haskoin.BlockTemplate
   , assembleBlock
     -- * Block Submission
   , submitBlock
+  , applyBlockToCache
     -- * Coinbase Construction
   , buildCoinbase
   , encodeHeight
@@ -51,7 +52,8 @@ import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 import Data.Int (Int32)
 import Data.Bits (shiftR, (.&.))
-import Control.Monad (forM, forM_, foldM, void)
+import Control.Monad (forM, forM_, foldM, void, unless)
+import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -73,6 +75,11 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            consensusFlagsAtHeight, connectBlock, disconnectBlock,
                            cumulativeWork, unapplyBlock,
                            getLegacySigOpCount,
+                           getTransactionSigOpCost, SigOpCost(..),
+                           maxMoney, isCoinbase,
+                           bip68Active,
+                           calculateSequenceLocks, checkSequenceLocks,
+                           SequenceLock(..),
                            buildConnectBlockOps, buildDisconnectBlockOps,
                            maxReorgDepth,
                            encodeBip34Height,
@@ -1176,74 +1183,198 @@ buildBlockUTXOMap cache block = do
                          , coinIsCoinbase = ueCoinbase e
                          }
 
--- | Apply a block to the UTXO cache, generating undo data
+-- | Apply a block to the UTXO cache, generating undo data.
+--
+-- W93 audit (ConnectBlock + ConnectTip + UpdateCoins comprehensive):
+-- this function used to skip a number of Bitcoin Core ConnectBlock
+-- gates entirely.  It is the cache-path analog of 'connectBlock' and
+-- gets called from the submitBlock arm and the side-branch reorg
+-- dispatcher; it MUST mirror Core's per-tx checks or the cache and
+-- the on-disk view drift on otherwise-rejectable blocks (the
+-- on-disk path is gated by 'validateFullBlockIO' upstream, but the
+-- cache path was bypassing every consensus check that Core does
+-- inside ConnectBlock).  Gates added (Core validation.cpp:2295-2673):
+--
+--   * G3+G4 IsUnspendable filter on output insertion (AddCoins skip).
+--   * G5    sigop cost accumulation + MAX_BLOCK_SIGOPS_COST.
+--   * G6    bad-cb-amount (coinbase > subsidy + fees).
+--   * G7    per-input MoneyRange (bad-txns-inputvalues-outofrange).
+--   * G8    nValueIn >= valueOut (bad-txns-in-belowout).
+--   * G9    accumulated-fee-outofrange.
+--   * G12   BIP-68 sequence locks (Core 2549-2561).
+--
+-- Reference: bitcoin-core/src/validation.cpp:2295-2673 (ConnectBlock),
+-- consensus/tx_verify.cpp:164-214 (CheckTxInputs).
 applyBlockToCache :: UTXOCache -> Network -> Block -> Word32
                   -> IO (Either String UndoData)
 applyBlockToCache cache net block height = do
   let bh = computeBlockHash (blockHeader block)
       txns = blockTxns block
       prevHash = bhPrevBlock (blockHeader block)
+      flags = consensusFlagsAtHeight net height
+      enforceBIP68 = bip68Active net height
 
   -- Collect TxUndo for each non-coinbase transaction
   txUndosRef <- newTVarIO []
+
+  -- W93 Gate G9: running fee accumulator (also used for G6 bad-cb-amount).
+  feesRef <- newIORef (0 :: Word64)
+  -- W93 Gate G5: running sigop-cost accumulator.
+  sigOpsRef <- newIORef (0 :: Int)
+  -- In-flight TxOut view (drives sigop counting + intra-block spends).
+  utxoViewRef <- newIORef (Map.empty :: Map OutPoint TxOut)
 
   -- Process each transaction
   results <- forM (zip [0..] txns) $ \(txIdx :: Int, tx) -> do
     if txIdx == 0  -- Coinbase
       then do
-        -- Coinbase: only create outputs, no undo data
-        atomically $ forM_ (zip [(0::Word32)..] (txOutputs tx)) $ \(outIdx, txout) -> do
-          let op = OutPoint (computeTxId tx) outIdx
-              entry = UTXOEntry txout height True False
-          addUTXO cache op entry
-        return (Right ())
+        -- W93 Gate G3: filter unspendable outputs from cache insertion
+        -- (Core AddCoins: coins.cpp:91 — IsUnspendable scripts never
+        -- enter the UTXO set; the BIP-141 witness-commitment OP_RETURN
+        -- is the canonical case).
+        atomically $ forM_ (zip [(0::Word32)..] (txOutputs tx)) $ \(outIdx, txout) ->
+          unless (isUnspendable (txOutScript txout)) $ do
+            let op = OutPoint (computeTxId tx) outIdx
+                entry = UTXOEntry txout height True False
+            addUTXO cache op entry
+        let cbId = computeTxId tx
+        modifyIORef' utxoViewRef $ \m ->
+          Map.union m $ Map.fromList
+            [ (OutPoint cbId (fromIntegral i), txout)
+            | (i, txout) <- zip [0 :: Int ..] (txOutputs tx)
+            ]
+        -- W93 Gate G5: count coinbase sigops (legacy only — coinbase
+        -- has no prevouts, so P2SH/witness components are zero).
+        -- Check against MAX_BLOCK_SIGOPS_COST immediately because the
+        -- non-coinbase branch may never execute (coinbase-only block).
+        view <- readIORef utxoViewRef
+        let SigOpCost c = getTransactionSigOpCost tx view flags
+        acc0 <- readIORef sigOpsRef
+        let acc1 = acc0 + c
+        if acc1 > maxBlockSigOpsCost
+          then return $ Left "bad-blk-sigops"
+          else do
+            writeIORef sigOpsRef acc1
+            return (Right ())
       else do
         -- Regular transaction: spend inputs, create outputs
         -- Collect TxInUndo for each input
         inputUndosRef <- newTVarIO []
 
-        inputResults <- forM (txInputs tx) $ \inp -> do
+        -- Step 1: resolve all prevouts up front so we can run the
+        -- value/range gates before any cache mutation.
+        prevoutResults <- forM (txInputs tx) $ \inp -> do
           let op = txInPrevOutput inp
           mEntry <- lookupUTXO cache op
-          case mEntry of
-            Nothing -> return $ Left $ "Missing UTXO: " ++ show op
-            Just entry -> do
-              -- Check coinbase maturity
-              if ueCoinbase entry && height - ueHeight entry < fromIntegral (netCoinbaseMaturity net)
-                then return $ Left "Coinbase not yet mature"
-                else do
-                  -- Build TxInUndo from the spent UTXO
-                  let txInUndo = TxInUndo
-                        { tuOutput   = ueOutput entry
-                        , tuHeight   = ueHeight entry
-                        , tuCoinbase = ueCoinbase entry
-                        }
-                  atomically $ do
-                    void $ spendUTXO cache op
-                    modifyTVar' inputUndosRef (txInUndo :)
-                  return (Right ())
+          return (op, mEntry)
 
-        case sequence inputResults of
-          Left err -> return (Left err)
-          Right _ -> do
-            -- Collect the TxUndo for this transaction
-            inputUndos <- readTVarIO inputUndosRef
-            let txUndo = TxUndo { tuPrevOutputs = reverse inputUndos }
-            atomically $ modifyTVar' txUndosRef (txUndo :)
+        let missing = [op | (op, Nothing) <- prevoutResults]
+        if not (null missing)
+          then return $ Left $ "Missing UTXO: " ++ show (head missing)
+          else do
+            let resolved = [(op, e) | (op, Just e) <- prevoutResults]
+                -- Check coinbase maturity (preserved from original).
+                immature = [() | (_, e) <- resolved
+                          , ueCoinbase e
+                          , height - ueHeight e < fromIntegral (netCoinbaseMaturity net)]
+            if not (null immature)
+              then return $ Left "Coinbase not yet mature"
+              else do
+                -- W93 Gate G7: per-input MoneyRange.
+                let inputValues = [ txOutValue (ueOutput e) | (_, e) <- resolved ]
+                    sumInputs   = foldl (+) 0 inputValues
+                    badInputs   = any (> maxMoney) inputValues
+                                   || sumInputs > maxMoney
+                if badInputs
+                  then return $ Left "bad-txns-inputvalues-outofrange"
+                  else do
+                    let valueOut = sum (map txOutValue (txOutputs tx))
+                    -- W93 Gate G8: nValueIn >= valueOut.
+                    if sumInputs < valueOut
+                      then return $ Left "bad-txns-in-belowout"
+                      else do
+                        let txfee = sumInputs - valueOut
+                        accFees0 <- readIORef feesRef
+                        let accFees1 = accFees0 + txfee
+                        -- W93 Gate G9: accumulated-fee-outofrange.
+                        if accFees1 > maxMoney
+                          then return $ Left "bad-txns-accumulated-fee-outofrange"
+                          else do
+                            writeIORef feesRef accFees1
+                            -- W93 Gate G12: BIP-68 sequence locks
+                            -- (height-only — see applyBlock comment;
+                            -- the time-based component is deferred to
+                            -- BIP-112 OP_CSV in the script interpreter).
+                            let seqOk
+                                  | not enforceBIP68 = True
+                                  | txVersion tx < 2 = True
+                                  | otherwise =
+                                      let prevHeights = [ueHeight e | (_, e) <- resolved]
+                                          prevMTPs    = map (const 0) prevHeights
+                                          lock = calculateSequenceLocks tx prevHeights prevMTPs True
+                                          mh   = slMinHeight lock
+                                      in mh < 0 || fromIntegral height > mh
+                            if not seqOk
+                              then return $ Left "bad-txns-nonfinal"
+                              else do
+                                -- W93 Gate G5: per-tx sigop cost.
+                                view <- readIORef utxoViewRef
+                                let SigOpCost c = getTransactionSigOpCost tx view flags
+                                acc <- readIORef sigOpsRef
+                                let acc' = acc + c
+                                if acc' > maxBlockSigOpsCost
+                                  then return $ Left "bad-blk-sigops"
+                                  else do
+                                    writeIORef sigOpsRef acc'
+                                    -- Spend inputs.
+                                    forM_ resolved $ \(op, entry) -> do
+                                      let txInUndo = TxInUndo
+                                            { tuOutput   = ueOutput entry
+                                            , tuHeight   = ueHeight entry
+                                            , tuCoinbase = ueCoinbase entry
+                                            }
+                                      atomically $ do
+                                        void $ spendUTXO cache op
+                                        modifyTVar' inputUndosRef (txInUndo :)
 
-            -- Create outputs
-            atomically $ forM_ (zip [(0::Word32)..] (txOutputs tx)) $ \(outIdx, txout) -> do
-              let op = OutPoint (computeTxId tx) outIdx
-                  entry = UTXOEntry txout height False False
-              addUTXO cache op entry
-            return (Right ())
+                                    -- Collect TxUndo
+                                    inputUndos <- readTVarIO inputUndosRef
+                                    let txUndo = TxUndo { tuPrevOutputs = reverse inputUndos }
+                                    atomically $ modifyTVar' txUndosRef (txUndo :)
+
+                                    -- W93 Gate G4: IsUnspendable filter
+                                    -- on output insertion (Core AddCoins skip).
+                                    atomically $ forM_ (zip [(0::Word32)..] (txOutputs tx)) $ \(outIdx, txout) ->
+                                      unless (isUnspendable (txOutScript txout)) $ do
+                                        let op = OutPoint (computeTxId tx) outIdx
+                                            entry = UTXOEntry txout height False False
+                                        addUTXO cache op entry
+                                    -- Update in-flight view.
+                                    let txid = computeTxId tx
+                                        newView = Map.fromList
+                                          [ (OutPoint txid (fromIntegral i), txout)
+                                          | (i, txout) <- zip [0 :: Int ..] (txOutputs tx)
+                                          ]
+                                        spent = [op | (op, _) <- resolved]
+                                    modifyIORef' utxoViewRef $ \m ->
+                                      foldr Map.delete (Map.union newView m) spent
+                                    return (Right ())
 
   case sequence results of
     Left err -> return (Left err)
     Right _ -> do
-      txUndos <- readTVarIO txUndosRef
-      let blockUndo = BlockUndo { buTxUndo = reverse txUndos }
-      return $ Right $ mkUndoData bh height prevHash blockUndo
+      -- W93 Gate G6: bad-cb-amount (Core 2611-2614).
+      totalFees <- readIORef feesRef
+      let maxCoinbase = blockReward height + totalFees
+          cbValueOut  = sum (map txOutValue (txOutputs (head txns)))
+      if cbValueOut > maxCoinbase
+        then return $ Left $
+          "bad-cb-amount: coinbase pays too much (actual=" ++ show cbValueOut
+          ++ " vs limit=" ++ show maxCoinbase ++ ")"
+        else do
+          txUndos <- readTVarIO txUndosRef
+          let blockUndo = BlockUndo { buTxUndo = reverse txUndos }
+          return $ Right $ mkUndoData bh height prevHash blockUndo
 
 --------------------------------------------------------------------------------
 -- Anti-Fee-Sniping
