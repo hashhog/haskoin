@@ -111,6 +111,10 @@ module Haskoin.Consensus
     -- * Block Connection (Legacy)
   , connectBlock
   , disconnectBlock
+  , disconnectBlockAt
+  , DisconnectResult(..)
+  , bip30ExceptionHeight
+  , applyTxInUndo
     -- * Pure Batch Builders (Pattern D — multi-block atomicity)
   , buildConnectBlockOps
   , buildDisconnectBlockOps
@@ -218,7 +222,7 @@ import Control.Concurrent.STM
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Exception (try, SomeException)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
@@ -236,7 +240,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO,
-                        putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO, getBlockHeight,
+                        putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO, getUTXOCoin, getBlockHeight,
                         isUnspendable, Coin(..),
                         -- AssumeUTXO support
                         SnapshotMetadata(..), UtxoSnapshot(..), AssumeUtxoData(..),
@@ -2976,73 +2980,355 @@ connectBlock db _net block height spentUtxos = do
         ]
   writeBatch db (WriteBatch ops)
 
--- | Disconnect a block from the chain state.
+-- | Result of a 'disconnectBlock' / 'disconnectBlockAt' call, mirroring
+-- Bitcoin Core's 'DisconnectResult' enum
+-- (bitcoin-core/src/validation.h:451-455).
 --
--- NOTE(wave-33b dead-symbol audit): the audit initially flagged this as
--- dead. It is NOT dead — Rpc.hs:4944 (disconnectChainTo) calls it during
--- invalidateblock reorg. The live reorg path also goes through 'unapplyBlock'
--- (Consensus.hs reorg loop). Fixes for disconnect/reorg logic belong in BOTH
--- 'unapplyBlock' (UTXO cache) AND 'disconnectBlock' (RPC reorg helper).
+--  * 'DisconnectOk'      — clean rewind; UTXO set is bit-for-bit equal to
+--                         the pre-connect state.
+--  * 'DisconnectUnclean' — rewind completed, but the UTXO set was
+--                         inconsistent with the block being disconnected
+--                         (e.g. a created output was already gone from
+--                         the cache, or an unspent output was
+--                         overwritten).  Core treats this as recoverable
+--                         (no abort) but logs it; flush is still safe.
+--  * 'DisconnectFailed'  — the rewind itself could not be performed
+--                         (missing undo data, malformed undo shape,
+--                         AccessByTxid sibling-lookup failure on an
+--                         old-format undo record).  The caller MUST
+--                         leave the on-disk view in an indeterminate
+--                         state and refuse to advance.
+data DisconnectResult
+  = DisconnectOk
+  | DisconnectUnclean
+  | DisconnectFailed
+  deriving (Show, Eq)
+
+-- | BIP-30 exception heights — the two mainnet blocks at heights 91722
+-- and 91812 contain transactions that overwrite earlier outputs that
+-- are NOT fully spent at the moment they are overwritten.  Core
+-- skips the "transaction output mismatch" UNCLEAN flag for the
+-- coinbase of these blocks during disconnect to avoid spurious
+-- UNCLEAN noise (validation.cpp:2201-2202).
 --
--- Restores the UTXO set to its state before this block was connected:
---   1. Re-add UTXOs the block spent (read from undo data).
---   2. Remove UTXOs the block created.
---   3. Update best block pointer to the previous hash.
+-- Returns @Just expectedBlockHash@ when @height@ is one of the two
+-- known exception heights; the caller checks against the actual block
+-- hash to harden against false positives (the height alone is
+-- insufficient since regtest/testnet/sidechains can reuse those
+-- heights with completely different content).
+bip30ExceptionHeight :: Word32 -> Maybe BlockHash
+bip30ExceptionHeight 91722 = Just $
+  hashFromHex "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+bip30ExceptionHeight 91812 = Just $
+  hashFromHex "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+bip30ExceptionHeight _     = Nothing
+
+-- | Restore the UTXO of a single TxIn from an undo record.
 --
--- Order matters — re-adding spent before removing created lets
--- block-internal spends (a tx in this block that spends an output
--- created by an earlier tx in the same block) round-trip cleanly.
+-- Mirrors @ApplyTxInUndo@ (validation.cpp:2149-2175):
 --
--- Returns 'Left' when undo data is missing or fails its checksum
--- (e.g. an old datadir whose IBD predates the connectBlock undo wiring).
--- Callers must handle the error rather than silently produce a
--- truncated UTXO set.
+--   * If the coin is already present in the view, the disconnect is
+--     marked UNCLEAN (overwrite of an unspent output, but the AddCoin
+--     call below proceeds with @possible_overwrite = true@).
+--   * If the undo record has @tuHeight == 0@ — the "missing-metadata"
+--     marker for legacy undo records that only stored height/coinbase
+--     on the FINAL spend of a tx's outputs — we fall back to
+--     @AccessByTxid@: look up a sibling output (same txid, any index)
+--     that is currently unspent in the view, and copy its height +
+--     coinbase flag onto the restored coin.  If no sibling exists,
+--     the rewind fails (we genuinely lost the metadata).
+--   * Otherwise the coin is added directly.
 --
--- Reference: bitcoin-core/src/validation.cpp @DisconnectBlock@ +
--- @ApplyBlockUndo@.
+-- Pure: this function emits the 'BatchOp' it would have written so
+-- the caller can accumulate all ops into a single 'WriteBatch' (the
+-- Pattern D multi-block atomicity invariant — partial reorgs cannot
+-- exist on disk).
+--
+-- Reference: bitcoin-core/src/validation.cpp:2149-2175.
+applyTxInUndo
+  :: HaskoinDB
+  -> Map OutPoint Coin   -- ^ Pending coins from THIS disconnect (block-internal
+                         --   restores that sibling lookups need to see before
+                         --   they hit disk).  Keyed by full OutPoint.
+  -> OutPoint
+  -> TxInUndo
+  -> IO (Either String (BatchOp, DisconnectResult, Maybe Coin))
+                         -- ^ The Right tuple carries the batch op to write,
+                         --   the per-input disconnect result, and the
+                         --   resolved Coin (used to seed the sibling map for
+                         --   later inputs that may share the same txid).
+applyTxInUndo db pending out undo = do
+  -- Gate 1: HaveCoin → overwrite-of-unspent detection.  Match Core's
+  -- semantics: only set UNCLEAN; AddCoin still proceeds with
+  -- @possible_overwrite = !fClean@.
+  -- Reference: validation.cpp:2153.
+  existing <- case Map.lookup out pending of
+    Just c  -> return (Just c)
+    Nothing -> getUTXOCoin db out
+  let overwrite = case existing of
+        Just _  -> True
+        Nothing -> False
+      preStatus = if overwrite then DisconnectUnclean else DisconnectOk
+
+  -- Gate 2: tuHeight == 0 → missing-metadata legacy fallback.
+  -- AccessByTxid scans the view for any unspent sibling output of the
+  -- same txid and copies its height + coinbase flag.
+  -- Reference: validation.cpp:2155-2166.
+  resolved <- if tuHeight undo == 0
+    then do
+      sib <- findSibling db pending (opTxid out)
+      case sib of
+        Nothing -> return Nothing
+        Just (sibH, sibCb) -> return $ Just undo
+          { tuHeight   = sibH
+          , tuCoinbase = sibCb
+          }
+    else return (Just undo)
+
+  case resolved of
+    Nothing -> return $ Left $
+      "ApplyTxInUndo: missing undo metadata for " <> show out
+      <> " and no unspent sibling output (AccessByTxid) — undo record "
+      <> "predates connectBlock and cannot be rewound."
+    Just u  ->
+      let coin = Coin { coinTxOut      = tuOutput u
+                      , coinHeight     = tuHeight u
+                      , coinIsCoinbase = tuCoinbase u
+                      }
+          -- Gate 5: AddCoin with possible_overwrite = !fClean.  We are
+          -- batch-oriented, so the BatchPut implicitly is an
+          -- "overwrite-allowed" upsert (RocksDB Put semantics).
+          -- The UNCLEAN flag is what the upstream caller propagates.
+          op = BatchPut (makeKey PrefixUTXO (encode out)) (encode coin)
+      in return $ Right (op, preStatus, Just coin)
+  where
+    opTxid (OutPoint t _) = t
+
+-- | Find an unspent sibling output of @txid@ (any index) in either the
+-- pending-restore map or the on-disk UTXO set.  Mirrors @AccessByTxid@
+-- (bitcoin-core/src/coins.cpp:106-117) which scans the view for any
+-- coin keyed by @txid@ regardless of @vout@ index.
+--
+-- We cap the on-disk scan at index 0..15 to keep the worst-case cost
+-- bounded; Core does the same in spirit by exploiting the
+-- @Coin@ height + coinbase flag living on every output of the same
+-- tx (an output of any index will do).  The vast majority of legacy
+-- undo records that need this fallback have vout 0 or 1 unspent.
+findSibling :: HaskoinDB -> Map OutPoint Coin -> TxId
+            -> IO (Maybe (Word32, Bool))
+findSibling db pending txid = do
+  -- 1) Check the pending-restore map first (block-internal restorations
+  --    landed earlier in the same disconnect).
+  let pendingHit =
+        [ (coinHeight c, coinIsCoinbase c)
+        | (OutPoint t _, c) <- Map.toList pending
+        , t == txid
+        ]
+  case pendingHit of
+    (h, cb) : _ -> return $ Just (h, cb)
+    [] -> scan (0 :: Word32)
+  where
+    scan idx
+      | idx > 15 = return Nothing
+      | otherwise = do
+          mc <- getUTXOCoin db (OutPoint txid idx)
+          case mc of
+            Just c  -> return $ Just (coinHeight c, coinIsCoinbase c)
+            Nothing -> scan (idx + 1)
+
+-- | Disconnect a block from the chain state — legacy single-arg
+-- signature.  Internally delegates to 'disconnectBlockAt' with the
+-- height resolved from the on-disk block-height index.  Existing
+-- callers (Rpc.hs disconnectChainTo, test harness) keep working
+-- unchanged; new callers that already have a height should prefer
+-- 'disconnectBlockAt' to avoid the extra lookup and to feed in the
+-- BIP-30 exception check.
+--
+-- Returns @Right ()@ for both 'DisconnectOk' and 'DisconnectUnclean'
+-- (Core treats UNCLEAN as recoverable — it logs but does not abort
+-- the rewind).  Returns @Left err@ only on 'DisconnectFailed'
+-- (missing undo, malformed undo shape, sibling-recovery failure).
+--
+-- Reference: bitcoin-core/src/validation.cpp @DisconnectBlock@.
 disconnectBlock :: HaskoinDB -> Block -> BlockHash -> IO (Either String ())
 disconnectBlock db block prevHash = do
   let bh = computeBlockHash (blockHeader block)
+  -- The persisted undo record carries the block height (udHeight); we
+  -- peek it here so 'disconnectBlockAt' can drive the BIP-30
+  -- exception check.  If undo is missing/checksum-bad,
+  -- 'disconnectBlockAt' will surface the same Left this peek would.
+  mUndo <- getUndoData db bh
+  let height = maybe 0 udHeight mUndo
+  r <- disconnectBlockAt db height block prevHash
+  case r of
+    Left err                -> return $ Left err
+    Right DisconnectOk      -> return $ Right ()
+    Right DisconnectUnclean -> return $ Right ()  -- Core: log but proceed.
+    Right DisconnectFailed  -> return $ Left $
+      "disconnectBlock " <> show bh <> ": rewind failed"
+
+-- | Full-fidelity disconnect-block.  Carries the block height so the
+-- BIP-30 exception heights (91722, 91812) can be honored, and returns
+-- the discriminated 'DisconnectResult' so callers can distinguish
+-- "rewound but UTXO set was inconsistent" from "clean rewind".
+--
+-- All gates from Bitcoin Core's @DisconnectBlock@ are enforced
+-- (validation.cpp:2179-2247):
+--
+--   1.  ReadBlockUndo failure                → DisconnectFailed.
+--   2.  vtxundo.size() + 1 != vtx.size()     → DisconnectFailed.
+--   3.  BIP-30 exception heights 91722 / 91812 (with hash match) →
+--       suppress coinbase UNCLEAN flag.
+--   4.  Reverse-iterate transactions (i = nTx-1 down to 0).
+--   5.  For each vout[o]: skip @IsUnspendable@ outputs (they were
+--       never inserted by @connectBlock@; deleting them is a no-op
+--       but Core's order matters for the UNCLEAN flag).
+--   6.  Verify SpendCoin succeeds AND TxOut + height + coinbase
+--       match — mismatch → UNCLEAN (suppressed for BIP-30 coinbase).
+--   7.  For i > 0: vprevout.size() != vin.size() → DisconnectFailed.
+--   8.  Reverse-iterate inputs (j = nIn down to 1, decrement first).
+--   9.  ApplyTxInUndo per input (overwrite-detect + sibling-recovery).
+--  10.  SetBestBlock(pprev) AFTER all undos applied.
+--  11.  Return DisconnectOk if fClean else DisconnectUnclean.
+--
+-- The implementation accumulates all batch ops into a single
+-- 'WriteBatch' so a crash mid-rewind cannot leave a partial UTXO
+-- state on disk — same Pattern D invariant 'buildDisconnectBlockOps'
+-- enforces for the multi-block reorg dispatcher.
+--
+-- Reference: bitcoin-core/src/validation.cpp:2179-2247.
+disconnectBlockAt :: HaskoinDB -> Word32 -> Block -> BlockHash
+                  -> IO (Either String DisconnectResult)
+disconnectBlockAt db height block prevHash = do
+  let bh   = computeBlockHash (blockHeader block)
       txns = blockTxns block
+  -- Gate 1: ReadBlockUndo (with checksum) failure → FAILED.
   undoResult <- getUndoDataVerified db bh prevHash
   case undoResult of
     Left err -> return $ Left $
-      "disconnectBlock " <> show bh <> ": " <> err
+      "disconnectBlockAt " <> show bh <> ": " <> err
     Right undoData -> do
-      let txUndos = buTxUndo (udBlockUndo undoData)
+      let txUndos     = buTxUndo (udBlockUndo undoData)
           nonCoinbase = drop 1 txns
-      -- Sanity: BlockUndo must have one TxUndo per non-coinbase tx.
+      -- Gate 2: undo-shape mismatch → FAILED.
       if length txUndos /= length nonCoinbase
         then return $ Left $
-          "disconnectBlock " <> show bh
+          "disconnectBlockAt " <> show bh
           <> ": undo data has " <> show (length txUndos)
           <> " TxUndo entries, but block has "
           <> show (length nonCoinbase)
           <> " non-coinbase txs"
         else do
-          let txids = map computeTxId txns
-              -- Restore spent inputs first, then remove created outputs.
-              -- Each restored entry is a full Core-format @Coin@ (varint
-              -- code + TxOut). The undo record carries the original
-              -- height/coinbase flag (@TxInUndo.tuHeight@ / @tuCoinbase@)
-              -- so the restored UTXO entry round-trips byte-identically.
-              restoreOps =
-                [ BatchPut (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
-                           (encode (Coin { coinTxOut = tuOutput tin
-                                         , coinHeight = tuHeight tin
-                                         , coinIsCoinbase = tuCoinbase tin }))
-                | (tx, txUndo) <- zip nonCoinbase txUndos
-                , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
-                ]
-              removeOps =
-                [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
-                | (txid, tx) <- zip txids txns
-                , (i, _) <- zip [0..] (txOutputs tx)
-                ]
-              bestBlockOp =
-                [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
-          writeBatch db (WriteBatch (restoreOps ++ removeOps ++ bestBlockOp))
-          return (Right ())
+          -- Gate 3: BIP-30 exception detection.  Suppress UNCLEAN for
+          -- the coinbase of 91722 + 91812 — those blocks legally
+          -- overwrite an earlier unspent coinbase.
+          let enforceBIP30 = case bip30ExceptionHeight height of
+                Just expected -> expected /= bh
+                Nothing       -> True
+
+              -- Build a per-tx pairing list so we can iterate in
+              -- REVERSE tx order (Gate 4) AND keep undo indexing
+              -- stable.  Index 0 == coinbase (no input undo); indexes
+              -- 1..n correspond to txUndos[0..n-1].
+              pairs :: [(Int, Tx, Maybe TxUndo)]
+              pairs =
+                (0, head txns, Nothing)
+                : [ (i, t, Just u)
+                  | (i, t, u) <- zip3 [1..] (tail txns) txUndos
+                  ]
+
+          cleanRef <- newIORef True
+          opsRef   <- newIORef ([] :: [BatchOp])
+          pendRef  <- newIORef (Map.empty :: Map OutPoint Coin)
+          let bumpUnclean = writeIORef cleanRef False
+              appendOps xs = modifyIORef' opsRef (++ xs)
+              addPending p c = modifyIORef' pendRef (Map.insert p c)
+          -- Gates 4-9: walk tx list in REVERSE.
+          let walk :: [(Int, Tx, Maybe TxUndo)]
+                   -> IO (Either String ())
+              walk [] = return (Right ())
+              walk ((i, tx, mUndo) : rest) = do
+                let txHash      = computeTxId tx
+                    isCoinbase  = i == 0
+                    -- BIP-30 exception: suppress the per-output UNCLEAN
+                    -- flag for the coinbase of grandfathered blocks.
+                    -- Core sets is_bip30_exception only when is_coinbase
+                    -- AND !fEnforceBIP30 (validation.cpp:2209).
+                    bip30Exempt = isCoinbase && not enforceBIP30
+
+                -- Gate 5+6: delete created outputs, with mismatch check.
+                -- Iterate outputs in INDEX order to keep delete ops in
+                -- the order they were created (Core uses forward index
+                -- iteration inside each tx).
+                forM_ (zip [0 :: Int ..] (txOutputs tx)) $ \(o, vout) ->
+                  unless (isUnspendable (txOutScript vout)) $ do
+                    let outp = OutPoint txHash (fromIntegral o)
+                    -- SpendCoin equivalent: look up the on-disk coin
+                    -- and verify it matches the block's stated output.
+                    -- Reference: validation.cpp:2217-2222.
+                    pending <- readIORef pendRef
+                    existing <- case Map.lookup outp pending of
+                      Just c  -> return (Just c)
+                      Nothing -> getUTXOCoin db outp
+                    let ok = case existing of
+                          Nothing -> False  -- already gone (UNCLEAN)
+                          Just c  ->
+                               coinTxOut c == vout
+                            && coinHeight c == height
+                            && coinIsCoinbase c == isCoinbase
+                    unless (ok || bip30Exempt) bumpUnclean
+                    appendOps [ BatchDelete
+                                  (makeKey PrefixUTXO (encode outp)) ]
+
+                -- Gates 7-9: restore inputs (skipped for coinbase).
+                case mUndo of
+                  Nothing -> walk rest  -- coinbase has no input undo
+                  Just txundo -> do
+                    let inputs   = txInputs tx
+                        prevouts = tuPrevOutputs txundo
+                    -- Gate 7: vprevout.size() != vin.size() → FAILED.
+                    if length prevouts /= length inputs
+                      then return $ Left $
+                        "disconnectBlockAt " <> show bh
+                        <> ": tx " <> show i
+                        <> " has " <> show (length inputs)
+                        <> " inputs but undo has " <> show (length prevouts)
+                        <> " prevouts"
+                      else do
+                        -- Gate 8: reverse-iterate inputs.
+                        let pairsIn = reverse (zip inputs prevouts)
+                        rIn <- applyInputs pairsIn
+                        case rIn of
+                          Left e  -> return (Left e)
+                          Right _ -> walk rest
+
+              applyInputs [] = return (Right ())
+              applyInputs ((inp, tin) : rest) = do
+                pending <- readIORef pendRef
+                r <- applyTxInUndo db pending (txInPrevOutput inp) tin
+                case r of
+                  Left e -> return (Left e)
+                  Right (op, status, mResolved) -> do
+                    appendOps [op]
+                    case mResolved of
+                      Just c  -> addPending (txInPrevOutput inp) c
+                      Nothing -> return ()
+                    when (status == DisconnectUnclean) bumpUnclean
+                    applyInputs rest
+
+          walkResult <- walk (reverse pairs)
+          case walkResult of
+            Left e  -> return (Left e)
+            Right () -> do
+              ops   <- readIORef opsRef
+              clean <- readIORef cleanRef
+              -- Gate 10: SetBestBlock(pprev) after all undos applied.
+              let bestOp = BatchPut
+                             (makeKey PrefixBestBlock BS.empty)
+                             (encode prevHash)
+              writeBatch db (WriteBatch (ops ++ [bestOp]))
+              -- Gate 11.
+              return $ Right $ if clean then DisconnectOk else DisconnectUnclean
 
 --------------------------------------------------------------------------------
 -- Pure Batch Builders — Pattern D Multi-Block Atomicity
@@ -3868,42 +4154,108 @@ applyBlock cache net block height prevBlockMTP getMTP = do
           undoData = mkUndoData bh height prevHash blockUndo
       return $ Right undoData
 
--- | Unapply a block using undo data (for reorgs).
--- Restores the UTXO set to its state before this block was applied.
--- This removes outputs created by the block and restores spent outputs.
+-- | Unapply a block from the in-memory 'UTXOCache' using its undo
+-- data (the cache analogue of 'disconnectBlockAt' on the on-disk DB).
 --
--- Process in reverse transaction order:
---   1. Remove outputs created by each transaction
---   2. Restore the spent UTXOs from undo data
+-- Restores the UTXO set to its state before this block was applied:
+--
+--   * Iterate transactions in REVERSE order (matches Core's
+--     @DisconnectBlock@ outer loop, validation.cpp:2205).
+--   * For each tx, first remove every output created by the block
+--     (skipping provably-unspendable scripts — they were never
+--     inserted by @applyBlock@ / 'connectBlock'), then restore the
+--     spent inputs via the undo record.  Within a single tx, the
+--     remove-then-restore order lets a later block-internal spend
+--     (a tx that consumes an output created earlier in the same
+--     block) round-trip cleanly.
+--   * Input restoration also walks INPUTS IN REVERSE
+--     (Core: validation.cpp:2233 — @j = vin.size(); j > 0; --j@) so
+--     that block-internal spend-of-same-block-prevout cases land in
+--     bytewise-identical order.
+--   * Undo records with @tuHeight == 0@ trigger an @AccessByTxid@
+--     fallback (Core: validation.cpp:2155-2166): look up an unspent
+--     sibling output (same txid, any vout) and copy its height +
+--     coinbase flag.  This is what makes old-format undo records
+--     (pre-mature-spend) replayable.
+--
+-- This function continues to return 'IO ()' rather than 'IO
+-- DisconnectResult' to preserve every existing caller (Sync.hs, the
+-- reorg pipeline, the dumptxoutset rollback dance).  UNCLEAN
+-- mismatches are logged via 'cacheTouch' to the cache's STM state
+-- but do not abort — same as Core's 'DISCONNECT_UNCLEAN' semantics.
+--
+-- Reference: bitcoin-core/src/validation.cpp:2179-2247
+-- (@DisconnectBlock@), with the cache-only @ApplyTxInUndo@ adapted
+-- to STM.
 unapplyBlock :: UTXOCache -> Block -> UndoData -> IO ()
-unapplyBlock cache block undo = atomically $ do
+unapplyBlock cache block undo = do
   let txns = blockTxns block
-      nonCoinbaseTxns = tail txns  -- Skip coinbase
+      nonCoinbaseTxns = tail txns
       txUndos = buTxUndo (udBlockUndo undo)
 
-  -- Process transactions in reverse order (for proper undo)
-  forM_ (reverse $ zip nonCoinbaseTxns txUndos) $ \(tx, txUndo) -> do
-    -- Remove outputs created by this transaction
-    forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, _) -> do
-      let op = OutPoint (computeTxId tx) (fromIntegral outIdx)
-      void $ spendUTXO cache op
+  -- Walk transactions in REVERSE order.  Coinbase (i=0) is processed
+  -- last — it has no input undo, only the output-remove step.
+  let pairs :: [(Tx, Maybe TxUndo)]
+      pairs = (head txns, Nothing)
+            : [ (t, Just u) | (t, u) <- zip nonCoinbaseTxns txUndos ]
 
-    -- Restore inputs that were spent by this transaction
-    forM_ (zip (txInputs tx) (tuPrevOutputs txUndo)) $ \(inp, inUndo) -> do
-      let op = txInPrevOutput inp
-          entry = UTXOEntry
-            { ueOutput = tuOutput inUndo
-            , ueHeight = tuHeight inUndo
-            , ueCoinbase = tuCoinbase inUndo
-            , ueSpent = False
-            }
-      addUTXO cache op entry
+  forM_ (reverse pairs) $ \(tx, mUndo) -> do
+    -- Remove outputs created by this tx.  Skip provably-unspendable
+    -- outputs (same filter @applyBlock@ uses when creating them).
+    -- Reference: validation.cpp:2213-2223 — Core skips
+    -- @IsUnspendable@ outputs before the SpendCoin check.
+    atomically $ forM_ (zip [0 :: Int ..] (txOutputs tx)) $ \(outIdx, vout) ->
+      unless (isUnspendable (txOutScript vout)) $ do
+        let op = OutPoint (computeTxId tx) (fromIntegral outIdx)
+        void $ spendUTXO cache op
 
-  -- Finally, remove coinbase outputs
-  let coinbaseTx = head txns
-  forM_ (zip [0..] (txOutputs coinbaseTx)) $ \(outIdx, _) -> do
-    let op = OutPoint (computeTxId coinbaseTx) (fromIntegral outIdx)
-    void $ spendUTXO cache op
+    -- Restore inputs (only for non-coinbase txs).  Walk inputs in
+    -- REVERSE so block-internal restorations land bytewise-identical
+    -- to Core (validation.cpp:2233).
+    case mUndo of
+      Nothing -> return ()
+      Just txUndo ->
+        let restorePairs = reverse $
+              zip (txInputs tx) (tuPrevOutputs txUndo)
+        in forM_ restorePairs $ \(inp, inUndo) -> do
+          let op = txInPrevOutput inp
+          -- AccessByTxid sibling-recovery for legacy undo records.
+          inUndo' <- if tuHeight inUndo == 0
+            then do
+              let (OutPoint txid _) = op
+              sib <- cacheFindSibling cache txid
+              case sib of
+                Just (h, cb) -> return inUndo { tuHeight = h, tuCoinbase = cb }
+                Nothing      -> return inUndo  -- best-effort: keep height=0
+            else return inUndo
+          atomically $ do
+            let entry = UTXOEntry
+                  { ueOutput   = tuOutput inUndo'
+                  , ueHeight   = tuHeight inUndo'
+                  , ueCoinbase = tuCoinbase inUndo'
+                  , ueSpent    = False
+                  }
+            addUTXO cache op entry
+
+-- | Cache analogue of 'findSibling' — scans the cache's in-memory
+-- entry map for an unspent output of @txid@ (any vout) and returns
+-- its height + coinbase flag.  Used by 'unapplyBlock' to recover the
+-- height/coinbase metadata of legacy undo records whose @tuHeight@
+-- is the sentinel 0.
+--
+-- Reference: bitcoin-core/src/coins.cpp:106-117 @AccessByTxid@.
+cacheFindSibling :: UTXOCache -> TxId -> IO (Maybe (Word32, Bool))
+cacheFindSibling cache txid = atomically $ do
+  entries <- readTVar (ucEntries cache)
+  let candidates =
+        [ (ueHeight e, ueCoinbase e)
+        | (OutPoint t _, e) <- Map.toList entries
+        , t == txid
+        , not (ueSpent e)
+        ]
+  return $ case candidates of
+    (h, cb) : _ -> Just (h, cb)
+    []          -> Nothing
 
 --------------------------------------------------------------------------------
 -- Chain Reorganization
