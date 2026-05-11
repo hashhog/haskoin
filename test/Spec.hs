@@ -3025,6 +3025,134 @@ main = hspec $ do
       -- Should have top bits and bit 2 set
       (version .&. 0x20000004) `shouldBe` 0x20000004
 
+    -- Bug A fix: getStateSinceHeight must return 0 for ALWAYS_ACTIVE / NEVER_ACTIVE
+    -- without attempting a period-walk.  Bitcoin Core versionbits.cpp:158-162.
+    it "getStateSinceHeight returns 0 for ALWAYS_ACTIVE deployment (Bug A)" $ do
+      let alwaysActiveDep = testDep { depStartTime = -1 }  -- ALWAYS_ACTIVE
+          (h, _) = getStateSinceHeight alwaysActiveDep getMTP Map.empty Nothing
+      h `shouldBe` 0
+
+    it "getStateSinceHeight returns 0 for NEVER_ACTIVE deployment (Bug A)" $ do
+      let neverActiveDep = testDep { depStartTime = -2 }  -- NEVER_ACTIVE
+          (h, _) = getStateSinceHeight neverActiveDep getMTP Map.empty Nothing
+      h `shouldBe` 0
+
+    it "getStateSinceHeight returns 0 for ALWAYS_ACTIVE with non-Nothing pindexPrev (Bug A)" $ do
+      -- Before this fix, an ALWAYS_ACTIVE dep with a real chain would try
+      -- to call findStateSince and return garbage instead of 0.
+      let alwaysActiveDep = testDep { depStartTime = -1 }
+          genesis' = BlockIndex 0 0x207fffff 500 1 genesisHash Nothing
+          chain = buildChain genesis' 100 1
+          pindexPrev = if null chain then genesis' else last chain
+          (h, _) = getStateSinceHeight alwaysActiveDep getMTP Map.empty (Just pindexPrev)
+      h `shouldBe` 0
+
+    it "getStateSinceHeight returns 0 for DEFINED state (genesis)" $ do
+      let (h, _) = getStateSinceHeight testDep getMTP Map.empty Nothing
+      h `shouldBe` 0
+
+    it "getStateSinceHeight returns period start for STARTED state" $ do
+      -- Build chain past start time to height 2015 (first period boundary).
+      let genesis' = BlockIndex 0 0x207fffff 1001 1 genesisHash Nothing
+          chain = buildChain genesis' 2015 1
+          pindexPrev = if null chain then genesis' else last chain
+          (h, _) = getStateSinceHeight testDep getMTP Map.empty (Just pindexPrev)
+      -- State became STARTED at the first period (height 2016 begins at block 2015 boundary)
+      h `shouldBe` 2016
+
+    it "computeBlockVersion sets no extra bits for DEFINED deployment" $ do
+      -- A deployment that has not yet started should not contribute bits.
+      let futureDep = testDep { depStartTime = 9999999999 }  -- far future
+          genesis' = BlockIndex 0 0x207fffff 500 1 genesisHash Nothing
+          (version, _) = computeBlockVersion [(futureDep, Map.empty)] getMTP (Just genesis')
+      version `shouldBe` versionBitsTopBits
+
+    it "computeBlockVersion sets no extra bits for FAILED deployment" $ do
+      -- Timeout occurs when a period boundary has MTP >= timeout.
+      -- With depTimeout=1001 and genesis MTP=1002, the first period boundary
+      -- transitions DEFINED→STARTED (MTP >= startTime=1000).
+      -- The SECOND period boundary has MTP >> 1001 → STARTED→FAILED.
+      -- We need TWO full periods (4031 blocks) to reach FAILED state.
+      let failDep = testDep { depStartTime = 1000, depTimeout = 1001 }
+          genesis' = BlockIndex 0 0x207fffff 1002 1 genesisHash Nothing
+          -- First period (height 1..2015): transition DEFINED→STARTED
+          period1 = buildChain genesis' 2015 1
+          period1End = if null period1 then genesis' else last period1
+          -- Second period (height 2016..4031): no signaling → STARTED→FAILED
+          period2 = buildChain period1End 2016 1
+          pindexPrev = if null period2 then period1End else last period2
+          (state, cache) = getDeploymentState failDep getMTP Map.empty (Just pindexPrev)
+          (version, _) = computeBlockVersion [(failDep, cache)] getMTP (Just pindexPrev)
+      -- After second period boundary, FAILED
+      state `shouldBe` Failed
+      version `shouldBe` versionBitsTopBits
+
+    it "computeBlockVersion ORs bits for LOCKED_IN deployment" $ do
+      -- Simulate threshold reached: signal on 1815 of 2016 blocks, then check at next period.
+      -- Build 2016 signaling blocks (version with bit 2 set).
+      let sigVersion = 0x20000004 :: Int32  -- top bits + bit 2
+          genesis' = BlockIndex 0 0x207fffff 1001 1 genesisHash Nothing
+          -- First period: DEFINED→STARTED (MTP >= startTime)
+          period1 = buildChain genesis' 2015 1         -- heights 1..2015
+          -- Second period: STARTED + count signals
+          period1End = if null period1 then genesis' else last period1
+          period2 = buildChain period1End 2016 sigVersion  -- heights 2016..4031 all signaling
+          period2End = if null period2 then period1End else last period2
+          (stateP2, cache2) = getDeploymentState testDep getMTP Map.empty (Just period2End)
+          (version, _) = computeBlockVersion [(testDep, cache2)] getMTP (Just period2End)
+      -- After full signaling period, should be LOCKED_IN
+      stateP2 `shouldBe` LockedIn
+      -- LOCKED_IN → bit 2 must be set in template version
+      (version .&. 0x20000004) `shouldBe` 0x20000004
+
+    it "LOCKED_IN transitions to ACTIVE when min_activation_height reached" $ do
+      -- Use a dep with min_activation_height = 5000.
+      -- Periods: 0..2015 = period1, 2016..4031 = period2 (signaling), 4032..6047 = period3.
+      -- period2End is at height 4031. LOCKED_IN state starts here.
+      -- The transition LOCKED_IN → ACTIVE happens at the period boundary after
+      -- pindexPrev.height + 1 >= minActivationHeight (5000). That is period3 boundary
+      -- (height 6047). We need to check the state at height 6047.
+      let depWithMinHeight = testDep { depMinActivationHeight = 5000 }
+          sigVersion = 0x20000004 :: Int32
+          genesis' = BlockIndex 0 0x207fffff 1001 1 genesisHash Nothing
+          period1 = buildChain genesis' 2015 1
+          period1End = if null period1 then genesis' else last period1
+          period2 = buildChain period1End 2016 sigVersion
+          period2End = if null period2 then period1End else last period2
+          -- At period2End (height 4031): state should be LOCKED_IN
+          (stateAtLockedIn, cache2) = getDeploymentState depWithMinHeight getMTP Map.empty (Just period2End)
+          -- Build the third period (height 4032..6047). biHeight period3End = 6047.
+          -- At boundary 6047: pindexPrev.height+1 = 6048 >= 5000 → ACTIVE.
+          period3 = buildChain period2End 2016 1
+          period3End = if null period3 then period2End else last period3
+          (stateAtActive, _) = getDeploymentState depWithMinHeight getMTP cache2 (Just period3End)
+      stateAtLockedIn `shouldBe` LockedIn
+      -- After building the full third period, should be ACTIVE
+      stateAtActive `shouldBe` Active
+
+    it "LOCKED_IN does not become ACTIVE before min_activation_height" $ do
+      let depWithMinHeight = testDep { depMinActivationHeight = 100000 }
+          sigVersion = 0x20000004 :: Int32
+          genesis' = BlockIndex 0 0x207fffff 1001 1 genesisHash Nothing
+          period1 = buildChain genesis' 2015 1
+          period1End = if null period1 then genesis' else last period1
+          period2 = buildChain period1End 2016 sigVersion
+          period2End = if null period2 then period1End else last period2
+          (state, _) = getDeploymentState depWithMinHeight getMTP Map.empty (Just period2End)
+      state `shouldBe` LockedIn
+
+    it "signaling condition requires top-3-bits = 001" $ do
+      -- All of these should NOT signal for bit 2:
+      isVersionBitSignaling 0x00000004 2 `shouldBe` False  -- wrong top bits
+      isVersionBitSignaling 0x40000004 2 `shouldBe` False  -- 010...
+      isVersionBitSignaling 0x60000004 2 `shouldBe` False  -- 011...
+      isVersionBitSignaling 0x80000004 2 `shouldBe` False  -- 100...
+      isVersionBitSignaling 0xa0000004 2 `shouldBe` False  -- 101...
+      isVersionBitSignaling 0xc0000004 2 `shouldBe` False  -- 110...
+      isVersionBitSignaling 0xe0000004 2 `shouldBe` False  -- 111...
+      -- Only 001 top bits should signal:
+      isVersionBitSignaling 0x20000004 2 `shouldBe` True
+
   describe "Full block validation" $ do
     it "rejects block with no transactions" $ do
       let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
