@@ -75,7 +75,10 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            getLegacySigOpCount,
                            buildConnectBlockOps, buildDisconnectBlockOps,
                            maxReorgDepth,
-                           encodeBip34Height)
+                           encodeBip34Height,
+                           Deployment, DeploymentCache,
+                           computeBlockVersionFromChain,
+                           taprootDeployment)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -260,8 +263,15 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
   let finalCoinbase = buildCoinbase height coinbaseValue coinbaseScript extraNonce
                         witnessCommitment
 
+  -- Compute block version: VERSIONBITS_TOP_BITS | signaling bits for STARTED/LOCKED_IN.
+  -- Reference: Bitcoin Core versionbits.cpp ComputeBlockVersion (lines 265-279).
+  -- Previously hardcoded to 0x20000000, which always missed deployment bits.
+  let activeDeployments :: [(Deployment, DeploymentCache)]
+      activeDeployments = [(taprootDeployment net, Map.empty)]
+      (blockVersion, _) = computeBlockVersionFromChain activeDeployments entries tip
+
   return BlockTemplate
-    { btVersion = 0x20000000  -- BIP-9 version bits signaling
+    { btVersion = blockVersion  -- BIP-9 version bits with deployment signaling
     , btPreviousBlock = prevHash
     , btTransactions = templateTxs
     , btCoinbaseValue = coinbaseValue
