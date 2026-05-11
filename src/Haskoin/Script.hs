@@ -84,6 +84,7 @@ module Haskoin.Script
   , initScriptEnvWithFlags
   , execCheckSig
   , execCheckSigAdd
+  , execCheckMultiSig
   , compactSizeLen
   , getSerializeSizeOfWitnessStack
   , evalScriptWithStack
@@ -1914,9 +1915,14 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
   -- Encoding checks happen BEFORE the empty sig shortcut, matching Bitcoin Core.
   -- CheckSignatureEncoding passes for empty sigs, then CheckPubKeyEncoding is checked.
   unless (BS.null sigBytes) $ do
-    -- STRICTENC / DERSIG: validate DER encoding of the signature
-    -- The signature includes the sighash type byte at the end
-    when (hasFlag (seFlags env'') VerifyStrictEncoding || hasFlag (seFlags env'') VerifyDERSig) $ do
+    -- STRICTENC / DERSIG / LOW_S: validate DER encoding of the signature.
+    -- Core's CheckSignatureEncoding (interpreter.cpp:207) checks DER when any
+    -- of DERSIG | LOW_S | STRICTENC is set, not just DERSIG | STRICTENC.
+    -- Including LOW_S here is necessary so that isLowDERSignature below is
+    -- never called on a malformed sig.  Ref: Core interpreter.cpp:207.
+    when (hasFlag (seFlags env'') VerifyStrictEncoding
+          || hasFlag (seFlags env'') VerifyDERSig
+          || hasFlag (seFlags env'') VerifyLowS) $ do
       unless (isValidDERSignature sigBytes) $
         Left "Non-canonical DER signature"
 
@@ -2158,14 +2164,30 @@ execCheckMultiSig env = do
         if length (pk:restPks) < nSigsRemaining
         then Right False
         else if BS.null s
-             -- Empty signatures never match; just advance pubkey cursor
-             then verifyMultiSig sigsLeft restPks nSigsRemaining
+             then do
+               -- Empty sigs: Core still calls CheckPubKeyEncoding for the
+               -- paired pubkey (interpreter.cpp:1161).  CheckSignatureEncoding
+               -- passes for empty sigs, but CheckPubKeyEncoding always runs.
+               -- STRICTENC: validate pubkey encoding even for empty sig
+               when (hasFlag (seFlags env5) VerifyStrictEncoding) $
+                 unless (isValidPubKeyEncoding pk) $
+                   Left "Invalid public key encoding"
+               -- BIP-141 WITNESS_PUBKEYTYPE: always enforced in witness v0
+               when (seIsWitness env5 && hasFlag (seFlags env5) VerifyWitnessPubkeyType) $
+                 unless (isCompressedPubKey pk) $
+                   Left "Witness pubkey not compressed"
+               -- Advance pubkey cursor only (empty sig never matches)
+               verifyMultiSig sigsLeft restPks nSigsRemaining
              else do
                -- Encoding checks for non-empty signatures (matching Bitcoin Core's
                -- CheckSignatureEncoding/CheckPubKeyEncoding inside the while loop)
 
-               -- STRICTENC / DERSIG: validate DER encoding of current signature
-               when (hasFlag (seFlags env5) VerifyStrictEncoding || hasFlag (seFlags env5) VerifyDERSig) $
+               -- STRICTENC / DERSIG / LOW_S: validate DER encoding of current signature.
+               -- Core checks DER when any of DERSIG | LOW_S | STRICTENC is set.
+               -- Ref: Core interpreter.cpp:207.
+               when (hasFlag (seFlags env5) VerifyStrictEncoding
+                     || hasFlag (seFlags env5) VerifyDERSig
+                     || hasFlag (seFlags env5) VerifyLowS) $
                  unless (isValidDERSignature s) $
                    Left "Non-canonical DER signature"
 
