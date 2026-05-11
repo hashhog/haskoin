@@ -68,7 +68,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          deleteUndoData, TxInUndo(..), TxUndo(..),
                          BlockUndo(..),
                          -- UTXO cache (for mempool wtxid test)
-                         UTXOCache(..), newUTXOCache,
+                         UTXOCache(..), newUTXOCache, addUTXO,
                          -- AssumeUTXO snapshot
                          SnapshotMetadata(..), SnapshotCoin(..),
                          UtxoSnapshot(..), snapshotMagicBytes,
@@ -4513,7 +4513,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
 
           -- Pre-populate two prevouts in the UTXO cache as if a
           -- prior disconnect just restored them.  P2WPKH-style
@@ -4578,7 +4578,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
 
           let prevScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0x55
               cbPrev = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
@@ -5508,7 +5508,7 @@ main = hspec $ do
             let dbCfg = defaultDBConfig (tmp </> "db")
             withDB dbCfg $ \db -> do
               cache <- newUTXOCache db 1024
-              mp <- newMempool regtest cache defaultMempoolConfig 0 0
+              mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
 
               -- Pre-populate one confirmed prevout in the UTXO cache. P2WPKH
               -- script keeps standardness checks happy.
@@ -7228,7 +7228,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
           -- parent: one output at vout=0
           let parentOut = TxOut 50000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x55)
               parentTx  = Tx 2 [] [parentOut] [[]] 0
@@ -7255,7 +7255,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
           let leafTx = Tx 2 [] [TxOut 1000 BS.empty] [[]] 0
               leafTxId = computeTxId leafTx
               leafEntry = (mkTestEntry leafTxId 100 50)
@@ -8617,6 +8617,235 @@ main = hspec $ do
       netCSVHeight mainnet `shouldBe` 419328
       -- Regtest CSV height matches Bitcoin Core: always active from block 1
       netCSVHeight regtest `shouldBe` 1
+
+  -- BIP-112 OP_CHECKSEQUENCEVERIFY script execution tests
+  describe "BIP-112 OP_CHECKSEQUENCEVERIFY execution" $ do
+    let csvFlags = flagSet [VerifyCheckSequenceVerify]
+        -- Build a v2 spending tx with a given input sequence number
+        mkSpendTx seqVal =
+          let inp = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                        BS.empty seqVal
+          in Tx 2 [inp] [] [[]] 0
+        -- Push a script number then OP_CSV
+        csvScript n = Script [OP_PUSHDATA (encodeScriptNum n) OPCODE, OP_CHECKSEQUENCEVERIFY]
+
+    it "NOP when CSV flag not set (treated as NOP3)" $ do
+      -- Without VerifyCheckSequenceVerify flag, OP_CSV is a NOP
+      let tx = mkSpendTx 0x00000000
+          scriptSig = Script [OP_1]  -- push 1 (will remain on stack after NOP)
+          scriptPubKey = Script [OP_CHECKSEQUENCEVERIFY, OP_DROP, OP_1]
+          result = evalScriptWithFlags emptyFlags tx 0 0 scriptSig scriptPubKey
+      -- Should succeed (NOP path, stack is [1] after DROP, then push 1)
+      result `shouldBe` Right True
+
+    it "passes when stack value has DISABLE_FLAG set (NOP path)" $ do
+      -- If script value has bit 31 set, CSV behaves as NOP regardless of tx
+      let tx = mkSpendTx 0x00000001  -- tx seq = 1 block
+          -- Push 0x80000000 (disable flag) — 5-byte encoding so it's positive
+          bigVal = fromIntegral (0x80000000 :: Word32) :: Int64
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum bigVal) OPCODE, OP_CHECKSEQUENCEVERIFY]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      -- CSV treats disable-flag script val as NOP; stack has [0x80000000] remaining
+      -- evalScriptWithFlags checks top-of-stack; non-empty with non-zero byte = True
+      result `shouldBe` Right True
+
+    it "fails for version 1 transaction" $ do
+      -- BIP-112: tx version must be >= 2
+      let tx1 = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                            BS.empty 0x00000005] [] [[]] 0
+          scriptPubKey = csvScript 5
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx1 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "CSV requires version >= 2"
+
+    it "fails when input sequence has DISABLE_FLAG (bit 31 set)" $ do
+      -- tx seq = 0x80000001 (bit 31 set) → script should fail
+      let tx = mkSpendTx 0x80000001
+          scriptPubKey = csvScript 1
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Input sequence has disable flag"
+
+    it "fails when type mismatch: script is time-based but tx is height-based" $ do
+      -- Script pushes TYPE_FLAG | 1 (time-based), tx seq = 1 (height-based, no TYPE_FLAG)
+      let tx = mkSpendTx 0x00000001  -- height-based
+          typeVal = fromIntegral (0x00400001 :: Word32) :: Int64  -- TYPE_FLAG | 1
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum typeVal) OPCODE, OP_CHECKSEQUENCEVERIFY]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Sequence type mismatch"
+
+    it "fails when type mismatch: script is height-based but tx is time-based" $ do
+      -- Script pushes 1 (height-based), tx seq = TYPE_FLAG | 1 (time-based)
+      let tx = mkSpendTx 0x00400001  -- time-based
+          scriptPubKey = csvScript 1  -- height-based
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Sequence type mismatch"
+
+    it "fails when script lock value exceeds tx sequence" $ do
+      -- Script requires 10 blocks; tx only has 5
+      let tx = mkSpendTx 0x00000005  -- 5 blocks
+          scriptPubKey = csvScript 10
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Sequence not satisfied"
+
+    it "passes when script lock value equals tx sequence" $ do
+      -- Script requires exactly N; tx has N → passes (N >= N)
+      let n = 42 :: Int64
+          tx = mkSpendTx (fromIntegral n)
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum n) OPCODE, OP_CHECKSEQUENCEVERIFY, OP_DROP, OP_1]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Right True
+
+    it "passes when tx sequence exceeds script lock value" $ do
+      -- Script requires 5 blocks; tx has 100
+      let tx = mkSpendTx 100
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum 5) OPCODE, OP_CHECKSEQUENCEVERIFY, OP_DROP, OP_1]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Right True
+
+    it "fails on stack underflow" $ do
+      let tx = mkSpendTx 100
+          scriptPubKey = Script [OP_CHECKSEQUENCEVERIFY]  -- empty stack
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Stack underflow"
+
+    it "fails for negative script value" $ do
+      -- Negative script value is not allowed by BIP-112
+      let tx = mkSpendTx 5
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum (-1)) OPCODE, OP_CHECKSEQUENCEVERIFY]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Negative sequence"
+
+    it "time-based: passes when types match and tx >= script" $ do
+      -- Both script and tx are time-based (TYPE_FLAG set), tx satisfies script
+      let timeVal = 0x00400005 :: Word32  -- TYPE_FLAG | 5 (5 * 512 seconds)
+          tx = mkSpendTx timeVal
+          typeVal = fromIntegral timeVal :: Int64
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum typeVal) OPCODE, OP_CHECKSEQUENCEVERIFY, OP_DROP, OP_1]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Right True
+
+    it "time-based: fails when tx has less time than script requires" $ do
+      -- Script requires TYPE_FLAG | 10 (10 * 512s), tx only has TYPE_FLAG | 5
+      let txTimeVal = 0x00400005 :: Word32  -- TYPE_FLAG | 5
+          tx = mkSpendTx txTimeVal
+          scriptTimeVal = fromIntegral (0x00400000 .|. 10 :: Word32) :: Int64
+          scriptPubKey = Script [OP_PUSHDATA (encodeScriptNum scriptTimeVal) OPCODE, OP_CHECKSEQUENCEVERIFY]
+          scriptSig = Script []
+          result = evalScriptWithFlags csvFlags tx 0 0 scriptSig scriptPubKey
+      result `shouldBe` Left "Sequence not satisfied"
+
+  -- BIP-113: median-time-past locktime cutoff tests
+  describe "BIP-113 median-time-past locktime cutoff" $ do
+    let mkTxLocktime lt = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0] [] [[]] lt
+
+    it "uses MTP (not block timestamp) for IsFinalTx when CSV is active (regtest)" $ do
+      -- A tx with locktime T is final when MTP > T (BIP-113)
+      -- and NOT final when T >= blockTimestamp > MTP
+      let locktime = 1600000100 :: Word32
+          mtp      = 1600000000 :: Word32   -- MTP < locktime → not final by BIP-113
+          blockTs  = 1600000200 :: Word32   -- block timestamp > locktime (BIP-113 ignored here)
+          height   = 100 :: Word32
+          csvActive = height >= netCSVHeight regtest  -- True (regtest CSV always active)
+          cutoff = if csvActive then mtp else blockTs
+          tx = mkTxLocktime locktime
+      -- With MTP cutoff: locktime (100) >= MTP (000) → NOT final
+      isFinalTxCheck tx height cutoff `shouldBe` False
+
+    it "tx is final when MTP exceeds locktime" $ do
+      let locktime = 1600000100 :: Word32
+          mtp      = 1600000200 :: Word32   -- MTP > locktime → final
+          height   = 100 :: Word32
+          tx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0] [] [[]] locktime
+      isFinalTxCheck tx height mtp `shouldBe` True
+
+    it "uses block timestamp (not MTP) before CSV activation" $ do
+      -- Before CSV, nLockTimeCutoff = block.nTime (BIP-113 not active)
+      -- A tx with locktime between MTP and blockTs is final by block timestamp
+      -- but not final by MTP.
+      let locktime = 1600000100 :: Word32
+          mtp      = 1600000000 :: Word32   -- MTP < locktime (not final by MTP)
+          blockTs  = 1600000200 :: Word32   -- blockTs > locktime (final by timestamp)
+          height   = 100 :: Word32
+          -- Use mainnet height below CSV (419327): cutoff = block timestamp
+          csvActive = height >= netCSVHeight mainnet  -- 100 < 419328 → False
+          cutoff = if csvActive then mtp else blockTs
+          tx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0] [] [[]] locktime
+      isFinalTxCheck tx height cutoff `shouldBe` True  -- final because blockTs > locktime
+
+    it "SEQUENCE_FINAL overrides locktime regardless of MTP" $ do
+      -- If all inputs have sequence = 0xffffffff, tx is always final
+      let locktime = 2000000000 :: Word32   -- far future
+          mtp      = 1600000000 :: Word32   -- MTP < locktime
+          height   = 100 :: Word32
+          -- inputs all have SEQUENCE_FINAL
+          tx = Tx 1 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty 0xffffffff] [] [[]] locktime
+      isFinalTxCheck tx height mtp `shouldBe` True
+
+  -- BIP-68 mempool sequence-lock correctness (Bug 1 fix validation)
+  describe "BIP-68 mempool sequence-lock per-input coin MTP" $ do
+    it "checkSeqLocksAtTip: time-based lock correctly uses per-input coin MTP" $ do
+      -- Before the Bug 1 fix, time-based BIP-68 checks always failed because
+      -- the tip MTP was used as coinMTP.  With the fix, the per-input MTP is
+      -- fetched from mpGetCoinMtp, allowing old coins to have long-passed MTPs.
+      --
+      -- Scenario: coin at height 100, coinMTP (of block 99) = 1_000_000_000.
+      -- Tx has time-based lock of 1 unit (512 s): nMinTime = 1_000_000_000 + 512 - 1.
+      -- Tip MTP = 1_600_000_000 (much larger), so the lock IS satisfied.
+      -- With old buggy code (tipMTP as coinMTP): nMinTime = 1_600_000_000 + 512 - 1
+      --   → check fails (tipMTP is not > tipMTP + 511).
+      -- With correct code: nMinTime = 1_000_000_000 + 511 → check passes.
+      withSystemTempDirectory "haskoin-bip68-mtp1" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db -> do
+          cache <- newUTXOCache db 1024
+          let coinHeight = 100 :: Word32
+              coinMtpAtH99 = 1_000_000_000 :: Word32  -- MTP of block 99
+              tipHeight = 1000 :: Word32
+              tipMtp    = 1_600_000_000 :: Word32
+              -- per-input MTP lookup returns coinMtpAtH99 for height 99
+              getCoinMtp h = return (if h == 99 then coinMtpAtH99 else 0)
+              timeSeq = 0x00400001 :: Word32  -- TYPE_FLAG | 1 (1 * 512 seconds)
+              tx = Tx 2 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0) BS.empty timeSeq] [] [[]] 0
+              prevOut = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0
+              entry = UTXOEntry (TxOut 1000 BS.empty) coinHeight False False
+          atomically $ addUTXO cache prevOut entry
+          mp <- newMempool regtest cache defaultMempoolConfig tipHeight tipMtp getCoinMtp
+          result <- checkSeqLocksAtTip mp tx tipHeight tipMtp
+          -- nMinTime = 1_000_000_000 + 512 - 1 = 1_000_000_511 < 1_600_000_000 → satisfies
+          result `shouldBe` Right ()
+
+    it "checkSeqLocksAtTip: time-based lock passes when coin is old enough" $ do
+      -- A coin confirmed at height 1000, coinMTP (of block 999) = 1_599_000_000.
+      -- Lock of 1 unit (512 s): nMinTime = 1_599_000_000 + 512 - 1 = 1_599_000_511
+      -- Tip MTP = 1_600_000_000 > 1_599_000_511 → PASSES.
+      withSystemTempDirectory "haskoin-bip68-mtp2" $ \tmp -> do
+        let cfg = defaultDBConfig (tmp </> "db")
+        withDB cfg $ \db2 -> do
+          cache2 <- newUTXOCache db2 1024
+          let coinHeight2 = 1000 :: Word32
+              coinMtp2 = 1_599_000_000 :: Word32
+              tipHeight2 = 1010 :: Word32
+              tipMtp2   = 1_600_000_000 :: Word32
+              getCoinMtp2 h = return (if h == 999 then coinMtp2 else 0)
+              timeSeq2 = 0x00400001 :: Word32  -- TYPE_FLAG | 1 (512 s)
+              tx2 = Tx 2 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0xbb))) 0) BS.empty timeSeq2] [] [[]] 0
+              prevOut2 = OutPoint (TxId (Hash256 (BS.replicate 32 0xbb))) 0
+              entry2 = UTXOEntry (TxOut 1000 BS.empty) coinHeight2 False False
+          atomically $ addUTXO cache2 prevOut2 entry2
+          mp2 <- newMempool regtest cache2 defaultMempoolConfig tipHeight2 tipMtp2 getCoinMtp2
+          result2 <- checkSeqLocksAtTip mp2 tx2 tipHeight2 tipMtp2
+          -- nMinTime = 1_599_000_000 + 512 - 1 = 1_599_000_511 < 1_600_000_000 → satisfies
+          result2 `shouldBe` Right ()
 
   -- Phase 13: Header Sync Anti-DoS Tests (PRESYNC/REDOWNLOAD)
   describe "header sync" $ do
@@ -11931,7 +12160,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let txid = TxId (Hash256 (BS.replicate 32 0x60))
                 tx   = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0
             result <- checkTrucPolicy tx 10001 mp
@@ -11944,7 +12173,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let tx = Tx 3 [] [TxOut 50000 BS.empty] [[]] 0
             result <- checkTrucPolicy tx 10000 mp
             -- No parents, no descendant issue → passes all gates
@@ -11959,7 +12188,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             -- Inject two v3 parent entries directly into the mempool index
             let p1id  = TxId (Hash256 (BS.replicate 32 0x70))
                 p1tx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x11)] [[]] 0
@@ -11993,7 +12222,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId  = TxId (Hash256 (BS.replicate 32 0x80))
                 parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x33)] [[]] 0
                 -- meAncestorCount=2 means the parent itself has 1 ancestor (grandparent)
@@ -12022,7 +12251,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId  = TxId (Hash256 (BS.replicate 32 0x81))
                 parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x44)] [[]] 0
                 parentEnt = (mkTestEntry parentId 1000 200)
@@ -12047,7 +12276,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId  = TxId (Hash256 (BS.replicate 32 0x82))
                 parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x55)] [[]] 0
                 parentEnt = (mkTestEntry parentId 1000 200)
@@ -12070,7 +12299,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId  = TxId (Hash256 (BS.replicate 32 0x83))
                 parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x66)] [[]] 0
                 parentEnt = (mkTestEntry parentId 1000 200)
@@ -12096,7 +12325,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId   = TxId (Hash256 (BS.replicate 32 0x90))
                 parentTx   = Tx 3 [] [ TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x77)
                                      , TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x78) ] [[]] 0
@@ -12140,7 +12369,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId   = TxId (Hash256 (BS.replicate 32 0xa0))
                 parentTx   = Tx 3 [] [ TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x88)
                                      , TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x89)] [[]] 0
@@ -12180,7 +12409,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId  = TxId (Hash256 (BS.replicate 32 0xb0))
                 parentTx  = Tx 3 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0x99)] [[]] 0
                 parentEnt = (mkTestEntry parentId 1000 200)
@@ -12201,7 +12430,7 @@ main = hspec $ do
           let cfg = defaultDBConfig (tmp </> "db")
           withDB cfg $ \db -> do
             cache <- newUTXOCache db 1024
-            mp    <- newMempool regtest cache defaultMempoolConfig 0 0
+            mp    <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             let parentId  = TxId (Hash256 (BS.replicate 32 0xb1))
                 parentTx  = Tx 2 [] [TxOut 60000 (BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa)] [[]] 0
                 parentEnt = (mkTestEntry parentId 1000 200)
@@ -14808,7 +15037,7 @@ main = hspec $ do
         let cfg = defaultDBConfig (tmp </> "db")
         withDB cfg $ \db -> do
           cache <- newUTXOCache db 1024
-          mp <- newMempool regtest cache defaultMempoolConfig 0 0
+          mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
           let entry = MempoolEntry
                 { meTransaction = tx
                 , meTxId = expectedTxid
