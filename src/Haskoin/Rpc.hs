@@ -2682,14 +2682,27 @@ buildWitnessCommitmentScript bt
 -- strings, NOT as JSON-RPC error objects.
 bip22ResultString :: String -> String
 bip22ResultString err
-  -- Already-canonical strings pass through unchanged
+  -- Already-canonical strings pass through unchanged.
+  -- W84: added bad-txns-inputs-duplicate (Core: consensus/tx_check.cpp:44),
+  --      bad-txns-oversize (Core: consensus/tx_check.cpp:19-21),
+  --      bad-txns-txouttotal-toolarge (Core: consensus/tx_check.cpp:33),
+  --      bad-txns-inputvalues-outofrange (Core: consensus/tx_verify.cpp:185-188),
+  --      bad-txns-accumulated-fee-outofrange (Core: validation.cpp:2537-2540),
+  --      bad-txns-fee-outofrange (Core: consensus/tx_verify.cpp:200-203).
+  -- Removed stale "bad-txns-duplicate" (not a Core string; was a mapping target,
+  -- now replaced by the canonical bad-txns-inputs-duplicate).
   | err `elem` ["duplicate", "inconclusive", "duplicate-invalid",
                 "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
                 "bad-witness-nonce-size", "unexpected-witness",
                 "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
-                "bad-txns-nonfinal", "bad-txns-duplicate", "rejected",
+                "bad-txns-nonfinal", "bad-txns-inputs-duplicate", "rejected",
                 "block-script-verify-flag-failed",
-                "bad-txns-inputs-missingorspent"] = err
+                "bad-txns-inputs-missingorspent",
+                "bad-txns-oversize",
+                "bad-txns-txouttotal-toolarge",
+                "bad-txns-inputvalues-outofrange",
+                "bad-txns-accumulated-fee-outofrange",
+                "bad-txns-fee-outofrange"] = err
 
   -- PoW / difficulty (from validateFullBlock / submitBlock)
   | "does not meet proof of work" `isInfixOf` s = "high-hash"
@@ -2726,9 +2739,10 @@ bip22ResultString err
   | "bad-txns-nonfinal" `isInfixOf` s           = "bad-txns-nonfinal"
   | "sequence lock" `isInfixOf` s               = "bad-txns-nonfinal"
 
-  -- Duplicate transactions
-  | "duplicate inputs" `isInfixOf` s            = "bad-txns-duplicate"
-  | "duplicate transaction" `isInfixOf` s       = "bad-txns-duplicate"
+  -- Duplicate inputs (legacy free-text mapping; canonical form is now emitted
+  -- directly by validateTransaction as "bad-txns-inputs-duplicate").
+  | "duplicate inputs" `isInfixOf` s            = "bad-txns-inputs-duplicate"
+  | "duplicate transaction" `isInfixOf` s       = "bad-txns-inputs-duplicate"
 
   -- Missing inputs / UTXO
   | "missing utxo" `isInfixOf` s                = "bad-txns-inputs-missingorspent"

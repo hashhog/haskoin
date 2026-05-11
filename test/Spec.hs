@@ -2004,21 +2004,53 @@ main = hspec $ do
         Left msg | "no outputs" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject tx with no outputs"
 
-    it "rejects transaction with duplicate inputs" $ do
+    it "rejects transaction with duplicate inputs (CVE-2018-17144)" $ do
+      -- Core: consensus/tx_check.cpp:41-44 → "bad-txns-inputs-duplicate"
       let txid = TxId (Hash256 (BS.replicate 32 0xbb))
           txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
           tx = Tx 1 [txin, txin] [TxOut 1000 "script"] [[], []] 0
       case validateTransaction tx of
-        Left msg | "Duplicate" `T.isInfixOf` T.pack msg -> return ()
+        Left msg | msg == "bad-txns-inputs-duplicate" -> return ()
+        Left msg -> expectationFailure $ "Wrong error: " ++ msg
         _ -> expectationFailure "Should reject tx with duplicate inputs"
 
-    it "rejects transaction with outputs exceeding max money" $ do
+    it "rejects oversize transaction (bad-txns-oversize)" $ do
+      -- Core: consensus/tx_check.cpp:19-21
+      -- Strip-witness size * 4 > 4,000,000 → bad-txns-oversize.
+      -- Craft a tx whose non-witness serialized size exceeds 1,000,000 bytes.
+      let txid  = TxId (Hash256 (BS.replicate 32 0xdd))
+          -- Each output: 8 bytes value + varint(len) + script bytes ≈ 9 + len
+          -- 112,000 outputs × ~9 bytes ≈ >1,000,000 bytes (well above 1 MB limit)
+          bigOut = TxOut 1 (BS.replicate 1 0x51)
+          txin   = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          tx     = Tx 1 [txin] (replicate 120000 bigOut) [[]] 0
+      case validateTransaction tx of
+        Left msg | msg == "bad-txns-oversize" -> return ()
+        Left msg -> expectationFailure $ "Wrong error: " ++ msg
+        _ -> expectationFailure "Should reject oversize tx"
+
+    it "rejects transaction with total output value exceeding max money (bad-txns-txouttotal-toolarge)" $ do
+      -- Core: consensus/tx_check.cpp:31-33 → "bad-txns-txouttotal-toolarge"
+      -- Two outputs each ≤ maxMoney but sum > maxMoney.
+      let txid = TxId (Hash256 (BS.replicate 32 0xcc))
+          txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
+          -- maxMoney = 2,100,000,000,000,000; two outputs just over half
+          halfMax = maxMoney `div` 2 + 1
+          tx = Tx 1 [txin] [TxOut halfMax "s", TxOut halfMax "s"] [[]] 0
+      case validateTransaction tx of
+        Left msg | msg == "bad-txns-txouttotal-toolarge" -> return ()
+        Left msg -> expectationFailure $ "Wrong error: " ++ msg
+        _ -> expectationFailure "Should reject tx with total output > maxMoney"
+
+    it "rejects transaction with single output exceeding MAX_MONEY (bad-txns-vout-toolarge)" $ do
+      -- Core: consensus/tx_check.cpp:29-30 → "bad-txns-vout-toolarge"
       let txid = TxId (Hash256 (BS.replicate 32 0xcc))
           txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
           tx = Tx 1 [txin] [TxOut (maxMoney + 1) "script"] [[]] 0
       case validateTransaction tx of
-        Left msg | "max money" `T.isInfixOf` T.pack msg -> return ()
-        _ -> expectationFailure "Should reject tx exceeding max money"
+        Left msg | "MAX_MONEY" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $ "Wrong error: " ++ msg
+        _ -> expectationFailure "Should reject tx exceeding max money per output"
 
     it "accepts valid coinbase transaction" $ do
       let nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
@@ -17353,8 +17385,27 @@ main = hspec $ do
       bip22ResultString "Block exceeds sigop cost limit"
         `shouldBe` "bad-blk-sigops"
 
-    it "'Duplicate inputs' maps to bad-txns-duplicate" $
-      bip22ResultString "Duplicate inputs" `shouldBe` "bad-txns-duplicate"
+    -- W84: canonical string is now bad-txns-inputs-duplicate (Core parity)
+    it "'Duplicate inputs' legacy text maps to bad-txns-inputs-duplicate" $
+      bip22ResultString "Duplicate inputs" `shouldBe` "bad-txns-inputs-duplicate"
+
+    it "canonical 'bad-txns-inputs-duplicate' passes through" $
+      bip22ResultString "bad-txns-inputs-duplicate" `shouldBe` "bad-txns-inputs-duplicate"
+
+    it "canonical 'bad-txns-oversize' passes through" $
+      bip22ResultString "bad-txns-oversize" `shouldBe` "bad-txns-oversize"
+
+    it "canonical 'bad-txns-txouttotal-toolarge' passes through" $
+      bip22ResultString "bad-txns-txouttotal-toolarge" `shouldBe` "bad-txns-txouttotal-toolarge"
+
+    it "canonical 'bad-txns-inputvalues-outofrange' passes through" $
+      bip22ResultString "bad-txns-inputvalues-outofrange" `shouldBe` "bad-txns-inputvalues-outofrange"
+
+    it "canonical 'bad-txns-accumulated-fee-outofrange' passes through" $
+      bip22ResultString "bad-txns-accumulated-fee-outofrange" `shouldBe` "bad-txns-accumulated-fee-outofrange"
+
+    it "canonical 'bad-txns-fee-outofrange' passes through" $
+      bip22ResultString "bad-txns-fee-outofrange" `shouldBe` "bad-txns-fee-outofrange"
 
     it "'Missing UTXO: ...' maps to bad-txns-inputs-missingorspent" $
       bip22ResultString "Missing UTXO: outpoint:0"
