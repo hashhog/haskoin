@@ -4304,7 +4304,11 @@ main = hspec $ do
             , ceMedianTime = 1000
             }
           entries = Map.singleton (ceHash entry) entry
-          expectedBits = difficultyAdjustment regtest entries entry
+          -- W85: difficultyAdjustment now takes the candidate header so the
+          -- testnet 20-minute min-diff rule can be evaluated.  For regtest
+          -- (netPowNoRetargeting = True) the header argument is not used.
+          candidateHdr = BlockHeader 1 (ceHash entry) (Hash256 (BS.replicate 32 0)) 2000 0x207fffff 0
+          expectedBits = difficultyAdjustment regtest entries entry candidateHdr
       expectedBits `shouldBe` 0x207fffff
 
   describe "ChainEntry" $ do
@@ -9591,6 +9595,324 @@ main = hspec $ do
       -- app/Main.hs) and verify the read-back.
       let info' = info { piWantsHeaders = True }
       piWantsHeaders info' `shouldBe` True
+
+  --------------------------------------------------------------------------------
+  -- W85: MedianTimePast + ContextualCheckBlockHeader audit
+  -- Reference: bitcoin-core/src/validation.cpp:4080-4121
+  -- Reference: bitcoin-core/src/chain.h:230-244
+  -- Reference: bitcoin-core/src/consensus/consensus.h:35
+  --------------------------------------------------------------------------------
+  describe "W85 ContextualCheckBlockHeader gates" $ do
+
+    -- Gate: time-too-old (MTP)
+    -- Core: block.GetBlockTime() <= pindexPrev->GetMedianTimePast()
+    -- validation.cpp:4092-4093
+    it "addHeader rejects header with timestamp == MTP (off-by-one: <= not <)" $ do
+      hc <- initHeaderChain regtest
+      let genesisHdr  = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          -- Build 11 headers with timestamps 100..1100 so MTP is computable.
+          -- Genesis timestamp is the genesis block's timestamp.
+          genesisMtp  = bhTimestamp genesisHdr  -- MTP of genesis = genesis ts
+          -- A header with timestamp == MTP of its parent must be rejected.
+          badHdr = mineRegtestHeader $
+            BlockHeader 1 genesisHash
+                        (Hash256 (BS.replicate 32 0x01))
+                        genesisMtp  -- timestamp == MTP (= genesis ts) => rejected
+                        0x207fffff 0
+      result <- addHeader regtest hc badHdr
+      case result of
+        Left err -> err `shouldSatisfy` (\e -> "time-too-old" `DL.isInfixOf` e
+                                           || "median" `DL.isInfixOf` e)
+        Right _  -> expectationFailure
+          "addHeader accepted header with timestamp == MTP (time-too-old gate missing)"
+
+    it "addHeader accepts header with timestamp == MTP + 1 (just above MTP)" $ do
+      hc <- initHeaderChain regtest
+      let genesisHdr  = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          genesisMtp  = bhTimestamp genesisHdr
+          okHdr = mineRegtestHeader $
+            BlockHeader 1 genesisHash
+                        (Hash256 (BS.replicate 32 0x02))
+                        (genesisMtp + 1)  -- timestamp = MTP + 1 => accepted
+                        0x207fffff 0
+      result <- addHeader regtest hc okHdr
+      case result of
+        Right _ -> return ()
+        Left err -> expectationFailure $
+          "addHeader rejected header with timestamp == MTP+1: " ++ err
+
+    -- Gate: bad-diffbits
+    -- Core: block.nBits != GetNextWorkRequired => "bad-diffbits"
+    -- validation.cpp:4088-4089
+    -- (Regtest has no retargeting so bits must always == 0x207fffff)
+    it "addHeader rejects header with wrong nBits (bad-diffbits)" $ do
+      hc <- initHeaderChain regtest
+      let genesisHdr  = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          genesisTs   = bhTimestamp genesisHdr
+          -- Use wrong nBits (mainnet difficulty instead of regtest 0x207fffff)
+          -- Note: regtest checkProofOfWork uses 0x207fffff limit, so a header
+          -- with wrongBits that still passes PoW at wrongBits would still fail
+          -- the ProofOfWork gate first.  We need to test bad-diffbits, not PoW.
+          -- With regtest (netPowNoRetargeting=True) expectedBits = prevBits = 0x207fffff.
+          -- Any header with bits != 0x207fffff is a bad-diffbits error BEFORE PoW check.
+          -- But addHeader checks PoW BEFORE diffbits.  Use 0x207ffffe (slightly harder
+          -- but still easy) so it can be mined and pass PoW, yet fail diffbits.
+          wrongBits = 0x207ffffe  -- one harder than regtest minimum, but still minable
+          -- Mine a header with the wrong bits value.
+          badHdr = head [ BlockHeader 1 genesisHash
+                                     (Hash256 (BS.replicate 32 0x03))
+                                     (genesisTs + 1) wrongBits k
+                        | k <- [0 :: Word32 ..]
+                        , checkProofOfWork
+                            (BlockHeader 1 genesisHash
+                                         (Hash256 (BS.replicate 32 0x03))
+                                         (genesisTs + 1) wrongBits k)
+                            (netPowLimit regtest) ]
+      result <- addHeader regtest hc badHdr
+      case result of
+        Left err -> err `shouldSatisfy` (\e -> "bad-diffbits" `DL.isInfixOf` e
+                                           || "difficulty" `DL.isInfixOf` e)
+        Right _  -> expectationFailure
+          "addHeader accepted header with wrong nBits (bad-diffbits gate missing)"
+
+    -- Gate: computeEntryMtp correct off-by-one fix
+    -- ceMedianTime should be MTP *of the entry itself*, not its parent.
+    -- Child blocks reading prevCe.ceMedianTime need MTP(prevCe), not MTP(prevCe's parent).
+    it "ceMedianTime stores MTP of the entry itself (not its parent)" $ do
+      hc <- initHeaderChain regtest
+      let genesisHdr  = blockHeader (netGenesisBlock regtest)
+          genesisHash = computeBlockHash genesisHdr
+          genesisTs   = bhTimestamp genesisHdr
+          -- Build block 1 with timestamp = genesisTs + 100.
+          hdr1 = mineRegtestHeader $
+            BlockHeader 1 genesisHash
+                        (Hash256 (BS.replicate 32 0x10))
+                        (genesisTs + 100) 0x207fffff 0
+      result1 <- addHeader regtest hc hdr1
+      case result1 of
+        Left err -> expectationFailure $ "addHeader block 1 failed: " ++ err
+        Right entry1 -> do
+          -- MTP of entry1 = median of [hdr1.timestamp, genesis.timestamp]
+          -- With only 2 timestamps, median(index = 2 `div` 2 = 1) = sort[genesisTs, genesisTs+100] !! 1
+          -- = genesisTs + 100 (the larger one at index 1 of 2-element sorted list).
+          -- Actually: length=2, index = 2 `div` 2 = 1, sorted = [genesisTs, genesisTs+100]
+          -- so ceMedianTime = genesisTs + 100.
+          -- Pre-fix: ceMedianTime stored MTP(parent=genesis) = genesisTs (off by one).
+          -- Post-fix: ceMedianTime should store MTP(entry1) = genesisTs + 100.
+          let expectedMtp = computeEntryMtp
+                              (Map.singleton genesisHash
+                                (ChainEntry genesisHdr genesisHash 0 (headerWork genesisHdr)
+                                            Nothing StatusValid genesisTs))
+                              genesisHash
+                              (bhTimestamp hdr1)
+          ceMedianTime entry1 `shouldBe` expectedMtp
+          -- Also verify it is NOT the parent's MTP (which would be the off-by-one value).
+          -- Parent's MTP = medianTimePast with just genesis = genesisTs.
+          ceMedianTime entry1 `shouldNotBe` genesisTs
+
+    -- Gate: MAX_FUTURE_BLOCK_TIME is Int64 (no Word32 overflow near 2106)
+    -- This is a property test: maxFutureBlockTime should equal 7200.
+    it "maxFutureBlockTime equals 7200 (Int64)" $
+      maxFutureBlockTime `shouldBe` (7200 :: Int64)
+
+    -- Gate: maxTimewarp equals 600 (BIP94 timewarp constant)
+    -- Reference: bitcoin-core/src/consensus/consensus.h:35
+    it "maxTimewarp equals 600 (BIP94 MAX_TIMEWARP, Int64)" $
+      maxTimewarp `shouldBe` (600 :: Int64)
+
+    -- Gate: computeEntryMtp with a known chain
+    it "computeEntryMtp returns correct median for short chain" $ do
+      -- Build a mini chain: timestamps 100, 200, 300.
+      -- New entry timestamp: 400.
+      -- Collection: [400, 300, 200, 100] (up to 11, but only 4 available).
+      -- Wait, computeEntryMtp collects from parentHash (up to 10 ancestors),
+      -- then prepends newTimestamp.
+      -- If parentHash = block3 (ts=300), ancestors collected from block3: [300, 200, 100]
+      -- newTimestamp = 400.
+      -- timestamps = [400, 300, 200, 100], sorted = [100, 200, 300, 400]
+      -- length=4, index = 4 `div` 2 = 2, result = 300.
+      let mkHash n = BlockHash (Hash256 (BS.replicate 31 0 <> BS.singleton n))
+          h1 = mkHash 1; h2 = mkHash 2; h3 = mkHash 3
+          mkHdr ts prev = BlockHeader 1 prev (Hash256 (BS.replicate 32 0)) ts 0 0
+          e1 = ChainEntry (mkHdr 100 (BlockHash (Hash256 (BS.replicate 32 0)))) h1 0 1 Nothing StatusValid 100
+          e2 = ChainEntry (mkHdr 200 h1) h2 1 2 (Just h1) StatusValid 150
+          e3 = ChainEntry (mkHdr 300 h2) h3 2 3 (Just h2) StatusValid 200
+          entries = Map.fromList [(h1, e1), (h2, e2), (h3, e3)]
+          result = computeEntryMtp entries h3 400
+      -- sorted [100, 200, 300, 400] !! 2 = 300
+      result `shouldBe` 300
+
+    -- Gate: BIP94 timewarp attack check
+    -- Core: validation.cpp:4097-4104
+    -- enforce_BIP94 + height % interval == 0 + timestamp < prevTimestamp - MAX_TIMEWARP
+    -- We use a custom network derived from regtest with BIP94 enabled and
+    -- netRetargetInterval=2 so we hit a retarget boundary quickly.
+    it "addHeader rejects timewarp-attack on BIP94 network at retarget boundary" $ do
+      -- Create a BIP94-enabled regtest variant with retarget interval 2.
+      -- That means block at height 2 is the first retarget block (height % 2 == 0).
+      let bip94net = regtest
+            { netEnforceBIP94 = True
+            , netRetargetInterval = 2
+            , netPowNoRetargeting = True  -- keep mining trivially easy
+            }
+          genesisHdr  = blockHeader (netGenesisBlock bip94net)
+          genesisHash = computeBlockHash genesisHdr
+          genesisTs   = bhTimestamp genesisHdr
+
+      -- Add block 1 (height=1, not at retarget boundary).
+      hc <- initHeaderChain bip94net
+      let hdr1 = mineRegtestHeader $
+                   BlockHeader 1 genesisHash
+                               (Hash256 (BS.replicate 32 0x20))
+                               (genesisTs + 1000) 0x207fffff 0
+      r1 <- addHeader bip94net hc hdr1
+      hash1 <- case r1 of
+        Left err -> do
+          expectationFailure $ "addHeader block 1 failed: " ++ err
+          return genesisHash  -- unreachable
+        Right e -> return (ceHash e)
+
+      -- Try to add block 2 (height=2, AT retarget boundary height % 2 == 0)
+      -- with a timestamp that is more than MAX_TIMEWARP (600s) BEFORE block 1.
+      -- prevTs = genesisTs + 1000. timewarp header ts < prevTs - 600 = genesisTs + 400.
+      -- Use genesisTs + 300 (600 + 100 seconds below prevTs - MAX_TIMEWARP boundary).
+      -- Note: must still be > MTP of prevBlock (which is genesisTs + some value).
+      -- MTP of block1: median of [genesisTs+1000, genesisTs] = genesisTs+1000 or genesisTs?
+      -- With 2 timestamps sorted = [genesisTs, genesisTs+1000], length=2, index=1 => genesisTs+1000.
+      -- Actually median index = length `div` 2 = 2 `div` 2 = 1 => sorted[1] = genesisTs+1000.
+      -- So MTP of block1 = genesisTs + 1000 (same as block1 timestamp since sorted ascending).
+      -- Wait: block1.ceMedianTime (post-fix) = computeEntryMtp starting from block1.
+      -- collectAncestors from genesisHash (10 slots): [genesisTs].
+      -- timestamps = [genesisTs+1000, genesisTs], sorted = [genesisTs, genesisTs+1000], index 1 = genesisTs+1000.
+      -- So MTP of block1 = genesisTs + 1000.
+      -- For block2 header, timestamp must be > MTP(block1) = genesisTs + 1000.
+      -- But also for BIP94 timewarp: ts < prevTs(block1) - MAX_TIMEWARP = genesisTs + 1000 - 600 = genesisTs + 400.
+      -- Since ts must be > genesisTs + 1000 for MTP gate AND ts < genesisTs + 400 for timewarp,
+      -- there's no valid conflicting timestamp — both gates can't fire simultaneously in this config.
+      --
+      -- Fix: use genesisTs + 2000 for block1 so MTP(block1) is lower.
+      -- Actually let's try different timestamps. Use block1 ts = genesisTs + 700.
+      -- MTP(block1) = median([genesisTs+700, genesisTs]) = index 1 of [genesisTs, genesisTs+700] = genesisTs+700.
+      -- Hmm, same issue. The MTP of a 2-block chain's last block equals its own timestamp
+      -- when the timestamp is greater than genesis.
+      --
+      -- To make the timewarp attack testable: we need prevTimestamp - MAX_TIMEWARP > MTP(prev).
+      -- MTP(prev) collects from prev-inclusive: for block1, it includes block1.ts and genesis.ts.
+      -- With 2 entries, index 1 = the larger one = block1.ts.
+      -- So MTP(block1) = block1.ts always (for 2-block chain).
+      -- The timewarp condition is: headerTs < prevTs - 600.
+      -- The MTP condition is: headerTs > MTP(prev) = prevTs.
+      -- So headerTs > prevTs AND headerTs < prevTs - 600 is impossible.
+      --
+      -- Use a longer chain: build up to block3 (retarget at height=4 for interval=4).
+      -- With interval=4, retarget at height 4, 8, 12, ...
+      -- Build blocks 1,2,3 with ts = T, T+100, T+200.
+      -- MTP(block3) with 4 timestamps = median([T+200, T+100, T, genesisTs]) = index 2 = T+100.
+      -- Timewarp: block4Ts < prevTs - 600 = T + 200 - 600 = T - 400.
+      -- MTP condition: block4Ts > MTP(block3) = T + 100.
+      -- Still impossible: can't have block4Ts > T+100 AND block4Ts < T-400.
+      --
+      -- The timewarp attack requires prevTs to be VERY large (attacker mines future-dated block
+      -- at the last block before the retarget boundary, then mines the retarget block with ts
+      -- far in the past). Let's simulate:
+      --   block_retarget-1: ts = T + 10000 (attacker backdated to big timestamp)
+      --   block_retarget: ts = T (attacker tries to go back 10000s-600s)
+      -- For this to pass MTP: T > MTP(block_{retarget-1}).
+      -- Let's see: chain[1..retarget-2] has ts ~= 100+n*100. Last block before retarget has ts=10000.
+      -- With many blocks, MTP will be the median of 11 recent timestamps. If 10 of the 11 are 100..1000
+      -- and one is 10000, median might still be low enough that T can be > MTP yet < prevTs - 600.
+      -- We need retarget boundary of at least 5 so we can build a proper chain.
+      let bip94net2 = regtest
+            { netEnforceBIP94    = True
+            , netRetargetInterval = 5  -- retarget at heights 5, 10, 15...
+            , netPowNoRetargeting = True
+            }
+          g2Hdr  = blockHeader (netGenesisBlock bip94net2)
+          g2Hash = computeBlockHash g2Hdr
+          g2Ts   = bhTimestamp g2Hdr
+
+      hc2 <- initHeaderChain bip94net2
+      -- Build blocks 1..4 sequentially with modest timestamps.
+      -- Block 4 has a very large ts (attacker inflates prev ts before retarget boundary).
+      let mkH n parent ts = mineRegtestHeader $
+                BlockHeader 1 parent (Hash256 (BS.replicate 31 0x00 <> BS.singleton n))
+                            ts 0x207fffff 0
+          hdr1 = mkH 1 g2Hash (g2Ts + 100)
+          hdr2 = mkH 2 (computeBlockHash hdr1) (g2Ts + 200)
+          hdr3 = mkH 3 (computeBlockHash hdr2) (g2Ts + 300)
+          hdr4 = mkH 4 (computeBlockHash hdr3) (g2Ts + 10000)
+      let addH net hc h = do
+            r <- addHeader net hc h
+            case r of
+              Left err -> expectationFailure ("build chain fail: " ++ err) >> return undefined
+              Right e  -> return e
+      _ <- addH bip94net2 hc2 hdr1
+      _ <- addH bip94net2 hc2 hdr2
+      _ <- addH bip94net2 hc2 hdr3
+      e4 <- addH bip94net2 hc2 hdr4
+      let prevHash5 = ceHash e4
+          -- Block 5 is at height 5 which is at retarget boundary (5 % 5 == 0).
+          -- prevTs = g2Ts + 10000 (block4 ts).
+          -- For timewarp: ts5 < prevTs - 600 = g2Ts + 9400.
+          -- For MTP: ts5 > MTP(block4).
+          -- MTP(block4) = median([g2Ts+10000, g2Ts+300, g2Ts+200, g2Ts+100, g2Ts]).
+          --   sorted = [g2Ts, g2Ts+100, g2Ts+200, g2Ts+300, g2Ts+10000], length=5, index 2 = g2Ts+200.
+          -- So need ts5 > g2Ts + 200 AND ts5 < g2Ts + 9400.
+          -- Choose ts5 = g2Ts + 500 (satisfies MTP > 200 but violates timewarp < 9400).
+          timewarpTs = g2Ts + 500  -- > MTP(block4)=g2Ts+200, but < prevTs-600=g2Ts+9400 => timewarp!
+          badHdr5 = mineRegtestHeader $
+            BlockHeader 1 prevHash5
+                        (Hash256 (BS.replicate 32 0x22))
+                        timewarpTs 0x207fffff 0
+      result5 <- addHeader bip94net2 hc2 badHdr5
+      case result5 of
+        Left err -> err `shouldSatisfy` (\e -> "time-timewarp-attack" `DL.isInfixOf` e
+                                           || "timewarp" `DL.isInfixOf` e)
+        Right _  -> expectationFailure
+          "addHeader accepted timewarp header at retarget boundary (BIP94 gate missing)"
+
+    it "addHeader accepts non-timewarp header at retarget boundary on BIP94 network" $ do
+      -- Same network/chain setup, but use a ts that doesn't violate the timewarp rule.
+      let bip94net3 = regtest
+            { netEnforceBIP94    = True
+            , netRetargetInterval = 5
+            , netPowNoRetargeting = True
+            }
+          g3Hdr  = blockHeader (netGenesisBlock bip94net3)
+          g3Hash = computeBlockHash g3Hdr
+          g3Ts   = bhTimestamp g3Hdr
+      hc3 <- initHeaderChain bip94net3
+      let mkH' n parent ts = mineRegtestHeader $
+                BlockHeader 1 parent (Hash256 (BS.replicate 31 0x00 <> BS.singleton n))
+                            ts 0x207fffff 0
+          hdr3_1 = mkH' 11 g3Hash (g3Ts + 100)
+          hdr3_2 = mkH' 12 (computeBlockHash hdr3_1) (g3Ts + 200)
+          hdr3_3 = mkH' 13 (computeBlockHash hdr3_2) (g3Ts + 300)
+          hdr3_4 = mkH' 14 (computeBlockHash hdr3_3) (g3Ts + 10000)
+      let addH3 h = do
+            r <- addHeader bip94net3 hc3 h
+            case r of
+              Left err -> expectationFailure ("build chain fail: " ++ err) >> return undefined
+              Right e  -> return e
+      _ <- addH3 hdr3_1; _ <- addH3 hdr3_2; _ <- addH3 hdr3_3; e3_4 <- addH3 hdr3_4
+      let prevHash3_5 = ceHash e3_4
+          -- Block 5 retarget. prevTs = g3Ts + 10000.
+          -- MAX_TIMEWARP = 600. Boundary: ts >= prevTs - 600 = g3Ts + 9400.
+          -- Also ts > MTP(block4) = g3Ts + 200.
+          -- Use g3Ts + 9400 (exactly at boundary — must be >= to pass).
+          okTs = g3Ts + 9400
+          okHdr5 = mineRegtestHeader $
+            BlockHeader 1 prevHash3_5
+                        (Hash256 (BS.replicate 32 0x32))
+                        okTs 0x207fffff 0
+      result5 <- addHeader bip94net3 hc3 okHdr5
+      case result5 of
+        Right _ -> return ()
+        Left err -> expectationFailure $
+          "addHeader rejected non-timewarp header at BIP94 retarget boundary: " ++ err
 
   --------------------------------------------------------------------------------
   -- Misbehavior Scoring Tests (Phase 14)
@@ -17367,8 +17689,14 @@ main = hspec $ do
     it "'Proof of work check failed' maps to high-hash" $
       bip22ResultString "Proof of work check failed" `shouldBe` "high-hash"
 
-    it "'Incorrect difficulty target' maps to high-hash" $
-      bip22ResultString "Incorrect difficulty target" `shouldBe` "high-hash"
+    -- W85: "Incorrect difficulty target" = wrong nBits field = bad-diffbits,
+    -- NOT "high-hash" (which means the block hash doesn't meet the target).
+    -- Reference: bitcoin-core/src/validation.cpp:4088-4089 "bad-diffbits"
+    it "'Incorrect difficulty target' maps to bad-diffbits (W85 fix)" $
+      bip22ResultString "Incorrect difficulty target" `shouldBe` "bad-diffbits"
+
+    it "'bad-diffbits' canonical error passes through" $
+      bip22ResultString "bad-diffbits" `shouldBe` "bad-diffbits"
 
     it "'Merkle root mismatch' maps to bad-txnmrklroot" $
       bip22ResultString "Merkle root mismatch" `shouldBe` "bad-txnmrklroot"
