@@ -144,6 +144,7 @@ module Haskoin.Network
   , maxHeadersResults
   , maxLocatorSz
   , maxAddrToSend
+  , maxProtocolMessageLength
   , getCappedVarInt
     -- * Misbehavior Scoring
   , MisbehaviorReason(..)
@@ -849,6 +850,14 @@ maxLocatorSz = 101
 -- (bitcoin-core/src/net_processing.cpp:190).
 maxAddrToSend :: Word64
 maxAddrToSend = 1_000
+
+-- | Maximum protocol message length (payload bytes) accepted from a peer.
+-- Mirrors Bitcoin Core's @MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000@
+-- (bitcoin-core/src/net.h).  Applied to both the v1 framing path
+-- (mhLength guard in 'receiveV1') and the BIP-324 v2 cipher layer
+-- ('readEncryptedPacket' contents-length guard).
+maxProtocolMessageLength :: Int
+maxProtocolMessageLength = 4 * 1000 * 1000
 
 -- | Helper: read a varint and reject if it exceeds @cap@.
 -- Returns the count if valid, or 'fail's the parser otherwise.  Used by
@@ -1920,8 +1929,8 @@ receiveMessage pc = do
               -- Verify network magic
               | mhMagic header /= netMagic (pcNetwork pc) ->
                   return $ Left "Wrong network magic"
-              -- Check payload size limit (32 MB)
-              | mhLength header > 32 * 1024 * 1024 ->
+              -- Check payload size limit (4 MB per Core MAX_PROTOCOL_MESSAGE_LENGTH)
+              | mhLength header > fromIntegral maxProtocolMessageLength ->
                   return $ Left "Payload too large"
               | otherwise -> do
                   -- Read payload
@@ -2230,16 +2239,22 @@ readEncryptedPacket pc transport aad = do
       case bip324DecryptLength cipher encLen of
         Left err -> return $ Left err
         Right (cipher1, len) -> do
-          let payloadLen = fromIntegral len + v2HeaderLen + 16  -- header + payload + tag
-          mPayload <- recvExact pc payloadLen
-          case mPayload of
-            Nothing -> return $ Left "v2: connection closed reading payload"
-            Just payload ->
-              case bip324Decrypt cipher1 payload aad of
-                Left err -> return $ Left err
-                Right (cipher2, ignore, contents) -> do
-                  atomically $ writeTVar (v2tCipher transport) cipher2
-                  return $ Right (ignore, contents)
+          -- Reject oversized packets before allocating the receive buffer
+          -- (mirrors Core MAX_PROTOCOL_MESSAGE_LENGTH guard in
+          -- ProcessReceivedPacketBytes).
+          if fromIntegral len > maxProtocolMessageLength
+            then return $ Left "v2: payload too large"
+            else do
+              let payloadLen = fromIntegral len + v2HeaderLen + 16  -- header + payload + tag
+              mPayload <- recvExact pc payloadLen
+              case mPayload of
+                Nothing -> return $ Left "v2: connection closed reading payload"
+                Just payload ->
+                  case bip324Decrypt cipher1 payload aad of
+                    Left err -> return $ Left err
+                    Right (cipher2, ignore, contents) -> do
+                      atomically $ writeTVar (v2tCipher transport) cipher2
+                      return $ Right (ignore, contents)
 
 -- | Send an encrypted packet over the wire.
 writeEncryptedPacket
