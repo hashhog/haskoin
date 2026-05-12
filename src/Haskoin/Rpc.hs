@@ -7423,13 +7423,25 @@ handleDumpTxOutSet server params = do
     -- (rewound, then partially rebuilt) chainstate at each step. This
     -- works because each block's prevouts are either in the rewound
     -- state or were created by an earlier replayed block.
+    --
+    -- W97/W99-G18: connectBlock now returns Either String () instead of
+    -- silently overwriting BestBlock on a gate failure.  Each block in
+    -- @ces@ extends the prior reconnected block by construction (the
+    -- list is produced by 'checkRewindFeasible' walking the active
+    -- chain backward), so a gate failure here means on-disk
+    -- corruption.  We surface the error so the caller can report
+    -- "chainstate may be inconsistent, restart to recover".
     reconnectChain :: HaskoinDB -> Network -> [(ChainEntry, Block)]
                    -> IO (Either String ())
     reconnectChain _ _ [] = return (Right ())
     reconnectChain db net ((ce, blk) : rest) = do
       spent <- buildSpentUtxoMapFromDB db blk
-      connectBlock db net blk (ceHeight ce) spent
-      reconnectChain db net rest
+      cbR <- connectBlock db net blk (ceHeight ce) spent
+      case cbR of
+        Left err -> return $ Left $
+          "reconnectChain at height " <> show (ceHeight ce)
+          <> ": " <> err
+        Right () -> reconnectChain db net rest
 
 --------------------------------------------------------------------------------
 -- Helper Functions

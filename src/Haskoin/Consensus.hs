@@ -224,7 +224,6 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Exception (try, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
-import System.IO (hPutStrLn, stderr)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
@@ -2907,75 +2906,32 @@ connectBlock :: HaskoinDB -> Network -> Block -> Word32
                                    --   carries Core-format height + coinbase
                                    --   metadata for byte-identical round-trip
                                    --   through 'disconnectBlock'.
-             -> IO ()
+             -> IO (Either String ())
 connectBlock db net block height spentUtxos = do
-  -- Legacy wrapper: invokes the W93-strict 'connectBlockAt' but tolerates
-  -- the Gate-G1 (prevHash mismatch) and Gate-G19 (missing prevout) failures
-  -- by falling back to the pre-W93 unchecked write.  This preserves the
-  -- existing test-harness contract (several legacy tests connect blocks
-  -- with @prevHash != BestBlock@ on purpose to exercise the round-trip
-  -- of the on-disk format).  Strict callers (IBD blockProcessor +
-  -- submitBlock) MUST use 'connectBlockAt' directly to surface the gate
-  -- failures as 'Either String ()'.
-  r <- connectBlockAt db net block height spentUtxos
-  case r of
-    Right () -> return ()
-    Left err -> do
-      -- Emit a warning to stderr so the silent-fallback is visible in
-      -- live logs without breaking ad-hoc test setups.
-      hPutStrLn stderr $ "WARN: connectBlock falling back through gate: " <> err
-      connectBlockUnchecked db block height spentUtxos
-
--- | Unchecked variant of 'connectBlock' — writes the same RocksDB
--- ops without running the W93 gates.  Used only by the legacy
--- 'connectBlock' wrapper after a gate-failure warning so pre-W93
--- callers that exercise structural round-trips still work.  New
--- code MUST use 'connectBlockAt'.
-connectBlockUnchecked :: HaskoinDB -> Block -> Word32
-                     -> Map OutPoint Coin -> IO ()
-connectBlockUnchecked db block height spentUtxos = do
-  let bh = computeBlockHash (blockHeader block)
-      prevHash = bhPrevBlock (blockHeader block)
-      txns = blockTxns block
-      txids = map computeTxId txns
-      mkTxInUndo inp = case Map.lookup (txInPrevOutput inp) spentUtxos of
-        Just c  -> Just (TxInUndo (coinTxOut c)
-                                  (coinHeight c)
-                                  (coinIsCoinbase c))
-        Nothing -> Nothing
-      mkTxUndo tx = TxUndo
-        { tuPrevOutputs = mapMaybe mkTxInUndo (txInputs tx) }
-      blockUndo = BlockUndo
-        { buTxUndo = map mkTxUndo (drop 1 txns) }
-      undoData = mkUndoData bh height prevHash blockUndo
-      undoKey  = BS.cons 0x10 (encode bh)
-      coinbaseFlag txIdx = txIdx == (0 :: Int)
-      ops = concat
-        [ [ BatchPut (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
-                     (encode (Coin { coinTxOut = txout
-                                   , coinHeight = height
-                                   , coinIsCoinbase = coinbaseFlag txIdx }))
-          | (txIdx, txid, tx) <- zip3 [0..] txids txns
-          , (i, txout) <- zip [0..] (txOutputs tx)
-          , not (isUnspendable (txOutScript txout))
-          ]
-        , [ BatchDelete (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
-          | tx <- drop 1 txns
-          , inp <- txInputs tx
-          ]
-        , [ BatchPut undoKey (encode undoData) ]
-        , [ BatchPut (makeKey PrefixTxIndex (encode txid))
-                     (encode (TxLocation bh (fromIntegral i)))
-          | (i, txid) <- zip [0..] txids
-          ]
-        , [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
-          , BatchPut (makeKey PrefixBlockHeader (encode bh))
-                     (encode (blockHeader block))
-          , BatchPut (makeKey PrefixBlockHeight (encode (toBE32 height)))
-                     (encode bh)
-          ]
-        ]
-  writeBatch db (WriteBatch ops)
+  -- W97/W99-G18 P0 fix: this is now a thin alias for 'connectBlockAt'.
+  -- The pre-fix version silently fell back to an unchecked variant when
+  -- 'connectBlockAt' rejected the G1 (prevHash mismatch) or G19
+  -- (missing prevout) gates — that unchecked variant overwrote the
+  -- PrefixBestBlock pointer unconditionally, so a peer that sent a
+  -- side-branch MBlock whose prevHash ≠ BestBlock could corrupt the
+  -- chain-tip pointer.  Reference (Core: bitcoin-core/src/validation.cpp
+  -- AcceptBlock @4298+): the tip pointer is only advanced through
+  -- 'ActivateBestChain' after a clean 'ConnectTip' on a block that
+  -- extends the active chain.  Side-branch blocks must go through a
+  -- reorg or be persisted as inactive — they NEVER unilaterally
+  -- overwrite BestBlock.
+  --
+  -- All callers MUST pattern-match the Either:
+  --   * MBlock peer handler — Left → log + misbehaving(InvalidBlock)
+  --   * submitBlock active-tip arm — Left is structurally impossible
+  --     (the if-guard above ensures parent==tip) and should surface
+  --     as an error if it ever fires
+  --   * reindex-chainstate replay — Left → log + stop (the on-disk
+  --     replay is sequential by height; a gate failure means data
+  --     corruption)
+  --   * dumptxoutset rollback replay — Left → bail and surface as
+  --     "chainstate may be inconsistent"
+  connectBlockAt db net block height spentUtxos
 
 -- | Connect a block to the chain state with the full Bitcoin Core
 -- ConnectBlock gate set (validation.cpp:2295-2673):
