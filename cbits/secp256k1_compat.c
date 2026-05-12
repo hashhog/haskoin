@@ -273,6 +273,14 @@ int haskoin_xonly_pubkey_tweak_add(
 
     if (!ctx) return 0;
 
+    /* W95: defensive NULL guard.  The Haskell wrapper enforces 32-byte
+     * lengths and passes pinned pointers, but the C ABI is exposed to
+     * any future FFI caller and a NULL deref inside libsecp's strict-arg
+     * macros aborts the process. */
+    if (!internal_pubkey32 || !tweak32 || !output_pubkey32 || !output_parity) {
+        return 0;
+    }
+
     /* Parse the 32-byte x-only internal public key */
     if (!secp256k1_xonly_pubkey_parse(ctx, &internal_pk, internal_pubkey32)) {
         return 0;
@@ -317,6 +325,15 @@ int haskoin_schnorrsig_verify(
     secp256k1_xonly_pubkey xonly;
 
     if (!ctx) return 0;
+
+    /* W95: defensive NULL guard.  Same rationale as
+     * haskoin_xonly_pubkey_tweak_add: the Haskell wrapper enforces
+     * 64/32/32-byte lengths and pins the ByteStrings before the FFI
+     * crossing, but a future caller via this C ABI gets a clean
+     * 0-return on NULL instead of an ARG_CHECK assertion inside libsecp. */
+    if (!sig64 || !msg32 || !pubkey_x32) {
+        return 0;
+    }
 
     if (!secp256k1_xonly_pubkey_parse(ctx, &xonly, pubkey_x32)) {
         return 0;
