@@ -21191,6 +21191,59 @@ main = hspec $ do
           other -> expectationFailure $
             "Expected ErrAlreadyInMempool (wtxid hit), got: " ++ show other
 
+    it "ErrSameNonwitnessInMempool on txid hit with different witness (W96 BIP-339)" $ do
+      -- Core PreChecks (validation.cpp:826-829): if wtxid is NOT in pool but
+      -- txid IS → TX_CONFLICT, "txn-same-nonwitness-data-in-mempool".
+      -- This covers the witness-mutated-relay case where the same non-witness
+      -- tx is already in the pool under a different wtxid.
+      -- Simulate: pre-populate only the txid index (not mpByWtxid), so the
+      -- wtxid lookup misses but the txid lookup hits.
+      let prevTxid2 = TxId (Hash256 (BS.replicate 32 0x02))
+          op2       = OutPoint prevTxid2 0
+          spk2      = BS.pack [0x00, 0x14] <> BS.replicate 20 0x88
+          txin2     = TxIn op2 BS.empty 0xfffffffd
+          txout2    = TxOut 2_000_000 spk2
+          -- tx2: non-segwit base tx (witness stack empty — wtxid == txid)
+          tx2      = Tx 2 [txin2] [txout2] [[]] 0
+          txid2    = computeTxId tx2
+          wtxid2   = computeWtxid tx2
+          fakeEntry2 = MempoolEntry
+            { meTransaction = tx2
+            , meTxId        = txid2
+            , meWtxid       = wtxid2
+            , meFee         = 0
+            , meFeeRate     = FeeRate 0
+            , meSize        = 100
+            , meTime        = 0
+            , meHeight      = 0
+            , meAncestorCount = 1
+            , meAncestorSize  = 100
+            , meAncestorFees  = 0
+            , meAncestorSigOps = 0
+            , meDescendantCount = 1
+            , meDescendantSize  = 100
+            , meDescendantFees  = 0
+            , meRBFOptIn      = False
+            }
+          -- tx2Mutated: same non-witness data, but with a different witness
+          -- stack (so computeWtxid yields a distinct hash while computeTxId
+          -- returns the same txid2).
+          tx2Mutated = tx2 { txWitness = [[BS.replicate 1 0xff]] }
+          mutatedWtxid = computeWtxid tx2Mutated
+      -- Sanity: txids must match, wtxids must differ
+      computeTxId tx2Mutated `shouldBe` txid2
+      mutatedWtxid `shouldNotBe` wtxid2
+      withTestMempool $ \mp -> do
+        -- Pre-populate txid index only (no wtxid entry), simulating a tx
+        -- already in the pool under a different wtxid.
+        atomically $ modifyTVar' (mpEntries mp) (Map.insert txid2 fakeEntry2)
+        -- Submit the witness-mutated variant — wtxid misses, txid hits.
+        result <- addTransaction mp tx2Mutated
+        case result of
+          Left ErrSameNonwitnessInMempool -> return ()
+          other -> expectationFailure $
+            "Expected ErrSameNonwitnessInMempool (txid hit), got: " ++ show other
+
     it "PreCheckEphemeralTx (general dust) — fee + dust rejects (W96)" $ do
       -- Core: ephemeral_policy.cpp:23-31. Any dust output + non-zero
       -- fee → "tx with dust output must be 0-fee".  Previously only
