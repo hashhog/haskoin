@@ -1486,12 +1486,15 @@ bsToInteger = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0
 
 -- | Validation status for a block.
 -- Tracks how far along the validation process each block is.
+-- Mirrors Core's BLOCK_VALID_* / BLOCK_FAILED_* flag semantics.
 data BlockStatus
   = StatusUnknown        -- ^ 0x00: Not yet validated
   | StatusHeaderValid    -- ^ 0x01: Header passes validation
   | StatusDataReceived   -- ^ 0x02: Full block data received
   | StatusValid          -- ^ 0x03: Fully validated (scripts, UTXOs)
-  | StatusInvalid        -- ^ 0x04: Validation failed
+  | StatusInvalid        -- ^ 0x04: Validation failed (legacy; use StatusFailedValid/StatusFailedChild)
+  | StatusFailedValid    -- ^ 0x05: Directly invalidated via invalidateblock (Core BLOCK_FAILED_VALID)
+  | StatusFailedChild    -- ^ 0x06: Descendant of an invalidated block (Core BLOCK_FAILED_CHILD)
   deriving (Show, Eq, Enum, Generic)
 
 instance Serialize BlockStatus where
