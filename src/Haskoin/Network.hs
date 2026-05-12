@@ -3288,26 +3288,29 @@ getUnconnectingHeadersCount pm addr = do
 -- Misbehavior Scoring API
 --------------------------------------------------------------------------------
 
--- | Record misbehavior for a peer (STM version for atomic operations).
--- Increments the peer's ban score based on the misbehavior reason.
--- When score reaches threshold (default 100), peer is marked for banning.
--- Returns the new total score and whether the peer should be banned.
+-- | Record misbehavior for a peer (single-event discourage).
+-- Any call for a regular peer immediately marks it for discouragement and
+-- disconnect, mirroring Bitcoin Core PR #25974 which replaced numeric
+-- score-accumulation with a boolean @m_should_discourage@ flag set on every
+-- @Misbehaving()@ call (net_processing.cpp:1898).
 --
--- Mirrors Bitcoin Core's @MaybeDiscourageAndDisconnect@
--- (net_processing.cpp:5083).  Three protection classes are checked
--- BEFORE applying any ban-score or disconnect:
+-- Returns @(diagnosticScore, shouldDisconnect)@ where @diagnosticScore@ is
+-- the event's score value (for logging) and @shouldDisconnect@ is @True@
+-- whenever the peer should be discouraged/disconnected.
+--
+-- Three protection classes are checked BEFORE discouraging (mirrors Core's
+-- @MaybeDiscourageAndDisconnect@, net_processing.cpp:5083):
 --
 --   1. @piNoBan@    — whitelisted peers (HasPermission(PF_NOBAN)): no-op.
 --   2. @piIsManual@ — -addnode / addnode-RPC peers (IsManualConn()): no-op.
 --   3. @piIsLocal@  — loopback/local peers (addr.IsLocal()): disconnect
 --                     without adding to the discourage list.
 --
--- Regular inbound/outbound peers that hit threshold are discouraged
--- (added to ban list) and disconnected.
+-- Regular inbound/outbound peers are discouraged (added to ban list) and
+-- disconnected immediately on the first misbehavior event.
 misbehaving :: PeerManager -> SockAddr -> MisbehaviorReason -> IO (Int, Bool)
 misbehaving pm addr reason = do
   let score = misbehaviorScore reason
-      threshold = pmcBanThreshold (pmConfig pm)
 
   peers <- readTVarIO (pmPeers pm)
   case Map.lookup addr peers of
@@ -3322,31 +3325,30 @@ misbehaving pm addr reason = do
         else if piIsManual info
           then return (piBanScore info, False)
           else do
-            (newScore, shouldBan) <- atomically $ do
+            -- Single-event discourage: set PeerBanned state immediately.
+            -- piBanScore is updated for diagnostic logging only.
+            newScore <- atomically $ do
               i <- readTVar (pcInfo pc)
-              let oldScore = piBanScore i
-                  newScore' = oldScore + score
-                  shouldBan' = newScore' >= threshold
+              let newScore' = piBanScore i + score
               modifyTVar' (pcInfo pc) $ \j ->
                 j { piBanScore = newScore'
-                  , piState = if shouldBan' then PeerBanned else piState j
+                  , piState = PeerBanned
                   }
-              return (newScore', shouldBan')
+              return newScore'
 
-            when shouldBan $ do
-              -- Gate 3: Local address — disconnect-only, no discourage list
-              -- (Core: addr.IsLocal() → fDisconnect=true without Discourage)
-              if piIsLocal info
-                then do
-                  disconnectPeer pc
-                  atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
-                else do
-                  -- Regular peer: add to discourage list and disconnect
-                  banPeer pm addr
-                  disconnectPeer pc
-                  atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+            -- Gate 3: Local address — disconnect-only, no discourage list
+            -- (Core: addr.IsLocal() → fDisconnect=true without Discourage)
+            if piIsLocal info
+              then do
+                disconnectPeer pc
+                atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+              else do
+                -- Regular peer: add to discourage list and disconnect
+                banPeer pm addr
+                disconnectPeer pc
+                atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
 
-            return (newScore, shouldBan)
+            return (newScore, True)
 
 -- | Check if an address is currently discouraged/banned
 -- Used before accepting new connections
