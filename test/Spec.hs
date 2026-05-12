@@ -91,6 +91,7 @@ import Haskoin.BlockTemplate
 import Haskoin.Rpc
 import Haskoin.Index
 import qualified Haskoin.MuHash as MuHash
+import qualified W100UTXOCacheSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22323,6 +22324,9 @@ main = hspec $ do
       -- Verify the after-verack send path exists:
       contents <- readFile "src/Haskoin/Network.hs"
       ("MFeeFilter (FeeFilter 100000)" `isInfixOf` contents) `shouldBe` True
+
+  -- W100 CCoinsViewCache + FlushStateToDisk gate audit
+  W100UTXOCacheSpec.spec
 
   where
     sampleTx = Tx
