@@ -21629,16 +21629,38 @@ main = hspec $ do
       ("fHasMoreOrSameWork" `isInfixOf` block) `shouldBe` False
       ("ChainWork"          `isInfixOf` block) `shouldBe` False
 
-    it "G19c BUG: fTooFarAhead (height > tip + 288) MISSING on MBlock (W97 DOS)" $ do
-      -- Core: line 4325+4339 — reject unrequested blocks whose height
-      -- exceeds ActiveHeight + MIN_BLOCKS_TO_KEEP (288).  haskoin
-      -- defines minBlocksToKeep in Storage.hs:2130 but never consults
-      -- it on the inbound-block path.
+    it "G19c unrequested too-far-ahead block is dropped (W97 G19c active)" $ do
+      -- Core: validation.cpp:4325 — for unrequested blocks, reject when
+      --   pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP (288).
+      -- Fixed: minBlocksToKeep (Storage.hs:2130) is now wired up in the
+      -- MBlock handler via an 'unless (not fRequested && fTooFarAhead)' guard.
+      -- Case 1: unrequested block at tip+289 → dropped (fTooFarAhead=True,
+      -- fRequested=False → unless condition is True → body is skipped).
       contents <- readFile "app/Main.hs"
       let block = unlines (take 130 (drop 1352 (lines contents)))
-      ("MIN_BLOCKS_TO_KEEP" `isInfixOf` block) `shouldBe` False
-      ("minBlocksToKeep"     `isInfixOf` block) `shouldBe` False
-      ("TooFarAhead"         `isInfixOf` block) `shouldBe` False
+      -- Gate must be present in the MBlock handler window.
+      ("minBlocksToKeep" `isInfixOf` block) `shouldBe` True
+      ("fTooFarAhead"    `isInfixOf` block) `shouldBe` True
+      ("fRequested"      `isInfixOf` block) `shouldBe` True
+
+    it "G19c unrequested block at-gate (tip+288) is accepted (W97 G19c boundary)" $ do
+      -- Case 2: height = activeTip + 288 → fTooFarAhead is False (288 == 288,
+      -- not > 288) → gate does NOT fire → block proceeds to connectBlock.
+      -- Verify the guard uses strict '>' (not '>='), matching Core line 4325.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 130 (drop 1352 (lines contents)))
+      -- The comparison must be strict greater-than, not >=.
+      ("height > activeTipHeight + minBlocksToKeep" `isInfixOf` block) `shouldBe` True
+
+    it "G19c requested block beyond tip+288 is accepted (W97 G19c fRequested exemption)" $ do
+      -- Case 3: even if height > tip + 288, if fRequested=True the gate must
+      -- not fire.  Verify the guard is conditioned on 'not fRequested'.
+      -- Core validation.cpp:4316 — 'if (!fRequested)' wraps ALL three
+      -- early-return sub-gates (4320 nTx, 4327 fHasMoreOrSameWork, 4325
+      -- fTooFarAhead, 4345 nMinimumChainWork).
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 130 (drop 1352 (lines contents)))
+      ("not fRequested" `isInfixOf` block) `shouldBe` True
 
     it "G19d BUG: nMinimumChainWork gate MISSING on MBlock (W97 DOS)" $ do
       -- Core: line 4345 — for unrequested blocks reject when
