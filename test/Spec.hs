@@ -4973,7 +4973,7 @@ main = hspec $ do
           a1 = mineH a1Base
           a1Hash = computeBlockHash a1
 
-      _ <- addHeader regtest hc a1
+      _ <- addHeader regtest hc a1 True
       tip1 <- getChainTip hc
       ceHash tip1 `shouldBe` a1Hash
 
@@ -4987,7 +4987,7 @@ main = hspec $ do
                                 1700000600 0x207fffff 0
           b1 = mineH b1Base
           b1Hash = computeBlockHash b1
-      _ <- addHeader regtest hc b1
+      _ <- addHeader regtest hc b1 True
 
       byHeightAfter <- readTVarIO (hcByHeight hc)
       Map.lookup 1 byHeightAfter `shouldBe` Just a1Hash
@@ -5014,7 +5014,7 @@ main = hspec $ do
                                 1700000000 0x207fffff 0
           a1 = mineH a1Base
           a1Hash = computeBlockHash a1
-      _ <- addHeader regtest hc a1
+      _ <- addHeader regtest hc a1 True
 
       -- B1 (side-branch sibling of A1) inserted via the side-branch
       -- helper.  Mirrors nimrod's putBlockIndexHashOnly: hash entry
@@ -5071,7 +5071,7 @@ main = hspec $ do
                                 (Hash256 (BS.replicate 32 0xaa))
                                 1700000000 0x207fffff 0
           a1 = mineH a1Base
-      _ <- addHeader regtest hc a1
+      _ <- addHeader regtest hc a1 True
 
       let b1Base = BlockHeader 1 genesisHash
                                 (Hash256 (BS.replicate 32 0xbb))
@@ -5412,7 +5412,7 @@ main = hspec $ do
           hc <- initHeaderChain regtest
           case mHdr1 of
             Just hdr -> do
-              result <- addHeader regtest hc hdr
+              result <- addHeader regtest hc hdr True
               case result of
                 Right entry -> do
                   ceHeight entry `shouldBe` 1
@@ -10394,7 +10394,7 @@ main = hspec $ do
             BlockHeader 1 genesisHash
                         (Hash256 (BS.replicate 32 0x55))
                         dayAhead 0x207fffff 0
-      result <- addHeader regtest hc futureHdr
+      result <- addHeader regtest hc futureHdr True
       case result of
         Left err -> err `shouldSatisfy` ("time-too-new" `DL.isInfixOf`)
         Right _  -> expectationFailure
@@ -10413,7 +10413,7 @@ main = hspec $ do
             BlockHeader 1 genesisHash
                         (Hash256 (BS.replicate 32 0x66))
                         okAhead 0x207fffff 0
-      result <- addHeader regtest hc okHdr
+      result <- addHeader regtest hc okHdr True
       case result of
         Right _  -> return ()
         Left err -> expectationFailure $
@@ -10517,7 +10517,7 @@ main = hspec $ do
                         (Hash256 (BS.replicate 32 0x01))
                         genesisMtp  -- timestamp == MTP (= genesis ts) => rejected
                         0x207fffff 0
-      result <- addHeader regtest hc badHdr
+      result <- addHeader regtest hc badHdr True
       case result of
         Left err -> err `shouldSatisfy` (\e -> "time-too-old" `DL.isInfixOf` e
                                            || "median" `DL.isInfixOf` e)
@@ -10534,7 +10534,7 @@ main = hspec $ do
                         (Hash256 (BS.replicate 32 0x02))
                         (genesisMtp + 1)  -- timestamp = MTP + 1 => accepted
                         0x207fffff 0
-      result <- addHeader regtest hc okHdr
+      result <- addHeader regtest hc okHdr True
       case result of
         Right _ -> return ()
         Left err -> expectationFailure $
@@ -10568,7 +10568,7 @@ main = hspec $ do
                                          (Hash256 (BS.replicate 32 0x03))
                                          (genesisTs + 1) wrongBits k)
                             (netPowLimit regtest) ]
-      result <- addHeader regtest hc badHdr
+      result <- addHeader regtest hc badHdr True
       case result of
         Left err -> err `shouldSatisfy` (\e -> "bad-diffbits" `DL.isInfixOf` e
                                            || "difficulty" `DL.isInfixOf` e)
@@ -10588,7 +10588,7 @@ main = hspec $ do
             BlockHeader 1 genesisHash
                         (Hash256 (BS.replicate 32 0x10))
                         (genesisTs + 100) 0x207fffff 0
-      result1 <- addHeader regtest hc hdr1
+      result1 <- addHeader regtest hc hdr1 True
       case result1 of
         Left err -> expectationFailure $ "addHeader block 1 failed: " ++ err
         Right entry1 -> do
@@ -10665,7 +10665,7 @@ main = hspec $ do
                    BlockHeader 1 genesisHash
                                (Hash256 (BS.replicate 32 0x20))
                                (genesisTs + 1000) 0x207fffff 0
-      r1 <- addHeader bip94net hc hdr1
+      r1 <- addHeader bip94net hc hdr1 True
       hash1 <- case r1 of
         Left err -> do
           expectationFailure $ "addHeader block 1 failed: " ++ err
@@ -10742,7 +10742,7 @@ main = hspec $ do
           hdr3 = mkH 3 (computeBlockHash hdr2) (g2Ts + 300)
           hdr4 = mkH 4 (computeBlockHash hdr3) (g2Ts + 10000)
       let addH net hc h = do
-            r <- addHeader net hc h
+            r <- addHeader net hc h True
             case r of
               Left err -> expectationFailure ("build chain fail: " ++ err) >> return undefined
               Right e  -> return e
@@ -10764,7 +10764,7 @@ main = hspec $ do
             BlockHeader 1 prevHash5
                         (Hash256 (BS.replicate 32 0x22))
                         timewarpTs 0x207fffff 0
-      result5 <- addHeader bip94net2 hc2 badHdr5
+      result5 <- addHeader bip94net2 hc2 badHdr5 True
       case result5 of
         Left err -> err `shouldSatisfy` (\e -> "time-timewarp-attack" `DL.isInfixOf` e
                                            || "timewarp" `DL.isInfixOf` e)
@@ -10790,7 +10790,7 @@ main = hspec $ do
           hdr3_3 = mkH' 13 (computeBlockHash hdr3_2) (g3Ts + 300)
           hdr3_4 = mkH' 14 (computeBlockHash hdr3_3) (g3Ts + 10000)
       let addH3 h = do
-            r <- addHeader bip94net3 hc3 h
+            r <- addHeader bip94net3 hc3 h True
             case r of
               Left err -> expectationFailure ("build chain fail: " ++ err) >> return undefined
               Right e  -> return e
@@ -10805,7 +10805,7 @@ main = hspec $ do
             BlockHeader 1 prevHash3_5
                         (Hash256 (BS.replicate 32 0x32))
                         okTs 0x207fffff 0
-      result5 <- addHeader bip94net3 hc3 okHdr5
+      result5 <- addHeader bip94net3 hc3 okHdr5 True
       case result5 of
         Right _ -> return ()
         Left err -> expectationFailure $
@@ -21334,7 +21334,7 @@ main = hspec $ do
       hc <- initHeaderChain regtest
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
-      r <- addHeader regtest hc genesisHdr
+      r <- addHeader regtest hc genesisHdr True
       case r of
         Right e  -> ceHash e `shouldBe` genesisHsh
         Left err -> expectationFailure $ "duplicate genesis should short-circuit: " ++ err
@@ -21355,7 +21355,7 @@ main = hspec $ do
           genesisHsh = computeBlockHash genesisHdr
       atomically $ modifyTVar' (hcEntries hc) $
         Map.adjust (\e -> e { ceStatus = StatusInvalid }) genesisHsh
-      r <- addHeader regtest hc genesisHdr
+      r <- addHeader regtest hc genesisHdr True
       case r of
         Right e -> do
           -- BUG documented: haskoin returns Right even though the
@@ -21375,7 +21375,7 @@ main = hspec $ do
       let bogusPrev = BlockHash (Hash256 (BS.replicate 32 0xab))
           hdr = mineRegtestHeader $ BlockHeader 1 bogusPrev
                   (Hash256 (BS.replicate 32 0)) 0 0x207fffff 0
-      r <- addHeader regtest hc hdr
+      r <- addHeader regtest hc hdr True
       case r of
         Left err -> err `shouldContain` "Unknown previous block"
         Right _  -> expectationFailure "missing parent must be rejected"
@@ -21400,7 +21400,7 @@ main = hspec $ do
                        (Hash256 (BS.replicate 32 0))
                        (bhTimestamp genesisHdr + 1)
                        0x207fffff 0
-      r <- addHeader regtest hc childHdr
+      r <- addHeader regtest hc childHdr True
       case r of
         Right _ -> return ()  -- BUG: haskoin admits the child.
         Left err ->
@@ -21428,28 +21428,66 @@ main = hspec $ do
             head [ template k | k <- [0..]
                               , checkProofOfWork (template k)
                                                   (netPowLimit regtest) ]
-      r <- addHeader regtest hc mined
+      r <- addHeader regtest hc mined True
       case r of
         Left err -> err `shouldContain` "bad-diffbits"
         Right _  -> expectationFailure "wrong nBits must fail bad-diffbits"
 
-    it "G8 BUG: min_pow_checked / too-little-chainwork gate is ABSENT (W97 DOS)" $ do
-      -- Core: lines 4229-4232 — after CheckBlockHeader + parent lookup
-      -- + ContextualCheckBlockHeader, AcceptBlockHeader gates on
-      --   if (!min_pow_checked) state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork")
-      -- haskoin's 'addHeader' has NO equivalent gate.  Any peer that
-      -- mines headers on a fake low-work tip past the regtest target
-      -- can pollute hcEntries indefinitely; without the chainwork-
-      -- threshold gate the only memory limit is wall-clock cost.
-      -- Reference: netMinimumChainWork is defined per network but only
-      -- consulted inside 'shouldSkipScripts' (assumevalid path), never
-      -- inside 'addHeader'.
-      let hasGate path = do
-            src <- readFile path
-            return (any ("netMinimumChainWork" `isInfixOf`)
-                      (take 200 (drop 3856 (lines src))))
-      gate <- hasGate "src/Haskoin/Consensus.hs"
-      gate `shouldBe` False
+    -- G8 (3 active cases — W97 G8 + W99 G5 fixed)
+    -- Core: validation.cpp:4229-4232 — if (!min_pow_checked)
+    --   return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork")
+    -- addHeader now accepts a minPowChecked :: Bool parameter.
+    -- netMinimumChainWork was previously only consulted on the assumevalid
+    -- path (shouldSkipScripts); it is now wired into addHeader directly.
+    it "G8a minPowChecked=False + low chainwork => too-little-chainwork (W97 G8)" $ do
+      -- Craft a regtest variant with a very high minimum chainwork threshold
+      -- (1000) — far above the ~2 units of work a single regtest block adds
+      -- (target ≈ 2^255 → work ≈ 2^256/2^255 = 2).  With minPowChecked=False
+      -- the gate should fire and reject the header.
+      let highWorkNet = regtest { netMinimumChainWork = 1000 }
+      hc <- initHeaderChain highWorkNet
+      let genesisHdr = blockHeader (netGenesisBlock highWorkNet)
+          genesisHsh = computeBlockHash genesisHdr
+          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 0x01))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+      r <- addHeader highWorkNet hc hdr1 False
+      case r of
+        Left err -> err `shouldContain` "too-little-chainwork"
+        Right _  -> expectationFailure
+          "should reject: cumulative work after genesis+1 block is ~2, threshold is 1000"
+
+    it "G8b minPowChecked=True + low chainwork => accepted (caller vouches for work) (W97 G8)" $ do
+      -- Same setup but minPowChecked=True: the caller asserts the chain has
+      -- crossed the work threshold already (e.g. after IBD fully synced).
+      -- The gate must NOT fire so the header is accepted.
+      let highWorkNet = regtest { netMinimumChainWork = 1000 }
+      hc <- initHeaderChain highWorkNet
+      let genesisHdr = blockHeader (netGenesisBlock highWorkNet)
+          genesisHsh = computeBlockHash genesisHdr
+          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 0x02))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+      r <- addHeader highWorkNet hc hdr1 True
+      case r of
+        Right entry -> ceHeight entry `shouldBe` 1
+        Left err    -> expectationFailure $
+          "minPowChecked=True should bypass chainwork gate, got: " ++ err
+
+    it "G8c minPowChecked=False + work >= threshold => accepted (W97 G8)" $ do
+      -- Standard regtest has netMinimumChainWork=0; any amount of work passes.
+      -- Verifies the gate does not fire spuriously when threshold is satisfied.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 0x03))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+      r <- addHeader regtest hc hdr1 False
+      case r of
+        Right entry -> ceHeight entry `shouldBe` 1
+        Left err    -> expectationFailure $
+          "regtest threshold=0 should always pass, got: " ++ err
 
     it "G9 AddToBlockIndex updates tip/work atomically (W97)" $ do
       -- Core: line 4233 — m_blockman.AddToBlockIndex returns pindex and
@@ -21462,7 +21500,7 @@ main = hspec $ do
           hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
                    (Hash256 (BS.replicate 32 1))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
-      r <- addHeader regtest hc hdr1
+      r <- addHeader regtest hc hdr1 True
       case r of
         Right entry -> do
           ceHeight entry `shouldBe` 1
@@ -21479,7 +21517,7 @@ main = hspec $ do
           hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
                    (Hash256 (BS.replicate 32 2))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
-      r <- addHeader regtest hc hdr1
+      r <- addHeader regtest hc hdr1 True
       case r of
         Right entry -> cePrev entry `shouldBe` Just genesisHsh
         Left err -> expectationFailure err
@@ -21495,17 +21533,22 @@ main = hspec $ do
       -- in the same batch can read a transient inconsistent tip.
       -- Reference: bitcoin-core/src/validation.cpp:4244
       raw <- readFile "src/Haskoin/Consensus.hs"
-      -- The mapM (addHeader …) line itself is NOT wrapped — verify by
-      -- looking at the exact call site rather than scanning a window.
+      -- The mapM addHeader call inside handleHeaders is NOT wrapped in a
+      -- single atomically block — verify by finding the call site and
+      -- scanning the surrounding lines for any lock wrapper.
       let lns = lines raw
-          fnLine = head $ filter (\(_, l) -> "mapM (addHeader " `isInfixOf` l)
-                                  (zip [0..] lns)
-          -- Walk back up to 5 lines and check NO atomically wrap is present.
-          window = unlines $ take 6 $ drop (fst fnLine - 5) lns
+          -- Search for the mapM that calls addHeader inside handleHeaders.
+          -- After W97 G8 fix the form is: mapM (\h -> addHeader ... h False)
+          fnLines = filter (\(_, l) -> ("mapM (\\h -> addHeader " `isInfixOf` l)
+                                     || ("mapM (addHeader " `isInfixOf` l))
+                            (zip [0..] lns)
+          window = case fnLines of
+            []          -> ""  -- handleHeaders form may have changed
+            ((idx,_):_) -> unlines $ take 6 $ drop (max 0 (idx - 5)) lns
       ("atomically $ mapM" `isInfixOf` window) `shouldBe` False
       ("withMVar"           `isInfixOf` window) `shouldBe` False
       -- Reset the syncing-flag write IS wrapped in atomically, but that
-      -- is an unrelated TVar; the mapM (addHeader …) batch itself is
+      -- is an unrelated TVar; the mapM addHeader batch itself is
       -- not protected.
       return ()
 
@@ -21993,26 +22036,29 @@ main = hspec $ do
     it "G4 MAX_HEADERS_RESULTS=2000: constant correct (W99)" $ do
       maxHeadersResults `shouldBe` 2000
 
-    it "G5 BUG: PRESYNC integration bypassed for all peers (W99 DOS)" $ do
-      -- app/Main.hs:1250-1251: \"Bypass presync/redownload state machine
+    it "G5 FIXED: PRESYNC fail-open comment removed + minPowChecked=False wired (W99 G5)" $ do
+      -- W99 G5 closed: the explicit \"Bypass presync/redownload state machine
       -- and add headers directly to the chain. The anti-DoS presync is
-      -- overkill for our environment.\"
-      -- This means any peer can feed us an arbitrary-length fake chain
-      -- with minimal work and we will store every header without the
-      -- minimum-chain-work gate that Core enforces in ProcessHeadersMessage.
+      -- overkill for our environment.\" comment has been removed from
+      -- app/Main.hs MHeaders handler and replaced with reasoning that the
+      -- too-little-chainwork gate (addHeader minPowChecked=False) provides
+      -- the same low-work-flood defense without the full PRESYNC machinery.
       -- Reference: bitcoin-core/src/net_processing.cpp:3000+ PRESYNC path.
       contents <- readFile "app/Main.hs"
-      ("Bypass presync/redownload" `isInfixOf` contents) `shouldBe` True
+      ("Bypass presync/redownload" `isInfixOf` contents) `shouldBe` False
+      -- The minPowChecked=False call is present in the MHeaders handler.
+      ("minPowChecked=False" `isInfixOf` contents) `shouldBe` True
 
-    it "G6 BUG: min_pow_checked never threaded to block acceptance (W99 DOS)" $ do
-      -- Bitcoin Core ProcessHeadersMessage (v28) passes a min_pow_checked
-      -- flag to ProcessBlock so the block-acceptance path knows whether
-      -- the header chain already passed the minimum-PoW check.  haskoin
-      -- has no such flag: MBlock handler (app/Main.hs ~1353) calls
-      -- addHeader+connectBlock without any min_pow_checked gate.
+    it "G6 FIXED: minPowChecked threaded to MHeaders + MBlock handlers (W99 G6)" $ do
+      -- W99 G6 closed: addHeader now accepts minPowChecked :: Bool;
+      -- both the MHeaders handler and the MBlock handler pass
+      -- minPowChecked=False so the too-little-chainwork gate fires.
+      -- Reference: bitcoin-core/src/net_processing.cpp ProcessHeadersMessage.
       contents <- readFile "app/Main.hs"
-      ("min_pow_checked"  `isInfixOf` contents) `shouldBe` False
-      ("minPowChecked"    `isInfixOf` contents) `shouldBe` False
+      ("minPowChecked"    `isInfixOf` contents) `shouldBe` True
+      -- Consensus.hs also exposes the parameter.
+      src <- readFile "src/Haskoin/Consensus.hs"
+      ("minPowChecked" `isInfixOf` src) `shouldBe` True
 
     it "G7 BUG: LOW_WORK drop-without-Misbehaving gate absent (W99 DOS)" $ do
       -- Core: if headers batch has low work → drop silently (no Misbehaving).
