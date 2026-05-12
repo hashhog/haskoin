@@ -1386,117 +1386,127 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         void $ misbehaving pm addr InvalidBlock
       Right entry -> do
         let height = ceHeight entry
-        -- Look up spent UTXOs so connectBlock writes undo data atomically.
-        spent <- buildSpentUtxoMapFromDB db block
-        -- W97/W99-G18 P0 fix: 'connectBlock' now surfaces a Left when the
-        -- block fails the W93 G1 (prevHash != BestBlock) or G19 (missing
-        -- prevout) gates.  A peer sending an unsolicited side-branch
-        -- MBlock whose prevHash ≠ BestBlock used to corrupt BestBlock
-        -- via the old 'connectBlockUnchecked' fallback; now it is
-        -- dropped + the peer is misbehaved.  See
-        --   bitcoin-core/src/validation.cpp AcceptBlock @4350-4354
-        --   (InvalidBlockFound -> Misbehaving(100, "bad-block")).
-        connectResult <-
-          (connectBlock db net block height spent)
-            `catch` (\(e :: SomeException) -> do
-                       putStrLn $ "ERROR connecting block "
-                               ++ show height ++ ": " ++ show e
-                       return (Left ("exception: " <> show e)))
-        case connectResult of
-          Left cbErr -> do
-            -- Block validation / gate failure: drop the block + ban the
-            -- peer.  Reference: bitcoin-core/src/net_processing.cpp:3388
-            -- CheckBlock failure -> Misbehaving(100, "bad-block").
-            putStrLn $ "Block rejected at height " ++ show height
-                    ++ " (peer " ++ show addr ++ "): " ++ cbErr
-            pm <- readIORef pmRef
-            void $ misbehaving pm addr InvalidBlock
-            -- IMPORTANT: do NOT advance nextBlockRef, do NOT broadcast
-            -- tip, do NOT refresh mempool, do NOT count toward flush.
-            -- The on-disk chainstate is untouched (connectBlockAt
-            -- short-circuits BEFORE writeBatch when the gate fails).
-          Right () -> do
-            -- Mirror the connect into any opted-in secondary indexes
-            -- (txindex / blockfilterindex / coinstatsindex).  We read
-            -- the freshly-persisted undo record back from disk so the
-            -- BlockFilterIndex sees the byte-identical 'BlockUndo' that
-            -- 'disconnectBlock' would replay — keeping the GCS filter
-            -- byte-for-byte compatible with Bitcoin Core's
-            -- blockfilterindex.cpp::CustomAppend output.
-            (case mIdxMgr of
-                Nothing -> return ()
-                Just im -> do
-                  mUndo <- getUndoData db bh
-                  case mUndo of
-                    Just undoData ->
-                      indexManagerConnectBlock im block
-                        (udBlockUndo undoData) bh height
-                    Nothing -> return ())
-              `catch` (\(e :: SomeException) ->
-                putStrLn $ "index mirror error at height "
-                        ++ show height ++ ": " ++ show e)
-            when (height `mod` 500 == 0) $
-              putStrLn $ "Connected block at height " ++ show height
-            -- Advance the next-block pointer past this height
-            -- This allows the download window to slide forward
-            nextBlock <- readIORef nextBlockRef
-            when (height >= nextBlock) $
-              writeIORef nextBlockRef (height + 1)
-            -- Durability: flush WAL + UTXO cache every flushBlockInterval
-            -- blocks. This bounds the data-loss window on a non-graceful
-            -- shutdown. Reference: Bitcoin Core src/validation.cpp
-            -- FlushStateToDisk (50 MB of UTXO changes / 24h).
-            let flushBlockInterval = 1000 :: Word32
-            cnt <- atomicModifyIORef' blocksSinceFlushRef (\c -> (c + 1, c + 1))
-            when (cnt >= flushBlockInterval) $ do
-              putStrLn $ "Block-count flush at height=" ++ show height
-                         ++ " (" ++ show cnt ++ " blocks since last flush)"
-              flushCache cache
-                `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
-              syncFlush db
-                `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
-              writeIORef blocksSinceFlushRef 0
-              nowE <- round <$> getPOSIXTime
-              writeIORef lastFlushEpochRef nowE
-              -- Auto-prune trigger.  Mirrors Bitcoin Core's
-              -- @FlushStateToDisk -> PruneBlockFiles@ branch in
-              -- bitcoin-core/src/validation.cpp: pruning fires only on a
-              -- flush boundary (not every block), only when prune mode is
-              -- on and the target is finite (not manual / disabled).
-              -- Best-effort; pruning errors must never abort the block
-              -- connection or the flush path.
-              case mBlockStore of
-                Just bs -> do
-                  n <- autoPruneIfNeeded bs height pruneCfg
-                         `catch` (\(e :: SomeException) -> do
-                                    putStrLn $ "auto-prune error: " ++ show e
-                                    return 0)
-                  when (n > 0) $
-                    putStrLn $ "auto-prune: pruned " ++ show n
-                            ++ " block file(s) at height=" ++ show height
-                Nothing -> return ()
-            -- Remove confirmed txs from mempool and clear rejection filter
-            blockConnected mp block
-            writeIORef recentlyRejectedRef Set.empty
-            -- Announce the new tip honouring BIP-130 sendheaders
-            -- preference: peers that requested 'sendheaders' get an
-            -- MHeaders, the rest get the legacy MInv.  Reference:
-            -- announceTip helper +
-            -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
-            pm <- readIORef pmRef
-            announceTip pm (blockHeader block) bh
-            -- After connecting a new block from a peer, request headers
-            -- to discover any further blocks we might be missing.
-            connPeers <- getConnectedPeerList pm
-            unless (null connPeers) $ do
-              let zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
-                  getHdrs = GetHeaders
-                    { ghVersion  = fromIntegral protocolVersion
-                    , ghLocators = [bh]
-                    , ghHashStop = zeroHash
-                    }
-              void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
-                `catch` (\(_ :: SomeException) -> return ())
+        -- W97 G19c: fTooFarAhead gate.
+        -- Core validation.cpp:4325 — for unrequested blocks, reject when
+        --   pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP (288).
+        -- "Unrequested" means we never sent a getdata for this height;
+        -- requestedUpToRef tracks the highest height we explicitly asked for.
+        requestedUpTo <- readIORef requestedUpToRef
+        activeTipHeight <- readTVarIO (hcHeight hc)
+        let fRequested    = height <= requestedUpTo
+            fTooFarAhead  = height > activeTipHeight + minBlocksToKeep
+        unless (not fRequested && fTooFarAhead) $ do
+          -- W97/W99-G18 P0 fix: 'connectBlock' now surfaces a Left when the
+          -- block fails the W93 G1 (prevHash != BestBlock) or G19 (missing
+          -- prevout) gates.  A peer sending an unsolicited side-branch
+          -- MBlock whose prevHash ≠ BestBlock used to corrupt BestBlock
+          -- via the old 'connectBlockUnchecked' fallback; now it is
+          -- dropped + the peer is misbehaved.  See
+          --   bitcoin-core/src/validation.cpp AcceptBlock @4350-4354
+          --   (InvalidBlockFound -> Misbehaving(100, "bad-block")).
+          -- Look up spent UTXOs so connectBlock writes undo data atomically.
+          spent <- buildSpentUtxoMapFromDB db block
+          connectResult <-
+            (connectBlock db net block height spent)
+              `catch` (\(e :: SomeException) -> do
+                         putStrLn $ "ERROR connecting block "
+                                 ++ show height ++ ": " ++ show e
+                         return (Left ("exception: " <> show e)))
+          case connectResult of
+            Left cbErr -> do
+              -- Block validation / gate failure: drop the block + ban the
+              -- peer.  Reference: bitcoin-core/src/net_processing.cpp:3388
+              -- CheckBlock failure -> Misbehaving(100, "bad-block").
+              putStrLn $ "Block rejected at height " ++ show height
+                      ++ " (peer " ++ show addr ++ "): " ++ cbErr
+              pm <- readIORef pmRef
+              void $ misbehaving pm addr InvalidBlock
+              -- IMPORTANT: do NOT advance nextBlockRef, do NOT broadcast
+              -- tip, do NOT refresh mempool, do NOT count toward flush.
+              -- The on-disk chainstate is untouched (connectBlockAt
+              -- short-circuits BEFORE writeBatch when the gate fails).
+            Right () -> do
+              -- Mirror the connect into any opted-in secondary indexes
+              -- (txindex / blockfilterindex / coinstatsindex).  We read
+              -- the freshly-persisted undo record back from disk so the
+              -- BlockFilterIndex sees the byte-identical 'BlockUndo' that
+              -- 'disconnectBlock' would replay — keeping the GCS filter
+              -- byte-for-byte compatible with Bitcoin Core's
+              -- blockfilterindex.cpp::CustomAppend output.
+              (case mIdxMgr of
+                  Nothing -> return ()
+                  Just im -> do
+                    mUndo <- getUndoData db bh
+                    case mUndo of
+                      Just undoData ->
+                        indexManagerConnectBlock im block
+                          (udBlockUndo undoData) bh height
+                      Nothing -> return ())
+                `catch` (\(e :: SomeException) ->
+                  putStrLn $ "index mirror error at height "
+                          ++ show height ++ ": " ++ show e)
+              when (height `mod` 500 == 0) $
+                putStrLn $ "Connected block at height " ++ show height
+              -- Advance the next-block pointer past this height
+              -- This allows the download window to slide forward
+              nextBlock <- readIORef nextBlockRef
+              when (height >= nextBlock) $
+                writeIORef nextBlockRef (height + 1)
+              -- Durability: flush WAL + UTXO cache every flushBlockInterval
+              -- blocks. This bounds the data-loss window on a non-graceful
+              -- shutdown. Reference: Bitcoin Core src/validation.cpp
+              -- FlushStateToDisk (50 MB of UTXO changes / 24h).
+              let flushBlockInterval = 1000 :: Word32
+              cnt <- atomicModifyIORef' blocksSinceFlushRef (\c -> (c + 1, c + 1))
+              when (cnt >= flushBlockInterval) $ do
+                putStrLn $ "Block-count flush at height=" ++ show height
+                           ++ " (" ++ show cnt ++ " blocks since last flush)"
+                flushCache cache
+                  `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
+                syncFlush db
+                  `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
+                writeIORef blocksSinceFlushRef 0
+                nowE <- round <$> getPOSIXTime
+                writeIORef lastFlushEpochRef nowE
+                -- Auto-prune trigger.  Mirrors Bitcoin Core's
+                -- @FlushStateToDisk -> PruneBlockFiles@ branch in
+                -- bitcoin-core/src/validation.cpp: pruning fires only on a
+                -- flush boundary (not every block), only when prune mode is
+                -- on and the target is finite (not manual / disabled).
+                -- Best-effort; pruning errors must never abort the block
+                -- connection or the flush path.
+                case mBlockStore of
+                  Just bs -> do
+                    n <- autoPruneIfNeeded bs height pruneCfg
+                           `catch` (\(e :: SomeException) -> do
+                                      putStrLn $ "auto-prune error: " ++ show e
+                                      return 0)
+                    when (n > 0) $
+                      putStrLn $ "auto-prune: pruned " ++ show n
+                              ++ " block file(s) at height=" ++ show height
+                  Nothing -> return ()
+              -- Remove confirmed txs from mempool and clear rejection filter
+              blockConnected mp block
+              writeIORef recentlyRejectedRef Set.empty
+              -- Announce the new tip honouring BIP-130 sendheaders
+              -- preference: peers that requested 'sendheaders' get an
+              -- MHeaders, the rest get the legacy MInv.  Reference:
+              -- announceTip helper +
+              -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
+              pm <- readIORef pmRef
+              announceTip pm (blockHeader block) bh
+              -- After connecting a new block from a peer, request headers
+              -- to discover any further blocks we might be missing.
+              connPeers <- getConnectedPeerList pm
+              unless (null connPeers) $ do
+                let zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+                    getHdrs = GetHeaders
+                      { ghVersion  = fromIntegral protocolVersion
+                      , ghLocators = [bh]
+                      , ghHashStop = zeroHash
+                      }
+                void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
+                  `catch` (\(_ :: SomeException) -> return ())
 
   MTx tx -> do
     let txid = computeTxId tx
