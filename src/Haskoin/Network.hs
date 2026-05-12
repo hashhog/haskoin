@@ -1986,29 +1986,31 @@ receiveMessage pc = do
 netMagicBytes :: Network -> ByteString
 netMagicBytes net = runPut (putWord32le (netMagic net))
 
--- | Peek the first 4 bytes from the wire (using buffered reads in
+-- | Peek the first 16 bytes from the wire (using buffered reads in
 -- 'pcReadBuffer' so the bytes remain available to the v1 path) and
 -- classify the connection as v1 or v2.
 --
--- A v1 peer's first message starts with the 4-byte network magic
--- (e.g. @0xf9beb4d9@ on mainnet).  A v2 peer's first message is a
--- 64-byte ElligatorSwift-encoded pubkey, which is computationally
--- indistinguishable from random (~1 in 2^32 chance of accidentally
--- matching the magic).  See BIP-324, "Transport version negotiation".
+-- Bitcoin Core @V1_PREFIX_LEN = 16@: the full V1 prefix is the 4-byte
+-- network magic followed by @"version\x00\x00\x00\x00\x00"@.  We must
+-- read all 16 bytes before we can definitively commit to V1; any
+-- mismatch within those 16 bytes means the peer is speaking V2.
+-- A V2 peer's first message is a 64-byte ElligatorSwift-encoded pubkey
+-- (computationally random), so it will almost certainly diverge before
+-- byte 5.  See BIP-324, "Transport version negotiation".
 --
 -- Returns 'Nothing' if the peer closed the connection before sending
--- 4 bytes.
+-- 16 bytes.
 peekTransportVersion :: PeerConnection -> IO (Maybe TransportVersion)
 peekTransportVersion pc = do
-  mFirst <- recvExact pc 4
+  mFirst <- recvExact pc 16
   case mFirst of
     Nothing -> return Nothing
-    Just first4 -> do
+    Just first16 -> do
       -- Push the bytes back at the head of the read buffer so the
       -- v1 path's recvExact still sees them.
       buf <- readIORef (pcReadBuffer pc)
-      writeIORef (pcReadBuffer pc) (first4 `BS.append` buf)
-      return $ detectTransportVersion first4 (netMagicBytes (pcNetwork pc))
+      writeIORef (pcReadBuffer pc) (first16 `BS.append` buf)
+      return $ detectTransportVersion first16 (netMagicBytes (pcNetwork pc))
 
 --------------------------------------------------------------------------------
 -- Version Handshake
@@ -6875,16 +6877,27 @@ data TransportVersion = TransportV1 | TransportV2
 
 instance NFData TransportVersion
 
--- | Detect transport version from first bytes received
+-- | Detect transport version from first bytes received.
+--
+-- BIP-324 / Bitcoin Core @V1_PREFIX_LEN = 16@: the distinguisher is NOT
+-- just the 4-byte network magic but the full 16-byte string
+-- @magic ++ "version" ++ "\x00\x00\x00\x00\x00"@.
+-- Core only commits to V1 once all 16 bytes have arrived and match;
+-- a mismatch at any position before that triggers the V2 path.
+--
 -- V2 starts with 64-byte ElligatorSwift public key
--- V1 starts with magic bytes
-detectTransportVersion :: ByteString   -- ^ First bytes received (need at least 4)
+-- V1 starts with 16-byte prefix: 4-byte network magic + "version" + 5 null bytes
+detectTransportVersion :: ByteString   -- ^ First bytes received (need at least 16)
                        -> ByteString   -- ^ Network magic (4 bytes)
                        -> Maybe TransportVersion
 detectTransportVersion firstBytes netMagic
-  | BS.length firstBytes < 4 = Nothing
-  | BS.take 4 firstBytes == netMagic = Just TransportV1
-  | otherwise = Just TransportV2  -- Assume V2 if not V1 magic
+  | BS.length firstBytes < v1PrefixLen = Nothing
+  | BS.take v1PrefixLen firstBytes == v1Prefix = Just TransportV1
+  | otherwise = Just TransportV2  -- Mismatch with v1 prefix, assume V2
+  where
+    v1PrefixLen = 16
+    -- magic[0..3] ++ "version\x00\x00\x00\x00\x00"
+    v1Prefix = netMagic `BS.append` BS.pack [0x76,0x65,0x72,0x73,0x69,0x6f,0x6e,0x00,0x00,0x00,0x00,0x00]
 
 -- | Initiate V2 handshake (for outbound connections).
 -- Returns bytes to send first: our 64-byte EllSwift pubkey + 0-4095 bytes

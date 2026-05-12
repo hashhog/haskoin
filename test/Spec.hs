@@ -16786,24 +16786,38 @@ main = hspec $ do
     let mainnetMagic = BS.pack [0xf9, 0xbe, 0xb4, 0xd9]
 
     describe "detectTransportVersion" $ do
-      it "returns Nothing for fewer than 4 bytes" $ do
+      -- G13: fewer than 16 bytes → Nothing (must wait for full prefix)
+      it "returns Nothing for fewer than 16 bytes (G13)" $ do
+        -- 15 bytes: incomplete prefix
+        detectTransportVersion (BS.pack [0xf9,0xbe,0xb4,0xd9,0x76,0x65,0x72,0x73,0x69,0x6f,0x6e,0x00,0x00,0x00,0x00]) mainnetMagic
+          `shouldBe` Nothing
+        -- 4 bytes: old (wrong) threshold — still Nothing now
         detectTransportVersion (BS.pack [0xf9, 0xbe, 0xb4]) mainnetMagic
           `shouldBe` Nothing
 
-      it "classifies a v1 peer (matches network magic)" $ do
-        detectTransportVersion mainnetMagic mainnetMagic
+      -- G13: full 16-byte V1 prefix (magic + "version" + 5 nulls) → TransportV1
+      it "classifies a v1 peer only after full 16-byte prefix (G13)" $ do
+        -- Construct: mainnetMagic ++ "version" ++ 5 null bytes
+        let v1Full = mainnetMagic `BS.append` BS.pack [0x76,0x65,0x72,0x73,0x69,0x6f,0x6e,0x00,0x00,0x00,0x00,0x00]
+        detectTransportVersion v1Full mainnetMagic
           `shouldBe` Just TransportV1
 
-      it "classifies a v2 peer (random first 4 bytes != magic)" $ do
-        let randomLooking = BS.pack [0xa1, 0xb2, 0xc3, 0xd4]
+      -- G14: 4 magic bytes alone no longer commit to V1 (old 4-byte check was wrong)
+      it "does not classify V1 from magic bytes alone — requires full 16-byte prefix (G14)" $ do
+        -- Only 4 bytes (the magic) is no longer enough to return Just TransportV1
+        detectTransportVersion mainnetMagic mainnetMagic
+          `shouldBe` Nothing
+
+      -- G14: mismatch anywhere in first 16 bytes → TransportV2
+      it "classifies V2 when first bytes mismatch the 16-byte prefix (G14)" $ do
+        let randomLooking = BS.pack [0xa1, 0xb2, 0xc3, 0xd4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         detectTransportVersion randomLooking mainnetMagic
           `shouldBe` Just TransportV2
 
-      it "classifies a longer prefix correctly" $ do
-        let prefix = BS.pack [0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72]
-        detectTransportVersion prefix mainnetMagic
-          `shouldBe` Just TransportV1
-        detectTransportVersion (BS.cons 0x00 (BS.tail prefix)) mainnetMagic
+      it "classifies V2 when magic matches but version bytes differ" $ do
+        -- magic OK, but byte 5 is wrong (not 'v')
+        let wrongVersion = mainnetMagic `BS.append` BS.pack [0xFF,0x65,0x72,0x73,0x69,0x6f,0x6e,0x00,0x00,0x00,0x00,0x00]
+        detectTransportVersion wrongVersion mainnetMagic
           `shouldBe` Just TransportV2
 
     describe "FSChaCha20 continuous keystream within an epoch" $ do
