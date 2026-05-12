@@ -4963,6 +4963,8 @@ handleGetChainTips server = do
       | ceHash entry == ceHash activeTip = "active"
       | Set.member (ceHash entry) invalidatedSet = "invalid"
       | ceStatus entry == StatusInvalid = "invalid"
+      | ceStatus entry == StatusFailedValid = "invalid"
+      | ceStatus entry == StatusFailedChild = "invalid"
       | ceStatus entry == StatusValid = "valid-fork"
       | ceStatus entry == StatusHeaderValid = "valid-headers"
       | otherwise = "headers-only"

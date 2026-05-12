@@ -202,6 +202,7 @@ module Haskoin.Consensus
   , reconsiderBlock
   , findDescendants
   , isBlockInvalidated
+  , isFailedStatus
   , activateBestChain
   ) where
 
@@ -4814,7 +4815,7 @@ isAssumeUtxoValidated state = readIORef (ausValidated state)
 --
 -- These RPCs allow manual marking of blocks as invalid (and reversing that).
 -- Key behaviors:
---   1. invalidateblock marks a block and all descendants as StatusInvalid
+--   1. invalidateblock marks the target StatusFailedValid, descendants StatusFailedChild
 --   2. If the block is on the active chain, disconnect back to before it
 --   3. Activate the best valid chain (may be a shorter fork)
 --   4. Track manually invalidated blocks so they aren't auto-reconsidered
@@ -4866,10 +4867,13 @@ findDescendants hc blockHash = do
 -- Reference: bitcoin/src/validation.cpp Chainstate::InvalidateBlock
 --
 -- This function:
---   1. Marks the block and all descendants as StatusInvalid
---   2. If on active chain, disconnects blocks back to before the invalid block
---   3. Activates the best remaining valid chain
---   4. Adds the block to the manually-invalidated set
+--   1. If on active chain, disconnects blocks back to before the invalid block
+--      THEN marks each disconnected entry (BUG-4 fix: mark-after-disconnect).
+--   2. For off-chain descendants, marks all at once (no UTXO state at risk).
+--   3. Uses StatusFailedValid for the directly-invalidated block and
+--      StatusFailedChild for its descendants (BUG-5 fix: distinct failure flags).
+--   4. Activates the best remaining valid chain.
+--   5. Adds the block to the manually-invalidated set.
 --
 -- Returns Left on error, Right on success (possibly with a new tip).
 invalidateBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
@@ -4887,32 +4891,43 @@ invalidateBlock net cache db hc blockHash = do
           -- Find all descendants (including this block)
           descendants <- findDescendants hc blockHash
 
-          -- Mark all descendants as invalid in memory and storage
-          forM_ descendants $ \ce -> do
-            -- Update in-memory status
-            atomically $ modifyTVar' (hcEntries hc) $
-              Map.adjust (\e -> e { ceStatus = StatusInvalid }) (ceHash ce)
-            -- Persist status
-            putBlockStatus db (ceHash ce) StatusInvalid
+          -- Helper: compute the appropriate failure status for one entry.
+          -- BUG-5 fix: directly-invalidated block → StatusFailedValid;
+          --            its descendants        → StatusFailedChild.
+          -- Mirrors Core validation.cpp:3618-3619 (FAILED_VALID) and
+          -- 3704-3705 (FAILED_CHILD).
+          let entryStatus ce = if ceHash ce == blockHash
+                                 then StatusFailedValid
+                                 else StatusFailedChild
 
-          -- Add to manually-invalidated set
-          atomically $ modifyTVar' (hcInvalidated hc) (Set.insert blockHash)
+          -- Mark all in-memory states first (single atomic STM update),
+          -- then persist to DB.  Separating the phases means the in-memory
+          -- index is consistent before the first DB write touches the disk.
+          let markDescendants ces = do
+                atomically $ modifyTVar' (hcEntries hc) $ \m ->
+                  foldl' (\acc ce ->
+                    Map.adjust (\e -> e { ceStatus = entryStatus ce }) (ceHash ce) acc)
+                    m ces
+                forM_ ces $ \ce -> putBlockStatus db (ceHash ce) (entryStatus ce)
 
           -- Check if the block is on the active chain (ancestor of tip)
           let isOnActiveChain = isAncestor entries blockHash (ceHash tip)
 
-          if isOnActiveChain
+          result <- if isOnActiveChain
             then do
-              -- Disconnect chain from tip back to the parent of invalid block
+              -- BUG-4 fix: disconnect FIRST, then mark each entry after its
+              -- successful disconnect (mirrors Core's per-block marking order).
               let targetHash = case cePrev entry of
                     Just prevHash -> prevHash
                     Nothing -> blockHash  -- Should never happen (genesis handled above)
 
-              -- Disconnect blocks
+              -- Disconnect blocks (UTXO state updated atomically per block inside)
               disconnectResult <- disconnectChain cache db hc (ceHash tip) targetHash
               case disconnectResult of
                 Left err -> return $ Left (InvalidateDisconnectFailed err)
                 Right () -> do
+                  -- Mark all descendants now that the UTXO rewind is done
+                  markDescendants descendants
                   -- Update tip to the parent of the invalid block
                   case Map.lookup targetHash entries of
                     Nothing -> return $ Left (InvalidateBlockNotFound targetHash)
@@ -4923,9 +4938,17 @@ invalidateBlock net cache db hc blockHash = do
                       -- Try to activate the best valid chain
                       activateBestChain net cache db hc
                       return (Right ())
-            else
-              -- Block not on active chain, just marking is enough
+            else do
+              -- Block not on active chain: no UTXO state to rewind, mark all.
+              markDescendants descendants
               return (Right ())
+
+          -- Add to manually-invalidated set only on success
+          case result of
+            Right () -> atomically $ modifyTVar' (hcInvalidated hc) (Set.insert blockHash)
+            Left _   -> return ()
+
+          return result
 
 -- | Check if hash1 is an ancestor of hash2.
 isAncestor :: Map BlockHash ChainEntry -> BlockHash -> BlockHash -> Bool
@@ -4937,6 +4960,15 @@ isAncestor entries ancestorHash descendantHash
         Nothing -> False
         Just prevHash -> isAncestor entries ancestorHash prevHash
 
+-- | True for any status that represents a failed/invalidated block.
+-- Covers the legacy StatusInvalid as well as the new StatusFailedValid and
+-- StatusFailedChild introduced by the BUG-5 fix.
+isFailedStatus :: BlockStatus -> Bool
+isFailedStatus StatusInvalid     = True
+isFailedStatus StatusFailedValid = True
+isFailedStatus StatusFailedChild = True
+isFailedStatus _                 = False
+
 -- | Activate the best valid chain.
 -- After invalidation, we may need to switch to a different fork.
 -- Reference: bitcoin/src/validation.cpp ActivateBestChain
@@ -4946,14 +4978,17 @@ activateBestChain net cache db hc = do
   currentTip <- readTVarIO (hcTip hc)
   invalidated <- readTVarIO (hcInvalidated hc)
 
-  -- Find all valid tips (blocks with no children that are not invalid)
+  -- Find all valid tips (blocks with no children that are not invalid).
+  -- BUG-3 fix: only admit entries with StatusValid — equivalent to Core's
+  -- BLOCK_HAVE_DATA guard in FindMostWorkChain (validation.cpp:3114).
+  -- StatusHeaderValid entries have no block body and must not be candidates.
   let allEntries = Map.elems entries
       -- A block is a tip candidate if it's valid and has no valid children
       hasValidChildren :: ChainEntry -> Bool
       hasValidChildren ce =
-        any (\other -> cePrev other == Just (ceHash ce) && ceStatus other /= StatusInvalid)
+        any (\other -> cePrev other == Just (ceHash ce) && ceStatus other == StatusValid)
             allEntries
-      tipCandidates = filter (\ce -> ceStatus ce /= StatusInvalid
+      tipCandidates = filter (\ce -> ceStatus ce == StatusValid
                                   && not (hasValidChildren ce)
                                   && not (Set.member (ceHash ce) invalidated))
                              allEntries
@@ -4994,7 +5029,7 @@ reconsiderBlock net cache db hc blockHash = do
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (ReconsiderBlockNotFound blockHash)
     Just entry
-      | ceStatus entry /= StatusInvalid && not (Set.member blockHash invalidated) ->
+      | not (isFailedStatus (ceStatus entry)) && not (Set.member blockHash invalidated) ->
           -- Block isn't actually invalid
           return $ Left (ReconsiderNotInvalidated blockHash)
       | otherwise -> do
