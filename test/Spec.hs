@@ -10483,6 +10483,9 @@ main = hspec $ do
             , piNextFeeFilterSend = 0
             , piBlockOnly = False
             , piUnconnectingHeaders = 0
+            , piNoBan    = False
+            , piIsManual = False
+            , piIsLocal  = False
             }
       piWantsHeaders info `shouldBe` False
       -- Toggle the flag (mirrors the inbound MSendHeaders handler in
@@ -10960,8 +10963,11 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
-            , piUnconnectingHeaders = 0
+              , piUnconnectingHeaders = 0
               , piTimeOffset = 0
+              , piNoBan    = False
+              , piIsManual = False
+              , piIsLocal  = False
               }
         piBanScore info `shouldBe` 0
 
@@ -10989,8 +10995,11 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
-            , piUnconnectingHeaders = 0
+              , piUnconnectingHeaders = 0
               , piTimeOffset = 0
+              , piNoBan    = False
+              , piIsManual = False
+              , piIsLocal  = False
               }
         piState info `shouldBe` PeerBanned
         piBanScore info `shouldBe` 100
@@ -11269,8 +11278,11 @@ main = hspec $ do
               , piFeeFilterSent = 0
               , piNextFeeFilterSend = 0
               , piBlockOnly = False
-            , piUnconnectingHeaders = 0
+              , piUnconnectingHeaders = 0
               , piTimeOffset = 0
+              , piNoBan    = False
+              , piIsManual = False
+              , piIsLocal  = False
               }
             candidate = peerToEvictionCandidate addr info
         ecAddress candidate `shouldBe` addr
@@ -21867,18 +21879,79 @@ main = hspec $ do
       s    `shouldBe` 0       -- unknown peer → no score stored
       banned `shouldBe` False
 
-    it "G2 BUG: noban/manual/outbound protections ABSENT from misbehaving (W99 DOS)" $ do
-      -- Bitcoin Core MaybeDiscourageAndDisconnect (@5083) checks
-      --   HasPermission(PF_NOBAN), IsManualConn(), IsBlockOnlyConn()
-      -- before adding ban-score.  haskoin's PeerInfo has no noban/manual
-      -- field — the misbehaving function applies the ban score to every
-      -- peer type equally, including -addnode manual connections and
-      -- outbound block-relay-only peers.
-      -- This documents the missing protection: PeerInfo has no piNoBan field.
-      contents <- readFile "src/Haskoin/Network.hs"
-      -- There is no noban / NoBan field on PeerInfo
-      ("piNoBan" `isInfixOf` contents) `shouldBe` False
-      ("HasPermission" `isInfixOf` contents) `shouldBe` False
+    it "G2 FIXED: noban/manual/local peer protections present in misbehaving (W99 G2)" $ do
+      -- Reference: bitcoin-core/src/net_processing.cpp MaybeDiscourageAndDisconnect @5083.
+      -- Four sub-cases from Core's protection model:
+      --   1. piNoBan=True  → misbehaving is a no-op (no ban-score, no disconnect).
+      --   2. piIsManual=True → misbehaving is a no-op (manual/addnode peer protected).
+      --   3. piIsLocal=True → disconnect-only (not added to discourage list).
+      --   4. Regular inbound → discouraged + disconnected at threshold.
+      let baseInfo = PeerInfo
+            { piAddress = SockAddrInet 0 0
+            , piVersion = Nothing
+            , piState = PeerConnected
+            , piServices = 0
+            , piStartHeight = 0
+            , piRelay = True
+            , piLastSeen = 0
+            , piLastPing = Nothing
+            , piPingLatency = Nothing
+            , piBanScore = 0
+            , piBytesSent = 0
+            , piBytesRecv = 0
+            , piMsgsSent = 0
+            , piMsgsRecv = 0
+            , piConnectedAt = 0
+            , piTimeOffset = 0
+            , piInbound = True
+            , piWantsAddrV2 = False
+            , piWantsHeaders = False
+            , piFeeFilterReceived = 0
+            , piFeeFilterSent = 0
+            , piNextFeeFilterSend = 0
+            , piBlockOnly = False
+            , piUnconnectingHeaders = 0
+            , piNoBan    = False
+            , piIsManual = False
+            , piIsLocal  = False
+            }
+
+      -- Case 1: NoBan peer — misbehaving must be a no-op (score unchanged, not banned).
+      do
+        pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+        let addr = SockAddrInet 18333 0x0101a8c0
+        insertTestPeer pm addr (baseInfo { piAddress = addr, piNoBan = True })
+        (s, banned) <- misbehaving pm addr InvalidBlock  -- score=100, threshold=100
+        banned `shouldBe` False
+        s `shouldBe` 0  -- NoBan: original score returned unchanged
+
+      -- Case 2: Manual peer — misbehaving must be a no-op.
+      do
+        pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+        let addr = SockAddrInet 18333 0x0202a8c0
+        insertTestPeer pm addr (baseInfo { piAddress = addr, piIsManual = True })
+        (s, banned) <- misbehaving pm addr InvalidBlock
+        banned `shouldBe` False
+        s `shouldBe` 0  -- Manual: original score returned unchanged
+
+      -- Case 3: Local peer at threshold — disconnect-only, NOT added to ban list.
+      do
+        pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+        let addr = SockAddrInet 18333 0x0000007f  -- 127.0.0.0 (loopback subnet)
+        insertTestPeer pm addr (baseInfo { piAddress = addr, piIsLocal = True })
+        (_, banned) <- misbehaving pm addr InvalidBlock  -- score=100 → threshold
+        banned `shouldBe` True   -- should disconnect
+        isBanned pm addr >>= (`shouldBe` False)  -- but NOT added to discourage list
+
+      -- Case 4: Regular inbound peer at threshold — discouraged + disconnected.
+      do
+        pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+        let addr = SockAddrInet 18333 0x0303a8c0
+        insertTestPeer pm addr (baseInfo { piAddress = addr })
+        (s, banned) <- misbehaving pm addr InvalidBlock
+        banned `shouldBe` True
+        s `shouldBe` 100
+        isBanned pm addr >>= (`shouldBe` True)  -- added to discourage list
 
     it "G3 persistent ban DB: saveBanList / loadBanList round-trip (W99)" $ do
       -- Verify ban-list persistence works correctly: a banned address
@@ -21944,10 +22017,14 @@ main = hspec $ do
       ("exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS" `isInfixOf` contents) `shouldBe` True
 
     it "G9 noban protection for getheaders re-request: absent (W99 CORRECTNESS)" $ do
-      -- Core skips the getheaders re-request for peers with PF_NOBAN.
-      -- Since haskoin has no noban field (see G2) this whole sub-gate
-      -- is also absent.
-      contents <- readFile "src/Haskoin/Network.hs"
+      -- Core skips the getheaders re-request for peers with PF_NOBAN
+      -- (net_processing.cpp: inside ProcessHeadersMessage, the re-request via
+      -- getheaders is guarded by !pfrom.HasPermission(PF_NOBAN)).
+      -- haskoin now has piNoBan on PeerInfo (G2 fixed), but the
+      -- getheaders re-request path in app/Main.hs does not yet consult
+      -- piNoBan before sending — that sub-gate remains absent.
+      contents <- readFile "app/Main.hs"
+      -- The getheaders-re-request code does not gate on piNoBan / noban.
       ("piNoBan" `isInfixOf` contents) `shouldBe` False
 
     it "G10 empty headers = no-more sentinel: handled (W99)" $ do

@@ -150,6 +150,7 @@ module Haskoin.Network
   , misbehaviorScore
   , defaultBanThreshold
   , misbehaving
+  , insertTestPeer
   , maxNumUnconnectingHeadersMsgs
   , noteUnconnectingHeaders
   , resetUnconnectingHeaders
@@ -533,7 +534,7 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        socket, connect, close, defaultHints,
                        SocketType(..), PortNumber, Family(..),
                        bind, listen, accept, setSocketOption,
-                       SocketOption(..))
+                       SocketOption(..), socketPair, defaultProtocol)
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -1693,6 +1694,19 @@ data PeerInfo = PeerInfo
     -- @CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md@
     -- (Pattern B), extended to Part-2 impls.
   , piUnconnectingHeaders :: !Int
+    -- | True if the peer has the NoBan permission (e.g. whitelisted).
+    -- Mirrors Bitcoin Core's @HasPermission(NetPermissionFlags::NoBan)@
+    -- check in @MaybeDiscourageAndDisconnect@ (net_processing.cpp:5083).
+    -- When True, 'misbehaving' will NOT ban or disconnect the peer.
+  , piNoBan    :: !Bool
+    -- | True if this is a manual connection (-addnode / addnode RPC).
+    -- Mirrors Core's @IsManualConn()@ check in
+    -- @MaybeDiscourageAndDisconnect@.  Manual peers are never banned.
+  , piIsManual :: !Bool
+    -- | True if the peer address is a local/loopback address.
+    -- Mirrors Core's @addr.IsLocal()@ check.  Local peers are disconnected
+    -- without being added to the discourage list.
+  , piIsLocal  :: !Bool
   } deriving (Show, Generic)
 
 instance NFData PeerInfo
@@ -1756,8 +1770,9 @@ connectPeer config host port = do
         sock <- socket (NS.addrFamily addr) (NS.addrSocketType addr) (NS.addrProtocol addr)
         connect sock (NS.addrAddress addr)
         now <- round <$> getPOSIXTime
-        let info = PeerInfo
-              { piAddress       = NS.addrAddress addr
+        let peerAddr = NS.addrAddress addr
+            info = PeerInfo
+              { piAddress       = peerAddr
               , piVersion       = Nothing
               , piState         = PeerConnecting
               , piServices      = 0
@@ -1781,6 +1796,9 @@ connectPeer config host port = do
               , piNextFeeFilterSend  = 0
               , piBlockOnly          = False
               , piUnconnectingHeaders = 0
+              , piNoBan    = False
+              , piIsManual = False
+              , piIsLocal  = isLocalAddr peerAddr
               }
         infoVar <- newTVarIO info
         sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
@@ -2958,6 +2976,20 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           unless blockRelayOnly $
             sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
 
+-- | Return True if the address is a loopback / local address.
+-- Mirrors Bitcoin Core's @CNetAddr::IsLocal()@:
+--   IPv4 127.0.0.0/8  (0x7f000000/8, network-byte order stored in hostAddr)
+--   IPv6 ::1
+isLocalAddr :: SockAddr -> Bool
+isLocalAddr (SockAddrInet _ hostAddr) =
+  -- hostAddr is stored in network byte order by Network.Socket on Linux.
+  -- 127.x.x.x → high byte (most-significant in big-endian) == 0x7f.
+  -- Network.Socket returns it as a host-endian Word32; on a little-endian
+  -- machine the lowest byte corresponds to the first octet.
+  (fromIntegral hostAddr :: Word32) .&. 0xff == 0x7f
+isLocalAddr (SockAddrInet6 _ _ (0, 0, 0, 1) _) = True  -- ::1
+isLocalAddr _ = False
+
 -- | Convert SockAddr to host string and port
 sockAddrToHostPort :: SockAddr -> Int -> (String, Int)
 sockAddrToHostPort addr defaultPort = case addr of
@@ -3022,6 +3054,9 @@ startInboundListener pm port = do
             , piNextFeeFilterSend = 0
             , piBlockOnly     = False
             , piUnconnectingHeaders = 0
+            , piNoBan    = False
+            , piIsManual = False
+            , piIsLocal  = isLocalAddr addr
             }
       infoVar <- newTVarIO info
       sendQ <- newTBQueueIO 100
@@ -3114,13 +3149,27 @@ startInboundListener pm port = do
                   putStrLn $ "Accepted inbound v2 (encrypted) connection from "
                     ++ show addr
 
--- | Connect to a peer by host:port string (for addnode RPC)
+-- | Connect to a peer by host:port string (for addnode RPC).
+-- Marks the resulting PeerInfo entry as a manual connection
+-- (piIsManual = True) so that 'misbehaving' will never ban or
+-- disconnect it.  Mirrors Bitcoin Core's @IsManualConn()@ guard in
+-- @MaybeDiscourageAndDisconnect@ (net_processing.cpp:5083).
 addNodeConnect :: PeerManager -> String -> Int -> IO ()
 addNodeConnect pm host port = do
   addrInfos <- getAddrInfo Nothing (Just host) (Just (show port)) :: IO [NS.AddrInfo]
   case addrInfos of
     [] -> putStrLn $ "addNodeConnect: cannot resolve " ++ host
-    (ai:_) -> tryConnect pm (NS.addrAddress ai)
+    (ai:_) -> do
+      let addr = NS.addrAddress ai
+      tryConnect pm addr
+      -- After the connection attempt, mark the peer as manual so that
+      -- misbehaving never bans it.  The peer may not be in pmPeers yet
+      -- if the handshake is still in progress; the mark is best-effort
+      -- and will be visible by the time any misbehavior event fires.
+      peers <- readTVarIO (pmPeers pm)
+      case Map.lookup addr peers of
+        Nothing -> return ()
+        Just pc -> atomically $ modifyTVar' (pcInfo pc) (\i -> i { piIsManual = True })
 
 --------------------------------------------------------------------------------
 -- Peer Manager API
@@ -3224,10 +3273,22 @@ getUnconnectingHeadersCount pm addr = do
 -- Misbehavior Scoring API
 --------------------------------------------------------------------------------
 
--- | Record misbehavior for a peer (STM version for atomic operations)
+-- | Record misbehavior for a peer (STM version for atomic operations).
 -- Increments the peer's ban score based on the misbehavior reason.
 -- When score reaches threshold (default 100), peer is marked for banning.
 -- Returns the new total score and whether the peer should be banned.
+--
+-- Mirrors Bitcoin Core's @MaybeDiscourageAndDisconnect@
+-- (net_processing.cpp:5083).  Three protection classes are checked
+-- BEFORE applying any ban-score or disconnect:
+--
+--   1. @piNoBan@    — whitelisted peers (HasPermission(PF_NOBAN)): no-op.
+--   2. @piIsManual@ — -addnode / addnode-RPC peers (IsManualConn()): no-op.
+--   3. @piIsLocal@  — loopback/local peers (addr.IsLocal()): disconnect
+--                     without adding to the discourage list.
+--
+-- Regular inbound/outbound peers that hit threshold are discouraged
+-- (added to ban list) and disconnected.
 misbehaving :: PeerManager -> SockAddr -> MisbehaviorReason -> IO (Int, Bool)
 misbehaving pm addr reason = do
   let score = misbehaviorScore reason
@@ -3237,26 +3298,40 @@ misbehaving pm addr reason = do
   case Map.lookup addr peers of
     Nothing -> return (0, False)
     Just pc -> do
-      (newScore, shouldBan) <- atomically $ do
-        info <- readTVar (pcInfo pc)
-        let oldScore = piBanScore info
-            newScore = oldScore + score
-            shouldBan = newScore >= threshold
-        -- Update the ban score
-        modifyTVar' (pcInfo pc) $ \i ->
-          i { piBanScore = newScore
-            , piState = if shouldBan then PeerBanned else piState i
-            }
-        return (newScore, shouldBan)
+      info <- readTVarIO (pcInfo pc)
 
-      -- If threshold reached, add to ban list
-      when shouldBan $ do
-        banPeer pm addr
-        -- Disconnect the peer
-        disconnectPeer pc
-        atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+      -- Gate 1: NoBan permission — skip entirely (Core HasPermission(PF_NOBAN))
+      if piNoBan info
+        then return (piBanScore info, False)
+        -- Gate 2: Manual connection — skip entirely (Core IsManualConn())
+        else if piIsManual info
+          then return (piBanScore info, False)
+          else do
+            (newScore, shouldBan) <- atomically $ do
+              i <- readTVar (pcInfo pc)
+              let oldScore = piBanScore i
+                  newScore' = oldScore + score
+                  shouldBan' = newScore' >= threshold
+              modifyTVar' (pcInfo pc) $ \j ->
+                j { piBanScore = newScore'
+                  , piState = if shouldBan' then PeerBanned else piState j
+                  }
+              return (newScore', shouldBan')
 
-      return (newScore, shouldBan)
+            when shouldBan $ do
+              -- Gate 3: Local address — disconnect-only, no discourage list
+              -- (Core: addr.IsLocal() → fDisconnect=true without Discourage)
+              if piIsLocal info
+                then do
+                  disconnectPeer pc
+                  atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+                else do
+                  -- Regular peer: add to discourage list and disconnect
+                  banPeer pm addr
+                  disconnectPeer pc
+                  atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
+            return (newScore, shouldBan)
 
 -- | Check if an address is currently discouraged/banned
 -- Used before accepting new connections
@@ -3285,6 +3360,37 @@ clearExpiredBans pm = do
     let (expired, active) = Map.partition (<= now) banned
     writeTVar (pmBannedAddrs pm) active
     return (Map.size expired)
+
+-- | Insert a minimal peer entry directly into the peer map for testing.
+-- Creates a loopback socket-pair so no real network connection is needed.
+-- The caller supplies a 'PeerInfo' template; the function fills in the
+-- socket and queue fields.
+--
+-- Intended ONLY for unit tests — the resulting peer has no I/O threads and
+-- will not actually exchange messages.
+insertTestPeer :: PeerManager -> SockAddr -> PeerInfo -> IO ()
+insertTestPeer pm addr info = do
+  -- Create a Unix loopback socket-pair (AF_UNIX SOCK_STREAM).
+  -- Both ends are valid sockets; we use sock as pcSocket and discard sock2.
+  (sock, sock2) <- socketPair AF_UNIX Stream defaultProtocol
+  close sock2
+  infoVar <- newTVarIO info
+  sendQ   <- newTBQueueIO 16
+  recvQ   <- newTBQueueIO 16
+  bufRef  <- newIORef BS.empty
+  v2Ref   <- newIORef Nothing
+  let pc = PeerConnection
+        { pcSocket      = sock
+        , pcInfo        = infoVar
+        , pcSendQueue   = sendQ
+        , pcRecvQueue   = recvQ
+        , pcSendThread  = Nothing
+        , pcRecvThread  = Nothing
+        , pcNetwork     = pmNetwork pm
+        , pcReadBuffer  = bufRef
+        , pcV2Transport = v2Ref
+        }
+  atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
 
 --------------------------------------------------------------------------------
 -- Ban List Persistence
@@ -3529,7 +3635,7 @@ peerToEvictionCandidate addr info = EvictionCandidate
   , ecRelaysTxs     = piRelay info
   , ecNetworkGroup  = getNetworkGroup addr
   , ecInbound       = piInbound info
-  , ecNoBan         = False  -- Would need permission system
+  , ecNoBan         = piNoBan info  -- W99 G2: populated from piNoBan
   }
 
 -- | Extract /16 network group from an IP address
@@ -8617,6 +8723,9 @@ createPeerConnectionFromSocket config sock _host = do
           , piNextFeeFilterSend = 0
           , piBlockOnly     = False
           , piUnconnectingHeaders = 0
+          , piNoBan    = False
+          , piIsManual = False
+          , piIsLocal  = False  -- proxy addresses are never local
           }
     infoVar <- newTVarIO info
     sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
