@@ -10876,25 +10876,44 @@ main = hspec $ do
         let config = defaultPeerManagerConfig
         pmcBanDuration config `shouldBe` 86400
 
-      it "single InvalidBlockHeader triggers ban (score 100)" $ do
+      -- W99 G1 FIXED: single-event discourage per Core PR #25974.
+      -- misbehaviorScore values are diagnostic only; every event discourages.
+      it "single InvalidBlockHeader scores 100 (diagnostic, immediate discourage)" $ do
         let score = misbehaviorScore InvalidBlockHeader
-        (score >= 100) `shouldBe` True
+        score `shouldBe` 100
 
-      it "10 InvalidTransaction offenses trigger ban (10 * 10 = 100)" $ do
-        let totalScore = 10 * misbehaviorScore InvalidTransaction
-        (totalScore >= 100) `shouldBe` True
+      it "single InvalidTransaction scores 10 (diagnostic, immediate discourage)" $ do
+        let score = misbehaviorScore InvalidTransaction
+        score `shouldBe` 10
 
-      it "5 TooLargeInvMessage offenses trigger ban (5 * 20 = 100)" $ do
-        let totalScore = 5 * misbehaviorScore TooLargeInvMessage
-        (totalScore >= 100) `shouldBe` True
+      it "single TooLargeInvMessage scores 20 (diagnostic, immediate discourage)" $ do
+        let score = misbehaviorScore TooLargeInvMessage
+        score `shouldBe` 20
 
-      it "99 UnsolicitedMessage offenses don't trigger ban" $ do
-        let totalScore = 99 * misbehaviorScore UnsolicitedMessage
-        (totalScore >= 100) `shouldBe` False
+      it "single UnsolicitedMessage scores 1 (diagnostic, immediate discourage)" $ do
+        let score = misbehaviorScore UnsolicitedMessage
+        score `shouldBe` 1
 
-      it "100 UnsolicitedMessage offenses trigger ban" $ do
-        let totalScore = 100 * misbehaviorScore UnsolicitedMessage
-        (totalScore >= 100) `shouldBe` True
+      it "every misbehavior event returns shouldDisconnect=True for regular peers (W99 G1)" $ do
+        -- Under Core PR #25974 semantics: any single misbehaving() call on a
+        -- regular (non-noban, non-manual) peer must return shouldDisconnect=True.
+        pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+        let addr = SockAddrInet 18333 0x0404a8c0
+            baseInfo = PeerInfo
+              { piAddress = addr, piVersion = Nothing, piState = PeerConnected
+              , piServices = 0, piStartHeight = 0, piRelay = True, piLastSeen = 0
+              , piLastPing = Nothing, piPingLatency = Nothing, piBanScore = 0
+              , piBytesSent = 0, piBytesRecv = 0, piMsgsSent = 0, piMsgsRecv = 0
+              , piConnectedAt = 0, piInbound = True, piWantsAddrV2 = False
+              , piWantsHeaders = False, piFeeFilterReceived = 0, piFeeFilterSent = 0
+              , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
+              , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
+              }
+        insertTestPeer pm addr baseInfo
+        -- Even a low-score event (UnsolicitedMessage=1) must immediately discourage
+        (_, shouldDisc) <- misbehaving pm addr UnsolicitedMessage
+        shouldDisc `shouldBe` True
+        stopPeerManager pm
 
     describe "PeerManagerConfig" $ do
       it "has reasonable default max outbound" $ do
@@ -11006,19 +11025,34 @@ main = hspec $ do
         piState info `shouldBe` PeerBanned
         piBanScore info `shouldBe` 100
 
+  -- W99 G1 FIXED: single-event discourage per Core PR #25974.
+  -- Score values are kept for diagnostics but do NOT gate the discourage decision.
   describe "Peer Scoring Integration" $ do
-    it "misbehavior accumulates until ban threshold" $ do
-      -- Simulate accumulating scores
-      let scores = [10, 10, 10, 10, 10, 10, 10, 10, 10, 10]  -- 10 x 10 = 100
-          totalScore = sum scores
-      totalScore `shouldBe` 100
+    it "misbehavior score values are positive (diagnostic only)" $ do
+      -- Under single-event semantics these scores are for logging, not gating.
+      misbehaviorScore InvalidTransaction `shouldSatisfy` (> 0)
+      misbehaviorScore TooLargeInvMessage `shouldSatisfy` (> 0)
+      misbehaviorScore UnsolicitedMessage `shouldSatisfy` (> 0)
 
-    it "mixed misbehavior types can accumulate to ban" $ do
-      -- 2 invalid tx (20) + 3 unsolicited (3) + 1 too large inv (20) = 43
-      -- Add 6 more invalid tx (60) = 103 > 100
-      let scores = [10, 10, 1, 1, 1, 20, 10, 10, 10, 10, 10, 10]
-          totalScore = sum scores
-      (totalScore >= 100) `shouldBe` True
+    it "any single misbehavior event discourages a regular peer (W99 G1)" $ do
+      -- Even the lowest-score event (UnsolicitedMessage=1) must immediately
+      -- return shouldDisconnect=True for a regular (non-noban, non-manual) peer.
+      pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+      let addr = SockAddrInet 18333 0x0505a8c0
+          info = PeerInfo
+            { piAddress = addr, piVersion = Nothing, piState = PeerConnected
+            , piServices = 0, piStartHeight = 0, piRelay = True, piLastSeen = 0
+            , piLastPing = Nothing, piPingLatency = Nothing, piBanScore = 0
+            , piBytesSent = 0, piBytesRecv = 0, piMsgsSent = 0, piMsgsRecv = 0
+            , piConnectedAt = 0, piInbound = True, piWantsAddrV2 = False
+            , piWantsHeaders = False, piFeeFilterReceived = 0, piFeeFilterSent = 0
+            , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
+            , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
+            }
+      insertTestPeer pm addr info
+      (_, d1) <- misbehaving pm addr InvalidTransaction
+      d1 `shouldBe` True
+      stopPeerManager pm
 
   --------------------------------------------------------------------------------
   -- Pre-Handshake Rejection Tests (Phase 16)
@@ -22002,16 +22036,38 @@ main = hspec $ do
 
   describe "W99 Misbehaving gates (G1-G3)" $ do
 
-    it "G1 single-event discourage: score>=threshold triggers ban+disconnect (W99)" $ do
-      -- Reference: bitcoin-core/src/net_processing.cpp Misbehaving @1893.
-      -- A single InvalidBlock event (score=100) should immediately meet
-      -- the default threshold (100) and trigger banPeer.
+    it "G1 FIXED: single-event discourage per Core PR #25974 (W99)" $ do
+      -- Reference: bitcoin-core/src/net_processing.cpp Misbehaving @1898:
+      --   peer.m_should_discourage = true;  (no score accumulation)
+      -- Any single misbehaving() call for a regular peer must return
+      -- shouldDisconnect=True regardless of the event's score value.
       pm <- startPeerManager regtest defaultPeerManagerConfig (\_ _ -> return ())
+
+      -- Sub-case A: unknown peer → safe no-op (returns (0, False))
       let mockAddr = SockAddrInet 18333 0x7f000001
-      -- misbehaving an unknown addr should be safe (returns (0,False))
       (s, banned) <- misbehaving pm mockAddr InvalidBlock
-      s    `shouldBe` 0       -- unknown peer → no score stored
+      s      `shouldBe` 0
       banned `shouldBe` False
+
+      -- Sub-case B: known regular peer with a LOW-score event (score=1)
+      -- must STILL be immediately discouraged (single-event semantics).
+      let addr2 = SockAddrInet 18333 0x0606a8c0
+          info2 = PeerInfo
+            { piAddress = addr2, piVersion = Nothing, piState = PeerConnected
+            , piServices = 0, piStartHeight = 0, piRelay = True, piLastSeen = 0
+            , piLastPing = Nothing, piPingLatency = Nothing, piBanScore = 0
+            , piBytesSent = 0, piBytesRecv = 0, piMsgsSent = 0, piMsgsRecv = 0
+            , piConnectedAt = 0, piInbound = True, piWantsAddrV2 = False
+            , piWantsHeaders = False, piFeeFilterReceived = 0, piFeeFilterSent = 0
+            , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
+            , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
+            }
+      insertTestPeer pm addr2 info2
+      (_, disc2) <- misbehaving pm addr2 UnsolicitedMessage  -- score=1, still discourages
+      disc2 `shouldBe` True
+      isBanned pm addr2 >>= (`shouldBe` True)
+
+      stopPeerManager pm
 
     it "G2 FIXED: noban/manual/local peer protections present in misbehaving (W99 G2)" $ do
       -- Reference: bitcoin-core/src/net_processing.cpp MaybeDiscourageAndDisconnect @5083.
