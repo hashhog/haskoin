@@ -1604,6 +1604,360 @@ main = hspec $ do
         Left other -> expectationFailure $ "Expected op-limit error, got: " ++ other
         Right _    -> expectationFailure "Legacy 202nd op must be rejected"
 
+  -- W94: BIP-341/342 Taproot + tapscript comprehensive audit.
+  -- Six bugs caught vs. bitcoin-core interpreter.cpp:1832-1999:
+  --   1. Raw-byte OP_SUCCESS scan (push-data byte misread as opcode)
+  --   2. Missing MAX_SCRIPT_ELEMENT_SIZE (520) check on witness stack
+  --   3. Missing MAX_STACK_SIZE (1000) check on initial tapscript stack
+  --   4. Missing TAPROOT_CONTROL_MAX_SIZE (4129) upper bound on control block
+  --   5. Missing SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION wiring
+  --   6. Missing SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE wiring (tapscript)
+  describe "W94 BIP-341/342 Taproot + tapscript audit" $ do
+
+    describe "Taproot named constants" $ do
+      it "match BIP-341/342 / interpreter.h" $ do
+        taprootLeafMask           `shouldBe` 0xfe
+        taprootLeafTapscript      `shouldBe` 0xc0
+        taprootAnnexTag           `shouldBe` 0x50
+        taprootControlBaseSize    `shouldBe` 33
+        taprootControlNodeSize    `shouldBe` 32
+        taprootControlMaxNodeCount `shouldBe` 128
+        -- 33 + 32 * 128 = 4129
+        taprootControlMaxSize     `shouldBe` 4129
+        -- MAX_SCRIPT_ELEMENT_SIZE / MAX_STACK_SIZE live in
+        -- 'Haskoin.Consensus' (which we don't reach into here);
+        -- the tapscript verifier uses local mirrors that we exercise
+        -- via the witness-stack-element / stack-depth tests below.
+
+    describe "scanTapscriptForOpSuccess (Bug #1: raw-byte OP_SUCCESS scan)" $ do
+      it "empty script -> no OP_SUCCESS" $
+        scanTapscriptForOpSuccess BS.empty `shouldBe` Right False
+
+      it "OP_1 OP_1 OP_EQUAL -> no OP_SUCCESS" $
+        -- 0x51 0x51 0x87
+        scanTapscriptForOpSuccess (BS.pack [0x51, 0x51, 0x87])
+          `shouldBe` Right False
+
+      it "OP_SUCCESS80 (0x50) as an opcode -> OP_SUCCESS detected" $
+        scanTapscriptForOpSuccess (BS.pack [0x50]) `shouldBe` Right True
+
+      it "OP_SUCCESS126 (0x7e, OP_CAT byte) -> OP_SUCCESS detected" $
+        scanTapscriptForOpSuccess (BS.pack [0x7e]) `shouldBe` Right True
+
+      it "0x50 byte inside a push payload is NOT OP_SUCCESS (Core parity)" $ do
+        -- <push 1 byte: 0x50> = 0x01 0x50. Under the OLD raw-byte scan
+        -- this was incorrectly reported as OP_SUCCESS (over-acceptance).
+        -- Core's GetOp loop walks opcodes and treats the 0x50 as a data
+        -- byte. Expected: no OP_SUCCESS, no error.
+        scanTapscriptForOpSuccess (BS.pack [0x01, 0x50])
+          `shouldBe` Right False
+
+      it "0x7e byte inside a push payload is NOT OP_SUCCESS" $
+        scanTapscriptForOpSuccess (BS.pack [0x01, 0x7e])
+          `shouldBe` Right False
+
+      it "PUSHDATA1 32 bytes of OP_SUCCESS-looking bytes is data, not OP_SUCCESS" $ do
+        -- 0x4c 0x20 (PUSHDATA1, len=32) followed by 32 × 0xfe.
+        let s = BS.pack ([0x4c, 0x20] ++ replicate 32 0xfe)
+        scanTapscriptForOpSuccess s `shouldBe` Right False
+
+      it "OP_SUCCESS reached before a malformed push at end -> success wins" $ do
+        -- Core: GetOp loop returns success on OP_SUCCESS before reaching
+        -- the malformed instruction. We mirror that.
+        let s = BS.pack [0x7e, 0x01]   -- OP_CAT (success) then a dangling push
+        scanTapscriptForOpSuccess s `shouldBe` Right True
+
+      it "malformed push BEFORE any OP_SUCCESS -> BAD_OPCODE (Core parity)" $ do
+        -- A direct-push 0x05 (5 bytes) with only 3 bytes following is
+        -- malformed; Core returns BAD_OPCODE. We mirror that with a
+        -- @Left@.
+        let s = BS.pack [0x05, 0x01, 0x02, 0x03]  -- claims 5 bytes, has 3
+        case scanTapscriptForOpSuccess s of
+          Left _  -> return ()
+          Right b -> expectationFailure $
+                       "Expected BAD_OPCODE on malformed push, got Right "
+                       ++ show b
+
+      it "PUSHDATA2 with truncated length prefix -> BAD_OPCODE" $ do
+        -- 0x4d followed by only 1 of 2 length bytes.
+        let s = BS.pack [0x4d, 0x10]
+        case scanTapscriptForOpSuccess s of
+          Left _ -> return ()
+          Right b -> expectationFailure $
+                       "Expected BAD_OPCODE on malformed PUSHDATA2, got "
+                       ++ show b
+
+      it "PUSHDATA4 with truncated body -> BAD_OPCODE" $ do
+        -- Claims 1000 bytes, has 0.
+        let s = BS.pack [0x4e, 0xe8, 0x03, 0x00, 0x00]
+        case scanTapscriptForOpSuccess s of
+          Left _ -> return ()
+          Right b -> expectationFailure $
+                       "Expected BAD_OPCODE on malformed PUSHDATA4, got "
+                       ++ show b
+
+    -- Build a synthetic Taproot script-path witness whose CONTROL block
+    -- length is over TAPROOT_CONTROL_MAX_SIZE (4129).
+    --
+    -- Control = leaf-version-byte || 32-byte internal pubkey || N × 32-byte siblings.
+    -- For N = 129, control size = 33 + 129*32 = 4161 (over the cap).
+    describe "Bug #4: TAPROOT_CONTROL_MAX_SIZE (4129) upper bound" $ do
+      let dummyTx idx = Tx 1
+            [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                BS.empty 0xffffffff
+            ]
+            [ TxOut 1000 BS.empty ]
+            [[]]
+            0
+          dummyProg  = BS.replicate 32 0x11   -- 32-byte output key
+          dummyScript = BS.pack [0x51]         -- OP_1 — minimal tapscript
+
+          mkCtrl :: Int -> BS.ByteString
+          mkCtrl nSiblings =
+            BS.singleton 0xc0
+            <> BS.replicate 32 0x22
+            <> BS.concat (replicate nSiblings (BS.replicate 32 0x33))
+
+          flags = Set.fromList [VerifyTaproot]
+
+      it "control block at the 4129 cap is structurally allowed" $ do
+        let ctrl = mkCtrl 128   -- 33 + 32*128 = 4129
+        BS.length ctrl `shouldBe` taprootControlMaxSize
+        -- We expect failure for some downstream reason (TapTweak mismatch,
+        -- etc.) but NOT the "too long" structural check.
+        case verifyTaprootWithFlags flags (dummyTx 0) 0 dummyProg
+                    [dummyScript, ctrl] 1000 [1000] [BS.empty] of
+          Left msg | "too long" `T.isInfixOf` T.pack msg ->
+            expectationFailure $ "Control block at cap wrongly rejected: " ++ msg
+          _ -> return ()
+
+      it "control block one node OVER the cap is rejected as too long" $ do
+        let ctrl = mkCtrl 129   -- 33 + 32*129 = 4161 > 4129
+        BS.length ctrl `shouldSatisfy` (> taprootControlMaxSize)
+        case verifyTaprootWithFlags flags (dummyTx 0) 0 dummyProg
+                    [dummyScript, ctrl] 1000 [1000] [BS.empty] of
+          Left msg | "too long" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected control-block-too-long, got: " ++ other
+          Right _ -> expectationFailure
+            "Control block over TAPROOT_CONTROL_MAX_SIZE must be rejected"
+
+      it "control block 32 bytes (under base size) is rejected as too short" $ do
+        let ctrl = BS.replicate 32 0x55  -- under 33
+        case verifyTaprootWithFlags flags (dummyTx 0) 0 dummyProg
+                    [dummyScript, ctrl] 1000 [1000] [BS.empty] of
+          Left msg | "too short" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected control-block-too-short, got: " ++ other
+          Right _ -> expectationFailure
+            "Control block under TAPROOT_CONTROL_BASE_SIZE must be rejected"
+
+      it "control block with (len - 33) not divisible by 32 is rejected" $ do
+        -- 33 + 16 = 49 bytes — (49-33) mod 32 = 16, not 0.
+        let ctrl = BS.singleton 0xc0
+                   <> BS.replicate 32 0x22
+                   <> BS.replicate 16 0x44
+        case verifyTaprootWithFlags flags (dummyTx 0) 0 dummyProg
+                    [dummyScript, ctrl] 1000 [1000] [BS.empty] of
+          Left msg | "invalid length" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected control-block-invalid-length, got: " ++ other
+          Right _ -> expectationFailure
+            "Misaligned control block must be rejected"
+
+    -- Bugs #5 + #6: discourage flags for unknown leaf versions /
+    -- unknown pubkey types. Build the simplest possible unknown-leaf-
+    -- version case to drive that gate.
+    describe "Bug #5: DISCOURAGE_UPGRADABLE_TAPROOT_VERSION" $ do
+      -- Build a real single-leaf Taproot commitment with an UNKNOWN
+      -- leaf version (anything 0x02..0xfe stepping by 2 except 0xc0).
+      -- Without that, the verifier would short-circuit at the tweak-
+      -- mismatch check before reaching the leaf-version branch.
+      let unknownLeafVersion :: Word8
+          unknownLeafVersion = 0x66   -- even (low bit clear), != 0xc0
+          tsSkBytes = BS.replicate 32 0x07
+          tsInternalX = case xonlyPubkeyFromSeckey tsSkBytes of
+            Just k  -> k
+            Nothing -> error "test setup: xonlyPubkeyFromSeckey failed"
+          -- Minimal leaf script: just OP_1 (so the tapscript stack is
+          -- non-empty and clean if it ever DID execute — but with an
+          -- unknown leaf version we never decode it).
+          leafScript = BS.singleton 0x51
+          -- Tapleaf hash uses the unknown leaf version.
+          leafHash = TS.tapleafHashWith unknownLeafVersion leafScript
+          -- Single-leaf tree: merkle root == leaf hash.
+          tweak    = taggedHash (BS8.pack "TapTweak")
+                       (tsInternalX <> leafHash)
+          (outputX, parity) = case xonlyPubkeyTweakAdd tsInternalX tweak of
+            Just (k, p) -> (k, p)
+            Nothing     -> error "test setup: tweakAdd failed"
+          ctrlBlock = BS.singleton
+                        (unknownLeafVersion .|. fromIntegral parity)
+                      <> tsInternalX
+          dummyTx = Tx 1
+            [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                BS.empty 0xffffffff
+            ]
+            [ TxOut 1000 BS.empty ]
+            [[]]
+            0
+
+      it "unknown leaf version: succeeds when flag NOT set (forward-compat)" $ do
+        let flags = Set.fromList [VerifyTaproot]
+        verifyTaprootWithFlags flags dummyTx 0 outputX
+              [leafScript, ctrlBlock] 1000 [1000] [BS.empty]
+          `shouldBe` Right True
+
+      it "unknown leaf version: rejected with discourage flag set" $ do
+        let flags = Set.fromList
+              [ VerifyTaproot
+              , VerifyDiscourageUpgradableTaprootVersion
+              ]
+        case verifyTaprootWithFlags flags dummyTx 0 outputX
+                [leafScript, ctrlBlock] 1000 [1000] [BS.empty] of
+          Left msg | "leaf version" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected leaf-version rejection, got: " ++ other
+          Right _ -> expectationFailure
+            "Unknown leaf version must be rejected when discourage flag set"
+
+    describe "Bug #2: MAX_SCRIPT_ELEMENT_SIZE (520) on witness stack" $ do
+      -- Build a tapscript commitment with leaf script "OP_DROP OP_1" so
+      -- the 520-byte arg gets dropped and the stack ends with just OP_1.
+      let tsSkBytes = BS.replicate 32 0x09
+          tsInternalX = case xonlyPubkeyFromSeckey tsSkBytes of
+            Just k  -> k
+            Nothing -> error "test setup"
+          leafScript = BS.pack [0x75, 0x51]   -- OP_DROP OP_1
+          leafHash   = TS.tapleafHashWith TS.tapscriptLeafVersion leafScript
+          tweak      = taggedHash (BS8.pack "TapTweak")
+                         (tsInternalX <> leafHash)
+          (outputX, parity) = case xonlyPubkeyTweakAdd tsInternalX tweak of
+            Just (k, p) -> (k, p)
+            Nothing     -> error "test setup"
+          ctrlBlock = BS.singleton
+                        (TS.tapscriptLeafVersion .|. fromIntegral parity)
+                      <> tsInternalX
+          dummyTx = Tx 1
+            [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                BS.empty 0xffffffff
+            ]
+            [ TxOut 1000 BS.empty ]
+            [[]]
+            0
+          flags = Set.fromList [VerifyTaproot]
+
+      it "tapscript with a 521-byte witness stack item is rejected" $ do
+        -- Witness: [oversized_arg, leafScript, ctrlBlock]
+        let oversized = BS.replicate 521 0x00
+        case verifyTaprootWithFlags flags dummyTx 0 outputX
+                [oversized, leafScript, ctrlBlock]
+                1000 [1000] [BS.empty] of
+          Left msg | "520" `T.isInfixOf` T.pack msg
+                  || "element" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected push-size rejection, got: " ++ other
+          Right _ -> expectationFailure
+            "Oversized witness stack item must be rejected"
+
+      it "tapscript with a 520-byte witness stack item is accepted" $ do
+        -- 520 bytes is at the cap — Core lets this through; we should too.
+        -- Leaf is OP_1 so it succeeds regardless of extra args.
+        let atCap = BS.replicate 520 0x00
+        verifyTaprootWithFlags flags dummyTx 0 outputX
+              [atCap, leafScript, ctrlBlock] 1000 [1000] [BS.empty]
+          `shouldBe` Right True
+
+    describe "Bug #3: MAX_STACK_SIZE (1000) on initial tapscript stack" $ do
+      let tsSkBytes = BS.replicate 32 0x0a
+          tsInternalX = case xonlyPubkeyFromSeckey tsSkBytes of
+            Just k  -> k
+            Nothing -> error "test setup"
+          leafScript = BS.singleton 0x51   -- OP_1
+          leafHash   = TS.tapleafHashWith TS.tapscriptLeafVersion leafScript
+          tweak      = taggedHash (BS8.pack "TapTweak")
+                         (tsInternalX <> leafHash)
+          (outputX, parity) = case xonlyPubkeyTweakAdd tsInternalX tweak of
+            Just (k, p) -> (k, p)
+            Nothing     -> error "test setup"
+          ctrlBlock = BS.singleton
+                        (TS.tapscriptLeafVersion .|. fromIntegral parity)
+                      <> tsInternalX
+          dummyTx = Tx 1
+            [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                BS.empty 0xffffffff
+            ]
+            [ TxOut 1000 BS.empty ]
+            [[]]
+            0
+          flags = Set.fromList [VerifyTaproot]
+
+      it "initial witness stack of 1001 args rejected (over MAX_STACK_SIZE)" $ do
+        -- Args = 1001 empty pushes, plus script + control_block.
+        let args = replicate 1001 BS.empty
+            wit  = args ++ [leafScript, ctrlBlock]
+        case verifyTaprootWithFlags flags dummyTx 0 outputX
+                wit 1000 [1000] [BS.empty] of
+          Left msg | "MAX_STACK_SIZE" `T.isInfixOf` T.pack msg
+                  || "stack size" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected MAX_STACK_SIZE rejection, got: " ++ other
+          Right _ -> expectationFailure
+            "Initial stack over 1000 must be rejected"
+
+    describe "Bug #6: DISCOURAGE_UPGRADABLE_PUBKEYTYPE in tapscript CHECKSIG" $ do
+      let blankTx2 = Tx 1
+            [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                BS.empty 0xffffffff
+            ]
+            [] [[]] 0
+          mkEnv flags = (initScriptEnvWithFlags blankTx2 0 0 BS.empty flags)
+                          { seIsTapscript = True
+                          , seSpentAmounts = [0]
+                          , seSpentScripts = [BS.empty]
+                          , seTapleafHash  = Just (BS.replicate 32 0)
+                          , seValidationWeightLeft = 10000
+                          , seValidationWeightInit = True
+                          }
+          pkUnknown = BS.replicate 33 0x02  -- 33 bytes — not 0 or 32
+
+      it "tapscript CHECKSIG with unknown-pubkey-type: succeeds w/o flag" $ do
+        -- Stack (top→bottom): pubkey, sig
+        let env = (mkEnv emptyFlags)
+                    { seStack = [pkUnknown, BS.replicate 64 0xab] }
+        case execCheckSig env of
+          Right _ -> return ()
+          Left err -> expectationFailure $
+            "Unknown pubkey w/o flag must succeed, got: " ++ err
+
+      it "tapscript CHECKSIG with unknown-pubkey-type: rejected with discourage flag" $ do
+        let flags = Set.fromList [VerifyDiscourageUpgradablePubkeyType]
+            env   = (mkEnv flags)
+                      { seStack = [pkUnknown, BS.replicate 64 0xab] }
+        case execCheckSig env of
+          Left msg | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" `T.isInfixOf` T.pack msg
+                  || "unknown pubkey" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected unknown-pubkey-type rejection, got: " ++ other
+          Right _ -> expectationFailure
+            "Unknown pubkey type must be rejected with discourage flag"
+
+      it "tapscript CHECKSIGADD with unknown-pubkey-type: rejected with discourage flag" $ do
+        let flags = Set.fromList [VerifyDiscourageUpgradablePubkeyType]
+            -- Stack (top→bottom): pubkey, num, sig
+            env   = (mkEnv flags)
+                      { seStack = [ pkUnknown
+                                  , encodeScriptNum 3
+                                  , BS.replicate 64 0xab
+                                  ] }
+        case execCheckSigAdd env of
+          Left msg | "DISCOURAGE_UPGRADABLE_PUBKEYTYPE" `T.isInfixOf` T.pack msg
+                  || "unknown pubkey" `T.isInfixOf` T.pack msg -> return ()
+          Left other -> expectationFailure $
+            "Expected unknown-pubkey-type rejection, got: " ++ other
+          Right _ -> expectationFailure
+            "Unknown pubkey type must be rejected with discourage flag"
+
   describe "isPushOnly and push only scripts" $ do
     it "returns True for empty script" $ do
       isPushOnly (Script []) `shouldBe` True
