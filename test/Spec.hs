@@ -17201,21 +17201,15 @@ main = hspec $ do
         Right _            -> pure ()  -- haskoin: accepted as a known command
         Left _             -> pure ()  -- correct behavior would be Left
 
-    -- G24 BUG: readEncryptedPacket does not cap the decrypted length before
-    -- calling recvExact.  A malicious peer can encrypt a length value up to
-    -- 2^24-1 (~16 MiB) and cause a large allocation before any AEAD check.
-    -- Bitcoin Core caps at MAX_CONTENTS_LEN ≈ 4 MiB.
-    -- We test by verifying the packet-level cipher correctly produces a
-    -- large-length ciphertext that a spec-compliant decoder should reject.
-    it "G24 BUG: no max-payload-len guard in cipher layer (>4MiB length accepted)" $ do
-      -- Bitcoin Core rejects packets with contents length > MAX_CONTENTS_LEN
-      -- (≈4 MiB + 13B overhead) inside ProcessReceivedPacketBytes before even
-      -- attempting to allocate a receive buffer.  Haskoin's cipher layer has no
-      -- such guard; bip324DecryptLength returns the raw Word32 value without
-      -- capping it, leaving the responsibility to the caller (readEncryptedPacket),
-      -- which also lacks the cap (Network.hs:2214-2216).
-      -- We verify the ABSENCE of the guard: encode a length > 4 MiB in 3 LE bytes
-      -- using a fresh FSChaCha20 key (key=encrypt=decrypt since we XOR with same stream).
+    -- G24 FIXED: readEncryptedPacket now caps the decrypted length at
+    -- maxProtocolMessageLength (4 * 1000 * 1000) before calling recvExact.
+    -- Bitcoin Core caps at MAX_PROTOCOL_MESSAGE_LENGTH inside
+    -- ProcessReceivedPacketBytes before allocating a receive buffer.
+    -- The FSChaCha20 cipher layer itself is intentionally uncapped (it is a
+    -- stream cipher that faithfully decodes whatever length is encoded); the
+    -- guard lives one level up in readEncryptedPacket, which is now correct.
+    it "G24 FIXED: readEncryptedPacket guards v2 payload at maxProtocolMessageLength (W98)" $ do
+      -- Cipher round-trip is still invertible for any length (cipher is correct):
       let key32 = BS.replicate 32 0xab
           cipher = newFSChaCha20 key32 224
           bigLen   = (4 * 1024 * 1024 + 1) :: Word32
@@ -17231,10 +17225,14 @@ main = hspec $ do
           decodedLen = fromIntegral (BS.index decLen 0)
                     .|. (fromIntegral (BS.index decLen 1) `shiftL` 8 :: Word32)
                     .|. (fromIntegral (BS.index decLen 2) `shiftL` 16 :: Word32)
-      -- The decoded length should equal the original (stream cipher is invertible)
+      -- Cipher correctly round-trips the length (unchanged):
       decodedLen `shouldBe` bigLen
-      -- And this value is > 4 MiB — the cipher layer returns it without capping
-      decodedLen `shouldSatisfy` (> 4 * 1024 * 1024)
+      -- The decoded length exceeds the cap — readEncryptedPacket must reject it:
+      decodedLen `shouldSatisfy` (> 4 * 1000 * 1000)
+      -- Verify the source-level guard is present in readEncryptedPacket:
+      contents <- readFile "src/Haskoin/Network.hs"
+      ("fromIntegral len > maxProtocolMessageLength" `isInfixOf` contents) `shouldBe` True
+      ("v2: payload too large" `isInfixOf` contents) `shouldBe` True
 
     -- G1/G26 BUG: Secret keys and entropy for the handshake are generated via
     -- System.Random (randomRIO in Network.hs:2276-2278 / 2339-2341), which is
@@ -22250,15 +22248,18 @@ main = hspec $ do
       -- inbound path skips the service check
       ("Right _ver ->" `isInfixOf` contents) `shouldBe` True
 
-    it "G23 MAX_PROTOCOL_MESSAGE_LENGTH=4MiB: actual limit is 32MiB (W99 DOS)" $ do
-      -- Bitcoin Core uses MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1024 * 1024 (4 MiB).
-      -- haskoin receiveMessage (Network.hs:1906): mhLength header > 32*1024*1024
-      -- → accepts messages up to 32 MiB, 8× larger than Core's limit.
+    it "G23 FIXED: MAX_PROTOCOL_MESSAGE_LENGTH=4MB (W99 DOS)" $ do
+      -- Bitcoin Core uses MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 (4 MB).
+      -- Fix: named constant maxProtocolMessageLength = 4 * 1000 * 1000 used in
+      -- both the v1 receiveV1 path and the BIP-324 readEncryptedPacket path.
       -- Reference: bitcoin-core/src/net.h MAX_PROTOCOL_MESSAGE_LENGTH.
       contents <- readFile "src/Haskoin/Network.hs"
-      ("32 * 1024 * 1024" `isInfixOf` contents) `shouldBe` True
-      -- Core's correct constant is 4 MiB:
-      ("4 * 1024 * 1024"  `isInfixOf` contents) `shouldBe` False
+      -- Old 32 MiB literal must be gone:
+      ("32 * 1024 * 1024" `isInfixOf` contents) `shouldBe` False
+      -- Named constant must be present:
+      ("maxProtocolMessageLength" `isInfixOf` contents) `shouldBe` True
+      -- Correct Core value must appear in the constant definition:
+      ("4 * 1000 * 1000" `isInfixOf` contents) `shouldBe` True
 
     it "G24 unknown msg log+ignore (no Misbehaving): present (W99)" $ do
       -- MUnknown falls through to `_other -> return ()` in syncMessageHandler
