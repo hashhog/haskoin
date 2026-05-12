@@ -52,6 +52,17 @@ module Haskoin.Script
   , isCompressedPubKey
     -- * Tapscript OP_SUCCESS (BIP-342)
   , isTapscriptSuccess
+  , scanTapscriptForOpSuccess
+    -- * Taproot verification (BIP-341/342) — test-only entry points
+  , verifyTaprootWithFlags
+    -- * Taproot constants (BIP-341/342)
+  , taprootLeafMask
+  , taprootLeafTapscript
+  , taprootAnnexTag
+  , taprootControlBaseSize
+  , taprootControlNodeSize
+  , taprootControlMaxNodeCount
+  , taprootControlMaxSize
     -- * Sigop Counting
   , countScriptSigops
     -- * Witness Program Detection
@@ -266,6 +277,8 @@ data ScriptVerifyFlag
   | VerifyDiscourageUpgradableWitnessProgram  -- ^ Fail on unknown witness versions (policy)
   | VerifyDiscourageUpgradableNops            -- ^ Fail on upgradable NOPs (policy)
   | VerifyDiscourageOpSuccess                 -- ^ Fail on OP_SUCCESS opcodes (policy)
+  | VerifyDiscourageUpgradableTaprootVersion -- ^ BIP-341: Fail on unknown tapleaf versions (policy)
+  | VerifyDiscourageUpgradablePubkeyType     -- ^ BIP-342: Fail on unknown tapscript pubkey types (policy)
   | VerifyConstScriptcode                    -- ^ OP_CODESEPARATOR forbidden in BASE (legacy, non-witness) scripts
   | VerifyStrictEncoding                     -- ^ BIP-62: Strict signature/pubkey encoding
   | VerifyLowS                              -- ^ BIP-62: Low-S signatures
@@ -1855,11 +1868,16 @@ execCheckSig env = do
       -- Empty pubkey is an error in tapscript
       when (BS.null pubkeyBytes) $
         Left "TAPSCRIPT_EMPTY_PUBKEY"
-      -- For non-empty, non-32-byte pubkeys: unknown pubkey type
+      -- For non-empty, non-32-byte pubkeys: unknown pubkey type.
+      -- BIP-342 §"Upgradable public key versions" / interpreter.cpp:379:
+      -- under SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE this is a
+      -- hard failure (policy gate against pre-relying on future soft
+      -- forks). Without the flag we succeed-forward-compat with the
+      -- usual sig-empty=>false, sig-non-empty=>true result push.
       if BS.length pubkeyBytes /= 32
-        then
-          -- Unknown pubkey type: if sig is non-empty, push true; if empty, push false
-          -- (BIP-342 soft-fork-safe forward compatibility)
+        then do
+          when (hasFlag (seFlags env''') VerifyDiscourageUpgradablePubkeyType) $
+            Left "Tapscript unknown pubkey type (DISCOURAGE_UPGRADABLE_PUBKEYTYPE)"
           if BS.null sigBytes
             then Right $ pushStack stackFalse env'''
             else Right $ pushStack stackTrue env'''
@@ -2053,9 +2071,14 @@ execCheckSigAdd env = do
       if BS.null pubkeyBytes
         then Left "TAPSCRIPT_EMPTY_PUBKEY"
         else if BS.length pubkeyBytes /= 32
-          then
+          then do
             -- Unknown pubkey type with non-empty sig: forward-compat success
             -- (matches OP_CHECKSIG path for non-32-byte tapscript pubkeys).
+            -- BIP-342 §"Upgradable public key versions" / interpreter.cpp:379:
+            -- DISCOURAGE_UPGRADABLE_PUBKEYTYPE upgrades the soft-fork hole
+            -- to a hard rejection.
+            when (hasFlag (seFlags env3w) VerifyDiscourageUpgradablePubkeyType) $
+              Left "Tapscript unknown pubkey type (DISCOURAGE_UPGRADABLE_PUBKEYTYPE)"
             Right True
           else case verifyTapscriptSchnorr env3w sigBytes pubkeyBytes of
             Right True  -> Right True
@@ -2352,6 +2375,100 @@ isTapscriptSuccess op =
   (op >= 0x8d && op <= 0x8e) ||
   (op >= 0x95 && op <= 0x99) ||
   (op >= 0xbb && op <= 0xfe)
+
+-- | Walk a tapscript byte-by-byte using a 'GetOp'-equivalent parser
+-- and decide whether any OP_SUCCESSx opcode is reachable as a true
+-- opcode (i.e. not inside push-data payload).
+--
+-- Reference: bitcoin-core/src/script/interpreter.cpp ExecuteWitnessScript
+-- (lines 1838-1852). Core uses @exec_script.GetOp(pc, opcode)@ which
+-- advances over push-data payload, so a 0xfe byte appearing INSIDE a
+-- push-data block is NOT an OP_SUCCESS — it is data. The old
+-- @any isTapscriptSuccess (BS.unpack rawBytes)@ implementation
+-- conflated the two, over-accepting tapscripts whose push-data
+-- contained any of the OP_SUCCESS byte values.
+--
+-- Return value:
+--
+--   * @Right True@  — an OP_SUCCESSx opcode was found at the opcode
+--     level; per BIP-342 the script succeeds unconditionally (subject
+--     to the DISCOURAGE_OP_SUCCESS policy gate, handled by the caller).
+--   * @Right False@ — script parsed cleanly with no OP_SUCCESSx.
+--   * @Left "BAD_OPCODE"@ — script is malformed (a push-data length
+--     ran past end-of-script) and we did NOT find an OP_SUCCESSx
+--     before the malformation. This matches Core's
+--     @SCRIPT_ERR_BAD_OPCODE@ at interpreter.cpp:1843; if an
+--     OP_SUCCESSx is reached first, Core returns success before
+--     hitting the malformed instruction, and so do we.
+scanTapscriptForOpSuccess :: ByteString -> Either String Bool
+scanTapscriptForOpSuccess = go
+  where
+    go bs
+      | BS.null bs = Right False
+      | otherwise  =
+          let b0 = BS.head bs
+              rest0 = BS.tail bs
+          in case getOpLen b0 rest0 of
+               Left _err
+                 -- Malformed push-data and we never saw OP_SUCCESS:
+                 -- mirror Core's SCRIPT_ERR_BAD_OPCODE.
+                 | isTapscriptSuccess b0 -> Right True
+                 | otherwise             -> Left "BAD_OPCODE"
+               Right (consumed, afterOp)
+                 | isTapscriptSuccess b0 -> Right True
+                 | otherwise             -> go (BS.drop consumed afterOp)
+
+    -- @getOpLen b rest@ : given opcode byte @b@ and the bytes after it
+    -- (@rest@), return @Right (pushBodyLen, rest)@ if it is a well-formed
+    -- direct push or OP_PUSHDATA{1,2,4}, where @pushBodyLen@ counts the
+    -- payload bytes only (the 1, 2, or 4 length prefix is consumed from
+    -- @rest@ before returning); for non-push opcodes returns
+    -- @Right (0, rest)@. Returns 'Left' on malformed push-data.
+    --
+    -- Note: callers must @BS.drop consumed afterOp@ where @afterOp@ has
+    -- the length prefix already removed.
+    getOpLen :: Word8 -> ByteString -> Either String (Int, ByteString)
+    getOpLen b rest
+      -- Direct push 0x01..0x4b: body length = b
+      | b >= 0x01 && b <= 0x4b =
+          let n = fromIntegral b
+          in if BS.length rest < n
+               then Left "truncated direct push"
+               else Right (n, rest)
+      -- OP_PUSHDATA1
+      | b == 0x4c =
+          case BS.uncons rest of
+            Nothing -> Left "truncated PUSHDATA1 length"
+            Just (l1, r1) ->
+              let n = fromIntegral l1
+              in if BS.length r1 < n
+                   then Left "truncated PUSHDATA1 body"
+                   else Right (n, r1)
+      -- OP_PUSHDATA2
+      | b == 0x4d =
+          if BS.length rest < 2
+            then Left "truncated PUSHDATA2 length"
+            else
+              let l = fromIntegral (BS.index rest 0)
+                      .|. (fromIntegral (BS.index rest 1) `shiftL` 8)
+                  r2 = BS.drop 2 rest
+              in if BS.length r2 < l
+                   then Left "truncated PUSHDATA2 body"
+                   else Right (l, r2)
+      -- OP_PUSHDATA4
+      | b == 0x4e =
+          if BS.length rest < 4
+            then Left "truncated PUSHDATA4 length"
+            else
+              let l = fromIntegral (BS.index rest 0)
+                      .|. (fromIntegral (BS.index rest 1) `shiftL` 8)
+                      .|. (fromIntegral (BS.index rest 2) `shiftL` 16)
+                      .|. (fromIntegral (BS.index rest 3) `shiftL` 24)
+                  r4 = BS.drop 4 rest
+              in if BS.length r4 < l
+                   then Left "truncated PUSHDATA4 body"
+                   else Right (l, r4)
+      | otherwise = Right (0, rest)
 
 --------------------------------------------------------------------------------
 -- Script Evaluation Entry Points
@@ -2697,6 +2814,55 @@ verifyP2WSHWithFlags flags tx idx expectedHash amount = do
     [_]   -> Left "Script evaluated to false"
     _     -> Left "Witness script must leave exactly one item on stack"
 
+-- | BIP-341/342 constants. Mirror @bitcoin-core/src/script/interpreter.h@
+-- and @script.h@.
+--
+-- These were previously sprinkled as magic numbers (@0xfe@, @0xc0@,
+-- @0x50@, @33@, @4129@) across the Taproot verifier. Naming them keeps
+-- the consensus rules legible and one-source-of-truth.
+taprootLeafMask :: Word8
+taprootLeafMask = 0xfe  -- mask out low parity bit of control block byte 0
+
+taprootLeafTapscript :: Word8
+taprootLeafTapscript = 0xc0  -- BIP-342 tapscript leaf version
+
+taprootAnnexTag :: Word8
+taprootAnnexTag = 0x50  -- BIP-341 annex prefix byte
+
+taprootControlBaseSize :: Int
+taprootControlBaseSize = 33  -- leaf_version || 32-byte internal pubkey
+
+taprootControlNodeSize :: Int
+taprootControlNodeSize = 32
+
+taprootControlMaxNodeCount :: Int
+taprootControlMaxNodeCount = 128
+
+-- | Maximum allowed control-block length in bytes: 33 + 32*128 = 4129.
+-- Mirrors @TAPROOT_CONTROL_MAX_SIZE@ in
+-- @bitcoin-core/src/script/interpreter.h@. Anything larger is a hard
+-- consensus failure.
+taprootControlMaxSize :: Int
+taprootControlMaxSize =
+  taprootControlBaseSize + taprootControlNodeSize * taprootControlMaxNodeCount
+
+-- | Max size of any individual stack element / push payload (520 bytes).
+-- Mirrors @MAX_SCRIPT_ELEMENT_SIZE@.  Re-stated locally here (the
+-- same constant lives in 'Haskoin.Consensus') because we cannot
+-- depend on @Haskoin.Consensus@ from @Haskoin.Script@ without a
+-- circular import, and the consensus-rule must be enforced inside
+-- the script-path verifier.
+tapMaxScriptElementSize :: Int
+tapMaxScriptElementSize = 520
+
+-- | Max total stack depth at any point during script evaluation (1000).
+-- For tapscript Core enforces this on the INITIAL witness stack before
+-- entering EvalScript (interpreter.cpp:1855); altstack is empty at
+-- that point so we compare against length of the witness stack only.
+-- Mirrors @MAX_STACK_SIZE@.
+tapMaxStackSize :: Int
+tapMaxStackSize = 1000
+
 -- | Verify Taproot (BIP-341/342) witness v1 program.
 -- Handles both key-path (single witness element = Schnorr sig) and
 -- script-path (witness stack + script + control block).
@@ -2705,9 +2871,13 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
   when (null witness) $
     Left "Taproot witness empty"
 
-  -- Check for annex: if >= 2 items and last starts with 0x50
+  -- Check for annex: if >= 2 items and last starts with ANNEX_TAG (0x50).
+  -- Mirrors interpreter.cpp:1951 — gated on @stack.size() >= 2@ so a
+  -- single-element witness whose first byte is 0x50 is NOT an annex.
   let (effectiveWitness, annex) =
-        if length witness >= 2 && not (BS.null (last witness)) && BS.head (last witness) == 0x50
+        if length witness >= 2
+           && not (BS.null (last witness))
+           && BS.head (last witness) == taprootAnnexTag
         then (init witness, Just (last witness))
         else (witness, Nothing)
 
@@ -2748,13 +2918,21 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
           tapscriptBytes = effectiveWitness !! (length effectiveWitness - 2)
           stack = take (length effectiveWitness - 2) effectiveWitness
 
-      -- Control block must be >= 33 bytes and (len - 33) must be multiple of 32
-      when (BS.length controlBlock < 33) $
+      -- BIP-341 control-block structural validation (interpreter.cpp:1970):
+      --   * size >= TAPROOT_CONTROL_BASE_SIZE (33)
+      --   * size <= TAPROOT_CONTROL_MAX_SIZE  (4129 = 33 + 32*128)
+      --   * (size - 33) divisible by TAPROOT_CONTROL_NODE_SIZE (32)
+      -- The upper bound (4129) was previously missing, allowing
+      -- merkle paths deeper than the BIP-341 cap of 128.
+      when (BS.length controlBlock < taprootControlBaseSize) $
         Left "Taproot control block too short"
-      when ((BS.length controlBlock - 33) `mod` 32 /= 0) $
+      when (BS.length controlBlock > taprootControlMaxSize) $
+        Left "Taproot control block too long"
+      when ((BS.length controlBlock - taprootControlBaseSize)
+            `mod` taprootControlNodeSize /= 0) $
         Left "Taproot control block invalid length"
 
-      let leafVersion = BS.head controlBlock .&. 0xfe
+      let leafVersion = BS.head controlBlock .&. taprootLeafMask
           parityBit   = BS.head controlBlock .&. 0x01
           internalKey = BS.take 32 (BS.drop 1 controlBlock)
 
@@ -2790,12 +2968,19 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
             length spentScripts /= length (txInputs tx)) $
         Left "Taproot script-path: caller did not supply per-input prevouts"
 
-      -- Check leaf version: 0xc0 = tapscript (BIP-342)
-      if leafVersion == 0xc0
+      -- Check leaf version: TAPROOT_LEAF_TAPSCRIPT (0xc0) = tapscript (BIP-342).
+      -- Other even leaf versions are reserved by BIP-341 for future
+      -- soft forks; under policy DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+      -- they are rejected so node operators don't preemptively rely on
+      -- them. Without the flag we succeed (forward-compat).
+      if leafVersion == taprootLeafTapscript
         then do
-          -- BIP-342: Check for OP_SUCCESS opcodes before full evaluation
-          let rawBytes = tapscriptBytes
-              hasOpSuccess = any isTapscriptSuccess (BS.unpack rawBytes)
+          -- BIP-342: Check for OP_SUCCESSx opcodes before evaluation.
+          -- Must walk OPCODES, not raw bytes — a 0xfe etc inside a
+          -- push-data payload is NOT an OP_SUCCESS (it is data).
+          -- Mirrors @ExecuteWitnessScript@'s GetOp loop in
+          -- bitcoin-core/src/script/interpreter.cpp:1838-1852.
+          hasOpSuccess <- scanTapscriptForOpSuccess tapscriptBytes
 
           if hasOpSuccess
             then do
@@ -2804,6 +2989,21 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
                 Left "OP_SUCCESS discouraged"
               Right True
             else do
+              -- BIP-342 (interpreter.cpp:1858-1861): every witness
+              -- stack item the tapscript inherits must be
+              -- <= MAX_SCRIPT_ELEMENT_SIZE (520 bytes). The annex and
+              -- the script/control-block items are popped before this
+              -- check, so it applies only to the surviving arg stack.
+              forM_ stack $ \el ->
+                when (BS.length el > tapMaxScriptElementSize) $
+                  Left "Tapscript witness element exceeds 520 bytes"
+
+              -- BIP-342 (interpreter.cpp:1854-1856): initial stack
+              -- depth must not exceed MAX_STACK_SIZE (1000). Altstack
+              -- is empty at this point.
+              when (length stack > tapMaxStackSize) $
+                Left "Tapscript initial stack size exceeds MAX_STACK_SIZE"
+
               -- Decode and evaluate the tapscript
               tapscript <- decodeScript tapscriptBytes
 
@@ -2835,7 +3035,13 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
                 [_]   -> Left "EVAL_FALSE"
                 _     -> Left "Tapscript must leave exactly one item on stack"
         else do
-          -- Unknown leaf version: succeed (future soft-fork compatibility)
+          -- Unknown leaf version. BIP-341 (interpreter.cpp:1985-1987):
+          -- under SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
+          -- treat as a hard failure so we don't pre-rely on unreserved
+          -- future soft forks. Without the flag, succeed for
+          -- forward-compatibility.
+          when (hasFlag flags VerifyDiscourageUpgradableTaprootVersion) $
+            Left "Unknown Taproot leaf version (DISCOURAGE_UPGRADABLE_TAPROOT_VERSION)"
           Right True
 
     _ -> Left "Taproot witness invalid"
