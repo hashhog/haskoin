@@ -677,6 +677,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- so misconfigured operators see the failure immediately rather
     -- than silently starting from genesis. Reference: Bitcoin Core's
     -- assumeutxo bootstrap (rpc/blockchain.cpp loadtxoutset).
+    --
+    -- W102 BUG-1: checkAssumeutxoWhitelist — snapshot height must appear
+    --   in the hardcoded table (Core validation.cpp:5776-5778).
+    -- W102 BUG-2: verifySnapshot — coin-set hash must match audHashSerialized
+    --   (Core validation.cpp:5920).
+    -- W102 BUG-8: base block must appear in the header chain before we
+    --   accept the snapshot (Core validation.cpp:5613).
+    -- W102 BUG-9+10: per-coin height ≤ base_height and MoneyRange guards
+    --   (Core validation.cpp:5818-5822), enforced via validateSnapshotCoins.
     forM_ noLoadSnapshot $ \snapshotPath -> do
       putStrLn $ "[--load-snapshot] reading " ++ snapshotPath
       let magic = netMagic net
@@ -686,13 +695,65 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           putStrLn $ "[--load-snapshot] FATAL: " ++ err
           exitWith (ExitFailure 1)
         Right snap -> do
-          let m = usMetadata snap
-          putStrLn $ "[--load-snapshot] base hash = "
-                  ++ show (smBaseBlockHash m)
-                  ++ ", coins = " ++ show (smCoinsCount m)
-          n <- loadSnapshotIntoLegacyUTXO db snap
-          putStrLn $ "[--load-snapshot] imported " ++ show n
-                  ++ " UTXO(s); best-block pinned to snapshot base."
+          let m        = usMetadata snap
+              baseHash = smBaseBlockHash m
+          -- BUG-8: base block must appear in the header chain.
+          -- Core validation.cpp:5613: "The base block header must appear
+          -- in the headers chain."
+          entries <- readTVarIO (hcEntries hc)
+          case Map.lookup baseHash entries of
+            Nothing -> do
+              putStrLn $ "[--load-snapshot] FATAL: base block "
+                      ++ show baseHash
+                      ++ " not found in header chain; "
+                      ++ "sync headers first or use the correct snapshot."
+              exitWith (ExitFailure 1)
+            Just baseEntry -> do
+              let baseHeight = ceHeight baseEntry
+              -- BUG-1: whitelist check — height must be in the
+              -- hardcoded assumeutxo table.
+              case checkAssumeutxoWhitelist net baseHeight of
+                Left wlErr -> do
+                  putStrLn $ "[--load-snapshot] FATAL: " ++ wlErr
+                  exitWith (ExitFailure 1)
+                Right () ->
+                  -- BUG-2: hash verification — coin-set hash must match
+                  -- the hardcoded audHashSerialized value.
+                  case assumeUtxoForHeight net baseHeight of
+                    Nothing -> do
+                      putStrLn "[--load-snapshot] FATAL: internal error: \
+                               \whitelist lookup failed after whitelist passed"
+                      exitWith (ExitFailure 1)
+                    Just params -> do
+                      let aud = AssumeUtxoData
+                                  { audHeight         = baseHeight
+                                  , audHashSerialized = aupHashSerialized params
+                                  , audChainTxCount   = aupChainTxCount   params
+                                  , audBlockHash      = aupBlockHash      params
+                                  }
+                      case verifySnapshot snap aud of
+                        Left vErr -> do
+                          putStrLn $ "[--load-snapshot] FATAL: "
+                                  ++ "snapshot hash verification failed: "
+                                  ++ vErr
+                          exitWith (ExitFailure 1)
+                        Right () -> do
+                          -- BUG-9+10: per-coin height ≤ base_height and
+                          -- MoneyRange guard.
+                          case validateSnapshotCoins baseHeight (usCoins snap) of
+                            Left vErr2 -> do
+                              putStrLn $ "[--load-snapshot] FATAL: "
+                                      ++ "snapshot coin validation failed: "
+                                      ++ vErr2
+                              exitWith (ExitFailure 1)
+                            Right () -> do
+                              putStrLn $ "[--load-snapshot] base hash = "
+                                      ++ show baseHash
+                                      ++ ", height = " ++ show baseHeight
+                                      ++ ", coins = " ++ show (smCoinsCount m)
+                              n <- loadSnapshotIntoLegacyUTXO db snap
+                              putStrLn $ "[--load-snapshot] imported " ++ show n
+                                      ++ " UTXO(s); best-block pinned to snapshot base."
 
     -- Initialize mempool.
     -- Provide a per-input coin-MTP lookup function (BIP-68 time-based locks):

@@ -189,6 +189,7 @@ module Haskoin.Storage
   , computeUtxoHash
   , computeUtxoMuHash
   , verifySnapshot
+  , validateSnapshotCoins
     -- ** Core-compatible compression primitives
   , compressAmount
   , decompressAmount
@@ -3172,6 +3173,42 @@ verifySnapshot snapshot audData
          then Right ()
          else Left $ "UTXO hash mismatch: expected " ++
            show (audHashSerialized audData) ++ ", got " ++ show actualHash
+
+-- | Per-coin validation for a loaded snapshot.
+--
+-- Mirrors the two guards in Bitcoin Core validation.cpp PopulateAndValidateSnapshot:
+--
+--   L5818: if (coin.nHeight > base_height || ...)
+--             return { InitStateError, "Bad snapshot data" }
+--   L5822: if (!MoneyRange(coin.out.nValue))
+--             return { InitStateError, "bad tx out value" }
+--
+-- Returns 'Left' with an error message on the first bad coin encountered.
+-- Returns 'Right ()' if every coin is valid.
+--
+-- W102 BUG-9: per-coin height guard.
+-- W102 BUG-10: per-coin MoneyRange guard.
+validateSnapshotCoins :: Word32           -- ^ base_height from the whitelist entry
+                      -> [SnapshotCoin]
+                      -> Either String ()
+validateSnapshotCoins baseHeight = mapM_ checkOne
+  where
+    maxMoneyVal :: Word64
+    maxMoneyVal = 2100000000000000  -- 21M * 100M satoshis (consensus/amount.h)
+    checkOne SnapshotCoin{..} =
+      let h = coinHeight scCoin
+          v = txOutValue (coinTxOut scCoin)
+      in if h > baseHeight
+         then Left $ "Bad snapshot data: coin at outpoint "
+                  ++ show scOutPoint
+                  ++ " has height " ++ show h
+                  ++ " > base_height " ++ show baseHeight
+         else if v > maxMoneyVal
+              then Left $ "bad tx out value: coin at outpoint "
+                       ++ show scOutPoint
+                       ++ " has value " ++ show v
+                       ++ " > MAX_MONEY " ++ show maxMoneyVal
+              else Right ()
 
 -- | Background validation state for assumeUTXO.
 -- Tracks progress of validating the chain from genesis to snapshot height.
