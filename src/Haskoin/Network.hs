@@ -514,7 +514,7 @@ import qualified Crypto.MAC.Poly1305 as Poly1305
 import qualified Crypto.Hash as H
 import qualified Crypto.MAC.HMAC as HMAC
 import qualified Crypto.ECC as ECC
-import Data.ByteArray (convert)
+import Data.ByteArray (convert, ScrubbedBytes)
 import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -6576,11 +6576,18 @@ initializeBIP324 cipher theirPubKey netMagic initiator = do
   case ecdhResult of
     Left err -> return (Left err)
     Right ecdhSecret -> do
-      let sessionKeys = deriveV2SessionKeys ecdhSecret netMagic initiator
-          sendLCipher = newFSChaCha20 (v2skSendLKey sessionKeys) v2RekeyInterval
-          recvLCipher = newFSChaCha20 (v2skRecvLKey sessionKeys) v2RekeyInterval
-          sendPCipher = newFSChaCha20Poly1305 (v2skSendPKey sessionKeys) v2RekeyInterval
-          recvPCipher = newFSChaCha20Poly1305 (v2skRecvPKey sessionKeys) v2RekeyInterval
+      -- W98 G10: wrap the 32-byte ECDH output in ScrubbedBytes immediately so
+      -- the memory package zeros it on finalization.  Convert back to ByteString
+      -- only for the HKDF call; the ScrubbedBytes value goes out of scope at the
+      -- end of this do-block, triggering zeroing.  Mirrors Bitcoin Core
+      -- bip324.cpp:67-70 (memory_cleanse on ecdh_secret + HKDF state).
+      let ecdhScrubbed = BA.convert ecdhSecret :: ScrubbedBytes
+          ecdhBs       = BA.convert ecdhScrubbed :: ByteString
+          sessionKeys  = deriveV2SessionKeys ecdhBs netMagic initiator
+          sendLCipher  = newFSChaCha20 (v2skSendLKey sessionKeys) v2RekeyInterval
+          recvLCipher  = newFSChaCha20 (v2skRecvLKey sessionKeys) v2RekeyInterval
+          sendPCipher  = newFSChaCha20Poly1305 (v2skSendPKey sessionKeys) v2RekeyInterval
+          recvPCipher  = newFSChaCha20Poly1305 (v2skRecvPKey sessionKeys) v2RekeyInterval
       return $ Right cipher
         { b324SendLCipher = Just sendLCipher
         , b324RecvLCipher = Just recvLCipher
