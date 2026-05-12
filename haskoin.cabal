@@ -105,6 +105,7 @@ test-suite haskoin-test
   type:          exitcode-stdio-1.0
   main-is:       Spec.hs
   other-modules: W100UTXOCacheSpec
+               , W101ActivateBestChainSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
