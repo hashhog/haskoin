@@ -2147,7 +2147,14 @@ mempoolErrorToRpcResponse err = RpcResponse Null (toJSON rpcErr) Null
   where
     rpcErr = case err of
       ErrAlreadyInMempool ->
+        -- Exact duplicate (same wtxid). Bitcoin Core: "txn-already-in-mempool".
         RpcError rpcVerifyAlreadyInChain "Transaction already in mempool"
+
+      ErrSameNonwitnessInMempool ->
+        -- Same txid but different witness (witness mutated).
+        -- Bitcoin Core: TX_CONFLICT, "txn-same-nonwitness-data-in-mempool"
+        -- (validation.cpp:829).
+        RpcError rpcVerifyAlreadyInChain "Transaction with same non-witness data already in mempool"
 
       ErrMissingInput op ->
         RpcError rpcVerifyError ("Missing inputs. OutPoint: " <> T.pack (show op))
@@ -5209,59 +5216,61 @@ handleTestMempoolAccept server params = do
               let txid = computeTxId tx
                   wtxid = computeWtxId tx
 
-              -- Check if already in mempool
-              mExisting <- getTransaction (rsMempool server) txid
-              case mExisting of
-                Just _ -> return $ pairs $
+              -- BIP-339 two-step duplicate check (mirrors Bitcoin Core
+              -- MemPoolAccept::PreChecks, validation.cpp:823-830):
+              --   a) wtxid hit → "txn-already-in-mempool"  (exact duplicate)
+              --   b) txid  hit → "txn-same-nonwitness-data-in-mempool"
+              --                  (witness-mutated, same non-witness data)
+              -- addTransaction returns ErrAlreadyInMempool or
+              -- ErrSameNonwitnessInMempool (without inserting) when either
+              -- condition holds; mempoolErrorToText maps each to the correct
+              -- Core-canonical reject-reason string.  No pre-check needed.
+              result <- addTransaction (rsMempool server) tx
+              case result of
+                Left err -> return $ pairs $
                   pair "txid"          (text (showHash (BlockHash (getTxIdHash txid))))  <>
                   pair "wtxid"         (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
                   pair "allowed"       (AE.bool False)                                   <>
-                  pair "reject-reason" (text "txn-already-in-mempool")
-                Nothing -> do
-                  -- Try to add (dry run)
-                  result <- addTransaction (rsMempool server) tx
-                  case result of
-                    Left err -> return $ pairs $
-                      pair "txid"          (text (showHash (BlockHash (getTxIdHash txid))))  <>
-                      pair "wtxid"         (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
-                      pair "allowed"       (AE.bool False)                                   <>
-                      pair "reject-reason" (text (mempoolErrorToText err))
-                    Right _ -> do
-                      -- Get the entry to compute vsize and fee
-                      mEntry <- getTransaction (rsMempool server) txid
-                      -- Remove it (since this is test only)
-                      removeTransaction (rsMempool server) txid
+                  pair "reject-reason" (text (mempoolErrorToText err))
+                Right _ -> do
+                  -- Get the entry to compute vsize and fee
+                  mEntry <- getTransaction (rsMempool server) txid
+                  -- Remove it (since this is test only)
+                  removeTransaction (rsMempool server) txid
 
-                      case mEntry of
-                        Nothing -> return $ pairs $
-                          pair "txid"    (text (showHash (BlockHash (getTxIdHash txid))))  <>
-                          pair "wtxid"   (text (showHash (BlockHash (getTxIdHash wtxid))))<>
-                          pair "allowed" (AE.bool True)
-                        Just entry -> do
-                          let vsize = meSize entry
-                              fee = meFee entry
-                              feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
-                              txidTxt = showHash (BlockHash (getTxIdHash txid))
-                              wtxidTxt = showHash (BlockHash (getTxIdHash wtxid))
+                  case mEntry of
+                    Nothing -> return $ pairs $
+                      pair "txid"    (text (showHash (BlockHash (getTxIdHash txid))))  <>
+                      pair "wtxid"   (text (showHash (BlockHash (getTxIdHash wtxid))))<>
+                      pair "allowed" (AE.bool True)
+                    Just entry -> do
+                      let vsize = meSize entry
+                          fee = meFee entry
+                          feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
+                          txidTxt = showHash (BlockHash (getTxIdHash txid))
+                          wtxidTxt = showHash (BlockHash (getTxIdHash wtxid))
 
-                          if feeRateSatPerVB > maxFeeRate
-                            then return $ pairs $
-                                   pair "txid"          (text txidTxt)             <>
-                                   pair "wtxid"         (text wtxidTxt)            <>
-                                   pair "allowed"       (AE.bool False)            <>
-                                   pair "reject-reason" (text "max-fee-exceeded")
-                            else do
-                              let feesEnc = pairs $ pair "base" (btcAmountEnc (fromIntegral fee))
-                              return $ pairs $
-                                         pair "txid"    (text txidTxt)  <>
-                                         pair "wtxid"   (text wtxidTxt) <>
-                                         pair "allowed" (AE.bool True)  <>
-                                         pair "vsize"   (AE.int vsize)  <>
-                                         pair "fees"    feesEnc
+                      if feeRateSatPerVB > maxFeeRate
+                        then return $ pairs $
+                               pair "txid"          (text txidTxt)             <>
+                               pair "wtxid"         (text wtxidTxt)            <>
+                               pair "allowed"       (AE.bool False)            <>
+                               pair "reject-reason" (text "max-fee-exceeded")
+                        else do
+                          let feesEnc = pairs $ pair "base" (btcAmountEnc (fromIntegral fee))
+                          return $ pairs $
+                                     pair "txid"    (text txidTxt)  <>
+                                     pair "wtxid"   (text wtxidTxt) <>
+                                     pair "allowed" (AE.bool True)  <>
+                                     pair "vsize"   (AE.int vsize)  <>
+                                     pair "fees"    feesEnc
 
     mempoolErrorToText :: MempoolError -> Text
     mempoolErrorToText err = case err of
-      ErrAlreadyInMempool -> "txn-already-known"
+      -- BIP-339: wtxid exact duplicate → "txn-already-in-mempool"
+      ErrAlreadyInMempool -> "txn-already-in-mempool"
+      -- BIP-339: same txid, different witness → "txn-same-nonwitness-data-in-mempool"
+      ErrSameNonwitnessInMempool -> "txn-same-nonwitness-data-in-mempool"
       ErrValidationFailed _ -> "bad-txns"
       ErrMissingInput _ -> "missing-inputs"
       ErrInputSpentInMempool _ -> "txn-mempool-conflict"
