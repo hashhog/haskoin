@@ -140,6 +140,12 @@ module Haskoin.Mempool
     -- * Cluster Limits
   , ClusterLimitError(..)
   , checkClusterLimit
+    -- * W96: AcceptToMemoryPool helpers
+  , validateInputsStandardness
+  , generalEphemeralPreCheck
+  , isUnknownWitnessProgram
+  , ancestorTxIdsForUnconfirmedTx
+  , maxP2SHSigOps
   ) where
 
 import Data.ByteString (ByteString)
@@ -167,13 +173,13 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            isFinalTxCheck, calculateSequenceLocks,
                            checkSequenceLocks, bip68Active,
                            getTransactionSigOpCost, consensusFlagsAtHeight,
-                           SigOpCost(..))
+                           SigOpCost(..), isCoinbase)
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
 import qualified Haskoin.Policy.Standard as Std
 import Haskoin.Policy.Standard (maxStandardTxSigOpsCost, defaultBytesPerSigop,
-                                getSigOpsAdjustedWeight)
+                                getSigOpsAdjustedWeight, dustRelayTxFee, isDust)
 
 --------------------------------------------------------------------------------
 -- Fee Rate
@@ -234,6 +240,16 @@ data MempoolConfig = MempoolConfig
                                       --   (default 336 = 14 days).
                                       --   Bitcoin Core: DEFAULT_MEMPOOL_EXPIRY_HOURS=336
                                       --   (kernel/mempool_options.h:23).
+  , mpcMaxFeeRate        :: !(Maybe FeeRate)
+                                      -- ^ Optional caller-defined maximum effective
+                                      --   fee-rate (sat/vB). When set, a transaction
+                                      --   whose modified-fee/vsize exceeds this is
+                                      --   rejected before mempool admission.
+                                      --   Mirrors Bitcoin Core's
+                                      --   ATMPArgs::m_client_maxfeerate
+                                      --   (validation.cpp:1368, set via
+                                      --   sendrawtransaction's maxfeerate arg or
+                                      --   -maxtxfee). Default Nothing = no cap.
   } deriving (Show, Generic)
 
 instance NFData MempoolConfig
@@ -250,6 +266,7 @@ defaultMempoolConfig = MempoolConfig
   , mpcMaxAncestorSize   = 101000             -- ~101 KB
   , mpcMaxDescendantSize = 101000             -- ~101 KB
   , mpcExpiryHours       = 336               -- 14 days
+  , mpcMaxFeeRate        = Nothing            -- no cap by default
   }
 
 --------------------------------------------------------------------------------
@@ -285,6 +302,28 @@ instance NFData MempoolEntry
 -- | Errors that can occur when adding a transaction to the mempool
 data MempoolError
   = ErrAlreadyInMempool
+    -- ^ Exact duplicate (same wtxid) already in mempool.
+    --   Bitcoin Core: TX_CONFLICT, "txn-already-in-mempool".
+  | ErrSameNonwitnessInMempool
+    -- ^ Same non-witness data (same txid) but different witness already
+    -- in mempool. Bitcoin Core: TX_CONFLICT,
+    -- "txn-same-nonwitness-data-in-mempool" (validation.cpp:829).
+  | ErrCoinbaseNotAllowed
+    -- ^ Coinbase transactions are only valid in a block, not as loose
+    -- mempool transactions. Bitcoin Core: TX_CONSENSUS, "coinbase"
+    -- (validation.cpp:804).
+  | ErrMaxFeeRateExceeded !FeeRate !FeeRate
+    -- ^ (effective_feerate, client_max_feerate). Caller-defined max
+    -- fee-rate exceeded. Bitcoin Core: TX_MEMPOOL_POLICY,
+    -- "max feerate exceeded" (validation.cpp:1369).
+  | ErrSpendsConflictingTx !TxId
+    -- ^ Transaction depends on an ancestor that is also in the conflict
+    -- set being replaced. Bitcoin Core: TX_CONSENSUS,
+    -- "bad-txns-spends-conflicting-tx" (validation.cpp:1359).
+  | ErrInputsNotStandard !Int !String
+    -- ^ (input_index, reason). ValidateInputsStandardness failure.
+    -- Bitcoin Core: TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs"
+    -- (policy.cpp:214 → validation.cpp:897).
   | ErrValidationFailed !String
   | ErrMissingInput !OutPoint
   | ErrInputSpentInMempool !TxId
@@ -613,19 +652,40 @@ newMempool net cache config height mtp getCoinMtp = do
 addTransaction :: Mempool -> Tx -> IO (Either MempoolError TxId)
 addTransaction mp tx = do
   let txid = computeTxId tx
+      wtxid = computeWtxid tx
 
-  -- 1. Check if already in mempool
-  existing <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
-  case existing of
+  -- 1. Existence checks — mirrors Bitcoin Core MemPoolAccept::PreChecks
+  --    (validation.cpp:823-830). Core distinguishes:
+  --      a) wtxid hit → "txn-already-in-mempool" (exact duplicate)
+  --      b) txid  hit → "txn-same-nonwitness-data-in-mempool"
+  --                     (witness mutated, same non-witness data)
+  --    We use ErrAlreadyInMempool for (a) and ErrSameNonwitnessInMempool
+  --    for (b) to distinguish on the wire / in RPC errors.
+  byWtxid <- atomically $ Map.lookup wtxid <$> readTVar (mpByWtxid mp)
+  case byWtxid of
     Just _ -> return $ Left ErrAlreadyInMempool
-    Nothing -> addTransactionInner mp tx txid
+    Nothing -> do
+      byTxid <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
+      case byTxid of
+        Just _ -> return $ Left ErrSameNonwitnessInMempool
+        Nothing -> addTransactionInner mp tx txid
 
 -- | Inner implementation of addTransaction after duplicate check
 addTransactionInner :: Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
 addTransactionInner mp tx txid = do
-  -- 2. Basic context-free validation
+  -- 2a. Context-free CheckTransaction (consensus/tx_check.cpp).
   case validateTransaction tx of
     Left err -> return $ Left (ErrValidationFailed err)
+    Right () | isCoinbase tx ->
+      -- Coinbase is only valid in a block, not as a loose mempool tx.
+      -- Mirrors Bitcoin Core PreChecks (validation.cpp:803-804):
+      --   if (tx.IsCoinBase()) return state.Invalid(TX_CONSENSUS, "coinbase").
+      -- Without this gate `validateTransaction` only checks coinbase
+      -- scriptSig size (2-100 bytes via BIP-34); a well-formed coinbase
+      -- otherwise reaches resolveInput and fails generically there. We
+      -- reject up-front with the canonical reason so the rejection is
+      -- byte-identical to Core's and doesn't depend on UTXO presence.
+      return $ Left ErrCoinbaseNotAllowed
     Right () ->
       -- 2b. Relay-policy standardness gate (Bitcoin Core IsStandardTx).
       -- Mirrors policy/policy.cpp:IsStandardTx — version bounds, weight
@@ -692,6 +752,26 @@ addTransactionNoConflicts mp tx txid = do
 -- | Add a transaction that replaces conflicting transactions (RBF)
 addTransactionWithReplacement :: Mempool -> Tx -> TxId -> [TxId] -> IO (Either MempoolError TxId)
 addTransactionWithReplacement mp tx txid conflictTxIds = do
+  -- W96 Gate: EntriesAndTxidsDisjoint (Bitcoin Core
+  -- validation.cpp:1356).  After we have the set of all ancestors of
+  -- @tx@ + the set of conflicts to be replaced, verify the two sets
+  -- are disjoint.  A tx that depends on one of its own conflicts is
+  -- pathological — Core classifies this as a consensus failure
+  -- (TX_CONSENSUS, "bad-txns-spends-conflicting-tx").  Without this
+  -- gate the package would silently corrupt the mempool: the conflict
+  -- gets removed (because it's in conflictTxIds) but the new tx still
+  -- references it as an unconfirmed ancestor.
+  ancestorTxids <- ancestorTxIdsForUnconfirmedTx mp tx
+  let conflictSet = Set.fromList conflictTxIds
+      overlap = Set.intersection ancestorTxids conflictSet
+  case Set.lookupMin overlap of
+    Just badId -> return $ Left (ErrSpendsConflictingTx badId)
+    Nothing -> addTransactionWithReplacementInner mp tx txid conflictTxIds
+
+-- | Inner body of 'addTransactionWithReplacement' after the disjoint-set
+-- check.  Kept separate so the disjoint gate is visually obvious.
+addTransactionWithReplacementInner :: Mempool -> Tx -> TxId -> [TxId] -> IO (Either MempoolError TxId)
+addTransactionWithReplacementInner mp tx txid conflictTxIds = do
   -- For RBF, we need to resolve inputs differently:
   -- - Conflicting inputs will fail resolveInput, so we need to resolve from UTXO
   -- - Non-conflicting inputs should resolve normally
@@ -764,67 +844,129 @@ finalizeTransaction mp tx txid inputPairs = do
   if totalIn < totalOut
     then return $ Left ErrInsufficientFee
     else do
-      let fee = totalIn - totalOut
+      let baseFee = totalIn - totalOut
           vsize = calculateVSize tx
-          feeRate = calculateFeeRate fee vsize
+      -- W96: modified-fee comes from any active PrioritiseTransaction
+      -- delta on this txid. Bitcoin Core stores the delta in
+      -- mapDeltas and applies it as `modified_fees = base_fees + delta`
+      -- in Workspace::m_modified_fees (validation.cpp:930). Without this
+      -- lookup, prioritised txs would still be filtered by the min-relay
+      -- fee gate against their base fee, defeating the whole point of
+      -- PrioritiseTransaction.
+      feeDeltas <- readTVarIO (mpFeeDeltas mp)
+      let delta = Map.findWithDefault 0 txid feeDeltas
+          -- Saturating add: negative delta cannot make modifiedFee go
+          -- below zero (Word64).
+          modifiedFee :: Word64
+          modifiedFee
+            | delta >= 0 = baseFee + fromIntegral delta
+            | otherwise =
+                let absD = fromIntegral (negate delta) :: Word64
+                in if absD > baseFee then 0 else baseFee - absD
+          fee = baseFee  -- preserve historical name for the body
+          feeRate = calculateFeeRate modifiedFee vsize
 
-      -- Check minimum fee rate
+      -- Check minimum fee rate (uses modified fee — Core parity).
       if feeRate < mpcMinFeeRate (mpConfig mp)
         then return $ Left (ErrFeeBelowMinimum feeRate (mpcMinFeeRate (mpConfig mp)))
-        else do
+        else
+          -- W96 Gate (client-maxfeerate): mirrors Bitcoin Core
+          -- validation.cpp:1368
+          --   if (args.m_client_maxfeerate &&
+          --       CFeeRate(ws.m_modified_fees, ws.m_vsize) > *args.m_client_maxfeerate)
+          --       → "max feerate exceeded"
+          -- Without this, sendrawtransaction's `maxfeerate` parameter
+          -- (default 0.10 BTC/kvB in Core) has no effect — fee-bumping
+          -- bugs in wallets can leak large fees into the mempool.
+          case mpcMaxFeeRate (mpConfig mp) of
+            Just cap | feeRate > cap ->
+              return $ Left (ErrMaxFeeRateExceeded feeRate cap)
+            _ ->
+              -- W96 Gate: ValidateInputsStandardness (Bitcoin Core
+              -- validation.cpp:896-901; policy.cpp:214).  Walks each
+              -- input's prevout, classifies it, and rejects:
+              --   * NONSTANDARD scriptPubKeys
+              --     ("input N script unknown")
+              --   * WITNESS_UNKNOWN scriptPubKeys
+              --     ("input N witness program is undefined")
+              --   * P2SH inputs whose redeem-script has more than
+              --     MAX_P2SH_SIGOPS=15 sigops.
+              -- Without this gate haskoin would relay txs that Core
+              -- rejects (TX_INPUTS_NOT_STANDARD,
+              -- "bad-txns-nonstandard-inputs").
+              case validateInputsStandardness tx inputPairs of
+                Left (idx, reason) ->
+                  return $ Left (ErrInputsNotStandard idx reason)
+                Right () -> do
+                  -- IsWitnessStandard: check P2WSH stack limits, tapscript annex,
+                  -- and witness-stuffing on P2A. Mirrors Bitcoin Core
+                  -- validation.cpp:904 → IsWitnessStandard(tx, m_view).
+                  let prevScripts = map (txOutScript . snd) inputPairs
+                      witStacks   = txWitness tx
+                  case Std.checkWitnessStandard tx prevScripts witStacks of
+                    Left wsErr -> return $ Left (ErrNonStandard (renderWitnessStdReason wsErr))
+                    Right () ->
+                      -- W96 Gate (PreCheckEphemeralTx): a tx with any dust output
+                      -- must pay zero fee.  Bitcoin Core
+                      -- policy/ephemeral_policy.cpp:23-31:
+                      --   if ((base_fee != 0 || mod_fee != 0)
+                      --       && !GetDust(tx, dust_relay_rate).empty())
+                      --     → "dust" / "tx with dust output must be 0-fee".
+                      -- Before this fix `checkEphemeralPreCheck` was only invoked
+                      -- via the package path and only checked zero-value P2A
+                      -- anchor outputs — general dust on a single-tx submission
+                      -- bypassed the gate entirely.  We now run the full
+                      -- Core-equivalent check here using
+                      -- `Std.isDust` + `dustRelayTxFee`.
+                      case generalEphemeralPreCheck tx modifiedFee of
+                        Left dustIdx -> return $
+                          Left (ErrNonStandard ("dust (output " ++ show dustIdx ++ ")"))
+                        Right () ->
+                          -- Also retain the P2A-anchor multiplicity check (only
+                          -- one anchor per tx).
+                          case checkEphemeralPreCheck tx fee of
+                            Left ephErr ->
+                              return $ Left (ErrEphemeralViolation ephErr)
+                            Right () -> do
+                              -- MAX_STANDARD_TX_SIGOPS_COST check
+                              -- (Bitcoin Core validation.cpp:908,941-943).
+                              tipHeight <- readTVarIO (mpHeight mp)
+                              let sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipHeight + 1)
+                                  SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
+                              if txSigOpCost > maxStandardTxSigOpsCost
+                                then return $ Left (ErrNonStandard "bad-txns-too-many-sigops")
+                                else do
+                                  -- Verify scripts
+                                  scriptResult <- verifyAllScripts mp tx inputMap
+                                  case scriptResult of
+                                    Left err -> return $ Left err
+                                    Right () -> do
+                                      -- Check ancestor/descendant limits
+                                      ancestorResult <- checkAncestorLimits mp tx vsize
+                                      case ancestorResult of
+                                        Left err -> return $ Left err
+                                        Right ancestors ->
+                                          -- Check TRUC (v3) policy
+                                          handleTruc mp tx txid fee vsize txSigOpCost ancestors
 
-          -- IsWitnessStandard: check P2WSH stack limits, tapscript annex,
-          -- and witness-stuffing on P2A. Mirrors Bitcoin Core
-          -- validation.cpp:904 → IsWitnessStandard(tx, m_view).
-          let prevScripts = map (txOutScript . snd) inputPairs
-              witStacks   = txWitness tx
-          case Std.checkWitnessStandard tx prevScripts witStacks of
-            Left wsErr -> return $ Left (ErrNonStandard (renderWitnessStdReason wsErr))
-            Right () -> do
-
-              -- MAX_STANDARD_TX_SIGOPS_COST check (Bitcoin Core validation.cpp:908,941-943).
-              -- GetTransactionSigOpCost counts legacy (×4) + P2SH (×4) + witness (×1).
-              -- Transactions exceeding 16,000 sigop-cost units are rejected as
-              -- non-standard ("bad-txns-too-many-sigops").
-              -- Reference: bitcoin-core/src/policy/policy.h:44 + validation.cpp:941.
-              tipHeight <- readTVarIO (mpHeight mp)
-              let sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipHeight + 1)
-                  SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
-              if txSigOpCost > maxStandardTxSigOpsCost
-                then return $ Left (ErrNonStandard "bad-txns-too-many-sigops")
-                else do
-
-                -- Verify scripts
-                scriptResult <- verifyAllScripts mp tx inputMap
-                case scriptResult of
-                  Left err -> return $ Left err
-                  Right () -> do
-
-                    -- Check ancestor/descendant limits
-                    ancestorResult <- checkAncestorLimits mp tx vsize
-                    case ancestorResult of
-                      Left err -> return $ Left err
-                      Right ancestors -> do
-
-                        -- Check TRUC (v3) policy
-                        trucResult <- checkTrucPolicy tx vsize mp
-                        case trucResult of
-                          Left trucErr@(TrucSiblingExists parentId siblingId) -> do
-                            -- Sibling eviction opportunity - try to evict existing child
-                            mParent <- getTransaction mp parentId
-                            case mParent of
-                              Just parent -> do
-                                evictResult <- attemptSiblingEviction tx fee vsize parent mp
-                                case evictResult of
-                                  Left _ -> return $ Left (ErrTrucViolation trucErr)
-                                  Right () ->
-                                    -- Sibling evicted, continue with addition
-                                    continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
-                              Nothing -> return $ Left (ErrTrucViolation trucErr)
-                          Left trucErr -> return $ Left (ErrTrucViolation trucErr)
-                          Right _ ->
-                            -- TRUC check passed (or tx is not v3), continue
-                            continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
+-- | Helper: run TRUC policy check and continue with addition.
+-- Extracted to avoid extreme indentation in 'finalizeTransaction'.
+handleTruc :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry]
+           -> IO (Either MempoolError TxId)
+handleTruc mp tx txid fee vsize txSigOpCost ancestors = do
+  trucResult <- checkTrucPolicy tx vsize mp
+  case trucResult of
+    Left trucErr@(TrucSiblingExists parentId _siblingId) -> do
+      mParent <- getTransaction mp parentId
+      case mParent of
+        Just parent -> do
+          evictResult <- attemptSiblingEviction tx fee vsize parent mp
+          case evictResult of
+            Left _ -> return $ Left (ErrTrucViolation trucErr)
+            Right () -> continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
+        Nothing -> return $ Left (ErrTrucViolation trucErr)
+    Left trucErr -> return $ Left (ErrTrucViolation trucErr)
+    Right _ -> continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
 
 -- | Continue adding a transaction after all checks pass
 continueAddTransaction :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO (Either MempoolError TxId)
@@ -1206,6 +1348,21 @@ getAncestorsRecursive mp tx = do
 
       parentIds = map (outPointHash . txInPrevOutput) (txInputs tx)
   return $ go Set.empty parentIds
+
+-- | Set of in-mempool ancestor txids for an *unconfirmed* (not yet
+-- inserted) transaction.  Wrapper around 'getAncestorsRecursive' that
+-- returns the txids rather than full entries.  Used by W96
+-- EntriesAndTxidsDisjoint to detect a replacement whose ancestor set
+-- intersects the conflict set.
+--
+-- Reference: Bitcoin Core validation.cpp:1356
+--   if (const auto err_string{EntriesAndTxidsDisjoint(ancestors,
+--                                                     ws.m_conflicts,
+--                                                     ptx->GetHash())})
+ancestorTxIdsForUnconfirmedTx :: Mempool -> Tx -> IO (Set TxId)
+ancestorTxIdsForUnconfirmedTx mp tx = do
+  ancEntries <- getAncestorsRecursive mp tx
+  return $ Set.fromList (map meTxId ancEntries)
 
 -- | Get direct descendants of a transaction
 getDescendants :: Mempool -> TxId -> IO [MempoolEntry]
@@ -2075,48 +2232,109 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
           -- Combine UTXO map with outputs from previously added package txs
           combinedMap = Map.union localOutputs utxoMap
 
-      -- Build input pairs
+      -- W96 (two-pipeline closure):  the package path historically
+      -- jumped straight to script-verify + addTransactionToMempool, which
+      -- skipped every ATMP gate that 'addTransaction' runs (coinbase
+      -- reject, IsStandardTx, IsFinalTx, BIP-68 sequence-locks,
+      -- IsWitnessStandard, MAX_STANDARD_TX_SIGOPS_COST,
+      -- ValidateInputsStandardness, PreCheckEphemeralTx).  We now run
+      -- those per-tx context-free / coin-aware checks before fee logic.
+      -- The package-feerate CPFP allowance only relaxes the *individual
+      -- fee gate*, not the standardness gates.
+      let coinbaseReject = isCoinbase tx
+      if coinbaseReject
+        then return $ Left $ PkgTxError txid ErrCoinbaseNotAllowed
+        else case validateTransaction tx of
+          Left vErr -> return $ Left $ PkgTxError txid (ErrValidationFailed vErr)
+          Right () -> case Std.checkStandardTx tx of
+            Left stdErr -> return $ Left $ PkgTxError txid
+                                       (ErrNonStandard (renderStdReason stdErr))
+            Right () -> do
+              -- IsFinalTx (BIP-113).
+              height <- readTVarIO (mpHeight mp)
+              mtp    <- readTVarIO (mpMTP mp)
+              let nextHeight = height + 1
+              if not (isFinalTxCheck tx nextHeight mtp)
+                then return $ Left $ PkgTxError txid (ErrNonFinal "non-final")
+                else do
+                  -- BIP-68 sequence-locks.
+                  seqRes <- checkSeqLocksAtTip mp tx height mtp
+                  case seqRes of
+                    Left err -> return $ Left $ PkgTxError txid err
+                    Right () -> goAfterCtxFree tx txid rest acc localOutputs combinedMap
+
+    -- Continuation once context-free / locktime gates pass.  Resolves
+    -- inputs, runs witness/sigops/ephemeral gates, verifies scripts,
+    -- then inserts via 'addTransactionToMempool'.
+    goAfterCtxFree tx txid rest acc localOutputs combinedMap = do
       let inputPairs = map (\inp -> (txInPrevOutput inp, Map.lookup (txInPrevOutput inp) combinedMap)) (txInputs tx)
           missingInputs = filter (null . snd) inputPairs
-
       case missingInputs of
         ((op, _):_) -> return $ Left $ PkgTxError txid (ErrMissingInput op)
         [] -> do
           let inputs = [(op, out) | (op, Just out) <- inputPairs]
               totalIn = sum $ map (txOutValue . snd) inputs
               totalOut = sum $ map txOutValue (txOutputs tx)
-
           if totalIn < totalOut
             then return $ Left $ PkgTxError txid ErrInsufficientFee
             else do
               let fee = totalIn - totalOut
                   vsize = calculateVSize tx
                   individualFeeRate = calculateFeeRate fee vsize
-
-              -- Use package fee rate for comparison if individual rate is too low
-              -- This is the key CPFP logic: low-fee parents accepted due to high-fee child
-              let effectiveFeeRate = max individualFeeRate pkgFeeRate
+                  -- CPFP allowance: package feerate can rescue a
+                  -- low-fee parent.  The *standardness* gates above are
+                  -- not relaxed by this — only this min-fee check.
+                  effectiveFeeRate = max individualFeeRate pkgFeeRate
                   minFeeRate = mpcMinFeeRate (mpConfig mp)
-
               if effectiveFeeRate < minFeeRate
                 then return $ Left $ PkgInsufficientFee effectiveFeeRate minFeeRate
-                else do
-                  -- Verify scripts
-                  scriptResult <- verifyAllScripts' tx (Map.fromList inputs)
-                  case scriptResult of
-                    Left err -> return $ Left $ PkgTxError txid (ErrScriptVerificationFailed err)
-                    Right () -> do
-                      -- Add to mempool
-                      result <- addTransactionToMempool mp tx txid inputs fee vsize
-                      case result of
-                        Left err -> return $ Left $ PkgTxError txid err
+                else
+                  -- ValidateInputsStandardness — non-standard P2SH
+                  -- redeem-script sigops, NONSTANDARD prevouts, etc.
+                  case validateInputsStandardness tx inputs of
+                    Left (idx, reason) -> return $ Left $
+                      PkgTxError txid (ErrInputsNotStandard idx reason)
+                    Right () ->
+                      -- IsWitnessStandard.
+                      case Std.checkWitnessStandard tx (map (txOutScript . snd) inputs) (txWitness tx) of
+                        Left wsErr -> return $ Left $ PkgTxError txid
+                          (ErrNonStandard (renderWitnessStdReason wsErr))
                         Right () -> do
-                          -- Add this tx's outputs to local map for children
-                          let newOutputs = Map.fromList
-                                [ (OutPoint txid (fromIntegral idx), out)
-                                | (idx, out) <- zip [0..] (txOutputs tx)
-                                ]
-                          go rest (txid : acc) (Map.union newOutputs localOutputs)
+                          -- MAX_STANDARD_TX_SIGOPS_COST.
+                          tipH <- readTVarIO (mpHeight mp)
+                          let inputMap = Map.fromList inputs
+                              sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipH + 1)
+                              SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
+                          if txSigOpCost > maxStandardTxSigOpsCost
+                            then return $ Left $ PkgTxError txid
+                                            (ErrNonStandard "bad-txns-too-many-sigops")
+                            else
+                              -- PreCheckEphemeralTx (general dust).
+                              -- In a package context, dust may legitimately
+                              -- be spent by a sibling tx — but a per-tx
+                              -- dust + fee combo is still forbidden
+                              -- (CheckEphemeralSpends handles the spending
+                              -- requirement separately, already run
+                              -- in 'acceptPackageInner').
+                              case generalEphemeralPreCheck tx fee of
+                                Left dustIdx -> return $ Left $ PkgTxError txid
+                                  (ErrNonStandard ("dust (output " ++ show dustIdx ++ ")"))
+                                Right () -> do
+                                  -- Verify scripts.
+                                  scriptResult <- verifyAllScripts' tx inputMap
+                                  case scriptResult of
+                                    Left err -> return $ Left $ PkgTxError txid
+                                                            (ErrScriptVerificationFailed err)
+                                    Right () -> do
+                                      result <- addTransactionToMempool mp tx txid inputs fee vsize
+                                      case result of
+                                        Left err -> return $ Left $ PkgTxError txid err
+                                        Right () -> do
+                                          let newOutputs = Map.fromList
+                                                [ (OutPoint txid (fromIntegral idx), out)
+                                                | (idx, out) <- zip [0..] (txOutputs tx)
+                                                ]
+                                          go rest (txid : acc) (Map.union newOutputs localOutputs)
 
 -- | Verify all scripts for a transaction (variant returning String error).
 -- Same Taproot-aware refactor as 'verifyAllScripts': pre-collect prevouts
@@ -3275,3 +3493,179 @@ renderStdReason e = case e of
 -- (validation.cpp:905).
 renderWitnessStdReason :: Std.WitnessStandardError -> String
 renderWitnessStdReason _ = "bad-witness-nonstandard"
+
+--------------------------------------------------------------------------------
+-- ValidateInputsStandardness (W96)
+--
+-- Mirrors @ValidateInputsStandardness@ in
+-- bitcoin-core/src/policy/policy.cpp:214-263 — the
+-- AreInputsStandard-equivalent that is run from
+-- MemPoolAccept::PreChecks (validation.cpp:896-901) when
+-- @require_standard@ is set.
+--------------------------------------------------------------------------------
+
+-- | Maximum number of sigops allowed in a P2SH redeem script for it to
+-- be considered standard. Bitcoin Core: @MAX_P2SH_SIGOPS = 15@
+-- (policy/policy.h:46).
+maxP2SHSigOps :: Int
+maxP2SHSigOps = 15
+
+-- | A scriptPubKey is a witness program of *unknown* version if its
+-- serialised form is exactly @OP_<n> + push(<2..40 bytes>)@ with
+-- @n > 1@ (versions 0 and 1 are P2WPKH/P2WSH and P2TR respectively
+-- and are classified above). The structural test matches Core's
+-- @CScript::IsWitnessProgram@ (script.h:240) for @n >= 2@.
+isUnknownWitnessProgram :: ByteString -> Bool
+isUnknownWitnessProgram bs
+  | BS.length bs < 4 || BS.length bs > 42 = False
+  | otherwise =
+      let op0 = BS.index bs 0
+          progLen = fromIntegral (BS.index bs 1) :: Int
+          -- OP_2 .. OP_16 are 0x52..0x60. Versions 0/1 are excluded
+          -- (Core classifies those as P2WPKH/P2WSH/P2TR via
+          -- standardness).
+          isWitnessVerOp = op0 >= 0x52 && op0 <= 0x60
+          lenOk = progLen >= 2 && progLen <= 40
+               && BS.length bs == 2 + progLen
+      in isWitnessVerOp && lenOk
+
+-- | Verify that every input of @tx@ spends a *standard* prevout.
+--
+-- Walks each input's previous scriptPubKey, classifies it via
+-- 'Script.classifyOutput', and rejects:
+--
+--   * NONSTANDARD scriptPubKeys (anything that doesn't match a known
+--     template). Core: @"input N script unknown"@.
+--   * WITNESS_UNKNOWN scriptPubKeys (witness version > 1, future
+--     soft-fork program shapes). Core:
+--     @"input N witness program is undefined"@.
+--   * P2SH inputs whose redeem-script contains more than
+--     'maxP2SHSigOps' (= 15) sigops in inaccurate-count mode. Core:
+--     @"p2sh redeemscript sigops exceed limit"@.
+--   * P2SH inputs whose scriptSig fails to decode to a push-only
+--     stack (cannot extract the redeem script). Core:
+--     @"p2sh scriptsig malformed"@.
+--
+-- Returns @Left (idx, reason)@ on the first failing input, else
+-- @Right ()@. The @idx@ is the input position (0-based), matching
+-- Core's error formatting.
+--
+-- NOTE: this gate is *standardness*, not consensus.  Failures here
+-- correspond to @TX_INPUTS_NOT_STANDARD@ in Core; the tx is silently
+-- not relayed but a miner can still include it.
+validateInputsStandardness
+  :: Tx
+  -> [(OutPoint, TxOut)]
+  -> Either (Int, String) ()
+validateInputsStandardness tx inputPairs
+  | isCoinbase tx = Right ()
+  | otherwise =
+      let prevs = zip [0..] (txInputs tx)
+          pMap  = Map.fromList inputPairs
+      in mapM_ (checkOne pMap) prevs
+  where
+    checkOne :: Map.Map OutPoint TxOut -> (Int, TxIn) -> Either (Int, String) ()
+    checkOne pMap (idx, txin) =
+      case Map.lookup (txInPrevOutput txin) pMap of
+        Nothing ->
+          -- Missing prevout is a different error class (TX_MISSING_INPUTS,
+          -- handled by resolveInputs before we get here). Skip silently.
+          Right ()
+        Just prevOut ->
+          case decodeScript (txOutScript prevOut) of
+            Left _ ->
+              -- Undecodable scriptPubKey is non-standard.
+              Left (idx, "input " ++ show idx ++ " script unknown")
+            Right scriptPubKey ->
+              case Script.classifyOutput scriptPubKey of
+                -- haskoin's classifier collapses NONSTANDARD and
+                -- WITNESS_UNKNOWN into a single NonStandard bucket.  We
+                -- additionally detect the witness-unknown case by
+                -- inspecting the raw bytes (OP_<n> + 2..40-byte push,
+                -- with n != 0/1) so callers can distinguish — useful
+                -- when Core's RPC string is the comparison point.
+                Script.NonStandard
+                  | isUnknownWitnessProgram (txOutScript prevOut) ->
+                      Left (idx, "input " ++ show idx ++ " witness program is undefined")
+                  | otherwise ->
+                      Left (idx, "input " ++ show idx ++ " script unknown")
+                Script.P2SH _ ->
+                  -- Decode the scriptSig as a stack (push-only). The
+                  -- last item is the redeem-script.
+                  case decodeScript (txInScript txin) of
+                    Left _ ->
+                      Left (idx, "p2sh scriptsig malformed (input "
+                                  ++ show idx ++ ")")
+                    Right sigScript ->
+                      case lastPushBytes sigScript of
+                        Nothing ->
+                          Left (idx, "input " ++ show idx
+                                      ++ " P2SH redeemscript missing")
+                        Just redeemBytes ->
+                          case decodeScript redeemBytes of
+                            Left _ ->
+                              Left (idx, "input " ++ show idx
+                                          ++ " P2SH redeemscript malformed")
+                            Right redeem ->
+                              -- Use accurate=True so multisig N-of-M
+                              -- counts as N (matches Core's
+                              -- GetSigOpCount(true)).
+                              let n = Script.countScriptSigops redeem True
+                              in if n > maxP2SHSigOps
+                                   then Left (idx, "p2sh redeemscript sigops exceed limit (input "
+                                                    ++ show idx ++ ": "
+                                                    ++ show n ++ " > "
+                                                    ++ show maxP2SHSigOps ++ ")")
+                                   else Right ()
+                _ -> Right ()
+
+    -- Last push-data byte string in a parsed script, if the script is
+    -- push-only and non-empty. Mirrors Core's
+    -- @stack.back()@ extraction in policy.cpp:253.
+    lastPushBytes :: Script.Script -> Maybe ByteString
+    lastPushBytes (Script.Script ops)
+      | null ops = Nothing
+      | otherwise = case last ops of
+          Script.OP_PUSHDATA bs _ -> Just bs
+          Script.OP_0             -> Just BS.empty
+          _                       -> Nothing
+
+
+--------------------------------------------------------------------------------
+-- PreCheckEphemeralTx (W96)
+--
+-- Mirrors @PreCheckEphemeralTx@ in
+-- bitcoin-core/src/policy/ephemeral_policy.cpp:23-31.
+--   if ((base_fee != 0 || mod_fee != 0) &&
+--       !GetDust(tx, dust_relay_rate).empty())
+--     return state.Invalid(TX_NOT_STANDARD, "dust",
+--                          "tx with dust output must be 0-fee");
+--
+-- Before this fix, haskoin's 'checkEphemeralPreCheck' only matched
+-- zero-value P2A anchor outputs.  A transaction with general dust
+-- outputs (e.g. P2WPKH below the 294-sat threshold) and non-zero fee
+-- would slip through.  Note that `Std.checkStandardTx` already caps
+-- the *number* of dust outputs, but Core's ephemeral pre-check is a
+-- separate gate: any dust + any fee → reject.
+--------------------------------------------------------------------------------
+
+-- | Reject the tx (returning the offending output index) if it has any
+-- dust output and pays any fee.  Returns 'Right ()' when the tx is
+-- either zero-fee OR has no dust outputs.
+generalEphemeralPreCheck :: Tx -> Word64 -> Either Word32 ()
+generalEphemeralPreCheck tx modFee
+  | modFee == 0 = Right ()
+  | otherwise =
+      case dustIndex of
+        Just i  -> Left i
+        Nothing -> Right ()
+  where
+    dustIndex :: Maybe Word32
+    dustIndex = listToMaybe
+      [ fromIntegral idx
+      | (idx, out) <- zip [(0 :: Int)..] (txOutputs tx)
+      , isDust out dustRelayTxFee
+      ]
+    listToMaybe :: [a] -> Maybe a
+    listToMaybe []    = Nothing
+    listToMaybe (x:_) = Just x
