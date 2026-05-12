@@ -1905,6 +1905,17 @@ verifyTapscriptSchnorr env sigBytesRaw pubkey32 = do
                     else (sigBytesRaw, TS.sighashDefault)
   when (sigLen == 65 && ht == TS.sighashDefault) $
     Left "Tapscript: explicit SIGHASH_DEFAULT byte"
+  -- W95: explicit BIP-341 hash_type gate.  The 65-byte form carries an
+  -- arbitrary trailing byte; only the set {0x01, 0x02, 0x03, 0x81, 0x82,
+  -- 0x83} is valid.  Without this gate the error surfaces deep inside
+  -- 'computeTaprootSighash' as "Tapscript sighash: InvalidHashType"; with
+  -- it we get a clean script-level error that mirrors Core's
+  -- @SignatureHashSchnorr@ early-return.  Consensus behavior is
+  -- unchanged (both paths fail the script) — this is defense-in-depth
+  -- against accidentally widening the accepted hash_type set in a future
+  -- refactor of 'buildSigMsg'.
+  unless (TS.isValidTaprootHashType ht) $
+    Left "Tapscript: invalid hash_type byte (BIP-341)"
   tlh <- case seTapleafHash env of
     Just h -> Right h
     Nothing -> Left "Tapscript checksig: tapleaf_hash missing in env"
@@ -2897,6 +2908,12 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
       -- 64-byte form must be used for default.
       when (sigLen == 65 && hashType == TS.sighashDefault) $
         Left "Taproot: explicit SIGHASH_DEFAULT byte"
+      -- W95: explicit BIP-341 hash_type gate (defense-in-depth — see the
+      -- equivalent guard in 'verifyTapscriptSchnorr').  buildSigMsg
+      -- enforces this downstream but a clean script-level error here
+      -- matches Core's @SignatureHashSchnorr@ early-return shape.
+      unless (TS.isValidTaprootHashType hashType) $
+        Left "Taproot key-path: invalid hash_type byte (BIP-341)"
       -- Need full prevouts; if the caller didn't supply them, fail closed.
       when (length spentAmounts /= length (txInputs tx) ||
             length spentScripts /= length (txInputs tx)) $

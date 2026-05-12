@@ -115,6 +115,7 @@ import System.IO.MMap (mmapFileByteString)
 
 import Haskoin.Types
 import Haskoin.Consensus (ConsensusFlags(..))
+import qualified Haskoin.Crypto as Crypto
 
 --------------------------------------------------------------------------------
 -- Hardware Crypto Detection (via CPUID)
@@ -224,11 +225,17 @@ data BatchVerifyResult
 
 instance NFData BatchVerifyResult
 
--- | A verification task for parallel processing
+-- | A verification task for parallel processing.
+--
+-- @vtSignature@ is a wire-format DER signature WITH the trailing 1-byte
+-- @SIGHASH@ type, exactly as seen on a CHECKSIG witness item.  The
+-- verify path strips the sighash byte before parsing, mirroring
+-- 'Haskoin.Script.execCheckSigLegacy' and Core's @CheckECDSASignature@
+-- (@bitcoin-core/src/script/interpreter.cpp@).
 data VerifyTask = VerifyTask
-  { vtPubKey    :: !ByteString    -- ^ Public key (33 or 65 bytes)
-  , vtMessage   :: !ByteString    -- ^ Message hash (32 bytes)
-  , vtSignature :: !ByteString    -- ^ Signature bytes
+  { vtPubKey    :: !ByteString    -- ^ Public key (33 compressed / 65 uncompressed)
+  , vtMessage   :: !ByteString    -- ^ Message hash (32 bytes; the sighash)
+  , vtSignature :: !ByteString    -- ^ DER signature ‖ 1-byte SIGHASH type
   , vtIndex     :: !Int           -- ^ Original index in block
   } deriving (Show, Eq, Generic)
 
@@ -236,34 +243,39 @@ instance NFData VerifyTask
 
 -- | Batch verify Schnorr signatures (BIP-340).
 --
--- Collects all Schnorr signatures from a Taproot block and verifies
--- them in a single batch call. This provides significant speedup
--- because batch verification uses multi-scalar multiplication.
+-- Each tuple is @(pubkey32, msg32, sig64)@ — the same byte order
+-- 'Haskoin.Crypto.verifySchnorr' expects.  We verify each signature in
+-- parallel via 'mapConcurrently'; the libsecp256k1 verify path itself
+-- enforces every BIP-340 gate (r < p, s < n, x-only-pubkey-parse,
+-- challenge = tagged_hash(\"BIP0340/challenge\", r ‖ P ‖ m), R != ∞,
+-- R.y even, R.x = r).
 --
--- For a block with N Schnorr signatures:
---   Individual: N * verify_time
---   Batch: ~verify_time + N * small_overhead
+-- This is a correctness wrapper — true multi-scalar batch verification
+-- (the speedup motivation) would call @secp256k1_schnorrsig_verify_batch@
+-- once it stabilises in libsecp.  Until then we stay byte-identical to
+-- the per-sig path, just parallelised by GHC capabilities.
 --
--- Typical speedup: 1.5-2x for blocks with many Taproot spends.
+-- Returns 'BatchVerifySuccess' if all signatures are valid, or
+-- 'BatchVerifyFailure' with the index of the first invalid signature.
 --
--- Returns BatchVerifySuccess if all signatures are valid,
--- or BatchVerifyFailure with the index of the first invalid signature.
+-- W95: previously this function was a length-check stub that returned
+-- success for any 32/64/32-byte tuple regardless of cryptographic
+-- validity.  Live consensus paths never invoked it (verified via grep),
+-- but a future wiring would have silently let invalid blocks through.
 batchVerifySchnorr :: [(ByteString, ByteString, ByteString)] -> IO BatchVerifyResult
 batchVerifySchnorr [] = return BatchVerifySuccess
 batchVerifySchnorr sigs = do
-  -- In production, this would call secp256k1_schnorrsig_verify_batch
-  -- For now, verify each signature individually in parallel
   results <- mapConcurrently verifyOne (zip [0..] sigs)
   return $ case filter (not . snd) results of
     [] -> BatchVerifySuccess
     ((idx, _):_) -> BatchVerifyFailure idx
   where
     verifyOne :: (Int, (ByteString, ByteString, ByteString)) -> IO (Int, Bool)
-    verifyOne (idx, (pubkey, msg, sig)) = do
-      -- Placeholder: real implementation uses secp256k1
-      -- secp256k1_schnorrsig_verify returns 1 on success
-      let !valid = BS.length pubkey == 32 && BS.length sig == 64 && BS.length msg == 32
-      return (idx, valid)
+    verifyOne (idx, (pubkey, msg, sig)) =
+      -- Delegate to the real BIP-340 verifier.  Length-mismatched
+      -- inputs are rejected by 'Crypto.verifySchnorr' itself (it
+      -- requires sig==64, msg==32, pubkey==32).
+      return (idx, Crypto.verifySchnorr sig msg pubkey)
 
 -- | Verify ECDSA signatures in parallel using async.
 --
@@ -281,13 +293,31 @@ parallelVerifyECDSA tasks = do
   results <- mapConcurrently (mapM verifyECDSATask) chunks
   return $ concat results
   where
+    -- W95: previously this was a stub that accepted any 33/65-byte pubkey
+    -- as a valid signature regardless of cryptographic validity.  Live
+    -- ECDSA verify still goes through 'Haskoin.Script.execCheckSig' which
+    -- calls 'Crypto.verifyMsgLax' directly, so the stub was unreachable;
+    -- still, future callers must get real verification.
+    --
+    -- The DER-signature carries a trailing sighash byte that's stripped
+    -- before parsing — this mirrors Bitcoin Core's CheckECDSASignature
+    -- (interpreter.cpp:200) and haskoin's own execCheckSigLegacy.
     verifyECDSATask :: VerifyTask -> IO (Either String Bool)
-    verifyECDSATask VerifyTask{..} = do
-      -- Placeholder: real implementation uses secp256k1
-      -- secp256k1_ecdsa_verify returns 1 on success
-      if BS.length vtSignature < 8
-        then return $ Left "Signature too short"
-        else return $ Right (BS.length vtPubKey `elem` [33, 65])
+    verifyECDSATask VerifyTask{..}
+      | BS.length vtSignature < 9 =
+          -- Min DER: 30 06 02 01 R 02 01 S (8) + 1 hashtype byte.
+          return $ Left "Signature too short"
+      | BS.length vtMessage /= 32 =
+          return $ Left "Message hash must be 32 bytes"
+      | not (BS.length vtPubKey `elem` [33, 65]) =
+          return $ Left "Pubkey must be 33 (compressed) or 65 (uncompressed) bytes"
+      | otherwise =
+          let sigNoHt = BS.init vtSignature  -- strip trailing sighash byte
+              msg     = Hash256 vtMessage
+          in case Crypto.parsePubKey vtPubKey of
+               Nothing -> return $ Left "Malformed pubkey"
+               Just pk -> return $ Right $
+                 Crypto.verifyMsgLax pk (Crypto.Sig sigNoHt) msg
 
     chunkList :: Int -> [a] -> [[a]]
     chunkList _ [] = []
