@@ -6,7 +6,7 @@ module Main where
 
 import Test.Hspec
 import Test.QuickCheck hiding ((.&.))
-import Control.Monad (forM_, when, unless)
+import Control.Monad (forM_, when, unless, void)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Serialize (encode, decode, runPut, runGet, putWord32le, put)
 import Data.Serialize.Put (putByteString, putWord8, putWord64le)
@@ -5138,7 +5138,7 @@ main = hspec $ do
           -- Reference: writeBatch via 'connectBlock'.
           putUTXO db spentOp spentTxOut
           spent <- buildSpentUtxoMapFromDB db block
-          connectBlock db regtest block height spent
+          void $ connectBlock db regtest block height spent
           let bh = computeBlockHash hdr
           refUndo  <- getUndoData db bh
           refUtxo  <- getUTXOCoin db (OutPoint (computeTxId cbTx) 0)
@@ -18546,7 +18546,7 @@ main = hspec $ do
             -- can see it via buildSpentUtxoMapFromDB.
             putUTXO db spentOp spentTxOut
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block 100 spent
+            void $ connectBlock db regtest block 100 spent
             -- The undo record must be on disk, keyed by block hash.
             mUndo <- getUndoData db (computeBlockHash (blockHeader block))
             mUndo `shouldSatisfy` isJust
@@ -18572,7 +18572,7 @@ main = hspec $ do
             -- metadata" path).  Real IBD always has a real height.
             putUTXOCoin db spentOp (Coin spentTxOut 50 False)
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block 100 spent
+            void $ connectBlock db regtest block 100 spent
 
             -- After connect: prevout is gone, new output exists.
             mPrePrev <- getUTXO db spentOp
@@ -18613,7 +18613,7 @@ main = hspec $ do
             (block, spentOp, spentTxOut, _) <- mkTestBlock prev
             putUTXO db spentOp spentTxOut
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block 100 spent
+            void $ connectBlock db regtest block 100 spent
             -- Lie about prevHash → checksum verification fails.
             r <- disconnectBlock db block bogusPrev
             case r of
@@ -18657,7 +18657,7 @@ main = hspec $ do
             -- prevout" above (W92 strict-metadata).
             putUTXOCoin db spentOpA (Coin spentTxOutA 150 False)
             spentA <- buildSpentUtxoMapFromDB db blockA
-            connectBlock db regtest blockA 200 spentA
+            void $ connectBlock db regtest blockA 200 spentA
 
             -- Block B spends one of block A's outputs.
             let aTxId = computeTxId (blockTxns blockA !! 1)
@@ -18674,7 +18674,7 @@ main = hspec $ do
                          (Hash256 (BS.replicate 32 0)) 1700000001 0x207fffff 0
                 blockB = Block hdrB [cbTxB, regTxB]
             spentB <- buildSpentUtxoMapFromDB db blockB
-            connectBlock db regtest blockB 201 spentB
+            void $ connectBlock db regtest blockB 201 spentB
 
             -- Disconnect tip first (B), then parent (A). Each step
             -- must succeed.
@@ -18701,7 +18701,7 @@ main = hspec $ do
             (block, spentOp, spentTxOut, _) <- mkTestBlock prev
             putUTXO db spentOp spentTxOut
             spent1 <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block 300 spent1
+            void $ connectBlock db regtest block 300 spent1
 
             let newOp = OutPoint (computeTxId (blockTxns block !! 1)) 0
             mNewBefore <- getUTXO db newOp
@@ -18710,7 +18710,7 @@ main = hspec $ do
             -- Re-connect: spentUtxos lookup re-runs against the now
             -- rewound chainstate.
             spent2 <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block 300 spent2
+            void $ connectBlock db regtest block 300 spent2
 
             mNewAfter <- getUTXO db newOp
             mNewAfter `shouldBe` mNewBefore
@@ -18738,7 +18738,7 @@ main = hspec $ do
                                     1700000040 0x207fffff 0
                 blockA = Block hdrA [cbTxA]
                 heightA = 700 :: Word32
-            connectBlock db regtest blockA heightA Map.empty
+            void $ connectBlock db regtest blockA heightA Map.empty
 
             -- Sanity: block A's coinbase output is now in PrefixUTXO
             -- with the right height + coinbase flag.
@@ -18775,7 +18775,7 @@ main = hspec $ do
               Nothing -> expectationFailure
                 "buildSpentUtxoMapFromDB lost block A's coinbase entry"
 
-            connectBlock db regtest blockB heightB spentB
+            void $ connectBlock db regtest blockB heightB spentB
 
             -- Inspect the BlockUndo record: TxInUndo for block B's
             -- regular tx must record A's coinbase at (heightA, True)
@@ -18838,7 +18838,7 @@ main = hspec $ do
                 block = Block hdr [cbTx, regTx]
                 blockHeightVal = 540 :: Word32
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block blockHeightVal spent
+            void $ connectBlock db regtest block blockHeightVal spent
 
             mUndo <- getUndoData db (computeBlockHash hdr)
             case mUndo of
@@ -18915,7 +18915,7 @@ main = hspec $ do
             putUTXOCoin db spentOp
               (Coin spentTxO 100 False)
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block height spent
+            void $ connectBlock db regtest block height spent
 
             r <- disconnectBlockAt db height block prev
             r `shouldBe` Right DisconnectOk
@@ -18953,7 +18953,7 @@ main = hspec $ do
                 height = 251 :: Word32
             putUTXOCoin db spentOp (Coin spentTxO 101 False)
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block height spent
+            void $ connectBlock db regtest block height spent
             -- Now corrupt the chainstate: delete the coinbase output
             -- the block created.  SpendCoin will miss on it, which
             -- Core flags UNCLEAN (validation.cpp:2218-2222).
@@ -19043,7 +19043,7 @@ main = hspec $ do
             putUTXOCoin db tx1Op (Coin (TxOut 5_000_000_000 "cb-out")
                                        height True)
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block height spent
+            void $ connectBlock db regtest block height spent
 
             r <- disconnectBlockAt db height block prev
             case r of
@@ -19111,7 +19111,7 @@ main = hspec $ do
                 height = 270 :: Word32
             putUTXOCoin db spentOp (Coin spentTx 102 False)
             spent <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block height spent
+            void $ connectBlock db regtest block height spent
             -- Best-block is the just-connected block, not prev.
             mPreBest <- getBestBlockHash db
             mPreBest `shouldBe` Just (computeBlockHash hdr)
@@ -19140,7 +19140,7 @@ main = hspec $ do
                                     1700000700 0x207fffff 0
                 blockA = Block hdrA [cbA]
                 heightA = 280 :: Word32
-            connectBlock db regtest blockA heightA Map.empty
+            void $ connectBlock db regtest blockA heightA Map.empty
 
             let aTxId  = computeTxId cbA
                 spent  = OutPoint aTxId 0
@@ -19156,7 +19156,7 @@ main = hspec $ do
                 blockB = Block hdrB [cbB, regB]
                 heightB = heightA + 101
             spentMap <- buildSpentUtxoMapFromDB db blockB
-            connectBlock db regtest blockB heightB spentMap
+            void $ connectBlock db regtest blockB heightB spentMap
 
             -- Step 1: disconnect tip (B).  BestBlock → A.
             rB <- disconnectBlockAt db heightB blockB
@@ -19263,7 +19263,7 @@ main = hspec $ do
                 block = Block hdr [cbTx, regTx]
             putUTXOCoin db spentOp (Coin spentTx 103 False)
             sp <- buildSpentUtxoMapFromDB db block
-            connectBlock db regtest block 290 sp
+            void $ connectBlock db regtest block 290 sp
             -- Corrupt: drop the coinbase output so SpendCoin misses.
             writeBatch db $ WriteBatch
               [ BatchDelete (makeKey PrefixUTXO
@@ -19565,7 +19565,7 @@ main = hspec $ do
                 cbTxId = computeTxId cbTx
                 cbOp = OutPoint cbTxId 0
                 blockHeightVal = 425 :: Word32
-            connectBlock db regtest block blockHeightVal Map.empty
+            void $ connectBlock db regtest block blockHeightVal Map.empty
 
             -- The on-disk Coin must carry the connectBlock-supplied height
             -- and the coinbase=True flag (txIdx == 0).
@@ -19598,7 +19598,7 @@ main = hspec $ do
                                   1700000020 0x207fffff 0
                 block = Block hdr [cbTx]
                 cbTxId = computeTxId cbTx
-            connectBlock db regtest block 426 Map.empty
+            void $ connectBlock db regtest block 426 Map.empty
             mSpend  <- getUTXOCoin db (OutPoint cbTxId 0)
             mOpRet  <- getUTXOCoin db (OutPoint cbTxId 1)
             mSpend `shouldSatisfy` isJust
@@ -19624,7 +19624,7 @@ main = hspec $ do
                 block = Block hdr [cbTx]
                 blockHeightVal = 110 :: Word32
                 snapPath = tmpDir </> "out.utxo.dat"
-            connectBlock db regtest block blockHeightVal Map.empty
+            void $ connectBlock db regtest block blockHeightVal Map.empty
             r <- dumpTxOutSetFromDB db snapPath 0xfabfb5da
                    (computeBlockHash hdr)
             case r of
@@ -21584,13 +21584,13 @@ main = hspec $ do
       -- Core: line 4318+4335 — pindex->nStatus & BLOCK_HAVE_DATA, return
       -- true.  Without it a peer can spam already-known blocks to
       -- force the node to re-execute connectBlock disk writes.
-      -- haskoin's MBlock handler (app/Main.hs:1353-1410) calls
+      -- haskoin's MBlock handler (app/Main.hs ~1353-1490) calls
       -- buildSpentUtxoMapFromDB + connectBlock unconditionally after
       -- addHeader returns Right — addHeader is idempotent on duplicate
       -- and returns the existing entry, but the *block-write* path is
       -- NOT short-circuited.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 60 (drop 1352 (lines contents)))
+      let block = unlines (take 130 (drop 1352 (lines contents)))
       -- No "HAVE_DATA" / "alreadyHave" / "BlockStatus" gate guards
       -- the connectBlock call.
       ("HAVE_DATA"   `isInfixOf` block) `shouldBe` False
@@ -21601,13 +21601,19 @@ main = hspec $ do
       -- Core: line 4319+4338 — drop unrequested low-work blocks.
       -- haskoin's MBlock handler has no chainwork comparison versus
       -- ActiveTip; any unsolicited low-work side-branch block is
-      -- processed.  Worse, connectBlockAt rejects prevHash mismatches
-      -- and the legacy 'connectBlock' wrapper FALLS BACK to
-      -- connectBlockUnchecked which overwrites BestBlock with the
-      -- side-branch hash.  This is the most severe finding of this
-      -- audit: peer-driven BestBlock corruption.
+      -- accepted at the header level (addHeader) and goes through to
+      -- 'connectBlock'.
+      --
+      -- The most-severe sub-issue (peer-driven BestBlock corruption
+      -- via the 'connectBlockUnchecked' fallback) was CLOSED by the
+      -- W97/W99-G18 P0 fix: 'connectBlock' now returns Left on
+      -- prevHash mismatch and the MBlock handler bans the peer.  This
+      -- DoS gate (drop low-work blocks pre-validation) remains
+      -- missing — Core would short-circuit BEFORE running expensive
+      -- gate checks; we run the gate and reject after, but we still
+      -- pay the validation cost.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 60 (drop 1352 (lines contents)))
+      let block = unlines (take 130 (drop 1352 (lines contents)))
       ("fHasMoreOrSameWork" `isInfixOf` block) `shouldBe` False
       ("ChainWork"          `isInfixOf` block) `shouldBe` False
 
@@ -21617,7 +21623,7 @@ main = hspec $ do
       -- defines minBlocksToKeep in Storage.hs:2130 but never consults
       -- it on the inbound-block path.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 60 (drop 1352 (lines contents)))
+      let block = unlines (take 130 (drop 1352 (lines contents)))
       ("MIN_BLOCKS_TO_KEEP" `isInfixOf` block) `shouldBe` False
       ("minBlocksToKeep"     `isInfixOf` block) `shouldBe` False
       ("TooFarAhead"         `isInfixOf` block) `shouldBe` False
@@ -21628,7 +21634,7 @@ main = hspec $ do
       -- for header-flood scenarios; haskoin's MBlock handler does
       -- NOT consult netMinimumChainWork.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 60 (drop 1352 (lines contents)))
+      let block = unlines (take 130 (drop 1352 (lines contents)))
       ("MinimumChainWork" `isInfixOf` block) `shouldBe` False
       ("minChainWork"      `isInfixOf` block) `shouldBe` False
 
@@ -21651,7 +21657,7 @@ main = hspec $ do
             case break (== '-') l of
               (pre, '-' : '-' : _) -> pre
               _                    -> l
-          mblockBody = take 60 (drop 1352 (lines contents))
+          mblockBody = take 130 (drop 1352 (lines contents))
           codeOnly   = unlines (map stripComment mblockBody)
       ("validateFullBlock" `isInfixOf` codeOnly) `shouldBe` False
       -- The actual function-call form (lowercase Haskell) is absent.
@@ -21723,7 +21729,7 @@ main = hspec $ do
       -- in the cache unflushed; a crash loses up to ~1000 blocks of
       -- work even though Core would have flushed each one.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 95 (drop 1352 (lines contents)))
+      let block = unlines (take 130 (drop 1352 (lines contents)))
       ("flushBlockInterval = 1000" `isInfixOf` block) `shouldBe` True
 
     it "G27 CheckBlockIndex final invariant is ABSENT (W97 OBSERVABILITY)" $ do
@@ -21746,7 +21752,7 @@ main = hspec $ do
       -- (Main.hs:1445-1452), including for duplicates accepted via
       -- connectBlockUnchecked fallback.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 100 (drop 1352 (lines contents)))
+      let block = unlines (take 130 (drop 1352 (lines contents)))
       ("fNewBlock" `isInfixOf` block) `shouldBe` False
       ("isNewBlock" `isInfixOf` block) `shouldBe` False
 
@@ -21774,24 +21780,75 @@ main = hspec $ do
       ibd <- readFile "src/Haskoin/Sync.hs"
       ("validateFullBlockIO" `isInfixOf` ibd) `shouldBe` True
       app <- readFile "app/Main.hs"
-      let mblock = unlines (take 60 (drop 1352 (lines app)))
+      let mblock = unlines (take 130 (drop 1352 (lines app)))
       ("validateFullBlockIO" `isInfixOf` mblock) `shouldBe` False
 
-    it "TWO-PIPELINE: connectBlock legacy wrapper silently overwrites BestBlock on gate failure (W97 CONSENSUS-DIVERGENT P0)" $ do
-      -- The legacy wrapper at Consensus.hs:2911-2927 falls back to
-      -- 'connectBlockUnchecked' whenever 'connectBlockAt' returns
-      -- Left.  'connectBlockUnchecked' writes PrefixBestBlock to the
-      -- block's hash REGARDLESS of whether that block extends the
-      -- active tip.  The MBlock handler (app/Main.hs:1376) uses the
-      -- legacy wrapper — so a peer sending a side-branch block whose
-      -- prevHash ≠ BestBlock will OVERWRITE BestBlock with the
-      -- side-branch tip, corrupting the chainstate.  Documented but
-      -- not fixed in this audit.
-      contents <- readFile "src/Haskoin/Consensus.hs"
-      let block = unlines (take 20 (drop 2910 (lines contents)))
-      -- Confirm the fall-through is unconditional on any Left.
-      ("connectBlockUnchecked" `isInfixOf` block) `shouldBe` True
-      ("Left err"               `isInfixOf` block) `shouldBe` True
+    it "TWO-PIPELINE: connectBlock surfaces gate failure as Left — BestBlock NOT overwritten on prevHash mismatch (W97 CONSENSUS-DIVERGENT P0 FIXED)" $
+      -- Pre-fix bug (haskoin commit a28a65a, W97 audit):
+      -- The legacy 'connectBlock' wrapper at Consensus.hs:2911-2927 fell
+      -- back to 'connectBlockUnchecked' whenever 'connectBlockAt'
+      -- returned Left.  'connectBlockUnchecked' wrote
+      -- 'PrefixBestBlock' to the block's hash REGARDLESS of whether
+      -- that block extended the active tip.  The MBlock peer handler
+      -- (app/Main.hs:1376) used the legacy wrapper, so a peer that
+      -- sent an unsolicited side-branch block whose prevHash ≠
+      -- BestBlock would OVERWRITE BestBlock with the side-branch tip,
+      -- corrupting the chainstate.  P0.
+      --
+      -- Fix: 'connectBlock' is now a thin alias for 'connectBlockAt'.
+      -- It returns IO (Either String ()) and short-circuits BEFORE
+      -- 'writeBatch' on a G1 (prevHash mismatch) or G19 (missing
+      -- prevout) gate failure.  The MBlock handler pattern-matches
+      -- the Either: on Left, drop the block + misbehaving(InvalidBlock).
+      -- BestBlock is NEVER overwritten.
+      --
+      -- This test reproduces the attack: seed BestBlock with blockA,
+      -- feed a side-branch blockB whose prevHash != hash(blockA),
+      -- assert connectBlock returns Left AND BestBlock is still
+      -- hash(blockA).
+      withSystemTempDirectory "haskoin-w97-p0-fix" $ \tmpDir -> do
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let mkPrev byte = BlockHash (Hash256 (BS.replicate 32 byte))
+              prevA = mkPrev 0xA0
+              prevB = mkPrev 0xB0  -- mismatches hash(blockA)
+              cbTx = Tx 1
+                [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
+                       "" 0xFFFFFFFF ]
+                [ TxOut 5_000_000_000 "cb" ] [] 0
+              hdrA = BlockHeader 1 prevA (Hash256 (BS.replicate 32 0))
+                                 1700000900 0x207fffff 0
+              blockA = Block hdrA [cbTx]
+              hashA  = computeBlockHash hdrA
+              hdrB = BlockHeader 1 prevB (Hash256 (BS.replicate 32 0))
+                                 1700001000 0x207fffff 0
+              blockB = Block hdrB [cbTx]
+          -- Seed: connect blockA. BestBlock = Nothing initially so the
+          -- G1 gate is skipped (fresh-DB bootstrap).
+          r1 <- connectBlock db regtest blockA 400 Map.empty
+          r1 `shouldBe` Right ()
+          best1 <- getBestBlockHash db
+          best1 `shouldBe` Just hashA
+          -- Attack: feed peer-supplied side-branch blockB. prevHash
+          -- (prevB = 0xB0) != current BestBlock (hashA). Pre-fix:
+          -- BestBlock would be overwritten to hash(blockB). Post-fix:
+          -- Left is returned and BestBlock is unchanged.
+          r2 <- connectBlock db regtest blockB 401 Map.empty
+          case r2 of
+            Right () -> expectationFailure $
+              "P0 REGRESSION: connectBlock accepted a peer block whose "
+              <> "prevHash != BestBlock; this would corrupt the chain "
+              <> "tip pointer. The W97 fallback to connectBlockUnchecked "
+              <> "must NOT be reintroduced."
+            Left _  -> return ()
+          -- Crucial invariant: BestBlock is STILL hash(blockA), NOT
+          -- hash(blockB).
+          best2 <- getBestBlockHash db
+          best2 `shouldBe` Just hashA
+          -- Belt-and-suspenders: assert the source code no longer
+          -- references the unchecked helper. If a future refactor
+          -- reintroduces it, this catches it at compile / test time.
+          src <- readFile "src/Haskoin/Consensus.hs"
+          ("connectBlockUnchecked" `isInfixOf` src) `shouldBe` False
 
   -- ──────────────────────────────────────────────────────────────────────────
   -- W99 net_processing dispatch + Misbehaving gate audit
@@ -21966,17 +22023,45 @@ main = hspec $ do
       let headerFail = "misbehaving pm addr InvalidBlock"
       (headerFail `isInfixOf` contents) `shouldBe` True
 
-    it "G18 BUG: fork-not-InvalidateBlock side branch missing (W99 CONSENSUS-DIVERGENT)" $ do
-      -- Core: when a block arrives for a side branch (not extending tip)
-      -- it is stored but NOT connected; the active chain is not modified.
-      -- haskoin MBlock handler calls connectBlock unconditionally on any
-      -- valid-header block — it does not check whether the block extends
-      -- the current best tip.  This can corrupt the UTXO set on a reorg.
-      contents <- readFile "app/Main.hs"
-      -- No side-branch check before connectBlock
-      ("hashPrevBlock" `isInfixOf` contents) `shouldBe` False
-      -- connectBlock is called unconditionally (no tip-extension check)
-      ("connectBlock" `isInfixOf` contents) `shouldBe` True
+    it "G18 fix: MBlock handler refuses side-branch blocks (no tip overwrite) (W99 CONSENSUS-DIVERGENT FIXED)" $ do
+      -- Pre-fix bug (haskoin commit 37596a0, W99 G18 audit):
+      -- The MBlock peer handler (app/Main.hs:1376) called the legacy
+      -- 'connectBlock' wrapper unconditionally on any block whose
+      -- header passed 'addHeader'.  The legacy wrapper silently fell
+      -- back to 'connectBlockUnchecked' when the W93 G1 gate
+      -- (prevHash == BestBlock) failed, overwriting the chain tip
+      -- pointer with a side-branch hash.  Two-pipeline gap: the IBD
+      -- blockProcessor (Sync.hs:403) used 'connectBlockAt' directly
+      -- and surfaced gate failures as Left; only the unsolicited
+      -- peer path was vulnerable.
+      --
+      -- Fix: 'connectBlock' now returns Either String () and is a thin
+      -- alias for 'connectBlockAt'.  The MBlock handler pattern-matches
+      -- the Either: on Left, log + 'misbehaving InvalidBlock'; on
+      -- Right, proceed with the post-accept bookkeeping.  Reference:
+      -- bitcoin-core/src/validation.cpp AcceptBlock @4350-4354
+      -- (InvalidBlockFound -> Misbehaving(100, "bad-block")).
+      --
+      -- We verify the structural fix by asserting (1) source no longer
+      -- contains 'connectBlockUnchecked', (2) the MBlock handler
+      -- block in app/Main.hs has both a Left arm that fires
+      -- 'misbehaving' AND a Right arm that does the post-accept
+      -- bookkeeping.
+      consensusSrc <- readFile "src/Haskoin/Consensus.hs"
+      ("connectBlockUnchecked" `isInfixOf` consensusSrc) `shouldBe` False
+      mainSrc <- readFile "app/Main.hs"
+      -- The MBlock handler must now pattern-match the Either.
+      let mblockLines = take 130 (drop 1352 (lines mainSrc))
+          mblockBody  = unlines mblockLines
+      -- Left arm fires misbehaving InvalidBlock.
+      ("Left cbErr"      `isInfixOf` mblockBody) `shouldBe` True
+      ("misbehaving pm addr InvalidBlock"
+                          `isInfixOf` mblockBody) `shouldBe` True
+      -- Right arm proceeds with post-accept work.
+      ("Right ()"         `isInfixOf` mblockBody) `shouldBe` True
+      -- The connectBlock call is still present but its result is now
+      -- bound and inspected (no longer fire-and-forget).
+      ("connectResult"    `isInfixOf` mblockBody) `shouldBe` True
 
   describe "W99 ProcessMessage dispatch gates (G19-G30)" $ do
 
