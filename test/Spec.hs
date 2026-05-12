@@ -20962,6 +20962,508 @@ main = hspec $ do
       -- Non-witness output (P2PKH) is not a witness program
       isUnknownWitnessProgram nonWit    `shouldBe` False
 
+  -- ------------------------------------------------------------------
+  -- W97 AcceptBlock / AcceptBlockHeader / ProcessNewBlockHeaders gate audit
+  --
+  -- Reference: bitcoin-core/src/validation.cpp
+  --   AcceptBlockHeader       4186-4239
+  --   ProcessNewBlockHeaders  4242-4270
+  --   AcceptBlock             4298-4396
+  --   CheckBlock              3918
+  --
+  -- Each test encodes one Core gate.  The block-level tests target two
+  -- distinct haskoin code paths: 'addHeader' / 'addSideBranchHeader'
+  -- (Consensus.hs) and the @MBlock@ peer-message handler (app/Main.hs).
+  -- TWO-PIPELINE GAP: the IBD path runs 'validateFullBlockIO' before
+  -- 'connectBlockAt', but the MBlock unsolicited-block path runs
+  -- 'addHeader' then 'connectBlock' (legacy wrapper that silently
+  -- falls back to 'connectBlockUnchecked' when 'connectBlockAt'
+  -- rejects), so the @MBlock@ pipeline is missing CheckBlock +
+  -- ContextualCheckBlock + the anti-DoS gates that Core's AcceptBlock
+  -- runs.  Tests here document the resulting consensus / DoS divergence.
+  -- ------------------------------------------------------------------
+  describe "W97 AcceptBlock/AcceptBlockHeader gate audit" $ do
+
+    -- ----- AcceptBlockHeader (Core validation.cpp:4186-4239) -----
+
+    it "G1 duplicate-hash short-circuits to existing entry (W97)" $ do
+      -- Core: line 4194-4205 — if hash is already in m_block_index,
+      -- return the existing pindex without re-running CheckBlockHeader
+      -- or ContextualCheckBlockHeader.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+      r <- addHeader regtest hc genesisHdr
+      case r of
+        Right e  -> ceHash e `shouldBe` genesisHsh
+        Left err -> expectationFailure $ "duplicate genesis should short-circuit: " ++ err
+
+    it "G3 BUG: duplicate-invalid is NOT distinguished from duplicate-valid (W97 CONSENSUS-DIVERGENT)" $ do
+      -- Core: lines 4199-4203 — if existing entry has BLOCK_FAILED_VALID
+      -- status, return state.Invalid(BLOCK_CACHED_INVALID, "duplicate-invalid").
+      -- haskoin's 'addHeader' Consensus.hs:3868-3869 only does
+      --   case Map.lookup hash entries of
+      --     Just existing -> return $ Right existing
+      -- A peer can resubmit a header we previously marked invalid and
+      -- haskoin will silently return Right, scoring no misbehavior +
+      -- not surfacing the cached-invalid result to the caller.
+      hc <- initHeaderChain regtest
+      -- Reach into the chain entries map and flip the genesis entry to
+      -- StatusInvalid to simulate a prior BLOCK_FAILED_VALID marking.
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+      atomically $ modifyTVar' (hcEntries hc) $
+        Map.adjust (\e -> e { ceStatus = StatusInvalid }) genesisHsh
+      r <- addHeader regtest hc genesisHdr
+      case r of
+        Right e -> do
+          -- BUG documented: haskoin returns Right even though the
+          -- existing entry is StatusInvalid.  Core would surface
+          -- BLOCK_CACHED_INVALID and the peer would be banned.
+          ceStatus e `shouldBe` StatusInvalid
+        Left err ->
+          expectationFailure $
+            "Once G3 is fixed this test will need updating. Current behavior: Right(StatusInvalid). Got: Left "
+              ++ err
+
+    it "G5 prev-blk-not-found is surfaced (W97)" $ do
+      -- Core: lines 4214-4218 — if hashPrevBlock is not in m_block_index,
+      -- state.Invalid(BLOCK_MISSING_PREV, "prev-blk-not-found").
+      -- haskoin returns Left "Unknown previous block: <hex>".
+      hc <- initHeaderChain regtest
+      let bogusPrev = BlockHash (Hash256 (BS.replicate 32 0xab))
+          hdr = mineRegtestHeader $ BlockHeader 1 bogusPrev
+                  (Hash256 (BS.replicate 32 0)) 0 0x207fffff 0
+      r <- addHeader regtest hc hdr
+      case r of
+        Left err -> err `shouldContain` "Unknown previous block"
+        Right _  -> expectationFailure "missing parent must be rejected"
+
+    it "G6 BUG: parent BLOCK_FAILED_VALID is NOT checked (W97 CONSENSUS-DIVERGENT)" $ do
+      -- Core: lines 4220-4223 — if pindexPrev->nStatus has BLOCK_FAILED_VALID,
+      -- state.Invalid(BLOCK_INVALID_PREV, "bad-prevblk").
+      -- haskoin's 'addHeader' Consensus.hs:3870-3974 reads the parent
+      -- entry but never inspects 'ceStatus' for StatusInvalid.  A peer
+      -- can chain a fresh header off a known-invalid parent and
+      -- haskoin will run all the per-header checks AS IF the parent
+      -- were valid — wasting CPU and admitting a doomed branch into
+      -- hcEntries.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+      -- Mark genesis (the only parent we have) as StatusInvalid.
+      atomically $ modifyTVar' (hcEntries hc) $
+        Map.adjust (\e -> e { ceStatus = StatusInvalid }) genesisHsh
+      -- Build a fresh header pointing at the now-invalid parent.
+      let childHdr = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                       (Hash256 (BS.replicate 32 0))
+                       (bhTimestamp genesisHdr + 1)
+                       0x207fffff 0
+      r <- addHeader regtest hc childHdr
+      case r of
+        Right _ -> return ()  -- BUG: haskoin admits the child.
+        Left err ->
+          expectationFailure $
+            "Once G6 is fixed this should reject with bad-prevblk. Got: " ++ err
+
+    it "G7 ContextualCheckBlockHeader: bad-diffbits enforced (W97)" $ do
+      -- Core: 4224-4227 — calls ContextualCheckBlockHeader.  haskoin
+      -- inlines time-too-old + BIP94-timewarp + time-too-new + bad-diffbits
+      -- + checkpoint into addHeader.  This test asserts the bad-diffbits
+      -- gate fires.  We pick bits that are SLIGHTLY tighter than the
+      -- regtest pow-limit (0x207ffffe vs 0x207fffff) so that PoW still
+      -- passes (regtest difficulty is so low that nearly every nonce
+      -- satisfies it) but the difficulty gate sees a mismatch.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+          badBits   = 0x207ffffe :: Word32
+          template n = BlockHeader 1 genesisHsh
+                         (Hash256 (BS.replicate 32 7))
+                         (bhTimestamp genesisHdr + 600)
+                         badBits n
+          -- Mine until PoW passes (so the difficulty gate is what fires).
+          mined =
+            head [ template k | k <- [0..]
+                              , checkProofOfWork (template k)
+                                                  (netPowLimit regtest) ]
+      r <- addHeader regtest hc mined
+      case r of
+        Left err -> err `shouldContain` "bad-diffbits"
+        Right _  -> expectationFailure "wrong nBits must fail bad-diffbits"
+
+    it "G8 BUG: min_pow_checked / too-little-chainwork gate is ABSENT (W97 DOS)" $ do
+      -- Core: lines 4229-4232 — after CheckBlockHeader + parent lookup
+      -- + ContextualCheckBlockHeader, AcceptBlockHeader gates on
+      --   if (!min_pow_checked) state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork")
+      -- haskoin's 'addHeader' has NO equivalent gate.  Any peer that
+      -- mines headers on a fake low-work tip past the regtest target
+      -- can pollute hcEntries indefinitely; without the chainwork-
+      -- threshold gate the only memory limit is wall-clock cost.
+      -- Reference: netMinimumChainWork is defined per network but only
+      -- consulted inside 'shouldSkipScripts' (assumevalid path), never
+      -- inside 'addHeader'.
+      let hasGate path = do
+            src <- readFile path
+            return (any ("netMinimumChainWork" `isInfixOf`)
+                      (take 200 (drop 3856 (lines src))))
+      gate <- hasGate "src/Haskoin/Consensus.hs"
+      gate `shouldBe` False
+
+    it "G9 AddToBlockIndex updates tip/work atomically (W97)" $ do
+      -- Core: line 4233 — m_blockman.AddToBlockIndex returns pindex and
+      -- updates m_best_header.  haskoin uses an STM atomic block at
+      -- Consensus.hs:3966-3972 that updates hcEntries + hcByHeight +
+      -- hcTip + hcHeight when chainwork strictly exceeds the current tip.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 1))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+      r <- addHeader regtest hc hdr1
+      case r of
+        Right entry -> do
+          ceHeight entry `shouldBe` 1
+          tip <- readTVarIO (hcTip hc)
+          ceHash tip `shouldBe` ceHash entry
+        Left err -> expectationFailure $ "should accept: " ++ err
+
+    it "G10 ppindex write-back: caller receives the inserted entry (W97)" $ do
+      -- Core: lines 4236-4237 — *ppindex = pindex.  haskoin returns
+      -- the entry inside Right, so the caller has equivalent access.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 2))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+      r <- addHeader regtest hc hdr1
+      case r of
+        Right entry -> cePrev entry `shouldBe` Just genesisHsh
+        Left err -> expectationFailure err
+
+    -- ----- ProcessNewBlockHeaders (Core 4242-4270) -----
+
+    it "G11 BUG: cs_main / single-lock guarantee for batched headers ABSENT (W97 CORRECTNESS)" $ do
+      -- Core: lines 4244-4246 wrap the for-loop in LOCK(cs_main).  The
+      -- 'handleHeaders' batch helper at Consensus.hs:4136-4155 simply
+      -- @mapM (addHeader …)@ — each addHeader takes its own atomically
+      -- block but the *batch* is not guarded by a single STM
+      -- transaction or lock.  A concurrent reorg between two headers
+      -- in the same batch can read a transient inconsistent tip.
+      -- Reference: bitcoin-core/src/validation.cpp:4244
+      raw <- readFile "src/Haskoin/Consensus.hs"
+      -- The mapM (addHeader …) line itself is NOT wrapped — verify by
+      -- looking at the exact call site rather than scanning a window.
+      let lns = lines raw
+          fnLine = head $ filter (\(_, l) -> "mapM (addHeader " `isInfixOf` l)
+                                  (zip [0..] lns)
+          -- Walk back up to 5 lines and check NO atomically wrap is present.
+          window = unlines $ take 6 $ drop (fst fnLine - 5) lns
+      ("atomically $ mapM" `isInfixOf` window) `shouldBe` False
+      ("withMVar"           `isInfixOf` window) `shouldBe` False
+      -- Reset the syncing-flag write IS wrapped in atomically, but that
+      -- is an unrelated TVar; the mapM (addHeader …) batch itself is
+      -- not protected.
+      return ()
+
+    it "G12 BUG: CheckBlockIndex invariant is NEVER called (W97 OBSERVABILITY)" $ do
+      -- Core: line 4250 — CheckBlockIndex() runs after EVERY successful
+      -- AcceptBlockHeader to catch index-corruption regressions.  Grep
+      -- the entire source tree for any function named CheckBlockIndex
+      -- or checkBlockIndex; haskoin has none.
+      let hasFn path = do
+            contents <- readFile path
+            return ("checkBlockIndex" `isInfixOf` contents
+                    || "CheckBlockIndex" `isInfixOf` contents)
+      a <- hasFn "src/Haskoin/Consensus.hs"
+      b <- hasFn "app/Main.hs"
+      (a || b) `shouldBe` False
+
+    it "G13 handleHeaders does NOT early-return on first failed header (W97 CORRECTNESS)" $ do
+      -- Core: lines 4252-4254 — return false on first failed
+      -- AcceptBlockHeader so a partially-accepted batch can be retried
+      -- cleanly.  haskoin's 'handleHeaders' Consensus.hs:4138 uses
+      -- @mapM (addHeader …)@ which RUNS every header even after the
+      -- first Left.  This is mostly harmless because each addHeader is
+      -- idempotent on a duplicate, but it diverges from Core's
+      -- atomicity model and the (_count, errors) tuple drops the
+      -- failed-index information.
+      -- We assert the behavioural divergence: feed [valid, invalid,
+      -- valid] and check that BOTH valid headers are accepted.
+      hs <- do
+        hc <- initHeaderChain regtest
+        startHeaderSync regtest hc
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+          h1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                 (Hash256 (BS.replicate 32 3))
+                 (bhTimestamp genesisHdr + 600) 0x207fffff 0
+          h1hash = computeBlockHash h1
+          -- broken middle header: bad bits on regtest.
+          h2 = BlockHeader 1 h1hash
+                 (Hash256 (BS.replicate 32 4))
+                 (bhTimestamp genesisHdr + 1200) 0x1d00ffff 0
+          h3 = mineRegtestHeader $ BlockHeader 1 h1hash
+                 (Hash256 (BS.replicate 32 5))
+                 (bhTimestamp genesisHdr + 1800) 0x207fffff 0
+      (succ_, _errs) <- handleHeaders hs [h1, h2, h3]
+      -- Core: succ_ would be 1 (first header), then return false.
+      -- haskoin: succ_ == 2 (h1 + h3) since the loop continued past h2.
+      succ_ `shouldBe` 2
+
+    it "G15 NotifyHeaderTip equivalent is ABSENT (W97 OBSERVABILITY)" $ do
+      -- Core: lines 4260-4267 — after the batch loop, NotifyHeaderTip()
+      -- fires (outside cs_main) so subscribers see the new tip + IBD
+      -- progress message.  haskoin has no NotifyHeaderTip / signal /
+      -- callback hook on header acceptance.  The MHeaders handler in
+      -- app/Main.hs:1248 logs ad-hoc but doesn't expose a
+      -- subscribe-able event.
+      let hasFn path = do
+            contents <- readFile path
+            return ("NotifyHeaderTip" `isInfixOf` contents
+                    || "notifyHeaderTip" `isInfixOf` contents)
+      a <- hasFn "src/Haskoin/Consensus.hs"
+      b <- hasFn "app/Main.hs"
+      c <- hasFn "src/Haskoin/Network.hs"
+      (a || b || c) `shouldBe` False
+
+    it "G16 IBD progress log: PowTargetSpacing is NOT used for ETA (W97 OBSERVABILITY)" $ do
+      -- Core: line 4263 —
+      --   blocks_left = (Now - last_accepted.Time()) / PowTargetSpacing()
+      --   progress = 100.0 * height / (height + blocks_left)
+      -- haskoin's MHeaders log in app/Main.hs:1277 just prints
+      -- "Added N of M headers" without an ETA.  netPowTargetSpacing
+      -- exists in chain params (Consensus.hs:269) but is never
+      -- consulted on the header path.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 80 (drop 1247 (lines contents)))
+      ("PowTargetSpacing" `isInfixOf` block) `shouldBe` False
+      ("powTargetSpacing" `isInfixOf` block) `shouldBe` False
+
+    -- ----- AcceptBlock (Core 4298-4396) — MBlock peer pipeline -----
+
+    it "G17 MBlock handler runs addHeader before processing block (W97)" $ do
+      -- Core: line 4308 — AcceptBlock calls AcceptBlockHeader first.
+      -- haskoin's MBlock handler at app/Main.hs:1359 does the same.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 30 (drop 1352 (lines contents)))
+      ("addHeader net hc hdr" `isInfixOf` block) `shouldBe` True
+
+    it "G18 BUG: fAlreadyHave / BLOCK_HAVE_DATA short-circuit MISSING on MBlock (W97 DOS)" $ do
+      -- Core: line 4318+4335 — pindex->nStatus & BLOCK_HAVE_DATA, return
+      -- true.  Without it a peer can spam already-known blocks to
+      -- force the node to re-execute connectBlock disk writes.
+      -- haskoin's MBlock handler (app/Main.hs:1353-1410) calls
+      -- buildSpentUtxoMapFromDB + connectBlock unconditionally after
+      -- addHeader returns Right — addHeader is idempotent on duplicate
+      -- and returns the existing entry, but the *block-write* path is
+      -- NOT short-circuited.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 60 (drop 1352 (lines contents)))
+      -- No "HAVE_DATA" / "alreadyHave" / "BlockStatus" gate guards
+      -- the connectBlock call.
+      ("HAVE_DATA"   `isInfixOf` block) `shouldBe` False
+      ("alreadyHave" `isInfixOf` block) `shouldBe` False
+      ("StatusValid" `isInfixOf` block) `shouldBe` False
+
+    it "G19b BUG: fHasMoreOrSameWork gate MISSING on MBlock (W97 DOS)" $ do
+      -- Core: line 4319+4338 — drop unrequested low-work blocks.
+      -- haskoin's MBlock handler has no chainwork comparison versus
+      -- ActiveTip; any unsolicited low-work side-branch block is
+      -- processed.  Worse, connectBlockAt rejects prevHash mismatches
+      -- and the legacy 'connectBlock' wrapper FALLS BACK to
+      -- connectBlockUnchecked which overwrites BestBlock with the
+      -- side-branch hash.  This is the most severe finding of this
+      -- audit: peer-driven BestBlock corruption.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 60 (drop 1352 (lines contents)))
+      ("fHasMoreOrSameWork" `isInfixOf` block) `shouldBe` False
+      ("ChainWork"          `isInfixOf` block) `shouldBe` False
+
+    it "G19c BUG: fTooFarAhead (height > tip + 288) MISSING on MBlock (W97 DOS)" $ do
+      -- Core: line 4325+4339 — reject unrequested blocks whose height
+      -- exceeds ActiveHeight + MIN_BLOCKS_TO_KEEP (288).  haskoin
+      -- defines minBlocksToKeep in Storage.hs:2130 but never consults
+      -- it on the inbound-block path.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 60 (drop 1352 (lines contents)))
+      ("MIN_BLOCKS_TO_KEEP" `isInfixOf` block) `shouldBe` False
+      ("minBlocksToKeep"     `isInfixOf` block) `shouldBe` False
+      ("TooFarAhead"         `isInfixOf` block) `shouldBe` False
+
+    it "G19d BUG: nMinimumChainWork gate MISSING on MBlock (W97 DOS)" $ do
+      -- Core: line 4345 — for unrequested blocks reject when
+      -- pindex->nChainWork < MinimumChainWork().  Critical anti-DoS
+      -- for header-flood scenarios; haskoin's MBlock handler does
+      -- NOT consult netMinimumChainWork.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 60 (drop 1352 (lines contents)))
+      ("MinimumChainWork" `isInfixOf` block) `shouldBe` False
+      ("minChainWork"      `isInfixOf` block) `shouldBe` False
+
+    it "G20+G21 BUG: CheckBlock + ContextualCheckBlock MISSING on MBlock (W97 CONSENSUS-DIVERGENT)" $ do
+      -- Core: lines 4350-4351 — AcceptBlock calls
+      --   CheckBlock(block, …) && ContextualCheckBlock(block, …, pprev)
+      -- BEFORE any disk write.  haskoin's MBlock pipeline (app/Main.hs:1374)
+      -- builds the spent-utxo map and calls 'connectBlock' directly.
+      -- 'connectBlock' delegates to 'connectBlockAt' which runs only
+      -- W93 gates G1+G19 (prev-hash match + per-input prevout existence),
+      -- NOT CheckBlock (size, coinbase, merkle, sigops cap) or
+      -- ContextualCheckBlock (BIP-34/65/66 nVersion gates, BIP-113
+      -- finality, BIP-141 witness commitment).  The IBD pipeline
+      -- (Sync.hs:403) calls 'validateFullBlockIO' which DOES cover
+      -- these — TWO-PIPELINE GAP.
+      contents <- readFile "app/Main.hs"
+      -- Strip line comments so we don't match prose like
+      -- "CheckBlock failure -> Misbehaving(100, …)".
+      let stripComment l =
+            case break (== '-') l of
+              (pre, '-' : '-' : _) -> pre
+              _                    -> l
+          mblockBody = take 60 (drop 1352 (lines contents))
+          codeOnly   = unlines (map stripComment mblockBody)
+      ("validateFullBlock" `isInfixOf` codeOnly) `shouldBe` False
+      -- The actual function-call form (lowercase Haskell) is absent.
+      ("validateFullBlockIO" `isInfixOf` codeOnly) `shouldBe` False
+
+    it "G22 InvalidBlockFound: peer is banned on validation failure (W97)" $ do
+      -- Core: lines 4352-4354 — InvalidBlockFound(pindex, state).
+      -- haskoin's MBlock handler at app/Main.hs:1397-1403 catches the
+      -- SomeException from connectBlock and calls misbehaving(addr,
+      -- InvalidBlock).  Score is 100 (line 601 of Network.hs).
+      contents <- readFile "app/Main.hs"
+      ("misbehaving pmRefVal addr InvalidBlock" `isInfixOf` contents
+       || "misbehaving pm addr InvalidBlock"     `isInfixOf` contents)
+        `shouldBe` True
+
+    it "G23 NewPoWValidBlock signal is ABSENT (W97 OBSERVABILITY)" $ do
+      -- Core: lines 4361-4363 — when (!IBD && ActiveTip == pprev),
+      -- m_options.signals->NewPoWValidBlock(pindex, pblock) fires.
+      -- This is what triggers compact-block relay.  haskoin's MBlock
+      -- handler does broadcast an MInv (app/Main.hs:1452), but does
+      -- NOT distinguish the IBD/non-IBD case for compact-block /
+      -- BIP-152 relay.
+      let hasFn path = do
+            contents <- readFile path
+            return ("NewPoWValidBlock" `isInfixOf` contents
+                    || "newPoWValidBlock" `isInfixOf` contents)
+      a <- hasFn "src/Haskoin/Consensus.hs"
+      b <- hasFn "src/Haskoin/Network.hs"
+      c <- hasFn "app/Main.hs"
+      (a || b || c) `shouldBe` False
+
+    it "G24 dbp path / UpdateBlockInfo equivalent is ABSENT (W97 CORRECTNESS)" $ do
+      -- Core: lines 4368-4373 — if dbp != nullptr (loading from disk
+      -- during reindex), UpdateBlockInfo(block, height, *dbp).  haskoin
+      -- has no equivalent path: reindex-chainstate at Main.hs:598-640
+      -- calls 'connectBlock db net blk h spent' unconditionally and
+      -- recomputes everything from the on-disk block bodies.  No
+      -- intrinsic divergence, but the gate as described in Core is
+      -- missing.
+      let hasFn path = do
+            contents <- readFile path
+            return ("UpdateBlockInfo" `isInfixOf` contents)
+      a <- hasFn "src/Haskoin/Consensus.hs"
+      b <- hasFn "src/Haskoin/Storage.hs"
+      (a || b) `shouldBe` False
+
+    it "G25 BUG: ReceivedBlockTransactions equivalent NOT called on accept (W97 OBSERVABILITY)" $ do
+      -- Core: line 4379 — ReceivedBlockTransactions(block, pindex, blockPos)
+      -- transitions pindex->nStatus to TRANSACTIONS+HAVE_DATA.  haskoin
+      -- stores the BlockStatus via 'putBlockStatus' but the MBlock
+      -- handler / IBD blockProcessor / submitBlock NEVER call it on
+      -- accept — only the invalidateBlock + reconsiderBlock RPCs do.
+      -- So the persisted-status field stays at StatusUnknown (0x00) for
+      -- every block accepted through normal flow.
+      mainApp <- readFile "app/Main.hs"
+      sync    <- readFile "src/Haskoin/Sync.hs"
+      btmpl   <- readFile "src/Haskoin/BlockTemplate.hs"
+      -- None of the accept-path modules call putBlockStatus.
+      ("putBlockStatus" `isInfixOf` mainApp) `shouldBe` False
+      ("putBlockStatus" `isInfixOf` sync   ) `shouldBe` False
+      ("putBlockStatus" `isInfixOf` btmpl  ) `shouldBe` False
+
+    it "G26 FlushStateToDisk(NONE) on the MBlock path is ABSENT (W97 CORRECTNESS)" $ do
+      -- Core: line 4391 —
+      -- ActiveChainstate().FlushStateToDisk(state, FlushStateMode::NONE)
+      -- fires after EVERY AcceptBlock so pruning + UTXO-cache spill can
+      -- happen.  haskoin's MBlock handler only flushes every
+      -- flushBlockInterval=1000 blocks (Main.hs:1415).  Block 999 sits
+      -- in the cache unflushed; a crash loses up to ~1000 blocks of
+      -- work even though Core would have flushed each one.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 95 (drop 1352 (lines contents)))
+      ("flushBlockInterval = 1000" `isInfixOf` block) `shouldBe` True
+
+    it "G27 CheckBlockIndex final invariant is ABSENT (W97 OBSERVABILITY)" $ do
+      -- Core: line 4393 — second CheckBlockIndex() AFTER block write.
+      -- Same as G12; haskoin has no equivalent.
+      let hasFn path = do
+            contents <- readFile path
+            return ("checkBlockIndex" `isInfixOf` contents
+                    || "CheckBlockIndex" `isInfixOf` contents)
+      a <- hasFn "src/Haskoin/Consensus.hs"
+      b <- hasFn "app/Main.hs"
+      (a || b) `shouldBe` False
+
+    it "G28 fNewBlock output is ABSENT (W97 OBSERVABILITY)" $ do
+      -- Core: lines 4302+4366 — fNewBlock is set true iff a NEW block
+      -- (not already-have) was processed.  Callers use it to gate
+      -- mempool refresh / compact-block relay.  haskoin's MBlock handler
+      -- has no such return-value distinction; mempool.blockConnected
+      -- + announceTip fire unconditionally after every connectBlock
+      -- (Main.hs:1445-1452), including for duplicates accepted via
+      -- connectBlockUnchecked fallback.
+      contents <- readFile "app/Main.hs"
+      let block = unlines (take 100 (drop 1352 (lines contents)))
+      ("fNewBlock" `isInfixOf` block) `shouldBe` False
+      ("isNewBlock" `isInfixOf` block) `shouldBe` False
+
+    -- ----- TWO-PIPELINE GAP summaries -----
+
+    it "TWO-PIPELINE: addHeader vs addSideBranchHeader (W97 CONSENSUS-DIVERGENT)" $ do
+      -- 'addHeader' (Consensus.hs:3856) runs PoW, time-too-old,
+      -- BIP-94 timewarp, time-too-new, bad-diffbits, checkpoint.
+      -- 'addSideBranchHeader' (Consensus.hs:3999) runs NONE of those —
+      -- its doc-comment claims the caller (submitBlock) already
+      -- validated, but validateFullBlockIO does NOT check time-too-new
+      -- (the +2h future-time gate is only in addHeader).  Locally-
+      -- mined side-branch blocks with a far-future timestamp slip in.
+      contents <- readFile "src/Haskoin/Consensus.hs"
+      let block = unlines (take 30 (drop 3998 (lines contents)))
+      ("checkProofOfWork"   `isInfixOf` block) `shouldBe` False
+      ("time-too-new"        `isInfixOf` block) `shouldBe` False
+      ("difficultyAdjustment" `isInfixOf` block) `shouldBe` False
+      ("verifyCheckpoint"    `isInfixOf` block) `shouldBe` False
+
+    it "TWO-PIPELINE: MBlock vs IBD blockProcessor — validateFullBlockIO presence (W97 CONSENSUS-DIVERGENT)" $ do
+      -- Sync.hs:403 — IBD calls
+      --   validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs skipScripts block utxoMap
+      -- before connectBlockAt.  app/Main.hs MBlock handler does NOT.
+      ibd <- readFile "src/Haskoin/Sync.hs"
+      ("validateFullBlockIO" `isInfixOf` ibd) `shouldBe` True
+      app <- readFile "app/Main.hs"
+      let mblock = unlines (take 60 (drop 1352 (lines app)))
+      ("validateFullBlockIO" `isInfixOf` mblock) `shouldBe` False
+
+    it "TWO-PIPELINE: connectBlock legacy wrapper silently overwrites BestBlock on gate failure (W97 CONSENSUS-DIVERGENT P0)" $ do
+      -- The legacy wrapper at Consensus.hs:2911-2927 falls back to
+      -- 'connectBlockUnchecked' whenever 'connectBlockAt' returns
+      -- Left.  'connectBlockUnchecked' writes PrefixBestBlock to the
+      -- block's hash REGARDLESS of whether that block extends the
+      -- active tip.  The MBlock handler (app/Main.hs:1376) uses the
+      -- legacy wrapper — so a peer sending a side-branch block whose
+      -- prevHash ≠ BestBlock will OVERWRITE BestBlock with the
+      -- side-branch tip, corrupting the chainstate.  Documented but
+      -- not fixed in this audit.
+      contents <- readFile "src/Haskoin/Consensus.hs"
+      let block = unlines (take 20 (drop 2910 (lines contents)))
+      -- Confirm the fall-through is unconditional on any Left.
+      ("connectBlockUnchecked" `isInfixOf` block) `shouldBe` True
+      ("Left err"               `isInfixOf` block) `shouldBe` True
+
   where
     sampleTx = Tx
       { txVersion = 1
