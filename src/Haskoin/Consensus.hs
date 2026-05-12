@@ -3795,6 +3795,13 @@ initHeaderChain net = do
 -- | Add a header to the chain after validation.
 -- Returns Left with error message on failure, Right with entry on success.
 --
+-- 'minPowChecked' mirrors Bitcoin Core's @min_pow_checked@ flag in
+-- @AcceptBlockHeader@ (validation.cpp:4229-4232).  Pass 'False' for
+-- headers received from peers (MHeaders / MBlock handlers) so that the
+-- too-little-chainwork gate fires; pass 'True' only when the caller has
+-- already verified sufficient chainwork externally (e.g. IBD after the
+-- chain has crossed the threshold).
+--
 -- Validation order mirrors Bitcoin Core's
 -- 'ContextualCheckBlockHeader' (validation.cpp:4080-4121):
 --  1. PoW check (context-free)
@@ -3803,14 +3810,15 @@ initHeaderChain net = do
 --  4. Timestamp <= now + 2h (time-too-new, anti-DoS)
 --  5. Difficulty bits match expected target (bad-diffbits)
 --  6. Checkpoint verification
+--  7. min_pow_checked / too-little-chainwork (W97 G8, Core 4229-4232)
 --
 -- The future-time gate is anti-DoS: without it a peer can announce a
 -- header chain whose timestamps are far in the future, which passes
 -- PoW + MTP + difficulty (the timestamps are internally consistent so
 -- all checks pass), and pollutes 'hcEntries' until manually pruned.
 -- Reference: bitcoin-core/src/validation.cpp:4108-4110.
-addHeader :: Network -> HeaderChain -> BlockHeader -> IO (Either String ChainEntry)
-addHeader net hc header = do
+addHeader :: Network -> HeaderChain -> BlockHeader -> Bool -> IO (Either String ChainEntry)
+addHeader net hc header minPowChecked = do
   let hash = computeBlockHash header
       prevHash = bhPrevBlock header
   entries <- readTVarIO (hcEntries hc)
@@ -3886,48 +3894,67 @@ addHeader net hc header = do
                         let newEntryMtp = computeEntryMtp entries prevHash (bhTimestamp header)
                         -- Compute metadata
                         let work = cumulativeWork (ceChainWork parent) header
-                            entry = ChainEntry
-                              { ceHeader = header
-                              , ceHash = hash
-                              , ceHeight = height
-                              , ceChainWork = work
-                              , cePrev = Just prevHash
-                              , ceStatus = StatusHeaderValid
-                              , ceMedianTime = newEntryMtp
-                              }
 
-                        -- Insert and potentially update tip atomically.
-                        --
-                        -- Pattern Y companion (CORE-PARITY-AUDIT
-                        -- _reorg-via-submitblock-fleet-result-2026-05-05.md):
-                        -- the @hcByHeight@ map is the height -> hash index for
-                        -- the ACTIVE chain only.  Pre-fix this branch wrote it
-                        -- unconditionally, so a side-branch header at the same
-                        -- height as an active-chain block CLOBBERED the active
-                        -- entry — the same shape camlcoin's pre-fix
-                        -- @Sync.accept_header@ exhibited (camlcoin 22667c2) and
-                        -- the cause nimrod's @putBlockIndexHashOnly@ split off
-                        -- (nimrod 7196d41).  Bitcoin Core decouples these two
-                        -- concerns: @BlockManager::AcceptBlock@ stores the
-                        -- index entry regardless of which chain the block
-                        -- lives on (validation.cpp), while @ActivateBestChain@
-                        -- separately maintains the active-chain pointers.
-                        --
-                        -- Mirror Core: only update @hcByHeight@ when this
-                        -- header becomes the new tip (strictly heavier work).
-                        -- Side-branch headers go into @hcEntries@ (hash-keyed)
-                        -- but leave the height index pointing at the active
-                        -- chain.  Reorg-driven tip switches handle the
-                        -- height-index rewrite.
-                        atomically $ do
-                          modifyTVar' (hcEntries hc) (Map.insert hash entry)
-                          currentTip <- readTVar (hcTip hc)
-                          when (work > ceChainWork currentTip) $ do
-                            modifyTVar' (hcByHeight hc) (Map.insert height hash)
-                            writeTVar (hcTip hc) entry
-                            writeTVar (hcHeight hc) height
+                        -- Gate 7: too-little-chainwork (W97 G8 + W99 G5).
+                        -- Core: validation.cpp:4229-4232 —
+                        --   if (!min_pow_checked)
+                        --     return state.Invalid(BLOCK_HEADER_LOW_WORK,
+                        --                          "too-little-chainwork");
+                        -- When minPowChecked is False (all peer-sourced paths:
+                        -- MHeaders handler, MBlock handler, handleHeaders) we
+                        -- check the cumulative work against the per-network
+                        -- nMinimumChainWork threshold.  A peer flooding low-work
+                        -- headers that individually satisfy the declared nBits
+                        -- target can still be rejected here because regtest/testnet4/
+                        -- mainnet each set a floor that a real chain of that height
+                        -- would have crossed.  netMinimumChainWork was previously a
+                        -- dead-helper: defined in all four Network records but only
+                        -- consulted inside shouldSkipScripts (assumevalid path).
+                        if not minPowChecked && work < netMinimumChainWork net
+                          then return $ Left "too-little-chainwork"
+                          else do
+                            let entry = ChainEntry
+                                  { ceHeader = header
+                                  , ceHash = hash
+                                  , ceHeight = height
+                                  , ceChainWork = work
+                                  , cePrev = Just prevHash
+                                  , ceStatus = StatusHeaderValid
+                                  , ceMedianTime = newEntryMtp
+                                  }
 
-                        return $ Right entry
+                            -- Insert and potentially update tip atomically.
+                            --
+                            -- Pattern Y companion (CORE-PARITY-AUDIT
+                            -- _reorg-via-submitblock-fleet-result-2026-05-05.md):
+                            -- the @hcByHeight@ map is the height -> hash index for
+                            -- the ACTIVE chain only.  Pre-fix this branch wrote it
+                            -- unconditionally, so a side-branch header at the same
+                            -- height as an active-chain block CLOBBERED the active
+                            -- entry — the same shape camlcoin's pre-fix
+                            -- @Sync.accept_header@ exhibited (camlcoin 22667c2) and
+                            -- the cause nimrod's @putBlockIndexHashOnly@ split off
+                            -- (nimrod 7196d41).  Bitcoin Core decouples these two
+                            -- concerns: @BlockManager::AcceptBlock@ stores the
+                            -- index entry regardless of which chain the block
+                            -- lives on (validation.cpp), while @ActivateBestChain@
+                            -- separately maintains the active-chain pointers.
+                            --
+                            -- Mirror Core: only update @hcByHeight@ when this
+                            -- header becomes the new tip (strictly heavier work).
+                            -- Side-branch headers go into @hcEntries@ (hash-keyed)
+                            -- but leave the height index pointing at the active
+                            -- chain.  Reorg-driven tip switches handle the
+                            -- height-index rewrite.
+                            atomically $ do
+                              modifyTVar' (hcEntries hc) (Map.insert hash entry)
+                              currentTip <- readTVar (hcTip hc)
+                              when (work > ceChainWork currentTip) $ do
+                                modifyTVar' (hcByHeight hc) (Map.insert height hash)
+                                writeTVar (hcTip hc) entry
+                                writeTVar (hcHeight hc) height
+
+                            return $ Right entry
 
 -- | Persist a side-branch header that has already been validated by the
 -- caller (typically 'submitBlock' which runs the full
@@ -4091,7 +4118,9 @@ headerSyncLoop hs = forever $ do
 -- Returns the number of successfully added headers.
 handleHeaders :: HeaderSync -> [BlockHeader] -> IO (Int, [String])
 handleHeaders hs hdrs = do
-  results <- mapM (addHeader (hsNetwork hs) (hsChain hs)) hdrs
+  -- Pass minPowChecked=False: headers arrive from peers so we must enforce
+  -- the too-little-chainwork gate (W97 G8).
+  results <- mapM (\h -> addHeader (hsNetwork hs) (hsChain hs) h False) hdrs
   let successes = length [() | Right _ <- results]
       failures = [e | Left e <- results]
 

@@ -1263,14 +1263,19 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
 
   MHeaders (Headers hdrs) -> do
     putStrLn $ "Received " ++ show (length hdrs) ++ " headers"
-    -- Bypass presync/redownload state machine and add headers directly
-    -- to the chain. The anti-DoS presync is overkill for our environment.
+    -- Headers arrive from a peer so minPowChecked=False: the
+    -- too-little-chainwork gate (W97 G8) must fire for any batch
+    -- whose cumulative work is below netMinimumChainWork.  We do not
+    -- stand up the full PRESYNC/REDOWNLOAD state machine (that is
+    -- implemented in headerssync.cpp and is a separate hardening layer);
+    -- the chainwork gate provides equivalent protection against
+    -- low-work header floods without requiring the extra round-trips.
     -- Track header rejection reasons so we can attribute misbehavior:
     -- "Block header has no valid parent" -> NonContinuousHeaders
     -- "Invalid proof of work" -> InvalidBlockHeader
     pmRefVal <- readIORef pmRef
     (added, badPow, badConn) <- foldM (\(count, pow, conn) hdr -> do
-        result <- addHeader net hc hdr
+        result <- addHeader net hc hdr False
         case result of
             Right entry -> do
               -- Persist header and height index so the chain survives restarts.
@@ -1372,7 +1377,9 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
     -- First, ensure the header is in our chain index.
     -- For unsolicited blocks (received via inv->getdata), the header may
     -- not yet be in the chain. addHeader is idempotent if already known.
-    addResult <- addHeader net hc hdr
+    -- minPowChecked=False: peer-sourced blocks must pass the
+    -- too-little-chainwork gate (W97 G8 + W99 G5).
+    addResult <- addHeader net hc hdr False
     case addResult of
       Left err -> do
         isIBD <- readIORef ibdModeRef

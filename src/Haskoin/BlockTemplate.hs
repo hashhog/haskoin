@@ -625,8 +625,12 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
                       -- headers so that getblock can return raw bytes).
                       putBlock db bh block
 
-                      -- Add header to chain (in-memory index + tip update)
-                      void $ addHeader net hc (blockHeader block)
+                      -- Add header to chain (in-memory index + tip update).
+                      -- minPowChecked=False: validateFullBlockIO has already
+                      -- verified PoW, but we still run the too-little-chainwork
+                      -- gate to reject submitblock calls that would import a
+                      -- low-work fork tip (W97 G8).
+                      void $ addHeader net hc (blockHeader block) False
 
                       -- Broadcast to peers
                       let invVec = InvVector InvBlock (getBlockHashHash bh)
