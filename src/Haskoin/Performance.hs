@@ -113,9 +113,11 @@ import Foreign.C.Types (CInt(..))
 import Network.Socket (Socket, SocketOption(..), setSocketOption)
 import System.IO.MMap (mmapFileByteString)
 
+import Data.Maybe (mapMaybe)
 import Haskoin.Types
 import Haskoin.Consensus (ConsensusFlags(..))
 import qualified Haskoin.Crypto as Crypto
+import qualified Haskoin.Script as Script
 
 --------------------------------------------------------------------------------
 -- Hardware Crypto Detection (via CPUID)
@@ -351,6 +353,12 @@ chunkTransactions n txs
 --
 -- Uses atomic operations on the TVar for thread-safe UTXO access.
 -- Each transaction is validated fully before moving to the next.
+-- W96: previously this function's body contained a "placeholder - real
+-- impl uses script interpreter" comment and only checked
+-- @totalIn >= totalOut@ — i.e., it pretended to validate without ever
+-- running the script interpreter.  Same W95 stub-with-passing-test
+-- anti-pattern.  Now wired to 'Script.verifyScriptWithFlags' so any
+-- future production caller is safe.
 validateTxChunk :: [(Int, Tx)]
                 -> TVar (Map OutPoint TxOut)
                 -> ConsensusFlags
@@ -374,12 +382,29 @@ validateTxChunk ((idx, tx):rest) utxoTVar flags = do
   case result of
     Left missing -> return $ PVUTXOMissing missing
     Right prevOuts -> do
-      -- Validate transaction (placeholder - real impl uses script interpreter)
       let !totalIn = sum [txOutValue out | (_, out) <- prevOuts]
           !totalOut = sum [txOutValue out | out <- txOutputs tx]
-      if totalIn >= totalOut
-        then validateTxChunk rest utxoTVar flags
-        else return $ PVFailure idx "Outputs exceed inputs"
+      if totalIn < totalOut
+        then return $ PVFailure idx "Outputs exceed inputs"
+        else do
+          -- Script verification (W96 fix — was missing).
+          let spentAmounts = [txOutValue out | (_, out) <- prevOuts]
+              spentScripts = [txOutScript out | (_, out) <- prevOuts]
+              indexed = zip [0..] (map snd prevOuts)
+              scriptRes =
+                [ verifyOne inpIdx prevOut
+                | (inpIdx, prevOut) <- indexed
+                ]
+              verifyOne i pOut =
+                case Script.verifyScriptWithFlags Script.emptyFlags tx i
+                       (txOutScript pOut) (txOutValue pOut)
+                       spentAmounts spentScripts of
+                  Right True  -> Nothing
+                  Right False -> Just ("input " ++ show i ++ ": script returned false")
+                  Left err    -> Just ("input " ++ show i ++ ": " ++ err)
+          case [e | Just e <- scriptRes] of
+            (err:_) -> return $ PVFailure idx err
+            []      -> validateTxChunk rest utxoTVar flags
 
 --------------------------------------------------------------------------------
 -- Memory-Mapped I/O
@@ -457,32 +482,50 @@ data VerifyResult
 -- The parallel map uses 'rseq' to evaluate each verification result to WHNF,
 -- which is sufficient since the verification either succeeds or returns an
 -- error string.
+-- W96: previously this function was a stub (only checked
+-- @txOutValue > 0@ and returned 'VerifyOK' regardless of whether the
+-- input script actually validated).  Same anti-pattern as W95's
+-- @batchVerifySchnorr@ / @parallelVerifyECDSA@.  The function was
+-- exported but never wired into production validation paths (only a
+-- single test that constructs an empty block exercises it), so no
+-- on-chain behaviour was affected — but a future caller would have
+-- silently accepted invalid blocks.  We now delegate to the real
+-- script interpreter via 'Script.verifyScriptWithFlags' so this
+-- entry point is safe to reuse.
 verifyBlockScriptsParallel :: Block
                           -> Map OutPoint TxOut
                           -> ConsensusFlags
                           -> Either String ()
 verifyBlockScriptsParallel block utxoMap _flags =
   let nonCoinbase = case blockTxns block of
-        [] -> []
+        []      -> []
         (_:txs) -> txs  -- Skip coinbase
-      -- Build verification tasks for each input of each transaction
-      tasks = [ (tx, idx, prevOut)
-              | tx <- nonCoinbase
-              , (idx, inp) <- zip [0..] (txInputs tx)
-              , let mPrevOut = Map.lookup (txInPrevOutput inp) utxoMap
-              , Just prevOut <- [mPrevOut]
-              ]
-      -- Execute verifications in parallel using parallel strategies
-      -- rseq evaluates to WHNF which is sufficient for Either
+      -- Pre-compute per-tx prevouts for BIP-341 sighash (sha_amounts,
+      -- sha_scriptpubkeys).  A missing prevout is itself a verification
+      -- failure (caller must populate utxoMap before this is called).
+      tasks =
+        [ (tx, idx, spentAmounts, spentScripts, prevOut)
+        | tx <- nonCoinbase
+        , let prevs = mapMaybe
+                (\inp -> Map.lookup (txInPrevOutput inp) utxoMap)
+                (txInputs tx)
+        , length prevs == length (txInputs tx)
+        , let spentAmounts = map txOutValue prevs
+              spentScripts = map txOutScript prevs
+        , (idx, prevOut) <- zip [0..] prevs
+        ]
+      -- Execute verifications in parallel using parallel strategies.
       results = parMap rseq verifyTask tasks
-      verifyTask (!tx, !idx, !prevOut) =
-        -- In production, this would call the script interpreter
-        -- For now, we just validate the UTXO exists
-        if txOutValue prevOut > 0
-          then VerifyOK
-          else VerifyError $ "Invalid UTXO value at index " ++ show idx
+      verifyTask (!tx, !idx, !spentAmts, !spentScrs, !prevOut) =
+        case Script.verifyScriptWithFlags
+               Script.emptyFlags tx idx
+               (txOutScript prevOut) (txOutValue prevOut)
+               spentAmts spentScrs of
+          Left err    -> VerifyError $ "Input " ++ show idx ++ ": " ++ err
+          Right False -> VerifyError $ "Input " ++ show idx ++ ": script returned false"
+          Right True  -> VerifyOK
   in case [err | VerifyError err <- results] of
-       [] -> Right ()
+       []      -> Right ()
        (err:_) -> Left err
 
 -- | Generic parallel map with configurable chunk size.
