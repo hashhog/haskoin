@@ -591,36 +591,48 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
                   -- 'putBlockHeader' / 'putBlockHeight'), and best-block pointer.
                   -- The only thing left for us is the full block body and the
                   -- in-memory header chain update.
-                  connectBlock db net block height utxoMap
-
-                  -- Mirror the connect into any opted-in secondary
-                  -- indexes.  Read the freshly-persisted undo record
-                  -- back from disk so the BlockFilterIndex sees the
-                  -- exact bytes 'disconnectBlock' would; this keeps
-                  -- the GCS filter byte-for-byte compatible with
-                  -- Bitcoin Core's blockfilterindex.cpp output.
-                  case mIdxMgr of
-                    Nothing -> return ()
-                    Just im -> do
-                      mUndo <- getUndoData db bh
-                      case mUndo of
-                        Just undoData ->
-                          indexManagerConnectBlock im block
-                            (udBlockUndo undoData) bh height
+                  --
+                  -- W97/W99-G18: connectBlock now returns Either String ()
+                  -- and refuses to overwrite BestBlock when prevHash does
+                  -- not extend the current tip.  Here we are inside the
+                  -- `parent == tip` branch (line 565 guard), so the G1
+                  -- gate is structurally guaranteed to pass; if it ever
+                  -- fires we surface as Left rather than silently
+                  -- corrupting the tip.
+                  cbR <- connectBlock db net block height utxoMap
+                  case cbR of
+                    Left cbErr -> return $ Left $
+                      "submitBlock connectBlock failed (should be unreachable "
+                      <> "from the parent==tip arm): " <> cbErr
+                    Right () -> do
+                      -- Mirror the connect into any opted-in secondary
+                      -- indexes.  Read the freshly-persisted undo record
+                      -- back from disk so the BlockFilterIndex sees the
+                      -- exact bytes 'disconnectBlock' would; this keeps
+                      -- the GCS filter byte-for-byte compatible with
+                      -- Bitcoin Core's blockfilterindex.cpp output.
+                      case mIdxMgr of
                         Nothing -> return ()
+                        Just im -> do
+                          mUndo <- getUndoData db bh
+                          case mUndo of
+                            Just undoData ->
+                              indexManagerConnectBlock im block
+                                (udBlockUndo undoData) bh height
+                            Nothing -> return ()
 
-                  -- Persist the full block body (separate keyspace from headers
-                  -- so that getblock can return raw bytes).
-                  putBlock db bh block
+                      -- Persist the full block body (separate keyspace from
+                      -- headers so that getblock can return raw bytes).
+                      putBlock db bh block
 
-                  -- Add header to chain (in-memory index + tip update)
-                  void $ addHeader net hc (blockHeader block)
+                      -- Add header to chain (in-memory index + tip update)
+                      void $ addHeader net hc (blockHeader block)
 
-                  -- Broadcast to peers
-                  let invVec = InvVector InvBlock (getBlockHashHash bh)
-                  broadcastMessage pm $ MInv $ Inv [invVec]
+                      -- Broadcast to peers
+                      let invVec = InvVector InvBlock (getBlockHashHash bh)
+                      broadcastMessage pm $ MInv $ Inv [invVec]
 
-                  return $ Right ()
+                      return $ Right ()
 
 -- | Side-branch arm of 'submitBlock'.  Runs after 'validateFullBlockIO'
 -- has approved the block but its parent is NOT the active tip (so a
