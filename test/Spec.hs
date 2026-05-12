@@ -92,6 +92,7 @@ import Haskoin.Rpc
 import Haskoin.Index
 import qualified Haskoin.MuHash as MuHash
 import qualified W100UTXOCacheSpec
+import qualified W101ActivateBestChainSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22394,6 +22395,9 @@ main = hspec $ do
 
   -- W100 CCoinsViewCache + FlushStateToDisk gate audit
   W100UTXOCacheSpec.spec
+
+  -- W101 ActivateBestChain + InvalidateBlock gate audit
+  W101ActivateBestChainSpec.spec
 
   where
     sampleTx = Tx
