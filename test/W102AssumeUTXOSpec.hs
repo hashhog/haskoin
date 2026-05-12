@@ -107,6 +107,7 @@ import Haskoin.Storage
   , snapshotMagicBytes
   , loadSnapshot
   , verifySnapshot
+  , validateSnapshotCoins
   , AssumeUtxoData(..)
   , computeUtxoHash
   , Coin(..)
@@ -307,46 +308,81 @@ spec = describe "W102 AssumeUTXO snapshot loading gates" $ do
       msg `shouldSatisfy` ("refusing to load snapshot" `isSuffixOf`)
 
   -- -----------------------------------------------------------------------
-  -- G9: Per-coin height guard (BUG-9 — document absent gate)
+  -- G9: Per-coin height guard (BUG-9 — fixed via validateSnapshotCoins)
   -- -----------------------------------------------------------------------
 
-  describe "G9 per-coin height guard missing (BUG-9)" $ do
-    it "snapshot with coin.height > base_height is NOT rejected — BUG-9" $ do
-      -- Bitcoin Core validation.cpp:5818 rejects this; haskoin does not.
+  describe "G9 per-coin height guard (BUG-9 fixed)" $ do
+    it "validateSnapshotCoins rejects coin.height > base_height (BUG-9)" $ do
+      -- Bitcoin Core validation.cpp:5818: if (coin.nHeight > base_height)
+      --   return {InitStateError, "Bad snapshot data"}
       let badCoin = Coin
             { coinTxOut      = TxOut 100_000 p2pkhScript
-            , coinHeight     = 9999   -- far above any base_height
+            , coinHeight     = 9999   -- far above base_height=100
             , coinIsCoinbase = False
             }
-          sc   = SnapshotCoin (OutPoint (mkTxId 0x01) 0) badCoin
-          snap = UtxoSnapshot
-                   (SnapshotMetadata 0 (mkBlockHash 0xbb) 1)
-                   [sc]
-      -- No height guard → coin passes through (BUG-9: this should fail)
-      length (usCoins snap) `shouldBe` 1
+          sc = SnapshotCoin (OutPoint (mkTxId 0x01) 0) badCoin
+      case validateSnapshotCoins 100 [sc] of
+        Left e  -> e `shouldSatisfy` ("Bad snapshot data" `isInfixOf`)
+        Right _ -> expectationFailure
+          "validateSnapshotCoins should reject coin.height > base_height"
+
+    it "validateSnapshotCoins accepts coin.height == base_height" $ do
+      let coinAtBase = Coin
+            { coinTxOut      = TxOut 100_000 p2pkhScript
+            , coinHeight     = 100
+            , coinIsCoinbase = False
+            }
+          sc = SnapshotCoin (OutPoint (mkTxId 0x01) 0) coinAtBase
+      validateSnapshotCoins 100 [sc] `shouldBe` Right ()
+
+    it "validateSnapshotCoins accepts coin.height < base_height" $ do
+      let oldCoin = Coin
+            { coinTxOut      = TxOut 50_000 p2pkhScript
+            , coinHeight     = 50
+            , coinIsCoinbase = True
+            }
+          sc = SnapshotCoin (OutPoint (mkTxId 0x03) 0) oldCoin
+      validateSnapshotCoins 100 [sc] `shouldBe` Right ()
 
   -- -----------------------------------------------------------------------
-  -- G10: MoneyRange guard (BUG-10 — document absent gate)
+  -- G10: MoneyRange guard (BUG-10 — fixed via validateSnapshotCoins)
   -- -----------------------------------------------------------------------
 
-  describe "G10 per-coin MoneyRange guard missing (BUG-10)" $ do
+  describe "G10 per-coin MoneyRange guard (BUG-10 fixed)" $ do
     it "MAX_MONEY matches Bitcoin Core consensus/amount.h" $
       maxMoneyConst `shouldBe` 2_100_000_000_000_000
 
-    it "snapshot with coin.value > MAX_MONEY is NOT rejected — BUG-10" $ do
-      -- Bitcoin Core validation.cpp:5822 rejects this; haskoin does not.
+    it "validateSnapshotCoins rejects coin.value > MAX_MONEY (BUG-10)" $ do
+      -- Bitcoin Core validation.cpp:5822: if (!MoneyRange(coin.out.nValue))
+      --   return {InitStateError, "bad tx out value"}
       let inflated = Coin
             { coinTxOut      = TxOut (maxMoneyConst + 1) p2pkhScript
             , coinHeight     = 100
             , coinIsCoinbase = False
             }
-          sc   = SnapshotCoin (OutPoint (mkTxId 0x02) 0) inflated
-          snap = UtxoSnapshot
-                   (SnapshotMetadata 0 (mkBlockHash 0xcc) 1)
-                   [sc]
-      -- No MoneyRange check → inflated coin passes through (BUG-10)
-      txOutValue (coinTxOut (scCoin (head (usCoins snap))))
-        `shouldBe` maxMoneyConst + 1
+          sc = SnapshotCoin (OutPoint (mkTxId 0x02) 0) inflated
+      case validateSnapshotCoins 100 [sc] of
+        Left e  -> e `shouldSatisfy` ("bad tx out value" `isInfixOf`)
+        Right _ -> expectationFailure
+          "validateSnapshotCoins should reject coin.value > MAX_MONEY"
+
+    it "validateSnapshotCoins accepts coin.value == MAX_MONEY" $ do
+      let atMax = Coin
+            { coinTxOut      = TxOut maxMoneyConst p2pkhScript
+            , coinHeight     = 100
+            , coinIsCoinbase = False
+            }
+          sc = SnapshotCoin (OutPoint (mkTxId 0x04) 0) atMax
+      validateSnapshotCoins 100 [sc] `shouldBe` Right ()
+
+    it "validateSnapshotCoins accepts coin.value == 0" $ do
+      let zeroCoin = Coin
+            { coinTxOut      = TxOut 0 p2pkhScript
+            , coinHeight     = 50
+            , coinIsCoinbase = False
+            }
+          sc = SnapshotCoin (OutPoint (mkTxId 0x05) 0) zeroCoin
+      validateSnapshotCoins 100 [sc] `shouldBe` Right ()
 
   -- -----------------------------------------------------------------------
   -- G15–G17: Background validation invariants (BUG-5, BUG-6, BUG-7)
