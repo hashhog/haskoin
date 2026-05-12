@@ -24,7 +24,7 @@ import Data.Maybe (mapMaybe, fromMaybe)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
 import Data.Word (Word32, Word64)
-import Data.Int (Int32)
+import Data.Int (Int32, Int64)
 import Data.IORef
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
@@ -41,6 +41,7 @@ import qualified Network.HTTP.Types as HTTP
 import qualified Network.Socket as NS (getAddrInfo, addrAddress, AddrInfo)
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeBlockHash, textToAddress, Address(..))
+import qualified Haskoin.Crypto as Crypto (computeWtxid)
 import Haskoin.Script (decodeScript)
 import Haskoin.Network
 import Haskoin.Consensus
@@ -740,6 +741,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     ibdModeRef <- newIORef True
     -- Recently-rejected transaction filter (cleared on each new block)
     recentlyRejectedRef <- newIORef (Set.empty :: Set.Set TxId)
+    -- BIP-339 wtxid-keyed orphan pool (W99 G12/G13/G14)
+    orphanPoolRef <- newIORef emptyOrphanPool
     -- Durability: count blocks since last chainstate flush. We do a
     -- periodic synchronous WAL fsync (see doPeriodicFlush) every
     -- flushBlockInterval blocks OR every flushTimeInterval seconds,
@@ -838,7 +841,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           }
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr addr msg
+      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr msg
         `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
     writeIORef pmRef pm
 
@@ -1230,6 +1233,120 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (chunk, rest) = splitAt n xs in chunk : chunksOf n rest
 
+--------------------------------------------------------------------------------
+-- Orphan Pool — BIP-339 wtxid-keyed (W99 G12/G13/G14)
+--------------------------------------------------------------------------------
+
+-- | In-memory orphan transaction pool.
+--
+-- Primary key  : Wtxid  (BIP-339 / Bitcoin Core txorphanage.h)
+-- Secondary idx: parent TxId → Set of child Wtxid
+--               (used for child-resolution on parent accept — mirrors Core's
+--                m_outpoint_to_orphan_it map in txorphanage.h)
+--
+-- Core reference: src/node/txorphanage.h — TxOrphanage uses wtxid as the
+-- primary key and AddChildrenToWorkSet(parent) for orphan re-queuing.
+-- Orphans expire after ORPHAN_TX_EXPIRE_TIME (5 min, net_processing.cpp:101).
+data OrphanPool = OrphanPool
+  { orphanPool  :: !(Map.Map Wtxid (Tx, Int64))
+    -- ^ Primary wtxid-keyed store.  Value is (tx, insertion-epoch-seconds).
+  , orphanWtxid :: !(Map.Map TxId (Set.Set Wtxid))
+    -- ^ Secondary index: parent TxId → Set of child Wtxids.
+    -- Populated by 'addOrphan'; used by 'processOrphan' to find all orphans
+    -- that spend outputs of a newly-accepted parent transaction.
+  } deriving (Show)
+
+emptyOrphanPool :: OrphanPool
+emptyOrphanPool = OrphanPool Map.empty Map.empty
+
+-- | Maximum orphan pool size (Bitcoin Core DEFAULT_MAX_ORPHAN_TRANSACTIONS=100).
+maxOrphanTxs :: Int
+maxOrphanTxs = 100
+
+-- | Orphan expiry in seconds (Bitcoin Core ORPHAN_TX_EXPIRE_TIME=300).
+orphanExpireSecs :: Int64
+orphanExpireSecs = 300
+
+-- | Add a transaction to the orphan pool keyed by its wtxid (BIP-339).
+-- Drops the oldest entry (by map order) when the pool is full.
+-- No-op if the wtxid is already present (exact-duplicate dedup).
+-- The secondary 'orphanWtxid' index maps each input's parent TxId to this
+-- orphan's wtxid so that 'processOrphan' can find it on parent acceptance.
+addOrphan :: IORef OrphanPool -> Tx -> Int64 -> IO ()
+addOrphan ref tx now = modifyIORef' ref $ \op ->
+  let wtxid    = Crypto.computeWtxid tx
+      parentIds = map (outPointHash . txInPrevOutput) (txInputs tx)
+  in if Map.member wtxid (orphanPool op)
+       then op  -- already present — deduplicate by wtxid
+       else
+         -- Evict the minimum-key entry when at capacity
+         let op' = if Map.size (orphanPool op) >= maxOrphanTxs
+                     then case Map.minViewWithKey (orphanPool op) of
+                            Nothing -> op
+                            Just ((_evictW, (evictTx, _)), m') ->
+                              let evictW2 = Crypto.computeWtxid evictTx
+                                  evictParents = map (outPointHash . txInPrevOutput) (txInputs evictTx)
+                                  removeChild pTxId idx =
+                                    Map.alter (\ms -> case ms of
+                                      Nothing  -> Nothing
+                                      Just s   -> let s' = Set.delete evictW2 s
+                                                  in if Set.null s' then Nothing else Just s'
+                                      ) pTxId idx
+                                  idx' = foldr removeChild (orphanWtxid op) evictParents
+                              in op { orphanPool  = m'
+                                    , orphanWtxid = idx'
+                                    }
+                     else op
+             -- Insert new orphan into primary store
+             pool' = Map.insert wtxid (tx, now) (orphanPool op')
+             -- Index this orphan under each of its parent TxIds
+             addChild pTxId idx =
+               Map.insertWith Set.union pTxId (Set.singleton wtxid) idx
+             idx' = foldr addChild (orphanWtxid op') parentIds
+         in op' { orphanPool  = pool'
+                , orphanWtxid = idx'
+                }
+
+-- | Remove expired orphans (older than 'orphanExpireSecs') from the pool.
+expireOrphans :: IORef OrphanPool -> Int64 -> IO ()
+expireOrphans ref now = modifyIORef' ref $ \op ->
+  let (keep, discard) = Map.partition (\(_, t) -> now - t < orphanExpireSecs) (orphanPool op)
+      discardWtxids   = Map.keysSet discard
+      pruneIdx        = Map.map (Set.\\ discardWtxids) (orphanWtxid op)
+      cleanIdx        = Map.filter (not . Set.null) pruneIdx
+  in op { orphanPool  = keep
+        , orphanWtxid = cleanIdx
+        }
+
+-- | Look up orphan children of a newly-accepted transaction and re-try them.
+-- Mirrors Bitcoin Core ProcessOrphanTx / AddChildrenToWorkSet: after a parent
+-- is accepted, all queued orphans that spend its outputs are re-submitted.
+processOrphan :: IORef OrphanPool -> Mempool -> TxId -> Int64 -> IO ()
+processOrphan ref mp parentTxId now = do
+  expireOrphans ref now
+  op <- readIORef ref
+  let childWtxids = Map.findWithDefault Set.empty parentTxId (orphanWtxid op)
+  forM_ (Set.toList childWtxids) $ \wtxid ->
+    case Map.lookup wtxid (orphanPool op) of
+      Nothing       -> return ()
+      Just (orphTx, _) -> do
+        -- Remove from pool before retry to avoid double-processing
+        modifyIORef' ref $ \o ->
+          let parentIds2 = map (outPointHash . txInPrevOutput) (txInputs orphTx)
+              removeChild pTxId idx =
+                Map.alter (\ms -> case ms of
+                  Nothing -> Nothing
+                  Just s  -> let s' = Set.delete wtxid s
+                             in if Set.null s' then Nothing else Just s'
+                  ) pTxId idx
+              idx'   = foldr removeChild (orphanWtxid o) parentIds2
+          in o { orphanPool  = Map.delete wtxid (orphanPool o)
+               , orphanWtxid = idx'
+               }
+        -- Re-try admission to the mempool.  Another missing input re-queues
+        -- this tx as a new orphan; a successful accept handles relay in MTx.
+        void $ addTransaction mp orphTx
+
 -- | Case-insensitive infix substring check used by message-handler
 -- misbehavior classifiers.  Lower-cases both sides before
 -- 'Data.List.isInfixOf' so error strings like "Invalid PoW",
@@ -1256,8 +1373,10 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- enabled indexes (txindex /
                       -- blockfilterindex / coinstatsindex) so the
                       -- index tracks the chain in real time.
+                   -> IORef OrphanPool
+                      -- ^ BIP-339 wtxid-keyed orphan pool (W99 G12/G13/G14).
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr addr msg = case msg of
+syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -1524,22 +1643,36 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         pm <- readIORef pmRef
         let invVec = InvVector InvWitnessTx (getTxIdHash txid)
         broadcastMessage pm (MInv (Inv [invVec]))
+        -- G13: recursive orphan resolution — re-try any queued orphan that
+        -- listed this tx as a parent.  Mirrors Bitcoin Core ProcessOrphanTx
+        -- (net_processing.cpp) which iterates AddChildrenToWorkSet after
+        -- each parent accept.
+        now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+        processOrphan orphanPoolRef mp txid now
       Left err -> do
-        -- Add to recently-rejected filter
-        rejected <- readIORef recentlyRejectedRef
-        when (Set.size rejected < 50000) $
-          writeIORef recentlyRejectedRef (Set.insert txid rejected)
-        -- Attribute misbehavior on consensus-invalid txs.  We deliberately
-        -- skip soft / policy-only rejections (mempool full, fee too low,
-        -- duplicate) — those are honest peer behavior.  Reference:
-        -- bitcoin-core/src/net_processing.cpp:3045 — only state.IsInvalid
-        -- (consensus failure) increments the score, not policy rejects.
-        let errStr = show err
-        when ("consensus" `infixOfStr` errStr
-             || "invalid"       `infixOfStr` errStr
-             || "bad-"          `infixOfStr` errStr) $ do
-          pm <- readIORef pmRef
-          void $ misbehaving pm addr InvalidTransaction
+        -- G12: on ErrMissingInput, park the tx in the wtxid-keyed orphan pool
+        -- instead of immediately discarding it.  Core: TX_MISSING_INPUTS path
+        -- calls AddOrphanTx (net_processing.cpp:3078).
+        case err of
+          ErrMissingInput _ -> do
+            now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+            addOrphan orphanPoolRef tx now
+          _ -> do
+            -- Add to recently-rejected filter for non-orphan failures
+            rejected <- readIORef recentlyRejectedRef
+            when (Set.size rejected < 50000) $
+              writeIORef recentlyRejectedRef (Set.insert txid rejected)
+            -- Attribute misbehavior on consensus-invalid txs.  We deliberately
+            -- skip soft / policy-only rejections (mempool full, fee too low,
+            -- duplicate) — those are honest peer behavior.  Reference:
+            -- bitcoin-core/src/net_processing.cpp:3045 — only state.IsInvalid
+            -- (consensus failure) increments the score, not policy rejects.
+            let errStr = show err
+            when ("consensus" `infixOfStr` errStr
+                 || "invalid"       `infixOfStr` errStr
+                 || "bad-"          `infixOfStr` errStr) $ do
+              pm <- readIORef pmRef
+              void $ misbehaving pm addr InvalidTransaction
 
   MGetData (GetData ivs) -> do
     pm <- readIORef pmRef
@@ -1731,7 +1864,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           then case fillPartialBlock pdb [] of
             Right block -> do
               putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr addr (MBlock block)
+              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr (MBlock block)
             Left err -> do
               putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
               pm <- readIORef pmRef

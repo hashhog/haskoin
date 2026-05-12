@@ -22182,34 +22182,32 @@ main = hspec $ do
     it "G11 MAX=100: mpcMaxOrphans default is 100 (W99)" $ do
       mpcMaxOrphans defaultMempoolConfig `shouldBe` 100
 
-    it "G12 BUG: orphan expiry (5-min) absent — orphan pool entry not time-bounded (W99 DOS)" $ do
-      -- Bitcoin Core ProcessOrphanTx removes orphans older than 5 min.
-      -- haskoin MempoolConfig has mpcMaxOrphans but no expiry field for
-      -- orphans specifically; the orphan code path in the MTx handler
-      -- (app/Main.hs ~1466) does NOT insert ErrMissingInput txs into an
-      -- orphan pool at all — it just drops them into recentlyRejectedRef.
-      -- This means orphan resolution (G13) is also absent.
+    it "G12 FIXED: orphan expiry (5-min) present — ErrMissingInput parks tx in orphan pool (W99 DOS)" $ do
+      -- FIX (W99 G12): The MTx handler now pattern-matches ErrMissingInput
+      -- and calls addOrphan (wtxid-keyed) with a timestamp, enabling the
+      -- 5-minute expiry enforced by expireOrphans (orphanExpireSecs=300).
+      -- Previously, ErrMissingInput txs were silently dropped into
+      -- recentlyRejectedRef with no expiry or re-try.
       contents <- readFile "app/Main.hs"
-      -- No orphan pool insertion on ErrMissingInput:
-      ("ErrMissingInput" `isInfixOf` contents) `shouldBe` False
+      -- orphan pool insertion on ErrMissingInput is now present:
+      ("ErrMissingInput" `isInfixOf` contents) `shouldBe` True
 
-    it "G13 BUG: recursive resolve on parent accept absent (W99 CORRECTNESS)" $ do
-      -- Core: when a parent tx is accepted, ProcessOrphanTx recursively
-      -- re-tries orphans that depended on it.  haskoin drops missing-input
-      -- txs into the recently-rejected filter instead of an orphan pool,
-      -- so there is no re-try on parent acceptance.
+    it "G13 FIXED: recursive resolve on parent accept present (W99 CORRECTNESS)" $ do
+      -- FIX (W99 G13): After a tx is accepted, processOrphan is called
+      -- with the new txid to re-try any queued orphans that spent its
+      -- outputs.  Mirrors Bitcoin Core ProcessOrphanTx / AddChildrenToWorkSet.
       contents <- readFile "app/Main.hs"
-      ("addOrphan"      `isInfixOf` contents) `shouldBe` False
-      ("orphanPool"     `isInfixOf` contents) `shouldBe` False
-      ("processOrphan"  `isInfixOf` contents) `shouldBe` False
+      ("addOrphan"      `isInfixOf` contents) `shouldBe` True
+      ("orphanPool"     `isInfixOf` contents) `shouldBe` True
+      ("processOrphan"  `isInfixOf` contents) `shouldBe` True
 
-    it "G14 BUG: WTxId-keyed orphan pool absent (W99 CORRECTNESS)" $ do
-      -- Core uses wtxid as the orphan pool key (BIP-339 parity).
-      -- Since haskoin has no orphan pool at all (G12/G13), WTxId keying
-      -- is also absent.
+    it "G14 FIXED: WTxId-keyed orphan pool present — BIP-339 primary key (W99 CORRECTNESS)" $ do
+      -- FIX (W99 G14): OrphanPool.orphanPool is Map Wtxid (Tx, Int64)
+      -- (wtxid = primary key, BIP-339).  Secondary index orphanWtxid maps
+      -- parent TxId → Set Wtxid for child-resolution on parent accept.
+      -- Mirrors Bitcoin Core txorphanage.h TxOrphanage primary key design.
       contents <- readFile "app/Main.hs"
-      ("wtxidOrphan"    `isInfixOf` contents) `shouldBe` False
-      ("orphanWtxid"    `isInfixOf` contents) `shouldBe` False
+      ("orphanWtxid"    `isInfixOf` contents) `shouldBe` True
 
   describe "W99 ProcessBlock gates (G15-G18)" $ do
 
