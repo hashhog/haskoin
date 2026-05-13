@@ -115,7 +115,7 @@ import System.IO.MMap (mmapFileByteString)
 
 import Data.Maybe (mapMaybe)
 import Haskoin.Types
-import Haskoin.Consensus (ConsensusFlags(..))
+import Haskoin.Consensus (ConsensusFlags(..), consensusFlagsToScriptFlags)
 import qualified Haskoin.Crypto as Crypto
 import qualified Haskoin.Script as Script
 
@@ -396,7 +396,7 @@ validateTxChunk ((idx, tx):rest) utxoTVar flags = do
                 | (inpIdx, prevOut) <- indexed
                 ]
               verifyOne i pOut =
-                case Script.verifyScriptWithFlags Script.emptyFlags tx i
+                case Script.verifyScriptWithFlags (consensusFlagsToScriptFlags flags) tx i
                        (txOutScript pOut) (txOutValue pOut)
                        spentAmounts spentScripts of
                   Right True  -> Nothing
@@ -496,7 +496,7 @@ verifyBlockScriptsParallel :: Block
                           -> Map OutPoint TxOut
                           -> ConsensusFlags
                           -> Either String ()
-verifyBlockScriptsParallel block utxoMap _flags =
+verifyBlockScriptsParallel block utxoMap flags =
   let nonCoinbase = case blockTxns block of
         []      -> []
         (_:txs) -> txs  -- Skip coinbase
@@ -518,7 +518,7 @@ verifyBlockScriptsParallel block utxoMap _flags =
       results = parMap rseq verifyTask tasks
       verifyTask (!tx, !idx, !spentAmts, !spentScrs, !prevOut) =
         case Script.verifyScriptWithFlags
-               Script.emptyFlags tx idx
+               (consensusFlagsToScriptFlags flags) tx idx
                (txOutScript prevOut) (txOutValue prevOut)
                spentAmts spentScrs of
           Left err    -> VerifyError $ "Input " ++ show idx ++ ": " ++ err
