@@ -120,6 +120,7 @@ import Haskoin.Crypto (computeTxId, computeWtxid)
 import Haskoin.Network
   ( InvType(..), InvVector(..), Inv(..), GetData(..)
   , maxInvSz
+  , maxGetDataSz
   , invTypeToWord32, word32ToInvType
   , inventoryBroadcastMax
   , outboundInventoryBroadcastInterval
@@ -180,30 +181,33 @@ spec_G1_maxInvSz = describe "G1 MAX_INV_SZ constant" $ do
 
 --------------------------------------------------------------------------------
 -- G2: MAX_GETDATA_SZ = 1000
--- BUG-5: No enforcement of the 1000-item outbound GETDATA cap
+-- BUG-5 FIXED: outbound GETDATA now batched at maxGetDataSz=1000
 --------------------------------------------------------------------------------
 
--- | Core's MAX_GETDATA_SZ = 1000 (net_processing.cpp:128).
---   The MInv handler (Main.hs:1810) can emit a single GetData for all
---   N unknown inv vectors in one message — no 1000-item cap.
---
---   We test that the constant is at minimum defined and correct, then
---   document the missing enforcement.
+-- | Core's MAX_GETDATA_SZ = 1000 (protocol.h:482).
+--   The MInv handler (Main.hs) now batches outgoing GetData at maxGetDataSz.
+--   Reference: bitcoin-core/src/net_processing.cpp:6207.
 spec_G2_maxGetDataSz :: Spec
-spec_G2_maxGetDataSz = describe "G2 MAX_GETDATA_SZ = 1000 (BUG-5: enforcement absent)" $ do
-  -- The constant exists conceptually; check MAX_INV_SZ for sanity first.
-  it "MAX_INV_SZ (50_000) > 1000 so uncapped getdata can exceed Core limit" $
-    (fromIntegral maxInvSz :: Int) > 1000 `shouldBe` True
+spec_G2_maxGetDataSz = describe "G2 MAX_GETDATA_SZ = 1000 (BUG-5 FIXED)" $ do
+  it "maxGetDataSz constant equals Bitcoin Core's MAX_GETDATA_SZ = 1000" $
+    -- Network.hs: maxGetDataSz = 1_000
+    -- Reference: bitcoin-core/src/protocol.h:482
+    maxGetDataSz `shouldBe` 1000
 
-  it "BUG-5 REGRESSION: a 2000-item GetData must be rejected or split at 1000 (currently not done)" $ do
-    -- Build a GetData of 2000 items — all valid inv type/hash pairs.
+  it "MAX_INV_SZ (50_000) > maxGetDataSz (1000): application-level cap is stricter than wire cap" $
+    (fromIntegral maxInvSz :: Int) `shouldSatisfy` (> maxGetDataSz)
+
+  it "BUG-5 FIXED: a 2000-item inv is split into batches of at most maxGetDataSz=1000" $ do
+    -- Build 2000 inv vectors and simulate the batching the MInv handler now applies.
     let ivs = [ InvVector InvWitnessTx (getTxIdHash (computeTxId (makeTx (fromIntegral i))))
               | i <- [1..2000 :: Int] ]
-        gd  = GetData ivs
-    -- Document that haskoin does NOT enforce the 1000-item cap:
-    -- the list goes in un-truncated.
-    length (getDataList gd) `shouldBe` 2000
-    -- EXPECTED (post-fix): length (getDataList gd) `shouldBe` 1000
+        chunksOf' _ [] = []
+        chunksOf' n xs = let (a, b) = splitAt n xs in a : chunksOf' n b
+        batches = chunksOf' maxGetDataSz ivs
+    -- Two full batches of 1000 each — no single GetData exceeds the cap.
+    length batches `shouldBe` 2
+    all (\b -> length b <= maxGetDataSz) batches `shouldBe` True
+    map length batches `shouldBe` [1000, 1000]
 
 --------------------------------------------------------------------------------
 -- G3: Inv type encoding — InvWitnessTx = MSG_WTX = 5
