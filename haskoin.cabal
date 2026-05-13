@@ -111,6 +111,7 @@ test-suite haskoin-test
                , W103TxRelaySpec
                , W104AddrManSpec
                , W105CheckQueueSpec
+               , W106MempoolSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
