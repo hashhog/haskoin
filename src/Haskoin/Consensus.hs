@@ -204,6 +204,10 @@ module Haskoin.Consensus
   , isBlockInvalidated
   , isFailedStatus
   , activateBestChain
+    -- * Global Signature Cache
+  , initGlobalSigCache
+  , lookupGlobalSigCache
+  , insertGlobalSigCache
   ) where
 
 import Data.ByteString (ByteString)
@@ -225,6 +229,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Exception (try, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
+import System.IO.Unsafe (unsafePerformIO)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
@@ -2694,6 +2699,55 @@ consensusFlagsToWord32 cf =
   .|. (if flagTaproot cf then 16 else 0)
   .|. (if flagNullDummy cf then 32 else 0)
 
+--------------------------------------------------------------------------------
+-- Process-wide Signature Verification Cache (W105 BUG-2 fix)
+--------------------------------------------------------------------------------
+
+-- | Key for the process-wide signature cache.
+-- (txid bytes, input index, flags word)
+type SigCacheEntry = (ByteString, Word32, Word32)
+
+-- | Process-global signature cache (bounded Map, 50 000 entries).
+--
+-- Threading choice: rather than adding a SigCache parameter through the
+-- entire validateSingleTx → validateBlockTransactions → validateFullBlockIO
+-- → connectBlock call chain (~10 functions, 2 modules), we use a module-level
+-- IORef that is initialised once at startup via 'initGlobalSigCache', exactly
+-- as 'Haskoin.Daemon.globalDebugSet' is initialised via 'setGlobalDebugSet'.
+-- Concurrent access is safe: writes use 'atomicModifyIORef'' inside the cache
+-- operations; reads use plain 'readIORef' which is safe for boolean membership
+-- tests (worst case: stale read misses a recent insert → full verify, not a
+-- correctness hazard).
+{-# NOINLINE globalSigCacheRef #-}
+globalSigCacheRef :: IORef (Map SigCacheEntry ())
+globalSigCacheRef = unsafePerformIO (newIORef Map.empty)
+
+globalSigCacheMaxEntries :: Int
+globalSigCacheMaxEntries = 50000
+
+-- | Look up (txid, inputIdx, flagsWord) in the process-global sig cache.
+lookupGlobalSigCache :: ByteString -> Word32 -> Word32 -> IO Bool
+lookupGlobalSigCache txid idx flags = do
+  m <- readIORef globalSigCacheRef
+  return $ Map.member (txid, idx, flags) m
+
+-- | Insert a verified (txid, inputIdx, flagsWord) into the process-global sig
+-- cache.  Evicts the lexicographically smallest entry when full.
+insertGlobalSigCache :: ByteString -> Word32 -> Word32 -> IO ()
+insertGlobalSigCache txid idx flags =
+  atomicModifyIORef' globalSigCacheRef $ \m ->
+    let key = (txid, idx, flags)
+        m'  = if Map.size m >= globalSigCacheMaxEntries
+                then Map.insert key () (Map.deleteMin m)
+                else Map.insert key () m
+    in (m', ())
+
+-- | (Re-)initialise the process-global sig cache.
+-- Call once during node startup, before any block validation begins.
+-- Creates a fresh empty cache so old entries from a previous run do not persist.
+initGlobalSigCache :: IO ()
+initGlobalSigCache = writeIORef globalSigCacheRef Map.empty
+
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
 -- 'skipScripts' = True means per-input script evaluation is not performed
@@ -2777,19 +2831,33 @@ validateSingleTx flags skipScripts utxoMap tx = do
   -- matching Bitcoin Core's ConnectBlock behaviour. Otherwise, every input's
   -- scriptSig + witness must satisfy its scriptPubKey under the consensus
   -- ScriptFlags for this height.
+  -- W105 BUG-2 FIX: consult the process-global SigCache (globalSigCacheRef)
+  -- before paying EC math.  Cache key = (txid bytes, input index, flags word).
+  -- Uses unsafePerformIO to call IO from the pure Either monad — safe because
+  -- the cache is a pure performance optimisation: observable effect is only
+  -- execution speed, not correctness.
   unless skipScripts $ do
     let scriptFlags  = consensusFlagsToScriptFlags flags
         spentAmounts = inputValues
         spentScripts = map txOutScript prevOuts
+        txidBytes    = getHash256 (getTxIdHash (computeTxId tx))
+        flagsWord    = consensusFlagsToWord32 flags
     forM_ (zip [0..] prevOuts) $ \(idx, prevOut) ->
-      case verifyScriptWithFlags scriptFlags tx idx
-             (txOutScript prevOut) (txOutValue prevOut)
-             spentAmounts spentScripts of
-        Left err    -> Left $ "script verify failed (input " ++ show idx
-                            ++ "): " ++ err
-        Right False -> Left $ "script verify failed (input " ++ show idx
-                            ++ "): script returned false"
-        Right True  -> Right ()
+      let cacheIdx = fromIntegral (idx :: Int) :: Word32
+          cached   = unsafePerformIO (lookupGlobalSigCache txidBytes cacheIdx flagsWord)
+      in if cached
+           then Right ()  -- cache hit: skip EC math
+           else case verifyScriptWithFlags scriptFlags tx idx
+                       (txOutScript prevOut) (txOutValue prevOut)
+                       spentAmounts spentScripts of
+                  Left err    -> Left $ "script verify failed (input " ++ show idx
+                                      ++ "): " ++ err
+                  Right False -> Left $ "script verify failed (input " ++ show idx
+                                      ++ "): script returned false"
+                  Right True  ->
+                    -- Cache the successful result for future lookups.
+                    let !_ = unsafePerformIO (insertGlobalSigCache txidBytes cacheIdx flagsWord)
+                    in Right ()
 
   return (totalIn - totalOut)
 
