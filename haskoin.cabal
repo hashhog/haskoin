@@ -112,6 +112,7 @@ test-suite haskoin-test
                , W104AddrManSpec
                , W105CheckQueueSpec
                , W106MempoolSpec
+               , W107CompactSizeSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
