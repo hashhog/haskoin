@@ -1700,10 +1700,21 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
     result <- addTransaction mp tx
     case result of
       Right _ -> do
-        -- Relay accepted tx inv to all connected peers
+        -- BIP-339: relay accepted tx inv to all connected peers,
+        -- selecting InvWtx (MSG_WTX=5) + wtxid for wtxid-relay peers
+        -- and InvTx (type=1) + txid for legacy peers.
+        -- Reference: bitcoin-core/src/net_processing.cpp RelayTransaction.
         pm <- readIORef pmRef
-        let invVec = InvVector InvWitnessTx (getTxIdHash txid)
-        broadcastMessage pm (MInv (Inv [invVec]))
+        let wtxid = Crypto.computeWtxid tx
+        peers <- readTVarIO (pmPeers pm)
+        forM_ (Map.elems peers) $ \pc -> do
+          info <- readTVarIO (pcInfo pc)
+          when (piState info == PeerConnected && not (piBlockOnly info)) $ do
+            let (itype, ihash)
+                  | piWtxidRelay info = (InvWtx, getWtxidHash wtxid)
+                  | otherwise         = (InvTx,  getTxIdHash txid)
+            sendMessage pc (MInv (Inv [InvVector itype ihash]))
+              `catch` (\(_ :: SomeException) -> return ())
         -- G13: recursive orphan resolution — re-try any queued orphan that
         -- listed this tx as a parent.  Mirrors Bitcoin Core ProcessOrphanTx
         -- (net_processing.cpp) which iterates AddChildrenToWorkSet after
@@ -1787,9 +1798,36 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           requestFromPeer pm addr (MGetData (GetData witnessIvs))
             `catch` (\(_ :: SomeException) -> return ())
 
-    -- Request unknown transactions (not in mempool, not recently rejected)
-    let txIvs = filter (\iv -> ivType iv == InvTx
-                             || ivType iv == InvWitnessTx) ivs
+    -- BUG-14 FIX: reject tx invs from block-relay-only peers.
+    -- Core: RejectIncomingTxs() returns true for block-relay-only connections;
+    -- a tx inv from such a peer triggers pfrom.fDisconnect = true.
+    -- Reference: bitcoin-core/src/net_processing.cpp:4080.
+    pm0 <- readIORef pmRef
+    peerIsBlockOnly <- do
+      peerMap <- readTVarIO (pmPeers pm0)
+      case Map.lookup addr peerMap of
+        Just pc -> piBlockOnly <$> readTVarIO (pcInfo pc)
+        Nothing -> return False
+    -- BUG-2 FIX: read the per-peer wtxid-relay flag for BIP-339 filtering.
+    peerWtxidRelay <- do
+      peerMap <- readTVarIO (pmPeers pm0)
+      case Map.lookup addr peerMap of
+        Just pc -> piWtxidRelay <$> readTVarIO (pcInfo pc)
+        Nothing -> return False
+
+    -- Request unknown transactions (not in mempool, not recently rejected).
+    -- BIP-339 / Core PR #18044: accept InvWtx (MSG_WTX=5) in addition to
+    -- InvTx (type=1) and InvWitnessTx (0x40000001, legacy compat).
+    -- Apply Core's filter: if peer is wtxid-relay, ignore InvTx entries
+    -- (they were replaced by InvWtx); if not, ignore InvWtx entries.
+    let isTxInv iv = ivType iv == InvTx || ivType iv == InvWitnessTx || ivType iv == InvWtx
+        txIvsRaw   = filter isTxInv ivs
+        -- BUG-339 filter per Core net_processing.cpp:4059-4063:
+        --   m_wtxid_relay ? drop InvTx : drop InvWtx
+        txIvs
+          | peerIsBlockOnly = []  -- BUG-14: no tx inv from block-relay-only
+          | peerWtxidRelay  = filter (\iv -> ivType iv /= InvTx)  txIvsRaw
+          | otherwise       = filter (\iv -> ivType iv /= InvWtx) txIvsRaw
     unless (null txIvs) $ do
       rejected <- readIORef recentlyRejectedRef
       -- Filter to unknown txs: not in mempool and not recently rejected
@@ -1979,7 +2017,19 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         i { piWantsHeaders = True }
       Nothing -> return ()
   MSendCmpct _ -> return ()
-  MWtxidRelay -> return ()
+  MWtxidRelay -> do
+    -- BIP-339: peer is requesting wtxid-based relay.
+    -- Set piWtxidRelay=True so all three relay paths (MTx handler,
+    -- broadcastTxToPeers, sendtoaddress) can select InvWtx (MSG_WTX=5)
+    -- + wtxid for this peer instead of InvTx (type=1) + txid.
+    -- Reference: bitcoin-core/src/net_processing.cpp:2027
+    --   peer.m_wtxid_relay = true;
+    pm <- readIORef pmRef
+    peerMap <- readTVarIO (pmPeers pm)
+    case Map.lookup addr peerMap of
+      Just pc -> atomically $ modifyTVar' (pcInfo pc) $ \i ->
+        i { piWtxidRelay = True }
+      Nothing -> return ()
 
   MMemPool -> do
     -- BIP-35: serve our mempool to the requesting peer.
