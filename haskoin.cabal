@@ -114,6 +114,7 @@ test-suite haskoin-test
                , W106MempoolSpec
                , W107CompactSizeSpec
                , W108GbtSpec
+               , W109BlockIndexSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
