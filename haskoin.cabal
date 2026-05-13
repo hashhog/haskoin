@@ -24,6 +24,7 @@ library
                  , Haskoin.MuHash
                  , Haskoin.TaprootSighash
                  , Haskoin.Daemon
+                 , Haskoin.TxOrphanage
                  , System.ZMQ4
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
