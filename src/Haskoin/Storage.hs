@@ -739,18 +739,15 @@ data Coin = Coin
 
 instance NFData Coin
 
+-- BUG-1 FIX (W107 G11 P0-CDIV): delegate to putCoreCoin/getCoreCoin so that
+-- every encode/decode of Coin (lines 526, 709, 851, 1070, 1110, 1567, 2721)
+-- uses Core VARINT + TxOutCompression rather than CompactSize + raw TxOut.
+-- The old instance used CompactSize (wrong) for the code field and uncompressed
+-- TxOut (wrong), diverging from bitcoin-core/src/coins.h Coin::Serialize for
+-- any coin at height >= 64 (code = height*2 >= 128).
 instance Serialize Coin where
-  put Coin{..} = do
-    -- Encode: (height << 1) | coinbase_flag
-    let code = (coinHeight `shiftL` 1) .|. (if coinIsCoinbase then 1 else 0)
-    put (VarInt (fromIntegral code))
-    put coinTxOut
-  get = do
-    VarInt code <- get
-    let height = fromIntegral (code `shiftR` 1)
-        isCoinbase = (code .&. 1) == 1
-    txout <- get
-    return $ Coin txout height isCoinbase
+  put = putCoreCoin
+  get = getCoreCoin
 
 -- | Check if a coin is "spent" (null output).
 -- A spent coin has a null TxOut (value 0, empty script).
@@ -1227,23 +1224,40 @@ data TxInUndo = TxInUndo
   , tuCoinbase :: !Bool      -- ^ True if from a coinbase transaction
   } deriving (Show, Eq, Generic)
 
+-- BUG-2 FIX (W107 G12 P0-CDIV): nCode encoded with Core VARINT (putCoreVarInt),
+--   not CompactSize (VarInt). Core's TxInUndoFormatter uses VARINT(nCode), which
+--   is the MSB-base-128 encoding, NOT the 0xFD/0xFE/0xFF CompactSize wire format.
+--   For height=64 (non-coinbase) nCode=128: CompactSize=[0x80] (1 byte) vs
+--   CoreVarInt=[0x80,0x00] (2 bytes) — they diverge on-disk.
+--
+-- BUG-3 FIX (W107 G13 P0-CDIV): TxOut serialized with TxOutCompression
+--   (putCoreVarInt(compressAmount(value)) + putCompressedScript(script)),
+--   not raw TxOut (LE64 value + VarInt(len) + script).
+--   Core's TxInUndoFormatter uses ::Serialize(s, Using<TxOutCompression>(txout.out)).
+--
+-- The dummy version byte (0x00 when height > 0) is correct as-is: Core writes
+-- VARINT(nVersionDummy) where nVersionDummy=0, and CoreVarInt(0) = [0x00] = Word8 0.
 instance Serialize TxInUndo where
   put TxInUndo{..} = do
-    -- Encode height * 2 + coinbase_flag as varint
-    let nCode = tuHeight * 2 + (if tuCoinbase then 1 else 0)
-    put (VarInt (fromIntegral nCode))
-    -- If height > 0, write a dummy version byte (for backwards compat)
-    when (tuHeight > 0) $ put (0 :: Word8)
-    -- Write the TxOut
-    put tuOutput
+    -- BUG-2 FIX: Core VARINT (MSB-base-128), not CompactSize
+    let nCode = fromIntegral tuHeight * 2 + (if tuCoinbase then 1 else 0) :: Word64
+    putCoreVarInt nCode
+    -- Dummy version byte (backwards compat) — CoreVarInt(0) = [0x00] = Word8(0)
+    when (tuHeight > 0) $ putWord8 0
+    -- BUG-3 FIX: TxOutCompression = VARINT(compressAmount(value)) + ScriptCompression
+    putCoreVarInt (compressAmount (txOutValue tuOutput))
+    putCompressedScript (txOutScript tuOutput)
   get = do
-    VarInt nCode <- get
-    let height = fromIntegral (nCode `div` 2)
-        coinbase = nCode `mod` 2 == 1
-    -- Read dummy version byte if height > 0
-    when (height > 0) $ void (get :: Get Word8)
-    output <- get
-    return $ TxInUndo output height coinbase
+    -- BUG-2 FIX: decode nCode with Core VARINT
+    nCode <- getCoreVarInt
+    let height = fromIntegral (nCode `div` 2) :: Word32
+        coinbase = (nCode .&. 1) == 1
+    -- Read dummy version byte if height > 0 (CoreVarInt(nVersionDummy))
+    when (height > 0) $ void getCoreVarInt
+    -- BUG-3 FIX: TxOutCompression = VARINT(compressedAmount) + ScriptCompression
+    amount <- decompressAmount <$> getCoreVarInt
+    script <- getCompressedScript
+    return $ TxInUndo (TxOut amount script) height coinbase
 
 -- | Undo information for a single transaction.
 -- Contains undo data for all inputs of the transaction.
