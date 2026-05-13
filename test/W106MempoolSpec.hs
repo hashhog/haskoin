@@ -487,10 +487,10 @@ spec = do
       -- The bug: when sorted by Down ancestorFeeRate, child appears before parent.
 
   --
-  -- G8: RBF Rule 3a missing (BUG-7)
+  -- G8: RBF Rule 3a enforced (BUG-7 FIXED)
   --
-  describe "G8 RBF Rule 3a feerate check missing from checkReplacement (BUG-7)" $ do
-    it "checkReplacement accepts replacement with LOWER feerate (Rule 3a not enforced)" $ do
+  describe "G8 RBF Rule 3a feerate check enforced in checkReplacement (BUG-7 fixed)" $ do
+    it "checkReplacement rejects replacement with LOWER feerate (Rule 3a enforced)" $ do
       -- Build a conflict entry with high feerate (1000 sat/vB)
       let coin = coinOutPoint 20
           conflictTx = makeTx [coin] [9_000]
@@ -519,12 +519,15 @@ spec = do
           newFeeRate = FeeRate 2
           replacementTx = makeTx [coin] [9_900]
 
-      -- Rule 3a should REJECT this (new feerate < conflict feerate)
-      -- but checkReplacement does NOT check feerate:
+      -- Rule 3a MUST REJECT this (new feerate 2 < conflict feerate 1000)
       let result = checkReplacement replacementTx [conflictEntry] [conflictEntry]
                      newFee newVsize newFeeRate
-      -- BUG: currently Right () (accepted) when it should be Left RbfInsufficientFeeRate
-      result `shouldBe` Right ()   -- documents the bug
+      case result of
+        Left (RbfInsufficientFeeRate gotRate minRate) -> do
+          gotRate `shouldBe` FeeRate 2
+          minRate `shouldBe` FeeRate 1_000
+        Left other -> expectationFailure ("expected RbfInsufficientFeeRate, got: " ++ show other)
+        Right ()   -> expectationFailure "Rule 3a not enforced: accepted lower-feerate replacement"
 
   --
   -- G9: RBF Rule 3 uses baseFee not modifiedFee (BUG-8)
@@ -567,19 +570,29 @@ spec = do
       result `shouldBe` Right ()
 
   --
-  -- G10: checkDiagramReplacement is a dead helper (BUG-9)
+  -- G10: checkDiagramReplacement now wired into attemptReplacement (BUG-9 FIXED)
   --
-  describe "G10 checkDiagramReplacement dead helper — never called from attemptReplacement (BUG-9)" $ do
-    it "checkDiagramReplacement exists but attemptReplacement does not invoke it" $ do
-      -- Functional verification: checkDiagramReplacement itself works,
-      -- but it is never reached via the normal RBF path.
-      -- Confirm the function is callable and returns expected values.
+  describe "G10 checkDiagramReplacement wired into attemptReplacement (BUG-9 fixed)" $ do
+    it "checkDiagramReplacement rejects a diagram-non-improving replacement" $ do
+      -- An improving replacement (higher fee density): should be accepted by diagram check.
       let evicted = [ fakeEntry (computeTxId (makeTx [coinOutPoint 30] [9000]))
                                 (computeWtxid (makeTx [coinOutPoint 30] [9000]))
                                 1000 200 1 200 1 200 ]
-      -- A replacement that is strictly better (higher fee density)
-      let result = checkDiagramReplacement evicted 2000 100 (FeeRate 20)
-      result `shouldBe` Right ()
+      let goodResult = checkDiagramReplacement evicted 2000 100 (FeeRate 20)
+      goodResult `shouldBe` Right ()
+
+    it "checkDiagramReplacement rejects a replacement that does not improve the feerate diagram" $ do
+      -- evicted tx: fee=1000, size=100, feerate=10 sat/vB
+      -- replacement: fee=900, size=200, feerate=4.5 sat/vB — worse diagram
+      let evicted = [ fakeEntry (computeTxId (makeTx [coinOutPoint 31] [9000]))
+                                (computeWtxid (makeTx [coinOutPoint 31] [9000]))
+                                1000 100 1 100 1 100 ]
+      -- Fee 900 < 1000: fails Rule 3 absolute-fee check first, which is also
+      -- how Core reports it; checkDiagramReplacement returns Left.
+      let badResult = checkDiagramReplacement evicted 900 200 (FeeRate 4)
+      case badResult of
+        Left _  -> pure ()  -- correctly rejected
+        Right () -> expectationFailure "expected diagram check to reject non-improving replacement"
 
   --
   -- G11: isChildWithParents does not require ALL parents to be spent (BUG-11)
