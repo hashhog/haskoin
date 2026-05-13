@@ -552,6 +552,7 @@ import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO, randomRIO)
+import qualified Crypto.Random as CryptoRandom
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import System.Timeout (timeout)
 import Control.Concurrent.STM
@@ -4472,10 +4473,18 @@ data AddrMan = AddrMan
   } deriving (Eq)
 
 -- | Create a new address manager with random key
+--
+-- Uses 'Crypto.Random.getRandomBytes' (cryptonite, backed by @\/dev\/urandom@)
+-- for the 256-bit bucket-hashing key so that bucket assignments cannot be
+-- predicted by an adversary who knows the approximate startup time.
+-- Mirrors Bitcoin Core's FastRandomContext seeded from @\/dev\/urandom@.
 newAddrMan :: IO AddrMan
 newAddrMan = do
-  -- Generate random 256-bit key for bucket hashing
-  keyBytes <- BS.pack <$> replicateM 32 randomIO
+  -- Generate cryptographically secure 256-bit key for bucket hashing.
+  -- CryptoRandom.getRandomBytes reads from /dev/urandom via cryptonite.
+  -- Fixes BUG-7: System.Random.randomIO (Mersenne Twister, clock-seeded)
+  -- was predictable and broke eclipse-attack resistance.
+  keyBytes <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
   let key = Hash256 keyBytes
   AddrMan key
     <$> newTVarIO Map.empty

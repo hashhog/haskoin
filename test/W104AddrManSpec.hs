@@ -967,22 +967,26 @@ spec_G22_addrCountLimit = describe "G22 addr message count limit BUG-22" $ do
 --------------------------------------------------------------------------------
 
 spec_G23_csprng :: Spec
-spec_G23_csprng = describe "G23 CSPRNG for AddrMan key (BUG-7)" $ do
-  it "BUG-7: newAddrMan uses System.Random.randomIO (not CSPRNG) for bucket key" $ do
-    -- System.Random.randomIO is seeded from the system clock; the 256-bit
-    -- bucket-hashing key can be predicted by an adversary who knows the
-    -- approximate startup time, breaking eclipse-attack resistance.
-    -- Core: insecure_rand.rand256() uses FastRandomContext seeded from /dev/urandom.
-    -- Documented; not fixed in this audit.
-    True `shouldBe` True
-
-  it "Two AddrMan instances get different keys" $ do
+spec_G23_csprng = describe "G23 CSPRNG for AddrMan key (BUG-7 — FIXED)" $ do
+  it "FIXED BUG-7: newAddrMan uses CSPRNG (Crypto.Random.getRandomBytes) not System.Random" $ do
+    -- Verifies the fix: two AddrMan instances created in rapid succession
+    -- (where Mersenne Twister seeded by clock would often collide) produce
+    -- distinct 256-bit keys.  With Crypto.Random.getRandomBytes (cryptonite,
+    -- backed by /dev/urandom), each call yields independent random bytes —
+    -- an adversary who knows the approximate startup time cannot predict the
+    -- bucket assignments.
+    -- Core: FastRandomContext seeded from /dev/urandom (GetStrongRandBytes).
     am1 <- newAddrMan
     am2 <- newAddrMan
-    -- randomIO from System.Random may produce the same sequence if called
-    -- in rapid succession on some platforms; just document the expectation.
-    -- In practice this test could be flaky on some RNG implementations.
-    (amKey am1 == amKey am2 || amKey am1 /= amKey am2) `shouldBe` True
+    amKey am1 `shouldNotBe` amKey am2
+
+  it "Two AddrMan instances get different keys (CSPRNG guarantees independence)" $ do
+    -- With Crypto.Random.getRandomBytes each invocation draws fresh entropy
+    -- from /dev/urandom regardless of how quickly the calls are made.
+    -- The probability of a collision is 1/2^256 — negligible.
+    am1 <- newAddrMan
+    am2 <- newAddrMan
+    amKey am1 `shouldNotBe` amKey am2
 
 --------------------------------------------------------------------------------
 -- G24: GetNewBucket hashing correctness
