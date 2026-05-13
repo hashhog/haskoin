@@ -1492,12 +1492,24 @@ checkReplacement :: Tx                -- ^ New replacement transaction
                  -> Int               -- ^ New transaction vsize
                  -> FeeRate           -- ^ New transaction feerate
                  -> Either RbfError ()
-checkReplacement _tx _directConflicts allEvictions newFee newVsize _newFeeRate = do
+checkReplacement _tx directConflicts allEvictions newFee newVsize newFeeRate = do
   -- Rule 5: Check eviction count limit
   -- bitcoin-core/src/policy/rbf.cpp:70 — GetEntriesForConflicts checks cluster count <= 100
   let evictionCount = length allEvictions
   when (evictionCount > maxReplacementEvictions) $
     Left $ RbfTooManyEvictions evictionCount maxReplacementEvictions
+
+  -- Rule 3a: New tx feerate must be strictly greater than the feerate of every
+  -- directly-conflicting transaction.
+  -- bitcoin-core/src/validation.cpp:1018-1026 — PaysMoreThanConflicts:
+  --   "New feerate must exceed the feerate of each conflicting transaction."
+  -- We find the maximum feerate among direct conflicts and compare.
+  case directConflicts of
+    [] -> pure ()  -- no direct conflicts: nothing to compare (defensive)
+    cs -> do
+      let maxConflictFeeRate = maximum (map meFeeRate cs)
+      when (newFeeRate <= maxConflictFeeRate) $
+        Left $ RbfInsufficientFeeRate newFeeRate maxConflictFeeRate
 
   -- Rule 3: New tx must pay at least as much as the sum of fees of ALL evicted txs.
   -- Bitcoin Core sums over the entire all_conflicts set (direct conflicts + descendants):
@@ -1646,10 +1658,21 @@ attemptReplacement mp tx _txid conflictTxIds newFee newVsize newFeeRate = do
               return $ Left $ ErrRBFSpendingConflict txid
             Left (RbfNewUnconfirmedInput parent) ->
               return $ Left $ ErrRBFNewUnconfirmedInput parent
-            Right () -> do
-              -- Remove all conflicting transactions and descendants
-              removeConflicts conflictSet mp
-              return $ Right ()
+            Right () ->
+              -- BUG-9 fix: Wire checkDiagramReplacement (ImprovesFeerateDiagram).
+              -- Bitcoin Core v28+ requires that the replacement strictly improves
+              -- the mempool feerate diagram (validation.cpp:1031-1044).
+              case checkDiagramReplacement allEvictions newFee newVsize newFeeRate of
+                Left (RbfInsufficientAbsoluteFee newF reqF) ->
+                  return $ Left $ ErrRBFInsufficientAbsoluteFee newF reqF
+                Left _ ->
+                  -- checkDiagramReplacement only emits RbfInsufficientAbsoluteFee;
+                  -- defensive case for future constructor additions.
+                  return $ Left $ ErrRBFInsufficientAbsoluteFee newFee 0
+                Right () -> do
+                  -- Remove all conflicting transactions and descendants
+                  removeConflicts conflictSet mp
+                  return $ Right ()
 
 --------------------------------------------------------------------------------
 -- Block Connection/Disconnection
