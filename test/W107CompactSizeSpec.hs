@@ -246,78 +246,74 @@ spec = describe "W107 CompactSize + VarInt 30-gate audit" $ do
   -- CONSENSUS-DIVERGENT: Coin.Serialize uses WRONG encoding
   -- =========================================================================
 
-  describe "G11 BUG: Coin.Serialize instance uses CompactSize VarInt, not Core VARINT" $ do
+  describe "G11 FIX: Coin.Serialize now delegates to putCoreCoin / getCoreCoin (W107 BUG-1 P0-CDIV)" $ do
     -- Bitcoin Core coins.h Coin::Serialize:
     --   ::Serialize(s, VARINT(code));     ← Core MSB 7-bit
     --   ::Serialize(s, Using<TxOutCompression>(out));  ← compressed
     --
-    -- haskoin Coin Serialize instance (Storage.hs):
-    --   put (VarInt (fromIntegral code))  ← CompactSize wire format  ← WRONG
-    --   put coinTxOut                     ← uncompressed             ← WRONG
-    --
-    -- This means haskoin writes Coin on-disk in a format incompatible with
-    -- Bitcoin Core for any coin at height >= 64 (code = height*2 >= 128).
-    it "KNOWN BUG: Coin.Serialize uses CompactSize VarInt (WRONG) instead of Core VARINT" $ do
+    -- FIX: Coin Serialize instance now delegates to putCoreCoin/getCoreCoin,
+    -- which use Core VARINT for the code field and TxOutCompression for the TxOut.
+    -- The old wrong patterns have been removed from Storage.hs.
+    it "FIX: Coin.Serialize no longer uses CompactSize VarInt for code field" $ do
       src <- readFile "src/Haskoin/Storage.hs"
-      -- The wrong instance:
-      ("put (VarInt (fromIntegral code))" `isInfixOf` src) `shouldBe` True
-    it "KNOWN BUG: Coin.Serialize writes raw TxOut (WRONG) instead of TxOutCompression" $ do
+      -- The wrong instance pattern is gone:
+      ("put (VarInt (fromIntegral code))" `isInfixOf` src) `shouldBe` False
+    it "FIX: Coin.Serialize no longer writes raw TxOut (now uses TxOutCompression via putCoreCoin)" $ do
       -- Core: Using<TxOutCompression> = AmountCompression + ScriptCompression
-      -- haskoin Coin.Serialize: put coinTxOut = 8-byte value + varint(scriptLen) + script
+      -- FIX: Coin Serialize delegates to putCoreCoin, which uses putCompressedScript.
       src <- readFile "src/Haskoin/Storage.hs"
-      ("put coinTxOut" `isInfixOf` src) `shouldBe` True
+      -- The wrong instance pattern is gone from the Coin Serialize instance
+      -- (it may still appear in TxInUndo comments but not as live Coin code):
+      ("put = putCoreCoin" `isInfixOf` src) `shouldBe` True
     it "putCoreCoin is the CORRECT encoder (VARINT code + TxOutCompression)" $ do
       -- Verify putCoreCoin exists and uses putCoreVarInt:
       src <- readFile "src/Haskoin/Storage.hs"
       ("putCoreVarInt code" `isInfixOf` src) `shouldBe` True
       ("putCoreVarInt (compressAmount" `isInfixOf` src) `shouldBe` True
-    it "Coin.Serialize and putCoreCoin diverge for height >= 64 (code >= 128)" $ do
+    it "FIX: Coin.Serialize and putCoreCoin produce identical bytes for height >= 64" $ do
       -- A coin at height=64, coinbase=False → code=128.
-      -- CompactSize(128) = [0x80] (1 byte)
-      -- CoreVarInt(128)  = [0x80, 0x00] (2 bytes)
+      -- CoreVarInt(128) = [0x80, 0x00] (2 bytes) — both Serialize and putCoreCoin.
       let coin = Coin { coinTxOut = TxOut 5000000000 (BS.replicate 25 0x76)
                       , coinHeight = 64
                       , coinIsCoinbase = False }
           csBs   = encode coin
           coreBs = runPut (putCoreCoin coin)
-      -- They should NOT be equal:
-      csBs `shouldNotBe` coreBs
+      -- They MUST be equal now that Serialize delegates to putCoreCoin:
+      csBs `shouldBe` coreBs
 
-  describe "G12 BUG: TxInUndo.Serialize uses CompactSize for nCode (should be Core VARINT)" $ do
+  describe "G12 FIX: TxInUndo.Serialize now uses Core VARINT for nCode (W107 BUG-2 P0-CDIV)" $ do
     -- bitcoin-core/src/undo.h TxInUndoFormatter::Ser:
     --   ::Serialize(s, VARINT(txout.nHeight * 2 + txout.fCoinBase));
-    -- haskoin TxInUndo Serialize:
-    --   put (VarInt (fromIntegral nCode))  ← CompactSize WRONG
-    it "KNOWN BUG: TxInUndo uses CompactSize VarInt for nCode instead of Core VARINT" $ do
+    -- FIX: TxInUndo Serialize now uses putCoreVarInt for nCode.
+    it "FIX: TxInUndo no longer uses CompactSize VarInt for nCode" $ do
       src <- readFile "src/Haskoin/Storage.hs"
-      -- Line: put (VarInt (fromIntegral nCode))
-      ("put (VarInt (fromIntegral nCode))" `isInfixOf` src) `shouldBe` True
-    it "TxInUndo nCode mismatch at height >= 64" $ do
+      -- The wrong pattern is gone:
+      ("put (VarInt (fromIntegral nCode))" `isInfixOf` src) `shouldBe` False
+    it "FIX: TxInUndo nCode at height=64 uses CoreVarInt [0x80, 0x00]" $ do
       -- height=64, non-coinbase → nCode=128
-      -- CompactSize(128) = [0x80] 1 byte
-      -- Core VARINT(128) = [0x80, 0x00] 2 bytes
+      -- Core VARINT(128) = [0x80, 0x00] 2 bytes (MSB-base-128 with bijection)
       let undo = TxInUndo { tuOutput   = TxOut 1000 (BS.replicate 22 0x00)
                            , tuHeight   = 64
                            , tuCoinbase = False }
-      -- The serialize instance should use putCoreVarInt, but it uses CompactSize:
       let bs = encode undo
-      -- First byte should be 0x80 in BOTH, but CompactSize stops there (1 byte)
-      -- while Core VARINT continues with 0x00.
-      -- We can detect this by checking if the byte after 0x80 is 0x00:
+      -- First byte 0x80 = MSB limb with continuation bit set (n=128 → low 7 bits = 0 | 0x80)
       BS.index bs 0 `shouldBe` 0x80
-      -- In Core: next byte would be 0x00 (continuation), then version dummy 0x00, then TxOut
-      -- In haskoin: next byte is the dummy 0x00 (written at height>0), then raw TxOut
-      -- The nCode encoding length is wrong (1 byte instead of 2 for value=128).
-      BS.index bs 1 `shouldBe` 0x00   -- haskoin: version dummy; Core: VARINT continuation
+      -- Second byte 0x00 = final limb (0x80 >> 7 - 1 = 0) — Core VARINT continuation byte
+      BS.index bs 1 `shouldBe` 0x00
+      -- Third byte 0x00 = dummy version byte (tuHeight > 0)
+      BS.index bs 2 `shouldBe` 0x00
 
-  describe "G13 BUG: TxInUndo writes raw TxOut (should use TxOutCompression)" $ do
+  describe "G13 FIX: TxInUndo now uses TxOutCompression for the output (W107 BUG-3 P0-CDIV)" $ do
     -- Core TxInUndoFormatter::Ser: ::Serialize(s, Using<TxOutCompression>(txout.out))
-    -- haskoin: put tuOutput = Serialize TxOut = LE64(value) + VarInt(len) + script
-    -- This is uncompressed — incompatible with Core's undo file format.
-    it "KNOWN BUG: TxInUndo writes raw TxOut instead of TxOutCompression" $ do
+    -- TxOutCompression = VARINT(CompressAmount(value)) + ScriptCompression(script).
+    -- FIX: TxInUndo Serialize now uses putCoreVarInt(compressAmount(value)) +
+    --      putCompressedScript(script) instead of the raw put tuOutput.
+    it "FIX: TxInUndo no longer writes raw TxOut (put tuOutput removed from Serialize instance)" $ do
       src <- readFile "src/Haskoin/Storage.hs"
-      -- The Serialize TxInUndo instance put:
-      ("put tuOutput" `isInfixOf` src) `shouldBe` True
+      -- The wrong raw-TxOut put is gone from the TxInUndo Serialize instance;
+      -- confirm the compressed helpers are used instead:
+      ("putCoreVarInt (compressAmount (txOutValue tuOutput))" `isInfixOf` src) `shouldBe` True
+      ("putCompressedScript (txOutScript tuOutput)" `isInfixOf` src) `shouldBe` True
 
   describe "G14 BUG: BlockUndo/TxUndo use CompactSize VarInt for count fields" $ do
     -- Core CBlockUndo/CTxUndo serialize via VectorFormatter which uses CompactSize.
@@ -394,12 +390,19 @@ spec = describe "W107 CompactSize + VarInt 30-gate audit" $ do
       BS.index bs 0 `shouldBe` 0x80
       BS.index bs 1 `shouldBe` 0x00
 
-  describe "G19 Coin.Serialize vs putCoreCoin produce incompatible bytes for height >= 64" $ do
-    it "encode coin (Serialize) differs from putCoreCoin for the same coin" $ do
+  describe "G19 FIX: Coin.Serialize == putCoreCoin (W107 BUG-1 P0-CDIV fixed)" $ do
+    -- Now that Coin's Serialize instance delegates to putCoreCoin/getCoreCoin,
+    -- encode coin and runPut (putCoreCoin coin) must produce identical bytes.
+    it "FIX: encode coin (Serialize) == putCoreCoin for height >= 64" $ do
       let coin = Coin { coinTxOut = TxOut 100_000 (BS.replicate 25 0x76)
                       , coinHeight = 100
                       , coinIsCoinbase = False }
-      encode coin `shouldNotBe` runPut (putCoreCoin coin)
+      encode coin `shouldBe` runPut (putCoreCoin coin)
+    it "FIX: encode coin == putCoreCoin round-trips correctly" $ do
+      let coin = Coin { coinTxOut = TxOut 100_000 (BS.replicate 25 0x76)
+                      , coinHeight = 100
+                      , coinIsCoinbase = False }
+      decode (encode coin) `shouldBe` Right coin
 
   -- =========================================================================
   -- Network-level CompactSize (pipeline 1, P2P wire)
@@ -468,24 +471,27 @@ spec = describe "W107 CompactSize + VarInt 30-gate audit" $ do
       BS.index bs 1 `shouldBe` 10         -- item length
       BS.take 10 (BS.drop 2 bs) `shouldBe` item
 
-  describe "G26 BUG: TxUndo/BlockUndo count fields use CompactSize but nCode uses CompactSize (WRONG)" $ do
+  describe "G26 FIX: TxInUndo nCode now uses Core VARINT (W107 BUG-2 P0-CDIV fixed)" $ do
     -- The count field for vectors in undo is CORRECT (CompactSize per Core).
-    -- But the individual nCode inside TxInUndo uses CompactSize (WRONG).
-    -- This gate verifies the incorrect encoding is observable.
-    it "TxInUndo with height=100 (code=200) encodes nCode as CompactSize, not CoreVarInt" $ do
-      -- CompactSize(200) = 1 byte [0xC8]
-      -- CoreVarInt(200)  = let's compute: 200 > 127, so two bytes
-      --   go [] 200: byte=(200 & 0x7F | 0x00)=0x48, 200<=0x7F? no → go [0x48] (200>>7 - 1)=0
-      --   go [0x48] 0: byte=(0|0x80)=0x80 → [0x80, 0x48]
-      -- So CoreVarInt(200) = [0x80, 0x48]
+    -- FIX: The individual nCode inside TxInUndo now uses Core VARINT (putCoreVarInt).
+    -- This gate verifies the CORRECT encoding is now observable.
+    it "FIX: TxInUndo with height=100 (code=200) now encodes nCode as CoreVarInt [0x80, 0x48]" $ do
+      -- CoreVarInt(200):
+      --   go [] 200: byte=(200 & 0x7F)=0x48 (no continuation on last), 200 > 0x7F
+      --   → go [0x48] (200>>7 - 1)=0: byte=(0|0x80)=0x80 (continuation bit)
+      --   Result (MSB first): [0x80, 0x48]
+      -- CompactSize(200) = 1 byte [0xC8] — this is the old WRONG encoding.
       let undo = TxInUndo { tuOutput   = TxOut 100 BS.empty
                            , tuHeight   = 100
                            , tuCoinbase = False }
       let bs = encode undo
-      -- First byte: CompactSize(200) = 0xC8
-      BS.index bs 0 `shouldBe` 0xC8
-      -- If it were CoreVarInt: first byte would be 0x80
-      BS.index bs 0 `shouldNotBe` 0x80
+      -- First byte: CoreVarInt MSB limb with continuation = 0x80
+      BS.index bs 0 `shouldBe` 0x80
+      -- Second byte: CoreVarInt final limb = 0x48 (value 200 >> 7 = 1, minus 1 = 0... wait)
+      -- Let's just verify: [0x80, 0x48] = G27 verified encoding for 200
+      BS.index bs 1 `shouldBe` 0x48
+      -- If it were CompactSize (old bug): first byte would be 0xC8
+      BS.index bs 0 `shouldNotBe` 0xC8
 
   describe "G27 CoreVarInt encoding of 200 is [0x80, 0x48]" $ do
     -- Independent verification of the CoreVarInt value for 200:
