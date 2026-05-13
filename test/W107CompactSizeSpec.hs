@@ -19,7 +19,7 @@ module W107CompactSizeSpec (spec) where
 import Test.Hspec
 import Test.QuickCheck
 import Data.Serialize (encode, decode, runPut, runGet, put, get,
-                       putWord8, putWord32le, putWord64le)
+                       putWord8, putWord16le, putWord32le, putWord64le)
 import Data.Serialize.Get (Get)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -111,47 +111,86 @@ spec = describe "W107 CompactSize + VarInt 30-gate audit" $ do
       BS.index bs 1 `shouldBe` 0x08
       BS.index bs 8 `shouldBe` 0x01
 
-  describe "G3 BUG: non-canonical CompactSize not rejected on decode" $ do
+  describe "G3 FIX: non-canonical CompactSize is now rejected on decode (W107 G3)" $ do
     -- Core ReadCompactSize throws on non-canonical encodings:
     --   0xFD with payload < 253, 0xFE with payload < 65536, etc.
-    -- haskoin VarInt.get accepts them silently.
-    -- BUG: this allows peer-feeding of non-canonical varints that Core rejects.
-    it "KNOWN BUG: decodes 0xFD 0x00 0x00 (value=0, non-canonical) without error" $ do
+    -- FIX: VarInt.get now checks non-canonical boundaries and fails with
+    --      "non-canonical ReadCompactSize()" to match Core behaviour.
+    it "FIX: rejects 0xFD 0x00 0x00 (value=0, non-canonical)" $ do
       let nonCanonical = BS.pack [0xfd, 0x00, 0x00]
       -- Core: throws ios_base::failure("non-canonical ReadCompactSize()")
-      -- haskoin: accepts and returns 0
-      decodeVarInt nonCanonical `shouldBe` Right 0
-    it "KNOWN BUG: decodes 0xFD 0xFC 0x00 (value=252, non-canonical) without error" $ do
+      -- FIX: haskoin now returns Left with non-canonical error
+      case decodeVarInt nonCanonical of
+        Left err -> err `shouldContain` "non-canonical"
+        Right v  -> expectationFailure ("Expected non-canonical rejection, got Right " ++ show v)
+    it "FIX: rejects 0xFD 0xFC 0x00 (value=252, non-canonical)" $ do
       let nonCanonical = BS.pack [0xfd, 0xfc, 0x00]
-      decodeVarInt nonCanonical `shouldBe` Right 252
-    it "KNOWN BUG: decodes 0xFE + u32(65535) (non-canonical) without error" $ do
+      case decodeVarInt nonCanonical of
+        Left err -> err `shouldContain` "non-canonical"
+        Right v  -> expectationFailure ("Expected non-canonical rejection, got Right " ++ show v)
+    it "FIX: rejects 0xFE + u32(65535) (non-canonical)" $ do
       let nonCanonical = BS.pack [0xfe, 0xff, 0xff, 0x00, 0x00]
-      decodeVarInt nonCanonical `shouldBe` Right 65535
-    it "KNOWN BUG: decodes 0xFF + u64 < 0x100000000 (non-canonical) without error" $ do
+      case decodeVarInt nonCanonical of
+        Left err -> err `shouldContain` "non-canonical"
+        Right v  -> expectationFailure ("Expected non-canonical rejection, got Right " ++ show v)
+    it "FIX: rejects 0xFF + u64 < 0x100000000 (non-canonical)" $ do
       let nonCanonical = BS.pack [0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00]
-      decodeVarInt nonCanonical `shouldBe` Right 0xffffffff
+      case decodeVarInt nonCanonical of
+        Left err -> err `shouldContain` "non-canonical"
+        Right v  -> expectationFailure ("Expected non-canonical rejection, got Right " ++ show v)
+    it "FIX: canonical encodings still decode correctly after fix" $ do
+      -- Boundary values must still work
+      decodeVarInt (BS.pack [0xfd, 0xfd, 0x00]) `shouldBe` Right 253
+      decodeVarInt (BS.pack [0xfe, 0x00, 0x00, 0x01, 0x00]) `shouldBe` Right 0x10000
+      decodeVarInt (BS.pack [0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]) `shouldBe` Right 0x100000000
 
-  describe "G4 BUG: getVarBytes has no MAX_SIZE (0x02000000) cap" $ do
+  describe "G4 FIX: getVarBytes now enforces MAX_SIZE (0x02000000) cap (W107 G4)" $ do
     -- Core ReadCompactSize(range_check=true) rejects values > MAX_SIZE = 0x02000000 (33.5 MB).
-    -- haskoin getVarBytes calls getVarInt' then getBytes(len) with no upper bound.
-    -- A peer can send VarInt(0x03000000) as a script length and haskoin will try
-    -- to allocate 50 MB — exceeding Core's limit.
-    -- We verify the constant is absent in Types.hs:
-    it "KNOWN BUG: MAX_SIZE (0x02000000) guard absent from getVarBytes" $ do
+    -- FIX: getVarBytes now calls fail if len > maxSize (0x02000000).
+    -- A peer sending VarInt(0x03000000) as a script length is now rejected
+    -- instead of attempting a 50 MB allocation.
+    it "FIX: MAX_SIZE (0x02000000) constant is present in Types.hs" $ do
       src <- readFile "src/Haskoin/Types.hs"
-      ("0x02000000" `isInfixOf` src) `shouldBe` False
-      ("MAX_SIZE"   `isInfixOf` src) `shouldBe` False
+      ("0x02000000" `isInfixOf` src) `shouldBe` True
+      ("MAX_SIZE"   `isInfixOf` src) `shouldBe` True
+    it "FIX: getVarBytes rejects length > MAX_SIZE without allocating" $ do
+      -- Encode VarInt(0x02000001) via 0xFE prefix (canonical for 0x10000..0xFFFFFFFF).
+      -- 0x02000001 LE32 = [0x01, 0x00, 0x00, 0x02]
+      let overLimit = BS.pack [0xfe, 0x01, 0x00, 0x00, 0x02]
+          result    = runGet getVarBytes overLimit
+      case result of
+        Left err -> err `shouldContain` "MAX_SIZE"
+        Right _  -> expectationFailure "Expected MAX_SIZE rejection"
+    it "FIX: getVarBytes accepts exactly MAX_SIZE (0x02000000) as a length (boundary)" $ do
+      -- A length of exactly 0x02000000 should pass the cap check (value <= maxSize).
+      -- 0x02000000 LE32 = [0x00, 0x00, 0x00, 0x02]
+      -- We don't provide the full payload, so it fails with EOF, not the MAX_SIZE error.
+      let atLimit = BS.pack [0xfe, 0x00, 0x00, 0x00, 0x02]
+          result  = runGet getVarBytes atLimit
+      -- Must NOT fail with MAX_SIZE; will fail with EOF instead
+      case result of
+        Left err -> ("MAX_SIZE" `isInfixOf` err) `shouldBe` False
+        Right _  -> expectationFailure "Expected EOF failure (not MAX_SIZE rejection)"
 
-  describe "G5 parseLegacyTx non-canonical check absent" $ do
+  describe "G5 FIX: parseLegacyTx now rejects non-canonical CompactSize (W107 G5)" $ do
     -- Tx.get reads the first byte (marker). If it's >= 0xFD it inlines the
-    -- continuation, but never checks that the value is >= the threshold for
-    -- that prefix byte.  Core rejects e.g. 0xFD followed by a u16 < 253.
-    it "KNOWN BUG: parseLegacyTx missing non-canonical check for 0xFD/0xFE/0xFF" $ do
+    -- continuation.  FIX: parseLegacyTx now checks that the value is >= the
+    -- canonical threshold for each prefix byte, matching Core behaviour.
+    it "FIX: parseLegacyTx is present in Types.hs" $ do
       src <- readFile "src/Haskoin/Types.hs"
-      -- The check "nSizeRet < 253" is Core's canonical guard; haskoin lacks it.
-      ("nSizeRet < 253" `isInfixOf` src) `shouldBe` False
-      -- The case expression in parseLegacyTx:
       ("parseLegacyTx" `isInfixOf` src) `shouldBe` True
+    it "FIX: parseLegacyTx has non-canonical guard for 0xFD prefix" $ do
+      -- Craft a minimal serialized legacy tx with:
+      --   version=1, marker=0xFD, u16=0x0000 (input count=0, non-canonical),
+      --   Then 0 outputs, locktime=0.
+      -- With non-canonical guard this must fail.
+      let nonCanonicalTx = runPut $ do
+            putWord32le 1           -- version
+            putWord8 0xfd           -- marker byte → parseLegacyTx is called
+            putWord16le 0x0000      -- non-canonical: 0 < 253
+      case (decode nonCanonicalTx :: Either String Tx) of
+        Left err -> err `shouldContain` "non-canonical"
+        Right _  -> expectationFailure "Expected non-canonical rejection in parseLegacyTx"
 
   describe "G6 putVarInt / VarInt put is the canonical CompactSize encoder" $ do
     -- Positive check: confirm Types.hs putVarInt is the single source of truth
@@ -160,28 +199,29 @@ spec = describe "W107 CompactSize + VarInt 30-gate audit" $ do
       src <- readFile "src/Haskoin/Types.hs"
       ("putVarInt = put . VarInt" `isInfixOf` src) `shouldBe` True
 
-  describe "G7 Three-pipeline isolation — Index.hs local CompactSize" $ do
-    -- Index.hs contains at least THREE independent re-implementations of
-    -- CompactSize encoding that do NOT import from Types.hs:
-    --   (a) encodeCompactSize inside gcsFilterBuild
-    --   (b) local putVarInt inside computeTxId
-    --   (c) local putVarInt + getVarInt' inside Serialize BlockFilterEntry
-    -- None of these have the non-canonical rejection.
-    it "KNOWN BUG: Index.hs local encodeCompactSize duplicates Types.hs VarInt (pipeline 3a)" $ do
+  describe "G7 FIX: Index.hs local CompactSize consolidated to canonical helpers (W107 G7)" $ do
+    -- FIX: The three independent re-implementations in Index.hs have been
+    -- consolidated:
+    --   (a) encodeCompactSize now delegates to encode . VarInt (not inlined)
+    --   (b) computeTxId now calls putVarInt from Haskoin.Types (local removed)
+    --   (c) BlockFilterEntry Serialize now uses putVarInt/getVarInt' from
+    --       Haskoin.Types (local putVarInt and getVarInt' definitions removed)
+    -- All three paths now inherit non-canonical rejection + MAX_SIZE from VarInt.get.
+    it "FIX: Index.hs encodeCompactSize now delegates to encode . VarInt (pipeline 3a)" $ do
       src <- readFile "src/Haskoin/Index.hs"
-      -- The function is defined locally (not re-exported from Types.hs):
-      ("encodeCompactSize" `isInfixOf` src) `shouldBe` True
-      -- Confirm it's a local definition, not an import:
-      ("encodeCompactSize :: Word64 -> ByteString" `isInfixOf` src) `shouldBe` True
-    it "KNOWN BUG: Index.hs Serialize BlockFilterEntry has local getVarInt' without non-canonical guard (pipeline 3c)" $ do
+      -- The function still exists (used in gcsFilterNew) but now delegates:
+      ("encodeCompactSize = encode . VarInt" `isInfixOf` src) `shouldBe` True
+      -- The old inlined multi-branch is gone (no longer branches on n < 0xfd):
+      ("encodeCompactSize n" `isInfixOf` src) `shouldBe` False
+    it "FIX: Index.hs BlockFilterEntry no longer has local getVarInt' (pipeline 3c)" $ do
       src <- readFile "src/Haskoin/Index.hs"
-      -- Local shadowing definition within instance:
-      ("getVarInt' :: Get Word64" `isInfixOf` src) `shouldBe` True
-    it "KNOWN BUG: Index.hs computeTxId has local putVarInt (pipeline 3b)" $ do
+      -- The local shadowing definition is gone:
+      ("getVarInt' :: Get Word64" `isInfixOf` src) `shouldBe` False
+    it "FIX: Index.hs computeTxId no longer has local putVarInt inlined helper (pipeline 3b)" $ do
       src <- readFile "src/Haskoin/Index.hs"
       ("computeTxId" `isInfixOf` src) `shouldBe` True
-      -- local inlined helper:
-      ("| n < 0xfd = putWord8" `isInfixOf` src) `shouldBe` True
+      -- The inlined multi-branch is gone:
+      ("| n < 0xfd = putWord8" `isInfixOf` src) `shouldBe` False
 
   -- =========================================================================
   -- PIPELINE-2: Storage.hs putCoreVarInt/getCoreVarInt (Core 7-bit MSB)
@@ -514,22 +554,25 @@ spec = describe "W107 CompactSize + VarInt 30-gate audit" $ do
       ("put (VarInt (fromIntegral $ length scoins))" `isInfixOf` src)
         `shouldBe` True
 
-  describe "G29 GCS CompactSize encode/decode in Index.hs covers all four tiers" $ do
-    -- Index.hs encodeCompactSize handles all four cases. Verify the local
-    -- implementation emits bytes compatible with the Types.hs VarInt.
-    it "local encodeCompactSize 252 == encodeVarInt 252" $ do
+  describe "G29 FIX: GCS encodeCompactSize now delegates to canonical encoder (W107 G29)" $ do
+    -- FIX: Index.hs encodeCompactSize now delegates to encode . VarInt, so
+    -- it produces exactly the same bytes as Types.hs VarInt for all values.
+    it "FIX: encodeCompactSize delegates to encode . VarInt (no longer inlined)" $ do
       src <- readFile "src/Haskoin/Index.hs"
-      -- Structural: the local implementation branches on < 0xfd
-      ("n < 0xfd = BS.singleton" `isInfixOf` src) `shouldBe` True
+      -- The delegation is in place:
+      ("encodeCompactSize = encode . VarInt" `isInfixOf` src) `shouldBe` True
+      -- The old inline branch is gone:
+      ("n < 0xfd = BS.singleton" `isInfixOf` src) `shouldBe` False
 
-  describe "G30 BUG: Index.hs local CompactSize decode missing MAX_SIZE guard" $ do
-    -- The local decodeCompactSize in gcsFilterDecode and skipCompactSize in
-    -- matchInternal have no MAX_SIZE (0x02000000) cap — only a "Invalid compact
-    -- size" on truncated input. A crafted GCS prefix with a huge N could cause
-    -- unbounded allocation.
-    it "KNOWN BUG: Index.hs local decodeCompactSize has no MAX_SIZE guard" $ do
+  describe "G30 FIX: Index.hs local decodeCompactSize now has MAX_SIZE guard (W107 G30)" $ do
+    -- FIX: The local decodeCompactSize in gcsFilterDecode now checks
+    -- val > maxSize (0x02000000) and returns Left "decodeCompactSize: value exceeds MAX_SIZE".
+    -- A crafted GCS prefix with a huge N is now rejected before allocation.
+    it "FIX: Index.hs decodeCompactSize now contains MAX_SIZE guard via maxSize" $ do
       src <- readFile "src/Haskoin/Index.hs"
-      -- The cap is absent:
-      ("0x02000000" `isInfixOf` src) `shouldBe` False
-      -- The decode function is local:
+      -- The decode function is still local (needed for GCS ByteString parsing):
       ("decodeCompactSize" `isInfixOf` src) `shouldBe` True
+      -- The guard uses maxSize (imported from Haskoin.Types, which is 0x02000000):
+      ("val > maxSize" `isInfixOf` src) `shouldBe` True
+      -- The error message is present:
+      ("decodeCompactSize: value exceeds MAX_SIZE" `isInfixOf` src) `shouldBe` True

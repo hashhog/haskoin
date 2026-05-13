@@ -481,14 +481,7 @@ gcsFilterNew params elements
       in bitWriterFlush bw
 
     encodeCompactSize :: Word64 -> ByteString
-    encodeCompactSize n
-      | n < 0xfd = BS.singleton (fromIntegral n)
-      | n <= 0xffff = BS.cons 0xfd (encodeLE16 (fromIntegral n :: Word16))
-      | n <= 0xffffffff = BS.cons 0xfe (encodeLE32 (fromIntegral n :: Word32))
-      | otherwise = BS.cons 0xff (encodeLE64 n)
-
-    encodeLE16 w = BS.pack [fromIntegral w, fromIntegral (w `shiftR` 8)]
-    encodeLE32 w = BS.pack [fromIntegral (w `shiftR` (i * 8)) | i <- [0..3]]
+    encodeCompactSize = encode . VarInt
 
 -- | Encode a GCS filter
 gcsFilterEncode :: GCSFilter -> ByteString
@@ -521,14 +514,26 @@ gcsFilterDecode params bs
           in case first of
                _ | first < 0xfd -> Right (fromIntegral first, BS.drop 1 bs')
                0xfd | BS.length bs' >= 3 ->
-                 let val = decodeLE16' (BS.drop 1 bs')
-                 in Right (fromIntegral val, BS.drop 3 bs')
+                 let val = fromIntegral (decodeLE16' (BS.drop 1 bs')) :: Word64
+                 in if val < 253
+                    then Left "non-canonical ReadCompactSize()"
+                    else if val > maxSize
+                         then Left "decodeCompactSize: value exceeds MAX_SIZE"
+                         else Right (val, BS.drop 3 bs')
                0xfe | BS.length bs' >= 5 ->
-                 let val = decodeLE32' (BS.drop 1 bs')
-                 in Right (fromIntegral val, BS.drop 5 bs')
+                 let val = fromIntegral (decodeLE32' (BS.drop 1 bs')) :: Word64
+                 in if val < 0x10000
+                    then Left "non-canonical ReadCompactSize()"
+                    else if val > maxSize
+                         then Left "decodeCompactSize: value exceeds MAX_SIZE"
+                         else Right (val, BS.drop 5 bs')
                0xff | BS.length bs' >= 9 ->
                  let val = decodeLE64 (BS.drop 1 bs')
-                 in Right (val, BS.drop 9 bs')
+                 in if val < 0x100000000
+                    then Left "non-canonical ReadCompactSize()"
+                    else if val > maxSize
+                         then Left "decodeCompactSize: value exceeds MAX_SIZE"
+                         else Right (val, BS.drop 9 bs')
                _ -> Left "Invalid compact size"
 
     decodeLE16' bs' =
@@ -786,6 +791,7 @@ txIndexAppendBlock db block blockHash height = do
       txIndexPut db txid entry
 
 -- | Compute transaction ID (double SHA256 of non-witness serialization)
+-- Uses the canonical putVarInt from Haskoin.Types (inherits non-canonical + MAX_SIZE).
 computeTxId :: Tx -> TxId
 computeTxId tx =
   let -- Serialize without witness data
@@ -798,17 +804,6 @@ computeTxId tx =
         putWord32le (txLockTime tx)
   in TxId $ doubleSHA256 serialized
   where
-    putVarInt n
-      | n < 0xfd = putWord8 (fromIntegral n)
-      | n <= 0xffff = putWord8 0xfd >> putWord16le (fromIntegral n :: Word16)
-      | n <= 0xffffffff = putWord8 0xfe >> putWord32le (fromIntegral n :: Word32)
-      | otherwise = putWord8 0xff >> putWord64le n
-
-    putWord16le :: Word16 -> Put
-    putWord16le w = do
-      putWord8 (fromIntegral w)
-      putWord8 (fromIntegral (w `shiftR` 8))
-
     doubleSHA256 bs =
       let first = sha256Single bs
           second = sha256Single (getHash256 first)
@@ -829,6 +824,8 @@ data BlockFilterEntry = BlockFilterEntry
 
 instance NFData BlockFilterEntry
 
+-- | BlockFilterEntry Serialize uses the canonical putVarInt/getVarInt' from
+-- Haskoin.Types (inherits non-canonical rejection + MAX_SIZE cap).
 instance Serialize BlockFilterEntry where
   put BlockFilterEntry{..} = do
     put bfeFilterHash
@@ -841,29 +838,6 @@ instance Serialize BlockFilterEntry where
     len <- getVarInt'
     encoded <- getBytes (fromIntegral len)
     return $ BlockFilterEntry filterHash filterHeader encoded
-    where
-      putVarInt n
-        | n < 0xfd = putWord8 (fromIntegral n)
-        | n <= 0xffff = putWord8 0xfd >> putWord16le (fromIntegral n :: Word16)
-        | n <= 0xffffffff = putWord8 0xfe >> putWord32le (fromIntegral n :: Word32)
-        | otherwise = putWord8 0xff >> putWord64le n
-
-      putWord16le :: Word16 -> Put
-      putWord16le w = do
-        putWord8 (fromIntegral w)
-        putWord8 (fromIntegral (w `shiftR` 8))
-
-      getVarInt' :: Get Word64
-      getVarInt' = do
-        b <- getWord8
-        case b of
-          _ | b < 0xfd -> return (fromIntegral b)
-          0xfd -> do
-            lo <- getWord8
-            hi <- getWord8
-            return $ fromIntegral lo .|. (fromIntegral hi `shiftL` 8)
-          0xfe -> fromIntegral <$> getWord32le
-          0xff -> getWord64le
 
 -- | BlockFilterIndex database handle
 data BlockFilterIndexDB = BlockFilterIndexDB

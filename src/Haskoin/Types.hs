@@ -27,6 +27,7 @@ module Haskoin.Types
   , getVarInt'
   , putVarBytes
   , getVarBytes
+  , maxSize
   ) where
 
 import Data.ByteString (ByteString)
@@ -84,6 +85,12 @@ newtype BlockHash = BlockHash { getBlockHashHash :: Hash256 }
 -- Variable-Length Encoding
 --------------------------------------------------------------------------------
 
+-- | Maximum allowed value from a length-prefixed CompactSize field.
+-- Matches Bitcoin Core's MAX_SIZE = 0x02000000 (33,554,432 bytes ≈ 32 MiB).
+-- ReadCompactSize(range_check=true) rejects values larger than this.
+maxSize :: Word64
+maxSize = 0x02000000
+
 -- | Bitcoin's variable-length integer encoding
 newtype VarInt = VarInt { getVarInt :: Word64 }
   deriving stock (Show, Eq, Generic)
@@ -97,9 +104,21 @@ instance Serialize VarInt where
   get = do
     b <- getWord8
     case b of
-      0xff -> VarInt <$> getWord64le
-      0xfe -> VarInt . fromIntegral <$> getWord32le
-      0xfd -> VarInt . fromIntegral <$> getWord16le
+      0xff -> do
+        v <- getWord64le
+        -- Non-canonical: 0xFF must encode values >= 0x100000000
+        when (v < 0x100000000) $ fail "non-canonical ReadCompactSize()"
+        return (VarInt v)
+      0xfe -> do
+        v <- fromIntegral <$> getWord32le
+        -- Non-canonical: 0xFE must encode values >= 0x10000
+        when (v < 0x10000) $ fail "non-canonical ReadCompactSize()"
+        return (VarInt v)
+      0xfd -> do
+        v <- fromIntegral <$> getWord16le
+        -- Non-canonical: 0xFD must encode values >= 253
+        when (v < 253) $ fail "non-canonical ReadCompactSize()"
+        return (VarInt v)
       _    -> return $ VarInt (fromIntegral b)
 
 -- | Variable-length string (length-prefixed ByteString)
@@ -126,10 +145,13 @@ putVarBytes bs = do
   putVarInt (fromIntegral $ BS.length bs)
   putByteString bs
 
--- | Deserialize a length-prefixed ByteString
+-- | Deserialize a length-prefixed ByteString.
+-- Rejects lengths > MAX_SIZE (0x02000000) to match Bitcoin Core's
+-- ReadCompactSize(range_check=true) behaviour and prevent 50+ MB allocations.
 getVarBytes :: Get ByteString
 getVarBytes = do
   len <- getVarInt'
+  when (len > maxSize) $ fail "getVarBytes: length exceeds MAX_SIZE"
   getBytes (fromIntegral len)
 
 --------------------------------------------------------------------------------
@@ -232,9 +254,21 @@ parseLegacyTx version firstByte = do
   count <- if firstByte < 0xfd
            then return firstByte
            else case firstByte of
-             0xfd -> fromIntegral <$> getWord16le
-             0xfe -> fromIntegral <$> getWord32le
-             0xff -> getWord64le
+             0xfd -> do
+               v <- fromIntegral <$> getWord16le
+               -- Non-canonical: 0xFD must encode values >= 253 (nSizeRet < 253 is invalid)
+               when (v < 253) $ fail "non-canonical ReadCompactSize()"
+               return v
+             0xfe -> do
+               v <- fromIntegral <$> getWord32le
+               -- Non-canonical: 0xFE must encode values >= 0x10000
+               when (v < 0x10000) $ fail "non-canonical ReadCompactSize()"
+               return v
+             0xff -> do
+               v <- getWord64le
+               -- Non-canonical: 0xFF must encode values >= 0x100000000
+               when (v < 0x100000000) $ fail "non-canonical ReadCompactSize()"
+               return v
              _    -> return firstByte
   inputs <- replicateM (fromIntegral count) get
   outCount <- getVarInt'
