@@ -109,6 +109,7 @@ test-suite haskoin-test
                , W101ActivateBestChainSpec
                , W102AssumeUTXOSpec
                , W103TxRelaySpec
+               , W104AddrManSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
