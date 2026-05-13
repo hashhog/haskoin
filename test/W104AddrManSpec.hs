@@ -684,24 +684,48 @@ spec_G10_networkGroup = describe "G10 computeNetworkGroup — eclipse protection
 --------------------------------------------------------------------------------
 
 spec_G11_isRoutable :: Spec
-spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8)" $ do
-  -- BUG-8: Core rejects non-routable addresses; haskoin does not
-  it "BUG-8: addAddress accepts loopback address 127.0.0.1 (should be rejected)" $ do
+spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8 fixed)" $ do
+  -- Core AddSingle first line: "if (!addr.IsRoutable()) return false;"
+
+  it "addAddress rejects loopback address 127.0.0.1" $ do
     am  <- newAddrMan
     now <- nowIO
-    -- 127.0.0.1 in little-endian host order: low byte = 0x7f = 127
+    -- 127.0.0.1 in host byte order (little-endian): low byte = 0x7f = 127
     let loopback = SockAddrInet 8333 0x0000007f
     r <- addAddress am loopback src1 0x409 now
-    -- Core would return false (not routable); haskoin returns True (BUG)
-    r `shouldBe` True  -- documents the bug: should be False
+    r `shouldBe` False  -- IsLocal → not routable
 
-  it "BUG-8: addAddress accepts private 10.x.x.x address (should be rejected)" $ do
+  it "addAddress rejects RFC1918 private address 10.0.0.1" $ do
     am  <- newAddrMan
     now <- nowIO
-    let priv = SockAddrInet 8333 0x0100000a  -- 10.0.0.1
+    -- 10.0.0.1 in host byte order: low byte = 0x0a = 10
+    let priv = SockAddrInet 8333 0x0100000a
     r <- addAddress am priv src1 0x409 now
-    -- Should be False (RFC1918 not routable); is True (BUG)
-    r `shouldBe` True
+    r `shouldBe` False  -- IsRFC1918 → not routable
+
+  it "addAddress rejects RFC1918 private address 192.168.1.1" $ do
+    am  <- newAddrMan
+    now <- nowIO
+    -- 192.168.1.1: bytes c0 a8 01 01 → host order = 0x0101a8c0
+    let priv2 = SockAddrInet 8333 0x0101a8c0
+    r <- addAddress am priv2 src1 0x409 now
+    r `shouldBe` False  -- IsRFC1918 → not routable
+
+  it "addAddress rejects RFC1918 private address 172.16.0.1" $ do
+    am  <- newAddrMan
+    now <- nowIO
+    -- 172.16.0.1: bytes ac 10 00 01 → host order = 0x010010ac
+    let priv3 = SockAddrInet 8333 0x010010ac
+    r <- addAddress am priv3 src1 0x409 now
+    r `shouldBe` False  -- IsRFC1918 → not routable
+
+  it "addAddress accepts a publicly routable address 1.2.3.4" $ do
+    am  <- newAddrMan
+    now <- nowIO
+    -- 1.2.3.4: bytes 01 02 03 04 → host order = 0x04030201
+    let pub = SockAddrInet 8333 0x04030201
+    r <- addAddress am pub src1 0x409 now
+    r `shouldBe` True   -- routable → should be accepted
 
 --------------------------------------------------------------------------------
 -- G12: addrmanNewBucketsPerAddress cap missing (BUG-9)
