@@ -771,11 +771,12 @@ instance Serialize Pong where
 -- | Inventory object types
 data InvType
   = InvError          -- ^ 0: Any data of unknown type
-  | InvTx             -- ^ 1: Hash of a transaction
+  | InvTx             -- ^ 1: Hash of a transaction (txid; legacy)
   | InvBlock          -- ^ 2: Hash of a block
   | InvFilteredBlock  -- ^ 3: Hash of a filtered block (BIP-37)
   | InvCompactBlock   -- ^ 4: Hash of a compact block (BIP-152)
-  | InvWitnessTx      -- ^ 0x40000001: SegWit transaction
+  | InvWtx            -- ^ 5: BIP-339 MSG_WTX — wtxid-relay inv (BIP-339 PR #18044)
+  | InvWitnessTx      -- ^ 0x40000001: Legacy SegWit getdata flag (NOT a valid inv type)
   | InvWitnessBlock   -- ^ 0x40000002: SegWit block
   deriving (Show, Eq, Generic)
 
@@ -788,6 +789,7 @@ invTypeToWord32 InvTx            = 1
 invTypeToWord32 InvBlock         = 2
 invTypeToWord32 InvFilteredBlock = 3
 invTypeToWord32 InvCompactBlock  = 4
+invTypeToWord32 InvWtx           = 5
 invTypeToWord32 InvWitnessTx     = 0x40000001
 invTypeToWord32 InvWitnessBlock  = 0x40000002
 
@@ -798,6 +800,7 @@ word32ToInvType 1          = InvTx
 word32ToInvType 2          = InvBlock
 word32ToInvType 3          = InvFilteredBlock
 word32ToInvType 4          = InvCompactBlock
+word32ToInvType 5          = InvWtx
 word32ToInvType 0x40000001 = InvWitnessTx
 word32ToInvType 0x40000002 = InvWitnessBlock
 word32ToInvType _          = InvError
@@ -1716,6 +1719,12 @@ data PeerInfo = PeerInfo
     -- Mirrors Core's @addr.IsLocal()@ check.  Local peers are disconnected
     -- without being added to the discourage list.
   , piIsLocal  :: !Bool
+    -- | BIP-339: True iff the peer sent MWtxidRelay before VERACK.
+    -- When set, we announce new txs to this peer via InvWtx (MSG_WTX=5)
+    -- with the wtxid as the hash.  Legacy peers receive InvTx (type=1)
+    -- with the txid.  Mirrors Bitcoin Core's m_wtxid_relay field set in
+    -- net_processing.cpp:2027 (ProcessMessage "wtxidrelay").
+  , piWtxidRelay :: !Bool
   } deriving (Show, Generic)
 
 instance NFData PeerInfo
@@ -1808,6 +1817,7 @@ connectPeer config host port = do
               , piNoBan    = False
               , piIsManual = False
               , piIsLocal  = isLocalAddr peerAddr
+              , piWtxidRelay = False
               }
         infoVar <- newTVarIO info
         sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
@@ -3074,6 +3084,7 @@ startInboundListener pm port = do
             , piNoBan    = False
             , piIsManual = False
             , piIsLocal  = isLocalAddr addr
+            , piWtxidRelay = False
             }
       infoVar <- newTVarIO info
       sendQ <- newTBQueueIO 100
@@ -8763,6 +8774,7 @@ createPeerConnectionFromSocket config sock _host = do
           , piNoBan    = False
           , piIsManual = False
           , piIsLocal  = False  -- proxy addresses are never local
+          , piWtxidRelay = False
           }
     infoVar <- newTVarIO info
     sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)

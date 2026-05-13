@@ -242,8 +242,10 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          getUTXOCount, getBlockHeight,
                          iterateWithPrefix, KeyPrefix(..), Coin(..),
                          SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash)
-import Haskoin.Network (PeerManager(..), PeerInfo(..), Version(..),
+import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
+                         PeerState(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
+                         sendMessage,
                          Message(..), Inv(..), InvVector(..), InvType(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, hasService, ServiceFlag(..),
@@ -2127,9 +2129,8 @@ handleSendRawTransaction server params = do
                                 ++ show actualFeeRate ++ " > " ++ show maxFeeRateSatPerVB
                                 ++ " sat/vB")) Null
                         else do
-                          -- Broadcast to peers via inv trickling
-                          -- The fee rate is used for prioritization
-                          broadcastTxToPeers server txid (getFeeRate (meFeeRate entry))
+                          -- Broadcast to peers via per-peer BIP-339 inv selection
+                          broadcastTxToPeers server tx (getFeeRate (meFeeRate entry))
                           return $ RpcResponse
                             (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
 
@@ -2229,16 +2230,28 @@ mempoolErrorToRpcResponse err = RpcResponse Null (toJSON rpcErr) Null
         -- ErrSeqLockNotSatisfied). Keeps the dispatch total.
         RpcError rpcVerifyRejected (T.pack (show err))
 
--- | Broadcast a transaction to all connected peers via inv trickling
--- Uses the trickling mechanism for privacy (batches inv messages)
-broadcastTxToPeers :: RpcServer -> TxId -> Word64 -> IO ()
-broadcastTxToPeers server txid feeRate = do
-  -- For now, use simple broadcast (direct inv to all peers)
-  -- In a full implementation, this would use the InvTrickler for privacy
-  broadcastMessage (rsPeerMgr server) $
-    MInv $ Inv [InvVector InvWitnessTx (getTxIdHash txid)]
-  -- Note: The feeRate parameter would be used by the trickling mechanism
-  -- to prioritize higher-fee transactions in the queue
+-- | Broadcast a transaction to all connected peers via inv.
+-- BIP-339 / Core PR #18044: select per-peer inv type:
+--   * wtxid-relay peers (piWtxidRelay=True) → InvWtx (MSG_WTX=5) + wtxid
+--   * legacy peers                           → InvTx  (type=1)  + txid
+-- Block-relay-only peers (piBlockOnly=True) never receive tx invs.
+-- Reference: bitcoin-core/src/net_processing.cpp RelayTransaction.
+broadcastTxToPeers :: RpcServer -> Tx -> Word64 -> IO ()
+broadcastTxToPeers server tx _feeRate = do
+  let pm    = rsPeerMgr server
+      txid  = computeTxId tx
+      -- Use computeWtxId (from Consensus, returns TxId) to get the
+      -- witness-txid hash; getTxIdHash extracts the Hash256.
+      wtxid = computeWtxId tx
+  peers <- readTVarIO (pmPeers pm)
+  forM_ (Map.elems peers) $ \pc -> do
+    info <- readTVarIO (pcInfo pc)
+    when (piState info == PeerConnected && not (piBlockOnly info)) $ do
+      let (itype, ihash)
+            | piWtxidRelay info = (InvWtx, getTxIdHash wtxid)
+            | otherwise         = (InvTx,  getTxIdHash txid)
+      sendMessage pc (MInv $ Inv [InvVector itype ihash])
+        `catch` (\(_ :: SomeException) -> return ())
 
 -- | Decode a raw transaction without submitting
 handleDecodeRawTransaction :: RpcServer -> Value -> IO RpcResponse
@@ -6223,11 +6236,10 @@ handleSendToAddress server params = do
                     Left err -> return $ RpcResponse Null
                       (toJSON $ RpcError rpcMiscError (T.pack err)) Null
                     Right tx -> do
-                      -- Broadcast to network
+                      -- Broadcast to network with per-peer BIP-339 inv selection
                       let txid = computeTxId tx
                       _ <- addTransaction (rsMempool server) tx
-                      broadcastMessage (rsPeerMgr server)
-                        (MInv (Inv [InvVector InvTx (getTxIdHash txid)]))
+                      broadcastTxToPeers server tx 0
                       return $ RpcResponse (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
             _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "Missing address or amount parameter") Null

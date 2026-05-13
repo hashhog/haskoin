@@ -10490,6 +10490,7 @@ main = hspec $ do
             , piNoBan    = False
             , piIsManual = False
             , piIsLocal  = False
+            , piWtxidRelay = False
             }
       piWantsHeaders info `shouldBe` False
       -- Toggle the flag (mirrors the inbound MSendHeaders handler in
@@ -10910,6 +10911,7 @@ main = hspec $ do
               , piWantsHeaders = False, piFeeFilterReceived = 0, piFeeFilterSent = 0
               , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
               , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
+              , piWtxidRelay = False
               }
         insertTestPeer pm addr baseInfo
         -- Even a low-score event (UnsolicitedMessage=1) must immediately discourage
@@ -10991,6 +10993,7 @@ main = hspec $ do
               , piNoBan    = False
               , piIsManual = False
               , piIsLocal  = False
+              , piWtxidRelay = False
               }
         piBanScore info `shouldBe` 0
 
@@ -11023,6 +11026,7 @@ main = hspec $ do
               , piNoBan    = False
               , piIsManual = False
               , piIsLocal  = False
+              , piWtxidRelay = False
               }
         piState info `shouldBe` PeerBanned
         piBanScore info `shouldBe` 100
@@ -11050,6 +11054,7 @@ main = hspec $ do
             , piWantsHeaders = False, piFeeFilterReceived = 0, piFeeFilterSent = 0
             , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
             , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
+            , piWtxidRelay = False
             }
       insertTestPeer pm addr info
       (_, d1) <- misbehaving pm addr InvalidTransaction
@@ -11321,6 +11326,7 @@ main = hspec $ do
               , piNoBan    = False
               , piIsManual = False
               , piIsLocal  = False
+              , piWtxidRelay = False
               }
             candidate = peerToEvictionCandidate addr info
         ecAddress candidate `shouldBe` addr
@@ -22077,6 +22083,7 @@ main = hspec $ do
             , piWantsHeaders = False, piFeeFilterReceived = 0, piFeeFilterSent = 0
             , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
             , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
+            , piWtxidRelay = False
             }
       insertTestPeer pm addr2 info2
       (_, disc2) <- misbehaving pm addr2 UnsolicitedMessage  -- score=1, still discourages
@@ -22120,6 +22127,7 @@ main = hspec $ do
             , piNoBan    = False
             , piIsManual = False
             , piIsLocal  = False
+            , piWtxidRelay = False
             }
 
       -- Case 1: NoBan peer — misbehaving must be a no-op (score unchanged, not banned).
@@ -22370,13 +22378,15 @@ main = hspec $ do
       ("fSuccessfullyConnected" `isInfixOf` contents) `shouldBe` False
       ("PeerConnected" `isInfixOf` contents) `shouldBe` True  -- used elsewhere but not in dispatch
 
-    it "G21 BUG: handshake-only messages (wtxidrelay) not segregated post-verack (W99 DOS)" $ do
-      -- Core: wtxidrelay received after handshake is ignored (fSuccessfullyConnected gate).
-      -- haskoin: MWtxidRelay -> return () everywhere — no distinction
-      -- between pre-verack (valid negotiation) and post-verack (should be ignored/scored).
-      -- The effect: a peer can send wtxidrelay at any time with no Misbehaving penalty.
+    it "G21 FIXED: MWtxidRelay handler now sets piWtxidRelay=True (W103 BUG-2 fix)" $ do
+      -- BUG-2 FIXED (W103): MWtxidRelay no longer no-ops; it sets piWtxidRelay=True
+      -- on the peer record so all three relay paths (wallet, MTx, broadcastTxToPeers)
+      -- use InvWtx (MSG_WTX=5) for this peer.
+      -- NOTE: BUG-17 (disconnect peer when wtxidrelay arrives post-verack) is still
+      -- open — the handler does not check piState for handshake completion.
+      -- Reference: bitcoin-core/src/net_processing.cpp:2027.
       contents <- readFile "app/Main.hs"
-      ("MWtxidRelay -> return ()" `isInfixOf` contents) `shouldBe` True
+      ("piWtxidRelay = True" `isInfixOf` contents) `shouldBe` True
 
     it "G22 BUG: service flags not validated on handshake (W99 CORRECTNESS)" $ do
       -- Core: checks NODE_NETWORK service flag before adding outbound peer.
@@ -22408,14 +22418,15 @@ main = hspec $ do
       contents <- readFile "app/Main.hs"
       ("_other -> return ()" `isInfixOf` contents) `shouldBe` True
 
-    it "G25 BUG: wtxidrelay state not recorded — peer always uses txid relay (W99 CORRECTNESS)" $ do
-      -- Core: MWtxidRelay sets m_peer_state.m_wtxid_relay = true so subsequent
-      -- inv/getdata use wtxid.  haskoin PeerInfo has no piWtxidRelay field;
-      -- MWtxidRelay -> return () discards the negotiation entirely.
-      -- Effect: even peers that negotiated wtxidrelay get txid-keyed INVs.
+    it "G25 FIXED: piWtxidRelay field added; wtxidrelay state now recorded (W103 BUG-2 fix)" $ do
+      -- BUG-2 FIXED (W103): PeerInfo now has piWtxidRelay :: !Bool.
+      -- MWtxidRelay handler sets piWtxidRelay=True.
+      -- All three relay paths (wallet, MTx, broadcastTxToPeers) select per peer:
+      --   InvWtx (MSG_WTX=5) + wtxid for wtxidrelay peers,
+      --   InvTx  (type=1)    + txid  for legacy peers.
+      -- Reference: bitcoin-core/src/net_processing.cpp:2027, RelayTransaction.
       contents <- readFile "src/Haskoin/Network.hs"
-      ("piWtxidRelay"   `isInfixOf` contents) `shouldBe` False
-      ("wtxidRelayEnabled" `isInfixOf` contents) `shouldBe` False
+      ("piWtxidRelay"   `isInfixOf` contents) `shouldBe` True
 
     it "G26 BUG: inv MSG_BLOOM_FILTER type filter absent (W99 CORRECTNESS)" $ do
       -- Core: if peer did not negotiate bloom (no NODE_BLOOM), discard
