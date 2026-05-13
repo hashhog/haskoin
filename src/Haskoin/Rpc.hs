@@ -54,6 +54,8 @@ module Haskoin.Rpc
   , maxGetUtxosOutpoints
     -- * BIP-22 result string mapping
   , bip22ResultString
+    -- * GBT deployment helpers (exported for testing)
+  , computeGbtDeploymentStatus
     -- * Internal helpers (exported for testing)
   , deploymentInfoForEntry
   , softforksFromEntry
@@ -209,6 +211,9 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            medianTimePast, maxBlockWeight,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
                            Deployment(..), taprootDeployment,
+                           ThresholdState(..), getDeploymentState,
+                           chainEntriesToBlockIndex,
+                           BlockIndex(biHash, biTimestamp),
                            checkAssumeutxoWhitelist,
                            AssumeUtxoParams(..), assumeUtxoForBlockHash,
                            connectBlock, disconnectBlock)
@@ -2555,6 +2560,42 @@ handleAddNode server params = do
 -- Mining RPC Handlers
 --------------------------------------------------------------------------------
 
+-- | Compute BIP-9 deployment status for getblocktemplate.
+--
+-- Returns @(vbavailable, activeRuleNames)@ where:
+--   * @vbavailable@ is a list of @(name, bit)@ pairs for STARTED/LOCKED_IN
+--     deployments — miners should signal these bits in the block version.
+--   * @activeRuleNames@ is a list of softfork names that are ACTIVE and must
+--     appear in the @rules@ array of the GBT response.
+--
+-- Reference: bitcoin-core/src/rpc/mining.cpp:965-991.
+-- Named deployments are passed in as @[(name, deployment)]@; the function
+-- queries @getDeploymentState@ for each one.
+computeGbtDeploymentStatus
+  :: [(Text, Deployment)]          -- ^ Named deployments to check
+  -> Map BlockHash ChainEntry      -- ^ Full in-memory header chain
+  -> ChainEntry                    -- ^ Current tip (parent of new block)
+  -> ([(Text, Int)], [Text])       -- ^ (vbavailable pairs, active rule names)
+computeGbtDeploymentStatus namedDeps entries tip =
+  let -- Build a BlockIndex chain deep enough for one BIP9 period.
+      mBI = chainEntriesToBlockIndex entries tip 2016
+      -- MTP function using pre-computed ceMedianTime stored in chain entries.
+      getMTP bi = case Map.lookup (biHash bi) entries of
+                    Just ce -> ceMedianTime ce
+                    Nothing -> biTimestamp bi
+      classify (name, dep) =
+        let (state, _) = getDeploymentState dep getMTP Map.empty mBI
+        in (name, dep, state)
+      classified = map classify namedDeps
+      -- STARTED / LOCKED_IN → goes into vbavailable with the bit number.
+      vbavail = [ (name, depBit dep)
+                | (name, dep, state) <- classified
+                , state == Started || state == LockedIn ]
+      -- ACTIVE → goes into rules array (soft-fork rule, no ! prefix needed
+      -- since miners are simply required to be aware of it after activation).
+      activeNames = [ name | (name, _, Active) <- classified ]
+  in (vbavail, activeNames)
+
 -- | Get a block template for mining
 -- | Get a block template for mining (BIP22/BIP23)
 -- Returns comprehensive block template matching Bitcoin Core's getblocktemplate
@@ -2575,7 +2616,8 @@ handleTemplateRequest server = do
           (rsMempool server) (rsUTXOCache server)
           BS.empty BS.empty  -- placeholder coinbase script
 
-  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  tip     <- readTVarIO (hcTip     (rsHeaderChain server))
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
 
   -- Generate longpollid: <previousblockhash><transactionsUpdated>
   -- For simplicity, we use the block hash and height
@@ -2584,17 +2626,26 @@ handleTemplateRequest server = do
       -- BIP22/23 capabilities we support
       capabilities = ["proposal" :: Text]
 
-      -- Active rules (soft forks that are active)
-      rules = catMaybes
-        [ Just ("csv" :: Text)        -- BIP68/112/113 always active now
-        , Just "!segwit"              -- ! prefix means required
-        ]
+      -- Named deployments to check for BIP-9 status.
+      -- Reference: bitcoin-core/src/rpc/mining.cpp:965-991.
+      namedDeps = [ ("taproot", taprootDeployment (rsNetwork server)) ]
+      (vbPairs, activeNames) =
+        computeGbtDeploymentStatus namedDeps entries tip
+
+      -- Active rules (soft forks that are active).
+      -- Core mining.cpp:950-958: csv always first, then !segwit (mandatory),
+      -- then each name from gbtstatus.active (no ! prefix for rules added
+      -- post-activation via the active list — Core adds ! only for taproot
+      -- in the pre-segwit block, not in the active block).
+      rules = ["csv" :: Text, "!segwit"] ++ activeNames
 
       -- Mutable fields that miners can modify
       mutable = ["time" :: Text, "transactions", "prevblock"]
 
-      -- Version bits available for signaling (BIP9)
-      vbavailable = object []  -- No active deployments for now
+      -- Version bits available for signaling (BIP9).
+      -- Core mining.cpp:968-983: STARTED and LOCKED_IN deployments with bit.
+      vbavailable = object [ Key.fromText name .= bit
+                           | (name, bit) <- vbPairs ]
 
       -- Coinbase auxiliary data
       coinbaseaux = object []
