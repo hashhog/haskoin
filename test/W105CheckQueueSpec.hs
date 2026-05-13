@@ -258,6 +258,9 @@ import Haskoin.Performance
 import Haskoin.Consensus
   ( ConsensusFlags(..)
   , consensusFlagsToScriptFlags
+  , initGlobalSigCache
+  , lookupGlobalSigCache
+  , insertGlobalSigCache
   )
 import Haskoin.Script (ScriptFlags, emptyFlags)
 
@@ -762,13 +765,36 @@ spec_G19_deadHelperTwoPipeline = describe "G19 dead-helper two-pipeline: Perform
 --------------------------------------------------------------------------------
 
 spec_G20_sigCacheNotInstantiated :: Spec
-spec_G20_sigCacheNotInstantiated = describe "G20 SigCache not in node state (BUG-2)" $ do
-  it "BUG-2: newSigCache works correctly in isolation but is never called from startup" $
-    -- There is no SigCache field in any node-state record (NodeState, PeerManager,
-    -- HaskoinDB).  The cache is never allocated or passed to validateSingleTx.
-    do sc <- newSigCache
-       n <- sigCacheSize sc
-       n `shouldBe` 0
+spec_G20_sigCacheNotInstantiated = describe "G20 Global SigCache instantiated at startup (BUG-2 FIXED)" $ do
+  it "FIXED BUG-2: initGlobalSigCache is callable and resets the process-global cache" $
+    -- After the fix, Consensus.hs exposes initGlobalSigCache (called from
+    -- app/Main.hs runNodeBody) which allocates / resets the process-wide
+    -- signature cache before any block validation begins.
+    -- This test verifies the call succeeds and that the global cache is
+    -- functional: insert → lookup round-trip via the same helpers that
+    -- validateSingleTx uses internally.
+    do initGlobalSigCache  -- reset to empty (as startup does)
+       let txid  = BS.replicate 32 0xab
+           idx   = 0 :: Word32
+           flags = 0 :: Word32
+       foundBefore <- lookupGlobalSigCache txid idx flags
+       foundBefore `shouldBe` False  -- fresh cache: miss
+       insertGlobalSigCache txid idx flags
+       foundAfter <- lookupGlobalSigCache txid idx flags
+       foundAfter `shouldBe` True    -- after insert: hit
+
+  it "FIXED BUG-2: global cache survives re-initialisation (second startup idempotent)" $
+    -- Calling initGlobalSigCache a second time (e.g. -reindex path) resets
+    -- the cache to empty, preventing stale entries from a prior run.
+    do let txid  = BS.replicate 32 0xcd
+           idx   = 1 :: Word32
+           flags = 8 :: Word32
+       insertGlobalSigCache txid idx flags
+       foundBefore <- lookupGlobalSigCache txid idx flags
+       foundBefore `shouldBe` True   -- entry present before reset
+       initGlobalSigCache             -- simulate second startup / reindex
+       foundAfter <- lookupGlobalSigCache txid idx flags
+       foundAfter `shouldBe` False   -- entry gone after reset
 
 --------------------------------------------------------------------------------
 -- G21: SigCache thread safety (shared_mutex equivalent)

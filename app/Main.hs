@@ -526,6 +526,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
   putStrLn $ "Starting Haskoin on " ++ netName net
   putStrLn $ "Data directory: " ++ dataDir
 
+  -- W105 BUG-2 FIX: initialise the process-global signature verification cache
+  -- before any block validation begins (db open, reindex, or live sync).
+  -- Core equivalent: SignatureCache construction in AppInitMain (init.cpp).
+  initGlobalSigCache
+  putStrLn "Signature cache initialised (50000 entries)"
+
   -- 2b. Parse --prune=N (Bitcoin Core init.cpp /
   --     node/blockmanager_args.cpp semantics).  Reject negative and
   --     2..549 values up front so misconfiguration fails fast before

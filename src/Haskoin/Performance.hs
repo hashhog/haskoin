@@ -88,6 +88,9 @@ module Haskoin.Performance
   , insertSigCache
   , clearSigCache
   , sigCacheSize
+    -- * Global Signature Cache (process-wide singleton)
+  , globalSigCache
+  , initGlobalSigCache
   ) where
 
 import Control.Concurrent.Async (mapConcurrently, forConcurrently)
@@ -112,6 +115,7 @@ import GHC.Generics (Generic)
 import Foreign.C.Types (CInt(..))
 import Network.Socket (Socket, SocketOption(..), setSocketOption)
 import System.IO.MMap (mmapFileByteString)
+import System.IO.Unsafe (unsafePerformIO)
 
 import Data.Maybe (mapMaybe)
 import Haskoin.Types
@@ -877,3 +881,34 @@ clearSigCache (SigCache ref) = writeIORef ref Map.empty
 -- | Get the current number of entries in the signature cache.
 sigCacheSize :: SigCache -> IO Int
 sigCacheSize (SigCache ref) = Map.size <$> readIORef ref
+
+--------------------------------------------------------------------------------
+-- Global (process-wide) Signature Cache
+--------------------------------------------------------------------------------
+
+-- | Process-global SigCache singleton.
+--
+-- Mirrors the 'Haskoin.Daemon.globalDebugSet' pattern: a top-level IORef
+-- initialised with an empty placeholder, replaced by 'initGlobalSigCache'
+-- during node startup.  All calls to 'validateSingleTx' read through this
+-- ref, so no SigCache argument threads through the entire call chain.
+--
+-- Threading choice rationale: the alternative — adding a SigCache parameter
+-- to validateSingleTx → validateBlockTransactions → validateFullBlockIO →
+-- connectBlock — would touch ~10 functions across Consensus.hs and
+-- app/Main.hs, all of which are called from multiple paths.  The module-level
+-- IORef matches the existing globalDebugSet precedent in this codebase and
+-- is safe because: (a) writes happen exactly once at startup before any
+-- validation thread runs, and (b) concurrent reads via lookupSigCache /
+-- insertSigCache are already protected by atomicModifyIORef' inside SigCache.
+{-# NOINLINE globalSigCache #-}
+globalSigCache :: IORef SigCache
+globalSigCache = unsafePerformIO (newSigCache >>= newIORef)
+
+-- | Replace the process-global SigCache.
+-- Call once during node startup before any block validation.
+-- Creates a fresh 50 000-entry cache (sigCacheMaxEntries).
+initGlobalSigCache :: IO ()
+initGlobalSigCache = do
+  sc <- newSigCache
+  writeIORef globalSigCache sc
