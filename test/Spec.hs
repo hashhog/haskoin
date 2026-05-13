@@ -97,6 +97,7 @@ import qualified W102AssumeUTXOSpec
 import qualified W103TxRelaySpec
 import qualified W104AddrManSpec
 import qualified W105CheckQueueSpec
+import qualified W106MempoolSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22495,6 +22496,9 @@ main = hspec $ do
 
   -- W105 CCheckQueue / parallel script verification audit
   W105CheckQueueSpec.spec
+
+  -- W106 CTxMemPool descendant/ancestor + RBF + package mempool audit
+  W106MempoolSpec.spec
 
   where
     sampleTx = Tx
