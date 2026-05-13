@@ -98,6 +98,7 @@ import qualified W103TxRelaySpec
 import qualified W104AddrManSpec
 import qualified W105CheckQueueSpec
 import qualified W106MempoolSpec
+import qualified W107CompactSizeSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22500,6 +22501,9 @@ main = hspec $ do
 
   -- W106 CTxMemPool descendant/ancestor + RBF + package mempool audit
   W106MempoolSpec.spec
+
+  -- W107 CompactSize + VarInt 30-gate audit
+  W107CompactSizeSpec.spec
 
   where
     sampleTx = Tx

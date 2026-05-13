@@ -197,6 +197,8 @@ module Haskoin.Storage
   , getCompressedScript
   , putCoreVarInt
   , getCoreVarInt
+  , putCoreCoin
+  , getCoreCoin
   , serializeSnapshotCoin
   , parseSnapshotCoin
   , BackgroundValidation(..)
