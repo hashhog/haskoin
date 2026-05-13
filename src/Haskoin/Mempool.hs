@@ -173,6 +173,7 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            isFinalTxCheck, calculateSequenceLocks,
                            checkSequenceLocks, bip68Active,
                            getTransactionSigOpCost, consensusFlagsAtHeight,
+                           consensusFlagsToScriptFlags,
                            SigOpCost(..), isCoinbase)
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
@@ -1086,7 +1087,7 @@ resolveInput mp op = do
 -- @sha_scriptpubkeys@ commitments can be computed correctly. Falls
 -- back to script-only behaviour for legacy / SegWit-v0 inputs.
 verifyAllScripts :: Mempool -> Tx -> Map OutPoint TxOut -> IO (Either MempoolError ())
-verifyAllScripts _mp tx inputMap = do
+verifyAllScripts mp tx inputMap = do
   -- First pass: resolve every input's prevout, fail fast on missing.
   let resolveAll = traverse
         (\inp -> case Map.lookup (txInPrevOutput inp) inputMap of
@@ -1096,11 +1097,15 @@ verifyAllScripts _mp tx inputMap = do
   case resolveAll of
     Left err -> return $ Left err
     Right prevs -> do
-      let spentAmounts = map txOutValue prevs
+      -- Use consensus flags for the next block height (mempool admission standard).
+      height <- readTVarIO (mpHeight mp)
+      let cflags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
+          scriptFlags = consensusFlagsToScriptFlags cflags
+          spentAmounts = map txOutValue prevs
           spentScripts = map txOutScript prevs
           indexed = zip [0..] prevs
       results <- forM indexed $ \(idx, prevOut) ->
-        case Script.verifyScriptWithFlags Script.emptyFlags tx idx
+        case Script.verifyScriptWithFlags scriptFlags tx idx
                (txOutScript prevOut) (txOutValue prevOut)
                spentAmounts spentScripts of
           Left err -> return $ Left (ErrScriptVerificationFailed err)
@@ -2321,7 +2326,7 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
                                   (ErrNonStandard ("dust (output " ++ show dustIdx ++ ")"))
                                 Right () -> do
                                   -- Verify scripts.
-                                  scriptResult <- verifyAllScripts' tx inputMap
+                                  scriptResult <- verifyAllScripts' mp tx inputMap
                                   case scriptResult of
                                     Left err -> return $ Left $ PkgTxError txid
                                                             (ErrScriptVerificationFailed err)
@@ -2339,8 +2344,9 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
 -- | Verify all scripts for a transaction (variant returning String error).
 -- Same Taproot-aware refactor as 'verifyAllScripts': pre-collect prevouts
 -- and pass to 'verifyScriptWithFlags' so BIP-341 sighash works.
-verifyAllScripts' :: Tx -> Map OutPoint TxOut -> IO (Either String ())
-verifyAllScripts' tx inputMap = do
+-- Uses consensus flags for the next block height (mempool admission standard).
+verifyAllScripts' :: Mempool -> Tx -> Map OutPoint TxOut -> IO (Either String ())
+verifyAllScripts' mp tx inputMap = do
   let resolveAll = traverse
         (\inp -> case Map.lookup (txInPrevOutput inp) inputMap of
             Nothing -> Left $ "Missing input: " ++ show (txInPrevOutput inp)
@@ -2349,11 +2355,15 @@ verifyAllScripts' tx inputMap = do
   case resolveAll of
     Left err -> return $ Left err
     Right prevs -> do
-      let spentAmounts = map txOutValue prevs
+      -- Use consensus flags for the next block height (mempool admission standard).
+      height <- readTVarIO (mpHeight mp)
+      let cflags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
+          scriptFlags = consensusFlagsToScriptFlags cflags
+          spentAmounts = map txOutValue prevs
           spentScripts = map txOutScript prevs
           indexed = zip [0..] prevs
       results <- forM indexed $ \(idx, prevOut) ->
-        case Script.verifyScriptWithFlags Script.emptyFlags tx idx
+        case Script.verifyScriptWithFlags scriptFlags tx idx
                (txOutScript prevOut) (txOutValue prevOut)
                spentAmounts spentScripts of
           Left err -> return $ Left err
