@@ -99,6 +99,8 @@ import Control.DeepSeq (NFData(..), force, deepseq)
 import Control.Monad (when, unless)
 import Control.Parallel.Strategies (parMap, rseq, using, parList)
 import qualified Crypto.Hash as H
+import qualified Crypto.Random as CryptoRandom
+import Data.Bits (shiftL, (.|.))
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -109,7 +111,7 @@ import Data.Ord (comparing)
 import Data.List (minimumBy)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Int (Int64)
-import Data.Word (Word32, Word64)
+import Data.Word (Word8, Word32, Word64)
 import GHC.Conc (numCapabilities)
 import GHC.Generics (Generic)
 import Foreign.C.Types (CInt(..))
@@ -823,8 +825,13 @@ compactUTXORange = do
 -- Signature Verification Cache
 --------------------------------------------------------------------------------
 
--- | Key for signature cache: (txid hash, input index, script flags)
-data SigCacheKey = SigCacheKey !ByteString !Word32 !Word32
+-- | Cache key: first 8 bytes of SHA256(nonce || sighash || pubkey || sig || flagsBytes).
+--
+-- Using a Word64 (Core's CheapHash pattern) keeps Map operations O(1) in
+-- key comparison while still providing 64-bit collision resistance on top
+-- of the per-process nonce.  Two entries can collide with probability
+-- 2^{-64} per pair — negligible for a 50 000-entry cache.
+newtype SigCacheKey = SigCacheKey Word64
   deriving (Eq, Ord, Show)
 
 -- | Thread-safe signature verification cache.
@@ -834,53 +841,102 @@ data SigCacheKey = SigCacheKey !ByteString !Word32 !Word32
 --   - Block validation (same tx may be verified multiple times during reorgs)
 --   - Mempool acceptance (transactions re-verified when blocks arrive)
 --
--- The cache uses a bounded Map with LRU-style eviction (oldest entries
--- removed when capacity is reached). Cache keys include the script flags
--- to ensure different verification contexts don't share cached results.
+-- The cache uses a bounded Map with deleteMin eviction.  The 32-byte random
+-- nonce (initialised from /dev/urandom at construction) prevents an attacker
+-- from predicting which key values collide, closing the cache-poisoning vector
+-- documented in W105 BUG-9.  The key commits to the full signature material
+-- (sighash, pubkey, sig bytes, flags) so DER-malleated signatures that share
+-- a txid never share a cache entry (W105 BUG-13 fix).
 --
 -- Typical hit rate: 30-50% during normal operation, higher during reorgs.
-newtype SigCache = SigCache (IORef (Map SigCacheKey ()))
+data SigCache = SigCache
+  { sigCacheNonce :: !ByteString        -- ^ 32-byte /dev/urandom nonce
+  , sigCacheRef   :: !(IORef (Map SigCacheKey ()))
+  }
 
 -- | Maximum number of entries in the signature cache.
 sigCacheMaxEntries :: Int
 sigCacheMaxEntries = 50000
 
--- | Create a new empty signature cache.
+-- | Create a new empty signature cache with a fresh cryptographic nonce.
+--
+-- Uses 'CryptoRandom.getRandomBytes' (cryptonite, backed by \/dev\/urandom)
+-- to generate a 32-byte nonce that salts every cache key.  This is the same
+-- approach as Bitcoin Core's @SignatureCache()@ constructor which calls
+-- @GetRandHash()@ at startup (sigcache.cpp).
 newSigCache :: IO SigCache
-newSigCache = SigCache <$> newIORef Map.empty
+newSigCache = do
+  nonce <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  ref   <- newIORef Map.empty
+  return (SigCache nonce ref)
+
+-- | Derive a 'SigCacheKey' from the per-cache nonce and full signature
+-- material.
+--
+-- Key = first 8 bytes of SHA256(nonce || sighash || pubkey || sig || flagsBytes)
+--
+-- This mirrors Core's @ComputeEntryECDSA@ / @ComputeEntrySchnorr@ which hash
+-- the nonce together with the sighash, pubkey, and raw signature bytes.
+-- Arguments:
+--   nonce      — 32-byte per-process secret
+--   sighash    — 32-byte transaction/input sighash (or txid bytes as proxy)
+--   pubkey     — compressed/uncompressed pubkey bytes (may be empty)
+--   sig        — raw DER or Schnorr signature bytes (may be empty)
+--   flagsBytes — 4-byte little-endian script flags word
+computeSigCacheKey :: ByteString -> ByteString -> ByteString -> ByteString -> ByteString -> SigCacheKey
+computeSigCacheKey nonce sighash pubkey sig flagsBytes =
+  let material = nonce <> sighash <> pubkey <> sig <> flagsBytes
+      digest   = convert (H.hashWith H.SHA256 material) :: ByteString
+      -- Fold the first 8 bytes into a big-endian Word64 (CheapHash)
+      w64      = BS.foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral (b :: Word8))
+                           (0 :: Word64)
+                           (BS.take 8 digest)
+  in SigCacheKey w64
+{-# INLINE computeSigCacheKey #-}
 
 -- | Look up a verification result in the cache.
 --
--- Returns True if the (txid, input index, flags) combination was
--- previously verified successfully.
-lookupSigCache :: SigCache -> ByteString -> Word32 -> Word32 -> IO Bool
-lookupSigCache (SigCache ref) txid idx flags = do
+-- Returns True if the given signature material was previously verified
+-- successfully within this cache instance.
+-- Arguments: (sighash, pubkey, sig, flagsBytes) — same convention as
+-- 'insertSigCache'.
+lookupSigCache :: SigCache -> ByteString -> ByteString -> ByteString -> ByteString -> IO Bool
+lookupSigCache (SigCache nonce ref) sighash pubkey sig flagsBytes = do
   m <- readIORef ref
-  return $ Map.member (SigCacheKey txid idx flags) m
+  let key = computeSigCacheKey nonce sighash pubkey sig flagsBytes
+  return $! Map.member key m
 
 -- | Insert a successful verification result into the cache.
 --
--- If the cache has reached its maximum size, the entry with the
--- smallest key is evicted to make room (approximates LRU behavior
--- since keys include txid bytes which are essentially random).
-insertSigCache :: SigCache -> ByteString -> Word32 -> Word32 -> IO ()
-insertSigCache (SigCache ref) txid idx flags =
+-- Arguments: (sighash, pubkey, sig, flagsBytes) where:
+--   sighash    — 32-byte transaction/input sighash (or txid bytes as proxy)
+--   pubkey     — raw pubkey bytes
+--   sig        — raw signature bytes (DER or Schnorr)
+--   flagsBytes — 4-byte little-endian script flags word
+--
+-- If the cache has reached 'sigCacheMaxEntries', the entry with the smallest
+-- key (lexicographic on the Word64 hash) is evicted.
+insertSigCache :: SigCache -> ByteString -> ByteString -> ByteString -> ByteString -> IO ()
+insertSigCache (SigCache nonce ref) sighash pubkey sig flagsBytes =
   atomicModifyIORef' ref $ \m ->
-    let m' = if Map.size m >= sigCacheMaxEntries
-             then Map.insert (SigCacheKey txid idx flags) () (Map.deleteMin m)
-             else Map.insert (SigCacheKey txid idx flags) () m
+    let key = computeSigCacheKey nonce sighash pubkey sig flagsBytes
+        m'  = if Map.size m >= sigCacheMaxEntries
+              then Map.insert key () (Map.deleteMin m)
+              else Map.insert key () m
     in (m', ())
 
 -- | Clear all entries from the signature cache.
 --
 -- Should be called when the chain tip changes significantly (e.g., reorg)
 -- to prevent stale cache entries from causing incorrect validation.
+-- The nonce is preserved — a fresh nonce is only generated at construction
+-- (via 'newSigCache' / 'initGlobalSigCache').
 clearSigCache :: SigCache -> IO ()
-clearSigCache (SigCache ref) = writeIORef ref Map.empty
+clearSigCache (SigCache _nonce ref) = writeIORef ref Map.empty
 
 -- | Get the current number of entries in the signature cache.
 sigCacheSize :: SigCache -> IO Int
-sigCacheSize (SigCache ref) = Map.size <$> readIORef ref
+sigCacheSize (SigCache _nonce ref) = Map.size <$> readIORef ref
 
 --------------------------------------------------------------------------------
 -- Global (process-wide) Signature Cache
@@ -907,7 +963,10 @@ globalSigCache = unsafePerformIO (newSigCache >>= newIORef)
 
 -- | Replace the process-global SigCache.
 -- Call once during node startup before any block validation.
--- Creates a fresh 50 000-entry cache (sigCacheMaxEntries).
+-- Creates a fresh 50 000-entry cache (sigCacheMaxEntries) with a new
+-- cryptographic nonce from /dev/urandom.  Previous entries (and the old
+-- nonce) are discarded, preventing any stale cache entries from a prior
+-- run or reindex from being reused.
 initGlobalSigCache :: IO ()
 initGlobalSigCache = do
   sc <- newSigCache
