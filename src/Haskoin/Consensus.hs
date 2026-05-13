@@ -237,7 +237,8 @@ import Data.Maybe (mapMaybe)
 import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
                       Block(..), putVarInt, putVarBytes)
-import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
+import qualified Crypto.Random as CryptoRandom
+import Haskoin.Crypto (doubleSHA256, sha256, computeTxId, computeBlockHash)
 import Haskoin.Script (decodeScript, countScriptSigops,
                        ScriptVerifyFlag(..), ScriptFlags, flagSet,
                        verifyScriptWithFlags, isPushOnly, classifyOutput,
@@ -2700,12 +2701,19 @@ consensusFlagsToWord32 cf =
   .|. (if flagNullDummy cf then 32 else 0)
 
 --------------------------------------------------------------------------------
--- Process-wide Signature Verification Cache (W105 BUG-2 fix)
+-- Process-wide Signature Verification Cache (W105 BUG-2 fix; nonce hardening
+-- W105 BUG-9 + BUG-13 fix)
 --------------------------------------------------------------------------------
 
--- | Key for the process-wide signature cache.
--- (txid bytes, input index, flags word)
-type SigCacheEntry = (ByteString, Word32, Word32)
+-- | Cache key: first 8 bytes of SHA256(nonce || sighash || scriptSig ||
+-- witnessBytes || prevoutScript || flagsBytes) as a big-endian Word64.
+--
+-- Using Word64 (Core's CheapHash pattern) keeps Map comparisons O(1).
+-- The 32-byte nonce makes the key space unpredictable across processes,
+-- closing the cache-poisoning vector (W105 BUG-9).  Including the full
+-- script/witness material (not just txid+idx) ensures DER-malleated
+-- signatures that share a txid never share a cache entry (W105 BUG-13).
+type SigCacheEntry = Word64
 
 -- | Process-global signature cache (bounded Map, 50 000 entries).
 --
@@ -2722,21 +2730,49 @@ type SigCacheEntry = (ByteString, Word32, Word32)
 globalSigCacheRef :: IORef (Map SigCacheEntry ())
 globalSigCacheRef = unsafePerformIO (newIORef Map.empty)
 
+-- | Process-global 32-byte nonce, written once by 'initGlobalSigCache'.
+-- Seeded from /dev/urandom via cryptonite.
+{-# NOINLINE globalSigCacheNonce #-}
+globalSigCacheNonce :: IORef ByteString
+globalSigCacheNonce = unsafePerformIO (newIORef (BS.replicate 32 0))
+
 globalSigCacheMaxEntries :: Int
 globalSigCacheMaxEntries = 50000
 
--- | Look up (txid, inputIdx, flagsWord) in the process-global sig cache.
-lookupGlobalSigCache :: ByteString -> Word32 -> Word32 -> IO Bool
-lookupGlobalSigCache txid idx flags = do
-  m <- readIORef globalSigCacheRef
-  return $ Map.member (txid, idx, flags) m
+-- | Derive the cache key from the per-process nonce and full input material.
+-- Key = first 8 bytes (big-endian Word64) of
+--   SHA256(nonce || sighash || scriptSig || witnessBytes || prevoutScript || flagsBytes)
+computeGlobalSigCacheKey :: ByteString  -- ^ nonce
+                         -> ByteString  -- ^ sighash / txid bytes
+                         -> ByteString  -- ^ scriptSig of this input
+                         -> ByteString  -- ^ concatenated witness stack items
+                         -> ByteString  -- ^ prevout scriptPubKey
+                         -> ByteString  -- ^ 4-byte little-endian flags word
+                         -> SigCacheEntry
+computeGlobalSigCacheKey nonce sighash scriptSig witnessBytes prevoutScript flagsBytes =
+  let material = nonce <> sighash <> scriptSig <> witnessBytes <> prevoutScript <> flagsBytes
+      digest   = sha256 material
+  in BS.foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral (b :: Word8)) 0 (BS.take 8 digest)
+{-# INLINE computeGlobalSigCacheKey #-}
 
--- | Insert a verified (txid, inputIdx, flagsWord) into the process-global sig
--- cache.  Evicts the lexicographically smallest entry when full.
-insertGlobalSigCache :: ByteString -> Word32 -> Word32 -> IO ()
-insertGlobalSigCache txid idx flags =
+-- | Look up signature material in the process-global sig cache.
+-- Arguments: (sighash, scriptSig, witnessBytes, prevoutScript, flagsBytes)
+lookupGlobalSigCache :: ByteString -> ByteString -> ByteString -> ByteString -> ByteString -> IO Bool
+lookupGlobalSigCache sighash scriptSig witnessBytes prevoutScript flagsBytes = do
+  nonce <- readIORef globalSigCacheNonce
+  m     <- readIORef globalSigCacheRef
+  let key = computeGlobalSigCacheKey nonce sighash scriptSig witnessBytes prevoutScript flagsBytes
+  return $! Map.member key m
+
+-- | Insert verified signature material into the process-global sig cache.
+-- Arguments: (sighash, scriptSig, witnessBytes, prevoutScript, flagsBytes)
+-- Evicts the entry with the smallest Word64 key when full.
+insertGlobalSigCache :: ByteString -> ByteString -> ByteString -> ByteString -> ByteString -> IO ()
+insertGlobalSigCache sighash scriptSig witnessBytes prevoutScript flagsBytes =
   atomicModifyIORef' globalSigCacheRef $ \m ->
-    let key = (txid, idx, flags)
+    let key = unsafePerformIO $ do
+                nonce <- readIORef globalSigCacheNonce
+                return $! computeGlobalSigCacheKey nonce sighash scriptSig witnessBytes prevoutScript flagsBytes
         m'  = if Map.size m >= globalSigCacheMaxEntries
                 then Map.insert key () (Map.deleteMin m)
                 else Map.insert key () m
@@ -2744,9 +2780,13 @@ insertGlobalSigCache txid idx flags =
 
 -- | (Re-)initialise the process-global sig cache.
 -- Call once during node startup, before any block validation begins.
--- Creates a fresh empty cache so old entries from a previous run do not persist.
+-- Generates a fresh /dev/urandom nonce and clears all cached entries so
+-- stale results from a prior run or reindex cannot be reused.
 initGlobalSigCache :: IO ()
-initGlobalSigCache = writeIORef globalSigCacheRef Map.empty
+initGlobalSigCache = do
+  nonce <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  writeIORef globalSigCacheNonce nonce
+  writeIORef globalSigCacheRef Map.empty
 
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
@@ -2832,7 +2872,13 @@ validateSingleTx flags skipScripts utxoMap tx = do
   -- scriptSig + witness must satisfy its scriptPubKey under the consensus
   -- ScriptFlags for this height.
   -- W105 BUG-2 FIX: consult the process-global SigCache (globalSigCacheRef)
-  -- before paying EC math.  Cache key = (txid bytes, input index, flags word).
+  -- before paying EC math.
+  -- W105 BUG-9 + BUG-13 FIX: cache key = SHA256(nonce || sighash ||
+  --   scriptSig || witnessBytes || prevoutScript || flagsBytes) first 8 bytes.
+  -- The nonce (32 bytes from /dev/urandom, initialised at startup) makes the
+  -- key space unpredictable across processes (BUG-9).  Including scriptSig +
+  -- witness stack ensures DER-malleated sigs that share a txid do NOT share a
+  -- cache entry (BUG-13).
   -- Uses unsafePerformIO to call IO from the pure Either monad — safe because
   -- the cache is a pure performance optimisation: observable effect is only
   -- execution speed, not correctness.
@@ -2842,9 +2888,16 @@ validateSingleTx flags skipScripts utxoMap tx = do
         spentScripts = map txOutScript prevOuts
         txidBytes    = getHash256 (getTxIdHash (computeTxId tx))
         flagsWord    = consensusFlagsToWord32 flags
-    forM_ (zip [0..] prevOuts) $ \(idx, prevOut) ->
-      let cacheIdx = fromIntegral (idx :: Int) :: Word32
-          cached   = unsafePerformIO (lookupGlobalSigCache txidBytes cacheIdx flagsWord)
+        flagsBytes   = runPut (putWord32le flagsWord)
+        inputs       = txInputs tx
+        witnesses    = txWitness tx ++ repeat []  -- pad with empty if needed
+    forM_ (zip3 [0..] prevOuts (zip inputs witnesses)) $ \(idx, prevOut, (inp, witStack)) ->
+      let scriptSig    = txInScript inp
+          witnessBytes = BS.concat witStack
+          prevoutScript = txOutScript prevOut
+          cached = unsafePerformIO
+                     (lookupGlobalSigCache txidBytes scriptSig witnessBytes
+                                          prevoutScript flagsBytes)
       in if cached
            then Right ()  -- cache hit: skip EC math
            else case verifyScriptWithFlags scriptFlags tx idx
@@ -2856,7 +2909,9 @@ validateSingleTx flags skipScripts utxoMap tx = do
                                       ++ "): script returned false"
                   Right True  ->
                     -- Cache the successful result for future lookups.
-                    let !_ = unsafePerformIO (insertGlobalSigCache txidBytes cacheIdx flagsWord)
+                    let !_ = unsafePerformIO
+                               (insertGlobalSigCache txidBytes scriptSig witnessBytes
+                                                     prevoutScript flagsBytes)
                     in Right ()
 
   return (totalIn - totalOut)
