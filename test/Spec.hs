@@ -101,6 +101,7 @@ import qualified W106MempoolSpec
 import qualified W107CompactSizeSpec
 import qualified W108GbtSpec
 import qualified W109BlockIndexSpec
+import qualified W110BloomFilterSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22512,6 +22513,9 @@ main = hspec $ do
 
   -- W109 CChain + CBlockIndex + CBlockTreeDB + block-file storage 30-gate audit
   W109BlockIndexSpec.spec
+
+  -- W110 BIP-37 bloom filter 30-gate audit
+  W110BloomFilterSpec.spec
 
   where
     sampleTx = Tx
