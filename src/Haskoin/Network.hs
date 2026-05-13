@@ -141,6 +141,7 @@ module Haskoin.Network
   , buildBlockLocator
     -- * Wire-decode caps (DoS hardening)
   , maxInvSz
+  , maxGetDataSz
   , maxHeadersResults
   , maxLocatorSz
   , maxAddrToSend
@@ -833,6 +834,15 @@ instance Serialize InvVector where
 -- followed by a tiny payload.
 maxInvSz :: Word64
 maxInvSz = 50_000
+
+-- | Maximum number of items in a single outgoing GETDATA message.
+-- Mirrors Bitcoin Core's @MAX_GETDATA_SZ = 1000@
+-- (bitcoin-core/src/protocol.h:482).  The wire-decode cap (@maxInvSz@
+-- = 50_000) is deliberately higher so a remote peer can send us large
+-- getdata requests; this constant is only applied when *we* build
+-- outbound getdata messages (e.g. in the MInv tx handler).
+maxGetDataSz :: Int
+maxGetDataSz = 1_000
 
 -- | Maximum number of headers in a 'Headers' message.
 -- Mirrors Bitcoin Core's @MAX_HEADERS_RESULTS = 2000@

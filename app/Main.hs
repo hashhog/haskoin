@@ -1843,10 +1843,17 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
             ) txIvs
       unless (null unknown) $ do
         pm <- readIORef pmRef
-        -- Request as witness txs for full witness data
+        -- Request as witness txs for full witness data.
+        -- BUG-5 FIX: cap outgoing GETDATA at maxGetDataSz=1000 per message.
+        -- Core net_processing.cpp:6207 batches at MAX_GETDATA_SZ=1000;
+        -- without this cap a single MInv with 50_000 items would emit one
+        -- giant GetData, violating Core's application-level protocol limit.
+        -- Reference: bitcoin-core/src/protocol.h:482 MAX_GETDATA_SZ = 1000.
         let witnessTxIvs = map (\iv -> iv { ivType = InvWitnessTx }) unknown
-        requestFromPeer pm addr (MGetData (GetData witnessTxIvs))
-          `catch` (\(_ :: SomeException) -> return ())
+            batches = chunksOf maxGetDataSz witnessTxIvs
+        mapM_ (\batch ->
+          requestFromPeer pm addr (MGetData (GetData batch))
+            `catch` (\(_ :: SomeException) -> return ())) batches
 
   MGetHeaders (GetHeaders _ver locators hashStop) -> do
     -- Respond to getheaders from peers so they can sync from us.
