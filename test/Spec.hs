@@ -6076,8 +6076,10 @@ main = hspec $ do
         it "Rule 3: rejects replacement with lower absolute fee" $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
               conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
-              -- New tx has 500 sat fee (< 1000)
-              result = checkReplacement dummyTx [conflict] [conflict] 500 200 (FeeRate 2500)
+              -- New tx has 500 sat fee (< 1000).
+              -- Use FeeRate 6000 > FeeRate 5000 to pass Rule 3a (W106 BUG-7 fix),
+              -- then Rule 3 fires for insufficient absolute fee.
+              result = checkReplacement dummyTx [conflict] [conflict] 500 200 (FeeRate 6000)
           case result of
             Left (RbfInsufficientAbsoluteFee newF reqF) -> do
               newF `shouldBe` 500
@@ -6092,26 +6094,23 @@ main = hspec $ do
               result = checkReplacement dummyTx [conflict] [conflict] 2000 200 (FeeRate 10000)
           result `shouldBe` Right ()
 
-        -- Rule 3a (standalone feerate gate) was a haskoin-internal non-Core
-        -- check. Bitcoin Core 27+ replaced it with ImprovesFeerateDiagram
-        -- (Gate 8, deferred). It has been removed from checkReplacement so
-        -- that we match Core's PaysForRBF semantics exactly. A replacement
-        -- that beats Rule 3 (absolute fee) and Rule 4 (relay bandwidth) but
-        -- has a lower feerate than the conflict is now accepted by
-        -- checkReplacement; the feerate diagram check (Gate 8) is the
-        -- correct place to enforce economic improvement.
-        it "Rule 3a (removed): replacement with lower feerate passes checkReplacement (feerate diagram gate deferred)" $ do
+        -- Rule 3a (W106 BUG-7 FIXED): checkReplacement now enforces that the
+        -- replacement's feerate must strictly exceed the feerate of every
+        -- directly-conflicting tx.  Core: validation.cpp:1018-1026.
+        it "Rule 3a (enforced): replacement with lower feerate is rejected by checkReplacement (W106 BUG-7 fixed)" $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
               conflict = mkMockEntry txid1 1000 200 (FeeRate 5000)
-              -- New tx: fee 1100 (> 1000 = all-evictions total), vsize 440
-              -- Additional fee = 100, required relay = 440*1000/1000 = 440 > 100 → Rule 4 fails
-              -- Use vsize=200 so additional=100, required=200 → also fails Rule 4.
-              -- Use a case that actually passes both Rule 3 + Rule 4:
-              -- fee=1500, vsize=200: additional=500 >= 200 → passes.
+              -- New tx: fee=1500, vsize=200 → feerate=7500 msat/vB ... wait, FeeRate here
+              -- is in sat/kvB units. conflict FeeRate 5000 = 5 sat/vB.
+              -- Replacement FeeRate 2500 = 2.5 sat/vB → lower → Rule 3a fires.
               result = checkReplacement dummyTx [conflict] [conflict] 1500 200 (FeeRate 2500)
-          -- With the old Rule 3a this would have failed (FeeRate 2500 < FeeRate 5000).
-          -- Now it passes because checkReplacement no longer enforces a feerate gate.
-          result `shouldBe` Right ()
+          -- Rule 3a: FeeRate 2500 <= FeeRate 5000 → rejected
+          case result of
+            Left (RbfInsufficientFeeRate newR minR) -> do
+              newR `shouldBe` FeeRate 2500
+              minR `shouldBe` FeeRate 5000
+            Left other -> expectationFailure ("expected RbfInsufficientFeeRate, got: " ++ show other)
+            Right ()   -> expectationFailure "Rule 3a not enforced: accepted lower-feerate replacement"
 
         it "Rule 4: rejects when additional fee < relay fee for bandwidth" $ do
           let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
@@ -6229,6 +6228,7 @@ main = hspec $ do
           -- With the fix, Rule 4 additional = newFee - sum(allEvictions fees).
           -- If we had only subtracted directConflict fee, additional would be larger
           -- and Rule 4 might pass incorrectly.
+          -- NOTE: newFeeRate must be > conflict FeeRate 1000 to pass Rule 3a (W106 BUG-7 fix).
           let mkEntry i fee = mkMockEntryW73 (TxId (Hash256 (BS.pack (replicate 32 i)))) fee 100 (FeeRate 1000)
               directConflict = mkEntry 0x01 500
               descendant     = mkEntry 0x02 600
@@ -6237,7 +6237,8 @@ main = hspec $ do
               -- additional = 1101 - 1100 = 1
               -- requiredRelay = 2000 * 100 / 1000 = 200 → fails Rule 4
               -- (incrementalRelayFeePerKvb = 100 sat/kvB, Core DEFAULT_INCREMENTAL_RELAY_FEE)
-              result = checkReplacement dummyTxW73 [directConflict] [directConflict, descendant] 1101 2000 (FeeRate 550)
+              -- Use FeeRate 2000 > FeeRate 1000 (conflict) to pass Rule 3a first.
+              result = checkReplacement dummyTxW73 [directConflict] [directConflict, descendant] 1101 2000 (FeeRate 2000)
           case result of
             Left (RbfInsufficientRelayFee addF reqF) -> do
               addF `shouldBe` 1
