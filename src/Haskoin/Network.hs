@@ -232,6 +232,7 @@ module Haskoin.Network
   , addrmanMaxFailures
   , addrmanMinFail
     -- ** AddrMan Helpers
+  , isRoutable
   , isTerribleAddress
   , getAddressChance
     -- ** Outbound Connection Diversity
@@ -4372,6 +4373,59 @@ data AddrInfo = AddrInfo
 
 instance NFData AddrInfo
 
+-- | Check if a SockAddr is publicly routable on the global internet.
+-- Reference: Bitcoin Core netaddress.cpp CNetAddr::IsRoutable()
+--
+-- Core: IsRoutable = IsValid && !(IsRFC1918 || IsRFC2544 || IsRFC3927 ||
+--         IsRFC4862 || IsRFC6598 || IsRFC5737 || IsRFC4193 || IsRFC4843 ||
+--         IsRFC7343 || IsLocal || IsInternal)
+--
+-- For IPv4 (SockAddrInet), HostAddress is stored in host byte order on
+-- Linux.  On a little-endian host the low byte is the first IP octet, so:
+--   first_octet  = addr .&. 0xff
+--   second_octet = (addr `shiftR` 8) .&. 0xff
+--   third_octet  = (addr `shiftR` 16) .&. 0xff
+--
+-- Excluded ranges (matching Core exactly):
+--   IsLocal:    127.0.0.0/8 or 0.0.0.0/8 (loopback / unspecified)
+--   IsRFC1918:  10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+--   IsRFC2544:  198.18.0.0/15 (benchmarking)
+--   IsRFC3927:  169.254.0.0/16 (link-local)
+--   IsRFC6598:  100.64.0.0/10 (shared address space)
+--   IsRFC5737:  192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 (documentation)
+--
+-- IPv6 SockAddrInet6 addresses are treated as not-routable here because the
+-- two-pipeline BUG-1 means pmKnownAddrs only ever holds IPv4 SockAddrInet;
+-- extend this function when IPv6 support is wired up.
+isRoutable :: SockAddr -> Bool
+isRoutable (SockAddrInet _port hostAddr) =
+  let o1 = hostAddr .&. 0xff
+      o2 = (hostAddr `shiftR` 8)  .&. 0xff
+      o3 = (hostAddr `shiftR` 16) .&. 0xff
+      -- IsLocal: 0.x.x.x or 127.x.x.x
+      isLocal    = o1 == 0 || o1 == 127
+      -- IsRFC1918: 10/8, 172.16/12, 192.168/16
+      isRfc1918  = o1 == 10
+               || (o1 == 172 && o2 >= 16 && o2 <= 31)
+               || (o1 == 192 && o2 == 168)
+      -- IsRFC2544: 198.18/15 and 198.19/15
+      isRfc2544  = o1 == 198 && (o2 == 18 || o2 == 19)
+      -- IsRFC3927: 169.254/16 (link-local)
+      isRfc3927  = o1 == 169 && o2 == 254
+      -- IsRFC6598: 100.64.0.0/10  (100.64–100.127)
+      isRfc6598  = o1 == 100 && o2 >= 64 && o2 <= 127
+      -- IsRFC5737: documentation ranges
+      isRfc5737  = (o1 == 192 && o2 == 0   && o3 == 2)
+               || (o1 == 198 && o2 == 51  && o3 == 100)
+               || (o1 == 203 && o2 == 0   && o3 == 113)
+      -- IsValid: not all-zeros (0.0.0.0 caught by isLocal) and not all-ones
+      isUnspecified = hostAddr == 0
+      isBroadcast   = hostAddr == 0xffffffff
+      isValidAddr   = not isUnspecified && not isBroadcast
+  in isValidAddr && not (isLocal || isRfc1918 || isRfc2544 || isRfc3927
+                                 || isRfc6598 || isRfc5737)
+isRoutable _ = False  -- IPv6 / Unix: not yet classified; conservatively reject
+
 -- | Check if an address is "terrible" (should not be selected)
 -- Reference: Bitcoin Core addrman.cpp AddrInfo::IsTerrible
 isTerribleAddress :: Int64 -> AddrInfo -> Bool
@@ -4477,8 +4531,13 @@ getBucketPosition key isNew bucket addr =
 
 -- | Add an address to the address manager
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Add_
+-- Core AddSingle first line: "if (!addr.IsRoutable()) return false;"
 addAddress :: AddrMan -> SockAddr -> SockAddr -> Word64 -> Int64 -> IO Bool
-addAddress am addr source services now = do
+addAddress am addr source services now
+  -- BUG-8 fix: reject non-routable addresses (RFC1918, loopback, link-local, etc.)
+  -- Core AddSingle: "if (!addr.IsRoutable()) return false;"
+  | not (isRoutable addr) = return False
+  | otherwise = do
   existing <- Map.lookup addr <$> readTVarIO (amAddrIndex am)
   case existing of
     Just info -> do
