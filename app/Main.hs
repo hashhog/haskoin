@@ -929,6 +929,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           forM_ addrInfos $ \ai -> do
             let addr = NS.addrAddress ai
             putStrLn $ "Adding connect peer: " ++ show addr
+            -- Feed into AddrMan (BUG-5/BUG-1 fix: structured storage).
+            -- Use addr as its own source (manual-connect = trusted source).
+            nowTs <- (round <$> getPOSIXTime :: IO Int64)
+            _ <- addAddress (pmAddrMan pm) addr addr 0x409 nowTs
+            -- Keep pmKnownAddrs in sync for backward-compat.
             atomically $ modifyTVar' (pmKnownAddrs pm) (Set.insert addr)
         _ -> putStrLn $ "Invalid connect address: " ++ connectStr
 

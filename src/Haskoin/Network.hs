@@ -530,7 +530,7 @@ import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe)
-import Data.List (sortBy, groupBy, partition, foldl')
+import Data.List (sortBy, groupBy, partition, foldl', nub)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
 import Control.Concurrent (threadDelay)
@@ -2551,6 +2551,9 @@ queueMessage pc msg = writeTBQueue (pcSendQueue pc) msg
 data PeerManager = PeerManager
   { pmPeers              :: !(TVar (Map SockAddr PeerConnection))
   , pmKnownAddrs         :: !(TVar (Set.Set SockAddr))
+    -- ^ Seed/addnode addresses before they are fed into AddrMan; kept for
+    --   backward-compat with callers that read this field directly.  The
+    --   production connection loop now selects via 'pmAddrMan'.
   , pmBannedAddrs        :: !(TVar (Map SockAddr Int64))
   , pmConfig             :: !PeerManagerConfig
   , pmNetwork            :: !Network
@@ -2572,6 +2575,12 @@ data PeerManager = PeerManager
     --   clean up per-peer state that lives outside the 'PeerManager'
     --   (e.g. orphan-pool entries — BUG-12 / EraseForPeer).
     --   The default callback (used by 'startPeerManager') is a no-op.
+  , pmAddrMan            :: !AddrMan
+    -- ^ Structured address manager (BUG-1 fix): replaces the flat
+    --   pmKnownAddrs Set as the primary peer-selection source.
+    --   Wires 1024-bucket new table + 256-bucket tried table with
+    --   IsTerrible filtering and chance-weighted selection.
+    --   Reference: Bitcoin Core addrman.h / addrman.cpp.
   }
 
 -- | Configuration for the peer manager
@@ -2661,8 +2670,9 @@ startPeerManagerWith :: Network -> PeerManagerConfig
                      -> (SockAddr -> IO ())          -- ^ on-peer-disconnect hook
                      -> IO PeerManager
 startPeerManagerWith net config handler onDisconnect = do
-  od <- newOutboundDiversity
-  pm <- PeerManager
+  od  <- newOutboundDiversity
+  am  <- newAddrMan
+  pm  <- PeerManager
     <$> newTVarIO Map.empty
     <*> newTVarIO Set.empty
     <*> newTVarIO Map.empty
@@ -2676,6 +2686,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> pure od
     <*> newTVarIO Set.empty
     <*> pure onDisconnect
+    <*> pure am
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -2749,48 +2760,72 @@ peerManagerLoop pm = forever $ do
 
   let outboundCount = fullRelayCount + blockRelayCount
   when (outboundCount < totalTarget) $ do
-    known <- readTVarIO (pmKnownAddrs pm)
-    banned <- readTVarIO (pmBannedAddrs pm)
-    failed <- readTVarIO (pmFailedAddrs pm)
-    lastDNS <- readTVarIO (pmLastDNSRefresh pm)
-    now <- round <$> getPOSIXTime
+    banned   <- readTVarIO (pmBannedAddrs pm)
+    lastDNS  <- readTVarIO (pmLastDNSRefresh pm)
+    nowTs    <- (round <$> getPOSIXTime :: IO Int64)
+    let activeBans = Map.filter (> nowTs) banned
+        connected  = Map.keysSet peers
 
-    -- Filter out expired bans
-    let activeBans = Map.filter (> now) banned
-        connected = Map.keysSet peers
-        -- Exclude connected, banned, AND recently-failed addresses
-        candidates = Set.toList $
-          Set.difference known (Set.unions [connected, Map.keysSet activeBans, failed])
+    -- BUG-1 FIX: use pmAddrMan for candidate selection instead of the flat
+    -- pmKnownAddrs set.  selectAddress applies IsTerrible filtering and
+    -- chance-weighted selection identical to Bitcoin Core's ThreadOpenConnections.
+    -- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections.
 
-    -- Re-discover via DNS if no viable candidates OR every 120 seconds
-    candidates' <- if null candidates || (now - lastDNS > 120)
-      then do
-        putStrLn $ "peerManagerLoop: discovering peers via DNS..."
-        discovered <- discoverPeers (pmNetwork pm)
-        putStrLn $ "peerManagerLoop: discovered " ++ show (length discovered) ++ " peers"
-        atomically $ do
-          modifyTVar' (pmKnownAddrs pm) (Set.union (Set.fromList discovered))
-          -- Clear failed set on DNS refresh so we retry previously-failed addresses
-          writeTVar (pmFailedAddrs pm) Set.empty
-          writeTVar (pmLastDNSRefresh pm) now
-        -- Recompute candidates with fresh data
-        known' <- readTVarIO (pmKnownAddrs pm)
-        let candidates2 = Set.toList $
-              Set.difference known' (Set.union connected (Map.keysSet activeBans))
-        if null candidates2
-          then return discovered
-          else return candidates2
-      else return candidates
+    -- Re-populate AddrMan from DNS if it is empty OR every 120 seconds.
+    amNewCnt   <- readTVarIO (amNewCount   (pmAddrMan pm))
+    amTriedCnt <- readTVarIO (amTriedCount (pmAddrMan pm))
+    when (amNewCnt + amTriedCnt == 0 || nowTs - lastDNS > 120) $ do
+      putStrLn "peerManagerLoop: discovering peers via DNS..."
+      discovered <- discoverPeers (pmNetwork pm)
+      putStrLn $ "peerManagerLoop: discovered " ++ show (length discovered) ++ " peers"
+      -- Feed every discovered address into AddrMan (addAddress applies
+      -- IsRoutable + bucket-placement; source = the address itself for
+      -- DNS-seed entries, consistent with Core's behaviour for seednodes).
+      forM_ discovered $ \a ->
+        addAddress (pmAddrMan pm) a a 0x409 nowTs
+      -- Also keep pmKnownAddrs in sync for callers that read it directly.
+      atomically $ do
+        modifyTVar' (pmKnownAddrs pm) (Set.union (Set.fromList discovered))
+        -- Clear failed set on DNS refresh so we retry previously-failed addresses
+        writeTVar (pmFailedAddrs pm) Set.empty
+        writeTVar (pmLastDNSRefresh pm) nowTs
 
-    -- Filter candidates by netgroup diversity (eclipse attack mitigation)
-    let od = pmOutboundDiversity pm
-    diverseCandidates <- filterM (checkOutboundDiversity od) candidates'
-
-    -- Fill full-relay slots first, then block-relay-only
-    let fullRelayNeeded = max 0 (fullRelayTarget - fullRelayCount)
+    -- Select candidates via AddrMan selectAddress.  Call once per needed slot;
+    -- each call returns a chance-weighted address from new or tried tables.
+    let fullRelayNeeded  = max 0 (fullRelayTarget  - fullRelayCount)
         blockRelayNeeded = max 0 (blockRelayTarget - blockRelayCount)
-        (forFullRelay, rest) = splitAt fullRelayNeeded diverseCandidates
-        forBlockRelay = take blockRelayNeeded rest
+        totalNeeded      = fullRelayNeeded + blockRelayNeeded
+
+    -- Collect up to totalNeeded*4 candidate draws (to handle misses due to
+    -- already-connected / banned / diversity filters) then dedup.
+    let drawCount = totalNeeded * 4 + 1
+    rawDraws <- replicateM drawCount (selectAddress (pmAddrMan pm) False)
+    let drawnAddrs = [ a | Just a <- rawDraws ]
+
+    -- Fall back to pmKnownAddrs for any addresses not yet in AddrMan
+    -- (e.g. addnode entries inserted before AddrMan was wired).
+    knownFallback <- readTVarIO (pmKnownAddrs pm)
+    failed        <- readTVarIO (pmFailedAddrs pm)
+    let fallbackCandidates = Set.toList $
+          Set.difference knownFallback
+            (Set.unions [connected, Map.keysSet activeBans, failed])
+
+    -- Merge: AddrMan draws first (preferred), then flat-set fallback.
+    let allCandidates = drawnAddrs ++ fallbackCandidates
+
+    -- Deduplicate, filter connected/banned/failed, then apply diversity.
+    let od = pmOutboundDiversity pm
+    let filtered = filter (\a ->
+          Set.notMember a connected &&
+          Map.notMember a activeBans &&
+          Set.notMember a failed) allCandidates
+    -- Remove duplicates while preserving order.
+    let unique = nub filtered
+    diverseCandidates <- filterM (checkOutboundDiversity od) unique
+
+    -- Fill full-relay slots first, then block-relay-only.
+    let (forFullRelay, rest) = splitAt fullRelayNeeded diverseCandidates
+        forBlockRelay        = take blockRelayNeeded rest
 
     unless (null forFullRelay) $
       putStrLn $ "peerManagerLoop: connecting " ++ show (length forFullRelay) ++ " full-relay"
@@ -2954,6 +2989,9 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
     case cr of
       Left err -> do
         putStrLn $ "v2 outbound: connect failed to " ++ host ++ ": " ++ err
+        -- BUG-6 FIX: TCP connect failure counts as an attempt.
+        nowFail <- (round <$> getPOSIXTime :: IO Int64)
+        markAttempt (pmAddrMan pm) addr nowFail
         return Nothing
       Right pc -> do
         hsRes <- v2OutboundHandshake pc net
@@ -2961,6 +2999,9 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
           Left err -> do
             putStrLn $ "v2 outbound handshake failed with " ++ host ++ ": " ++ err
             disconnectPeer pc
+            -- BUG-6 FIX: v2 cipher handshake failure counts as an attempt.
+            nowFail <- (round <$> getPOSIXTime :: IO Int64)
+            markAttempt (pmAddrMan pm) addr nowFail
             return Nothing
           Right transport -> do
             -- Cipher handshake done.  Attach the transport so subsequent
@@ -2974,6 +3015,9 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
               Left err -> do
                 putStrLn $ "v2 outbound app-handshake failed with " ++ host ++ ": " ++ err
                 disconnectPeer pc
+                -- BUG-6 FIX: app-layer handshake failure counts as an attempt.
+                nowFail <- (round <$> getPOSIXTime :: IO Int64)
+                markAttempt (pmAddrMan pm) addr nowFail
                 return Nothing
               Right ver -> do
                 if not (hasService (vServices ver) nodeNetwork)
@@ -2986,6 +3030,10 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
                       atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
                     addOutboundConnection (pmOutboundDiversity pm) addr
                     atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+                    -- BUG-6 FIX: successful v2 connection → markGood so the
+                    -- address moves from new table to tried table in AddrMan.
+                    nowOk <- (round <$> getPOSIXTime :: IO Int64)
+                    markGood (pmAddrMan pm) addr nowOk
                     pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
                              (\reason err -> do
                                 putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
@@ -3016,6 +3064,12 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
       putStrLn $ "tryConnect: connect failed to " ++ host ++ ": " ++ err
       -- Track this address as failed so we don't keep retrying it
       atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+      -- BUG-6 FIX: inform AddrMan of the failed attempt so the tried-table
+      -- and chance-selection are updated.
+      -- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections calls
+      -- addrman.Attempt(addr) after a failed TCP connect.
+      nowFail <- (round <$> getPOSIXTime :: IO Int64)
+      markAttempt (pmAddrMan pm) addr nowFail
     Right pc -> do
       putStrLn $ "tryConnect: connected to " ++ host ++ ", starting handshake..."
       hsResult <- performHandshake config pc
@@ -3024,6 +3078,9 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           putStrLn $ "tryConnect: handshake failed with " ++ host ++ ": " ++ err
           disconnectPeer pc
           atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+          -- BUG-6 FIX: handshake failure also counts as an attempt.
+          nowFail <- (round <$> getPOSIXTime :: IO Int64)
+          markAttempt (pmAddrMan pm) addr nowFail
         Right ver -> do
           -- Verify peer supports required services
           unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
@@ -3037,6 +3094,13 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
 
           -- Add to peer map
           atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+
+          -- BUG-6 FIX: successful connection → mark address as good in AddrMan
+          -- so it moves from the new table to the tried table.
+          -- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections calls
+          -- addrman.Good(addr) after a successful VERSION/VERACK exchange.
+          nowOk <- (round <$> getPOSIXTime :: IO Int64)
+          markGood (pmAddrMan pm) addr nowOk
 
           -- Start peer threads with message handler
           pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
@@ -3568,9 +3632,23 @@ loadBanList pm path = do
 --------------------------------------------------------------------------------
 
 -- | Handle an addr message by adding addresses to the known pool
+-- BUG-5 FIX: feed peer-advertised addresses into pmAddrMan (addAddress)
+-- instead of inserting directly into the flat pmKnownAddrs set.
+-- addAddress applies IsRoutable, bucket-placement, IsTerrible/collision
+-- eviction, and source-group spread — all of which were bypassed before.
+-- Reference: bitcoin-core/src/net_processing.cpp ProcessMessage("addr")
+--   calls m_addrman.Add(vAddr, pfrom.addr).
 handleAddrMessage :: PeerManager -> Addr -> IO ()
 handleAddrMessage pm (Addr entries) = do
+  now <- (round <$> getPOSIXTime :: IO Int64)
   let addrs = mapMaybe (addrToSockAddr . aeAddress) entries
+  -- Each entry's source is the sending peer; we use the address itself as
+  -- source here because the Addr type does not carry a per-entry source.
+  -- This matches the "source = pfrom.addr" semantics in Core when the peer
+  -- is untrusted (no whitelisting in this impl).
+  forM_ addrs $ \a ->
+    addAddress (pmAddrMan pm) a a 0x409 now
+  -- Keep pmKnownAddrs in sync for callers that read it directly.
   atomically $ modifyTVar' (pmKnownAddrs pm) $
     Set.union (Set.fromList addrs)
   where
