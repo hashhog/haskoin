@@ -95,6 +95,7 @@ import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
 import qualified W103TxRelaySpec
+import qualified W104AddrManSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22487,6 +22488,9 @@ main = hspec $ do
 
   -- W103 Tx relay flow gate audit
   W103TxRelaySpec.spec
+
+  -- W104 AddrMan 30-gate fleet audit
+  W104AddrManSpec.spec
 
   where
     sampleTx = Tx

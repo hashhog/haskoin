@@ -226,6 +226,14 @@ module Haskoin.Network
   , addrmanBucketSize
   , addrmanTriedBucketsPerGroup
   , addrmanNewBucketsPerSourceGroup
+  , addrmanNewBucketsPerAddress
+  , addrmanHorizon
+  , addrmanRetries
+  , addrmanMaxFailures
+  , addrmanMinFail
+    -- ** AddrMan Helpers
+  , isTerribleAddress
+  , getAddressChance
     -- ** Outbound Connection Diversity
   , OutboundDiversity(..)
   , newOutboundDiversity
