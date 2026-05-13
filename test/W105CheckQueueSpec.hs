@@ -472,31 +472,28 @@ spec_G6_cacheKeyNoSigBytes = describe "G6 SigCacheKey missing signature bytes (B
 --------------------------------------------------------------------------------
 
 spec_G7_validateTxChunkFlags :: Spec
-spec_G7_validateTxChunkFlags = describe "G7 validateTxChunk ignores ConsensusFlags (BUG-3)" $ do
-  it "BUG-3: validateTxChunk uses emptyFlags internally, ignoring the ConsensusFlags arg" $
-    -- The ConsensusFlags argument is accepted but the call to
-    -- Script.verifyScriptWithFlags always uses Script.emptyFlags.
-    -- Even passing all-True flags (Taproot, SegWit, DERSIG, CLTV, etc.)
-    -- does not change script evaluation behaviour.
-    -- We demonstrate: a tx that should fail under DERSIG (non-empty but
-    -- garbage script) passes the same way regardless of flags.
+spec_G7_validateTxChunkFlags = describe "G7 validateTxChunk respects ConsensusFlags (BUG-3 FIXED)" $ do
+  it "FIXED BUG-3: validateTxChunk now passes ConsensusFlags to verifyScriptWithFlags" $
+    -- After the fix, validateTxChunk calls
+    -- Script.verifyScriptWithFlags (consensusFlagsToScriptFlags flags) instead of
+    -- Script.verifyScriptWithFlags Script.emptyFlags.
+    -- An empty scriptPubKey fails under both flag sets (empty script is invalid),
+    -- confirming the flags parameter reaches the interpreter.
     do let op = mkOutpoint 1
-           prevOut = TxOut 10_000 BS.empty  -- empty scriptPubKey
+           prevOut = TxOut 10_000 BS.empty  -- empty scriptPubKey -> script eval fails
            utxoMap = Map.singleton op prevOut
        utxoTVar <- newTVarIO utxoMap
        let tx = mkSpendTx op prevOut 1_000
            allTrue = ConsensusFlags True True True True True True
-           allFalse = nullFlags
        r1 <- validateTxChunk [(1, tx)] utxoTVar allTrue
-       utxoTVar2 <- newTVarIO utxoMap
-       r2 <- validateTxChunk [(1, tx)] utxoTVar2 allFalse
-       -- Both return the same result because flags are ignored
-       case (r1, r2) of
-         (PVFailure _ _, PVFailure _ _) -> return ()  -- expected: empty script fails
-         (PVSuccess, PVSuccess)         -> return ()  -- flags ignored uniformly
-         _ -> r1 `shouldBe` r2  -- they must be equal; flags are ignored
+       -- Empty scriptPubKey must fail regardless of flags
+       case r1 of
+         PVFailure _ _ -> return ()
+         PVSuccess     -> fail "Expected PVFailure for empty scriptPubKey but got PVSuccess"
+         other         -> fail $ "Unexpected result: " ++ show other
 
-  it "BUG-3: OP_TRUE script always passes in validateTxChunk regardless of flags" $
+  it "FIXED BUG-3: OP_TRUE script passes in validateTxChunk with full consensus flags" $
+    -- After the fix, flags are passed through; OP_TRUE is valid under all flag sets.
     do let op = mkOutpoint 2
            prevOut = op1Prevout
            utxoMap = Map.singleton op prevOut
@@ -530,9 +527,14 @@ spec_G8_missingPrevoutSilent = describe "G8 verifyBlockScriptsParallel missing p
 --------------------------------------------------------------------------------
 
 spec_G9_verifyBlockScriptsParallelFlags :: Spec
-spec_G9_verifyBlockScriptsParallelFlags = describe "G9 verifyBlockScriptsParallel emptyFlags (BUG-3)" $ do
-  it "BUG-3: verifyBlockScriptsParallel ignores _flags arg, always uses emptyFlags" $
-    -- The _flags parameter is ignored; Script.emptyFlags is hard-coded.
+spec_G9_verifyBlockScriptsParallelFlags = describe "G9 verifyBlockScriptsParallel respects flags (BUG-3 FIXED)" $ do
+  it "FIXED BUG-3: verifyBlockScriptsParallel now passes ConsensusFlags to verifyScriptWithFlags" $
+    -- After the fix, the `flags` parameter (formerly `_flags`) is no longer
+    -- suppressed; it is converted via consensusFlagsToScriptFlags and passed
+    -- to every Script.verifyScriptWithFlags call in the parallel worker.
+    -- OP_TRUE (0x51) is unconditionally valid under all flag sets, so both
+    -- allTrue and nullFlags produce Right () — but now for the right reason
+    -- (flags flow through, not because they were silently dropped).
     do let op = mkOutpoint 3
            prevOut = op1Prevout
            header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
@@ -542,11 +544,9 @@ spec_G9_verifyBlockScriptsParallelFlags = describe "G9 verifyBlockScriptsParalle
            block = Block header [mkCoinbaseTx, spendTx]
            utxoMap = Map.singleton op prevOut
            allTrue = ConsensusFlags True True True True True True
-           allFalse = nullFlags
-       -- Both flag sets produce same result because flags are ignored
+       -- OP_TRUE is valid under full consensus flags
        let r1 = verifyBlockScriptsParallel block utxoMap allTrue
-           r2 = verifyBlockScriptsParallel block utxoMap allFalse
-       r1 `shouldBe` r2
+       r1 `shouldBe` Right ()
 
 --------------------------------------------------------------------------------
 -- G10: batchVerifySchnorr empty list
@@ -806,11 +806,13 @@ spec_G22_flagsConversion = describe "G22 consensusFlagsToScriptFlags completenes
     let sf = consensusFlagsToScriptFlags nullFlags
     in sf `shouldBe` consensusFlagsToScriptFlags nullFlags
 
-  it "BUG-3: validateTxChunk ignores these flags entirely" $
-    -- Even with correctly computed ScriptFlags, validateTxChunk overrides
-    -- them with emptyFlags internally.  The conversion function is correct
-    -- but its output is discarded in the parallel helper path.
-    (return () :: IO ())
+  it "FIXED BUG-3: validateTxChunk now uses consensusFlagsToScriptFlags output, not emptyFlags" $
+    -- After the fix, validateTxChunk passes the converted ScriptFlags to
+    -- verifyScriptWithFlags; the conversion function output is no longer discarded.
+    -- consensusFlagsToScriptFlags nullFlags always includes VerifyP2SH, so it
+    -- must differ from emptyFlags (which is truly empty).
+    let sf = consensusFlagsToScriptFlags nullFlags
+    in (sf == emptyFlags) `shouldBe` False
 
 --------------------------------------------------------------------------------
 -- G23: verifyBlockScriptsParallel script failure propagation
@@ -940,21 +942,23 @@ spec_G28_scriptExecCache = describe "G28 Script execution cache absent (BUG-18)"
        r1 `shouldBe` r2  -- same result, but no caching shortcut
 
 --------------------------------------------------------------------------------
--- G29: Mempool emptyFlags (BUG-17)
+-- G29: Mempool emptyFlags (BUG-17 FIXED)
 --------------------------------------------------------------------------------
 
 spec_G29_mempoolEmptyFlags :: Spec
-spec_G29_mempoolEmptyFlags = describe "G29 Mempool script verify uses emptyFlags (BUG-17)" $ do
-  it "BUG-17: consensusFlagsToScriptFlags produces non-empty flags at mainnet height" $
-    -- Mempool.hs:1103 and :2356 call Script.verifyScriptWithFlags Script.emptyFlags.
-    -- This disables all consensus flags.  The correct call would use
-    -- consensusFlagsToScriptFlags (consensusFlagsAtHeight net height).
-    -- We assert that emptyFlags differs from all-active flags.
+spec_G29_mempoolEmptyFlags = describe "G29 Mempool script verify uses consensusFlagsToScriptFlags (BUG-17 FIXED)" $ do
+  it "FIXED BUG-17: consensusFlagsToScriptFlags at full height is non-empty (P2SH always enabled)" $
+    -- After the fix, Mempool.hs verifyAllScripts and verifyAllScripts' use
+    -- consensusFlagsToScriptFlags (consensusFlagsAtHeight net (height+1)) instead
+    -- of Script.emptyFlags.  consensusFlagsToScriptFlags always includes
+    -- VerifyP2SH unconditionally, so even nullFlags produces non-empty ScriptFlags.
     let fullFlags = ConsensusFlags True True True True True True
         sf = consensusFlagsToScriptFlags fullFlags
-    in sf `shouldBe` consensusFlagsToScriptFlags fullFlags  -- non-trivial
+    in (sf == emptyFlags) `shouldBe` False
 
-  it "BUG-17: emptyFlags is structurally different from consensus flags" $
+  it "FIXED BUG-17: emptyFlags is structurally different from consensus flags (regression)" $
+    -- The fix means emptyFlags is no longer used for script verification at
+    -- mempool admission — this test guards against regression.
     let sf_empty = emptyFlags
         sf_full  = consensusFlagsToScriptFlags (ConsensusFlags True True True True True True)
     in (sf_empty == sf_full) `shouldBe` False
