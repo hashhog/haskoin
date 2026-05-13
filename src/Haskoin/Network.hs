@@ -126,6 +126,7 @@ module Haskoin.Network
   , defaultPeerManagerConfig
     -- * Peer Manager Operations
   , startPeerManager
+  , startPeerManagerWith
   , stopPeerManager
   , startInboundListener
   , addNodeConnect
@@ -2555,6 +2556,12 @@ data PeerManager = PeerManager
                             --   go straight to v1 (mirrors clearbit's
                             --   v2_fallback_set).  Soft-capped via 'markV1Only'
                             --   to prevent unbounded growth.
+  , pmOnPeerDisconnect   :: !(SockAddr -> IO ())
+    -- ^ Called by 'peerManagerLoop' when a peer is removed from the peer
+    --   map after it transitions to 'PeerDisconnected'.  Use this hook to
+    --   clean up per-peer state that lives outside the 'PeerManager'
+    --   (e.g. orphan-pool entries — BUG-12 / EraseForPeer).
+    --   The default callback (used by 'startPeerManager') is a no-op.
   }
 
 -- | Configuration for the peer manager
@@ -2632,7 +2639,18 @@ discoverPeers net = do
 -- | Start the peer manager background thread
 startPeerManager :: Network -> PeerManagerConfig
                  -> (SockAddr -> Message -> IO ()) -> IO PeerManager
-startPeerManager net config handler = do
+startPeerManager net config handler =
+  startPeerManagerWith net config handler (\_ -> return ())
+
+-- | Like 'startPeerManager' but also accepts a disconnect callback.
+-- 'onDisconnect' is invoked by 'peerManagerLoop' whenever a peer is
+-- removed from the map after transitioning to 'PeerDisconnected'.
+-- This allows callers to purge per-peer state (e.g. orphan-pool entries).
+startPeerManagerWith :: Network -> PeerManagerConfig
+                     -> (SockAddr -> Message -> IO ())
+                     -> (SockAddr -> IO ())          -- ^ on-peer-disconnect hook
+                     -> IO PeerManager
+startPeerManagerWith net config handler onDisconnect = do
   od <- newOutboundDiversity
   pm <- PeerManager
     <$> newTVarIO Map.empty
@@ -2647,6 +2665,7 @@ startPeerManager net config handler = do
     <*> newTVarIO 0
     <*> pure od
     <*> newTVarIO Set.empty
+    <*> pure onDisconnect
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -2694,6 +2713,14 @@ peerManagerLoop pm = forever $ do
       unless (piInbound peerInfo) $
         removeOutboundConnection (pmOutboundDiversity pm) addr
       atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+      -- EraseForPeer: fire the caller-supplied disconnect hook so
+      -- per-peer state outside PeerManager (e.g. orphan pool entries)
+      -- is cleaned up.  Mirrors TxOrphanage::EraseForPeer in Core.
+      -- Reference: bitcoin-core/src/node/txorphanage.h:86
+      pmOnPeerDisconnect pm addr
+        `catch` (\(e :: SomeException) ->
+          putStrLn $ "peerManagerLoop: onDisconnect error for "
+                  ++ show addr ++ ": " ++ show e)
 
   -- Maintain target outbound connections (8 full-relay + 2 block-relay-only)
   peers <- readTVarIO (pmPeers pm)

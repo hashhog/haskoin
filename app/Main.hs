@@ -56,6 +56,11 @@ import Haskoin.Index (IndexManager(..), IndexConfig(..),
                        indexManagerInitFromDB, indexManagerBackfill,
                        indexManagerConnectBlock,
                        blockFilterIndexTipHeight)
+import Haskoin.TxOrphanage
+  ( OrphanPool(..), emptyOrphanPool, maxOrphanTxs, orphanExpireSecs
+  , addOrphan, expireOrphans
+  , eraseOrphansForPeer, eraseOrphansForBlock
+  )
 
 --------------------------------------------------------------------------------
 -- CLI Data Types
@@ -901,9 +906,16 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , pmcPruneMode   = pruneOn
           }
     pmRef <- newIORef (undefined :: PeerManager)
-    pm <- startPeerManager net pmConfig (\addr msg ->
-      syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr msg
-        `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
+    pm <- startPeerManagerWith net pmConfig
+      (\addr msg ->
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr msg
+          `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
+      -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
+      -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
+      -- net_processing.cpp FinalizeNode when a peer disconnects.
+      (\addr -> eraseOrphansForPeer addr orphanPoolRef
+          `catch` (\(e :: SomeException) ->
+            putStrLn $ "eraseOrphansForPeer error: " ++ show e))
     writeIORef pmRef pm
 
     -- Seed known addresses from --connect flags
@@ -1296,88 +1308,10 @@ chunksOf n xs = let (chunk, rest) = splitAt n xs in chunk : chunksOf n rest
 
 --------------------------------------------------------------------------------
 -- Orphan Pool — BIP-339 wtxid-keyed (W99 G12/G13/G14)
+-- OrphanPool, emptyOrphanPool, maxOrphanTxs, orphanExpireSecs,
+-- addOrphan, expireOrphans, eraseOrphansForPeer, eraseOrphansForBlock
+-- are imported from Haskoin.TxOrphanage.
 --------------------------------------------------------------------------------
-
--- | In-memory orphan transaction pool.
---
--- Primary key  : Wtxid  (BIP-339 / Bitcoin Core txorphanage.h)
--- Secondary idx: parent TxId → Set of child Wtxid
---               (used for child-resolution on parent accept — mirrors Core's
---                m_outpoint_to_orphan_it map in txorphanage.h)
---
--- Core reference: src/node/txorphanage.h — TxOrphanage uses wtxid as the
--- primary key and AddChildrenToWorkSet(parent) for orphan re-queuing.
--- Orphans expire after ORPHAN_TX_EXPIRE_TIME (5 min, net_processing.cpp:101).
-data OrphanPool = OrphanPool
-  { orphanPool  :: !(Map.Map Wtxid (Tx, Int64))
-    -- ^ Primary wtxid-keyed store.  Value is (tx, insertion-epoch-seconds).
-  , orphanWtxid :: !(Map.Map TxId (Set.Set Wtxid))
-    -- ^ Secondary index: parent TxId → Set of child Wtxids.
-    -- Populated by 'addOrphan'; used by 'processOrphan' to find all orphans
-    -- that spend outputs of a newly-accepted parent transaction.
-  } deriving (Show)
-
-emptyOrphanPool :: OrphanPool
-emptyOrphanPool = OrphanPool Map.empty Map.empty
-
--- | Maximum orphan pool size (Bitcoin Core DEFAULT_MAX_ORPHAN_TRANSACTIONS=100).
-maxOrphanTxs :: Int
-maxOrphanTxs = 100
-
--- | Orphan expiry in seconds (Bitcoin Core ORPHAN_TX_EXPIRE_TIME=300).
-orphanExpireSecs :: Int64
-orphanExpireSecs = 300
-
--- | Add a transaction to the orphan pool keyed by its wtxid (BIP-339).
--- Drops the oldest entry (by map order) when the pool is full.
--- No-op if the wtxid is already present (exact-duplicate dedup).
--- The secondary 'orphanWtxid' index maps each input's parent TxId to this
--- orphan's wtxid so that 'processOrphan' can find it on parent acceptance.
-addOrphan :: IORef OrphanPool -> Tx -> Int64 -> IO ()
-addOrphan ref tx now = modifyIORef' ref $ \op ->
-  let wtxid    = Crypto.computeWtxid tx
-      parentIds = map (outPointHash . txInPrevOutput) (txInputs tx)
-  in if Map.member wtxid (orphanPool op)
-       then op  -- already present — deduplicate by wtxid
-       else
-         -- Evict the minimum-key entry when at capacity
-         let op' = if Map.size (orphanPool op) >= maxOrphanTxs
-                     then case Map.minViewWithKey (orphanPool op) of
-                            Nothing -> op
-                            Just ((_evictW, (evictTx, _)), m') ->
-                              let evictW2 = Crypto.computeWtxid evictTx
-                                  evictParents = map (outPointHash . txInPrevOutput) (txInputs evictTx)
-                                  removeChild pTxId idx =
-                                    Map.alter (\ms -> case ms of
-                                      Nothing  -> Nothing
-                                      Just s   -> let s' = Set.delete evictW2 s
-                                                  in if Set.null s' then Nothing else Just s'
-                                      ) pTxId idx
-                                  idx' = foldr removeChild (orphanWtxid op) evictParents
-                              in op { orphanPool  = m'
-                                    , orphanWtxid = idx'
-                                    }
-                     else op
-             -- Insert new orphan into primary store
-             pool' = Map.insert wtxid (tx, now) (orphanPool op')
-             -- Index this orphan under each of its parent TxIds
-             addChild pTxId idx =
-               Map.insertWith Set.union pTxId (Set.singleton wtxid) idx
-             idx' = foldr addChild (orphanWtxid op') parentIds
-         in op' { orphanPool  = pool'
-                , orphanWtxid = idx'
-                }
-
--- | Remove expired orphans (older than 'orphanExpireSecs') from the pool.
-expireOrphans :: IORef OrphanPool -> Int64 -> IO ()
-expireOrphans ref now = modifyIORef' ref $ \op ->
-  let (keep, discard) = Map.partition (\(_, t) -> now - t < orphanExpireSecs) (orphanPool op)
-      discardWtxids   = Map.keysSet discard
-      pruneIdx        = Map.map (Set.\\ discardWtxids) (orphanWtxid op)
-      cleanIdx        = Map.filter (not . Set.null) pruneIdx
-  in op { orphanPool  = keep
-        , orphanWtxid = cleanIdx
-        }
 
 -- | Look up orphan children of a newly-accepted transaction and re-try them.
 -- Mirrors Bitcoin Core ProcessOrphanTx / AddChildrenToWorkSet: after a parent
@@ -1390,7 +1324,7 @@ processOrphan ref mp parentTxId now = do
   forM_ (Set.toList childWtxids) $ \wtxid ->
     case Map.lookup wtxid (orphanPool op) of
       Nothing       -> return ()
-      Just (orphTx, _) -> do
+      Just (orphTx, _, _) -> do
         -- Remove from pool before retry to avoid double-processing
         modifyIORef' ref $ \o ->
           let parentIds2 = map (outPointHash . txInPrevOutput) (txInputs orphTx)
@@ -1675,6 +1609,13 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
               -- Remove confirmed txs from mempool and clear rejection filter
               blockConnected mp block
               writeIORef recentlyRejectedRef Set.empty
+              -- BUG-13 FIX: EraseForBlock — remove confirmed txs from the
+              -- orphan pool.  Core calls TxOrphanage::EraseForBlock after
+              -- each block is connected so that orphans whose parents are
+              -- now on-chain do not linger until expiry.
+              -- Reference: bitcoin-core/src/node/txorphanage.h:89
+              let confirmedTxIds = map computeTxId (blockTxns block)
+              eraseOrphansForBlock confirmedTxIds orphanPoolRef
               -- Announce the new tip honouring BIP-130 sendheaders
               -- preference: peers that requested 'sendheaders' get an
               -- MHeaders, the rest get the legacy MInv.  Reference:
@@ -1728,7 +1669,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
         case err of
           ErrMissingInput _ -> do
             now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
-            addOrphan orphanPoolRef tx now
+            addOrphan orphanPoolRef tx now addr
           _ -> do
             -- Add to recently-rejected filter for non-orphan failures
             rejected <- readIORef recentlyRejectedRef

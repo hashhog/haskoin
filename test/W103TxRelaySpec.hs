@@ -109,11 +109,13 @@ module W103TxRelaySpec (spec) where
 import Test.Hspec
 import Data.Word (Word32, Word64)
 import Data.Int (Int64)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import Control.Monad (forM_)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified Data.ByteString as BS
+import Network.Socket (SockAddr(..))
 
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeWtxid)
@@ -124,6 +126,10 @@ import Haskoin.Network
   , invTypeToWord32, word32ToInvType
   , inventoryBroadcastMax
   , outboundInventoryBroadcastInterval
+  )
+import Haskoin.TxOrphanage
+  ( OrphanPool(..), emptyOrphanPool
+  , addOrphan, eraseOrphansForPeer, eraseOrphansForBlock
   )
 
 --------------------------------------------------------------------------------
@@ -517,25 +523,168 @@ spec_G12_orphanEviction = describe "G12 orphan eviction strategy (BUG-9: map-key
 --------------------------------------------------------------------------------
 
 spec_G13_orphanCleanup :: Spec
-spec_G13_orphanCleanup = describe "G13 EraseForPeer + EraseForBlock (BUG-12, BUG-13: absent)" $ do
-  it "BUG-12 DOCUMENTED: no per-peer orphan attribution; disconnected peer orphans linger" $
-    -- Core: TxOrphanage::EraseForPeer(peer) removes all orphans announced
-    -- by that peer.  haskoin orphan pool (Map Wtxid (Tx, Int64)) has no
-    -- peer attribution at all.
-    True `shouldBe` True
+spec_G13_orphanCleanup = describe "G13 EraseForPeer + EraseForBlock (BUG-12, BUG-13 FIXED)" $ do
 
-  it "BUG-13 DOCUMENTED: blockConnected does not prune the orphan pool" $
-    -- Core: EraseForBlock removes confirmed txs from the orphanage.
-    -- haskoin: blockConnected mp block (Mempool.hs) removes from mempool only.
-    -- The orphan pool is untouched; confirmed orphans (whose parents were just
-    -- mined) remain in the pool until they expire or are evicted.
-    True `shouldBe` True
+  -- ---------------------------------------------------------------------------
+  -- BUG-12 FIXED: eraseOrphansForPeer
+  -- Core reference: TxOrphanage::EraseForPeer (txorphanage.h:86)
+  -- ---------------------------------------------------------------------------
 
-  it "Orphan pool is a plain IORef (no peer attribution field)" $ do
-    -- We verify by examining the data type: OrphanPool = Map Wtxid (Tx, Int64).
-    -- The Int64 is insertion time, not peer id — so no per-peer cleanup.
+  it "BUG-12 FIXED: orphan pool now has peer attribution field (Tx, Int64, SockAddr)" $ do
+    -- Verify by constructing an orphan entry and checking the 3-tuple:
     now <- round . realToFrac <$> getPOSIXTime :: IO Int64
-    now `shouldSatisfy` (> 0)
+    let tx    = makeTx 1
+        peer0 = SockAddrInet 1234 0x7f000001
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef tx now peer0
+    op <- readIORef poolRef
+    -- Pool should have 1 entry attributed to peer0
+    Map.size (orphanPool op) `shouldBe` 1
+    -- The entry's peer address should match
+    case Map.elems (orphanPool op) of
+      [(_, _, addr)] -> addr `shouldBe` peer0
+      _              -> expectationFailure "Expected exactly one orphan entry"
+
+  it "BUG-12 FIXED: eraseOrphansForPeer removes all orphans from that peer" $ do
+    -- Add orphans from two peers; erase peer0's; verify only peer1's remain.
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0  = SockAddrInet 1111 0x7f000001
+        peer1  = SockAddrInet 2222 0x7f000002
+        txA    = makeTx 10
+        txB    = makeTx 20
+        txC    = makeTx 30
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef txA now peer0
+    addOrphan poolRef txB now peer0
+    addOrphan poolRef txC now peer1
+    opBefore <- readIORef poolRef
+    Map.size (orphanPool opBefore) `shouldBe` 3
+    -- Disconnect peer0 — should remove txA and txB
+    eraseOrphansForPeer peer0 poolRef
+    opAfter <- readIORef poolRef
+    -- Only txC (peer1's orphan) should remain
+    Map.size (orphanPool opAfter) `shouldBe` 1
+    case Map.elems (orphanPool opAfter) of
+      [(tx', _, addr)] -> do
+        addr `shouldBe` peer1
+        computeTxId tx' `shouldBe` computeTxId txC
+      _ -> expectationFailure "Expected exactly one orphan after EraseForPeer"
+
+  it "BUG-12 FIXED: eraseOrphansForPeer also cleans up the secondary wtxid index" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0   = SockAddrInet 3333 0x7f000001
+        parentTx = makeTx 99
+        pTxId    = computeTxId parentTx
+        -- Child orphan spending parent's output
+        childTx = Tx
+                  { txVersion  = 1
+                  , txInputs   = [ TxIn { txInPrevOutput = OutPoint pTxId 0
+                                        , txInScript  = BS.empty
+                                        , txInSequence = 0xFFFFFFFF
+                                        }
+                                 ]
+                  , txOutputs  = [ TxOut { txOutValue = 500, txOutScript = BS.empty } ]
+                  , txWitness  = [[]]
+                  , txLockTime = 42
+                  }
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef childTx now peer0
+    opBefore <- readIORef poolRef
+    -- Secondary index should have an entry for the parent txid
+    Map.member pTxId (orphanWtxid opBefore) `shouldBe` True
+    -- Erase the peer — secondary index must also be cleaned
+    eraseOrphansForPeer peer0 poolRef
+    opAfter <- readIORef poolRef
+    Map.null (orphanPool opAfter)  `shouldBe` True
+    Map.null (orphanWtxid opAfter) `shouldBe` True
+
+  it "BUG-12 FIXED: eraseOrphansForPeer on unknown peer is a no-op" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0   = SockAddrInet 4444 0x7f000001
+        unknown = SockAddrInet 9999 0x7f000002
+        tx      = makeTx 55
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef tx now peer0
+    eraseOrphansForPeer unknown poolRef
+    opAfter <- readIORef poolRef
+    -- peer0's orphan must be untouched
+    Map.size (orphanPool opAfter) `shouldBe` 1
+
+  -- ---------------------------------------------------------------------------
+  -- BUG-13 FIXED: eraseOrphansForBlock
+  -- Core reference: TxOrphanage::EraseForBlock (txorphanage.h:89)
+  -- ---------------------------------------------------------------------------
+
+  it "BUG-13 FIXED: eraseOrphansForBlock removes confirmed orphans from the pool" $ do
+    -- Suppose txA was an orphan (missing parent); parent is now mined, and
+    -- txA itself appears in the same block.  eraseOrphansForBlock must remove it.
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0 = SockAddrInet 5555 0x7f000001
+        txA   = makeTx 100  -- will be "confirmed"
+        txB   = makeTx 200  -- not confirmed, should remain
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef txA now peer0
+    addOrphan poolRef txB now peer0
+    opBefore <- readIORef poolRef
+    Map.size (orphanPool opBefore) `shouldBe` 2
+    -- Block confirms txA
+    eraseOrphansForBlock [computeTxId txA] poolRef
+    opAfter <- readIORef poolRef
+    -- txA gone, txB remains
+    Map.size (orphanPool opAfter) `shouldBe` 1
+    case Map.elems (orphanPool opAfter) of
+      [(tx', _, _)] -> computeTxId tx' `shouldBe` computeTxId txB
+      _             -> expectationFailure "Expected exactly txB after EraseForBlock"
+
+  it "BUG-13 FIXED: eraseOrphansForBlock cleans up secondary wtxid index" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0    = SockAddrInet 6666 0x7f000001
+        parentTx = makeTx 77
+        pTxId    = computeTxId parentTx
+        childTx  = Tx
+                   { txVersion  = 1
+                   , txInputs   = [ TxIn { txInPrevOutput = OutPoint pTxId 0
+                                         , txInScript  = BS.empty
+                                         , txInSequence = 0xFFFFFFFF
+                                         }
+                                  ]
+                   , txOutputs  = [ TxOut { txOutValue = 500, txOutScript = BS.empty } ]
+                   , txWitness  = [[]]
+                   , txLockTime = 7
+                   }
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef childTx now peer0
+    opBefore <- readIORef poolRef
+    Map.member pTxId (orphanWtxid opBefore) `shouldBe` True
+    -- Block confirms the child tx
+    eraseOrphansForBlock [computeTxId childTx] poolRef
+    opAfter <- readIORef poolRef
+    Map.null (orphanPool opAfter)  `shouldBe` True
+    Map.null (orphanWtxid opAfter) `shouldBe` True
+
+  it "BUG-13 FIXED: eraseOrphansForBlock with empty list is a no-op" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0 = SockAddrInet 7777 0x7f000001
+        tx    = makeTx 88
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef tx now peer0
+    eraseOrphansForBlock [] poolRef
+    opAfter <- readIORef poolRef
+    Map.size (orphanPool opAfter) `shouldBe` 1
+
+  it "Orphan pool entry now includes peer attribution (SockAddr in 3-tuple)" $ do
+    -- Verify the data model has changed from (Tx, Int64) to (Tx, Int64, SockAddr).
+    -- If this compiles, the type is correct.
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    let peer0 = SockAddrInet 8888 0x7f000001
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef (makeTx 1) now peer0
+    op <- readIORef poolRef
+    case Map.elems (orphanPool op) of
+      [(_, t, addr)] -> do
+        t    `shouldSatisfy` (> 0)
+        addr `shouldBe` peer0
+      _ -> expectationFailure "Expected 1 entry with 3-tuple"
 
 --------------------------------------------------------------------------------
 -- G14: block-relay-only peer isolation (BUG-14: MInv accepts tx inv from all)
