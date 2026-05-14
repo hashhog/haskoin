@@ -122,6 +122,7 @@ test-suite haskoin-test
                , W113CoinSelectionSpec
                , W114FeeEstimationSpec
                , W115ASMapSpec
+               , W116PackageRelaySpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
