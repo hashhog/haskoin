@@ -102,6 +102,7 @@ import qualified W107CompactSizeSpec
 import qualified W108GbtSpec
 import qualified W109BlockIndexSpec
 import qualified W110BloomFilterSpec
+import qualified W111WalletSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22516,6 +22517,9 @@ main = hspec $ do
 
   -- W110 BIP-37 bloom filter 30-gate audit
   W110BloomFilterSpec.spec
+
+  -- W111 wallet / HD / descriptors 30-gate audit
+  W111WalletSpec.spec
 
   where
     sampleTx = Tx
