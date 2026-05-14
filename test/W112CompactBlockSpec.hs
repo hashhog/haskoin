@@ -474,21 +474,23 @@ spec = describe "W112 BIP-152 Compact Blocks" $ do
   -- G19  MBlockTxn handler completes reconstruction (BUG-1 P0-CDIV)
   -- =========================================================================
   describe "G19 MBlockTxn reconstruction (BUG-1 P0-CDIV)" $ do
-    it "FAIL: MBlockTxn handler is a stub (never calls fillPartialBlock)" $ do
+    it "FIX: MBlockTxn handler calls fillPartialBlock to complete reconstruction (BUG-1 FIX-41)" $ do
       src <- readFile "app/Main.hs"
-      -- Extract MBlockTxn handler body and verify fillPartialBlock is absent.
-      let handlerBlock = extractAfter "MBlockTxn bt ->" src
-          first300     = take 300 handlerBlock
-      ("fillPartialBlock" `isInfixOf` first300) `shouldBe` False  -- BUG
+      -- The MBlockTxn handler must call fillPartialBlock.
+      -- Fixed in FIX-41: handler looks up pdb from cbsPending, calls
+      -- fillPartialBlock, and on success dispatches to the MBlock path.
+      ("fillPartialBlock" `isInfixOf` src) `shouldBe` True  -- FIX-41
 
-    it "FAIL: PartiallyDownloadedBlock state not persisted between messages (BUG-1)" $ do
+    it "FIX: PartiallyDownloadedBlock state is now persisted between MCmpctBlock and MBlockTxn (BUG-1 FIX-41)" $ do
       src <- readFile "app/Main.hs"
-      -- There should be a TVar or IORef holding the in-flight partial blocks.
-      ("pdbPending" `isInfixOf` src ||
-       "pendingPartial" `isInfixOf` src ||
-       "compactBlockState" `isInfixOf` src ||
+      -- CompactBlockState / cbsPending TVar must appear in Main.hs so that
+      -- in-flight partial blocks survive across the two-round-trip path.
+      -- Fixed in FIX-41: compactBlockStateRef IORef instantiated and plumbed
+      -- through syncMessageHandler; MCmpctBlock stores pdb in cbsPending;
+      -- MBlockTxn looks it up, calls fillPartialBlock, and submits to chain.
+      ("compactBlockState" `isInfixOf` src ||
        "cbsPending" `isInfixOf` src)
-        `shouldBe` False  -- BUG: no persistent state
+        `shouldBe` True  -- FIX-41: persistent state now wired
 
   -- =========================================================================
   -- G20  MAX_CMPCTBLOCK_DEPTH = 5 check (BUG-4)
@@ -703,11 +705,12 @@ spec = describe "W112 BIP-152 Compact Blocks" $ do
   -- G30  CompactBlockState (cbsPending) never instantiated (BUG-8)
   -- =========================================================================
   describe "G30 CompactBlockState dead-helper (BUG-8)" $ do
-    it "FAIL: CompactBlockState is never instantiated in Main.hs" $ do
+    it "FIX: CompactBlockState is now instantiated in Main.hs (BUG-8 FIX-41)" $ do
       src <- readFile "app/Main.hs"
       -- CompactBlockState holds the TVar for in-flight partial blocks.
-      -- It is defined in Network.hs but never created or used in Main.hs.
-      ("CompactBlockState" `isInfixOf` src) `shouldBe` False  -- BUG: dead-helper
+      -- Fixed in FIX-41: CompactBlockState is created in main and passed to
+      -- syncMessageHandler as compactBlockStateRef.
+      ("CompactBlockState" `isInfixOf` src) `shouldBe` True  -- FIX-41: dead-helper wired
 
     it "CompactBlockState type is defined in Network.hs" $ do
       src <- readFile "src/Haskoin/Network.hs"
