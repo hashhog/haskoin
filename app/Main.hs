@@ -1922,65 +1922,107 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
   MCmpctBlock cb -> do
     -- BIP 152: Reconstruct block from compact block + mempool
     let bh = computeBlockHash (cbHeader cb)
-    entries <- readTVarIO (mpEntries mp)
-    let mempoolTxMap = Map.map meTransaction entries
-    case initPartialBlock cb mempoolTxMap of
-      Left err -> do
-        putStrLn $ "Compact block " ++ show bh ++ " init failed: " ++ err
+    -- MAX_CMPCTBLOCK_DEPTH=5 guard (BUG-4 FIX, W112).
+    -- Core (net_processing.cpp:2466): only process compact blocks within 5 of
+    -- the tip. Blocks deeper than that waste mempool lookup time and enable
+    -- trivial CPU/memory exhaustion. Fall back to full block getdata.
+    -- Reference: bitcoin-core/src/net_processing.cpp:2466-2470
+    currentTipHeight <- readTVarIO (hcHeight hc)
+    chainEntries <- readTVarIO (hcEntries hc)
+    let mBlockHeight = fmap ceHeight (Map.lookup bh chainEntries)
+        depth = case mBlockHeight of
+          Just blockH -> fromIntegral currentTipHeight - fromIntegral blockH :: Int
+          Nothing     -> 0  -- Unknown block: depth=0 (let normal validation handle it)
+    if depth > maxCmpctBlockDepth
+      then do
+        putStrLn $ "Compact block " ++ show bh ++ " too old (depth=" ++ show depth
+                ++ " > MAX_CMPCTBLOCK_DEPTH=" ++ show maxCmpctBlockDepth
+                ++ "), falling back to full block"
         pm <- readIORef pmRef
-        -- Bad compact-block reconstruction is a Core ban offense.
-        -- Reference: bitcoin-core/src/net_processing.cpp:3700 —
-        -- "non-continuous-headers" for cmpctblock with bogus parent.
-        void $ misbehaving pm addr InvalidCompactBlock
         let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
         requestFromPeer pm addr (MGetData (GetData [iv]))
           `catch` (\(_ :: SomeException) -> return ())
-      Right (pdb, missing) ->
-        if null missing
-          then case fillPartialBlock pdb [] of
-            Right block -> do
-              putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
-            Left err -> do
-              putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
-              pm <- readIORef pmRef
-              let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
-              requestFromPeer pm addr (MGetData (GetData [iv]))
-                `catch` (\(_ :: SomeException) -> return ())
-          else do
-            let missPct = fromIntegral (length missing) / fromIntegral (pdbTotalTxns pdb) * 100.0 :: Double
-            if missPct > 50.0
-              then do
-                putStrLn $ "Compact block " ++ show bh ++ " too many missing, requesting full block"
-                pm <- readIORef pmRef
-                let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
-                requestFromPeer pm addr (MGetData (GetData [iv]))
-                  `catch` (\(_ :: SomeException) -> return ())
+      else do
+        entries <- readTVarIO (mpEntries mp)
+        let mempoolTxMap = Map.map meTransaction entries
+        case initPartialBlock cb mempoolTxMap of
+          Left err -> do
+            putStrLn $ "Compact block " ++ show bh ++ " init failed: " ++ err
+            pm <- readIORef pmRef
+            -- Bad compact-block reconstruction is a Core ban offense.
+            -- Reference: bitcoin-core/src/net_processing.cpp:3700 —
+            -- "non-continuous-headers" for cmpctblock with bogus parent.
+            void $ misbehaving pm addr InvalidCompactBlock
+            let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+            requestFromPeer pm addr (MGetData (GetData [iv]))
+              `catch` (\(_ :: SomeException) -> return ())
+          Right (pdb, missing) ->
+            if null missing
+              then case fillPartialBlock pdb [] of
+                Right block -> do
+                  putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
+                  syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+                Left err -> do
+                  putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
+                  pm <- readIORef pmRef
+                  let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+                  requestFromPeer pm addr (MGetData (GetData [iv]))
+                    `catch` (\(_ :: SomeException) -> return ())
               else do
-                putStrLn $ "Compact block " ++ show bh ++ " missing " ++ show (length missing) ++ " txns, sending getblocktxn"
-                -- BIP-152 BUG-1 FIX: persist the partial block state so MBlockTxn
-                -- can complete reconstruction.  Core keeps PartiallyDownloadedBlock
-                -- alive in mapBlocksInFlight keyed by block hash until BLOCKTXN arrives.
-                -- Reference: bitcoin-core/src/net_processing.cpp:3964-3967
-                cbs <- readIORef compactBlockStateRef
-                atomically $ modifyTVar' (cbsPending cbs) (Map.insert bh pdb)
-                pm <- readIORef pmRef
-                let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
-                requestFromPeer pm addr (MGetBlockTxn gbt)
-                  `catch` (\(_ :: SomeException) -> return ())
+                let missPct = fromIntegral (length missing) / fromIntegral (pdbTotalTxns pdb) * 100.0 :: Double
+                if missPct > 50.0
+                  then do
+                    putStrLn $ "Compact block " ++ show bh ++ " too many missing, requesting full block"
+                    pm <- readIORef pmRef
+                    let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+                    requestFromPeer pm addr (MGetData (GetData [iv]))
+                      `catch` (\(_ :: SomeException) -> return ())
+                  else do
+                    putStrLn $ "Compact block " ++ show bh ++ " missing " ++ show (length missing) ++ " txns, sending getblocktxn"
+                    -- BIP-152 BUG-1 FIX: persist the partial block state so MBlockTxn
+                    -- can complete reconstruction.  Core keeps PartiallyDownloadedBlock
+                    -- alive in mapBlocksInFlight keyed by block hash until BLOCKTXN arrives.
+                    -- Reference: bitcoin-core/src/net_processing.cpp:3964-3967
+                    cbs <- readIORef compactBlockStateRef
+                    atomically $ modifyTVar' (cbsPending cbs) (Map.insert bh pdb)
+                    pm <- readIORef pmRef
+                    let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
+                    requestFromPeer pm addr (MGetBlockTxn gbt)
+                      `catch` (\(_ :: SomeException) -> return ())
 
   MGetBlockTxn gbt -> do
     -- Serve missing transactions for compact block reconstruction
+    -- MAX_BLOCKTXN_DEPTH=10 guard (BUG-5 FIX, W112).
+    -- Core (net_processing.cpp:4276): if the requested block is more than 10
+    -- deep from the tip, respond with the full block (MSG_WITNESS_BLOCK)
+    -- instead of serving individual transactions.
+    -- Reference: bitcoin-core/src/net_processing.cpp:4276-4285
     let blockHash = gbtBlockHash gbt
         indices = gbtIndexes gbt
-    mBlock <- getBlock db blockHash
-    case mBlock of
-      Just block -> do
-        let txns = mapMaybe (\i -> let idx = fromIntegral i in if idx < length (blockTxns block) then Just (blockTxns block !! idx) else Nothing) indices
+    currentTip <- readTVarIO (hcHeight hc)
+    chainEnts <- readTVarIO (hcEntries hc)
+    let mBlkHeight = fmap ceHeight (Map.lookup blockHash chainEnts)
+        blkDepth = case mBlkHeight of
+          Just blockH -> fromIntegral currentTip - fromIntegral blockH :: Int
+          Nothing     -> 0  -- Unknown: let normal block lookup handle it
+    if blkDepth > maxBlocktxnDepth
+      then do
+        putStrLn $ "GetBlockTxn for " ++ show blockHash ++ " too old (depth=" ++ show blkDepth
+                ++ " > MAX_BLOCKTXN_DEPTH=" ++ show maxBlocktxnDepth
+                ++ "), sending full block"
         pm <- readIORef pmRef
-        requestFromPeer pm addr (MBlockTxn (BlockTxn { btBlockHash = blockHash, btTxns = txns }))
+        let iv = InvVector InvWitnessBlock (getBlockHashHash blockHash)
+        requestFromPeer pm addr (MGetData (GetData [iv]))
           `catch` (\(_ :: SomeException) -> return ())
-      Nothing -> return ()
+      else do
+        mBlock <- getBlock db blockHash
+        case mBlock of
+          Just block -> do
+            let txns = mapMaybe (\i -> let idx = fromIntegral i in if idx < length (blockTxns block) then Just (blockTxns block !! idx) else Nothing) indices
+            pm <- readIORef pmRef
+            requestFromPeer pm addr (MBlockTxn (BlockTxn { btBlockHash = blockHash, btTxns = txns }))
+              `catch` (\(_ :: SomeException) -> return ())
+          Nothing -> return ()
 
   MBlockTxn bt -> do
     -- BIP-152 BUG-1 FIX (W112): Complete compact block reconstruction.

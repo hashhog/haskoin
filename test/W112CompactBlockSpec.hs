@@ -460,15 +460,16 @@ spec = describe "W112 BIP-152 Compact Blocks" $ do
       src <- readFile "app/Main.hs"
       ("MBlockTxn (BlockTxn" `isInfixOf` src) `shouldBe` True
 
-    it "FAIL: MGetBlockTxn handler lacks MAX_BLOCKTXN_DEPTH=10 guard (BUG-5)" $ do
+    it "FIX: MGetBlockTxn handler has MAX_BLOCKTXN_DEPTH=10 guard (BUG-5 FIX-42)" $ do
       src <- readFile "app/Main.hs"
       -- Core (net_processing.cpp:4276) checks height >= tip - MAX_BLOCKTXN_DEPTH.
-      -- Haskoin serves any depth. The depth guard would reference the height/tip.
+      -- Fixed in FIX-42: guard checks depth vs maxBlocktxnDepth; blocks deeper
+      -- than 10 receive a full-block getdata response instead of blocktxn.
       ("MAX_BLOCKTXN_DEPTH" `isInfixOf` src ||
        "maxBlockTxnDepth" `isInfixOf` src ||
        ("tipHeight" `isInfixOf` extractAfter "MGetBlockTxn gbt" src &&
         "depth" `isInfixOf` extractAfter "MGetBlockTxn gbt" src))
-        `shouldBe` False  -- BUG: depth guard absent
+        `shouldBe` True  -- FIX-42: depth guard present
 
   -- =========================================================================
   -- G19  MBlockTxn handler completes reconstruction (BUG-1 P0-CDIV)
@@ -496,10 +497,13 @@ spec = describe "W112 BIP-152 Compact Blocks" $ do
   -- G20  MAX_CMPCTBLOCK_DEPTH = 5 check (BUG-4)
   -- =========================================================================
   describe "G20 MAX_CMPCTBLOCK_DEPTH=5 check (BUG-4)" $ do
-    it "FAIL: MCmpctBlock handler has no depth guard (MAX_CMPCTBLOCK_DEPTH absent)" $ do
+    it "FIX: MCmpctBlock handler has depth guard (MAX_CMPCTBLOCK_DEPTH present, BUG-4 FIX-42)" $ do
       src <- readFile "app/Main.hs"
+      -- Fixed in FIX-42: MCmpctBlock handler reads currentTipHeight and
+      -- chainEntries, computes depth, and falls back to full-block getdata
+      -- when depth > maxCmpctBlockDepth (5).
       ("MAX_CMPCTBLOCK_DEPTH" `isInfixOf` src || "maxCmpctDepth" `isInfixOf` src)
-        `shouldBe` False  -- BUG: depth guard absent
+        `shouldBe` True  -- FIX-42: depth guard present
 
   -- =========================================================================
   -- G21  Block reconstruction: prefilled at index 0, short IDs for rest

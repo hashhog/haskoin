@@ -69,6 +69,8 @@ module Haskoin.Network
   , CompactBlockState(..)
   , CompactBlockConfig(..)
   , defaultCompactBlockConfig
+  , maxCmpctBlockDepth
+  , maxBlocktxnDepth
     -- ** Compact Block Operations
   , computeShortIdKey
   , computeShortId
@@ -5708,6 +5710,18 @@ defaultCompactBlockConfig = CompactBlockConfig
   , cbcHighBandwidth = True
   , cbcMaxHighBW     = 3
   }
+
+-- | Maximum depth (from tip) at which a compact block (CMPCTBLOCK) is
+-- processed. Mirrors Bitcoin Core net_processing.cpp:2466.
+-- Blocks older than this are served/processed as full blocks instead.
+maxCmpctBlockDepth :: Int
+maxCmpctBlockDepth = 5
+
+-- | Maximum depth (from tip) at which blocktxn (BLOCKTXN) responses are
+-- served. Mirrors Bitcoin Core net_processing.cpp:4276.
+-- Requests deeper than this fall back to sending the full block.
+maxBlocktxnDepth :: Int
+maxBlocktxnDepth = 10
 
 -- | Create a compact block from a full block
 -- The coinbase is always prefilled at index 0
