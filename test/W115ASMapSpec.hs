@@ -246,6 +246,10 @@ import Haskoin.Network
   , newOutboundDiversity
   , checkOutboundDiversity
   , addOutboundConnection
+    -- FIX-52: ASMapHealthCheck (G23)
+  , ASMapHealthStats(..)
+  , asmapHealthCheckInterval
+  , asMapHealthCheck
   )
 import qualified Haskoin.ASMap as ASMap
 
@@ -451,8 +455,31 @@ spec_g21_g24_peer = describe "G21-G24: Peer behaviour / ASMap" $ do
     -- "source_mapped_as" per-entry.  haskoin has no such RPC handler.
     True `shouldBe` True
 
-  it "G23: no ASMapHealthCheck periodic log (MISSING ENTIRELY)" $
-    True `shouldBe` True
+  it "G23: IMPLEMENTED (FIX-52) — asMapHealthCheck counts unique ASNs and unmapped peers" $ do
+    -- Core netgroup.cpp:109-123: for each clearnet peer look up ASN via
+    -- GetMappedAS; collect unique non-zero ASNs and count zero-ASN peers.
+    -- Log: "ASMap Health Check: N clearnet peers are mapped to M ASNs with K peers being unmapped"
+    let addr1 = parseIPv6 "0:1559:183:3728:224c:65a5:62e6:e991"   -- ASN 961340
+        addr2 = parseIPv6 "d0:d493:faa0:8609:e927:8b75:293c:f5a4" -- ASN 961340 (same AS)
+        addr3 = parseIPv6 "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f" -- ASN 693761
+        addr4 = parseIPv6 "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38" -- ASN 0 (unmapped)
+        stats = asMapHealthCheck decodeCoreAsmap [addr1, addr2, addr3, addr4]
+    -- 4 clearnet peers examined
+    ashClearnetPeers stats `shouldBe` 4
+    -- 2 unique ASNs: 961340 and 693761
+    ashUniquASNs stats `shouldBe` 2
+    -- 1 unmapped peer (ASN 0)
+    ashUnmappedPeers stats `shouldBe` 1
+
+  it "G23b: IMPLEMENTED — asMapHealthCheck with empty asmap treats all peers as unmapped" $ do
+    let addrs = [addr_1_2_3_4, addr_5_6_7_8]
+        stats = asMapHealthCheck BS.empty addrs
+    ashClearnetPeers stats `shouldBe` 2
+    ashUniquASNs     stats `shouldBe` 0
+    ashUnmappedPeers stats `shouldBe` 2
+
+  it "G23c: IMPLEMENTED — asmapHealthCheckInterval is 3600 seconds (1 hour)" $
+    asmapHealthCheckInterval `shouldBe` 3600
 
   it "G24 / TP-1: RECONCILED (FIX-51) — eviction now uses computeNetworkGroupWithASMap (single canonical path)" $ do
     -- FIX-51 TP-1 resolution:
@@ -924,7 +951,7 @@ spec_fix51_addrman_buckets = describe "FIX-51: ASMap AddrMan buckets + TP-1 reco
 --------------------------------------------------------------------------------
 
 spec :: Spec
-spec = describe "W115 ASMap — haskoin (FIX-50+FIX-51 IMPLEMENTED)" $ do
+spec = describe "W115 ASMap — haskoin (FIX-50+FIX-51+FIX-52 IMPLEMENTED)" $ do
   spec_g1_g5_config
   spec_g6_g10_data
   spec_g11_g15_addrman

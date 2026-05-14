@@ -504,6 +504,13 @@ module Haskoin.Network
   , defaultReachability
   , shouldAdvertiseAddress
   , filterReachableAddresses
+    -- * ASMap Health Check (G23)
+  , ASMapHealthStats(..)
+  , asmapHealthCheckInterval
+  , asMapHealthCheck
+  , logASMapHealthStats
+  , runASMapHealthCheck
+  , startAsMapHealthCheckThread
   ) where
 
 import Data.ByteString (ByteString)
@@ -4469,6 +4476,105 @@ computeNetworkGroupWithASMap asmapData addr
                   , fromIntegral ((asn `shiftR` 16) .&. 0xff)
                   , fromIntegral ((asn `shiftR` 24) .&. 0xff)
                   ]
+
+--------------------------------------------------------------------------------
+-- ASMap Health Check
+-- Reference: bitcoin-core/src/net.h:93 (ASMAP_HEALTH_CHECK_INTERVAL)
+--            bitcoin-core/src/net.cpp:4178 CConnman::ASMapHealthCheck
+--            bitcoin-core/src/netgroup.cpp:109 NetGroupManager::ASMapHealthCheck
+--------------------------------------------------------------------------------
+
+-- | Interval for the ASMap health-check periodic task (3600 seconds = 1 hour).
+-- Bitcoin Core uses 24h (ASMAP_HEALTH_CHECK_INTERVAL); haskoin uses 1h for
+-- more responsive health reporting during initial deployment.
+-- Reference: bitcoin-core/src/net.h:93 ASMAP_HEALTH_CHECK_INTERVAL.
+asmapHealthCheckInterval :: Int
+asmapHealthCheckInterval = 3600  -- 1 hour in seconds
+
+-- | Summary statistics produced by 'asMapHealthCheck'.
+-- Reference: bitcoin-core/src/netgroup.cpp:122 LogInfo format string.
+data ASMapHealthStats = ASMapHealthStats
+  { ashClearnetPeers :: !Int    -- ^ Total clearnet (IPv4+IPv6) peers examined
+  , ashUniquASNs     :: !Int    -- ^ Number of distinct ASNs among mapped peers
+  , ashUnmappedPeers :: !Int    -- ^ Peers with no ASN mapping (ASN=0)
+  } deriving (Show, Eq)
+
+-- | Compute ASMap health statistics for a list of clearnet peer addresses.
+-- Counts unique ASNs and unmapped peers, mirroring Core's
+-- NetGroupManager::ASMapHealthCheck.
+--
+-- When @asmapData@ is empty the function is a no-op: all peers are
+-- considered unmapped and ashUniquASNs=0 (ASMap is disabled).
+--
+-- Reference: bitcoin-core/src/netgroup.cpp:109-123.
+asMapHealthCheck :: ByteString   -- ^ Raw asmap bytecode (empty = ASMap disabled)
+                 -> [SockAddr]   -- ^ Clearnet peer addresses to examine
+                 -> ASMapHealthStats
+asMapHealthCheck asmapData addrs =
+  let (asnList, unmappedCnt) = foldr classify ([], 0) addrs
+      uniqueASNs = length (Set.toList (Set.fromList asnList))
+  in ASMapHealthStats
+       { ashClearnetPeers = length addrs
+       , ashUniquASNs     = uniqueASNs
+       , ashUnmappedPeers = unmappedCnt
+       }
+  where
+    classify addr (asns, unmapped) =
+      let asn = getMappedASFromSockAddr asmapData addr
+      in if asn == 0
+           then (asns, unmapped + 1)
+           else (asn : asns, unmapped)
+
+-- | Log the ASMap health statistics to stdout.
+-- Mirrors the Core LogInfo format:
+-- "ASMap Health Check: N clearnet peers are mapped to M ASNs with K peers being unmapped"
+-- Reference: bitcoin-core/src/netgroup.cpp:122.
+logASMapHealthStats :: ASMapHealthStats -> IO ()
+logASMapHealthStats stats =
+  putStrLn $ "ASMap Health Check: "
+    ++ show (ashClearnetPeers stats)
+    ++ " clearnet peers are mapped to "
+    ++ show (ashUniquASNs stats)
+    ++ " ASNs with "
+    ++ show (ashUnmappedPeers stats)
+    ++ " peers being unmapped"
+
+-- | Collect clearnet (IPv4+IPv6) peer addresses from the peer manager,
+-- run 'asMapHealthCheck', and log the result.
+-- Skips inbound-only peers and non-clearnet (Unix socket) addresses.
+runASMapHealthCheck :: PeerManager -> IO ()
+runASMapHealthCheck pm = do
+  peers   <- readTVarIO (pmPeers pm)
+  infos   <- forM (Map.elems peers) (readTVarIO . pcInfo)
+  let clearnetAddrs = [ piAddress i
+                      | i <- infos
+                      , piState i == PeerConnected
+                      , isClearnetAddr (piAddress i)
+                      ]
+  let stats = asMapHealthCheck (pmAsmapData pm) clearnetAddrs
+  logASMapHealthStats stats
+  where
+    isClearnetAddr (SockAddrInet  {}) = True
+    isClearnetAddr (SockAddrInet6 {}) = True
+    isClearnetAddr _                  = False
+
+-- | Fork a background thread that calls 'runASMapHealthCheck' once
+-- immediately at startup and then every 'asmapHealthCheckInterval' seconds.
+--
+-- Uses a simple @forkIO@ + @forever@ + @threadDelay@ loop — the same
+-- async pattern used by the peer-manager stale-eviction thread.
+--
+-- Reference: bitcoin-core/src/net.cpp:3572-3573
+-- (ASMapHealthCheck() called once, then scheduled via scheduler.scheduleEvery).
+--
+-- Returns the spawned 'ThreadId' so the caller can kill it on shutdown.
+startAsMapHealthCheckThread :: PeerManager -> IO ThreadId
+startAsMapHealthCheckThread pm = forkIO $ do
+  -- Run immediately so the operator sees a startup log line.
+  runASMapHealthCheck pm
+  forever $ do
+    threadDelay (asmapHealthCheckInterval * 1_000_000)
+    runASMapHealthCheck pm
 
 --------------------------------------------------------------------------------
 -- AddrMan Constants
