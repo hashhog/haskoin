@@ -118,6 +118,16 @@ module Haskoin.Wallet
   , SelectionAlgorithm(..)
   , selectCoinsBnB
   , knapsackSolver
+  , approximateBestSubset
+  , partitionUtxos
+  , findExactMatch
+  , maxBnBIterations
+  , dustThreshold
+  , minChangeAmount
+  , costOfChange
+  , estimateTxWeight
+  , feeFromWeight
+  , effectiveValue
     -- * UTXO Types
   , Utxo(..)
   , utxoValue
