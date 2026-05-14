@@ -11127,7 +11127,7 @@ main = hspec $ do
               , ecLastTxTime = 1700000050
               , ecServices = 0x409
               , ecRelaysTxs = True
-              , ecNetworkGroup = 127
+              , ecNetworkGroup = NetworkGroup (BS.singleton 127)
               , ecInbound = True
               , ecNoBan = False
               }
@@ -11142,7 +11142,7 @@ main = hspec $ do
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = 0
+              , ecNetworkGroup = NetworkGroup BS.empty
               , ecInbound = True
               , ecNoBan = False
               }
@@ -11157,7 +11157,7 @@ main = hspec $ do
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = 0
+              , ecNetworkGroup = NetworkGroup BS.empty
               , ecInbound = True
               , ecNoBan = False
               }
@@ -11200,7 +11200,7 @@ main = hspec $ do
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = 127
+              , ecNetworkGroup = NetworkGroup (BS.singleton 127)
               , ecInbound = False  -- Outbound
               , ecNoBan = False
               }
@@ -11215,7 +11215,7 @@ main = hspec $ do
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = 127
+              , ecNetworkGroup = NetworkGroup (BS.singleton 127)
               , ecInbound = True
               , ecNoBan = True  -- Protected
               }
@@ -11233,7 +11233,7 @@ main = hspec $ do
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = fromIntegral i  -- Each peer in its own group
+              , ecNetworkGroup = NetworkGroup (BS.singleton (fromIntegral i))  -- Each peer in its own group
               , ecInbound = True
               , ecNoBan = False
               }
@@ -11253,7 +11253,8 @@ main = hspec $ do
         --
         -- Strategy: lone peers have better metrics, so they get protected first.
         -- Group-2570 peers have worse metrics and survive all protections.
-        let group1 = 2570  -- group number for the "large" group
+        -- group1: a distinctive NetworkGroup bytes value used for the "large" group
+        let group1 = NetworkGroup (BS.pack [0x0a, 0x0a])  -- distinct ASN-style group
             -- 6 peers in group1: poor ping, no tx/block, youngest (high connectedAt)
             -- These survive all protections because lone peers are always "better"
             mkGroup1 i = EvictionCandidate
@@ -11277,12 +11278,12 @@ main = hspec $ do
               , ecLastTxTime = fromIntegral (1000 + i)     -- recent txs
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = fromIntegral (100 + i)  -- unique groups
+              , ecNetworkGroup = NetworkGroup (BS.singleton (fromIntegral (100 + i)))  -- unique groups
               , ecInbound = True
               , ecNoBan = False
               }
             candidates = map mkGroup1 [1..6 :: Int] ++ map mkLone [1..30 :: Int]
-        -- After protections, group-2570 peers survive; group-2570 is largest
+        -- After protections, group1 peers survive; group1 is largest
         case selectEvictionCandidate candidates of
           Just c -> ecNetworkGroup c `shouldBe` group1
           Nothing -> expectationFailure "Expected to find eviction candidate"
@@ -11299,7 +11300,7 @@ main = hspec $ do
               , ecLastTxTime = 0
               , ecServices = 0
               , ecRelaysTxs = False
-              , ecNetworkGroup = 42  -- all same group
+              , ecNetworkGroup = NetworkGroup (BS.singleton 42)  -- all same group
               , ecInbound = True
               , ecNoBan = False
               }
@@ -11342,7 +11343,7 @@ main = hspec $ do
               , piIsLocal  = False
               , piWtxidRelay = False
               }
-            candidate = peerToEvictionCandidate addr info
+            candidate = peerToEvictionCandidate BS.empty addr info
         ecAddress candidate `shouldBe` addr
         ecConnectedAt candidate `shouldBe` 1700000000
         ecMinPingTime candidate `shouldBe` Just 0.05
@@ -11413,14 +11414,14 @@ main = hspec $ do
         let key = Hash256 $ BS.replicate 32 0
             addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-            bucket = getNewBucket key addr source
+            bucket = getNewBucket key BS.empty addr source
         bucket `shouldSatisfy` (>= 0)
         bucket `shouldSatisfy` (< addrmanNewBucketCount)
 
       it "getTriedBucket returns valid bucket index" $ do
         let key = Hash256 $ BS.replicate 32 0
             addr = SockAddrInet 8333 0x0100007f
-            bucket = getTriedBucket key addr
+            bucket = getTriedBucket key BS.empty addr
         bucket `shouldSatisfy` (>= 0)
         bucket `shouldSatisfy` (< addrmanTriedBucketCount)
 
@@ -11435,7 +11436,7 @@ main = hspec $ do
         let key = Hash256 $ BS.replicate 32 0
             source = SockAddrInet 8333 0
             addrs = [SockAddrInet 8333 (fromIntegral i) | i <- [1..100 :: Int]]
-            buckets = Set.fromList [getNewBucket key a source | a <- addrs]
+            buckets = Set.fromList [getNewBucket key BS.empty a source | a <- addrs]
         -- With 100 random addresses we should get some distribution
         Set.size buckets `shouldSatisfy` (> 10)
 
@@ -11443,8 +11444,8 @@ main = hspec $ do
         let key = Hash256 $ BS.replicate 32 0
             addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-            bucket1 = getNewBucket key addr source
-            bucket2 = getNewBucket key addr source
+            bucket1 = getNewBucket key BS.empty addr source
+            bucket2 = getNewBucket key BS.empty addr source
         bucket1 `shouldBe` bucket2
 
       it "same address different source may get different bucket" $ do
@@ -11452,8 +11453,8 @@ main = hspec $ do
             addr = SockAddrInet 8333 0x0100007f
             source1 = SockAddrInet 8333 0x0100000a
             source2 = SockAddrInet 8333 0x02000014
-            bucket1 = getNewBucket key addr source1
-            bucket2 = getNewBucket key addr source2
+            bucket1 = getNewBucket key BS.empty addr source1
+            bucket2 = getNewBucket key BS.empty addr source2
         -- Different sources typically produce different buckets
         -- but we can't guarantee it for any specific pair
         (bucket1 == bucket2 || bucket1 /= bucket2) `shouldBe` True
@@ -11470,7 +11471,7 @@ main = hspec $ do
         am <- newAddrMan
         let addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-        result <- addAddress am addr source 0x409 1700000000
+        result <- addAddress am BS.empty addr source 0x409 1700000000
         result `shouldBe` True
         newCount <- readTVarIO (amNewCount am)
         newCount `shouldBe` 1
@@ -11479,8 +11480,8 @@ main = hspec $ do
         am <- newAddrMan
         let addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-        _ <- addAddress am addr source 0x409 1700000000
-        _ <- addAddress am addr source 0x409 1700000001
+        _ <- addAddress am BS.empty addr source 0x409 1700000000
+        _ <- addAddress am BS.empty addr source 0x409 1700000001
         newCount <- readTVarIO (amNewCount am)
         newCount `shouldBe` 1
 
@@ -11493,7 +11494,7 @@ main = hspec $ do
         am <- newAddrMan
         let addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-        _ <- addAddress am addr source 0x409 1700000000
+        _ <- addAddress am BS.empty addr source 0x409 1700000000
         result <- selectAddress am True
         result `shouldBe` Just addr
 
@@ -11501,8 +11502,8 @@ main = hspec $ do
         am <- newAddrMan
         let addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-        _ <- addAddress am addr source 0x409 1700000000
-        markGood am addr 1700000001
+        _ <- addAddress am BS.empty addr source 0x409 1700000000
+        markGood am BS.empty addr 1700000001
         newCount <- readTVarIO (amNewCount am)
         triedCount <- readTVarIO (amTriedCount am)
         newCount `shouldBe` 0
@@ -11512,7 +11513,7 @@ main = hspec $ do
         am <- newAddrMan
         let addr = SockAddrInet 8333 0x0100007f
             source = SockAddrInet 8333 0x0100000a
-        _ <- addAddress am addr source 0x409 1700000000
+        _ <- addAddress am BS.empty addr source 0x409 1700000000
         markAttempt am addr 1700000001
         addrIdx <- readTVarIO (amAddrIndex am)
         case Map.lookup addr addrIdx of
@@ -11523,32 +11524,32 @@ main = hspec $ do
       it "checkOutboundDiversity returns True for new group" $ do
         od <- newOutboundDiversity
         let addr = SockAddrInet 8333 0x0100007f
-        result <- checkOutboundDiversity od addr
+        result <- checkOutboundDiversity od BS.empty addr
         result `shouldBe` True
 
       it "checkOutboundDiversity returns False for connected group" $ do
         od <- newOutboundDiversity
         let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
             addr2 = SockAddrInet 8333 0x0201a8c0  -- 192.168.1.2 (same /16)
-        addOutboundConnection od addr1
-        result <- checkOutboundDiversity od addr2
+        addOutboundConnection od BS.empty addr1
+        result <- checkOutboundDiversity od BS.empty addr2
         result `shouldBe` False
 
       it "checkOutboundDiversity returns True for different /16" $ do
         od <- newOutboundDiversity
         let addr1 = SockAddrInet 8333 0x0101a8c0  -- 192.168.1.1
             addr2 = SockAddrInet 8333 0x0100000a  -- 10.0.0.1 (different /16)
-        addOutboundConnection od addr1
-        result <- checkOutboundDiversity od addr2
+        addOutboundConnection od BS.empty addr1
+        result <- checkOutboundDiversity od BS.empty addr2
         result `shouldBe` True
 
       it "removeOutboundConnection allows reconnection" $ do
         od <- newOutboundDiversity
         let addr1 = SockAddrInet 8333 0x0101a8c0
             addr2 = SockAddrInet 8333 0x0201a8c0  -- same /16
-        addOutboundConnection od addr1
-        removeOutboundConnection od addr1
-        result <- checkOutboundDiversity od addr2
+        addOutboundConnection od BS.empty addr1
+        removeOutboundConnection od BS.empty addr1
+        result <- checkOutboundDiversity od BS.empty addr2
         result `shouldBe` True
 
       it "tracks multiple connections per group" $ do
@@ -11556,15 +11557,15 @@ main = hspec $ do
         let addr1 = SockAddrInet 8333 0x0101a8c0
             addr2 = SockAddrInet 8333 0x0201a8c0  -- same /16
             addr3 = SockAddrInet 8333 0x0301a8c0  -- same /16
-        addOutboundConnection od addr1
-        addOutboundConnection od addr2
+        addOutboundConnection od BS.empty addr1
+        addOutboundConnection od BS.empty addr2
         -- After removing one, group still connected
-        removeOutboundConnection od addr1
-        result <- checkOutboundDiversity od addr3
+        removeOutboundConnection od BS.empty addr1
+        result <- checkOutboundDiversity od BS.empty addr3
         result `shouldBe` False
         -- After removing second, group is free
-        removeOutboundConnection od addr2
-        result2 <- checkOutboundDiversity od addr3
+        removeOutboundConnection od BS.empty addr2
+        result2 <- checkOutboundDiversity od BS.empty addr3
         result2 `shouldBe` True
 
     describe "inbound connection limiting" $ do
