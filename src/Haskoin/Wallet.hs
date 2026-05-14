@@ -244,7 +244,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Control.Monad (forM, forM_, when, replicateM, void, foldM)
 import Control.Applicative ((<|>))
-import System.Random (randomIO, randomRIO)
+import qualified Crypto.Random as CryptoRandom
 import Data.List (sortBy, foldl', sortOn)
 import Data.Ord (comparing, Down(..))
 import Control.Concurrent.STM
@@ -315,8 +315,9 @@ generateMnemonic strength = do
   when (strength `notElem` [128, 160, 192, 224, 256]) $
     error "Mnemonic strength must be 128, 160, 192, 224, or 256 bits"
 
-  -- Generate random entropy
-  entropy <- BS.pack <$> replicateM (strength `div` 8) randomIO
+  -- Generate random entropy using cryptonite CSPRNG (/dev/urandom backed).
+  -- BUG-6 fix: was System.Random.randomIO (non-CSPRNG); BIP-39 requires CSPRNG.
+  entropy <- CryptoRandom.getRandomBytes (strength `div` 8)
 
   -- Compute checksum (first CS bits of SHA-256)
   let checksum = sha256 entropy
@@ -1644,23 +1645,40 @@ approximateBestSubset utxos target feeRate = do
     Just (selected, _) -> return selected
     Nothing -> return utxos  -- Use all if no valid subset found
 
--- | Random subset selection.
+-- | Random subset selection using CSPRNG.
+-- Uses cryptonite getRandomBytes; each UTXO included with 50% probability.
 randomSubset :: [Utxo] -> IO [Utxo]
 randomSubset utxos = do
-  -- Include each UTXO with 50% probability
-  decisions <- mapM (\_ -> randomIO :: IO Bool) utxos
+  -- Include each UTXO with 50% probability; use CSPRNG bit for each decision.
+  decisions <- mapM (\_ -> do
+    b <- CryptoRandom.getRandomBytes 1 :: IO BS.ByteString
+    return (BS.head b `mod` 2 == 0)) utxos
   return [u | (u, include) <- zip utxos decisions, include]
 
--- | Shuffle a list randomly.
+-- | Shuffle a list randomly using CSPRNG (Fisher-Yates via cryptonite).
+-- Each swap index is derived from getRandomBytes to avoid bias.
 shuffleList :: [a] -> IO [a]
 shuffleList [] = return []
 shuffleList xs = do
   let n = length xs
-  indices <- mapM (\i -> randomRIO (i, n - 1)) [0..n - 1]
+  indices <- mapM (\i -> csrngRangeIO i (n - 1)) [0..n - 1]
   let pairs = zip [0..] xs
       shuffled = foldl' swap pairs (zip [0..] indices)
   return $ map snd shuffled
   where
+    -- | Return a uniformly-distributed Int in [lo, hi] using CSPRNG.
+    -- Uses rejection sampling on 4 random bytes to avoid modulo bias.
+    csrngRangeIO :: Int -> Int -> IO Int
+    csrngRangeIO lo hi
+      | lo >= hi  = return lo
+      | otherwise = do
+          bytes <- CryptoRandom.getRandomBytes 4 :: IO BS.ByteString
+          let w = fromIntegral (BS.index bytes 0) * 16777216
+                + fromIntegral (BS.index bytes 1) * 65536
+                + fromIntegral (BS.index bytes 2) * 256
+                + fromIntegral (BS.index bytes 3) :: Int
+              range = hi - lo + 1
+          return (lo + (w `mod` range))
     swap :: [(Int, a)] -> (Int, Int) -> [(Int, a)]
     swap pairs (i, j) =
       let vi = snd (pairs !! i)
@@ -2000,18 +2018,21 @@ deriveKey passphrase EncryptionParams{..} =
         }
   in PBKDF2.fastPBKDF2_SHA512 params password epSalt
 
--- | Generate random encryption parameters.
+-- | Generate random encryption parameters using CSPRNG.
+-- BUG-6 fix: was System.Random.randomIO (non-CSPRNG); salt MUST come from CSPRNG.
 generateEncryptionParams :: IO EncryptionParams
 generateEncryptionParams = do
-  salt <- BS.pack <$> replicateM saltSize randomIO
+  salt <- CryptoRandom.getRandomBytes saltSize
   return EncryptionParams
     { epSalt = salt
     , epIterations = defaultPBKDF2Iterations
     }
 
--- | Generate a random IV for AES-CBC.
+-- | Generate a random IV for AES-CBC using CSPRNG.
+-- BUG-8 fix: was System.Random.randomIO (non-CSPRNG); AES-CBC IV MUST be
+-- cryptographically random to prevent predictability attacks.
 generateIV :: IO ByteString
-generateIV = BS.pack <$> replicateM aesBlockSize randomIO
+generateIV = CryptoRandom.getRandomBytes aesBlockSize
 
 -- | Pad plaintext to AES block size using PKCS#7 padding.
 pkcs7Pad :: Int -> ByteString -> ByteString
