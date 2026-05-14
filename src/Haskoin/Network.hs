@@ -78,6 +78,11 @@ module Haskoin.Network
   , fillPartialBlock
   , reconstructBlock
   , getMissingTxIndices
+  , differentialEncode
+  , differentialDecode
+    -- ** SipHash (BIP-152 compact blocks)
+  , SipHashKey(..)
+  , sipHash128
     -- ** High-Bandwidth Mode
   , HighBandwidthState(..)
   , newHighBandwidthState
