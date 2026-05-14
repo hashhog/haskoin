@@ -1400,7 +1400,7 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- Reference: bitcoin-core/src/net_processing.cpp
                       -- mapBlocksInFlight / PartiallyDownloadedBlock lifetime.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -1645,6 +1645,12 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
               -- Reference: bitcoin-core/src/node/txorphanage.h:89
               let confirmedTxIds = map computeTxId (blockTxns block)
               eraseOrphansForBlock confirmedTxIds orphanPoolRef
+              -- BUG-1 FIX (W114): record confirmation heights for all txs in
+              -- this block so the fee estimator can compute how long they took
+              -- to confirm.  Reference: bitcoin-core/src/policy/fees.cpp
+              -- CBlockPolicyEstimator::processBlock — called from
+              -- CTxMemPool::removeForBlock after each valid block.
+              recordConfirmation fe height confirmedTxIds
               -- Announce the new tip honouring BIP-130 sendheaders
               -- preference: peers that requested 'sendheaders' get an
               -- MHeaders, the rest get the legacy MInv.  Reference:
@@ -1685,6 +1691,18 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
                   | otherwise         = (InvTx,  getTxIdHash txid)
             sendMessage pc (MInv (Inv [InvVector itype ihash]))
               `catch` (\(_ :: SomeException) -> return ())
+        -- BUG-1 FIX (W114): feed accepted tx into the fee estimator.
+        -- Reference: bitcoin-core/src/txmempool.cpp
+        -- CTxMemPool::addUnchecked — notifies policy estimator via
+        -- CBlockPolicyEstimator::processTransaction.
+        -- Look up the just-added entry to get the mempool fee rate
+        -- (sat/vB), then record it at the current best-tip height.
+        mEntry <- getTransaction mp txid
+        case mEntry of
+          Just entry -> do
+            tipHeight <- readTVarIO (hcHeight hc)
+            trackTransaction fe txid (getFeeRate (meFeeRate entry)) tipHeight
+          Nothing -> return ()
         -- G13: recursive orphan resolution — re-try any queued orphan that
         -- listed this tx as a parent.  Mirrors Bitcoin Core ProcessOrphanTx
         -- (net_processing.cpp) which iterates AddChildrenToWorkSet after
@@ -1961,7 +1979,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -2067,7 +2085,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()
