@@ -105,6 +105,7 @@ import qualified W109BlockIndexSpec
 import qualified W110BloomFilterSpec
 import qualified W111WalletSpec
 import qualified W112CompactBlockSpec
+import qualified W113CoinSelectionSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22525,6 +22526,9 @@ main = hspec $ do
 
   -- W112 BIP-152 compact blocks 30-gate audit
   W112CompactBlockSpec.spec
+
+  -- W113 Coin selection algorithms 30-gate audit
+  W113CoinSelectionSpec.spec
 
   where
     sampleTx = Tx
