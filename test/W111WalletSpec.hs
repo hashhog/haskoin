@@ -408,9 +408,25 @@ spec = do
         TaprootAddress _ -> pure ()
         _ -> expectationFailure ("Expected P2TR, got: " ++ show addr)
 
-    -- G20/BUG-7: Taproot output key is not BIP-341-tweaked
-    it "G20 [BUG-7] P2TR output key should be BIP-341 tweaked (KNOWN BROKEN)" $ do
-      pending -- pubKeyToAddress AddrP2TR uses raw x-only key without taptweak
+    -- G20/BUG-7 (FIX-38): Taproot output key must be BIP-341 TapTweaked.
+    -- BIP-86 test vector: internal key (x-only) cc8a4bc6...
+    -- Expected tweaked output key: a60869f0...
+    -- Tested via tr() descriptor deriveScripts (same code path as getNewAddress).
+    it "G20 [FIX-38] tr() descriptor applies BIP-341 TapTweak — BIP-86 key-path vector" $ do
+      -- BIP-86 standard test vector (key-path-only, no script tree).
+      -- Source: BIP-86 specification §Test Vectors.
+      let internalHex = "02cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+          expectedOutputKeyHex = "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
+      case parseDescriptor ("tr(" <> internalHex <> ")") of
+        Left err -> expectationFailure ("parseDescriptor tr failed: " ++ show err)
+        Right d ->
+          let scripts = deriveScripts d 0
+          in case scripts of
+               [script] | BS.length script == 34
+                        , BS.index script 0 == 0x51
+                        , BS.index script 1 == 0x20 ->
+                          hexEnc (BS.take 32 (BS.drop 2 script)) `shouldBe` expectedOutputKeyHex
+               _ -> expectationFailure ("Expected single P2TR script, got: " ++ show scripts)
 
     -- G21 pubKeyToAddress
     it "G21 pubKeyToAddress P2SH-P2WPKH produces script hash address" $ do
@@ -726,6 +742,39 @@ spec = do
           in case addrs of
                [WitnessPubKeyAddress _] -> pure ()
                _ -> expectationFailure ("Expected [P2WPKH], got: " ++ show addrs)
+
+    -- G14/FIX-38: tr() descriptor applies BIP-341 TapTweak (BIP-86 test vector)
+    it "G14 [FIX-38] tr(KEY) applies BIP-341 TapTweak — BIP-86 vector" $ do
+      -- BIP-86 test vector: internal key cc8a4bc6... (02-prefix, even Y).
+      -- Expected tweaked output key (x-only): a60869f0...
+      -- The descriptor tr(KEY) uses BIP-86: merkle_root = "".
+      let internalHex = "02cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+          expectedOutputKeyHex = "a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"
+      case parseDescriptor ("tr(" <> internalHex <> ")") of
+        Left err -> expectationFailure ("parseDescriptor tr failed: " ++ show err)
+        Right d ->
+          let scripts = deriveScripts d 0
+          in case scripts of
+               [script] | BS.length script == 34
+                        , BS.index script 0 == 0x51
+                        , BS.index script 1 == 0x20 ->
+                            -- OP_1 <32-byte x-only output key>
+                            hexEnc (BS.take 32 (BS.drop 2 script)) `shouldBe` expectedOutputKeyHex
+               _ -> expectationFailure ("Expected P2TR script (34 bytes OP_1 <32>), got: " ++ show scripts)
+
+    -- G14/FIX-38: tr(KEY) does NOT produce the raw internal key as output key
+    it "G14 [FIX-38] tr(KEY) output key differs from raw internal key (tweak is non-identity)" $ do
+      -- Verify the fix: before FIX-38 output_key == internal_key; after fix they differ.
+      let internalHex = "02cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+          rawInternalXOnly = "cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"
+      case parseDescriptor ("tr(" <> internalHex <> ")") of
+        Left err -> expectationFailure ("parseDescriptor tr failed: " ++ show err)
+        Right d ->
+          let scripts = deriveScripts d 0
+          in case scripts of
+               [script] | BS.length script == 34 ->
+                 hexEnc (BS.take 32 (BS.drop 2 script)) `shouldNotBe` rawInternalXOnly
+               _ -> expectationFailure ("Unexpected scripts: " ++ show scripts)
 
     -- G15 isRangeDescriptor
     it "G15 isRangeDescriptor is False for literal-key descriptors" $ do
