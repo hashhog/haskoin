@@ -256,7 +256,8 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          nodeNetworkLimited, hasService, ServiceFlag(..),
                          disconnectPeer, addNodeConnect, sockAddrToHostPort,
                          banPeer, getBanList, clearExpiredBans,
-                         saveBanList, loadBanList)
+                         saveBanList, loadBanList,
+                         getMappedASFromSockAddr)
 import qualified Network.Socket as NS
 import Network.Socket (SockAddr(..), Socket, socket, Family(..), SocketType(..),
                        connect, close, getAddrInfo, defaultHints,
@@ -402,6 +403,11 @@ data RpcServer = RpcServer
     -- Reference: bitcoin-core/src/rpc/blockchain.cpp pruneblockchain
     -- and getblockchaininfo.
     -- Audit: CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md.
+  , rsAsmapData      :: !ByteString
+    -- ^ Raw ASMap bytecode loaded at startup from @-asmap=\<file\>@.
+    -- Empty ByteString when ASMap is not configured (default).
+    -- Used by 'handleGetPeerInfo' to emit @mapped_as@ per peer.
+    -- Reference: bitcoin-core/src/rpc/net.cpp getpeerinfo mapped_as.
   }
 
 -- | Back-compat accessor: True iff prune mode is on (manual or auto).
@@ -637,7 +643,7 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
   -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset). Initialised
   -- to False; flipped True only inside the rollback dance.
   pauseVar <- newTVarIO False
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty
   -- Restore persisted banlist at startup (best-effort; absence is fine on
   -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
   -- which loads banlist.json on boot.
@@ -2454,15 +2460,18 @@ handleGetNetworkInfo server = do
 -- | Get information about connected peers
 -- minfeefilter uses btcAmountEnc (Core's fixed-decimal BTC/kB, 0.00000000)
 -- rather than Double 0.0 which Aeson collapses to scientific notation.
+-- W115 FIX-50: emit "mapped_as" when ASMap is loaded and ASN is non-zero.
+-- Reference: bitcoin-core/src/rpc/net.cpp:236-237.
 handleGetPeerInfo :: RpcServer -> IO RpcResponse
 handleGetPeerInfo server = do
   peers <- getConnectedPeers (rsPeerMgr server)
-  let peerEncs = zipWith peerToEnc [0..] peers
-      rawBs    = encodingToLazyByteString (AE.list id peerEncs)
+  let asmapData = rsAsmapData server
+      peerEncs  = zipWith (peerToEnc asmapData) [0..] peers
+      rawBs     = encodingToLazyByteString (AE.list id peerEncs)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    peerToEnc :: Int -> (SockAddr, PeerInfo) -> AE.Encoding
-    peerToEnc idx (addr, info) =
+    peerToEnc :: ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
+    peerToEnc asmapData idx (addr, info) =
       let services = piServices info
           serviceNames :: [Text]
           serviceNames = catMaybes
@@ -2472,6 +2481,13 @@ handleGetPeerInfo server = do
             ]
           isInbound = piInbound info
           pingTime = fromMaybe 0.0 (piPingLatency info)
+          -- W115 FIX-50: compute ASN for this peer's address.
+          -- Core rpc/net.cpp:236-237: emits "mapped_as" only when non-zero.
+          mappedAS = if BS.null asmapData then 0
+                     else getMappedASFromSockAddr asmapData addr
+          mappedASPair = if mappedAS /= 0
+                           then pair "mapped_as" (AE.word32 mappedAS)
+                           else mempty
       in pairs $
            pair "id"                      (AE.int idx)                                  <>
            pair "addr"                    (text (T.pack (show addr)))                   <>
@@ -2508,7 +2524,8 @@ handleGetPeerInfo server = do
            pair "bytesrecv_per_msg"       (pairs mempty)                                <>
            pair "connection_type"         (text (if isInbound then "inbound" else "outbound-full-relay")) <>
            pair "transport_protocol_type" (text "v1")                                   <>
-           pair "session_id"              (text "")
+           pair "session_id"              (text "")                                     <>
+           mappedASPair
 
 -- | Get the number of connected peers
 handleGetConnectionCount :: RpcServer -> IO RpcResponse

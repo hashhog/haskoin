@@ -226,14 +226,18 @@ import Test.Hspec
 import Data.Bits (shiftR, (.&.), (.|.))
 import Data.Word (Word8, Word32)
 import qualified Data.ByteString as BS
-import Network.Socket (SockAddr(..))
+import qualified Data.ByteString.Base16 as B16
+import Network.Socket (SockAddr(..), HostAddress6)
 
 import Haskoin.Network
   ( computeNetworkGroup
   , getNetworkGroup
   , NetworkGroup(..)
   , getNetworkGroupBS
+  , computeNetworkGroupWithASMap
+  , getMappedASFromSockAddr
   )
+import qualified Haskoin.ASMap as ASMap
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -550,11 +554,232 @@ spec_asmap_contracts = describe "ASMap contracts (Core format reference pins)" $
     in (bit0, bit7) `shouldBe` (0, 1)
 
 --------------------------------------------------------------------------------
+-- Core test vector helpers
+--------------------------------------------------------------------------------
+
+-- | The ASMAP_DATA from bitcoin-core/src/test/netbase_tests.cpp:622-631
+-- (randomly generated, 128 ranges, up to 20-bit AS numbers).
+coreAsmapHex :: BS.ByteString
+coreAsmapHex =
+  "fd38d50f7d5d665357f64bba6bfc190d6078a7e68e5d3ac032edf47f8b5755f8788" <>
+  "1bfd3633d9aa7c1fa279b36fe26c63bbc9de44e0f04e5a382d8e1cddbe1c26653bc" <>
+  "939d4327f287e8b4d1f8aff33176787cb0ff7cb28e3fdaef0f8f47357f801c9f7ff" <>
+  "7a99f7f9c9f99de7f3156ae00f23eb27a303bc486aa3ccc31ec19394c2f8a53ddde" <>
+  "a3cc56257f3b7e9b1f488be9c1137db823759aa4e071eef2e984aaf97b52d5f88d0" <>
+  "f373dd190fe45e06efef1df7278be680a73a74c76db4dd910f1d30752c57fe2bc9f" <>
+  "079f1a1e1b036c2a69219f11c5e11980a3fa51f4f82d36373de73b1863a8c27e36a" <>
+  "e0e4f705be3d76ecff038a75bc0f92ba7e7f6f4080f1c47c34d095367ecf4406c1e" <>
+  "3bbc17ba4d6f79ea3f031b876799ac268b1e0ea9babf0f9a8e5f6c55e363c6363df" <>
+  "46afc696d7afceaf49b6e62df9e9dc27e70664cafe5c53df66dd0b8237678ada90e" <>
+  "73f05ec60e6f6e96c3cbb1ea2f9dece115d5bdba1033e53662a7d72a29477b5beb3" <>
+  "5710591d3e23e5f0379baea62ffdee535bcdf879cbf69b88d7ea37c8015381cf63d" <>
+  "c33d28f757a4a5e15d6a08"
+
+-- | Decode the Core test asmap from hex.
+decodeCoreAsmap :: BS.ByteString
+decodeCoreAsmap =
+  case B16.decode coreAsmapHex of
+    Right bs -> bs
+    Left _   -> error "decodeCoreAsmap: invalid hex in test data"
+
+-- | Parse a compact IPv6 address string like "0:1559:183:3728:224c:65a5:62e6:e991"
+-- into a SockAddr for use with getMappedASFromSockAddr.
+-- Groups are 16-bit big-endian words; we pack them into 4 Host32 words.
+parseIPv6 :: String -> SockAddr
+parseIPv6 s =
+  let parts = splitOn ':' s
+      words16 :: [Word32]
+      words16 = map parseHex16 parts
+      -- Pack pairs of 16-bit values into 32-bit host words (big-endian within each word)
+      toWord32 hi lo = (hi `shiftL` 16) .|. lo
+      [w0, w1, w2, w3, w4, w5, w6, w7] = words16
+      h1 = toWord32 w0 w1
+      h2 = toWord32 w2 w3
+      h3 = toWord32 w4 w5
+      h4 = toWord32 w6 w7
+  in SockAddrInet6 0 0 (h1, h2, h3, h4) 0
+  where
+    splitOn _ [] = []
+    splitOn c xs = let (before, rest) = break (== c) xs
+                   in before : case rest of
+                                  [] -> []
+                                  (_:after) -> splitOn c after
+    parseHex16 str = foldl (\acc c -> acc * 16 + hexDigit c) 0 str
+    hexDigit c
+      | c >= '0' && c <= '9' = fromIntegral (fromEnum c - fromEnum '0')
+      | c >= 'a' && c <= 'f' = fromIntegral (fromEnum c - fromEnum 'a' + 10)
+      | c >= 'A' && c <= 'F' = fromIntegral (fromEnum c - fromEnum 'A' + 10)
+      | otherwise = 0
+    shiftL x n = x * (2 ^ n :: Word32)
+
+--------------------------------------------------------------------------------
+-- FIX-50 implementation tests (gates now IMPLEMENTED)
+--------------------------------------------------------------------------------
+
+spec_fix50_interpreter :: Spec
+spec_fix50_interpreter = describe "FIX-50: ASMap interpreter (IMPLEMENTED)" $ do
+
+  it "maxAsmapFileSize is 8 MiB (8388608 bytes)" $
+    ASMap.maxAsmapFileSize `shouldBe` 8_388_608
+
+  it "checkStandardAsmap accepts a valid asmap (Core test data)" $
+    ASMap.checkStandardAsmap decodeCoreAsmap `shouldBe` True
+
+  it "checkStandardAsmap rejects empty bytestring" $
+    ASMap.checkStandardAsmap BS.empty `shouldBe` False
+
+  it "checkStandardAsmap rejects all-zeros bytestring" $
+    ASMap.checkStandardAsmap (BS.replicate 10 0x00) `shouldBe` False
+
+  it "getMappedAS returns 0 for empty asmap" $
+    ASMap.getMappedAS BS.empty (BS.replicate 16 0x00) `shouldBe` 0
+
+  it "getMappedAS returns 0 for wrong-size IP (not 16 bytes)" $
+    ASMap.getMappedAS decodeCoreAsmap (BS.replicate 4 0x00) `shouldBe` 0
+
+  it "padIpv4ToIpv6 produces 16 bytes with correct prefix" $ do
+    let ipv4 = BS.pack [1, 2, 3, 4]
+        padded = ASMap.padIpv4ToIpv6 ipv4
+    BS.length padded `shouldBe` 16
+    -- First 10 bytes are 0x00
+    BS.take 10 padded `shouldBe` BS.replicate 10 0x00
+    -- Bytes 10-11 are 0xFF
+    BS.index padded 10 `shouldBe` 0xFF
+    BS.index padded 11 `shouldBe` 0xFF
+    -- Last 4 bytes are the IPv4 address
+    BS.drop 12 padded `shouldBe` ipv4
+
+  -- Core test vectors from netbase_tests.cpp:639-657
+  -- Reference: bitcoin-core/src/test/netbase_tests.cpp:618-658
+  describe "Core test vectors (netbase_tests.cpp:618-658)" $ do
+
+    it "0:1559:183:3728:224c:65a5:62e6:e991 -> ASN 961340" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "0:1559:183:3728:224c:65a5:62e6:e991")
+        `shouldBe` 961340
+
+    it "d0:d493:faa0:8609:e927:8b75:293c:f5a4 -> ASN 961340" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "d0:d493:faa0:8609:e927:8b75:293c:f5a4")
+        `shouldBe` 961340
+
+    it "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f -> ASN 693761" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f")
+        `shouldBe` 693761
+
+    it "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38 -> ASN 0 (no match)" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38")
+        `shouldBe` 0
+
+    it "1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615 -> ASN 672176" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615")
+        `shouldBe` 672176
+
+    it "1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792 -> ASN 499880" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792")
+        `shouldBe` 499880
+
+    it "378e:7290:54e5:bd36:4760:971c:e9b9:570d -> ASN 0 (no match)" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "378e:7290:54e5:bd36:4760:971c:e9b9:570d")
+        `shouldBe` 0
+
+    it "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc -> ASN 248495" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc")
+        `shouldBe` 248495
+
+    it "46c2:ae07:9d08:2d56:d473:2bc7:57e3:20ac -> ASN 248495" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "46c2:ae07:9d08:2d56:d473:2bc7:57e3:20ac")
+        `shouldBe` 248495
+
+    it "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9 -> ASN 124471" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9")
+        `shouldBe` 124471
+
+    it "53e1:1812:ffa:dccf:f9f2:64be:75fa:795 -> ASN 539993" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "53e1:1812:ffa:dccf:f9f2:64be:75fa:795")
+        `shouldBe` 539993
+
+    it "544d:eeba:3990:35d1:ad66:f9a3:576d:8617 -> ASN 374443" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "544d:eeba:3990:35d1:ad66:f9a3:576d:8617")
+        `shouldBe` 374443
+
+    it "6a53:40dc:8f1d:3ffa:efeb:3aa3:df88:b94b -> ASN 435070" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "6a53:40dc:8f1d:3ffa:efeb:3aa3:df88:b94b")
+        `shouldBe` 435070
+
+    it "87aa:d1c9:9edb:91e7:aab1:9eb9:baa0:de18 -> ASN 244121" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "87aa:d1c9:9edb:91e7:aab1:9eb9:baa0:de18")
+        `shouldBe` 244121
+
+    it "9f00:48fa:88e3:4b67:a6f3:e6d2:5cc1:5be2 -> ASN 862116" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "9f00:48fa:88e3:4b67:a6f3:e6d2:5cc1:5be2")
+        `shouldBe` 862116
+
+    it "c49f:9cc6:86ad:ba08:4580:315e:dbd1:8a62 -> ASN 969411" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "c49f:9cc6:86ad:ba08:4580:315e:dbd1:8a62")
+        `shouldBe` 969411
+
+    it "dff5:8021:61d:b17d:406d:7888:fdac:4a20 -> ASN 969411" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "dff5:8021:61d:b17d:406d:7888:fdac:4a20")
+        `shouldBe` 969411
+
+    it "e888:6791:2960:d723:bcfd:47e1:2d8c:599f -> ASN 824019" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "e888:6791:2960:d723:bcfd:47e1:2d8c:599f")
+        `shouldBe` 824019
+
+    it "ffff:d499:8c4b:4941:bc81:d5b9:b51e:85a8 -> ASN 824019" $
+      getMappedASFromSockAddr decodeCoreAsmap (parseIPv6 "ffff:d499:8c4b:4941:bc81:d5b9:b51e:85a8")
+        `shouldBe` 824019
+
+spec_fix50_network_group :: Spec
+spec_fix50_network_group = describe "FIX-50: computeNetworkGroupWithASMap" $ do
+
+  it "returns raw IP group when asmap is empty" $ do
+    let ng = computeNetworkGroupWithASMap BS.empty addr_1_2_3_4
+        bs = getNetworkGroupBytes ng
+    BS.index bs 0 `shouldBe` 0x04  -- NET_IPV4
+
+  it "returns ASN-keyed group (5 bytes, NET_IPV6 tag) when ASN is non-zero" $ do
+    let ipv6Addr = parseIPv6 "0:1559:183:3728:224c:65a5:62e6:e991"  -- ASN 961340
+        ng = computeNetworkGroupWithASMap decodeCoreAsmap ipv6Addr
+        bs = getNetworkGroupBytes ng
+    BS.length bs `shouldBe` 5
+    BS.index bs 0 `shouldBe` 0x06  -- NET_IPV6 tag for ASN groups
+    -- ASN 961340 = 0x000EAB3C; little-endian bytes: 0x3C, 0xAB, 0x0E, 0x00
+    BS.index bs 1 `shouldBe` 0x3C  -- asn .&. 0xff        = 60
+    BS.index bs 2 `shouldBe` 0xAB  -- (asn >> 8) .&. 0xff = 171
+    BS.index bs 3 `shouldBe` 0x0E  -- (asn >> 16) .&. 0xff = 14
+    BS.index bs 4 `shouldBe` 0x00  -- (asn >> 24) .&. 0xff = 0
+
+  it "two IPv6 addresses in the same AS share a network group" $ do
+    -- Both 0:1559:... and d0:d493:... map to ASN 961340
+    let addr1 = parseIPv6 "0:1559:183:3728:224c:65a5:62e6:e991"
+        addr2 = parseIPv6 "d0:d493:faa0:8609:e927:8b75:293c:f5a4"
+        ng1 = computeNetworkGroupWithASMap decodeCoreAsmap addr1
+        ng2 = computeNetworkGroupWithASMap decodeCoreAsmap addr2
+    ng1 `shouldBe` ng2
+
+  it "two IPv6 addresses in different ASes get different groups" $ do
+    -- ASN 961340 vs ASN 693761
+    let addr1 = parseIPv6 "0:1559:183:3728:224c:65a5:62e6:e991"
+        addr2 = parseIPv6 "2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f"
+        ng1 = computeNetworkGroupWithASMap decodeCoreAsmap addr1
+        ng2 = computeNetworkGroupWithASMap decodeCoreAsmap addr2
+    ng1 `shouldNotBe` ng2
+
+  it "falls back to raw IP group when ASN is 0 (no match)" $ do
+    -- a77:7cd4:... maps to ASN 0 in the Core test data
+    let addr = parseIPv6 "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38"
+        ng = computeNetworkGroupWithASMap decodeCoreAsmap addr
+        bs = getNetworkGroupBytes ng
+    -- Should be 5 bytes with NET_IPV6 tag (raw /32 group)
+    BS.length bs `shouldBe` 5
+    BS.index bs 0 `shouldBe` 0x06  -- NET_IPV6 from computeNetworkGroup
+
+--------------------------------------------------------------------------------
 -- Top-level spec
 --------------------------------------------------------------------------------
 
 spec :: Spec
-spec = describe "W115 ASMap — haskoin (MISSING ENTIRELY)" $ do
+spec = describe "W115 ASMap — haskoin (FIX-50 IMPLEMENTED)" $ do
   spec_g1_g5_config
   spec_g6_g10_data
   spec_g11_g15_addrman
@@ -563,3 +788,5 @@ spec = describe "W115 ASMap — haskoin (MISSING ENTIRELY)" $ do
   spec_g25_g28_stats
   spec_g29_g30_persist
   spec_asmap_contracts
+  spec_fix50_interpreter
+  spec_fix50_network_group

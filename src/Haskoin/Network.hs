@@ -216,6 +216,8 @@ module Haskoin.Network
   , NetworkGroup(..)
   , getNetworkGroupBS
   , computeNetworkGroup
+  , computeNetworkGroupWithASMap
+  , getMappedASFromSockAddr
     -- ** Address Manager
   , AddrMan(..)
   , AddrInfo(..)
@@ -569,6 +571,7 @@ import Data.Hashable (Hashable(..))
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, sha256)
 import Haskoin.Consensus (Network(..))
+import qualified Haskoin.ASMap as ASMap
 
 --------------------------------------------------------------------------------
 -- Protocol Constants
@@ -2588,6 +2591,11 @@ data PeerManager = PeerManager
     --   Wires 1024-bucket new table + 256-bucket tried table with
     --   IsTerrible filtering and chance-weighted selection.
     --   Reference: Bitcoin Core addrman.h / addrman.cpp.
+  , pmAsmapData          :: !ByteString
+    -- ^ Raw ASMap bytecode loaded from -asmap=<file> at startup.
+    -- Empty ByteString when ASMap is disabled (default).
+    -- Used by 'computeNetworkGroupWithASMap' for ASN-keyed bucketing.
+    -- Reference: bitcoin-core/src/netgroup.cpp NetGroupManager.
   }
 
 -- | Configuration for the peer manager
@@ -2694,6 +2702,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTVarIO Set.empty
     <*> pure onDisconnect
     <*> pure am
+    <*> pure BS.empty   -- pmAsmapData: empty = ASMap disabled; set via pmAsmapData field
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -4390,6 +4399,66 @@ computeNetworkGroup (SockAddrInet6 _ _ (h1, h2, _, _) _) =
 computeNetworkGroup (SockAddrUnix _) =
   -- Unix sockets: local group
   NetworkGroup $ BS.pack [0x00]  -- NET_UNROUTABLE
+
+-- | Convert a SockAddr to a 16-byte big-endian IP for ASMap lookup.
+-- IPv4 addresses are padded with the IPv4-in-IPv6 prefix.
+-- Reference: bitcoin-core/src/netgroup.cpp GetMappedAS IPv4 padding.
+sockAddrToIpBytes :: SockAddr -> Maybe ByteString
+sockAddrToIpBytes (SockAddrInet _ hostAddr) =
+  -- hostAddr is stored in host byte order on Linux (little-endian).
+  -- Extract the 4 octets and arrange them in network (big-endian) order.
+  let a  = fromIntegral hostAddr :: Word32
+      o1 = fromIntegral (a .&. 0xff)          :: Word8
+      o2 = fromIntegral ((a `shiftR` 8)  .&. 0xff) :: Word8
+      o3 = fromIntegral ((a `shiftR` 16) .&. 0xff) :: Word8
+      o4 = fromIntegral ((a `shiftR` 24) .&. 0xff) :: Word8
+      ipv4BE = BS.pack [o1, o2, o3, o4]
+  in Just (ASMap.padIpv4ToIpv6 ipv4BE)
+sockAddrToIpBytes (SockAddrInet6 _ _ (h1, h2, h3, h4) _) =
+  -- Each HostAddress6 Word32 is in host byte order; extract big-endian bytes.
+  let w32ToBytes w =
+        [ fromIntegral ((w `shiftR` 24) .&. 0xff) :: Word8
+        , fromIntegral ((w `shiftR` 16) .&. 0xff) :: Word8
+        , fromIntegral ((w `shiftR` 8)  .&. 0xff) :: Word8
+        , fromIntegral (w .&. 0xff) :: Word8
+        ]
+  in Just $ BS.pack (concatMap w32ToBytes [h1, h2, h3, h4])
+sockAddrToIpBytes _ = Nothing
+
+-- | Look up the ASN for a peer address using an asmap bytecode blob.
+-- Returns 0 if no mapping found, asmap is empty, or address is not IPv4/IPv6.
+-- Reference: bitcoin-core/src/netgroup.cpp NetGroupManager::GetMappedAS.
+getMappedASFromSockAddr :: ByteString  -- ^ Raw asmap bytecode (from 'ASMap.loadAsmap')
+                        -> SockAddr
+                        -> Word32      -- ^ ASN (0 = not found)
+getMappedASFromSockAddr asmapData addr =
+  case sockAddrToIpBytes addr of
+    Nothing -> 0
+    Just ipBytes -> ASMap.getMappedAS asmapData ipBytes
+
+-- | Compute the network group, optionally overriding with an ASN from an asmap.
+-- When @asmapData@ is non-empty and a non-zero ASN is found, the group is
+-- [NET_IPV6 (0x06), asn_b0, asn_b1, asn_b2, asn_b3] (little-endian ASN bytes)
+-- so that IPv4 and IPv6 peers sharing the same AS map to the same bucket.
+-- Reference: bitcoin-core/src/netgroup.cpp NetGroupManager::GetGroup.
+computeNetworkGroupWithASMap :: ByteString  -- ^ Raw asmap bytecode (empty = disabled)
+                              -> SockAddr
+                              -> NetworkGroup
+computeNetworkGroupWithASMap asmapData addr
+  | BS.null asmapData = computeNetworkGroup addr
+  | otherwise =
+      let asn = getMappedASFromSockAddr asmapData addr
+      in if asn == 0
+           then computeNetworkGroup addr
+           else -- Encode ASN as 5-byte group: [NET_IPV6, asn_b0, asn_b1, asn_b2, asn_b3]
+                -- (little-endian ASN bytes, matching Core netgroup.cpp:26-30)
+                NetworkGroup $ BS.pack
+                  [ 0x06  -- NET_IPV6 tag (used for all ASN-keyed groups)
+                  , fromIntegral (asn .&. 0xff)
+                  , fromIntegral ((asn `shiftR` 8)  .&. 0xff)
+                  , fromIntegral ((asn `shiftR` 16) .&. 0xff)
+                  , fromIntegral ((asn `shiftR` 24) .&. 0xff)
+                  ]
 
 --------------------------------------------------------------------------------
 -- AddrMan Constants

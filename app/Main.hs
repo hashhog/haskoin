@@ -44,6 +44,7 @@ import Haskoin.Crypto (computeTxId, computeBlockHash, textToAddress, Address(..)
 import qualified Haskoin.Crypto as Crypto (computeWtxid)
 import Haskoin.Script (decodeScript)
 import Haskoin.Network
+import qualified Haskoin.ASMap as ASMap (loadAsmap)
 import Haskoin.Consensus
 import Haskoin.Storage
 import Haskoin.Rpc
@@ -135,6 +136,16 @@ data NodeOptions = NodeOptions
     -- recompute from stored block + undo data — O(tip_height) per
     -- request from genesis.  Reference:
     -- bitcoin-core/src/index/blockfilterindex.cpp.
+  , noAsmapFile          :: !(Maybe FilePath)
+    -- ^ @-asmap=\<file\>@: path to an ASMap bytecode file for
+    -- ASN-based IP bucketing.  When set, haskoin loads the file at
+    -- startup, validates it with 'checkStandardAsmap' (128-bit
+    -- inputs), rejects files exceeding MAX_ASMAP_FILESIZE (8 MiB),
+    -- and stores the bytecode in 'rsAsmapData' / 'pmAsmapData' for
+    -- use in 'computeNetworkGroupWithASMap' and the @getpeerinfo@
+    -- RPC @mapped_as@ field.
+    -- Reference: bitcoin-core/src/init.cpp:1587-1628,
+    -- bitcoin-core/src/util/asmap.cpp DecodeAsmap/CheckStandardAsmap.
   } deriving (Show)
 
 data WalletCommand
@@ -242,6 +253,13 @@ parseNodeOptions = NodeOptions
                 \through this index in O(1)/O(count). On startup \
                 \haskoin backfills any gap between the index tip \
                 \and the chain tip before opening the network port.")
+  <*> optional (strOption (long "asmap" <> metavar "FILE"
+        <> help "Path to an ASMap bytecode file for ASN-based IP \
+                \bucketing (Bitcoin Core -asmap=<file>). When set, \
+                \haskoin loads and validates the file at startup, \
+                \and uses ASN-keyed groups for AddrMan bucketing + \
+                \getpeerinfo mapped_as. File must be <= 8 MiB and \
+                \pass sanity check. Default: off (raw /16 or /32 groups)."))
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -453,6 +471,9 @@ applyConfigOverlay cm n = n
   , noBlockFilterIndex = if not (noBlockFilterIndex n)
                           then Daemon.configLookupBool "blockfilterindex" False cm
                           else noBlockFilterIndex n
+  , noAsmapFile  = case noAsmapFile n of
+                     Just _  -> noAsmapFile n
+                     Nothing -> Daemon.configLookup "asmap" cm
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
@@ -531,6 +552,23 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
   -- Core equivalent: SignatureCache construction in AppInitMain (init.cpp).
   initGlobalSigCache
   putStrLn "Signature cache initialised (50000 entries)"
+
+  -- W115 FIX-50: load ASMap file if -asmap=<file> is configured.
+  -- Reference: bitcoin-core/src/init.cpp:1587-1628 (DecodeAsmap call).
+  -- MAX_ASMAP_FILESIZE = 8 MiB; CheckStandardAsmap (128-bit) is applied
+  -- inside ASMap.loadAsmap.
+  asmapData <- case noAsmapFile of
+    Nothing -> return BS.empty
+    Just asmapPath -> do
+      r <- ASMap.loadAsmap asmapPath
+      case r of
+        Left err -> do
+          putStrLn $ "FATAL: -asmap=" ++ asmapPath ++ ": " ++ err
+          exitWith (ExitFailure 1)
+        Right bs -> do
+          putStrLn $ "Using asmap file " ++ asmapPath
+                  ++ " (" ++ show (BS.length bs) ++ " bytes)"
+          return bs
 
   -- 2b. Parse --prune=N (Bitcoin Core init.cpp /
   --     node/blockmanager_args.cpp semantics).  Reject negative and
@@ -936,6 +974,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           `catch` (\(e :: SomeException) ->
             putStrLn $ "eraseOrphansForPeer error: " ++ show e))
     writeIORef pmRef pm
+    -- W115 FIX-50: inject asmap bytecode into PeerManager so that
+    -- computeNetworkGroupWithASMap can use ASN-keyed bucketing.
+    let pm' = pm { pmAsmapData = asmapData }
+    writeIORef pmRef pm'
 
     -- Seed known addresses from --connect flags
     forM_ noConnect $ \connectStr -> do
@@ -951,13 +993,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
             -- Feed into AddrMan (BUG-5/BUG-1 fix: structured storage).
             -- Use addr as its own source (manual-connect = trusted source).
             nowTs <- (round <$> getPOSIXTime :: IO Int64)
-            _ <- addAddress (pmAddrMan pm) addr addr 0x409 nowTs
+            _ <- addAddress (pmAddrMan pm') addr addr 0x409 nowTs
             -- Keep pmKnownAddrs in sync for backward-compat.
-            atomically $ modifyTVar' (pmKnownAddrs pm) (Set.insert addr)
+            atomically $ modifyTVar' (pmKnownAddrs pm') (Set.insert addr)
         _ -> putStrLn $ "Invalid connect address: " ++ connectStr
 
     -- Spawn a thread to send getheaders once a peer connects
-    void $ forkIO $ getheadersSender pm hc net
+    void $ forkIO $ getheadersSender pm' hc net
       `catch` (\(e :: SomeException) -> putStrLn $ "getheadersSender error: " ++ show e)
 
     -- Block downloading is done from the MHeaders and MBlock handlers
@@ -988,7 +1030,9 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- 2026-05-06: Rpc.hs:3124-3152 returned 200 OK + empty bodies).
     -- The manager owns its wallet directory under {datadir}/wallets/.
     walletMgr <- newWalletManager (dataDir </> "wallets") net
-    rpcServer <- startRpcServer rpcConfig db hc pm mp fe cache net mBlockStore (Just walletMgr) pruneCfg mIdxMgr
+    rpcServer <- startRpcServer rpcConfig db hc pm' mp fe cache net mBlockStore (Just walletMgr) pruneCfg mIdxMgr
+    -- W115 FIX-50: inject asmap bytecode into RpcServer for getpeerinfo mapped_as.
+    let rpcServer' = rpcServer { rsAsmapData = asmapData }
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
             ++ (if noEnableRest then " (REST enabled)" else " (REST disabled)")
 
@@ -1099,9 +1143,9 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- flush / closeDB. killThread on Haskell threads is cooperative
     -- (delivers an async exception at the next safe point); we don't
     -- wait for them to report completion.
-    (stopRpcServer rpcServer
+    (stopRpcServer rpcServer'
        `catch` (\(e :: SomeException) -> putStrLn $ "stopRpcServer error: " ++ show e))
-    (stopPeerManager pm
+    (stopPeerManager pm'
        `catch` (\(e :: SomeException) -> putStrLn $ "stopPeerManager error: " ++ show e))
     killThread flushThreadId
       `catch` (\(e :: SomeException) -> putStrLn $ "killThread flushThreadId error: " ++ show e)
