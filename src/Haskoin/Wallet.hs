@@ -1192,12 +1192,14 @@ pubKeyToAddress AddrP2SH_P2WPKH pk =
   in scriptToP2SH redeemScript
 pubKeyToAddress AddrP2WPKH pk = pubKeyToP2WPKH pk
 pubKeyToAddress AddrP2TR pk =
-  -- For P2TR, we use the internal key directly (simplified, no tweaking)
-  -- In production, this should use proper BIP-341 key tweaking
-  let pubKeyBytes = serializePubKeyCompressed pk
-      -- Take the x-coordinate (drop the prefix byte)
-      xOnly = BS.drop 1 pubKeyBytes
-  in TaprootAddress (Hash256 xOnly)
+  -- BIP-86: apply BIP-341 TapTweak with empty merkle root (key-path-only).
+  -- output_key = lift_x(internal_key) + int(hashTapTweak(internal_key || ""))*G
+  -- Reference: BIP-341 §4.2, BIP-86 §Derivation.
+  let internalX = BS.drop 1 (serializePubKeyCompressed pk)
+      tweak     = bip86TapTweakHash internalX
+  in case xonlyPubkeyTweakAdd internalX tweak of
+       Just (tweakedX, _) -> TaprootAddress (Hash256 tweakedX)
+       Nothing            -> TaprootAddress (Hash256 internalX)  -- unreachable for valid keys
 
 -- | Get a change address of the specified type.
 getChangeAddressTyped :: AddressType -> Wallet -> IO Address
@@ -5081,10 +5083,19 @@ deriveScriptsAt desc idx = case desc of
     -- BIP-386: x-only pubkey IS the output key, no taproot tweak.
     let pk = deriveKeyExpr key idx
     in [encodeScript (encodeP2TR (xOnlyPubKey pk))]
-  Tr key _ ->
-    let pk = deriveKeyExpr key idx
-        -- Simplified: just output spend key (no script path)
-    in [encodeScript (encodeP2TR (xOnlyPubKey pk))]
+  Tr key mTree ->
+    -- BIP-341 §4.2: output_key = lift_x(internal_key) + int(tapTweak)*G
+    -- where tapTweak = hashTapTweak(internal_key || merkle_root).
+    -- merkle_root is "" for key-path-only (BIP-86), or the root of the
+    -- Merkle tree of leaf scripts for tr(KEY,TREE).
+    -- Reference: bitcoin-core/src/script/descriptor.cpp TrDescriptor::MakeScripts.
+    let pk        = deriveKeyExpr key idx
+        internalX = getHash256 (xOnlyPubKey pk)
+        merkleRoot = maybe BS.empty (tapTreeMerkleRoot idx) mTree
+        tweak      = computeTapTweakHash internalX merkleRoot
+    in case xonlyPubkeyTweakAdd internalX tweak of
+         Just (tweakedX, _) -> [encodeScript (encodeP2TR (Hash256 tweakedX))]
+         Nothing            -> [encodeScript (encodeP2TR (xOnlyPubKey pk))]  -- unreachable for valid keys
   Addr addr ->
     [addressToScript addr]
   Raw script ->
@@ -5100,6 +5111,28 @@ deriveScriptsAt desc idx = case desc of
        , p2wpkhBS                                        -- P2WPKH
        , encodeScript (encodeP2SH (hash160 p2wpkhBS))    -- P2SH-P2WPKH
        ]
+
+-- | Compute the BIP-341 Merkle root for a descriptor TapTree at a given
+-- derivation index.
+--
+-- For a single leaf: @tapleafHash("TapLeaf", 0xc0 || compactSize(script) || script)@.
+-- For a branch: @tagged_hash("TapBranch", sort(left, right))@ recursively.
+--
+-- Reference: bitcoin-core/src/script/descriptor.cpp TaprootBuilder::Add,
+--            BIP-341 §"Computing the Taproot tree" (merkle tree hashing).
+tapTreeMerkleRoot :: Int -> TapTree -> ByteString
+tapTreeMerkleRoot idx = go
+  where
+    go (TapLeaf d) =
+      -- Use the first derived script for the leaf; tapscript leaf version 0xc0.
+      let scripts = deriveScriptsAt d idx
+          script  = if null scripts then BS.empty else head scripts
+      in TS.tapleafHashWith TS.tapscriptLeafVersion script
+    go (TapBranch l r) =
+      let lh         = go l
+          rh         = go r
+          (lo, hi)   = if lh <= rh then (lh, rh) else (rh, lh)
+      in taggedHash "TapBranch" (lo <> hi)
 
 -- | Derive a public key from a key expression at a given index.
 deriveKeyExpr :: KeyExpr -> Int -> PubKey
