@@ -107,6 +107,7 @@ import qualified W111WalletSpec
 import qualified W112CompactBlockSpec
 import qualified W113CoinSelectionSpec
 import qualified W114FeeEstimationSpec
+import qualified W115ASMapSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22533,6 +22534,9 @@ main = hspec $ do
 
   -- W114 Fee estimation (CBlockPolicyEstimator) 30-gate audit
   W114FeeEstimationSpec.spec
+
+  -- W115 ASMap (Autonomous System Map) 30-gate audit
+  W115ASMapSpec.spec
 
   where
     sampleTx = Tx
