@@ -21,6 +21,7 @@ module Haskoin.FeeEstimator
   ( -- * Fee Estimator
     FeeEstimator(..)
   , newFeeEstimator
+  , newFeeEstimatorWithDecay
     -- * Estimation Modes
   , FeeEstimateMode(..)
     -- * Recording Data
@@ -43,6 +44,8 @@ module Haskoin.FeeEstimator
   , maxConfirmBlocks
   , bucketFeeRate
   , feeRateToBucket
+  , confirmThreshold
+  , minTxsForEstimate
   ) where
 
 import qualified Data.Map.Strict as Map
