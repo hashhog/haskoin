@@ -154,6 +154,7 @@
 module W113CoinSelectionSpec (spec) where
 
 import Test.Hspec
+import Control.Monad (forM_, replicateM_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
@@ -431,21 +432,24 @@ spec = do
       sum (map utxoValue r1) `shouldSatisfy` (>= target)
       sum (map utxoValue r2) `shouldSatisfy` (>= target)
 
-    it "BUG-6: shuffleList length bug — self-swap (i==j) inserts duplicate entry" $ do
-      -- The swap helper in shuffleList:
-      --   swap pairs (i,j) = take i ++ [(i,vj)] ++ drop(i+1)(take j) ++ [(j,vi)] ++ drop(j+1)
-      -- When j==i: drop(i+1)(take i pairs) = [] so result has TWO entries for index i.
-      -- The output list has length n+1 (bug) instead of n.
-      -- This test documents the bug.  A correct Fisher-Yates produces
-      -- exactly n elements.  We check knapsackSolver still returns a valid
-      -- selection (it falls back to all UTXOs if random subset yields nothing).
-      let utxos = [ mkUtxo 1 50000, mkUtxo 2 50000 ]
-          feeRate = FeeRate 1
-          target  = 30000
-      -- Repeated calls may occasionally trigger self-swap; the function should
-      -- not crash (though it may produce wrong results silently).
-      results <- mapM (\_ -> knapsackSolver utxos target feeRate) [1..10 :: Int]
-      mapM_ (\r -> sum (map utxoValue r) `shouldSatisfy` (>= target)) results
+    it "FIX-46 BUG-6: shuffleList always produces a list of the same length as input" $ do
+      -- BUG-6 fix: the self-swap guard (i==j → no-op) in `swap` prevents the
+      -- double-entry insertion that grew the list by 1 per self-swap.
+      -- A correct Fisher-Yates shuffle must preserve list length exactly.
+      let sizes = [0, 1, 2, 3, 5, 7, 10] :: [Int]
+      forM_ sizes $ \n -> do
+        let xs = [1..n] :: [Int]
+        -- Run 20 iterations per size to increase chance of hitting a self-swap.
+        replicateM_ 20 $ do
+          shuffled <- shuffleList xs
+          length shuffled `shouldBe` n
+
+    it "FIX-46 BUG-6: shuffleList output is a permutation of the input" $ do
+      -- After the fix, shuffled elements should be exactly the same as input
+      -- (just reordered) — no duplicates, no missing elements.
+      let xs = [1..8 :: Int]
+      shuffled <- shuffleList xs
+      sort shuffled `shouldBe` sort xs
 
   describe "G17 Knapsack partitionUtxos" $ do
     it "partitionUtxos separates UTXOs below and above fullTarget" $ do
@@ -546,30 +550,39 @@ spec = do
     it "dustThreshold = 546 sat" $
       dustThreshold `shouldBe` 546
 
-  describe "G22 Word64 underflow in change calculation (BUG-4 — P1)" $ do
-    -- `changeAmount = totalSelected - targetAmount - feeWithChange` is Word64.
-    -- If totalSelected < targetAmount + feeWithChange, this wraps to ~2^64.
-    -- The subsequent `changeAmount > dustThreshold` fires, producing a
-    -- billion-sat change output, corrupting the transaction.
-    it "BUG-4: change calculation uses Word64 arithmetic — underflow risk present" $ do
-      -- We cannot trigger this via the public API without crafting internal state,
-      -- but we can verify the arithmetic rule: Word64 subtraction wraps.
-      let a, b :: Word64
-          a = 100
-          b = 200
-          -- This would wrap to maxBound - 99
-          wrapped = a - b  -- if this were used as changeAmount, it would be huge
-      wrapped `shouldSatisfy` (> 1000000000)  -- wrapped past max satoshi supply
+  describe "G22 Word64 underflow guard in change calculation (FIX-46 BUG-4)" $ do
+    -- FIX-46: `changeAmount = totalSelected - targetAmount - feeWithChange` was
+    -- unguarded Word64 subtraction.  The fix introduces a `totalNeeded` guard:
+    -- if totalSelected < totalNeeded, changeAmount = 0 (no change), preventing
+    -- the wrap to ~2^64 that would have produced a multi-billion-sat change output.
+    it "FIX-46 BUG-4: change amount is never astronomically large (no Word64 wrap)" $ do
+      -- Construct a wallet where Knapsack selects a barely-sufficient UTXO.
+      -- After the fix, changeAmount must be within a plausible Bitcoin range.
+      wallet <- mkWallet
+      addUtxo wallet 1 102000  -- barely covers 100000 + fees
+      let outputs = [WalletTxOutput dummyAddr 100000]
+      result <- selectCoinsWithHeight wallet outputs (FeeRate 1000) 200
+      case result of
+        Right cs ->
+          case csChange cs of
+            Nothing         -> return ()  -- no-change path is fine
+            Just (_, chAmt) ->
+              -- After fix: must be within plausible Bitcoin supply
+              -- (21 million BTC = 2_100_000_000_000_000 sat).
+              chAmt `shouldSatisfy` (<= 2100000000000000)
+        Left _   -> return ()
 
-    it "BUG-4: selectCoinsWithHeight change field can be Nothing (safe path)" $ do
-      -- When BnB succeeds, csChange = Nothing (no underflow risk).
-      -- The underflow risk is in the Knapsack path only.
+    it "FIX-46 BUG-4: selectCoinsWithHeight change field is Nothing or sane positive" $ do
       wallet <- mkWallet
       addUtxo wallet 1 1000000
       let outputs = [WalletTxOutput dummyAddr 100000]
       result <- selectCoinsWithHeight wallet outputs (FeeRate 10) 200
       case result of
-        Right cs -> length (csInputs cs) `shouldSatisfy` (>= 1)
+        Right cs -> do
+          length (csInputs cs) `shouldSatisfy` (>= 1)
+          case csChange cs of
+            Nothing         -> return ()
+            Just (_, chAmt) -> chAmt `shouldSatisfy` (> 0)
         Left _   -> return ()
 
   describe "G23 Change address via getChangeAddress" $ do

@@ -128,6 +128,7 @@ module Haskoin.Wallet
   , estimateTxWeight
   , feeFromWeight
   , effectiveValue
+  , shuffleList
     -- * UTXO Types
   , Utxo(..)
   , utxoValue
@@ -1690,11 +1691,16 @@ shuffleList xs = do
               range = hi - lo + 1
           return (lo + (w `mod` range))
     swap :: [(Int, a)] -> (Int, Int) -> [(Int, a)]
-    swap pairs (i, j) =
-      let vi = snd (pairs !! i)
-          vj = snd (pairs !! j)
-      in take i pairs ++ [(i, vj)] ++ drop (i+1) (take j pairs)
-         ++ [(j, vi)] ++ drop (j+1) pairs
+    swap pairs (i, j)
+      -- BUG-6 fix: self-swap (i==j) must be a no-op.  Without this guard the
+      -- two-entry insertion below produces [(i,vj),(j,vi)] at the same index,
+      -- growing the list by 1 per self-swap.
+      | i == j    = pairs
+      | otherwise =
+          let vi = snd (pairs !! i)
+              vj = snd (pairs !! j)
+          in take i pairs ++ [(i, vj)] ++ drop (i+1) (take j pairs)
+             ++ [(j, vi)] ++ drop (j+1) pairs
 
 --------------------------------------------------------------------------------
 -- Coinbase Maturity
@@ -1774,7 +1780,13 @@ selectCoinsWithHeight wallet outputs feeRate tipHeight = do
                   -- Calculate fee with change output
                   feeWithChange = feeFromWeight
                     (estimateTxWeight (length selected) numOutputs True) feeRate
-                  changeAmount = totalSelected - targetAmount - feeWithChange
+                  -- BUG-4 fix: guard against Word64 underflow before subtraction.
+                  -- If totalSelected < targetAmount + feeWithChange the change
+                  -- calculation would wrap to ~2^64; treat as no-change instead.
+                  totalNeeded = targetAmount + feeWithChange
+                  changeAmount = if totalSelected >= totalNeeded
+                                 then totalSelected - totalNeeded
+                                 else 0
 
               -- Add change output if above dust threshold
               changeAddr <- if changeAmount > dustThreshold
@@ -1855,7 +1867,13 @@ selectCoins wallet outputs feeRate = do
                   -- Calculate fee with change output
                   feeWithChange = feeFromWeight
                     (estimateTxWeight (length selected) numOutputs True) feeRate
-                  changeAmount = totalSelected - targetAmount - feeWithChange
+                  -- BUG-4 fix: guard against Word64 underflow before subtraction.
+                  -- If totalSelected < targetAmount + feeWithChange the change
+                  -- calculation would wrap to ~2^64; treat as no-change instead.
+                  totalNeeded = targetAmount + feeWithChange
+                  changeAmount = if totalSelected >= totalNeeded
+                                 then totalSelected - totalNeeded
+                                 else 0
 
               -- Add change output if above dust threshold
               changeAddr <- if changeAmount > dustThreshold
