@@ -829,6 +829,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Start header sync
     hs <- startHeaderSync net hc
 
+    -- BIP-152 BUG-1/BUG-8 FIX (W112): Instantiate CompactBlockState so that
+    -- in-flight PartiallyDownloadedBlocks can be persisted between MCmpctBlock
+    -- (which calls initPartialBlock + sends getblocktxn) and MBlockTxn (which
+    -- must call fillPartialBlock to complete the two-round-trip path).
+    -- Reference: bitcoin-core/src/net_processing.cpp mapBlocksInFlight /
+    -- PartiallyDownloadedBlock kept alive across the two messages.
+    cbsPendingVar <- newTVarIO (Map.empty :: Map.Map BlockHash PartiallyDownloadedBlock)
+    let compactBlockState = CompactBlockState
+          { cbsPending = cbsPendingVar
+          , cbsConfig  = defaultCompactBlockConfig
+          }
+    compactBlockStateRef <- newIORef compactBlockState
+
     -- Initialise BlockStore IFF pruning is enabled.  Most haskoin
     -- block I/O still flows through RocksDB, so the BlockStore is
     -- not on the hot path; we only create it when prune RPC /
@@ -914,7 +927,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1381,8 +1394,13 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- index tracks the chain in real time.
                    -> IORef OrphanPool
                       -- ^ BIP-339 wtxid-keyed orphan pool (W99 G12/G13/G14).
+                   -> IORef CompactBlockState
+                      -- ^ BIP-152 BUG-1 FIX: in-flight partial blocks keyed by
+                      -- BlockHash, persisted across MCmpctBlock→MBlockTxn.
+                      -- Reference: bitcoin-core/src/net_processing.cpp
+                      -- mapBlocksInFlight / PartiallyDownloadedBlock lifetime.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -1922,7 +1940,7 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           then case fillPartialBlock pdb [] of
             Right block -> do
               putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef addr (MBlock block)
+              syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
             Left err -> do
               putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
               pm <- readIORef pmRef
@@ -1940,6 +1958,12 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
                   `catch` (\(_ :: SomeException) -> return ())
               else do
                 putStrLn $ "Compact block " ++ show bh ++ " missing " ++ show (length missing) ++ " txns, sending getblocktxn"
+                -- BIP-152 BUG-1 FIX: persist the partial block state so MBlockTxn
+                -- can complete reconstruction.  Core keeps PartiallyDownloadedBlock
+                -- alive in mapBlocksInFlight keyed by block hash until BLOCKTXN arrives.
+                -- Reference: bitcoin-core/src/net_processing.cpp:3964-3967
+                cbs <- readIORef compactBlockStateRef
+                atomically $ modifyTVar' (cbsPending cbs) (Map.insert bh pdb)
                 pm <- readIORef pmRef
                 let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
                 requestFromPeer pm addr (MGetBlockTxn gbt)
@@ -1958,8 +1982,50 @@ syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef
           `catch` (\(_ :: SomeException) -> return ())
       Nothing -> return ()
 
-  MBlockTxn bt ->
-    putStrLn $ "Received blocktxn for " ++ show (btBlockHash bt) ++ " (" ++ show (length (btTxns bt)) ++ " txns)"
+  MBlockTxn bt -> do
+    -- BIP-152 BUG-1 FIX (W112): Complete compact block reconstruction.
+    -- Bitcoin Core BLOCKTXN handler (net_processing.cpp:4307-4360):
+    --   1. Look up PartiallyDownloadedBlock from mapBlocksInFlight.
+    --   2. Call partialBlock.FillBlock(block, resp.txn).
+    --   3. On READ_STATUS_OK  → ProcessNewBlock.
+    --   4. On READ_STATUS_INVALID → Misbehaving(100) + getdata MSG_WITNESS_BLOCK.
+    let blockHash = btBlockHash bt
+        missingTxns = btTxns bt
+    cbs <- readIORef compactBlockStateRef
+    mPdb <- atomically $ do
+      pending <- readTVar (cbsPending cbs)
+      case Map.lookup blockHash pending of
+        Nothing  -> return Nothing
+        Just pdb -> do
+          -- Remove from pending regardless of outcome (either we reconstruct
+          -- successfully and submit, or we fall back to full block getdata).
+          writeTVar (cbsPending cbs) (Map.delete blockHash pending)
+          return (Just pdb)
+    case mPdb of
+      Nothing -> do
+        -- No pending partial block for this hash — stale or unsolicited.
+        -- This can happen if we already fell back to a full block getdata.
+        putStrLn $ "MBlockTxn: no pending partial block for " ++ show blockHash ++ " (stale/unsolicited)"
+      Just pdb -> do
+        putStrLn $ "MBlockTxn: filling " ++ show blockHash ++ " with " ++ show (length missingTxns) ++ " missing txns"
+        case fillPartialBlock pdb missingTxns of
+          Left err -> do
+            -- Reconstruction failure (merkle mismatch or wrong tx count).
+            -- Core: Misbehaving(100, "invalid-cmpctblk-txns") + getdata fallback.
+            -- Reference: bitcoin-core/src/net_processing.cpp:4339-4349
+            putStrLn $ "MBlockTxn: fillPartialBlock failed for " ++ show blockHash ++ ": " ++ err
+            pm <- readIORef pmRef
+            void $ misbehaving pm addr InvalidCompactBlock
+            let iv = InvVector InvWitnessBlock (getBlockHashHash blockHash)
+            requestFromPeer pm addr (MGetData (GetData [iv]))
+              `catch` (\(_ :: SomeException) -> return ())
+          Right block -> do
+            -- Reconstruction succeeded — submit to the validation pipeline.
+            -- Reuse the MBlock path exactly (handles connectBlock, reorg,
+            -- IBD, header indexing, index manager mirroring, etc.).
+            -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
+            putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
+            syncMessageHandler db hc hs cache mp _fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()
