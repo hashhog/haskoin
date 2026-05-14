@@ -993,7 +993,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
             -- Feed into AddrMan (BUG-5/BUG-1 fix: structured storage).
             -- Use addr as its own source (manual-connect = trusted source).
             nowTs <- (round <$> getPOSIXTime :: IO Int64)
-            _ <- addAddress (pmAddrMan pm') addr addr 0x409 nowTs
+            _ <- addAddress (pmAddrMan pm') (pmAsmapData pm') addr addr 0x409 nowTs
             -- Keep pmKnownAddrs in sync for backward-compat.
             atomically $ modifyTVar' (pmKnownAddrs pm') (Set.insert addr)
         _ -> putStrLn $ "Invalid connect address: " ++ connectStr

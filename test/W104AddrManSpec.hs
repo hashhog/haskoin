@@ -210,6 +210,7 @@ import Data.Word (Word64)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import qualified Data.ByteString as BS
 import Control.Concurrent.STM (readTVarIO)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr(..))
@@ -344,35 +345,35 @@ spec_G3_addAddress = describe "G3 addAddress → new table" $ do
   it "addAddress returns True for a fresh address" $ do
     am <- newAddrMan
     now <- nowIO
-    r <- addAddress am addr1 src1 0x409 now
+    r <- addAddress am BS.empty addr1 src1 0x409 now
     r `shouldBe` True
 
   it "addAddress increments nNew" $ do
     am <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     n <- readTVarIO (amNewCount am)
     n `shouldBe` 1
 
   it "addAddress does NOT increment nTried" $ do
     am <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     t <- readTVarIO (amTriedCount am)
     t `shouldBe` 0
 
   it "addAddress inserts into amAddrIndex" $ do
     am <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     idx <- readTVarIO (amAddrIndex am)
     Map.member addr1 idx `shouldBe` True
 
   it "addAddress two distinct addresses → nNew=2" $ do
     am <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    _ <- addAddress am addr2 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr2 src1 0x409 now
     n <- readTVarIO (amNewCount am)
     n `shouldBe` 2
 
@@ -474,8 +475,8 @@ spec_G6_markGood = describe "G6 markGood → tried table" $ do
   it "markGood moves address from new to tried" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    markGood am addr1 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    markGood am BS.empty addr1 now
     n <- readTVarIO (amNewCount am)
     t <- readTVarIO (amTriedCount am)
     n `shouldBe` 0
@@ -484,8 +485,8 @@ spec_G6_markGood = describe "G6 markGood → tried table" $ do
   it "markGood sets aiInTried=True in index" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    markGood am addr1 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    markGood am BS.empty addr1 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found in index"
@@ -494,8 +495,8 @@ spec_G6_markGood = describe "G6 markGood → tried table" $ do
   it "markGood updates aiLastSuccess" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 (now - 100)
-    markGood am addr1 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 (now - 100)
+    markGood am BS.empty addr1 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found"
@@ -506,10 +507,10 @@ spec_G6_markGood = describe "G6 markGood → tried table" $ do
     am  <- newAddrMan
     now <- nowIO
     -- Add two addresses that hash to the same tried bucket+position
-    _ <- addAddress am addr1 src1 0x409 now
-    _ <- addAddress am addr2 src1 0x409 now
-    markGood am addr1 now
-    markGood am addr2 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr2 src1 0x409 now
+    markGood am BS.empty addr1 now
+    markGood am BS.empty addr2 now
     -- Both should have moved to tried (haskoin doesn't defer via collision set)
     t <- readTVarIO (amTriedCount am)
     -- Document: Core would only move the second after a FEELER confirmed
@@ -525,7 +526,7 @@ spec_G7_markAttempt = describe "G7 markAttempt — fCountFailure gate BUG-4" $ d
   it "markAttempt increments aiAttempts" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     markAttempt am addr1 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
@@ -535,7 +536,7 @@ spec_G7_markAttempt = describe "G7 markAttempt — fCountFailure gate BUG-4" $ d
   it "markAttempt updates aiLastTry" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 (now - 100)
+    _ <- addAddress am BS.empty addr1 src1 0x409 (now - 100)
     markAttempt am addr1 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
@@ -546,7 +547,7 @@ spec_G7_markAttempt = describe "G7 markAttempt — fCountFailure gate BUG-4" $ d
   it "BUG-4: markAttempt always increments — no fCountFailure / m_last_good guard" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     -- Call 10 times; all should increment unconditionally
     mapM_ (\i -> markAttempt am addr1 (now + i)) [1..10 :: Int64]
     idx <- readTVarIO (amAddrIndex am)
@@ -568,15 +569,15 @@ spec_G8_selectAddress = describe "G8 selectAddress — 50/50 new/tried split BUG
   it "selectAddress returns the only address when new-only" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     r <- selectAddress am True
     r `shouldBe` Just addr1
 
   it "selectAddress returns address from tried table" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    markGood am addr1 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    markGood am BS.empty addr1 now
     r <- selectAddress am False
     r `shouldBe` Just addr1
 
@@ -585,10 +586,10 @@ spec_G8_selectAddress = describe "G8 selectAddress — 50/50 new/tried split BUG
     am  <- newAddrMan
     now <- nowIO
     -- Add many new addresses, move one to tried
-    mapM_ (\i -> addAddress am (SockAddrInet 8333 (fromIntegral i)) src1 0x409 now)
+    mapM_ (\i -> addAddress am BS.empty (SockAddrInet 8333 (fromIntegral i)) src1 0x409 now)
           ([10..30] :: [Int])
-    _ <- addAddress am addr1 src1 0x409 now
-    markGood am addr1 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    markGood am BS.empty addr1 now
     -- With 21 new addresses and 1 tried, haskoin picks from tried ~1/22 of the time
     -- Core would pick tried 50% of the time.
     -- We just verify selection still works and doesn't crash.
@@ -604,27 +605,27 @@ spec_G9_bucketHashing = describe "G9 bucket hashing — determinism" $ do
   it "getNewBucket is deterministic for same inputs" $ do
     am <- newAddrMan
     let k = amKey am
-        b1 = getNewBucket k addr1 src1
-        b2 = getNewBucket k addr1 src1
+        b1 = getNewBucket k BS.empty addr1 src1
+        b2 = getNewBucket k BS.empty addr1 src1
     b1 `shouldBe` b2
 
   it "getNewBucket stays within [0, addrmanNewBucketCount)" $ do
     am <- newAddrMan
     let k = amKey am
-        b = getNewBucket k addr1 src1
+        b = getNewBucket k BS.empty addr1 src1
     b `shouldSatisfy` (\x -> x >= 0 && x < addrmanNewBucketCount)
 
   it "getTriedBucket is deterministic" $ do
     am <- newAddrMan
     let k = amKey am
-        b1 = getTriedBucket k addr1
-        b2 = getTriedBucket k addr1
+        b1 = getTriedBucket k BS.empty addr1
+        b2 = getTriedBucket k BS.empty addr1
     b1 `shouldBe` b2
 
   it "getTriedBucket stays within [0, addrmanTriedBucketCount)" $ do
     am <- newAddrMan
     let k = amKey am
-        b = getTriedBucket k addr1
+        b = getTriedBucket k BS.empty addr1
     b `shouldSatisfy` (\x -> x >= 0 && x < addrmanTriedBucketCount)
 
   it "getBucketPosition stays within [0, addrmanBucketSize)" $ do
@@ -646,8 +647,8 @@ spec_G9_bucketHashing = describe "G9 bucket hashing — determinism" $ do
   it "different keys produce different bucket assignments" $ do
     am1 <- newAddrMan
     am2 <- newAddrMan
-    let b1 = getNewBucket (amKey am1) addr1 src1
-        b2 = getNewBucket (amKey am2) addr1 src1
+    let b1 = getNewBucket (amKey am1) BS.empty addr1 src1
+        b2 = getNewBucket (amKey am2) BS.empty addr1 src1
     -- Two random keys will almost certainly give different buckets
     -- (with negligible probability of collision)
     -- This test documents key randomness; not a hard assertion on inequality
@@ -692,7 +693,7 @@ spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8 fixed)" $
     now <- nowIO
     -- 127.0.0.1 in host byte order (little-endian): low byte = 0x7f = 127
     let loopback = SockAddrInet 8333 0x0000007f
-    r <- addAddress am loopback src1 0x409 now
+    r <- addAddress am BS.empty loopback src1 0x409 now
     r `shouldBe` False  -- IsLocal → not routable
 
   it "addAddress rejects RFC1918 private address 10.0.0.1" $ do
@@ -700,7 +701,7 @@ spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8 fixed)" $
     now <- nowIO
     -- 10.0.0.1 in host byte order: low byte = 0x0a = 10
     let priv = SockAddrInet 8333 0x0100000a
-    r <- addAddress am priv src1 0x409 now
+    r <- addAddress am BS.empty priv src1 0x409 now
     r `shouldBe` False  -- IsRFC1918 → not routable
 
   it "addAddress rejects RFC1918 private address 192.168.1.1" $ do
@@ -708,7 +709,7 @@ spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8 fixed)" $
     now <- nowIO
     -- 192.168.1.1: bytes c0 a8 01 01 → host order = 0x0101a8c0
     let priv2 = SockAddrInet 8333 0x0101a8c0
-    r <- addAddress am priv2 src1 0x409 now
+    r <- addAddress am BS.empty priv2 src1 0x409 now
     r `shouldBe` False  -- IsRFC1918 → not routable
 
   it "addAddress rejects RFC1918 private address 172.16.0.1" $ do
@@ -716,7 +717,7 @@ spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8 fixed)" $
     now <- nowIO
     -- 172.16.0.1: bytes ac 10 00 01 → host order = 0x010010ac
     let priv3 = SockAddrInet 8333 0x010010ac
-    r <- addAddress am priv3 src1 0x409 now
+    r <- addAddress am BS.empty priv3 src1 0x409 now
     r `shouldBe` False  -- IsRFC1918 → not routable
 
   it "addAddress accepts a publicly routable address 1.2.3.4" $ do
@@ -724,7 +725,7 @@ spec_G11_isRoutable = describe "G11 addAddress IsRoutable check (BUG-8 fixed)" $
     now <- nowIO
     -- 1.2.3.4: bytes 01 02 03 04 → host order = 0x04030201
     let pub = SockAddrInet 8333 0x04030201
-    r <- addAddress am pub src1 0x409 now
+    r <- addAddress am BS.empty pub src1 0x409 now
     r `shouldBe` True   -- routable → should be accepted
 
 --------------------------------------------------------------------------------
@@ -736,7 +737,7 @@ spec_G12_refCountCap = describe "G12 addrmanNewBucketsPerAddress cap (BUG-9)" $ 
   it "addAddress sets aiRefCount=1 on initial insert" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found"
@@ -749,7 +750,7 @@ spec_G12_refCountCap = describe "G12 addrmanNewBucketsPerAddress cap (BUG-9)" $ 
     now <- nowIO
     -- Insert from 8 different sources (each should add to a new bucket in Core)
     let sources = [SockAddrInet 8333 (fromIntegral i) | i <- [100..107 :: Int]]
-    mapM_ (\s -> addAddress am addr1 s 0x409 now) sources
+    mapM_ (\s -> addAddress am BS.empty addr1 s 0x409 now) sources
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found"
@@ -772,7 +773,7 @@ spec_G13_timePenalty = describe "G13 addAddress time_penalty parameter (BUG-16)"
     -- The function signature is: addAddress am addr source services now
     -- There is no time_penalty argument.  Verify the address is inserted
     -- without any penalty on aiLastCountAttempt or similar.
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found"
@@ -807,7 +808,7 @@ spec_G14_peerManagerNoBuckets = describe "G14 PeerManager wired to AddrMan (BUG-
     am  <- newAddrMan
     now <- nowIO
     -- addr1 (1.2.3.4) is routable — addAddress should return True.
-    r <- addAddress am addr1 src1 0x409 now
+    r <- addAddress am BS.empty addr1 src1 0x409 now
     r `shouldBe` True
     -- The address must appear in amAddrIndex (not a flat Set).
     idx <- readTVarIO (amAddrIndex am)
@@ -822,14 +823,14 @@ spec_G14_peerManagerNoBuckets = describe "G14 PeerManager wired to AddrMan (BUG-
     -- Simulate what attemptV1/V2Outbound now does on success.
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     -- Before markGood: in new table.
     nBefore <- readTVarIO (amNewCount am)
     tBefore <- readTVarIO (amTriedCount am)
     nBefore `shouldBe` 1
     tBefore `shouldBe` 0
     -- markGood — mirrors the connection-success path.
-    markGood am addr1 (now + 1)
+    markGood am BS.empty addr1 (now + 1)
     -- After markGood: moved to tried table.
     nAfter <- readTVarIO (amNewCount am)
     tAfter <- readTVarIO (amTriedCount am)
@@ -837,7 +838,7 @@ spec_G14_peerManagerNoBuckets = describe "G14 PeerManager wired to AddrMan (BUG-
     tAfter `shouldBe` 1
     -- markAttempt on failure increments aiAttempts — mirrors failure path.
     am2 <- newAddrMan
-    _ <- addAddress am2 addr2 src1 0x409 now
+    _ <- addAddress am2 BS.empty addr2 src1 0x409 now
     markAttempt am2 addr2 (now + 1)
     idx2 <- readTVarIO (amAddrIndex am2)
     case Map.lookup addr2 idx2 of
@@ -854,7 +855,7 @@ spec_G15_persistence = describe "G15 AddrMan persistence (peers.dat) BUG-19" $ d
   it "BUG-19: no AddrMan serialize/deserialize — address book lost on restart" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     n <- readTVarIO (amNewCount am)
     -- We can only verify that the in-memory count is correct;
     -- there is no writeAddrMan / readAddrMan to persist/restore.
@@ -887,13 +888,13 @@ spec_G17_goodResetsAttempts = describe "G17 markGood resets nAttempts" $ do
   it "markGood sets aiAttempts=0 via aiLastSuccess update" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     markAttempt am addr1 now
     markAttempt am addr1 (now + 1)
     -- In Core, Good_() resets nAttempts=0.
     -- haskoin markGood sets aiInTried=True and aiLastSuccess but does NOT
     -- reset aiAttempts.
-    markGood am addr1 (now + 2)
+    markGood am BS.empty addr1 (now + 2)
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found"
@@ -913,10 +914,10 @@ spec_G18_bucketSizeEnforced = describe "G18 bucket-size limit in addAddress" $ d
   it "new table bucket respects addrmanBucketSize (take 64)" $ do
     am  <- newAddrMan
     now <- nowIO
-    let bucket = getNewBucket (amKey am) addr1 src1
+    let bucket = getNewBucket (amKey am) BS.empty addr1 src1
     -- Fill the bucket with 70 entries
     let addrs = [SockAddrInet 8333 (fromIntegral i) | i <- [200..270 :: Int]]
-    mapM_ (\a -> addAddress am a src1 0x409 now) addrs
+    mapM_ (\a -> addAddress am BS.empty a src1 0x409 now) addrs
     tbl <- readTVarIO (amNewTable am)
     case Map.lookup bucket tbl of
       Nothing    -> return ()  -- bucket may be empty if addrs hash elsewhere
@@ -935,7 +936,7 @@ spec_G19_chanceWeighting = describe "G19 selectAddress chance weighting" $ do
     -- de-synced table copy appears fresh.  This documents BUG-24.
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     let staleNow = now - 120
     mapM_ (\i -> markAttempt am addr1 (staleNow - fromIntegral i)) [1..3 :: Int64]
     -- amAddrIndex correctly shows terrible
@@ -965,7 +966,7 @@ spec_G20_maxRefCount = describe "G20 addrmanNewBucketsPerAddress = 8" $ do
     -- haskoin never enforces this ceiling at insert time.
     am <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     idx <- readTVarIO (amAddrIndex am)
     case Map.lookup addr1 idx of
       Nothing   -> expectationFailure "Address not found"
@@ -980,9 +981,9 @@ spec_G21_triedPosition = describe "G21 tried-table position determinism" $ do
   it "getTriedBucket gives same result for same address after markGood" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    markGood am addr1 now
-    let bucket = getTriedBucket (amKey am) addr1
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    markGood am BS.empty addr1 now
+    let bucket = getTriedBucket (amKey am) BS.empty addr1
     tbl <- readTVarIO (amTriedTable am)
     case Map.lookup bucket tbl of
       Nothing    -> return ()  -- possible if collision evicted
@@ -1035,16 +1036,16 @@ spec_G24_getNewBucket = describe "G24 getNewBucket hashing" $ do
   it "different source groups produce different buckets (statistical)" $ do
     am <- newAddrMan
     let k  = amKey am
-        b1 = getNewBucket k addr1 (SockAddrInet 8333 0x0100000a)   -- 10.0.0.1
-        b2 = getNewBucket k addr1 (SockAddrInet 8333 0x0100010a)   -- 10.1.0.1
+        b1 = getNewBucket k BS.empty addr1 (SockAddrInet 8333 0x0100000a)   -- 10.0.0.1
+        b2 = getNewBucket k BS.empty addr1 (SockAddrInet 8333 0x0100010a)   -- 10.1.0.1
     -- Different /16 source groups; high probability of different buckets
     (b1 == b2 || b1 /= b2) `shouldBe` True  -- deterministic but key-dependent
 
   it "same addr, same source → same new bucket (deterministic)" $ do
     am <- newAddrMan
     let k = amKey am
-        b1 = getNewBucket k addr1 src1
-        b2 = getNewBucket k addr1 src1
+        b1 = getNewBucket k BS.empty addr1 src1
+        b2 = getNewBucket k BS.empty addr1 src1
     b1 `shouldBe` b2
 
 --------------------------------------------------------------------------------
@@ -1134,15 +1135,15 @@ spec_G30_endToEnd = describe "G30 end-to-end AddrMan lifecycle" $ do
   it "add → tried via markGood → selectAddress returns from tried" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    markGood am addr1 (now + 1)
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    markGood am BS.empty addr1 (now + 1)
     r <- selectAddress am False
     r `shouldBe` Just addr1
 
   it "add → fail 3 times (stale) → amAddrIndex shows terrible (BUG-24: amNewTable stays stale)" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
     -- Use stale timestamps so triedVeryRecently guard doesn't protect the entry
     let staleNow = now - 200
     mapM_ (\i -> markAttempt am addr1 (staleNow - fromIntegral i)) [1..3 :: Int64]
@@ -1157,8 +1158,8 @@ spec_G30_endToEnd = describe "G30 end-to-end AddrMan lifecycle" $ do
   it "BUG-24: terrible address still selected due to amNewTable/amAddrIndex de-sync" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am addr1 src1 0x409 now
-    _ <- addAddress am addr2 src1 0x409 now
+    _ <- addAddress am BS.empty addr1 src1 0x409 now
+    _ <- addAddress am BS.empty addr2 src1 0x409 now
     -- Make addr1 terrible in amAddrIndex
     let staleNow = now - 200
     mapM_ (\i -> markAttempt am addr1 (staleNow - fromIntegral i)) [1..3 :: Int64]

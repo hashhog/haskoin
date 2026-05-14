@@ -2748,7 +2748,7 @@ peerManagerLoop pm = forever $ do
     when (piState peerInfo == PeerDisconnected) $ do
       -- Remove from netgroup diversity tracker if outbound
       unless (piInbound peerInfo) $
-        removeOutboundConnection (pmOutboundDiversity pm) addr
+        removeOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
       atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
       -- EraseForPeer: fire the caller-supplied disconnect hook so
       -- per-peer state outside PeerManager (e.g. orphan pool entries)
@@ -2798,7 +2798,7 @@ peerManagerLoop pm = forever $ do
       -- IsRoutable + bucket-placement; source = the address itself for
       -- DNS-seed entries, consistent with Core's behaviour for seednodes).
       forM_ discovered $ \a ->
-        addAddress (pmAddrMan pm) a a 0x409 nowTs
+        addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 nowTs
       -- Also keep pmKnownAddrs in sync for callers that read it directly.
       atomically $ do
         modifyTVar' (pmKnownAddrs pm) (Set.union (Set.fromList discovered))
@@ -2831,13 +2831,14 @@ peerManagerLoop pm = forever $ do
 
     -- Deduplicate, filter connected/banned/failed, then apply diversity.
     let od = pmOutboundDiversity pm
+    let asmapD = pmAsmapData pm
     let filtered = filter (\a ->
           Set.notMember a connected &&
           Map.notMember a activeBans &&
           Set.notMember a failed) allCandidates
     -- Remove duplicates while preserving order.
     let unique = nub filtered
-    diverseCandidates <- filterM (checkOutboundDiversity od) unique
+    diverseCandidates <- filterM (checkOutboundDiversity od asmapD) unique
 
     -- Fill full-relay slots first, then block-relay-only.
     let (forFullRelay, rest) = splitAt fullRelayNeeded diverseCandidates
@@ -3044,12 +3045,12 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
                     -- Mark as block-relay-only if requested
                     when blockRelayOnly $
                       atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
-                    addOutboundConnection (pmOutboundDiversity pm) addr
+                    addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
                     atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
                     -- BUG-6 FIX: successful v2 connection → markGood so the
                     -- address moves from new table to tried table in AddrMan.
                     nowOk <- (round <$> getPOSIXTime :: IO Int64)
-                    markGood (pmAddrMan pm) addr nowOk
+                    markGood (pmAddrMan pm) (pmAsmapData pm) addr nowOk
                     pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
                              (\reason err -> do
                                 putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
@@ -3106,7 +3107,7 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
             atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
 
           -- Track netgroup diversity for outbound connections
-          addOutboundConnection (pmOutboundDiversity pm) addr
+          addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
 
           -- Add to peer map
           atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
@@ -3116,7 +3117,7 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           -- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections calls
           -- addrman.Good(addr) after a successful VERSION/VERACK exchange.
           nowOk <- (round <$> getPOSIXTime :: IO Int64)
-          markGood (pmAddrMan pm) addr nowOk
+          markGood (pmAddrMan pm) (pmAsmapData pm) addr nowOk
 
           -- Start peer threads with message handler
           pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
@@ -3663,7 +3664,7 @@ handleAddrMessage pm (Addr entries) = do
   -- This matches the "source = pfrom.addr" semantics in Core when the peer
   -- is untrusted (no whitelisting in this impl).
   forM_ addrs $ \a ->
-    addAddress (pmAddrMan pm) a a 0x409 now
+    addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 now
   -- Keep pmKnownAddrs in sync for callers that read it directly.
   atomically $ modifyTVar' (pmKnownAddrs pm) $
     Set.union (Set.fromList addrs)
@@ -3789,14 +3790,17 @@ data EvictionCandidate = EvictionCandidate
   , ecLastTxTime      :: !Int64             -- ^ Last time peer sent us a novel transaction
   , ecServices        :: !Word64            -- ^ Services advertised
   , ecRelaysTxs       :: !Bool              -- ^ Whether peer relays transactions
-  , ecNetworkGroup    :: !Word32            -- ^ /16 network group for IPv4
+  , ecNetworkGroup    :: !NetworkGroup      -- ^ Network group (ASN-keyed when ASMap loaded, else /16 or /32 prefix)
   , ecInbound         :: !Bool              -- ^ Is this an inbound connection?
   , ecNoBan           :: !Bool              -- ^ Has NoBan permission (never evict)
   } deriving (Show, Eq)
 
--- | Convert a PeerInfo to an EvictionCandidate
-peerToEvictionCandidate :: SockAddr -> PeerInfo -> EvictionCandidate
-peerToEvictionCandidate addr info = EvictionCandidate
+-- | Convert a PeerInfo to an EvictionCandidate.
+-- @asmapData@ is the raw ASMap bytecode (empty = disabled); when non-empty,
+-- @ecNetworkGroup@ is ASN-keyed so peers in the same AS share a group slot.
+-- Reference: bitcoin-core/src/node/eviction.cpp GetNetworkGroup (via NetGroupManager).
+peerToEvictionCandidate :: ByteString -> SockAddr -> PeerInfo -> EvictionCandidate
+peerToEvictionCandidate asmapData addr info = EvictionCandidate
   { ecAddress       = addr
   , ecConnectedAt   = piConnectedAt info
   , ecMinPingTime   = piPingLatency info
@@ -3804,14 +3808,17 @@ peerToEvictionCandidate addr info = EvictionCandidate
   , ecLastTxTime    = 0  -- Would need to track this in PeerInfo
   , ecServices      = piServices info
   , ecRelaysTxs     = piRelay info
-  , ecNetworkGroup  = getNetworkGroup addr
+  , ecNetworkGroup  = computeNetworkGroupWithASMap asmapData addr
   , ecInbound       = piInbound info
   , ecNoBan         = piNoBan info  -- W99 G2: populated from piNoBan
   }
 
--- | Extract /16 network group from an IP address
--- For IPv4: use first two octets (e.g., 192.168.x.x -> 192.168)
--- Reference: Bitcoin Core netaddress.cpp GetGroup
+-- | DEPRECATED — TP-1 reconciliation (FIX-51).
+-- This function returns a raw Word32 scalar and uses @h1 \`div\` 0x10000@ for
+-- IPv6, which drops the lower 16 bits of the first Word32 (wrong /32 prefix).
+-- Kept for backward-compatibility with tests that import it; all internal code
+-- now uses 'computeNetworkGroupWithASMap' (the canonical single path).
+-- Reference divergence: bitcoin-core/src/netgroup.cpp — one canonical GetGroup.
 getNetworkGroup :: SockAddr -> Word32
 getNetworkGroup (SockAddrInet _ hostAddr) =
   -- hostAddr is in network byte order (big-endian on wire, but stored as host order)
@@ -3823,6 +3830,8 @@ getNetworkGroup (SockAddrInet _ hostAddr) =
   in octet1 * 256 + octet2
 getNetworkGroup (SockAddrInet6 _ _ (h1, h2, _, _) _) =
   -- For IPv6, use first 32 bits as a simplification
+  -- NOTE: this is the buggy path — `div 0x10000` drops bits 0-15 of h1.
+  -- The canonical 4-byte /32 extraction is in computeNetworkGroup / computeNetworkGroupWithASMap.
   fromIntegral $ h1 `div` 0x10000
 getNetworkGroup _ = 0  -- Unix sockets, etc.
 
@@ -3830,9 +3839,10 @@ getNetworkGroup _ = 0  -- Unix sockets, etc.
 buildEvictionCandidates :: PeerManager -> IO [EvictionCandidate]
 buildEvictionCandidates pm = do
   peers <- readTVarIO (pmPeers pm)
+  let asmapData = pmAsmapData pm
   forM (Map.toList peers) $ \(addr, pc) -> do
     info <- readTVarIO (pcInfo pc)
-    return $ peerToEvictionCandidate addr info
+    return $ peerToEvictionCandidate asmapData addr info
 
 -- | Select a peer to evict using Bitcoin Core's eviction algorithm
 -- Returns Nothing if no suitable candidate exists
@@ -4647,12 +4657,15 @@ newAddrMan = do
     <*> newTVarIO 0
     <*> newTVarIO 0
 
--- | Compute bucket for the new table
--- Reference: Bitcoin Core addrman.cpp AddrInfo::GetNewBucket
-getNewBucket :: Hash256 -> SockAddr -> SockAddr -> Int
-getNewBucket key addr source =
-  let addrGroup = getNetworkGroupBS addr
-      sourceGroup = getNetworkGroupBS source
+-- | Compute bucket for the new table.
+-- When @asmapData@ is non-empty, @addrGroup@ and @sourceGroup@ are ASN-keyed
+-- (matching Core NetGroupManager::GetGroup behaviour): two peers in the same AS
+-- but different /16 prefixes share a bucket, improving eclipse-attack resistance.
+-- Reference: Bitcoin Core addrman.cpp AddrInfo::GetNewBucket.
+getNewBucket :: Hash256 -> ByteString -> SockAddr -> SockAddr -> Int
+getNewBucket key asmapData addr source =
+  let addrGroup   = getNetworkGroupBytes (computeNetworkGroupWithASMap asmapData addr)
+      sourceGroup = getNetworkGroupBytes (computeNetworkGroupWithASMap asmapData source)
       -- hash1 = H(key, addrGroup, sourceGroup)
       hash1Data = BS.concat [getHash256 key, addrGroup, sourceGroup]
       hash1 = cheapHash $ doubleSHA256 hash1Data
@@ -4663,11 +4676,12 @@ getNewBucket key addr source =
       hash2 = cheapHash $ doubleSHA256 hash2Data
   in fromIntegral $ hash2 `mod` fromIntegral addrmanNewBucketCount
 
--- | Compute bucket for the tried table
--- Reference: Bitcoin Core addrman.cpp AddrInfo::GetTriedBucket
-getTriedBucket :: Hash256 -> SockAddr -> Int
-getTriedBucket key addr =
-  let addrGroup = getNetworkGroupBS addr
+-- | Compute bucket for the tried table.
+-- When @asmapData@ is non-empty, the address group is ASN-keyed.
+-- Reference: Bitcoin Core addrman.cpp AddrInfo::GetTriedBucket.
+getTriedBucket :: Hash256 -> ByteString -> SockAddr -> Int
+getTriedBucket key asmapData addr =
+  let addrGroup = getNetworkGroupBytes (computeNetworkGroupWithASMap asmapData addr)
       -- hash1 = H(key, addr)
       hash1Data = BS.concat [getHash256 key, encodeSockAddr addr]
       hash1 = cheapHash $ doubleSHA256 hash1Data
@@ -4692,11 +4706,14 @@ getBucketPosition key isNew bucket addr =
       hash = cheapHash $ doubleSHA256 hashData
   in fromIntegral $ hash `mod` fromIntegral addrmanBucketSize
 
--- | Add an address to the address manager
--- Reference: Bitcoin Core addrman.cpp AddrManImpl::Add_
+-- | Add an address to the address manager.
+-- @asmapData@ is the raw ASMap bytecode (empty = disabled); when non-empty,
+-- the cached network group and bucket assignments are ASN-keyed, matching
+-- Core's NetGroupManager::GetGroup behaviour.
+-- Reference: Bitcoin Core addrman.cpp AddrManImpl::Add_.
 -- Core AddSingle first line: "if (!addr.IsRoutable()) return false;"
-addAddress :: AddrMan -> SockAddr -> SockAddr -> Word64 -> Int64 -> IO Bool
-addAddress am addr source services now
+addAddress :: AddrMan -> ByteString -> SockAddr -> SockAddr -> Word64 -> Int64 -> IO Bool
+addAddress am asmapData addr source services now
   -- BUG-8 fix: reject non-routable addresses (RFC1918, loopback, link-local, etc.)
   -- Core AddSingle: "if (!addr.IsRoutable()) return false;"
   | not (isRoutable addr) = return False
@@ -4705,8 +4722,8 @@ addAddress am addr source services now
   case existing of
     Just info -> do
       -- Address exists, update if source is same group
-      let sourceGroup = computeNetworkGroup source
-          infoSourceGroup = computeNetworkGroup (aiSource info)
+      let sourceGroup = computeNetworkGroupWithASMap asmapData source
+          infoSourceGroup = computeNetworkGroupWithASMap asmapData (aiSource info)
       if sourceGroup == infoSourceGroup
         then do
           -- Update existing entry
@@ -4717,8 +4734,8 @@ addAddress am addr source services now
           -- Different source, consider adding to more buckets
           return False
     Nothing -> do
-      -- New address
-      let netGroup = computeNetworkGroup addr
+      -- New address: cache ASN-aware network group for later bucket queries
+      let netGroup = computeNetworkGroupWithASMap asmapData addr
           info = AddrInfo
             { aiAddress = addr
             , aiServices = services
@@ -4731,7 +4748,7 @@ addAddress am addr source services now
             , aiInTried = False
             , aiRefCount = 1
             }
-          bucket = getNewBucket (amKey am) addr source
+          bucket = getNewBucket (amKey am) asmapData addr source
           position = getBucketPosition (amKey am) True bucket addr
 
       atomically $ do
@@ -4797,11 +4814,13 @@ selectFromTable am isNew now = do
       | r <= chance = Just (aiAddress info)
       | otherwise = selectByChance (r - chance) rest
 
--- | Mark an address as successfully connected
--- Moves address from new to tried table
--- Reference: Bitcoin Core addrman.cpp AddrManImpl::Good_
-markGood :: AddrMan -> SockAddr -> Int64 -> IO ()
-markGood am addr now = do
+-- | Mark an address as successfully connected.
+-- @asmapData@ is the raw ASMap bytecode (empty = disabled); used for
+-- ASN-keyed tried-bucket assignment matching Core's behaviour.
+-- Moves address from new to tried table.
+-- Reference: Bitcoin Core addrman.cpp AddrManImpl::Good_.
+markGood :: AddrMan -> ByteString -> SockAddr -> Int64 -> IO ()
+markGood am asmapData addr now = do
   mInfo <- Map.lookup addr <$> readTVarIO (amAddrIndex am)
   case mInfo of
     Nothing -> return ()
@@ -4812,7 +4831,7 @@ markGood am addr now = do
           atomically $ modifyTVar' (amAddrIndex am) (Map.insert addr updated)
       | otherwise -> do
           -- Move from new to tried
-          let bucket = getTriedBucket (amKey am) addr
+          let bucket = getTriedBucket (amKey am) asmapData addr
               position = getBucketPosition (amKey am) False bucket addr
               updated = info { aiInTried = True, aiLastSuccess = now }
 
@@ -4860,28 +4879,33 @@ newOutboundDiversity = OutboundDiversity
   <$> newTVarIO Set.empty
   <*> newTVarIO Map.empty
 
--- | Check if connecting to an address would maintain diversity
--- Reference: Bitcoin Core net.cpp - rejects duplicate network groups
-checkOutboundDiversity :: OutboundDiversity -> SockAddr -> IO Bool
-checkOutboundDiversity od addr = do
-  let group = computeNetworkGroup addr
+-- | Check if connecting to an address would maintain ASN/IP diversity.
+-- @asmapData@ is the raw ASMap bytecode (empty = disabled).
+-- When ASMap is loaded, rejects a candidate whose ASN is already represented
+-- among outbound connections (ASN-level eclipse resistance).
+-- Reference: Bitcoin Core net.cpp ThreadOpenConnections duplicate-group check.
+checkOutboundDiversity :: OutboundDiversity -> ByteString -> SockAddr -> IO Bool
+checkOutboundDiversity od asmapData addr = do
+  let group = computeNetworkGroupWithASMap asmapData addr
   connected <- readTVarIO (odConnectedGroups od)
-  -- Accept if this group is not already connected
+  -- Accept if this group (ASN-keyed or raw /16) is not already connected
   return $ not $ Set.member group connected
 
--- | Add an outbound connection to the diversity tracker
-addOutboundConnection :: OutboundDiversity -> SockAddr -> IO ()
-addOutboundConnection od addr = do
-  let group = computeNetworkGroup addr
+-- | Add an outbound connection to the diversity tracker.
+-- @asmapData@ is the raw ASMap bytecode (empty = disabled).
+addOutboundConnection :: OutboundDiversity -> ByteString -> SockAddr -> IO ()
+addOutboundConnection od asmapData addr = do
+  let group = computeNetworkGroupWithASMap asmapData addr
   atomically $ do
     modifyTVar' (odConnectedGroups od) (Set.insert group)
     modifyTVar' (odGroupCounts od) $ \m ->
       Map.insertWith (+) group 1 m
 
--- | Remove an outbound connection from the diversity tracker
-removeOutboundConnection :: OutboundDiversity -> SockAddr -> IO ()
-removeOutboundConnection od addr = do
-  let group = computeNetworkGroup addr
+-- | Remove an outbound connection from the diversity tracker.
+-- @asmapData@ is the raw ASMap bytecode (empty = disabled).
+removeOutboundConnection :: OutboundDiversity -> ByteString -> SockAddr -> IO ()
+removeOutboundConnection od asmapData addr = do
+  let group = computeNetworkGroupWithASMap asmapData addr
   atomically $ do
     counts <- readTVar (odGroupCounts od)
     let newCount = Map.findWithDefault 1 group counts - 1
