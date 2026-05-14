@@ -90,6 +90,7 @@ import Haskoin.Performance
 import Haskoin.BlockTemplate
 import Haskoin.Rpc
 import Haskoin.Index
+import qualified Haskoin.Index as Index
 import qualified Haskoin.MuHash as MuHash
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
@@ -103,6 +104,7 @@ import qualified W108GbtSpec
 import qualified W109BlockIndexSpec
 import qualified W110BloomFilterSpec
 import qualified W111WalletSpec
+import qualified W112CompactBlockSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -13311,55 +13313,55 @@ main = hspec $ do
       -- Key: 00 01 02 .. 0f (little-endian: k0=0x0706050403020100, k1=0x0f0e0d0c0b0a0908)
       -- Input: 00 01 02 ... (i-1 bytes), Hash: given in paper
       it "spec vector: 0-byte input" $ do
-        let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
-            result = sipHash128 key BS.empty
+        let key = Index.SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            result = Index.sipHash128 key BS.empty
         result `shouldBe` 0x726fdb47dd0e0e31
 
       it "spec vector: 1-byte input (0x00)" $ do
-        let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
-            result = sipHash128 key (BS.singleton 0x00)
+        let key = Index.SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            result = Index.sipHash128 key (BS.singleton 0x00)
         result `shouldBe` 0x74f839c593dc67fd
 
       it "spec vector: 7-byte input (0x00..0x06)" $ do
         -- 7 bytes = all leftover (no full 8-byte block)
         -- Core siphash_4_2_testvec[7] = 0xab0200f58b01d137
-        let key  = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+        let key  = Index.SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
             msg  = BS.pack [0x00..0x06]
-            result = sipHash128 key msg
+            result = Index.sipHash128 key msg
         result `shouldBe` 0xab0200f58b01d137
 
       it "spec vector: 8-byte input (0x00..0x07)" $ do
         -- 8 bytes = exactly one full block, no leftover
         -- Core siphash_4_2_testvec[8] = 0x93f5f5799a932462
-        let key  = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+        let key  = Index.SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
             msg  = BS.pack [0x00..0x07]
-            result = sipHash128 key msg
+            result = Index.sipHash128 key msg
         result `shouldBe` 0x93f5f5799a932462
 
       it "spec vector: 15-byte input (0x00..0x0e)" $ do
         -- 15 bytes = one full block + 7-byte leftover
         -- Core siphash_4_2_testvec[15] = 0xa129ca6149be45e5
-        let key  = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+        let key  = Index.SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
             msg  = BS.pack [0x00..0x0e]
-            result = sipHash128 key msg
+            result = Index.sipHash128 key msg
         result `shouldBe` 0xa129ca6149be45e5
 
       it "produces non-zero output for non-empty input" $ do
-        let key = SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
-            result = sipHash128 key "hello"
+        let key = Index.SipHashKey 0x0706050403020100 0x0f0e0d0c0b0a0908
+            result = Index.sipHash128 key "hello"
         result `shouldSatisfy` (/= 0)
 
       it "produces different outputs for different inputs" $ do
-        let key = SipHashKey 0x0102030405060708 0x090a0b0c0d0e0f10
-            result1 = sipHash128 key "hello"
-            result2 = sipHash128 key "world"
+        let key = Index.SipHashKey 0x0102030405060708 0x090a0b0c0d0e0f10
+            result1 = Index.sipHash128 key "hello"
+            result2 = Index.sipHash128 key "world"
         result1 `shouldNotBe` result2
 
       it "produces different outputs for different keys" $ do
-        let key1 = SipHashKey 0x0102030405060708 0x090a0b0c0d0e0f10
-            key2 = SipHashKey 0x1112131415161718 0x191a1b1c1d1e1f20
-            result1 = sipHash128 key1 "test"
-            result2 = sipHash128 key2 "test"
+        let key1 = Index.SipHashKey 0x0102030405060708 0x090a0b0c0d0e0f10
+            key2 = Index.SipHashKey 0x1112131415161718 0x191a1b1c1d1e1f20
+            result1 = Index.sipHash128 key1 "test"
+            result2 = Index.sipHash128 key2 "test"
         result1 `shouldNotBe` result2
 
     describe "BIP-152 compact block reconstruction" $ do
@@ -22520,6 +22522,9 @@ main = hspec $ do
 
   -- W111 wallet / HD / descriptors 30-gate audit
   W111WalletSpec.spec
+
+  -- W112 BIP-152 compact blocks 30-gate audit
+  W112CompactBlockSpec.spec
 
   where
     sampleTx = Tx

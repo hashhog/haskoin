@@ -117,6 +117,7 @@ test-suite haskoin-test
                , W109BlockIndexSpec
                , W110BloomFilterSpec
                , W111WalletSpec
+               , W112CompactBlockSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
