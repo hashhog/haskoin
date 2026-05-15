@@ -1230,13 +1230,53 @@ newtype AddrV2Msg = AddrV2Msg { getAddrV2List :: [AddrV2] }
   deriving stock (Show, Eq, Generic)
   deriving newtype (NFData)
 
+-- | Parse a single AddrV2 entry, returning 'Nothing' for entries with
+-- unknown network IDs (BIP-155 §3 silent-skip requirement).
+--
+-- BIP-155 §3: "An addrv2 message may contain entries with network IDs that
+-- are not known to the implementation.  These entries MUST be silently
+-- skipped; the implementation MUST NOT close the connection in response."
+--
+-- The 'Serialize AddrV2' 'get' calls 'fail' on unknown net IDs, which aborts
+-- the entire cereal parse.  Using that inside @replicateM n get@ means a
+-- single unknown net ID in an addrv2 message would drop all 1000 entries
+-- and look like a malformed message to the caller.  This wrapper consumes
+-- the entry's bytes (so the outer parser stays aligned) and yields
+-- 'Nothing' for unknown net IDs, letting the caller filter them out.
+getAddrV2Maybe :: Get (Maybe AddrV2)
+getAddrV2Maybe = do
+  time     <- getWord32le
+  services <- getVarInt'
+  netIdByte <- getWord8
+  addrLen  <- getVarInt'
+  case word8ToNetworkId netIdByte of
+    Just netId
+      | fromIntegral addrLen == networkIdAddrLen netId -> do
+          addr <- getBytes (fromIntegral addrLen)
+          port <- getWord16be
+          return $ Just (AddrV2 time services netId addr port)
+      | otherwise ->
+          -- Known net ID with wrong address length is a malformed message
+          -- (BIP-155 §3 only talks about unknown net IDs).  Mirror the
+          -- single-entry 'Serialize AddrV2' behaviour and fail the parse.
+          fail $ "Invalid address length " ++ show addrLen ++
+                 " for network " ++ show netId
+    Nothing -> do
+      -- Unknown network ID: consume the address + port bytes so the outer
+      -- parser stays aligned, then yield Nothing.  Connection MUST NOT
+      -- be closed (callers should treat this as a silent skip).
+      _ <- getBytes (fromIntegral addrLen)  -- consume addrLen bytes
+      _ <- getWord16be                       -- port (2 bytes, BIP-155 BE)
+      return Nothing
+
 instance Serialize AddrV2Msg where
   put (AddrV2Msg as) = do
     putVarInt (fromIntegral $ length as)
     mapM_ put as
   get = do
     n <- getCappedVarInt maxAddrToSend "addrv2"
-    AddrV2Msg <$> replicateM n get
+    entries <- replicateM n getAddrV2Maybe
+    return $ AddrV2Msg (mapMaybe id entries)
 
 -- | SendAddrV2 message - signals support for addrv2 (BIP155)
 -- Must be sent between version and verack
