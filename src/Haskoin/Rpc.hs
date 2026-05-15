@@ -304,7 +304,11 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         createPsbt, updatePsbt, signPsbt,
                         combinePsbts, finalizePsbt, extractTransaction,
                         decodePsbt, encodePsbt, isPsbtFinalized, getPsbtFee,
-                        parseMultisigRedeem)
+                        parseMultisigRedeem,
+                        -- BIP-125 fee bumping (W118 G22, FIX-61)
+                        BumpFeeOptions(..), BumpFeeResult(..), BumpFeeError(..),
+                        defaultBumpFeeOptions, bumpFee, psbtBumpFee,
+                        bumpFeeErrorMessage)
 
 --------------------------------------------------------------------------------
 -- RPC Configuration
@@ -993,6 +997,10 @@ handleRpcRequest server req = do
     "sendtoaddress"        -> handleSendToAddress server params
     "listtransactions"     -> handleListTransactions server params
     "listunspent"          -> handleListUnspent server params
+
+    -- BIP-125 Fee Bumping (W118 G22, FIX-61)
+    "bumpfee"              -> handleBumpFee server params
+    "psbtbumpfee"          -> handlePsbtBumpFee server params
 
     -- AssumeUTXO RPCs
     "loadtxoutset"         -> handleLoadTxOutSet server params
@@ -6439,6 +6447,170 @@ handleListUnspent server params = do
                   pair "solvable"      (AE.bool True)                                               <>
                   pair "safe"          (AE.bool True)
            else Nothing
+
+--------------------------------------------------------------------------------
+-- Wallet: bumpfee / psbtbumpfee RPC Handlers (W118 G22, FIX-61)
+--
+-- Reference: bitcoin-core/src/wallet/rpc/spend.cpp bumpfee_helper
+--            bitcoin-core/src/wallet/feebumper.cpp
+--            BIP-125 (Opt-in Full Replace-by-Fee Signaling)
+--
+-- The two RPCs share the same precondition + replacement logic.  The
+-- only difference is the return shape:
+--   bumpfee     -> { txid, origfee, fee, errors:[] }
+--   psbtbumpfee -> { psbt, origfee, fee, errors:[] }
+--
+-- TP-2 status: this fix routes re-signing for `bumpfee` through the
+-- signPsbt pipeline.  signTransaction (the non-PSBT signing path)
+-- remains a stub used nowhere in production; this fix does NOT
+-- consolidate TP-2.  Closing TP-2 cleanly would require deleting
+-- signTransaction (single dead-export) — deferred to a follow-up
+-- since callers of the stub may exist in tests we have not audited.
+--------------------------------------------------------------------------------
+
+-- | Parse a hex-encoded txid (lowercase or mixed case) into a 'TxId'.
+-- Returns 'Nothing' on malformed hex or wrong length.
+-- Mirrors the local parseTxId helpers in handleGetMempoolEntry /
+-- handleSendRawTransaction.
+parseTxIdHex :: Text -> Maybe TxId
+parseTxIdHex hex =
+  case B16.decode (TE.encodeUtf8 hex) of
+    Left _ -> Nothing
+    Right bs
+      | BS.length bs == 32 -> Just $ TxId (Hash256 (BS.reverse bs))
+      | otherwise -> Nothing
+
+-- | Render a TxId as the standard hex string (big-endian display order).
+showTxIdHex :: TxId -> Text
+showTxIdHex (TxId (Hash256 bs)) = TE.decodeUtf8 $ B16.encode (BS.reverse bs)
+
+-- | Extract a Bool from an aeson Object by key.
+objBoolKey :: KM.KeyMap Value -> Text -> Maybe Bool
+objBoolKey km k = case KM.lookup (Key.fromText k) km of
+  Just (Bool b) -> Just b
+  _             -> Nothing
+
+-- | Extract a numeric (Double / Scientific) from an aeson Object by key.
+objNumKey :: KM.KeyMap Value -> Text -> Maybe Double
+objNumKey km k = case KM.lookup (Key.fromText k) km of
+  Just (Number s) -> Just (realToFrac s)
+  _               -> Nothing
+
+-- | Parse the bumpfee / psbtbumpfee options object.
+-- Recognised keys: fee_rate (sat/vB), confTarget / conf_target (ignored
+-- without a smart fee estimator in this path), replaceable (bool, default
+-- True), original_change_index (int).
+parseBumpFeeOptions :: Maybe Value -> BumpFeeOptions
+parseBumpFeeOptions Nothing            = defaultBumpFeeOptions
+parseBumpFeeOptions (Just (Object km)) =
+  let replaceable = fromMaybe True (objBoolKey km "replaceable")
+      mFr         = objNumKey km "fee_rate"
+      feeRate     = fmap (\fr -> FeeRate (round (fr * 1000))) mFr
+        -- fee_rate is in sat/vB, FeeRate stores sat/kvB.
+      mOci        = case KM.lookup "original_change_index" km of
+                      Just (Number s) -> toBoundedInteger s :: Maybe Word32
+                      _               -> Nothing
+  in BumpFeeOptions
+       { bfoFeeRate             = feeRate
+       , bfoReplaceable         = replaceable
+       , bfoOriginalChangeIndex = mOci
+       }
+parseBumpFeeOptions _ = defaultBumpFeeOptions
+
+-- | Map a 'BumpFeeError' to a JSON-RPC (code, message) pair matching
+-- Core's bumpfee_helper error taxonomy.
+bumpFeeErrorCode :: BumpFeeError -> Int
+bumpFeeErrorCode e = case e of
+  BumpFeeTxNotFound        -> rpcInvalidAddressOrKey  -- -5
+  BumpFeeAlreadyConfirmed  -> rpcWalletError          -- -4
+  BumpFeeAlreadyReplaced _ -> rpcWalletError          -- -4
+  BumpFeeNotReplaceable    -> rpcWalletError          -- -4
+  BumpFeeNoChange          -> rpcWalletError          -- -4
+  BumpFeeChangeBelowDust   -> rpcInvalidParams        -- -32602 (Core: INVALID_PARAMETER)
+  BumpFeeFeeRateTooLow     -> rpcInvalidParams        -- -32602
+  BumpFeeSignFailed _      -> rpcWalletError          -- -4
+
+-- | Shared body: parse params, run the wallet helper, format the result.
+-- The @kRender@ continuation produces the success-payload object (either
+-- "txid" or "psbt"); both shapes share origfee / fee / errors keys.
+bumpFeeShared
+  :: RpcServer
+  -> Value
+  -> Bool       -- ^ True for psbtbumpfee, False for bumpfee
+  -> IO RpcResponse
+bumpFeeShared server params wantPsbt = withWalletMgr server $ \walletMgr -> do
+  (mWallet, _) <- getDefaultWallet walletMgr
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletState -> do
+      let wallet = wsWallet walletState
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            "Missing required parameter: txid") Null
+        Just hex -> case parseTxIdHex hex of
+          Nothing -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidAddressOrKey
+              "Invalid txid (must be 32-byte hex)") Null
+          Just txid -> do
+            let opts = parseBumpFeeOptions (extractParamObject params 1)
+            if wantPsbt
+              then do
+                res <- psbtBumpFee wallet txid opts
+                case res of
+                  Left e -> return $ RpcResponse Null
+                    (toJSON $ RpcError (bumpFeeErrorCode e)
+                      (T.pack (bumpFeeErrorMessage e))) Null
+                  Right (psbt, oldFee, newFee, origTxId) -> do
+                    let psbtBytes = encodePsbt psbt
+                        psbtB64   = TE.decodeUtf8 (B64.encode psbtBytes)
+                        enc = pairs $
+                                pair "psbt"    (text psbtB64) <>
+                                pair "origfee" (btcAmountEnc (fromIntegral oldFee)) <>
+                                pair "fee"     (btcAmountEnc (fromIntegral newFee)) <>
+                                pair "txid"    (text (showTxIdHex origTxId)) <>
+                                pair "errors"  (AE.list text [])
+                        rawBs = encodingToLazyByteString enc
+                    return $ RpcResponse (rawJsonResult rawBs) Null Null
+              else do
+                res <- bumpFee wallet txid opts
+                case res of
+                  Left e -> return $ RpcResponse Null
+                    (toJSON $ RpcError (bumpFeeErrorCode e)
+                      (T.pack (bumpFeeErrorMessage e))) Null
+                  Right BumpFeeResult{..} -> do
+                    -- Broadcast the bumped tx into the local mempool + to peers.
+                    _ <- addTransaction (rsMempool server) bfrTx
+                    broadcastTxToPeers server bfrTx 0
+                    let newTxId = computeTxId bfrTx
+                        enc = pairs $
+                                pair "txid"    (text (showTxIdHex newTxId)) <>
+                                pair "origfee" (btcAmountEnc (fromIntegral bfrOrigFee)) <>
+                                pair "fee"     (btcAmountEnc (fromIntegral bfrNewFee)) <>
+                                pair "errors"  (AE.list text [])
+                        rawBs = encodingToLazyByteString enc
+                    return $ RpcResponse (rawJsonResult rawBs) Null Null
+  where
+    -- Extract param N from positional array params if it is an Object,
+    -- otherwise Nothing.  Used for the optional `options` argument.
+    extractParamObject :: Value -> Int -> Maybe Value
+    extractParamObject (Array arr) idx
+      | idx < V.length arr = case arr V.! idx of
+          o@(Object _) -> Just o
+          _            -> Nothing
+      | otherwise = Nothing
+    extractParamObject _ _ = Nothing
+
+-- | The @bumpfee@ RPC.  Signs the replacement transaction and broadcasts it.
+-- Reference: bitcoin-core/src/wallet/rpc/spend.cpp bumpfee
+handleBumpFee :: RpcServer -> Value -> IO RpcResponse
+handleBumpFee server params = bumpFeeShared server params False
+
+-- | The @psbtbumpfee@ RPC.  Returns a base64-encoded unsigned PSBT
+-- (no broadcast).  Reference: bitcoin-core/src/wallet/rpc/spend.cpp psbtbumpfee
+handlePsbtBumpFee :: RpcServer -> Value -> IO RpcResponse
+handlePsbtBumpFee server params = bumpFeeShared server params True
 
 --------------------------------------------------------------------------------
 -- Control: Help RPC Handler
