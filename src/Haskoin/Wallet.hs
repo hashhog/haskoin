@@ -62,6 +62,7 @@ module Haskoin.Wallet
   , derivePath
   , derivePathPriv
   , deriveChildPriv
+  , deriveChildPub
   , toExtendedPubKey
     -- * BIP-32 Extended Key Serialization
   , encodeExtKey
@@ -529,26 +530,56 @@ deriveHardened parent index =
 
 -- | Derive child public key (non-hardened only).
 -- KNOWN PITFALL: Cannot derive hardened children from public key alone.
+--
+-- Computes @child_pubkey = parent_pubkey + parse256(IL)*G@ per BIP-32 §
+-- "Public parent key → public child key" via libsecp256k1's
+-- @secp256k1_ec_pubkey_tweak_add@.  Mirrors Bitcoin Core's
+-- @CPubKey::Derive@ (`bitcoin-core/src/pubkey.cpp:341`).
+--
+-- Throws via 'error' on the vanishingly-rare invalid-child case
+-- (@IL >= n@ or resulting point at infinity).  Callers that want
+-- to advance to the next index instead should use 'deriveChildPub'.
 derivePublic :: ExtendedPubKey -> Word32 -> ExtendedPubKey
-derivePublic parent index
-  | index >= 0x80000000 = error "derivePublic: cannot derive hardened child from public key"
+derivePublic parent index = case deriveChildPub parent index of
+  Just child -> child
+  Nothing
+    | index >= 0x80000000 ->
+        error "derivePublic: cannot derive hardened child from public key"
+    | otherwise ->
+        error "derivePublic: invalid child key (IL >= n or point at infinity)"
+
+-- | 'Maybe'-returning child-public derivation.  Returns 'Nothing' on:
+--
+--   * @index >= 0x80000000@ (hardened, not derivable from xpub)
+--   * @parse256(IL) >= n@ (BIP-32 spec: skip and bump index)
+--   * resulting point is the point at infinity (BIP-32 spec: skip
+--     and bump index)
+--
+-- This is the canonical BIP-32 CKDpub predicate; 'derivePublic' is the
+-- partial variant that 'error's instead.  Wallet code that scans many
+-- indices to find a valid one should call 'deriveChildPub' directly.
+deriveChildPub :: ExtendedPubKey -> Word32 -> Maybe ExtendedPubKey
+deriveChildPub parent index
+  | index >= 0x80000000 = Nothing
   | otherwise =
-      let pubBytes = serializePubKeyCompressed (epkKey parent)
-          dat = BS.append pubBytes (encodeWord32BE' index)
+      let pubBytes   = serializePubKeyCompressed (epkKey parent)
+          dat        = BS.append pubBytes (encodeWord32BE' index)
           hmacResult = hmacSHA512 (epkChainCode parent) dat
-          (il, ir) = BS.splitAt 32 hmacResult
-          -- Child pubkey = point(il) + parent pubkey
-          -- This requires EC point addition which we don't have fully implemented
-          -- For now, this is a placeholder
-          childPubKey = addPublicKeyPoint il (epkKey parent)
-          fingerprint = computeFingerprint pubBytes
-      in ExtendedPubKey
-        { epkKey = childPubKey
-        , epkChainCode = ir
-        , epkDepth = epkDepth parent + 1
-        , epkParentFP = fingerprint
-        , epkIndex = index
-        }
+          (il, ir)   = BS.splitAt 32 hmacResult
+          ilInt      = bsToIntegerBE il
+      in if ilInt >= secp256k1Order
+           then Nothing
+           else case addPublicKeyPoint il (epkKey parent) of
+             Nothing -> Nothing  -- point at infinity or libsecp failure
+             Just childPubKey ->
+               let fingerprint = computeFingerprint pubBytes
+               in Just ExtendedPubKey
+                 { epkKey = childPubKey
+                 , epkChainCode = ir
+                 , epkDepth = epkDepth parent + 1
+                 , epkParentFP = fingerprint
+                 , epkIndex = index
+                 }
 
 -- | Derive along a path.
 -- Path elements >= 0x80000000 are hardened.
@@ -579,10 +610,25 @@ addPrivateKeys a b =
       sumInt = (aInt + bInt) `mod` n
   in integerToBS32 sumInt
 
--- | Add a scalar to a public key point (simplified placeholder).
--- In production, this requires proper EC point arithmetic.
-addPublicKeyPoint :: ByteString -> PubKey -> PubKey
-addPublicKeyPoint _scalar pk = pk  -- Placeholder - needs secp256k1 implementation
+-- | BIP-32 CKDpub EC point addition: child = parent_pubkey + scalar*G.
+--
+-- Routes through 'Haskoin.Crypto.pubKeyTweakAdd', which is FFI-backed by
+-- libsecp256k1 (`secp256k1_ec_pubkey_tweak_add`).  Returns 'Nothing' on
+-- @scalar >= n@ (curve order), point-at-infinity result, or malformed
+-- parent serialization (none of which should happen in practice for a
+-- correctly-typed 'PubKey', but we propagate the failure as BIP-32 instructs
+-- the caller to skip the index).
+--
+-- Result is always a compressed pubkey ('PubKeyCompressed').
+--
+-- Prior to W118 FIX-59 this function was a stub returning the parent
+-- unchanged, causing every CKDpub step to be a no-op (G10 / DH-1 / TP-1
+-- in the W118 audit).  Reference: @bitcoin-core/src/pubkey.cpp@
+-- `CPubKey::Derive`.
+addPublicKeyPoint :: ByteString -> PubKey -> Maybe PubKey
+addPublicKeyPoint scalar pk =
+  let parentBytes = serializePubKeyCompressed pk
+  in PubKeyCompressed <$> pubKeyTweakAdd parentBytes scalar
 
 -- | Derive public key from private key.
 --
@@ -5301,41 +5347,39 @@ hexEncode' = T.pack . concatMap (\b -> [hexChar (b `shiftR` 4), hexChar (b .&. 0
       | n < 10 = toEnum (fromIntegral n + ord '0')
       | otherwise = toEnum (fromIntegral n - 10 + ord 'a')
 
--- | Placeholder for xpub decoding.
+-- | Decode a base58check BIP-32 extended public key (xpub.../tpub...)
+-- as used inside a descriptor key expression.
+--
+-- Delegates to 'decodeExtPubKey' (the real BIP-32 base58check decoder
+-- — Wallet.hs:767) and discards the network tag, since the descriptor
+-- caller already disambiguated via the prefix.
+--
+-- Prior to W118 FIX-59 this returned a dummy 'ExtendedPubKey' ignoring
+-- the input entirely (G6 / DH-4 in the W118 audit).
 decodeXPub :: Text -> Maybe ExtendedPubKey
-decodeXPub t
-  | "xpub" `T.isPrefixOf` t || "tpub" `T.isPrefixOf` t =
-      -- Placeholder: return a dummy xpub
-      -- In production, this would do proper base58 decoding
-      Just $ ExtendedPubKey
-        { epkKey = PubKeyCompressed (BS.replicate 33 0x02)
-        , epkChainCode = BS.replicate 32 0
-        , epkDepth = 0
-        , epkParentFP = 0
-        , epkIndex = 0
-        }
-  | otherwise = Nothing
+decodeXPub t = snd <$> decodeExtPubKey t
 
--- | Placeholder for xprv decoding.
+-- | Decode a base58check BIP-32 extended private key (xprv.../tprv...)
+-- as used inside a descriptor key expression.  See 'decodeXPub'.
 decodeXPriv :: Text -> Maybe ExtendedKey
-decodeXPriv t
-  | "xprv" `T.isPrefixOf` t || "tprv" `T.isPrefixOf` t =
-      Just $ ExtendedKey
-        { ekKey = SecKey (BS.replicate 32 0x01)
-        , ekChainCode = BS.replicate 32 0
-        , ekDepth = 0
-        , ekParentFP = 0
-        , ekIndex = 0
-        }
-  | otherwise = Nothing
+decodeXPriv t = snd <$> decodeExtKey t
 
--- | Placeholder for xpub encoding.
+-- | Encode a BIP-32 extended public key as base58check (xpub.../tpub...).
+-- Used by descriptor pretty-printing for 'KeyXPub' expressions.
+--
+-- Defaults to mainnet (xpub) since the descriptor 'KeyXPub' carries no
+-- network tag; callers that need testnet should round-trip through
+-- 'encodeExtPubKey' with the desired network instead.
+--
+-- Prior to W118 FIX-59 this returned the literal string "xpub..."
+-- (G6 / DH-4 in the W118 audit).
 encodeXPub :: ExtendedPubKey -> Text
-encodeXPub _ = "xpub..."  -- Placeholder
+encodeXPub = encodeExtPubKey Haskoin.Consensus.mainnet
 
--- | Placeholder for xprv encoding.
+-- | Encode a BIP-32 extended private key as base58check (xprv.../tprv...).
+-- See 'encodeXPub' for the network-defaulting behavior.
 encodeXPriv :: ExtendedKey -> Text
-encodeXPriv _ = "xprv..."  -- Placeholder
+encodeXPriv = encodeExtKey Haskoin.Consensus.mainnet
 
 -- | Encode a private key as WIF (Wallet Import Format).
 -- Encodes as compressed (with 0x01 suffix) for mainnet.
