@@ -265,7 +265,8 @@ import Network.Socket (SockAddr(..), Socket, socket, Family(..), SocketType(..),
 import qualified Network.Socket.ByteString as SockBS
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
-                         addTransaction, getTransaction, getMempoolTxIds,
+                         addTransaction, testAcceptTransaction,
+                         getTransaction, getMempoolTxIds,
                          getMempoolSize, FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
@@ -5297,57 +5298,47 @@ handleTestMempoolAccept server params = do
               pair "allowed"       (AE.bool False) <>
               pair "reject-reason" (text ("TX decode failed: " <> T.pack err))
             Right tx -> do
-              let txid = computeTxId tx
+              let txid  = computeTxId tx
                   wtxid = computeWtxId tx
 
-              -- BIP-339 two-step duplicate check (mirrors Bitcoin Core
-              -- MemPoolAccept::PreChecks, validation.cpp:823-830):
-              --   a) wtxid hit → "txn-already-in-mempool"  (exact duplicate)
-              --   b) txid  hit → "txn-same-nonwitness-data-in-mempool"
-              --                  (witness-mutated, same non-witness data)
-              -- addTransaction returns ErrAlreadyInMempool or
-              -- ErrSameNonwitnessInMempool (without inserting) when either
-              -- condition holds; mempoolErrorToText maps each to the correct
-              -- Core-canonical reject-reason string.  No pre-check needed.
-              result <- addTransaction (rsMempool server) tx
+              -- W116 BUG-G6 FIX: use testAcceptTransaction (dry-run, no TVar
+              -- writes) instead of addTransaction + removeTransaction.
+              -- Bitcoin Core validation.cpp:1388 returns early before
+              -- AddUnchecked when test_accept=true — we mirror that here.
+              -- The old add+remove pattern created a race window where another
+              -- thread could observe the transaction as "in mempool" between
+              -- the insert and the subsequent remove.
+              -- BIP-339 duplicate checks (wtxid → "txn-already-in-mempool",
+              -- txid → "txn-same-nonwitness-data-in-mempool") are handled
+              -- inside testAcceptTransaction the same way addTransaction did.
+              result <- testAcceptTransaction (rsMempool server) tx
               case result of
                 Left err -> return $ pairs $
                   pair "txid"          (text (showHash (BlockHash (getTxIdHash txid))))  <>
                   pair "wtxid"         (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
                   pair "allowed"       (AE.bool False)                                   <>
                   pair "reject-reason" (text (mempoolErrorToText err))
-                Right _ -> do
-                  -- Get the entry to compute vsize and fee
-                  mEntry <- getTransaction (rsMempool server) txid
-                  -- Remove it (since this is test only)
-                  removeTransaction (rsMempool server) txid
+                Right entry -> do
+                  let vsize = meSize entry
+                      fee   = meFee entry
+                      feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
+                      txidTxt  = showHash (BlockHash (getTxIdHash txid))
+                      wtxidTxt = showHash (BlockHash (getTxIdHash wtxid))
 
-                  case mEntry of
-                    Nothing -> return $ pairs $
-                      pair "txid"    (text (showHash (BlockHash (getTxIdHash txid))))  <>
-                      pair "wtxid"   (text (showHash (BlockHash (getTxIdHash wtxid))))<>
-                      pair "allowed" (AE.bool True)
-                    Just entry -> do
-                      let vsize = meSize entry
-                          fee = meFee entry
-                          feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
-                          txidTxt = showHash (BlockHash (getTxIdHash txid))
-                          wtxidTxt = showHash (BlockHash (getTxIdHash wtxid))
-
-                      if feeRateSatPerVB > maxFeeRate
-                        then return $ pairs $
-                               pair "txid"          (text txidTxt)             <>
-                               pair "wtxid"         (text wtxidTxt)            <>
-                               pair "allowed"       (AE.bool False)            <>
-                               pair "reject-reason" (text "max-fee-exceeded")
-                        else do
-                          let feesEnc = pairs $ pair "base" (btcAmountEnc (fromIntegral fee))
-                          return $ pairs $
-                                     pair "txid"    (text txidTxt)  <>
-                                     pair "wtxid"   (text wtxidTxt) <>
-                                     pair "allowed" (AE.bool True)  <>
-                                     pair "vsize"   (AE.int vsize)  <>
-                                     pair "fees"    feesEnc
+                  if feeRateSatPerVB > maxFeeRate
+                    then return $ pairs $
+                           pair "txid"          (text txidTxt)             <>
+                           pair "wtxid"         (text wtxidTxt)            <>
+                           pair "allowed"       (AE.bool False)            <>
+                           pair "reject-reason" (text "max-fee-exceeded")
+                    else do
+                      let feesEnc = pairs $ pair "base" (btcAmountEnc (fromIntegral fee))
+                      return $ pairs $
+                                 pair "txid"    (text txidTxt)  <>
+                                 pair "wtxid"   (text wtxidTxt) <>
+                                 pair "allowed" (AE.bool True)  <>
+                                 pair "vsize"   (AE.int vsize)  <>
+                                 pair "fees"    feesEnc
 
     mempoolErrorToText :: MempoolError -> Text
     mempoolErrorToText err = case err of
