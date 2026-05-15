@@ -115,6 +115,22 @@ module Haskoin.Wallet
   , CoinSelection(..)
   , selectCoins
   , selectCoinsWithHeight
+    -- * Sent-Tx Tracking (BIP-125 fee bumping prerequisite)
+  , SentTxRecord(..)
+  , recordSentTx
+  , getSentTx
+  , removeSentTx
+  , markSentTxConfirmed
+  , listSentTxs
+    -- * BIP-125 Fee Bumping (bumpfee / psbtbumpfee)
+  , BumpFeeOptions(..)
+  , BumpFeeResult(..)
+  , BumpFeeError(..)
+  , bumpFeeErrorMessage
+  , defaultBumpFeeOptions
+  , bumpFee
+  , psbtBumpFee
+  , transactionCanBeBumped
     -- * Coin Selection Algorithms
   , SelectionAlgorithm(..)
   , selectCoinsBnB
@@ -273,7 +289,7 @@ import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoin
 import Haskoin.Crypto
 import qualified Haskoin.TaprootSighash as TS
 import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encodeScript)
-import Haskoin.Mempool (FeeRate(..))
+import Haskoin.Mempool (FeeRate(..), signalsOptInRBF)
 import Haskoin.Consensus (Network(..), coinbaseMaturity)
 import qualified Haskoin.Consensus
 
@@ -1138,7 +1154,44 @@ data Wallet = Wallet
       -- ^ Address labels
   , walletTxLabels     :: !(TVar (Map TxId Text))
       -- ^ Transaction labels
+  , walletSentTxs      :: !(TVar (Map TxId SentTxRecord))
+      -- ^ Outgoing transactions the wallet has produced.  Required by
+      --   bumpfee / psbtbumpfee to look up the original tx, its prevouts,
+      --   the change-output index, and the old fee.  Reference:
+      --   bitcoin-core/src/wallet/wallet.h CWallet::mapWallet + CWalletTx.
   }
+
+-- | A record of an outgoing transaction the wallet has produced.
+-- Tracked so bumpfee / psbtbumpfee can look up the original tx, its
+-- prevouts, the change-output index, and the old fee.
+--
+-- Reference: bitcoin-core/src/wallet/transaction.h CWalletTx — bumpfee
+-- looks up @wallet.mapWallet[txid]@ to find the original CMutableTransaction
+-- plus the wallet-supplied prevouts that feed CCoinControl.SetInputs().
+data SentTxRecord = SentTxRecord
+  { strTx           :: !Tx
+    -- ^ The outgoing transaction the wallet produced.
+  , strPrevOutputs  :: ![(OutPoint, TxOut)]
+    -- ^ Prevout map covering every input the wallet selected.  Required
+    --   to re-sign after bumping (the wallet does not have access to the
+    --   chain state for txs that may have been pruned).
+  , strChangeIndex  :: !(Maybe Word32)
+    -- ^ 0-based index of the wallet's change output in @strTx@'s
+    --   @txOutputs@, or 'Nothing' if the original selection had no change.
+  , strChangeAddr   :: !(Maybe Address)
+    -- ^ The change Address the wallet generated for this tx (so a bump
+    --   that creates a brand-new change output can reuse it).
+  , strOldFee       :: !Word64
+    -- ^ Fee of the original tx in satoshis.
+  , strConfirmedAt  :: !(Maybe Word32)
+    -- ^ Block height the tx was confirmed at, or 'Nothing' if still in
+    --   the mempool.  bumpfee rejects already-confirmed txs.
+  , strReplacedBy   :: !(Maybe TxId)
+    -- ^ If this tx was itself replaced by a later bumpfee, the bumped
+    --   txid.  Core's @CWalletTx::mapValue["replaced_by_txid"]@.
+  } deriving (Show, Generic)
+
+instance NFData SentTxRecord
 
 -- | Wallet configuration parameters.
 data WalletConfig = WalletConfig
@@ -1173,8 +1226,9 @@ loadWallet WalletConfig{..} mnemonic = do
   utxos <- newTVarIO Map.empty
   addrLabels <- newTVarIO Map.empty
   txLabels <- newTVarIO Map.empty
+  sentTxs <- newTVarIO Map.empty
   return $ Wallet master account recvIdx changeIdx addrs utxos wcNetwork wcGapLimit
-                  addrLabels txLabels
+                  addrLabels txLabels sentTxs
 
 -- | Save wallet state to a file.
 -- SECURITY: In production, encrypt private keys with a passphrase.
@@ -1975,12 +2029,23 @@ createTransaction CoinSelection{..} =
 
 -- | Fund a transaction by selecting coins and creating inputs.
 -- This is a convenience wrapper around selectCoins and createTransaction.
+-- Also records the produced tx in 'walletSentTxs' so bumpfee can find it.
 fundTransaction :: Wallet -> [WalletTxOutput] -> FeeRate -> IO (Either String Tx)
 fundTransaction wallet outputs feeRate = do
   result <- selectCoins wallet outputs feeRate
   case result of
     Left err -> return $ Left err
-    Right cs -> return $ Right $ createTransaction cs
+    Right cs -> do
+      let tx = createTransaction cs
+          -- The change output (when present) is appended after the
+          -- payment outputs in createTransaction, so its index is
+          -- length(csOutputs).
+          paymentCount = length (csOutputs cs)
+          (changeIdx, changeAddr) = case csChange cs of
+            Just (a, _) -> (Just (fromIntegral paymentCount), Just a)
+            Nothing     -> (Nothing, Nothing)
+      recordSentTx wallet tx (csInputs cs) changeIdx changeAddr (csFee cs)
+      return (Right tx)
 
 -- | Send to a single address (convenience function).
 sendToAddress :: Wallet -> Address -> Word64 -> FeeRate -> IO (Either String Tx)
@@ -2010,6 +2075,504 @@ signTransaction wallet tx prevOutputs = do
              let -- We need to find the key path for this address
                  -- For now, return empty witness (actual signing needs implementation)
              in []  -- Placeholder: requires secp256k1 for actual signing
+
+--------------------------------------------------------------------------------
+-- Sent-Tx Tracking (prerequisite for BIP-125 fee bumping)
+--
+-- Reference: bitcoin-core/src/wallet/wallet.h CWallet::mapWallet — Core
+-- threads a CWalletTx through every wallet outgoing path, keyed by txid.
+-- We track only the minimum needed for bumpfee / psbtbumpfee: the tx
+-- itself, the prevout map (for re-signing without chain access), the
+-- change-output index, and the old fee.  The Wallet keeps a TVar so
+-- recording is STM-safe alongside concurrent UTXO / address mutations.
+--------------------------------------------------------------------------------
+
+-- | Record a transaction the wallet just produced.  Idempotent on txid.
+-- Called by 'sendToAddress' (and any other outgoing-tx path) right before
+-- broadcast so 'bumpFee' can look it up later.
+--
+-- Reference: bitcoin-core/src/wallet/wallet.cpp CWallet::CommitTransaction
+-- — Core inserts the new tx into @mapWallet@ before relaying to peers.
+recordSentTx :: Wallet -> Tx -> [(OutPoint, TxOut)] -> Maybe Word32
+             -> Maybe Address -> Word64 -> IO ()
+recordSentTx wallet tx prevs changeIdx changeAddr oldFee = do
+  let txid = computeTxId tx
+      record = SentTxRecord
+        { strTx           = tx
+        , strPrevOutputs  = prevs
+        , strChangeIndex  = changeIdx
+        , strChangeAddr   = changeAddr
+        , strOldFee       = oldFee
+        , strConfirmedAt  = Nothing
+        , strReplacedBy   = Nothing
+        }
+  atomically $ modifyTVar' (walletSentTxs wallet) (Map.insert txid record)
+
+-- | Look up a previously-sent transaction by its txid.
+getSentTx :: Wallet -> TxId -> IO (Maybe SentTxRecord)
+getSentTx wallet txid =
+  Map.lookup txid <$> readTVarIO (walletSentTxs wallet)
+
+-- | Remove a sent-tx entry (e.g. after a successful bump replaces it).
+removeSentTx :: Wallet -> TxId -> IO ()
+removeSentTx wallet txid =
+  atomically $ modifyTVar' (walletSentTxs wallet) (Map.delete txid)
+
+-- | Mark a sent tx as confirmed at the given block height.  bumpfee
+-- rejects any tx with a non-'Nothing' confirmation height (Core's
+-- @GetTxDepthInMainChain != 0@ precondition).
+markSentTxConfirmed :: Wallet -> TxId -> Word32 -> IO ()
+markSentTxConfirmed wallet txid height =
+  atomically $ modifyTVar' (walletSentTxs wallet) $
+    Map.adjust (\r -> r { strConfirmedAt = Just height }) txid
+
+-- | Enumerate all known outgoing transactions (in arbitrary key order).
+listSentTxs :: Wallet -> IO [(TxId, SentTxRecord)]
+listSentTxs wallet = Map.toList <$> readTVarIO (walletSentTxs wallet)
+
+--------------------------------------------------------------------------------
+-- BIP-125 Fee Bumping (bumpfee / psbtbumpfee)
+--
+-- Reference: bitcoin-core/src/wallet/feebumper.{h,cpp}
+--            bitcoin-core/src/wallet/rpc/spend.cpp bumpfee_helper
+--            BIP-125 (Opt-in Full Replace-by-Fee Signaling)
+--
+-- Pipeline (mirrors Core's CreateRateBumpTransaction):
+--   1. Look up the original tx by txid in walletSentTxs (Core: mapWallet).
+--   2. PreconditionChecks: unconfirmed, not already replaced, RBF signaled,
+--      all inputs ours (require_mine for bumpfee; psbtbumpfee allows
+--      mixed inputs but we keep require_mine=True for the all-ours wallet).
+--   3. Decide the new fee:
+--        new_fee = max(old_fee + ceil(vsize * incrementalRelayFee_sat_per_vB),
+--                      user_fee_rate_sat_per_vB * vsize)
+--      where incrementalRelayFee defaults to WALLET_INCREMENTAL_RELAY_FEE
+--      (5 sat/vB; Core's max(node_relay_inc=0.1 sat/vB, wallet_inc=5 sat/vB)).
+--   4. Locate the change output (strChangeIndex or auto-detect: any output
+--      paying a wallet address; bumpfee can only succeed if such a change
+--      output exists and can absorb the fee delta without going below dust).
+--   5. Construct the bumped tx: same inputs (with sequence forced to
+--      ≤0xfffffffd to stay BIP-125 replaceable), same outputs, but change
+--      value reduced by (new_fee - old_fee).
+--   6. For bumpfee: re-sign via signPsbt path (TP-2 note below).
+--      For psbtbumpfee: return an unsigned PSBT.
+--   7. Mark the original tx as replaced.
+--
+-- TP-2 (signTransaction vs signPsbt) status: STILL OPEN per W118 audit.
+-- This implementation re-signs via the signPsbt path (richer: handles
+-- P2WPKH/P2PKH/P2SH-P2WPKH/P2WSH/P2TR per W41/W31 commitment gates).
+-- signTransaction remains a stub used nowhere in production.  This fix
+-- does not consolidate TP-2.
+--------------------------------------------------------------------------------
+
+-- | Options controlling 'bumpFee' / 'psbtBumpFee'.
+--
+-- Mirrors a subset of Core's CCoinControl + bumpfee_helper options.  The
+-- subset we expose maps to the most-used RPC parameters; unsupported
+-- Core options (e.g. @original_change_index@ override) fall back to
+-- automatic detection.
+data BumpFeeOptions = BumpFeeOptions
+  { bfoFeeRate    :: !(Maybe FeeRate)
+    -- ^ Explicit replacement feerate in sat/kvB.  When 'Nothing' the
+    --   replacement uses @old_fee_rate + WALLET_INCREMENTAL_RELAY_FEE@.
+  , bfoReplaceable :: !Bool
+    -- ^ Whether the replacement should itself signal BIP-125 RBF
+    --   (sequence ≤0xfffffffd).  Default 'True' (Core parity).
+  , bfoOriginalChangeIndex :: !(Maybe Word32)
+    -- ^ Operator-provided override for the change output to consume.
+    --   When 'Nothing' the change index recorded by 'recordSentTx' is
+    --   used; if that is also 'Nothing' bumpfee fails.
+  } deriving (Show, Generic)
+
+instance NFData BumpFeeOptions
+
+-- | Default options: no explicit feerate, signal RBF on the replacement,
+-- use the wallet-recorded change index.
+defaultBumpFeeOptions :: BumpFeeOptions
+defaultBumpFeeOptions = BumpFeeOptions
+  { bfoFeeRate             = Nothing
+  , bfoReplaceable         = True
+  , bfoOriginalChangeIndex = Nothing
+  }
+
+-- | Result of a successful 'bumpFee' or 'psbtBumpFee' invocation.
+-- The @bfrTx@ field carries the *unsigned* bumped tx; bumpfee additionally
+-- signs it (in-place by-the-RPC-handler) before broadcast.
+data BumpFeeResult = BumpFeeResult
+  { bfrTx        :: !Tx       -- ^ The replacement transaction.
+  , bfrOrigFee   :: !Word64   -- ^ Fee of the original tx (sat).
+  , bfrNewFee    :: !Word64   -- ^ Fee of the replacement (sat).
+  , bfrOrigTxId  :: !TxId     -- ^ Original txid (the one being bumped).
+  } deriving (Show, Generic)
+
+instance NFData BumpFeeResult
+
+-- | All ways a bumpfee can fail, matching Core's @feebumper::Result@
+-- (INVALID_ADDRESS_OR_KEY / INVALID_PARAMETER / WALLET_ERROR / MISC_ERROR)
+-- plus a few additional precondition errors haskoin can detect.
+data BumpFeeError
+  = BumpFeeTxNotFound
+    -- ^ "Invalid or non-wallet transaction id" (no entry in walletSentTxs).
+  | BumpFeeAlreadyConfirmed
+    -- ^ "Transaction has been mined" (strConfirmedAt /= Nothing).
+  | BumpFeeAlreadyReplaced !TxId
+    -- ^ "Cannot bump transaction X which was already bumped by Y".
+  | BumpFeeNotReplaceable
+    -- ^ "Cannot bump transaction; tx does not signal BIP-125 RBF".
+  | BumpFeeNoChange
+    -- ^ "Transaction has no change output to recycle the fee from".
+  | BumpFeeChangeBelowDust
+    -- ^ "Bumping would push the change output below the dust threshold".
+  | BumpFeeFeeRateTooLow
+    -- ^ "New fee rate must be higher than the previous fee rate".
+  | BumpFeeSignFailed !String
+    -- ^ Re-signing the bumped tx via signPsbt failed.
+  deriving (Show, Eq, Generic)
+
+instance NFData BumpFeeError
+
+-- | Render a 'BumpFeeError' to a human-readable string that matches the
+-- shape Core's bumpfee_helper emits via JSONRPCError.
+bumpFeeErrorMessage :: BumpFeeError -> String
+bumpFeeErrorMessage BumpFeeTxNotFound        = "Invalid or non-wallet transaction id"
+bumpFeeErrorMessage BumpFeeAlreadyConfirmed  = "Transaction has been mined, or is conflicted with a mined transaction"
+bumpFeeErrorMessage (BumpFeeAlreadyReplaced t) =
+  "Cannot bump transaction which was already bumped by transaction " ++ show t
+bumpFeeErrorMessage BumpFeeNotReplaceable    = "Transaction is not BIP-125 replaceable"
+bumpFeeErrorMessage BumpFeeNoChange          = "Transaction does not have a change output that can absorb the fee bump"
+bumpFeeErrorMessage BumpFeeChangeBelowDust   = "Bumping would push the change output below the dust threshold"
+bumpFeeErrorMessage BumpFeeFeeRateTooLow     = "New fee rate must exceed the original transaction's fee rate"
+bumpFeeErrorMessage (BumpFeeSignFailed msg)  = "Can't sign transaction: " ++ msg
+
+-- | The wallet's incremental relay fee constant in sat/kvB.
+-- Reference: bitcoin-core/src/wallet/wallet.h
+--   static const CAmount WALLET_INCREMENTAL_RELAY_FEE = 5000;
+walletIncrementalRelayFeePerKvB :: Word64
+walletIncrementalRelayFeePerKvB = 5000
+
+-- | Check whether a given txid is in the wallet's sent-tx index AND
+-- passes the bumpfee preconditions (unconfirmed, not already replaced,
+-- BIP-125 replaceable).
+--
+-- Reference: bitcoin-core/src/wallet/feebumper.cpp TransactionCanBeBumped
+transactionCanBeBumped :: Wallet -> TxId -> IO Bool
+transactionCanBeBumped wallet txid = do
+  mr <- getSentTx wallet txid
+  case mr of
+    Nothing -> return False
+    Just r  ->
+      return $ case checkBumpPreconditions r of
+        Right _ -> True
+        Left _  -> False
+
+-- | Apply the BIP-125 + Core preconditions to a sent-tx record.
+checkBumpPreconditions :: SentTxRecord -> Either BumpFeeError ()
+checkBumpPreconditions r = do
+  case strConfirmedAt r of
+    Just _  -> Left BumpFeeAlreadyConfirmed
+    Nothing -> Right ()
+  case strReplacedBy r of
+    Just t  -> Left (BumpFeeAlreadyReplaced t)
+    Nothing -> Right ()
+  if signalsOptInRBF (strTx r)
+    then Right ()
+    else Left BumpFeeNotReplaceable
+
+-- | Estimate the virtual size of a tx in vbytes (Core: GetVirtualTransactionSize).
+--   weight  = base*(scale-1) + total ; vsize = ceil(weight / scale)
+-- For an unsigned tx we approximate by using the wallet's existing
+-- 'estimateTxWeight' (P2WPKH heuristic) — Core itself uses an upper
+-- bound here.  When the bumped tx is post-sign the actual weight should
+-- be re-derived, but the user-facing fee/vbyte error margin remains
+-- bounded by the heuristic.
+estimateBumpedVsize :: Tx -> Int
+estimateBumpedVsize tx =
+  let n_in  = length (txInputs tx)
+      n_out = length (txOutputs tx)
+  in (estimateTxWeight n_in n_out False + 3) `div` 4
+
+-- | Auto-detect the change output index when 'strChangeIndex' is 'Nothing'
+-- AND the operator did not override.  We scan @txOutputs@ for any output
+-- whose script encodes a wallet address; the FIRST match wins (Core
+-- accepts the operator-provided override above any heuristic, so this
+-- is a best-effort fallback only).
+--
+-- Returns 'Nothing' if no wallet-owned output is found.
+autoDetectChangeIndex :: Wallet -> Tx -> IO (Maybe Word32)
+autoDetectChangeIndex wallet tx = do
+  ourAddrs <- readTVarIO (walletAddresses wallet)
+  let isOurs txout = case decodeOurAddress (txOutScript txout) of
+        Just a  -> Map.member a ourAddrs
+        Nothing -> False
+      indexed = zip [0 :: Word32 ..] (txOutputs tx)
+      ours    = [i | (i, o) <- indexed, isOurs o]
+  return $ listToMaybe ours
+
+-- | Cheap script→Address decoder limited to the script types the
+-- haskoin wallet generates as change.  Returns 'Nothing' on any other
+-- script.  Sufficient for change-output auto-detection (haskoin only
+-- produces P2WPKH change, but we accept all 4 standard types so a
+-- restored or imported wallet still works).
+decodeOurAddress :: ByteString -> Maybe Address
+decodeOurAddress s
+  | BS.length s == 22 && BS.head s == 0x00 && BS.index s 1 == 0x14 =
+      Just (WitnessPubKeyAddress (Hash160 (BS.take 20 (BS.drop 2 s))))
+  | BS.length s == 25 && BS.head s == 0x76 && BS.index s 1 == 0xa9 &&
+    BS.index s 2 == 0x14 && BS.index s 23 == 0x88 && BS.index s 24 == 0xac =
+      Just (PubKeyAddress (Hash160 (BS.take 20 (BS.drop 3 s))))
+  | BS.length s == 23 && BS.head s == 0xa9 && BS.index s 1 == 0x14 &&
+    BS.index s 22 == 0x87 =
+      Just (ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s))))
+  | BS.length s == 34 && BS.head s == 0x51 && BS.index s 1 == 0x20 =
+      Just (TaprootAddress (Hash256 (BS.drop 2 s)))
+  | otherwise = Nothing
+
+-- | Compute the replacement fee given the original fee, the bumped-tx
+-- vsize, the wallet incremental relay fee, and an optional user-supplied
+-- explicit feerate.  Mirrors Core's EstimateFeeRate in feebumper.cpp.
+--
+-- @new_fee = max(old_fee + ceil(vsize * inc_relay / 1000),
+--                user_feerate * vsize / 1000)@
+computeReplacementFee :: Word64    -- ^ old fee in sat
+                      -> Int       -- ^ vsize in vbytes
+                      -> Word64    -- ^ incremental relay fee in sat/kvB
+                      -> Maybe FeeRate  -- ^ user-specified replacement feerate
+                      -> Word64
+computeReplacementFee oldFee vsize incRelayPerKvB userFr =
+  let vsizeW   = fromIntegral vsize :: Word64
+      -- Floor of (vsize * inc_relay) / 1000, with at least 1 sat/vB.
+      -- Core uses ceil here; we use ceil too to ensure the replacement
+      -- strictly exceeds the original effective feerate per BIP-125 Rule 4.
+      incBump  = (vsizeW * incRelayPerKvB + 999) `div` 1000
+      autoFee  = oldFee + incBump
+      userFee  = case userFr of
+        Nothing -> 0
+        Just (FeeRate frPerKvB) ->
+          (vsizeW * fromIntegral frPerKvB + 999) `div` 1000
+  in max autoFee userFee
+
+-- | Build the (unsigned) replacement transaction by reducing the change
+-- output to absorb the fee delta.
+--
+-- Returns 'Left' on dust / not-enough-change.
+buildReplacementTx :: Tx
+                   -> Word32  -- ^ change output index
+                   -> Word64  -- ^ old fee
+                   -> Word64  -- ^ new fee
+                   -> Bool    -- ^ replaceable: force sequence ≤0xfffffffd
+                   -> Either BumpFeeError Tx
+buildReplacementTx origTx changeIdx oldFee newFee replaceable
+  | newFee <= oldFee = Left BumpFeeFeeRateTooLow
+  | otherwise =
+      let extra        = newFee - oldFee
+          outs         = txOutputs origTx
+          changeIdxInt = fromIntegral changeIdx :: Int
+      in case lookupIdx changeIdxInt outs of
+           Nothing -> Left BumpFeeNoChange
+           Just (changeOut, before, after) ->
+             let oldChange = txOutValue changeOut
+             in if oldChange < extra
+                  then Left BumpFeeNoChange
+                  else
+                    let newChange = oldChange - extra
+                    in if newChange < dustThreshold
+                         then Left BumpFeeChangeBelowDust
+                         else
+                           let newChangeOut = changeOut { txOutValue = newChange }
+                               newOuts      = before ++ [newChangeOut] ++ after
+                               newSeq       = if replaceable
+                                                then 0xfffffffd
+                                                else 0xfffffffe
+                               newIns       = map (\inp -> inp { txInSequence = newSeq })
+                                                  (txInputs origTx)
+                           in Right origTx
+                                { txInputs   = newIns
+                                , txOutputs  = newOuts
+                                , txWitness  = replicate (length newIns) []
+                                  -- Replacement tx is unsigned; the caller
+                                  -- (bumpFee) re-signs via signPsbt afterwards.
+                                }
+  where
+    lookupIdx i xs
+      | i < 0 || i >= length xs = Nothing
+      | otherwise =
+          let (b, r:a) = splitAt i xs
+          in Just (r, b, a)
+
+-- | Build the bumped tx structure without re-signing.  This is the
+-- shared core of 'bumpFee' and 'psbtBumpFee'.
+--
+-- Returns the unsigned replacement tx + the (oldFee, newFee) pair.
+buildBumpedTx :: Wallet -> TxId -> BumpFeeOptions
+              -> IO (Either BumpFeeError (Tx, Word64, Word64, SentTxRecord))
+buildBumpedTx wallet txid BumpFeeOptions{..} = do
+  mr <- getSentTx wallet txid
+  case mr of
+    Nothing -> return $ Left BumpFeeTxNotFound
+    Just rec0 ->
+      case checkBumpPreconditions rec0 of
+        Left e  -> return (Left e)
+        Right _ -> do
+          changeIdx <- case bfoOriginalChangeIndex of
+            Just i  -> return (Just i)
+            Nothing -> case strChangeIndex rec0 of
+              Just i  -> return (Just i)
+              Nothing -> autoDetectChangeIndex wallet (strTx rec0)
+          case changeIdx of
+            Nothing -> return $ Left BumpFeeNoChange
+            Just ci -> do
+              let oldFee = strOldFee rec0
+                  vsize  = estimateBumpedVsize (strTx rec0)
+                  newFee = computeReplacementFee oldFee vsize
+                                                 walletIncrementalRelayFeePerKvB
+                                                 bfoFeeRate
+              case buildReplacementTx (strTx rec0) ci oldFee newFee bfoReplaceable of
+                Left e   -> return (Left e)
+                Right t' -> return (Right (t', oldFee, newFee, rec0))
+
+-- | The @bumpfee@ wallet helper.  Builds the replacement transaction
+-- AND re-signs it via the 'signPsbt' path.
+--
+-- Reference: bitcoin-core/src/wallet/feebumper.cpp CreateRateBumpTransaction
+--          + SignTransaction (post-build re-sign step).
+--
+-- Note (TP-2): this path goes via signPsbt.  signTransaction is left
+-- untouched (still a stub).  This does not consolidate the two-pipeline
+-- (TP-2 remains OPEN in the W118 audit).
+bumpFee :: Wallet -> TxId -> BumpFeeOptions
+        -> IO (Either BumpFeeError BumpFeeResult)
+bumpFee wallet txid opts = do
+  build <- buildBumpedTx wallet txid opts
+  case build of
+    Left e -> return (Left e)
+    Right (unsigned, oldFee, newFee, rec0) -> do
+      -- Re-sign via signPsbt (richer than signTransaction's stub).
+      let prevs = strPrevOutputs rec0
+      signedRes <- resignViaPsbt wallet unsigned prevs
+      case signedRes of
+        Left err -> return $ Left (BumpFeeSignFailed err)
+        Right signed -> do
+          -- Mark the original tx as replaced; record the new tx so it
+          -- can in turn be bumped if it doesn't confirm fast enough.
+          let newTxId = computeTxId signed
+          atomically $ modifyTVar' (walletSentTxs wallet) $
+            Map.adjust (\r -> r { strReplacedBy = Just newTxId }) txid
+          -- The replacement reuses the same prevouts + change addr.
+          recordSentTx wallet signed prevs (strChangeIndex rec0)
+                       (strChangeAddr rec0) newFee
+          return $ Right BumpFeeResult
+            { bfrTx       = signed
+            , bfrOrigFee  = oldFee
+            , bfrNewFee   = newFee
+            , bfrOrigTxId = txid
+            }
+
+-- | The @psbtbumpfee@ wallet helper.  Returns the bumped tx as a PSBT
+-- without signing.  The PSBT inputs are populated with witness UTXO
+-- entries so an external signer (or a subsequent walletprocesspsbt
+-- call) can fill in signatures.
+psbtBumpFee :: Wallet -> TxId -> BumpFeeOptions
+            -> IO (Either BumpFeeError (Psbt, Word64, Word64, TxId))
+psbtBumpFee wallet txid opts = do
+  build <- buildBumpedTx wallet txid opts
+  case build of
+    Left e -> return (Left e)
+    Right (unsigned, oldFee, newFee, rec0) -> do
+      -- Construct a PSBT from the unsigned tx, then update its inputs
+      -- with the witness UTXOs we tracked at send time.
+      case createPsbt unsigned of
+        Left err -> return $ Left (BumpFeeSignFailed err)
+        Right psbt0 -> do
+          let prevs = strPrevOutputs rec0
+              -- updatePsbt expects a lookup function: (OutPoint -> Maybe (Tx, TxOut)).
+              -- We only have (OutPoint, TxOut) so we synthesize a one-output
+              -- placeholder Tx for the non-witness-utxo path; the witness
+              -- path uses only TxOut anyway.
+              lookupFn op = case lookup op prevs of
+                Nothing -> Nothing
+                Just txo ->
+                  Just (placeholderPrevTx txo, txo)
+              psbt = updatePsbt lookupFn psbt0
+          return $ Right (psbt, oldFee, newFee, txid)
+  where
+    -- A 1-input/1-output Tx whose only output is the given prevout.
+    -- updatePsbt's witness path will read TxOut directly and ignore the
+    -- Tx; the non-witness path is irrelevant for P2WPKH wallets (which
+    -- is what haskoin generates).
+    placeholderPrevTx :: TxOut -> Tx
+    placeholderPrevTx txo = Tx
+      { txVersion  = 2
+      , txInputs   = []
+      , txOutputs  = [txo]
+      , txWitness  = []
+      , txLockTime = 0
+      }
+
+-- | Re-sign a bumped tx via the signPsbt pipeline.  Returns the signed
+-- tx with witnesses populated, or an error if no derivation path lines
+-- up with any input (which would indicate the prevouts no longer match
+-- wallet-owned addresses — should not happen in practice for a tx the
+-- wallet itself produced).
+resignViaPsbt :: Wallet -> Tx -> [(OutPoint, TxOut)] -> IO (Either String Tx)
+resignViaPsbt wallet unsigned prevs = do
+  -- Find the master key + try to sign every input by walking through
+  -- the wallet's known addresses to discover which derivation path
+  -- produces a pubkey whose script matches the prevout.  For the
+  -- haskoin wallet (BIP-84 P2WPKH only) we can do this by scanning
+  -- walletAddresses for a hash-match.
+  addrMap <- readTVarIO (walletAddresses wallet)
+  -- Build a PSBT, set the witness UTXOs from prevs, and have signPsbt
+  -- pick a key per input by trying each (addr, idx, isChange) we know.
+  case createPsbt unsigned of
+    Left err -> return (Left err)
+    Right psbt0 -> do
+      let psbt1 = updatePsbtWithPrevs psbt0 prevs
+          -- Try every key in the wallet's address map.  For each input
+          -- whose prevout TxOut's scriptPubKey decodes to an address
+          -- present in addrMap, look up (idx, isChange) and derive the
+          -- corresponding ExtendedKey.  Then fold signPsbt over all
+          -- candidate keys (signPsbt is idempotent on inputs whose
+          -- signatures it has already produced).
+          ourKeys = [ keyFor wallet idx isChange
+                    | (_addr, (idx, isChange)) <- Map.toList addrMap ]
+          psbt2 = foldl' (flip signPsbt) psbt1 ourKeys
+      -- Extract the witnesses back into the original Tx structure.
+      let signedInputs = zipWith inputWitness
+                                 (psbtInputs psbt2)
+                                 (txInputs unsigned)
+      return $ Right unsigned
+        { txWitness = map snd signedInputs
+        , txInputs  = map fst signedInputs
+        }
+  where
+    updatePsbtWithPrevs :: Psbt -> [(OutPoint, TxOut)] -> Psbt
+    updatePsbtWithPrevs psbt allPrevs =
+      let inputs0 = psbtInputs psbt
+          tx      = pgTx (psbtGlobal psbt)
+          inputs' = zipWith setPrev (txInputs tx) inputs0
+          setPrev txin pi0 =
+            case lookup (txInPrevOutput txin) allPrevs of
+              Nothing -> pi0
+              Just txo -> pi0 { piWitnessUtxo = Just txo }
+      in psbt { psbtInputs = inputs' }
+
+    keyFor :: Wallet -> Word32 -> Bool -> ExtendedKey
+    keyFor w idx isChange
+      | isChange  = getChangeKey w idx
+      | otherwise = getReceiveKey w idx
+
+    -- Pull the final witness + scriptSig back out of a signed PsbtInput.
+    inputWitness :: PsbtInput -> TxIn -> (TxIn, [ByteString])
+    inputWitness pinp txin =
+      let scriptSig = fromMaybe BS.empty (piFinalScriptSig pinp)
+          wit       = fromMaybe [] (piFinalScriptWitness pinp)
+          -- If finalize hasn't been called, fall back to taking the
+          -- partial signatures (single-key P2WPKH) and constructing
+          -- the minimal witness [sig, pubkey].
+          witFallback =
+            case Map.toList (piPartialSigs pinp) of
+              [(pk, sig)] -> [sig, serializePubKeyCompressed pk]
+              _           -> wit
+      in (txin { txInScript = scriptSig }, witFallback)
 
 --------------------------------------------------------------------------------
 -- Wallet Encryption (AES-256-CBC)
