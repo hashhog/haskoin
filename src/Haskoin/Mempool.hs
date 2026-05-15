@@ -81,6 +81,7 @@ module Haskoin.Mempool
   , isConsistentPackage
   , isWellFormedPackage
   , isChildWithParents
+  , isChildWithParentsTree
   , calculatePackageFeeRate
     -- * v3/TRUC Transactions (BIP 431)
   , TrucError(..)
@@ -2068,6 +2069,29 @@ isChildWithParents txns =
       childInputTxids = Set.fromList $ map (outPointHash . txInPrevOutput) (txInputs child)
   in not (Set.null (Set.intersection parentTxids childInputTxids))
 
+-- | Check if a package is a child-with-parents-tree structure (Core IsChildWithParentsTree).
+-- The last transaction (child) must spend at least one output of a preceding tx, AND
+-- none of the preceding transactions (parents) may spend any output of another preceding tx.
+-- This rejects chains (A→B→C) where parent B depends on parent A.
+-- Reference: bitcoin-core/src/policy/packages.h:85
+-- Reference: bitcoin-core/src/policy/packages.cpp:136-149
+isChildWithParentsTree :: [Tx] -> Bool
+isChildWithParentsTree txns
+  | length txns < 2 = False
+  | otherwise =
+      let parents      = init txns
+          child        = last txns
+          parentTxids  = Set.fromList $ map computeTxId parents
+          -- Child must spend at least one parent output.
+          childInputs  = Set.fromList $ map (outPointHash . txInPrevOutput) (txInputs child)
+          childOk      = not (Set.null (Set.intersection parentTxids childInputs))
+          -- No parent may spend another parent's output.
+          parentsIndep = not $ any (\p ->
+              let pInputTxids = Set.fromList $ map (outPointHash . txInPrevOutput) (txInputs p)
+              in not (Set.null (Set.intersection parentTxids pInputTxids)))
+            parents
+      in childOk && parentsIndep
+
 -- | Calculate package fee rate (total fees / total vsize)
 calculatePackageFeeRate :: [Tx] -> Map OutPoint TxOut -> Either String FeeRate
 calculatePackageFeeRate txns utxoMap = do
@@ -2114,8 +2138,9 @@ acceptPackage pkg mp = do
     Left err -> return $ Left err
     Right () -> do
 
-      -- 2. Check child-with-parents structure
-      if not (isChildWithParents allTxns)
+      -- 2. Check child-with-parents-tree structure (Core IsChildWithParentsTree):
+      --    child must spend a parent AND no parent may depend on another parent.
+      if not (isChildWithParentsTree allTxns)
         then return $ Left PkgChildNoParentSpend
         else do
           -- 3. Check for duplicates with mempool

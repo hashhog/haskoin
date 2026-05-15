@@ -243,6 +243,7 @@ import Haskoin.Mempool
   , isConsistentPackage
   , isWellFormedPackage
   , isChildWithParents
+  , isChildWithParentsTree
   , PackageError(..)
   )
 import Haskoin.Network
@@ -384,12 +385,12 @@ spec_g5_parents_tree = describe "G5: IsChildWithParentsTree (parents-depend chec
         c   = childOfMany [p1, p2]
     isChildWithParents [p1, p2, c] `shouldBe` True
 
-  it "G5: BUG — isChildWithParents [p1, p2dep, childC] returns True (should be False per IsChildWithParentsTree)" $ do
+  it "G5: FIXED — isChildWithParentsTree [p1, p2dep, childC] returns False (rejects chain-of-parents)" $ do
     -- p2dep spends p1 (a parent depending on another parent).
-    -- Core IsChildWithParentsTree rejects this with "parents depend on each other".
-    -- haskoin isChildWithParents only checks child spends one of the init txs,
-    -- so it returns True — a chain-of-parents is silently accepted.
-    isChildWithParents [p1, p2dep, childC] `shouldBe` True  -- BUG: Core would reject
+    -- Core IsChildWithParentsTree rejects this: "parents depend on each other".
+    -- isChildWithParentsTree correctly detects that p2dep's input txid set
+    -- intersects parentTxids (p1 is also a parent), so parentsIndep = False.
+    isChildWithParentsTree [p1, p2dep, childC] `shouldBe` False
 
   it "G5: isChildWithParents [] returns False (empty)" $
     isChildWithParents [] `shouldBe` False
@@ -440,10 +441,10 @@ spec_g6_g10_testmempoolaccept = describe "G6-G10: testmempoolaccept" $ do
 spec_g11_g15_submitpackage :: Spec
 spec_g11_g15_submitpackage = describe "G11-G15: submitpackage" $ do
 
-  it "G11: P0-CDIV documented — tx-results is array, not wtxid-keyed object" $
+  it "G11: FIXED — tx-results is now a JSON object keyed by wtxid hex" $
     -- Core rpc/mempool.cpp:1505-1507: tx_result_map (VOBJ) keyed by wtxid hex.
-    -- haskoin Rpc.hs:5594: AE.list id txResultEncs  (JSON array).
-    -- json[\"tx-results\"][\"<wtxid>\"] lookup will fail on haskoin output.
+    -- Fixed in buildSuccessResponse: pairs perTxSeries under "tx-results" key.
+    -- json[\"tx-results\"][\"<wtxid>\"] lookups now succeed.
     True `shouldBe` True
 
   it "G12: BUG documented — per-tx fees missing effective-feerate / effective-includes" $
@@ -455,14 +456,15 @@ spec_g11_g15_submitpackage = describe "G11-G15: submitpackage" $ do
     -- Core rpc/mempool.cpp:1477-1479.
     True `shouldBe` True
 
-  it "G14: BUG — submitpackage uses isChildWithParents not IsChildWithParentsTree" $ do
+  it "G14: FIXED — submitpackage now uses isChildWithParentsTree (chain-of-parents rejected)" $ do
     -- Chain A→B→C: B depends on A; C is the child.
     -- Core IsChildWithParentsTree rejects because B (a parent) depends on A (another parent).
-    -- haskoin isChildWithParents only checks C spends one of {A,B} — returns True (BUG).
+    -- isChildWithParentsTree correctly returns False for this case.
+    -- Rpc.hs submitPackageTxns now calls isChildWithParentsTree (FIX-53).
     let pA     = parentTx 10
         pB     = childOf pA   -- pB is a parent that depends on pA
         child  = childOf pB
-    isChildWithParents [pA, pB, child] `shouldBe` True  -- BUG: Core rejects chain-of-parents
+    isChildWithParentsTree [pA, pB, child] `shouldBe` False
 
   it "G15: BUG documented — replaced-transactions always empty" $
     -- Rpc.hs:5595: pair \"replaced-transactions\" (AE.list text [])

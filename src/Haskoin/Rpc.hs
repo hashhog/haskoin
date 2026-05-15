@@ -272,7 +272,8 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          isRbfReplaceable,
                          -- Package relay (BIP-331) — submitpackage RPC
                          TxPackage(..), maxPackageCount, acceptPackage,
-                         isWellFormedPackage, isChildWithParents)
+                         isWellFormedPackage, isChildWithParents,
+                         isChildWithParentsTree)
 import qualified Haskoin.Mempool.Persist as MPP
 import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..),
                               estimateRawFee, RawFeeEstimate(..), RawBucketRange(..))
@@ -5460,21 +5461,25 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
       packageNotValidated :: Value
       packageNotValidated = String "package-not-validated"
 
-      mkAbortResults :: Value -> [Value]
+      -- Build a tx-results JSON object keyed by wtxid hex (Core wire format).
+      -- Core: tx_result_map (UniValue::VOBJ), keyed by wtxid_hex
+      -- Reference: bitcoin-core/src/rpc/mempool.cpp:1459-1507
+      mkAbortResults :: Value -> Value
       mkAbortResults reason =
-        [ object
-            [ "wtxid" .= showHash (BlockHash (getTxIdHash wtxid))
-            , "txid"  .= showHash (BlockHash (getTxIdHash txid))
-            , "error" .= reason
-            ]
-        | (wtxid, txid) <- skel
-        ]
+        object
+          [ Key.fromText (showHash (BlockHash (getTxIdHash wtxid))) .=
+              object
+                [ "txid"  .= showHash (BlockHash (getTxIdHash txid))
+                , "error" .= reason
+                ]
+          | (wtxid, txid) <- skel
+          ]
 
       buildAbortResponse :: Text -> Value -> RpcResponse
       buildAbortResponse pkgMsg reason = RpcResponse
         (object
-          [ "package_msg"          .= pkgMsg
-          , "tx-results"           .= mkAbortResults reason
+          [ "package_msg"           .= pkgMsg
+          , "tx-results"            .= mkAbortResults reason
           , "replaced-transactions" .= ([] :: [Text])
           ])
         Null Null
@@ -5527,10 +5532,10 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
           return $ buildAbortResponse "package topology disallowed"
                                       (String (T.pack (show perr)))
         Right () ->
-          if not (isChildWithParents multi)
+          if not (isChildWithParentsTree multi)
             then return $ buildAbortResponse
                             "package topology disallowed"
-                            (String "package topology disallowed: not child-with-parents")
+                            (String "package topology disallowed. not child-with-parents or parents depend on each other.")
             else do
               -- Drive the existing acceptPackage engine (parents init, child last).
               let parents = init multi
@@ -5573,25 +5578,27 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
                       return $ buildSuccessResponse entries
   where
     -- Build the success response from a list of (tx, txid, wtxid, maybe entry).
+    -- tx-results is a JSON object keyed by wtxid hex (Core wire format).
+    -- Reference: bitcoin-core/src/rpc/mempool.cpp:1459-1507
     buildSuccessResponse :: [(Tx, TxId, TxId, Maybe MempoolEntry)] -> RpcResponse
     buildSuccessResponse entries =
-      -- Build tx-results on the streaming path so fees.base uses
-      -- Core's fixed-decimal format (btcAmountEnc).
-      let txResultEncs =
-            [ let baseSeries =
-                    pair "wtxid" (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
-                    pair "txid"  (text (showHash (BlockHash (getTxIdHash txid))))
-                  extraSeries = case mEntry of
-                    Nothing -> mempty
-                    Just e  ->
-                      pair "vsize" (AE.int (meSize e)) <>
-                      pair "fees"  (pairs (pair "base" (btcAmountEnc (fromIntegral (meFee e)))))
-              in pairs (baseSeries <> extraSeries)
-            | (_tx, txid, wtxid, mEntry) <- entries
-            ]
+      -- Build tx-results as a JSON object keyed by wtxid hex.
+      -- Each value is an object with txid, vsize?, fees? fields.
+      let perTxSeries =
+            foldl' (<>) mempty
+              [ pair (Key.fromText (showHash (BlockHash (getTxIdHash wtxid))))
+                     (pairs $
+                        pair "txid" (text (showHash (BlockHash (getTxIdHash txid)))) <>
+                        case mEntry of
+                          Nothing -> mempty
+                          Just e  ->
+                            pair "vsize" (AE.int (meSize e)) <>
+                            pair "fees"  (pairs (pair "base" (btcAmountEnc (fromIntegral (meFee e))))))
+              | (_tx, txid, wtxid, mEntry) <- entries
+              ]
           enc = pairs $
                   pair "package_msg"           (text "success")               <>
-                  pair "tx-results"            (AE.list id txResultEncs)      <>
+                  pair "tx-results"            (pairs perTxSeries)            <>
                   pair "replaced-transactions" (AE.list text [])
       in RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
