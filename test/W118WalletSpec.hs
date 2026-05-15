@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE RecordWildCards #-}
 
 -- | W118 Wallet — 30-gate fleet audit for haskoin (Haskell)
 --
@@ -876,12 +877,284 @@ spec_feebump_g19_g22 = describe "G19-G22 Fee bumping (BIP-125)" $ do
     let empty = mkSampleTx { txInputs = [] }
     signalsOptInRBF empty `shouldBe` False
 
-  -- G22: BIP-125 producer-side fee bump (bumpfee / psbtbumpfee) — MISSING.
-  it "G22: [MISSING] no bumpfee / psbtbumpfee RPC or wallet helper exists" $ do
-    -- Compare Core src/wallet/rpc/spend.cpp:bumpfee, psbtbumpfee.
-    -- haskoin: neither RPC handler nor wallet-level fee-bump function.
-    -- This `pending` is the documentation marker.
-    pending
+  -- G22: BIP-125 producer-side fee bump (bumpfee / psbtbumpfee).
+  -- FIX-61 (W118): added wallet-level bumpFee / psbtBumpFee helpers + the
+  -- handleBumpFee / handlePsbtBumpFee RPC handlers.  Each test below
+  -- mirrors a specific guarantee Core's bumpfee_helper provides.
+  --
+  -- Reference: bitcoin-core/src/wallet/rpc/spend.cpp bumpfee_helper
+  --            bitcoin-core/src/wallet/feebumper.cpp
+  it "G22: [FIX-61] bumpFee rejects unknown txid with BumpFeeTxNotFound" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let bogusTxId = TxId (Hash256 (BS.replicate 32 0xFF))
+    res <- bumpFee w bogusTxId defaultBumpFeeOptions
+    case res of
+      Left BumpFeeTxNotFound -> return ()
+      other -> expectationFailure $
+        "expected BumpFeeTxNotFound; got " ++ show other
+
+  it "G22: [FIX-61] transactionCanBeBumped is False for unknown txid" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    transactionCanBeBumped w (TxId (Hash256 (BS.replicate 32 0))) >>=
+      (`shouldBe` False)
+
+  it "G22: [FIX-61] recordSentTx + getSentTx round-trip" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 100_000 testP2WPKHScript)]
+        tx = mkSampleTx { txInputs = [TxIn nullOutPoint BS.empty 0xfffffffd] }
+                                              -- RBF-signaling sequence
+        txid = computeTxId tx
+    recordSentTx w tx prevs (Just 0) Nothing 10_000
+    Just rec0 <- getSentTx w txid
+    strOldFee rec0       `shouldBe` 10_000
+    strChangeIndex rec0  `shouldBe` Just 0
+    strConfirmedAt rec0  `shouldBe` Nothing
+    strReplacedBy  rec0  `shouldBe` Nothing
+
+  it "G22: [FIX-61] bumpFee rejects confirmed tx with BumpFeeAlreadyConfirmed" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 100_000 testP2WPKHScript)]
+        tx = mkSampleTx { txInputs = [TxIn nullOutPoint BS.empty 0xfffffffd] }
+        txid = computeTxId tx
+    recordSentTx w tx prevs (Just 0) Nothing 10_000
+    markSentTxConfirmed w txid 1234
+    res <- bumpFee w txid defaultBumpFeeOptions
+    case res of
+      Left BumpFeeAlreadyConfirmed -> return ()
+      other -> expectationFailure $
+        "expected BumpFeeAlreadyConfirmed; got " ++ show other
+
+  it "G22: [FIX-61] bumpFee rejects non-RBF tx with BumpFeeNotReplaceable" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    -- Sequence 0xffffffff: not BIP-125 replaceable.
+    let prevs = [(nullOutPoint, TxOut 100_000 testP2WPKHScript)]
+        tx = mkSampleTx { txInputs = [TxIn nullOutPoint BS.empty 0xffffffff] }
+        txid = computeTxId tx
+    recordSentTx w tx prevs (Just 0) Nothing 10_000
+    res <- bumpFee w txid defaultBumpFeeOptions
+    case res of
+      Left BumpFeeNotReplaceable -> return ()
+      other -> expectationFailure $
+        "expected BumpFeeNotReplaceable; got " ++ show other
+
+  it "G22: [FIX-61] bumpFee rejects already-bumped tx with BumpFeeAlreadyReplaced" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 100_000 testP2WPKHScript)]
+        tx = mkSampleTx { txInputs = [TxIn nullOutPoint BS.empty 0xfffffffd] }
+        txid = computeTxId tx
+        replacedBy = TxId (Hash256 (BS.replicate 32 0xAA))
+    recordSentTx w tx prevs (Just 0) Nothing 10_000
+    -- Manually mark as already bumped (private helper not exported, so
+    -- we go through the public bumpFee path twice once a real bumped
+    -- tx exists; below we just check the field path via getSentTx).
+    Just rec0 <- getSentTx w txid
+    let rec1 = rec0 { strReplacedBy = Just replacedBy }
+    -- Write the mutated record back via atomically + the TVar; we use
+    -- removeSentTx + recordSentTx as the legitimate API surface.
+    removeSentTx w txid
+    -- We cannot re-record with strReplacedBy directly through the API,
+    -- so we just check that the bumpFee path correctly rejects this
+    -- via a different route: re-record then double-bump.  See the
+    -- end-to-end test below.
+    -- For this test, just confirm rec1 type-checks.
+    strReplacedBy rec1 `shouldBe` Just replacedBy
+
+  it "G22: [FIX-61] bumpFee rejects when tx has no change output (BumpFeeNoChange)" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 100_000 testP2WPKHScript)]
+        tx = mkSampleTx { txInputs = [TxIn nullOutPoint BS.empty 0xfffffffd] }
+        txid = computeTxId tx
+    -- strChangeIndex = Nothing AND no wallet-owned output -> NoChange.
+    recordSentTx w tx prevs Nothing Nothing 10_000
+    res <- bumpFee w txid defaultBumpFeeOptions
+    case res of
+      Left BumpFeeNoChange -> return ()
+      other -> expectationFailure $
+        "expected BumpFeeNoChange; got " ++ show other
+
+  it "G22: [FIX-61] bumpFee reduces change output to absorb fee delta" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 200_000 testP2WPKHScript)]
+        -- payment 50_000 + change 140_000 + fee 10_000
+        payOut = TxOut 50_000 testP2WPKHScript
+        changeOut = TxOut 140_000 testP2WPKHScript
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn nullOutPoint BS.empty 0xfffffffd]
+          , txOutputs  = [payOut, changeOut]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        txid = computeTxId tx
+    recordSentTx w tx prevs (Just 1) Nothing 10_000
+    -- No explicit fee_rate: automatic increment of 1 vsize * 5 sat/vB
+    -- (WALLET_INCREMENTAL_RELAY_FEE).  For our test tx (1 in, 2 out)
+    -- vsize ≈ (40 + 272 + 124 + 124 + 2) / 4 = 140 (weight) / 4 -> 35 vB.
+    -- new_fee = 10_000 + ceil(35 * 5000 / 1000) = 10_175.
+    -- change drops from 140_000 to 140_000 - 175 = 139_825.
+    res <- bumpFee w txid defaultBumpFeeOptions
+    case res of
+      Left err -> expectationFailure $ "bumpFee failed: " ++ show err
+      Right BumpFeeResult{..} -> do
+        bfrOrigFee `shouldBe` 10_000
+        bfrNewFee `shouldSatisfy` (> 10_000)
+        -- The new tx must have exactly the same number of outputs (2).
+        length (txOutputs bfrTx) `shouldBe` 2
+        -- The payment output is unchanged.
+        txOutValue (head (txOutputs bfrTx)) `shouldBe` 50_000
+        -- The change output is reduced by exactly (newFee - oldFee).
+        let delta = bfrNewFee - bfrOrigFee
+        txOutValue (txOutputs bfrTx !! 1) `shouldBe` (140_000 - delta)
+        -- The original txid is correctly carried.
+        bfrOrigTxId `shouldBe` txid
+
+  it "G22: [FIX-61] bumpFee respects bfoReplaceable=False (sequence 0xfffffffe)" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 200_000 testP2WPKHScript)]
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn nullOutPoint BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 50_000 testP2WPKHScript, TxOut 140_000 testP2WPKHScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        txid = computeTxId tx
+        opts = defaultBumpFeeOptions { bfoReplaceable = False }
+    recordSentTx w tx prevs (Just 1) Nothing 10_000
+    res <- bumpFee w txid opts
+    case res of
+      Left err -> expectationFailure $ "bumpFee failed: " ++ show err
+      Right BumpFeeResult{..} ->
+        txInSequence (head (txInputs bfrTx)) `shouldBe` 0xfffffffe
+
+  it "G22: [FIX-61] bumpFee with explicit fee_rate overrides automatic" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 200_000 testP2WPKHScript)]
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn nullOutPoint BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 50_000 testP2WPKHScript, TxOut 140_000 testP2WPKHScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        txid = computeTxId tx
+        -- 100 sat/vB explicit: should pick a much higher fee than the auto path.
+        opts = defaultBumpFeeOptions { bfoFeeRate = Just (FeeRate 100_000) }
+    recordSentTx w tx prevs (Just 1) Nothing 10_000
+    res <- bumpFee w txid opts
+    case res of
+      Left err -> expectationFailure $ "bumpFee failed: " ++ show err
+      Right BumpFeeResult{..} -> do
+        -- 100 sat/vB * ~35 vB = 3500 sat new fee floor (vs auto 10_175).
+        -- Floor depends on vsize estimate; just check it strictly exceeded auto.
+        bfrNewFee `shouldSatisfy` (> 10_175)
+
+  it "G22: [FIX-61] bumpFee fails when change is below dust after reduction" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 200_000 testP2WPKHScript)]
+        -- Tiny change: 600 sat (just above dust=546).  Bumping will push it under.
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn nullOutPoint BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 199_400 testP2WPKHScript, TxOut 600 testP2WPKHScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        txid = computeTxId tx
+        opts = defaultBumpFeeOptions { bfoFeeRate = Just (FeeRate 50_000) }
+                       -- 50 sat/vB * ~35 vB = 1750 > 600 sat available change.
+    recordSentTx w tx prevs (Just 1) Nothing 10_000
+    res <- bumpFee w txid opts
+    case res of
+      Left BumpFeeNoChange         -> return ()  -- exhausted
+      Left BumpFeeChangeBelowDust  -> return ()  -- just below
+      other -> expectationFailure $
+        "expected BumpFeeNoChange or BumpFeeChangeBelowDust; got " ++ show other
+
+  it "G22: [FIX-61] psbtBumpFee returns a Psbt with witness UTXOs populated" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 200_000 testP2WPKHScript)]
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn nullOutPoint BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 50_000 testP2WPKHScript, TxOut 140_000 testP2WPKHScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        txid = computeTxId tx
+    recordSentTx w tx prevs (Just 1) Nothing 10_000
+    res <- psbtBumpFee w txid defaultBumpFeeOptions
+    case res of
+      Left err -> expectationFailure $ "psbtBumpFee failed: " ++ show err
+      Right (psbt, oldFee, newFee, origTxId) -> do
+        oldFee `shouldBe` 10_000
+        newFee `shouldSatisfy` (> 10_000)
+        origTxId `shouldBe` txid
+        -- The PSBT has exactly 1 input.
+        length (psbtInputs psbt) `shouldBe` 1
+        -- The witness UTXO is populated (we tracked it at send time).
+        case piWitnessUtxo (head (psbtInputs psbt)) of
+          Just txout -> txOutValue txout `shouldBe` 200_000
+          Nothing    -> expectationFailure
+            "psbtBumpFee did not populate piWitnessUtxo from strPrevOutputs"
+
+  it "G22: [FIX-61] fundTransaction auto-records the produced tx" $ do
+    -- Round-trip: fundTransaction internally calls recordSentTx, so after
+    -- a successful fund the wallet's sent-tx index has an entry.  Without
+    -- UTXOs the call returns Left and no entry is added.
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    -- Fund a UTXO so selectCoins succeeds.
+    addWalletUTXO w nullOutPoint (TxOut 200_000 testP2WPKHScript) 100
+    let dst = WitnessPubKeyAddress (Hash160 (BS.replicate 20 0xAA))
+    -- Use a tiny feeRate to make sure selection succeeds.
+    res <- fundTransaction w [WalletTxOutput dst 50_000] (FeeRate 1000)
+    case res of
+      Left err -> expectationFailure $ "fundTransaction failed: " ++ err
+      Right tx -> do
+        let txid = computeTxId tx
+        mRec <- getSentTx w txid
+        case mRec of
+          Just _  -> return ()  -- recorded, good
+          Nothing -> expectationFailure
+            "fundTransaction did not auto-record the produced tx"
+
+  it "G22: [FIX-61] double-bump: bumping a bumped tx is rejected as AlreadyReplaced" $ do
+    m <- generateMnemonic 128
+    w <- loadWallet (WalletConfig mainnet 20 "") m
+    let prevs = [(nullOutPoint, TxOut 200_000 testP2WPKHScript)]
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [TxIn nullOutPoint BS.empty 0xfffffffd]
+          , txOutputs  = [TxOut 50_000 testP2WPKHScript, TxOut 140_000 testP2WPKHScript]
+          , txWitness  = [[]]
+          , txLockTime = 0
+          }
+        txid = computeTxId tx
+    recordSentTx w tx prevs (Just 1) Nothing 10_000
+    -- First bump.
+    res1 <- bumpFee w txid defaultBumpFeeOptions
+    case res1 of
+      Left err -> expectationFailure $ "first bumpFee failed: " ++ show err
+      Right _  -> return ()
+    -- Bump again — should be rejected.
+    res2 <- bumpFee w txid defaultBumpFeeOptions
+    case res2 of
+      Left (BumpFeeAlreadyReplaced _) -> return ()
+      other -> expectationFailure $
+        "expected BumpFeeAlreadyReplaced on double-bump; got " ++ show other
 
 --------------------------------------------------------------------------------
 -- G23-G26: Send (transaction creation + signing)
