@@ -674,28 +674,25 @@ spec_g21_cjdns_status = describe "G21: CJDNS operational status (MISSING ENTIREL
 --------------------------------------------------------------------------------
 
 spec_g22_unknown_netid :: Spec
-spec_g22_unknown_netid = describe "G22: P0-CDIV — unknown network ID causes hard parse fail" $ do
+spec_g22_unknown_netid = describe "G22: FIXED — unknown network ID silently skipped per BIP-155" $ do
 
-  it "G22: BUG — AddrV2 parse fails hard on unknown network ID (should skip per BIP-155)" $ do
-    -- BIP-155 §7: "Receivers MUST ignore addresses with unknown network IDs."
-    -- haskoin: fail $ "Unknown network ID: " ++ show netIdByte
-    -- The `fail` call aborts the cereal Get monad, so a SINGLE unknown-netid
-    -- entry poisons the ENTIRE AddrV2Msg parse.
-    -- Build a well-formed AddrV2Msg with netid=7 (unknown).
+  it "G22: known-netid round-trip still works after silent-skip fix" $ do
+    -- Sanity: the silent-skip wrapper must not break the happy path.
     let av2 = AddrV2
               { av2Time     = 1700000000
               , av2Services = 9
-              , av2NetId    = NetIPv4   -- we encode manually below
+              , av2NetId    = NetIPv4
               , av2Addr     = BS.pack [1,2,3,4]
               , av2Port     = 8333
               }
         goodMsg = AddrV2Msg [av2]
         goodBs  = encode goodMsg
-    -- Verify round-trip works for a known netid.
     decode goodBs `shouldBe` Right goodMsg
 
-  it "G22: BUG — manually-encoded unknown-netid=7 entry causes AddrV2Msg parse failure" $ do
-    -- Construct a raw addrv2 message with netid=7 (unknown per BIP-155).
+  it "G22: manually-encoded unknown-netid=7 entry is silently skipped (BIP-155 §3)" $ do
+    -- BIP-155 §3: "An addrv2 message may contain entries with network IDs that
+    -- are not known to the implementation.  These entries MUST be silently
+    -- skipped; the implementation MUST NOT close the connection in response."
     -- count=1 then entry: time(4LE) services(varint=9) netid(1=7) addrlen(4) addr(4) port(2BE)
     let rawMsg = BS.concat
           [ BS.singleton 0x01                     -- count = 1
@@ -707,16 +704,13 @@ spec_g22_unknown_netid = describe "G22: P0-CDIV — unknown network ID causes ha
           , BS.pack [0x20, 0x8D]                  -- port 8333 BE
           ]
         result = decode rawMsg :: Either String AddrV2Msg
-    -- Per BIP-155: should succeed and return an empty list (unknown entry skipped).
-    -- BUG: haskoin returns Left (parse error).
-    case result of
-      Left _  -> return ()  -- BUG: this is the current broken behaviour
-      Right _ -> expectationFailure "Expected parse failure for unknown netid (BUG not fixed yet)"
+    -- Per BIP-155: parse succeeds and the unknown entry is dropped.
+    result `shouldBe` Right (AddrV2Msg [])
 
-  it "G22: a single unknown-netid entry causes the entire AddrV2Msg to fail (blast radius)" $ do
-    -- If a mixed message has [IPv4, unknownNetid=7, TorV3], haskoin
-    -- fails parsing and drops ALL entries.  Core would accept IPv4 + TorV3.
-    -- This test demonstrates the blast radius of the current bug.
+  it "G22: mixed [IPv4, unknown=7, TorV3] yields [IPv4, TorV3] (blast-radius fix)" $ do
+    -- Pre-fix: a single unknown-netid entry aborted the entire parse and
+    -- callers saw zero addresses.  Post-fix: callers see the two valid
+    -- entries and the unknown is silently skipped.
     let mixedMsg = BS.concat
           [ BS.singleton 0x03                     -- count = 3
             -- entry 1: IPv4
@@ -742,8 +736,49 @@ spec_g22_unknown_netid = describe "G22: P0-CDIV — unknown network ID causes ha
           <> torV3Bytes
           <> BS.pack [0x20,0x8D]
         result = decode mixedMsg :: Either String AddrV2Msg
-    -- BUG: the whole message fails instead of accepting [IPv4, TorV3].
-    result `shouldSatisfy` (\r -> case r of Left _ -> True; Right _ -> False)
+    case result of
+      Left err -> expectationFailure $ "Expected silent-skip success, got: " ++ err
+      Right (AddrV2Msg entries) -> do
+        length entries `shouldBe` 2
+        av2NetId (entries !! 0) `shouldBe` NetIPv4
+        av2NetId (entries !! 1) `shouldBe` NetTorV3
+
+  it "G22: prescribed scenario — [IPv4, unknown=99, TorV3] yields [IPv4, TorV3]" $ do
+    -- Direct scenario from the FIX-57 spec: net ID 99 is far above any
+    -- defined BIP-155 value and must be silently skipped.
+    let mixedMsg = BS.concat
+          [ BS.singleton 0x03                     -- count = 3
+            -- entry 1: IPv4
+          , BS.pack [0x00,0x00,0x00,0x00]         -- time
+          , BS.singleton 0x09                     -- services
+          , BS.singleton 0x01                     -- IPv4
+          , BS.singleton 0x04                     -- len=4
+          , BS.pack [10,0,0,1]                    -- 10.0.0.1
+          , BS.pack [0x20,0x8D]                   -- port 8333
+            -- entry 2: UNKNOWN netid=99
+          , BS.pack [0x00,0x00,0x00,0x00]
+          , BS.singleton 0x09
+          , BS.singleton 99                       -- UNKNOWN netid = 99
+          , BS.singleton 0x08                     -- addrlen = 8 (arbitrary)
+          , BS.pack [0xde,0xad,0xbe,0xef,0xca,0xfe,0xba,0xbe]
+          , BS.pack [0x20,0x8D]                   -- port
+            -- entry 3: TorV3
+          , BS.pack [0x00,0x00,0x00,0x00]
+          , BS.singleton 0x09
+          , BS.singleton 0x04                     -- TorV3
+          , BS.singleton 0x20                     -- len=32
+          ]
+          <> torV3Bytes
+          <> BS.pack [0x20,0x8D]
+        result = decode mixedMsg :: Either String AddrV2Msg
+    case result of
+      Left err -> expectationFailure $ "Expected silent-skip success, got: " ++ err
+      Right (AddrV2Msg entries) -> do
+        length entries `shouldBe` 2
+        av2NetId (entries !! 0) `shouldBe` NetIPv4
+        av2NetId (entries !! 1) `shouldBe` NetTorV3
+        av2Addr  (entries !! 0) `shouldBe` BS.pack [10,0,0,1]
+        BS.length (av2Addr (entries !! 1)) `shouldBe` 32
 
 --------------------------------------------------------------------------------
 -- G23: Known-netid length mismatch correctly rejected
