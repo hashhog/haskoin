@@ -194,6 +194,12 @@ import Haskoin.Wallet
 import Haskoin.Types (TxId(..), Hash256(..), OutPoint(..),
                       TxIn(..), TxOut(..), Tx(..))
 
+-- FIX-62: BIP-21 URI parser is now wired (closes BUG-2).  G16/G28/G29
+-- are flipped from pending to real assertions below.
+import Haskoin.Bip21 (parseBip21, Bip21Uri(..))
+import Haskoin.Consensus (mainnet)
+import qualified Data.Map.Strict as Map
+
 --------------------------------------------------------------------------------
 -- Helpers
 --------------------------------------------------------------------------------
@@ -318,10 +324,36 @@ spec_send_g10_g15 = describe "G10-G15 Sender-side checks (anti-snoop)" $ do
 spec_query_errors_g16_g17 :: Spec
 spec_query_errors_g16_g17 = describe "G16-G17 Query params + errors" $ do
 
-  it "G16: query-params (v=1, additionalfeeoutputindex, ...) parser MISSING" $
-    pendingWith "BUG-1 + BUG-2: no `?v=1&additionalfeeoutputindex=N&\
-                \maxadditionalfeecontribution=X&disableoutputsubstitution=true&\
-                \minfeerate=R` query parsing; also no BIP-21 URI parser."
+  it "G16: BIP-21 query-string parser now PRESENT (FIX-62)" $ do
+    -- FIX-62 wired Haskoin.Bip21.  This locks the surface: the
+    -- BIP-78-specific subkeys (additionalfeeoutputindex,
+    -- maxadditionalfeecontribution, minfeerate, v=) ride on top of
+    -- BIP-21's generic query parser as 'uriExtras' entries until a
+    -- BIP-78 receiver consumes them.  The plain BIP-21 keys (amount,
+    -- label, pj, pjos) are first-class fields.  Full BIP-21 coverage:
+    -- see Bip21Spec.hs.
+    case parseBip21 mainnet
+          ("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+           <> "?amount=0.1"
+           <> "&pj=https%3A%2F%2Fpj.example%2Fpayjoin"
+           <> "&pjos=1"
+           <> "&v=1"
+           <> "&additionalfeeoutputindex=0"
+           <> "&maxadditionalfeecontribution=1000"
+           <> "&minfeerate=2") of
+      Right u -> do
+        uriAmount u `shouldBe` Just 10000000
+        uriPj u     `shouldBe` Just "https://pj.example/payjoin"
+        uriPjos u   `shouldBe` Just True
+        -- BIP-78-specific keys live in uriExtras until a BIP-78
+        -- receiver lands; verify they survive the parse intact.
+        Map.lookup "v" (uriExtras u) `shouldBe` Just "1"
+        Map.lookup "additionalfeeoutputindex" (uriExtras u)
+          `shouldBe` Just "0"
+        Map.lookup "maxadditionalfeecontribution" (uriExtras u)
+          `shouldBe` Just "1000"
+        Map.lookup "minfeerate" (uriExtras u) `shouldBe` Just "2"
+      Left err -> expectationFailure ("BIP-21 parse failed: " ++ show err)
 
   it "G17: receiver emits BIP-78 well-known error strings MISSING" $
     pendingWith "BUG-1: required error strings ('unavailable', \
@@ -401,13 +433,34 @@ spec_rpc_uri_g26_g30 = describe "G26-G30 RPC + URI + replay" $ do
                 \URI, builds the Original PSBT, POSTs, validates the \
                 \receiver's response, signs, and broadcasts — absent."
 
-  it "G28: BIP-21 URI `pj=` key MISSING" $
-    pendingWith "BUG-1 + BUG-2: no BIP-21 parser/emitter at all.  No \
-                \occurrences of 'bitcoin:' literal in src/ or app/."
+  it "G28: BIP-21 URI `pj=` key now PARSED (FIX-62)" $ do
+    -- FIX-62: Haskoin.Bip21 lifts pj= to a first-class Maybe Text on
+    -- Bip21Uri.  The BIP-78 receiver simply reads uriPj.  Note this
+    -- only proves the *URI surface*; the actual HTTP transport is
+    -- still BUG-3 (no http-client dep).
+    case parseBip21 mainnet
+          ("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+           <> "?pj=https%3A%2F%2Fpj.example.com%2Fpayjoin") of
+      Right u  -> uriPj u `shouldBe` Just "https://pj.example.com/payjoin"
+      Left err -> expectationFailure ("pj= parse failed: " ++ show err)
 
-  it "G29: BIP-21 URI `pjos=` (disable-output-substitution) MISSING" $
-    pendingWith "BUG-1 + BUG-2: same — no BIP-21 parser, no pjos= \
-                \default-true semantics."
+  it "G29: BIP-21 URI `pjos=` (disable-output-substitution) now PARSED (FIX-62)" $ do
+    -- FIX-62: pjos=0 / pjos=1 both round-trip via Maybe Bool, with
+    -- BTCPay tolerance for true/false aliases.  Default (absence of
+    -- the key) is left as `Nothing`; per BIP-78 the receiver should
+    -- then treat output-substitution as ALLOWED.
+    case parseBip21 mainnet
+          ("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?pjos=1") of
+      Right u  -> uriPjos u `shouldBe` Just True
+      Left err -> expectationFailure ("pjos=1 parse failed: " ++ show err)
+    case parseBip21 mainnet
+          ("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?pjos=0") of
+      Right u  -> uriPjos u `shouldBe` Just False
+      Left err -> expectationFailure ("pjos=0 parse failed: " ++ show err)
+    case parseBip21 mainnet
+          "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" of
+      Right u  -> uriPjos u `shouldBe` Nothing
+      Left err -> expectationFailure ("bare URI parse failed: " ++ show err)
 
   it "G30: receiver replay-protection cache MISSING" $
     pendingWith "BUG-1: BIP-78 receiver should reject duplicate \

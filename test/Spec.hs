@@ -112,6 +112,7 @@ import qualified W116PackageRelaySpec
 import qualified W117BIP155NetworksSpec
 import qualified W118WalletSpec
 import qualified W119PayjoinSpec
+import qualified Bip21Spec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22554,6 +22555,9 @@ main = hspec $ do
 
   -- W119 BIP-78 PayJoin 30-gate audit
   W119PayjoinSpec.spec
+
+  -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
+  Bip21Spec.spec
 
   where
     sampleTx = Tx
