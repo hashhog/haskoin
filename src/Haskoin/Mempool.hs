@@ -35,6 +35,7 @@ module Haskoin.Mempool
   , noopCoinMtp
     -- * Transaction Operations
   , addTransaction
+  , testAcceptTransaction
   , removeTransaction
   , getTransaction
   , getTransactionByWtxid
@@ -970,6 +971,41 @@ handleTruc mp tx txid fee vsize txSigOpCost ancestors = do
     Left trucErr -> return $ Left (ErrTrucViolation trucErr)
     Right _ -> continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors
 
+-- | Build a MempoolEntry from validated transaction data (no TVar writes).
+-- Used by both 'continueAddTransaction' (commit path) and 'testAcceptTransaction'
+-- (dry-run path).  Mirrors the entry construction in Bitcoin Core's
+-- AddUnchecked (txmempool.cpp) without the side-effecting insertion.
+buildMempoolEntry :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO MempoolEntry
+buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors = do
+  let adjVsize = calculateAdjustedVSize tx txSigOpCost
+      feeRate  = calculateFeeRate fee adjVsize
+  now    <- round <$> getPOSIXTime
+  height <- readTVarIO (mpHeight mp)
+  let rbfOptIn      = signalsOptInRBF tx
+      ancestorCount = length ancestors + 1
+      ancestorSize  = sum (map meSize ancestors) + adjVsize
+      ancestorFees  = sum (map meFee ancestors) + fee
+      ancestorSigOps = sum (map meAncestorSigOps ancestors) + txSigOpCost
+      wtxid = computeWtxid tx
+  return MempoolEntry
+    { meTransaction    = tx
+    , meTxId           = txid
+    , meWtxid          = wtxid
+    , meFee            = fee
+    , meFeeRate        = feeRate
+    , meSize           = adjVsize
+    , meTime           = now
+    , meHeight         = height
+    , meAncestorCount  = ancestorCount
+    , meAncestorSize   = ancestorSize
+    , meAncestorFees   = ancestorFees
+    , meAncestorSigOps = ancestorSigOps
+    , meDescendantCount = 1
+    , meDescendantSize  = adjVsize
+    , meDescendantFees  = fee
+    , meRBFOptIn       = rbfOptIn
+    }
+
 -- | Continue adding a transaction after all checks pass
 continueAddTransaction :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO (Either MempoolError TxId)
 continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
@@ -979,40 +1015,11 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
   -- in bitcoin-core/src/policy/policy.cpp:400-403.
   -- The unadjusted `vsize` (weight-only) was used for the min-relay-fee gate;
   -- the adjusted `adjVsize` is what Core stores and uses for fee-rate comparisons.
-  let adjVsize = calculateAdjustedVSize tx txSigOpCost
-      feeRate = calculateFeeRate fee adjVsize
-  -- Build and insert the entry
-  now <- round <$> getPOSIXTime
-  height <- readTVarIO (mpHeight mp)
-  let rbfOptIn = signalsOptInRBF tx
-      -- Ancestor counts include this transaction (self is included in all ancestor_ fields)
-      ancestorCount = length ancestors + 1
-      ancestorSize = sum (map meSize ancestors) + adjVsize
-      ancestorFees = sum (map meFee ancestors) + fee
-      -- meAncestorSigOps accumulates ancestors' own sigop costs plus self.
-      -- Each ancestor's meAncestorSigOps already includes that ancestor's
-      -- own sigop cost; we add only self's cost to avoid double-counting.
-      -- Reference: Bitcoin Core CTxMemPool nAncestorSigOpCost tracking.
-      ancestorSigOps = sum (map meAncestorSigOps ancestors) + txSigOpCost
-      wtxid = computeWtxid tx
-      entry = MempoolEntry
-        { meTransaction = tx
-        , meTxId = txid
-        , meWtxid = wtxid
-        , meFee = fee
-        , meFeeRate = feeRate
-        , meSize = adjVsize
-        , meTime = now
-        , meHeight = height
-        , meAncestorCount = ancestorCount
-        , meAncestorSize = ancestorSize
-        , meAncestorFees = ancestorFees
-        , meAncestorSigOps = ancestorSigOps
-        , meDescendantCount = 1  -- includes self
-        , meDescendantSize = adjVsize  -- includes self
-        , meDescendantFees = fee  -- includes self
-        , meRBFOptIn = rbfOptIn
-        }
+  entry <- buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors
+  let adjVsize = meSize entry
+      feeRate  = meFeeRate entry
+      wtxid    = meWtxid entry
+      commitFee = meFee entry
 
   -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync)
   atomically $ do
@@ -1024,12 +1031,13 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
     modifyTVar' (mpSize mp) (+ adjVsize)
 
   -- Update ancestor entries with new descendant
-  atomically $ forM_ ancestors $ \anc ->
+  let ancUpdates = map meTxId ancestors
+  atomically $ forM_ ancUpdates $ \ancId ->
     modifyTVar' (mpEntries mp) $ Map.adjust
       (\e -> e { meDescendantCount = meDescendantCount e + 1
-               , meDescendantSize = meDescendantSize e + adjVsize
-               , meDescendantFees = meDescendantFees e + fee
-               }) (meTxId anc)
+               , meDescendantSize  = meDescendantSize  e + adjVsize
+               , meDescendantFees  = meDescendantFees  e + commitFee
+               }) ancId
 
   -- Evict if mempool is too large
   totalSize <- readTVarIO (mpSize mp)
@@ -1037,6 +1045,145 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
     evictLowestFee mp
 
   return $ Right txid
+
+-- | Dry-run variant of 'continueAddTransaction': runs TRUC check and
+-- builds the entry but does NOT insert into any TVar.
+-- Returns 'Right entry' on success so the caller can read fee/vsize.
+-- Mirrors Bitcoin Core validation.cpp:1388 test_accept early-return path.
+continueAddTransactionDry :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO (Either MempoolError MempoolEntry)
+continueAddTransactionDry mp tx txid fee vsize txSigOpCost ancestors = do
+  entry <- buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors
+  return $ Right entry
+
+-- | Helper: TRUC check for dry-run path — returns entry instead of committing.
+handleTrucDry :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry]
+              -> IO (Either MempoolError MempoolEntry)
+handleTrucDry mp tx txid fee vsize txSigOpCost ancestors = do
+  trucResult <- checkTrucPolicy tx vsize mp
+  case trucResult of
+    Left trucErr -> return $ Left (ErrTrucViolation trucErr)
+    Right _      -> continueAddTransactionDry mp tx txid fee vsize txSigOpCost ancestors
+
+-- | Dry-run finalizeTransaction: runs all gates but does NOT commit.
+finalizeTransactionDry :: Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> IO (Either MempoolError MempoolEntry)
+finalizeTransactionDry mp tx txid inputPairs = do
+  let inputMap = Map.fromList inputPairs
+      totalIn  = sum $ map (txOutValue . snd) inputPairs
+      totalOut = sum $ map txOutValue (txOutputs tx)
+  if totalIn < totalOut
+    then return $ Left ErrInsufficientFee
+    else do
+      let baseFee = totalIn - totalOut
+          vsize   = calculateVSize tx
+      feeDeltas <- readTVarIO (mpFeeDeltas mp)
+      let delta = Map.findWithDefault 0 txid feeDeltas
+          modifiedFee :: Word64
+          modifiedFee
+            | delta >= 0 = baseFee + fromIntegral delta
+            | otherwise  =
+                let absD = fromIntegral (negate delta) :: Word64
+                in if absD > baseFee then 0 else baseFee - absD
+          fee          = baseFee
+          modifiedRate = calculateFeeRate modifiedFee vsize
+      if modifiedRate < mpcMinFeeRate (mpConfig mp)
+        then return $ Left (ErrFeeBelowMinimum modifiedRate (mpcMinFeeRate (mpConfig mp)))
+        else case mpcMaxFeeRate (mpConfig mp) of
+          Just cap | modifiedRate > cap ->
+            return $ Left (ErrMaxFeeRateExceeded modifiedRate cap)
+          _ ->
+            case validateInputsStandardness tx inputPairs of
+              Left (idx, reason) ->
+                return $ Left (ErrInputsNotStandard idx reason)
+              Right () -> do
+                let prevScripts = map (txOutScript . snd) inputPairs
+                    witStacks   = txWitness tx
+                case Std.checkWitnessStandard tx prevScripts witStacks of
+                  Left wsErr -> return $ Left (ErrNonStandard (renderWitnessStdReason wsErr))
+                  Right () ->
+                    case generalEphemeralPreCheck tx modifiedFee of
+                      Left dustIdx -> return $
+                        Left (ErrNonStandard ("dust (output " ++ show dustIdx ++ ")"))
+                      Right () ->
+                        case checkEphemeralPreCheck tx fee of
+                          Left ephErr ->
+                            return $ Left (ErrEphemeralViolation ephErr)
+                          Right () -> do
+                            tipHeight <- readTVarIO (mpHeight mp)
+                            let sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipHeight + 1)
+                                SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
+                            if txSigOpCost > maxStandardTxSigOpsCost
+                              then return $ Left (ErrNonStandard "bad-txns-too-many-sigops")
+                              else do
+                                scriptResult <- verifyAllScripts mp tx inputMap
+                                case scriptResult of
+                                  Left err -> return $ Left err
+                                  Right () -> do
+                                    ancestorResult <- checkAncestorLimits mp tx vsize
+                                    case ancestorResult of
+                                      Left err -> return $ Left err
+                                      Right ancestors ->
+                                        handleTrucDry mp tx txid fee vsize txSigOpCost ancestors
+
+-- | Test whether a transaction would be accepted by the mempool without
+-- modifying any mempool state.
+--
+-- Mirrors Bitcoin Core MemPoolAccept with @test_accept = true@
+-- (validation.cpp:1388): all validation gates run but @AddUnchecked@ is
+-- never called, so no TVar is ever written.  In contrast, the old
+-- @addTransaction@ + @removeTransaction@ idiom created a race window
+-- where another thread could observe the transaction as "in mempool"
+-- between the insert and the remove.
+--
+-- Returns @Left err@ if the transaction would be rejected, or
+-- @Right entry@ with the computed 'MempoolEntry' (fee, vsize, etc.) if
+-- it would be accepted.  The caller can read 'meFee' and 'meSize' from
+-- the returned entry to populate the RPC response.
+testAcceptTransaction :: Mempool -> Tx -> IO (Either MempoolError MempoolEntry)
+testAcceptTransaction mp tx = do
+  let txid  = computeTxId tx
+      wtxid = computeWtxid tx
+  -- Duplicate checks (same as addTransaction)
+  byWtxid <- atomically $ Map.lookup wtxid <$> readTVar (mpByWtxid mp)
+  case byWtxid of
+    Just _ -> return $ Left ErrAlreadyInMempool
+    Nothing -> do
+      byTxid <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
+      case byTxid of
+        Just _ -> return $ Left ErrSameNonwitnessInMempool
+        Nothing -> testAcceptTransactionInner mp tx txid
+
+-- | Inner dry-run validation (mirrors addTransactionInner without commits).
+testAcceptTransactionInner :: Mempool -> Tx -> TxId -> IO (Either MempoolError MempoolEntry)
+testAcceptTransactionInner mp tx txid = do
+  case validateTransaction tx of
+    Left err -> return $ Left (ErrValidationFailed err)
+    Right () | isCoinbase tx -> return $ Left ErrCoinbaseNotAllowed
+    Right () ->
+      case Std.checkStandardTx tx of
+        Left stdErr -> return $ Left (ErrNonStandard (renderStdReason stdErr))
+        Right () -> do
+          height <- readTVarIO (mpHeight mp)
+          mtp    <- readTVarIO (mpMTP mp)
+          let nextHeight = height + 1
+          if not (isFinalTxCheck tx nextHeight mtp)
+            then return $ Left (ErrNonFinal "non-final")
+            else do
+              seqLockResult <- checkSeqLocksAtTip mp tx height mtp
+              case seqLockResult of
+                Left err -> return $ Left err
+                Right () -> do
+                  -- For the dry-run we resolve inputs read-only (no writes),
+                  -- and treat any conflict as a rejection (we don't attempt
+                  -- RBF in test-accept mode, matching Core's behaviour where
+                  -- test_accept with conflicts returns "txn-mempool-conflict").
+                  conflicts <- getConflicts mp tx
+                  if not (null conflicts)
+                    then return $ Left (ErrInputSpentInMempool (head conflicts))
+                    else do
+                      inputResults <- resolveInputs mp tx
+                      case inputResults of
+                        Left err     -> return $ Left err
+                        Right inputPairs -> finalizeTransactionDry mp tx txid inputPairs
 
 -- | Resolve all inputs of a transaction
 -- Returns the OutPoint -> TxOut mapping, or an error
