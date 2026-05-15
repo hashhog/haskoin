@@ -2276,11 +2276,17 @@ calculatePackageFeeRate txns utxoMap = do
 -- | Accept a package into the mempool
 -- Validates the package as a unit using package feerate.
 -- A parent with low feerate can be accepted if the package feerate is sufficient.
+--
+-- BUG-G16 fix: de-duplicate already-in-mempool transactions (mirrors Core
+-- ProcessNewPackage validation.cpp:1661-1675).  Txs already in the mempool
+-- receive a MEMPOOL_ENTRY result; only genuinely new txs are submitted to
+-- acceptPackageInner.  If every tx is already in the mempool the call
+-- succeeds and returns the empty list (nothing newly admitted).
 acceptPackage :: TxPackage -> Mempool -> IO (Either PackageError [TxId])
 acceptPackage pkg mp = do
   let allTxns = pkgParents pkg ++ [pkgChild pkg]
 
-  -- 1. Context-free validation
+  -- 1. Context-free validation (applied to the full declared package).
   case isWellFormedPackage allTxns of
     Left err -> return $ Left err
     Right () -> do
@@ -2290,13 +2296,16 @@ acceptPackage pkg mp = do
       if not (isChildWithParentsTree allTxns)
         then return $ Left PkgChildNoParentSpend
         else do
-          -- 3. Check for duplicates with mempool
+          -- 3. De-duplicate: remove txs already in the mempool (MEMPOOL_ENTRY).
+          --    Core validation.cpp:1661-1675 records MEMPOOL_ENTRY for them and
+          --    continues processing the remaining new txs.  We drop them from
+          --    allTxns so they don't hit acceptPackageInner / addPackageTransactions.
           entries <- readTVarIO (mpEntries mp)
-          let txids = map computeTxId allTxns
-              duplicates = filter (`Map.member` entries) txids
-          case duplicates of
-            [] -> acceptPackageInner pkg mp allTxns
-            (dup:_) -> return $ Left $ PkgTxError dup ErrAlreadyInMempool
+          let newTxns = filter (\tx -> not (Map.member (computeTxId tx) entries)) allTxns
+          if null newTxns
+            -- Every tx is already in the mempool — nothing to do.
+            then return $ Right []
+            else acceptPackageInner pkg mp newTxns
 
 -- | Inner package acceptance after basic validation
 acceptPackageInner :: TxPackage -> Mempool -> [Tx] -> IO (Either PackageError [TxId])
@@ -2526,15 +2535,28 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
                                     Left err -> return $ Left $ PkgTxError txid
                                                             (ErrScriptVerificationFailed err)
                                     Right () -> do
-                                      result <- addTransactionToMempool mp tx txid inputs fee vsize
-                                      case result of
-                                        Left err -> return $ Left $ PkgTxError txid err
-                                        Right () -> do
-                                          let newOutputs = Map.fromList
-                                                [ (OutPoint txid (fromIntegral idx), out)
-                                                | (idx, out) <- zip [0..] (txOutputs tx)
-                                                ]
-                                          go rest (txid : acc) (Map.union newOutputs localOutputs)
+                                      -- BUG-G17 fix (TP-1): enforce TRUC/v3 policy in the
+                                      -- package path.  The single-tx path calls
+                                      -- checkTrucPolicy via handleTruc (Mempool.hs:960).
+                                      -- addPackageTransactions previously jumped directly
+                                      -- to addTransactionToMempool, skipping this gate
+                                      -- entirely.  A v3 parent could therefore have more
+                                      -- than one unconfirmed child when submitted as a
+                                      -- package, violating BIP-431.
+                                      trucResult <- checkTrucPolicy tx vsize mp
+                                      case trucResult of
+                                        Left trucErr -> return $ Left $
+                                          PkgTxError txid (ErrTrucViolation trucErr)
+                                        Right _ -> do
+                                          result <- addTransactionToMempool mp tx txid inputs fee vsize
+                                          case result of
+                                            Left err -> return $ Left $ PkgTxError txid err
+                                            Right () -> do
+                                              let newOutputs = Map.fromList
+                                                    [ (OutPoint txid (fromIntegral idx), out)
+                                                    | (idx, out) <- zip [0..] (txOutputs tx)
+                                                    ]
+                                              go rest (txid : acc) (Map.union newOutputs localOutputs)
 
 -- | Verify all scripts for a transaction (variant returning String error).
 -- Same Taproot-aware refactor as 'verifyAllScripts': pre-collect prevouts
