@@ -169,6 +169,17 @@ data NodeOptions = NodeOptions
     -- as reachable and stores / advertises CJDNS peers.  Operator is
     -- responsible for having a working CJDNS interface up; we do not
     -- bring up cjdroute ourselves.  W117 DH-1 + DH-2 wire.
+  , noRpcTlsCert         :: !(Maybe FilePath)
+    -- ^ @--rpc-tls-cert=\<file\>@: optional X.509 certificate (PEM)
+    -- for HTTPS termination on the RPC listener.  When set together
+    -- with @--rpc-tls-key@, the JSON-RPC / REST listener serves over
+    -- TLS via warp-tls.  When neither flag is set, the listener
+    -- stays plain HTTP (backward-compat).  Setting only one of the
+    -- two is a startup error (mirrors Core's @httpserver.cpp@).
+    -- W119 + FIX-64.
+  , noRpcTlsKey          :: !(Maybe FilePath)
+    -- ^ @--rpc-tls-key=\<file\>@: PEM private key matching
+    -- @--rpc-tls-cert@. See 'noRpcTlsCert' for the full contract.
   } deriving (Show)
 
 data WalletCommand
@@ -306,6 +317,15 @@ parseNodeOptions = NodeOptions
                 \addrv2 peers are stored / advertised / relayed. \
                 \Operator is responsible for cjdroute setup; we do \
                 \not start the interface. Default: off.")
+  -- W119 + FIX-64: optional HTTPS termination on the RPC listener.
+  <*> optional (strOption (long "rpc-tls-cert" <> metavar "PATH"
+        <> help "PEM X.509 certificate for HTTPS termination on the \
+                \RPC listener. Must be paired with --rpc-tls-key. \
+                \When neither flag is set, the listener stays plain \
+                \HTTP. Setting only one of the two is a startup error."))
+  <*> optional (strOption (long "rpc-tls-key" <> metavar "PATH"
+        <> help "PEM private key for HTTPS termination. Pair with \
+                \--rpc-tls-cert."))
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -520,6 +540,14 @@ applyConfigOverlay cm n = n
   , noAsmapFile  = case noAsmapFile n of
                      Just _  -> noAsmapFile n
                      Nothing -> Daemon.configLookup "asmap" cm
+  -- W119 + FIX-64: TLS cert/key may also be sourced from the config
+  -- file (rpc-tls-cert + rpc-tls-key) when the CLI flag is absent.
+  , noRpcTlsCert = case noRpcTlsCert n of
+                     Just _  -> noRpcTlsCert n
+                     Nothing -> Daemon.configLookup "rpc-tls-cert" cm
+  , noRpcTlsKey  = case noRpcTlsKey n of
+                     Just _  -> noRpcTlsKey n
+                     Nothing -> Daemon.configLookup "rpc-tls-key" cm
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
@@ -1159,6 +1187,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           --   CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
           --   flagged the previous always-on listener as a P3
           --   over-exposure.
+          , rpcTlsCertFile = noRpcTlsCert
+          , rpcTlsKeyFile  = noRpcTlsKey
+          -- ^ W119 + FIX-64: optional HTTPS termination via warp-tls.
+          --   Both set => listener runs WarpTLS.runTLS; both unset =>
+          --   plain HTTP (backward-compat).  Half-configured TLS
+          --   aborts at startup inside startRpcServer.
           }
     -- Plumb the parsed --prune=N config into the RPC server.  The
     -- 'pruneblockchain' RPC refuses calls when prune mode is off
