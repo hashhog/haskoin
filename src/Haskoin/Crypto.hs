@@ -19,6 +19,7 @@ module Haskoin.Crypto
   , serializePubKeyCompressed
   , serializePubKeyUncompressed
   , parsePubKey
+  , pubKeyTweakAdd
     -- * Signatures
   , Sig(..)
   , signMsg
@@ -146,6 +147,18 @@ foreign import ccall unsafe "haskoin_ec_pubkey_create"
                      -> Ptr CUChar    -- output (33 or 65 bytes)
                      -> Ptr CSize     -- in/out length
                      -> IO CInt
+
+-- | FFI binding for BIP-32 CKDpub: child = parent + tweak*G.
+-- Wraps libsecp256k1's @secp256k1_ec_pubkey_tweak_add@.  Returns 0 on
+-- failure (invalid parent, tweak >= curve order, point-at-infinity);
+-- the BIP-32 spec instructs the caller to advance the child index and
+-- retry on failure.  Reference: @bitcoin-core/src/pubkey.cpp@
+-- `CPubKey::Derive`.
+foreign import ccall unsafe "haskoin_ec_pubkey_tweak_add"
+  c_ec_pubkey_tweak_add :: Ptr CUChar  -- parent_pubkey33
+                        -> Ptr CUChar  -- tweak32
+                        -> Ptr CUChar  -- output33
+                        -> IO CInt
 
 -- | FFI binding for ECDSA recoverable-compact signing
 -- (signmessage / verifymessage layout: header byte + 64 byte R||S).
@@ -447,6 +460,36 @@ parsePubKey bs
   | BS.length bs == 65 && (BS.head bs == 0x04 || BS.head bs == 0x06 || BS.head bs == 0x07) =
       Just (PubKeyUncompressed bs)
   | otherwise = Nothing
+
+-- | BIP-32 CKDpub primitive: compute @parent_pubkey + tweak*G@.
+--
+-- The parent must be a 33-byte compressed pubkey; the tweak is a 32-byte
+-- big-endian scalar (typically the IL half of HMAC-SHA512 in CKDpub).
+-- Returns 'Nothing' on:
+--
+--   * malformed parent (wrong length or invalid X coordinate)
+--   * malformed tweak (wrong length)
+--   * tweak >= curve order n
+--   * result is the point at infinity
+--
+-- BIP-32 instructs callers to advance the child index and retry on
+-- 'Nothing'.  The returned bytes are 33-byte compressed.
+--
+-- Reference: @bitcoin-core/src/pubkey.cpp@ `CPubKey::Derive` (uses
+-- @secp256k1_ec_pubkey_tweak_add@ identically to this wrapper).
+pubKeyTweakAdd :: ByteString -> ByteString -> Maybe ByteString
+pubKeyTweakAdd parent33 tweak32
+  | BS.length parent33 /= 33 = Nothing
+  | BS.length tweak32  /= 32 = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen parent33 $ \(pPtr, _) ->
+        BS.useAsCStringLen tweak32 $ \(tPtr, _) ->
+          allocaArray 33 $ \outPtr -> do
+            ok <- c_ec_pubkey_tweak_add
+                    (castPtr pPtr) (castPtr tPtr) outPtr
+            if ok == 1
+              then Just <$> BS.packCStringLen (castPtr outPtr, 33)
+              else return Nothing
 
 --------------------------------------------------------------------------------
 -- Signature Types
