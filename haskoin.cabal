@@ -47,6 +47,7 @@ library
                  , resourcet
                  , aeson
                  , warp
+                 , warp-tls
                  , wai
                  , http-types
                  , base16-bytestring
@@ -128,6 +129,7 @@ test-suite haskoin-test
                , W118WalletSpec
                , W119PayjoinSpec
                , Bip21Spec
+               , Fix64TlsSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
@@ -149,8 +151,13 @@ test-suite haskoin-test
                , directory
                , network
                , time
+               , wai
+               , warp
+               , warp-tls
+               , http-types
+               , process
   default-language: Haskell2010
-  ghc-options:     -Wall -O2
+  ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
 
 test-suite sighash-vectors
   type:          exitcode-stdio-1.0

@@ -29,6 +29,9 @@ module Haskoin.Rpc
   , defaultRpcConfig
   , startRpcServer
   , stopRpcServer
+    -- * TLS (HTTPS) configuration — W119 + FIX-64
+  , validateTlsConfig
+  , rpcTlsSettings
     -- * Request/Response Types
   , RpcRequest(..)
   , RpcResponse(..)
@@ -152,7 +155,9 @@ import Data.Int (Int32, Int64)
 import Network.Wai (Application, Request, Response, responseLBS, requestBody,
                     requestMethod, requestHeaders, pathInfo, rawPathInfo,
                     rawQueryString)
-import Network.Wai.Handler.Warp (run, Settings, defaultSettings, setPort, setHost)
+import Network.Wai.Handler.Warp (run, runSettings, Settings, defaultSettings, setPort, setHost)
+import qualified Network.Wai.Handler.WarpTLS as WarpTLS
+import Data.String (fromString)
 import Network.HTTP.Types (status200, status400, status401, status404, status405,
                            status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
@@ -331,6 +336,20 @@ data RpcConfig = RpcConfig
                                 -- as Core does when @-rest=0@. Audit:
                                 -- CORE-PARITY-AUDIT/_rest-api-cross-impl-audit-2026-05-06-part2.md
                                 -- (R7 / Pattern P4).
+  , rpcTlsCertFile :: !(Maybe FilePath)
+    -- ^ @-rpctlscert=\<file\>@: optional X.509 certificate (PEM)
+    -- for HTTPS termination on the RPC listener.  When BOTH
+    -- 'rpcTlsCertFile' and 'rpcTlsKeyFile' are 'Just', the listener
+    -- runs via 'Network.Wai.Handler.WarpTLS.runTLS' instead of plain
+    -- 'Network.Wai.Handler.Warp.run'.  When NEITHER is set, the
+    -- listener stays plain HTTP (backward-compat with all existing
+    -- cookie-auth flows).  Exactly one set is a startup error,
+    -- mirroring Core's httpserver.cpp which refuses to half-configure
+    -- TLS.  W119 + FIX-64.  Reference:
+    -- bitcoin-core/src/httpserver.cpp HTTPSEnabled.
+  , rpcTlsKeyFile  :: !(Maybe FilePath)
+    -- ^ @-rpctlskey=\<file\>@: PEM-encoded private key matching
+    -- 'rpcTlsCertFile'.  See 'rpcTlsCertFile' for the full contract.
   } deriving (Show, Generic)
 
 instance NFData RpcConfig
@@ -349,6 +368,8 @@ defaultRpcConfig = RpcConfig
   , rpcAllowIp  = ["127.0.0.1"]
   , rpcDataDir  = "."
   , rpcRestEnabled = False
+  , rpcTlsCertFile = Nothing
+  , rpcTlsKeyFile  = Nothing
   }
 
 --------------------------------------------------------------------------------
@@ -659,10 +680,49 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
   case loaded of
     Right n | n > 0 -> putStrLn $ "Loaded " ++ show n ++ " ban entries from " ++ bnPath
     _              -> return ()
-  -- Use combined app to handle both RPC and REST endpoints
-  tid <- forkIO $ run (rpcPort config) (combinedApp server)
+  -- Use combined app to handle both RPC and REST endpoints.  W119 +
+  -- FIX-64: when both 'rpcTlsCertFile' and 'rpcTlsKeyFile' are set,
+  -- terminate TLS via warp-tls so Core-style HTTPS clients (BIP-78
+  -- PayJoin senders, in-browser tools) can talk to the listener
+  -- without an external reverse proxy.  Half-configured TLS aborts at
+  -- startup (mirrors Core httpserver.cpp HTTPSEnabled validation).
+  let tlsErr = validateTlsConfig config
+  case tlsErr of
+    Just msg -> error ("RPC TLS configuration error: " ++ msg)
+    Nothing  -> return ()
+  let settings = setPort (rpcPort config)
+               $ setHost (fromString (rpcHost config))
+               $ defaultSettings
+  tid <- forkIO $ case rpcTlsSettings config of
+    Just tlsSet -> WarpTLS.runTLS tlsSet settings (combinedApp server)
+    Nothing     -> runSettings settings (combinedApp server)
   atomically $ writeTVar threadVar (Just tid)
   return server
+
+-- | Validate the optional TLS knobs in the RPC config.  Returns
+-- @Just err@ when exactly one of 'rpcTlsCertFile' / 'rpcTlsKeyFile'
+-- is set (a half-configured listener is refused at startup just as
+-- Bitcoin Core's @httpserver.cpp@ refuses to bring up the HTTPS path
+-- without both a cert and a key).  Returns @Nothing@ when both are
+-- set or both are unset.  Pure: exposed so the W119 / FIX-64 test
+-- suite can exercise the rejection path without spinning up a real
+-- listener.  W119 + FIX-64.
+validateTlsConfig :: RpcConfig -> Maybe String
+validateTlsConfig cfg = case (rpcTlsCertFile cfg, rpcTlsKeyFile cfg) of
+  (Just _,  Just _)  -> Nothing
+  (Nothing, Nothing) -> Nothing
+  (Just _,  Nothing) -> Just "rpc-tls-cert is set but rpc-tls-key is missing \
+                             \(both must be provided together)"
+  (Nothing, Just _)  -> Just "rpc-tls-key is set but rpc-tls-cert is missing \
+                             \(both must be provided together)"
+
+-- | Build a 'WarpTLS.TLSSettings' record from an 'RpcConfig', or
+-- 'Nothing' when TLS is not configured.  Callers should only invoke
+-- this after 'validateTlsConfig' returned 'Nothing'.  W119 + FIX-64.
+rpcTlsSettings :: RpcConfig -> Maybe WarpTLS.TLSSettings
+rpcTlsSettings cfg = case (rpcTlsCertFile cfg, rpcTlsKeyFile cfg) of
+  (Just c, Just k) -> Just (WarpTLS.tlsSettings c k)
+  _                -> Nothing
 
 -- | Stop the RPC server
 stopRpcServer :: RpcServer -> IO ()
