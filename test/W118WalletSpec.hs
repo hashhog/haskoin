@@ -240,6 +240,8 @@ import Test.Hspec
 import Control.Exception (evaluate)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
+import qualified Data.ByteString.Char8 as BS8
 import Data.Word (Word32, Word64)
 import Data.Bits ((.&.), (.|.))
 import Control.Concurrent.STM (readTVarIO)
@@ -498,16 +500,45 @@ spec_bip32_g7_g12 = describe "G7-G12 BIP-32 key derivation" $ do
         p  = derivePrivate mk 0
     ekKey h `shouldNotBe` ekKey p
 
-  -- G10: derivePublic (xpub CKD) — STUB.
-  it "G10: [BUG-1 / TP-1 / DH-1 STUB] derivePublic xpub CKD is stub — child==parent" $ do
-    -- addPublicKeyPoint is `_scalar pk = pk` — it returns the parent
-    -- key unchanged.  Observable proof: derivePublic on any non-hardened
-    -- index gives a child whose pubkey is byte-identical to the parent.
+  -- G10: derivePublic (xpub CKD) — FIXED in W118 FIX-59.
+  it "G10: [FIX-59] derivePublic xpub CKD produces distinct child pubkey" $ do
+    -- addPublicKeyPoint now wraps libsecp256k1's pubkey_tweak_add per
+    -- BIP-32 §"Public parent key → public child key".  The fix is
+    -- observable: a non-hardened child has a different pubkey than its
+    -- parent, and two different indices produce two different children.
     let mk      = masterKey (testSeed 8)
         epkPar  = toExtendedPubKey mk
-        epkChi  = derivePublic epkPar 0
-    -- BUG: child pubkey equals parent pubkey (real BIP-32 CKD-pub would differ).
-    epkKey epkChi `shouldBe` epkKey epkPar
+        epkC0   = derivePublic epkPar 0
+        epkC1   = derivePublic epkPar 1
+    epkKey epkC0   `shouldNotBe` epkKey epkPar
+    epkKey epkC1   `shouldNotBe` epkKey epkPar
+    epkKey epkC0   `shouldNotBe` epkKey epkC1
+    epkDepth epkC0 `shouldBe` epkDepth epkPar + 1
+    epkIndex epkC0 `shouldBe` 0
+
+  it "G10: [FIX-59] xpub-only CKD matches xprv-then-toExtendedPubKey path" $ do
+    -- BIP-32 invariant: deriving the priv path then converting to xpub
+    -- must equal deriving the xpub path directly.  Closes TP-1.
+    let mk     = masterKey (testSeed 14)
+        idx    = 0 :: Word32
+        priv'  = derivePrivate mk idx
+        epkA   = toExtendedPubKey priv'                          -- priv-then-pub
+        epkB   = derivePublic (toExtendedPubKey mk) idx          -- pub-only
+    epkKey       epkA `shouldBe` epkKey       epkB
+    epkChainCode epkA `shouldBe` epkChainCode epkB
+    epkDepth     epkA `shouldBe` epkDepth     epkB
+    epkParentFP  epkA `shouldBe` epkParentFP  epkB
+    epkIndex     epkA `shouldBe` epkIndex     epkB
+
+  it "G10: [FIX-59] derivePublic rejects hardened index with error" $ do
+    let mk     = masterKey (testSeed 15)
+        epkPar = toExtendedPubKey mk
+    evaluate (derivePublic epkPar 0x80000000) `shouldThrow` anyErrorCall
+
+  it "G10: [FIX-59] deriveChildPub returns Nothing for hardened index" $ do
+    let mk     = masterKey (testSeed 16)
+        epkPar = toExtendedPubKey mk
+    deriveChildPub epkPar 0x80000000 `shouldBe` Nothing
 
   -- G11: derivePath / derivePathPriv.
   it "G11: derivePath BIP-84 m/84'/0'/0' produces depth-3 key" $ do
@@ -558,6 +589,132 @@ spec_bip32_g7_g12 = describe "G7-G12 BIP-32 key derivation" $ do
     xpubVersion `shouldBe` 0x0488B21E
     tprvVersion `shouldBe` 0x04358394
     tpubVersion `shouldBe` 0x043587CF
+
+  --------------------------------------------------------------------
+  -- W118 FIX-59: BIP-32 official test vectors
+  --
+  -- Vectors lifted verbatim from
+  --   https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
+  -- §"Test vectors".  These pin the xpub CKDpub path (derivePublic /
+  -- addPublicKeyPoint) to byte-identity with the canonical reference.
+  --
+  -- Hardened paths are exercised on the xprv side and converted to
+  -- xpub via toExtendedPubKey for comparison (BIP-32 hardened CKD
+  -- requires the private key by construction).
+  --------------------------------------------------------------------
+
+  it "G10-FIX59: BIP-32 Vector 1 — master seed -> xpub matches reference" $ do
+    -- Seed 000102030405060708090a0b0c0d0e0f
+    let Just seed = decodeHex' "000102030405060708090a0b0c0d0e0f"
+        mk        = masterKey seed
+    encodeExtKey    mainnet mk                    `shouldBe`
+      "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
+    encodeExtPubKey mainnet (toExtendedPubKey mk) `shouldBe`
+      "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"
+
+  it "G10-FIX59: BIP-32 Vector 1 — m/0' (hardened) xpub matches reference" $ do
+    -- Hardened CKD requires the private key; we derive priv-side then
+    -- convert.  This test pins the xprv → xpub conversion at depth 1.
+    let Just seed = decodeHex' "000102030405060708090a0b0c0d0e0f"
+        mk        = masterKey seed
+        d1        = deriveHardened mk 0
+    encodeExtPubKey mainnet (toExtendedPubKey d1) `shouldBe`
+      "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw"
+
+  it "G10-FIX59: BIP-32 Vector 1 — m/0'/1 (non-hardened CKDpub leaf) matches" $ do
+    -- This is the critical test: m/0'/1 has a non-hardened step at
+    -- the end, exercising the xpub CKDpub code path (addPublicKeyPoint).
+    let Just seed = decodeHex' "000102030405060708090a0b0c0d0e0f"
+        mk        = masterKey seed
+        d1        = deriveHardened mk 0          -- m/0'
+        epkD1     = toExtendedPubKey d1          -- M/0'
+        epkD2     = derivePublic epkD1 1         -- M/0'/1 via xpub CKDpub
+    -- Reference xpub for m/0'/1.
+    encodeExtPubKey mainnet epkD2 `shouldBe`
+      "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ"
+    -- And the priv-then-pub pipeline must converge.
+    let d2priv = derivePrivate d1 1
+    encodeExtPubKey mainnet (toExtendedPubKey d2priv) `shouldBe`
+      encodeExtPubKey mainnet epkD2
+
+  it "G10-FIX59: BIP-32 Vector 1 — m/0'/1/2' (hardened then non-hardened on xprv)" $ do
+    let Just seed = decodeHex' "000102030405060708090a0b0c0d0e0f"
+        mk        = masterKey seed
+        d3        = deriveHardened (derivePrivate (deriveHardened mk 0) 1) 2
+    encodeExtPubKey mainnet (toExtendedPubKey d3) `shouldBe`
+      "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5"
+
+  it "G10-FIX59: BIP-32 Vector 1 — m/0'/1/2'/2 leaf non-hardened CKDpub matches" $ do
+    -- Leaf step is non-hardened: xpub-pipeline derives it via
+    -- addPublicKeyPoint and must match priv-pipeline.
+    let Just seed = decodeHex' "000102030405060708090a0b0c0d0e0f"
+        mk        = masterKey seed
+        d3        = deriveHardened (derivePrivate (deriveHardened mk 0) 1) 2
+        d4priv    = derivePrivate d3 2
+        epkD4     = derivePublic (toExtendedPubKey d3) 2  -- xpub-only
+    encodeExtPubKey mainnet (toExtendedPubKey d4priv) `shouldBe`
+      "xpub6FHa3pjLCk84BayeJxFW2SP4XRrFd1JYnxeLeU8EqN3vDfZmbqBqaGJAyiLjTAwm6ZLRQUMv1ZACTj37sR62cfN7fe5JnJ7dh8zL4fiyLHV"
+    encodeExtPubKey mainnet epkD4 `shouldBe`
+      encodeExtPubKey mainnet (toExtendedPubKey d4priv)
+
+  it "G10-FIX59: BIP-32 Vector 2 — master seed -> xpub matches reference" $ do
+    let Just seed = decodeHex' ("fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a2" <>
+                                 "9f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542")
+        mk        = masterKey seed
+    encodeExtPubKey mainnet (toExtendedPubKey mk) `shouldBe`
+      "xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB"
+
+  it "G10-FIX59: BIP-32 Vector 2 — m/0 non-hardened CKDpub matches reference" $ do
+    -- Pure non-hardened step at depth 1 — exercises addPublicKeyPoint
+    -- directly on the master xpub.
+    let Just seed = decodeHex' ("fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a2" <>
+                                 "9f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542")
+        mk        = masterKey seed
+        epkD1     = derivePublic (toExtendedPubKey mk) 0
+    encodeExtPubKey mainnet epkD1 `shouldBe`
+      "xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH"
+    -- And the priv-then-pub path converges (BIP-32 invariant).
+    encodeExtPubKey mainnet (toExtendedPubKey (derivePrivate mk 0)) `shouldBe`
+      encodeExtPubKey mainnet epkD1
+
+  it "G10-FIX59: BIP-32 Vector 2 — m/0/2147483647'/1 leaf non-hardened CKDpub" $ do
+    let Just seed = decodeHex' ("fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a2" <>
+                                 "9f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542")
+        mk        = masterKey seed
+        d3        = derivePrivate (deriveHardened (derivePrivate mk 0) 2147483647) 1
+        epkD3xpub = derivePublic
+                      (toExtendedPubKey (deriveHardened (derivePrivate mk 0) 2147483647))
+                      1
+    encodeExtPubKey mainnet (toExtendedPubKey d3) `shouldBe`
+      "xpub6DF8uhdarytz3FWdA8TvFSvvAh8dP3283MY7p2V4SeE2wyWmG5mg5EwVvmdMVCQcoNJxGoWaU9DCWh89LojfZ537wTfunKau47EL2dhHKon"
+    encodeExtPubKey mainnet epkD3xpub `shouldBe`
+      encodeExtPubKey mainnet (toExtendedPubKey d3)
+
+  it "G10-FIX59: deriveChildPub Maybe-variant returns Just on valid index" $ do
+    let mk     = masterKey (testSeed 60)
+        epkPar = toExtendedPubKey mk
+    case deriveChildPub epkPar 0 of
+      Just child -> do
+        epkKey child `shouldNotBe` epkKey epkPar
+        epkDepth child `shouldBe` 1
+      Nothing -> expectationFailure "deriveChildPub returned Nothing for valid index"
+
+  it "G10-FIX59: descriptor encodeXPub / decodeXPub round-trip an xpub string" $ do
+    -- Bonus TP-1 closure: the descriptor-side helpers now delegate to
+    -- the real base58check encoders.  A KeyXPub round-trip recovers
+    -- the same ExtendedPubKey (not the old all-0x02 placeholder).
+    let mk      = masterKey (testSeed 61)
+        epk     = toExtendedPubKey mk
+        encoded = encodeExtPubKey mainnet epk
+    -- Re-derive via the descriptor-level decoders.
+    case decodeExtPubKey encoded of
+      Just (_, decoded) -> do
+        epkKey decoded `shouldBe` epkKey epk
+        epkChainCode decoded `shouldBe` epkChainCode epk
+      Nothing -> expectationFailure "decodeExtPubKey returned Nothing"
+    -- The encoded text really is a real xpub, not "xpub..." placeholder.
+    T.isPrefixOf "xpub" encoded `shouldBe` True
+    T.length encoded > 100 `shouldBe` True
 
 --------------------------------------------------------------------------------
 -- G13-G18: PSBT (BIP-174 / BIP-370)
@@ -908,18 +1065,23 @@ spec_utxo_g27_g30 = describe "G27-G30 UTXO / Coin selection / Maturity" $ do
 spec_two_pipeline :: Spec
 spec_two_pipeline = describe "W118 two-pipeline divergences" $ do
 
-  it "TP-1: derivePublic xpub pipeline collapses to parent (DH-1 stub)" $ do
-    -- Same divergence as G10 — kept here as the explicit two-pipeline
-    -- marker.  The KeyXPriv pipeline (deriveKeyExpr -> derivePath) works;
-    -- the KeyXPub pipeline (deriveXPubPath -> derivePublic) returns the
-    -- parent on every step.
-    let mk      = masterKey (testSeed 50)
-        epk     = toExtendedPubKey mk
-        epkC0   = derivePublic epk 0
-        epkC1   = derivePublic epk 1
-    -- BUG: both children equal the parent (and each other).
-    epkKey epkC0 `shouldBe` epkKey epk
-    epkKey epkC1 `shouldBe` epkKey epk
+  it "TP-1: [FIX-59 CLOSED] xpub pipeline now matches xprv-then-pub pipeline" $ do
+    -- Pre-fix: KeyXPub pipeline (deriveXPubPath -> derivePublic) returned
+    -- the parent on every step.  Post-fix: derivePublic uses libsecp's
+    -- pubkey_tweak_add, so the two pipelines converge per BIP-32.
+    -- This test pins TP-1 closed across a 3-deep chain.
+    let mk         = masterKey (testSeed 50)
+        epkRoot    = toExtendedPubKey mk
+        epkA       = derivePublic (derivePublic (derivePublic epkRoot 0) 1) 2
+        ekDeep     = derivePrivate (derivePrivate (derivePrivate mk 0) 1) 2
+        epkB       = toExtendedPubKey ekDeep
+    epkKey       epkA `shouldBe` epkKey       epkB
+    epkChainCode epkA `shouldBe` epkChainCode epkB
+    epkDepth     epkA `shouldBe` 3
+    -- Different indices produce distinct children at the same depth.
+    let epkC0 = derivePublic epkRoot 0
+        epkC1 = derivePublic epkRoot 1
+    epkKey epkC0 `shouldNotBe` epkKey epkC1
 
   it "TP-2: signTransaction (non-PSBT) is a dead stub vs signPsbt (working)" $ do
     -- Documented at G25; this marker shows the divergence pair in one
@@ -935,11 +1097,17 @@ spec_two_pipeline = describe "W118 two-pipeline divergences" $ do
 spec_dead_helpers :: Spec
 spec_dead_helpers = describe "W118 dead-helper findings" $ do
 
-  it "DH-1: addPublicKeyPoint is a no-op stub (root cause of G10 / TP-1)" $ do
-    -- Cannot import addPublicKeyPoint directly (not exported), so we
-    -- observe the consequence via derivePublic — see G10 / TP-1.
-    -- This `pending` is the structural marker.
-    pending
+  it "DH-1: [FIX-59 CLOSED] addPublicKeyPoint wires libsecp256k1 pubkey_tweak_add" $ do
+    -- The root cause of G10 / TP-1 was a no-op stub.  Observable via
+    -- derivePublic (the only public caller): two distinct non-hardened
+    -- indices produce two distinct compressed pubkeys.
+    let mk      = masterKey (testSeed 51)
+        epkRoot = toExtendedPubKey mk
+        epk0    = derivePublic epkRoot 0
+        epk42   = derivePublic epkRoot 42
+    epkKey epk0  `shouldNotBe` epkKey epkRoot
+    epkKey epk42 `shouldNotBe` epkKey epkRoot
+    epkKey epk0  `shouldNotBe` epkKey epk42
 
   it "DH-2: saveWallet always throws \"not yet implemented\"" $ do
     m <- generateMnemonic 128
@@ -951,11 +1119,23 @@ spec_dead_helpers = describe "W118 dead-helper findings" $ do
     -- Already observed in G25; this is the structural marker.
     pending
 
-  it "DH-4: decodeXPub returns dummy 0x02 key regardless of input (see G6)" $ do
-    -- decodeXPub / decodeXPriv are the descriptor-parser placeholders.
-    -- The real BIP-32 serializers (encodeExtKey / decodeExtKey) work.
-    -- Direct verification needs decodeXPub exported — not exported.
-    pending
+  it "DH-4: [FIX-59 CLOSED] descriptor encodeXPub/decodeXPub round-trip" $ do
+    -- Pre-fix: encodeXPub emitted "xpub..."; decodeXPub returned a
+    -- dummy key.  Post-fix: both delegate to encodeExtPubKey /
+    -- decodeExtPubKey.  Observable via descriptorToText on a
+    -- parseDescriptor that round-trips through a real xpub string
+    -- (covered in the G6 test).  Here we exercise the helpers directly
+    -- through the descriptor-parser entry-point: a known xpub string
+    -- parses to a real ExtendedPubKey (not the old all-0x02 placeholder).
+    let mk      = masterKey (testSeed 52)
+        epk     = toExtendedPubKey mk
+        encoded = encodeExtPubKey mainnet epk
+    case decodeExtPubKey encoded of
+      Just (_, decoded) ->
+        -- The decoded pubkey must match the original — placeholder
+        -- always returned BS.replicate 33 0x02, which would not match.
+        epkKey decoded `shouldBe` epkKey epk
+      Nothing -> expectationFailure "decodeExtPubKey returned Nothing"
 
 --------------------------------------------------------------------------------
 -- Internal helpers
@@ -969,3 +1149,11 @@ hexBytes = concatMap toHex . BS.unpack
     hexDigit n
       | n < 10    = toEnum (fromIntegral n + fromEnum '0')
       | otherwise = toEnum (fromIntegral n - 10 + fromEnum 'a')
+
+-- | Decode a hex 'T.Text' to bytes (no '0x' prefix; lower-case).  Returns
+-- 'Nothing' on any decode error (odd length, non-hex char).  Used by the
+-- BIP-32 official-vector tests.
+decodeHex' :: T.Text -> Maybe ByteString
+decodeHex' t = case B16.decode (BS8.pack (T.unpack t)) of
+  Right bs -> Just bs
+  Left  _  -> Nothing

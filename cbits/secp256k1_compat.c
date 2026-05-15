@@ -446,6 +446,51 @@ int haskoin_ec_pubkey_create(
 }
 
 /*
+ * BIP-32 CKDpub: child pubkey = parent_pubkey + tweak*G.
+ *
+ * Parses a 33-byte compressed parent pubkey, applies the 32-byte scalar
+ * tweak via libsecp256k1's `secp256k1_ec_pubkey_tweak_add` (which is
+ * exactly the operation Bitcoin Core's `CPubKey::Derive` uses in
+ * `bitcoin-core/src/pubkey.cpp:341`), and serializes the result as
+ * 33-byte compressed.
+ *
+ * Returns 1 on success, 0 on failure (invalid parent parse, tweak >=
+ * curve order, point-at-infinity result, or any other libsecp failure).
+ * The BIP-32 spec instructs the caller to advance the child index and
+ * retry on failure.
+ */
+int haskoin_ec_pubkey_tweak_add(
+    const unsigned char *parent_pubkey33,
+    const unsigned char *tweak32,
+    unsigned char *output33
+) {
+    secp256k1_context *ctx = get_verify_ctx();
+    secp256k1_pubkey pubkey;
+    size_t out_len = 33;
+
+    if (!ctx) return 0;
+    if (!parent_pubkey33 || !tweak32 || !output33) return 0;
+
+    /* Parse the 33-byte compressed parent pubkey. */
+    if (!secp256k1_ec_pubkey_parse(ctx, &pubkey, parent_pubkey33, 33)) {
+        return 0;
+    }
+
+    /* Apply the scalar tweak: pubkey += tweak*G.
+     * Rejects tweak >= curve order and point-at-infinity result. */
+    if (!secp256k1_ec_pubkey_tweak_add(ctx, &pubkey, tweak32)) {
+        return 0;
+    }
+
+    /* Serialize as 33-byte compressed. */
+    if (!secp256k1_ec_pubkey_serialize(ctx, output33, &out_len, &pubkey,
+                                        SECP256K1_EC_COMPRESSED)) {
+        return 0;
+    }
+    return out_len == 33 ? 1 : 0;
+}
+
+/*
  * Produce a Bitcoin "compact recoverable" ECDSA signature, as used by
  * signmessage / verifymessage.  Output buffer must be 65 bytes; the layout
  * is: [header_byte][R(32)][S(32)] where header = 27 + recid + (4 if compressed).
