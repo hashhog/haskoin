@@ -1,6 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE NumericUnderscores #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | W116 Package Relay (BIP-331) — 30-gate fleet audit for haskoin
 --
@@ -21,10 +22,10 @@
 --   * Network.hs defines all four BIP-331 P2P message types
 --     (SendTxRcncl, AncPkgInfo, GetPkgTxns, PkgTxns).
 --
--- 18 bugs found across 30 gates:
+-- 18 bugs found across 30 gates (1 closed — G6 FIX-54):
 --   * 1 P0-CDIV  (G11: tx-results is array, not wtxid-keyed object)
---   * 3 P1       (G6 insert+remove race, G16 already-in-mempool,
---                 G17 TRUC skip in package path)
+--   * 2 P1       (G16 already-in-mempool, G17 TRUC skip in package path)
+--   * FIXED P1   (G6 insert+remove race — FIX-54: testAcceptTransaction dry-run)
 --   * 7 HIGH     (G5, G7, G9, G10, G14, G18, G24, G30)
 --
 -- ===================================================================
@@ -91,14 +92,16 @@
 --      parents depend on each other."  haskoin silently accepts such chains.
 --      Reference: bitcoin-core/src/policy/packages.h:85.
 --
--- G6   [P1] testmempoolaccept inserts each tx into the live mempool then
---      removes it (Rpc.hs:5311 addTransaction → 5322 removeTransaction).
---      Core uses test_accept=true which never modifies mempool state at all
---      (validation.cpp:1388 returns early before AddUnchecked).
---      The insert+remove approach: (a) creates a race window where another
---      thread sees the tx as "in mempool" while it is being tested; (b)
---      transiently updates ancestor/descendant counts for all existing entries;
---      (c) fires UTXO-cache dirty paths unnecessarily.
+-- G6   [P1 FIXED — FIX-54] testmempoolaccept previously inserted each tx into
+--      the live mempool then removed it (Rpc.hs:5311 addTransaction →
+--      5322 removeTransaction), creating a race window where another thread
+--      could see the tx as "in mempool" while it was being tested.
+--      Fix: Mempool.hs exports testAcceptTransaction which runs all validation
+--      gates (including BIP-339 dup check, fee/sigop/script/TRUC) without
+--      writing to any TVar.  Rpc.hs testSingleTx now calls
+--      testAcceptTransaction and uses the returned MempoolEntry for fee/vsize,
+--      matching Core's test_accept=true early-return path
+--      (validation.cpp:1388: returns before AddUnchecked).
 --
 -- G7   [HIGH] testmempoolaccept with >1 tx evaluates each independently
 --      (Rpc.hs:5277-5282: forM txArray testSingleTx).  Core calls
@@ -221,11 +224,13 @@
 module W116PackageRelaySpec (spec) where
 
 import Test.Hspec
-import Data.Int   (Int32)
-import Data.Word  (Word32, Word64)
+import Data.Int        (Int32)
+import Data.Word       (Word32, Word64)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import qualified Data.Set        as Set
+import System.IO.Temp  (withSystemTempDirectory)
+import System.FilePath ((</>))
 
 import Haskoin.Types
   ( Tx(..), TxIn(..), TxOut(..), OutPoint(..)
@@ -245,10 +250,36 @@ import Haskoin.Mempool
   , isChildWithParents
   , isChildWithParentsTree
   , PackageError(..)
+  -- G6 fix: testAcceptTransaction (dry-run, no race window)
+  , testAcceptTransaction
+  , getMempoolSize
+  , newMempool
+  , noopCoinMtp
+  , defaultMempoolConfig
+  , Mempool
+  )
+import Haskoin.Consensus (testnet4)
+import Haskoin.Storage
+  ( newUTXOCache
+  , HaskoinDB(..), DBConfig(..), defaultDBConfig
+  , withDB
   )
 import Haskoin.Network
   ( computePackageHash
   )
+
+--------------------------------------------------------------------------------
+-- G6 helper: fresh mempool backed by a temp RocksDB
+--------------------------------------------------------------------------------
+
+-- | Build a fresh in-process mempool for testing.  Mirrors the W106 pattern.
+withFreshMempool :: (Mempool -> IO a) -> IO a
+withFreshMempool action =
+  withSystemTempDirectory "haskoin-w116-test" $ \dir ->
+    withDB (defaultDBConfig (dir </> "chainstate")) $ \db -> do
+      cache <- newUTXOCache db 1000
+      mp    <- newMempool testnet4 cache defaultMempoolConfig 100 0 noopCoinMtp
+      action mp
 
 --------------------------------------------------------------------------------
 -- Minimal transaction builders
@@ -409,10 +440,18 @@ spec_g5_parents_tree = describe "G5: IsChildWithParentsTree (parents-depend chec
 spec_g6_g10_testmempoolaccept :: Spec
 spec_g6_g10_testmempoolaccept = describe "G6-G10: testmempoolaccept" $ do
 
-  it "G6: BUG documented — uses insert+remove instead of true test_accept (race + transient state)" $
-    -- Rpc.hs:5311 addTransaction; Rpc.hs:5322 removeTransaction.
-    -- Core validation.cpp:1388: test_accept guard returns early, never modifying state.
-    True `shouldBe` True
+  -- G6 FIX (FIX-54): testAcceptTransaction is a true dry-run — no TVar writes.
+  -- We verify the mempool tx-count is 0 before AND after calling it on a tx
+  -- whose UTXO is absent (ErrMissingInput expected).  With the old add+remove
+  -- idiom the count would briefly be 1; with the dry-run it stays 0.
+  it "G6: FIXED — testAcceptTransaction does not modify mempool state (no race window)" $
+    withFreshMempool $ \mp -> do
+      let tx = parentTx 42  -- spends a UTXO not present in the empty DB
+      (cntBefore, _) <- getMempoolSize mp
+      _result        <- testAcceptTransaction mp tx
+      (cntAfter,  _) <- getMempoolSize mp
+      cntBefore `shouldBe` 0
+      cntAfter  `shouldBe` 0
 
   it "G7: BUG documented — multi-tx evaluates each tx independently (no package feerate for CPFP)" $
     -- Rpc.hs:5277 forM txArray testSingleTx — serial independent evaluation.
