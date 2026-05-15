@@ -110,6 +110,7 @@ import qualified W114FeeEstimationSpec
 import qualified W115ASMapSpec
 import qualified W116PackageRelaySpec
 import qualified W117BIP155NetworksSpec
+import qualified W118WalletSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22546,6 +22547,9 @@ main = hspec $ do
 
   -- W117 BIP-155 Privacy Networks (Tor / I2P / CJDNS) 30-gate audit
   W117BIP155NetworksSpec.spec
+
+  -- W118 Wallet (BIP-32/38/39/43/44/49/84/86/125/174/370/380) 30-gate audit
+  W118WalletSpec.spec
 
   where
     sampleTx = Tx
