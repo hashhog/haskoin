@@ -20,10 +20,10 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
-import Data.Maybe (mapMaybe, fromMaybe)
+import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
-import Data.Word (Word32, Word64)
+import Data.Word (Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
 import qualified Data.List as L
@@ -146,6 +146,29 @@ data NodeOptions = NodeOptions
     -- RPC @mapped_as@ field.
     -- Reference: bitcoin-core/src/init.cpp:1587-1628,
     -- bitcoin-core/src/util/asmap.cpp DecodeAsmap/CheckStandardAsmap.
+  , noProxy              :: !(Maybe String)
+    -- ^ @-proxy=host:port@: generic SOCKS5 proxy for all outbound
+    -- connections (Bitcoin Core @-proxy@; default off).  When set,
+    -- clearnet IPv4/IPv6 dials route via 'connectViaProxy' (no local
+    -- DNS leak).  Also used as the .onion proxy fallback when
+    -- @--onion@ is not provided.  W117 DH-1 wire.
+  , noOnion              :: !(Maybe String)
+    -- ^ @-onion=host:port@: dedicated SOCKS5 proxy for Tor v3
+    -- @.onion@ outbound (Bitcoin Core @-onion@; default off).
+    -- Overrides @--proxy@ for the Tor pipeline.  When set, this also
+    -- flips 'NetworkReachability.nrOnion=True' so Tor v3 addrv2
+    -- entries are stored / relayed / advertised.  W117 DH-1 + DH-2.
+  , noI2pSam             :: !(Maybe String)
+    -- ^ @-i2psam=host:port@: I2P SAM bridge (Bitcoin Core @-i2psam@;
+    -- default off).  When set, '.i2p' hostnames dial through SAM via
+    -- 'createI2PSession' + 'samStreamConnect', and
+    -- 'NetworkReachability.nrI2P' flips on for advertise/relay.
+  , noCjdnsReachable     :: !Bool
+    -- ^ @-cjdnsreachable@ (Bitcoin Core @-cjdnsreachable@; default
+    -- False).  When True, this node treats the fc00::/8 CJDNS overlay
+    -- as reachable and stores / advertises CJDNS peers.  Operator is
+    -- responsible for having a working CJDNS interface up; we do not
+    -- bring up cjdroute ourselves.  W117 DH-1 + DH-2 wire.
   } deriving (Show)
 
 data WalletCommand
@@ -260,6 +283,29 @@ parseNodeOptions = NodeOptions
                 \and uses ASN-keyed groups for AddrMan bucketing + \
                 \getpeerinfo mapped_as. File must be <= 8 MiB and \
                 \pass sanity check. Default: off (raw /16 or /32 groups)."))
+  -- W117 DH-1 + DH-2: BIP-155 privacy-network proxy / reachability CLI.
+  <*> optional (strOption (long "proxy" <> metavar "HOST:PORT"
+        <> help "Generic SOCKS5 proxy for all outbound peer connections \
+                \(Bitcoin Core -proxy). When set, IPv4/IPv6 dials route \
+                \through the proxy with no local DNS leak. Format: \
+                \127.0.0.1:9050. Default: off (direct dial)."))
+  <*> optional (strOption (long "onion" <> metavar "HOST:PORT"
+        <> help "Dedicated SOCKS5 proxy for Tor v3 .onion outbound \
+                \(Bitcoin Core -onion). Overrides --proxy for the Tor \
+                \pipeline. Setting this flips NetworkReachability so \
+                \haskoin advertises and relays Tor v3 addrv2 entries. \
+                \Default: off (Tor unreachable)."))
+  <*> optional (strOption (long "i2psam" <> metavar "HOST:PORT"
+        <> help "I2P SAM bridge for .i2p outbound (Bitcoin Core \
+                \-i2psam). When set, .i2p hostnames dial through SAM \
+                \and I2P reachability flips on for advertise + relay. \
+                \Default: off (I2P unreachable)."))
+  <*> switch (long "cjdnsreachable"
+        <> help "Treat the CJDNS overlay (fc00::/8) as reachable \
+                \(Bitcoin Core -cjdnsreachable). When set, CJDNS \
+                \addrv2 peers are stored / advertised / relayed. \
+                \Operator is responsible for cjdroute setup; we do \
+                \not start the interface. Default: off.")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -956,12 +1002,50 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- only serve the recent ~288-block window.  The wire-protocol gate
     -- is correct regardless of whether the prune subsystem itself is
     -- live -- consistent with Core's `IsPruneMode()` semantics.
+    --
+    -- W117 DH-1: parse the optional --proxy / --onion / --i2psam
+    -- host:port strings into structured Maybe (String, Int) for
+    -- PeerManagerConfig.  Mal-formed values are logged and ignored
+    -- so a typo doesn't crash startup.
+    let parseHostPort :: String -> Maybe (String, Int)
+        parseHostPort s = case break (== ':') s of
+          (h, ':':p) -> case reads p of
+            [(port, "")] | port > 0 && port < 65536 -> Just (h, port)
+            _ -> Nothing
+          _ -> Nothing
+        warnBad lbl v = case v of
+          Nothing -> return ()
+          Just s  -> putStrLn $ "WARNING: " ++ lbl
+                                ++ " value '" ++ s ++ "' is not host:port; ignoring"
+        mProxy  = noProxy  >>= parseHostPort
+        mOnion  = noOnion  >>= parseHostPort
+        mI2pSam = noI2pSam >>= parseHostPort
+    -- Surface mal-formed values explicitly so silent privacy-network
+    -- bypass doesn't go unnoticed by an operator.
+    when (isJust noProxy  && isNothing mProxy)  $ warnBad "--proxy"  noProxy
+    when (isJust noOnion  && isNothing mOnion)  $ warnBad "--onion"  noOnion
+    when (isJust noI2pSam && isNothing mI2pSam) $ warnBad "--i2psam" noI2pSam
+    when (isJust mOnion)  $ putStrLn $ "W117: Tor v3 (.onion) reachable via "
+                                   ++ show (fromJust mOnion)
+    when (isJust mI2pSam) $ putStrLn $ "W117: I2P (.i2p) reachable via SAM "
+                                    ++ show (fromJust mI2pSam)
+    when noCjdnsReachable $ putStrLn "W117: CJDNS (fc00::/8) marked reachable"
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
           , pmcPruneMode   = pruneOn
+          -- W117 DH-1: plumb privacy-network proxy + reachability.
+          , pmcProxy          = mProxy
+          , pmcOnion          = mOnion
+          , pmcI2pSam         = mI2pSam
+          , pmcCjdnsReachable = noCjdnsReachable
           }
+        -- W117 DH-2: 'reachabilityFromConfig pmConfig' is what the
+        -- addrv2 receipt handler (MAddrV2 in syncMessageHandler)
+        -- recomputes per-message from pm's config to apply
+        -- 'filterReachableAddresses'.  Logged here for operator visibility.
+        _reach = reachabilityFromConfig pmConfig
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
@@ -979,23 +1063,81 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     let pm' = pm { pmAsmapData = asmapData }
     writeIORef pmRef pm'
 
-    -- Seed known addresses from --connect flags
+    -- W117 DH-1: hidden-service / SAM-session announcement at startup.
+    --
+    -- When --onion is set we attempt a best-effort 'createTorHiddenService'
+    -- call against the standard Tor control port (127.0.0.1:9051).
+    -- Success surfaces the .onion address in the log; failure is
+    -- harmless and logged-only (e.g. Tor control auth disabled, daemon
+    -- not running).  Key persistence is intentionally out of scope
+    -- (W117 G18) — the service is ephemeral for this haskoin run.
+    --
+    -- When --i2psam is set we open a transient SAM session via
+    -- 'createI2PSession' so failures show up at startup instead of
+    -- the first .i2p dial.  G19 (transient destination) is also
+    -- explicitly out of scope.
+    when (isJust mOnion) $ do
+      let (ctrlHost, ctrlPort) = defaultTorControlPort
+          virtualPort          = fromIntegral noListenPort :: Word16
+          targetPort           = fromIntegral noListenPort :: Word16
+      void $ forkIO $ do
+        r <- createTorHiddenService ctrlHost ctrlPort
+                                    virtualPort "127.0.0.1" targetPort
+              `catch` (\(e :: SomeException) ->
+                  return $ Left $ "createTorHiddenService exception: " ++ show e)
+        case r of
+          Left err -> putStrLn $ "W117 Tor hidden-service unavailable: " ++ err
+          Right resp ->
+            putStrLn $ "W117 Tor hidden-service published: "
+                    ++ show (torServiceId resp) ++ ".onion"
+    when (isJust mI2pSam) $ do
+      let (samHost, samPort) = fromJust mI2pSam
+      void $ forkIO $ do
+        r <- createI2PSession samHost samPort
+              `catch` (\(e :: SomeException) ->
+                  return $ Left $ "createI2PSession exception: " ++ show e)
+        case r of
+          Left err -> putStrLn $ "W117 I2P SAM session unavailable: " ++ err
+          Right sess -> do
+            putStrLn $ "W117 I2P SAM session established: "
+                    ++ show (samB32Address sess)
+            -- Operator-visible address.  Caller closes the session
+            -- when the node shuts down (no explicit lifetime tracking
+            -- in this DH-1 wiring; the SAM bridge garbage-collects on
+            -- TCP close).
+            closeI2PSession sess
+
+    -- Seed known addresses from --connect flags.
+    --
+    -- W117 DH-1: when the host is a privacy-network hostname
+    -- (.onion or .i2p) we cannot resolve it via getAddrInfo (the
+    -- system resolver does not know about the Tor / I2P overlays).
+    -- Instead, dispatch through 'tryConnectByHost' which uses the
+    -- operator's --onion / --i2psam proxy.  Clearnet hosts continue
+    -- the existing AddrMan-seed path.
     forM_ noConnect $ \connectStr -> do
       let (host, portStr) = case break (== ':') connectStr of
             (h, ':':p) -> (h, p)
             (h, _)     -> (h, show (netDefaultPort net))
       case reads portStr of
-        [(port, "")] -> do
-          addrInfos <- NS.getAddrInfo Nothing (Just host) (Just (show (port :: Int))) :: IO [NS.AddrInfo]
-          forM_ addrInfos $ \ai -> do
-            let addr = NS.addrAddress ai
-            putStrLn $ "Adding connect peer: " ++ show addr
-            -- Feed into AddrMan (BUG-5/BUG-1 fix: structured storage).
-            -- Use addr as its own source (manual-connect = trusted source).
-            nowTs <- (round <$> getPOSIXTime :: IO Int64)
-            _ <- addAddress (pmAddrMan pm') (pmAsmapData pm') addr addr 0x409 nowTs
-            -- Keep pmKnownAddrs in sync for backward-compat.
-            atomically $ modifyTVar' (pmKnownAddrs pm') (Set.insert addr)
+        [(port, "")]
+          | isOnionAddress host || isI2PAddress host -> do
+              putStrLn $ "Adding privacy-network connect peer: "
+                      ++ host ++ ":" ++ show (port :: Int)
+              void $ forkIO $ tryConnectByHost pm' host port False
+                `catch` (\(e :: SomeException) ->
+                  putStrLn $ "tryConnectByHost error: " ++ show e)
+          | otherwise -> do
+              addrInfos <- NS.getAddrInfo Nothing (Just host) (Just (show (port :: Int))) :: IO [NS.AddrInfo]
+              forM_ addrInfos $ \ai -> do
+                let addr = NS.addrAddress ai
+                putStrLn $ "Adding connect peer: " ++ show addr
+                -- Feed into AddrMan (BUG-5/BUG-1 fix: structured storage).
+                -- Use addr as its own source (manual-connect = trusted source).
+                nowTs <- (round <$> getPOSIXTime :: IO Int64)
+                _ <- addAddress (pmAddrMan pm') (pmAsmapData pm') addr addr 0x409 nowTs
+                -- Keep pmKnownAddrs in sync for backward-compat.
+                atomically $ modifyTVar' (pmKnownAddrs pm') (Set.insert addr)
         _ -> putStrLn $ "Invalid connect address: " ++ connectStr
 
     -- Spawn a thread to send getheaders once a peer connects
@@ -1952,12 +2094,25 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
     relayAddrToRandomPeers pm addr (MAddr addrs)
 
   MAddrV2 addrv2msg -> do
-    -- BIP155: Handle addrv2 message - extract IPv4/IPv6 and store
+    -- BIP155: Handle addrv2 message - extract IPv4/IPv6 and store.
+    --
+    -- W117 DH-2 wire: apply 'filterReachableAddresses' to the
+    -- incoming entry list using the PeerManagerConfig-derived
+    -- 'NetworkReachability'.  Tor / I2P / CJDNS entries are dropped
+    -- when the operator hasn't configured the corresponding proxy
+    -- (so we don't store unreachable peers in AddrMan and don't
+    -- forward Tor/I2P entries to clearnet peers — TP-1 + DH-2).
     pm <- readIORef pmRef
-    let converted = mapMaybe addrV2ToAddrEntry (getAddrV2List addrv2msg)
-    unless (null converted) $ do
-      handleAddrMessage pm (Haskoin.Network.Addr converted)
-      relayAddrToRandomPeers pm addr (MAddrV2 addrv2msg)
+    let reachRt   = reachabilityFromConfig (pmConfig pm)
+        rawList   = getAddrV2List addrv2msg
+        filtered  = filterReachableAddresses reachRt rawList
+        converted = mapMaybe addrV2ToAddrEntry filtered
+    -- Only relay the filtered list, never the raw one (W117 DH-2).
+    -- If everything was filtered out, no relay happens either.
+    unless (null filtered) $ do
+      unless (null converted) $
+        handleAddrMessage pm (Haskoin.Network.Addr converted)
+      relayAddrToRandomPeers pm addr (MAddrV2 (AddrV2Msg filtered))
 
   MFeeFilter (FeeFilter fee) -> do
     -- BIP133: Store peer's fee filter

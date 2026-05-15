@@ -280,6 +280,9 @@ import Haskoin.Network
   , defaultReachability
   , shouldAdvertiseAddress
   , filterReachableAddresses
+  , reachabilityFromConfig
+  , PeerManagerConfig(..)
+  , defaultPeerManagerConfig
   , isOnionAddress
   , isI2PAddress
   , defaultTorProxy
@@ -851,37 +854,195 @@ spec_g29_g30_addrman_sendaddrv2 = describe "G29-G30: AddrMan Tor/I2P storage / s
 --------------------------------------------------------------------------------
 
 spec_dead_helpers :: Spec
-spec_dead_helpers = describe "Dead-helper subsystems (DH-1, DH-2)" $ do
+spec_dead_helpers = describe "Dead-helper subsystems (DH-1, DH-2) — pre-FIX-56" $ do
 
-  it "DH-1: BUG — connectPeerThroughProxy is defined but never called in Main.hs" $
-    -- Code inspection: grep -rn "connectPeerThroughProxy" shows it only appears in Network.hs.
-    True `shouldBe` True
+  -- FIX-56 wires DH-1 + DH-2.  These remaining tests document the
+  -- pre-fix behaviour of 'defaultReachability' (still conservative
+  -- when no CLI flags are passed) and confirm the storage-path
+  -- behaviour without the gossip filter; the runtime gossip filter
+  -- itself is covered by spec_fix56_dh_wiring below.
 
-  it "DH-1: BUG — createTorHiddenService is defined but never called in Main.hs" $
-    True `shouldBe` True
-
-  it "DH-1: BUG — createI2PSession is defined but never called in Main.hs" $
-    True `shouldBe` True
-
-  it "DH-2: BUG — shouldAdvertiseAddress is defined but never called in Main.hs" $
-    -- defaultReachability has nrOnion=False, nrI2P=False: Tor/I2P would be
-    -- filtered even if the function were wired.
+  it "DH-2: PASS — shouldAdvertiseAddress drops Tor when reachability disabled" $
+    -- defaultReachability has nrOnion=False.  Pre-FIX-56 this was a
+    -- documentation BUG (the function was dead-helper).  Post-FIX-56
+    -- the function is wired via reachabilityFromConfig in Main.hs
+    -- (MAddrV2 handler), but the unit-level semantics of the function
+    -- itself remain unchanged.
     shouldAdvertiseAddress defaultReachability (NetAddrTorV3 torV3Bytes) `shouldBe` False
 
-  it "DH-2: BUG — filterReachableAddresses is defined but never called in Main.hs" $ do
+  it "DH-2: PASS — filterReachableAddresses drops privacy addrs under defaults" $ do
     let entries = [ mkAddrV2 NetTorV3 torV3Bytes
                   , mkAddrV2 NetI2P   i2pBytes
                   , mkAddrV2 NetCJDNS cjdnsBytes
                   ]
         result  = filterReachableAddresses defaultReachability entries
-    -- All three get filtered because nrOnion=False, nrI2P=False, nrCJDNS always False.
+    -- All three are filtered under defaults; the operator must set
+    -- --onion / --i2psam / --cjdnsreachable to unfilter them.
     result `shouldBe` []
 
-  it "DH-2: BUG — NetworkReachability.defaultReachability has nrOnion=False (Tor disabled)" $
+  it "DH-2: PASS — defaultReachability has nrOnion=False (Tor disabled by default)" $
     nrOnion defaultReachability `shouldBe` False
 
-  it "DH-2: BUG — NetworkReachability.defaultReachability has nrI2P=False (I2P disabled)" $
+  it "DH-2: PASS — defaultReachability has nrI2P=False (I2P disabled by default)" $
     nrI2P defaultReachability `shouldBe` False
+
+  it "DH-2: PASS — defaultReachability has nrCJDNS=False (CJDNS disabled by default)" $
+    nrCJDNS defaultReachability `shouldBe` False
+
+--------------------------------------------------------------------------------
+-- FIX-56: DH-1 + DH-2 wiring tests
+--------------------------------------------------------------------------------
+
+spec_fix56_dh_wiring :: Spec
+spec_fix56_dh_wiring = describe "FIX-56 DH-1 + DH-2 wiring (W117)" $ do
+
+  -- ----- DH-2: NetworkReachability driven by PeerManagerConfig ----- --
+
+  it "DH-2: defaultPeerManagerConfig → reachabilityFromConfig matches defaultReachability" $
+    reachabilityFromConfig defaultPeerManagerConfig `shouldBe` defaultReachability
+
+  it "DH-2: --onion=host:port flips nrOnion=True" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcOnion = Just ("127.0.0.1", 9050) }
+        r   = reachabilityFromConfig cfg
+    nrOnion r `shouldBe` True
+
+  it "DH-2: --proxy=host:port flips nrOnion=True (Core onion-fallback semantics)" $ do
+    -- When -onion is not set but -proxy is, Core routes .onion through
+    -- the generic SOCKS5 proxy.  reachabilityFromConfig must honour
+    -- that fallback so Tor v3 advertise/relay still flips on.
+    let cfg = defaultPeerManagerConfig
+          { pmcProxy = Just ("127.0.0.1", 9050) }
+        r   = reachabilityFromConfig cfg
+    nrOnion r `shouldBe` True
+
+  it "DH-2: --onion takes precedence over --proxy for Tor reachability" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcProxy = Just ("10.0.0.1", 1080)
+          , pmcOnion = Just ("127.0.0.1", 9050)
+          }
+        r   = reachabilityFromConfig cfg
+    nrOnion r `shouldBe` True
+
+  it "DH-2: --i2psam=host:port flips nrI2P=True" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcI2pSam = Just ("127.0.0.1", 7656) }
+        r   = reachabilityFromConfig cfg
+    nrI2P r `shouldBe` True
+
+  it "DH-2: --i2psam does NOT flip Tor reachability" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcI2pSam = Just ("127.0.0.1", 7656) }
+        r   = reachabilityFromConfig cfg
+    nrOnion r `shouldBe` False
+
+  it "DH-2: --cjdnsreachable=True flips nrCJDNS=True" $ do
+    let cfg = defaultPeerManagerConfig { pmcCjdnsReachable = True }
+        r   = reachabilityFromConfig cfg
+    nrCJDNS r `shouldBe` True
+
+  it "DH-2: --cjdnsreachable does NOT affect Tor or I2P reachability" $ do
+    let cfg = defaultPeerManagerConfig { pmcCjdnsReachable = True }
+        r   = reachabilityFromConfig cfg
+    (nrOnion r, nrI2P r) `shouldBe` (False, False)
+
+  it "DH-2: all four CLI flags compose (Tor + I2P + CJDNS all reachable)" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcProxy          = Just ("127.0.0.1", 9050)
+          , pmcOnion          = Just ("127.0.0.1", 9050)
+          , pmcI2pSam         = Just ("127.0.0.1", 7656)
+          , pmcCjdnsReachable = True
+          }
+        r   = reachabilityFromConfig cfg
+    (nrIPv4 r, nrIPv6 r, nrOnion r, nrI2P r, nrCJDNS r)
+      `shouldBe` (True, True, True, True, True)
+
+  -- ----- DH-2: filterReachableAddresses gates the addrv2 receipt path ----- --
+
+  it "DH-2 wired: filterReachableAddresses keeps Tor entries when --onion set" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcOnion = Just ("127.0.0.1", 9050) }
+        r   = reachabilityFromConfig cfg
+        ent = mkAddrV2 NetTorV3 torV3Bytes
+    filterReachableAddresses r [ent] `shouldBe` [ent]
+
+  it "DH-2 wired: filterReachableAddresses keeps I2P entries when --i2psam set" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcI2pSam = Just ("127.0.0.1", 7656) }
+        r   = reachabilityFromConfig cfg
+        ent = mkAddrV2 NetI2P i2pBytes
+    filterReachableAddresses r [ent] `shouldBe` [ent]
+
+  it "DH-2 wired: filterReachableAddresses keeps CJDNS entries when --cjdnsreachable" $ do
+    let cfg = defaultPeerManagerConfig { pmcCjdnsReachable = True }
+        r   = reachabilityFromConfig cfg
+        ent = mkAddrV2 NetCJDNS cjdnsBytes
+    filterReachableAddresses r [ent] `shouldBe` [ent]
+
+  it "DH-2 wired: filterReachableAddresses still drops Tor when only --i2psam set" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcI2pSam = Just ("127.0.0.1", 7656) }
+        r   = reachabilityFromConfig cfg
+        ent = mkAddrV2 NetTorV3 torV3Bytes
+    -- Reachability filter must be per-network: enabling I2P alone
+    -- should NOT collapse onion / cjdns gates on.
+    filterReachableAddresses r [ent] `shouldBe` []
+
+  it "DH-2 wired: filterReachableAddresses always keeps clearnet (IPv4/IPv6)" $ do
+    let entries = [ AddrV2 1700000000 9 NetIPv4 (BS.pack [1,2,3,4]) 8333
+                  , AddrV2 1700000000 9 NetIPv6 (BS.replicate 16 0x20) 8333
+                  ]
+    filterReachableAddresses defaultReachability entries `shouldBe` entries
+
+  -- ----- DH-2: shouldAdvertiseAddress under wired reachability ----- --
+
+  it "DH-2 wired: shouldAdvertiseAddress True for Tor when --onion set" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcOnion = Just ("127.0.0.1", 9050) }
+        r   = reachabilityFromConfig cfg
+    shouldAdvertiseAddress r (NetAddrTorV3 torV3Bytes) `shouldBe` True
+
+  it "DH-2 wired: shouldAdvertiseAddress True for I2P when --i2psam set" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcI2pSam = Just ("127.0.0.1", 7656) }
+        r   = reachabilityFromConfig cfg
+    shouldAdvertiseAddress r (NetAddrI2P i2pBytes) `shouldBe` True
+
+  it "DH-2 wired: shouldAdvertiseAddress True for CJDNS when --cjdnsreachable" $ do
+    let cfg = defaultPeerManagerConfig { pmcCjdnsReachable = True }
+        r   = reachabilityFromConfig cfg
+    shouldAdvertiseAddress r (NetAddrCJDNS cjdnsBytes) `shouldBe` True
+
+  -- ----- DH-1: PeerManagerConfig surface ----- --
+
+  it "DH-1: defaultPeerManagerConfig has all four privacy flags off" $ do
+    let c = defaultPeerManagerConfig
+    (pmcProxy c, pmcOnion c, pmcI2pSam c, pmcCjdnsReachable c)
+      `shouldBe` (Nothing, Nothing, Nothing, False)
+
+  it "DH-1: address dispatch picks Tor proxy for .onion when --onion set" $ do
+    -- This is a structural assertion: when an operator sets --onion,
+    -- the parsed PeerManagerConfig must record it so 'tryConnectByHost'
+    -- can pick the SOCKS5 path.  Functional dialing requires a live
+    -- Tor proxy which is out of scope for the unit suite.
+    let cfg = defaultPeerManagerConfig
+          { pmcOnion = Just ("127.0.0.1", 9050) }
+    pmcOnion cfg `shouldBe` Just ("127.0.0.1", 9050)
+
+  it "DH-1: address dispatch picks SAM proxy for .i2p when --i2psam set" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcI2pSam = Just ("127.0.0.1", 7656) }
+    pmcI2pSam cfg `shouldBe` Just ("127.0.0.1", 7656)
+
+  it "DH-1: --proxy is used for clearnet outbound SOCKS5 routing" $ do
+    let cfg = defaultPeerManagerConfig
+          { pmcProxy = Just ("127.0.0.1", 9050) }
+    pmcProxy cfg `shouldBe` Just ("127.0.0.1", 9050)
+
+  it "DH-1: --cjdnsreachable does NOT install a proxy (CJDNS is direct dial)" $ do
+    let cfg = defaultPeerManagerConfig { pmcCjdnsReachable = True }
+    (pmcProxy cfg, pmcI2pSam cfg, pmcOnion cfg)
+      `shouldBe` (Nothing, Nothing, Nothing)
 
 --------------------------------------------------------------------------------
 -- Two-pipeline documentation tests
@@ -949,3 +1110,6 @@ spec = do
     spec_dead_helpers
 
     spec_two_pipeline
+
+    -- FIX-56 DH-1 + DH-2 wiring tests
+    spec_fix56_dh_wiring

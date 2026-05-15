@@ -147,6 +147,10 @@ module Haskoin.Network
   , addBanScore
   , handleAddrMessage
   , buildBlockLocator
+    -- ** W117 DH-1 outbound dispatch (proxy / Tor / I2P / CJDNS)
+  , tryConnect
+  , tryConnectBlockRelay
+  , tryConnectByHost
     -- * Wire-decode caps (DoS hardening)
   , maxInvSz
   , maxGetDataSz
@@ -504,6 +508,7 @@ module Haskoin.Network
   , defaultReachability
   , shouldAdvertiseAddress
   , filterReachableAddresses
+  , reachabilityFromConfig
     -- * ASMap Health Check (G23)
   , ASMapHealthStats(..)
   , asmapHealthCheckInterval
@@ -2618,6 +2623,29 @@ data PeerManagerConfig = PeerManagerConfig
   , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
   , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default False, matches Core's DEFAULT_PEERBLOOMFILTERS)
   , pmcPruneMode        :: !Bool       -- ^ BIP-159: advertise NODE_NETWORK_LIMITED (1<<10) when prune mode is on (default False, mirrors Core's `IsPruneMode()` gate in init.cpp)
+  -- W117 DH-1: BIP-155 privacy-network proxy + reachability wiring.
+  , pmcProxy            :: !(Maybe (String, Int))
+    -- ^ Generic SOCKS5 proxy host:port used for clearnet outbound
+    --   when set (Core @-proxy=host:port@).  When 'Nothing', clearnet
+    --   peers are dialed directly via 'connectPeer'.  When 'Just (h, p)',
+    --   IPv4/IPv6 outbound dispatch routes through 'connectViaProxy'.
+  , pmcOnion            :: !(Maybe (String, Int))
+    -- ^ SOCKS5 proxy host:port specifically for *.onion outbound
+    --   (Core @-onion=host:port@; falls back to @-proxy@ when unset).
+    --   When set, '.onion' hostnames in addnode / addr gossip dial
+    --   through this proxy via 'connectPeerThroughProxy' /
+    --   'connectThroughTor'.  Setting this flips 'NetworkReachability'
+    --   so this node will advertise + relay Tor v3 entries.
+  , pmcI2pSam           :: !(Maybe (String, Int))
+    -- ^ I2P SAM bridge host:port (Core @-i2psam=host:port@).
+    --   When set, '.i2p' hostnames are dialed via 'createI2PSession'
+    --   + 'samStreamConnect'.  Setting this flips
+    --   'NetworkReachability' to advertise I2P entries.
+  , pmcCjdnsReachable   :: !Bool
+    -- ^ Core @-cjdnsreachable@.  When 'True', this node will treat
+    --   the fc00::/8 CJDNS overlay as reachable and accept / advertise
+    --   CJDNS peers.  Direct connect (no proxy); operator is responsible
+    --   for having a CJDNS interface up.
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -2634,6 +2662,44 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcDataDir          = "."
   , pmcPeerBloomFilters = False    -- Bitcoin Core default (DEFAULT_PEERBLOOMFILTERS=false, net_processing.h:44)
   , pmcPruneMode        = False    -- BIP-159 NODE_NETWORK_LIMITED off by default; flipped on when --prune is set
+  -- W117 DH-1: privacy-network proxy + reachability defaults.
+  -- All four fields default to "no proxy / unreachable" to match Core's
+  -- default operator posture (clearnet-only).  Flipped on via CLI.
+  , pmcProxy            = Nothing
+  , pmcOnion            = Nothing
+  , pmcI2pSam           = Nothing
+  , pmcCjdnsReachable   = False
+  }
+
+-- | W117 DH-2 wiring: derive a 'NetworkReachability' record from the
+-- proxy / SAM / CJDNS fields of a 'PeerManagerConfig'.  This is the
+-- single source of truth used by:
+--   * outbound dispatch ('tryConnectWithType' / 'connectByHost')
+--   * address gossip ('handleAddrV2GossipFilter' in @app/Main.hs@)
+--   * inbound address-broadcast ('shouldAdvertiseAddress' callers)
+--
+-- Reference: Bitcoin Core net.cpp / netbase.cpp: a network is "reachable"
+-- iff it is wired to a working proxy (SOCKS5 for Tor, SAM for I2P,
+-- direct for CJDNS when @-cjdnsreachable@ is set).  IPv4 and IPv6 are
+-- always reachable.
+reachabilityFromConfig :: PeerManagerConfig -> NetworkReachability
+reachabilityFromConfig cfg = NetworkReachability
+  { nrIPv4  = True
+  , nrIPv6  = True
+  -- Tor is reachable iff we have either a dedicated onion proxy or a
+  -- generic SOCKS5 proxy.  Matches Core's SetProxy/SetReachable wiring
+  -- in init.cpp: -onion= overrides -proxy= for NET_ONION.
+  , nrOnion = case pmcOnion cfg of
+                Just _  -> True
+                Nothing -> case pmcProxy cfg of
+                             Just _  -> True
+                             Nothing -> False
+  -- I2P is reachable only when an explicit SAM bridge is configured.
+  , nrI2P   = case pmcI2pSam cfg of
+                Just _  -> True
+                Nothing -> False
+  -- CJDNS reachability is opt-in (operator must have a CJDNS interface up).
+  , nrCJDNS = pmcCjdnsReachable cfg
   }
 
 --------------------------------------------------------------------------------
@@ -2943,7 +3009,15 @@ bip324V2OutboundEnabled = do
     enabled (Just s) | s /= "" && s /= "0" = True
     enabled _                              = False
 
--- | Internal: connect to a peer with optional block-relay-only mode
+-- | Internal: connect to a peer with optional block-relay-only mode.
+--
+-- W117 DH-1 wiring: dispatches on the operator's proxy configuration.
+--   * @pmcProxy = Just (h, p)@ → route through the generic SOCKS5 proxy
+--     via 'connectViaProxy' (no local DNS leak; matches Core's
+--     CConnman::ConnectNode -> ConnectThroughProxy path).
+--   * Otherwise → direct TCP connect as before.
+-- This is the IPv4/IPv6 SockAddr path; '.onion' / '.i2p' string-hostname
+-- dispatch lives in 'tryConnectByHost'.
 tryConnectWithType :: PeerManager -> SockAddr -> Bool -> IO ()
 tryConnectWithType pm addr blockRelayOnly = do
   -- Check if address is discouraged/banned before connecting
@@ -2973,29 +3047,224 @@ tryConnectWithType pm addr blockRelayOnly = do
         (host, port) = sockAddrToHostPort addr (netDefaultPort net)
         connLabel = if blockRelayOnly then "block-relay-only" else "full-relay"
 
-    -- BIP-324: try v2 first when enabled and the address is not in the
-    -- v1-only fall-back set.  v2 garbage is destructive on a v1 peer
-    -- (the bytes look like garbled magic) so on failure we MUST close the
-    -- socket and reconnect for the v1 attempt rather than retrying on the
-    -- same TCP connection.  Mirrors clearbit's connectOutboundNegotiated.
-    -- Both full-relay and block-relay-only outbound attempts try v2 first;
-    -- block-relay semantics (no tx relay, no addr exchange) are orthogonal
-    -- to the transport-layer encryption choice.
-    v2Enabled <- bip324V2OutboundEnabled
-    v1Only    <- isV1Only pm addr
-    let tryV2 = v2Enabled && not v1Only
-    if tryV2
-      then do
-        putStrLn $ "tryConnect[" ++ connLabel ++ "][v2]: attempting " ++ host ++ ":" ++ show port
-        v2res <- attemptV2Outbound pm config blockRelayOnly addr host port
-        case v2res of
-          Just () -> return ()  -- v2 succeeded and the peer is registered
-          Nothing -> do
-            putStrLn $ "tryConnect[" ++ connLabel ++ "][v2->v1]: falling back to v1 for " ++ host
+    -- W117 DH-1: if a generic SOCKS5 proxy is configured, route the
+    -- clearnet dial through it.  This is invoked before BIP-324 v2
+    -- probing because the v2 cipher handshake runs over whichever
+    -- socket we hand it, and the proxy is transparent at the byte level.
+    case pmcProxy (pmConfig pm) of
+      Just (proxyHost, proxyPort) -> do
+        putStrLn $ "tryConnect[" ++ connLabel ++ "][proxy]: "
+                ++ host ++ ":" ++ show port
+                ++ " via SOCKS5 " ++ proxyHost ++ ":" ++ show proxyPort
+        attemptProxyOutbound pm config blockRelayOnly addr
+                             proxyHost proxyPort host port
+      Nothing -> do
+        -- BIP-324: try v2 first when enabled and the address is not in the
+        -- v1-only fall-back set.  v2 garbage is destructive on a v1 peer
+        -- (the bytes look like garbled magic) so on failure we MUST close the
+        -- socket and reconnect for the v1 attempt rather than retrying on the
+        -- same TCP connection.  Mirrors clearbit's connectOutboundNegotiated.
+        -- Both full-relay and block-relay-only outbound attempts try v2 first;
+        -- block-relay semantics (no tx relay, no addr exchange) are orthogonal
+        -- to the transport-layer encryption choice.
+        v2Enabled <- bip324V2OutboundEnabled
+        v1Only    <- isV1Only pm addr
+        let tryV2 = v2Enabled && not v1Only
+        if tryV2
+          then do
+            putStrLn $ "tryConnect[" ++ connLabel ++ "][v2]: attempting " ++ host ++ ":" ++ show port
+            v2res <- attemptV2Outbound pm config blockRelayOnly addr host port
+            case v2res of
+              Just () -> return ()  -- v2 succeeded and the peer is registered
+              Nothing -> do
+                putStrLn $ "tryConnect[" ++ connLabel ++ "][v2->v1]: falling back to v1 for " ++ host
+                attemptV1Outbound pm config blockRelayOnly addr host port
+          else do
+            putStrLn $ "tryConnect[" ++ connLabel ++ "]: attempting " ++ host ++ ":" ++ show port
             attemptV1Outbound pm config blockRelayOnly addr host port
-      else do
-        putStrLn $ "tryConnect[" ++ connLabel ++ "]: attempting " ++ host ++ ":" ++ show port
-        attemptV1Outbound pm config blockRelayOnly addr host port
+
+-- | W117 DH-1: clearnet outbound through a SOCKS5 proxy.  Uses
+-- 'connectViaProxy' from the Phase-48 helper bank so the dial doesn't
+-- leak DNS to the local resolver (the proxy resolves the destination).
+--
+-- v2 probe is intentionally skipped: BIP-324 over an unauthenticated
+-- SOCKS5 hop is supported in principle but the haskoin v2 handshake
+-- assumes a fresh raw TCP socket; routing v2 cipher bytes through a
+-- proxied tunnel works opportunistically but we keep this path on v1 to
+-- minimise interop surprises.  Mirrors Core's posture: -proxy clearnet
+-- dials are v1-only unless @v2transport@ is explicitly enabled.
+attemptProxyOutbound :: PeerManager -> PeerConfig -> Bool -> SockAddr
+                    -> String -> Int -> String -> Int -> IO ()
+attemptProxyOutbound pm config blockRelayOnly addr
+                     proxyHost proxyPort destHost destPort = do
+  sockResult <- connectViaProxy proxyHost proxyPort Nothing destHost destPort
+  case sockResult of
+    Left err -> do
+      putStrLn $ "proxy outbound: SOCKS5 connect failed to "
+              ++ destHost ++ ": " ++ err
+      atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+      nowFail <- (round <$> getPOSIXTime :: IO Int64)
+      markAttempt (pmAddrMan pm) addr nowFail
+    Right sock -> do
+      pcRes <- createPeerConnectionFromSocket config sock destHost
+      case pcRes of
+        Left err -> do
+          putStrLn $ "proxy outbound: peer setup failed for "
+                  ++ destHost ++ ": " ++ err
+          close sock `catch` (\(_ :: SomeException) -> return ())
+          atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+          nowFail <- (round <$> getPOSIXTime :: IO Int64)
+          markAttempt (pmAddrMan pm) addr nowFail
+        Right pc -> do
+          -- Stamp the real SockAddr we wanted (createPeerConnectionFromSocket
+          -- writes a 0.0.0.0:0 dummy because the proxy is transparent).
+          atomically $ modifyTVar' (pcInfo pc) (\i -> i { piAddress = addr })
+          hsResult <- performHandshake config pc
+          case hsResult of
+            Left err -> do
+              putStrLn $ "proxy outbound: handshake failed with "
+                      ++ destHost ++ ": " ++ err
+              disconnectPeer pc
+              atomically $ modifyTVar' (pmFailedAddrs pm) (Set.insert addr)
+              nowFail <- (round <$> getPOSIXTime :: IO Int64)
+              markAttempt (pmAddrMan pm) addr nowFail
+            Right ver -> do
+              unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+              when blockRelayOnly $
+                atomically $ modifyTVar' (pcInfo pc)
+                  (\i -> i { piBlockOnly = True })
+              addOutboundConnection (pmOutboundDiversity pm)
+                                    (pmAsmapData pm) addr
+              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+              nowOk <- (round <$> getPOSIXTime :: IO Int64)
+              markGood (pmAddrMan pm) (pmAsmapData pm) addr nowOk
+              pc' <- startPeerThreadsWithMisbehavior pc
+                       (pmMessageHandler pm addr)
+                       (\reason err -> do
+                          putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
+                                  ++ show reason ++ " (" ++ err ++ ")"
+                          void $ misbehaving pm addr reason)
+              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+              unless blockRelayOnly $
+                sendMessage pc' MGetAddr
+                  `catch` (\(_ :: IOException) -> return ())
+
+-- | W117 DH-1: outbound dial by hostname string (the .onion / .i2p path).
+--
+-- Used by addnode / @-connect=<host>@ when @host@ has a '.onion' or
+-- '.i2p' suffix.  Dispatches to:
+--   * 'connectPeerThroughProxy' with the operator's @pmcOnion@ /
+--     @pmcProxy@ SOCKS5 for '.onion' (Tor).
+--   * 'connectPeerThroughProxy' with @pmcI2pSam@ for '.i2p' (SAM bridge).
+--   * 'connectPeer' direct for clearnet hostnames (DNS-resolved).
+--
+-- Unlike the SockAddr path, AddrMan is *not* updated for hostname dials
+-- because Tor v3 / I2P destinations have no faithful 'SockAddr' encoding
+-- (G29 in the W117 audit).  We rely on the peer map for tracking.
+tryConnectByHost :: PeerManager -> String -> Int -> Bool -> IO ()
+tryConnectByHost pm host port blockRelayOnly = do
+  let net = pmNetwork pm
+      baseFlags = [nodeNetwork, nodeWitness]
+      bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
+                    then nodeBloom : baseFlags
+                    else baseFlags
+      flags = if pmcPruneMode (pmConfig pm)
+                then nodeNetworkLimited : bloomFlags
+                else bloomFlags
+      config = PeerConfig
+        { pcfgNetwork     = net
+        , pcfgServices    = combineServices flags
+        , pcfgBestHeight  = 0
+        , pcfgUserAgent   = userAgent
+        , pcfgRelay       = not blockRelayOnly
+        , pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
+        , pcfgQueueSize   = 100
+        }
+      cfg = pmConfig pm
+      -- Compute the proxy config to use.  Onion gets the dedicated
+      -- @pmcOnion@ first, then falls back to @pmcProxy@; I2P uses
+      -- @pmcI2pSam@ exclusively (SAM is a different protocol).
+      mProxyCfg
+        | isOnionAddress host = case pmcOnion cfg of
+            Just (h, p) -> Just (Socks5Proxy h p)
+            Nothing -> case pmcProxy cfg of
+              Just (h, p) -> Just (Socks5Proxy h p)
+              Nothing     -> Nothing
+        | isI2PAddress host = case pmcI2pSam cfg of
+            Just (h, p) -> Just (I2PSamProxy h p)
+            Nothing     -> Nothing
+        | otherwise         = case pmcProxy cfg of
+            Just (h, p) -> Just (Socks5Proxy h p)
+            Nothing     -> Nothing
+  case mProxyCfg of
+    Nothing
+      | isOnionAddress host ->
+          putStrLn $ "tryConnectByHost: refusing .onion dial to "
+                  ++ host ++ ": no --onion or --proxy configured"
+      | isI2PAddress host ->
+          putStrLn $ "tryConnectByHost: refusing .i2p dial to "
+                  ++ host ++ ": no --i2psam configured"
+      | otherwise -> do
+          -- Plain clearnet host, no proxy: fall through to direct
+          -- connect (matches the legacy AddrMan-driven SockAddr path).
+          res <- connectPeer config host port
+          finalizeHostConnect pm config host port blockRelayOnly res
+    Just proxyCfg -> do
+      let ppc = ProxyPeerConfig { ppcBase = config, ppcProxyConfig = proxyCfg }
+      putStrLn $ "tryConnectByHost: dialing " ++ host ++ ":" ++ show port
+              ++ " via " ++ show proxyCfg
+      res <- connectPeerThroughProxy ppc host port
+      finalizeHostConnect pm config host port blockRelayOnly res
+
+-- | Helper: complete the handshake + peer-map insert for a connection
+-- established by 'tryConnectByHost'.  Common tail shared by the proxy
+-- and direct branches.
+--
+-- For Tor / I2P / proxy connections, 'createPeerConnectionFromSocket'
+-- writes a 0.0.0.0:0 placeholder for 'piAddress' because the proxy
+-- gives us no remote endpoint.  We synthesise a unique SockAddrInet
+-- key from a hash of the destination hostname so multiple Tor/I2P peers
+-- don't collide in 'pmPeers'.  G29 in the W117 audit notes that proper
+-- Tor/I2P SockAddr handling requires an ADT extension; this stand-in
+-- keeps the peer map indexable without that wider refactor.
+finalizeHostConnect :: PeerManager -> PeerConfig -> String -> Int
+                   -> Bool -> Either String PeerConnection -> IO ()
+finalizeHostConnect pm config host port blockRelayOnly res = case res of
+  Left err ->
+    putStrLn $ "tryConnectByHost: connect failed to " ++ host ++ ": " ++ err
+  Right pc -> do
+    -- Synthesise a hostname-keyed SockAddr so the peer map can
+    -- distinguish multiple Tor/I2P/clearnet-via-proxy peers that
+    -- otherwise all share the 0.0.0.0:0 placeholder from
+    -- 'createPeerConnectionFromSocket'.
+    let synthHost  = fromIntegral
+                       (hash host :: Int) :: Word32
+        synthAddr0 = SockAddrInet (fromIntegral port) synthHost
+    atomically $ modifyTVar' (pcInfo pc)
+      (\i -> i { piAddress = synthAddr0 })
+    hsResult <- performHandshake config pc
+    case hsResult of
+      Left err -> do
+        putStrLn $ "tryConnectByHost: handshake failed with "
+                ++ host ++ ": " ++ err
+        disconnectPeer pc
+      Right ver -> do
+        unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+        when blockRelayOnly $
+          atomically $ modifyTVar' (pcInfo pc)
+            (\i -> i { piBlockOnly = True })
+        atomically $ modifyTVar' (pmPeers pm) (Map.insert synthAddr0 pc)
+        pc' <- startPeerThreadsWithMisbehavior pc
+                 (pmMessageHandler pm synthAddr0)
+                 (\reason err -> do
+                    putStrLn $ "Peer " ++ host ++ " misbehavior: "
+                            ++ show reason ++ " (" ++ err ++ ")"
+                    void $ misbehaving pm synthAddr0 reason)
+        atomically $ modifyTVar' (pmPeers pm) (Map.insert synthAddr0 pc')
+        unless blockRelayOnly $
+          sendMessage pc' MGetAddr
+            `catch` (\(_ :: IOException) -> return ())
+        putStrLn $ "tryConnectByHost: connected to " ++ host
 
 -- | Attempt a BIP-324 v2 outbound handshake on a fresh socket.  Returns
 -- 'Just ()' if the peer was successfully registered (v2 cipher state
@@ -9209,26 +9478,45 @@ createPeerConnectionFromSocket config sock _host = do
 -- Address Reachability for Advertising
 --------------------------------------------------------------------------------
 
--- | Network reachability flags for address advertising
+-- | Network reachability flags for address advertising.
+--
+-- W117 DH-2 wiring: this record is now plumbed through
+-- 'reachabilityFromConfig' (above) from the operator's
+-- @--proxy@ / @--onion@ / @--i2psam@ / @--cjdnsreachable@ CLI flags so
+-- 'shouldAdvertiseAddress' / 'filterReachableAddresses' actually
+-- reflect runtime configuration instead of always returning the
+-- conservative 'defaultReachability'.
 data NetworkReachability = NetworkReachability
   { nrIPv4    :: !Bool  -- ^ Can reach IPv4
   , nrIPv6    :: !Bool  -- ^ Can reach IPv6
-  , nrOnion   :: !Bool  -- ^ Can reach .onion (Tor configured)
-  , nrI2P     :: !Bool  -- ^ Can reach .i2p (I2P configured)
+  , nrOnion   :: !Bool  -- ^ Can reach .onion (Tor proxy configured)
+  , nrI2P     :: !Bool  -- ^ Can reach .i2p (I2P SAM bridge configured)
+  , nrCJDNS   :: !Bool  -- ^ Can reach CJDNS overlay (@-cjdnsreachable@)
   } deriving (Show, Eq, Generic)
 
 instance NFData NetworkReachability
 
--- | Default reachability (clearnet only)
+-- | Default reachability (clearnet only).
+--
+-- IPv4 + IPv6 are always reachable in default operator posture; Tor,
+-- I2P, and CJDNS default to off and are flipped on by
+-- 'reachabilityFromConfig' once the operator passes @--proxy@,
+-- @--onion@, @--i2psam@ or @--cjdnsreachable@.
 defaultReachability :: NetworkReachability
 defaultReachability = NetworkReachability
   { nrIPv4  = True
   , nrIPv6  = True
   , nrOnion = False
   , nrI2P   = False
+  , nrCJDNS = False
   }
 
--- | Check if we should advertise an address based on reachability
+-- | Check if we should advertise an address based on reachability.
+--
+-- Mirrors Bitcoin Core's @IsReachable(enum Network)@ in netbase.cpp:
+-- the gossip layer should only forward addresses for networks the
+-- node can actually dial — otherwise relaying Tor/I2P/CJDNS to
+-- clearnet-only peers wastes bandwidth and leaks topology.
 shouldAdvertiseAddress :: NetworkReachability -> NetAddr -> Bool
 shouldAdvertiseAddress reach addr =
   case netAddrNetworkId addr of
@@ -9236,9 +9524,13 @@ shouldAdvertiseAddress reach addr =
     NetIPv6  -> nrIPv6 reach
     NetTorV3 -> nrOnion reach
     NetI2P   -> nrI2P reach
-    NetCJDNS -> False  -- CJDNS not supported yet
+    NetCJDNS -> nrCJDNS reach
 
--- | Filter addresses to only those we can reach
+-- | Filter addresses to only those we can reach.
+--
+-- Called from 'app/Main.hs' before passing addrv2 entries to
+-- 'addAddress' / 'relayAddrToRandomPeers' so unreachable Tor / I2P /
+-- CJDNS entries are dropped before they pollute AddrMan.
 filterReachableAddresses :: NetworkReachability -> [AddrV2] -> [AddrV2]
 filterReachableAddresses reach = filter (shouldAdvertise . av2NetId)
   where
@@ -9246,4 +9538,4 @@ filterReachableAddresses reach = filter (shouldAdvertise . av2NetId)
     shouldAdvertise NetIPv6  = nrIPv6 reach
     shouldAdvertise NetTorV3 = nrOnion reach
     shouldAdvertise NetI2P   = nrI2P reach
-    shouldAdvertise NetCJDNS = False
+    shouldAdvertise NetCJDNS = nrCJDNS reach
