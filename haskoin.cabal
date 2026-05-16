@@ -27,6 +27,7 @@ library
                  , Haskoin.TxOrphanage
                  , Haskoin.ASMap
                  , Haskoin.Bip21
+                 , Haskoin.Payjoin
                  , System.ZMQ4
   hs-source-dirs:  src
   build-depends:   base >= 4.14 && < 5
@@ -130,6 +131,7 @@ test-suite haskoin-test
                , W119PayjoinSpec
                , Bip21Spec
                , Fix64TlsSpec
+               , Fix65PayjoinReceiverSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
@@ -138,6 +140,7 @@ test-suite haskoin-test
                , cereal
                , QuickCheck
                , base16-bytestring
+               , base64-bytestring
                , text
                , containers
                , stm
