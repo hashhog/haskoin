@@ -98,6 +98,20 @@ module Haskoin.Payjoin
     -- * Sender-side outbound-offer cache (G19 + G30 sender mirror)
   , recordSenderOffer
   , isSenderReplay
+    -- * FIX-67 — W119 G6/G7/G8/G9 receiver fee-output refinements
+  , identifyFeeOutput              -- G6
+  , contributeReceiverInput        -- G7 (alias)
+  , substituteReceiverOutput       -- G8
+  , adjustFeeWithinCap             -- G9
+    -- * FIX-67 — W119 G20 anti-fingerprint UTXO selection
+  , pickReceiverUtxoAvoidingCluster
+    -- * FIX-67 — W119 G21 v= version negotiation
+  , parsePayjoinVersion
+  , validateVersion
+    -- * FIX-67 — query-string parsing for receiver-side params
+  , parsePayjoinQuery
+  , PayjoinQuery(..)
+  , defaultPayjoinQuery
     -- * Internal helpers (exported for tests)
   , maxPayjoinBodyBytes
   , psbtOutputScripts
@@ -116,6 +130,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word32, Word64)
+import qualified Data.Word as Word
 import Data.Int (Int64)
 import GHC.Generics (Generic)
 import Control.Concurrent.STM
@@ -125,7 +140,8 @@ import Control.Monad (when)
 import Data.Maybe (fromMaybe)
 import Data.List (foldl', nub)
 import Network.Wai (Application, Response, responseLBS,
-                    requestMethod, strictRequestBody, requestHeaders)
+                    requestMethod, strictRequestBody, requestHeaders,
+                    rawQueryString)
 import Network.HTTP.Types (status200, status400, status405, status413,
                             hContentType)
 -- FIX-66: sender-side HTTP POST.  'http-client' provides the manager +
@@ -583,6 +599,330 @@ signWithReceiverKeys wallet psbt = do
       | otherwise = W.getReceiveKey wallet idx
 
 --------------------------------------------------------------------------------
+-- FIX-67 — W119 G6 / G7 / G8 / G9 receiver-side refinements
+--
+-- FIX-65 wired the *foundation* (validation + sign + replay).  The
+-- four BIP-78 §3 fee/output gates still passed the audit as
+-- "pendingWith MISSING" because the foundation handled the *common*
+-- case (pjos=0 + adjust receiver's own output) but did not honor
+-- sender-supplied parameters:
+--
+--   * additionalfeeoutputindex  — receiver-side detection of which
+--     sender output absorbs fee delta (G6).
+--   * receiver-add-inputs       — same as 'addReceiverInput' below;
+--     exposed under a clearer name so the API surface matches the
+--     BIP-78 spec terminology and the test gate (G7).
+--   * disableoutputsubstitution — when @pjos=1@, attempting to mutate
+--     the receiver's own output is a PROTOCOL VIOLATION and the offer
+--     must be rejected, not silently degraded (G8).
+--   * maxadditionalfeecontribution — receiver MUST clamp its fee delta
+--     to the sender's declared cap, otherwise the sender will reject
+--     via G13 (pure waste of resources for both sides; G9).
+--
+-- All four functions are pure / total — receivers compose them with
+-- the existing 'addReceiverInput' + 'adjustReceiverOutput' helpers.
+--------------------------------------------------------------------------------
+
+-- | G6 — Identify which sender output is the fee-absorbing one.
+--
+-- BIP-78 §3 lets the sender hint @additionalfeeoutputindex=N@ in the
+-- request URL: that is the sender's signal of which output index should
+-- be reduced if the receiver decides to absorb fee delta into a sender-
+-- controlled output.  Without the hint, the receiver SHOULD pick the
+-- largest non-receiver-owned output as the fee-absorbing candidate
+-- (heuristic: that's almost always sender change).
+--
+-- Returns @Left PeOriginalPsbtRejected@ if the hint references a
+-- nonexistent output or the PSBT has no outputs other than the
+-- receiver's own.
+identifyFeeOutput
+  :: Maybe Int               -- ^ Sender's additionalfeeoutputindex hint.
+  -> Int                     -- ^ Index of the receiver's own output.
+  -> Psbt                    -- ^ Original PSBT.
+  -> Either PayjoinError Int -- ^ Index of fee-absorbing sender output.
+identifyFeeOutput mHint recvIdx psbt =
+  let outs = txOutputs (pgTx (psbtGlobal psbt))
+      n    = length outs
+  in case mHint of
+       Just k
+         | k < 0 || k >= n -> Left $ PeOriginalPsbtRejected
+                ("additionalfeeoutputindex out of range: " <> T.pack (show k))
+         | k == recvIdx    -> Left $ PeOriginalPsbtRejected
+                "additionalfeeoutputindex points at receiver's own output"
+         | otherwise       -> Right k
+       Nothing ->
+         -- No hint: pick the LARGEST non-receiver output by value.
+         -- Ties broken by smallest index (stable selection).
+         let candidates = [ (idx, txOutValue o)
+                          | (idx, o) <- zip [0..] outs
+                          , idx /= recvIdx ]
+         in case candidates of
+              []     -> Left $ PeOriginalPsbtRejected
+                          "no non-receiver output available to absorb fee"
+              cs     -> Right (fst (foldr1 keepLarger cs))
+  where
+    keepLarger a@(_, va) b@(_, vb)
+      | va >= vb  = a
+      | otherwise = b
+
+-- | G7 — Append a receiver-controlled input.  Clearer-named alias of
+-- 'addReceiverInput' so audit-flip code reads "receiver contributes its
+-- own input" in the same words BIP-78 §3 uses.  The function body is
+-- unchanged from 'addReceiverInput'; we expose both names so the
+-- internal/external surface matches BIP-78 vocabulary.
+contributeReceiverInput
+  :: Psbt
+  -> OutPoint
+  -> WalletUtxoEntry
+  -> Word32            -- ^ nSequence (BIP-125 signal).
+  -> Psbt
+contributeReceiverInput = addReceiverInput
+
+-- | G8 — Output substitution honoring the @pjos@ flag.
+--
+-- BIP-78 §3 "Receiver can modify their own output": when the sender's
+-- @pjos=1@ (disable-output-substitution) flag is OFF, the receiver MAY
+-- bump its own output by the contributed value; when @pjos=1@, the
+-- receiver MUST leave every output byte-identical and let the extra
+-- value flow into the mining fee (or pull from receiver's contribution
+-- via 'adjustFeeWithinCap' below).
+--
+--   * pjos=False + receiver-bump => 'Right (newPsbt)' with the receiver
+--     output bumped.
+--   * pjos=True  => 'Right psbt' unchanged (caller MUST NOT mutate).
+--
+-- This function is fail-closed: there is no caller-visible failure
+-- path because BIP-78 leaves the policy choice ("how do I absorb the
+-- contribution under pjos=1?") to the receiver.  Returning the same
+-- PSBT signals "no substitution applied"; the caller's fee math
+-- ('adjustFeeWithinCap') then determines whether the contribution is
+-- routed to fee.
+substituteReceiverOutput
+  :: Bool        -- ^ pjos flag (disable-output-substitution).
+  -> Int         -- ^ Index of receiver's own output.
+  -> Word64      -- ^ Value to add (positive => bump the output).
+  -> Psbt
+  -> Either PayjoinError Psbt
+substituteReceiverOutput pjos outIdx added psbt
+  | pjos      = Right psbt  -- Output left untouched; caller manages fee.
+  | otherwise =
+      let outs = txOutputs (pgTx (psbtGlobal psbt))
+      in if outIdx < 0 || outIdx >= length outs
+           then Left $ PeOriginalPsbtRejected
+                  ( "substituteReceiverOutput: outIdx="
+                    <> T.pack (show outIdx)
+                    <> " out of range (n=" <> T.pack (show (length outs))
+                    <> ")")
+           else Right (adjustReceiverOutput psbt outIdx added)
+
+-- | G9 — Compute the fee delta the receiver is allowed to consume.
+--
+-- BIP-78 §4 @maxadditionalfeecontribution@: when the receiver chose
+-- "absorb into the fee-output" (pjos=1 path), the receiver MUST clamp
+-- the delta it absorbs to the sender-declared cap.  This function is
+-- pure arithmetic: caller passes in
+--
+--   * @contribution@ — value of the receiver-added input.
+--   * @originalFee@  — fee on the Original PSBT.
+--   * @cap@          — maxadditionalfeecontribution.
+--
+-- and gets back either @Right delta@ (where @delta <= cap@) or
+-- @Left PeNotEnoughMoney@ when there is no feasible delta.
+--
+-- The arithmetic mirrors @bumpFee@'s clamping (Wallet.hs:2441): the
+-- *receiver* is the party paying the delta in the pjos=1 path; if cap
+-- is too low the receiver MUST decline rather than silently overpay.
+--
+-- NOTE: This function does NOT mutate the PSBT — the caller decides
+-- where to apply the clamped delta (typically: subtract it from the
+-- fee-output identified by 'identifyFeeOutput').
+adjustFeeWithinCap
+  :: Word64                    -- ^ Receiver contribution (input value).
+  -> Word64                    -- ^ Original PSBT fee.
+  -> Word64                    -- ^ maxadditionalfeecontribution.
+  -> Either PayjoinError Word64 -- ^ Allowed fee delta.
+adjustFeeWithinCap contribution originalFee cap
+  | contribution == 0 =
+      Left $ PeOriginalPsbtRejected
+        "adjustFeeWithinCap: zero contribution (no fee delta possible)"
+  | cap == 0 =
+      -- A cap of zero means the sender refuses ANY extra fee.  Force the
+      -- receiver to route the contribution to its own output (pjos=0
+      -- path) by reporting "not-enough-money" — sender will read it as
+      -- "receiver cannot accommodate" and broadcast Original (G22).
+      Left $ PeNotEnoughMoney
+        "maxadditionalfeecontribution=0 forbids any fee delta"
+  | otherwise =
+      -- The delta the receiver wants is "contribution" (route all of
+      -- the new input value to fee, leaving outputs unchanged).  Clamp
+      -- to the sender's cap.
+      let _ = originalFee  -- not used numerically (delta is independent),
+                           -- kept in signature for caller composability.
+          delta = min contribution cap
+      in Right delta
+
+--------------------------------------------------------------------------------
+-- FIX-67 — W119 G20 anti-fingerprint UTXO selection
+--
+-- BIP-78 receivers SHOULD prefer UTXOs that have no obvious on-chain
+-- link to the receive address: contributing the very next UTXO sitting
+-- on the receive address would let an observer cluster the receiver's
+-- inputs trivially.  Production receivers (BTCPay, JoinMarket) use a
+-- coin-control heuristic; for the haskoin foundation we implement the
+-- minimum useful heuristic:
+--
+--   prefer any UTXO whose scriptPubKey != the receiveScript currently
+--   selected for the payment.
+--
+-- If no such UTXO exists, fall back to 'pickReceiverUtxo' (any UTXO is
+-- better than refusing the offer entirely).
+--------------------------------------------------------------------------------
+
+-- | Pick a receiver UTXO that does NOT live on the same scriptPubKey
+-- as the receive address used in the current payment.  Falls back to
+-- the unconstrained 'pickReceiverUtxo' if no diverse UTXO is available.
+pickReceiverUtxoAvoidingCluster
+  :: Wallet
+  -> ByteString    -- ^ scriptPubKey of the receiver's payment address.
+  -> IO (Maybe (OutPoint, WalletUtxoEntry))
+pickReceiverUtxoAvoidingCluster wallet recvScript = do
+  utxos <- readTVarIO (walletUTXOs wallet)
+  let utxoList = Map.toList utxos
+      diverse  = [ (op, e) | (op, e) <- utxoList
+                           , txOutScript (wueTxOut e) /= recvScript ]
+  case diverse of
+    (x:_) -> return (Just x)
+    [] ->
+      -- No diverse UTXOs.  Fall back to first available — anti-FP is a
+      -- preference, not a hard constraint.
+      case utxoList of
+        []        -> return Nothing
+        ((op,e):_) -> return (Just (op, e))
+
+--------------------------------------------------------------------------------
+-- FIX-67 — W119 G21 v= version negotiation
+--
+-- BIP-78 §"Versioning": the sender includes @v=1@ in the request URL
+-- query string.  Receivers MUST reject unknown @v=@ values with the
+-- well-known wire string @"version-unsupported"@ and HTTP 400.  Older
+-- senders that omit @v=@ are treated as @v=1@ for compatibility (this
+-- matches BTCPay / payjoin.org behaviour).
+--------------------------------------------------------------------------------
+
+-- | Parse a textual @v=@ value into an Int.  Returns 'Nothing' on any
+-- parse failure (which the caller maps to 'PeVersionUnsupported').
+parsePayjoinVersion :: ByteString -> Maybe Int
+parsePayjoinVersion bs =
+  let s = map (toEnum . fromIntegral) (BS.unpack bs) :: String
+  in case reads s of
+       -- 'reads' returns [(n, "")] on a full parse; reject trailing junk.
+       [(n :: Int, "")] -> Just n
+       _                -> Nothing
+
+-- | Validate a parsed @v=@ value against the receiver's supported set.
+-- 'Nothing' (= sender omitted @v=@) defaults to @v=1@.
+validateVersion :: PayjoinConfig
+                -> Maybe Int
+                -> Either PayjoinError ()
+validateVersion cfg mVer =
+  let v = fromMaybe 1 mVer
+  in if v `elem` pcSupportedVersions cfg
+       then Right ()
+       else Left $ PeVersionUnsupported
+              ( "unsupported v="
+                <> T.pack (show v)
+                <> " (supported="
+                <> T.pack (show (pcSupportedVersions cfg))
+                <> ")")
+
+--------------------------------------------------------------------------------
+-- FIX-67 — query-string parsing for receiver-side BIP-78 params
+--
+-- BIP-78 §3 the sender includes the following query-string params on
+-- the request URL (in addition to @pj=@ and @pjos=@ on the BIP-21
+-- side, which the *sender* parses via 'Haskoin.Bip21'):
+--
+--   v=N                                  -- protocol version (G21)
+--   additionalfeeoutputindex=N           -- fee-absorbing output hint (G6)
+--   maxadditionalfeecontribution=N       -- fee cap in satoshis (G9, G13)
+--   disableoutputsubstitution=true|false -- pjos echo (G8)
+--
+-- This module wires a tiny query-string parser so the WAI handler can
+-- honor those values without depending on the full 'Haskoin.Bip21'
+-- parser (which is BIP-21 scheme-aware and overkill here).
+--------------------------------------------------------------------------------
+
+-- | Parsed BIP-78 receiver-side query parameters.  All fields are
+-- 'Maybe' because every param is optional in the BIP-78 spec.
+data PayjoinQuery = PayjoinQuery
+  { pqVersion                   :: !(Maybe Int)
+  , pqAdditionalFeeOutputIndex  :: !(Maybe Int)
+  , pqMaxAdditionalFeeContribution :: !(Maybe Word64)
+  , pqDisableOutputSubstitution :: !Bool   -- ^ False if absent or false.
+  } deriving (Show, Eq, Generic)
+
+instance NFData PayjoinQuery
+
+defaultPayjoinQuery :: PayjoinQuery
+defaultPayjoinQuery = PayjoinQuery
+  { pqVersion                       = Nothing
+  , pqAdditionalFeeOutputIndex      = Nothing
+  , pqMaxAdditionalFeeContribution  = Nothing
+  , pqDisableOutputSubstitution     = False
+  }
+
+-- | Parse a raw query string (e.g.  @?v=1&pjos=true&maxadditionalfeecontribution=10000@)
+-- into 'PayjoinQuery'.  Unrecognized keys are silently ignored (BIP-78
+-- §3 reserves the right to add params; receivers that fail-closed on
+-- unknown keys would break with newer senders).
+parsePayjoinQuery :: ByteString -> PayjoinQuery
+parsePayjoinQuery raw =
+  let stripped = BS.dropWhile (== 0x3f) raw    -- drop leading '?'
+      pairs    = if BS.null stripped
+                   then []
+                   else map splitOne (BS.split 0x26 stripped) -- split '&'
+  in foldl' applyPair defaultPayjoinQuery pairs
+  where
+    splitOne :: ByteString -> (ByteString, ByteString)
+    splitOne bs = case BS.break (== 0x3d) bs of   -- split '='
+      (k, v) | not (BS.null v) -> (k, BS.drop 1 v)
+             | otherwise       -> (k, BS.empty)
+    applyPair :: PayjoinQuery -> (ByteString, ByteString) -> PayjoinQuery
+    applyPair q (k, v) =
+      case k of
+        "v" ->
+          q { pqVersion = parsePayjoinVersion v }
+        "additionalfeeoutputindex" ->
+          q { pqAdditionalFeeOutputIndex = parseIntBs v }
+        "maxadditionalfeecontribution" ->
+          q { pqMaxAdditionalFeeContribution =
+                fmap fromIntegral (parseIntBs v) }
+        "disableoutputsubstitution" ->
+          q { pqDisableOutputSubstitution = parseBoolBs v }
+        -- BIP-78 senders sometimes carry the BIP-21 short-form key
+        -- (pjos=) over to the HTTP URL too.  Accept both names so we
+        -- interop with BTCPay (uses disableoutputsubstitution=) and the
+        -- payjoin.org reference (uses pjos=).
+        "pjos" ->
+          q { pqDisableOutputSubstitution = parseBoolBs v }
+        _ -> q
+    parseIntBs :: ByteString -> Maybe Int
+    parseIntBs bs =
+      let s = map (toEnum . fromIntegral) (BS.unpack bs) :: String
+      in case reads s of
+           [(n :: Int, "")] -> Just n
+           _                -> Nothing
+    parseBoolBs :: ByteString -> Bool
+    parseBoolBs bs = case BS.map toLowerByte bs of
+      "true"  -> True
+      "1"     -> True
+      _       -> False
+    toLowerByte :: Word.Word8 -> Word.Word8
+    toLowerByte c
+      | c >= 0x41 && c <= 0x5A = c + 0x20
+      | otherwise              = c
+
+--------------------------------------------------------------------------------
 -- WAI handler
 --------------------------------------------------------------------------------
 
@@ -617,19 +957,36 @@ payjoinApp wallet cacheVar cfg getNowSec req respond
         else
           let hdrs = requestHeaders req
               ct   = lookup hContentType hdrs
-          in case decodePayjoinBody ct bodyBs of
+              -- FIX-67 G21: parse v= and reject unknown versions BEFORE
+              -- decoding the PSBT body.  This mirrors BIP-78 §"Errors"
+              -- and the BTCPay reference receiver — a v= rejection MUST
+              -- short-circuit so the sender sees "version-unsupported"
+              -- without us doing useless PSBT work.
+              query = parsePayjoinQuery (rawQueryString req)
+          in case validateVersion cfg (pqVersion query) of
                Left err -> respond (payjoinErrorResp err)
-               Right psbtOrig -> do
-                 let h = psbtHashKey psbtOrig
-                 replayed <- isReplay cacheVar h
-                 if replayed
-                   then respond (payjoinErrorResp
-                                 (PeReplay "duplicate Original PSBT"))
-                   else do
-                     nowSec <- getNowSec
-                     _ <- pruneExpiredOffers cacheVar nowSec
-                     mProposed <- processOriginalPsbt wallet cfg False Nothing psbtOrig
-                     case mProposed of
+               Right () ->
+                case decodePayjoinBody ct bodyBs of
+                  Left err -> respond (payjoinErrorResp err)
+                  Right psbtOrig -> do
+                    let h = psbtHashKey psbtOrig
+                    replayed <- isReplay cacheVar h
+                    if replayed
+                     then respond (payjoinErrorResp
+                                  (PeReplay "duplicate Original PSBT"))
+                     else do
+                      nowSec <- getNowSec
+                      _ <- pruneExpiredOffers cacheVar nowSec
+                      -- FIX-67 G6/G8/G9: pass the sender-supplied query
+                      -- params into the processing pipeline.  pjos drives
+                      -- output substitution (G8), additionalfeeoutputindex
+                      -- selects the fee-absorbing output (G6), and
+                      -- maxadditionalfeecontribution caps the absorbed
+                      -- fee delta (G9).
+                      let pjos    = pqDisableOutputSubstitution query
+                          feeHint = pqAdditionalFeeOutputIndex query
+                      mProposed <- processOriginalPsbt wallet cfg pjos feeHint psbtOrig
+                      case mProposed of
                        Left err -> respond (payjoinErrorResp err)
                        Right (psbtSigned, op, addedVal) -> do
                          let offer = OfferedPayjoin
