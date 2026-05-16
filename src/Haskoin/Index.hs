@@ -262,16 +262,50 @@ data BitWriter = BitWriter
 bitWriterNew :: BitWriter
 bitWriterNew = BitWriter 0 0 []
 
--- | Write bits to the bit writer
+-- | Write bits to the bit writer.
+--
+-- The @numBits@ least-significant bits of @value@ are appended to the stream.
+--
+-- BUG-16 P0 (W121 addendum): when @numBits + bwBits > 64@ the high-order bits
+-- of the shifted value fell off the top of the 'Word64' buffer.  We now split
+-- any cross-Word64-boundary write into two phases:
+--
+--   (1) write @(64 - bwBits)@ low-order bits with the fast path; the recursive
+--       'flushBytes' drains the now-full 64-bit buffer to the byte stream;
+--   (2) recursively write the remaining @numBits - (64 - bwBits)@ high-order
+--       bits — these are @value `shiftR` (64 - bwBits)@.
+--
+-- Reference: bitcoin-core/src/streams.h BitStreamWriter::Write, which solves
+-- the same boundary problem with a per-octet inner loop.  We keep the
+-- existing Word64-buffer shape (cheaper than a per-byte loop in Haskell) but
+-- never let an unsplit write straddle the 64-bit boundary.
 bitWriterWrite :: BitWriter -> Int -> Word64 -> BitWriter
 bitWriterWrite bw numBits value
   | numBits <= 0 = bw
+  | numBits >  64 = error "bitWriterWrite: numBits > 64"
+  | numBits + bwBits bw > 64 =
+      -- Cross-Word64-boundary write: split into low + high halves.
+      -- The low half exactly fills the current buffer to 64 bits, which
+      -- flushBytes then drains as 8 full bytes, leaving bwBits = 0.
+      let lowN  = 64 - bwBits bw                    -- bits that fit now
+          highN = numBits - lowN                    -- bits left to write
+          lowV  = value .&. (mask lowN)             -- low-order bits
+          highV = value `shiftR` lowN               -- high-order bits
+          bw'   = bitWriterWrite bw  lowN  lowV
+      in     bitWriterWrite bw' highN highV
   | otherwise =
-      let maskedValue = value .&. ((1 `shiftL` numBits) - 1)
+      let maskedValue = value .&. (mask numBits)
           newBuffer = bwBuffer bw .|. (maskedValue `shiftL` bwBits bw)
           newBits = bwBits bw + numBits
       in flushBytes $ bw { bwBuffer = newBuffer, bwBits = newBits }
   where
+    -- | n-bit mask with n in [0,64].  At n=64 the naive @(1 << 64) - 1@
+    -- collapses to 0 - 1 = 0xFFFF... by GHC's modular semantics, but spelling
+    -- it explicitly avoids relying on that and matches Core's '~0ULL'.
+    mask :: Int -> Word64
+    mask 64 = maxBound
+    mask n  = (1 `shiftL` n) - 1
+
     flushBytes !bw'
       | bwBits bw' >= 8 =
           let byte = fromIntegral (bwBuffer bw' .&. 0xff)

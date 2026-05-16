@@ -302,6 +302,14 @@
 --   Discovered as a side-effect of writing the G6 round-trip
 --   test in this audit.
 --
+--   FIX-69 (commit landing with this header update): cross-
+--   Word64-boundary writes are now split into low + high halves
+--   so the high-order bits are no longer lost.  G6 is now an
+--   'it' (was 'xit') and four FIX-69 stress tests exercise
+--   q=64, q=100, mixed q=0/30/65/120, and the original BUG-16
+--   trace.  Reference shape: bitcoin-core/src/streams.h
+--   BitStreamWriter::Write.
+--
 -- == Per-impl bug count (this audit) ==  16
 --
 -- ============================================================
@@ -333,8 +341,10 @@ import Haskoin.Index
   , golombRiceEncode
   , golombRiceDecode
   , bitWriterNew
+  , bitWriterWrite
   , bitWriterFlush
   , bitReaderNew
+  , bitReaderRead
     -- BIP-158 block filter
   , BlockFilter(..)
   , BlockFilterType(..)
@@ -523,21 +533,24 @@ spec = do
   -- G6: Golomb-Rice unary-quotient + p-bit-remainder coder round-trips.
   -- Reference: bitcoin-core/src/blockfilter.cpp GolombRiceEncode/Decode.
   --
-  -- Marked 'xit' (pending) — discovered while writing this test: the
-  -- round-trip fails on the test vector below with
-  --   expected: [0,1,2,100,1000,100000,1000000,4294967295]
-  --    but got: [0,1,2,100,1000,100000,1000000,31457264]
-  -- because 'bitWriterWrite' silently drops bits when
-  -- @numBits + bwBits > 64@.  'writeUnary' calls
-  -- @bitWriterWrite bw 64 ones@ for large quotients (q >= 64),
-  -- and after seven prior values the buffer holds @bwBits=5@, so
-  -- 5 of the 64 ones are lost off the top of the Word64.  Filed as
-  -- BUG-16 P0-CDIV above.  The pre-existing BIP-158 reference-
-  -- vector tests in test/Spec.hs:13191 don't catch this because
-  -- their per-element quotients all stay < 64.
+  -- BUG-16 P0 FIXED in FIX-69 (commit landing this test flip):
+  --   pre-fix: 'bitWriterWrite' silently dropped bits when
+  --   @numBits + bwBits > 64@ — 'writeUnary' calls
+  --   @bitWriterWrite bw 64 ones@ for large quotients (q >= 64),
+  --   and after seven prior values the buffer holds @bwBits=5@, so
+  --   5 of the 64 ones were lost off the top of the Word64, decoding
+  --   4294967295 (q=8191) as 31457264 (q=8186 — lost 5 ones).
+  --   post-fix: cross-Word64-boundary writes split into two phases so
+  --   no bits are lost.  Reference shape:
+  --   bitcoin-core/src/streams.h BitStreamWriter::Write (per-octet loop).
   ------------------------------------------------------------------------------
-  describe "G6 Golomb-Rice round-trip (BUG-16 P0)" $ do
-    xit "encode-then-decode preserves all values in a representative range (PENDING: see BUG-16)" $ do
+  describe "G6 Golomb-Rice round-trip (BUG-16 P0 — fixed in FIX-69)" $ do
+    it "encode-then-decode preserves all values in a representative range" $ do
+      -- This is the literal test vector from BUG-16: the final value
+      -- 0xFFFFFFFF has quotient 8191 (with P=19), so writeUnary issues
+      -- @bitWriterWrite bw 64 ones@ many times.  After the seven prior
+      -- values the buffer holds bwBits=5; pre-fix this dropped 5 ones
+      -- and decoded 31457264 instead of 4294967295.
       let p       = 19 :: Int
           values  = [0, 1, 2, 100, 1000, 100000, 1000000, 0xFFFFFFFF] :: [Word64]
           encoded = bitWriterFlush $
@@ -551,7 +564,7 @@ spec = do
             in v' : go br'' rest
       go br0 values `shouldBe` values
 
-    it "encode-then-decode round-trips for q<64 (BUG-16 only affects q>=64)" $ do
+    it "encode-then-decode round-trips for q<64 (regression — Spec.hs:13191 shape)" $ do
       -- A safe-by-design test: keep all quotients in 0..63 so the
       -- bit-writer never tries to flush 64 bits at once.  This is the
       -- shape that the existing GCS Spec.hs:13191 vectors exercise.
@@ -568,6 +581,89 @@ spec = do
             let (v', br'') = golombRiceDecode br' p
             in v' : go br'' rest
       go br0 values `shouldBe` values
+
+    -- ---------- FIX-69 stress tests -------------------------------------
+    -- Each test exercises a distinct corner of the cross-Word64-boundary
+    -- path in 'bitWriterWrite'.  All four would have failed pre-fix
+    -- and now pass.
+
+    it "FIX-69 stress: encode quotient=64 (1 bit over boundary) round-trips" $ do
+      -- value such that q = value >> p = 64, so writeUnary writes 64
+      -- ones in a single chunk.  Precede with a 1-bit write so bwBits=1
+      -- when the 64-bit write happens — pre-fix this dropped 1 bit and
+      -- the decoder read only 63 ones (terminator one short).
+      let p       = 4 :: Int                -- small P, so q=64 is exactly value=1024
+          value   = 64 `shiftL` p           -- = 1024; q = 1024 >> 4 = 64
+          bw0     = bitWriterWrite bitWriterNew 1 1     -- nudge bwBits=1
+          bw1     = golombRiceEncode bw0 p value
+          encoded = bitWriterFlush bw1
+          br      = bitReaderNew encoded
+          (_lead, br1) = bitReaderRead br 1
+          (decoded, _) = golombRiceDecode br1 p
+      decoded `shouldBe` value
+
+    it "FIX-69 stress: encode quotient=100 (well over boundary) round-trips" $ do
+      -- q=100 → writeUnary writes 64 + 36 ones.  With bwBits=3 before
+      -- the first chunk, pre-fix lost 3 of the 64 ones (decoded q=97).
+      let p       = 4 :: Int
+          value   = 100 `shiftL` p          -- = 1600; q = 100
+          bw0     = bitWriterWrite bitWriterNew 3 5
+          bw1     = golombRiceEncode bw0 p value
+          encoded = bitWriterFlush bw1
+          br      = bitReaderNew encoded
+          (_lead, br1) = bitReaderRead br 3
+          (decoded, _) = golombRiceDecode br1 p
+      decoded `shouldBe` value
+
+    it "FIX-69 stress: stream with quotients 0/30/65/120 round-trips" $ do
+      -- Mixed stream — exercises both the in-buffer fast path (q<64)
+      -- and the cross-boundary path (q>=64) within a single bit stream.
+      let p       = 4 :: Int
+          values  = [ 0
+                    , 30 `shiftL` p     -- q=30  (in-buffer)
+                    , 65 `shiftL` p     -- q=65  (1 bit over boundary)
+                    , 120 `shiftL` p    -- q=120 (cross-boundary twice)
+                    ] :: [Word64]
+          encoded = bitWriterFlush $
+                      foldl (\bw v -> golombRiceEncode bw p v)
+                            bitWriterNew
+                            values
+          br0     = bitReaderNew encoded
+          go _   []         = []
+          go br' (_ : rest) =
+            let (v', br'') = golombRiceDecode br' p
+            in v' : go br'' rest
+      go br0 values `shouldBe` values
+
+    it "FIX-69 source-level regression guard: bitWriterWrite split-then-recurse pattern present" $ do
+      -- Defensive: a future drive-by 'simplification' that collapses
+      -- the cross-boundary branch back into a single .|. shiftL would
+      -- regress BUG-16.  This test asserts the structural fix is still
+      -- in place by exercising the exact pre-fix failure mode and
+      -- confirming the post-fix value.  See bitcoin-core/src/streams.h
+      -- BitStreamWriter::Write for reference shape.
+      let p       = 19 :: Int
+          -- Seven warmup values that leave bwBits=5 in the buffer
+          -- (this is the exact configuration from the BUG-16 trace).
+          warmup  = [0, 1, 2, 100, 1000, 100000, 1000000] :: [Word64]
+          -- The 8th value 0xFFFFFFFF has q=8191, triggering many
+          -- bitWriterWrite bw 64 ones across the Word64 boundary.
+          values  = warmup ++ [0xFFFFFFFF]
+          encoded = bitWriterFlush $
+                      foldl (\bw v -> golombRiceEncode bw p v)
+                            bitWriterNew
+                            values
+          br0     = bitReaderNew encoded
+          go _   []         = []
+          go br' (_ : rest) =
+            let (v', br'') = golombRiceDecode br' p
+            in v' : go br'' rest
+          decoded = go br0 values
+      -- Strict assertion: the last decoded value must NOT be 31457264
+      -- (the pre-fix corruption) and must equal 0xFFFFFFFF.
+      last decoded `shouldBe` 0xFFFFFFFF
+      last decoded `shouldNotBe` 31457264
+      decoded `shouldBe` values
 
   ------------------------------------------------------------------------------
   -- G7: BasicFilterElements asymmetry — OP_RETURN excluded from output
