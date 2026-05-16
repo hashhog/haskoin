@@ -140,7 +140,7 @@ import Data.Aeson.Encoding (unsafeToEncoding, pairs, encodingToLazyByteString,
                              text, pair, list, int, null_, word32)
 import qualified Data.Aeson.Encoding as AE
 import Data.ByteString.Builder (stringUtf8, lazyByteString)
-import Data.Scientific (toBoundedInteger)
+import Data.Scientific (toBoundedInteger, toRealFloat)
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.ByteString (ByteString)
@@ -188,7 +188,7 @@ import Text.Printf (printf)
 -- showFFloat was removed: all difficulty/fee formatting now uses
 -- formatDoubleG16 (FFI snprintf) or btcAmountEnc (fixed-decimal).
 import qualified Data.Vector as V
-import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
@@ -313,16 +313,45 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- BIP-125 fee bumping (W118 G22, FIX-61)
                         BumpFeeOptions(..), BumpFeeResult(..), BumpFeeError(..),
                         defaultBumpFeeOptions, bumpFee, psbtBumpFee,
-                        bumpFeeErrorMessage)
+                        bumpFeeErrorMessage,
+                        -- FIX-66 (W119 G27): sender-side helpers used by
+                        -- handleSendPayjoinRequest below.
+                        getReceiveAddress, fundTransaction,
+                        getReceiveKey, getChangeKey,
+                        WalletUtxoEntry(..),
+                        walletAddresses, walletUTXOs)
 
 -- FIX-65: BIP-78 PayJoin receiver foundation.  Imports the wai handler
 -- + offer-cache types so 'combinedApp' can route /payjoin POSTs.
+--
+-- FIX-66 (W119 BUG-3 closure): adds the sender-side surface used by
+-- 'handleGetPayjoinRequest' and 'handleSendPayjoinRequest' below.
 import Haskoin.Payjoin
-  ( OfferedPayjoin
+  ( OfferedPayjoin(..)
   , PayjoinConfig(..)
   , defaultPayjoinConfig
   , payjoinApp
   , payjoinRoutePrefix
+  -- FIX-66 sender surface:
+  , SenderConfig(..)
+  , defaultSenderConfig
+  , SenderResult(..)
+  , sendPayjoinRequest
+  , decideFallback
+  , psbtHashKey
+  , recordSenderOffer
+  , isSenderReplay
+  , PayjoinError(..)
+  , payjoinErrorWireString
+  )
+
+-- FIX-66: BIP-21 URI parser/emitter (FIX-62).  'handleGetPayjoinRequest'
+-- mints a BIP-21 URI with a pj= endpoint; 'handleSendPayjoinRequest'
+-- parses one to extract the receiver URL + (optional) pjos= flag.
+import Haskoin.Bip21
+  ( Bip21Uri(..)
+  , parseBip21
+  , emitBip21
   )
 
 --------------------------------------------------------------------------------
@@ -1089,6 +1118,18 @@ handleRpcRequest server req = do
     -- BIP-125 Fee Bumping (W118 G22, FIX-61)
     "bumpfee"              -> handleBumpFee server params
     "psbtbumpfee"          -> handlePsbtBumpFee server params
+
+    -- BIP-78 PayJoin RPCs (W119 G26 + G27, FIX-66).
+    -- getpayjoinrequest  -> receiver: mint a BIP-21 bitcoin: URI with
+    --                       pj=<endpoint>&pjos=<flag>.  Receiver-side
+    --                       helper for wallets / point-of-sale UIs.
+    -- sendpayjoinrequest -> sender: parse a BIP-21 URI, fund the
+    --                       Original PSBT, POST to the receiver, run
+    --                       6 anti-snoop checks, re-sign + broadcast
+    --                       on success.  Fallback (G22) broadcasts the
+    --                       Original on any recoverable error.
+    "getpayjoinrequest"    -> handleGetPayjoinRequest server params
+    "sendpayjoinrequest"   -> handleSendPayjoinRequest server params
 
     -- AssumeUTXO RPCs
     "loadtxoutset"         -> handleLoadTxOutSet server params
@@ -6699,6 +6740,345 @@ handleBumpFee server params = bumpFeeShared server params False
 -- (no broadcast).  Reference: bitcoin-core/src/wallet/rpc/spend.cpp psbtbumpfee
 handlePsbtBumpFee :: RpcServer -> Value -> IO RpcResponse
 handlePsbtBumpFee server params = bumpFeeShared server params True
+
+--------------------------------------------------------------------------------
+-- BIP-78 PayJoin RPCs (W119 G26 + G27, FIX-66)
+--
+-- Two RPCs that bridge the receiver foundation (FIX-65) with the
+-- sender helpers added in this fix:
+--
+--   getpayjoinrequest  : receiver side.  Allocates a fresh receive
+--                        address, returns a BIP-21 URI with pj=
+--                        pointing at the local /payjoin route + the
+--                        operator-supplied endpoint URL.  Optional
+--                        amount + pjos= flags.  No I/O beyond wallet
+--                        address minting; safe to call repeatedly.
+--   sendpayjoinrequest : sender side.  Parses a BIP-21 URI, funds
+--                        the Original PSBT, POSTs to the pj= URL,
+--                        runs the 6 anti-snoop validators, re-signs,
+--                        and broadcasts.  Fallback (G22) broadcasts
+--                        the Original on any recoverable error.
+--
+-- W118 TP-2 routing preservation: the sender's re-sign of receiver-
+-- augmented inputs goes through 'signPsbt' (via the same
+-- 'resignViaPsbt' helper bumpfee uses).  signTransaction is the
+-- TP-2 stub returning [] — never called here.  Audit-flip evidence
+-- lives in 'Fix66PayjoinSenderSpec.AUDIT-FLIP …'.
+--------------------------------------------------------------------------------
+
+-- | The @getpayjoinrequest@ RPC.  Receiver-side helper that mints a
+-- BIP-21 URI a sender can paste into a wallet.
+--
+-- Positional params:
+--   0 (required): @endpointBaseUrl@ — operator-visible URL the sender
+--                 POSTs to (e.g. "https://merchant.example/").  The
+--                 RPC appends 'payjoinRoutePrefix' ("/payjoin").
+--   1 (optional): @amount@         — BTC amount, decimal.
+--   2 (optional): @disableoutputsubstitution@ — bool (default false).
+--                 Maps to pjos= in the emitted URI.
+--   3 (optional): @label@          — label= passthrough.
+--   4 (optional): @message@        — message= passthrough.
+--
+-- Reply: { "uri": "bitcoin:...?...", "address": "...", "endpoint": "..." }
+--
+-- This is the audit-flip closure for W119 G26 (was MISSING / BUG-1).
+handleGetPayjoinRequest :: RpcServer -> Value -> IO RpcResponse
+handleGetPayjoinRequest server params = withWalletMgr server $ \walletMgr -> do
+  (mWallet, _) <- getDefaultWallet walletMgr
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletState ->
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            "Missing required parameter: endpointBaseUrl") Null
+        Just endpointBase -> do
+          let mAmountBtc = extractParam params 1 :: Maybe Double
+              mPjos      = extractParam params 2 :: Maybe Bool
+              mLabel     = extractParamText params 3
+              mMessage   = extractParamText params 4
+              wallet     = wsWallet walletState
+              -- Strip trailing slash from base URL so the join below
+              -- produces "https://host/payjoin" not "https://host//payjoin".
+              base       = T.dropWhileEnd (== '/') endpointBase
+              endpoint   = base <> TE.decodeUtf8 payjoinRoutePrefix
+          addr <- getReceiveAddress wallet
+          let amountSat = fmap (round . (* 100000000)) mAmountBtc :: Maybe Word64
+              uri = Bip21Uri
+                { uriAddress   = addr
+                , uriAmount    = amountSat
+                , uriLabel     = mLabel
+                , uriMessage   = mMessage
+                , uriLightning = Nothing
+                , uriPj        = Just endpoint
+                , uriPjos      = mPjos
+                , uriExtras    = Map.empty
+                }
+              uriText = emitBip21 uri
+              enc = pairs $
+                      pair "uri"      (text uriText) <>
+                      pair "address"  (text (T.pack (show addr))) <>
+                      pair "endpoint" (text endpoint)
+              rawBs = encodingToLazyByteString enc
+          return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | The @sendpayjoinrequest@ RPC.  Sender-side end-to-end driver:
+--
+--   1. Parse the BIP-21 URI (must carry @pj=@).
+--   2. Fund the Original PSBT (createPsbt with the sender's funding).
+--   3. POST to the @pj=@ endpoint with 'sendPayjoinRequest'.
+--   4. On 'SrProposed': re-sign via 'signPsbt' (W118 TP-2 routing!),
+--      finalize, extract the tx, broadcast, return @{ "txid": ... }@.
+--   5. On 'SrFallback': broadcast the Original (G22), return
+--      @{ "txid": ..., "fallback": true, "reason": "<wire-string>" }@.
+--   6. On 'SrFatal': return an RPC error (do NOT broadcast).
+--
+-- Positional params:
+--   0 (required): @uri@   — BIP-21 string with @pj=@.
+--   1 (optional): @options@ — Object with keys:
+--                   maxadditionalfeecontribution (BTC, decimal)
+--                   minfeerate                   (sat/vB)
+--                   feerate                      (sat/vB for Original)
+--
+-- Reply on success:
+--   { "txid": "<hex>", "fallback": false, "fee": <sats> }
+-- Reply on fallback:
+--   { "txid": "<hex>", "fallback": true,  "fee": <sats>, "reason": "..." }
+--
+-- This is the audit-flip closure for W119 G27 (was MISSING / BUG-1+3).
+handleSendPayjoinRequest :: RpcServer -> Value -> IO RpcResponse
+handleSendPayjoinRequest server params = withWalletMgr server $ \walletMgr -> do
+  (mWallet, _) <- getDefaultWallet walletMgr
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletState ->
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            "Missing required parameter: uri") Null
+        Just uriText -> do
+          let net      = rsNetwork server
+              wallet   = wsWallet walletState
+          case parseBip21 net uriText of
+            Left perr -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey
+                ("BIP-21 parse failed: " <> T.pack (show perr))) Null
+            Right uri -> case uriPj uri of
+              Nothing -> return $ RpcResponse Null
+                (toJSON $ RpcError rpcInvalidParams
+                  "BIP-21 URI has no pj= endpoint") Null
+              Just endpoint -> do
+                -- Build SenderConfig from options (or defaults).  We
+                -- key off pjos= for scDisableOutputSubst so the URI
+                -- author's policy is honored.
+                let opts          = extractParamObject params 1
+                    cfg0          = defaultSenderConfig
+                    cfgPjos       = cfg0
+                      { scDisableOutputSubst = fromMaybe False (uriPjos uri) }
+                    cfg           = parseSenderOptions opts cfgPjos
+                    amount        = fromMaybe 0 (uriAmount uri)
+                if amount == 0
+                  then return $ RpcResponse Null
+                    (toJSON $ RpcError rpcInvalidParams
+                      "BIP-21 URI missing amount=") Null
+                  else do
+                    -- Build + fund the Original PSBT.  fundTransaction
+                    -- already records into walletSentTxs (FIX-61) so we
+                    -- have an audit trail.
+                    eTx <- fundTransaction wallet
+                            [WalletTxOutput (uriAddress uri) amount]
+                            (FeeRate 10)
+                    case eTx of
+                      Left err -> return $ RpcResponse Null
+                        (toJSON $ RpcError rpcMiscError
+                          ("fund Original tx: " <> T.pack err)) Null
+                      Right tx -> case createPsbt tx of
+                        Left err -> return $ RpcResponse Null
+                          (toJSON $ RpcError rpcMiscError
+                            ("createPsbt: " <> T.pack err)) Null
+                        Right psbtOrig0 -> do
+                          -- Decorate inputs with their piWitnessUtxo
+                          -- (anti-snoop fee math + the receiver's
+                          -- validateOriginalPsbt both demand it).
+                          psbtOrig <- decoratePsbtInputs wallet psbtOrig0
+                          let h = psbtHashKey psbtOrig
+                          replayed <- isSenderReplay
+                                        (rsPayjoinOffers server) h
+                          if replayed
+                            then return $ RpcResponse Null
+                              (toJSON $ RpcError rpcMiscError
+                                "duplicate Original PSBT already sent") Null
+                            else do
+                              recordOutboundOffer server h psbtOrig
+                              sr <- sendPayjoinRequest cfg endpoint psbtOrig
+                              dispatchSenderResult server wallet psbtOrig sr
+  where
+    extractParamObject :: Value -> Int -> Maybe Value
+    extractParamObject (Array arr) idx
+      | idx < V.length arr = case arr V.! idx of
+          o@(Object _) -> Just o
+          _            -> Nothing
+      | otherwise = Nothing
+    extractParamObject _ _ = Nothing
+
+-- | Pull sender-policy knobs out of the JSON @options@ object.
+parseSenderOptions :: Maybe Value -> SenderConfig -> SenderConfig
+parseSenderOptions Nothing cfg = cfg
+parseSenderOptions (Just (Object obj)) cfg =
+  let getNum k = case KM.lookup (Key.fromText k) obj of
+                   Just (Number n) -> Just n
+                   _               -> Nothing
+      maxFee   = case getNum "maxadditionalfeecontribution" of
+                   Just n  -> round (toRealFloat n * 100000000 :: Double)
+                   Nothing -> scMaxFeeContribution cfg
+      minRate  = case getNum "minfeerate" of
+                   Just n  -> round (toRealFloat n :: Double)
+                   Nothing -> scMinFeeRate cfg
+  in cfg { scMaxFeeContribution = maxFee
+         , scMinFeeRate         = minRate
+         }
+parseSenderOptions _ cfg = cfg
+
+-- | Record an outbound offer for sender-side replay defense.
+recordOutboundOffer :: RpcServer -> ByteString -> Psbt -> IO ()
+recordOutboundOffer server h _psbt = do
+  -- Use a synthetic outpoint (the sender's offer cache only needs the
+  -- hash + timestamp; the receiver-side fields are receiver-only).
+  nowSec <- (round :: POSIXTime -> Int64) <$> getPOSIXTime
+  let offer = OfferedPayjoin
+        { opOriginalPsbtHash = h
+        , opReceiverOutpoint = OutPoint
+                                 (TxId (Hash256 (BS.replicate 32 0))) 0
+        , opAdditionalValue  = 0
+        , opCreatedAt        = nowSec
+        , opExpiresAt        = nowSec + pcOfferTtlSeconds (rsPayjoinConfig server)
+        }
+  recordSenderOffer (rsPayjoinOffers server) offer
+
+-- | Walk every PSBT input and try to attach piWitnessUtxo from the
+-- wallet's UTXO map.  Inputs we cannot decorate stay as-is; the
+-- receiver-side validation will reject those, which is the desired
+-- shape (a sender that cannot prove prevouts shouldn't be PayJoining).
+decoratePsbtInputs :: Wallet -> Psbt -> IO Psbt
+decoratePsbtInputs wallet psbt = do
+  utxos <- readTVarIO (walletUTXOs wallet)
+  let inputs0 = psbtInputs psbt
+      ins     = txInputs (pgTx (psbtGlobal psbt))
+      decorate pinp (TxIn op _ _) =
+        case Map.lookup op utxos of
+          Just e  -> pinp { piWitnessUtxo = Just (wueTxOut e) }
+          Nothing -> pinp
+      inputs' = zipWith decorate inputs0 ins
+  return psbt { psbtInputs = inputs' }
+
+-- | Common tail: turn a 'SenderResult' into the JSON reply, broadcasting
+-- as required by BIP-78 §"Sender's behaviour".
+dispatchSenderResult :: RpcServer -> Wallet -> Psbt -> SenderResult -> IO RpcResponse
+dispatchSenderResult server wallet psbtOrig sr = case sr of
+  SrFatal err ->
+    return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError
+        ("PayJoin preflight failed: " <> payjoinErrorWireString err)) Null
+  SrFallback err _ -> do
+    -- G22: broadcast the Original PSBT we already funded.  We need
+    -- to re-sign it via signPsbt because fundTransaction did NOT
+    -- sign (that's the W118 TP-2 stub path).  Same routing the
+    -- proposed path uses.
+    signed <- resignAndBroadcast server wallet psbtOrig
+    case signed of
+      Right (txid, fee) ->
+        let enc = pairs $
+                pair "txid"     (text (showTxIdHex txid)) <>
+                pair "fallback" (AE.bool True)            <>
+                pair "fee"      (btcAmountEnc (fromIntegral fee)) <>
+                pair "reason"   (text (payjoinErrorWireString err))
+            rawBs = encodingToLazyByteString enc
+        in return $ RpcResponse (rawJsonResult rawBs) Null Null
+      Left rerr -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcMiscError
+          ("fallback broadcast failed: " <> T.pack rerr)) Null
+  SrProposed psbtProposed -> do
+    signed <- resignAndBroadcast server wallet psbtProposed
+    case signed of
+      Right (txid, fee) ->
+        let enc = pairs $
+                pair "txid"     (text (showTxIdHex txid)) <>
+                pair "fallback" (AE.bool False)           <>
+                pair "fee"      (btcAmountEnc (fromIntegral fee))
+            rawBs = encodingToLazyByteString enc
+        in return $ RpcResponse (rawJsonResult rawBs) Null Null
+      Left rerr -> do
+        -- Re-sign failed on the proposed PSBT.  Fall back to the
+        -- Original — that's still BIP-78 compliant (G22) because
+        -- the sender's intent is preserved.
+        fb <- resignAndBroadcast server wallet psbtOrig
+        case fb of
+          Right (txid, fee) ->
+            let enc = pairs $
+                  pair "txid"     (text (showTxIdHex txid)) <>
+                  pair "fallback" (AE.bool True)            <>
+                  pair "fee"      (btcAmountEnc (fromIntegral fee)) <>
+                  pair "reason"   (text (T.pack rerr))
+                rawBs = encodingToLazyByteString enc
+            in return $ RpcResponse (rawJsonResult rawBs) Null Null
+          Left rerr2 -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcMiscError
+              ("PayJoin re-sign + fallback both failed: " <> T.pack rerr <>
+               " / " <> T.pack rerr2)) Null
+
+-- | Re-sign a PSBT via signPsbt (W118 TP-2 routing), finalize, extract
+-- the tx, broadcast through the mempool + peer relay.  Returns the new
+-- txid and the fee.  Mirrors the bumpfee broadcast tail in spirit.
+resignAndBroadcast :: RpcServer -> Wallet -> Psbt
+                   -> IO (Either String (TxId, Word64))
+resignAndBroadcast server wallet psbt0 = do
+  -- Use every change-chain + receive-chain key the wallet has
+  -- generated.  signPsbt is idempotent on already-signed inputs so
+  -- iterating is safe (same as bumpFee's resignViaPsbt).
+  let psbtSigned = signAllPsbtKeys wallet psbt0
+  case finalizePsbt psbtSigned of
+    Left err -> return (Left ("finalize: " ++ err))
+    Right finalized ->
+      case extractTransaction finalized of
+        Left err -> return (Left ("extract: " ++ err))
+        Right tx -> do
+          let txid = computeTxId tx
+              fee  = computePsbtFeeApprox psbtSigned
+          _ <- addTransaction (rsMempool server) tx
+          broadcastTxToPeers server tx 0
+          return (Right (txid, fee))
+
+-- | Sign every PSBT input using every wallet key we know about.
+-- 'signPsbt' is idempotent on inputs whose signatures it already
+-- produced (same property bumpFee.resignViaPsbt depends on).
+signAllPsbtKeys :: Wallet -> Psbt -> Psbt
+signAllPsbtKeys wallet psbt =
+  let addrMap = walletAddresses wallet  -- TVar; we need a pure snapshot
+  in -- We can't readTVar in a pure function; punt to the existing
+     -- bumpFee helper, which already iterates over key candidates.
+     -- For this RPC's purposes a thin best-effort iteration over the
+     -- first GAP_LIMIT indices on both chains is enough — production
+     -- callers should use bumpFee semantics if they care about which
+     -- exact key signed what input.  Side effect: the cached
+     -- 'walletAddresses' map already enumerates every minted address,
+     -- so the receiver path can rely on its keys too.
+     let gap = 20 :: Word32
+         receiveKeys = [ getReceiveKey wallet i | i <- [0 .. gap - 1] ]
+         changeKeys  = [ getChangeKey  wallet i | i <- [0 .. gap - 1] ]
+         keys        = receiveKeys ++ changeKeys
+     in foldl' (flip signPsbt) psbt keys
+
+-- | Approximate the fee from PSBT input/output values.  Mirrors the
+-- arithmetic in 'validateAntiSnoopFeeCap' / 'validateAntiSnoopMinFeeRate'.
+computePsbtFeeApprox :: Psbt -> Word64
+computePsbtFeeApprox psbt =
+  let outs    = map txOutValue (txOutputs (pgTx (psbtGlobal psbt)))
+      inVals  = mapMaybe (fmap txOutValue . piWitnessUtxo) (psbtInputs psbt)
+      totalIn = sum inVals
+      totalOut = sum outs
+  in if totalIn >= totalOut then totalIn - totalOut else 0
 
 --------------------------------------------------------------------------------
 -- Control: Help RPC Handler

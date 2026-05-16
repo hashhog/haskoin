@@ -115,6 +115,7 @@ import qualified W119PayjoinSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
+import qualified Fix66PayjoinSenderSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22567,6 +22568,11 @@ main = hspec $ do
   -- FIX-65: BIP-78 PayJoin receiver foundation (closes W119 BUG-1 partial:
   -- /payjoin route + handler module + receiver-side processOriginalPsbt).
   Fix65PayjoinReceiverSpec.spec
+
+  -- FIX-66: BIP-78 PayJoin SENDER + anti-snoop + 2 RPCs.  Closes W119
+  -- BUG-3 (http-client dep) and flips G10-G15 / G22 / G26 / G27 in
+  -- W119PayjoinSpec.  Round-trip with FIX-65 receiver via http-client.
+  Fix66PayjoinSenderSpec.spec
 
   where
     sampleTx = Tx
