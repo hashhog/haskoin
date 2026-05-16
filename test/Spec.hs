@@ -113,6 +113,7 @@ import qualified W117BIP155NetworksSpec
 import qualified W118WalletSpec
 import qualified W119PayjoinSpec
 import qualified W120MempoolRbfSpec
+import qualified W121CompactFiltersSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22562,6 +22563,9 @@ main = hspec $ do
 
   -- W120 Mempool strict BIP-125 RBF rules 1-5 (30-gate audit)
   W120MempoolRbfSpec.spec
+
+  -- W121 BIP-157/158 Compact Block Filters (30-gate audit)
+  W121CompactFiltersSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
