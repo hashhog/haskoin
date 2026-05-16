@@ -315,6 +315,16 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         defaultBumpFeeOptions, bumpFee, psbtBumpFee,
                         bumpFeeErrorMessage)
 
+-- FIX-65: BIP-78 PayJoin receiver foundation.  Imports the wai handler
+-- + offer-cache types so 'combinedApp' can route /payjoin POSTs.
+import Haskoin.Payjoin
+  ( OfferedPayjoin
+  , PayjoinConfig(..)
+  , defaultPayjoinConfig
+  , payjoinApp
+  , payjoinRoutePrefix
+  )
+
 --------------------------------------------------------------------------------
 -- RPC Configuration
 --------------------------------------------------------------------------------
@@ -435,6 +445,18 @@ data RpcServer = RpcServer
     -- Empty ByteString when ASMap is not configured (default).
     -- Used by 'handleGetPeerInfo' to emit @mapped_as@ per peer.
     -- Reference: bitcoin-core/src/rpc/net.cpp getpeerinfo mapped_as.
+  , rsPayjoinOffers  :: !(TVar (Map ByteString OfferedPayjoin))
+    -- ^ FIX-65: BIP-78 PayJoin receiver offer cache.  Keyed by
+    -- SHA-256 of the encoded Original PSBT.  Provides G18 TTL +
+    -- G30 replay defense; mirrors the FIX-61 'walletSentTxs' shape.
+    -- Always allocated even when 'rsPayjoinConfig' is disabled, so
+    -- enabling PayJoin at runtime does not require a restart.
+  , rsPayjoinConfig  :: !PayjoinConfig
+    -- ^ FIX-65: BIP-78 PayJoin receiver static config.  Defaults to
+    -- 'defaultPayjoinConfig' (disabled), so the /payjoin route
+    -- returns 400 + "unavailable" until an operator opts in.  When
+    -- 'pcEnabled' = True, the route consumes a wallet UTXO per
+    -- request via 'processOriginalPsbt'.
   }
 
 -- | Back-compat accessor: True iff prune mode is on (manual or auto).
@@ -670,7 +692,13 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
   -- TemporaryRollback in rpc/blockchain.cpp::dumptxoutset). Initialised
   -- to False; flipped True only inside the rollback dance.
   pauseVar <- newTVarIO False
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty
+  -- FIX-65: allocate the BIP-78 PayJoin offer cache + load the static
+  -- config.  The cache is empty at startup; the config defaults to
+  -- 'defaultPayjoinConfig' (disabled) so the /payjoin route returns
+  -- 400 + "unavailable" until an operator flips 'pcEnabled' on.
+  payjoinOffersVar <- newTVarIO Map.empty
+  let payjoinCfg = defaultPayjoinConfig
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty payjoinOffersVar payjoinCfg
   -- Restore persisted banlist at startup (best-effort; absence is fine on
   -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
   -- which loads banlist.json on boot.
@@ -9932,7 +9960,47 @@ combinedApp server req respond = do
     then if rpcRestEnabled (rsConfig server)
            then restApp server req respond
            else respond $ restError 404 "Not found"
+    -- FIX-65: BIP-78 PayJoin receiver endpoint.  /payjoin and
+    -- /payjoin/ both route to 'payjoinApp'.  Routing is unconditional
+    -- here; the handler itself checks 'pcEnabled' on the static config
+    -- and returns 400 + "unavailable" when PayJoin is off (the
+    -- default).  We resolve a wallet via the same default-wallet
+    -- single-wallet rule as 'getWalletForRequest', falling back to a
+    -- 400 + "unavailable" response if no wallet is loaded.  W118 TP-2
+    -- is NOT a blocker here because 'processOriginalPsbt' uses
+    -- 'signPsbt' (not 'signTransaction') — see the Haskoin.Payjoin
+    -- module-header note.
+    else if path == payjoinRoutePrefix || path == payjoinRoutePrefix <> "/"
+           then routePayjoin server req respond
     else rpcApp server req respond
+
+-- | Resolve a wallet for the /payjoin route.  If a wallet manager is
+-- present and exactly one wallet is loaded, route through it; else
+-- return a 400 + "unavailable" body so the sender knows the receiver
+-- has no funds source.  Mirrors the multi-wallet rule in
+-- 'getWalletForRequest' (Rpc.hs:912) so future per-wallet PayJoin
+-- endpoints (e.g. /wallet/<name>/payjoin) can layer on cleanly.
+routePayjoin :: RpcServer -> Application
+routePayjoin server req respond = do
+  case rsWalletMgr server of
+    Nothing ->
+      respond $ responseLBS status400
+                  [(hContentType, "text/plain")]
+                  "unavailable\r\n"
+    Just wm -> do
+      (mDefault, _count) <- getDefaultWallet wm
+      case mDefault of
+        Nothing ->
+          respond $ responseLBS status400
+                      [(hContentType, "text/plain")]
+                      "unavailable\r\n"
+        Just ws -> do
+          let wallet = wsWallet ws
+              cache  = rsPayjoinOffers server
+              cfg    = rsPayjoinConfig server
+              clock  = do t <- getPOSIXTime
+                          return (round t :: Int64)
+          payjoinApp wallet cache cfg clock req respond
 
 --------------------------------------------------------------------------------
 -- W47B: gettxoutsetinfo / getnetworkhashps / gettxoutproof / verifytxoutproof

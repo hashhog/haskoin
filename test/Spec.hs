@@ -114,6 +114,7 @@ import qualified W118WalletSpec
 import qualified W119PayjoinSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
+import qualified Fix65PayjoinReceiverSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -22562,6 +22563,10 @@ main = hspec $ do
 
   -- FIX-64: HTTPS / TLS termination on the RPC listener (W119 host gap)
   Fix64TlsSpec.spec
+
+  -- FIX-65: BIP-78 PayJoin receiver foundation (closes W119 BUG-1 partial:
+  -- /payjoin route + handler module + receiver-side processOriginalPsbt).
+  Fix65PayjoinReceiverSpec.spec
 
   where
     sampleTx = Tx
