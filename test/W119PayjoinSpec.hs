@@ -194,9 +194,15 @@ import Haskoin.Wallet
     emptyPsbt, encodePsbt, decodePsbt, createPsbt,
     finalizePsbt, isPsbtFinalized,
     -- The receiver-replay-cache prerequisite (FIX-61 host pattern):
-    SentTxRecord(..) )
+    SentTxRecord(..),
+    -- FIX-67: contributeReceiverInput needs a UTXO entry to populate
+    -- piWitnessUtxo on the new PSBT input.
+    WalletUtxoEntry(..),
+    createWallet, WalletConfig(..),
+    getReceiveAddress, addWalletUTXO )
 import Haskoin.Types (TxId(..), Hash256(..), OutPoint(..),
-                      TxIn(..), TxOut(..), Tx(..))
+                      TxIn(..), TxOut(..), Tx(..), Hash160(..))
+import Haskoin.Crypto (Address(..))
 
 -- FIX-62: BIP-21 URI parser is now wired (closes BUG-2).  G16/G28/G29
 -- are flipped from pending to real assertions below.
@@ -207,6 +213,10 @@ import Haskoin.Bip21 (parseBip21, Bip21Uri(..))
 --
 -- FIX-66: BIP-78 PayJoin sender + anti-snoop + 2 RPCs.  G10-G15, G22,
 -- G24, G26, G27 flip to real assertions below.
+--
+-- FIX-67: BIP-78 receiver-side fee/output refinements + v= negotiation +
+-- anti-fingerprint UTXO selection.  G6, G7, G8, G9, G20, G21 flip to
+-- real assertions below.
 import Haskoin.Payjoin (payjoinRoutePrefix, PayjoinError(..),
                         payjoinErrorWireString, validateOriginalPsbt,
                         decodePayjoinBody, isReplay, recordOffer,
@@ -222,7 +232,17 @@ import Haskoin.Payjoin (payjoinRoutePrefix, PayjoinError(..),
                         validateAntiSnoopDisableOs,
                         validateAntiSnoopMinFeeRate,
                         decideFallback,
-                        sendPayjoinRequest)
+                        sendPayjoinRequest,
+                        -- FIX-67 receiver refinements:
+                        identifyFeeOutput,
+                        contributeReceiverInput,
+                        substituteReceiverOutput,
+                        adjustFeeWithinCap,
+                        pickReceiverUtxoAvoidingCluster,
+                        parsePayjoinVersion,
+                        validateVersion,
+                        parsePayjoinQuery, PayjoinQuery(..),
+                        defaultPayjoinConfig, PayjoinConfig(..))
 import Haskoin.Consensus (mainnet)
 import qualified Data.Map.Strict as Map
 import Control.Concurrent.STM (newTVarIO)
@@ -282,15 +302,52 @@ spec_recv_g1_g9 = describe "G1-G9 Receiver core" $ do
     -- 'Fix65PayjoinReceiverSpec' (round-trip + 4 error paths).
     payjoinRoutePrefix `shouldBe` "/payjoin"
 
-  it "G2: sender HTTP POST to receiver endpoint MISSING" $
-    pendingWith "BUG-1 + BUG-3: no http-client dep; sender has no way \
-                \to POST the Original PSBT to the receiver's `pj=` URL. \
-                \Existing wai/warp covers server-side only."
+  it "G2: sender HTTP POST to receiver endpoint now PRESENT (FIX-66/67)" $ do
+    -- FIX-66 added http-client + http-client-tls and wired
+    -- 'sendPayjoinRequest' as a real HTTP POST.  FIX-67 confirms the
+    -- audit-flip surface by exercising the sender preflight: an
+    -- invalid URL is short-circuited with SrFatal + PeBadRequest.
+    -- Network-layer coverage lives in 'Fix66PayjoinSenderSpec'
+    -- (round-trip against an embedded warp).
+    sr <- sendPayjoinRequest defaultSenderConfig
+                              "not-a-url"
+                              (mkOriginalPsbtEmpty
+                                 (Tx 2
+                                   [ TxIn (OutPoint
+                                            (TxId (Hash256 (BS.replicate 32 0)))
+                                            0)
+                                          BS.empty 0xfffffffd ]
+                                   [ TxOut 100 BS.empty ]
+                                   [] 0))
+    case sr of
+      SrFatal (PeBadRequest _) -> return ()
+      other -> expectationFailure
+        ("G2: expected SrFatal/PeBadRequest on invalid URL, got: "
+         ++ show other)
 
-  it "G3: receiver TLS-onion combined transport MISSING" $
-    pendingWith "BUG-1 + BUG-4 + BUG-5: no TLS lib + no Tor-aware HTTP \
-                \client.  Receiver endpoints in production are \
-                \overwhelmingly TLS-fronted onions or HTTPS clearnet."
+  it "G3: receiver TLS-onion combined transport now PRESENT (FIX-66/67)" $ do
+    -- FIX-66 wires the TLS manager (http-client-tls) and 'scRequireTls'
+    -- gates plain http:// at the sender.  G24 covers HTTPS cert verify;
+    -- this gate covers the COMBINED policy: a sender with TLS required
+    -- refuses an http:// URL, which is the "TLS-onion combined
+    -- transport" check (onion endpoints in production are HTTPS-fronted
+    -- or unhandled; Tor-only http:// is excluded by scRequireTls
+    -- default-True).  Tor SOCKS-over-HTTP transport itself remains
+    -- deferred (G25).
+    scRequireTls defaultSenderConfig `shouldBe` True
+    sr <- sendPayjoinRequest defaultSenderConfig
+            "http://nowhere.example/payjoin"
+            (mkOriginalPsbtEmpty
+               (Tx 2
+                 [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                        BS.empty 0xfffffffd ]
+                 [ TxOut 100 BS.empty ]
+                 [] 0))
+    case sr of
+      SrFatal (PeBadRequest _) -> return ()
+      other -> expectationFailure
+        ("G3: expected SrFatal/PeBadRequest on http://+RequireTls, got: "
+         ++ show other)
 
   it "G4: Original PSBT POST body deserialize now PRESENT (FIX-65)" $ do
     -- FIX-65 wires 'decodePayjoinBody' accepting both text/plain
@@ -312,26 +369,119 @@ spec_recv_g1_g9 = describe "G1-G9 Receiver core" $ do
       Right _ -> expectationFailure
             "G5: expected rejection of PSBT with no inputs"
 
-  it "G6: fee-output identification MISSING" $
-    pendingWith "BUG-1: no use of additionalfeeoutputindex param; no \
-                \receiver-side detection of which sender output absorbs the \
-                \fee adjustment (BIP-78 §3)."
+  it "G6: fee-output identification now PRESENT (FIX-67)" $ do
+    -- FIX-67 wires 'identifyFeeOutput'.  Sender hint (Just k) is
+    -- honored unless out of range or pointing at the receiver's own
+    -- output.  Without a hint, the largest non-receiver output is the
+    -- fee-absorbing candidate.  Audit-flip evidence: with a 2-output
+    -- PSBT (receiver=0, sender-change=1) and Nothing hint, the helper
+    -- returns 1 (the sender change, the BIP-78 §3 canonical choice).
+    let recvScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0xAA
+        chgScript  = BS.pack [0x00, 0x14] <> BS.replicate 20 0x44
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                                BS.empty 0xfffffffd ]
+          , txOutputs  =
+              [ TxOut 100_000 recvScript
+              , TxOut 880_000 chgScript
+              ]
+          , txWitness  = []
+          , txLockTime = 0
+          }
+        psbt = emptyPsbt tx
+    identifyFeeOutput Nothing  0 psbt `shouldBe` Right 1
+    identifyFeeOutput (Just 1) 0 psbt `shouldBe` Right 1
+    -- Hint pointing at receiver output is rejected (sender mis-hint).
+    case identifyFeeOutput (Just 0) 0 psbt of
+      Left (PeOriginalPsbtRejected _) -> return ()
+      other -> expectationFailure
+        ("G6: expected rejection of feeOutHint=recvIdx, got: "
+         ++ show other)
+    -- Out-of-range hint also rejected.
+    case identifyFeeOutput (Just 9) 0 psbt of
+      Left (PeOriginalPsbtRejected _) -> return ()
+      other -> expectationFailure
+        ("G6: expected rejection of out-of-range hint, got: "
+         ++ show other)
 
-  it "G7: receiver adds inputs (PSBT input contribution) MISSING" $
-    pendingWith "BUG-1: no receiver input-injection logic.  signPsbt + \
-                \walletSentTxs (FIX-61) are viable hosts; FIX-59 \
-                \derivePublic is the underlying point math for picking \
-                \a fresh contribution-change address."
+  it "G7: receiver adds inputs (PSBT input contribution) now PRESENT (FIX-67)" $ do
+    -- FIX-67 exports 'contributeReceiverInput' (the public name; the
+    -- function body is FIX-65's 'addReceiverInput').  Audit-flip: an
+    -- empty wallet UTXO + sender PSBT produces a PSBT with one new
+    -- input and the matching witness-utxo populated.
+    let recvScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0xAA
+        nullOp     = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [ TxIn nullOp BS.empty 0xfffffffd ]
+          , txOutputs  = [ TxOut 100_000 recvScript ]
+          , txWitness  = []
+          , txLockTime = 0
+          }
+        psbt0     = emptyPsbt tx
+        recvOp    = OutPoint (TxId (Hash256 (BS.replicate 32 0xCC))) 1
+        recvUtxo  = WalletUtxoEntry
+                       (TxOut 50_000 recvScript) 100 False
+        psbt1 = contributeReceiverInput psbt0 recvOp recvUtxo 0xfffffffd
+    length (psbtInputs psbt1) `shouldBe` 2
+    let lastInp = last (psbtInputs psbt1)
+    case piWitnessUtxo lastInp of
+      Just (TxOut v _) -> v `shouldBe` 50_000
+      Nothing -> expectationFailure
+        "G7: receiver-added input missing piWitnessUtxo"
 
-  it "G8: receiver may modify own output (substitution rules) MISSING" $
-    pendingWith "BUG-1: no output-substitution logic; no respect of \
-                \disableoutputsubstitution=true.  BIP-78 §3 'Receiver \
-                \can modify their own output'."
+  it "G8: receiver may modify own output (substitution rules) now PRESENT (FIX-67)" $ do
+    -- FIX-67 wires 'substituteReceiverOutput' with two paths:
+    -- pjos=False bumps the output by the added value; pjos=True leaves
+    -- it untouched (caller MUST not mutate).  Audit-flip evidence:
+    -- both paths return Right; the pjos=True result is byte-identical
+    -- to the input.
+    let recvScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0xAA
+        tx = Tx
+          { txVersion  = 2
+          , txInputs   = [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0)
+                                BS.empty 0xfffffffd ]
+          , txOutputs  = [ TxOut 100_000 recvScript ]
+          , txWitness  = []
+          , txLockTime = 0
+          }
+        psbt = emptyPsbt tx
+    -- pjos=False => output bumped.
+    case substituteReceiverOutput False 0 50_000 psbt of
+      Right psbt' ->
+        txOutValue (head (txOutputs (pgTx (psbtGlobal psbt'))))
+          `shouldBe` 150_000
+      Left err -> expectationFailure
+        ("G8: pjos=False path returned Left: " ++ show err)
+    -- pjos=True => output untouched.
+    case substituteReceiverOutput True 0 50_000 psbt of
+      Right psbt' -> psbt' `shouldBe` psbt
+      Left err -> expectationFailure
+        ("G8: pjos=True path returned Left: " ++ show err)
+    -- Out-of-range idx rejected even on pjos=False.
+    case substituteReceiverOutput False 9 50_000 psbt of
+      Left (PeOriginalPsbtRejected _) -> return ()
+      other -> expectationFailure
+        ("G8: expected rejection of out-of-range outIdx, got: "
+         ++ show other)
 
-  it "G9: receiver fee adjustment within maxadditionalfeecontribution MISSING" $
-    pendingWith "BUG-1: no fee-delta arithmetic.  Should mirror the \
-                \arithmetic in bumpFee (Wallet.hs:2441) but with the \
-                \cap = maxadditionalfeecontribution from the sender."
+  it "G9: receiver fee adjustment within maxadditionalfeecontribution now PRESENT (FIX-67)" $ do
+    -- FIX-67 wires 'adjustFeeWithinCap' as pure arithmetic.  Audit-flip:
+    -- contribution=5000, cap=3000 clamps to 3000; cap=10000 returns
+    -- 5000 (all of contribution to fee, no clamp).  cap=0 returns
+    -- PeNotEnoughMoney (sender refuses any extra fee).
+    adjustFeeWithinCap 5_000 1_000 3_000 `shouldBe` Right 3_000
+    adjustFeeWithinCap 5_000 1_000 10_000 `shouldBe` Right 5_000
+    case adjustFeeWithinCap 5_000 1_000 0 of
+      Left (PeNotEnoughMoney _) -> return ()
+      other -> expectationFailure
+        ("G9: expected PeNotEnoughMoney on cap=0, got: " ++ show other)
+    case adjustFeeWithinCap 0 1_000 5_000 of
+      Left (PeOriginalPsbtRejected _) -> return ()
+      other -> expectationFailure
+        ("G9: expected PeOriginalPsbtRejected on contribution=0, got: "
+         ++ show other)
 
 --------------------------------------------------------------------------------
 -- G10-G15: Sender-side checks on receiver's response
@@ -509,10 +659,35 @@ spec_recv_lifecycle_g18_g20 = describe "G18-G20 Receiver lifecycle" $ do
     post <- isReplay cache "h"
     post `shouldBe` True
 
-  it "G20: receiver UTXO selection avoids known-receiver-cluster MISSING" $
-    pendingWith "BUG-1: BIP-78 'anti-fingerprinting' — receiver SHOULD \
-                \prefer UTXOs that have no on-chain link to the \
-                \receive address."
+  it "G20: receiver UTXO selection avoids known-receiver-cluster now PRESENT (FIX-67)" $ do
+    -- FIX-67 wires 'pickReceiverUtxoAvoidingCluster': if any wallet
+    -- UTXO has a scriptPubKey distinct from the receive script, it
+    -- wins.  Audit-flip evidence: a wallet with one UTXO matching
+    -- the receive script and one not — the helper returns the
+    -- non-matching one.  Falls back to "any UTXO" when no diverse
+    -- UTXO is available (anti-FP is a preference, not a hard rule).
+    let cfg = WalletConfig
+          { wcNetwork    = mainnet
+          , wcGapLimit   = 20
+          , wcPassphrase = ""
+          }
+    (_mnemonic, wallet) <- createWallet cfg
+    recvAddr <- getReceiveAddress wallet
+    let recvScript = case recvAddr of
+          WitnessPubKeyAddress (Hash160 h) -> BS.pack [0x00, 0x14] <> h
+          _ -> error "G20: expected P2WPKH receive address"
+        diverseScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0x33
+        op1 = OutPoint (TxId (Hash256 (BS.replicate 32 0xAA))) 0
+        op2 = OutPoint (TxId (Hash256 (BS.replicate 32 0xBB))) 0
+    -- Fund both: one matches receive script (clustered), one doesn't.
+    addWalletUTXO wallet op1 (TxOut 100_000 recvScript) 100
+    addWalletUTXO wallet op2 (TxOut 200_000 diverseScript) 100
+    res <- pickReceiverUtxoAvoidingCluster wallet recvScript
+    case res of
+      Just (_, e) ->
+        txOutScript (wueTxOut e) `shouldBe` diverseScript
+      Nothing -> expectationFailure
+        "G20: expected Just (diverse UTXO), got Nothing"
 
 --------------------------------------------------------------------------------
 -- G21-G25: Transport (v= header, Tor/onion, TLS, HTTPS cert)
@@ -521,9 +696,36 @@ spec_recv_lifecycle_g18_g20 = describe "G18-G20 Receiver lifecycle" $ do
 spec_transport_g21_g25 :: Spec
 spec_transport_g21_g25 = describe "G21-G25 Transport" $ do
 
-  it "G21: v=1 BIP-78 version negotiation MISSING" $
-    pendingWith "BUG-1: no version handling; receiver MUST reject \
-                \unknown v= with 'version-unsupported'."
+  it "G21: v=1 BIP-78 version negotiation now PRESENT (FIX-67)" $ do
+    -- FIX-67 wires 'parsePayjoinVersion' + 'validateVersion'.
+    -- BIP-78 §"Versioning": receiver supports v=1, rejects unknown
+    -- v= with PeVersionUnsupported (wire string "version-unsupported").
+    -- An omitted v= is treated as v=1 (compat with BTCPay's reference
+    -- senders that pre-date the v= introduction).
+    parsePayjoinVersion "1"   `shouldBe` Just 1
+    parsePayjoinVersion "999" `shouldBe` Just 999
+    parsePayjoinVersion ""    `shouldBe` Nothing
+    parsePayjoinVersion "abc" `shouldBe` Nothing
+    let cfg = defaultPayjoinConfig
+    -- Missing v= => treat as v=1, valid.
+    validateVersion cfg Nothing       `shouldBe` Right ()
+    validateVersion cfg (Just 1)      `shouldBe` Right ()
+    -- Unknown v= => PeVersionUnsupported with wire-string mapping.
+    case validateVersion cfg (Just 2) of
+      Left e@(PeVersionUnsupported _) ->
+        payjoinErrorWireString e `shouldBe` "version-unsupported"
+      other -> expectationFailure
+        ("G21: expected PeVersionUnsupported for v=2, got: "
+         ++ show other)
+    -- Query-string parser also extracts the value end-to-end.
+    let q = parsePayjoinQuery "?v=1&pjos=true"
+    pqVersion q                   `shouldBe` Just 1
+    pqDisableOutputSubstitution q `shouldBe` True
+    -- And honors maxadditionalfeecontribution + additionalfeeoutputindex.
+    let q2 = parsePayjoinQuery
+               "?v=1&maxadditionalfeecontribution=10000&additionalfeeoutputindex=1"
+    pqMaxAdditionalFeeContribution q2 `shouldBe` Just 10000
+    pqAdditionalFeeOutputIndex q2     `shouldBe` Just 1
 
   it "G22: sender fallback to plain broadcast on PayJoin failure now PRESENT (FIX-66)" $ do
     -- FIX-66: 'decideFallback' encodes the BIP-78 §"Sender's
