@@ -101,6 +101,10 @@ module Haskoin.Wallet
   , getAddresses
   , isOurAddress
   , getReceiveAddressAt
+    -- * HD Key Derivation (per-index, for advanced callers — used by
+    --   bumpfee resign + BIP-78 PayJoin receiver, exported in FIX-65)
+  , getReceiveKey
+  , getChangeKey
     -- * Balance & UTXOs
   , getBalance
   , getWalletUTXOs
