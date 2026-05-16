@@ -62,6 +62,14 @@ library
                  , filepath
                  , unix
                  , scientific
+                 -- FIX-66 (W119 BUG-3): sender-side HTTP POST + HTTPS for
+                 -- BIP-78 PayJoin.  'http-client' provides the engine and
+                 -- the 'http-client-tls' backend wires the TLS manager
+                 -- (used by `sendPayjoinRequest` when the receiver's
+                 -- `pj=` endpoint is HTTPS).  Both are long-standing
+                 -- snoyberg packages with a stable API.
+                 , http-client
+                 , http-client-tls
   c-sources:       cbits/hwdetect.c
                  , cbits/secp256k1_compat.c
                  , cbits/zmq_stubs.c
@@ -132,6 +140,7 @@ test-suite haskoin-test
                , Bip21Spec
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec
+               , Fix66PayjoinSenderSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
@@ -159,6 +168,14 @@ test-suite haskoin-test
                , warp-tls
                , http-types
                , process
+               -- FIX-66 sender spec (test/Fix66PayjoinSenderSpec.hs) runs
+               -- the real http-client + http-client-tls stack against an
+               -- embedded warp + warp-tls listener.  Both packages are
+               -- already library deps; we list them here so the test
+               -- suite imports resolve without depending on cabal's
+               -- transitive-dep solver behavior.
+               , http-client
+               , http-client-tls
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
 
