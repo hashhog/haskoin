@@ -122,6 +122,7 @@ import qualified W127TaprootSpec
 import qualified W128AddrManSpec
 import qualified W129CoinSelectionSpec
 import qualified W130BIP125FeeBumperRule3Spec
+import qualified W133IndexDatabasesSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22598,6 +22599,9 @@ main = hspec $ do
 
   -- W130 BIP-125 Fee Bumper Rule 3 (incrementalRelayFee.GetFee invariant) — 30-gate audit, discovery
   W130BIP125FeeBumperRule3Spec.spec
+
+  -- W133 Index databases (txindex + coinstatsindex) — 30-gate audit, discovery
+  W133IndexDatabasesSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
