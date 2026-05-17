@@ -23,7 +23,7 @@ import qualified Haskoin.Daemon as Daemon
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
-import Data.Word (Word16, Word32, Word64)
+import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
 import qualified Data.List as L
@@ -33,7 +33,7 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Serialize (decode)
-import Data.Bits (shiftR, (.&.))
+import Data.Bits (shiftR, (.&.), (.|.))
 import qualified Network.Wai as Wai
 import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.HTTP.Types as HTTP
@@ -56,7 +56,11 @@ import Haskoin.Index (IndexManager(..), IndexConfig(..),
                        defaultIndexConfig, newIndexManager,
                        indexManagerInitFromDB, indexManagerBackfill,
                        indexManagerConnectBlock,
-                       blockFilterIndexTipHeight)
+                       blockFilterIndexTipHeight,
+                       -- FIX-86: serving compact filters over P2P.
+                       BlockFilterIndexDB(..),
+                       BlockFilterEntry(..),
+                       blockFilterIndexGet)
 import Haskoin.TxOrphanage
   ( OrphanPool(..), emptyOrphanPool, maxOrphanTxs, orphanExpireSecs
   , addOrphan, expireOrphans
@@ -1068,6 +1072,18 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , pmcOnion          = mOnion
           , pmcI2pSam         = mI2pSam
           , pmcCjdnsReachable = noCjdnsReachable
+          -- FIX-86: BIP-157 NODE_COMPACT_FILTERS advertisement.
+          -- Honest only when the operator opted in via @-blockfilterindex@
+          -- AND we successfully built the IndexManager (which implies the
+          -- on-disk index is openable; indexManagerInitFromDB has loaded
+          -- any persisted state).  The handler-side gate in syncMessageHandler
+          -- provides defence-in-depth: it refuses to serve cfilters/cfheaders/
+          -- cfcheckpts when this bit is off.
+          , pmcCompactFilters = case mIdxMgr of
+              Just im -> case imBlockFilterIndex im of
+                Just _  -> True
+                Nothing -> False
+              Nothing -> False
           }
         -- W117 DH-2: 'reachabilityFromConfig pmConfig' is what the
         -- addrv2 receipt handler (MAddrV2 in syncMessageHandler)
@@ -2385,7 +2401,301 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
         putStrLn $ "MMemPool: served " ++ show (length invs)
                 ++ " inv entries to " ++ show addr
 
+  -- ============================================================
+  -- FIX-86: BIP-157 Compact Block Filter P2P serving
+  -- ============================================================
+  --
+  -- Reference: bitcoin-core/src/net_processing.cpp:3260-3422
+  --   PrepareBlockFilterRequest / ProcessGetCFilters /
+  --   ProcessGetCFHeaders / ProcessGetCFCheckPt
+  --
+  -- Each handler:
+  --   1. Parses the payload with decodeGetCF*Msg.  If the wire bytes are
+  --      malformed, the peer scored MalformedMessage and the message is
+  --      dropped (we do not partially honour a request we can't parse).
+  --   2. Gates on NODE_COMPACT_FILTERS in our advertised service set
+  --      (handler-side defence-in-depth per FIX-85 hotbuns pattern, so
+  --      we can't accidentally serve while not advertising the bit).
+  --   3. Walks the active chain via the in-memory header chain to
+  --      locate stop_hash and follow the FIX-74 stop-hash-anchor
+  --      ancestor pattern (NOT the active-chain walk, which would
+  --      lie to peers probing orphan-hash stop hashes).
+  --   4. Enforces filter_type == BASIC (0), range caps
+  --      MAX_GETCFILTERS_SIZE=1000 / MAX_GETCFHEADERS_SIZE=2000, and
+  --      start_height <= stop_height.  Violations:
+  --        InvalidTransaction (1) is too soft; UnsolicitedMessage (1)
+  --        is too soft.  Core sets pfrom.fDisconnect = true for every
+  --        violation, so we use 'misbehaving ... ProtocolViolation'
+  --        (10) which triggers ban scoring and disconnect under
+  --        Bitcoin Core parity.  Additionally we explicitly
+  --        disconnect the peer afterward to mirror Core's
+  --        fDisconnect=true semantics.
+  --   5. Looks up the filter via the BlockFilterIndexDB; if a record
+  --      is missing (e.g. index isn't fully synced yet), the request
+  --      is silently dropped per Core's behaviour at LookupFilterRange
+  --      / LookupFilterHeader failure (LogDebug + return).
+
+  MGetCFilters payload ->
+    handleGetCFilters pmRef hc mIdxMgr addr payload
+
+  MGetCFHeaders payload ->
+    handleGetCFHeaders pmRef hc mIdxMgr addr payload
+
+  MGetCFCheckpt payload ->
+    handleGetCFCheckpt pmRef hc mIdxMgr addr payload
+
   _other -> return ()  -- Silently ignore other messages
+
+--------------------------------------------------------------------------------
+-- FIX-86: BIP-157 P2P handler implementations
+--------------------------------------------------------------------------------
+
+-- | Common validation step shared by all three cfilter handlers.  Mirrors
+-- Core's @PrepareBlockFilterRequest@ at net_processing.cpp:3262.  Returns
+-- 'Right (stopHeight, bfIdx)' on success, 'Left' on the misbehave path.
+--
+-- Five invariants enforced (Core net_processing.cpp:3262-3313):
+--
+--   (1) filter_type == BASIC (0).  Any other value: misbehave + disconnect.
+--   (2) NODE_COMPACT_FILTERS in our advertised services.  Core checks
+--       @peer.m_our_services & NODE_COMPACT_FILTERS@; we mirror via the
+--       PeerManager config's pcfgServices.  Misbehave + disconnect.
+--   (3) stop_hash is a known block on the active chain.  Core uses
+--       LookupBlockIndex + BlockRequestAllowed; we look up the chain
+--       entry by stop_hash and confirm height->hash matches (i.e. it's
+--       on the active chain, not on an orphan side branch).  This is
+--       the FIX-74 stop-hash-anchor invariant.  Misbehave + disconnect.
+--   (4) start_height <= stop_height.  Misbehave + disconnect.
+--   (5) stop_height - start_height < max_height_diff.  Misbehave + disconnect.
+--
+-- After all five pass, we also assert the BlockFilterIndex exists; if
+-- not (e.g. operator turned off the index between advertisement and
+-- request) we return Left silently — the misbehaviour gate already
+-- ensured we wouldn't be advertising if we couldn't serve.
+prepareBlockFilterRequest
+  :: IORef PeerManager
+  -> HeaderChain
+  -> Maybe IndexManager
+  -> SockAddr
+  -> Word8           -- ^ filter_type
+  -> Word32          -- ^ start_height
+  -> BlockHash       -- ^ stop_hash
+  -> Word32          -- ^ max_height_diff (MAX_GETCF*_SIZE or maxBound)
+  -> IO (Either String (Word32, BlockFilterIndexDB))
+prepareBlockFilterRequest pmRef hc mIdxMgr addr filterType startHeight stopHash maxHeightDiff = do
+  pm <- readIORef pmRef
+
+  -- Invariant (1): only BASIC (0) is supported.
+  if filterType /= 0
+    then do
+      void $ misbehaving pm addr (ProtocolViolation "cfilter: unsupported filter type")
+      forceDisconnect pm addr
+      return $ Left "unsupported filter type"
+    else do
+      -- Invariant (2): we must have advertised NODE_COMPACT_FILTERS.
+      let myServices = pcfgServices (defaultPeerConfig (pmNetwork pm))
+          --   ^ shape of what defaultPeerConfig would build; we OR
+          --   in pmConfig-derived flags below if the index is live.
+      mIdxBit <- pure $ case mIdxMgr >>= imBlockFilterIndex of
+        Just _  -> getServiceFlag nodeCompactFilters
+        Nothing -> 0
+      let effectiveServices = myServices .|. mIdxBit
+      if not (hasService effectiveServices nodeCompactFilters)
+        then do
+          void $ misbehaving pm addr (ProtocolViolation "cfilter: NODE_COMPACT_FILTERS not advertised")
+          forceDisconnect pm addr
+          return $ Left "service not advertised"
+        else do
+          -- Invariant (3): stop_hash is on the active chain (FIX-74 anchor).
+          entries  <- readTVarIO (hcEntries hc)
+          byHeight <- readTVarIO (hcByHeight hc)
+          case Map.lookup stopHash entries of
+            Nothing -> do
+              void $ misbehaving pm addr (ProtocolViolation "cfilter: unknown stop_hash")
+              forceDisconnect pm addr
+              return $ Left "unknown stop_hash"
+            Just stopEntry ->
+              -- Confirm the stop_hash is on the active chain by checking
+              -- the height->hash map.  This is the FIX-74 stop-hash-anchor
+              -- semantics: a peer probing with an orphan-side stop_hash
+              -- must NOT receive a signed-but-lying response.
+              case Map.lookup (ceHeight stopEntry) byHeight of
+                Just activeHash | activeHash == stopHash -> do
+                  let stopHeight = ceHeight stopEntry
+                  -- Invariant (4): start_height <= stop_height
+                  if startHeight > stopHeight
+                    then do
+                      void $ misbehaving pm addr (ProtocolViolation "cfilter: start>stop")
+                      forceDisconnect pm addr
+                      return $ Left "start>stop"
+                    -- Invariant (5): range cap.  Core compares
+                    --   stop_height - start_height >= max_height_diff
+                    -- (i.e. the *count*, stop-start+1, > max_height_diff).
+                    else if stopHeight - startHeight >= maxHeightDiff
+                      then do
+                        void $ misbehaving pm addr (ProtocolViolation "cfilter: range too large")
+                        forceDisconnect pm addr
+                        return $ Left "range too large"
+                      else case mIdxMgr >>= imBlockFilterIndex of
+                        Just bfIdx -> return $ Right (stopHeight, bfIdx)
+                        Nothing    -> return $ Left "no block filter index"
+                _ -> do
+                  -- stop_hash exists in the entries map but is on a
+                  -- side branch (different hash at that height in the
+                  -- active chain).  This is the FIX-74 case we MUST
+                  -- reject — Core treats it as "block not in active
+                  -- chain" via BlockRequestAllowed.
+                  void $ misbehaving pm addr (ProtocolViolation "cfilter: stop_hash not on active chain")
+                  forceDisconnect pm addr
+                  return $ Left "stop_hash not on active chain"
+
+-- | Force-disconnect a peer immediately, mirroring Core's
+-- @node.fDisconnect = true@.  Misbehaving above already adds ban score
+-- via the threshold gate; this is the explicit kick.
+forceDisconnect :: PeerManager -> SockAddr -> IO ()
+forceDisconnect pm addr = do
+  peerMap <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peerMap of
+    Just pc -> disconnectPeer pc `catch` (\(_ :: SomeException) -> return ())
+    Nothing -> return ()
+
+handleGetCFilters
+  :: IORef PeerManager -> HeaderChain -> Maybe IndexManager
+  -> SockAddr -> BS.ByteString -> IO ()
+handleGetCFilters pmRef hc mIdxMgr addr payload =
+  case decodeGetCFiltersMsg payload of
+    Left _ -> do
+      pm <- readIORef pmRef
+      void $ misbehaving pm addr MalformedMessage
+    Right (GetCFiltersMsg ft sh stopH) -> do
+      res <- prepareBlockFilterRequest pmRef hc mIdxMgr addr
+               ft sh stopH maxGetCFiltersSize
+      case res of
+        Left _ -> return ()
+        Right (stopHeight, bfIdx) -> do
+          pm <- readIORef pmRef
+          byHeight <- readTVarIO (hcByHeight hc)
+          -- Walk start_height..stop_height inclusive; per Core, the
+          -- block-index walk uses stop_index->GetAncestor(h) (FIX-74
+          -- ancestor anchor).  We have already verified above that
+          -- stop_hash is on the active chain, so the active-chain
+          -- height->hash mapping IS the stop_hash ancestor chain in
+          -- this range.
+          let heights = [sh .. stopHeight]
+          forM_ heights $ \h ->
+            case Map.lookup h byHeight of
+              Nothing -> return ()  -- gap; Core LogDebug + return
+              Just bh -> do
+                mEntry <- blockFilterIndexGet bfIdx h
+                case mEntry of
+                  Nothing -> return ()
+                  Just BlockFilterEntry{..} -> do
+                    let msg = MCFilter
+                            $ encodeCFilterMsg
+                            $ CFilterMsg ft bh bfeEncoded
+                    requestFromPeer pm addr msg
+                      `catch` (\(_ :: SomeException) -> return ())
+
+handleGetCFHeaders
+  :: IORef PeerManager -> HeaderChain -> Maybe IndexManager
+  -> SockAddr -> BS.ByteString -> IO ()
+handleGetCFHeaders pmRef hc mIdxMgr addr payload =
+  case decodeGetCFHeadersMsg payload of
+    Left _ -> do
+      pm <- readIORef pmRef
+      void $ misbehaving pm addr MalformedMessage
+    Right (GetCFHeadersMsg ft sh stopH) -> do
+      res <- prepareBlockFilterRequest pmRef hc mIdxMgr addr
+               ft sh stopH maxGetCFHeadersSize
+      case res of
+        Left _ -> return ()
+        Right (stopHeight, bfIdx) -> do
+          pm <- readIORef pmRef
+          byHeight <- readTVarIO (hcByHeight hc)
+          -- prev_header = filter_header at (start_height - 1).  Defensive
+          -- per FIX-79 ouroboros pattern: if the prev filter header is
+          -- missing (index lag), silently drop the response — never
+          -- emit a header with a zeroed prev that the peer would
+          -- accept as canonical.  At start_height == 0, prev_header
+          -- is the conventional 32-byte zero (BIP-157 genesis seed).
+          mPrev <- if sh == 0
+                     then return (Just (Hash256 (BS.replicate 32 0)))
+                     else do
+                       me <- blockFilterIndexGet bfIdx (sh - 1)
+                       return (fmap bfeFilterHeader me)
+          case mPrev of
+            Nothing -> return ()
+            Just prevHeader -> do
+              -- Collect filter hashes for [sh .. stopHeight].
+              let heights = [sh .. stopHeight]
+              entries' <- forM heights $ \h -> do
+                me <- blockFilterIndexGet bfIdx h
+                return (fmap bfeFilterHash me)
+              if any (\m -> case m of Nothing -> True; _ -> False) entries'
+                then return ()  -- gap; LogDebug + return
+                else do
+                  let hashes = [ x | Just x <- entries' ]
+                  -- stop_index hash is the canonical stop_hash on the
+                  -- active chain at stopHeight.  Reuse the verified
+                  -- stopH from the request.
+                  let _ = stopHeight
+                      stopBlockHash = case Map.lookup stopHeight byHeight of
+                                        Just b -> b
+                                        Nothing -> stopH
+                  let msg = MCFHeaders
+                          $ encodeCFHeadersMsg
+                          $ CFHeadersMsg ft stopBlockHash prevHeader hashes
+                  requestFromPeer pm addr msg
+                    `catch` (\(_ :: SomeException) -> return ())
+
+handleGetCFCheckpt
+  :: IORef PeerManager -> HeaderChain -> Maybe IndexManager
+  -> SockAddr -> BS.ByteString -> IO ()
+handleGetCFCheckpt pmRef hc mIdxMgr addr payload =
+  case decodeGetCFCheckptMsg payload of
+    Left _ -> do
+      pm <- readIORef pmRef
+      void $ misbehaving pm addr MalformedMessage
+    Right (GetCFCheckptMsg ft stopH) -> do
+      -- Core passes start_height=0 + max_height_diff=UINT32_MAX so the
+      -- range-cap branch never triggers; the start-vs-stop branch can
+      -- still fire if stopHeight is somehow negative-equivalent (it
+      -- can't, since stopHeight is Word32 and start_height is 0).
+      res <- prepareBlockFilterRequest pmRef hc mIdxMgr addr
+               ft 0 stopH maxBound
+      case res of
+        Left _ -> return ()
+        Right (stopHeight, bfIdx) -> do
+          pm <- readIORef pmRef
+          byHeight <- readTVarIO (hcByHeight hc)
+          -- One header per CFCHECKPT_INTERVAL=1000 blocks.
+          --   headers.size() = stopHeight / CFCHECKPT_INTERVAL.
+          -- Core walks i in [headers.size()-1 .. 0] via
+          -- stop_index->GetAncestor((i+1) * CFCHECKPT_INTERVAL); we walk
+          -- forward over the same heights (1000, 2000, 3000, ...).
+          let nHeaders :: Word32
+              nHeaders = stopHeight `div` cfcheckptInterval
+              checkptHeights = [ i * cfcheckptInterval | i <- [1 .. nHeaders] ]
+          entries' <- forM checkptHeights $ \h -> do
+            -- Verify the height is still on the active chain at
+            -- request-service time (could race with reorg).
+            case Map.lookup h byHeight of
+              Nothing -> return Nothing
+              Just _bh -> do
+                me <- blockFilterIndexGet bfIdx h
+                return (fmap bfeFilterHeader me)
+          if any (\m -> case m of Nothing -> True; _ -> False) entries'
+            then return ()  -- gap; LogDebug + return
+            else do
+              let headers' = [ x | Just x <- entries' ]
+                  stopBlockHash = case Map.lookup stopHeight byHeight of
+                                    Just b  -> b
+                                    Nothing -> stopH
+                  msg = MCFCheckpt
+                      $ encodeCFCheckptMsg
+                      $ CFCheckptMsg ft stopBlockHash headers'
+              requestFromPeer pm addr msg
+                `catch` (\(_ :: SomeException) -> return ())
 
 -- | Relay a message to up to 2 random connected peers, excluding the source.
 -- Implements Bitcoin Core's RelayAddress behavior (BIP155).
