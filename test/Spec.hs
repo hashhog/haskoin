@@ -117,6 +117,7 @@ import qualified W121CompactFiltersSpec
 import qualified W123MiningGBTSpec
 import qualified W124OperatorSpec
 import qualified W125RPCErrorParitySpec
+import qualified W128AddrManSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22578,6 +22579,9 @@ main = hspec $ do
 
   -- W125 JSON-RPC error code parity (30-gate audit)
   W125RPCErrorParitySpec.spec
+
+  -- W128 AddrMan + connman + peer selection (30-gate audit, discovery)
+  W128AddrManSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
