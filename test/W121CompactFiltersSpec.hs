@@ -371,6 +371,7 @@ import Haskoin.Index
 import Haskoin.Network
   ( Message(..)
   , commandName
+  , decodeMessage
   , PeerConfig(..)
   , defaultPeerConfig
   , ServiceFlag(..)
@@ -380,6 +381,30 @@ import Haskoin.Network
   , nodeNetworkLimited
   , hasService
   , combineServices
+    -- FIX-86: BIP-157 P2P wiring
+  , nodeCompactFilters
+  , maxGetCFiltersSize
+  , maxGetCFHeadersSize
+  , cfcheckptInterval
+  , basicFilterTypeWord
+  , GetCFiltersMsg(..)
+  , CFilterMsg(..)
+  , GetCFHeadersMsg(..)
+  , CFHeadersMsg(..)
+  , GetCFCheckptMsg(..)
+  , CFCheckptMsg(..)
+  , encodeGetCFiltersMsg
+  , decodeGetCFiltersMsg
+  , encodeCFilterMsg
+  , decodeCFilterMsg
+  , encodeGetCFHeadersMsg
+  , decodeGetCFHeadersMsg
+  , encodeCFHeadersMsg
+  , decodeCFHeadersMsg
+  , encodeGetCFCheckptMsg
+  , decodeGetCFCheckptMsg
+  , encodeCFCheckptMsg
+  , decodeCFCheckptMsg
   )
 import Haskoin.Consensus (regtest)
 import Haskoin.Storage (BlockUndo(..), TxUndo(..), TxInUndo(..))
@@ -1326,3 +1351,220 @@ spec = do
       -- record their presence as an audit marker — the integration
       -- coverage lives in the higher-level RPC suite.
       True `shouldBe` True
+
+  ------------------------------------------------------------------------------
+  -- FIX-86: BIP-157 P2P wiring (10-of-10 fleet milestone).
+  --
+  -- W121 BUG-1 / BUG-2 / BUG-3 are closed by FIX-86.  The constructors
+  -- under 'Message' remain payload-typed @!ByteString@ — the parser
+  -- lives outside the constructor at @decodeGetCFiltersMsg@ etc. so the
+  -- legacy G18-G23 "dead-wire shape" assertions still pass.  These new
+  -- tests assert FIX-86's added surface:
+  --
+  --   * NODE_COMPACT_FILTERS = 1<<6 = 64 is now a named ServiceFlag.
+  --   * Six wire records exist with Core-faithful binary codecs.
+  --   * Round-trip every record through encode . decode.
+  --   * BIP-157 protocol-level constants exposed (MAX_GETCFILTERS_SIZE,
+  --     MAX_GETCFHEADERS_SIZE, CFCHECKPT_INTERVAL).
+  --   * Forward-regression source-grep guard: assert that the three
+  --     dispatch branches (MGetCFilters / MGetCFHeaders / MGetCFCheckpt)
+  --     are present in @app/Main.hs@'s @syncMessageHandler@.
+  --
+  -- Reference: bitcoin-core/src/protocol.h:218-303 +
+  -- net_processing.cpp:3260-3422 + index/blockfilterindex.h:31.
+  --
+  -- Cross-impl precedent: blockbrew FIX-74 4cee2c6 + lunarblock FIX-81
+  -- 0de7b2a + rustoshi FIX-82 03c7be4 + clearbit FIX-84 be6f05d +
+  -- hotbuns FIX-85 731931d.
+  ------------------------------------------------------------------------------
+  describe "FIX-86 BIP-157 P2P wiring (10-of-10 fleet milestone)" $ do
+
+    describe "NODE_COMPACT_FILTERS service flag (BUG-1 P0 fix)" $ do
+      it "nodeCompactFilters equals 1<<6 = 64 (Core protocol.h:321-323)" $
+        getServiceFlag nodeCompactFilters `shouldBe` 64
+
+      it "nodeCompactFilters is OFF in defaultPeerConfig (operator must opt in)" $ do
+        let services = pcfgServices (defaultPeerConfig regtest)
+        hasService services nodeCompactFilters `shouldBe` False
+
+      it "hasService recognises the bit when combined into a flag set" $ do
+        let combined = combineServices
+              [nodeNetwork, nodeWitness, nodeCompactFilters]
+        hasService combined nodeCompactFilters `shouldBe` True
+
+    describe "BIP-157 protocol constants" $ do
+      it "maxGetCFiltersSize == 1000 (Core MAX_GETCFILTERS_SIZE)" $
+        maxGetCFiltersSize `shouldBe` 1000
+
+      it "maxGetCFHeadersSize == 2000 (Core MAX_GETCFHEADERS_SIZE)" $
+        maxGetCFHeadersSize `shouldBe` 2000
+
+      it "cfcheckptInterval == 1000 (Core CFCHECKPT_INTERVAL)" $
+        cfcheckptInterval `shouldBe` 1000
+
+      it "basicFilterTypeWord == 0 (BIP-158 BASIC filter type enum)" $
+        basicFilterTypeWord `shouldBe` 0
+
+    describe "getcfilters wire codec (BUG-2 P0 fix)" $ do
+      let msg = GetCFiltersMsg
+                  { gcfFilterType  = 0
+                  , gcfStartHeight = 100
+                  , gcfStopHash    = patternBlockHash
+                  }
+
+      it "encode . decode round-trips" $
+        decodeGetCFiltersMsg (encodeGetCFiltersMsg msg) `shouldBe` Right msg
+
+      it "encoded length == 1 + 4 + 32 = 37 bytes" $
+        BS.length (encodeGetCFiltersMsg msg) `shouldBe` 37
+
+      it "first byte is filter_type (u8)" $
+        BS.head (encodeGetCFiltersMsg msg) `shouldBe` 0
+
+    describe "cfilter wire codec (BUG-3 P0 fix)" $ do
+      let payload = BS.pack [0x01, 0x02, 0x03, 0x04, 0x05]
+          msg = CFilterMsg
+                  { cfFilterType = 0
+                  , cfBlockHash  = patternBlockHash
+                  , cfFilterData = payload
+                  }
+      it "encode . decode round-trips" $
+        decodeCFilterMsg (encodeCFilterMsg msg) `shouldBe` Right msg
+
+      it "encoded length == 1 + 32 + 1(varint) + 5 = 39 bytes (small payload)" $
+        BS.length (encodeCFilterMsg msg) `shouldBe` 39
+
+    describe "getcfheaders wire codec (BUG-2 P0 fix)" $ do
+      let msg = GetCFHeadersMsg
+                  { gcfhFilterType  = 0
+                  , gcfhStartHeight = 200
+                  , gcfhStopHash    = patternBlockHash
+                  }
+      it "encode . decode round-trips" $
+        decodeGetCFHeadersMsg (encodeGetCFHeadersMsg msg) `shouldBe` Right msg
+
+      it "encoded length == 1 + 4 + 32 = 37 bytes" $
+        BS.length (encodeGetCFHeadersMsg msg) `shouldBe` 37
+
+    describe "cfheaders wire codec (BUG-3 P0 fix)" $ do
+      let h1 = Hash256 (BS.replicate 32 0x11)
+          h2 = Hash256 (BS.replicate 32 0x22)
+          h3 = Hash256 (BS.replicate 32 0x33)
+          msg = CFHeadersMsg
+                  { cfhFilterType   = 0
+                  , cfhStopHash     = patternBlockHash
+                  , cfhPrevHeader   = h1
+                  , cfhFilterHashes = [h2, h3]
+                  }
+      it "encode . decode round-trips" $
+        decodeCFHeadersMsg (encodeCFHeadersMsg msg) `shouldBe` Right msg
+
+      it "encoded length == 1 + 32 + 32 + 1(varint) + 64 = 130 bytes" $
+        BS.length (encodeCFHeadersMsg msg) `shouldBe` 130
+
+      it "encoded layout: type | stop_hash | prev_header | N | hashes" $ do
+        let bytes = encodeCFHeadersMsg msg
+        BS.head bytes `shouldBe` 0  -- filter_type
+        -- Hash bytes 1..32 are stop_hash; bytes 33..64 are prev_header (all 0x11)
+        BS.take 32 (BS.drop 33 bytes) `shouldBe` BS.replicate 32 0x11
+
+    describe "getcfcheckpt wire codec (BUG-2 P0 fix)" $ do
+      let msg = GetCFCheckptMsg
+                  { gcfcFilterType = 0
+                  , gcfcStopHash   = patternBlockHash
+                  }
+      it "encode . decode round-trips" $
+        decodeGetCFCheckptMsg (encodeGetCFCheckptMsg msg) `shouldBe` Right msg
+
+      it "encoded length == 1 + 32 = 33 bytes" $
+        BS.length (encodeGetCFCheckptMsg msg) `shouldBe` 33
+
+    describe "cfcheckpt wire codec (BUG-3 P0 fix)" $ do
+      let h1 = Hash256 (BS.replicate 32 0xaa)
+          h2 = Hash256 (BS.replicate 32 0xbb)
+          msg = CFCheckptMsg
+                  { cfcFilterType    = 0
+                  , cfcStopHash      = patternBlockHash
+                  , cfcFilterHeaders = [h1, h2]
+                  }
+      it "encode . decode round-trips" $
+        decodeCFCheckptMsg (encodeCFCheckptMsg msg) `shouldBe` Right msg
+
+      it "encoded length == 1 + 32 + 1(varint) + 64 = 98 bytes" $
+        BS.length (encodeCFCheckptMsg msg) `shouldBe` 98
+
+    describe "Message-level integration" $ do
+      it "MGetCFilters payload decodes via wire codec to recover the request" $ do
+        let req = GetCFiltersMsg 0 17 patternBlockHash
+            payload = encodeGetCFiltersMsg req
+            -- Round-trip through decodeMessage to assert the wire byte
+            -- routes to the same constructor it goes out under.
+            msgRT = decodeMessage "getcfilters" payload
+        case msgRT of
+          Right (MGetCFilters bs) ->
+            decodeGetCFiltersMsg bs `shouldBe` Right req
+          other -> expectationFailure $
+                     "expected MGetCFilters, got: " ++ show other
+
+      it "MGetCFHeaders payload decodes via wire codec to recover the request" $ do
+        let req = GetCFHeadersMsg 0 0 patternBlockHash
+            payload = encodeGetCFHeadersMsg req
+            msgRT = decodeMessage "getcfheaders" payload
+        case msgRT of
+          Right (MGetCFHeaders bs) ->
+            decodeGetCFHeadersMsg bs `shouldBe` Right req
+          other -> expectationFailure $
+                     "expected MGetCFHeaders, got: " ++ show other
+
+      it "MGetCFCheckpt payload decodes via wire codec to recover the request" $ do
+        let req = GetCFCheckptMsg 0 patternBlockHash
+            payload = encodeGetCFCheckptMsg req
+            msgRT = decodeMessage "getcfcheckpt" payload
+        case msgRT of
+          Right (MGetCFCheckpt bs) ->
+            decodeGetCFCheckptMsg bs `shouldBe` Right req
+          other -> expectationFailure $
+                     "expected MGetCFCheckpt, got: " ++ show other
+
+    describe "malformed payload rejection (per-violation peer disconnect)" $ do
+      it "decodeGetCFiltersMsg rejects truncated payload (Left)" $
+        case decodeGetCFiltersMsg (BS.pack [0x00, 0x01]) of
+          Left _  -> return ()
+          Right _ -> expectationFailure "expected decode failure"
+
+      it "decodeGetCFHeadersMsg rejects truncated payload (Left)" $
+        case decodeGetCFHeadersMsg (BS.pack [0x00]) of
+          Left _  -> return ()
+          Right _ -> expectationFailure "expected decode failure"
+
+      it "decodeGetCFCheckptMsg rejects truncated payload (Left)" $
+        case decodeGetCFCheckptMsg BS.empty of
+          Left _  -> return ()
+          Right _ -> expectationFailure "expected decode failure"
+
+    describe "forward-regression source-grep guard" $ do
+      it "app/Main.hs's syncMessageHandler has MGetCFilters dispatch branch" $ do
+        src <- readFile "app/Main.hs"
+        ("MGetCFilters payload" `isInfixOfStr'` src) `shouldBe` True
+
+      it "app/Main.hs's syncMessageHandler has MGetCFHeaders dispatch branch" $ do
+        src <- readFile "app/Main.hs"
+        ("MGetCFHeaders payload" `isInfixOfStr'` src) `shouldBe` True
+
+      it "app/Main.hs's syncMessageHandler has MGetCFCheckpt dispatch branch" $ do
+        src <- readFile "app/Main.hs"
+        ("MGetCFCheckpt payload" `isInfixOfStr'` src) `shouldBe` True
+
+      it "Main.hs wires pmcCompactFilters from imBlockFilterIndex (handler-side gate)" $ do
+        src <- readFile "app/Main.hs"
+        ("pmcCompactFilters" `isInfixOfStr'` src) `shouldBe` True
+
+      it "Main.hs uses prepareBlockFilterRequest helper (Core invariant gate)" $ do
+        src <- readFile "app/Main.hs"
+        ("prepareBlockFilterRequest" `isInfixOfStr'` src) `shouldBe` True
+  where
+    -- Small string-search helper (no Data.Text dependency at this scope).
+    isInfixOfStr' :: String -> String -> Bool
+    isInfixOfStr' needle hay =
+      let nlen = length needle
+      in any (\i -> take nlen (drop i hay) == needle) [0 .. length hay - nlen]
