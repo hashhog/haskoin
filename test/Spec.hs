@@ -114,6 +114,9 @@ import qualified W118WalletSpec
 import qualified W119PayjoinSpec
 import qualified W120MempoolRbfSpec
 import qualified W121CompactFiltersSpec
+import qualified W123MiningGBTSpec
+import qualified W124OperatorSpec
+import qualified W125RPCErrorParitySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22566,6 +22569,15 @@ main = hspec $ do
 
   -- W121 BIP-157/158 Compact Block Filters (30-gate audit)
   W121CompactFiltersSpec.spec
+
+  -- W123 Mining / GBT parity discovery audit (30 gates)
+  W123MiningGBTSpec.spec
+
+  -- W124 Operator experience audit (30 gates) — Path A 4-day outage context
+  W124OperatorSpec.spec
+
+  -- W125 JSON-RPC error code parity (30-gate audit)
+  W125RPCErrorParitySpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
