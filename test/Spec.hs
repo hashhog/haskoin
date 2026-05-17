@@ -119,6 +119,7 @@ import qualified W124OperatorSpec
 import qualified W125RPCErrorParitySpec
 import qualified W127TaprootSpec
 import qualified W128AddrManSpec
+import qualified W129CoinSelectionSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22586,6 +22587,9 @@ main = hspec $ do
 
   -- W128 AddrMan + connman + peer selection (30-gate audit, discovery)
   W128AddrManSpec.spec
+
+  -- W129 Coin Selection (BnB / Knapsack / SRD / CG) — 30-gate audit, discovery
+  W129CoinSelectionSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
