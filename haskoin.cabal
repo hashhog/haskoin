@@ -139,6 +139,9 @@ test-suite haskoin-test
                , W119PayjoinSpec
                , W120MempoolRbfSpec
                , W121CompactFiltersSpec
+               , W123MiningGBTSpec
+               , W124OperatorSpec
+               , W125RPCErrorParitySpec
                , Bip21Spec
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec
