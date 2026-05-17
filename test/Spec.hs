@@ -117,6 +117,7 @@ import qualified W121CompactFiltersSpec
 import qualified W123MiningGBTSpec
 import qualified W124OperatorSpec
 import qualified W125RPCErrorParitySpec
+import qualified W126BIP152CompactBlocksSpec
 import qualified W127TaprootSpec
 import qualified W128AddrManSpec
 import qualified W129CoinSelectionSpec
@@ -22581,6 +22582,9 @@ main = hspec $ do
 
   -- W125 JSON-RPC error code parity (30-gate audit)
   W125RPCErrorParitySpec.spec
+
+  -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)
+  W126BIP152CompactBlocksSpec.spec
 
   -- W127 Taproot / Schnorr / Tapscript (BIP-340/341/342) — 30-gate audit, discovery
   W127TaprootSpec.spec
