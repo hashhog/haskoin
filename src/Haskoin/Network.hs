@@ -516,6 +516,33 @@ module Haskoin.Network
   , logASMapHealthStats
   , runASMapHealthCheck
   , startAsMapHealthCheckThread
+    -- * BIP-157 Compact Block Filters P2P (FIX-86)
+    -- ** Wire payload records
+  , GetCFiltersMsg(..)
+  , CFilterMsg(..)
+  , GetCFHeadersMsg(..)
+  , CFHeadersMsg(..)
+  , GetCFCheckptMsg(..)
+  , CFCheckptMsg(..)
+    -- ** Constants
+  , nodeCompactFilters
+  , maxGetCFiltersSize
+  , maxGetCFHeadersSize
+  , cfcheckptInterval
+  , basicFilterTypeWord
+    -- ** Wire codecs
+  , encodeGetCFiltersMsg
+  , decodeGetCFiltersMsg
+  , encodeCFilterMsg
+  , decodeCFilterMsg
+  , encodeGetCFHeadersMsg
+  , decodeGetCFHeadersMsg
+  , encodeCFHeadersMsg
+  , decodeCFHeadersMsg
+  , encodeGetCFCheckptMsg
+  , decodeGetCFCheckptMsg
+  , encodeCFCheckptMsg
+  , decodeCFCheckptMsg
   ) where
 
 import Data.ByteString (ByteString)
@@ -685,6 +712,15 @@ nodeWitness = ServiceFlag 8
 -- | NODE_NETWORK_LIMITED: serves last 288 blocks (BIP-159)
 nodeNetworkLimited :: ServiceFlag
 nodeNetworkLimited = ServiceFlag 1024
+
+-- | NODE_COMPACT_FILTERS: serves BIP-157/158 compact block filters (1<<6 = 64).
+-- Reference: bitcoin-core/src/protocol.h:321-323
+--   NODE_COMPACT_FILTERS = (1 << 6),
+-- Advertised iff the node maintains a usable BlockFilterIndex (i.e. the
+-- operator passed @-blockfilterindex@ AND the index is synced to the active
+-- chain).  Light clients use this bit to pick which peers to ask for cfilters.
+nodeCompactFilters :: ServiceFlag
+nodeCompactFilters = ServiceFlag 64
 
 -- | Combine multiple service flags into a single bitmask
 combineServices :: [ServiceFlag] -> Word64
@@ -1500,6 +1536,205 @@ computePackageHash wtxids =
     -- Compare hashes in reverse byte order (little-endian comparison)
     compareHashes (Hash256 a) (Hash256 b) =
       compare (BS.reverse a) (BS.reverse b)
+
+--------------------------------------------------------------------------------
+-- BIP-157 Compact Block Filter P2P (FIX-86)
+--------------------------------------------------------------------------------
+--
+-- 10-of-10 fleet milestone: prior to FIX-86, haskoin's BIP-157 P2P surface
+-- existed only as opaque @!ByteString@ constructors on 'Message' with no
+-- parsers, no handlers, and no senders.  Per W121 audit at the parent commit
+-- (@8d8a587@): NODE_COMPACT_FILTERS = 1<<6 = 64 was never advertised, and
+-- the three inbound P2P messages fell off the dispatch case with no reply.
+-- This block adds the typed records + Get/Put codecs.  The 'Message'
+-- envelope retains the @!ByteString@ payload (the audit asserts the
+-- "dead-wire shape" at G18/G19/G20 — we keep the constructor compatible
+-- with that test by parsing the payload on dispatch).  Three handler
+-- functions (live in @app/Main.hs@'s @syncMessageHandler@) mirror Core's
+-- @PrepareBlockFilterRequest@ + @ProcessGetCFilters@ /
+-- @ProcessGetCFHeaders@ / @ProcessGetCFCheckPt@ validation invariants.
+--
+-- References:
+--   bitcoin-core/src/protocol.h:218-303 — message constants
+--   bitcoin-core/src/net_processing.cpp:184-186 — MAX_GETCFILTERS_SIZE etc.
+--   bitcoin-core/src/net_processing.cpp:3260-3422 — PrepareBlockFilterRequest +
+--     ProcessGetCFilters / ProcessGetCFHeaders / ProcessGetCFCheckPt
+--   bitcoin-core/src/index/blockfilterindex.h:31 — CFCHECKPT_INTERVAL=1000
+--   BIP-157 — "Client Side Block Filtering" (wire spec)
+--   Cross-impl: blockbrew FIX-74 4cee2c6 (Go cfilter_handlers.go) +
+--     hotbuns FIX-85 731931d + clearbit FIX-84 be6f05d +
+--     rustoshi FIX-82 03c7be4 + lunarblock FIX-81 0de7b2a.
+
+-- | Maximum number of filters a single @getcfilters@ request may cover.
+-- Reference: bitcoin-core/src/net_processing.cpp:184
+--   static constexpr uint32_t MAX_GETCFILTERS_SIZE = 1000;
+maxGetCFiltersSize :: Word32
+maxGetCFiltersSize = 1000
+
+-- | Maximum filter-header range for a single @getcfheaders@ request.
+-- Reference: bitcoin-core/src/net_processing.cpp:186
+--   static constexpr uint32_t MAX_GETCFHEADERS_SIZE = 2000;
+maxGetCFHeadersSize :: Word32
+maxGetCFHeadersSize = 2000
+
+-- | Interval at which checkpoint headers are returned by @getcfcheckpt@.
+-- Reference: bitcoin-core/src/index/blockfilterindex.h:31
+--   static constexpr int CFCHECKPT_INTERVAL = 1000;
+cfcheckptInterval :: Word32
+cfcheckptInterval = 1000
+
+-- | BIP-158 BASIC filter type enum value (BlockFilterType::BASIC = 0).
+-- Today this is the only filter type Core (and haskoin) supports.
+basicFilterTypeWord :: Word8
+basicFilterTypeWord = 0
+
+-- | @getcfilters@ payload.
+-- Wire: filter_type (u8) || start_height (u32 LE) || stop_hash (32 bytes).
+-- Reference: bitcoin-core/src/net_processing.cpp:3315-3321 ProcessGetCFilters.
+data GetCFiltersMsg = GetCFiltersMsg
+  { gcfFilterType  :: !Word8
+  , gcfStartHeight :: !Word32
+  , gcfStopHash    :: !BlockHash
+  } deriving (Show, Eq, Generic)
+
+instance NFData GetCFiltersMsg
+
+-- | @cfilter@ payload.
+-- Wire: filter_type (u8) || block_hash (32) || varint(len) || filter_bytes.
+-- Reference: bitcoin-core/src/blockfilter.{cpp,h} BlockFilter::Serialize.
+data CFilterMsg = CFilterMsg
+  { cfFilterType :: !Word8
+  , cfBlockHash  :: !BlockHash
+  , cfFilterData :: !ByteString  -- ^ Encoded GCS filter bytes (BIP-158 format)
+  } deriving (Show, Eq, Generic)
+
+instance NFData CFilterMsg
+
+-- | @getcfheaders@ payload.
+-- Wire: filter_type (u8) || start_height (u32 LE) || stop_hash (32 bytes).
+-- Reference: bitcoin-core/src/net_processing.cpp:3344-3350 ProcessGetCFHeaders.
+data GetCFHeadersMsg = GetCFHeadersMsg
+  { gcfhFilterType  :: !Word8
+  , gcfhStartHeight :: !Word32
+  , gcfhStopHash    :: !BlockHash
+  } deriving (Show, Eq, Generic)
+
+instance NFData GetCFHeadersMsg
+
+-- | @cfheaders@ payload.
+-- Wire: filter_type (u8) || stop_hash (32) || prev_header (32) ||
+--       varint(N) || N filter_hashes.
+-- Reference: bitcoin-core/src/net_processing.cpp:3379-3383.
+data CFHeadersMsg = CFHeadersMsg
+  { cfhFilterType   :: !Word8
+  , cfhStopHash     :: !BlockHash
+  , cfhPrevHeader   :: !Hash256
+  , cfhFilterHashes :: ![Hash256]
+  } deriving (Show, Eq, Generic)
+
+instance NFData CFHeadersMsg
+
+-- | @getcfcheckpt@ payload.
+-- Wire: filter_type (u8) || stop_hash (32 bytes).
+-- Reference: bitcoin-core/src/net_processing.cpp:3386-3391.
+data GetCFCheckptMsg = GetCFCheckptMsg
+  { gcfcFilterType :: !Word8
+  , gcfcStopHash   :: !BlockHash
+  } deriving (Show, Eq, Generic)
+
+instance NFData GetCFCheckptMsg
+
+-- | @cfcheckpt@ payload.
+-- Wire: filter_type (u8) || stop_hash (32) || varint(N) || N filter_headers.
+-- Reference: bitcoin-core/src/net_processing.cpp:3418-3421.
+data CFCheckptMsg = CFCheckptMsg
+  { cfcFilterType    :: !Word8
+  , cfcStopHash      :: !BlockHash
+  , cfcFilterHeaders :: ![Hash256]
+  } deriving (Show, Eq, Generic)
+
+instance NFData CFCheckptMsg
+
+-- Codecs ---------------------------------------------------------------------
+
+encodeGetCFiltersMsg :: GetCFiltersMsg -> ByteString
+encodeGetCFiltersMsg GetCFiltersMsg{..} = runPut $ do
+  putWord8 gcfFilterType
+  putWord32le gcfStartHeight
+  put gcfStopHash
+
+decodeGetCFiltersMsg :: ByteString -> Either String GetCFiltersMsg
+decodeGetCFiltersMsg = runGet $ GetCFiltersMsg
+  <$> getWord8
+  <*> getWord32le
+  <*> get
+
+encodeCFilterMsg :: CFilterMsg -> ByteString
+encodeCFilterMsg CFilterMsg{..} = runPut $ do
+  putWord8 cfFilterType
+  put cfBlockHash
+  putVarInt (fromIntegral (BS.length cfFilterData))
+  putByteString cfFilterData
+
+decodeCFilterMsg :: ByteString -> Either String CFilterMsg
+decodeCFilterMsg = runGet $ do
+  ft <- getWord8
+  bh <- get
+  n  <- getVarInt'
+  bytes <- getBytes (fromIntegral n)
+  return $ CFilterMsg ft bh bytes
+
+encodeGetCFHeadersMsg :: GetCFHeadersMsg -> ByteString
+encodeGetCFHeadersMsg GetCFHeadersMsg{..} = runPut $ do
+  putWord8 gcfhFilterType
+  putWord32le gcfhStartHeight
+  put gcfhStopHash
+
+decodeGetCFHeadersMsg :: ByteString -> Either String GetCFHeadersMsg
+decodeGetCFHeadersMsg = runGet $ GetCFHeadersMsg
+  <$> getWord8
+  <*> getWord32le
+  <*> get
+
+encodeCFHeadersMsg :: CFHeadersMsg -> ByteString
+encodeCFHeadersMsg CFHeadersMsg{..} = runPut $ do
+  putWord8 cfhFilterType
+  put cfhStopHash
+  put cfhPrevHeader
+  putVarInt (fromIntegral (length cfhFilterHashes))
+  mapM_ put cfhFilterHashes
+
+decodeCFHeadersMsg :: ByteString -> Either String CFHeadersMsg
+decodeCFHeadersMsg = runGet $ do
+  ft <- getWord8
+  sh <- get
+  ph <- get
+  n  <- getVarInt'
+  hashes <- replicateM (fromIntegral n) get
+  return $ CFHeadersMsg ft sh ph hashes
+
+encodeGetCFCheckptMsg :: GetCFCheckptMsg -> ByteString
+encodeGetCFCheckptMsg GetCFCheckptMsg{..} = runPut $ do
+  putWord8 gcfcFilterType
+  put gcfcStopHash
+
+decodeGetCFCheckptMsg :: ByteString -> Either String GetCFCheckptMsg
+decodeGetCFCheckptMsg = runGet $ GetCFCheckptMsg <$> getWord8 <*> get
+
+encodeCFCheckptMsg :: CFCheckptMsg -> ByteString
+encodeCFCheckptMsg CFCheckptMsg{..} = runPut $ do
+  putWord8 cfcFilterType
+  put cfcStopHash
+  putVarInt (fromIntegral (length cfcFilterHeaders))
+  mapM_ put cfcFilterHeaders
+
+decodeCFCheckptMsg :: ByteString -> Either String CFCheckptMsg
+decodeCFCheckptMsg = runGet $ do
+  ft <- getWord8
+  sh <- get
+  n  <- getVarInt'
+  hashes <- replicateM (fromIntegral n) get
+  return $ CFCheckptMsg ft sh hashes
 
 --------------------------------------------------------------------------------
 -- Unified Message Type
@@ -2686,6 +2921,16 @@ data PeerManagerConfig = PeerManagerConfig
     --   the fc00::/8 CJDNS overlay as reachable and accept / advertise
     --   CJDNS peers.  Direct connect (no proxy); operator is responsible
     --   for having a CJDNS interface up.
+  , pmcCompactFilters   :: !Bool
+    -- ^ FIX-86 / BIP-157: advertise NODE_COMPACT_FILTERS (1<<6 = 64)
+    --   in the version handshake when the operator has enabled
+    --   @-blockfilterindex@ AND the on-disk index is usable.  When
+    --   'False' (the default), peers will not pick this node as a
+    --   compact-filter server, AND the handler-side gate in
+    --   @app/Main.hs@'s @MGetCFilters/MGetCFHeaders/MGetCFCheckpt@
+    --   branches will refuse to serve.  Reference:
+    --   bitcoin-core/src/protocol.h:321-323; init.cpp's
+    --   IsBlockFilterIndexEnabled() gate at NODE_COMPACT_FILTERS.
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -2709,6 +2954,7 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcOnion            = Nothing
   , pmcI2pSam           = Nothing
   , pmcCjdnsReachable   = False
+  , pmcCompactFilters   = False  -- FIX-86: NODE_COMPACT_FILTERS off by default
   }
 
 -- | W117 DH-2 wiring: derive a 'NetworkReachability' record from the
@@ -3071,9 +3317,14 @@ tryConnectWithType pm addr blockRelayOnly = do
         -- BIP-159: signal limited-archive serving when prune mode is on.
         -- Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in
         -- the auto-prune case (the node still has the recent-288 window).
-        flags = if pmcPruneMode (pmConfig pm)
-                  then nodeNetworkLimited : bloomFlags
-                  else bloomFlags
+        prunedFlags = if pmcPruneMode (pmConfig pm)
+                        then nodeNetworkLimited : bloomFlags
+                        else bloomFlags
+        -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — advertise when the
+        -- operator enabled @-blockfilterindex@ AND the index is usable.
+        flags = if pmcCompactFilters (pmConfig pm)
+                  then nodeCompactFilters : prunedFlags
+                  else prunedFlags
         config = PeerConfig
           { pcfgNetwork     = net
           , pcfgServices    = combineServices flags
@@ -3208,9 +3459,15 @@ tryConnectByHost pm host port blockRelayOnly = do
       bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
                     then nodeBloom : baseFlags
                     else baseFlags
-      flags = if pmcPruneMode (pmConfig pm)
-                then nodeNetworkLimited : bloomFlags
-                else bloomFlags
+      prunedFlags = if pmcPruneMode (pmConfig pm)
+                      then nodeNetworkLimited : bloomFlags
+                      else bloomFlags
+      -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
+      -- decision as 'tryConnectWithType' so the hostname dial path
+      -- doesn't accidentally bypass the index gate.
+      flags = if pmcCompactFilters (pmConfig pm)
+                then nodeCompactFilters : prunedFlags
+                else prunedFlags
       config = PeerConfig
         { pcfgNetwork     = net
         , pcfgServices    = combineServices flags
@@ -3554,9 +3811,15 @@ startInboundListener pm port = do
                            else baseFlagsIn
           -- BIP-159: same gate as outbound; advertise NODE_NETWORK_LIMITED
           -- iff prune mode is on.
-          flagsIn = if pmcPruneMode (pmConfig pm)
-                      then nodeNetworkLimited : bloomFlagsIn
-                      else bloomFlagsIn
+          prunedFlagsIn = if pmcPruneMode (pmConfig pm)
+                            then nodeNetworkLimited : bloomFlagsIn
+                            else bloomFlagsIn
+          -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
+          -- decision as outbound paths.  Inbound peers must see the
+          -- same service-bit picture as outbound dials.
+          flagsIn = if pmcCompactFilters (pmConfig pm)
+                      then nodeCompactFilters : prunedFlagsIn
+                      else prunedFlagsIn
           config = PeerConfig
             { pcfgNetwork     = net
             , pcfgServices    = combineServices flagsIn
