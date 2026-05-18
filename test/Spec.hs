@@ -125,6 +125,7 @@ import qualified W130BIP125FeeBumperRule3Spec
 import qualified W131DescriptorsMiniscriptSpec
 import qualified W132NSequenceCSVMTPSpec
 import qualified W133IndexDatabasesSpec
+import qualified W137PSBTSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22610,6 +22611,9 @@ main = hspec $ do
 
   -- W133 Index databases (txindex + coinstatsindex) — 30-gate audit, discovery
   W133IndexDatabasesSpec.spec
+
+  -- W135 Standardness rules (IsStandardTx) — 30-gate audit, discovery
+  W135StandardnessSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
