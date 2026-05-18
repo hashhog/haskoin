@@ -125,6 +125,7 @@ import qualified W130BIP125FeeBumperRule3Spec
 import qualified W131DescriptorsMiniscriptSpec
 import qualified W132NSequenceCSVMTPSpec
 import qualified W133IndexDatabasesSpec
+import qualified W134BIP37BloomFilterSpec
 import qualified W135StandardnessSpec
 import qualified W136RelayFlagsSpec
 import qualified W137PSBTSpec
@@ -22613,6 +22614,11 @@ main = hspec $ do
 
   -- W133 Index databases (txindex + coinstatsindex) — 30-gate audit, discovery
   W133IndexDatabasesSpec.spec
+
+  -- W134 BIP-37 Bloom Filter (legacy SPV) — follow-up 30-gate audit (W110
+  -- companion). Discovery; no production code changes. Catalogues the
+  -- post-FIX-86 advertise-without-honour bug (BUG-19, NEW since W110).
+  W134BIP37BloomFilterSpec.spec
 
   -- W135 Standardness rules (IsStandardTx) — 30-gate audit, discovery
   W135StandardnessSpec.spec
