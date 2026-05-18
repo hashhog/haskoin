@@ -132,6 +132,7 @@ import qualified W137PSBTSpec
 import qualified W138AssumeUTXOSpec
 import qualified W139FeeEstimationSpec
 import qualified W140HTTPRpcAuthSpec
+import qualified W141ZmqRestNotifySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22640,6 +22641,9 @@ main = hspec $ do
 
   -- W140 HTTP server + rpcauth + cookie auth + JSON-RPC dispatch — 30-gate audit, discovery
   W140HTTPRpcAuthSpec.spec
+
+  -- W141 ZMQ + REST + Notification scripts (bundled) — 30-gate audit, discovery
+  W141ZmqRestNotifySpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
