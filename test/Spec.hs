@@ -125,6 +125,8 @@ import qualified W130BIP125FeeBumperRule3Spec
 import qualified W131DescriptorsMiniscriptSpec
 import qualified W132NSequenceCSVMTPSpec
 import qualified W133IndexDatabasesSpec
+import qualified W135StandardnessSpec
+import qualified W136RelayFlagsSpec
 import qualified W137PSBTSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -22614,6 +22616,12 @@ main = hspec $ do
 
   -- W135 Standardness rules (IsStandardTx) — 30-gate audit, discovery
   W135StandardnessSpec.spec
+
+  -- W136 BIP-130 sendheaders + BIP-133 feefilter + BIP-339 wtxidrelay — 30-gate audit, discovery
+  W136RelayFlagsSpec.spec
+
+  -- W137 PSBT v0 / v2 (BIP-174 / BIP-370 / BIP-371) — 30-gate audit, discovery
+  W137PSBTSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
