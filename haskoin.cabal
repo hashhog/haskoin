@@ -154,6 +154,8 @@ test-suite haskoin-test
                , W135StandardnessSpec
                , W136RelayFlagsSpec
                , W137PSBTSpec
+               , W139FeeEstimationSpec
+               , W140HTTPRpcAuthSpec
                , Bip21Spec
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec
