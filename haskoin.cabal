@@ -157,6 +157,7 @@ test-suite haskoin-test
                , W138AssumeUTXOSpec
                , W139FeeEstimationSpec
                , W140HTTPRpcAuthSpec
+               , W141ZmqRestNotifySpec
                , Bip21Spec
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec
