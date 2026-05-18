@@ -129,6 +129,7 @@ import qualified W134BIP37BloomFilterSpec
 import qualified W135StandardnessSpec
 import qualified W136RelayFlagsSpec
 import qualified W137PSBTSpec
+import qualified W138AssumeUTXOSpec
 import qualified W139FeeEstimationSpec
 import qualified W140HTTPRpcAuthSpec
 import qualified Bip21Spec
@@ -22630,6 +22631,9 @@ main = hspec $ do
 
   -- W137 PSBT v0 / v2 (BIP-174 / BIP-370 / BIP-371) — 30-gate audit, discovery
   W137PSBTSpec.spec
+
+  -- W138 assumeUTXO snapshots — 30-gate audit, discovery
+  W138AssumeUTXOSpec.spec
 
   -- W139 Fee estimation engine (CBlockPolicyEstimator + CFeeRate + RPC clamps) — 30-gate audit, discovery
   W139FeeEstimationSpec.spec
