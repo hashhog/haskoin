@@ -150,6 +150,8 @@ test-suite haskoin-test
                , W131DescriptorsMiniscriptSpec
                , W132NSequenceCSVMTPSpec
                , W133IndexDatabasesSpec
+               , W135StandardnessSpec
+               , W136RelayFlagsSpec
                , W137PSBTSpec
                , Bip21Spec
                , Fix64TlsSpec
