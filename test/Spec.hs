@@ -129,6 +129,7 @@ import qualified W134BIP37BloomFilterSpec
 import qualified W135StandardnessSpec
 import qualified W136RelayFlagsSpec
 import qualified W137PSBTSpec
+import qualified W140HTTPRpcAuthSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22628,6 +22629,9 @@ main = hspec $ do
 
   -- W137 PSBT v0 / v2 (BIP-174 / BIP-370 / BIP-371) — 30-gate audit, discovery
   W137PSBTSpec.spec
+
+  -- W140 HTTP server + rpcauth + cookie auth + JSON-RPC dispatch — 30-gate audit, discovery
+  W140HTTPRpcAuthSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
