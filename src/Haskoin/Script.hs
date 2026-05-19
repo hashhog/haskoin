@@ -1931,7 +1931,9 @@ verifyTapscriptSchnorr env sigBytesRaw pubkey32 = do
                     prevouts ht (seTaprootAnnex env) (Just sp) of
     Right h -> Right h
     Left  e -> Left ("Tapscript sighash: " ++ show e)
-  pure $ Crypto.verifySchnorr sig64 sighash pubkey32
+  -- W159 BUG-17 / W160 BUG-16 FIX: use process-global SigCache keyed on
+  -- (sighash, pubkey, sig) — matches Core sigcache.cpp:45-48.
+  pure $ Crypto.cachedVerifySchnorr sig64 sighash pubkey32
 
 -- | Legacy/witness-v0 CHECKSIG path (non-tapscript)
 execCheckSigLegacy :: ScriptEnv -> ByteString -> ByteString -> Either String ScriptEnv
@@ -2000,11 +2002,13 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
 
       -- Verify signature using secp256k1 with lax DER parsing
       -- (matches Bitcoin Core's CPubKey::Verify which uses ecdsa_signature_parse_der_lax)
+      -- W159 BUG-17 / W160 BUG-16 FIX: use process-global SigCache keyed on
+      -- (sighash, pubkey, sig) — matches Core sigcache.cpp:39-42.
       let sigCheckResult = case parsePubKey pubkeyBytes of
             Nothing -> False
             Just pubkey ->
               let sig = Sig _sigWithoutType
-              in verifyMsgLax pubkey sig _sighash
+              in Crypto.cachedVerifyMsgLax pubkey sig _sighash
 
       -- BIP-146 NULLFAIL: If signature check failed and we have NULLFAIL flag,
       -- the signature must be empty. Since we already checked for empty sig above,
@@ -2259,7 +2263,9 @@ execCheckMultiSig env = do
                          in case parsePubKey pk of
                               Nothing -> False
                               Just pubkey ->
-                                verifyMsgLax pubkey (Sig sigWithoutType) sighash
+                                -- W159 BUG-17 / W160 BUG-16 FIX: cached
+                                -- verify keyed on (sighash, pubkey, sig).
+                                Crypto.cachedVerifyMsgLax pubkey (Sig sigWithoutType) sighash
                if matched
                   then verifyMultiSig restSigs restPks (nSigsRemaining - 1)
                   else verifyMultiSig sigsLeft restPks nSigsRemaining
@@ -2925,7 +2931,9 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
         Left e  -> Left ("Taproot sighash: " ++ show e)
       when (BS.length outputKeyBytes /= 32) $
         Left "Taproot: witness program is not 32 bytes"
-      if Crypto.verifySchnorr sigBytes sighash outputKeyBytes
+      -- W159 BUG-17 / W160 BUG-16 FIX: cached Schnorr verify keyed on
+      -- (sighash, x-only pubkey, sig).
+      if Crypto.cachedVerifySchnorr sigBytes sighash outputKeyBytes
         then Right True
         else Left "Taproot key-path Schnorr verify failed"
 

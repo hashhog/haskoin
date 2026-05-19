@@ -237,8 +237,8 @@ import Data.Maybe (mapMaybe)
 import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
                       Block(..), putVarInt, putVarBytes)
-import qualified Crypto.Random as CryptoRandom
-import Haskoin.Crypto (doubleSHA256, sha256, computeTxId, computeBlockHash)
+import Haskoin.Crypto (doubleSHA256, sha256, computeTxId, computeBlockHash,
+                       initGlobalSigCache, lookupGlobalSigCache, insertGlobalSigCache)
 import Haskoin.Script (decodeScript, countScriptSigops,
                        ScriptVerifyFlag(..), ScriptFlags, flagSet,
                        verifyScriptWithFlags, isPushOnly, classifyOutput,
@@ -2701,92 +2701,21 @@ consensusFlagsToWord32 cf =
   .|. (if flagNullDummy cf then 32 else 0)
 
 --------------------------------------------------------------------------------
--- Process-wide Signature Verification Cache (W105 BUG-2 fix; nonce hardening
--- W105 BUG-9 + BUG-13 fix)
+-- Process-wide Signature Verification Cache
+--
+-- The primitives (initGlobalSigCache, lookupGlobalSigCache,
+-- insertGlobalSigCache) now live in 'Haskoin.Crypto' so that 'Haskoin.Script'
+-- can call them at the actual EC verify site without creating a Script ↔
+-- Consensus import cycle.  We re-export them from here so that existing
+-- consumers (app/Main.hs runNodeBody, test/W105CheckQueueSpec.hs) keep
+-- compiling.
+--
+-- W159 BUG-17 / W160 BUG-16 FIX: cache key is now Core's
+-- @(sighash, pubkey, sig)@ triple — matching
+-- @SignatureCache::ComputeEntryECDSA@ / @ComputeEntrySchnorr@
+-- (bitcoin-core/src/script/sigcache.cpp:39-49).  See Haskoin.Crypto for
+-- the long-form rationale.
 --------------------------------------------------------------------------------
-
--- | Cache key: first 8 bytes of SHA256(nonce || sighash || scriptSig ||
--- witnessBytes || prevoutScript || flagsBytes) as a big-endian Word64.
---
--- Using Word64 (Core's CheapHash pattern) keeps Map comparisons O(1).
--- The 32-byte nonce makes the key space unpredictable across processes,
--- closing the cache-poisoning vector (W105 BUG-9).  Including the full
--- script/witness material (not just txid+idx) ensures DER-malleated
--- signatures that share a txid never share a cache entry (W105 BUG-13).
-type SigCacheEntry = Word64
-
--- | Process-global signature cache (bounded Map, 50 000 entries).
---
--- Threading choice: rather than adding a SigCache parameter through the
--- entire validateSingleTx → validateBlockTransactions → validateFullBlockIO
--- → connectBlock call chain (~10 functions, 2 modules), we use a module-level
--- IORef that is initialised once at startup via 'initGlobalSigCache', exactly
--- as 'Haskoin.Daemon.globalDebugSet' is initialised via 'setGlobalDebugSet'.
--- Concurrent access is safe: writes use 'atomicModifyIORef'' inside the cache
--- operations; reads use plain 'readIORef' which is safe for boolean membership
--- tests (worst case: stale read misses a recent insert → full verify, not a
--- correctness hazard).
-{-# NOINLINE globalSigCacheRef #-}
-globalSigCacheRef :: IORef (Map SigCacheEntry ())
-globalSigCacheRef = unsafePerformIO (newIORef Map.empty)
-
--- | Process-global 32-byte nonce, written once by 'initGlobalSigCache'.
--- Seeded from /dev/urandom via cryptonite.
-{-# NOINLINE globalSigCacheNonce #-}
-globalSigCacheNonce :: IORef ByteString
-globalSigCacheNonce = unsafePerformIO (newIORef (BS.replicate 32 0))
-
-globalSigCacheMaxEntries :: Int
-globalSigCacheMaxEntries = 50000
-
--- | Derive the cache key from the per-process nonce and full input material.
--- Key = first 8 bytes (big-endian Word64) of
---   SHA256(nonce || sighash || scriptSig || witnessBytes || prevoutScript || flagsBytes)
-computeGlobalSigCacheKey :: ByteString  -- ^ nonce
-                         -> ByteString  -- ^ sighash / txid bytes
-                         -> ByteString  -- ^ scriptSig of this input
-                         -> ByteString  -- ^ concatenated witness stack items
-                         -> ByteString  -- ^ prevout scriptPubKey
-                         -> ByteString  -- ^ 4-byte little-endian flags word
-                         -> SigCacheEntry
-computeGlobalSigCacheKey nonce sighash scriptSig witnessBytes prevoutScript flagsBytes =
-  let material = nonce <> sighash <> scriptSig <> witnessBytes <> prevoutScript <> flagsBytes
-      digest   = sha256 material
-  in BS.foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral (b :: Word8)) 0 (BS.take 8 digest)
-{-# INLINE computeGlobalSigCacheKey #-}
-
--- | Look up signature material in the process-global sig cache.
--- Arguments: (sighash, scriptSig, witnessBytes, prevoutScript, flagsBytes)
-lookupGlobalSigCache :: ByteString -> ByteString -> ByteString -> ByteString -> ByteString -> IO Bool
-lookupGlobalSigCache sighash scriptSig witnessBytes prevoutScript flagsBytes = do
-  nonce <- readIORef globalSigCacheNonce
-  m     <- readIORef globalSigCacheRef
-  let key = computeGlobalSigCacheKey nonce sighash scriptSig witnessBytes prevoutScript flagsBytes
-  return $! Map.member key m
-
--- | Insert verified signature material into the process-global sig cache.
--- Arguments: (sighash, scriptSig, witnessBytes, prevoutScript, flagsBytes)
--- Evicts the entry with the smallest Word64 key when full.
-insertGlobalSigCache :: ByteString -> ByteString -> ByteString -> ByteString -> ByteString -> IO ()
-insertGlobalSigCache sighash scriptSig witnessBytes prevoutScript flagsBytes =
-  atomicModifyIORef' globalSigCacheRef $ \m ->
-    let key = unsafePerformIO $ do
-                nonce <- readIORef globalSigCacheNonce
-                return $! computeGlobalSigCacheKey nonce sighash scriptSig witnessBytes prevoutScript flagsBytes
-        m'  = if Map.size m >= globalSigCacheMaxEntries
-                then Map.insert key () (Map.deleteMin m)
-                else Map.insert key () m
-    in (m', ())
-
--- | (Re-)initialise the process-global sig cache.
--- Call once during node startup, before any block validation begins.
--- Generates a fresh /dev/urandom nonce and clears all cached entries so
--- stale results from a prior run or reindex cannot be reused.
-initGlobalSigCache :: IO ()
-initGlobalSigCache = do
-  nonce <- CryptoRandom.getRandomBytes 32 :: IO ByteString
-  writeIORef globalSigCacheNonce nonce
-  writeIORef globalSigCacheRef Map.empty
 
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
@@ -2871,48 +2800,33 @@ validateSingleTx flags skipScripts utxoMap tx = do
   -- matching Bitcoin Core's ConnectBlock behaviour. Otherwise, every input's
   -- scriptSig + witness must satisfy its scriptPubKey under the consensus
   -- ScriptFlags for this height.
-  -- W105 BUG-2 FIX: consult the process-global SigCache (globalSigCacheRef)
-  -- before paying EC math.
-  -- W105 BUG-9 + BUG-13 FIX: cache key = SHA256(nonce || sighash ||
-  --   scriptSig || witnessBytes || prevoutScript || flagsBytes) first 8 bytes.
-  -- The nonce (32 bytes from /dev/urandom, initialised at startup) makes the
-  -- key space unpredictable across processes (BUG-9).  Including scriptSig +
-  -- witness stack ensures DER-malleated sigs that share a txid do NOT share a
-  -- cache entry (BUG-13).
-  -- Uses unsafePerformIO to call IO from the pure Either monad — safe because
-  -- the cache is a pure performance optimisation: observable effect is only
-  -- execution speed, not correctness.
+  --
+  -- W159 BUG-17 / W160 BUG-16 FIX: the SigCache no longer wraps the entire
+  -- per-input script-verify call.  The prior wrapping passed @txidBytes@
+  -- into the slot named @sighash@ and keyed on (scriptSig, witnessBytes,
+  -- prevoutScript) — for a multi-input tx with two inputs sharing empty
+  -- scriptSig + identical witness + identical prevout scriptPubKey the
+  -- cache hit on input 0 short-circuited input 1's script-verify even
+  -- though its BIP-143 sighash differed.  The cache now lives one level
+  -- deeper, inside @cachedVerifyMsgLax@ / @cachedVerifySchnorr@ in
+  -- Haskoin.Script, keyed on the actual per-input @(sighash, pubkey, sig)@
+  -- triple — matching Core's @SignatureCache::ComputeEntryECDSA@
+  -- (src/script/sigcache.cpp:39-49).
   unless skipScripts $ do
     let scriptFlags  = consensusFlagsToScriptFlags flags
         spentAmounts = inputValues
         spentScripts = map txOutScript prevOuts
-        txidBytes    = getHash256 (getTxIdHash (computeTxId tx))
-        flagsWord    = consensusFlagsToWord32 flags
-        flagsBytes   = runPut (putWord32le flagsWord)
         inputs       = txInputs tx
         witnesses    = txWitness tx ++ repeat []  -- pad with empty if needed
-    forM_ (zip3 [0..] prevOuts (zip inputs witnesses)) $ \(idx, prevOut, (inp, witStack)) ->
-      let scriptSig    = txInScript inp
-          witnessBytes = BS.concat witStack
-          prevoutScript = txOutScript prevOut
-          cached = unsafePerformIO
-                     (lookupGlobalSigCache txidBytes scriptSig witnessBytes
-                                          prevoutScript flagsBytes)
-      in if cached
-           then Right ()  -- cache hit: skip EC math
-           else case verifyScriptWithFlags scriptFlags tx idx
-                       (txOutScript prevOut) (txOutValue prevOut)
-                       spentAmounts spentScripts of
-                  Left err    -> Left $ "script verify failed (input " ++ show idx
-                                      ++ "): " ++ err
-                  Right False -> Left $ "script verify failed (input " ++ show idx
-                                      ++ "): script returned false"
-                  Right True  ->
-                    -- Cache the successful result for future lookups.
-                    let !_ = unsafePerformIO
-                               (insertGlobalSigCache txidBytes scriptSig witnessBytes
-                                                     prevoutScript flagsBytes)
-                    in Right ()
+    forM_ (zip3 [0..] prevOuts (zip inputs witnesses)) $ \(idx, prevOut, (_inp, _witStack)) ->
+      case verifyScriptWithFlags scriptFlags tx idx
+                  (txOutScript prevOut) (txOutValue prevOut)
+                  spentAmounts spentScripts of
+             Left err    -> Left $ "script verify failed (input " ++ show idx
+                                 ++ "): " ++ err
+             Right False -> Left $ "script verify failed (input " ++ show idx
+                                 ++ "): script returned false"
+             Right True  -> Right ()
 
   return (totalIn - totalOut)
 
