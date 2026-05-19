@@ -13,7 +13,48 @@
 #include <secp256k1_recovery.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdint.h>
+
+/* Entropy source for secp256k1_context_randomize (side-channel blinding).
+ * Mirrors Core's ECC_Start (src/key.cpp:572-587) which seeds the context with
+ * 32 strong-random bytes after every context_create. Per secp256k1.h:286-290
+ * this is "highly recommended" to protect scalar multiplications in signing
+ * paths from cache-timing / EM / power side-channels. */
+#if defined(__linux__)
+  #include <sys/random.h>  /* getrandom(2) */
+#endif
+
+/* Fill `out` with 32 bytes of strong entropy. Returns 1 on success,
+ * 0 on failure. Same pattern as beamchain/c_src/beamchain_crypto_nif.c
+ * (commit a41e0bc): prefer getrandom(2) on Linux, fall back to /dev/urandom
+ * on EINTR / older kernels / non-Linux. */
+static int haskoin_get_entropy_32(unsigned char out[32]) {
+#if defined(__linux__)
+    ssize_t n = getrandom(out, 32, 0);
+    if (n == 32) return 1;
+    /* Fall through to /dev/urandom on EINTR / older kernels */
+#endif
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    size_t got = fread(out, 1, 32, f);
+    fclose(f);
+    return got == 32 ? 1 : 0;
+}
+
+/* Side-channel-blind `ctx` with 32 fresh bytes from haskoin_get_entropy_32.
+ * Returns 1 on success, 0 on failure (and the caller should destroy the
+ * context and refuse to run, matching Core's assert(ret) posture). */
+static int haskoin_randomize_ctx(secp256k1_context *ctx) {
+    unsigned char seed32[32];
+    if (!haskoin_get_entropy_32(seed32)) {
+        return 0;
+    }
+    int ok = secp256k1_context_randomize(ctx, seed32);
+    /* Wipe the seed from the stack ASAP. */
+    memset(seed32, 0, sizeof(seed32));
+    return ok;
+}
 
 /* ---- Deprecated API shims ------------------------------------------------ */
 
@@ -353,8 +394,19 @@ static secp256k1_context *g_ellswift_ctx = NULL;
 
 static secp256k1_context *get_ellswift_ctx(void) {
     if (g_ellswift_ctx == NULL) {
-        g_ellswift_ctx = secp256k1_context_create(
+        secp256k1_context *ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+        if (!ctx) return NULL;
+        /* W159 BUG-3 fix: side-channel-blind the context immediately after
+         * creation. ellswift_create derives a private-key value internally
+         * (BIP-324 handshake), so the same blinding requirement that applies
+         * to g_sign_ctx applies here. Fail-loud (destroy + NULL) rather than
+         * silently running unblinded if entropy is unavailable. */
+        if (!haskoin_randomize_ctx(ctx)) {
+            secp256k1_context_destroy(ctx);
+            return NULL;
+        }
+        g_ellswift_ctx = ctx;
     }
     return g_ellswift_ctx;
 }
@@ -413,8 +465,20 @@ static secp256k1_context *g_sign_ctx = NULL;
 
 static secp256k1_context *get_sign_ctx(void) {
     if (g_sign_ctx == NULL) {
-        g_sign_ctx = secp256k1_context_create(
+        secp256k1_context *ctx = secp256k1_context_create(
             SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+        if (!ctx) return NULL;
+        /* W159 BUG-3 fix: side-channel-blind the context immediately after
+         * creation. Per Core src/key.cpp:572-587 and secp256k1.h:286-290,
+         * randomizing the sign context with fresh 32-byte entropy is the
+         * defence against cache-timing / EM / power side-channels on the
+         * scalar-mul step of ECDSA / ellswift sign. Fail-loud rather than
+         * silently running unblinded. */
+        if (!haskoin_randomize_ctx(ctx)) {
+            secp256k1_context_destroy(ctx);
+            return NULL;
+        }
+        g_sign_ctx = ctx;
     }
     return g_sign_ctx;
 }
