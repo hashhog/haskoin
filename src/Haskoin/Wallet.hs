@@ -509,6 +509,11 @@ masterKey seed =
 -- | Derive child private key (non-hardened).
 -- Index must be < 0x80000000.
 -- KNOWN PITFALL: Public key derivation can follow, but NOT for hardened keys.
+--
+-- Partial: 'error's on the vanishingly-rare invalid-child case
+-- (@IL >= n@ or @k_child == 0@ — BIP-32 spec instructs to skip that
+-- index).  Callers that need the safe Maybe variant should use
+-- 'deriveChildPriv'.
 derivePrivate :: ExtendedKey -> Word32 -> ExtendedKey
 derivePrivate parent index
   | index >= 0x80000000 = error "derivePrivate: use deriveHardened for index >= 0x80000000"
@@ -518,7 +523,9 @@ derivePrivate parent index
           dat = BS.append pubBytes (encodeWord32BE' index)
           hmacResult = hmacSHA512 (ekChainCode parent) dat
           (il, ir) = BS.splitAt 32 hmacResult
-          childKey = addPrivateKeys il (getSecKey (ekKey parent))
+          childKey = case addPrivateKeys (getSecKey (ekKey parent)) il of
+            Just k  -> k
+            Nothing -> error "derivePrivate: invalid child key (IL >= n or k_child == 0) — use deriveChildPriv to skip index"
           fingerprint = computeFingerprint pubBytes
       in ExtendedKey
         { ekKey = SecKey childKey
@@ -531,13 +538,20 @@ derivePrivate parent index
 -- | Derive child private key (hardened).
 -- Hardened derivation uses the private key directly, preventing public
 -- key derivation without the private key.
+--
+-- Partial: 'error's on the vanishingly-rare invalid-child case
+-- (@IL >= n@ or @k_child == 0@ — BIP-32 spec instructs to skip that
+-- index).  Callers that need the safe Maybe variant should use
+-- 'deriveChildPriv'.
 deriveHardened :: ExtendedKey -> Word32 -> ExtendedKey
 deriveHardened parent index =
   let hardenedIndex = index .|. 0x80000000
       dat = BS.cons 0x00 (getSecKey (ekKey parent)) `BS.append` encodeWord32BE' hardenedIndex
       hmacResult = hmacSHA512 (ekChainCode parent) dat
       (il, ir) = BS.splitAt 32 hmacResult
-      childKey = addPrivateKeys il (getSecKey (ekKey parent))
+      childKey = case addPrivateKeys (getSecKey (ekKey parent)) il of
+        Just k  -> k
+        Nothing -> error "deriveHardened: invalid child key (IL >= n or k_child == 0) — use deriveChildPriv to skip index"
       pubBytes = serializePubKeyCompressed (derivePubKeyFromPrivate (ekKey parent))
       fingerprint = computeFingerprint pubBytes
   in ExtendedKey
@@ -619,16 +633,34 @@ toExtendedPubKey ek = ExtendedPubKey
   , epkIndex = ekIndex ek
   }
 
--- | Add two 32-byte private keys modulo the secp256k1 order.
--- This is simplified - in production, use proper big integer arithmetic.
-addPrivateKeys :: ByteString -> ByteString -> ByteString
-addPrivateKeys a b =
-  let -- secp256k1 order n
-      n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 :: Integer
-      aInt = bsToIntegerBE a
-      bInt = bsToIntegerBE b
-      sumInt = (aInt + bInt) `mod` n
-  in integerToBS32 sumInt
+-- | BIP-32 CKDpriv scalar tweak: @child_seckey = (parent_seckey + tweak) mod n@.
+--
+-- Routes through 'Haskoin.Crypto.seckeyTweakAdd', which is FFI-backed by
+-- libsecp256k1's @secp256k1_ec_seckey_tweak_add@ (constant-time).
+-- Mirrors Bitcoin Core's @CKey::Derive@ (`bitcoin-core/src/key.cpp:307`).
+--
+-- W159 BUG-14 fix: prior to this routing the function did the modular
+-- addition in pure-Haskell GMP @Integer@ — timing-variant, lazy-thunked,
+-- NOT constant-time — which was the named-origin of the fleet pattern
+-- "BIP-32 private-side GMP / public-side libsecp asymmetry".  The
+-- public-side 'addPublicKeyPoint' has always (post W118 FIX-59) routed
+-- through libsecp; private side now matches.
+--
+-- Returns 'Nothing' on:
+--
+--   * @parent_seckey@ wrong length, or @>= n@
+--   * @tweak@ wrong length, or @>= n@
+--   * resulting seckey is 0 (would map to point at infinity)
+--
+-- BIP-32 spec instructs callers to advance the child index and retry on
+-- 'Nothing'.  TODO(W159 follow-up Tier 3): the @derivePrivate@ /
+-- @deriveHardened@ partial wrappers currently 'error' on 'Nothing'
+-- rather than incrementing the child index — the safe variant
+-- @deriveChildPriv@ correctly returns 'Nothing'.  Wallet code that
+-- needs the BIP-32 retry-on-invalid-child semantics should call
+-- @deriveChildPriv@ + @derivePathPriv@.
+addPrivateKeys :: ByteString -> ByteString -> Maybe ByteString
+addPrivateKeys parent tweak = seckeyTweakAdd parent tweak
 
 -- | BIP-32 CKDpub EC point addition: child = parent_pubkey + scalar*G.
 --
@@ -711,15 +743,16 @@ deriveChildPriv parent index =
                    in BS.append pubBytes (encodeWord32BE' index)
       hmacResult = hmacSHA512 (ekChainCode parent) dat
       (il, ir) = BS.splitAt 32 hmacResult
-      ilInt = bsToIntegerBE il
-      parentInt = bsToIntegerBE (getSecKey (ekKey parent))
-      childInt = (ilInt + parentInt) `mod` secp256k1Order
-      childKey = integerToBS32 childInt
       pubBytesParent = serializePubKeyCompressed (derivePubKeyFromPrivate (ekKey parent))
       fingerprint = computeFingerprint pubBytesParent
-  in if ilInt >= secp256k1Order || childInt == 0
-       then Nothing
-       else Just $ ExtendedKey
+      -- W159 BUG-14 fix: route through constant-time libsecp
+      -- @secp256k1_ec_seckey_tweak_add@ instead of pure-Haskell GMP
+      -- @Integer (parent + IL) mod n@.  The wrapper rejects @IL >= n@
+      -- and zero-result internally; we no longer need the explicit
+      -- @ilInt >= secp256k1Order || childInt == 0@ gate.
+  in case addPrivateKeys (getSecKey (ekKey parent)) il of
+       Nothing -> Nothing  -- IL >= n, parent >= n, or k_child == 0
+       Just childKey -> Just $ ExtendedKey
               { ekKey = SecKey childKey
               , ekChainCode = ir
               , ekDepth = ekDepth parent + 1

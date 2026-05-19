@@ -20,6 +20,7 @@ module Haskoin.Crypto
   , serializePubKeyUncompressed
   , parsePubKey
   , pubKeyTweakAdd
+  , seckeyTweakAdd
     -- * Signatures
   , Sig(..)
   , signMsg
@@ -171,6 +172,20 @@ foreign import ccall unsafe "haskoin_ec_pubkey_tweak_add"
   c_ec_pubkey_tweak_add :: Ptr CUChar  -- parent_pubkey33
                         -> Ptr CUChar  -- tweak32
                         -> Ptr CUChar  -- output33
+                        -> IO CInt
+
+-- | FFI binding for BIP-32 CKDpriv: child_seckey = (parent + tweak) mod n.
+-- Wraps libsecp256k1's @secp256k1_ec_seckey_tweak_add@ (constant-time).
+-- Returns 0 on failure (tweak >= curve order, parent >= n, zero result);
+-- the BIP-32 spec instructs the caller to advance the child index and
+-- retry on failure.  Reference: @bitcoin-core/src/key.cpp:307@
+-- @CKey::Derive@.  W159 BUG-14 fix: closes the private-side GMP / public-
+-- side libsecp asymmetry that exposed BIP-32 CKDpriv to cache-timing
+-- side-channels on every wallet derivation.
+foreign import ccall unsafe "haskoin_seckey_tweak_add"
+  c_ec_seckey_tweak_add :: Ptr CUChar  -- parent_seckey32
+                        -> Ptr CUChar  -- tweak32
+                        -> Ptr CUChar  -- output_seckey32
                         -> IO CInt
 
 -- | FFI binding for ECDSA recoverable-compact signing
@@ -502,6 +517,41 @@ pubKeyTweakAdd parent33 tweak32
                     (castPtr pPtr) (castPtr tPtr) outPtr
             if ok == 1
               then Just <$> BS.packCStringLen (castPtr outPtr, 33)
+              else return Nothing
+
+-- | BIP-32 CKDpriv primitive: compute @(parent_seckey + tweak) mod n@
+-- in constant time via libsecp256k1's
+-- @secp256k1_ec_seckey_tweak_add@.  Both inputs are 32-byte big-endian
+-- scalars; the result is a 32-byte big-endian secret key.
+--
+-- Returns 'Nothing' on:
+--
+--   * malformed parent (wrong length)
+--   * malformed tweak (wrong length)
+--   * tweak >= curve order n
+--   * parent >= curve order n
+--   * result is zero (would map to point at infinity)
+--
+-- BIP-32 instructs callers to advance the child index and retry on
+-- 'Nothing'.  Reference: @bitcoin-core/src/key.cpp:307@ @CKey::Derive@.
+--
+-- W159 BUG-14 fix: prior to this wrapper the only @addPrivateKeys@
+-- implementation lived in @Haskoin.Wallet@ and used GHC's @Integer@
+-- (GMP, lazy-thunked, NOT constant-time), creating the named-origin
+-- "BIP-32 private-side GMP / public-side libsecp asymmetry" fleet
+-- pattern.  Both sides now route through constant-time libsecp.
+seckeyTweakAdd :: ByteString -> ByteString -> Maybe ByteString
+seckeyTweakAdd parent32 tweak32
+  | BS.length parent32 /= 32 = Nothing
+  | BS.length tweak32  /= 32 = Nothing
+  | otherwise = unsafePerformIO $
+      BS.useAsCStringLen parent32 $ \(pPtr, _) ->
+        BS.useAsCStringLen tweak32 $ \(tPtr, _) ->
+          allocaArray 32 $ \outPtr -> do
+            ok <- c_ec_seckey_tweak_add
+                    (castPtr pPtr) (castPtr tPtr) outPtr
+            if ok == 1
+              then Just <$> BS.packCStringLen (castPtr outPtr, 32)
               else return Nothing
 
 --------------------------------------------------------------------------------
