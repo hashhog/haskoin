@@ -796,10 +796,10 @@ spec_G20_sigCacheNotInstantiated = describe "G20 Global SigCache instantiated at
     do initGlobalSigCache  -- reset to empty + fresh nonce (as startup does)
        let sighash = BS.replicate 32 0xab
            flagsB  = BS.pack [0,0,0,0]
-       foundBefore <- lookupGlobalSigCache sighash BS.empty BS.empty BS.empty flagsB
+       foundBefore <- lookupGlobalSigCache sighash BS.empty BS.empty
        foundBefore `shouldBe` False  -- fresh cache: miss
-       insertGlobalSigCache sighash BS.empty BS.empty BS.empty flagsB
-       foundAfter <- lookupGlobalSigCache sighash BS.empty BS.empty BS.empty flagsB
+       insertGlobalSigCache sighash BS.empty BS.empty
+       foundAfter <- lookupGlobalSigCache sighash BS.empty BS.empty
        foundAfter `shouldBe` True    -- after insert: hit
 
   it "FIXED BUG-2: global cache survives re-initialisation (second startup idempotent)" $
@@ -807,12 +807,11 @@ spec_G20_sigCacheNotInstantiated = describe "G20 Global SigCache instantiated at
     -- the cache to empty and rotates the nonce, preventing stale entries
     -- from a prior run.
     do let sighash = BS.replicate 32 0xcd
-           flagsB  = BS.pack [8,0,0,0]
-       insertGlobalSigCache sighash BS.empty BS.empty BS.empty flagsB
-       foundBefore <- lookupGlobalSigCache sighash BS.empty BS.empty BS.empty flagsB
+       insertGlobalSigCache sighash BS.empty BS.empty
+       foundBefore <- lookupGlobalSigCache sighash BS.empty BS.empty
        foundBefore `shouldBe` True   -- entry present before reset
        initGlobalSigCache             -- simulate second startup / reindex
-       foundAfter <- lookupGlobalSigCache sighash BS.empty BS.empty BS.empty flagsB
+       foundAfter <- lookupGlobalSigCache sighash BS.empty BS.empty
        foundAfter `shouldBe` False   -- entry gone after reset (new nonce + empty map)
 
 --------------------------------------------------------------------------------

@@ -133,6 +133,7 @@ import qualified W138AssumeUTXOSpec
 import qualified W139FeeEstimationSpec
 import qualified W140HTTPRpcAuthSpec
 import qualified W141ZmqRestNotifySpec
+import qualified W160SigCacheKeySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22644,6 +22645,9 @@ main = hspec $ do
 
   -- W141 ZMQ + REST + Notification scripts (bundled) — 30-gate audit, discovery
   W141ZmqRestNotifySpec.spec
+
+  -- W160 SigCache key composition regression (W159 BUG-17 / W160 BUG-16 fix)
+  W160SigCacheKeySpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec

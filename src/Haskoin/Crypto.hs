@@ -86,13 +86,26 @@ module Haskoin.Crypto
   , xonlyPubkeyFromSeckey
   , computeTapTweakHash
   , bip86TapTweakHash
+    -- * Process-wide Signature Verification Cache
+    -- (W105 BUG-2 / BUG-9 / BUG-13 + W159 BUG-17 / W160 BUG-16 fixes)
+  , SigCacheEntry
+  , initGlobalSigCache
+  , lookupGlobalSigCache
+  , insertGlobalSigCache
+  , cachedVerifyMsgLax
+  , cachedVerifySchnorr
   ) where
 
 import qualified Crypto.Hash as H
 import qualified Crypto.MAC.HMAC as HMAC
+import qualified Crypto.Random as CryptoRandom
+import Control.Monad (when)
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
+import qualified Data.Map.Strict as Map
+import Data.Map.Strict (Map)
 import Data.Serialize (Serialize(..), Put, runPut, putWord32le, putWord64le,
                        putByteString, encode)
 import Data.Word (Word8, Word32, Word64)
@@ -563,6 +576,120 @@ verifyMsgLax pk (Sig sigDer) (Hash256 hashBytes) =
             (castPtr sigPtr) (fromIntegral sigLen)
             (castPtr hashPtr)
           return (result == 1)
+
+--------------------------------------------------------------------------------
+-- Process-wide Signature Verification Cache
+--
+-- W105 BUG-2: cache absent → EC math paid on every reorg / mempool admit.
+-- W105 BUG-9: keys must not be predictable across processes → 32-byte nonce.
+-- W105 BUG-13: keys must distinguish DER-malleated sigs that share a txid.
+--
+-- W159 BUG-17 / W160 BUG-16 FIX: the cache is keyed on Core's
+-- @(sighash, pubkey, sig)@ triple — exactly what
+-- @SignatureCache::ComputeEntryECDSA@ / @ComputeEntrySchnorr@ commit
+-- to (bitcoin-core/src/script/sigcache.cpp:39-49).  The previous key
+-- used @(scriptSig, witnessBytes, prevoutScript)@ AND placed the
+-- transaction txid in the slot named @sighash@; two inputs of the
+-- same tx with identical empty scriptSig + identical witness +
+-- identical prevout scriptPubKey collided across distinct per-input
+-- sighashes (BIP-143 commits to prevout amount and index), silently
+-- short-circuiting input N's script verify on a cache hit from input 0.
+-- P0-CDIV: SegWit-malleability chain-split candidate.  Now the cache
+-- lookup happens inside @cachedVerifyMsgLax@ / @cachedVerifySchnorr@
+-- at the actual EC verify site, where the real per-input sighash,
+-- the parsed pubkey, and the raw signature are all in scope.
+--------------------------------------------------------------------------------
+
+-- | Cache entry: first 8 bytes of SHA256(nonce || sighash || pubkey || sig)
+-- folded into a big-endian Word64.  Matches Core's CheapHash pattern
+-- (Map comparisons remain O(1)).
+type SigCacheEntry = Word64
+
+{-# NOINLINE globalSigCacheRef #-}
+globalSigCacheRef :: IORef (Map SigCacheEntry ())
+globalSigCacheRef = unsafePerformIO (newIORef Map.empty)
+
+{-# NOINLINE globalSigCacheNonce #-}
+globalSigCacheNonce :: IORef ByteString
+globalSigCacheNonce = unsafePerformIO (newIORef (BS.replicate 32 0))
+
+globalSigCacheMaxEntries :: Int
+globalSigCacheMaxEntries = 50000
+
+-- | Derive the cache key from the per-process nonce and Core's
+-- @(sighash, pubkey, sig)@ triple.
+computeGlobalSigCacheKey :: ByteString -> ByteString -> ByteString -> ByteString
+                         -> SigCacheEntry
+computeGlobalSigCacheKey nonce sighash pubkey sig =
+  let material = nonce <> sighash <> pubkey <> sig
+      digest   = convert (H.hashWith H.SHA256 material) :: ByteString
+  in BS.foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral (b :: Word8))
+               (0 :: Word64) (BS.take 8 digest)
+{-# INLINE computeGlobalSigCacheKey #-}
+
+-- | Look up signature material in the process-global sig cache.
+-- Arguments: (sighash, pubkey, sig).
+lookupGlobalSigCache :: ByteString -> ByteString -> ByteString -> IO Bool
+lookupGlobalSigCache sighash pubkey sig = do
+  nonce <- readIORef globalSigCacheNonce
+  m     <- readIORef globalSigCacheRef
+  let key = computeGlobalSigCacheKey nonce sighash pubkey sig
+  return $! Map.member key m
+
+-- | Insert verified signature material into the process-global sig cache.
+-- Arguments: (sighash, pubkey, sig).  Evicts the entry with the smallest
+-- Word64 key when full.
+insertGlobalSigCache :: ByteString -> ByteString -> ByteString -> IO ()
+insertGlobalSigCache sighash pubkey sig = do
+  nonce <- readIORef globalSigCacheNonce
+  let key = computeGlobalSigCacheKey nonce sighash pubkey sig
+  atomicModifyIORef' globalSigCacheRef $ \m ->
+    let m' = if Map.size m >= globalSigCacheMaxEntries
+                then Map.insert key () (Map.deleteMin m)
+                else Map.insert key () m
+    in (m', ())
+
+-- | (Re-)initialise the process-global sig cache.  Call once during node
+-- startup, before any block validation begins.  Generates a fresh
+-- /dev/urandom nonce and clears all cached entries so stale results from
+-- a prior run or reindex cannot be reused.
+initGlobalSigCache :: IO ()
+initGlobalSigCache = do
+  nonce <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  writeIORef globalSigCacheNonce nonce
+  writeIORef globalSigCacheRef Map.empty
+
+-- | ECDSA verify with process-global SigCache.  Caches the
+-- @(sighash, pubkey, sig)@ triple on first successful verify, returning
+-- True directly on subsequent calls for the same triple.  Negative
+-- results are NOT cached (matches Core's @CachingTransactionSignatureChecker@).
+cachedVerifyMsgLax :: PubKey -> Sig -> Hash256 -> Bool
+cachedVerifyMsgLax pk s@(Sig sigBytes) h@(Hash256 hashBytes) =
+  unsafePerformIO $ do
+    let pkBytes = serializePubKeyRaw pk
+    hit <- lookupGlobalSigCache hashBytes pkBytes sigBytes
+    if hit
+      then return True
+      else do
+        let ok = verifyMsgLax pk s h
+        when ok $ insertGlobalSigCache hashBytes pkBytes sigBytes
+        return ok
+{-# NOINLINE cachedVerifyMsgLax #-}
+
+-- | Schnorr verify with process-global SigCache.  Triple is
+-- @(sighash, x-only pubkey, 64-byte signature)@.  Like ECDSA, only
+-- positive results are cached.
+cachedVerifySchnorr :: ByteString -> ByteString -> ByteString -> Bool
+cachedVerifySchnorr sig msg pubkey =
+  unsafePerformIO $ do
+    hit <- lookupGlobalSigCache msg pubkey sig
+    if hit
+      then return True
+      else do
+        let ok = verifySchnorr sig msg pubkey
+        when ok $ insertGlobalSigCache msg pubkey sig
+        return ok
+{-# NOINLINE cachedVerifySchnorr #-}
 
 -- | Get raw bytes of a public key (compressed or uncompressed)
 serializePubKeyRaw :: PubKey -> ByteString
