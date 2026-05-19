@@ -555,6 +555,55 @@ int haskoin_ec_pubkey_tweak_add(
 }
 
 /*
+ * BIP-32 CKDpriv: child_seckey = (parent_seckey + tweak) mod n.
+ *
+ * Wraps libsecp256k1's `secp256k1_ec_seckey_tweak_add` (aliased here via
+ * the shim `secp256k1_ec_privkey_tweak_add`).  This is exactly the
+ * operation Bitcoin Core's `CKey::Derive` uses in
+ * `bitcoin-core/src/key.cpp:307`, and it runs in constant-time inside
+ * libsecp, eliminating the timing-/cache-side-channel that a pure
+ * Haskell GMP `Integer (parent + tweak) mod n` implementation exposes.
+ *
+ * libsecp's primitive tweaks the seckey *in place*; we copy
+ * `parent_seckey32` into `output_seckey32` first so the input buffer
+ * (which is a pinned GHC ByteString) is never mutated.  This matches
+ * the calling convention of the sibling `haskoin_ec_pubkey_tweak_add`
+ * (parse → tweak → serialize).
+ *
+ * Returns 1 on success, 0 on failure:
+ *   - tweak >= curve order n
+ *   - parent_seckey >= curve order n (invalid)
+ *   - resulting seckey == 0 (point at infinity / hits the identity)
+ *   - any other libsecp ARG_CHECK failure
+ * The BIP-32 spec instructs the caller to advance the child index and
+ * retry on failure.
+ */
+int haskoin_seckey_tweak_add(
+    const unsigned char *parent_seckey32,
+    const unsigned char *tweak32,
+    unsigned char *output_seckey32
+) {
+    secp256k1_context *ctx = get_sign_ctx();
+
+    if (!ctx) return 0;
+    if (!parent_seckey32 || !tweak32 || !output_seckey32) return 0;
+
+    /* Copy parent into output buffer; libsecp's tweak_add mutates in place. */
+    memcpy(output_seckey32, parent_seckey32, 32);
+
+    /* Apply the scalar tweak: output_seckey = (output_seckey + tweak) mod n.
+     * libsecp's `secp256k1_ec_seckey_tweak_add` runs in constant time and
+     * rejects tweak >= n, parent >= n, and a zero result. */
+    if (!secp256k1_ec_seckey_tweak_add(ctx, output_seckey32, tweak32)) {
+        /* On failure libsecp may have left the buffer partially modified;
+         * wipe it so the caller can't accidentally use a junk seckey. */
+        memset(output_seckey32, 0, 32);
+        return 0;
+    }
+    return 1;
+}
+
+/*
  * Produce a Bitcoin "compact recoverable" ECDSA signature, as used by
  * signmessage / verifymessage.  Output buffer must be 65 bytes; the layout
  * is: [header_byte][R(32)][S(32)] where header = 27 + recid + (4 if compressed).

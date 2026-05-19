@@ -158,6 +158,7 @@ test-suite haskoin-test
                , W139FeeEstimationSpec
                , W140HTTPRpcAuthSpec
                , W141ZmqRestNotifySpec
+               , W159BIP32PrivTweakSpec
                , W160SigCacheKeySpec
                , Bip21Spec
                , Fix64TlsSpec

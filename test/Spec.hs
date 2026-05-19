@@ -133,6 +133,7 @@ import qualified W138AssumeUTXOSpec
 import qualified W139FeeEstimationSpec
 import qualified W140HTTPRpcAuthSpec
 import qualified W141ZmqRestNotifySpec
+import qualified W159BIP32PrivTweakSpec
 import qualified W160SigCacheKeySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -22645,6 +22646,10 @@ main = hspec $ do
 
   -- W141 ZMQ + REST + Notification scripts (bundled) — 30-gate audit, discovery
   W141ZmqRestNotifySpec.spec
+
+  -- W159 BIP-32 CKDpriv via libsecp256k1 (W159 BUG-14 fix: closes
+  -- "BIP-32 private-side GMP / public-side libsecp asymmetry" fleet pattern)
+  W159BIP32PrivTweakSpec.spec
 
   -- W160 SigCache key composition regression (W159 BUG-17 / W160 BUG-16 fix)
   W160SigCacheKeySpec.spec
