@@ -1136,6 +1136,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     requestedUpToRef <- newIORef loadedHeight
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
+    -- Headers-first IBD: POSIX time of the last full (>=2000) header
+    -- batch. Block download is deferred while this is recent, so the
+    -- block processor does not throttle bulk header sync via RocksDB +
+    -- CPU contention. 0 = no full batch seen (steady-state node).
+    lastFullBatchAtRef <- newIORef (0 :: Int64)
     -- Recently-rejected transaction filter (cleared on each new block)
     recentlyRejectedRef <- newIORef (Set.empty :: Set.Set TxId)
     -- BIP-339 wtxid-keyed orphan pool (W99 G12/G13/G14)
@@ -1302,7 +1307,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1424,7 +1429,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
              peers <- getConnectedPeerList pm'
              headerTip <- readTVarIO (hcHeight hc)
              nextBlock <- readIORef nextBlockRef
-             when (not (null peers) && nextBlock <= headerTip) $ do
+             -- Headers-first: stay quiet while bulk header sync is live
+             -- (a full 2000-header batch within the last 45 s) so block
+             -- download does not throttle header sync.
+             nowKick <- (round <$> getPOSIXTime :: IO Int64)
+             lastFullKick <- readIORef lastFullBatchAtRef
+             let headerSyncActiveKick = nowKick - lastFullKick < 45
+             when (not (null peers) && nextBlock <= headerTip && not headerSyncActiveKick) $ do
                -- Request a bounded window so we don't blast every gap
                -- block at once; the loop re-runs every 3 s and slides
                -- forward as blocks connect.
@@ -1870,7 +1881,7 @@ infixOfStr needle haystack =
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
                    -> IORef PeerManager -> IORef Word32 -> IORef Word32
-                   -> IORef Bool -> IORef (Set.Set TxId)
+                   -> IORef Bool -> IORef Int64 -> IORef (Set.Set TxId)
                    -> IORef Word32 -> IORef Integer
                    -> PruneConfig -> Maybe BlockStore
                    -> Maybe IndexManager
@@ -1888,7 +1899,7 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- Reference: bitcoin-core/src/net_processing.cpp
                       -- mapBlocksInFlight / PartiallyDownloadedBlock lifetime.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -1964,6 +1975,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
       resetUnconnectingHeaders pmRefVal addr
     -- If we got a full batch (2000), request more headers immediately
     when (added >= 2000) $ do
+      -- Headers-first: mark bulk header sync as live so the block-gap
+      -- kicker and the post-headers requestBlocks below stay deferred.
+      nowFull <- (round <$> getPOSIXTime :: IO Int64)
+      writeIORef lastFullBatchAtRef nowFull
       tip <- getChainTip hc
       let tipHeight = ceHeight tip
           locator = [ceHash tip]
@@ -1992,8 +2007,18 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
         putStrLn "Header sync complete — leaving IBD mode"
         writeIORef ibdModeRef False
 
-    -- After headers, request ALL blocks up to new tip
-    when (added > 0) $ do
+    -- After headers, request blocks — but ONLY once headers-first bulk
+    -- sync has gone quiet (no full 2000-header batch for 45 s). While
+    -- full batches are still arriving, the block processor would
+    -- saturate RocksDB + CPU and throttle header sync to block-IBD pace.
+    -- A from-genesis sync therefore pulls the whole header chain first;
+    -- the block-gap kicker then drives block download in 256-block
+    -- windows. A steady-state node never sees full batches (lastFull
+    -- stays 0), so this fires immediately as before.
+    nowHdr <- (round <$> getPOSIXTime :: IO Int64)
+    lastFullHdr <- readIORef lastFullBatchAtRef
+    let headerSyncActive = nowHdr - lastFullHdr < 45
+    when (added > 0 && not headerSyncActive) $ do
       tip <- getChainTip hc
       let tipHeight = ceHeight tip
       nextBlock <- readIORef nextBlockRef
@@ -2480,7 +2505,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -2586,7 +2611,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()
