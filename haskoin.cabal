@@ -160,6 +160,7 @@ test-suite haskoin-test
                , W141ZmqRestNotifySpec
                , W159BIP32PrivTweakSpec
                , W160SigCacheKeySpec
+               , W162ChainstateWedgeSpec
                , Bip21Spec
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec

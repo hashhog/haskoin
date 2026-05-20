@@ -3022,11 +3022,20 @@ connectBlockAt db net block height spentUtxos = do
   if bh == genesisHash
     then do
       -- Genesis: just stamp BestBlock + header index entries.
+      --
+      -- W162: the height-index key payload is the bare 4-byte
+      -- big-endian height ('toBE32 height'), NOT 'encode (toBE32 …)'.
+      -- 'Data.Serialize.encode' on a 'ByteString' prepends an 8-byte
+      -- Word64 length tag, so 'encode (toBE32 h)' produced a 12-byte
+      -- payload — a key that 'Storage.getBlockHeight' / 'putBlockHeight'
+      -- (which use the bare 'toBE32 height') can never read back.  The
+      -- old form silently wrote phantom keys; this matches the
+      -- canonical 'batchPutBlockHeight' encoding in Storage.hs.
       writeBatch db (WriteBatch
         [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
         , BatchPut (makeKey PrefixBlockHeader (encode bh))
                    (encode (blockHeader block))
-        , BatchPut (makeKey PrefixBlockHeight (encode (toBE32 height)))
+        , BatchPut (makeKey PrefixBlockHeight (toBE32 height))
                    (encode bh)
         ])
       return (Right ())
@@ -3105,7 +3114,11 @@ connectBlockAt db net block height spentUtxos = do
                     , [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
                       , BatchPut (makeKey PrefixBlockHeader (encode bh))
                                  (encode (blockHeader block))
-                      , BatchPut (makeKey PrefixBlockHeight (encode (toBE32 height)))
+                      -- W162: bare 'toBE32 height' (4-byte BE) so this
+                      -- key matches 'Storage.getBlockHeight'.  See the
+                      -- genesis fast-path note above — 'encode' on a
+                      -- ByteString prepends an 8-byte length tag.
+                      , BatchPut (makeKey PrefixBlockHeight (toBE32 height))
                                  (encode bh)
                       ]
                     ]
@@ -3547,10 +3560,14 @@ buildConnectBlockOps _net block height spentUtxos =
          | (i, txid) <- zip [0..] txids
          ]
        , -- Chain state pointers (PrefixBestBlock + headers + height).
+         -- W162: bare 'toBE32 height' key payload (4-byte BE), matching
+         -- 'Storage.getBlockHeight' / 'batchPutBlockHeight'.  'encode'
+         -- on a ByteString prepends an 8-byte length tag and would make
+         -- the key unreadable — see the connectBlockAt notes above.
          [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
          , BatchPut (makeKey PrefixBlockHeader (encode bh))
                     (encode (blockHeader block))
-         , BatchPut (makeKey PrefixBlockHeight (encode (toBE32 height)))
+         , BatchPut (makeKey PrefixBlockHeight (toBE32 height))
                     (encode bh)
          ]
        ]
