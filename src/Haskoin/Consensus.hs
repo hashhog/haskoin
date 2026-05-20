@@ -3972,21 +3972,34 @@ addHeader net hc header minPowChecked = do
                         let work = cumulativeWork (ceChainWork parent) header
 
                         -- Gate 7: too-little-chainwork (W97 G8 + W99 G5).
-                        -- Core: validation.cpp:4229-4232 —
-                        --   if (!min_pow_checked)
-                        --     return state.Invalid(BLOCK_HEADER_LOW_WORK,
-                        --                          "too-little-chainwork");
-                        -- When minPowChecked is False (all peer-sourced paths:
-                        -- MHeaders handler, MBlock handler, handleHeaders) we
-                        -- check the cumulative work against the per-network
-                        -- nMinimumChainWork threshold.  A peer flooding low-work
-                        -- headers that individually satisfy the declared nBits
-                        -- target can still be rejected here because regtest/testnet4/
-                        -- mainnet each set a floor that a real chain of that height
-                        -- would have crossed.  netMinimumChainWork was previously a
-                        -- dead-helper: defined in all four Network records but only
-                        -- consulted inside shouldSkipScripts (assumevalid path).
-                        if not minPowChecked && work < netMinimumChainWork net
+                        -- Core enforces nMinimumChainWork through the
+                        -- headerssync.cpp PRESYNC machine: a peer's whole header
+                        -- chain is tallied in a temporary structure and committed
+                        -- only once its TOTAL work clears the threshold; Core also
+                        -- passes min_pow_checked=true outright when the headers
+                        -- extend a chain already past nMinimumChainWork.
+                        --
+                        -- haskoin has no PRESYNC machine.  The pre-fix code gated
+                        -- every header on its OWN cumulative work, which is
+                        -- unsatisfiable during a from-genesis sync: header 1's
+                        -- cumulative work is far below the mainnet threshold, so it
+                        -- was rejected "too-little-chainwork", every later header in
+                        -- the batch then failed the parent lookup, and the sync
+                        -- wedged ("Unconnecting headers" forever).  The bug stayed
+                        -- latent because a populated chainstate never re-runs the
+                        -- height-1 path — only a genuinely empty DB exposes it.
+                        --
+                        -- Fix: enforce the gate only once our own best chain has
+                        -- itself reached nMinimumChainWork (Core's "extending an
+                        -- already-high-work chain" case).  During from-genesis
+                        -- bootstrap the gate is skipped; a low-work header flood is
+                        -- still bounded by the checkpoint set (Gate 5), PoW (Gate 3)
+                        -- and diffbits (Gate 4).  A real PRESYNC machine is the
+                        -- principled follow-up.
+                        tipWork <- ceChainWork <$> readTVarIO (hcTip hc)
+                        if not minPowChecked
+                             && tipWork >= netMinimumChainWork net
+                             && work < netMinimumChainWork net
                           then return $ Left "too-little-chainwork"
                           else do
                             let entry = ChainEntry
