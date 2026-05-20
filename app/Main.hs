@@ -901,8 +901,26 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                       ++ ", height = " ++ show baseHeight
                                       ++ ", coins = " ++ show (smCoinsCount m)
                               n <- loadSnapshotIntoLegacyUTXO db snap
+                              -- Durably record the snapshot base hash
+                              -- (analogue of Core's
+                              -- chainstate_snapshot/base_blockhash file,
+                              -- utxo_snapshot.cpp WriteSnapshotBaseBlockhash).
+                              -- The startup chainstate reconciliation reads
+                              -- this back via 'getSnapshotBaseHash' to learn
+                              -- that the UTXO set legitimately begins at the
+                              -- snapshot base — a snapshot import writes NO
+                              -- per-block undo records, so without this
+                              -- marker the undo-record binary search would
+                              -- mistake the chainstate for empty and seed
+                              -- block download from height 1.  The 0x53
+                              -- key survives both restarts and
+                              -- 'wipeChainstate'.
+                              putSnapshotBaseHash db baseHash
                               putStrLn $ "[--load-snapshot] imported " ++ show n
                                       ++ " UTXO(s); best-block pinned to snapshot base."
+                              putStrLn $ "[--load-snapshot] recorded snapshot "
+                                      ++ "base marker (height " ++ show baseHeight
+                                      ++ ") for restart-safe reconciliation."
 
     -- Initialize mempool.
     -- Provide a per-input coin-MTP lookup function (BIP-68 time-based locks):
@@ -998,16 +1016,82 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               if connected
                 then findConnectedTip mid hi
                 else findConnectedTip lo (mid - 1)
+    -- Snapshot-aware lower bound for the connected-tip search.
+    --
+    -- An assumeUTXO snapshot load ('--load-snapshot',
+    -- loadSnapshotIntoLegacyUTXO) writes the full UTXO set + the
+    -- @PrefixBestBlock@ pointer (= snapshot base hash) but writes NO
+    -- per-block undo records: the UTXO set is imported wholesale, not
+    -- replayed block-by-block.  So on a snapshot-bootstrapped node the
+    -- per-block undo records do NOT occupy [1..U] — they occupy
+    -- [base+1 .. U], with heights [1..base] permanently empty.
+    --
+    -- The plain binary search above assumes a [1..U] range: it probes
+    -- block 1, finds no undo record, and reports connectedTipHeight = 0.
+    -- That seeds nextBlockRef to 1 and makes haskoin try to connect
+    -- block 1 on top of a best-block pointer far up the chain — the
+    -- ConnectBlock G1 gate (@hashPrevBlock == view.GetBestBlock()@,
+    -- validation.cpp:2333) then rejects every downloaded block and the
+    -- node wedges + DoS-bans its peers.  This bites BOTH immediately
+    -- after the snapshot load AND on every later restart (once blocks
+    -- above the base have connected, the best-block pointer no longer
+    -- names a snapshot base either).
+    --
+    -- Fix: '--load-snapshot' durably records the snapshot base hash
+    -- under the 0x53 key ('putSnapshotBaseHash' — Core's
+    -- chainstate_snapshot/base_blockhash file analogue).  We read it
+    -- back here: when set, the UTXO set legitimately begins at the
+    -- snapshot base, so the connected tip is >= baseHeight and the
+    -- undo-record search floor is baseHeight+1 (not 1).  If even
+    -- baseHeight+1 has no undo record, no post-snapshot block has
+    -- connected yet and the connected tip is exactly baseHeight.
+    -- This is haskoin's analogue of Core resuming the active chain from
+    -- @m_from_snapshot_blockhash@ after an assumeutxo bootstrap.
+    mSnapshotBase <- getSnapshotBaseHash db
+    mSnapshotBaseHeight <-
+      case mSnapshotBase of
+        Nothing       -> return Nothing
+        Just baseHash -> do
+          -- Resolve the base hash to a height.  Prefer the in-memory
+          -- header chain ('initHeaderChainFromDB' already loaded it);
+          -- fall back to the hardcoded assumeUTXO whitelist (the same
+          -- table '--load-snapshot' validates against) so the floor is
+          -- still correct even if the base header is not in the height
+          -- index for any reason.
+          entries <- readTVarIO (hcEntries hc)
+          case Map.lookup baseHash entries of
+            Just ce -> return (Just (ceHeight ce))
+            Nothing -> return (aupHeight <$> assumeUtxoForBlockHash net baseHash)
     connectedTipHeight <-
       if headerTipHeight == 0
         then return 0
-        else do
-          -- If even block 1 has no undo record the UTXO set never
-          -- advanced past genesis; otherwise binary-search [1..tip].
-          oneConnected <- blockIsConnected 1
-          if not oneConnected
-            then return 0
-            else findConnectedTip 1 headerTipHeight
+        else case mSnapshotBaseHeight of
+          -- Snapshot-bootstrapped chainstate: undo records (if any)
+          -- start at baseHeight+1.  The connected tip is at least
+          -- baseHeight.
+          Just baseHeight -> do
+            if baseHeight >= headerTipHeight
+              then return baseHeight
+              else do
+                aboveConnected <- blockIsConnected (baseHeight + 1)
+                if not aboveConnected
+                  then do
+                    putStrLn $ "Chainstate reconciliation: assumeUTXO "
+                            ++ "snapshot base at height " ++ show baseHeight
+                            ++ "; no post-snapshot blocks connected yet "
+                            ++ "(snapshot UTXO set has no undo records by "
+                            ++ "design) — treating the base as the "
+                            ++ "connected tip."
+                    return baseHeight
+                  else findConnectedTip (baseHeight + 1) headerTipHeight
+          -- Normal (genesis-up) chainstate: undo records start at 1.
+          Nothing -> do
+            -- If even block 1 has no undo record the UTXO set never
+            -- advanced past genesis; otherwise binary-search [1..tip].
+            oneConnected <- blockIsConnected 1
+            if not oneConnected
+              then return 0
+              else findConnectedTip 1 headerTipHeight
     -- Repair the best-block pointer so it names the true connected tip.
     -- This is the recovery: a genesis-stuck (or otherwise stale)
     -- @PrefixBestBlock@ is re-pointed at the block whose UTXO mutations
