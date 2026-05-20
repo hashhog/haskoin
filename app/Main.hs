@@ -674,9 +674,31 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         { dbBlockCacheSize = noDbCache * 1024 * 1024 }
   bracket (openDB dbConfig) closeDB $ \db -> do
 
-    -- Initialize or load chain state
-    mState <- getChainState db
-    case mState of
+    -- Initialize or load chain state.
+    --
+    -- W162 P0 chainstate-wedge fix.  The authoritative on-disk
+    -- chainstate-existence signal is the @PrefixBestBlock@ pointer
+    -- ('getBestBlockHash') — the UTXO-view tip that 'connectBlockAt'
+    -- advances atomically with every block.  We must NOT use
+    -- 'getChainState' here: 'saveChainState' is exported but has zero
+    -- callers (test W109 BUG-31 documents this), so 'getChainState'
+    -- ALWAYS returns 'Nothing'.  The pre-fix code therefore took the
+    -- 'Nothing' branch on EVERY restart and ran
+    -- @putBestBlockHash db genesisHash@, resetting the live UTXO-view
+    -- best-block pointer all the way back to genesis even though the
+    -- 74 GB UTXO set on disk was intact at height ~949 k.  After the
+    -- reset, every peer block failed the ConnectBlock G1 gate
+    -- (hashPrevBlock == view.GetBestBlock(), validation.cpp:2333)
+    -- because no block's prevHash equals genesis — a permanent wedge.
+    --
+    -- Fix: gate the genesis-init on 'getBestBlockHash'.  Only a DB that
+    -- has never had a best-block pointer written (genuinely fresh) is
+    -- initialised; an existing chainstate is left completely untouched.
+    -- Core analogue: AppInitMain only writes the genesis coins entry
+    -- when the chainstate is empty (validation.cpp LoadBlockIndex /
+    -- LoadGenesisBlock), and never rewinds an existing best block.
+    mBestAtStartup <- getBestBlockHash db
+    case mBestAtStartup of
       Nothing -> do
         putStrLn "Initializing new chain..."
         let genesis = netGenesisBlock net
@@ -684,8 +706,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         putBlockHeader db genesisHash (blockHeader genesis)
         putBlockHeight db 0 genesisHash
         putBestBlockHash db genesisHash
-      Just state ->
-        putStrLn $ "Resuming from height " ++ show (pcsHeight state)
+      Just bestHash ->
+        putStrLn $ "Resuming chainstate from best-block " ++ show bestHash
 
     -- -reindex / -reindex-chainstate.
     --
@@ -918,10 +940,113 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     let feeEstimatesPath = dataDir </> "fee_estimates.json"
     loadFeeEstimates fe feeEstimatesPath
 
-    -- Track next expected block height for download.
-    -- Resume from the loaded header chain tip so we don't re-request
-    -- blocks that are already connected.
-    loadedHeight <- readTVarIO (hcHeight hc)
+    -- Startup chainstate reconciliation (Core: Chainstate::LoadChainTip
+    -- + Chainstate::ReplayBlocks, bitcoin-core/src/validation.cpp:4546
+    -- / :4773).
+    --
+    -- W162 P0 chainstate-wedge recovery + prevention.
+    --
+    -- haskoin is headers-first: 'initHeaderChainFromDB' rebuilds the
+    -- in-memory header chain from the persisted height index, which
+    -- header sync advances *ahead* of block connection.  So 'hcHeight'
+    -- is the highest known *header*, NOT the highest *connected* block.
+    -- The block-download resume point must be the connected-block tip.
+    --
+    -- We do NOT trust the @PrefixBestBlock@ pointer to give us that
+    -- tip.  In the incident this fix targets, that pointer had been
+    -- destroyed: the startup code (now fixed above) reset it to genesis
+    -- on every restart, so on disk it read "height 0" while the UTXO
+    -- set was actually intact at ~949 k.  Trusting it and replaying
+    -- from block 1 would re-apply coinbases and resurrect long-spent
+    -- coins — corrupting the UTXO set.
+    --
+    -- Instead we recover the *true* connected tip from the per-block
+    -- undo records.  'connectBlockAt' commits the UTXO mutations, the
+    -- undo record (key @0x10 ++ blockHash@) and the chain pointers in
+    -- ONE atomic RocksDB 'writeBatch' — so an undo record for the
+    -- block at height H exists IFF that block's UTXO mutations were
+    -- applied.  Blocks connect strictly sequentially (the ConnectBlock
+    -- G1 gate enforces it), so undo records occupy a contiguous range
+    -- [1 .. U]; we binary-search for U.  This is haskoin's analogue of
+    -- Core's ReplayBlocks, which reconstructs the correct tip from the
+    -- on-disk coins view rather than a possibly-stale hint.
+    --
+    -- Having found U we (a) re-stamp @PrefixBestBlock@ to the block at
+    -- height U — repairing a corrupted pointer in place, the actual
+    -- recovery step — and (b) resume block download from U+1.  No
+    -- reindex or chainstate wipe is needed: the UTXO set is already
+    -- correct at U, only the pointer and the un-connected tail need
+    -- fixing.  On a healthy node U already equals the pointer height
+    -- and both steps are no-ops.
+    headerTipHeight <- readTVarIO (hcHeight hc)
+    let -- Does the block at height @h@ have a persisted undo record?
+        -- Height 0 (genesis) has no undo record but is always
+        -- "connected"; callers handle 0 separately.
+        blockIsConnected h = do
+          mHash <- getBlockHeight db h
+          case mHash of
+            Nothing -> return False
+            Just bh -> isJust <$> getUndoData db bh
+        -- Binary search for the highest contiguous connected height in
+        -- the inclusive range [lo .. hi].  Invariant on entry: every
+        -- height <= lo is connected, every height > hi is not.
+        findConnectedTip lo hi
+          | lo >= hi  = return lo
+          | otherwise = do
+              let mid = lo + (hi - lo + 1) `div` 2
+              connected <- blockIsConnected mid
+              if connected
+                then findConnectedTip mid hi
+                else findConnectedTip lo (mid - 1)
+    connectedTipHeight <-
+      if headerTipHeight == 0
+        then return 0
+        else do
+          -- If even block 1 has no undo record the UTXO set never
+          -- advanced past genesis; otherwise binary-search [1..tip].
+          oneConnected <- blockIsConnected 1
+          if not oneConnected
+            then return 0
+            else findConnectedTip 1 headerTipHeight
+    -- Repair the best-block pointer so it names the true connected tip.
+    -- This is the recovery: a genesis-stuck (or otherwise stale)
+    -- @PrefixBestBlock@ is re-pointed at the block whose UTXO mutations
+    -- are actually the last ones on disk, so the ConnectBlock G1 gate
+    -- (validation.cpp:2333) will accept block U+1.
+    do
+      mBest <- getBestBlockHash db
+      mTrueTipHash <-
+        if connectedTipHeight == 0
+          then return Nothing
+          else getBlockHeight db connectedTipHeight
+      case (mBest, mTrueTipHash) of
+        (Just cur, Just trueTip)
+          | cur /= trueTip -> do
+              putStrLn $ "Chainstate reconciliation: persisted best-block "
+                      ++ show cur ++ " disagrees with the true connected "
+                      ++ "tip at height " ++ show connectedTipHeight
+                      ++ " (" ++ show trueTip ++ "); re-stamping best-block "
+                      ++ "pointer to the connected tip."
+              putBestBlockHash db trueTip
+          | otherwise -> return ()
+        (Nothing, Just trueTip) -> do
+          putStrLn $ "Chainstate reconciliation: best-block pointer absent; "
+                  ++ "stamping it to the true connected tip at height "
+                  ++ show connectedTipHeight ++ " (" ++ show trueTip ++ ")."
+          putBestBlockHash db trueTip
+        _ ->
+          -- connectedTipHeight == 0: the genesis pointer (or a fresh
+          -- DB) is already correct for an empty UTXO set.
+          return ()
+    when (connectedTipHeight < headerTipHeight) $
+      putStrLn $ "Chainstate reconciliation: connected-block tip is height "
+              ++ show connectedTipHeight ++ ", header tip is height "
+              ++ show headerTipHeight ++ "; will re-download + connect "
+              ++ show (headerTipHeight - connectedTipHeight)
+              ++ " block(s) to catch the UTXO set up."
+    -- Track next expected block height for download. Resume from the
+    -- connected-block tip (true UTXO-view tip), NOT the header tip.
+    let loadedHeight = connectedTipHeight
     nextBlockRef <- newIORef (loadedHeight + 1)
     -- Track highest block we've requested (for sliding window)
     requestedUpToRef <- newIORef loadedHeight
@@ -1188,7 +1313,50 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     void $ forkIO $ getheadersSender pm' hc net
       `catch` (\(e :: SomeException) -> putStrLn $ "getheadersSender error: " ++ show e)
 
-    -- Block downloading is done from the MHeaders and MBlock handlers
+    -- Block downloading is done from the MHeaders and MBlock handlers.
+    --
+    -- W162 P0 chainstate-wedge fix — gap re-download kicker.
+    --
+    -- The MHeaders handler only fires 'requestBlocks' when it accepts
+    -- *new* headers ('added > 0'), and the MInv handler only requests
+    -- blocks whose header is *unknown*.  Neither path covers the case
+    -- this fix targets: a restart where the header chain is already
+    -- fully synced but the UTXO-view tip ('getBestBlockHash') lags the
+    -- header tip — every gap block's header is already known, so no
+    -- getdata is ever sent and the UTXO set stays frozen forever.
+    --
+    -- This watcher closes that gap.  Once peers are connected it
+    -- re-requests the blocks between the next-needed height
+    -- ('nextBlockRef', seeded from the connected-block tip by the
+    -- reconciliation step above) and the header tip, then keeps
+    -- polling: as blocks connect 'nextBlockRef' advances and the
+    -- watcher requests the next window, so a dropped or slow block
+    -- never permanently stalls catch-up.  It is a no-op once the UTXO
+    -- tip reaches the header tip (nextBlock > headerTip), so it costs
+    -- nothing in steady state.
+    void $ forkIO $
+      (let kicker = do
+             threadDelay (3 * 1_000_000)
+             peers <- getConnectedPeerList pm'
+             headerTip <- readTVarIO (hcHeight hc)
+             nextBlock <- readIORef nextBlockRef
+             when (not (null peers) && nextBlock <= headerTip) $ do
+               -- Request a bounded window so we don't blast every gap
+               -- block at once; the loop re-runs every 3 s and slides
+               -- forward as blocks connect.
+               let windowEnd = min headerTip (nextBlock + 255)
+               putStrLn $ "Block-gap kicker: requesting blocks "
+                       ++ show nextBlock ++ "-" ++ show windowEnd
+                       ++ " (UTXO-view tip behind header tip "
+                       ++ show headerTip ++ ")"
+               requestBlocks pm' hc nextBlock windowEnd
+               -- Advance the requested-window marker so the MBlock
+               -- handler's fTooFarAhead gate admits these blocks.
+               modifyIORef' requestedUpToRef (max windowEnd)
+             kicker
+       in kicker)
+        `catch` (\(e :: SomeException) ->
+                   putStrLn $ "block-gap kicker error: " ++ show e)
 
     -- Start RPC server
     let rpcConfig = defaultRpcConfig

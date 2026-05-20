@@ -135,6 +135,7 @@ import qualified W140HTTPRpcAuthSpec
 import qualified W141ZmqRestNotifySpec
 import qualified W159BIP32PrivTweakSpec
 import qualified W160SigCacheKeySpec
+import qualified W162ChainstateWedgeSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22653,6 +22654,11 @@ main = hspec $ do
 
   -- W160 SigCache key composition regression (W159 BUG-17 / W160 BUG-16 fix)
   W160SigCacheKeySpec.spec
+
+  -- W162 chainstate-wedge regression: height-index key encoding +
+  -- best-block-pointer-survives-restart + startup LoadChainTip
+  -- reconciliation (mainnet genesis-pointer wedge fix)
+  W162ChainstateWedgeSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
