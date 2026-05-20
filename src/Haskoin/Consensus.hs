@@ -1124,6 +1124,27 @@ mainnet = Network
           , aupChainTxCount = 1305397408
           , aupBlockHash = hashFromHex "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
           })
+      -- hashhog-local snapshot at h=944183, used to recover haskoin's
+      -- mainnet chainstate after the W162 corruption (UTXO-view best-block
+      -- stuck at genesis).  NOT a Bitcoin Core chainparams entry — the four
+      -- 840k/880k/910k/935k entries above ARE.  The serialized-UTXO hash
+      -- below is computed locally over the on-disk snapshot file
+      -- (165,095,935 coins, /data/nvme1/rustoshi-recovery-snapshot-944183.dat)
+      -- and is cross-impl consistent with rustoshi's
+      -- crates/consensus/src/params.rs and blockbrew's
+      -- internal/consensus/assumeutxo.go (both store ChainTxCount =
+      -- 1334000000 and the same display-order hash 2eaf7172…).
+      --
+      -- 'aupHashSerialized' is in DISPLAY (uint256) order to match the four
+      -- Core entries above: 'hexToHash256' does NOT reverse, and
+      -- 'verifySnapshot' compares this value byte-for-byte against
+      -- 'computeUtxoHash' which yields display order.
+      , (944183, AssumeUtxoParams
+          { aupHeight = 944183
+          , aupHashSerialized = hexToHash256 "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"
+          , aupChainTxCount = 1334000000
+          , aupBlockHash = hashFromHex "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
+          })
       ]
   -- Assume-valid (Bitcoin Core v28.0): skip scripts for ancestors of this block.
   -- Hash: mainnet block 938343.

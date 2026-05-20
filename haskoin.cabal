@@ -161,6 +161,7 @@ test-suite haskoin-test
                , W159BIP32PrivTweakSpec
                , W160SigCacheKeySpec
                , W162ChainstateWedgeSpec
+               , W163SnapshotRecoverySpec
                , Bip21Spec
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec
