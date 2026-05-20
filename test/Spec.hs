@@ -136,6 +136,7 @@ import qualified W141ZmqRestNotifySpec
 import qualified W159BIP32PrivTweakSpec
 import qualified W160SigCacheKeySpec
 import qualified W162ChainstateWedgeSpec
+import qualified W163SnapshotRecoverySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -18497,8 +18498,13 @@ main = hspec $ do
             "expected rejection, got " <> show t
 
     describe "dumptxoutset latestAvailableSnapshotHeight" $ do
-      it "returns the highest mainnet entry ≤ tip (tip = 950000 → 935000)" $
-        latestAvailableSnapshotHeight mainnet 950000 `shouldBe` Just 935000
+      it "returns the highest mainnet entry ≤ tip (tip = 950000 → 944183)" $
+        -- W163 added the 944183 hashhog-recovery snapshot entry; it is
+        -- now the highest mainnet assumeUTXO height ≤ a 950000 tip.
+        latestAvailableSnapshotHeight mainnet 950000 `shouldBe` Just 944183
+
+      it "returns 935000 for a tip between 935000 and 944183 (tip = 940000)" $
+        latestAvailableSnapshotHeight mainnet 940000 `shouldBe` Just 935000
 
       it "returns the lowest entry when tip is between two (tip = 850000 → 840000)" $
         latestAvailableSnapshotHeight mainnet 850000 `shouldBe` Just 840000
@@ -22659,6 +22665,11 @@ main = hspec $ do
   -- best-block-pointer-survives-restart + startup LoadChainTip
   -- reconciliation (mainnet genesis-pointer wedge fix)
   W162ChainstateWedgeSpec.spec
+
+  -- W163 assumeUTXO snapshot-recovery code prep: 944183 checkpoint +
+  -- snapshot-aware startup reconciliation (resume from snapshot base,
+  -- not height 1) + BIP-113 MTP parity over the snapshot base
+  W163SnapshotRecoverySpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
