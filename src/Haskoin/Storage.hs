@@ -3186,8 +3186,16 @@ verifySnapshot snapshot audData
         show (audBlockHash audData) ++ ", got " ++
         show (smBaseBlockHash (usMetadata snapshot))
   | otherwise =
-      -- Compute and verify hash
-      let actualHash = computeUtxoHash (usCoins snapshot)
+      -- 'computeUtxoHash' returns the raw double-SHA256 digest, i.e. the
+      -- internal byte order of a Core 'uint256'. 'audHashSerialized'
+      -- holds the canonical txoutset hash exactly as 'gettxoutsetinfo' /
+      -- 'dumptxoutset' DISPLAY it — Bitcoin's reversed hex, parsed by the
+      -- non-reversing 'hexToHash256'. Reverse the computed digest into
+      -- that display order before comparing. Pre-fix the two were exact
+      -- byte-reverses of each other and every '--load-snapshot' FATAL'd
+      -- on a spurious hash mismatch.
+      let Hash256 rawDigest = computeUtxoHash (usCoins snapshot)
+          actualHash        = Hash256 (BS.reverse rawDigest)
       in if actualHash == audHashSerialized audData
          then Right ()
          else Left $ "UTXO hash mismatch: expected " ++
