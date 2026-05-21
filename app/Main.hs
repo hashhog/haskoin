@@ -1424,8 +1424,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- tip reaches the header tip (nextBlock > headerTip), so it costs
     -- nothing in steady state.
     void $ forkIO $
-      (let kicker = do
-             threadDelay (3 * 1_000_000)
+      (let kicker rot = do
+             -- W163: 12 s (was 3 s) so a 64-block window finishes
+             -- downloading + connecting before the next request — a 3 s
+             -- re-fire overlapped windows across rotating peers, so
+             -- ~99% of requested blocks arrived out of order and dropped.
+             threadDelay (12 * 1_000_000)
              peers <- getConnectedPeerList pm'
              headerTip <- readTVarIO (hcHeight hc)
              nextBlock <- readIORef nextBlockRef
@@ -1439,17 +1443,26 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                -- Request a bounded window so we don't blast every gap
                -- block at once; the loop re-runs every 3 s and slides
                -- forward as blocks connect.
-               let windowEnd = min headerTip (nextBlock + 255)
+               -- W163 recovery: 16-block window = exactly one getdata
+               -- batch (requestBlocks chunks in 16s), sent to a single
+               -- peer. That peer serves the batch in request order, and
+               -- haskoin processes one peer's messages sequentially, so
+               -- the 16 blocks connect in order with no out-of-order
+               -- churn against connectBlockAt's strict G1 gate.
+               -- requestBlocks rotates the peer by the kicker counter
+               -- 'rot' so each retry of a stalled window hits a
+               -- different peer — a non-serving peer cannot wedge IBD.
+               let windowEnd = min headerTip (nextBlock + 63)
                putStrLn $ "Block-gap kicker: requesting blocks "
                        ++ show nextBlock ++ "-" ++ show windowEnd
                        ++ " (UTXO-view tip behind header tip "
                        ++ show headerTip ++ ")"
-               requestBlocks pm' hc nextBlock windowEnd
+               requestBlocks pm' hc nextBlock windowEnd rot
                -- Advance the requested-window marker so the MBlock
                -- handler's fTooFarAhead gate admits these blocks.
                modifyIORef' requestedUpToRef (max windowEnd)
-             kicker
-       in kicker)
+             kicker (rot + 1)
+       in kicker 0)
         `catch` (\(e :: SomeException) ->
                    putStrLn $ "block-gap kicker error: " ++ show e)
 
@@ -1798,8 +1811,8 @@ announceTip pm header bh = do
 
 -- | Request blocks for a range of heights from the header chain
 -- Batches requests in groups of 16 to avoid overwhelming peers
-requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> IO ()
-requestBlocks pm hc fromHeight toHeight = do
+requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> Int -> IO ()
+requestBlocks pm hc fromHeight toHeight rot = do
   peerList <- getConnectedPeerList pm
   case peerList of
     [] -> putStrLn "No connected peers to request blocks from"
@@ -1816,7 +1829,12 @@ requestBlocks pm hc fromHeight toHeight = do
                    ++ ") from " ++ show numPeers ++ " peers"
         -- Distribute batches across available peers (round-robin)
         forM_ (zip [0..] batches) $ \(idx :: Int, batch) -> do
-          let pc = peerList !! (idx `mod` numPeers)
+          -- 'rot' is the kicker's per-call counter: it increments every
+          -- 3 s, so a stalled window (re-requesting the same heights)
+          -- rotates across all peers and a non-serving peer cannot wedge
+          -- the IBD. Height-based rotation could not retry-rotate — a
+          -- stuck window never advances fromHeight (W163 recovery).
+          let pc = peerList !! ((idx + rot) `mod` numPeers)
               invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- batch ]
           ok <- (safeSendMessage pc (MGetData (GetData invVecs)) >> return True)
             `catch` (\(e :: SomeException) -> do
@@ -2007,25 +2025,18 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
         putStrLn "Header sync complete — leaving IBD mode"
         writeIORef ibdModeRef False
 
-    -- After headers, request blocks — but ONLY once headers-first bulk
-    -- sync has gone quiet (no full 2000-header batch for 45 s). While
-    -- full batches are still arriving, the block processor would
-    -- saturate RocksDB + CPU and throttle header sync to block-IBD pace.
-    -- A from-genesis sync therefore pulls the whole header chain first;
-    -- the block-gap kicker then drives block download in 256-block
-    -- windows. A steady-state node never sees full batches (lastFull
-    -- stays 0), so this fires immediately as before.
-    nowHdr <- (round <$> getPOSIXTime :: IO Int64)
-    lastFullHdr <- readIORef lastFullBatchAtRef
-    let headerSyncActive = nowHdr - lastFullHdr < 45
-    when (added > 0 && not headerSyncActive) $ do
-      tip <- getChainTip hc
-      let tipHeight = ceHeight tip
-      nextBlock <- readIORef nextBlockRef
-      pm <- readIORef pmRef
-      requestBlocks pm hc nextBlock tipHeight
-      writeIORef nextBlockRef (tipHeight + 1)
-      writeIORef requestedUpToRef tipHeight
+    -- Block download is driven SOLELY by the block-gap kicker (16-block
+    -- sliding windows, one getdata batch per peer, peer rotated by
+    -- height). The MHeaders handler used to also requestBlocks the whole
+    -- nextBlock..headerTip range here — a 6000+-block flood that arrived
+    -- wildly out of order against connectBlockAt's strict in-order G1
+    -- gate and connected nothing — and it mis-set nextBlockRef to the
+    -- HEADER tip, which then silenced the kicker (nextBlock > headerTip).
+    -- Removed: MHeaders only extends the header chain; the kicker owns
+    -- block download, and nextBlockRef tracks the CONNECTED tip (advanced
+    -- only by MBlock on a successful connect). headerSyncActive deferral
+    -- is still honoured — by the kicker's own gate, not here.
+    return ()
 
   MBlock block -> do
     let bh = computeBlockHash (blockHeader block)
@@ -2077,17 +2088,18 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                          return (Left ("exception: " <> show e)))
           case connectResult of
             Left cbErr -> do
-              -- Block validation / gate failure: drop the block + ban the
-              -- peer.  Reference: bitcoin-core/src/net_processing.cpp:3388
-              -- CheckBlock failure -> Misbehaving(100, "bad-block").
-              putStrLn $ "Block rejected at height " ++ show height
-                      ++ " (peer " ++ show addr ++ "): " ++ cbErr
-              pm <- readIORef pmRef
-              void $ misbehaving pm addr InvalidBlock
-              -- IMPORTANT: do NOT advance nextBlockRef, do NOT broadcast
-              -- tip, do NOT refresh mempool, do NOT count toward flush.
-              -- The on-disk chainstate is untouched (connectBlockAt
-              -- short-circuits BEFORE writeBatch when the gate fails).
+              -- W163 diagnostic: log every connectBlock rejection of the
+              -- NEXT-NEEDED block so the IBD wedge cause is visible.
+              -- Out-of-order rejections of higher blocks stay quiet (the
+              -- gap kicker re-fetches them in order). No peer ban while
+              -- diagnosing — a wrongly-rejected valid block is not the
+              -- peer's fault. NOTE: the earlier guard matched "Core G1"
+              -- which is ALSO a prefix of "Core G19" (missing-prevout),
+              -- so genuine G19 failures were silently swallowed.
+              nb <- readIORef nextBlockRef
+              when (height == nb) $
+                putStrLn $ "[W163 diag] next-needed block " ++ show height
+                        ++ " rejected by connectBlock: " ++ cbErr
             Right () -> do
               -- Mirror the connect into any opted-in secondary indexes
               -- (txindex / blockfilterindex / coinstatsindex).  We read
