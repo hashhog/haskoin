@@ -3078,13 +3078,33 @@ connectBlockAt db net block height spentUtxos = do
           <> " (Core G1 — validation.cpp:2333)"
         else do
           -- W93 Gate G19: every non-coinbase input must have a resolvable
-          -- prevout — either in the passed-in spentUtxos map or on disk.
+          -- prevout — in the passed-in spentUtxos map, on disk, or
+          -- created by an earlier transaction in THIS block.
           -- This mirrors Core's @assert(is_spent)@ in UpdateCoins.
           let inputs = [ inp | tx <- drop 1 txns, inp <- txInputs tx ]
+              -- W163: outpoints created by this block's own transactions.
+              -- A later tx may spend an output of an earlier tx in the
+              -- SAME block (chained / intra-block spend); that prevout is
+              -- in neither the pre-block UTXO set nor 'spentUtxos' (which
+              -- is built from the DB), so G19 must accept it here too —
+              -- otherwise every block containing a chained transaction is
+              -- falsely rejected "missing prevout". This wedged the W163
+              -- assumeUTXO recovery: block 944184 (the first block to
+              -- connect) has an intra-block spend at tx index 1. The
+              -- WriteBatch below already resolves such an outpoint
+              -- correctly (BatchPut then BatchDelete on the same key).
+              blockCreated = Map.fromList
+                [ (OutPoint txid (fromIntegral i), ())
+                | (txid, tx) <- zip (map computeTxId txns) txns
+                , (i, _) <- zip [(0 :: Int) ..] (txOutputs tx)
+                ]
           missingInputs <- foldM (\acc inp ->
               case acc of
                 Just _  -> return acc  -- short-circuit
-                Nothing ->
+                Nothing
+                  | Map.member (txInPrevOutput inp) blockCreated ->
+                      return Nothing
+                  | otherwise ->
                   case Map.lookup (txInPrevOutput inp) spentUtxos of
                     Just _  -> return Nothing
                     Nothing -> do
