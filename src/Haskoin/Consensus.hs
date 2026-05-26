@@ -147,6 +147,7 @@ module Haskoin.Consensus
   , addHeader
   , addSideBranchHeader
   , getChainTip
+  , getValidatedChainTip
   , findForkPoint
   , getAncestor
   , buildLocatorHeights
@@ -3052,12 +3053,28 @@ connectBlockAt db net block height spentUtxos = do
       -- (which use the bare 'toBE32 height') can never read back.  The
       -- old form silently wrote phantom keys; this matches the
       -- canonical 'batchPutBlockHeight' encoding in Storage.hs.
+      --
+      -- 2026-05-24 fix: also persist the full block body (PrefixBlockData)
+      -- in the same atomic batch.  The pre-fix code only wrote the
+      -- header / height / best-block pointer; the body was the
+      -- responsibility of a separate 'putBlock' callsite — but the only
+      -- such caller in the live tree was 'Sync.handleBlockMessage' in
+      -- the (dead) BlockDownloader pipeline.  Every block reaching the
+      -- running daemon through the MBlock arm therefore left
+      -- 'PrefixBlockData' empty, so 'getblock' could never serve a
+      -- locally-stored block.  Folding 'putBlock' into the connect
+      -- batch fixes the universal "Block not found" symptom and keeps
+      -- body + chainstate atomic across crashes — a crash between two
+      -- separate writes could otherwise diverge them.  See
+      -- _bug-reports/haskoin-chain-state-inconsistency-2026-05-24.md.
       writeBatch db (WriteBatch
         [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
         , BatchPut (makeKey PrefixBlockHeader (encode bh))
                    (encode (blockHeader block))
         , BatchPut (makeKey PrefixBlockHeight (toBE32 height))
                    (encode bh)
+        , BatchPut (makeKey PrefixBlockData (encode bh))
+                   (encode block)
         ])
       return (Right ())
     else do
@@ -3161,6 +3178,21 @@ connectBlockAt db net block height spentUtxos = do
                       -- ByteString prepends an 8-byte length tag.
                       , BatchPut (makeKey PrefixBlockHeight (toBE32 height))
                                  (encode bh)
+                      -- 2026-05-24 fix: persist the full block body in
+                      -- the same atomic batch.  Pre-fix, only the
+                      -- 'Sync.handleBlockMessage' downloader wrote
+                      -- PrefixBlockData — but that pipeline is dead
+                      -- code; every block reaching the live MBlock arm
+                      -- (Main.hs:2041) went through 'connectBlock' and
+                      -- the body was never persisted.  As a result
+                      -- 'getblock' always missed on local storage and
+                      -- fell back to the Bitcoin Core proxy.  Folding
+                      -- 'putBlock' into the connect batch closes the
+                      -- "Block not found" hole AND keeps body +
+                      -- chainstate atomic across crashes.  See
+                      -- _bug-reports/haskoin-chain-state-inconsistency-2026-05-24.md.
+                      , BatchPut (makeKey PrefixBlockData (encode bh))
+                                 (encode block)
                       ]
                     ]
               writeBatch db (WriteBatch ops)
@@ -3605,11 +3637,20 @@ buildConnectBlockOps _net block height spentUtxos =
          -- 'Storage.getBlockHeight' / 'batchPutBlockHeight'.  'encode'
          -- on a ByteString prepends an 8-byte length tag and would make
          -- the key unreadable — see the connectBlockAt notes above.
+         --
+         -- 2026-05-24 fix: include PrefixBlockData so the multi-block
+         -- reorg batch ('doSideBranchReorg' → 'buildConnectChain')
+         -- persists block bodies alongside the chainstate, matching the
+         -- single-block 'connectBlockAt' path.  Without this, the body
+         -- of a side-branch block that becomes the new active tip is
+         -- lost.  See _bug-reports/haskoin-chain-state-inconsistency-2026-05-24.md.
          [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode bh)
          , BatchPut (makeKey PrefixBlockHeader (encode bh))
                     (encode (blockHeader block))
          , BatchPut (makeKey PrefixBlockHeight (toBE32 height))
                     (encode bh)
+         , BatchPut (makeKey PrefixBlockData (encode bh))
+                    (encode block)
          ]
        ]
 
@@ -4120,6 +4161,60 @@ addSideBranchHeader hc header = do
 -- | Get the current chain tip.
 getChainTip :: HeaderChain -> IO ChainEntry
 getChainTip hc = readTVarIO (hcTip hc)
+
+-- | Get the /validated/ chain tip — the highest block that has actually
+-- been connected to the on-disk chainstate, not merely the highest header
+-- whose PoW + chain-context checks passed.
+--
+-- These two can differ during header-first sync (Core's
+-- @m_chainman->m_best_header@ vs @ActiveChain().Tip()@): a header may be
+-- added to the in-memory 'HeaderChain' (mutating 'hcTip', 'hcHeight',
+-- and 'hcByHeight' via 'addHeader') long before — or independently of —
+-- its block body being validated and committed to the UTXO set via
+-- 'connectBlock'.  Side-branch headers that win the chainwork race also
+-- overwrite 'hcByHeight[h]' regardless of whether their bodies ever
+-- connected, so reading the header chain to answer "what hash sits at
+-- height h on the active validated chain?" is unsafe.
+--
+-- The validated tip is anchored to the on-disk 'PrefixBestBlock' pointer
+-- that 'connectBlockAt' commits as part of its atomic write batch.
+-- This helper resolves that pointer back to its 'ChainEntry' so chain-
+-- state-reading RPCs ('getblockcount', 'getbestblockhash', the
+-- chainstate-derived fields of 'getblockchaininfo') can serve a tip
+-- that is internally consistent with 'getblockhash' / 'getblock'.
+--
+-- Fallback semantics:
+--
+--   * 'PrefixBestBlock' unset (fresh DB / pre-genesis bootstrap) —
+--     return the in-memory 'hcTip'.  At this point the header chain
+--     contains exactly the genesis 'ChainEntry' inserted by
+--     'initHeaderChain', so 'hcTip' IS the (degenerate) validated tip.
+--
+--   * 'PrefixBestBlock' set but its hash is not in 'hcEntries' —
+--     return 'hcTip' as a defensive fallback.  In a well-formed DB this
+--     should never trigger; if it does the operator should run
+--     @-reindex-chainstate@ to rebuild the header chain from disk.
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp keys every
+-- chainstate-derived RPC field off @m_chainman->ActiveChain().Tip()@,
+-- with @m_chainman->m_best_header@ reserved for the @"headers"@ field
+-- of @getblockchaininfo@.
+--
+-- Companion fix: camlcoin commit 2a915b6 ("fix(rpc): getbestblockhash
+-- returns validated tip not header tip").  See haskoin
+-- _bug-reports/haskoin-chain-state-inconsistency-2026-05-24.md for the
+-- full root-cause analysis (fuzzamoto IR-corpus replay surfaced the
+-- divergence as @getblockhash(getblockcount) != getbestblockhash@).
+getValidatedChainTip :: HaskoinDB -> HeaderChain -> IO ChainEntry
+getValidatedChainTip db hc = do
+  mBest <- getBestBlockHash db
+  case mBest of
+    Nothing -> readTVarIO (hcTip hc)
+    Just bh -> do
+      entries <- readTVarIO (hcEntries hc)
+      case Map.lookup bh entries of
+        Just ce -> return ce
+        Nothing -> readTVarIO (hcTip hc)
 
 --------------------------------------------------------------------------------
 -- Chain Navigation

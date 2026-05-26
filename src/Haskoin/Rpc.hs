@@ -221,7 +221,15 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            BlockIndex(biHash, biTimestamp),
                            checkAssumeutxoWhitelist,
                            AssumeUtxoParams(..), assumeUtxoForBlockHash,
-                           connectBlock, disconnectBlock)
+                           connectBlock, disconnectBlock,
+                           -- 2026-05-24 chain-state-inconsistency fix:
+                           -- chain-state-reading RPCs ('getblockcount',
+                           -- 'getbestblockhash', the chainstate-derived
+                           -- fields of 'getblockchaininfo', and
+                           -- 'getblockhash' for height bounds) must
+                           -- report the validated tip ('PrefixBestBlock'
+                           -- on disk), not the in-memory header tip.
+                           getValidatedChainTip)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 -- BIP-157/158 helpers for the REST blockfilter / blockfilterheaders
@@ -1167,9 +1175,26 @@ handleRpcRequest server req = do
 
 -- | Get information about the current state of the blockchain
 -- Returns comprehensive blockchain state matching Bitcoin Core's getblockchaininfo
+--
+-- 2026-05-24: every chainstate-derived field ('blocks',
+-- 'bestblockhash', 'bits', 'target', 'difficulty', 'time',
+-- 'mediantime', 'verificationprogress', 'initialblockdownload',
+-- 'chainwork', 'softforks') is keyed off the /validated/ chain tip
+-- ('PrefixBestBlock' → 'ChainEntry'), matching Bitcoin Core's
+-- @rpc/blockchain.cpp@ getblockchaininfo which uses
+-- @m_chainman->ActiveChain().Tip()@ for all of these.  The 'headers'
+-- field continues to report the in-memory header tip ('hcHeight'),
+-- matching Core's @m_chainman->m_best_header->nHeight@.  Pre-fix
+-- both fields shared 'hcTip' / 'hcHeight', so a header sync racing
+-- ahead of block connect made every chainstate field disagree with
+-- 'getblock' / 'getblockhash'.  See
+-- _bug-reports/haskoin-chain-state-inconsistency-2026-05-24.md.
 handleGetBlockchainInfo :: RpcServer -> IO RpcResponse
 handleGetBlockchainInfo server = do
-  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  -- Validated tip drives every chainstate-derived field.
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  -- Header tip drives the 'headers' field only.
+  headerHeight <- readTVarIO (hcHeight (rsHeaderChain server))
   -- Compute verification progress estimate (blocks validated / estimated total)
   -- For a fully synced node this approaches 1.0
   let progress = computeVerificationProgress (ceHeight tip) (bhTimestamp (ceHeader tip))
@@ -1214,7 +1239,7 @@ handleGetBlockchainInfo server = do
       enc = pairs $
               pair "chain"                (text (T.pack (netName (rsNetwork server))))  <>
               pair "blocks"               (AE.word32 (ceHeight tip))                   <>
-              pair "headers"              (AE.word32 (ceHeight tip))                   <>
+              pair "headers"              (AE.word32 headerHeight)                     <>
               pair "bestblockhash"        (text (showHash (ceHash tip)))               <>
               pair "bits"                 (text (showBits bits))                       <>
               pair "target"               (text (showHex (bitsToTarget bits)))         <>
@@ -1358,15 +1383,28 @@ handleGetDeploymentInfo server params = do
       return $ RpcResponse (deploymentInfoForEntry net entry) Null Null
 
 -- | Get the current block height
+--
+-- 2026-05-24: returns the height of the /validated/ chain tip
+-- ('PrefixBestBlock' on disk → 'ChainEntry'), not the in-memory
+-- header tip ('hcHeight').  Header sync can advance 'hcHeight'
+-- ahead of the connected chain; reading 'hcHeight' here violated
+-- the @getblockcount == height(getbestblockhash)@ invariant.
+-- See _bug-reports/haskoin-chain-state-inconsistency-2026-05-24.md.
 handleGetBlockCount :: RpcServer -> IO RpcResponse
 handleGetBlockCount server = do
-  height <- readTVarIO (hcHeight (rsHeaderChain server))
-  return $ RpcResponse (toJSON height) Null Null
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  return $ RpcResponse (toJSON (ceHeight tip)) Null Null
 
 -- | Get the hash of the best (tip) block
+--
+-- 2026-05-24: returns the hash of the /validated/ chain tip — same
+-- rationale as 'handleGetBlockCount'.  Mirrors camlcoin commit
+-- 2a915b6 ("fix(rpc): getbestblockhash returns validated tip not
+-- header tip").  Bitcoin Core: @bitcoin-core/src/rpc/blockchain.cpp@
+-- @getbestblockhash@ → @m_chainman->ActiveChain().Tip()@.
 handleGetBestBlockHash :: RpcServer -> IO RpcResponse
 handleGetBestBlockHash server = do
-  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   return $ RpcResponse (toJSON $ showHash (ceHash tip)) Null Null
 
 -- | hashhog W70: uniform fleet-wide sync-state report.
@@ -1397,17 +1435,44 @@ handleGetSyncState server = do
   return $ RpcResponse result Null Null
 
 -- | Get block hash at a specific height
+--
+-- 2026-05-24: bounded by the /validated/ chain tip height (not the
+-- header tip) AND resolved through the on-disk 'PrefixBlockHeight'
+-- index ('getBlockHeight') instead of the in-memory 'hcByHeight'
+-- map.  'hcByHeight' is mutated by 'addHeader' as soon as a
+-- side-branch header wins the chainwork race, so it could return a
+-- hash whose body never connected; the on-disk height index is
+-- only written by 'connectBlockAt' on a successful connect, which
+-- keeps it in lock-step with 'PrefixBestBlock'.  Together with
+-- 'handleGetBlockCount' / 'handleGetBestBlockHash' this restores
+-- the @getblockhash(getblockcount) == getbestblockhash@ invariant.
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp @getblockhash@ →
+-- @m_chainman->ActiveChain()[nHeight]@.
 handleGetBlockHash :: RpcServer -> Value -> IO RpcResponse
 handleGetBlockHash server params = do
   case extractParam params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
     Just height -> do
-      heightMap <- readTVarIO (hcByHeight (rsHeaderChain server))
-      case Map.lookup height heightMap of
-        Just bh -> return $ RpcResponse (toJSON $ showHash bh) Null Null
-        Nothing -> return $ RpcResponse Null
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      if height > ceHeight tip
+        then return $ RpcResponse Null
           (toJSON $ RpcError rpcMiscError "Block height out of range") Null
+        else do
+          mBh <- getBlockHeight (rsDB server) height
+          case mBh of
+            Just bh -> return $ RpcResponse (toJSON $ showHash bh) Null Null
+            Nothing -> do
+              -- Defensive fallback: validated tip says this height is
+              -- in range but the on-disk height index is missing the
+              -- entry.  Fall through to the in-memory header chain to
+              -- preserve pre-fix behavior on partially-rebuilt
+              -- chainstates (e.g. mid-reindex).
+              heightMap <- readTVarIO (hcByHeight (rsHeaderChain server))
+              case Map.lookup height heightMap of
+                Just bh -> return $ RpcResponse (toJSON $ showHash bh) Null Null
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError "Block height out of range") Null
 
 -- | Get block data by hash
 -- | Handle getblock RPC.
