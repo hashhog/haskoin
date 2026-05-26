@@ -621,9 +621,12 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
                                 (udBlockUndo undoData) bh height
                             Nothing -> return ()
 
-                      -- Persist the full block body (separate keyspace from
-                      -- headers so that getblock can return raw bytes).
-                      putBlock db bh block
+                      -- 2026-05-24: block body is now persisted as part
+                      -- of the 'connectBlock' write batch (Consensus.hs
+                      -- fix for haskoin-chain-state-inconsistency).
+                      -- The standalone 'putBlock' here is therefore
+                      -- redundant; we removed it to avoid a second
+                      -- non-batched write to the same key.
 
                       -- Add header to chain (in-memory index + tip update).
                       -- minPowChecked=False: validateFullBlockIO has already
