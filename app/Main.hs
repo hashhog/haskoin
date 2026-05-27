@@ -14,7 +14,7 @@ import System.IO (hSetBuffering, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory, doesFileExist)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
@@ -1172,6 +1172,40 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           }
     compactBlockStateRef <- newIORef compactBlockState
 
+    -- P1-2 (chainstate-atomicity family, dispatch-layer race).
+    --
+    -- Per-peer recv threads call 'syncMessageHandler' directly
+    -- (Network.hs:2797 in 'startPeerThreadsWithMisbehavior'), so two
+    -- different peer threads can land inside the MBlock arm at the same
+    -- instant. 'connectBlockAt' (Consensus.hs:3031) does a
+    -- read-BestBlock / check-G1 / build-WriteBatch / commit sequence
+    -- with no internal lock. Two threads can both see
+    -- @BestBlock = hash(N)@, both pass G1 for the same height N+1,
+    -- both write the same WriteBatch (idempotent), AND on different
+    -- blocks the chainstate + the in-memory 'nextBlockRef' desync —
+    -- the kicker's next-needed height diverges from the actual on-disk
+    -- tip and the catch-up wedges. This race is acknowledged in the
+    -- commit body of '9fda3f4' ("A concurrency race remains — blocks
+    -- connect from multiple peer threads with no lock around
+    -- connectBlockAt's read-best-block / check-G1 / write sequence").
+    --
+    -- The MVar serialises the read-check-write critical section across
+    -- all peer threads + both compact-block re-dispatch sites. We hold
+    -- it across 'connectBlock', the 'nextBlockRef' bump, and the flush
+    -- bookkeeping so the @BestBlock / nextBlockRef@ pair stays
+    -- consistent end-to-end. Held only for the block-connection arm;
+    -- other message types (MTx, MInv, MGetData, etc.) are unaffected.
+    --
+    -- Reference: bitcoin-core/src/validation.cpp 'ChainstateManager'
+    -- holds 'cs_main' across 'ActivateBestChainStep' for the same
+    -- reason — Core's single mutex serialises tip-update across all
+    -- net_processing threads.
+    --
+    -- Cross-ref: '_chainstate-atomicity-family-2026-05-26.md' (this is
+    -- the new dispatch-layer sibling) and
+    -- '_haskoin-unfreeze-plan-2026-05-27.md' (Phase 1, P1-2).
+    connectLock <- newMVar () :: IO (MVar ())
+
     -- Initialise BlockStore IFF pruning is enabled.  Most haskoin
     -- block I/O still flows through RocksDB, so the BlockStore is
     -- not on the hot path; we only create it when prune RPC /
@@ -1307,7 +1341,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1935,8 +1969,17 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- BlockHash, persisted across MCmpctBlock→MBlockTxn.
                       -- Reference: bitcoin-core/src/net_processing.cpp
                       -- mapBlocksInFlight / PartiallyDownloadedBlock lifetime.
+                   -> MVar ()
+                      -- ^ P1-2 connect-lock — serialises the read-BestBlock /
+                      -- check-G1 / write critical section in the MBlock arm
+                      -- across all per-peer recv threads (Network.hs:2797)
+                      -- + the two compact-block re-dispatch sites. Closes
+                      -- the dispatch-layer chainstate-atomicity race
+                      -- documented in commit 9fda3f4. Cross-ref:
+                      -- _chainstate-atomicity-family-2026-05-26.md +
+                      -- _haskoin-unfreeze-plan-2026-05-27.md (Phase 1, P1-2).
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -2097,14 +2140,46 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
           -- dropped + the peer is misbehaved.  See
           --   bitcoin-core/src/validation.cpp AcceptBlock @4350-4354
           --   (InvalidBlockFound -> Misbehaving(100, "bad-block")).
-          -- Look up spent UTXOs so connectBlock writes undo data atomically.
-          spent <- buildSpentUtxoMapFromDB db block
-          connectResult <-
-            (connectBlock db net block height spent)
-              `catch` (\(e :: SomeException) -> do
-                         putStrLn $ "ERROR connecting block "
-                                 ++ show height ++ ": " ++ show e
-                         return (Left ("exception: " <> show e)))
+          --
+          -- P1-2 (chainstate-atomicity family, dispatch-layer race):
+          -- The read-BestBlock / check-G1 / write-WriteBatch / advance-
+          -- nextBlockRef sequence below is the critical section. Per-peer
+          -- recv threads call this handler directly (Network.hs:2797);
+          -- without the lock, two threads racing the same height N+1
+          -- both pass G1 against @BestBlock = hash(N)@ and both commit —
+          -- idempotent on the same block, but on different blocks the
+          -- chainstate and 'nextBlockRef' desync and the kicker wedges.
+          -- See _haskoin-unfreeze-plan-2026-05-27.md (Phase 1, P1-2).
+          --
+          -- The lock is held across:
+          --   1. buildSpentUtxoMapFromDB — reads UTXOs that an in-flight
+          --      sibling MBlock might mutate via its WriteBatch.
+          --   2. connectBlock — reads BestBlock + G1 check + WriteBatch
+          --      commit (the entire 'connectBlockAt' body).
+          --   3. nextBlockRef advance — keeps the download cursor
+          --      consistent with on-disk tip.
+          -- It is RELEASED before secondary-index mirror, flush, mempool
+          -- clean, peer announce — those are independently thread-safe
+          -- and don't compete with another peer's tip update.
+          connectResult <- withMVar connectLock $ \() -> do
+            spent <- buildSpentUtxoMapFromDB db block
+            r <- (connectBlock db net block height spent)
+                   `catch` (\(e :: SomeException) -> do
+                              putStrLn $ "ERROR connecting block "
+                                      ++ show height ++ ": " ++ show e
+                              return (Left ("exception: " <> show e)))
+            -- Advance the next-block pointer IF the connect succeeded.
+            -- Done inside the lock so the @BestBlock / nextBlockRef@
+            -- pair stays consistent end-to-end — a concurrent kicker
+            -- read of 'nextBlockRef' won't see a "tip without cursor"
+            -- or vice versa.
+            case r of
+              Right () -> do
+                nextBlock <- readIORef nextBlockRef
+                when (height >= nextBlock) $
+                  writeIORef nextBlockRef (height + 1)
+              Left _ -> return ()
+            return r
           case connectResult of
             Left cbErr -> do
               -- W163 diagnostic: log every connectBlock rejection of the
@@ -2141,11 +2216,6 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                           ++ show height ++ ": " ++ show e)
               when (height `mod` 500 == 0) $
                 putStrLn $ "Connected block at height " ++ show height
-              -- Advance the next-block pointer past this height
-              -- This allows the download window to slide forward
-              nextBlock <- readIORef nextBlockRef
-              when (height >= nextBlock) $
-                writeIORef nextBlockRef (height + 1)
               -- Durability: flush WAL + UTXO cache every flushBlockInterval
               -- blocks. This bounds the data-loss window on a non-graceful
               -- shutdown. Reference: Bitcoin Core src/validation.cpp
@@ -2536,7 +2606,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -2642,7 +2712,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()
