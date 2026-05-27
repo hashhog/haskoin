@@ -1734,6 +1734,28 @@ initHeaderChainFromDB db net = do
   -- Load persisted headers from the height index to rebuild the in-memory chain.
   -- connectBlock writes PrefixBlockHeader and PrefixBlockHeight for every
   -- connected block, so we can walk the height index sequentially.
+  --
+  -- Phase 2 step P2-5 (rewrite-design haskoin §5; unfreeze plan
+  -- _haskoin-unfreeze-plan-2026-05-27.md): closes W101 BUG-7 /
+  -- W109 BUG-4 (P4).  Pre-fix this loop set
+  -- @ceMedianTime = bhTimestamp header@ — the entry's OWN raw
+  -- timestamp — so every reloaded ChainEntry stored a wrong MTP.
+  -- Live @addHeader@ (Consensus.hs:4031) calls
+  -- @computeEntryMtp entries prevHash (bhTimestamp header)@, which is
+  -- the median of (new timestamp : up-to-10 ancestor timestamps), and
+  -- BIP-113 (CSV / CLTV) consensus checks read @prevCe.ceMedianTime@
+  -- via @ceMedianTime@ lookup at @Consensus.hs:4763/4773@.  After a
+  -- restart the raw-timestamp values fed BIP-113 the wrong cutoff,
+  -- potentially mis-accepting or mis-rejecting timelocked
+  -- transactions — a silent consensus divergence with Core that
+  -- existed only on the reloaded chain.
+  --
+  -- Fix: mirror @addHeader@.  We already build the entries map in
+  -- height order, so a small per-iteration call to 'computeEntryMtp'
+  -- against the entries-so-far snapshot produces the same median that
+  -- @addHeader@ writes on live receive.  Cost: at most 10 'Map.lookup's
+  -- per block (the 10-ancestor walk inside 'computeEntryMtp').
+  -- Reference: bitcoin-core/src/chain.h:233-244 (GetMedianTimePast).
   mBestHash <- getBestBlockHash db
   case mBestHash of
     Nothing -> return ()
@@ -1748,7 +1770,15 @@ initHeaderChainFromDB db net = do
                 case mHeader of
                   Nothing -> return ()
                   Just header -> do
+                    -- Snapshot the entries-so-far map so 'computeEntryMtp'
+                    -- can walk parent ancestors.  We need entries-up-to-prev
+                    -- here, not entries-including-self; reading the TVar
+                    -- BEFORE the insert below gives exactly that.
+                    entriesSoFar <- readTVarIO entriesVar
                     let work = ceChainWork prevEntry + headerWork header
+                        newMtp = computeEntryMtp entriesSoFar
+                                                 (ceHash prevEntry)
+                                                 (bhTimestamp header)
                         entry = ChainEntry
                           { ceHeader = header
                           , ceHash = bh
@@ -1756,7 +1786,7 @@ initHeaderChainFromDB db net = do
                           , ceChainWork = work
                           , cePrev = Just (ceHash prevEntry)
                           , ceStatus = StatusValid
-                          , ceMedianTime = bhTimestamp header
+                          , ceMedianTime = newMtp
                           }
                     atomically $ do
                       modifyTVar' entriesVar (Map.insert bh entry)
