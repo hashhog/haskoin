@@ -1452,7 +1452,26 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                -- requestBlocks rotates the peer by the kicker counter
                -- 'rot' so each retry of a stalled window hits a
                -- different peer — a non-serving peer cannot wedge IBD.
-               let windowEnd = min headerTip (nextBlock + 63)
+               --
+               -- 2026-05-27 fix: the window was `nextBlock + 63` (64
+               -- blocks) — but the comment above says 16. A 64-block
+               -- window is `chunksOf 16` = 4 batches distributed across
+               -- 4 peers. Three of those batches start at heights
+               -- `nextBlock + 16/32/48` whose parent is NOT yet the
+               -- BestBlock when the blocks arrive, so they fail
+               -- connectBlockAt G1 and are silently dropped (the
+               -- W163 diag only logs height==nextBlock rejections).
+               -- The mainnet sync wedged at h=976 reproducing exactly
+               -- this: kicker re-fires every 12s on the same window,
+               -- all 4 peers send 64 blocks back, only the one peer
+               -- serving the [nextBlock..nextBlock+15] batch ever
+               -- makes progress, and even that intermittently because
+               -- of the concurrency race in connectBlockAt (no lock
+               -- around read-BestBlock / check-G1 / write).
+               -- Truncate to 16 to match the comment's intent: one
+               -- batch, one peer, in-order, no race.
+               -- (chainstate-atomicity family — _chainstate-atomicity-family-2026-05-26.md)
+               let windowEnd = min headerTip (nextBlock + 15)
                putStrLn $ "Block-gap kicker: requesting blocks "
                        ++ show nextBlock ++ "-" ++ show windowEnd
                        ++ " (UTXO-view tip behind header tip "
