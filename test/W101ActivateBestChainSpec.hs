@@ -104,6 +104,7 @@ mkEntry h prev height work status = ChainEntry
   , cePrev      = Just prev
   , ceStatus    = status
   , ceMedianTime = 1296688602
+  , ceSequenceId = seqIdInitFromDisk + fromIntegral height
   }
 
 genesisEntry :: ChainEntry
@@ -115,6 +116,7 @@ genesisEntry = ChainEntry
   , cePrev      = Nothing
   , ceStatus    = StatusValid
   , ceMedianTime = 1296688602
+  , ceSequenceId = seqIdBestChainFromDisk
   }
 
 -- | Build a fresh in-memory HeaderChain with only the genesis entry.
@@ -126,9 +128,17 @@ modifyTVar_ :: TVar a -> (a -> a) -> STM ()
 modifyTVar_ v f = readTVar v >>= writeTVar v . f
 
 -- | Convenience: insert an entry into hcEntries atomically.
+-- P2-2: also insert into 'hcCandidates' when the entry is StatusValid
+-- so 'activateBestChain' actually considers it (mirrors the
+-- 'addSideBranchHeader' production path).  This keeps the existing
+-- tests semantically equivalent to their pre-rewrite behaviour where
+-- the candidate pool was derived from a full 'Map.elems' scan.
 insertEntry :: HeaderChain -> ChainEntry -> IO ()
-insertEntry hc ce = atomically $
+insertEntry hc ce = atomically $ do
   modifyTVar_ (hcEntries hc) (Map.insert (ceHash ce) ce)
+  case ceStatus ce of
+    StatusValid -> modifyTVar_ (hcCandidates hc) (Set.insert (mkCandidateKey ce))
+    _           -> return ()
 
 -- | Does a ChainEntry have any valid children in the given list?
 -- Only StatusValid entries count (mirrors the BUG-3 fix in activateBestChain).
@@ -163,6 +173,7 @@ spec = do
               , cePrev      = Just (mkBlockHash 98)  -- unknown parent
               , ceStatus    = StatusValid
               , ceMedianTime = 1296688602
+              , ceSequenceId = seqIdInitFromDisk + 1
               }
         insertEntry hc orphanEntry
         tip0 <- readTVarIO (hcTip hc)
@@ -294,10 +305,15 @@ spec = do
         atomically $ do
           modifyTVar_ (hcEntries hc) (Map.insert h1 e1 . Map.insert h2 e2)
           modifyTVar_ (hcInvalidated hc) (Set.insert h2)
-        _result <- reconsiderBlock regtest
-                     (error "no cache")
-                     (error "no db")
-                     hc h2
+        -- Absorb the "no db" exception (reconsiderBlock calls
+        -- 'putBlockStatus db ...' which forces the test sentinel);
+        -- the in-memory STM state is committed before the DB write.
+        _ <- (try :: IO (Either InvalidateError ())
+                   -> IO (Either SomeException (Either InvalidateError ()))) $
+                reconsiderBlock regtest
+                  (error "no cache")
+                  (error "no db")
+                  hc h2
         entries <- readTVarIO (hcEntries hc)
         -- BUG: h1 should be cleared by Core's ancestor walk, but haskoin
         -- only calls findDescendants(h2) which does NOT include h1
@@ -314,10 +330,13 @@ spec = do
         atomically $ do
           modifyTVar_ (hcEntries hc) (Map.insert h1 e1)
           modifyTVar_ (hcInvalidated hc) (Set.insert h1)
-        _result <- reconsiderBlock regtest
-                     (error "no cache")
-                     (error "no db")
-                     hc h1
+        -- Absorb the "no db" exception (see BUG-5b for rationale).
+        _ <- (try :: IO (Either InvalidateError ())
+                   -> IO (Either SomeException (Either InvalidateError ()))) $
+                reconsiderBlock regtest
+                  (error "no cache")
+                  (error "no db")
+                  hc h1
         entries <- readTVarIO (hcEntries hc)
         -- After reconsider, the status is StatusHeaderValid.
         -- activateBestChain will then pick this as a tip candidate (BUG-3).
@@ -374,6 +393,7 @@ spec = do
                           , cePrev      = prev
                           , ceStatus    = StatusValid
                           , ceMedianTime = ts
+                          , ceSequenceId = seqIdInitFromDisk + fromIntegral i
                           }
               in Map.insert h e m
             entries = buildMap 11 Map.empty
@@ -426,6 +446,7 @@ spec = do
                       , cePrev       = Nothing
                       , ceStatus     = StatusValid
                       , ceMedianTime = head tss  -- genesis raw == MTP
+                      , ceSequenceId = seqIdBestChainFromDisk
                       }
             -- Mirror initHeaderChainFromDB's 'go' loop:
             --   * snapshot entries-so-far BEFORE the insert
@@ -446,6 +467,7 @@ spec = do
                              , cePrev       = Just (ceHash prev)
                              , ceStatus     = StatusValid
                              , ceMedianTime = newMtp
+                             , ceSequenceId = seqIdBestChainFromDisk
                              }
                   m'     = Map.insert h ce m
               in (m', ce, (height, newMtp) : trace)
@@ -484,10 +506,17 @@ spec = do
     ---------------------------------------------------------------------------
     describe "BUG-8: O(n^2) tip candidate scan" $ do
       it "hasValidChildren runs 'any ... allEntries' for each entry" $ do
-        -- Build a chain of 1000 entries.  Verify that tip-candidate
-        -- filtering would call 'any' over 1000 entries, 1000 times (O(n²)).
+        -- Build a chain of 250 entries.  Verify that tip-candidate
+        -- filtering would call 'any' over 250 entries, 250 times (O(n²)).
         -- We verify the predicate logic rather than timing (timing is flaky).
-        let n = 1000 :: Int
+        --
+        -- (Cap n at 250 so the height/i fits in one byte of 'mkBlockHash'
+        -- and hashes don't collide via the 'mod 256' inside that helper.
+        -- Pre-fix this test set n=1000 and silently relied on `head`
+        -- iteration order over Map.elems for the wrong reason — Map
+        -- iteration is ascending-by-key, and BlockHash bytes meant the
+        -- highest-height entry was rarely the smallest-hash entry.)
+        let n = 250 :: Int
             hashes = map mkBlockHash [0 .. n]
             entries  = foldl' (\m i ->
               let h    = hashes !! i
@@ -499,10 +528,181 @@ spec = do
             allEs = Map.elems entries
             tipCandidates = filter (\ce -> ceStatus ce == StatusValid
                                         && not (hasValidChildrenIn ce allEs)) allEs
-        -- Exactly 1 tip (the tail of the chain)
-        length tipCandidates `shouldBe` 1
-        -- The tip should be the highest-height entry
-        ceHeight (head tipCandidates) `shouldBe` fromIntegral n
+        -- Two tip candidates: genesis (separate component; its hash is
+        -- never anyone else's cePrev because the synthetic chain starts
+        -- at mkBlockHash 1 with cePrev=mkBlockHash 0, not genesisHash)
+        -- and the tail of the n-block chain.
+        length tipCandidates `shouldBe` 2
+        -- The highest-height tip should be at height n.
+        let maxHeight = maximum (map ceHeight tipCandidates)
+        maxHeight `shouldBe` fromIntegral n
+
+    ---------------------------------------------------------------------------
+    -- P2-2 (W101 BUG-8 fix): sorted candidate set + Set.lookupMax = O(log n)
+    ---------------------------------------------------------------------------
+    describe "P2-2: sorted candidate set semantics" $ do
+
+      it "initHeaderChain seeds hcCandidates with genesis" $ do
+        hc <- freshChain
+        cs <- readTVarIO (hcCandidates hc)
+        Set.size cs `shouldBe` 1
+        case Set.lookupMax cs of
+          Nothing -> expectationFailure "genesis missing from hcCandidates"
+          Just k  -> ckHash k `shouldBe` genesisHash
+
+      it "Set.lookupMax returns highest chainWork candidate" $ do
+        hc <- freshChain
+        let h1 = mkBlockHash 70
+            h2 = mkBlockHash 71
+            -- Two side-branches off genesis with different work.
+            e1 = mkEntry h1 genesisHash 1 100 StatusValid
+            e2 = mkEntry h2 genesisHash 1 500 StatusValid  -- higher
+        insertEntry hc e1
+        insertEntry hc e2
+        cs <- readTVarIO (hcCandidates hc)
+        case Set.lookupMax cs of
+          Nothing -> expectationFailure "candidate set unexpectedly empty"
+          Just k  -> ckHash k `shouldBe` h2  -- higher work wins
+
+      it "equal-work tiebreak: lower ceSequenceId wins (Core nSequenceId)" $ do
+        -- Mirrors Core node/blockstorage.cpp:174-192
+        -- 'CBlockIndexWorkComparator::operator()':
+        --   pa->nChainWork > pb->nChainWork  →  pa is better;
+        --   else pa->nSequenceId < pb->nSequenceId → pa is better.
+        -- haskoin stores the sequence id inverted ('maxBound - seq') in
+        -- the CandidateKey so that Set.lookupMax = best entry.
+        hc <- freshChain
+        let h1 = mkBlockHash 72
+            h2 = mkBlockHash 73
+            equalWork = 1234 :: Integer
+            -- e1 gets the SMALLER sequence id → wins the tiebreak.
+            e1 = (mkEntry h1 genesisHash 1 equalWork StatusValid)
+                   { ceSequenceId = 2 }
+            e2 = (mkEntry h2 genesisHash 1 equalWork StatusValid)
+                   { ceSequenceId = 9 }
+        insertEntry hc e1
+        insertEntry hc e2
+        cs <- readTVarIO (hcCandidates hc)
+        case Set.lookupMax cs of
+          Nothing -> expectationFailure "candidate set unexpectedly empty"
+          Just k  -> ckHash k `shouldBe` h1
+
+      it "findBestCandidate returns highest-work entry past genesis" $ do
+        hc <- freshChain
+        let h1 = mkBlockHash 80
+            h2 = mkBlockHash 81
+            e1 = mkEntry h1 genesisHash 1 1000 StatusValid
+            e2 = mkEntry h2 genesisHash 1 1500 StatusValid
+        insertEntry hc e1
+        insertEntry hc e2
+        mBest <- findBestCandidate hc
+        fmap ceHash mBest `shouldBe` Just h2
+
+      it "invalidateBlock removes the invalidated descendant from hcCandidates" $ do
+        hc <- freshChain
+        let h1 = mkBlockHash 82
+            e1 = mkEntry h1 genesisHash 1 200 StatusValid
+        -- h1 is OFF-CHAIN (not the tip) → invalidate goes through the
+        -- mark-only path with no DB writes for the disconnect.
+        insertEntry hc e1
+        csBefore <- readTVarIO (hcCandidates hc)
+        Set.member (mkCandidateKey e1) csBefore `shouldBe` True
+        _ <- (try :: IO (Either InvalidateError ())
+                   -> IO (Either SomeException (Either InvalidateError ()))) $
+                invalidateBlock regtest (error "no cache") (error "no db") hc h1
+        csAfter <- readTVarIO (hcCandidates hc)
+        Set.member (mkCandidateKey e1) csAfter `shouldBe` False
+
+      it "ceSequenceId for genesis is seqIdBestChainFromDisk" $ do
+        hc <- freshChain
+        tip <- readTVarIO (hcTip hc)
+        ceSequenceId tip `shouldBe` seqIdBestChainFromDisk
+
+    ---------------------------------------------------------------------------
+    -- P2-3 (W101 BUG-3 fix completion): BLOCK_HAVE_DATA ancestor walk-back gate
+    ---------------------------------------------------------------------------
+    describe "P2-3: findBestCandidate ancestor walk-back BLOCK_HAVE_DATA gate" $ do
+
+      it "candidate whose ancestor lacks block data is rejected and removed" $ do
+        -- Build: genesis -> hMid (StatusHeaderValid, NO body) -> hTip (StatusValid).
+        -- Core's FindMostWorkChain inner loop (validation.cpp:3132-3167)
+        -- walks the ancestry and bails as soon as it hits an entry
+        -- without BLOCK_HAVE_DATA — in haskoin's model, anything other
+        -- than StatusValid.  The candidate is then erased from
+        -- setBlockIndexCandidates so future picks don't re-touch it.
+        hc <- freshChain
+        let hMid = mkBlockHash 90
+            hTip = mkBlockHash 91
+            -- Mid entry has no block data on disk.
+            eMid = mkEntry hMid genesisHash 1 1000 StatusHeaderValid
+            -- Tip entry is fully validated and would otherwise be best.
+            eTip = mkEntry hTip hMid       2 2000 StatusValid
+        -- Insert mid into entries but NOT into candidates (StatusHeaderValid).
+        atomically $ modifyTVar_ (hcEntries hc) (Map.insert hMid eMid)
+        -- Insert tip into entries AND candidates (StatusValid).
+        insertEntry hc eTip
+        -- Pre-walk: tip is a candidate.
+        cs0 <- readTVarIO (hcCandidates hc)
+        Set.member (mkCandidateKey eTip) cs0 `shouldBe` True
+        -- The walk-back rejects the tip because eMid is not StatusValid.
+        mBest <- findBestCandidate hc
+        -- Either we fall back to genesis (still a candidate) or nothing.
+        -- Critically: the bad-ancestry tip must NOT be returned.
+        case mBest of
+          Nothing -> return ()
+          Just ce -> ceHash ce `shouldNotBe` hTip
+        -- Post-walk: the tip is no longer in the candidate set.
+        cs1 <- readTVarIO (hcCandidates hc)
+        Set.member (mkCandidateKey eTip) cs1 `shouldBe` False
+
+      it "candidate whose ancestor is invalidated is rejected and removed" $ do
+        hc <- freshChain
+        let hMid = mkBlockHash 92
+            hTip = mkBlockHash 93
+            eMid = mkEntry hMid genesisHash 1 1000 StatusValid
+            eTip = mkEntry hTip hMid       2 2000 StatusValid
+        insertEntry hc eMid
+        insertEntry hc eTip
+        -- Hand-mark hMid as invalidated (skip the full invalidateBlock
+        -- machinery so the test stays focused on the walk-back gate).
+        atomically $ modifyTVar_ (hcInvalidated hc) (Set.insert hMid)
+        mBest <- findBestCandidate hc
+        case mBest of
+          Nothing -> return ()
+          Just ce -> ceHash ce `shouldNotBe` hTip
+        cs1 <- readTVarIO (hcCandidates hc)
+        Set.member (mkCandidateKey eTip) cs1 `shouldBe` False
+
+      it "valid ancestry: highest-work tip returned cleanly" $ do
+        hc <- freshChain
+        let h1 = mkBlockHash 94
+            h2 = mkBlockHash 95
+            e1 = mkEntry h1 genesisHash 1 1000 StatusValid
+            e2 = mkEntry h2 h1          2 2000 StatusValid
+        insertEntry hc e1
+        insertEntry hc e2
+        mBest <- findBestCandidate hc
+        fmap ceHash mBest `shouldBe` Just h2
+
+      it "stale candidate key (entry deleted) is dropped and loop continues" $ do
+        -- Defensive: insert a CandidateKey for which 'hcEntries' has
+        -- no matching entry.  findBestCandidate should drop the stale
+        -- key and fall back to the next candidate (genesis here).
+        hc <- freshChain
+        let fakeKey = CandidateKey
+              { ckWork   = 999999999  -- highest work in set
+              , ckSeqInv = maxBound
+              , ckHash   = mkBlockHash 96
+              }
+        atomically $ modifyTVar_ (hcCandidates hc) (Set.insert fakeKey)
+        cs0 <- readTVarIO (hcCandidates hc)
+        Set.member fakeKey cs0 `shouldBe` True
+        mBest <- findBestCandidate hc
+        -- Fell back to genesis (the only real candidate).
+        fmap ceHash mBest `shouldBe` Just genesisHash
+        -- The stale key was pruned.
+        cs1 <- readTVarIO (hcCandidates hc)
+        Set.member fakeKey cs1 `shouldBe` False
 
     ---------------------------------------------------------------------------
     -- FindMostWorkChain: highest-work valid entry wins

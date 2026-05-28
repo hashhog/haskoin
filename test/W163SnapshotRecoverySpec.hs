@@ -173,6 +173,7 @@ buildChain pairs =
                    , cePrev       = mPrev
                    , ceStatus     = StatusValid
                    , ceMedianTime = ts  -- not consulted by medianTimePast
+                   , ceSequenceId = fromIntegral h
                    }
         in (hh, ce) : go (Just hh) rest
       entries = go Nothing pairs
