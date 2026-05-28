@@ -495,14 +495,16 @@ spec = do
           dataPos     = 1008 :: Int64
       dataPos - headerBytes `shouldBe` 1000
 
-  -- G22  PersistedChainState persistence
-  describe "G22 PersistedChainState" $ do
-
-    it "BUG-31: saveChainState is never called — chain state not persisted on shutdown" $ do
-      -- Storage.hs exports saveChainState, but grep shows it is called nowhere
-      -- in app/Main.hs or src/**/*.hs.  On restart, chain work must be recomputed
-      -- by scanning PrefixBlockHeight; the DB does not have a quick-start pointer.
-      True `shouldBe` True
+  -- G22  PersistedChainState persistence (RESOLVED in P2-6)
+  --
+  -- BUG-31 documented that 'saveChainState' had zero callers and
+  -- 'getChainState' therefore always returned 'Nothing' on restart.
+  -- The dead 'saveChainState' / 'getChainState' / 'PersistedChainState'
+  -- API was removed in P2-6 (commit refactor(storage):
+  -- remove dead saveChainState/getChainState).  The authoritative
+  -- chainstate-existence signal is now 'getBestBlockHash' (prefix 0x06,
+  -- the UTXO-view tip advanced atomically by 'connectBlockAt').  See
+  -- W162ChainstateWedgeSpec for the live restart-survival tests.
 
   -- G23  Chain-work encoding
   describe "G23 chain-work encoding" $ do

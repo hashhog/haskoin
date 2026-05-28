@@ -31,7 +31,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          batchPutBlockHeader, batchPutUTXO, batchDeleteUTXO,
                          batchPutBestBlock, batchPutBlockHeight,
                          UTXOEntry(..), UndoData(..), BlockUndo(..), TxUndo(..),
-                         mkUndoData, PersistedChainState(..),
+                         mkUndoData,
                          -- Flat file storage
                          BlockFileInfo(..), FlatFilePos(..),
                          maxBlockFileSize, blockFileChunkSize,
@@ -5603,32 +5603,11 @@ main = hspec $ do
           udHeight decoded `shouldBe` 12345
         Left err -> expectationFailure $ "Decode failed: " ++ err
 
-  describe "PersistedChainState serialization" $ do
-    it "roundtrips correctly" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0xff))
-          pcs = PersistedChainState 100 bh 12345678
-      decode (encode pcs) `shouldBe` Right pcs
-
-    it "handles zero chain work" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
-          pcs = PersistedChainState 0 bh 0
-      decode (encode pcs) `shouldBe` Right pcs
-
-    it "handles large chain work" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0xab))
-          largeWork = 2 ^ (200 :: Integer)  -- Very large number
-          pcs = PersistedChainState 500000 bh largeWork
-      decode (encode pcs) `shouldBe` Right pcs
-
-    it "preserves all fields" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0xcd))
-          pcs = PersistedChainState 999 bh 42
-      case decode (encode pcs) of
-        Right decoded -> do
-          pcsHeight decoded `shouldBe` 999
-          pcsBestBlock decoded `shouldBe` bh
-          pcsChainWork decoded `shouldBe` 42
-        Left err -> expectationFailure $ "Decode failed: " ++ err
+  -- 'describe "PersistedChainState serialization"' was deleted in P2-6:
+  -- the PersistedChainState type and the saveChainState/getChainState
+  -- API were dead code (W109 BUG-31).  The live chainstate-existence
+  -- signal is the PrefixBestBlock pointer ('getBestBlockHash'); see
+  -- W162ChainstateWedgeSpec for the round-trip + restart-survival tests.
 
   describe "UTXOEntry metadata" $ do
     it "tracks creation height" $ do
@@ -5699,21 +5678,9 @@ main = hspec $ do
           undo = mkUndoData bh 100 prevHash (BlockUndo [txUndo])
       length (buTxUndo (udBlockUndo undo)) `shouldBe` 1
 
-  describe "Chain state fields" $ do
-    it "PersistedChainState tracks height" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
-          pcs = PersistedChainState 500 bh 1000
-      pcsHeight pcs `shouldBe` 500
-
-    it "PersistedChainState tracks best block" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0xab))
-          pcs = PersistedChainState 100 bh 500
-      pcsBestBlock pcs `shouldBe` bh
-
-    it "PersistedChainState tracks chain work" $ do
-      let bh = BlockHash (Hash256 (BS.replicate 32 0x00))
-          pcs = PersistedChainState 100 bh 999999
-      pcsChainWork pcs `shouldBe` 999999
+  -- 'describe "Chain state fields"' was deleted in P2-6 alongside the
+  -- PersistedChainState type itself (see W109 BUG-31).  No replacement
+  -- needed — the live chainstate signal is the PrefixBestBlock pointer.
 
   --------------------------------------------------------------------------------
   -- Mempool Tests
