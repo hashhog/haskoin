@@ -135,6 +135,7 @@ import qualified W140HTTPRpcAuthSpec
 import qualified W141ZmqRestNotifySpec
 import qualified W159BIP32PrivTweakSpec
 import qualified W160SigCacheKeySpec
+import qualified W161WordlistDataFileSpec
 import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
 import qualified Bip21Spec
@@ -22637,6 +22638,10 @@ main = hspec $ do
 
   -- W160 SigCache key composition regression (W159 BUG-17 / W160 BUG-16 fix)
   W160SigCacheKeySpec.spec
+
+  -- W161 BUG-8: bundle BIP-39 wordlist via cabal data-files (fix-burn
+  -- closes "every non-source-tree install crashes on first wallet op")
+  W161WordlistDataFileSpec.spec
 
   -- W162 chainstate-wedge regression: height-index key encoding +
   -- best-block-pointer-survives-restart + startup LoadChainTip

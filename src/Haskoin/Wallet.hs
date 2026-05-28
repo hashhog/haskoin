@@ -306,22 +306,36 @@ import Data.Time.Calendar (Day(..))
 import qualified Crypto.KDF.PBKDF2 as PBKDF2
 import Crypto.Hash (SHA512(..))
 
+-- W161 BUG-8: resolve the BIP-39 English wordlist via Cabal's
+-- auto-generated Paths_haskoin module so installed binaries find the
+-- file at runtime regardless of CWD.  Pre-fix the loader read
+-- "resources/bip39-english.txt" relative to the process CWD, which
+-- crashed every non-source-tree install on the first wallet op.
+import qualified Paths_haskoin
+
 --------------------------------------------------------------------------------
 -- BIP-39 Word List
 --------------------------------------------------------------------------------
 
 -- | BIP-39 English word list (2048 words).
--- Loaded from resources/bip39-english.txt at module initialization.
+-- Loaded from the Cabal-bundled @resources/bip39-english.txt@ data file
+-- at module initialization (see 'loadBip39WordList').
 -- KNOWN PITFALL: Using unsafePerformIO is acceptable here as the file is
 -- read-only and the result is pure.
 {-# NOINLINE bip39WordList #-}
 bip39WordList :: [Text]
 bip39WordList = unsafePerformIO loadBip39WordList
 
--- | Load the BIP-39 word list from the resources file.
+-- | Load the BIP-39 word list from the Cabal-bundled data file.
+-- W161 BUG-8: previously read the literal relative path
+-- @"resources/bip39-english.txt"@, which only worked when the process
+-- CWD was the source tree.  We now resolve the absolute path via
+-- 'Paths_haskoin.getDataFileName' so any install (cabal install,
+-- distro package, container image) finds it.
 loadBip39WordList :: IO [Text]
 loadBip39WordList = do
-  content <- TIO.readFile "resources/bip39-english.txt"
+  path    <- Paths_haskoin.getDataFileName "resources/bip39-english.txt"
+  content <- TIO.readFile path
   let wordLines = T.lines content
       -- Filter out empty lines and trim whitespace
       words' = filter (not . T.null) $ map T.strip wordLines
