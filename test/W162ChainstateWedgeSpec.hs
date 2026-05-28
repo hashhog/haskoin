@@ -25,13 +25,16 @@
 --
 --   BUG-B  Destructive best-block reset on every restart.
 --          Startup decided "fresh DB vs resume" from 'getChainState'
---          (prefix 0x20).  But 'saveChainState' has zero callers
---          (test W109 BUG-31 documents this), so 'getChainState'
---          ALWAYS returns 'Nothing'.  The startup code therefore took
---          the fresh-DB branch on every restart and ran
+--          (prefix 0x20).  But 'saveChainState' had zero callers
+--          (W109 BUG-31), so 'getChainState' ALWAYS returned
+--          'Nothing'.  The startup code therefore took the fresh-DB
+--          branch on every restart and ran
 --          @putBestBlockHash db genesisHash@, rewinding the live
 --          UTXO-view tip pointer to genesis.  The authoritative
 --          chainstate-existence signal is 'getBestBlockHash' itself.
+--          The dead 'saveChainState' / 'getChainState' API was
+--          removed in P2-6; this suite continues to pin the live
+--          'getBestBlockHash' contract.
 --
 -- The fix also adds startup reconciliation (Core's
 -- @Chainstate::LoadChainTip@, validation.cpp:4546): block download
@@ -175,23 +178,20 @@ spec = do
         after <- getBestBlockHash db
         after `shouldBe` Just genesisHash
 
-    it "getBestBlockHash is the authoritative chainstate-existence signal (not getChainState)" $ do
+    it "getBestBlockHash is the authoritative chainstate-existence signal" $ do
       -- The startup fix gates genesis-init on getBestBlockHash.  A DB
       -- that has a best-block pointer must be treated as an existing
-      -- chainstate even though getChainState (saveChainState has zero
-      -- callers) returns Nothing.
+      -- chainstate.  (Pre-fix, startup also consulted a dead
+      -- 'getChainState' / 'saveChainState' pair keyed at prefix 0x20
+      -- which always returned Nothing — that API was removed in P2-6.)
       withTestDB "existence-signal" $ \db -> do
         -- Simulate an already-synced node: a best-block pointer well
         -- above genesis is present on disk.
         let fakeTip = BlockHash (Hash256 (BS.cons 0xAB (BS.replicate 31 0)))
         putBestBlockHash db fakeTip
-        -- getChainState would (always) say Nothing -> pre-fix the
-        -- startup would call putBestBlockHash db genesisHash here and
-        -- destroy the pointer.  The fix consults getBestBlockHash.
-        mChainState <- S.getChainState db
-        mBest       <- getBestBlockHash db
-        mChainState `shouldBe` Nothing        -- saveChainState never called
-        mBest       `shouldBe` Just fakeTip   -- the real, intact signal
+        -- The fix consults getBestBlockHash.
+        mBest <- getBestBlockHash db
+        mBest `shouldBe` Just fakeTip   -- the real, intact signal
         -- The decision the fixed startup makes: existing chainstate ->
         -- do NOT re-init genesis.
         let chainExists = case mBest of

@@ -111,10 +111,6 @@ module Haskoin.Storage
   , getUndoData
   , getUndoDataVerified
   , deleteUndoData
-    -- * Persisted Chain State
-  , PersistedChainState(..)
-  , saveChainState
-  , getChainState
     -- * Chain Work
   , putChainWork
   , getChainWork
@@ -1385,48 +1381,6 @@ instance Serialize LegacyUndoData where
     count <- getWord32be
     spent <- sequence $ replicate (fromIntegral count) ((,) <$> get <*> get)
     return $ LegacyUndoData spent
-
---------------------------------------------------------------------------------
--- Persisted Chain State
---------------------------------------------------------------------------------
-
--- | Chain state that is persisted to disk.
--- KNOWN PITFALL: header_tip vs chain_tip - these must be separate DB entries.
--- Header sync updates header_tip, block validation updates chain_tip.
-data PersistedChainState = PersistedChainState
-  { pcsHeight    :: !Word32     -- ^ Height of the best validated block
-  , pcsBestBlock :: !BlockHash  -- ^ Hash of the best validated block
-  , pcsChainWork :: !Integer    -- ^ Cumulative proof-of-work
-  } deriving (Show, Eq, Generic)
-
-instance Serialize PersistedChainState where
-  put PersistedChainState{..} = do
-    putWord32be pcsHeight
-    put pcsBestBlock
-    -- Encode chain work as variable-length integer
-    let workBS = integerToBS pcsChainWork
-    putWord32be (fromIntegral $ BS.length workBS)
-    put workBS
-  get = do
-    height <- getWord32be
-    bestBlock <- get
-    workLen <- getWord32be
-    workBS <- get
-    return $ PersistedChainState height bestBlock (bsToInteger workBS)
-
--- | Save chain state to the database.
--- Uses prefix 0x20 for chain state.
-saveChainState :: HaskoinDB -> PersistedChainState -> IO ()
-saveChainState db pcs =
-  let key = BS.cons 0x20 BS.empty
-  in R.put (dbHandle db) (dbWriteOpts db) key (encode pcs)
-
--- | Load chain state from the database.
-getChainState :: HaskoinDB -> IO (Maybe PersistedChainState)
-getChainState db = do
-  let key = BS.cons 0x20 BS.empty
-  mval <- R.get (dbHandle db) (dbReadOpts db) key
-  return $ mval >>= either (const Nothing) Just . decode
 
 --------------------------------------------------------------------------------
 -- Transaction Index

@@ -679,17 +679,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- W162 P0 chainstate-wedge fix.  The authoritative on-disk
     -- chainstate-existence signal is the @PrefixBestBlock@ pointer
     -- ('getBestBlockHash') — the UTXO-view tip that 'connectBlockAt'
-    -- advances atomically with every block.  We must NOT use
-    -- 'getChainState' here: 'saveChainState' is exported but has zero
-    -- callers (test W109 BUG-31 documents this), so 'getChainState'
-    -- ALWAYS returns 'Nothing'.  The pre-fix code therefore took the
-    -- 'Nothing' branch on EVERY restart and ran
+    -- advances atomically with every block.  The pre-fix code used a
+    -- separate 'getChainState' / 'saveChainState' pair keyed at prefix
+    -- 0x20, but 'saveChainState' was never called from any code path,
+    -- so 'getChainState' ALWAYS returned 'Nothing'.  The startup logic
+    -- therefore took the 'Nothing' branch on EVERY restart and ran
     -- @putBestBlockHash db genesisHash@, resetting the live UTXO-view
     -- best-block pointer all the way back to genesis even though the
     -- 74 GB UTXO set on disk was intact at height ~949 k.  After the
     -- reset, every peer block failed the ConnectBlock G1 gate
     -- (hashPrevBlock == view.GetBestBlock(), validation.cpp:2333)
     -- because no block's prevHash equals genesis — a permanent wedge.
+    -- The dead 'saveChainState' / 'getChainState' / 'PersistedChainState'
+    -- API was removed in P2-6 (W109 BUG-31 root cause).
     --
     -- Fix: gate the genesis-init on 'getBestBlockHash'.  Only a DB that
     -- has never had a best-block pointer written (genuinely fresh) is
