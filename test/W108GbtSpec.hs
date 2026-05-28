@@ -64,6 +64,7 @@ minimalChainEntry = ChainEntry
   , cePrev       = Nothing
   , ceStatus     = StatusValid
   , ceMedianTime = 1700000000
+  , ceSequenceId = 0
   }
 
 spec :: Spec

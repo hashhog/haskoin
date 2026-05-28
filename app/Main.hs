@@ -1725,6 +1725,8 @@ initHeaderChainFromDB db net = do
         , cePrev = Nothing
         , ceStatus = StatusValid
         , ceMedianTime = bhTimestamp (blockHeader genesis)
+        -- P2-2: genesis sits at Core's SEQ_ID_BEST_CHAIN_FROM_DISK (0).
+        , ceSequenceId = seqIdBestChainFromDisk
         }
 
   entriesVar <- newTVarIO (Map.singleton genesisHash genesisEntry)
@@ -1732,6 +1734,13 @@ initHeaderChainFromDB db net = do
   heightVar <- newTVarIO 0
   byHeightVar <- newTVarIO (Map.singleton 0 genesisHash)
   invalidatedVar <- newTVarIO Set.empty
+  -- P2-2: seed the sorted candidate set with genesis so 'activateBestChain'
+  -- always has at least one tip candidate available.  'hcSeqCounter'
+  -- starts at 'seqIdInitFromDisk + 1' (== 2) so the first live insert
+  -- ranks strictly behind any disk-loaded entries with equal work
+  -- (Core comparator invariant; see node/blockstorage.cpp:174-192).
+  candidatesVar <- newTVarIO (Set.singleton (mkCandidateKey genesisEntry))
+  seqCounterVar <- newTVarIO (seqIdInitFromDisk + 1)
 
   -- Load persisted headers from the height index to rebuild the in-memory chain.
   -- connectBlock writes PrefixBlockHeader and PrefixBlockHeight for every
@@ -1781,6 +1790,16 @@ initHeaderChainFromDB db net = do
                         newMtp = computeEntryMtp entriesSoFar
                                                  (ceHash prevEntry)
                                                  (bhTimestamp header)
+                        -- P2-2: every reloaded entry IS on the best chain
+                        -- (we walk PrefixBlockHeight, which only stores
+                        -- the active chain — side-branch headers go
+                        -- through 'addSideBranchHeader' on the live path
+                        -- and are not persisted via this prefix).  So
+                        -- each loaded entry gets Core's
+                        -- 'seqIdBestChainFromDisk' value (0), matching
+                        -- @LoadBlockIndex@'s @SEQ_ID_BEST_CHAIN_FROM_DISK@
+                        -- assignment for active-chain tips
+                        -- (validation.cpp:4566-4576).
                         entry = ChainEntry
                           { ceHeader = header
                           , ceHash = bh
@@ -1789,12 +1808,21 @@ initHeaderChainFromDB db net = do
                           , cePrev = Just (ceHash prevEntry)
                           , ceStatus = StatusValid
                           , ceMedianTime = newMtp
+                          , ceSequenceId = seqIdBestChainFromDisk
                           }
                     atomically $ do
                       modifyTVar' entriesVar (Map.insert bh entry)
                       modifyTVar' byHeightVar (Map.insert height bh)
                       writeTVar tipVar entry
                       writeTVar heightVar height
+                      -- P2-2 + P2-3: every reloaded StatusValid entry is a
+                      -- candidate.  PruneBlockIndexCandidates-style cleanup
+                      -- (Core validation.cpp:3173-3183) happens lazily
+                      -- inside 'findBestCandidate' on the next
+                      -- 'activateBestChain' call — we don't need a
+                      -- separate post-load pruning sweep.
+                      modifyTVar' candidatesVar
+                        (Set.insert (mkCandidateKey entry))
                     when (height `mod` 100000 == 0) $
                       putStrLn $ "  loaded headers up to height " ++ show height
                     go (height + 1) entry
@@ -1808,6 +1836,8 @@ initHeaderChainFromDB db net = do
     , hcHeight = heightVar
     , hcByHeight = byHeightVar
     , hcInvalidated = invalidatedVar
+    , hcCandidates = candidatesVar
+    , hcSeqCounter = seqCounterVar
     }
 
 -- | Send a message to a peer.

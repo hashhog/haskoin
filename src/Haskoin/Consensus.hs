@@ -138,6 +138,10 @@ module Haskoin.Consensus
   , ChainEntry(..)
   , HeaderChain(..)
   , HeaderSync(..)
+  , CandidateKey(..)
+  , mkCandidateKey
+  , seqIdBestChainFromDisk
+  , seqIdInitFromDisk
   , initHeaderChain
   , headerWork
   , cumulativeWork
@@ -205,6 +209,7 @@ module Haskoin.Consensus
   , isBlockInvalidated
   , isFailedStatus
   , activateBestChain
+  , findBestCandidate
     -- * Global Signature Cache
   , initGlobalSigCache
   , lookupGlobalSigCache
@@ -3709,6 +3714,17 @@ buildDisconnectBlockOps block prevHash undoData =
 -- | An entry in the header chain with computed metadata.
 -- KNOWN PITFALL: header_tip vs chain_tip - track separately in DB.
 -- Headers can be far ahead of validated blocks. Same DB key = data corruption.
+--
+-- 'ceSequenceId' mirrors Core's @CBlockIndex::nSequenceId@
+-- (bitcoin-core/src/chain.h:149) and is the tiebreaker after
+-- @nChainWork@ in 'CBlockIndexWorkComparator' — "earliest activatable
+-- time wins" at equal chainwork.  Genesis uses 'seqIdBestChainFromDisk'
+-- (== 0), entries reloaded from disk get 'seqIdBestChainFromDisk' as
+-- well (they sit on the active chain), and live entries (added via
+-- 'addHeader' / 'addSideBranchHeader') pull a fresh value from
+-- 'hcSeqCounter' on insert.  Closes W101 BUG-8 by giving the sorted
+-- candidate set a stable second-key so 'activateBestChain' can do an
+-- O(log n) best-pick instead of an O(n²) full-map scan.
 data ChainEntry = ChainEntry
   { ceHeader     :: !BlockHeader     -- ^ The raw 80-byte header
   , ceHash       :: !BlockHash       -- ^ Block hash (computed from header)
@@ -3717,16 +3733,59 @@ data ChainEntry = ChainEntry
   , cePrev       :: !(Maybe BlockHash) -- ^ Previous block hash (for genesis: Nothing)
   , ceStatus     :: !BlockStatus     -- ^ Validation status
   , ceMedianTime :: !Word32          -- ^ Median time past for this block
+  , ceSequenceId :: !Word64          -- ^ Activation-order tiebreaker (Core nSequenceId)
   } deriving (Show, Eq, Generic)
+
+-- | Core's @SEQ_ID_BEST_CHAIN_FROM_DISK@ (bitcoin-core/src/chain.h:39).
+-- Assigned to entries on the best chain when they are loaded from disk
+-- (and to genesis at 'initHeaderChain' time).  Wins ties against
+-- 'seqIdInitFromDisk' under 'CBlockIndexWorkComparator'.
+seqIdBestChainFromDisk :: Word64
+seqIdBestChainFromDisk = 0
+
+-- | Core's @SEQ_ID_INIT_FROM_DISK@ (bitcoin-core/src/chain.h:40).
+-- Assigned to non-best-chain entries when they are loaded from disk;
+-- new live entries from 'addHeader' / 'addSideBranchHeader' get a
+-- monotonically incremented value strictly greater than this one.
+seqIdInitFromDisk :: Word64
+seqIdInitFromDisk = 1
+
+-- | Sorted-set key for the candidate-tip set.  Mirrors Core's
+-- @CBlockIndexWorkComparator@ (node/blockstorage.cpp:174-192):
+--   * Primary: highest 'ceChainWork' wins.
+--   * Secondary: at equal work, lowest 'ceSequenceId' wins
+--     (\"earliest activatable\").
+--   * Final tiebreaker: 'BlockHash' identity.
+--
+-- The 'Set' is ordered by Haskell's derived 'Ord' (ascending on
+-- 'Integer' then 'Word64' then 'BlockHash').  We store
+-- @sequenceId@ as @maxBound - seq@ so that \"max\" in the Set
+-- corresponds to \"lowest actual seq\" — letting @Set.lookupMax@
+-- return the same element Core's @std::set::rbegin()@ would.
+data CandidateKey = CandidateKey
+  { ckWork   :: !Integer   -- ^ Cumulative chain work (higher = better)
+  , ckSeqInv :: !Word64    -- ^ maxBound - ceSequenceId (higher = older = better)
+  , ckHash   :: !BlockHash -- ^ Identity tiebreaker
+  } deriving (Show, Eq, Ord)
+
+-- | Build a 'CandidateKey' for an entry.
+mkCandidateKey :: ChainEntry -> CandidateKey
+mkCandidateKey ce = CandidateKey
+  { ckWork   = ceChainWork ce
+  , ckSeqInv = maxBound - ceSequenceId ce
+  , ckHash   = ceHash ce
+  }
 
 -- | In-memory header chain with concurrent access support.
 -- Uses TVars for thread-safe access from multiple threads.
 data HeaderChain = HeaderChain
-  { hcEntries  :: !(TVar (Map BlockHash ChainEntry)) -- ^ All known entries by hash
-  , hcTip      :: !(TVar ChainEntry)                 -- ^ Current best tip
-  , hcHeight   :: !(TVar Word32)                     -- ^ Height of current tip
-  , hcByHeight :: !(TVar (Map Word32 BlockHash))     -- ^ Height -> hash index
-  , hcInvalidated :: !(TVar (Set.Set BlockHash))     -- ^ Manually invalidated blocks (via invalidateblock RPC)
+  { hcEntries     :: !(TVar (Map BlockHash ChainEntry)) -- ^ All known entries by hash
+  , hcTip         :: !(TVar ChainEntry)                 -- ^ Current best tip
+  , hcHeight      :: !(TVar Word32)                     -- ^ Height of current tip
+  , hcByHeight    :: !(TVar (Map Word32 BlockHash))     -- ^ Height -> hash index
+  , hcInvalidated :: !(TVar (Set.Set BlockHash))        -- ^ Manually invalidated blocks (via invalidateblock RPC)
+  , hcCandidates  :: !(TVar (Set.Set CandidateKey))     -- ^ Sorted candidate tips (Core's setBlockIndexCandidates)
+  , hcSeqCounter  :: !(TVar Word64)                     -- ^ Monotonic counter for ceSequenceId on live inserts
   }
 
 --------------------------------------------------------------------------------
@@ -3898,6 +3957,16 @@ testnetExpectedBits net entries lastEntry newHeader
 --------------------------------------------------------------------------------
 
 -- | Initialize a header chain with the genesis block.
+--
+-- P2-2: 'hcCandidates' is seeded with the genesis entry: it is the
+-- only validated chain tip at startup, so 'activateBestChain' has a
+-- non-empty candidate pool from the first instant (mirrors Core,
+-- which inserts the genesis 'CBlockIndex' into
+-- 'setBlockIndexCandidates' inside @LoadChainTip@).  'hcSeqCounter'
+-- starts at 'seqIdInitFromDisk + 1' so the next live insert gets
+-- @2@ (strictly greater than the disk-init values @0@ and @1@) —
+-- preserving the comparator invariant that disk-loaded entries
+-- always rank ahead of live entries at equal work.
 initHeaderChain :: Network -> IO HeaderChain
 initHeaderChain net = do
   let genesis = blockHeader (netGenesisBlock net)
@@ -3911,18 +3980,23 @@ initHeaderChain net = do
         , cePrev = Nothing
         , ceStatus = StatusValid
         , ceMedianTime = bhTimestamp genesis
+        , ceSequenceId = seqIdBestChainFromDisk
         }
   entriesVar <- newTVarIO (Map.singleton genesisHash genesisEntry)
   tipVar <- newTVarIO genesisEntry
   heightVar <- newTVarIO 0
   byHeightVar <- newTVarIO (Map.singleton 0 genesisHash)
   invalidatedVar <- newTVarIO Set.empty
+  candidatesVar <- newTVarIO (Set.singleton (mkCandidateKey genesisEntry))
+  seqCounterVar <- newTVarIO (seqIdInitFromDisk + 1)
   return HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
     , hcHeight = heightVar
     , hcByHeight = byHeightVar
     , hcInvalidated = invalidatedVar
+    , hcCandidates = candidatesVar
+    , hcSeqCounter = seqCounterVar
     }
 
 --------------------------------------------------------------------------------
@@ -4063,6 +4137,30 @@ addHeader net hc header minPowChecked = do
                              && work < netMinimumChainWork net
                           then return $ Left "too-little-chainwork"
                           else do
+                            -- P2-2: allocate a fresh sequence ID under the same
+                            -- STM transaction that inserts the entry.  Doing
+                            -- the increment outside the atomic block would
+                            -- race against a sibling 'addHeader' on a
+                            -- different thread (Main.hs hands each peer its
+                            -- own recv thread); two concurrent inserts could
+                            -- otherwise hand out duplicate sequence IDs and
+                            -- break the candidate-set ordering invariant.
+                            -- Note that 'StatusHeaderValid' entries do NOT
+                            -- enter 'hcCandidates' — Core's FindMostWorkChain
+                            -- requires BLOCK_HAVE_DATA (validation.cpp:3140)
+                            -- and a header-only entry has no body to connect.
+                            -- The candidate insert happens once the body is
+                            -- received and the entry transitions to
+                            -- StatusValid (via 'addSideBranchHeader' on the
+                            -- submitblock path; the live MBlock arm does not
+                            -- currently transition in-memory status, so
+                            -- 'activateBestChain' for IBD-style live receive
+                            -- is a no-op — the tip advances via direct
+                            -- 'connectBlockAt' writes instead).
+                            seqId <- atomically $ do
+                              n <- readTVar (hcSeqCounter hc)
+                              writeTVar (hcSeqCounter hc) (n + 1)
+                              return n
                             let entry = ChainEntry
                                   { ceHeader = header
                                   , ceHash = hash
@@ -4071,6 +4169,7 @@ addHeader net hc header minPowChecked = do
                                   , cePrev = Just prevHash
                                   , ceStatus = StatusHeaderValid
                                   , ceMedianTime = newEntryMtp
+                                  , ceSequenceId = seqId
                                   }
 
                             -- Insert and potentially update tip atomically.
@@ -4146,7 +4245,21 @@ addSideBranchHeader hc header = do
             -- get the correct value rather than the off-by-one parent's MTP.
             -- Reference: bitcoin-core/src/chain.h:233-244
             newMtp = computeEntryMtp entries prevHash (bhTimestamp header)
-            entry = ChainEntry
+        -- P2-2 + P2-3: allocate sequenceId AND insert into the candidate
+        -- set in the same STM transaction.  Side-branch headers are
+        -- validated by the caller before reaching this function
+        -- ('submitBlock' runs the full pipeline first), so the entry
+        -- already satisfies Core's BLOCK_HAVE_DATA + BLOCK_VALID_SCRIPTS
+        -- precondition for being a candidate (validation.cpp:3140).
+        -- Combining the sequence-ID handout, entries insert, and
+        -- candidate insert under one 'atomically' keeps the three TVars
+        -- mutually consistent against a concurrent 'invalidateBlock'
+        -- or sibling 'addSideBranchHeader' on another thread.
+        seqId <- atomically $ do
+          n <- readTVar (hcSeqCounter hc)
+          writeTVar (hcSeqCounter hc) (n + 1)
+          return n
+        let entry = ChainEntry
               { ceHeader     = header
               , ceHash       = hash
               , ceHeight     = height
@@ -4154,8 +4267,11 @@ addSideBranchHeader hc header = do
               , cePrev       = Just prevHash
               , ceStatus     = StatusValid -- caller has run validateFullBlockIO
               , ceMedianTime = newMtp
+              , ceSequenceId = seqId
               }
-        atomically $ modifyTVar' (hcEntries hc) (Map.insert hash entry)
+        atomically $ do
+          modifyTVar' (hcEntries hc) (Map.insert hash entry)
+          modifyTVar' (hcCandidates hc) (Set.insert (mkCandidateKey entry))
         return $ Right entry
 
 -- | Get the current chain tip.
@@ -5106,11 +5222,23 @@ invalidateBlock net cache db hc blockHash = do
           -- Mark all in-memory states first (single atomic STM update),
           -- then persist to DB.  Separating the phases means the in-memory
           -- index is consistent before the first DB write touches the disk.
+          --
+          -- P2-2 + P2-3: drop every affected entry from 'hcCandidates'
+          -- in the SAME STM transaction that flips its status.  Without
+          -- this an invalidated entry would still satisfy the
+          -- 'Set.lookupMax' in 'activateBestChain' until the next
+          -- BLOCK_HAVE_DATA-gate failure rejects it on the ancestry
+          -- walk — wasted work proportional to the bad subtree's depth.
+          -- Mirrors Core's @setBlockIndexCandidates.erase(pindexFailed)@
+          -- in validation.cpp:3159.
           let markDescendants ces = do
-                atomically $ modifyTVar' (hcEntries hc) $ \m ->
-                  foldl' (\acc ce ->
-                    Map.adjust (\e -> e { ceStatus = entryStatus ce }) (ceHash ce) acc)
-                    m ces
+                atomically $ do
+                  modifyTVar' (hcEntries hc) $ \m ->
+                    foldl' (\acc ce ->
+                      Map.adjust (\e -> e { ceStatus = entryStatus ce }) (ceHash ce) acc)
+                      m ces
+                  modifyTVar' (hcCandidates hc) $ \s ->
+                    foldl' (\acc ce -> Set.delete (mkCandidateKey ce) acc) s ces
                 forM_ ces $ \ce -> putBlockStatus db (ceHash ce) (entryStatus ce)
 
           -- Check if the block is on the active chain (ancestor of tip)
@@ -5174,44 +5302,121 @@ isFailedStatus _                 = False
 
 -- | Activate the best valid chain.
 -- After invalidation, we may need to switch to a different fork.
--- Reference: bitcoin/src/validation.cpp ActivateBestChain
+-- Reference: bitcoin/src/validation.cpp ActivateBestChain +
+-- FindMostWorkChain (validation.cpp:3114-3170).
+--
+-- P2-2 (W101 BUG-8): the pre-fix implementation built a 'tipCandidates'
+-- list by filtering 'Map.elems entries' (O(n)) and, for each entry,
+-- calling 'any (… == cePrev …) allEntries' (O(n) per entry) — O(n²)
+-- total on every invalidate/reconsider RPC.  At mainnet IBD scale
+-- (>850k entries) that scan stalls the main thread.  Fix: read the
+-- sorted 'hcCandidates' set and pull the best candidate via
+-- 'Set.lookupMax' (O(log n)).
+--
+-- P2-3 (W101 BUG-3): Core also walks the candidate's ancestry back to
+-- the active chain checking @BLOCK_HAVE_DATA@ on every step
+-- (validation.cpp:3132-3167); a chain whose ancestor's body is missing
+-- (or whose ancestor is invalidated) is dropped from
+-- @setBlockIndexCandidates@ and the loop tries the next-best
+-- candidate.  We replicate that here: 'haveBlockData' equates to
+-- @StatusValid@ in haskoin's status model
+-- ('addSideBranchHeader' is the only path that sets 'StatusValid';
+-- 'addHeader' parks a new header at 'StatusHeaderValid').
 activateBestChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain -> IO ()
 activateBestChain net cache db hc = do
-  entries <- readTVarIO (hcEntries hc)
   currentTip <- readTVarIO (hcTip hc)
+  best       <- findBestCandidate hc
+  case best of
+    Nothing     -> return ()
+    Just bestCe ->
+      when (ceChainWork bestCe > ceChainWork currentTip) $ do
+        -- BUG-1: propagate findForkPoint failure (don't silently swallow it).
+        mFork <- findForkPoint hc (ceHash currentTip) (ceHash bestCe)
+        case mFork of
+          Nothing -> do
+            -- No common ancestor: prune this disconnected candidate
+            -- from 'hcCandidates' so future calls don't re-pick it.
+            atomically $
+              modifyTVar' (hcCandidates hc)
+                (Set.delete (mkCandidateKey bestCe))
+          Just _fork ->
+            void $ performReorg net cache db hc (ceHash currentTip) (ceHash bestCe)
+
+-- | Pull the best valid tip candidate from the sorted set, applying
+-- Core's ancestor-walk @BLOCK_HAVE_DATA@ + invalidation gate
+-- (validation.cpp:3128-3167).
+--
+-- If the best candidate's ancestor chain has any entry missing block
+-- data (haskoin: not 'StatusValid') or any invalidated entry, the
+-- candidate and its disconnected ancestor subtree are removed from
+-- 'hcCandidates' and the loop retries with the next-best candidate.
+-- Returns 'Nothing' when the set is exhausted.
+findBestCandidate :: HeaderChain -> IO (Maybe ChainEntry)
+findBestCandidate hc = do
+  entries     <- readTVarIO (hcEntries hc)
   invalidated <- readTVarIO (hcInvalidated hc)
-
-  -- Find all valid tips (blocks with no children that are not invalid).
-  -- BUG-3 fix: only admit entries with StatusValid — equivalent to Core's
-  -- BLOCK_HAVE_DATA guard in FindMostWorkChain (validation.cpp:3114).
-  -- StatusHeaderValid entries have no block body and must not be candidates.
-  let allEntries = Map.elems entries
-      -- A block is a tip candidate if it's valid and has no valid children
-      hasValidChildren :: ChainEntry -> Bool
-      hasValidChildren ce =
-        any (\other -> cePrev other == Just (ceHash ce) && ceStatus other == StatusValid)
-            allEntries
-      tipCandidates = filter (\ce -> ceStatus ce == StatusValid
-                                  && not (hasValidChildren ce)
-                                  && not (Set.member (ceHash ce) invalidated))
-                             allEntries
-
-  -- Find the best tip by chain work
-  case tipCandidates of
-    [] -> return ()  -- No valid tips (shouldn't happen)
-    candidates ->
-      let best = maximumBy (\a b -> compare (ceChainWork a) (ceChainWork b)) candidates
-      in when (ceChainWork best > ceChainWork currentTip) $ do
-           -- Need to switch to a better chain
-           mFork <- findForkPoint hc (ceHash currentTip) (ceHash best)
-           case mFork of
-             Nothing -> return ()  -- No common ancestor (shouldn't happen)
-             Just fork -> void $ performReorg net cache db hc (ceHash currentTip) (ceHash best)
+  byHeight    <- readTVarIO (hcByHeight hc)
+  let onActiveChain h = case Map.lookup h entries of
+        Nothing -> False
+        Just ce -> Map.lookup (ceHeight ce) byHeight == Just (ceHash ce)
+  let loop = do
+        cs <- readTVarIO (hcCandidates hc)
+        case Set.lookupMax cs of
+          Nothing -> return Nothing
+          Just bestKey -> case Map.lookup (ckHash bestKey) entries of
+            Nothing -> do
+              -- Stale key (entry was removed); drop and retry.
+              atomically $ modifyTVar' (hcCandidates hc) (Set.delete bestKey)
+              loop
+            Just bestCe ->
+              case walkAncestry entries invalidated onActiveChain bestCe of
+                Right ()   -> return (Just bestCe)
+                Left badCe -> do
+                  -- Drop this candidate AND any descendant of the bad
+                  -- ancestor that's still in the set.  Mirrors Core's
+                  -- inner @while (pindexTest != pindexFailed)@ loop
+                  -- (validation.cpp:3148-3162).
+                  atomically $ modifyTVar' (hcCandidates hc) $ \s ->
+                    Set.filter (\k ->
+                      case Map.lookup (ckHash k) entries of
+                        Nothing -> False
+                        Just ce -> not (descendsFrom entries ce (ceHash badCe)))
+                      s
+                  loop
+  loop
   where
-    maximumBy :: (a -> a -> Ordering) -> [a] -> a
-    maximumBy _ [x] = x
-    maximumBy cmp (x:xs) = foldl' (\acc y -> if cmp acc y == LT then y else acc) x xs
-    maximumBy _ [] = error "maximumBy: empty list"
+    -- | Walk from 'start' back toward genesis, stopping at the active
+    -- chain.  Returns 'Left badCe' on the first ancestor that fails the
+    -- gate, 'Right ()' if every ancestor up to the active chain has
+    -- BLOCK_HAVE_DATA + is not invalidated.
+    walkAncestry :: Map BlockHash ChainEntry
+                 -> Set.Set BlockHash
+                 -> (BlockHash -> Bool)
+                 -> ChainEntry
+                 -> Either ChainEntry ()
+    walkAncestry ents inv onActive ce
+      | onActive (ceHash ce)               = Right ()
+      | Set.member (ceHash ce) inv         = Left ce
+      | ceStatus ce /= StatusValid         = Left ce
+      | otherwise = case cePrev ce of
+          Nothing      -> Right ()  -- reached genesis
+          Just prevHash -> case Map.lookup prevHash ents of
+            Nothing  -> Left ce  -- missing parent in index; treat as bad
+            Just par -> walkAncestry ents inv onActive par
+
+    -- | True iff 'ce' is 'target' or a descendant of 'target'.  Used to
+    -- evict an entire side-branch when one ancestor fails the gate.
+    descendsFrom :: Map BlockHash ChainEntry
+                 -> ChainEntry
+                 -> BlockHash
+                 -> Bool
+    descendsFrom ents ce target
+      | ceHash ce == target = True
+      | otherwise = case cePrev ce of
+          Nothing       -> False
+          Just prevHash -> case Map.lookup prevHash ents of
+            Nothing  -> False
+            Just par -> descendsFrom ents par target
 
 -- | Reconsider a previously invalidated block.
 -- Reference: bitcoin/src/validation.cpp Chainstate::ResetBlockFailureFlags
