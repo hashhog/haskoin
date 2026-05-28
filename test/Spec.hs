@@ -4001,6 +4001,7 @@ main = hspec $ do
           , cePrev      = prev
           , ceStatus    = StatusHeaderValid
           , ceMedianTime = ts
+          , ceSequenceId = fromIntegral height
           }
 
         -- Chain: genesis(0) -> e1(1) -> e2(2)
@@ -4094,7 +4095,7 @@ main = hspec $ do
           skipFlag = shouldSkipScripts (computeBlockHash header) 1
                        (bhTimestamp header) regtest Map.empty
                        (ChainEntry header (computeBlockHash header)
-                         0 0 Nothing StatusHeaderValid 0)
+                         0 0 Nothing StatusHeaderValid 0 0)
           resultNoSkip = validateFullBlock regtest cs False block Map.empty
           resultSkip   = validateFullBlock regtest cs skipFlag block Map.empty
       -- Both must agree (skipFlag should be False on regtest)
@@ -4895,6 +4896,7 @@ main = hspec $ do
             , cePrev = Nothing
             , ceStatus = StatusHeaderValid
             , ceMedianTime = 1000
+            , ceSequenceId = 0
             }
           entries = Map.singleton (ceHash entry) entry
           mtp = medianTimePast entries (ceHash entry)
@@ -4909,15 +4911,18 @@ main = hspec $ do
             { ceHeader = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
                                       (Hash256 (BS.replicate 32 0)) 100 0x207fffff 0
             , ceHash = hash1, ceHeight = 0, ceChainWork = 1
-            , cePrev = Nothing, ceStatus = StatusHeaderValid, ceMedianTime = 100 }
+            , cePrev = Nothing, ceStatus = StatusHeaderValid, ceMedianTime = 100
+            , ceSequenceId = 0 }
           entry2 = ChainEntry
             { ceHeader = BlockHeader 1 hash1 (Hash256 (BS.replicate 32 0)) 200 0x207fffff 0
             , ceHash = hash2, ceHeight = 1, ceChainWork = 2
-            , cePrev = Just hash1, ceStatus = StatusHeaderValid, ceMedianTime = 100 }
+            , cePrev = Just hash1, ceStatus = StatusHeaderValid, ceMedianTime = 100
+            , ceSequenceId = 1 }
           entry3 = ChainEntry
             { ceHeader = BlockHeader 1 hash2 (Hash256 (BS.replicate 32 0)) 300 0x207fffff 0
             , ceHash = hash3, ceHeight = 2, ceChainWork = 3
-            , cePrev = Just hash2, ceStatus = StatusHeaderValid, ceMedianTime = 150 }
+            , cePrev = Just hash2, ceStatus = StatusHeaderValid, ceMedianTime = 150
+            , ceSequenceId = 2 }
           entries = Map.fromList [(hash1, entry1), (hash2, entry2), (hash3, entry3)]
           mtp = medianTimePast entries hash3
       -- Median of [100, 200, 300] = 200
@@ -4936,6 +4941,7 @@ main = hspec $ do
             , cePrev = Nothing
             , ceStatus = StatusHeaderValid
             , ceMedianTime = 1000
+            , ceSequenceId = 0
             }
           entries = Map.singleton (ceHash entry) entry
           -- W85: difficultyAdjustment now takes the candidate header so the
@@ -4958,6 +4964,7 @@ main = hspec $ do
             , cePrev = Just (BlockHash (Hash256 (BS.replicate 32 0)))
             , ceStatus = StatusHeaderValid
             , ceMedianTime = 12000
+            , ceSequenceId = 0
             }
       ceHeight entry `shouldBe` 100
       ceChainWork entry `shouldBe` 12345678
@@ -10621,7 +10628,7 @@ main = hspec $ do
           let expectedMtp = computeEntryMtp
                               (Map.singleton genesisHash
                                 (ChainEntry genesisHdr genesisHash 0 (headerWork genesisHdr)
-                                            Nothing StatusValid genesisTs))
+                                            Nothing StatusValid genesisTs 0))
                               genesisHash
                               (bhTimestamp hdr1)
           ceMedianTime entry1 `shouldBe` expectedMtp
@@ -10653,9 +10660,9 @@ main = hspec $ do
       let mkHash n = BlockHash (Hash256 (BS.replicate 31 0 <> BS.singleton n))
           h1 = mkHash 1; h2 = mkHash 2; h3 = mkHash 3
           mkHdr ts prev = BlockHeader 1 prev (Hash256 (BS.replicate 32 0)) ts 0 0
-          e1 = ChainEntry (mkHdr 100 (BlockHash (Hash256 (BS.replicate 32 0)))) h1 0 1 Nothing StatusValid 100
-          e2 = ChainEntry (mkHdr 200 h1) h2 1 2 (Just h1) StatusValid 150
-          e3 = ChainEntry (mkHdr 300 h2) h3 2 3 (Just h2) StatusValid 200
+          e1 = ChainEntry (mkHdr 100 (BlockHash (Hash256 (BS.replicate 32 0)))) h1 0 1 Nothing StatusValid 100 0
+          e2 = ChainEntry (mkHdr 200 h1) h2 1 2 (Just h1) StatusValid 150 1
+          e3 = ChainEntry (mkHdr 300 h2) h3 2 3 (Just h2) StatusValid 200 2
           entries = Map.fromList [(h1, e1), (h2, e2), (h3, e3)]
           result = computeEntryMtp entries h3 400
       -- sorted [100, 200, 300, 400] !! 2 = 300
@@ -16624,6 +16631,7 @@ main = hspec $ do
           , cePrev      = Nothing
           , ceStatus    = StatusHeaderValid
           , ceMedianTime = 0
+          , ceSequenceId = fromIntegral h
           }
 
     it "returns non-empty deployments on regtest" $ do
@@ -16729,6 +16737,7 @@ main = hspec $ do
           , cePrev      = Nothing
           , ceStatus    = StatusHeaderValid
           , ceMedianTime = 0
+          , ceSequenceId = fromIntegral h
           }
 
     it "softforksFromEntry equals the deployments sub-object of deploymentInfoForEntry at height 0" $ do
@@ -18494,6 +18503,7 @@ main = hspec $ do
             , cePrev      = prev
             , ceStatus    = StatusHeaderValid
             , ceMedianTime = ts
+            , ceSequenceId = fromIntegral height
             }
           -- Build a tiny three-block synthetic chain: 0 → 1 → 2.
           h0 = BlockHash (Hash256 (BS.replicate 32 0xa0))

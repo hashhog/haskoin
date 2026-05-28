@@ -89,6 +89,7 @@ mkEntry h height ts work prev = ChainEntry
   , cePrev       = prev
   , ceStatus     = StatusHeaderValid
   , ceMedianTime = ts
+  , ceSequenceId = fromIntegral height
   }
 
 -- ============================================================
