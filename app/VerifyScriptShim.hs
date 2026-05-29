@@ -68,6 +68,7 @@ import Control.Exception (evaluate, try, SomeException)
 import Haskoin.Types
   (Tx(..), TxIn(..), TxOut(..), OutPoint(..), TxId(..), Hash256(..))
 import Haskoin.Crypto (computeTxId)
+import Haskoin.Consensus (validateTransaction)
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
   , verifyScriptWithFlags )
@@ -197,6 +198,7 @@ processLine line =
                  _          -> "verifyscript"
       in case op of
            "verifytx" -> processVerifyTx line
+           "checktx"  -> processCheckTx line
            _          -> processVerifyScript line
 
 processVerifyScript :: BL.ByteString -> IO String
@@ -359,6 +361,65 @@ verifyAllInputs flags tx spentScripts spentAmounts =
     -- spentScripts/spentAmounts are derived 1:1 from txInputs, so the
     -- ragged case is unreachable; close it explicitly rather than crash.
     go i _ _ = Left (i, "internal: input/prevout length mismatch")
+
+------------------------------------------------------------------------------
+-- checktx op (tx_valid.json / tx_invalid.json BADTX rows —
+-- CheckTransaction-level, context-free structural validation; tx_check.cpp).
+--
+-- Unlike verifytx (per-input VerifyScript), the 9 BADTX rows
+-- (no-inputs / no-outputs / dup-inputs / bad-amount / oversize /
+-- null-prevout) are rejected by Core BEFORE script verification, inside
+-- CheckTransaction. We delegate to haskoin's OWN context-free
+-- 'Haskoin.Consensus.validateTransaction' (Consensus.hs:1395, which mirrors
+-- bitcoin-core/src/consensus/tx_check.cpp::CheckTransaction: empty vin/vout,
+-- per-output value range + running MAX_MONEY total, duplicate inputs,
+-- oversize via non-witness size * WITNESS_SCALE_FACTOR vs MAX_BLOCK_WEIGHT,
+-- coinbase scriptSig length 2..100, non-coinbase null prevout). NO prevouts
+-- / flags / UTXO state needed — so a divergence here is a real haskoin
+-- CheckTransaction consensus bug, not a shim artifact.
+--
+--   request:  {"op":"checktx","tx_hex":"..."}
+--   response: {"valid":true}                   (CheckTransaction passes)
+--             {"valid":false,"reason":"..."}   (rejected)
+--             {"error":"..."}                  (could not deserialize)
+------------------------------------------------------------------------------
+
+newtype CheckTxRequest = CheckTxRequest { ctxTxHex :: T.Text }
+
+instance A.FromJSON CheckTxRequest where
+  parseJSON = A.withObject "CheckTxRequest" $ \o -> CheckTxRequest
+    <$> o .:? "tx_hex" A..!= ""
+
+processCheckTx :: BL.ByteString -> IO String
+processCheckTx line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareCheckTx req of
+      Left e   -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right tx -> do
+        r <- try (evaluate (forceEither (validateTransaction tx)))
+               :: IO (Either SomeException (Either String ()))
+        pure $ case r of
+          Left ex          ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Right ()) -> "{\"valid\":true}"
+          Right (Left err) ->
+            "{\"valid\":false,\"reason\":\"" <> escapeJson err <> "\"}"
+  where
+    forceEither x = case x of
+      Left s   -> Left $! (length s `seq` s)
+      Right () -> Right ()
+
+-- | Hex-decode + deserialize the tx with haskoin's own 'Tx' 'Serialize'
+-- instance (same path verifytx uses). A deserialize failure => {"error"}
+-- (driver treats that as a reject decision; never a fake CheckTransaction
+-- pass).
+prepareCheckTx :: CheckTxRequest -> Either String Tx
+prepareCheckTx req = do
+  txBytes <- decodeHex (ctxTxHex req)
+  case S.decode txBytes :: Either String Tx of
+    Right t -> Right t
+    Left e  -> Left ("tx deserialize: " <> e)
 
 main :: IO ()
 main = loop
