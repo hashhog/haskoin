@@ -1943,6 +1943,24 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
     unless (isCompressedPubKey pubkeyBytes) $
       Left "Witness pubkey not compressed"
 
+  -- SCRIPT_VERIFY_CONST_SCRIPTCODE: in legacy (BASE, non-witness) scripts the
+  -- signature is dropped from the scriptCode via FindAndDelete before sighash.
+  -- Core forbids the scriptCode actually containing the signature: if
+  -- FindAndDelete removes >= 1 occurrence and CONST_SCRIPTCODE is set, the
+  -- script fails with SIG_FINDANDDELETE.
+  --   int found = FindAndDelete(scriptCode, CScript() << vchSig);
+  --   if (found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+  --       return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE);
+  -- Reference: Bitcoin Core interpreter.cpp:330-332 (EvalChecksigPreTapscript).
+  -- Witness v0 / tapscript do NOT FindAndDelete, so this is BASE-only.
+  -- (fixes tx_invalid #190, #194, #195.)
+  when (not (seIsWitness env'')
+        && hasFlag (seFlags env'') VerifyConstScriptcode) $ do
+    let subscript = subscriptAfterCodeSep (seScriptCode env'') (seCodeSepPos env'')
+        found     = findAndDeleteCount subscript (encodePushData sigBytes)
+    when (found > 0) $
+      Left "SIG_FINDANDDELETE: signature found in scriptCode with CONST_SCRIPTCODE"
+
   -- Encoding checks happen BEFORE the empty sig shortcut, matching Bitcoin Core.
   -- CheckSignatureEncoding passes for empty sigs, then CheckPubKeyEncoding is checked.
   unless (BS.null sigBytes) $ do
@@ -2185,6 +2203,31 @@ execCheckMultiSig env = do
                          -- Then remove ALL signatures from the scriptCode
                          in foldl' (\s sig -> findAndDelete s (encodePushData sig)) sc sigs
 
+  -- SCRIPT_VERIFY_CONST_SCRIPTCODE (multisig): mirror the single-sig rule.
+  -- Core loops over every signature, FindAndDelete-ing it from the running
+  -- scriptCode; if any removal had found > 0 and CONST_SCRIPTCODE is set, the
+  -- script fails with SIG_FINDANDDELETE. BASE-only (witness v0 / tapscript do
+  -- not FindAndDelete).
+  --   for (int k = 0; k < nSigsCount; k++) {
+  --       int found = FindAndDelete(scriptCode, CScript() << vchSig);
+  --       if (found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+  --           return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE);
+  --   }
+  -- Reference: Bitcoin Core interpreter.cpp:1142-1150.
+  -- (fixes tx_invalid #197, #199.)
+  when (not (seIsWitness env5)
+        && hasFlag (seFlags env5) VerifyConstScriptcode) $ do
+    let subscript0 = subscriptAfterCodeSep (seScriptCode env5) (seCodeSepPos env5)
+        -- Accumulate FindAndDelete over the signatures, exactly like Core's
+        -- running scriptCode; reject if any step removes >= 1 occurrence.
+        step (sc, anyFound) sig =
+          let pat   = encodePushData sig
+              found = findAndDeleteCount sc pat
+          in (findAndDelete sc pat, anyFound || found > 0)
+        (_, anyFound) = foldl' step (subscript0, False) sigs
+    when anyFound $
+      Left "SIG_FINDANDDELETE: signature found in scriptCode with CONST_SCRIPTCODE"
+
   -- Verify signatures against pubkeys in order.
   -- Bitcoin Core's algorithm: two cursors walk forward through sigs and pubkeys.
   -- For each sig, try pubkeys from current position. If match, advance both.
@@ -2340,8 +2383,14 @@ execCheckSequenceVerify env = do
       if seqVal .&. 0x80000000 /= 0
         then Right env  -- Disabled, treated as NOP
         else do
-          -- Check tx version
-          when (txVersion (seTx env) < 2) $
+          -- Check tx version. Core compares the tx version as an UNSIGNED
+          -- 32-bit field: `if (txTo->version < 2) return false;` where
+          -- CTransaction::version is uint32_t (interpreter.cpp:1790,
+          -- CheckSequence). haskoin stores txVersion as Int32, so a tx with
+          -- version 0xFFFFFFFF deserializes to -1 and would wrongly compare
+          -- < 2. Reinterpret the bits as Word32 before the comparison so the
+          -- signedness matches Core (fixes tx_valid #165).
+          when ((fromIntegral (txVersion (seTx env)) :: Word32) < 2) $
             Left "CSV requires version >= 2"
 
           let inp = txInputs (seTx env) !! seInputIdx env
@@ -2601,8 +2650,14 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
   when (isP2SHPubKey && not (isPushOnly scriptSig)) $
     Left "P2SH scriptSig must be push-only"
 
-  -- Evaluate scriptSig
-  env1 <- evalScriptWithStack [] scriptSig env
+  -- Evaluate scriptSig. The scriptCode for any CHECKSIG/CHECKMULTISIG that
+  -- executes *inside* the scriptSig must be the scriptSig itself (Core derives
+  -- it from pbegincodehash..pend of the currently-executing script), so that
+  -- the CONST_SCRIPTCODE FindAndDelete reject sees a signature embedded in the
+  -- scriptSig. Previously seScriptCode stayed pinned to the scriptPubKey for
+  -- both phases, so an embedded-sig scriptSig was wrongly accepted under
+  -- CONST_SCRIPTCODE (fixes tx_invalid #190, #194, #195).
+  env1 <- evalScriptWithStack [] scriptSig (env { seScriptCode = scriptSigBytes })
   let sigStack = seStack env1
       savedStack = sigStack  -- Save for P2SH
 
@@ -2610,9 +2665,13 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
   unless (null $ seIfStack env1) $
     Left "Unbalanced IF/ENDIF"
 
-  -- Clear altstack between scriptSig and scriptPubKey evaluation
-  -- Reset for scriptPubKey evaluation
-  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [], seAltStack = [] }
+  -- Clear altstack between scriptSig and scriptPubKey evaluation; restore the
+  -- scriptCode to the scriptPubKey for the scriptPubKey-execution phase
+  -- (and reset the codeseparator position, which is per-script).
+  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = []
+                  , seAltStack = []
+                  , seScriptCode = prevScriptPubKey
+                  , seCodeSepPos = 0xFFFFFFFF }
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
 
   unless (null $ seIfStack env3) $
@@ -2804,6 +2863,19 @@ verifyP2WSHWithFlags flags tx idx expectedHash amount = do
   -- Last item is the witness script
   let witnessScriptBytes = last witness
       stack = init witness
+
+  -- Disallow any INITIAL witness stack element > MAX_SCRIPT_ELEMENT_SIZE
+  -- (520 bytes). Core enforces this in VerifyWitnessProgram on the witness
+  -- stack (with the witness script already popped off) BEFORE running the
+  -- interpreter: interpreter.cpp:1858-1861
+  --   for (const valtype& elem : stack)
+  --     if (elem.size() > MAX_SCRIPT_ELEMENT_SIZE) -> SCRIPT_ERR_PUSH_SIZE
+  -- haskoin only enforced the 520-byte limit on push opcodes DURING
+  -- execution, never on the items the witness pushes onto the initial
+  -- stack, so an oversized initial element was wrongly accepted
+  -- (fixes tx_invalid #141).
+  when (any (\elem' -> BS.length elem' > tapMaxScriptElementSize) stack) $
+    Left "Witness stack item exceeds 520 bytes (PUSH_SIZE)"
 
   -- Verify script hash (single SHA256 for P2WSH)
   let actualHash = sha256 witnessScriptBytes

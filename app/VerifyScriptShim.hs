@@ -25,6 +25,30 @@
 --   response: {"result":true}                  (accept)
 --             {"result":false,"reason":"..."}  (reject)
 --             {"error":"..."}                  (could not evaluate)
+--
+-- Second op @verifytx@ (for tx_valid.json / tx_invalid.json): unlike
+-- @verifyscript@ (which rebuilds Core's synthetic credit/spend pair),
+-- these vectors give a REAL serialized multi-input tx, so the sighash
+-- must be computed over THAT tx. Mirrors
+-- bitcoin-core/src/test/transaction_tests.cpp::CheckTxScripts: deserialize
+-- tx_hex with haskoin's OWN tx deserializer (the 'Serialize' 'Tx' instance,
+-- which parses the segwit marker/flag + per-input witness), build the
+-- prevout->(scriptPubKey, amount) map, and for EACH input run haskoin's
+-- real 'verifyScriptWithFlags' against THE REAL TX. haskoin's interpreter
+-- sources the input's scriptSig from @txInScript (txInputs tx !! idx)@ and
+-- its witness from @txWitness tx !! idx@ (Script.hs:1210), so the legacy /
+-- BIP-143 / BIP-341 sighash commits to the actual surrounding tx. Valid
+-- iff ALL inputs pass; reject on the FIRST failing input (Core's loop is
+-- @i < vin.size() && tx_valid@).
+--
+--   request:  {"op":"verifytx",
+--              "tx_hex":"...",
+--              "prevouts":[{"txid":"<display-hex>","vout":N,
+--                           "scriptPubKey_hex":"...","amount_sats":0},...],
+--              "flags":["P2SH","WITNESS",...]}
+--   response: {"valid":true}                   (all inputs verify)
+--             {"valid":false,"reason":"..."}   (>=1 input failed)
+--             {"error":"..."}                  (could not evaluate)
 module Main where
 
 import qualified Data.Aeson as A
@@ -33,9 +57,11 @@ import Data.Aeson ((.:?))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.ByteString.Base16 as B16
+import qualified Data.Map.Strict as Map
+import qualified Data.Serialize as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Word (Word64)
+import Data.Word (Word32, Word64)
 import System.IO (hFlush, stdout, isEOF)
 import Control.Exception (evaluate, try, SomeException)
 
@@ -157,8 +183,24 @@ instance A.FromJSON Request where
     <*> o .:? "flags"           A..!= []
     where toW64 d = round (d :: Double)
 
+-- | Dispatch on the request's @op@ field (defaulting to @verifyscript@ for
+-- back-compat with the script_tests harness, which omits it for haskoin).
 processLine :: BL.ByteString -> IO String
 processLine line =
+  case A.eitherDecode line :: Either String A.Value of
+    Left e  -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right v ->
+      let op = case v of
+                 A.Object o -> case A.parseMaybe (.:? "op") o of
+                                 Just (Just (s :: T.Text)) -> s
+                                 _                          -> "verifyscript"
+                 _          -> "verifyscript"
+      in case op of
+           "verifytx" -> processVerifyTx line
+           _          -> processVerifyScript line
+
+processVerifyScript :: BL.ByteString -> IO String
+processVerifyScript line =
   case A.eitherDecode line of
     Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
     Right req -> case decodeReq req of
@@ -192,6 +234,131 @@ decodeReq req = do
   wit   <- traverse decodeHex (reqWitness req)
   flags <- buildFlags (reqFlags req)
   Right (ssig, spk, wit, reqAmount req, flags)
+
+------------------------------------------------------------------------------
+-- verifytx op (tx_valid.json / tx_invalid.json — REAL multi-input tx).
+--
+-- See transaction_tests.cpp::CheckTxScripts. The driver hands us a
+-- serialized tx + the prevout set; we deserialize with haskoin's own 'Tx'
+-- 'Serialize' instance (which parses segwit marker/flag + per-input
+-- witness), key the prevouts by (txid-wire-order, vout), assemble per-input
+-- spent_scripts/spent_amounts in the tx's INPUT order (BIP-341 commits to
+-- ALL prevouts), and run verifyScriptWithFlags per input over the real tx.
+------------------------------------------------------------------------------
+
+data Prevout = Prevout
+  { poTxidDisplayHex :: T.Text   -- DISPLAY-order hex (reverse for wire)
+  , poVout           :: Word32
+  , poSpkHex         :: T.Text
+  , poAmount         :: Word64
+  }
+
+instance A.FromJSON Prevout where
+  parseJSON = A.withObject "Prevout" $ \o -> Prevout
+    <$> o .:? "txid"            A..!= ""
+    <*> (toW32 <$> o .:? "vout" A..!= (0 :: Double))
+    <*> o .:? "scriptPubKey_hex" A..!= ""
+    <*> (toW64 <$> o .:? "amount_sats" A..!= (0 :: Double))
+    where
+      toW32 d = round (d :: Double)
+      toW64 d = round (d :: Double)
+
+data TxRequest = TxRequest
+  { reqTxHex    :: T.Text
+  , reqPrevouts :: [Prevout]
+  , reqTxFlags  :: [T.Text]
+  }
+
+instance A.FromJSON TxRequest where
+  parseJSON = A.withObject "TxRequest" $ \o -> TxRequest
+    <$> o .:? "tx_hex"   A..!= ""
+    <*> o .:? "prevouts" A..!= []
+    <*> o .:? "flags"    A..!= []
+
+-- | The display-order txid hex from the driver must be reversed to the
+-- wire-byte order that haskoin's deserialized 'OutPoint' carries (the
+-- 'Hash256' inside an 'OutPoint' is the raw little-endian-on-the-wire
+-- bytes; 'putByteString' emits them verbatim — Types.hs:56,170).
+displayHexToWireTxId :: T.Text -> Either String TxId
+displayHexToWireTxId t = do
+  raw <- decodeHex t
+  if BS.length raw /= 32
+    then Left ("prevout txid not 32 bytes: " <> show (BS.length raw))
+    else Right (TxId (Hash256 (BS.reverse raw)))
+
+processVerifyTx :: BL.ByteString -> IO String
+processVerifyTx line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareTx req of
+      Left e               -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right (tx, flags, spentScripts, spentAmounts) -> do
+        r <- try (evaluate (forceVerdict
+                    (verifyAllInputs flags tx spentScripts spentAmounts)))
+               :: IO (Either SomeException (Either (Int, String) ()))
+        pure $ case r of
+          Left ex            ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Right ())   -> "{\"valid\":true}"
+          Right (Left (i,e)) ->
+            "{\"valid\":false,\"reason\":\"input " <> show i <> ": "
+              <> escapeJson e <> "\"}"
+  where
+    forceVerdict v = case v of
+      Left (i, s) -> Left (i, length s `seq` s)
+      Right ()    -> Right ()
+
+-- | Decode + validate the tx request: hex-decode tx, deserialize with
+-- haskoin's 'Tx' 'Serialize', build the prevout map, then materialize the
+-- per-input spent_scripts/spent_amounts in input order. A prevout missing
+-- from the map => {"error"} (driver skips the row; never fake-pass).
+prepareTx :: TxRequest
+          -> Either String (Tx, ScriptFlags, [BS.ByteString], [Word64])
+prepareTx req = do
+  txBytes <- decodeHex (reqTxHex req)
+  tx      <- case S.decode txBytes :: Either String Tx of
+               Right t -> Right t
+               Left e  -> Left ("tx deserialize: " <> e)
+  flags   <- buildFlags (reqTxFlags req)
+  -- Build (TxId, vout) -> (scriptPubKey, amount) map from the request.
+  entries <- traverse mkEntry (reqPrevouts req)
+  let m = Map.fromList entries
+  -- Per-input spent_scripts / spent_amounts in the tx's OWN input order.
+  perInput <- traverse (lookupInput m) (txInputs tx)
+  let spentScripts = map fst perInput
+      spentAmounts = map snd perInput
+  Right (tx, flags, spentScripts, spentAmounts)
+  where
+    mkEntry p = do
+      txid <- displayHexToWireTxId (poTxidDisplayHex p)
+      spk  <- decodeHex (poSpkHex p)
+      Right ((txid, poVout p), (spk, poAmount p))
+    lookupInput m inp =
+      let op = txInPrevOutput inp
+          key = (outPointHash op, outPointIndex op)
+      in case Map.lookup key m of
+           Just sa -> Right sa
+           Nothing -> Left ("no prevout scriptPubKey for input "
+                            <> show key)
+
+-- | Loop EVERY input, running haskoin's real verifyScriptWithFlags over the
+-- REAL tx (it sources scriptSig + witness from the tx itself). Reject on
+-- the FIRST failing input, mirroring Core's short-circuit. Left carries the
+-- 0-based input index + reason.
+verifyAllInputs :: ScriptFlags -> Tx -> [BS.ByteString] -> [Word64]
+                -> Either (Int, String) ()
+verifyAllInputs flags tx spentScripts spentAmounts =
+    go 0 spentScripts spentAmounts
+  where
+    go _ [] [] = Right ()
+    go i (spk:spks) (amt:amts) =
+      case verifyScriptWithFlags flags tx i spk amt spentAmounts spentScripts of
+        Right True  -> go (i + 1) spks amts
+        Right False -> Left (i, "EVAL_FALSE")
+        Left err    -> Left (i, err)
+    -- spentScripts/spentAmounts are derived 1:1 from txInputs, so the
+    -- ragged case is unreachable; close it explicitly rather than crash.
+    go i _ _ = Left (i, "internal: input/prevout length mismatch")
 
 main :: IO ()
 main = loop
