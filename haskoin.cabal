@@ -275,6 +275,7 @@ executable verifyscript-shim
                , bytestring
                , aeson
                , base16-bytestring
+               , cereal
                , text
                , containers
   default-language: Haskell2010

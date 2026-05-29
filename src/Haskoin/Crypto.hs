@@ -53,6 +53,8 @@ module Haskoin.Crypto
   , txSigHashSegWit
     -- * Legacy sighash helpers
   , findAndDelete
+  , findAndDeleteCount
+  , subscriptAfterCodeSep
   , removeCodeSeparators
   , scriptCodeForSighash
   , encodePushData
@@ -1064,6 +1066,71 @@ findAndDelete script pattern
                     fromIntegral (BS.index rest 3) * 16777216
           in Just (len, 4)
       | otherwise = Nothing  -- Not a push data opcode
+
+-- | Count how many occurrences 'findAndDelete' would remove (the @found@
+-- value in Bitcoin Core's @FindAndDelete@, interpreter.cpp:229). Walks the
+-- script at opcode boundaries exactly like 'findAndDelete', but returns the
+-- match count instead of the rewritten script. Used to implement the
+-- SCRIPT_VERIFY_CONST_SCRIPTCODE reject rule (interpreter.cpp:331,1147):
+-- in legacy (BASE) scripts, if FindAndDelete removed >= 1 occurrence and the
+-- CONST_SCRIPTCODE flag is set, the script fails with SIG_FINDANDDELETE.
+findAndDeleteCount :: ByteString -> ByteString -> Int
+findAndDeleteCount script pattern
+  | BS.null pattern = 0
+  | otherwise = go script 0
+  where
+    patLen = BS.length pattern
+
+    go :: ByteString -> Int -> Int
+    go remaining found
+      | BS.null remaining = found
+      | otherwise =
+          let matchesHere = BS.length remaining >= patLen &&
+                            BS.take patLen remaining == pattern
+          in if matchesHere
+             then go (BS.drop patLen remaining) (found + 1)
+             else let (_, nextRemaining, _) = getNextOpcode remaining
+                  in go nextRemaining found
+
+    getNextOpcode :: ByteString -> (ByteString, ByteString, Int)
+    getNextOpcode bs
+      | BS.null bs = (BS.empty, BS.empty, 0)
+      | otherwise =
+          let op = BS.head bs
+          in case getPushDataLength op (BS.tail bs) of
+               Just (dataLen, prefixLen) ->
+                 let totalLen = 1 + prefixLen + dataLen
+                 in (BS.take totalLen bs, BS.drop totalLen bs, totalLen)
+               Nothing -> (BS.take 1 bs, BS.tail bs, 1)
+
+    getPushDataLength :: Word8 -> ByteString -> Maybe (Int, Int)
+    getPushDataLength op rest
+      | op <= 0x4b = Just (fromIntegral op, 0)
+      | op == 0x4c && not (BS.null rest) =
+          Just (fromIntegral (BS.head rest), 1)
+      | op == 0x4d && BS.length rest >= 2 =
+          let len = fromIntegral (BS.index rest 0) +
+                    fromIntegral (BS.index rest 1) * 256
+          in Just (len, 2)
+      | op == 0x4e && BS.length rest >= 4 =
+          let len = fromIntegral (BS.index rest 0) +
+                    fromIntegral (BS.index rest 1) * 256 +
+                    fromIntegral (BS.index rest 2) * 65536 +
+                    fromIntegral (BS.index rest 3) * 16777216
+          in Just (len, 4)
+      | otherwise = Nothing
+
+-- | The codeseparator-sliced subscript that Bitcoin Core's
+-- @EvalChecksigPreTapscript@ runs FindAndDelete over:
+-- @CScript scriptCode(pbegincodehash, pend)@ (interpreter.cpp:326) — i.e. the
+-- subscript from the byte just after the last executed OP_CODESEPARATOR to the
+-- end. Unlike 'scriptCodeForSighash' this does NOT strip OP_CODESEPARATOR
+-- bytes, matching Core's @found@ count for the CONST_SCRIPTCODE reject.
+subscriptAfterCodeSep :: ByteString -> Word32 -> ByteString
+subscriptAfterCodeSep subscript codeSepPos
+  | codeSepPos /= 0xFFFFFFFF && fromIntegral codeSepPos < BS.length subscript
+      = BS.drop (fromIntegral codeSepPos) subscript
+  | otherwise = subscript
 
 -- | Remove all OP_CODESEPARATOR (0xab) opcodes from a script
 -- This is used when preparing the scriptCode for legacy sighash computation
