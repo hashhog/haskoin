@@ -9397,7 +9397,7 @@ main = hspec $ do
             witness = [BS.singleton 0x02, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             scriptPubKey = encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+        case verifySegWitScriptWithFlags (flagSet [VerifyMinimalIf]) tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject 0x02 as OP_IF argument"
@@ -9413,7 +9413,7 @@ main = hspec $ do
             witness = [BS.singleton 0x00, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             scriptPubKey = encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+        case verifySegWitScriptWithFlags (flagSet [VerifyMinimalIf]) tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject 0x00 as OP_IF argument"
@@ -9429,7 +9429,7 @@ main = hspec $ do
             witness = [BS.pack [0x01, 0x00], witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             scriptPubKey = encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+        case verifySegWitScriptWithFlags (flagSet [VerifyMinimalIf]) tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject multi-byte OP_IF argument"
@@ -9461,7 +9461,7 @@ main = hspec $ do
             witness = [BS.singleton 0x02, witnessScript]
             tx = Tx 2 [txIn] [txOut] [witness] 0
             scriptPubKey = encodeP2WSH (Hash256 scriptHash)
-        case verifySegWitScriptWithFlags emptyFlags tx 0 (encodeScript scriptPubKey) 100000 of
+        case verifySegWitScriptWithFlags (flagSet [VerifyMinimalIf]) tx 0 (encodeScript scriptPubKey) 100000 of
           Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
           Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
           Right _ -> expectationFailure "Should reject 0x02 as OP_NOTIF argument"
@@ -9475,16 +9475,15 @@ main = hspec $ do
         -- 0x02 is truthy, should take IF branch -> OP_1 -> True
         evalScript dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
 
-      it "rejects non-minimal OP_IF argument with MinimalIf flag" $ do
-        -- When VerifyMinimalIf flag is set, even legacy scripts reject non-minimal
+      it "accepts non-minimal OP_IF argument even with MinimalIf flag (base never enforces — Core interpreter.cpp:614-626)" $ do
+        -- MINIMALIF is consensus only in tapscript and policy under witness-v0;
+        -- Core never checks it in BASE/legacy scripts, even when the flag is set.
         let scriptSig = Script [OP_PUSHDATA (BS.singleton 0x02) OPCODE]
             scriptPubKey = Script [OP_IF, OP_1, OP_ELSE, OP_0, OP_ENDIF]
             dummyTx = Tx 1 [] [] [] 0
             flags = flagSet [VerifyMinimalIf]
-        case evalScriptWithFlags flags dummyTx 0 0 scriptSig scriptPubKey of
-          Left err | "MINIMALIF" `T.isInfixOf` T.pack err -> return ()
-          Left err -> expectationFailure $ "Expected MINIMALIF error, got: " ++ err
-          Right _ -> expectationFailure "Should reject with MinimalIf flag"
+        -- 0x02 is truthy -> IF branch -> OP_1 -> True; MinimalIf is a no-op in base
+        evalScriptWithFlags flags dummyTx 0 0 scriptSig scriptPubKey `shouldBe` Right True
 
   -- BIP68 Sequence Lock Tests
   describe "BIP68 sequence lock constants" $ do
