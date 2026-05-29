@@ -2000,9 +2000,19 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
       let sigHashByte = BS.last sigBytes
           sigHashType = parseSigHashByte sigHashByte
 
-      -- Build scriptCode for sighash computation
+      -- Build scriptCode for sighash computation.
+      -- WITNESS_V0 (BIP-143): scriptCode = witnessScript sliced at the byte
+      -- position just after the most-recently-executed OP_CODESEPARATOR
+      -- (Core's CScript(pbegincodehash, pend), EvalChecksigPreTapscript →
+      -- SignatureHash, interpreter.cpp:326). NO FindAndDelete and NO
+      -- OP_CODESEPARATOR stripping for segwit-v0 — only the codesep slice.
+      -- (fixes BIP143 P2WSH OP_CODESEPARATOR tx_valid #222/#224/#226.)
+      -- LEGACY (BASE): slice at codesep, strip OP_CODESEPARATORs, then
+      -- FindAndDelete the signature.
       let scriptCode = if seIsWitness env''
-                       then seScriptCode env''
+                       then subscriptAfterCodeSep
+                              (seScriptCode env'')
+                              (seCodeSepPos env'')
                        else scriptCodeForSighash
                               (seScriptCode env'')
                               (seCodeSepPos env'')
@@ -2194,7 +2204,12 @@ execCheckMultiSig env = do
   -- 2. Remove all OP_CODESEPARATOR opcodes
   -- 3. Remove ALL signatures from the scriptCode (FindAndDelete)
   let baseScriptCode = if seIsWitness env5
-                       then seScriptCode env5  -- Witness v0: no FindAndDelete
+                       -- WITNESS_V0 (BIP-143): slice witnessScript at the byte
+                       -- position after the last executed OP_CODESEPARATOR; NO
+                       -- FindAndDelete, NO codesep stripping (interpreter.cpp:326,
+                       -- 1139 CScript(pbegincodehash, pend)).
+                       then subscriptAfterCodeSep (seScriptCode env5)
+                                                  (seCodeSepPos env5)
                        else
                          -- For legacy: start with CODESEP handling and remove CODESEPs
                          let sc = scriptCodeForSighash (seScriptCode env5)
