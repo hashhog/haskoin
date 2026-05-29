@@ -1502,11 +1502,11 @@ execIf :: Bool -> ScriptEnv -> Either String ScriptEnv
 execIf matchTrue env = do
   env' <- incOpCount env
   (top, env'') <- popStack env'
-  -- MINIMALIF check: enforce minimal IF/NOTIF inputs for witness scripts
-  -- In witness v0/v1 (tapscript), the argument must be exactly empty or [0x01]
-  -- Reference: Bitcoin Core interpreter.cpp OP_IF handler
-  -- MINIMALIF is mandatory in segwit (witness v0/v1), or when the flag is set
-  let minimalIfRequired = seIsWitness env'' || hasFlag (seFlags env'') VerifyMinimalIf
+  -- MINIMALIF check: the IF/NOTIF argument must be exactly empty or [0x01].
+  -- Reference: Bitcoin Core interpreter.cpp:614-626 (OP_IF handler).
+  -- Consensus in tapscript (always); policy under witness v0 (flag-gated);
+  -- never checked in base scripts.
+  let minimalIfRequired = seIsTapscript env'' || (seIsWitness env'' && hasFlag (seFlags env'') VerifyMinimalIf)
   -- Check for valid minimal IF argument when required
   _ <- if minimalIfRequired
        then case BS.unpack top of
