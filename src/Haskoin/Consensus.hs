@@ -61,6 +61,7 @@ module Haskoin.Consensus
     -- * Validation
   , validateTransaction
   , computeMerkleRoot
+  , computeMerkleRootMutated
     -- * AssumeValid
   , shouldSkipScripts
     -- * Transaction Finality
@@ -1354,25 +1355,61 @@ regtest = Network
 -- Merkle Root Computation
 --------------------------------------------------------------------------------
 
--- | Compute Merkle root from list of transaction IDs
--- Returns zero hash for empty list
+-- | Compute Merkle root from list of transaction IDs.
+-- Returns zero hash for empty list. This is the root-only projection of
+-- 'computeMerkleRootMutated' (which additionally reports the CVE-2012-2459
+-- mutation flag); the root bytes are byte-identical to the previous
+-- implementation.
 computeMerkleRoot :: [TxId] -> Hash256
-computeMerkleRoot [] = Hash256 (BS.replicate 32 0)
-computeMerkleRoot [TxId h] = h
-computeMerkleRoot txids =
+computeMerkleRoot = fst . computeMerkleRootMutated
+
+-- | Compute the Merkle root AND the CVE-2012-2459 mutation flag, mirroring
+-- Bitcoin Core's @ComputeMerkleRoot(std::vector<uint256> hashes, bool* mutated)@
+-- (bitcoin-core/src/consensus/merkle.cpp:46-63).
+--
+-- Core's mutation rule, per-level:
+--   1. At the TOP of each level-collapse iteration (BEFORE the odd-tail
+--      duplication and BEFORE any pairwise hashing), scan COMPLETE adjacent
+--      pairs only: @for (pos = 0; pos + 1 < size; pos += 2) if h[pos]==h[pos+1]@.
+--      The lone trailing element on an odd level (pos+1 == size) is NOT
+--      compared at this level.
+--   2. THEN, if the level size is odd, duplicate the last element
+--      (merkle.cpp:54-56) — that duplicate becomes an identical adjacent pair
+--      caught on the NEXT level's top-of-loop scan.
+--   3. Hash the pairs to form the next level; repeat while size > 1.
+--
+-- Scanning BEFORE the odd-dup and over complete pairs only is essential:
+-- doing it after duplication (or including the lone tail) would false-reject
+-- honest odd-N blocks. CheckBlock treats @mutated=True@ identically to a bad
+-- merkle root ("bad-txns-duplicate"); see 'validateFullBlock' step 3.
+computeMerkleRootMutated :: [TxId] -> (Hash256, Bool)
+computeMerkleRootMutated []        = (Hash256 (BS.replicate 32 0), False)
+computeMerkleRootMutated [TxId h]  = (h, False)
+computeMerkleRootMutated txids =
   let hashes = map (\(TxId h) -> h) txids
-  in merkleStep hashes
+  in merkleStep False hashes
   where
-    merkleStep :: [Hash256] -> Hash256
-    merkleStep [h] = h
-    merkleStep hs =
-      let -- If odd number of hashes, duplicate the last one
+    -- mutation: sticky accumulator carried across levels, exactly like Core's
+    -- @bool mutation@ local that persists through the while loop.
+    merkleStep :: Bool -> [Hash256] -> (Hash256, Bool)
+    merkleStep mutation [h] = (h, mutation)
+    merkleStep mutation hs =
+      let -- (1) Top-of-iteration scan over COMPLETE adjacent pairs, BEFORE the
+          --     odd-tail duplication. Lone trailing element is excluded.
+          mutation' = mutation || scanAdjacentPairs hs
+          -- (2) If odd number of hashes, duplicate the last one.
           hs' = if odd (length hs) then hs ++ [last hs] else hs
-          -- Pair up and hash
+          -- (3) Pair up and hash to form the next level.
           pairs = pairUp hs'
           nextLevel = map (\(Hash256 a, Hash256 b) ->
             doubleSHA256 (BS.append a b)) pairs
-      in merkleStep nextLevel
+      in merkleStep mutation' nextLevel
+
+    -- Core merkle.cpp:50-52 — only complete pairs (pos, pos+1) are compared;
+    -- a final odd element is skipped at THIS level.
+    scanAdjacentPairs :: [Hash256] -> Bool
+    scanAdjacentPairs (a:b:rest) = a == b || scanAdjacentPairs rest
+    scanAdjacentPairs _          = False   -- 0 or 1 element left: no complete pair
 
     pairUp :: [a] -> [(a, a)]
     pairUp [] = []
@@ -2478,9 +2515,18 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
   when (flagBIP65 flags && blockVer < 4) $
     Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
 
-  -- 3. Verify merkle root
-  let computedRoot = computeMerkleRoot (map computeTxId txns)
+  -- 3. Verify merkle root + CVE-2012-2459 mutation detection.
+  -- Bitcoin Core CheckBlock (validation.cpp:3850-3858) calls
+  -- BlockMerkleRoot(block, &mutated) and rejects with "bad-txns-duplicate"
+  -- when mutated is set — treating a duplicate-txid mutation identically to a
+  -- bad merkle root. Detection (consensus/merkle.cpp:46-63) scans complete
+  -- adjacent pairs at the top of each level BEFORE the odd-tail duplication;
+  -- see 'computeMerkleRootMutated'. We MUST reject on mutation even when the
+  -- recomputed root matches the header root, because a CVE-2012-2459 mutated
+  -- tx list produces the SAME root as the honest list.
+  let (computedRoot, merkleMutated) = computeMerkleRootMutated (map computeTxId txns)
   unless (computedRoot == bhMerkleRoot header) $ Left "Merkle root mismatch"
+  when merkleMutated $ Left "bad-txns-duplicate"
 
   -- 4. Check block weight (only after SegWit activation)
   when (flagSegWit flags && blockWeight block > maxBlockWeight) $
