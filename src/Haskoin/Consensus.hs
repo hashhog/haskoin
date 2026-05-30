@@ -1517,6 +1517,17 @@ data ConsensusFlags = ConsensusFlags
   , flagSegWit      :: !Bool    -- ^ Segregated Witness
   , flagTaproot     :: !Bool    -- ^ Taproot
   , flagNullDummy   :: !Bool    -- ^ NULLDUMMY (BIP-147) — consensus (Core MANDATORY set)
+  , flagCSV         :: !Bool    -- ^ OP_CHECKSEQUENCEVERIFY (BIP-68/112/113) —
+                                --   keyed off 'netCSVHeight', which on mainnet
+                                --   (419328) is EARLIER than 'netSegwitHeight'
+                                --   (481824).  Core's GetBlockScriptFlags
+                                --   (validation.cpp:2278-2281) gates
+                                --   SCRIPT_VERIFY_CHECKSEQUENCEVERIFY on
+                                --   DEPLOYMENT_CSV, NOT on segwit.  Was
+                                --   previously aliased to 'flagSegWit', which
+                                --   under-flagged OP_CSV as a NOP for the
+                                --   62,496-block CSV-only window
+                                --   (W132 BUG-1 P0-CONSENSUS).
   } deriving (Show, Generic)
 
 -- | Compute consensus flags for a given height based on network rules.
@@ -1530,6 +1541,7 @@ consensusFlagsAtHeight net h = ConsensusFlags
   , flagSegWit    = h >= netSegwitHeight net
   , flagNullDummy = h >= netSegwitHeight net
   , flagTaproot   = h >= netTaprootHeight net
+  , flagCSV       = h >= netCSVHeight net
   }
 
 -- | Convert ConsensusFlags to ScriptFlags for script verification.
@@ -1540,7 +1552,11 @@ consensusFlagsToScriptFlags cf = flagSet $ concat
   [ [VerifyP2SH]  -- P2SH is always enabled (post BIP-16)
   , [VerifyDERSig | flagBIP66 cf]
   , [VerifyCheckLockTimeVerify | flagBIP65 cf]
-  , [VerifyCheckSequenceVerify | flagSegWit cf]  -- CSV activated with SegWit
+  , [VerifyCheckSequenceVerify | flagCSV cf]     -- CSV (BIP-112) gated by
+                                                 -- netCSVHeight, EARLIER than
+                                                 -- segwit on mainnet — matches
+                                                 -- Core GetBlockScriptFlags
+                                                 -- DEPLOYMENT_CSV gate.
   , [VerifyWitness | flagSegWit cf]
   , [VerifyNullDummy | flagNullDummy cf]
   , [VerifyTaproot | flagTaproot cf]
@@ -2726,6 +2742,7 @@ consensusFlagsToWord32 cf =
   .|. (if flagSegWit cf then 8 else 0)
   .|. (if flagTaproot cf then 16 else 0)
   .|. (if flagNullDummy cf then 32 else 0)
+  .|. (if flagCSV cf then 64 else 0)
 
 --------------------------------------------------------------------------------
 -- Process-wide Signature Verification Cache
@@ -4839,7 +4856,7 @@ performReorg net cache db hc oldTip newTip = do
             Left err -> return $ Left err
             Right () -> do
               -- Connect blocks from fork to new tip
-              connectChain cache db hc (ceHash forkEntry) newTip
+              connectChain net cache db hc (ceHash forkEntry) newTip
 
 -- | Disconnect blocks from current hash back to target hash.
 -- Uses undo data to restore spent UTXOs at each step.
@@ -4864,9 +4881,29 @@ disconnectChain cache db _hc currentHash targetHash
 
 -- | Connect blocks from fork point to new tip.
 -- Applies each block in order, generating and storing undo data.
-connectChain :: UTXOCache -> HaskoinDB -> HeaderChain
+--
+-- REORG SCRIPT VERIFICATION (Core parity):
+--   Core connects a side-branch block during a reorg through exactly the
+--   same path the main chain uses: @ActivateBestChainStep@ → @ConnectTip@
+--   → @ConnectBlock@, which calls @CheckInputScripts@ under the
+--   per-height @GetBlockScriptFlags@ (validation.cpp:2250-2289).  A
+--   side-branch block with MORE work but an INVALID input script must be
+--   rejected and the reorg aborted, NOT silently accepted.
+--
+--   Pre-fix, this path applied blocks with 'applyBlock' (the cache-only
+--   UTXO/value/sigop analog of 'connectBlock') which performs NO script
+--   verification — a chain-split-class false-accept: a heavier fork whose
+--   scripts Core rejects would be adopted as the active tip.  We now run
+--   'validateFullBlock' (with @skipScripts = False@) against each
+--   side-branch block BEFORE 'applyBlock' mutates the cache, mirroring
+--   rustoshi (chain_state.rs reorganize → connect_block_with_sequence_locks)
+--   and blockbrew (ReorgTo → ConnectBlock).  Script verification runs via
+--   'validateBlockTransactions' → 'validateSingleTx' → 'verifyScriptWithFlags'
+--   under 'consensusFlagsAtHeight' for the block's height — the SAME flag
+--   computer + verifier the straight-line connect path uses.
+connectChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
              -> BlockHash -> BlockHash -> IO (Either String ())
-connectChain cache db hc fromHash toHash = do
+connectChain net cache db hc fromHash toHash = do
   -- Build list of blocks to connect (from fork to new tip)
   entries <- readTVarIO (hcEntries hc)
   let path = buildPath entries toHash fromHash []
@@ -4878,7 +4915,6 @@ connectChain cache db hc fromHash toHash = do
         case Map.lookup h byHeight >>= (`Map.lookup` ents) of
           Just ce -> return $ ceMedianTime ce
           Nothing -> return 0  -- Fallback for missing data
-  -- Use the network from the header chain context (default to mainnet)
   results <- forM path $ \ce -> do
     mBlock <- getBlock db (ceHash ce)
     case mBlock of
@@ -4888,13 +4924,37 @@ connectChain cache db hc fromHash toHash = do
         prevBlockMTP <- case cePrev ce >>= (`Map.lookup` entries) of
           Just prevCe -> return $ ceMedianTime prevCe
           Nothing -> return 0  -- Genesis or missing parent
-        result <- applyBlock cache mainnet block (ceHeight ce) prevBlockMTP getMTP
-        case result of
-          Left err -> return $ Left err
-          Right undoData -> do
-            -- Store undo data for this block
-            putUndoData db (ceHash ce) undoData
-            return (Right ())
+
+        -- FULL SCRIPT-VERIFYING VALIDATION of the side-branch block, BEFORE
+        -- 'applyBlock' spends its inputs from the cache.  This is the reorg
+        -- analog of the main path's 'validateFullBlockIO' gate (Sync.hs:403,
+        -- BlockTemplate.hs:544).  Build the spent-prevout 'Coin' map from the
+        -- post-disconnect / mid-connect cache (the same view 'applyBlock'
+        -- reads), then run the height-correct consensus checks INCLUDING
+        -- per-input 'verifyScriptWithFlags'.
+        spentRes <- buildReorgSpentCoinMap cache block (ceHeight ce)
+        case spentRes of
+          Left e -> return (Left e)
+          Right spentCoins -> do
+            -- csHeight + 1 == this block's height (validateFullBlock derives
+            -- the connect height internally), csMedianTime == prev block MTP
+            -- (BIP-113 / timestamp cutoff).  Flags computed for ceHeight ce.
+            let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader block))
+                                0 prevBlockMTP
+                                (consensusFlagsAtHeight net (ceHeight ce))
+            case validateFullBlock net cs False block spentCoins of
+              Left err -> return $ Left $
+                "reorg connect: block " ++ show (ceHash ce)
+                ++ " (height " ++ show (ceHeight ce)
+                ++ ") failed full validation: " ++ err
+              Right () -> do
+                result <- applyBlock cache net block (ceHeight ce) prevBlockMTP getMTP
+                case result of
+                  Left err -> return $ Left err
+                  Right undoData -> do
+                    -- Store undo data for this block
+                    putUndoData db (ceHash ce) undoData
+                    return (Right ())
   return $ sequence_ results
   where
     -- Build the path from toHash back to fromHash, then reverse
@@ -4906,6 +4966,33 @@ connectChain cache db hc fromHash toHash = do
           Just ce -> case cePrev ce of
             Nothing -> acc  -- Reached genesis
             Just prevH -> buildPath ents prevH target (ce : acc)
+
+-- | Build the spent-prevout 'Coin' map for a side-branch block from the
+-- in-memory 'UTXOCache' as it stands BEFORE the block is applied (i.e. the
+-- post-disconnect / mid-connect chainstate during a reorg).  This is the
+-- input 'validateFullBlock' needs to run per-input script verification on a
+-- reorg connect — the same 'Map OutPoint Coin' shape the IBD / submitBlock
+-- paths build via 'buildUTXOMap' / 'buildBlockUTXOMap'.
+--
+-- Only prevouts already present in the cache are included.  Prevouts created
+-- earlier WITHIN the same block (intra-block spends) are intentionally
+-- absent: 'validateBlockTransactions' threads each tx's outputs into its
+-- working UTXO map as it processes the block, so those resolve there.  A
+-- prevout that is in neither the cache nor the block surfaces as a
+-- "Missing UTXO" rejection inside 'validateSingleTx', which is the correct
+-- consensus outcome.
+buildReorgSpentCoinMap :: UTXOCache -> Block -> Word32 -> IO (Either String (Map OutPoint Coin))
+buildReorgSpentCoinMap cache block _height = do
+  let nonCoinbase = drop 1 (blockTxns block)
+      prevouts    = [ txInPrevOutput inp | tx <- nonCoinbase, inp <- txInputs tx ]
+  pairs <- forM prevouts $ \op -> do
+    mEntry <- lookupUTXO cache op
+    case mEntry of
+      Just ue -> return [ (op, Coin { coinTxOut      = ueOutput ue
+                                    , coinHeight     = ueHeight ue
+                                    , coinIsCoinbase = ueCoinbase ue }) ]
+      Nothing -> return []  -- intra-block prevout (resolved by validateBlockTransactions)
+  return $ Right (Map.fromList (concat pairs))
 
 --------------------------------------------------------------------------------
 -- Checkpoint Enforcement
