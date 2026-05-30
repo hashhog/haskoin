@@ -61,14 +61,20 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Serialize as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Int (Int32)
 import Data.Word (Word32, Word64)
+import Numeric (readHex)
+import Text.Printf (printf)
 import System.IO (hFlush, stdout, isEOF)
 import Control.Exception (evaluate, try, SomeException)
 
 import Haskoin.Types
-  (Tx(..), TxIn(..), TxOut(..), OutPoint(..), TxId(..), Hash256(..))
+  ( Tx(..), TxIn(..), TxOut(..), OutPoint(..), TxId(..), Hash256(..)
+  , BlockHeader(..), BlockHash(..) )
 import Haskoin.Crypto (computeTxId)
-import Haskoin.Consensus (validateTransaction)
+import Haskoin.Consensus
+  ( validateTransaction, getNextWorkRequired, BlockIndex(..)
+  , Network, mainnet, testnet3, testnet4, regtest )
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
   , verifyScriptWithFlags )
@@ -199,6 +205,7 @@ processLine line =
       in case op of
            "verifytx" -> processVerifyTx line
            "checktx"  -> processCheckTx line
+           "nextwork" -> processNextWork line
            _          -> processVerifyScript line
 
 processVerifyScript :: BL.ByteString -> IO String
@@ -420,6 +427,143 @@ prepareCheckTx req = do
   case S.decode txBytes :: Either String Tx of
     Right t -> Right t
     Left e  -> Left ("tx deserialize: " <> e)
+
+------------------------------------------------------------------------------
+-- nextwork op (GetNextWorkRequired PoW differential — pow.cpp).
+--
+-- Drives haskoin's REAL 'Haskoin.Consensus.getNextWorkRequired' (the
+-- BlockIndex/chain-generic entrypoint at Consensus.hs:744 that handles
+-- retarget + the (interval-1) off-by-one + the timespan/4..*4 clamps +
+-- powLimit + the BIP-94 first-vs-last selection), NOT a value-based or
+-- legacy twin.
+--
+-- The driver hands us @last@ (= pindexLast, the tip the solver builds on,
+-- height H-1) and, only on retarget-boundary rows (H % 2016 == 0),
+-- @first@ (= the block at height H-2016, i.e. pindexLast.height-2015).
+--
+-- We reconstruct exactly the chain context Core's CalculateNextWorkRequired
+-- needs: getNextWorkRequired calls calculateNextWorkRequired, which does
+-- @getAncestorBI pindexLast (interval - 1)@ to find pindexFirst. With a
+-- 2-node BlockIndex chain (@last@ whose biPrev is @first@, and @first@ whose
+-- biPrev is Nothing), the 2015-step walk-back terminates at @first@ when it
+-- runs off the chain end (getAncestorBI returns the deepest node it reaches),
+-- so pindexFirst lands on @first@ exactly. For passthrough rows there is no
+-- retarget: getNextWorkRequired returns @last@'s bits directly (no ancestor
+-- walk), so a single-node chain (biPrev = Nothing) suffices.
+--
+-- The candidate BlockHeader carries bhTimestamp = block_time (only consulted
+-- by the testnet min-difficulty rule; mainnet ignores it). All other header
+-- fields are inert for the difficulty calc and use neutral placeholders.
+--
+--   request:  {"op":"nextwork","network":"mainnet","height":H,
+--              "block_time":<u32>,
+--              "last":{"height":<int>,"bits":"<8hex>","time":<u32>},
+--              "first":{"height":<int>,"bits":"<8hex>","time":<u32>}}  (boundary only)
+--   response: {"nbits":"<8hex>"}   (impl's REAL computed required nBits)
+--             {"error":"..."}      (could not compute -> driver SKIPS)
+------------------------------------------------------------------------------
+
+data NwBlock = NwBlock
+  { nwHeight :: Word32
+  , nwBits   :: T.Text   -- 8-lowercase-hex (Core getblockheader format)
+  , nwTime   :: Word32
+  }
+
+instance A.FromJSON NwBlock where
+  parseJSON = A.withObject "NwBlock" $ \o -> NwBlock
+    <$> (toW32 <$> o A..: "height")
+    <*> o A..: "bits"
+    <*> (toW32 <$> o A..: "time")
+    where toW32 d = round (d :: Double)
+
+data NextWorkRequest = NextWorkRequest
+  { nwNetwork   :: T.Text
+  , nwBlockTime :: Word32
+  , nwLast      :: NwBlock
+  , nwFirst     :: Maybe NwBlock   -- present ONLY on retarget-boundary rows
+  }
+
+instance A.FromJSON NextWorkRequest where
+  parseJSON = A.withObject "NextWorkRequest" $ \o -> NextWorkRequest
+    <$> o .:? "network"     A..!= "mainnet"
+    <*> (toW32 <$> o .:? "block_time" A..!= (0 :: Double))
+    <*> o A..: "last"
+    <*> o .:? "first"
+    where toW32 d = round (d :: Double)
+
+-- | Map the network string to the haskoin 'Network'. Unknown => Left so the
+-- shim emits {"error"} and the driver SKIPS (never a faked nBits).
+mapNetwork :: T.Text -> Either String Network
+mapNetwork t = case t of
+  "mainnet"  -> Right mainnet
+  "testnet"  -> Right testnet3
+  "testnet3" -> Right testnet3
+  "testnet4" -> Right testnet4
+  "regtest"  -> Right regtest
+  other      -> Left ("unknown network: " <> T.unpack other)
+
+-- | Parse 8-lowercase-hex compact bits (getblockheader format) to Word32.
+parseBits :: T.Text -> Either String Word32
+parseBits t = case readHex (T.unpack t) of
+  [(v, "")] | v >= 0 && v <= 0xffffffff -> Right (fromIntegral (v :: Integer))
+  _                                     -> Left ("bad bits hex: " <> T.unpack t)
+
+-- | Format a Word32 compact-bits value as 8-lowercase-hex (Core format).
+formatBits :: Word32 -> String
+formatBits = printf "%08x"
+
+-- | A neutral BlockIndex node. Only height/bits/timestamp/prev are consulted
+-- by the difficulty path; hash + version are inert placeholders.
+mkBI :: Word32 -> Word32 -> Word32 -> Maybe BlockIndex -> BlockIndex
+mkBI h bits ts prev = BlockIndex
+  { biHeight    = h
+  , biBits      = bits
+  , biTimestamp = ts
+  , biVersion   = 0
+  , biHash      = BlockHash (Hash256 (BS.replicate 32 0))
+  , biPrev      = prev
+  }
+
+processNextWork :: BL.ByteString -> IO String
+processNextWork line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareNextWork req of
+      Left e   -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right (net, pindexLast, candidate) -> do
+        r <- try (evaluate (getNextWorkRequired net pindexLast candidate))
+               :: IO (Either SomeException Word32)
+        pure $ case r of
+          Left ex   ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right nb  ->
+            "{\"nbits\":\"" <> formatBits nb <> "\"}"
+
+-- | Build the (Network, pindexLast, candidate header) triple. On boundary
+-- rows the @first@ block becomes pindexLast's biPrev so the impl's
+-- getAncestorBI walk-back lands on it; on passthrough rows pindexLast has no
+-- prev (no ancestor walk happens). A missing/garbled field => Left (skip).
+prepareNextWork :: NextWorkRequest
+                -> Either String (Network, BlockIndex, BlockHeader)
+prepareNextWork req = do
+  net      <- mapNetwork (nwNetwork req)
+  let lastB = nwLast req
+  lastBits <- parseBits (nwBits lastB)
+  prevNode <- case nwFirst req of
+    Nothing -> Right Nothing
+    Just f  -> do
+      fBits <- parseBits (nwBits f)
+      Right (Just (mkBI (nwHeight f) fBits (nwTime f) Nothing))
+  let pindexLast = mkBI (nwHeight lastB) lastBits (nwTime lastB) prevNode
+      candidate  = BlockHeader
+        { bhVersion    = 0 :: Int32
+        , bhPrevBlock  = biHash pindexLast
+        , bhMerkleRoot = Hash256 (BS.replicate 32 0)
+        , bhTimestamp  = nwBlockTime req   -- testnet min-diff only; mainnet ignores
+        , bhBits       = lastBits          -- placeholder; computed value is what we return
+        , bhNonce      = 0
+        }
+  Right (net, pindexLast, candidate)
 
 main :: IO ()
 main = loop
