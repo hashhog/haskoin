@@ -1143,34 +1143,63 @@ buildReorgBatch net db cache hc disList disUndos conList = do
           case spentRes of
             Left e        -> return (Left e)
             Right spentUtxos -> do
-              let blockOps = buildConnectBlockOps n blk (ceHeight ce) spentUtxos
-                  -- Newly created (non-unspendable) UTXOs go into
-                  -- overlay so a follow-on connect block in the
-                  -- same reorg can spend them.
-                  txids = map computeTxId txns
-                  coinbaseFlag txIdx = txIdx == (0 :: Int)
-                  created =
-                    [ ( OutPoint txid (fromIntegral i)
-                      , Coin txout (ceHeight ce) (coinbaseFlag txIdx)
-                      )
-                    | (txIdx, txid, tx) <- zip3 [0..] txids txns
-                    , (i, txout) <- zip [0..] (txOutputs tx)
-                    , not (isUnspendable (txOutScript txout))
-                    ]
-                  ov' = ov
-                    { overlayAdded =
-                        foldr (\(op, c') m -> Map.insert op c' m)
-                              (overlayAdded ov) created
-                    -- Inputs are now spent in the virtual world.
-                    , overlaySpent =
-                        foldr Set.insert (overlaySpent ov) prevouts
-                    }
-                  ov'' = ov'
-                    { overlayAdded =
-                        foldr (\op m -> Map.delete op m)
-                              (overlayAdded ov') prevouts
-                    }
-              buildConnectChain c dbh hc' n rest ov'' (ops ++ blockOps)
+              -- REORG SCRIPT VERIFICATION (Core parity): a side-branch block
+              -- that becomes the new active tip must be connected through the
+              -- SAME full-validation path the main chain uses
+              -- (Core ActivateBestChainStep → ConnectTip → ConnectBlock →
+              -- CheckInputScripts under GetBlockScriptFlags).  Pre-fix this
+              -- arm only built UTXO 'BatchOp's via 'buildConnectBlockOps' and
+              -- NEVER verified scripts — a chain-split-class false-accept: a
+              -- heavier fork whose input scripts Core rejects would be adopted
+              -- as the active tip.  We now run the height-correct
+              -- 'validateFullBlock' (skipScripts=False) on each side-branch
+              -- block BEFORE building its connect ops, mirroring rustoshi
+              -- (reorganize → connect_block_with_sequence_locks) and blockbrew
+              -- (ReorgTo → ConnectBlock).  'spentUtxos' is the overlay→cache→
+              -- disk-resolved prevout map; intra-block spends are threaded by
+              -- 'validateBlockTransactions' itself.  csMedianTime = parent MTP
+              -- (BIP-113 / nLockTime cutoff); csHeight+1 == this block height.
+              let parentMTP = case cePrev ce >>= (`Map.lookup` entries) of
+                                Just prevCe -> ceMedianTime prevCe
+                                Nothing     -> 0   -- genesis / missing parent
+                  csReorg   = ChainState (ceHeight ce - 1)
+                                         (bhPrevBlock (blockHeader blk))
+                                         0 parentMTP
+                                         (consensusFlagsAtHeight n (ceHeight ce))
+              case validateFullBlock n csReorg False blk spentUtxos of
+                Left err -> return $ Left $
+                  "reorg connect: block " ++ show bh
+                  ++ " (height " ++ show (ceHeight ce)
+                  ++ ") failed full validation: " ++ err
+                Right () -> do
+                  let blockOps = buildConnectBlockOps n blk (ceHeight ce) spentUtxos
+                      -- Newly created (non-unspendable) UTXOs go into
+                      -- overlay so a follow-on connect block in the
+                      -- same reorg can spend them.
+                      txids = map computeTxId txns
+                      coinbaseFlag txIdx = txIdx == (0 :: Int)
+                      created =
+                        [ ( OutPoint txid (fromIntegral i)
+                          , Coin txout (ceHeight ce) (coinbaseFlag txIdx)
+                          )
+                        | (txIdx, txid, tx) <- zip3 [0..] txids txns
+                        , (i, txout) <- zip [0..] (txOutputs tx)
+                        , not (isUnspendable (txOutScript txout))
+                        ]
+                      ov' = ov
+                        { overlayAdded =
+                            foldr (\(op, c') m -> Map.insert op c' m)
+                                  (overlayAdded ov) created
+                        -- Inputs are now spent in the virtual world.
+                        , overlaySpent =
+                            foldr Set.insert (overlaySpent ov) prevouts
+                        }
+                      ov'' = ov'
+                        { overlayAdded =
+                            foldr (\op m -> Map.delete op m)
+                                  (overlayAdded ov') prevouts
+                        }
+                  buildConnectChain c dbh hc' n rest ov'' (ops ++ blockOps)
 
 -- | Build a UTXO map for block validation.
 --
