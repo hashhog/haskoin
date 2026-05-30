@@ -184,6 +184,14 @@ data NodeOptions = NodeOptions
   , noRpcTlsKey          :: !(Maybe FilePath)
     -- ^ @--rpc-tls-key=\<file\>@: PEM private key matching
     -- @--rpc-tls-cert@. See 'noRpcTlsCert' for the full contract.
+  , noNoDnsSeed          :: !Bool
+    -- ^ @--nodnsseed@ (Bitcoin Core @-dnsseed=0@): suppress DNS seed
+    --   resolution independently of @--connect@.  AddrMan / anchors /
+    --   addr gossip still drive auto-outbound, but 'discoverPeers' is
+    --   never called.  When @--connect@ peers are given, DNS is
+    --   suppressed regardless of this flag (Core's @-connect@ implies
+    --   @-dnsseed=0@).  Mirrors clearbit's standalone @--nodnsseed@.
+    --   Default: 'False' (DNS seeding on, Core DEFAULT_DNSSEED = true).
   } deriving (Show)
 
 data WalletCommand
@@ -330,6 +338,12 @@ parseNodeOptions = NodeOptions
   <*> optional (strOption (long "rpc-tls-key" <> metavar "PATH"
         <> help "PEM private key for HTTPS termination. Pair with \
                 \--rpc-tls-cert."))
+  <*> switch (long "nodnsseed"
+        <> help "Disable DNS seed resolution (Bitcoin Core -dnsseed=0). \
+                \AddrMan/anchors/addr-gossip still drive auto-outbound, \
+                \but DNS seeds are never queried. When --connect peers \
+                \are given, DNS is suppressed regardless of this flag. \
+                \Default: off (DNS seeding on).")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -555,6 +569,12 @@ applyConfigOverlay cm n = n
   -- noConnect (peer list) and noDebug are list-valued: append from conf.
   , noConnect    = noConnect n ++ maybe [] (splitCsv) (Daemon.configLookup "connect" cm)
   , noDebug      = noDebug n ++ maybe [] (splitCsv) (Daemon.configLookup "debug" cm)
+  -- --nodnsseed / -dnsseed=0: conf overlay accepts dnsseed=0 (Core
+  -- naming) when the CLI flag is absent.  configLookupBool "dnsseed"
+  -- defaults True; we invert it to the "no DNS" flag.
+  , noNoDnsSeed  = if noNoDnsSeed n
+                     then True
+                     else not (Daemon.configLookupBool "dnsseed" True cm)
   -- Pass-through (not in conf overlay).
   , noConfFile   = noConfFile n
   }
@@ -1312,11 +1332,55 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     when (isJust mI2pSam) $ putStrLn $ "W117: I2P (.i2p) reachable via SAM "
                                     ++ show (fromJust mI2pSam)
     when noCjdnsReachable $ putStrLn "W117: CJDNS (fc00::/8) marked reachable"
+
+    -- Bitcoin Core @-connect=<ip:port>@ peer pinning.  Resolve every
+    -- clearnet @--connect@ entry to a concrete 'SockAddr' here, ONCE,
+    -- so 'peerManagerLoop' never does a host lookup in connect mode.
+    -- The resolved list feeds 'pmcConnectAddrs' which flips the peer
+    -- manager into connect-only mode: DNS seeds + addrman auto-outbound
+    -- are both suppressed and only these peers are (re)dialed (mirrors
+    -- clearbit peer.zig:7009 + 7050 and Core's @-connect@ which implies
+    -- @-dnsseed=0@).  Privacy-network (.onion/.i2p) @--connect@ entries
+    -- keep their existing 'tryConnectByHost' dispatch below and are NOT
+    -- added to 'pmcConnectAddrs' (they cannot be dialed as a plain
+    -- SockAddr); but their presence still enables connect-only mode.
+    let connectClearnet = [ (h, p)
+                          | c <- noConnect
+                          , let (h, p) = case break (== ':') c of
+                                  (h', ':':ps) -> (h', ps)
+                                  (h', _)      -> (h', show (netDefaultPort net))
+                          , not (isOnionAddress h)
+                          , not (isI2PAddress h)
+                          , case reads p of [(_ :: Int, "")] -> True; _ -> False ]
+    resolvedConnectAddrs <- fmap concat $ forM connectClearnet $ \(h, p) ->
+      (map NS.addrAddress
+        <$> (NS.getAddrInfo Nothing (Just h) (Just p) :: IO [NS.AddrInfo]))
+        `catch` (\(e :: SomeException) -> do
+            putStrLn $ "WARNING: --connect peer " ++ h ++ ":" ++ p
+                    ++ " did not resolve (" ++ show e ++ "); skipping"
+            return [])
+    -- Connect mode is active whenever ANY --connect peer was supplied
+    -- (clearnet OR privacy-network).  Core's -connect disables DNS even
+    -- if the only pinned peer is a .onion; honour that.
+    let connectModeActive = not (null noConnect)
+    when connectModeActive $
+      putStrLn $ "-connect: peer-pinning ON ("
+              ++ show (length resolvedConnectAddrs)
+              ++ " clearnet addr(s) resolved); DNS seeds + auto-outbound "
+              ++ "disabled, dialing only pinned peers"
+    -- --nodnsseed (or -connect) suppresses DNS seed resolution.
+    let dnsSeedEnabled = not noNoDnsSeed && not connectModeActive
+    when (noNoDnsSeed && not connectModeActive) $
+      putStrLn "--nodnsseed: DNS seed resolution disabled"
+
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
           , pmcPruneMode   = pruneOn
+          -- -connect peer pinning + -dnsseed gate (see resolution above).
+          , pmcConnectAddrs = resolvedConnectAddrs
+          , pmcDnsSeed      = dnsSeedEnabled
           -- W117 DH-1: plumb privacy-network proxy + reachability.
           , pmcProxy          = mProxy
           , pmcOnion          = mOnion
