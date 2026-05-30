@@ -2931,6 +2931,28 @@ data PeerManagerConfig = PeerManagerConfig
     --   branches will refuse to serve.  Reference:
     --   bitcoin-core/src/protocol.h:321-323; init.cpp's
     --   IsBlockFilterIndexEnabled() gate at NODE_COMPACT_FILTERS.
+  , pmcConnectAddrs     :: ![SockAddr]
+    -- ^ Bitcoin Core @-connect=\<ip:port\>@ (repeatable): when this
+    --   list is non-empty, connect ONLY to these pinned peers.  This
+    --   flips the peer manager into "connect mode", mirroring Core's
+    --   @-connect@ (which implies @-dnsseed=0@ + no addrman/auto-
+    --   outbound dialing) and clearbit's @connect_address@ branch
+    --   (peer.zig:7009 / 7050).  In connect mode 'peerManagerLoop':
+    --     * does NOT resolve DNS seeds ('discoverPeers'),
+    --     * does NOT fill outbound slots from AddrMan, and
+    --     * reconnects only the pinned peers when they drop (the
+    --       equivalent of clearbit's @maintainManualConnections@).
+    --   Empty (the default) preserves the normal addrman-driven
+    --   auto-outbound behaviour.  The addresses are resolved once at
+    --   startup (app/Main.hs) so the loop never does host lookups.
+  , pmcDnsSeed          :: !Bool
+    -- ^ Bitcoin Core @-dnsseed@ (default true).  When 'False'
+    --   (@--nodnsseed@ / @-dnsseed=0@) DNS seed resolution is
+    --   suppressed *independently* of @-connect@ — addrman / anchors /
+    --   addr-gossip still drive auto-outbound, but 'discoverPeers' is
+    --   never called.  Mirrors clearbit's standalone @--nodnsseed@
+    --   (sets @dns_seed=false@).  Connect mode ('pmcConnectAddrs'
+    --   non-empty) additionally forces DNS off regardless of this flag.
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -2955,6 +2977,8 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcI2pSam           = Nothing
   , pmcCjdnsReachable   = False
   , pmcCompactFilters   = False  -- FIX-86: NODE_COMPACT_FILTERS off by default
+  , pmcConnectAddrs     = []     -- -connect: empty = normal addrman-driven outbound
+  , pmcDnsSeed          = True   -- -dnsseed (Core DEFAULT_DNSSEED = true)
   }
 
 -- | W117 DH-2 wiring: derive a 'NetworkReachability' record from the
@@ -3134,7 +3158,38 @@ peerManagerLoop pm = forever $ do
       totalTarget = fullRelayTarget + blockRelayTarget
 
   let outboundCount = fullRelayCount + blockRelayCount
-  when (outboundCount < totalTarget) $ do
+
+  -- Bitcoin Core @-connect@ / clearbit @connect_address@ branch
+  -- (peer.zig:7009 + 7050).  When the operator pinned one or more
+  -- peers via @-connect@, this node connects to ONLY those peers:
+  -- DNS seed resolution and addrman/auto-outbound dialing are both
+  -- suppressed.  We only (re)dial pinned peers that are not currently
+  -- connected — the equivalent of clearbit's @maintainManualConnections@,
+  -- which runs even in connect mode so a dropped trusted peer is
+  -- re-established.  Pinned addresses are resolved once at startup
+  -- (app/Main.hs), so no host lookup happens here.
+  let connectAddrs = pmcConnectAddrs (pmConfig pm)
+      connectMode  = not (null connectAddrs)
+  when connectMode $ do
+    banned   <- readTVarIO (pmBannedAddrs pm)
+    nowTs    <- (round <$> getPOSIXTime :: IO Int64)
+    let activeBans = Map.filter (> nowTs) banned
+        connected  = Map.keysSet peers
+        -- Pinned peers not already connected and not actively banned.
+        toDial = [ a | a <- connectAddrs
+                     , Set.notMember a connected
+                     , Map.notMember a activeBans ]
+    unless (null toDial) $
+      putStrLn $ "peerManagerLoop: -connect mode — (re)dialing "
+              ++ show (length toDial) ++ " pinned peer(s); "
+              ++ "DNS + auto-outbound suppressed"
+    -- tryConnectManual: full-relay + mark the peer manual so
+    -- 'misbehaving' never bans/drops the operator-pinned peer.
+    mapM_ (void . forkIO . tryConnectManual pm) toDial
+
+  -- Normal addrman-driven auto-outbound + DNS.  Suppressed entirely
+  -- in connect mode (Core's @-connect@ disables addrman dialing).
+  when (not connectMode && outboundCount < totalTarget) $ do
     banned   <- readTVarIO (pmBannedAddrs pm)
     lastDNS  <- readTVarIO (pmLastDNSRefresh pm)
     nowTs    <- (round <$> getPOSIXTime :: IO Int64)
@@ -3147,9 +3202,13 @@ peerManagerLoop pm = forever $ do
     -- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections.
 
     -- Re-populate AddrMan from DNS if it is empty OR every 120 seconds.
+    -- Gated on @pmcDnsSeed@ (Bitcoin Core @-dnsseed@; @--nodnsseed@ /
+    -- @-dnsseed=0@ sets it False).  In connect mode we never reach this
+    -- branch at all (the outer @if connectMode@ short-circuits it).
     amNewCnt   <- readTVarIO (amNewCount   (pmAddrMan pm))
     amTriedCnt <- readTVarIO (amTriedCount (pmAddrMan pm))
-    when (amNewCnt + amTriedCnt == 0 || nowTs - lastDNS > 120) $ do
+    when (pmcDnsSeed (pmConfig pm)
+          && (amNewCnt + amTriedCnt == 0 || nowTs - lastDNS > 120)) $ do
       putStrLn "peerManagerLoop: discovering peers via DNS..."
       discovered <- discoverPeers (pmNetwork pm)
       putStrLn $ "peerManagerLoop: discovered " ++ show (length discovered) ++ " peers"
@@ -3249,6 +3308,19 @@ tryConnect pm addr = tryConnectWithType pm addr False
 -- | Try to connect as a block-relay-only peer (no tx relay, no addr exchange)
 tryConnectBlockRelay :: PeerManager -> SockAddr -> IO ()
 tryConnectBlockRelay pm addr = tryConnectWithType pm addr True
+
+-- | Try to connect to a pinned @-connect@ peer (full-relay), then mark
+-- the resulting 'PeerInfo' as a manual connection (@piIsManual = True@)
+-- so 'misbehaving' will never ban or disconnect it.  Mirrors Bitcoin
+-- Core's @IsManualConn()@ guard (net_processing.cpp:5083) and the
+-- best-effort post-connect mark in 'addNodeConnect'.
+tryConnectManual :: PeerManager -> SockAddr -> IO ()
+tryConnectManual pm addr = do
+  tryConnect pm addr
+  peers <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peers of
+    Nothing -> return ()
+    Just pc -> atomically $ modifyTVar' (pcInfo pc) (\i -> i { piIsManual = True })
 
 -- | BIP-324 v2 outbound probe deadline.  Bitcoin Core's @net.cpp@ uses
 -- ~30s; we mirror that.  Short enough that a stalled remote doesn't wedge
