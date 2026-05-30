@@ -74,7 +74,8 @@ import Haskoin.Types
 import Haskoin.Crypto (computeTxId)
 import Haskoin.Consensus
   ( validateTransaction, getNextWorkRequired, BlockIndex(..)
-  , Network, mainnet, testnet3, testnet4, regtest )
+  , Network, mainnet, testnet3, testnet4, regtest
+  , computeMerkleRootMutated )
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
   , verifyScriptWithFlags )
@@ -203,10 +204,11 @@ processLine line =
                                  _                          -> "verifyscript"
                  _          -> "verifyscript"
       in case op of
-           "verifytx" -> processVerifyTx line
-           "checktx"  -> processCheckTx line
-           "nextwork" -> processNextWork line
-           _          -> processVerifyScript line
+           "verifytx"   -> processVerifyTx line
+           "checktx"    -> processCheckTx line
+           "nextwork"   -> processNextWork line
+           "merkleroot" -> processMerkleRoot line
+           _            -> processVerifyScript line
 
 processVerifyScript :: BL.ByteString -> IO String
 processVerifyScript line =
@@ -564,6 +566,64 @@ prepareNextWork req = do
         , bhNonce      = 0
         }
   Right (net, pindexLast, candidate)
+
+------------------------------------------------------------------------------
+-- merkleroot op (tx merkle root + CVE-2012-2459 mutation differential).
+--
+-- Drives haskoin's REAL merkle primitive
+-- 'Haskoin.Consensus.computeMerkleRoot' (Consensus.hs:1359,
+-- @computeMerkleRoot :: [TxId] -> Hash256@) — the same function
+-- validateBlock uses at Consensus.hs:2482 to recompute the header
+-- merkleroot. The driver hands txids in DISPLAY order (Core getblock
+-- convention, big-endian); we reverse each to internal wire-byte order
+-- (reusing the SAME 'displayHexToWireTxId' the verifytx op uses) before
+-- feeding computeMerkleRoot, then reverse the computed internal root back to
+-- display order to match Core's header merkleroot.
+--
+-- CVE-2012-2459 mutation: haskoin now detects this via
+-- 'Haskoin.Consensus.computeMerkleRootMutated' (Consensus.hs), which mirrors
+-- Core's @ComputeMerkleRoot(hashes, bool* mutated)@ (merkle.cpp:46-63):
+-- it scans COMPLETE adjacent pairs at the top of each level BEFORE the
+-- odd-tail duplication, so honest odd-N blocks do NOT false-reject while a
+-- duplicate-txid mutated list reports @mutated=true@. validateFullBlock
+-- (Consensus.hs step 3) rejects such a block with "bad-txns-duplicate",
+-- matching Core's CheckBlock (validation.cpp:3850-3858). The shim reports the
+-- REAL mutated flag this function returns (no longer hardcoded false).
+--
+--   request:  {"op":"merkleroot","txids":["<64-hex display-order>",...]}
+--   response: {"root":"<64-hex display-order>","mutated":<bool>}
+--             {"error":"..."}   (could not compute -> driver SKIPS)
+------------------------------------------------------------------------------
+
+newtype MerkleRootRequest = MerkleRootRequest { mrTxids :: [T.Text] }
+
+instance A.FromJSON MerkleRootRequest where
+  parseJSON = A.withObject "MerkleRootRequest" $ \o -> MerkleRootRequest
+    <$> o .:? "txids" A..!= []
+
+processMerkleRoot :: BL.ByteString -> IO String
+processMerkleRoot line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case traverse displayHexToWireTxId (mrTxids req) of
+      Left e      -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right txids -> do
+        -- haskoin's REAL merkle primitive; root is internal-order bytes and
+        -- the second component is the REAL CVE-2012-2459 mutation flag.
+        r <- try (evaluate (forceResult (computeMerkleRootMutated txids)))
+               :: IO (Either SomeException (Hash256, Bool))
+        pure $ case r of
+          Left ex                      ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Hash256 bs, mutated)  ->
+            -- reverse internal -> display order to match Core header merkleroot;
+            -- mutated reports haskoin's real adjacent-pair detection.
+            let displayHex = TE.decodeUtf8 (B16.encode (BS.reverse bs))
+                mutatedTok = if mutated then "true" else "false"
+            in "{\"root\":\"" <> T.unpack displayHex
+                 <> "\",\"mutated\":" <> mutatedTok <> "}"
+  where
+    forceResult res@(Hash256 bs, m) = BS.length bs `seq` m `seq` res
 
 main :: IO ()
 main = loop
