@@ -48,6 +48,7 @@ module Haskoin.Consensus
     -- * Block Reward
   , halvingInterval
   , blockReward
+  , blockRewardForNet
   , totalSupply
     -- * BIP Activation Heights
   , bip34Height
@@ -888,16 +889,36 @@ permittedDifficultyTransition net height oldNBits newNBits
 -- Initial reward: 50 BTC (5,000,000,000 satoshis)
 -- Halves every 210,000 blocks
 blockReward :: Word32 -> Word64
-blockReward height =
-  let halvings = height `div` halvingInterval
-  in if halvings >= 64
-     then 0  -- After 64 halvings, reward is 0
-     else 5000000000 `shiftR` fromIntegral halvings
+blockReward = blockRewardWithInterval halvingInterval
   -- Block 0-209999:      50 BTC
   -- Block 210000-419999: 25 BTC
   -- Block 420000-629999: 12.5 BTC
   -- Block 630000-839999: 6.25 BTC
   -- Block 840000-1049999: 3.125 BTC (April 2024)
+
+-- | Network-aware block subsidy.  Bitcoin Core's GetBlockSubsidy halves on
+-- @consensus.nSubsidyHalvingInterval@, which is 210000 on mainnet/testnet3/
+-- testnet4/signet but 150 on REGTEST (kernel/chainparams.cpp:535).  The
+-- value-blind 'blockReward' baked in the mainnet 210000 constant, so the
+-- coinbase-cap gate ('validateFullBlock' / 'applyBlock' — @blockReward height
+-- + fees@) computed the WRONG ceiling on regtest: at regtest height >= 150 the
+-- true subsidy has already halved to 25 BTC, but the 210000-constant gate still
+-- permitted a 50-BTC coinbase (a regtest-only "bad-cb-amount" false-accept).
+-- This delegates to the per-network 'netHalvingInterval', which already carries
+-- 150 for regtest and 210000 for mainnet/testnet — so mainnet/testnet output is
+-- byte-identical (default-preserving) and only regtest is corrected.
+-- Reference: bitcoin-core/src/validation.cpp GetBlockSubsidy +
+-- kernel/chainparams.cpp nSubsidyHalvingInterval.
+blockRewardForNet :: Network -> Word32 -> Word64
+blockRewardForNet net = blockRewardWithInterval (netHalvingInterval net)
+
+-- | Shared subsidy schedule parameterised on the halving interval.
+blockRewardWithInterval :: Word32 -> Word32 -> Word64
+blockRewardWithInterval interval height =
+  let halvings = height `div` interval
+  in if halvings >= 64
+     then 0  -- After 64 halvings, reward is 0
+     else 5000000000 `shiftR` fromIntegral halvings
 
 -- | Total supply of Bitcoin in satoshis
 -- Slightly less than 21 million BTC due to rounding
@@ -2662,7 +2683,11 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
   totalFees <- validateBlockTransactions flags skipScripts txns utxoMap
 
   -- 8. Coinbase value must not exceed reward + fees
-  let maxCoinbase = blockReward height + totalFees
+  -- Network-aware subsidy: regtest halves at 150 (Core
+  -- kernel/chainparams.cpp:535), mainnet/testnet at 210000 — see
+  -- 'blockRewardForNet'.  Using the value-blind 'blockReward' here computed the
+  -- wrong cap on regtest (a regtest-only bad-cb-amount false-accept).
+  let maxCoinbase = blockRewardForNet net height + totalFees
       coinbaseValue = sum $ map txOutValue (txOutputs (head txns))
   when (coinbaseValue > maxCoinbase) $
     Left "Coinbase value exceeds allowed amount"
@@ -4814,7 +4839,9 @@ applyBlock cache net block height prevBlockMTP getMTP = do
       -- W93 Gate (G6): bad-cb-amount — coinbase value out must not
       -- exceed blockReward + accumulated fees (Core 2611-2614).
       totalFees <- readIORef feesRef
-      let maxCoinbase  = blockReward height + totalFees
+      -- Network-aware subsidy (regtest halves at 150; mainnet/testnet 210000).
+      -- See 'blockRewardForNet' — value-blind 'blockReward' mis-capped regtest.
+      let maxCoinbase  = blockRewardForNet net height + totalFees
           cbValueOut   = sum (map txOutValue (txOutputs (head txns)))
       if cbValueOut > maxCoinbase
         then return $ Left $
