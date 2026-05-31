@@ -88,13 +88,14 @@ import Haskoin.Consensus
   , Network, mainnet, testnet3, testnet4, regtest
   , computeMerkleRootMutated, blockReward
   , checkTxInputsConnect, consensusFlagsAtHeight
-  , validateFullBlock, ChainState(..)
+  , validateFullBlock, validateFullBlockIO, ChainState(..)
+  , netBIP34Height, netBIP34Hash
   , applyBlock, disconnectBlockAt, DisconnectResult(..)
   , maxReorgDepth )
 import Haskoin.Storage
   ( HaskoinDB, DBConfig(..), defaultDBConfig, openDB, closeDB
   , UTXOEntry(..), UTXOCache(..), newUTXOCache, addUTXO
-  , Coin(..), putUTXOCoin
+  , Coin(..), putUTXOCoin, putBlockHeight
   , KeyPrefix(..), iterateWithPrefix
   , TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData, putUndoData )
 import Haskoin.Script
@@ -229,6 +230,7 @@ processLine line =
            "checktx"    -> processCheckTx line
            "connecttx"  -> processConnectTx line
            "checkblock" -> processCheckBlock line
+           "checkbip30" -> processCheckBIP30 line
            "reorg"      -> processReorg line
            "nextwork"   -> processNextWork line
            "merkleroot" -> processMerkleRoot line
@@ -631,6 +633,88 @@ prepareCheckBlock req = do
                , csFlags      = consensusFlagsAtHeight mainnet sh
                }
   Right (block, cs, cbSkipScripts req, coinMap)
+
+------------------------------------------------------------------------------
+-- checkbip30 op (BIP-30 / CVE-2012-1909 duplicate-txid coin-overwrite
+-- differential — ConnectBlock HaveCoin gate; validation.cpp:2467-2475 +
+-- IsBIP30Repeat:6189 + BIP34-implies-BIP30 short-circuit).
+--
+-- WHY A SEPARATE OP FROM checkblock: BIP-30 in haskoin lives in 'checkBIP30'
+-- (Consensus.hs:2721), which is DB-backed (it scans the UTXO set via
+-- @getUTXO db op@ and consults the BIP-34 anchor via @getBlockHeight db
+-- bip34Height@). It is NOT part of the PURE 'validateFullBlock' that the
+-- @checkblock@ op drives — the pure path takes a @Map OutPoint Coin@ and never
+-- runs the HaveCoin scan. The canonical entry point that sequences BIP-30
+-- BEFORE the pure block validation is 'validateFullBlockIO'
+-- (Consensus.hs:2802), the EXACT same call the IBD path (Sync.hs:399) and the
+-- submitblock path (BlockTemplate.hs:539) make. So this op drives
+-- 'validateFullBlockIO' over a REAL throwaway RocksDB seeded from the prevout
+-- set (reusing the reorg op's 'withTempDB' + 'putUTXOCoin' plumbing) — exactly
+-- the connect-time machinery, no BIP-30 reimplementation in the shim.
+--
+-- THE COLLISION CONSTRUCTION (corpus-driven, impl-agnostic): a coinbase tx has
+-- a deterministic txid T = dbl-sha256(non-witness coinbase bytes). The corpus
+-- seeds an UNSPENT coin at (T,0) as if a prior block created it; the block's
+-- own coinbase output (T,0) then collides, so 'checkBIP30''s HaveCoin((T,0))
+-- scan fires -> "bad-txns-BIP30".
+--
+-- BIP-34 short-circuit (N1): once BIP-34 is active (mainnet h>=227931) and the
+-- block at netBIP34Height carries the canonical netBIP34Hash, coinbase txids
+-- are unique by construction and the HaveCoin scan is SKIPPED (until
+-- h>=1,983,702). 'checkBIP30' confirms that anchor via @getBlockHeight db
+-- 227931@. So this op SEEDS the anchor (@putBlockHeight db (netBIP34Height
+-- mainnet) (netBIP34Hash mainnet)@) — without it, h=400000 would NOT short-
+-- circuit (anchor unconfirmed -> scan runs -> would over-enforce / reject N1).
+--
+-- spend_height threads through 'prepareCheckBlock': csHeight = spend_height-1,
+-- and 'validateFullBlockIO' derives the connect height as csHeight+1 =
+-- spend_height, which is the height fed to 'checkBIP30'. h=91000 is pre-BIP34
+-- (scan enforced -> R1 rejects); h=400000 is post-BIP34 (scan skipped -> N1
+-- accepts).
+--
+--   request:  {"op":"checkbip30","block_hex":"<FINAL block bytes>",
+--              "prevouts":[{"txid":"<display-hex>","vout":N,
+--                           "scriptPubKey_hex":"...","value_sats":<u64>,
+--                           "height":N,"is_coinbase":bool}, ...],
+--              "spend_height":<int>,"skip_pow":<bool>,"skip_scripts":<bool>}
+--   response: {"valid":true}                    (BIP-30 + block validation OK)
+--             {"valid":false,"reason":"..."}    (BIP-30 collision or other gate)
+--             {"error":"..."}                   (could not evaluate -> SKIP)
+------------------------------------------------------------------------------
+
+processCheckBIP30 :: BL.ByteString -> IO String
+processCheckBIP30 line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareCheckBlock req of
+      Left e                                  ->
+        pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right (block, cs, skipScripts, coinMap) -> do
+        r <- try (withTempDB $ \db -> do
+                    -- Seed the DB UTXO set from the prevout list — this is the
+                    -- view 'checkBIP30' scans via getUTXO. The seeded (T,0)
+                    -- coin (if present) is what triggers the HaveCoin collision.
+                    forM_ (Map.toList coinMap) $ \(op, coin) ->
+                      putUTXOCoin db op coin
+                    -- Seed the BIP-34 anchor so the post-BIP34 short-circuit
+                    -- ('checkBIP30' Gate 2) can confirm it via getBlockHeight.
+                    -- Inert pre-BIP34 (height <= bip34Height returns early).
+                    putBlockHeight db (netBIP34Height mainnet) (netBIP34Hash mainnet)
+                    -- Drive the REAL canonical connect-time entry point:
+                    -- checkBIP30 THEN validateFullBlock (Consensus.hs:2802).
+                    res <- validateFullBlockIO db mainnet cs skipScripts block coinMap
+                    evaluate (forceEither res))
+               :: IO (Either SomeException (Either String ()))
+        pure $ case r of
+          Left ex          ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Right ()) -> "{\"valid\":true}"
+          Right (Left err) ->
+            "{\"valid\":false,\"reason\":\"" <> escapeJson err <> "\"}"
+  where
+    forceEither x = case x of
+      Left s   -> Left $! (length s `seq` s)
+      Right () -> Right ()
 
 ------------------------------------------------------------------------------
 -- reorg op (DETERMINISTIC side-branch re-validation — ActivateBestChain
