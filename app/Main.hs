@@ -868,19 +868,25 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         Right snap -> do
           let m        = usMetadata snap
               baseHash = smBaseBlockHash m
-          -- BUG-8: base block must appear in the header chain.
-          -- Core validation.cpp:5613: "The base block header must appear
-          -- in the headers chain."
-          entries <- readTVarIO (hcEntries hc)
-          case Map.lookup baseHash entries of
+          -- Snapshot-bootstrap: resolve the base HEIGHT from the hardcoded
+          -- assumeutxo whitelist (keyed by base hash), NOT from the in-memory
+          -- header chain. Core requires the base header to already appear in
+          -- the headers chain (validation.cpp:5613), but on a wiped datadir the
+          -- chain holds only genesis — the genesis->base headers-first P2P sync
+          -- backfills the real header chain AFTER import (the proven
+          -- snapshot-bootstrap recipe; nimrod/camlcoin/clearbit do the same).
+          -- Validity is still pinned: the base hash must be a known assumeutxo
+          -- base, and verifySnapshot below checks the coin-set hash against the
+          -- hardcoded audHashSerialized.
+          case assumeUtxoForBlockHash net baseHash of
             Nothing -> do
               putStrLn $ "[--load-snapshot] FATAL: base block "
                       ++ show baseHash
-                      ++ " not found in header chain; "
-                      ++ "sync headers first or use the correct snapshot."
+                      ++ " is not a known assumeutxo base "
+                      ++ "(wrong snapshot for this network)."
               exitWith (ExitFailure 1)
-            Just baseEntry -> do
-              let baseHeight = ceHeight baseEntry
+            Just baseParams -> do
+              let baseHeight = aupHeight baseParams
               -- BUG-1: whitelist check — height must be in the
               -- hardcoded assumeutxo table.
               case checkAssumeutxoWhitelist net baseHeight of
@@ -1085,35 +1091,63 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
             Just ce -> return (Just (ceHeight ce))
             Nothing -> return (aupHeight <$> assumeUtxoForBlockHash net baseHash)
     connectedTipHeight <-
-      if headerTipHeight == 0
-        then return 0
-        else case mSnapshotBaseHeight of
-          -- Snapshot-bootstrapped chainstate: undo records (if any)
-          -- start at baseHeight+1.  The connected tip is at least
-          -- baseHeight.
-          Just baseHeight -> do
-            if baseHeight >= headerTipHeight
-              then return baseHeight
-              else do
-                aboveConnected <- blockIsConnected (baseHeight + 1)
-                if not aboveConnected
-                  then do
-                    putStrLn $ "Chainstate reconciliation: assumeUTXO "
-                            ++ "snapshot base at height " ++ show baseHeight
-                            ++ "; no post-snapshot blocks connected yet "
-                            ++ "(snapshot UTXO set has no undo records by "
-                            ++ "design) — treating the base as the "
-                            ++ "connected tip."
-                    return baseHeight
-                  else findConnectedTip (baseHeight + 1) headerTipHeight
-          -- Normal (genesis-up) chainstate: undo records start at 1.
-          Nothing -> do
-            -- If even block 1 has no undo record the UTXO set never
-            -- advanced past genesis; otherwise binary-search [1..tip].
-            oneConnected <- blockIsConnected 1
-            if not oneConnected
-              then return 0
-              else findConnectedTip 1 headerTipHeight
+      case mSnapshotBaseHeight of
+        -- Snapshot-bootstrapped chainstate: undo records (if any) start
+        -- at baseHeight+1.  The connected tip is at least baseHeight —
+        -- the imported UTXO set legitimately begins at the snapshot base.
+        --
+        -- W164 forward-sync-wedge fix: this case MUST take priority over
+        -- the @headerTipHeight == 0@ short-circuit below.  On a freshly
+        -- wiped datadir bootstrapped from a snapshot, 'initHeaderChainFromDB'
+        -- loads only genesis ("Loaded 0 headers"), so 'headerTipHeight' is 0
+        -- at this point — the genesis->base->tip header chain is backfilled
+        -- by the headers-first P2P sync that runs AFTER node startup, not
+        -- before this reconciliation.  The old @if headerTipHeight == 0
+        -- then return 0@ guard ran first and seeded connectedTipHeight=0
+        -- (=> nextBlockRef=1), so the block-gap kicker forever requested
+        -- block 1 on top of BestBlock=base and every getdata failed the
+        -- ConnectBlock G1 gate (validation.cpp:2333) — the node wedged at
+        -- the base with blocks=base / headers=tip / ibd=false.  The snapshot
+        -- base marker is the authoritative UTXO-set floor regardless of how
+        -- far the header chain has rebuilt, so honour it unconditionally.
+        Just baseHeight -> do
+          -- No usable header tip yet (genesis-only chain, headers still
+          -- backfilling): the connected tip is exactly the snapshot base.
+          if headerTipHeight <= baseHeight
+            then do
+              putStrLn $ "Chainstate reconciliation: assumeUTXO snapshot "
+                      ++ "base at height " ++ show baseHeight
+                      ++ "; header chain not yet rebuilt past the base "
+                      ++ "(header tip " ++ show headerTipHeight
+                      ++ ") — treating the base as the connected tip. The "
+                      ++ "headers-first P2P sync will backfill "
+                      ++ "genesis->base->tip; the block-gap kicker then "
+                      ++ "downloads bodies " ++ show (baseHeight + 1)
+                      ++ "..header-tip."
+              return baseHeight
+            else do
+              aboveConnected <- blockIsConnected (baseHeight + 1)
+              if not aboveConnected
+                then do
+                  putStrLn $ "Chainstate reconciliation: assumeUTXO "
+                          ++ "snapshot base at height " ++ show baseHeight
+                          ++ "; no post-snapshot blocks connected yet "
+                          ++ "(snapshot UTXO set has no undo records by "
+                          ++ "design) — treating the base as the "
+                          ++ "connected tip."
+                  return baseHeight
+                else findConnectedTip (baseHeight + 1) headerTipHeight
+        -- Normal (genesis-up) chainstate, no snapshot marker.
+        Nothing ->
+          if headerTipHeight == 0
+            then return 0
+            else do
+              -- If even block 1 has no undo record the UTXO set never
+              -- advanced past genesis; otherwise binary-search [1..tip].
+              oneConnected <- blockIsConnected 1
+              if not oneConnected
+                then return 0
+                else findConnectedTip 1 headerTipHeight
     -- Repair the best-block pointer so it names the true connected tip.
     -- This is the recovery: a genesis-stuck (or otherwise stale)
     -- @PrefixBestBlock@ is re-pointed at the block whose UTXO mutations
