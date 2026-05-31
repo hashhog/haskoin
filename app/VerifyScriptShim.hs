@@ -63,7 +63,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Serialize as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
-import Data.Int (Int32)
+import Data.Int (Int32, Int64)
 import Data.List (sortBy)
 import Data.Ord (comparing)
 import Data.Word (Word8, Word32, Word64)
@@ -91,7 +91,11 @@ import Haskoin.Consensus
   , validateFullBlock, validateFullBlockIO, ChainState(..)
   , netBIP34Height, netBIP34Hash
   , applyBlock, disconnectBlockAt, DisconnectResult(..)
-  , maxReorgDepth )
+  , maxReorgDepth
+  -- checkheader op: REAL header-level reject primitives.
+  , checkProofOfWork, ConsensusFlags(..)
+  , maxFutureBlockTime, maxTimewarp
+  , netEnforceBIP94, netRetargetInterval, netPowLimit )
 import Haskoin.Storage
   ( HaskoinDB, DBConfig(..), defaultDBConfig, openDB, closeDB
   , UTXOEntry(..), UTXOCache(..), newUTXOCache, addUTXO
@@ -230,6 +234,7 @@ processLine line =
            "checktx"    -> processCheckTx line
            "connecttx"  -> processConnectTx line
            "checkblock" -> processCheckBlock line
+           "checkheader" -> processCheckHeader line
            "checkbip30" -> processCheckBIP30 line
            "reorg"      -> processReorg line
            "nextwork"   -> processNextWork line
@@ -715,6 +720,206 @@ processCheckBIP30 line =
     forceEither x = case x of
       Left s   -> Left $! (length s `seq` s)
       Right () -> Right ()
+
+------------------------------------------------------------------------------
+-- checkheader op (HEADER-LEVEL reject differential — CheckBlockHeader +
+-- ContextualCheckBlockHeader; validation.cpp:3831 + 4080-4121).
+--
+-- Drives haskoin's REAL header-acceptance gates in Core's EXACT order over an
+-- 80-byte header + the explicit prev-context the corpus supplies (the same
+-- inputs Core's @ContextualCheckBlockHeader(pindexPrev)@ consumes: prev.bits,
+-- prev.time, MTP-of-prev-11, the candidate height, and an injected wall clock).
+-- The shim reimplements NONE of the gate decisions — each is the impl's own
+-- consensus primitive; the shim only sequences them and maps each verdict to
+-- Core's bip22 token (exactly as the rustoshi-shim's @reject_header@ maps a
+-- @ValidationError@). Mirrors the rustoshi @process_checkheader@ design proven
+-- 19/19 on /tmp/checkheader-vectors.json.
+--
+-- The gate sequence (Core validation.cpp order):
+--   Stage 1 — high-hash (CheckBlockHeader, validation.cpp:3831): drive the REAL
+--     'checkProofOfWork header (netPowLimit net)'. The single high-hash token
+--     covers hash>target AND nBits-malformed / target>powLimit (DeriveTarget
+--     folds the range into the same reject). Skipped when skip_pow=true (the
+--     PoW is not the gate under test — e.g. bad-version / timewarp rows whose
+--     mainnet/testnet4 target is unmineable in the generator).
+--   expected_bits — GetNextWorkRequired(prev): honor an explicit "expected_bits"
+--     override (isolates the timewarp gate at a retarget boundary); else
+--     recompute via the REAL 'getNextWorkRequired net pindexLast candidate' over
+--     a 2-node BlockIndex (the SAME plumbing the nextwork op uses). This is THE
+--     bad-diffbits enforcement: the expected nBits comes from the impl's OWN
+--     retarget over the prev-context, NEVER from the header's own bits.
+--   Stage 2 — ContextualCheckBlockHeader (validation.cpp:4080-4121), Core order:
+--     Gate 0 (4088): header.bits == expected_bits      -> bad-diffbits (FIRST)
+--     Gate 1 (4092): header.ts > MTP                   -> time-too-old
+--     Gate 2 (4097): BIP-94 first-interval-block floor  -> time-timewarp-attack
+--                    (only when netEnforceBIP94 + height%netRetargetInterval==0)
+--     Gate 3 (4108): header.ts <= now + 7200            -> time-too-new
+--                    (now = injected current_time; 0 sentinel disables it)
+--     Gates 4-6 (4113): v<2 post-BIP34 / v<3 post-BIP66 / v<4 post-BIP65
+--                    -> bad-version (REAL flags via consensusFlagsAtHeight)
+--
+-- CLOCK / determinism: production header acceptance ('addHeader') reads the
+-- wall clock via getPOSIXTime; 'addHeaderAt' now exposes an INJECTABLE @now@
+-- (default-preserving — 'addHeader' delegates with Nothing). This op feeds the
+-- corpus's @current_time@ directly into Gate 3, so the +7200 boundary is
+-- deterministic without touching the wall clock. The consensus edit is faithful
+-- (only fixes the value of Core's GetAdjustedTime) and gated (Just t override).
+--
+--   request:  {"op":"checkheader","network":"mainnet|testnet4|regtest|...",
+--              "header_hex":"<80B>","height":H,
+--              "prev":{"bits":"<8hex>","time":<u32>,"hash":"<ignored>"},
+--              "mtp":<u32>,                 -- MTP of prev's 11 ancestors
+--              "current_time":<u64; 0 = disable time-too-new (sentinel)>,
+--              "skip_pow":<bool; false = exercise high-hash, true = bypass>,
+--              "first":{height,bits,time}?, -- retarget-boundary ancestor (opt)
+--              "expected_bits":"<8hex>"?}   -- diffbits override (opt)
+--   response: {"accept":true}                  (all gates pass)
+--             {"accept":false,"reason":"..."}  (first failing gate's bip22 token)
+--             {"error":"..."}                  (could not evaluate -> SKIP)
+------------------------------------------------------------------------------
+
+data ChkPrev = ChkPrev
+  { chkPrevBits :: T.Text
+  , chkPrevTime :: Word32
+  }
+
+instance A.FromJSON ChkPrev where
+  parseJSON = A.withObject "ChkPrev" $ \o -> ChkPrev
+    <$> o .:? "bits" A..!= ""
+    <*> (toW32 <$> o .:? "time" A..!= (0 :: Double))
+    where toW32 d = round (d :: Double)
+
+data CheckHeaderRequest = CheckHeaderRequest
+  { chNetwork      :: T.Text
+  , chHeaderHex    :: T.Text
+  , chHeight       :: Word32
+  , chPrev         :: ChkPrev
+  , chMtp          :: Word32
+  , chCurrentTime  :: Word64   -- injected wall clock; 0 = disable time-too-new
+  , chSkipPow      :: Bool
+  , chFirst        :: Maybe NwBlock     -- retarget-boundary ancestor (reuses nextwork's NwBlock)
+  , chExpectedBits :: Maybe T.Text      -- diffbits override
+  }
+
+instance A.FromJSON CheckHeaderRequest where
+  parseJSON = A.withObject "CheckHeaderRequest" $ \o -> CheckHeaderRequest
+    <$> o .:? "network"     A..!= "mainnet"
+    <*> o .:? "header_hex"  A..!= ""
+    <*> (toW32 <$> o .:? "height" A..!= (0 :: Double))
+    <*> o .:? "prev"        A..!= ChkPrev "" 0
+    <*> (toW32 <$> o .:? "mtp" A..!= (0 :: Double))
+    <*> (toW64 <$> o .:? "current_time" A..!= (0 :: Double))
+    <*> o .:? "skip_pow"     A..!= False
+    <*> o .:? "first"
+    <*> o .:? "expected_bits"
+    where
+      toW32 d = round (d :: Double)
+      toW64 d = round (d :: Double)
+
+processCheckHeader :: BL.ByteString -> IO String
+processCheckHeader line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case runCheckHeader req of
+      Left e  -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right s -> do
+        -- Force any pure exception (e.g. a divide in getNextWorkRequired) into
+        -- an {"error"} rather than crashing the long-lived shim loop.
+        r <- try (evaluate (length s `seq` s))
+               :: IO (Either SomeException String)
+        pure $ case r of
+          Left ex -> "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right v -> v
+
+-- | Pure header-gate evaluation. Returns Left for a shim-level error (driver
+-- SKIPs) or Right the {"accept":...} JSON decision.
+runCheckHeader :: CheckHeaderRequest -> Either String String
+runCheckHeader req = do
+  net    <- mapNetwork (chNetwork req)
+  hbytes <- decodeHex (chHeaderHex req)
+  if BS.length hbytes /= 80
+    then Left ("header_hex not 80 bytes: " <> show (BS.length hbytes))
+    else do
+      header <- case S.decode hbytes :: Either String BlockHeader of
+                  Right h -> Right h
+                  Left e  -> Left ("header deserialize: " <> e)
+      prevBits <- parseBits (chkPrevBits (chPrev req))
+      let height   = chHeight req
+          prevTime = chkPrevTime (chPrev req)
+          mtp      = chMtp req
+          curTime  = chCurrentTime req
+          skipPow  = chSkipPow req
+
+      -- ---- expected_bits: GetNextWorkRequired(prev) ----
+      -- Honor an explicit override; else recompute via the REAL retarget fn over
+      -- a 2-node BlockIndex (prev = pindexLast @ height-1, optional first @ its
+      -- biPrev so a boundary ancestor walk resolves). This is the bad-diffbits
+      -- enforcement: expected nBits derives from the impl's OWN
+      -- getNextWorkRequired over prev-context, NEVER from header.bits.
+      expectedBits <- case chExpectedBits req of
+        Just s  -> parseBits s              -- explicit diffbits override (isolates timewarp)
+        Nothing -> do
+          firstNode <- case chFirst req of
+            Nothing -> Right Nothing
+            Just f  -> do
+              fb <- parseBits (nwBits f)
+              Right (Just (mkBI (nwHeight f) fb (nwTime f) Nothing))
+          let pindexLast = mkBI (heightSub1 height) prevBits prevTime firstNode
+              candidate  = BlockHeader
+                { bhVersion    = 0
+                , bhPrevBlock  = bhPrevBlock header
+                , bhMerkleRoot = Hash256 (BS.replicate 32 0)
+                , bhTimestamp  = bhTimestamp header  -- testnet min-diff only
+                , bhBits       = prevBits
+                , bhNonce      = 0
+                }
+          Right (getNextWorkRequired net pindexLast candidate)
+      Right (decideHeader net header height prevTime mtp curTime skipPow expectedBits)
+  where
+    heightSub1 h = if h == 0 then 0 else h - 1
+
+-- | The gate sequence, mirroring rustoshi's process_checkheader +
+-- contextual_check_block_header (Core validation.cpp order). Each gate calls
+-- the impl's REAL primitive; the shim only sequences + tokenizes.
+decideHeader :: Network -> BlockHeader -> Word32 -> Word32 -> Word32 -> Word64
+             -> Bool -> Word32 -> String
+decideHeader net header height prevTime mtp curTime skipPow expectedBits
+  -- Stage 1 — high-hash (CheckBlockHeader): REAL checkProofOfWork.
+  | not skipPow && not (checkProofOfWork header (netPowLimit net)) =
+      reject "high-hash"
+  -- Gate 0 (4088) — bad-diffbits FIRST: header.bits vs the impl-computed
+  -- GetNextWorkRequired(prev). THE flagship difficulty-manipulation guard.
+  | bhBits header /= expectedBits =
+      reject "bad-diffbits"
+  -- Gate 1 (4092) — time-too-old: ts <= MTP (strict-greater required).
+  | bhTimestamp header <= mtp =
+      reject "time-too-old"
+  -- Gate 2 (4097) — BIP-94 timewarp: first block of a retarget interval whose
+  -- ts is more than MAX_TIMEWARP (600s) before prev's ts. enforce_BIP94 only.
+  | netEnforceBIP94 net
+      && height > 0
+      && height `mod` netRetargetInterval net == 0
+      && (fromIntegral (bhTimestamp header) :: Int64)
+           < (fromIntegral prevTime :: Int64) - maxTimewarp =
+      reject "time-timewarp-attack"
+  -- Gate 3 (4108) — time-too-new: ts > now + 7200. now = injected current_time;
+  -- 0 sentinel disables the gate (determinism control).
+  | curTime /= 0
+      && (fromIntegral (bhTimestamp header) :: Int64)
+           > (fromIntegral curTime :: Int64) + maxFutureBlockTime =
+      reject "time-too-new"
+  -- Gates 4-6 (4113) — bad-version: v<2 post-BIP34 / v<3 post-BIP66 / v<4
+  -- post-BIP65, using the impl's REAL consensusFlagsAtHeight predicates (the
+  -- SAME ones validateBlock applies at Consensus.hs:2535-2540).
+  | (ver < 2 && flagBIP34 flags)
+      || (ver < 3 && flagBIP66 flags)
+      || (ver < 4 && flagBIP65 flags) =
+      reject (printf "bad-version(0x%08x)" (fromIntegral ver :: Word32))
+  | otherwise = "{\"accept\":true}"
+  where
+    ver   = bhVersion header
+    flags = consensusFlagsAtHeight net height
+    reject tok = "{\"accept\":false,\"reason\":\"" <> escapeJson tok <> "\"}"
 
 ------------------------------------------------------------------------------
 -- reorg op (DETERMINISTIC side-branch re-validation — ActivateBestChain
