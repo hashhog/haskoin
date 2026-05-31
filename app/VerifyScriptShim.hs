@@ -53,6 +53,8 @@ module Main where
 
 import qualified Data.Aeson as A
 import qualified Data.Aeson.Types as A
+import qualified Data.Aeson.Key as AK
+import qualified Data.Aeson.KeyMap as AKM
 import Data.Aeson ((.:?))
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
@@ -62,21 +64,39 @@ import qualified Data.Serialize as S
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Int (Int32)
-import Data.Word (Word32, Word64)
+import Data.List (sortBy)
+import Data.Ord (comparing)
+import Data.Word (Word8, Word32, Word64)
 import Numeric (readHex)
 import Text.Printf (printf)
 import System.IO (hFlush, stdout, isEOF)
-import Control.Exception (evaluate, try, SomeException)
+import System.Directory
+  ( getTemporaryDirectory, createDirectoryIfMissing, removeDirectoryRecursive )
+import Data.IORef (IORef, newIORef, modifyIORef', readIORef, atomicModifyIORef')
+import System.IO.Unsafe (unsafePerformIO)
+import Control.Exception (evaluate, try, bracket, SomeException)
+import Control.Monad (forM_, (>=>))
+import Control.Concurrent.STM (atomically)
+import qualified Control.Concurrent.STM as STM
 
 import Haskoin.Types
   ( Tx(..), TxIn(..), TxOut(..), OutPoint(..), TxId(..), Hash256(..)
-  , BlockHeader(..), BlockHash(..) )
-import Haskoin.Crypto (computeTxId)
+  , BlockHeader(..), BlockHash(..), Block(..) )
+import Haskoin.Crypto (computeTxId, computeBlockHash, sha256)
 import Haskoin.Consensus
   ( validateTransaction, getNextWorkRequired, BlockIndex(..)
   , Network, mainnet, testnet3, testnet4, regtest
   , computeMerkleRootMutated, blockReward
-  , checkTxInputsConnect, consensusFlagsAtHeight, UTXOEntry(..) )
+  , checkTxInputsConnect, consensusFlagsAtHeight
+  , validateFullBlock, ChainState(..)
+  , applyBlock, disconnectBlockAt, DisconnectResult(..)
+  , maxReorgDepth )
+import Haskoin.Storage
+  ( HaskoinDB, DBConfig(..), defaultDBConfig, openDB, closeDB
+  , UTXOEntry(..), UTXOCache(..), newUTXOCache, addUTXO
+  , Coin(..), putUTXOCoin
+  , KeyPrefix(..), iterateWithPrefix
+  , TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData, putUndoData )
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
   , verifyScriptWithFlags )
@@ -208,6 +228,8 @@ processLine line =
            "verifytx"   -> processVerifyTx line
            "checktx"    -> processCheckTx line
            "connecttx"  -> processConnectTx line
+           "checkblock" -> processCheckBlock line
+           "reorg"      -> processReorg line
            "nextwork"   -> processNextWork line
            "merkleroot" -> processMerkleRoot line
            "subsidy"    -> processSubsidy line
@@ -493,6 +515,540 @@ prepareConnTx req = do
                             , ueSpent    = False
                             }
       Right (OutPoint txid (cpVout p), entry)
+
+------------------------------------------------------------------------------
+-- checkblock op (VALIDATE-ONLY decision-level CheckBlock / ContextualCheckBlock
+-- / ConnectBlock differential — generalizes connecttx from a single tx to a
+-- FULL BLOCK).
+--
+-- Deserialize the FINAL block_hex with haskoin's OWN segwit-aware 'Block'
+-- 'Serialize' (Types.hs), seed an in-memory @Map OutPoint Coin@ from the
+-- prevout set (REUSING the connecttx 'ConnPrevout' decoder + display->wire
+-- txid reversal VERBATIM), synthesize the ChainState the connect path needs,
+-- and drive haskoin's REAL 'validateFullBlock' — the EXACT same call
+-- 'connectChain' makes on a reorg connect (Consensus.hs:5057,
+-- @validateFullBlock net cs False block spentCoins@). The shim reimplements
+-- NONE of the CheckBlock / ContextualCheckBlock / ConnectBlock gates — the
+-- decision is entirely the impl's.
+--
+-- ChainState: csHeight = spend_height-1 (validateFullBlock derives the connect
+-- height as csHeight+1 internally), csBestBlock = the block's prev hash,
+-- csChainWork = 0 (inert here), csMedianTime = 0 (a 0x7FFFFF* sentinel-timed
+-- real mainnet block always satisfies @bhTimestamp > csMedianTime@; the corpus
+-- blocks are real accepted blocks whose timestamps are far above 0),
+-- csFlags = consensusFlagsAtHeight mainnet spend_height (mirrors
+-- connectChain's @consensusFlagsAtHeight net (ceHeight ce)@).
+--
+-- skip_pow: 'validateFullBlock' performs NO proof-of-work check (it is a pure
+-- CheckBlock/ContextualCheckBlock/ConnectBlock composite; PoW lives in the
+-- header-acceptance path, NOT here). So a FINAL/mutated block that misses the
+-- mainnet PoW target is NEVER rejected on high-hash — skip_pow=true is the
+-- corpus default and is satisfied structurally.
+--
+-- skip_scripts: forwarded as validateFullBlock's @skipScripts@ flag. The
+-- contract default is False, so per-input 'verifyScriptWithFlags' actually
+-- runs (no assume-valid skip in this pure path — validateFullBlock has no
+-- assume-valid heuristic, so the script gate is always live when
+-- skip_scripts=false).
+--
+--   request:  {"op":"checkblock","block_hex":"<FINAL block bytes>",
+--              "prevouts":[{"txid":"<display-hex>","vout":N,
+--                           "scriptPubKey_hex":"...","value_sats":<u64>,
+--                           "height":N,"is_coinbase":bool}, ...],
+--              "spend_height":<int>,"skip_pow":<bool>,"skip_scripts":<bool>}
+--   response: {"valid":true}                    (CheckBlock chain accepts)
+--             {"valid":false,"reason":"..."}    (some gate rejects)
+--             {"error":"..."}                   (could not evaluate -> SKIP)
+------------------------------------------------------------------------------
+
+data CheckBlockRequest = CheckBlockRequest
+  { cbBlockHex     :: T.Text
+  , cbPrevouts     :: [ConnPrevout]
+  , cbSpendHeight  :: Word32
+  , cbSkipPow      :: Bool
+  , cbSkipScripts  :: Bool
+  }
+
+instance A.FromJSON CheckBlockRequest where
+  parseJSON = A.withObject "CheckBlockRequest" $ \o -> CheckBlockRequest
+    <$> o .:? "block_hex" A..!= ""
+    <*> o .:? "prevouts"  A..!= []
+    <*> (toW32 <$> o .:? "spend_height" A..!= (0 :: Double))
+    <*> o .:? "skip_pow"     A..!= True
+    <*> o .:? "skip_scripts" A..!= False
+    where toW32 d = round (d :: Double)
+
+-- | Build a @Map OutPoint Coin@ from the prevout set (same view shape
+-- 'validateFullBlock' consumes via 'connectChain' / 'buildReorgSpentCoinMap').
+prevoutsToCoinMap :: [ConnPrevout] -> Either String (Map.Map OutPoint Coin)
+prevoutsToCoinMap ps = Map.fromList <$> traverse mk ps
+  where
+    mk p = do
+      txid <- displayHexToWireTxId (cpTxidDisplayHex p)
+      spk  <- decodeHex (cpSpkHex p)
+      let txout = TxOut { txOutValue = cpValue p, txOutScript = spk }
+          coin  = Coin { coinTxOut      = txout
+                       , coinHeight     = cpHeight p
+                       , coinIsCoinbase = cpIsCoinbase p }
+      Right (OutPoint txid (cpVout p), coin)
+
+processCheckBlock :: BL.ByteString -> IO String
+processCheckBlock line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareCheckBlock req of
+      Left e                            -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right (block, cs, skipScripts, coinMap) -> do
+        r <- try (evaluate
+                    (forceEither (validateFullBlock mainnet cs skipScripts block coinMap)))
+               :: IO (Either SomeException (Either String ()))
+        pure $ case r of
+          Left ex          ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Right ()) -> "{\"valid\":true}"
+          Right (Left err) ->
+            "{\"valid\":false,\"reason\":\"" <> escapeJson err <> "\"}"
+  where
+    forceEither x = case x of
+      Left s   -> Left $! (length s `seq` s)
+      Right () -> Right ()
+
+prepareCheckBlock :: CheckBlockRequest
+                  -> Either String (Block, ChainState, Bool, Map.Map OutPoint Coin)
+prepareCheckBlock req = do
+  blockBytes <- decodeHex (cbBlockHex req)
+  block      <- case S.decode blockBytes :: Either String Block of
+                  Right b -> Right b
+                  Left e  -> Left ("block deserialize: " <> e)
+  coinMap    <- prevoutsToCoinMap (cbPrevouts req)
+  let sh   = cbSpendHeight req
+      prev = bhPrevBlock (blockHeader block)
+      cs   = ChainState
+               { csHeight     = sh - 1
+               , csBestBlock  = prev
+               , csChainWork  = 0
+               , csMedianTime = 0
+               , csFlags      = consensusFlagsAtHeight mainnet sh
+               }
+  Right (block, cs, cbSkipScripts req, coinMap)
+
+------------------------------------------------------------------------------
+-- reorg op (DETERMINISTIC side-branch re-validation — ActivateBestChain
+-- differential). Drives haskoin's REAL reorg pipeline over a THROWAWAY temp
+-- RocksDB + UTXOCache seeded with explicit chain-state, removing the live-tip /
+-- first-seen / nSequenceId race: the most-work DECISION, the fork-point coins
+-- view, and the per-block UNDO TABLE are all EXPLICIT DATA.
+--
+-- CORRECTED HASKOIN DRIVE (matching connectChain, Consensus.hs:5018-5069):
+--   (0) DEPTH CAP: disconnect+connect > maxReorgDepth(100) -> reorg-too-deep
+--       (haskoin Consensus.hs:3700 caps the SUM; Core has no fixed cap ->
+--       EXPECTED-DIVERGENCE, marked in the corpus).
+--   (1) WORK DECISION: strict BE-256 new > old on the EXPLICIT work hex (NOT a
+--       live tip / readTVarIO hcTip / ceSequenceId). Not strictly greater ->
+--       no-reorg-equal-or-less-work, view UNTOUCHED, connected_count=0, the
+--       (possibly invalid) connect blocks NEVER evaluated.
+--   (2) DISCONNECT: drive the REAL DB-backed 'disconnectBlockAt' tip-first over
+--       the explicit undo table (BlockUndo/TxUndo tuPrevOutputs). It restores
+--       inputs + deletes created outputs and returns a 'DisconnectResult'
+--       (ok/unclean/failed) — the OVERWRITE-of-unspent (R5) and
+--       OUTPUT-identity-mismatch (R5b) UNCLEAN checks are haskoin's own
+--       (Consensus.hs:applyTxInUndo:3423 + the SpendCoin check:3625). We store
+--       the explicit undo via 'putUndoData' (with the per-disconnect prev-hash
+--       so the checksum verifies) so 'disconnectBlockAt' reads it back.
+--   (3) CONNECT: per side-branch block in order, EXACTLY connectChain:
+--       build the spent-prevout 'Coin' map from the post-disconnect cache,
+--       'validateFullBlock net cs False block spentCoins' (FULL scripts +
+--       economics), THEN 'applyBlock'. The coinbase-MATURITY gate (R6,
+--       "Coinbase not yet mature") lives in 'applyBlock' (Consensus.hs:4715),
+--       NOT in validateFullBlock — so this two-step drive is what makes R6 fire.
+--       Stop at the FIRST reject (R9: MUST NOT skip ahead to a later valid
+--       block). connected_count = blocks applied before the first reject.
+--
+-- View metadata: the cache is pre-seeded from the post-disconnect DB UTXO set
+-- with FULL Core 'Coin' metadata (height + coinbase), NOT via lookupUTXO
+-- fallthrough (which would zero the height/coinbase and break R6 maturity).
+-- The final 'fork_utxo_digest' is computed over the cache's unspent entries
+-- (canonical sort + byte layout identical to reorg_vectors.py view_digest).
+--
+--   request:  {"op":"reorg","network":...,"fork_utxo":[coin...],
+--              "disconnect":[{block_hex,height,undo:[{tx_index,vin:[coin...]}]}],
+--              "connect":[{block_hex,height,prev_mtp}],
+--              "old_tip_work_hex":<32B BE hex>,"new_tip_work_hex":<32B BE hex>}
+--   response: {"outcome":"reorg-applied"|"reorg-rejected"|
+--                 "no-reorg-equal-or-less-work"|"reorg-too-deep",
+--              "disconnect_result":"ok"|"unclean"|"failed",
+--              "connected_count":N,"reject_reason":<token>?,
+--              "fork_utxo_digest":<sha256 hex of canonically-sorted view>}
+------------------------------------------------------------------------------
+
+shimMaxReorgDepth :: Int
+shimMaxReorgDepth = maxReorgDepth   -- 100 (Consensus.hs:3700)
+
+processReorg :: BL.ByteString -> IO String
+processReorg line =
+  case A.eitherDecode line :: Either String A.Value of
+    Left e  -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right v -> do
+      r <- try (runReorg v) :: IO (Either SomeException String)
+      pure $ case r of
+        Left ex  -> "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+        Right s  -> s
+
+-- | A single fork-point / undo coin entry (same shape as 'ConnPrevout').
+parseReorgCoin :: A.Value -> Either String (OutPoint, Coin)
+parseReorgCoin val = case A.parseEither A.parseJSON val of
+  Left e  -> Left ("coin parse: " <> e)
+  Right p -> do
+    txid <- displayHexToWireTxId (cpTxidDisplayHex p)
+    spk  <- decodeHex (cpSpkHex p)
+    let txout = TxOut { txOutValue = cpValue p, txOutScript = spk }
+        coin  = Coin { coinTxOut      = txout
+                     , coinHeight     = cpHeight p
+                     , coinIsCoinbase = cpIsCoinbase p }
+    Right (OutPoint txid (cpVout p), coin)
+
+-- | Parse a 32-byte BE work hex into an 'Integer'. Absent/null -> Nothing.
+parseWorkHex :: Maybe A.Value -> Either String (Maybe Integer)
+parseWorkHex Nothing            = Right Nothing
+parseWorkHex (Just A.Null)      = Right Nothing
+parseWorkHex (Just (A.String s)) = do
+  raw <- decodeHex s
+  if BS.length raw /= 32
+    then Left ("work hex not 32 bytes: " <> show (BS.length raw))
+    else Right (Just (BS.foldl' (\acc b -> acc * 256 + fromIntegral b) 0 raw))
+parseWorkHex (Just _)           = Left "work hex not a string"
+
+-- | Canonical coins-view digest — byte-identical to reorg_vectors.py
+-- view_digest: sort by (wire-txid, vout), then per coin:
+--   txid[32] || vout u32 LE || height u32 LE || is_coinbase u8 ||
+--   value u64 LE || spk_len u32 LE || spk.
+reorgViewDigest :: [(OutPoint, Coin)] -> String
+reorgViewDigest coins =
+  let entries = sortBy (comparing keyOf) coins
+      buf = BS.concat (map enc entries)
+      d   = sha256 buf
+  in concatMap (printf "%02x") (BS.unpack d)
+  where
+    keyOf (OutPoint (TxId (Hash256 bs)) vout, _) = (BS.unpack bs, vout)
+    le32 w = BS.pack [ fromIntegral (w `div` (256 ^ i)) | i <- [0 .. 3 :: Int] ]
+    le64 w = BS.pack [ fromIntegral (w `div` (256 ^ i)) | i <- [0 .. 7 :: Int] ]
+    enc (OutPoint (TxId (Hash256 txbs)) vout, Coin txout h cb) =
+      let spk = txOutScript txout
+      in BS.concat
+           [ txbs
+           , le32 (fromIntegral vout :: Word64)
+           , le32 (fromIntegral h :: Word64)
+           , BS.singleton (if cb then 1 else 0 :: Word8)
+           , le64 (txOutValue txout)
+           , le32 (fromIntegral (BS.length spk) :: Word64)
+           , spk ]
+
+-- | Decode a disconnect entry: (block, height, flattened ordered undo coins
+-- grouped per non-coinbase tx). Returns the per-tx undo prevout lists in
+-- tx-ascending / input-ascending order (exactly Core's vtxundo layout).
+data DiscEntry = DiscEntry
+  { deBlock     :: Block
+  , deHeight    :: Word32
+  , deTxUndos   :: [[Coin]]   -- one inner list per non-coinbase tx, input order
+  }
+
+decodeDisc :: A.Value -> Either String DiscEntry
+decodeDisc = A.parseEither pj >=> finish
+  where
+    pj = A.withObject "disc" $ \o -> (,,)
+      <$> (o A..: "block_hex" :: A.Parser T.Text)
+      <*> (round <$> (o A..: "height" :: A.Parser Double) :: A.Parser Word32)
+      <*> (o .:? "undo" A..!= [] :: A.Parser [A.Value])
+    finish (bhex, h, undoVals) = do
+      block  <- decodeHex bhex >>= \bs -> case S.decode bs :: Either String Block of
+                  Right b -> Right b
+                  Left e  -> Left ("disconnect block deserialize: " <> e)
+      txUndos <- traverse decodeUndoTx undoVals
+      Right (DiscEntry block h txUndos)
+    decodeUndoTx = A.parseEither (A.withObject "undoTx" (\o -> o .:? "vin" A..!= []))
+                 >=> traverse parseReorgCoin
+                 >=> \pairs -> Right (map snd pairs)
+
+-- | Decode a connect entry: (block, height, prev_mtp).
+data ConnEntry = ConnEntry
+  { ceBlock   :: Block
+  , ceHeight  :: Word32
+  , cePrevMtp :: Word32
+  }
+
+decodeConn :: A.Value -> Either String ConnEntry
+decodeConn = A.parseEither pj >=> finish
+  where
+    pj = A.withObject "conn" $ \o -> (,,)
+      <$> (o A..: "block_hex" :: A.Parser T.Text)
+      <*> (round <$> (o A..: "height" :: A.Parser Double) :: A.Parser Word32)
+      <*> (round <$> (o .:? "prev_mtp" A..!= (0 :: Double)) :: A.Parser Word32)
+    finish (bhex, h, mtp) = do
+      block <- decodeHex bhex >>= \bs -> case S.decode bs :: Either String Block of
+                 Right b -> Right b
+                 Left e  -> Left ("connect block deserialize: " <> e)
+      Right (ConnEntry block h mtp)
+
+-- | Map the reorg network string -> haskoin 'Network'.
+reorgNetwork :: T.Text -> Either String Network
+reorgNetwork t = case t of
+  "mainnet"  -> Right mainnet
+  "regtest"  -> Right regtest
+  "testnet"  -> Right testnet3
+  "testnet3" -> Right testnet3
+  "testnet4" -> Right testnet4
+  other      -> Left ("unknown network: " <> T.unpack other)
+
+-- | Look up a top-level object field by name (Nothing if absent / not object).
+lookupField :: A.Value -> T.Text -> Maybe A.Value
+lookupField (A.Object o) k = AKM.lookup (AK.fromText k) o
+lookupField _            _ = Nothing
+
+-- | A required-with-default string field.
+textField :: A.Value -> T.Text -> T.Text -> T.Text
+textField v k dflt = case lookupField v k of
+  Just (A.String s) -> s
+  _                 -> dflt
+
+-- | A required array field (defaults to empty when absent / null).
+arrField :: A.Value -> T.Text -> Either String [A.Value]
+arrField v k = case lookupField v k of
+  Nothing            -> Right []
+  Just A.Null        -> Right []
+  Just (A.Array a)   -> Right (foldr (:) [] a)
+  Just _             -> Left (T.unpack k <> " is not an array")
+
+runReorg :: A.Value -> IO String
+runReorg v = do
+  let res = do
+        net      <- reorgNetwork (textField v "network" "mainnet")
+        forkVals <- arrField v "fork_utxo"
+        forkCoins <- traverse parseReorgCoin forkVals
+        discVals <- arrField v "disconnect"
+        discs    <- traverse decodeDisc discVals
+        connVals <- arrField v "connect"
+        conns    <- traverse decodeConn connVals
+        oldW     <- parseWorkHex (lookupField v "old_tip_work_hex")
+        newW     <- parseWorkHex (lookupField v "new_tip_work_hex")
+        Right (net, forkCoins, discs, conns, oldW, newW)
+  case res of
+    Left e -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+    Right (net, forkCoins, discs, conns, oldW, newW) -> do
+      let seedDigest = reorgViewDigest forkCoins
+      -- (0) DEPTH CAP — haskoin caps the SUM of disconnect + connect.
+      if length discs + length conns > shimMaxReorgDepth
+        then pure (mk "reorg-too-deep" "ok" 0 Nothing seedDigest)
+      -- (1) WORK DECISION — pure strict BE-256 new > old.
+      else if maybe False not (compareStrictGreater <$> newW <*> oldW)
+        then pure (mk "no-reorg-equal-or-less-work" "ok" 0 Nothing seedDigest)
+        else withTempDB $ \db -> do
+          -- Seed the DB UTXO set from fork_utxo (full Coin metadata).
+          forM_ forkCoins $ \(op, coin) -> putUTXOCoin db op coin
+          -- (2) DISCONNECT — REAL disconnectBlockAt tip-first over explicit undo.
+          discResult <- runDisconnects db discs
+          case discResult of
+            DiscFailed reason ->
+              pure (mk "reorg-rejected" "failed" 0 (Just reason) seedDigest)
+            DiscDone worst   -> do
+              let discStr = case worst of
+                    DisconnectOk      -> "ok"
+                    DisconnectUnclean -> "unclean"
+                    DisconnectFailed  -> "failed"
+              -- Pre-seed a cache from the post-disconnect DB UTXO set with FULL
+              -- metadata, so connect-phase maturity (R6) sees real height/coinbase.
+              cache <- seedCacheFromDB db
+              -- (3) CONNECT — EXACTLY connectChain per side-branch block.
+              (connCount, mReject) <- runConnects cache net conns 0
+              finalCoins <- cacheUnspent cache
+              let dig = reorgViewDigest finalCoins
+              pure $ case mReject of
+                Just reason -> mk "reorg-rejected" discStr connCount (Just reason) dig
+                Nothing     -> mk "reorg-applied"  discStr connCount Nothing       dig
+  where
+    -- Build the canonical JSON response.
+    mk outcome disc cc mReason dig =
+      let base = "{\"outcome\":\"" <> outcome <> "\",\"disconnect_result\":\""
+                 <> disc <> "\",\"connected_count\":" <> show (cc :: Int)
+          reasonPart = case mReason of
+            Just r  -> ",\"reject_reason\":\"" <> escapeJson r <> "\""
+            Nothing -> ""
+      in base <> reasonPart <> ",\"fork_utxo_digest\":\"" <> dig <> "\"}"
+
+-- Disconnect run result.
+data DiscRun = DiscDone DisconnectResult | DiscFailed String
+
+-- | Drive the REAL DB-backed 'disconnectBlockAt' for every disconnect block
+-- tip-first, storing the explicit undo via 'putUndoData' (so the checksum
+-- verifies on read-back). The worst result across blocks wins
+-- (failed > unclean > ok); a hard failure short-circuits.
+runDisconnects :: HaskoinDB -> [DiscEntry] -> IO DiscRun
+runDisconnects db = go DisconnectOk
+  where
+    go worst [] = pure (DiscDone worst)
+    go worst (d:ds) = do
+      let block   = deBlock d
+          height  = deHeight d
+          bh      = computeBlockHash (blockHeader block)
+          prev    = bhPrevBlock (blockHeader block)
+          -- Build a BlockUndo from the explicit per-tx undo coin lists.
+          txUndos = map (\coins -> TxUndo
+                          { tuPrevOutputs =
+                              [ TxInUndo { tuOutput   = coinTxOut c
+                                         , tuHeight   = coinHeight c
+                                         , tuCoinbase = coinIsCoinbase c }
+                              | c <- coins ] })
+                        (deTxUndos d)
+          blockUndo = BlockUndo { buTxUndo = txUndos }
+          undoData  = mkUndoData bh height prev blockUndo
+      putUndoData db bh undoData
+      r <- disconnectBlockAt db height block prev
+      case r of
+        Left e -> pure (DiscFailed e)
+        Right dr ->
+          let worst' = case (worst, dr) of
+                (DisconnectFailed, _) -> DisconnectFailed
+                (_, DisconnectFailed) -> DisconnectFailed
+                (DisconnectUnclean, _) -> DisconnectUnclean
+                (_, DisconnectUnclean) -> DisconnectUnclean
+                _                      -> DisconnectOk
+          in go worst' ds
+
+-- | Pre-seed a UTXOCache from the post-disconnect DB by enumerating the full
+-- PrefixUTXO keyspace and inserting each coin with its FULL Core 'Coin'
+-- metadata (height + coinbase). This is required because 'applyBlock' reads
+-- via 'lookupUTXO', whose DB fallthrough would zero the height/coinbase
+-- (Storage.hs:643) and break the connect-phase coinbase-maturity gate (R6).
+-- With the cache fully pre-loaded, no fallthrough ever occurs.
+seedCacheFromDB :: HaskoinDB -> IO UTXOCache
+seedCacheFromDB db = do
+  cache <- newUTXOCache db (maxBound :: Int)
+  coins <- dumpAllCoins db
+  forM_ coins $ \(op, c) ->
+    atomicallyAdd cache op
+      (UTXOEntry { ueOutput   = coinTxOut c
+                 , ueHeight   = coinHeight c
+                 , ueCoinbase = coinIsCoinbase c
+                 , ueSpent    = False })
+  pure cache
+
+-- | 'addUTXO' is 'STM ()'; lift it.
+atomicallyAdd :: UTXOCache -> OutPoint -> UTXOEntry -> IO ()
+atomicallyAdd cache op entry = atomically (addUTXO cache op entry)
+
+-- | Enumerate the full PrefixUTXO keyspace, decoding each (OutPoint, Coin).
+-- Key layout: 0x05 ++ encode OutPoint ; value: encode Coin (Storage.hs:521).
+dumpAllCoins :: HaskoinDB -> IO [(OutPoint, Coin)]
+dumpAllCoins db = do
+  ref <- newIORef []
+  iterateWithPrefix db PrefixUTXO $ \key val -> do
+    let opBytes = BS.drop 1 key   -- strip the 1-byte prefix
+    case (S.decode opBytes :: Either String OutPoint,
+          S.decode val     :: Either String Coin) of
+      (Right op, Right c) -> modifyIORef' ref ((op, c) :)
+      _                   -> pure ()
+    pure True
+  readIORef ref
+
+-- | Enumerate the cache's UNSPENT entries -> (OutPoint, Coin) for the digest.
+-- The cache holds the authoritative final state after connect (applyBlock
+-- mutates it in place; spent entries are flagged 'ueSpent').
+cacheUnspent :: UTXOCache -> IO [(OutPoint, Coin)]
+cacheUnspent cache = do
+  entries <- atomically (readTVarCache cache)
+  pure [ (op, Coin { coinTxOut = ueOutput e
+                   , coinHeight = ueHeight e
+                   , coinIsCoinbase = ueCoinbase e })
+       | (op, e) <- Map.toList entries, not (ueSpent e) ]
+  where
+    -- Read ucEntries (the in-memory map). Local helper to keep the STM read
+    -- self-contained without importing readTVar at call sites.
+    readTVarCache = readTVarSTM . ucEntries
+
+-- | Drive the CONNECT phase EXACTLY as 'connectChain' (Consensus.hs:5040-5063):
+-- per side-branch block, build the spent-prevout Coin map from the
+-- post-disconnect / mid-connect cache, run 'validateFullBlock' (full scripts +
+-- economics), THEN 'applyBlock' (carries the coinbase-maturity gate). Stop at
+-- the FIRST reject (R9). Returns (count applied, Just rejectReason | Nothing).
+runConnects :: UTXOCache -> Network -> [ConnEntry] -> Int
+            -> IO (Int, Maybe String)
+runConnects _ _ [] n = pure (n, Nothing)
+runConnects cache net (c:cs) n = do
+  let block    = ceBlock c
+      height    = ceHeight c
+      prevMtp   = cePrevMtp c
+      prevHash  = bhPrevBlock (blockHeader block)
+  -- (a) buildReorgSpentCoinMap: prevouts present in the cache become Coin
+  -- entries; intra-block-created prevouts are absent (resolved inside
+  -- validateBlockTransactions). Mirrors Consensus.hs:5096-5107.
+  spentCoins <- buildSpentCoinMap cache block
+  -- (b) ChainState exactly as connectChain (Consensus.hs:5054): csHeight =
+  -- height-1, csBestBlock = prev, csChainWork inert, csMedianTime = prevMtp
+  -- (BIP-113 / timestamp cutoff), csFlags @ this block's height.
+  let cs0 = ChainState
+              { csHeight     = height - 1
+              , csBestBlock  = prevHash
+              , csChainWork  = 0
+              , csMedianTime = prevMtp
+              , csFlags      = consensusFlagsAtHeight net height
+              }
+  case validateFullBlock net cs0 False block spentCoins of
+    Left err -> pure (n, Just err)
+    Right () -> do
+      -- (c) applyBlock — spends inputs from the cache, checks coinbase maturity
+      -- (R6), sigops, bad-cb-amount, etc. getMTP is unused on these vectors
+      -- (height-based BIP-68 only); return prevMtp as a safe constant.
+      applyRes <- applyBlock cache net block height prevMtp (\_ -> pure prevMtp)
+      case applyRes of
+        Left err -> pure (n, Just err)
+        Right _  -> runConnects cache net cs (n + 1)
+
+-- | The connectChain spent-prevout Coin map: for every non-coinbase input,
+-- look the prevout up in the cache; present -> a Coin entry, absent -> dropped
+-- (intra-block prevout). Mirrors 'buildReorgSpentCoinMap' (Consensus.hs:5096).
+buildSpentCoinMap :: UTXOCache -> Block -> IO (Map.Map OutPoint Coin)
+buildSpentCoinMap cache block = do
+  entries <- atomically (readTVarSTM (ucEntries cache))
+  let nonCoinbase = drop 1 (blockTxns block)
+      prevouts    = [ txInPrevOutput inp | tx <- nonCoinbase, inp <- txInputs tx ]
+      pairs = [ (op, Coin { coinTxOut = ueOutput e
+                          , coinHeight = ueHeight e
+                          , coinIsCoinbase = ueCoinbase e })
+              | op <- prevouts
+              , Just e <- [Map.lookup op entries]
+              , not (ueSpent e) ]
+  pure (Map.fromList pairs)
+
+-- | STM read of the cache's entry map (ucEntries is a TVar).
+readTVarSTM :: STM.TVar a -> STM.STM a
+readTVarSTM = STM.readTVar
+
+-- | Strict BE-256 most-work comparison: True iff @new > old@.
+compareStrictGreater :: Integer -> Integer -> Bool
+compareStrictGreater new old = new > old
+
+-- | Open a throwaway RocksDB in a fresh temp dir; remove it on exit.
+-- A monotone per-process counter makes the dir name unique across the many
+-- requests one long-lived shim handles on its stdin loop.
+withTempDB :: (HaskoinDB -> IO a) -> IO a
+withTempDB act = do
+  tmp <- getTemporaryDirectory
+  n   <- nextTempId
+  let dir = tmp <> "/haskoin-reorg-shim-" <> show n
+  bracket
+    (do createDirectoryIfMissing True dir
+        openDB (defaultDBConfig dir) { dbBloomFilterBits = 0
+                                     , dbWriteBufferSize = 4 * 1024 * 1024
+                                     , dbBlockCacheSize  = 8 * 1024 * 1024 })
+    (\db -> closeDB db >> removeDirectoryRecursive dir)
+    act
+
+-- | Process-global monotone counter for unique temp-dir names.
+{-# NOINLINE tempIdRef #-}
+tempIdRef :: IORef Int
+tempIdRef = unsafePerformIO (newIORef 0)
+
+nextTempId :: IO Int
+nextTempId = atomicModifyIORef' tempIdRef (\x -> (x + 1, x))
 
 ------------------------------------------------------------------------------
 -- checktx op (tx_valid.json / tx_invalid.json BADTX rows —
