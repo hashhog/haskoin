@@ -154,6 +154,7 @@ module Haskoin.Consensus
   , computeEntryMtp
   , difficultyAdjustment
   , addHeader
+  , addHeaderAt
   , addSideBranchHeader
   , getChainTip
   , getValidatedChainTip
@@ -4183,7 +4184,24 @@ initHeaderChain net = do
 -- all checks pass), and pollutes 'hcEntries' until manually pruned.
 -- Reference: bitcoin-core/src/validation.cpp:4108-4110.
 addHeader :: Network -> HeaderChain -> BlockHeader -> Bool -> IO (Either String ChainEntry)
-addHeader net hc header minPowChecked = do
+addHeader net hc header minPowChecked =
+  -- Default (production) path: read the wall clock for the +2h future-time
+  -- gate.  Byte-for-byte identical to the original behaviour.
+  addHeaderAt net hc header minPowChecked Nothing
+
+-- | 'addHeader' with an INJECTABLE current time for the +2h future-time gate
+-- (Gate 3 / @time-too-new@).  @mNow@ of 'Nothing' reads the wall clock via
+-- 'getPOSIXTime' (the production path 'addHeader' uses); @Just t@ overrides it
+-- with @t@ (POSIX seconds, Int64) so a differential harness can drive the
+-- @time-too-new@ boundary deterministically WITHOUT touching the wall clock.
+-- The override changes NOTHING about the gate logic — it only fixes the value
+-- of @now@ that Core's @ContextualCheckBlockHeader@ reads from
+-- @GetAdjustedTime()@ (validation.cpp:4108).  All other gates are unaffected.
+-- Default-preserving: every production caller goes through 'addHeader' (mNow =
+-- Nothing) and observes the wall-clock behaviour exactly as before.
+addHeaderAt :: Network -> HeaderChain -> BlockHeader -> Bool -> Maybe Int64
+            -> IO (Either String ChainEntry)
+addHeaderAt net hc header minPowChecked mNow = do
   let hash = computeBlockHash header
       prevHash = bhPrevBlock header
   entries <- readTVarIO (hcEntries hc)
@@ -4191,7 +4209,9 @@ addHeader net hc header minPowChecked = do
   -- batch-acceptance does not see a sliding cutoff inside one call.
   -- Use Int64 to match Core's int64_t and avoid Word32 overflow near 2106.
   -- Reference: bitcoin-core/src/chain.h:29 (MAX_FUTURE_BLOCK_TIME is int64_t)
-  now <- (round <$> getPOSIXTime) :: IO Int64
+  now <- case mNow of
+           Just t  -> pure t
+           Nothing -> (round <$> getPOSIXTime) :: IO Int64
 
   -- Check if already known
   case Map.lookup hash entries of
