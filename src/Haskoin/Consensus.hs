@@ -72,6 +72,8 @@ module Haskoin.Consensus
   , validateFullBlock
   , validateFullBlockIO
   , validateBlockTransactions
+  , validateSingleTx
+  , checkTxInputsConnect
   , checkBIP30
   , ChainState(..)
   , ConsensusFlags(..)
@@ -125,6 +127,7 @@ module Haskoin.Consensus
   , applyBlock
   , unapplyBlock
     -- * Undo Data Types (re-exported from Storage)
+  , UTXOEntry(..)
   , TxInUndo(..)
   , TxUndo(..)
   , BlockUndo(..)
@@ -2919,6 +2922,69 @@ validateSingleTx flags skipScripts utxoMap tx = do
              Right True  -> Right ()
 
   return (totalIn - totalOut)
+
+-- | Connect-time @Consensus::CheckTxInputs@ composite — the economic verdict
+-- a non-coinbase tx must pass when it is connected into a block at
+-- @nSpendHeight@ (bitcoin-core/src/consensus/tx_verify.cpp:164-214).
+--
+-- This is a THIN PURE wrapper over the existing 'validateSingleTx' that
+-- restores the ONE check 'validateSingleTx' structurally cannot make: the
+-- coinbase-maturity rule.  'validateSingleTx' takes a @Map OutPoint TxOut@
+-- view which carries no per-coin height / is-coinbase metadata, so it omits
+-- maturity and would FALSE-ACCEPT a premature coinbase spend.  The live
+-- connect path ('applyBlock', Consensus.hs:4644-4649) reads that metadata
+-- from the 'UTXOEntry' view; we take the SAME @Map OutPoint UTXOEntry@ view
+-- and inline that exact maturity loop, then delegate the rest
+-- (missing/spent inputs, per-input + running-sum MoneyRange, nValueIn >=
+-- valueOut, structural CheckTransaction) to 'validateSingleTx'.
+--
+-- We do NOT re-implement value-in>=value-out, MoneyRange, or the missing-input
+-- check here — those run inside 'validateSingleTx' exactly as the connect path
+-- and mempool path use them.  We pass @skipScripts = True@ so a script failure
+-- cannot mask the ECONOMIC verdict this function isolates (Core's CheckTxInputs
+-- runs before CheckInputScripts).
+--
+-- Reject reasons follow Core's @bad-txns-*@ tokens:
+--   * missing/spent input               -> @bad-txns-inputs-missingorspent@
+--   * premature coinbase spend           -> @bad-txns-premature-spend-of-coinbase@
+--     (re-mapped from 'validateSingleTx'\''s twin "Coinbase not yet mature")
+--   * per-input / running-sum MoneyRange -> @bad-txns-inputvalues-outofrange@
+--   * nValueIn < valueOut                -> @bad-txns-in-belowout@
+--     ('validateSingleTx' returns "Outputs exceed inputs"; re-mapped here)
+-- On success returns the fee (nValueIn - valueOut).
+checkTxInputsConnect :: Network -> ConsensusFlags -> Word32
+                     -> Map OutPoint UTXOEntry -> Tx
+                     -> Either String Word64
+checkTxInputsConnect net flags spendHeight utxoView tx = do
+  -- (1) HaveInputs: resolve EVERY prevout from the UTXOEntry view; an
+  --     omitted prevout models a missing/spent input. Core: tx_verify.cpp:166.
+  entries <- forM (txInputs tx) $ \inp ->
+    case Map.lookup (txInPrevOutput inp) utxoView of
+      Nothing -> Left "bad-txns-inputs-missingorspent"
+      Just e  -> Right e
+
+  -- (2) Coinbase maturity — the SAME loop the live connect path runs at
+  --     applyBlock Consensus.hs:4644-4649 (Core tx_verify.cpp:177-180:
+  --     coin.IsCoinBase() && nSpendHeight - coin.nHeight < COINBASE_MATURITY).
+  --     validateSingleTx cannot see ueCoinbase/ueHeight, so it is inlined here.
+  let maturity = fromIntegral (netCoinbaseMaturity net) :: Word32
+      immature = [ () | e <- entries
+                      , ueCoinbase e
+                      , spendHeight - ueHeight e < maturity ]
+  unless (null immature) $
+    Left "bad-txns-premature-spend-of-coinbase"
+
+  -- (3) Delegate the remaining economic checks (missing-again no-op,
+  --     per-input + running-sum MoneyRange, nValueIn >= valueOut) AND the
+  --     structural CheckTransaction to the SAME validateSingleTx the connect
+  --     and mempool paths use. skipScripts=True isolates the economic verdict.
+  let txOutView = Map.map ueOutput utxoView
+  fee <- case validateSingleTx flags True txOutView tx of
+           Right f  -> Right f
+           -- Normalize validateSingleTx's twin to the Core bad-txns-* token.
+           Left "Outputs exceed inputs" -> Left "bad-txns-in-belowout"
+           Left err -> Left err
+  return fee
 
 --------------------------------------------------------------------------------
 -- Witness Commitment Validation

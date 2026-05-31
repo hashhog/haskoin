@@ -75,7 +75,8 @@ import Haskoin.Crypto (computeTxId)
 import Haskoin.Consensus
   ( validateTransaction, getNextWorkRequired, BlockIndex(..)
   , Network, mainnet, testnet3, testnet4, regtest
-  , computeMerkleRootMutated, blockReward )
+  , computeMerkleRootMutated, blockReward
+  , checkTxInputsConnect, consensusFlagsAtHeight, UTXOEntry(..) )
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
   , verifyScriptWithFlags )
@@ -206,6 +207,7 @@ processLine line =
       in case op of
            "verifytx"   -> processVerifyTx line
            "checktx"    -> processCheckTx line
+           "connecttx"  -> processConnectTx line
            "nextwork"   -> processNextWork line
            "merkleroot" -> processMerkleRoot line
            "subsidy"    -> processSubsidy line
@@ -371,6 +373,126 @@ verifyAllInputs flags tx spentScripts spentAmounts =
     -- spentScripts/spentAmounts are derived 1:1 from txInputs, so the
     -- ragged case is unreachable; close it explicitly rather than crash.
     go i _ _ = Left (i, "internal: input/prevout length mismatch")
+
+------------------------------------------------------------------------------
+-- connecttx op (REAL connect-time Consensus::CheckTxInputs — the ECONOMIC
+-- verdict; tx_verify.cpp:164-214).
+--
+-- Drives haskoin's 'Haskoin.Consensus.checkTxInputsConnect', a thin pure
+-- composite over the SAME 'validateSingleTx' the connect/mempool paths use,
+-- with the coinbase-maturity loop from applyBlock (Consensus.hs:4644-4649)
+-- inlined (validateSingleTx's @Map OutPoint TxOut@ view has no height/coinbase
+-- metadata, so it omits maturity and would false-accept a premature coinbase
+-- spend). The four economic rejects this isolates:
+--   * missing/spent input  -> bad-txns-inputs-missingorspent
+--   * premature coinbase    -> bad-txns-premature-spend-of-coinbase
+--   * MoneyRange violation  -> bad-txns-inputvalues-outofrange
+--   * value-in < value-out  -> bad-txns-in-belowout
+--
+-- We seed an in-memory UTXO VIEW (one 'UTXOEntry' per prevout entry carrying
+-- value + height + is_coinbase). An OMITTED prevout models a missing/spent
+-- input. We reuse the verifytx prevout plumbing (display->wire txid reversal).
+-- checkTxInputsConnect passes skipScripts=True internally so a SCRIPT failure
+-- cannot mask the economic decision (this op scores only the economic verdict).
+-- The flags fed to validateSingleTx are taken at @spend_height@ via
+-- 'consensusFlagsAtHeight' (mainnet) — inert here since scripts are skipped.
+--
+--   request:  {"op":"connecttx","tx_hex":"...",
+--              "prevouts":[{"txid":"<display-hex>","vout":N,
+--                           "scriptPubKey_hex":"...","value_sats":<i64>,
+--                           "height":<int>,"is_coinbase":<bool>},...],
+--              "spend_height":<int>}
+--   response: {"valid":true,"fee_sats":<i64>}      (CheckTxInputs passes)
+--             {"valid":false,"reason":"<bad-txns-*>"} (economic reject)
+--             {"error":"..."}                       (could not evaluate -> SKIP)
+------------------------------------------------------------------------------
+
+data ConnPrevout = ConnPrevout
+  { cpTxidDisplayHex :: T.Text   -- DISPLAY-order hex (reverse for wire)
+  , cpVout           :: Word32
+  , cpSpkHex         :: T.Text
+  , cpValue          :: Word64
+  , cpHeight         :: Word32
+  , cpIsCoinbase     :: Bool
+  }
+
+instance A.FromJSON ConnPrevout where
+  parseJSON = A.withObject "ConnPrevout" $ \o -> ConnPrevout
+    <$> o .:? "txid"             A..!= ""
+    <*> (toW32 <$> o .:? "vout"  A..!= (0 :: Double))
+    <*> o .:? "scriptPubKey_hex" A..!= ""
+    <*> (toW64 <$> o .:? "value_sats" A..!= (0 :: Double))
+    <*> (toW32 <$> o .:? "height" A..!= (0 :: Double))
+    <*> o .:? "is_coinbase"      A..!= False
+    where
+      toW32 d = round (d :: Double)
+      toW64 d = round (d :: Double)
+
+data ConnTxRequest = ConnTxRequest
+  { creqTxHex       :: T.Text
+  , creqPrevouts    :: [ConnPrevout]
+  , creqSpendHeight :: Word32
+  }
+
+instance A.FromJSON ConnTxRequest where
+  parseJSON = A.withObject "ConnTxRequest" $ \o -> ConnTxRequest
+    <$> o .:? "tx_hex"   A..!= ""
+    <*> o .:? "prevouts" A..!= []
+    <*> (toW32 <$> o .:? "spend_height" A..!= (0 :: Double))
+    where toW32 d = round (d :: Double)
+
+processConnectTx :: BL.ByteString -> IO String
+processConnectTx line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareConnTx req of
+      Left e                  -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right (tx, view, sh) -> do
+        -- mainnet flags at spend_height: inert (scripts skipped) but lets the
+        -- impl pick its real connect-time flag set rather than a synthetic one.
+        let flags = consensusFlagsAtHeight mainnet sh
+        r <- try (evaluate
+                    (forceEcon (checkTxInputsConnect mainnet flags sh view tx)))
+               :: IO (Either SomeException (Either String Word64))
+        pure $ case r of
+          Left ex            ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Right fee)  ->
+            "{\"valid\":true,\"fee_sats\":" <> show fee <> "}"
+          Right (Left reason) ->
+            "{\"valid\":false,\"reason\":\"" <> escapeJson reason <> "\"}"
+  where
+    forceEcon x = case x of
+      Left s  -> Left $! (length s `seq` s)
+      Right f -> Right $! f
+
+-- | Decode the connecttx request: hex-decode + deserialize the tx with
+-- haskoin's own 'Tx' 'Serialize' (segwit-aware), then seed an in-memory UTXO
+-- VIEW — one 'UTXOEntry' per prevout entry with value + height + is_coinbase.
+-- A prevout that fails to decode => {"error"} (driver skips, never fake-pass);
+-- an OMITTED prevout simply does not appear in the view and is surfaced by
+-- checkTxInputsConnect as bad-txns-inputs-missingorspent.
+prepareConnTx :: ConnTxRequest
+              -> Either String (Tx, Map.Map OutPoint UTXOEntry, Word32)
+prepareConnTx req = do
+  txBytes <- decodeHex (creqTxHex req)
+  tx      <- case S.decode txBytes :: Either String Tx of
+               Right t -> Right t
+               Left e  -> Left ("tx deserialize: " <> e)
+  entries <- traverse mkEntry (creqPrevouts req)
+  let view = Map.fromList entries
+  Right (tx, view, creqSpendHeight req)
+  where
+    mkEntry p = do
+      txid <- displayHexToWireTxId (cpTxidDisplayHex p)
+      spk  <- decodeHex (cpSpkHex p)
+      let txout = TxOut { txOutValue = cpValue p, txOutScript = spk }
+          entry = UTXOEntry { ueOutput   = txout
+                            , ueHeight   = cpHeight p
+                            , ueCoinbase = cpIsCoinbase p
+                            , ueSpent    = False
+                            }
+      Right (OutPoint txid (cpVout p), entry)
 
 ------------------------------------------------------------------------------
 -- checktx op (tx_valid.json / tx_invalid.json BADTX rows —
