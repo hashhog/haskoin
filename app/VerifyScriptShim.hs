@@ -75,7 +75,7 @@ import Haskoin.Crypto (computeTxId)
 import Haskoin.Consensus
   ( validateTransaction, getNextWorkRequired, BlockIndex(..)
   , Network, mainnet, testnet3, testnet4, regtest
-  , computeMerkleRootMutated )
+  , computeMerkleRootMutated, blockReward )
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
   , verifyScriptWithFlags )
@@ -208,6 +208,7 @@ processLine line =
            "checktx"    -> processCheckTx line
            "nextwork"   -> processNextWork line
            "merkleroot" -> processMerkleRoot line
+           "subsidy"    -> processSubsidy line
            _            -> processVerifyScript line
 
 processVerifyScript :: BL.ByteString -> IO String
@@ -624,6 +625,40 @@ processMerkleRoot line =
                  <> "\",\"mutated\":" <> mutatedTok <> "}"
   where
     forceResult res@(Hash256 bs, m) = BS.length bs `seq` m `seq` res
+
+------------------------------------------------------------------------------
+-- subsidy op (GetBlockSubsidy block-reward differential — Consensus.hs).
+--
+-- Drives haskoin's REAL 'Haskoin.Consensus.blockReward' (Consensus.hs:887,
+-- @blockReward :: Word32 -> Word64@) — the SAME function ConnectBlock uses
+-- for the coinbase cap (@maxCoinbase = blockReward height + totalFees@,
+-- Consensus.hs:2662,4751). Mainnet halving interval (210000) is baked into
+-- 'halvingInterval' (Consensus.hs:603). We do NOT re-implement the halving
+-- schedule here — we feed the height straight into blockReward so any
+-- boundary off-by-one / >=64-halving zero-guard bug surfaces.
+--
+--   request:  {"op":"subsidy","height":<int>}
+--   response: {"subsidy_sats":<int>}   (impl's REAL block subsidy in sats)
+--             {"error":"..."}          (could not compute -> driver SKIPS)
+------------------------------------------------------------------------------
+
+newtype SubsidyRequest = SubsidyRequest { srHeight :: Word32 }
+
+instance A.FromJSON SubsidyRequest where
+  parseJSON = A.withObject "SubsidyRequest" $ \o -> SubsidyRequest
+    <$> (toW32 <$> o A..: "height")
+    where toW32 d = round (d :: Double)
+
+processSubsidy :: BL.ByteString -> IO String
+processSubsidy line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> do
+      r <- try (evaluate (blockReward (srHeight req)))
+             :: IO (Either SomeException Word64)
+      pure $ case r of
+        Left ex -> "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+        Right s -> "{\"subsidy_sats\":" <> show s <> "}"
 
 main :: IO ()
 main = loop
