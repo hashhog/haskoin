@@ -2503,6 +2503,28 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
       -- TxOut-only view for validateBlockTransactions (script checking).
       utxoMap = fmap coinTxOut utxoCoinMap
 
+  -- 0a. COINBASE_MATURITY (W164 follow-up). A tx may not spend a coinbase
+  -- output until it is netCoinbaseMaturity (100) blocks deep. validateFullBlock
+  -- receives the full Map OutPoint Coin (coinHeight + coinIsCoinbase), but the
+  -- TxOut-only utxoMap above DISCARDS that metadata (fmap coinTxOut) -- so the
+  -- live MBlock arm (Main.hs) and the dead Sync.hs IBD path both skipped
+  -- maturity (only the submitblock arm enforced it, via applyBlockToCache).
+  -- Check it HERE, the single chokepoint both leaky arms flow through,
+  -- mirroring checkTxInputsConnect (:2996) and applyBlock (:4644). Spend height
+  -- is the connecting block's own `height` (= csHeight cs + 1), matching Core
+  -- consensus/tx_verify.cpp:177-180 + validation.cpp:2535 (NO +1: the +1 is
+  -- mempool-only). Coinbase tx is naturally exempt (its null prevout is absent
+  -- from utxoCoinMap); an intra-block coinbase spend is absent too (added to
+  -- the UTXO set only after the block connects).
+  let cbMaturity  = fromIntegral (netCoinbaseMaturity net)
+      immatureCb  = [ () | tx   <- tail txns
+                         , txin <- txInputs tx
+                         , Just c <- [Map.lookup (txInPrevOutput txin) utxoCoinMap]
+                         , coinIsCoinbase c
+                         , height - coinHeight c < cbMaturity ]
+  unless (null immatureCb) $
+    Left "bad-txns-premature-spend-of-coinbase"
+
   -- 0. Verify checkpoint (if one exists at this height)
   case verifyCheckpoint checkpoints height blockHash of
     Left (ChainErrCheckpoint h expected actual) ->
