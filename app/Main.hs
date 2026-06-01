@@ -2323,11 +2323,41 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
           -- and don't compete with another peer's tip update.
           connectResult <- withMVar connectLock $ \() -> do
             spent <- buildSpentUtxoMapFromDB db block
-            r <- (connectBlock db net block height spent)
-                   `catch` (\(e :: SomeException) -> do
-                              putStrLn $ "ERROR connecting block "
-                                      ++ show height ++ ": " ++ show e
-                              return (Left ("exception: " <> show e)))
+            -- W164 hollow-live-path fix: run the SAME full consensus gate the
+            -- shim (VerifyScriptShim.hs:710) and submitblock (BlockTemplate.hs:544)
+            -- use, BEFORE connecting.  connectBlock alone (connectBlockAt)
+            -- enforces only G1/G2/G19; this adds scripts, sigops, BIP30, merkle +
+            -- CVE-2012-2459, bad-cb-amount, value-conservation, BIP34/65/66/68/113,
+            -- witness commitment, weight, coinbase structure, and checkpoints.
+            -- Mirrors the dead Sync.hs:382-403 IBD template, with the PARENT-hash
+            -- MTP (NOT Sync.hs:387's own-hash, one block too deep because addHeader
+            -- at :2271 already inserted bh into hcEntries).  assumevalid skip is
+            -- fail-closed: best-header lag => shouldSkipScripts=False => scripts
+            -- verified.  validateFullBlock is pure; checkBIP30's only IO is
+            -- read-only DB lookups on the same db.  NOTE: coinbase-maturity is
+            -- still NOT enforced on this arm (TxOut-only view), a residual
+            -- false-ACCEPT gap, not a spurious reject.
+            blockEntries <- readTVarIO (hcEntries hc)
+            bestHdr      <- readTVarIO (hcTip hc)
+            let blockTs     = bhTimestamp hdr
+                parentHash  = bhPrevBlock hdr
+                prevMTP     = medianTimePast blockEntries parentHash
+                skipScripts = shouldSkipScripts bh height blockTs net blockEntries bestHdr
+                cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
+                                (consensusFlagsAtHeight net height)
+            vr <- (validateFullBlockIO db net cs skipScripts block spent)
+                    `catch` (\(e :: SomeException) -> do
+                               putStrLn $ "ERROR validating block "
+                                       ++ show height ++ ": " ++ show e
+                               return (Left ("Core full-block validation: exception: " <> show e)))
+            r <- case vr of
+                   Left verr -> return (Left ("Core full-block validation: " <> verr))
+                   Right () ->
+                     (connectBlock db net block height spent)
+                       `catch` (\(e :: SomeException) -> do
+                                  putStrLn $ "ERROR connecting block "
+                                          ++ show height ++ ": " ++ show e
+                                  return (Left ("exception: " <> show e)))
             -- Advance the next-block pointer IF the connect succeeded.
             -- Done inside the lock so the @BestBlock / nextBlockRef@
             -- pair stays consistent end-to-end — a concurrent kicker
