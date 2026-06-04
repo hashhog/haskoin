@@ -234,7 +234,10 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            -- 'getblockhash' for height bounds) must
                            -- report the validated tip ('PrefixBestBlock'
                            -- on disk), not the in-memory header tip.
-                           getValidatedChainTip)
+                           getValidatedChainTip,
+                           -- COINBASE_MATURITY (100) for the generate vs.
+                           -- immature category split in listtransactions.
+                           coinbaseMaturity)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 -- BIP-157/158 helpers for the REST blockfilter / blockfilterheaders
@@ -308,6 +311,8 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
                         getSpendableBalance, scanBlockForWallet, resignViaPsbt,
+                        WalletTxHistoryEntry(..), WalletTxDetail(..),
+                        getWalletTxHistory, lookupWalletTx,
                         -- Wallet encryption (BIP-38-style passphrase locking)
                         Passphrase, encryptWallet, unlockWallet, lockWallet,
                         isWalletLocked,
@@ -1132,6 +1137,7 @@ handleRpcRequest server req = do
     "getnewaddress"        -> handleGetNewAddress server params
     "sendtoaddress"        -> handleSendToAddress server params
     "listtransactions"     -> handleListTransactions server params
+    "gettransaction"       -> handleGetTransaction server params
     "listunspent"          -> handleListUnspent server params
 
     -- BIP-125 Fee Bumping (W118 G22, FIX-61)
@@ -3430,7 +3436,7 @@ generateSingleBlock server scriptPubKey specificTxs = do
             Just wm -> do
               wallets <- Map.elems <$> readTVarIO (wmWallets wm)
               forM_ wallets $ \ws ->
-                scanBlockForWallet (wsWallet ws) (blockTxns block) height
+                scanBlockForWallet (wsWallet ws) block height
           return $ Right bh
 
 -- | Build a coinbase transaction for regtest.
@@ -6707,14 +6713,18 @@ handleSendToAddress server params = do
 -- Wallet: List Transactions RPC Handler
 --------------------------------------------------------------------------------
 
--- | List wallet transaction history
--- Reference: Bitcoin Core's listtransactions RPC (wallet/rpc/transactions.cpp)
+-- | List wallet transaction history.
+--
+-- Reference: bitcoin-core/src/wallet/rpc/transactions.cpp listtransactions /
+-- ListTransactions.  Core walks the wallet's txs oldest→newest, expanding each
+-- into "send" rows (one per debit, NEGATIVE amount + NEGATIVE fee) and
+-- "receive"/"generate"/"immature" rows (one per credit, POSITIVE amount), then
+-- returns the LAST `count` rows after skipping `skip` from the tail.
+--
 -- Parameters:
---   label (optional): Filter by label, or "*" for all
---   count (optional): Number of transactions to return (default 10)
---   skip (optional): Number of transactions to skip (default 0)
--- Returns:
---   Array of transaction entries
+--   label (optional): "*" (all) — we surface all wallet rows.
+--   count (optional): max rows to return (default 10).
+--   skip  (optional): rows to skip from the most-recent end (default 0).
 handleListTransactions :: RpcServer -> Value -> IO RpcResponse
 handleListTransactions server params = do
   case rsWalletMgr server of
@@ -6727,57 +6737,190 @@ handleListTransactions server params = do
           (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
         Just walletState -> do
           let count = fromMaybe 10 (extractParam params 1 :: Maybe Int)
-              skip = fromMaybe 0 (extractParam params 2 :: Maybe Int)
-
-          -- Get wallet transactions
-          txHistory <- getWalletTransactions walletState count skip
-
-          let resultsEnc = AE.list txHistoryEnc txHistory
-              rawBs      = encodingToLazyByteString resultsEnc
+              skip  = fromMaybe 0  (extractParam params 2 :: Maybe Int)
+          tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+          -- Oldest→newest entries; each entry expands to one or more
+          -- per-category rows.  Concat in entry order, then apply Core's
+          -- tail-slice (skip from the end, take `count`).
+          entries <- getWalletTxHistory (wsWallet walletState)
+          let allRows = concatMap (entryToListRows tipHeight) entries
+              n       = length allRows
+              -- Core: nFrom counts from the END.  rows[n-skip-count .. n-skip).
+              endIdx  = max 0 (n - max 0 skip)
+              startIdx = max 0 (endIdx - max 0 count)
+              chosen  = take (endIdx - startIdx) (drop startIdx allRows)
+              rawBs   = encodingToLazyByteString (AE.list listRowEnc chosen)
           return $ RpcResponse (rawJsonResult rawBs) Null Null
-  where
-    -- | Streaming Encoding for one wallet transaction entry.
-    -- amount uses btcAmountEnc for Core's fixed-decimal format.
-    txHistoryEnc :: WalletTransaction -> AE.Encoding
-    txHistoryEnc wtx =
-      let addrEnc = case wtxAddress wtx of
-            Just addr -> pair "address" (text addr)
-            Nothing   -> mempty
-          bhEnc = case wtxBlockHash wtx of
-            Just bh -> pair "blockhash" (text (showHash bh))
-            Nothing -> mempty
-          btEnc = case wtxBlockTime wtx of
-            Just t  -> pair "blocktime" (AE.word32 t)
-            Nothing -> mempty
-      in pairs $
-           pair "txid"          (text (showHash (BlockHash (getTxIdHash (wtxTxId wtx))))) <>
-           addrEnc                                                                         <>
-           pair "category"      (text (wtxCategory wtx))                                  <>
-           pair "amount"        (btcAmountEnc (wtxAmount wtx))                            <>
-           pair "vout"          (AE.int (wtxVout wtx))                                    <>
-           pair "confirmations" (AE.int (wtxConfirmations wtx))                           <>
-           bhEnc                                                                          <>
-           btEnc                                                                          <>
-           pair "time"          (AE.word32 (wtxTime wtx))
 
--- | Wallet transaction record
-data WalletTransaction = WalletTransaction
-  { wtxTxId          :: !TxId
-  , wtxAddress       :: !(Maybe Text)
-  , wtxCategory      :: !Text
-  , wtxAmount        :: !Int64
-  , wtxVout          :: !Int
-  , wtxConfirmations :: !Int
-  , wtxBlockHash     :: !(Maybe BlockHash)
-  , wtxBlockTime     :: !(Maybe Word32)
-  , wtxTime          :: !Word32
+-- | One listtransactions output row (a flattened send/receive detail with
+-- its parent tx's confirmation context).
+data ListTxRow = ListTxRow
+  { ltrAddress       :: !(Maybe Text)
+  , ltrCategory      :: !Text
+  , ltrAmount        :: !Int64        -- ^ signed satoshis (negative for send)
+  , ltrVout          :: !Int
+  , ltrFee           :: !(Maybe Int64) -- ^ negative; send rows only
+  , ltrConfirmations :: !Int
+  , ltrGenerated     :: !Bool
+  , ltrBlockHash     :: !BlockHash
+  , ltrBlockHeight   :: !Word32
+  , ltrBlockTime     :: !Word32
+  , ltrTxId          :: !TxId
+  , ltrTime          :: !Word32
   }
 
--- | Get wallet transactions (placeholder - needs proper wallet tx tracking)
-getWalletTransactions :: WalletState -> Int -> Int -> IO [WalletTransaction]
-getWalletTransactions _walletState _count _skip = do
-  -- TODO: Implement proper transaction history from wallet
-  return []
+-- | Resolve a coinbase credit's category from its confirmation count:
+-- < COINBASE_MATURITY -> "immature", else "generate" (Core
+-- ListTransactions: IsTxImmatureCoinBase ? "immature" : "generate").
+coinbaseCategory :: Int -> Text
+coinbaseCategory confs
+  | confs < coinbaseMaturity = "immature"
+  | otherwise                = "generate"
+
+-- | Expand one wallet tx entry into its listtransactions rows: a "send"
+-- row per debit detail, then a credit row per receive detail.
+entryToListRows :: Word32 -> WalletTxHistoryEntry -> [ListTxRow]
+entryToListRows tipHeight e =
+  let confs = computeConfsInt tipHeight (wthBlockHeight e)
+      -- fee (negative, send rows only): Core nFee = GetValueOut - nDebit,
+      -- displayed as -nFee.  fee = valueOut - debit (a small NEGATIVE
+      -- number for a normal send); we surface it negated for the row.
+      feeNeg = if wthDebit e > 0
+                 then Just (fromIntegral (wthValueOut e) - fromIntegral (wthDebit e) :: Int64)
+                 else Nothing
+      mkRow d =
+        let cat = case wtdCategory d of
+                    "send"     -> "send"
+                    "coinbase" -> coinbaseCategory confs
+                    _          -> "receive"
+            isSend = wtdCategory d == "send"
+        in ListTxRow
+             { ltrAddress       = wtdAddress d
+             , ltrCategory      = cat
+             , ltrAmount        = wtdAmount d
+             , ltrVout          = wtdVout d
+             , ltrFee           = if isSend then feeNeg else Nothing
+             , ltrConfirmations = confs
+             , ltrGenerated     = wthIsCoinbase e
+             , ltrBlockHash     = wthBlockHash e
+             , ltrBlockHeight   = wthBlockHeight e
+             , ltrBlockTime     = wthBlockTime e
+             , ltrTxId          = wthTxId e
+             , ltrTime          = wthBlockTime e
+             }
+  in map mkRow (wthDetails e)
+
+-- | Confirmations as a plain Int (tip - height + 1, clamped at 0).
+computeConfsInt :: Word32 -> Word32 -> Int
+computeConfsInt tipHeight blockHeight
+  | tipHeight >= blockHeight = fromIntegral (tipHeight - blockHeight) + 1
+  | otherwise                = 0
+
+-- | Streaming Encoding for one listtransactions row.  Field order + sign
+-- conventions match Core's ListTransactions (negative amount/fee for send).
+listRowEnc :: ListTxRow -> AE.Encoding
+listRowEnc r =
+  let addrEnc = case ltrAddress r of
+        Just a  -> pair "address" (text a)
+        Nothing -> mempty
+      feeEnc = case ltrFee r of
+        Just f  -> pair "fee" (btcAmountEnc f)
+        Nothing -> mempty
+  in pairs $
+       addrEnc                                                                  <>
+       pair "category"      (text (ltrCategory r))                             <>
+       pair "amount"        (btcAmountEnc (ltrAmount r))                       <>
+       pair "vout"          (AE.int (ltrVout r))                              <>
+       feeEnc                                                                   <>
+       pair "confirmations" (AE.int (ltrConfirmations r))                      <>
+       pair "generated"     (AE.bool (ltrGenerated r))                         <>
+       pair "blockhash"     (text (showHash (ltrBlockHash r)))                 <>
+       pair "blockheight"   (AE.word32 (ltrBlockHeight r))                     <>
+       pair "blocktime"     (AE.word32 (ltrBlockTime r))                       <>
+       pair "txid"          (text (showHash (BlockHash (getTxIdHash (ltrTxId r))))) <>
+       pair "time"          (AE.word32 (ltrTime r))
+
+--------------------------------------------------------------------------------
+-- Wallet: Get Transaction RPC Handler
+--------------------------------------------------------------------------------
+
+-- | Get detailed info about an in-wallet transaction.
+--
+-- Reference: bitcoin-core/src/wallet/rpc/transactions.cpp gettransaction.
+-- Top-level shape: { amount, fee (send only), confirmations, generated,
+-- blockhash, blockheight, blocktime, txid, time, details:[...], hex }.
+--   amount = nNet - nFee = (credit - debit) - fee.  For a pure receive this
+--            is the credit; for a send it nets to (change - sent) - fee.
+--   fee    = -(valueOut - debit) when is-from-me (NEGATIVE; a cost).
+handleGetTransaction :: RpcServer -> Value -> IO RpcResponse
+handleGetTransaction server params =
+  case rsWalletMgr server of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+        Just walletState ->
+          case extractParamText params 0 >>= parseTxIdHex of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams "txid must be a 64-char hex string") Null
+            Just txid -> do
+              mEntry <- lookupWalletTx (wsWallet walletState) txid
+              case mEntry of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidAddressOrKey
+                     "Invalid or non-wallet transaction id") Null
+                Just e -> do
+                  tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+                  let confs   = computeConfsInt tipHeight (wthBlockHeight e)
+                      isFromMe = wthDebit e > 0
+                      -- fee (NEGATIVE; only when from-me): valueOut - debit.
+                      feeNeg  = fromIntegral (wthValueOut e)
+                                  - fromIntegral (wthDebit e) :: Int64
+                      -- amount = (credit - debit) - fee.  feeNeg is already
+                      -- (valueOut - debit) <= 0; subtracting it adds the
+                      -- spent-to-others amount back as a negative net.
+                      net     = fromIntegral (wthCredit e)
+                                  - fromIntegral (wthDebit e) :: Int64
+                      amount  = if isFromMe then net - feeNeg else net
+                      feeEnc  = if isFromMe
+                                  then pair "fee" (btcAmountEnc feeNeg)
+                                  else mempty
+                      rows    = entryToListRows tipHeight e
+                      detailEnc = AE.list detailRowEnc rows
+                      enc = pairs $
+                        pair "amount"        (btcAmountEnc amount)                 <>
+                        feeEnc                                                      <>
+                        pair "confirmations" (AE.int confs)                        <>
+                        pair "generated"     (AE.bool (wthIsCoinbase e))           <>
+                        pair "blockhash"     (text (showHash (wthBlockHash e)))    <>
+                        pair "blockheight"   (AE.word32 (wthBlockHeight e))        <>
+                        pair "blocktime"     (AE.word32 (wthBlockTime e))          <>
+                        pair "txid"          (text (showHash (BlockHash (getTxIdHash (wthTxId e))))) <>
+                        pair "time"          (AE.word32 (wthBlockTime e))          <>
+                        pair "details"       detailEnc                            <>
+                        pair "hex"           (text (wthHex e))
+                      rawBs = encodingToLazyByteString enc
+                  return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Streaming Encoding for one gettransaction "details" entry (a slimmer
+-- form of a listtransactions row: no parent-tx confirmation fields).
+detailRowEnc :: ListTxRow -> AE.Encoding
+detailRowEnc r =
+  let addrEnc = case ltrAddress r of
+        Just a  -> pair "address" (text a)
+        Nothing -> mempty
+      feeEnc = case ltrFee r of
+        Just f  -> pair "fee" (btcAmountEnc f)
+        Nothing -> mempty
+  in pairs $
+       addrEnc                                          <>
+       pair "category" (text (ltrCategory r))          <>
+       pair "amount"   (btcAmountEnc (ltrAmount r))    <>
+       pair "vout"     (AE.int (ltrVout r))            <>
+       feeEnc
 
 --------------------------------------------------------------------------------
 -- Wallet: List Unspent RPC Handler

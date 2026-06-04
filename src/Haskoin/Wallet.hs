@@ -114,6 +114,11 @@ module Haskoin.Wallet
     -- * Block -> wallet UTXO ledger (CWallet::blockConnected analogue)
   , scanBlockForWallet
   , unscanBlockForWallet
+    -- * Wallet transaction history (CWallet::mapWallet analogue)
+  , WalletTxHistoryEntry(..)
+  , WalletTxDetail(..)
+  , getWalletTxHistory
+  , lookupWalletTx
     -- * Transaction Creation
   , createTransaction
   , fundTransaction
@@ -265,6 +270,7 @@ module Haskoin.Wallet
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as C8
+import qualified Data.ByteString.Base16 as B16
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
@@ -294,7 +300,8 @@ import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirec
 import System.FilePath ((</>))
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
-                       TxIn(..), TxOut(..), Tx(..), putVarInt, getVarInt', putVarBytes, getVarBytes)
+                       TxIn(..), TxOut(..), Tx(..), BlockHeader(..), Block(..),
+                       putVarInt, getVarInt', putVarBytes, getVarBytes)
 import Haskoin.Crypto
 import qualified Haskoin.TaprootSighash as TS
 import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encodeScript)
@@ -1215,6 +1222,14 @@ data Wallet = Wallet
       --   bumpfee / psbtbumpfee to look up the original tx, its prevouts,
       --   the change-output index, and the old fee.  Reference:
       --   bitcoin-core/src/wallet/wallet.h CWallet::mapWallet + CWalletTx.
+  , walletTxHistory    :: !(TVar (Map TxId WalletTxHistoryEntry))
+      -- ^ Wallet transaction history: one entry per wallet-relevant tx,
+      --   recorded at block-connect time by 'scanBlockForWallet' and
+      --   removed on disconnect by 'unscanBlockForWallet'.  Surfaced by
+      --   listtransactions / gettransaction.  The CWallet::mapWallet
+      --   analogue for history (vs. walletUTXOs which is the spendable
+      --   coin set).  Reference: bitcoin-core/src/wallet/wallet.h
+      --   CWallet::mapWallet, rpc/wallet/transactions.cpp ListTransactions.
   }
 
 -- | A record of an outgoing transaction the wallet has produced.
@@ -1248,6 +1263,71 @@ data SentTxRecord = SentTxRecord
   } deriving (Show, Generic)
 
 instance NFData SentTxRecord
+
+--------------------------------------------------------------------------------
+-- Wallet transaction history (CWallet::mapWallet analogue)
+--
+-- One entry per wallet-relevant transaction, recorded at block-connect
+-- time and surfaced by listtransactions / gettransaction.  Mirrors the
+-- per-tx accounting Bitcoin Core's CWallet does in CachedTxGetAmounts
+-- (wallet/transaction.cpp) + ListTransactions (rpc/wallet/transactions.cpp):
+-- a tx splits into "received" output entries (credits to wallet addresses)
+-- and "sent" entries (debits — wallet inputs spending wallet UTXOs).  We
+-- collapse the per-tx state needed to reproduce that shape.
+--------------------------------------------------------------------------------
+
+-- | A single credit (output) or debit (input) detail of a wallet tx,
+-- mirroring Core's COutputEntry — one listtransactions row's worth.
+data WalletTxDetail = WalletTxDetail
+  { wtdAddress  :: !(Maybe Text)
+    -- ^ Address this detail pays / spends from, if decodable.
+  , wtdCategory :: !Text
+    -- ^ "send" | "receive" | "generate" | "immature".  For "generate" /
+    --   "immature" the final string is computed at query time from the
+    --   tip height (maturity is confirmation-dependent); we store the
+    --   base "receive"/"coinbase-receive" flag via 'wtdIsCoinbase'.
+  , wtdAmount   :: !Int64
+    -- ^ Signed satoshis: negative for "send", positive for credits.
+  , wtdVout     :: !Int
+    -- ^ The output index this detail refers to (-1 for an input/send-only
+    --   aggregate that does not map to one of our outputs).
+  } deriving (Show, Eq, Generic)
+
+instance NFData WalletTxDetail
+
+-- | A wallet transaction history entry — the CWalletTx analogue for the
+-- subset of fields listtransactions / gettransaction surface.
+data WalletTxHistoryEntry = WalletTxHistoryEntry
+  { wthTxId        :: !TxId
+    -- ^ The transaction id.
+  , wthBlockHeight :: !Word32
+    -- ^ Height of the block that confirmed this tx.
+  , wthBlockHash   :: !BlockHash
+    -- ^ Hash of the confirming block.
+  , wthBlockTime   :: !Word32
+    -- ^ The confirming block's header timestamp (used for both
+    --   "blocktime" and "time", as Core does for mined-into-block txs
+    --   the wallet first sees at connect).
+  , wthBlockIndex  :: !Int
+    -- ^ 0-based position of this tx within its block.
+  , wthIsCoinbase  :: !Bool
+    -- ^ Whether this tx is a coinbase (drives generate/immature).
+  , wthCredit      :: !Word64
+    -- ^ Total satoshis this tx paid TO wallet addresses (sum of credits).
+  , wthDebit       :: !Word64
+    -- ^ Total satoshis this tx spent FROM wallet UTXOs (sum of inputs we
+    --   tracked).  Non-zero => the wallet sent this tx (is-from-me).
+  , wthValueOut    :: !Word64
+    -- ^ Total output value of the tx (all outputs), used to derive the
+    --   fee for sends: fee = debit - valueOut (Core: GetValueOut - nDebit,
+    --   then negated for display).
+  , wthDetails     :: ![WalletTxDetail]
+    -- ^ Per-output/input detail rows (the gettransaction "details" array).
+  , wthHex         :: !Text
+    -- ^ Raw serialized tx hex (gettransaction "hex").
+  } deriving (Show, Eq, Generic)
+
+instance NFData WalletTxHistoryEntry
 
 -- | Wallet configuration parameters.
 data WalletConfig = WalletConfig
@@ -1283,8 +1363,9 @@ loadWallet WalletConfig{..} mnemonic = do
   addrLabels <- newTVarIO Map.empty
   txLabels <- newTVarIO Map.empty
   sentTxs <- newTVarIO Map.empty
+  txHistory <- newTVarIO Map.empty
   return $ Wallet master account recvIdx changeIdx addrs utxos wcNetwork wcGapLimit
-                  addrLabels txLabels sentTxs
+                  addrLabels txLabels sentTxs txHistory
 
 -- | Save wallet state to a file.
 -- SECURITY: In production, encrypt private keys with a passphrase.
@@ -1500,44 +1581,157 @@ getSpendableBalance wallet tipHeight = do
 --------------------------------------------------------------------------------
 
 -- | Scan a freshly-connected block, crediting wallet-owned outputs and
--- debiting spent wallet UTXOs.  @blockTxs@ MUST be in block order with
--- the coinbase first.
-scanBlockForWallet :: Wallet -> [Tx] -> Word32 -> IO ()
-scanBlockForWallet wallet txs height = do
+-- debiting spent wallet UTXOs, AND recording a wallet transaction history
+-- entry for every wallet-relevant tx (listtransactions / gettransaction).
+-- @block@'s txs MUST be in block order with the coinbase first.
+--
+-- History accounting mirrors Core's CachedTxGetAmounts + ListTransactions:
+-- for each tx we sum the CREDIT (outputs paying our addresses) and the
+-- DEBIT (inputs spending UTXOs we tracked, looked up in the live UTXO map
+-- BEFORE the debit removes them).  A non-zero debit means the wallet sent
+-- the tx; the displayed fee is then @debit - totalValueOut@ (Core:
+-- GetValueOut - nDebit).  A tx with neither credit nor debit is not
+-- wallet-relevant and is skipped (no history row), matching Core which
+-- only adds wallet-relevant txs to mapWallet.
+scanBlockForWallet :: Wallet -> Block -> Word32 -> IO ()
+scanBlockForWallet wallet block height = do
+  let txs       = blockTxns block
+      header    = blockHeader block
+      bHash     = computeBlockHash header
+      bTime     = bhTimestamp header
   ourAddrs <- readTVarIO (walletAddresses wallet)
-  let isOurScript s = case decodeOurAddress s of
+  let net = walletNetwork wallet
+      decodeAddr s = decodeOurAddress s
+      isOurScript s = case decodeAddr s of
         Just a  -> Map.member a ourAddrs
         Nothing -> False
-  atomically $ modifyTVar' (walletUTXOs wallet) $ \utxos0 ->
-    let step utxos (idx, tx) =
+      addrText s = addressToTextW net <$> decodeAddr s
+  atomically $ do
+    utxos0 <- readTVar (walletUTXOs wallet)
+    let -- Thread (utxoMap, [historyEntry]) through the block's txs.
+        step (utxos, hist) (idx, tx) =
           let txid       = computeTxId tx
               isCb       = idx == (0 :: Int)
-              -- Debit: drop any prevout this tx spends that we track.
-              -- The coinbase's single synthetic input (all-zero prevout)
-              -- never matches a tracked UTXO, so skipping it is harmless.
-              spent      = if isCb then []
+              -- Debit: inputs spending a UTXO we currently track.  Look
+              -- them up in the LIVE map before deletion so we capture the
+              -- spent amount + address.  Coinbase has only the synthetic
+              -- all-zero input, which never matches.
+              spentOps   = if isCb then []
                            else map txInPrevOutput (txInputs tx)
-              utxosDebit = foldr Map.delete utxos spent
+              spentHits  = [ (op, e) | op <- spentOps
+                           , Just e <- [Map.lookup op utxos] ]
+              debit      = sum [ txOutValue (wueTxOut e) | (_, e) <- spentHits ]
+              utxosDebit = foldr (Map.delete . fst) utxos spentHits
               -- Credit: outputs paying a wallet address.
-              credits    = [ ( OutPoint txid (fromIntegral oi)
-                             , WalletUtxoEntry txout height isCb )
+              ourOuts    = [ (oi, txout)
                            | (oi, txout) <- zip [0 :: Int ..] (txOutputs tx)
                            , isOurScript (txOutScript txout) ]
-          in foldr (\(op, e) m -> Map.insert op e m) utxosDebit credits
-    in foldl step utxos0 (zip [0 ..] txs)
+              credit     = sum [ txOutValue txout | (_, txout) <- ourOuts ]
+              utxosCredit = foldr
+                (\(oi, txout) m ->
+                   Map.insert (OutPoint txid (fromIntegral oi))
+                              (WalletUtxoEntry txout height isCb) m)
+                utxosDebit ourOuts
+              valueOut   = sum (map txOutValue (txOutputs tx))
+              -- Per-detail rows.  Mirrors Core CachedTxGetAmounts +
+              -- ListTransactions: when the wallet spent (debit > 0) emit one
+              -- "send" row PER output that is NOT ours (the foreign / non-
+              -- change payees), amount NEGATED, vout = that output index,
+              -- address = the payee.  Then emit one "receive" row per
+              -- wallet output (category resolved generate/immature/receive
+              -- at query time from wthIsCoinbase + confirmations).
+              ourOutIdxs = map fst ourOuts
+              sendDetails = if debit > 0
+                              then [ WalletTxDetail (addrText (txOutScript txout))
+                                       "send"
+                                       (negate (fromIntegral (txOutValue txout))) oi
+                                   | (oi, txout) <- zip [0 :: Int ..] (txOutputs tx)
+                                   , oi `notElem` ourOutIdxs ]
+                              else []
+              recvDetails = [ WalletTxDetail (addrText (txOutScript txout))
+                               (if isCb then "coinbase" else "receive")
+                               (fromIntegral (txOutValue txout)) oi
+                           | (oi, txout) <- ourOuts ]
+              relevant   = credit > 0 || debit > 0
+              entry      = WalletTxHistoryEntry
+                             { wthTxId        = txid
+                             , wthBlockHeight = height
+                             , wthBlockHash   = bHash
+                             , wthBlockTime   = bTime
+                             , wthBlockIndex  = idx
+                             , wthIsCoinbase  = isCb
+                             , wthCredit      = credit
+                             , wthDebit       = debit
+                             , wthValueOut    = valueOut
+                             , wthDetails     = sendDetails ++ recvDetails
+                             , wthHex         = TE.decodeUtf8 (B16.encode (encode tx))
+                             }
+              hist'      = if relevant then (txid, entry) : hist else hist
+          in (utxosCredit, hist')
+        (utxosFinal, histEntries) = foldl step (utxos0, []) (zip [0 ..] txs)
+    writeTVar (walletUTXOs wallet) utxosFinal
+    modifyTVar' (walletTxHistory wallet) $ \h ->
+      foldr (\(tid, e) m -> Map.insert tid e m) h histEntries
 
 -- | Reverse 'scanBlockForWallet' for a reorg disconnect: remove the
 -- credits this block created (the outputs whose txids belong to this
--- block).  Inputs spent by this block's txs are NOT restored here (their
--- metadata is gone); a rescan reconstructs full state if needed.
-unscanBlockForWallet :: Wallet -> [Tx] -> Word32 -> IO ()
-unscanBlockForWallet wallet txs _height = do
-  let createdOutpoints =
-        [ OutPoint (computeTxId tx) (fromIntegral oi)
-        | tx <- txs
+-- block) AND the history entries this block recorded (txs confirmed at
+-- this height).  Inputs spent by this block's txs are NOT restored here
+-- (their metadata is gone); a rescan reconstructs full state if needed.
+unscanBlockForWallet :: Wallet -> Block -> Word32 -> IO ()
+unscanBlockForWallet wallet block height = do
+  let txs = blockTxns block
+      blockTxIds = map computeTxId txs
+      createdOutpoints =
+        [ OutPoint tid (fromIntegral oi)
+        | (tid, tx) <- zip blockTxIds txs
         , (oi, _txout) <- zip [0 :: Int ..] (txOutputs tx) ]
-  atomically $ modifyTVar' (walletUTXOs wallet) $ \utxos ->
-    foldr Map.delete utxos createdOutpoints
+  atomically $ do
+    modifyTVar' (walletUTXOs wallet) $ \utxos ->
+      foldr Map.delete utxos createdOutpoints
+    -- Drop history rows recorded for txs in THIS block at THIS height.
+    modifyTVar' (walletTxHistory wallet) $ \h ->
+      foldr (\tid m -> case Map.lookup tid m of
+                Just e | wthBlockHeight e == height -> Map.delete tid m
+                _ -> m) h blockTxIds
+
+-- | Network-aware address rendering for history detail rows.  Mirrors
+-- the dispatch in 'addressToText' / the RPC layer's addressToTextNet so
+-- the wallet records regtest 'bcrt1…' / testnet 'tb1…' strings, not the
+-- mainnet 'bc1…' form.
+addressToTextW :: Network -> Address -> Text
+addressToTextW net addr =
+  let hrp = case Haskoin.Consensus.netName net of
+              "main"    -> "bc"
+              "regtest" -> "bcrt"
+              _         -> "tb"
+      (verP2PKH, verP2SH) = case Haskoin.Consensus.netName net of
+              "main" -> (0x00, 0x05)
+              _      -> (0x6f, 0xc4)
+  in case addr of
+       PubKeyAddress h        -> base58Check verP2PKH (getHash160 h)
+       ScriptAddress h        -> base58Check verP2SH  (getHash160 h)
+       WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
+       WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
+       TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
+
+-- | Return wallet transaction history, most-recent first.  Ordering keys
+-- on (block height DESC, then block index DESC) so the newest confirmed
+-- tx sorts first — matching listtransactions' "most recent last → we
+-- reverse to first" convention after the caller applies skip/count.
+-- Mirrors the time-ordering Core's listtransactions uses (it sorts the
+-- collected entries by CWalletTx time then returns the tail).
+getWalletTxHistory :: Wallet -> IO [WalletTxHistoryEntry]
+getWalletTxHistory wallet = do
+  h <- readTVarIO (walletTxHistory wallet)
+  -- Ascending by (height, blockindex): oldest first, as Core builds the
+  -- vector; the RPC layer takes the LAST `count` after `skip`.
+  return $ sortOn (\e -> (wthBlockHeight e, wthBlockIndex e)) (Map.elems h)
+
+-- | Look up a single wallet transaction by id (gettransaction).
+lookupWalletTx :: Wallet -> TxId -> IO (Maybe WalletTxHistoryEntry)
+lookupWalletTx wallet tid =
+  Map.lookup tid <$> readTVarIO (walletTxHistory wallet)
 
 --------------------------------------------------------------------------------
 -- UTXO Types for Coin Selection
