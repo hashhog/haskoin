@@ -311,6 +311,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
                         getSpendableBalance, scanBlockForWallet, resignViaPsbt,
+                        importPrivKeyW, dumpPrivKeyForAddress, wifEncode,
                         WalletTxHistoryEntry(..), WalletTxDetail(..),
                         getWalletTxHistory, lookupWalletTx,
                         -- Wallet encryption (BIP-38-style passphrase locking)
@@ -1095,6 +1096,15 @@ handleRpcRequest server req = do
 
     -- Wallet balance RPCs (require wallet selection)
     "getbalance"           -> handleGetBalance server params
+
+    -- Wallet rescan + raw-key import (CWallet::ScanForWalletTransactions /
+    -- ImportPrivKeys analogues).  rescanblockchain re-scans EXISTING chain
+    -- blocks to (re)credit wallet-owned outputs — the wallet rescan a
+    -- seed-restored wallet needs to rediscover its funds.  importprivkey
+    -- adds a raw key + (optionally) rescans to credit its funds.
+    "rescanblockchain"     -> handleRescanBlockchain server params
+    "importprivkey"        -> handleImportPrivKey server params
+    "dumpprivkey"          -> handleDumpPrivKey server params
 
     -- PSBT RPCs
     "createpsbt"           -> handleCreatePsbt server params
@@ -5361,6 +5371,146 @@ handleGetBalance server _params = withWalletMgr server $ \wm -> do
       let enc   = btcAmountEnc (fromIntegral sats)
           rawBs = encodingToLazyByteString enc
       return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+--------------------------------------------------------------------------------
+-- Wallet rescan + raw-key import
+--
+-- 'rescanWalletRange' is the BACKWARD counterpart of the forward
+-- block-connect scan ('scanBlockForWallet', wired at generatetoaddress /
+-- block-connect time): it walks an EXISTING height range, re-reading each
+-- already-validated block from storage and feeding it through the very same
+-- 'scanBlockForWallet' so wallet-owned outputs are credited and spent inputs
+-- debited.  Mirrors Bitcoin Core's CWallet::ScanForWalletTransactions
+-- (wallet/wallet.cpp), which iterates the active chain block-by-block calling
+-- the same per-block transaction handler the connect path uses.
+--
+-- This is the REAL wallet rescan: a wallet restored from a seed derives its
+-- keys but has an empty coin set until something scans the chain for it.
+-- 'rescanblockchain' provides that, distinct from 'scantxoutset' (a chain-level
+-- UTXO query that never touches the wallet ledger).
+--------------------------------------------------------------------------------
+
+-- | Re-scan blocks [start, stop] (inclusive) on the active chain through the
+-- wallet's block-connect scan, crediting/debiting the wallet ledger.  Reads
+-- each block hash from the on-disk height index and the body from block
+-- storage; heights with no stored body are skipped (assume-valid IBD may not
+-- have persisted every body — on regtest the miner persists every block).
+rescanWalletRange :: RpcServer -> Wallet -> Word32 -> Word32 -> IO ()
+rescanWalletRange server wallet start stop =
+  forM_ [start .. stop] $ \h -> do
+    mBh <- getBlockHeight (rsDB server) h
+    case mBh of
+      Nothing -> return ()
+      Just bh -> do
+        mBlock <- getBlock (rsDB server) bh
+        case mBlock of
+          Nothing    -> return ()
+          Just block -> scanBlockForWallet wallet block h
+
+-- | rescanblockchain [start_height] [stop_height]
+--
+-- Rescan the local block chain for transactions affecting the wallet.  Returns
+-- @{"start_height": <s>, "stop_height": <e>}@ (Core shape,
+-- wallet/rpc/transactions.cpp @rescanblockchain@).  Both parameters are
+-- optional: start defaults to 0 (genesis), stop defaults to the validated tip.
+--
+-- Reference: bitcoin-core/src/wallet/rpc/transactions.cpp rescanblockchain →
+-- CWallet::ScanForWalletTransactions.
+handleRescanBlockchain :: RpcServer -> Value -> IO RpcResponse
+handleRescanBlockchain server params = withWalletMgr server $ \wm -> do
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound
+        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+    Just ws -> do
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      let tipH  = ceHeight tip
+          start = case extractParam params 0 :: Maybe Int of
+                    Just s | s >= 0 -> fromIntegral s
+                    _              -> 0 :: Word32
+          stop  = case extractParam params 1 :: Maybe Int of
+                    Just e | e >= 0 -> min (fromIntegral e) tipH
+                    _              -> tipH
+      if start > stop
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            "Invalid start_height (greater than stop_height / chain tip)") Null
+        else do
+          rescanWalletRange server (wsWallet ws) start stop
+          let enc = pairs $
+                      pair "start_height" (AE.word32 start) <>
+                      pair "stop_height"  (AE.word32 stop)
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | importprivkey "privkey" ( "label" ) ( rescan )
+--
+-- Import a WIF-encoded private key into the wallet keychain and, by default,
+-- rescan the chain to credit its existing funds.  Returns null on success
+-- (Core shape, wallet/rpc/backup.cpp @importprivkey@).
+--
+-- The key's standard single-key address forms (native P2WPKH + legacy P2PKH +
+-- P2SH-wrapped-P2WPKH) are registered with the wallet ('importPrivKeyW') so the
+-- chain scan recognises any output paying it.  @rescan@ (param 2, default true)
+-- controls whether we immediately scan [0, tip] for the key's funds.
+--
+-- Reference: bitcoin-core/src/wallet/rpc/backup.cpp importprivkey →
+-- CWallet::ImportPrivKeys + RescanWallet.
+handleImportPrivKey :: RpcServer -> Value -> IO RpcResponse
+handleImportPrivKey server params = withWalletMgr server $ \wm -> do
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound
+        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+    Just ws ->
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Missing private key parameter") Null
+        Just wif ->
+          case wifDecode (T.strip wif) of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Invalid private key encoding") Null
+            Just sk -> do
+              -- Param 2 = rescan flag (default true), matching Core's signature
+              -- importprivkey "privkey" ( "label" rescan ).
+              let doRescan = fromMaybe True (extractParam params 2 :: Maybe Bool)
+              _addrs <- importPrivKeyW (wsWallet ws) sk
+              when doRescan $ do
+                tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                rescanWalletRange server (wsWallet ws) 0 (ceHeight tip)
+              return $ RpcResponse Null Null Null
+
+-- | dumpprivkey "address"
+--
+-- Reveal the WIF-encoded private key for a wallet-owned address.  Used by
+-- operators (and our own import test) to extract a key for re-import.  Returns
+-- the WIF string, or @rpcInvalidAddressOrKey@ if the wallet cannot derive the
+-- address.
+--
+-- Reference: bitcoin-core/src/wallet/rpc/backup.cpp dumpprivkey.
+handleDumpPrivKey :: RpcServer -> Value -> IO RpcResponse
+handleDumpPrivKey server params = withWalletMgr server $ \wm -> do
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound
+        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+    Just ws ->
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Missing address parameter") Null
+        Just addrText ->
+          case textToAddress (T.strip addrText) of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Invalid Bitcoin address") Null
+            Just addr -> do
+              mSk <- dumpPrivKeyForAddress (wsWallet ws) addr
+              case mSk of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidAddressOrKey
+                    "Private key for address is not known") Null
+                Just sk -> return $ RpcResponse (toJSON (wifEncode sk)) Null Null
 
 --------------------------------------------------------------------------------
 -- Chain Tips RPC Handler
