@@ -114,6 +114,9 @@ module Haskoin.Wallet
     -- * Block -> wallet UTXO ledger (CWallet::blockConnected analogue)
   , scanBlockForWallet
   , unscanBlockForWallet
+    -- * importprivkey / dumpprivkey (CWallet::ImportPrivKeys analogue)
+  , importPrivKeyW
+  , dumpPrivKeyForAddress
     -- * Wallet transaction history (CWallet::mapWallet analogue)
   , WalletTxHistoryEntry(..)
   , WalletTxDetail(..)
@@ -1714,6 +1717,57 @@ addressToTextW net addr =
        WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
        WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
        TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
+
+-- | Import a raw private key into the wallet keychain (importprivkey).
+--
+-- Mirrors Bitcoin Core's CWallet::ImportPrivKeys / the @importprivkey@ RPC
+-- (wallet/rpc/backup.cpp): a single key is added to the wallet's set of
+-- watched scripts so a subsequent chain scan credits any output paying it.
+-- haskoin's coin scan keys on 'walletAddresses' (decodeOurAddress → membership
+-- check in 'scanBlockForWallet'), so importing the key means registering EVERY
+-- standard single-key address form it can produce — P2WPKH (the wallet's native
+-- output type), legacy P2PKH, and P2SH-wrapped-P2WPKH — exactly as Core watches
+-- the corresponding scriptPubKeys for an imported key.  We tag them with a
+-- sentinel index 'maxBound' and isChange='False' so they never collide with the
+-- HD-derived gap-limit entries and are never handed out by getnewaddress.
+--
+-- Returns the addresses registered (used by the RPC layer to report them).
+importPrivKeyW :: Wallet -> SecKey -> IO [Address]
+importPrivKeyW wallet sk = do
+  let pubKey = derivePubKeyFromPrivate sk
+      addrs  = [ pubKeyToP2WPKH pubKey            -- bech32 v0 (native)
+               , pubKeyToP2PKH  pubKey            -- legacy base58
+               , pubKeyToAddress AddrP2SH_P2WPKH pubKey  -- P2SH(P2WPKH)
+               ]
+  atomically $ modifyTVar' (walletAddresses wallet) $ \m ->
+    foldr (\a acc -> Map.insert a (maxBound :: Word32, False) acc) m addrs
+  return addrs
+
+-- | Find the private key for a wallet-owned address (dumpprivkey).
+--
+-- haskoin's wallet stores only the HD master/account key, not a per-address
+-- key map, so we re-derive: walk the receive (external) and change (internal)
+-- chains for every standard address type up to (next-index + gap-limit) and
+-- return the 'SecKey' whose derived address matches.  Mirrors the lookup Core's
+-- @dumpprivkey@ performs over the wallet's key store.  Returns 'Nothing' when
+-- the address is not one this wallet can derive (e.g. a watch-only import).
+dumpPrivKeyForAddress :: Wallet -> Address -> IO (Maybe SecKey)
+dumpPrivKeyForAddress wallet target = do
+  recvN   <- readTVarIO (walletReceiveIndex wallet)
+  changeN <- readTVarIO (walletChangeIndex wallet)
+  let gap      = fromIntegral (walletGapLimit wallet)
+      recvMax  = recvN   + gap
+      chgMax   = changeN + gap
+      atypes   = [AddrP2WPKH, AddrP2PKH, AddrP2SH_P2WPKH, AddrP2TR]
+      -- Candidate (secret-key, address) pairs across both chains, every type.
+      candidates =
+        [ (ekKey key, pubKeyToAddress at (derivePubKeyFromPrivate (ekKey key)))
+        | (deriveAt, hi) <- [ (getReceiveKey wallet, recvMax)
+                            , (getChangeKey  wallet, chgMax) ]
+        , idx <- [0 .. hi]
+        , let key = deriveAt idx
+        , at <- atypes ]
+  return $ listToMaybe [ k | (k, a) <- candidates, a == target ]
 
 -- | Return wallet transaction history, most-recent first.  Ordering keys
 -- on (block height DESC, then block index DESC) so the newest confirmed
