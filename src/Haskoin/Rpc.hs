@@ -288,7 +288,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          getMempoolSize, FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
-                         isRbfReplaceable,
+                         isRbfReplaceable, blockConnected,
                          -- Package relay (BIP-331) — submitpackage RPC
                          TxPackage(..), maxPackageCount, acceptPackage,
                          isWellFormedPackage, isChildWithParents,
@@ -307,6 +307,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         newWalletManager, createManagedWallet, loadManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
+                        getSpendableBalance, scanBlockForWallet, resignViaPsbt,
                         -- Wallet encryption (BIP-38-style passphrase locking)
                         Passphrase, encryptWallet, unlockWallet, lockWallet,
                         isWalletLocked,
@@ -3349,19 +3350,34 @@ generateSingleBlock server scriptPubKey specificTxs = do
   let mtp = medianTimePast entries prevHash
       blockTime = max (mtp + 1) now
 
-  -- Build coinbase transaction
   let reward = blockReward height
-  -- Note: For regtest with specific transactions, we would add their fees too
-  -- For simplicity, we use just the block reward here
-  let coinbase = buildRegtestCoinbase height reward scriptPubKey blockTime
 
-  -- Get transactions from mempool if none specified
+  -- Get transactions from mempool if none specified.  Selected FIRST so we
+  -- can build the coinbase's BIP-141 witness commitment over their wtxids.
   txs <- if null specificTxs
     then do
       -- Select from mempool
       entries' <- selectTransactions (rsMempool server) (maxBlockWeight - 4000)
       return $ map meTransaction entries'
     else return specificTxs
+
+  -- BIP-141 witness commitment.  Segwit is active from genesis on regtest,
+  -- so a block that contains ANY witness-carrying tx (e.g. a P2WPKH spend
+  -- from sendtoaddress) MUST carry the witness commitment in the coinbase,
+  -- else ConnectBlock rejects it with "unexpected-witness"
+  -- (Consensus.checkWitnessMalleation).  The previous regtest coinbase had
+  -- no commitment + no witness nonce, which was fine only for the empty
+  -- blocks generatetoaddress used to mine.  We build the commitment over
+  -- [coinbase-wtxid(=0x00..) , wtxid(tx1) ..] with the all-zero witness
+  -- nonce (Core's default), exactly as BlockTemplate.createBlockTemplate does.
+  let needsCommitment = any (\t -> any (not . null) (txWitness t)) txs
+      wtxids = TxId (Hash256 (BS.replicate 32 0)) : map computeWtxId txs
+      witnessRoot = computeMerkleRoot wtxids
+      witnessNonce = BS.replicate 32 0
+      witnessCommitment = getHash256 $
+        doubleSHA256 (BS.append (getHash256 witnessRoot) witnessNonce)
+      coinbase = buildRegtestCoinbase height reward scriptPubKey blockTime
+                   (if needsCommitment then Just witnessCommitment else Nothing)
 
   -- Build the block
   let allTxs = coinbase : txs
@@ -3390,11 +3406,44 @@ generateSingleBlock server scriptPubKey specificTxs = do
                   (rsIndexMgr server) block
       case result of
         Left err -> return $ Left err
-        Right () -> return $ Right bh
+        Right () -> do
+          -- Post-connect notifications that the consensus 'submitBlock'
+          -- path (intentionally consensus-only) does not perform but the
+          -- P2P connect path in Main.hs does.  We replicate them here for
+          -- the regtest miner so generatetoaddress behaves like a real
+          -- node from the wallet's point of view:
+          --
+          --   1. Mempool: drop the txs this block confirmed (and any that
+          --      now conflict) so getrawmempool clears and the next block
+          --      does not re-mine an already-confirmed tx (BIP30 wedge).
+          --      Mirrors CTxMemPool::removeForBlock.
+          --   2. Wallet UTXO ledger: credit wallet-owned outputs + debit
+          --      spent wallet UTXOs.  Mirrors CWallet::blockConnected.
+          --      Without this the wallet never sees its own coins and
+          --      getbalance/listunspent stay 0/[] (the fleet root cause).
+          --
+          -- The block's height (computed from its own parent in
+          -- submitBlock) is the active-tip arm's @height@ here; reuse it.
+          blockConnected (rsMempool server) block
+          case rsWalletMgr server of
+            Nothing -> return ()
+            Just wm -> do
+              wallets <- Map.elems <$> readTVarIO (wmWallets wm)
+              forM_ wallets $ \ws ->
+                scanBlockForWallet (wsWallet ws) (blockTxns block) height
+          return $ Right bh
 
--- | Build a coinbase transaction for regtest
-buildRegtestCoinbase :: Word32 -> Word64 -> ByteString -> Word32 -> Tx
-buildRegtestCoinbase height value scriptPubKey _blockTime =
+-- | Build a coinbase transaction for regtest.
+--
+-- The final argument is an optional BIP-141 witness commitment (the
+-- 32-byte SHA256d(witnessMerkleRoot || nonce)).  When 'Just', we append
+-- the standard OP_RETURN commitment output and set the coinbase witness
+-- stack to the single all-zero 32-byte nonce — required for any block
+-- that contains a witness-carrying transaction (else ConnectBlock
+-- rejects "unexpected-witness").  When 'Nothing' (empty block), we keep
+-- the minimal coinbase the empty-block miner has always used.
+buildRegtestCoinbase :: Word32 -> Word64 -> ByteString -> Word32 -> Maybe ByteString -> Tx
+buildRegtestCoinbase height value scriptPubKey _blockTime mWitnessCommitment =
   let -- BIP-34: height in coinbase scriptSig.  MUST use the canonical
       -- 'encodeBip34Height' (the validator's own encoder) so the byte-exact
       -- prefix match in 'validateCoinbaseHeightConsensus' accepts the block;
@@ -3422,11 +3471,29 @@ buildRegtestCoinbase height value scriptPubKey _blockTime =
       -- Main output: reward to miner's address
       mainOutput = TxOut value scriptPubKey
 
+      -- BIP-141 witness commitment output (OP_RETURN OP_PUSHBYTES_36
+      -- <aa21a9ed><32-byte commitment>), present only when the block
+      -- carries witness data.
+      commitmentOutputs = case mWitnessCommitment of
+        Nothing -> []
+        Just commitment ->
+          [ TxOut 0 $ BS.concat
+              [ BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+              , commitment
+              ] ]
+
+      -- Coinbase witness stack: the 32-byte all-zero nonce when we emit a
+      -- commitment (checkWitnessMalleation requires exactly one 32-byte
+      -- item), otherwise the empty stack the minimal coinbase used.
+      witness = case mWitnessCommitment of
+        Nothing -> [[]]
+        Just _  -> [[BS.replicate 32 0]]
+
   in Tx
     { txVersion = 2
     , txInputs = [coinbaseInput]
-    , txOutputs = [mainOutput]
-    , txWitness = [[]]  -- Empty witness for coinbase
+    , txOutputs = mainOutput : commitmentOutputs
+    , txWitness = witness
     , txLockTime = 0
     }
 
@@ -5276,7 +5343,13 @@ handleGetBalance server _params = withWalletMgr server $ \wm -> do
       (toJSON $ RpcError rpcWalletNotFound
         "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
     Just ws -> do
-      sats <- getBalance (wsWallet ws)
+      -- getbalance reports the SPENDABLE balance: immature coinbase is
+      -- excluded (Core's CWallet::GetBalance "trusted" balance skips
+      -- IsImmatureCoinBase).  Anchor maturity on the current tip height
+      -- so a freshly-mined coinbase (immature) does not inflate the
+      -- figure and the number matches what coin-selection can spend.
+      tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+      sats <- getSpendableBalance (wsWallet ws) tipHeight
       -- Use btcAmountEnc (streaming path) so balance emits in Core's
       -- fixed-decimal format (e.g. "1.00000000", not "1.0").
       let enc   = btcAmountEnc (fromIntegral sats)
@@ -6583,18 +6656,50 @@ handleSendToAddress server params = do
                 Just addr -> do
                   -- Convert BTC to satoshis
                   let satoshis = round (amountBtc * 100000000) :: Word64
+                      wallet   = wsWallet walletState
 
-                  -- Create and send transaction
-                  result <- sendToAddress (wsWallet walletState) addr satoshis (FeeRate 10)
-                  case result of
+                  -- Maturity-aware coin selection: pin the spendable set to
+                  -- the current tip height so immature coinbase is excluded
+                  -- (Core's CWallet only spends mature coins).  The legacy
+                  -- 'sendToAddress' wrapper used 'selectCoins' (tip 0) which
+                  -- both ignored maturity AND produced an UNSIGNED tx; we go
+                  -- through select -> build -> sign here instead.
+                  tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+                  -- Fee rate in sat/kvB (FeeRate's unit; calculateFeeRate /
+                  -- feeFromWeight both scale by /1000).  FeeRate 1000 = 1
+                  -- sat/vB — comfortably above the mempool relay floor
+                  -- (mpcMinFeeRate = FeeRate 1 = 0.001 sat/vB) and large
+                  -- enough that the per-tx fee is a clearly-positive amount
+                  -- (~110 sat for a 1-in/2-out P2WPKH tx) rather than
+                  -- rounding toward zero.
+                  selRes <- selectCoinsWithHeight wallet
+                              [WalletTxOutput addr satoshis] (FeeRate 1000) tipHeight
+                  case selRes of
                     Left err -> return $ RpcResponse Null
                       (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-                    Right tx -> do
-                      -- Broadcast to network with per-peer BIP-339 inv selection
-                      let txid = computeTxId tx
-                      _ <- addTransaction (rsMempool server) tx
-                      broadcastTxToPeers server tx 0
-                      return $ RpcResponse (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
+                    Right cs -> do
+                      let unsigned = createTransaction cs
+                          -- Prevout map for the signer: every selected input
+                          -- with its (value, scriptPubKey) so the PSBT signer
+                          -- can compute the BIP-143 sighash and pick the key
+                          -- whose pubkey-hash matches (resolves the wallet's
+                          -- own coinbase prevout).
+                          prevs    = csInputs cs
+                      signedRes <- resignViaPsbt wallet unsigned prevs
+                      case signedRes of
+                        Left err -> return $ RpcResponse Null
+                          (toJSON $ RpcError rpcMiscError ("Signing failed: " <> T.pack err)) Null
+                        Right tx -> do
+                          let txid = computeTxId tx
+                          addRes <- addTransaction (rsMempool server) tx
+                          case addRes of
+                            Left mErr -> return $ RpcResponse Null
+                              (toJSON $ RpcError rpcMiscError
+                                ("Transaction rejected by mempool: " <> T.pack (show mErr))) Null
+                            Right _ -> do
+                              broadcastTxToPeers server tx 0
+                              return $ RpcResponse
+                                (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
             _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "Missing address or amount parameter") Null
 
@@ -6713,9 +6818,16 @@ handleListUnspent server params = do
   where
     -- | Build a streaming Encoding for one UTXO entry.
     -- amount uses btcAmountEnc for Core's fixed-decimal format.
+    -- NOTE: 'getWalletUTXOs' returns the UTXO's CREATION block height in
+    -- the third slot (not confirmations); convert to real confirmations
+    -- here as @tipHeight - blockHeight + 1@ so the minconf/maxconf filter
+    -- behaves like Core's.
     utxoToEnc :: Word32 -> Int -> Int -> (OutPoint, TxOut, Word32) -> Maybe AE.Encoding
-    utxoToEnc _tipHeight minConf maxConf (op, txout, confs) =
-      let confirmations = fromIntegral confs :: Int
+    utxoToEnc tipHeight minConf maxConf (op, txout, blockHeight) =
+      let confirmations =
+            if tipHeight >= blockHeight
+              then fromIntegral (tipHeight - blockHeight + 1) :: Int
+              else 0
       in if confirmations >= minConf && confirmations <= maxConf
            then Just $ pairs $
                   pair "txid"          (text (showHash (BlockHash (getTxIdHash (outPointHash op))))) <>

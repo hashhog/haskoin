@@ -107,14 +107,19 @@ module Haskoin.Wallet
   , getChangeKey
     -- * Balance & UTXOs
   , getBalance
+  , getSpendableBalance
   , getWalletUTXOs
   , addWalletUTXO
   , removeWalletUTXO
+    -- * Block -> wallet UTXO ledger (CWallet::blockConnected analogue)
+  , scanBlockForWallet
+  , unscanBlockForWallet
     -- * Transaction Creation
   , createTransaction
   , fundTransaction
   , sendToAddress
   , signTransaction
+  , resignViaPsbt
   , WalletTxOutput(..)
   , CoinSelection(..)
   , selectCoins
@@ -1449,6 +1454,90 @@ addWalletUTXOFull wallet op txout blockHeight isCoinbase = do
 removeWalletUTXO :: Wallet -> OutPoint -> IO ()
 removeWalletUTXO wallet op =
   atomically $ modifyTVar' (walletUTXOs wallet) (Map.delete op)
+
+-- | Get the total SPENDABLE balance at a given chain-tip height.
+--
+-- Unlike 'getBalance' (which sums every tracked UTXO regardless of
+-- coinbase maturity), this filters out immature coinbase outputs: a
+-- coinbase UTXO is spendable only once @tipHeight >= blockHeight + 100@
+-- (COINBASE_MATURITY).  This is what @getbalance@ should report so the
+-- figure matches what coin-selection can actually spend.
+--
+-- Reference: bitcoin-core/src/wallet/wallet.cpp CWallet::GetBalance —
+-- the "trusted" balance excludes immature coinbase
+-- (CWalletTx::IsImmatureCoinBase).
+getSpendableBalance :: Wallet -> Word32 -> IO Word64
+getSpendableBalance wallet tipHeight = do
+  utxos <- readTVarIO (walletUTXOs wallet)
+  let mature entry =
+        not (wueIsCoinbase entry)
+        || tipHeight >= wueBlockHeight entry + fromIntegral coinbaseMaturity
+  return $ sum [ txOutValue (wueTxOut entry)
+              | entry <- Map.elems utxos, mature entry ]
+
+--------------------------------------------------------------------------------
+-- Block -> Wallet UTXO Ledger
+--
+-- THE FLEET ROOT CAUSE for the "wallet can't see/spend its own coins"
+-- axis: the wallet had a complete UTXO ledger + coin-selection + signer,
+-- but nothing ever drove the ledger from chain connect, so the table
+-- stayed empty and getbalance/listunspent were always 0/[].
+--
+-- 'scanBlockForWallet' mirrors Bitcoin Core's CWallet::blockConnected
+-- (wallet/wallet.cpp): on every block that connects to the active tip,
+-- walk the txs in block order — for each tx FIRST debit any input that
+-- spends a wallet UTXO (the prevout we already track), THEN credit any
+-- output paying a wallet-owned address.  The coinbase tx (block tx 0)
+-- has its credits flagged is_coinbase so coin-selection / spendable
+-- balance enforce the 100-confirmation maturity rule.
+--
+-- 'unscanBlockForWallet' is the symmetric reverse for a reorg
+-- disconnect so the ledger does not over-count coins that no longer
+-- exist on the active chain.  (Best-effort: it cannot perfectly restore
+-- a spent prevout's metadata since the spending tx is being undone, but
+-- it removes this block's credits, which is what prevents balance
+-- inflation across a reorg; a full rescan is always available.)
+--------------------------------------------------------------------------------
+
+-- | Scan a freshly-connected block, crediting wallet-owned outputs and
+-- debiting spent wallet UTXOs.  @blockTxs@ MUST be in block order with
+-- the coinbase first.
+scanBlockForWallet :: Wallet -> [Tx] -> Word32 -> IO ()
+scanBlockForWallet wallet txs height = do
+  ourAddrs <- readTVarIO (walletAddresses wallet)
+  let isOurScript s = case decodeOurAddress s of
+        Just a  -> Map.member a ourAddrs
+        Nothing -> False
+  atomically $ modifyTVar' (walletUTXOs wallet) $ \utxos0 ->
+    let step utxos (idx, tx) =
+          let txid       = computeTxId tx
+              isCb       = idx == (0 :: Int)
+              -- Debit: drop any prevout this tx spends that we track.
+              -- The coinbase's single synthetic input (all-zero prevout)
+              -- never matches a tracked UTXO, so skipping it is harmless.
+              spent      = if isCb then []
+                           else map txInPrevOutput (txInputs tx)
+              utxosDebit = foldr Map.delete utxos spent
+              -- Credit: outputs paying a wallet address.
+              credits    = [ ( OutPoint txid (fromIntegral oi)
+                             , WalletUtxoEntry txout height isCb )
+                           | (oi, txout) <- zip [0 :: Int ..] (txOutputs tx)
+                           , isOurScript (txOutScript txout) ]
+          in foldr (\(op, e) m -> Map.insert op e m) utxosDebit credits
+    in foldl step utxos0 (zip [0 ..] txs)
+
+-- | Reverse 'scanBlockForWallet' for a reorg disconnect: remove the
+-- credits this block created (the outputs whose txids belong to this
+-- block).  Inputs spent by this block's txs are NOT restored here (their
+-- metadata is gone); a rescan reconstructs full state if needed.
+unscanBlockForWallet :: Wallet -> [Tx] -> Word32 -> IO ()
+unscanBlockForWallet wallet txs _height = do
+  let createdOutpoints =
+        [ OutPoint (computeTxId tx) (fromIntegral oi)
+        | tx <- txs
+        , (oi, _txout) <- zip [0 :: Int ..] (txOutputs tx) ]
+  atomically $ modifyTVar' (walletUTXOs wallet) $ \utxos ->
+    foldr Map.delete utxos createdOutpoints
 
 --------------------------------------------------------------------------------
 -- UTXO Types for Coin Selection
