@@ -222,6 +222,11 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            checkAssumeutxoWhitelist,
                            AssumeUtxoParams(..), assumeUtxoForBlockHash,
                            connectBlock, disconnectBlock,
+                           -- Recovery: regtest coinbase must use the SAME
+                           -- BIP-34 height encoder that the consensus gate
+                           -- ('validateCoinbaseHeightConsensus') prefix-matches
+                           -- against, else generatetoaddress fails bad-cb-height.
+                           encodeBip34Height,
                            -- 2026-05-24 chain-state-inconsistency fix:
                            -- chain-state-reading RPCs ('getblockcount',
                            -- 'getbestblockhash', the chainstate-derived
@@ -327,7 +332,11 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         getReceiveAddress, fundTransaction,
                         getReceiveKey, getChangeKey,
                         WalletUtxoEntry(..),
-                        walletAddresses, walletUTXOs)
+                        walletAddresses, walletUTXOs,
+                        -- Seed-restore (recovery): mnemonic -> wallet, used by
+                        -- 'handleRestoreWallet' (createwallet-with-mnemonic).
+                        Mnemonic(..), WalletConfig(..), validateMnemonic,
+                        importMnemonic, createWalletState, getReceiveAddressAt)
 
 -- FIX-65: BIP-78 PayJoin receiver foundation.  Imports the wai handler
 -- + offer-cache types so 'combinedApp' can route /payjoin POSTs.
@@ -1072,6 +1081,7 @@ handleRpcRequest server req = do
 
     -- Multi-wallet management RPCs
     "createwallet"         -> handleCreateWallet server params
+    "restorewallet"        -> handleRestoreWallet server params
     "loadwallet"           -> handleLoadWallet server params
     "unloadwallet"         -> handleUnloadWallet server params
     "listwallets"          -> handleListWallets server
@@ -1145,6 +1155,7 @@ handleRpcRequest server req = do
 
     -- W47B: UTXO set / mining stats / proof RPCs
     "gettxoutsetinfo"      -> handleGetTxOutSetInfo server params
+    "scantxoutset"         -> handleScanTxOutSet server params
     "getnetworkhashps"     -> handleGetNetworkHashPS server params
     "gettxoutproof"        -> handleGetTxOutProof server params
     "verifytxoutproof"     -> handleVerifyTxOutProof server params
@@ -3384,9 +3395,22 @@ generateSingleBlock server scriptPubKey specificTxs = do
 -- | Build a coinbase transaction for regtest
 buildRegtestCoinbase :: Word32 -> Word64 -> ByteString -> Word32 -> Tx
 buildRegtestCoinbase height value scriptPubKey _blockTime =
-  let -- BIP-34: height in coinbase scriptSig
-      heightBytes = encodeRegtestHeight height
-      scriptSig = heightBytes
+  let -- BIP-34: height in coinbase scriptSig.  MUST use the canonical
+      -- 'encodeBip34Height' (the validator's own encoder) so the byte-exact
+      -- prefix match in 'validateCoinbaseHeightConsensus' accepts the block;
+      -- the old bespoke 'encodeRegtestHeight' diverged for heights 1..16
+      -- (push form vs OP_N) and for the high-bit sign byte, causing
+      -- bad-cb-height on every generatetoaddress call.
+      heightBytes = encodeBip34Height height
+      -- Core appends miner/extranonce data after the BIP-34 height push
+      -- (CreateNewBlock: coinbaseTx.vin[0].scriptSig = CScript() << nHeight
+      -- << extraNonce ...).  We append a 1-byte push (OP_PUSH1 <0x00>) so the
+      -- scriptSig is always >= 2 bytes — the consensus minimum — even for
+      -- heights 1..16 where 'encodeBip34Height' is a single OP_N byte.  The
+      -- height gate does a byte-exact PREFIX match, so trailing bytes are
+      -- accepted.
+      extraNonce = BS.pack [0x01, 0x00]
+      scriptSig = heightBytes <> extraNonce
 
       -- Coinbase input with null prevout
       coinbaseInput = TxIn
@@ -5055,6 +5079,65 @@ handleCreateWallet server params = withWalletMgr server $ \wm ->
                     , "warning" .= warnings
                     ]) Null Null
 
+-- | restorewallet wallet_name mnemonic [passphrase]
+--
+-- Restore (or create) a deterministic wallet from a BIP-39 mnemonic — the
+-- seed-only recovery entry point.  Equivalent in spirit to Core's
+-- @sethdseed@ / @createwallet …descriptors@ + @importdescriptors@ round
+-- trip: it reconstructs the HD keychain from the supplied words alone, so
+-- a wallet whose disk state was lost can re-derive every address it ever
+-- owned.  Address derivation is byte-deterministic in the mnemonic (see
+-- 'loadWallet' / 'getReceiveAddressAt'), which is what lets a subsequent
+-- 'scantxoutset' rediscover 100% of the funds.
+--
+-- Parameters:
+--   wallet_name (required)
+--   mnemonic    (required) — space-separated BIP-39 words
+--   passphrase  (optional) — BIP-39 passphrase (NOT the encryption pass)
+-- Returns: {"name": <wallet_name>, "warning": <text>}
+--
+-- Reference: bitcoin-core/src/wallet/rpc/backup.cpp (sethdseed) and
+-- wallet/rpc/wallet.cpp (createwallet).  We reuse 'importMnemonic', which
+-- validates the BIP-39 checksum / word count / dictionary before deriving.
+handleRestoreWallet :: RpcServer -> Value -> IO RpcResponse
+handleRestoreWallet server params = withWalletMgr server $ \wm ->
+  case (extractParamText params 0, extractParamText params 1) of
+    (Nothing, _) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing wallet_name parameter") Null
+    (_, Nothing) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing mnemonic parameter") Null
+    (Just walletName, _) | T.null walletName -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "wallet_name must not be empty") Null
+    (Just walletName, Just mnemonicText) -> do
+      let passphrase = fromMaybe "" (extractParamText params 2)
+          words'     = filter (not . T.null) (T.words (T.strip mnemonicText))
+          mnemonic   = Mnemonic words'
+      existing <- readTVarIO (wmWallets wm)
+      if Map.member walletName existing
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcWalletAlreadyExists
+            ("Wallet \"" <> walletName <> "\" already exists")) Null
+        else do
+          let config = WalletConfig (wmNetwork wm) 20 passphrase
+          eWallet <- importMnemonic config mnemonic
+          case eWallet of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
+            Right wallet -> do
+              -- Pre-derive the gap-limit receive addresses so getnewaddress /
+              -- listing reflects the restored keychain immediately.
+              mapM_ (\i -> void $ getReceiveAddressAt wallet i) [0 .. 19]
+              walletState <- createWalletState wallet
+              atomically $ do
+                modifyTVar' (wmWallets wm) (Map.insert walletName walletState)
+                mDefault <- readTVar (wmDefaultName wm)
+                when (mDefault == Nothing) $
+                  writeTVar (wmDefaultName wm) (Just walletName)
+              return $ RpcResponse
+                (object [ "name"    .= walletName
+                        , "warning" .= ("" :: Text)
+                        ]) Null Null
+
 -- | Load an existing wallet by name.
 -- Reference: bitcoin-core/src/wallet/rpc/wallet.cpp loadwallet
 -- Parameters:
@@ -6454,7 +6537,10 @@ handleGetNewAddress server params = do
           case addrType of
             Just aType -> do
               addr <- getNewAddress aType (wsWallet walletState)
-              return $ RpcResponse (toJSON (show addr)) Null Null
+              -- Emit the network-correct address string (bcrt1q… on regtest)
+              -- rather than the Haskell ADT 'show', so the result round-trips
+              -- through textToAddress (funding / scantxoutset recovery).
+              return $ RpcResponse (toJSON (addressToTextNet (rsNetwork server) addr)) Null Null
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams ("Unknown address type: " <> addrTypeStr)) Null
   where
@@ -8262,6 +8348,29 @@ extractParamArray (Array arr) idx
       _       -> Nothing
   | otherwise = Nothing
 extractParamArray _ _ = Nothing
+
+-- | Network-aware address string encoding.  The bare 'addressToText' in
+-- Haskoin.Crypto hardcodes the mainnet HRP / version bytes ("bc" /
+-- 0x00 / 0x05), so it produces a mainnet string even on regtest.  This
+-- variant selects the correct human-readable part and base58 version
+-- byte from the active network, so generatetoaddress / scantxoutset
+-- round-trips work on regtest ("bcrt1q…") and testnet ("tb1q…").
+-- Reference: bitcoin-core/src/chainparams.cpp bech32_hrp + base58Prefixes.
+addressToTextNet :: Network -> Address -> Text
+addressToTextNet net addr =
+  let hrp = case netName net of
+              "main"     -> "bc"
+              "regtest"  -> "bcrt"
+              _          -> "tb"          -- testnet3 / testnet4
+      (verP2PKH, verP2SH) = case netName net of
+              "main" -> (0x00, 0x05)
+              _      -> (0x6f, 0xc4)       -- testnet3 / testnet4 / regtest
+  in case addr of
+       PubKeyAddress h        -> base58Check verP2PKH (getHash160 h)
+       ScriptAddress h        -> base58Check verP2SH  (getHash160 h)
+       WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
+       WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
+       TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
 
 -- | Display a BlockHash as hex (reversed byte order for display)
 showHash :: BlockHash -> Text
@@ -10662,6 +10771,138 @@ handleGetTxOutSetInfo server params = do
                   serializedEnc                                                     <>
                   muHashEnc
       return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | scantxoutset "start" [ scanobjects ]
+--
+-- Scans the on-disk UTXO set ('PrefixUTXO') for unspent outputs whose
+-- scriptPubKey matches one of the supplied scan objects, returning the
+-- Core-shape result object.  This is the core recovery primitive: a wallet
+-- restored from seed re-derives its addresses, then scantxoutset finds the
+-- funds those addresses received with no wallet-side transaction history.
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp scantxoutset + the
+-- CoinsViewScanReserver / pcursor walk in scanblocks.  We reuse the same
+-- whole-UTXO-set iteration that 'handleGetTxOutSetInfo' already performs
+-- ('iterateWithPrefix … PrefixUTXO'), so generated regtest coinbases and
+-- IBD coins are both visible (connectBlockAt writes PrefixUTXO directly).
+--
+-- Supported scan-object forms (sufficient for seed recovery):
+--   * "addr(<address>)"   — match the address's canonical scriptPubKey
+--   * "raw(<hex script>)" — match an explicit raw scriptPubKey hex
+--   * a bare address or bare hex script (lenient convenience form)
+-- Range/xpub descriptor expansion is intentionally out of scope here; a
+-- recovering wallet derives concrete addresses and passes addr() targets.
+handleScanTxOutSet :: RpcServer -> Value -> IO RpcResponse
+handleScanTxOutSet server params = do
+  let mAction = extractParamText params 0
+  case mAction of
+    Just "start" ->
+      case extractParamArray params 1 of
+        Nothing ->
+          return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams
+              "scantxoutset 'start' requires a scanobjects array") Null
+        Just objs ->
+          case mapM (parseScanObject (rsNetwork server)) (V.toList objs) of
+            Left err ->
+              return $ RpcResponse Null
+                (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
+            Right targetLists -> do
+              -- A scriptPubKey -> descriptor-text map of everything we look for.
+              let targets = Map.fromList (concat targetLists)
+              runScan server targets
+    Just "status" ->
+      -- We scan synchronously, so there is never a scan in progress.
+      return $ RpcResponse Null Null Null
+    Just "abort" ->
+      return $ RpcResponse (toJSON False) Null Null
+    Just other ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams
+          (T.pack ("Invalid action '" ++ T.unpack other ++
+                   "' (expected start/status/abort)"))) Null
+    Nothing ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParams
+          "scantxoutset requires an action ('start')") Null
+  where
+    -- Walk the whole UTXO set and collect matches.
+    runScan :: RpcServer -> Map ByteString Text -> IO RpcResponse
+    runScan srv targets = do
+      tip      <- readTVarIO (hcTip (rsHeaderChain srv))
+      countRef <- newIORef (0 :: Int)
+      sumRef   <- newIORef (0 :: Word64)
+      hitsRef  <- newIORef ([] :: [AE.Encoding])
+      iterateWithPrefix (rsDB srv) PrefixUTXO $ \key val -> do
+        let opBytes = BS.drop 1 key
+        case (S.decode opBytes :: Either String OutPoint,
+              S.decode val :: Either String Coin) of
+          (Right op, Right coin) -> do
+            modifyIORef' countRef (+1)
+            let txout  = coinTxOut coin
+                script = txOutScript txout
+            case Map.lookup script targets of
+              Just descTxt -> do
+                modifyIORef' sumRef (+ txOutValue txout)
+                let sats    = fromIntegral (txOutValue txout) :: Int64
+                    txidHex = showHash (BlockHash (getTxIdHash (outPointHash op)))
+                    hex     = TE.decodeUtf8 (B16.encode script)
+                    enc = pairs $
+                            pair "txid"         (text txidHex)                          <>
+                            pair "vout"         (AE.word32 (outPointIndex op))          <>
+                            pair "scriptPubKey" (text hex)                              <>
+                            pair "desc"         (text descTxt)                          <>
+                            pair "amount"       (btcAmountEnc sats)                     <>
+                            pair "coinbase"     (AE.bool (coinIsCoinbase coin))         <>
+                            pair "height"       (AE.word32 (coinHeight coin))
+                modifyIORef' hitsRef (enc :)
+                return True
+              Nothing -> return True
+          _ -> return True
+      txouts   <- readIORef countRef
+      totalSat <- readIORef sumRef
+      hits     <- readIORef hitsRef
+      let enc = pairs $
+                  pair "success"      (AE.bool True)                             <>
+                  pair "txouts"       (AE.int txouts)                            <>
+                  pair "height"       (AE.word32 (ceHeight tip))                 <>
+                  pair "bestblock"    (text (showHash (ceHash tip)))             <>
+                  pair "unspents"     (AE.list id (reverse hits))                <>
+                  pair "total_amount" (btcAmountEnc (fromIntegral totalSat))
+      return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+    -- Parse one scan object into a list of (scriptPubKey, descriptorText).
+    -- Accepts a string ("addr(..)" / "raw(..)" / bare addr / bare hex) or
+    -- a {"desc": "..."} object (range is ignored for the addr()/raw() forms).
+    parseScanObject :: Network -> Value -> Either String [(ByteString, Text)]
+    parseScanObject net v = case v of
+      String s              -> parseDescString net s
+      Object o -> case KM.lookup "desc" o of
+        Just (String s) -> parseDescString net s
+        _               -> Left "scan object must have a string 'desc' field"
+      _ -> Left "scan object must be a descriptor string or {desc:..} object"
+
+    parseDescString :: Network -> Text -> Either String [(ByteString, Text)]
+    parseDescString net raw =
+      -- Strip an optional #checksum suffix (Core descriptor form).
+      let s = T.takeWhile (/= '#') (T.strip raw)
+      in if "addr(" `T.isPrefixOf` s && ")" `T.isSuffixOf` s
+           then let inner = T.drop 5 (T.dropEnd 1 s)
+                in case textToAddress inner of
+                     Just a  -> Right [(addressToScript a, "addr(" <> inner <> ")")]
+                     Nothing -> Left ("scantxoutset: invalid address in addr(): " ++ T.unpack inner)
+         else if "raw(" `T.isPrefixOf` s && ")" `T.isSuffixOf` s
+           then let inner = T.drop 4 (T.dropEnd 1 s)
+                in case B16.decode (TE.encodeUtf8 inner) of
+                     Right bs -> Right [(bs, "raw(" <> inner <> ")")]
+                     Left _   -> Left ("scantxoutset: invalid hex in raw(): " ++ T.unpack inner)
+         -- Lenient bare forms.
+         else case textToAddress s of
+                Just a  -> Right [(addressToScript a, "addr(" <> s <> ")")]
+                Nothing -> case B16.decode (TE.encodeUtf8 s) of
+                  Right bs | not (BS.null bs) -> Right [(bs, "raw(" <> s <> ")")]
+                  _ -> Left ("scantxoutset: unsupported scan object '" ++ T.unpack raw ++
+                             "' (use addr(<address>) or raw(<hexscript>))")
 
 -- | getnetworkhashps: estimate network hash rate over sliding window.
 handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
