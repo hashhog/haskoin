@@ -11657,12 +11657,26 @@ handleGetTxOutSetInfo server params = do
   let hashType = case extractParam params 0 :: Maybe Text of
         Just t  -> T.unpack t
         Nothing -> "hash_serialized_3"
+      -- Core (rpc/blockchain.cpp::gettxoutsetinfo) treats a present,
+      -- non-null @hash_or_height@ (param index 1) as a request for a
+      -- specific block. We have no coinstatsindex, so the only base-mode
+      -- behaviour we must reproduce is the @hash_serialized_3@ rejection:
+      -- @RPC_INVALID_PARAMETER (-8) "hash_serialized_3 hash type cannot be
+      -- queried for a specific block"@.
+      heightGiven = case extractParam params 1 :: Maybe Value of
+        Just Null -> False
+        Just _    -> True
+        Nothing   -> False
   case hashType of
-    "hash_serialized_3" -> compute True False
+    "hash_serialized_3"
+      | heightGiven -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            "hash_serialized_3 hash type cannot be queried for a specific block") Null
+      | otherwise   -> compute True False
     "muhash"            -> compute False True
     "none"              -> compute False False
     other               -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams
+      (toJSON $ RpcError rpcInvalidParameter
         (T.pack ("'" ++ other ++ "' is not a valid hash_type"))) Null
   where
     compute wantSerialized wantMuHash = do
@@ -11671,6 +11685,8 @@ handleGetTxOutSetInfo server params = do
       countRef  <- newIORef (0 :: Int)
       sumRef    <- newIORef (0 :: Word64)
       bogosizeRef <- newIORef (0 :: Int)
+      diskRef   <- newIORef (0 :: Int)
+      txidsRef  <- newIORef (Set.empty :: Set.Set TxId)
       coinsRef  <- newIORef ([] :: [SnapshotCoin])
       iterateWithPrefix (rsDB server) PrefixUTXO $ \key val -> do
         let opBytes = BS.drop 1 key
@@ -11678,13 +11694,25 @@ handleGetTxOutSetInfo server params = do
           (Right op, Right coin) -> do
             modifyIORef' countRef (+1)
             modifyIORef' sumRef   (+ txOutValue (coinTxOut coin))
-            modifyIORef' bogosizeRef (+ (32 + 4 + 1 + 8 + BS.length (txOutScript (coinTxOut coin))))
+            -- bogosize: Core kernel/coinstats.cpp GetBogoSize ==
+            --   32 (txid) + 4 (vout) + 4 (height|coinbase) + 8 (amount)
+            --   + 2 (scriptPubKey len) + scriptPubKey.size().
+            modifyIORef' bogosizeRef (+ (32 + 4 + 4 + 8 + 2 + BS.length (txOutScript (coinTxOut coin))))
+            -- transactions: number of DISTINCT txids with unspent outputs
+            -- (Core CCoinsStats::nTransactions). Count via the outpoint hash.
+            modifyIORef' txidsRef (Set.insert (outPointHash op))
+            -- disk_size: impl-specific estimate of the chainstate footprint.
+            -- We approximate Core's view->EstimateSize() with the on-disk
+            -- key+value byte count (outpoint key 33B + serialized coin value).
+            modifyIORef' diskRef (+ (1 + BS.length opBytes + BS.length val))
             modifyIORef' coinsRef (SnapshotCoin op coin :)
             return True
           _ -> return True
       n        <- readIORef countRef
       totalSat <- readIORef sumRef
       bogo     <- readIORef bogosizeRef
+      diskSize <- readIORef diskRef
+      nTxns    <- Set.size <$> readIORef txidsRef
       coins    <- readIORef coinsRef
       -- Build the response on the streaming path so total_amount uses
       -- Core's fixed-decimal format (btcAmountEnc) instead of Double.
@@ -11696,14 +11724,19 @@ handleGetTxOutSetInfo server params = do
             if wantMuHash
               then pair "muhash" (text (showHash256 (computeUtxoMuHash coins)))
               else mempty
+          -- Field order mirrors Core rpc/blockchain.cpp::gettxoutsetinfo:
+          -- height, bestblock, txouts, bogosize, [hash_serialized_3|muhash],
+          -- total_amount, transactions, disk_size.
           enc = pairs $
                   pair "height"       (AE.word32 tipH)                              <>
                   pair "bestblock"    (text (showHash (ceHash tip)))                 <>
                   pair "txouts"       (AE.int n)                                    <>
                   pair "bogosize"     (AE.int bogo)                                 <>
-                  pair "total_amount" (btcAmountEnc (fromIntegral totalSat))        <>
                   serializedEnc                                                     <>
-                  muHashEnc
+                  muHashEnc                                                         <>
+                  pair "total_amount" (btcAmountEnc (fromIntegral totalSat))        <>
+                  pair "transactions" (AE.int nTxns)                               <>
+                  pair "disk_size"    (AE.int diskSize)
       return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 -- | scantxoutset "start" [ scanobjects ]
