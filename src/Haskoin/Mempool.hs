@@ -1172,18 +1172,125 @@ testAcceptTransactionInner mp tx txid = do
               case seqLockResult of
                 Left err -> return $ Left err
                 Right () -> do
-                  -- For the dry-run we resolve inputs read-only (no writes),
-                  -- and treat any conflict as a rejection (we don't attempt
-                  -- RBF in test-accept mode, matching Core's behaviour where
-                  -- test_accept with conflicts returns "txn-mempool-conflict").
+                  -- Conflict handling.  Bitcoin Core runs the SAME MemPoolAccept
+                  -- pipeline under test_accept=true and only skips the final
+                  -- AddUnchecked (validation.cpp:1388).  That means an RBF
+                  -- conflict that fails Rule #3 / #4 surfaces as "insufficient
+                  -- fee" (TX_RECONSIDERABLE) — NOT "txn-mempool-conflict" —
+                  -- even in test-accept mode.  We mirror that: if the incoming
+                  -- tx conflicts with mempool entries that are RBF-replaceable,
+                  -- evaluate the replacement rules (dry-run, no eviction) and
+                  -- return the precise reject category; otherwise fall back to
+                  -- "txn-mempool-conflict".
                   conflicts <- getConflicts mp tx
-                  if not (null conflicts)
-                    then return $ Left (ErrInputSpentInMempool (head conflicts))
-                    else do
+                  if null conflicts
+                    then do
                       inputResults <- resolveInputs mp tx
                       case inputResults of
                         Left err     -> return $ Left err
                         Right inputPairs -> finalizeTransactionDry mp tx txid inputPairs
+                    else if mpcRBFEnabled (mpConfig mp)
+                      -- Full-RBF (mempoolfullrbf): every in-mempool tx is
+                      -- treated as replaceable (rbf.cpp:IsRBFOptIn).
+                      then testAcceptWithReplacement mp tx txid conflicts
+                      else do
+                        -- Legacy BIP-125: attempt replacement only if every
+                        -- conflicting tx (or one of its ancestors) signals
+                        -- opt-in RBF.
+                        rbfOk <- checkAllConflictsRbfReplaceable mp conflicts
+                        if rbfOk
+                          then testAcceptWithReplacement mp tx txid conflicts
+                          else return $ Left (ErrInputSpentInMempool (head conflicts))
+
+-- | Dry-run RBF evaluation for 'testAcceptTransaction'.
+--
+-- Mirrors 'addTransactionWithReplacement' + 'attemptReplacement' but performs
+-- NO mempool mutation (no 'removeConflicts', no insertion).  It runs the same
+-- BIP-125 gates — disjoint-set (Rule "spends-conflicting"), Rule 2
+-- (no new unconfirmed inputs), and Rules 3/3a/4/5 via 'checkReplacement' — and
+-- returns the precise 'MempoolError' so testmempoolaccept's reject-reason
+-- matches Bitcoin Core's category ("insufficient fee" for Rule 3/4, etc.).
+-- On success it returns the would-be 'MempoolEntry' so the caller can report
+-- vsize/fees, exactly like the non-conflicting dry-run path.
+testAcceptWithReplacement :: Mempool -> Tx -> TxId -> [TxId]
+                          -> IO (Either MempoolError MempoolEntry)
+testAcceptWithReplacement mp tx txid conflictTxIds = do
+  -- EntriesAndTxidsDisjoint (validation.cpp:1356): the new tx may not depend on
+  -- a tx it is replacing (TX_CONSENSUS, "bad-txns-spends-conflicting-tx").
+  ancestorTxids <- ancestorTxIdsForUnconfirmedTx mp tx
+  let conflictSet = Set.fromList conflictTxIds
+      overlap     = Set.intersection ancestorTxids conflictSet
+  case Set.lookupMin overlap of
+    Just badId -> return $ Left (ErrSpendsConflictingTx badId)
+    Nothing -> do
+      -- Resolve inputs (conflicting outpoints resolve from the UTXO set only,
+      -- matching resolveInputsForReplacement in the commit path).
+      inputResults <- resolveInputsForReplacement mp tx conflictTxIds
+      case inputResults of
+        Left err -> return $ Left err
+        Right inputPairs -> do
+          let totalIn  = sum $ map (txOutValue . snd) inputPairs
+              totalOut = sum $ map txOutValue (txOutputs tx)
+          if totalIn < totalOut
+            then return $ Left ErrInsufficientFee
+            else do
+              let fee     = totalIn - totalOut
+                  vsize   = calculateVSize tx
+                  feeRate = calculateFeeRate fee vsize
+              if feeRate < mpcMinFeeRate (mpConfig mp)
+                then return $ Left (ErrFeeBelowMinimum feeRate (mpcMinFeeRate (mpConfig mp)))
+                else do
+                  -- Run the RBF replacement rule-set WITHOUT mutating the pool.
+                  rbfCheck <- evaluateReplacementRules mp tx conflictTxIds fee vsize feeRate
+                  case rbfCheck of
+                    Left err -> return $ Left err
+                    Right () ->
+                      -- Replacement would succeed; now run the remaining
+                      -- standardness / script / ancestor gates as a dry run.
+                      -- Inputs were resolved against the UTXO set already (the
+                      -- conflicts are logically evicted), so finalizeTransactionDry
+                      -- gives the same answer the commit path would.
+                      finalizeTransactionDry mp tx txid inputPairs
+
+-- | Read-only evaluation of the BIP-125 replacement rules (2, 3, 3a, 4, 5)
+-- plus the no-conflict-spending gate.  Identical decision logic to
+-- 'attemptReplacement' but performs no eviction.  Returns @Right ()@ when the
+-- replacement would be allowed, or the mapped 'MempoolError' otherwise.
+evaluateReplacementRules :: Mempool -> Tx -> [TxId] -> Word64 -> Int -> FeeRate
+                         -> IO (Either MempoolError ())
+evaluateReplacementRules mp tx conflictTxIds newFee newVsize newFeeRate = do
+  entries <- readTVarIO (mpEntries mp)
+  let directConflicts = mapMaybe (`Map.lookup` entries) conflictTxIds
+      conflictSet     = Set.fromList conflictTxIds
+  allEvictions <- getConflictSet mp conflictTxIds
+  case checkNoConflictSpending tx conflictSet of
+    Left (RbfSpendingConflict t) -> return $ Left (ErrRBFSpendingConflict t)
+    Left _ -> return $ Left (ErrRBFSpendingConflict (head conflictTxIds))
+    Right () -> do
+      let mempoolTxIds = Map.keysSet entries
+          oldSpends    = Set.fromList
+            [ txInPrevOutput inp
+            | e <- allEvictions
+            , inp <- txInputs (meTransaction e)
+            ]
+      case checkNoNewUnconfirmedInputs tx mempoolTxIds oldSpends of
+        Left (RbfNewUnconfirmedInput parent) ->
+          return $ Left (ErrRBFNewUnconfirmedInput parent)
+        Left _ ->
+          return $ Left (ErrRBFNewUnconfirmedInput (head conflictTxIds))
+        Right () ->
+          case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
+            Left (RbfInsufficientAbsoluteFee f r) -> return $ Left (ErrRBFInsufficientAbsoluteFee f r)
+            Left (RbfInsufficientFeeRate r m)     -> return $ Left (ErrRBFInsufficientFeeRate r m)
+            Left (RbfTooManyEvictions c m)        -> return $ Left (ErrRBFTooManyReplacements c m)
+            Left (RbfInsufficientRelayFee a r)    -> return $ Left (ErrRBFInsufficientRelayFee a r)
+            Left (RbfSpendingConflict t)          -> return $ Left (ErrRBFSpendingConflict t)
+            Left (RbfNewUnconfirmedInput p)       -> return $ Left (ErrRBFNewUnconfirmedInput p)
+            Right () ->
+              case checkDiagramReplacement allEvictions newFee newVsize newFeeRate of
+                Left (RbfInsufficientAbsoluteFee f r) -> return $ Left (ErrRBFInsufficientAbsoluteFee f r)
+                Left _ -> return $ Left (ErrRBFInsufficientAbsoluteFee newFee 0)
+                Right () -> return $ Right ()
 
 -- | Resolve all inputs of a transaction
 -- Returns the OutPoint -> TxOut mapping, or an error
