@@ -1303,6 +1303,34 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         let idxConfig = defaultIndexConfig { icBlockFilterIndex = True }
         im <- newIndexManager db idxConfig
         indexManagerInitFromDB im
+        -- Seed the GENESIS filter (height 0) when the filter index is
+        -- empty.  BIP-157 chains every block's filter header off the
+        -- PARENT block's filter header, and the genesis block's parent
+        -- header is the all-zero hash.  Core indexes the genesis filter
+        -- (blockfilterindex starts at block 0); if we skip it, height 1
+        -- would (incorrectly) chain off 0x00..00 instead of the genesis
+        -- filter header, breaking every subsequent block's header.  The
+        -- genesis block has no spent prevouts, so its undo data is the
+        -- empty 'BlockUndo []'.  Idempotent: only runs when the index
+        -- has no entry yet (fresh datadir), so a restart never re-seeds.
+        -- Reference: bitcoin-core/src/index/blockfilterindex.cpp
+        -- BlockFilterIndex::CustomAppend (called for the genesis block).
+        case imBlockFilterIndex im of
+          Nothing  -> return ()
+          Just bfIdx0 -> do
+            mTip0 <- blockFilterIndexTipHeight bfIdx0
+            case mTip0 of
+              Just _  -> return ()  -- already has entries (incl. genesis)
+              Nothing -> do
+                -- Use 'netGenesisBlock' directly: the genesis block body
+                -- is NOT persisted via 'putBlock' at chain init (only its
+                -- header is), so 'getBlock db genHash' would return
+                -- Nothing.  The in-memory genesis block carries the
+                -- coinbase output(s) the filter is built over.
+                let genBlk  = netGenesisBlock net
+                    genHash = computeBlockHash (blockHeader genBlk)
+                putStrLn "BlockFilterIndex: seeding genesis filter (height 0)"
+                indexManagerConnectBlock im genBlk (BlockUndo []) genHash 0
         -- Backfill from index tip to chain tip. We capture the
         -- pre-backfill height so the operator log line is accurate
         -- regardless of whether init read genesis or a populated

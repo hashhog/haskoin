@@ -1056,6 +1056,9 @@ handleRpcRequest server req = do
     -- Index status RPC
     "getindexinfo"         -> handleGetIndexInfo server params
 
+    -- BIP-157/158 compact block filter RPC
+    "getblockfilter"       -> handleGetBlockFilter server params
+
     -- Transaction RPCs
     "getrawtransaction"    -> handleGetRawTransaction server params
     "sendrawtransaction"   -> handleSendRawTransaction server params
@@ -2360,6 +2363,119 @@ handleGetIndexInfo server params = do
       enc = pairs (mconcat (map mkPair selected))
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+--------------------------------------------------------------------------------
+-- getblockfilter — BIP-157 content filter for a single block
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp getblockfilter (2956-3030).
+--   getblockfilter "blockhash" ( "filtertype" )  — filtertype default "basic".
+--   Returns { "filter": <hex GCS bytes>, "header": <hex 32-byte filter header> }.
+--
+-- Error parity with Core:
+--   * unknown filtertype       -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+--   * filter index not enabled -> RPC_MISC_ERROR (-1)
+--                                 "Index is not enabled for filtertype <name>"
+--   * block not found          -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Block not found"
+--
+-- The "filter" field is the raw GCS-encoded bytes hex-encoded
+-- (Core: HexStr(filter.GetEncodedFilter())) — NOT byte-reversed.  The
+-- "header" field is the 32-byte filter header in big-endian display order
+-- (Core: filter_header.GetHex()), produced here by 'showHash256' (which
+-- reverses the internal little-endian bytes for display), so it matches
+-- Core byte-for-byte.
+--------------------------------------------------------------------------------
+handleGetBlockFilter :: RpcServer -> Value -> IO RpcResponse
+handleGetBlockFilter server params =
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
+    Just hexHash ->
+      -- filtertype: optional positional arg, default "basic".  Core resolves
+      -- the type FIRST (before the block lookup) via BlockFilterTypeByName,
+      -- so an unknown type is reported even for a bogus block hash.
+      case parseFilterTypeName (fromMaybe "basic" (extractParamText params 1)) of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidAddressOrKey "Unknown filtertype") Null
+        Just _filterType ->
+          -- Index enabled?  Core: GetBlockFilterIndex(filtertype) == nullptr
+          -- -> RPC_MISC_ERROR "Index is not enabled for filtertype basic".
+          case rsIndexMgr server >>= imBlockFilterIndex of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcMiscError
+                "Index is not enabled for filtertype basic") Null
+            Just bfIdx ->
+              case parseHash hexHash of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
+                Just bh -> do
+                  -- Core: LookupBlockIndex(block_hash) miss ->
+                  -- RPC_INVALID_ADDRESS_OR_KEY "Block not found".
+                  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+                  case Map.lookup bh entries of
+                    Nothing -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
+                    Just ce -> do
+                      let height = ceHeight ce
+                      -- Fast path: the per-height index entry carries both the
+                      -- encoded filter bytes and the chained filter header.
+                      mEntry <- blockFilterIndexGet bfIdx height
+                      case mEntry of
+                        Just entry ->
+                          return $ blockFilterResponse
+                            (bfeEncoded entry) (bfeFilterHeader entry)
+                        Nothing -> do
+                          -- Slow path: the block exists in the header chain but
+                          -- the index has not reached it yet (or undo data is
+                          -- pre-index).  Recompute the filter bytes from the
+                          -- stored block + undo, and the chained header by
+                          -- walking from genesis.  Byte-identical to the index
+                          -- result; just slower.
+                          recomputed <- recomputeFilterAndHeader server bh height
+                          case recomputed of
+                            Just (fBytes, fHeader) ->
+                              return $ blockFilterResponse fBytes fHeader
+                            Nothing -> return $ RpcResponse Null
+                              (toJSON $ RpcError rpcInvalidAddressOrKey
+                                ("Filter not found. " <>
+                                 "Block was not connected to active chain.")) Null
+  where
+    blockFilterResponse :: ByteString -> Hash256 -> RpcResponse
+    blockFilterResponse filterBytes filterHeader =
+      let enc = pairs $
+                  pair "filter" (text (TE.decodeUtf8 (B16.encode filterBytes))) <>
+                  pair "header" (text (showHash256 filterHeader))
+          rawBs = encodingToLazyByteString enc
+      in RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Recompute a block's GCS filter bytes and chained filter header from
+-- stored block + undo data, walking from genesis to chain the header.
+-- Used as the slow-path fallback in 'handleGetBlockFilter' when the
+-- BlockFilterIndex has not yet reached the requested height.  Produces
+-- byte-identical output to the index entry.  Returns 'Nothing' if the
+-- block, or any ancestor's block/undo, is unavailable.
+recomputeFilterAndHeader :: RpcServer -> BlockHash -> Word32
+                         -> IO (Maybe (ByteString, Hash256))
+recomputeFilterAndHeader server _bh height = do
+  byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+  let genesisHeader = Hash256 (BS.replicate 32 0)
+      go !prevHeader !h
+        | h > height = return Nothing  -- unreachable: loop returns at h==height
+        | otherwise =
+            case Map.lookup h byHeight of
+              Nothing -> return Nothing
+              Just hashAtH -> do
+                mBlock <- getBlock (rsDB server) hashAtH
+                mUndo  <- getUndoData (rsDB server) hashAtH
+                case (mBlock, mUndo) of
+                  (Just block, Just undoData) -> do
+                    let filt    = computeBlockFilter block (udBlockUndo undoData) hashAtH
+                        fBytes  = encodeBlockFilter filt
+                        fHeader = blockFilterHeader filt prevHeader
+                    if h == height
+                      then return (Just (fBytes, fHeader))
+                      else go fHeader (h + 1)
+                  _ -> return Nothing
+  go genesisHeader 0
 
 --------------------------------------------------------------------------------
 -- Transaction RPC Handlers
@@ -8079,6 +8195,7 @@ allRpcCommands =
   , "reconsiderblock \"blockhash\""
   , ""
   , "== Index =="
+  , "getblockfilter \"blockhash\" ( \"filtertype\" )"
   , "getindexinfo ( \"index_name\" )"
   , ""
   , "== Mempool =="
