@@ -251,120 +251,120 @@ sipHash128 (SipHashKey k0 k1) msg =
 -- Bit Stream Reader/Writer for Golomb-Rice coding
 --------------------------------------------------------------------------------
 
--- | Bit writer state
+-- | Bit writer state — BIG-ENDIAN / MSB-first bit packing, byte-for-byte
+-- identical to bitcoin-core/src/streams.h @BitStreamWriter@.
+--
+-- BIP-158's GCS is serialized MSB-first: the first bit written goes to the
+-- most-significant bit of the first output byte, and the @nbits@
+-- least-significant bits of @value@ are written most-significant-first.
+-- 'bwBuffer' holds the in-progress (not-yet-complete) byte with its bits
+-- packed from the MSB downward; 'bwBits' is how many high bits of that byte
+-- are already filled; 'bwOutput' is the completed bytes in reverse order.
+--
+-- WHY THIS MATTERS (the W164 fix): the previous implementation packed bits
+-- LSB-first.  It round-tripped against its own (also-LSB-first) reader and so
+-- passed the round-trip + header-chaining tests (which decode pre-supplied
+-- Core filter bytes), but the *encoded* filter bytes produced from an element
+-- set did NOT match Core — getblockfilter returned the wrong "filter"/"header"
+-- hex.  SipHash, FastRange64, and the Golomb-Rice quotient/remainder split
+-- were all already correct; only the bit-serialization order was wrong.
 data BitWriter = BitWriter
-  { bwBuffer :: !Word64      -- ^ Current buffer
-  , bwBits   :: !Int         -- ^ Bits used in buffer
-  , bwOutput :: ![Word8]     -- ^ Output bytes (in reverse order)
+  { bwBuffer :: !Word8       -- ^ Partial byte, bits filled from the MSB down
+  , bwBits   :: !Int         -- ^ Bits already filled in 'bwBuffer' (0..7)
+  , bwOutput :: ![Word8]     -- ^ Completed output bytes (in reverse order)
   } deriving (Show)
 
 -- | Create a new bit writer
 bitWriterNew :: BitWriter
 bitWriterNew = BitWriter 0 0 []
 
--- | Write bits to the bit writer.
+-- | Write the @numBits@ least-significant bits of @value@ to the stream,
+-- most-significant-first.  Direct port of Core's @BitStreamWriter::Write@
+-- (bitcoin-core/src/streams.h:329-344): each iteration writes up to a byte
+-- boundary, OR-ing the appropriate slice of @value@ into the partial byte.
 --
--- The @numBits@ least-significant bits of @value@ are appended to the stream.
+--   m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset);
 --
--- BUG-16 P0 (W121 addendum): when @numBits + bwBits > 64@ the high-order bits
--- of the shifted value fell off the top of the 'Word64' buffer.  We now split
--- any cross-Word64-boundary write into two phases:
---
---   (1) write @(64 - bwBits)@ low-order bits with the fast path; the recursive
---       'flushBytes' drains the now-full 64-bit buffer to the byte stream;
---   (2) recursively write the remaining @numBits - (64 - bwBits)@ high-order
---       bits — these are @value `shiftR` (64 - bwBits)@.
---
--- Reference: bitcoin-core/src/streams.h BitStreamWriter::Write, which solves
--- the same boundary problem with a per-octet inner loop.  We keep the
--- existing Word64-buffer shape (cheaper than a per-byte loop in Haskell) but
--- never let an unsplit write straddle the 64-bit boundary.
+-- i.e. left-align the remaining @nbits@ of @data@ in a 64-bit word, then
+-- shift down so the next chunk lands just after the already-filled high bits
+-- of the current octet.
 bitWriterWrite :: BitWriter -> Int -> Word64 -> BitWriter
-bitWriterWrite bw numBits value
-  | numBits <= 0 = bw
-  | numBits >  64 = error "bitWriterWrite: numBits > 64"
-  | numBits + bwBits bw > 64 =
-      -- Cross-Word64-boundary write: split into low + high halves.
-      -- The low half exactly fills the current buffer to 64 bits, which
-      -- flushBytes then drains as 8 full bytes, leaving bwBits = 0.
-      let lowN  = 64 - bwBits bw                    -- bits that fit now
-          highN = numBits - lowN                    -- bits left to write
-          lowV  = value .&. (mask lowN)             -- low-order bits
-          highV = value `shiftR` lowN               -- high-order bits
-          bw'   = bitWriterWrite bw  lowN  lowV
-      in     bitWriterWrite bw' highN highV
-  | otherwise =
-      let maskedValue = value .&. (mask numBits)
-          newBuffer = bwBuffer bw .|. (maskedValue `shiftL` bwBits bw)
-          newBits = bwBits bw + numBits
-      in flushBytes $ bw { bwBuffer = newBuffer, bwBits = newBits }
+bitWriterWrite bw0 numBits0 value
+  | numBits0 < 0 || numBits0 > 64 = error "bitWriterWrite: numBits must be 0..64"
+  | otherwise = go bw0 numBits0
   where
-    -- | n-bit mask with n in [0,64].  At n=64 the naive @(1 << 64) - 1@
-    -- collapses to 0 - 1 = 0xFFFF... by GHC's modular semantics, but spelling
-    -- it explicitly avoids relying on that and matches Core's '~0ULL'.
-    mask :: Int -> Word64
-    mask 64 = maxBound
-    mask n  = (1 `shiftL` n) - 1
+    go !bw nbits
+      | nbits <= 0 = bw
+      | otherwise =
+          let bits = min (8 - bwBits bw) nbits
+              -- (data << (64 - nbits)) >> (64 - 8 + m_offset), truncated to 8 bits.
+              contrib = fromIntegral
+                          ((value `shiftL` (64 - nbits)) `shiftR` (64 - 8 + bwBits bw))
+                          :: Word8
+              newBuf  = bwBuffer bw .|. contrib
+              newBits = bwBits bw + bits
+              bw'     = bw { bwBuffer = newBuf, bwBits = newBits }
+              bw''    = if newBits == 8 then flushPartial bw' else bw'
+          in go bw'' (nbits - bits)
 
-    flushBytes !bw'
-      | bwBits bw' >= 8 =
-          let byte = fromIntegral (bwBuffer bw' .&. 0xff)
-              remaining = bwBuffer bw' `shiftR` 8
-              newBits = bwBits bw' - 8
-          in flushBytes $ bw' { bwBuffer = remaining, bwBits = newBits,
-                                bwOutput = byte : bwOutput bw' }
-      | otherwise = bw'
+    -- Emit the now-full partial byte to the output and reset it.
+    flushPartial !bw =
+      bw { bwBuffer = 0, bwBits = 0, bwOutput = bwBuffer bw : bwOutput bw }
 
--- | Flush remaining bits and get output
+-- | Flush any remaining partial byte (zero-padded to the next byte boundary,
+-- exactly like Core's @BitStreamWriter::Flush@) and return the bytes.
 bitWriterFlush :: BitWriter -> ByteString
 bitWriterFlush bw =
   let finalOutput = if bwBits bw > 0
-                    then fromIntegral (bwBuffer bw .&. 0xff) : bwOutput bw
+                    then bwBuffer bw : bwOutput bw   -- already MSB-aligned
                     else bwOutput bw
   in BS.pack (reverse finalOutput)
 
--- | Bit reader state
+-- | Bit reader state — BIG-ENDIAN / MSB-first, byte-for-byte identical to
+-- bitcoin-core/src/streams.h @BitStreamReader@.  'brBuffer' is the current
+-- input byte; 'brOffset' is how many high bits of it have already been
+-- consumed (starts at 8 = "need a fresh byte").
 data BitReader = BitReader
-  { brInput  :: !ByteString  -- ^ Remaining input
-  , brBuffer :: !Word64      -- ^ Current buffer
-  , brBits   :: !Int         -- ^ Bits available in buffer
+  { brInput  :: !ByteString  -- ^ Remaining input bytes
+  , brBuffer :: !Word8       -- ^ Current input byte
+  , brOffset :: !Int         -- ^ High bits of 'brBuffer' already returned (0..8)
   } deriving (Show)
 
--- | Create a new bit reader
+-- | Create a new bit reader.  Mirrors Core's initial state (m_offset = 8,
+-- meaning the first 'Read' pulls a byte from the stream).
 bitReaderNew :: ByteString -> BitReader
-bitReaderNew bs = fillBuffer $ BitReader bs 0 0
-  where
-    fillBuffer !br
-      | brBits br >= 56 = br
-      | BS.null (brInput br) = br
-      | otherwise =
-          let byte = fromIntegral (BS.head (brInput br)) :: Word64
-              rest = BS.tail (brInput br)
-              newBuffer = brBuffer br .|. (byte `shiftL` brBits br)
-              newBits = brBits br + 8
-          in fillBuffer $ br { brInput = rest, brBuffer = newBuffer, brBits = newBits }
+bitReaderNew bs = BitReader bs 0 8
 
--- | Read bits from the bit reader
+-- | Read @numBits@ bits, most-significant-first, returned in the low bits of
+-- the result.  Direct port of Core's @BitStreamReader::Read@
+-- (bitcoin-core/src/streams.h:281-300):
+--
+--   data <<= bits;
+--   data |= (uint8_t)(m_buffer << m_offset) >> (8 - bits);
+--   m_offset += bits;
 bitReaderRead :: BitReader -> Int -> (Word64, BitReader)
-bitReaderRead br numBits
-  | numBits <= 0 = (0, br)
-  | brBits br < numBits = error "Not enough bits in reader"
-  | otherwise =
-      let mask = (1 `shiftL` numBits) - 1
-          value = brBuffer br .&. mask
-          newBuffer = brBuffer br `shiftR` numBits
-          newBits = brBits br - numBits
-      in (value, fillBuffer $ br { brBuffer = newBuffer, brBits = newBits })
+bitReaderRead br0 numBits0
+  | numBits0 < 0 || numBits0 > 64 = error "bitReaderRead: numBits must be 0..64"
+  | otherwise = go br0 numBits0 0
   where
-    fillBuffer !br'
-      | brBits br' >= 56 = br'
-      | BS.null (brInput br') = br'
+    go !br nbits !acc
+      | nbits <= 0 = (acc, br)
       | otherwise =
-          let byte = fromIntegral (BS.head (brInput br')) :: Word64
-              rest = BS.tail (brInput br')
-              newBuffer = brBuffer br' .|. (byte `shiftL` brBits br')
-              newBits = brBits br' + 8
-          in fillBuffer $ br' { brInput = rest, brBuffer = newBuffer, brBits = newBits }
+          let -- Refill the byte buffer when fully consumed.
+              br1 = if brOffset br == 8
+                      then case BS.uncons (brInput br) of
+                             Just (b, rest) -> br { brInput = rest, brBuffer = b, brOffset = 0 }
+                             Nothing        -> error "bitReaderRead: not enough bits in reader"
+                      else br
+              bits   = min (8 - brOffset br1) nbits
+              -- (uint8_t)(m_buffer << m_offset) >> (8 - bits)
+              chunk  = fromIntegral
+                         (((brBuffer br1 `shiftL` brOffset br1) :: Word8)
+                            `shiftR` (8 - bits))
+                         :: Word64
+              acc'   = (acc `shiftL` bits) .|. chunk
+              br2    = br1 { brOffset = brOffset br1 + bits }
+          in go br2 (nbits - bits) acc'
 
 --------------------------------------------------------------------------------
 -- Golomb-Rice Encoding/Decoding
@@ -397,12 +397,18 @@ golombRiceDecode br p =
   in (quotient `shiftL` p .|. remainder, br'')
   where
     readUnary !br' !acc
-      | brBits br' == 0 && BS.null (brInput br') = (acc, br')
+      | bitReaderExhausted br' = (acc, br')
       | otherwise =
           let (bit, br'') = bitReaderRead br' 1
           in if bit == 1
              then readUnary br'' (acc + 1)
              else (acc, br'')
+
+-- | True when the reader has no more bits to return (current byte fully
+-- consumed AND no input bytes remain).  Used by 'golombRiceDecode' as a
+-- defensive end-of-stream guard so a malformed/truncated filter does not loop.
+bitReaderExhausted :: BitReader -> Bool
+bitReaderExhausted br = brOffset br == 8 && BS.null (brInput br)
 
 --------------------------------------------------------------------------------
 -- Fast Range Mapping
