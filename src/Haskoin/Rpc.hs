@@ -278,7 +278,9 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          disconnectPeer, addNodeConnect, sockAddrToHostPort,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList,
-                         getMappedASFromSockAddr)
+                         getMappedASFromSockAddr,
+                         -- AddrMan dump / inject for getnodeaddresses + addpeeraddress
+                         AddrMan(..), AddrInfo(..), addAddress, isRoutable)
 import qualified Network.Socket as NS
 import Network.Socket (SockAddr(..), Socket, socket, Family(..), SocketType(..),
                        connect, close, getAddrInfo, defaultHints,
@@ -620,6 +622,13 @@ rpcInternalError = -32603
 -- | Miscellaneous error (Bitcoin-specific)
 rpcMiscError :: Int
 rpcMiscError = -1
+
+-- | Invalid, missing or out-of-range parameter (Bitcoin Core
+-- RPC_INVALID_PARAMETER, -8).  e.g. getchaintxstats out-of-range nblocks,
+-- getnodeaddresses "Address count out of range" / "Network not recognized".
+-- ('rpcInvalidAddressOrKey' (-5) is already defined further down.)
+rpcInvalidParameter :: Int
+rpcInvalidParameter = -8
 
 --------------------------------------------------------------------------------
 -- Bitcoin Core Transaction Error Codes
@@ -1042,6 +1051,10 @@ handleRpcRequest server req = do
     "pruneblockchain"      -> handlePruneBlockchain server params
     "invalidateblock"      -> handleInvalidateBlock server params
     "reconsiderblock"      -> handleReconsiderBlock server params
+    "getchaintxstats"      -> handleGetChainTxStats server params
+
+    -- Index status RPC
+    "getindexinfo"         -> handleGetIndexInfo server params
 
     -- Transaction RPCs
     "getrawtransaction"    -> handleGetRawTransaction server params
@@ -1136,6 +1149,8 @@ handleRpcRequest server req = do
 
     -- Network RPCs (new)
     "disconnectnode"       -> handleDisconnectNode server params
+    "getnodeaddresses"     -> handleGetNodeAddresses server params
+    "addpeeraddress"       -> handleAddPeerAddress server params
 
     -- Ban management RPCs (DoS / operator-mitigation)
     -- Reference: bitcoin-core/src/rpc/net.cpp setban / listbanned / clearbanned
@@ -2139,6 +2154,191 @@ handleReconsiderBlock server params = do
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError "Block reconsideration failed") Null
             Right () -> return $ RpcResponse Null Null Null
+
+--------------------------------------------------------------------------------
+-- getchaintxstats — chain-wide transaction statistics
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp getchaintxstats
+-- (chain.h m_chain_tx_count, GetMedianTimePast 11-block window,
+-- GetAncestor).
+--
+--   getchaintxstats ( nblocks "blockhash" )  — both args optional.
+--
+--   nblocks   default = one month of blocks = 30*24*60*60 / 600 = 4320,
+--             then clamped to [1 .. height-1] for the window computation;
+--             nblocks == 0 drops the three window_* extras.
+--   blockhash default = the active chain tip.
+--
+-- Fields:
+--   * time                      = the FINAL block's RAW header nTime.
+--   * txcount                   = cumulative #txs genesis..pindex.
+--   * window_final_block_hash   = pindex hash.
+--   * window_final_block_height = pindex height.
+--   * window_block_count        = resolved window size.
+--   * window_interval           = MTP(pindex) - MTP(pindex - nblocks),
+--                                 emitted only when window_block_count > 0.
+--   * window_tx_count           = txcount(pindex) - txcount(ancestor),
+--                                 emitted only when window_block_count > 0.
+--   * txrate                    = window_tx_count / window_interval,
+--                                 emitted only when window_interval > 0.
+--
+-- Errors: -5 "Block not found" (unknown blockhash); -8 for a blockhash not
+-- in the active chain, or an out-of-range nblocks.
+--------------------------------------------------------------------------------
+handleGetChainTxStats :: RpcServer -> Value -> IO RpcResponse
+handleGetChainTxStats server params = do
+  let mNblocks = extractParam params 0 :: Maybe Int
+      mBlockHashTxt = extractParamText params 1
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+  -- Resolve pindex.
+  mResolved <- case mBlockHashTxt of
+    Nothing -> return (Right tip)
+    Just hexHash -> case parseHash hexHash of
+      Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
+      Just bh -> case Map.lookup bh entries of
+        Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
+        Just ce -> do
+          -- "in main chain": the canonical hash at this height equals ce's hash.
+          mCanon <- getBlockHeight (rsDB server) (ceHeight ce)
+          byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+          let canon = case mCanon of
+                        Just h  -> Just h
+                        Nothing -> Map.lookup (ceHeight ce) byHeight
+          if canon == Just (ceHash ce)
+            then return (Right ce)
+            else return (Left (rpcInvalidParameter, "Block is not in main chain"))
+  case mResolved of
+    Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+    Right pindex -> do
+      let height = ceHeight pindex
+          -- Default nblocks = one month of 10-minute blocks (Core).
+          oneMonth = 30 * 24 * 60 * 60 `div` 600 :: Int
+          nReq = fromMaybe oneMonth mNblocks
+      -- Validate nblocks: Core rejects nblocks < 0 or nblocks > height.
+      -- nblocks == 0 is allowed (drops the window extras).
+      if nReq < 0 || nReq > fromIntegral height
+        then return $ RpcResponse Null
+               (toJSON $ RpcError rpcInvalidParameter
+                  "Invalid block count: should be between 0 and the block's height - 1") Null
+        else do
+          -- Cumulative tx count genesis..h, by reading stored block bodies.
+          -- Coinbase-only blocks → 1 tx each; genesis counts its 1 tx too.
+          -- O(height); fine for the regtest differential and any non-archival
+          -- query.  Mirrors Core's m_chain_tx_count which is the same running
+          -- sum maintained at connect time.
+          let cumulativeTxCount :: Word32 -> IO Integer
+              cumulativeTxCount h = go 0 0
+                where
+                  go acc i
+                    | i > h = return acc
+                    | otherwise = do
+                        mbh <- getBlockHeight (rsDB server) i
+                        n <- case mbh of
+                          Nothing -> return 1  -- defensive: assume coinbase-only
+                          Just bh -> do
+                            mBlk <- getBlock (rsDB server) bh
+                            return $ case mBlk of
+                              Just blk -> fromIntegral (length (blockTxns blk))
+                              Nothing  -> 1
+                        go (acc + n) (i + 1)
+          txcount <- cumulativeTxCount height
+          let finalTime = bhTimestamp (ceHeader pindex)
+              finalHashTxt = showHash (ceHash pindex)
+              -- window_block_count: clamp request into [0, height].
+              window = min nReq (fromIntegral height)
+          -- Window extras only when window > 0.
+          windowEnc <-
+            if window <= 0
+              then return mempty
+              else do
+                let ancestorHeight = height - fromIntegral window
+                txcountAnc <- cumulativeTxCount ancestorHeight
+                mAncHash <- getBlockHeight (rsDB server) ancestorHeight
+                let mtpFinal = medianTimePast entries (ceHash pindex)
+                    mtpAnc = case mAncHash of
+                      Just ah -> medianTimePast entries ah
+                      Nothing -> mtpFinal
+                    interval = fromIntegral mtpFinal - fromIntegral mtpAnc :: Int
+                    windowTx = txcount - txcountAnc
+                    rateEnc =
+                      if interval > 0
+                        then pair "txrate"
+                               (AE.double (fromIntegral windowTx / fromIntegral interval))
+                        else mempty
+                return $
+                  pair "window_interval" (AE.int interval) <>
+                  pair "window_tx_count" (AE.integer windowTx) <>
+                  rateEnc
+          let enc = pairs $
+                      pair "time"                      (AE.word32 finalTime)            <>
+                      pair "txcount"                   (AE.integer txcount)             <>
+                      pair "window_final_block_hash"   (text finalHashTxt)              <>
+                      pair "window_final_block_height" (AE.word32 height)               <>
+                      pair "window_block_count"        (AE.int window)                  <>
+                      windowEnc
+              rawBs = encodingToLazyByteString enc
+          return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+--------------------------------------------------------------------------------
+-- getindexinfo — secondary-index status
+--
+-- Reference: bitcoin-core/src/rpc/node.cpp getindexinfo + SummaryToJSON,
+-- src/index/base.cpp GetSummary.
+--
+--   getindexinfo ( "index_name" )  — one optional positional arg.
+--
+-- Returns a dynamic JSON OBJECT keyed by index name.  Each value has
+-- EXACTLY two fields, in this order: { "synced": <bool>, "best_block_height":
+-- <int> } — and NOTHING else (no best_hash).  An index appears only if it is
+-- enabled/running.  haskoin runs the "basic block filter index" when started
+-- with @--blockfilterindex@ (and a txindex when its config enables one); we
+-- emit a key for each enabled index.  The optional "index_name" arg filters to
+-- a single index; a non-matching name yields {} (empty object, NOT an error).
+--------------------------------------------------------------------------------
+handleGetIndexInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetIndexInfo server params = do
+  let mFilter = extractParamText params 0
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  let tipHeight = ceHeight tip
+  -- Build (name, synced, best_block_height) for each running index.
+  entriesRaw <- case rsIndexMgr server of
+    Nothing -> return []
+    Just im -> do
+      -- The IndexManager syncs every enabled index in lockstep to
+      -- 'imSyncHeight'; the block filter index additionally carries its
+      -- own persisted tip pointer ('blockFilterIndexTipHeight') which is
+      -- the authoritative best-block-height for that index.
+      txEntry <- case imTxIndex im of
+        Nothing -> return []
+        Just _  -> do
+          h <- readIORef (imSyncHeight im)
+          return [("txindex", h)]
+      bfEntry <- case imBlockFilterIndex im of
+        Nothing -> return []
+        Just bf -> do
+          mTip <- blockFilterIndexTipHeight bf
+          h <- maybe (readIORef (imSyncHeight im)) return mTip
+          return [("basic block filter index", h)]
+      csEntry <- case imCoinStatsIndex im of
+        Nothing -> return []
+        Just _  -> do
+          h <- readIORef (imSyncHeight im)
+          return [("coinstatsindex", h)]
+      return (txEntry ++ bfEntry ++ csEntry)
+  let -- An index is synced when its best height equals (or exceeds) the
+      -- active chain tip height.
+      mkPair (name, h) =
+        pair (Key.fromText (T.pack name))
+          (pairs $ pair "synced" (AE.bool (h >= tipHeight))
+                <> pair "best_block_height" (AE.word32 h))
+      keep (name, _) = case mFilter of
+        Nothing  -> True
+        Just flt -> T.pack name == flt
+      selected = filter keep entriesRaw
+      enc = pairs (mconcat (map mkPair selected))
+      rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 --------------------------------------------------------------------------------
 -- Transaction RPC Handlers
@@ -5883,6 +6083,26 @@ handleTestMempoolAccept server params = do
       ErrTrucViolation _ -> "non-standard"
       ErrEphemeralViolation _ -> "dust"
       ErrClusterLimitExceeded _ _ -> "too-long-mempool-chain"
+      -- Relay-policy / standardness rejection (IsStandardTx).  The carried
+      -- tag is already a Core reason token ("dust", "version", "datacarrier",
+      -- "bare-multisig", "tx-size", "scriptpubkey", ...) produced by
+      -- 'renderStdReason' / 'renderWitnessStdReason' in Haskoin.Mempool, so we
+      -- surface it verbatim.  WITHOUT this case 'mempoolErrorToText' was a
+      -- partial function and testmempoolaccept threw a PatternMatchFail
+      -- whenever the standardness gate rejected (dust / bad-version / etc.).
+      ErrNonStandard tag -> T.pack tag
+      -- Inputs-standardness (AreInputsStandard) rejection.
+      ErrInputsNotStandard _ tag -> T.pack tag
+      -- nLockTime not satisfied at tip+1 (BIP-113 IsFinalTx).
+      ErrNonFinal _ -> "non-final"
+      -- BIP-68 relative-locktime sequence lock not met at tip+1.
+      ErrSeqLockNotSatisfied -> "non-BIP68-final"
+      -- A coinbase transaction was submitted directly to the mempool.
+      ErrCoinbaseNotAllowed -> "coinbase"
+      -- Submitted feerate exceeds the caller's maxfeerate ceiling.
+      ErrMaxFeeRateExceeded _ _ -> "max-fee-exceeded"
+      -- Spends an output already spent by another mempool transaction.
+      ErrSpendsConflictingTx _ -> "txn-mempool-conflict"
 
 --------------------------------------------------------------------------------
 -- Mempool Submit Package RPC Handler (BIP-331)
@@ -6546,6 +6766,126 @@ handleDisconnectNode server params = do
 -- | Error code for node not connected (-29 in Bitcoin Core)
 rpcClientNodeNotConnected :: Int
 rpcClientNodeNotConnected = -29
+
+--------------------------------------------------------------------------------
+-- getnodeaddresses / addpeeraddress — addrman dump + inject
+--
+-- Reference: bitcoin-core/src/rpc/net.cpp getnodeaddresses (911-970) +
+-- addpeeraddress (972-...), src/netbase.cpp ParseNetwork / GetNetworkName.
+--
+--   getnodeaddresses ( count "network" )
+--
+-- Returns a JSON ARRAY of objects, each with EXACTLY 5 keys in this order:
+--   "time"     unix seconds INTEGER (Core nTime)
+--   "services" raw services bitfield as an INTEGER (NOT a hex string)
+--   "address"  ip literal (no port)
+--   "port"     INTEGER
+--   "network"  ipv4 | ipv6 | onion | i2p | cjdns | not_publicly_routable
+--
+--   count   (positional 0, default 1) = max to return; 0 = ALL; <0 → error -8
+--           "Address count out of range".
+--   network (positional 1, optional) = filter; accepts ONLY
+--           ipv4|ipv6|onion|i2p|cjdns (lowercased); anything else → error -8
+--           "Network not recognized: <raw>".
+--
+-- addrman shuffles, so the returned order is non-deterministic.
+--------------------------------------------------------------------------------
+
+-- | Parse a dotted-IPv4 literal into the host-byte-order 'Word32' that
+-- 'SockAddrInet' stores (matching 'parseBanSubnet'/'sockAddrToHostPort').
+parseIPv4Word :: String -> Maybe Word32
+parseIPv4Word s =
+  case mapM readByte (splitDots s) of
+    Just [b1, b2, b3, b4] ->
+      Just $ fromIntegral b1
+           + fromIntegral b2 * 0x100
+           + fromIntegral b3 * 0x10000
+           + fromIntegral b4 * 0x1000000
+    _ -> Nothing
+  where
+    readByte str = case reads str of
+      [(n, "")] | n >= 0 && n <= 255 -> Just (n :: Int)
+      _ -> Nothing
+    splitDots [] = [""]
+    splitDots (c:cs)
+      | c == '.'  = "" : splitDots cs
+      | otherwise = let (h:t) = splitDots cs in (c:h) : t
+
+-- | Map a 'SockAddr' to Core's GetNetworkName string for the address class.
+-- haskoin's addrman currently only tracks IPv4 'SockAddrInet'; classify those
+-- routable IPv4 addresses as "ipv4" and everything else (loopback, RFC1918,
+-- IPv6, unix) as "not_publicly_routable", mirroring GetNetClass().
+sockAddrNetworkName :: SockAddr -> Text
+sockAddrNetworkName addr@(SockAddrInet _ _)
+  | isRoutable addr = "ipv4"
+  | otherwise       = "not_publicly_routable"
+sockAddrNetworkName (SockAddrInet6 _ _ _ _) = "ipv6"
+sockAddrNetworkName _ = "not_publicly_routable"
+
+handleGetNodeAddresses :: RpcServer -> Value -> IO RpcResponse
+handleGetNodeAddresses server params = do
+  let mCount = extractParam params 0 :: Maybe Int
+      count  = fromMaybe 1 mCount
+      mNetwork = extractParamText params 1
+  if count < 0
+    then return $ RpcResponse Null
+           (toJSON $ RpcError rpcInvalidParameter "Address count out of range") Null
+    else case mNetwork of
+      Just netRaw
+        | T.toLower netRaw `notElem` ["ipv4","ipv6","onion","i2p","cjdns"] ->
+            return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParameter
+                 ("Network not recognized: " <> netRaw)) Null
+      _ -> do
+        let am = pmAddrMan (rsPeerMgr server)
+        idx <- readTVarIO (amAddrIndex am)
+        let allInfos = Map.elems idx
+            netFilter = fmap T.toLower mNetwork
+            matchesNet ai = case netFilter of
+              Nothing  -> True
+              Just flt -> sockAddrNetworkName (aiAddress ai) == flt
+            filtered = filter matchesNet allInfos
+            -- count == 0 → return ALL; else cap at count.  addrman shuffles;
+            -- a Map traversal is already an arbitrary (key) order which is
+            -- order-insensitive for the consumer.
+            limited = if count == 0 then filtered else take count filtered
+            mkObj ai =
+              let (addrStr, port) = sockAddrToHostPort (aiAddress ai)
+                                      (fromIntegral (netDefaultPort (rsNetwork server)))
+              in pairs $
+                   pair "time"     (AE.int64 (aiTime ai))                    <>
+                   pair "services" (AE.word64 (aiServices ai))               <>
+                   pair "address"  (text (T.pack addrStr))                   <>
+                   pair "port"     (AE.int port)                             <>
+                   pair "network"  (text (sockAddrNetworkName (aiAddress ai)))
+            enc = AE.list mkObj limited
+            rawBs = encodingToLazyByteString enc
+        return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | addpeeraddress "address" port ( tried )  → { "success": bool }
+-- Injects an address into the addrman.  Used to seed peers deterministically
+-- (and by the getnodeaddresses test).  Reference: net.cpp addpeeraddress.
+handleAddPeerAddress :: RpcServer -> Value -> IO RpcResponse
+handleAddPeerAddress server params = do
+  let mAddr = extractParamText params 0
+      mPort = extractParam params 1 :: Maybe Int
+  case (mAddr, mPort) of
+    (Just addrTxt, Just port) -> do
+      case parseIPv4Word (T.unpack addrTxt) of
+        Nothing ->
+          return $ RpcResponse (rawJsonResult (mkSuccess False)) Null Null
+        Just w -> do
+          let sa = SockAddrInet (fromIntegral port) w
+              am = pmAddrMan (rsPeerMgr server)
+          now <- round <$> getPOSIXTime :: IO Int64
+          -- NODE_NETWORK | NODE_WITNESS = 0x409, matching the addrman feed in
+          -- Haskoin.Network's peer-receipt path.
+          ok <- addAddress am (pmAsmapData (rsPeerMgr server)) sa sa 0x409 now
+          return $ RpcResponse (rawJsonResult (mkSuccess ok)) Null Null
+    _ -> return $ RpcResponse Null
+           (toJSON $ RpcError rpcInvalidParams "address and port are required") Null
+  where
+    mkSuccess b = encodingToLazyByteString (pairs (pair "success" (AE.bool b)))
 
 --------------------------------------------------------------------------------
 -- setban / listbanned / clearbanned RPC Handlers (DoS mitigation)
@@ -7673,11 +8013,15 @@ allRpcCommands =
   , "getblockhash height"
   , "getblockheader \"blockhash\" ( verbose )"
   , "getchaintips"
+  , "getchaintxstats ( nblocks \"blockhash\" )"
   , "getdifficulty"
   , "gettxout \"txid\" n ( include_mempool )"
   , "invalidateblock \"blockhash\""
   , "pruneblockchain height"
   , "reconsiderblock \"blockhash\""
+  , ""
+  , "== Index =="
+  , "getindexinfo ( \"index_name\" )"
   , ""
   , "== Mempool =="
   , "getmempoolancestors \"txid\" ( verbose )"
@@ -7695,9 +8039,11 @@ allRpcCommands =
   , ""
   , "== Network =="
   , "addnode \"node\" \"command\""
+  , "addpeeraddress \"address\" port ( tried )"
   , "disconnectnode ( \"address\" nodeid )"
   , "getconnectioncount"
   , "getnetworkinfo"
+  , "getnodeaddresses ( count \"network\" )"
   , "getpeerinfo"
   , ""
   , "== Rawtransactions =="

@@ -5276,6 +5276,9 @@ addrmanMinFail = 7 * 24 * 60 * 60
 data AddrInfo = AddrInfo
   { aiAddress       :: !SockAddr           -- ^ The network address
   , aiServices      :: !Word64             -- ^ Services advertised
+  , aiTime          :: !Int64              -- ^ Unix timestamp Core's @nTime@: when the
+                                           --   address was last seen/learned.  Surfaced by
+                                           --   the getnodeaddresses RPC ("time" field).
   , aiLastTry       :: !Int64              -- ^ Unix timestamp of last connection attempt
   , aiLastSuccess   :: !Int64              -- ^ Unix timestamp of last successful connection
   , aiLastCountAttempt :: !Int64           -- ^ Time of last counted attempt
@@ -5489,6 +5492,7 @@ addAddress am asmapData addr source services now
           info = AddrInfo
             { aiAddress = addr
             , aiServices = services
+            , aiTime = now
             , aiLastTry = 0
             , aiLastSuccess = 0
             , aiLastCountAttempt = now
