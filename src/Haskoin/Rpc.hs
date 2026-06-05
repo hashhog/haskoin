@@ -1874,8 +1874,10 @@ handleGetBlockHeader server params = do
           let verbose = fromMaybe True (extractParam params 1 :: Maybe Bool)
           mHeader <- getBlockHeader (rsDB server) bh
           case mHeader of
+            -- Core: LookupBlockIndex miss → RPC_INVALID_ADDRESS_OR_KEY (-5)
+            -- "Block not found" (bitcoin-core/src/rpc/blockchain.cpp:654-656).
             Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError "Block header not found") Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
             Just header -> do
               if not verbose
                 then do
@@ -1888,7 +1890,15 @@ handleGetBlockHeader server params = do
                   let mEntry  = Map.lookup bh entries
                       height  = maybe 0 ceHeight mEntry
                       tipH    = ceHeight tip
-                      confs   = fromIntegral tipH - fromIntegral height + 1 :: Int
+                      -- confirmations: Core's ComputeNextBlockAndDepth returns
+                      -- tipHeight - height + 1 when the block is on the active
+                      -- chain, else -1 (bitcoin-core/src/rpc/blockchain.cpp:162,
+                      -- :135-152).  A block is "on the active chain" iff the
+                      -- canonical height→hash index maps `height` back to `bh`.
+                      onActive = Map.lookup height byHeight == Just bh
+                      confs   = if onActive
+                                  then fromIntegral tipH - fromIntegral height + 1
+                                  else -1 :: Int
                       bits    = bhBits header
                       -- chainwork: 64-char zero-padded lowercase hex (Core format)
                       cwStr   = maybe (T.replicate 64 "0") (showHex64 . ceChainWork) mEntry
@@ -1900,8 +1910,17 @@ handleGetBlockHeader server params = do
                       -- versionHex: big-endian 8-char hex of the 32-bit version field
                       verHex  = T.pack $ printf "%08x"
                                   (fromIntegral (bhVersion header) :: Word32)
+                      -- previousblockhash: Core emits it only when the block has a
+                      -- parent (blockindex.pprev). Genesis has cePrev == Nothing
+                      -- (and an all-zero bhPrevBlock) — omit the key for it.
+                      mPrevBh = case mEntry of
+                                  Just ce -> cePrev ce
+                                  Nothing -> let p = bhPrevBlock header
+                                             in if p == BlockHash (Hash256 (BS.replicate 32 0))
+                                                  then Nothing else Just p
                       -- nextblockhash: canonical chain entry at height+1, if present
-                      mNextBh = Map.lookup (height + 1) byHeight
+                      mNextBh = if onActive then Map.lookup (height + 1) byHeight
+                                            else Nothing
                   -- nTx: count from stored block body, or Core RPC fallback
                   nTx <- fetchNTxForBlock server bh
                   let enc = pairs $
@@ -1915,12 +1934,14 @@ handleGetBlockHeader server params = do
                               pair "mediantime"        (AE.word32 mTime)                                <>
                               pair "nonce"             (AE.word32 (bhNonce header))                     <>
                               pair "bits"              (text (showBits bits))                           <>
+                              pair "target"            (text (showHex64 (bitsToTarget bits)))           <>
                               pair "difficulty"
                                 (unsafeToEncoding (stringUtf8 (difficultyStr bits)))                   <>
                               pair "chainwork"         (text cwStr)                                     <>
                               pair "nTx"               (AE.int nTx)                                    <>
-                              pair "previousblockhash" (text (showHash (bhPrevBlock header)))           <>
-                              pair "target"            (text (showHex64 (bitsToTarget bits)))           <>
+                              (case mPrevBh of
+                                 Just ph -> pair "previousblockhash" (text (showHash ph))
+                                 Nothing -> mempty)                                                     <>
                               (case mNextBh of
                                  Just nh -> pair "nextblockhash" (text (showHash nh))
                                  Nothing -> mempty)
