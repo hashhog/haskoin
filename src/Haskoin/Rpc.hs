@@ -2376,7 +2376,30 @@ handleGetRawTransaction server params = do
               -- Parse optional blockhash parameter
               mBlockHashText  = extractParamText params 2
               mBlockHashParam = mBlockHashText >>= parseHash
+              -- Whether a blockhash ARG was explicitly supplied (drives in_active_chain).
+              blockHashArgGiven = case mBlockHashText of
+                Just _  -> True
+                Nothing -> False
+              -- The genesis-block coinbase is not an ordinary transaction. Core
+              -- (rpc/rawtransaction.cpp:290) special-cases it BEFORE any lookup:
+              -- compares the requested txid against the genesis block's merkle
+              -- root (== the genesis coinbase txid for the single-tx block).
+              genesisCoinbaseTxid =
+                computeTxId (head (blockTxns (netGenesisBlock (rsNetwork server))))
 
+          if txid == genesisCoinbaseTxid
+            then return $ RpcResponse Null
+              (toJSON $ RpcError (-5)
+                "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved")
+              Null
+            else
+              handleGetRawTransactionLookup server txid verbosity
+                mBlockHashText mBlockHashParam blockHashArgGiven
+
+handleGetRawTransactionLookup
+  :: RpcServer -> TxId -> Int -> Maybe Text -> Maybe BlockHash -> Bool
+  -> IO RpcResponse
+handleGetRawTransactionLookup server txid verbosity mBlockHashText mBlockHashParam blockHashArgGiven = do
           -- verbosity=2: proxy to Bitcoin Core to get prevout-enriched output
           -- with byte-identical formatting (fee, in_active_chain, vin[].prevout).
           -- haskoin does not store block bodies during assumevalid IBD, so the
@@ -2385,36 +2408,48 @@ handleGetRawTransaction server params = do
           -- Aeson re-encoding and preserve 0.00000000 eight-decimal formatting.
           if verbosity >= 2
             then do
+              -- Canonical display-order txid hex (equivalent to the user-supplied
+              -- string) for the Core proxy lookup.
+              let hexTxid = showHash (BlockHash (getTxIdHash txid))
               mRaw <- fetchGetRawTxFromCore hexTxid verbosity mBlockHashText
               case mRaw of
                 Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
                 Nothing  -> return $ RpcResponse Null
                   (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash to a node with block access.") Null
-            else do
-              -- 1. Check mempool first
-              mMempoolEntry <- getTransaction (rsMempool server) txid
-              case mMempoolEntry of
-                Just entry -> do
-                  let tx = meTransaction entry
-                  returnTxResult server tx txid Nothing verbosity
+            else
+              -- Lookup precedence mirrors Core's node::GetTransaction
+              -- (node/transaction.cpp:143-174):
+              --   1. mempool — ONLY when no blockhash arg was supplied.
+              --   2. txindex — when present (and, if a blockhash arg is given,
+              --      only when the indexed block matches that hash).
+              --   3. the specific block named by the blockhash arg.
+              -- Critically, when a blockhash arg is given Core does NOT consult
+              -- the mempool, so a still-unconfirmed-locally tx is reported with
+              -- its confirmation context rather than the bare mempool form.
+              case mBlockHashParam of
+                Just blockHash -> do
+                  -- A blockhash arg was supplied: look up that block directly.
+                  mBlock <- getBlock (rsDB server) blockHash
+                  case mBlock of
+                    Nothing -> return $ RpcResponse Null
+                      (toJSON $ RpcError (-5) "Block hash not found") Null
+                    Just block -> do
+                      let mTx = find (\t -> computeTxId t == txid) (blockTxns block)
+                      case mTx of
+                        Nothing -> return $ RpcResponse Null
+                          (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
+                        Just tx -> returnTxResult server tx txid (Just blockHash) blockHashArgGiven verbosity
 
                 Nothing -> do
-                  -- 2. If blockhash provided, load that specific block
-                  case mBlockHashParam of
-                    Just blockHash -> do
-                      mBlock <- getBlock (rsDB server) blockHash
-                      case mBlock of
-                        Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "Block hash not found") Null
-                        Just block -> do
-                          let mTx = find (\t -> computeTxId t == txid) (blockTxns block)
-                          case mTx of
-                            Nothing -> return $ RpcResponse Null
-                              (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
-                            Just tx -> returnTxResult server tx txid (Just blockHash) verbosity
+                  -- No blockhash arg: mempool first.
+                  mMempoolEntry <- getTransaction (rsMempool server) txid
+                  case mMempoolEntry of
+                    Just entry -> do
+                      let tx = meTransaction entry
+                      returnTxResult server tx txid Nothing False verbosity
 
                     Nothing -> do
-                      -- 3. Try txindex lookup
+                      -- Then the txindex (if -txindex is enabled).
                       mTxLoc <- getTxIndex (rsDB server) txid
                       case mTxLoc of
                         Nothing -> return $ RpcResponse Null
@@ -2430,18 +2465,20 @@ handleGetRawTransaction server params = do
                               if txIdx < length txns
                                 then do
                                   let tx = txns !! txIdx
-                                  returnTxResult server tx txid (Just (txLocBlock txLoc)) verbosity
+                                  returnTxResult server tx txid (Just (txLocBlock txLoc)) blockHashArgGiven verbosity
                                 else return $ RpcResponse Null
                                   (toJSON $ RpcError (-5) "Transaction index out of range") Null
 
--- | Helper to return transaction result (raw hex or verbose JSON)
-returnTxResult :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Int -> IO RpcResponse
-returnTxResult server tx txid mBlockHash verbosity =
+-- | Helper to return transaction result (raw hex or verbose JSON).
+-- @blockHashArgGiven@ tracks whether the caller supplied an explicit
+-- blockhash argument; Core only emits "in_active_chain" in that case.
+returnTxResult :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> Int -> IO RpcResponse
+returnTxResult server tx txid mBlockHash blockHashArgGiven verbosity =
   if verbosity == 0
     then return $ RpcResponse
       (toJSON $ TE.decodeUtf8 $ B16.encode $ S.encode tx) Null Null
     else do
-      verboseResult <- txToVerboseJSON server tx txid mBlockHash
+      verboseResult <- txToVerboseJSON server tx txid mBlockHash blockHashArgGiven
       return $ RpcResponse verboseResult Null Null
 
 -- | Proxy getrawtransaction to the local Bitcoin Core node (port 8332).
@@ -9405,11 +9442,15 @@ computeBlockRestConfirmations (Just (entryHash, entryHeight)) tipHeight byHeight
     then fromIntegral tipHeight - fromIntegral entryHeight + 1
     else -1
 
--- | Convert a transaction to verbose JSON with blockchain context
--- Includes: txid, hash (wtxid), size, vsize, weight, version, locktime,
--- vin, vout, hex, and optionally blockhash, confirmations, blocktime
-txToVerboseJSON :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> IO Value
-txToVerboseJSON server tx txid mBlockHash = do
+-- | Convert a transaction to verbose JSON with blockchain context.
+-- Mirrors Bitcoin Core core_io.cpp::TxToUniv + rpc/rawtransaction.cpp::TxToJSON.
+-- Includes: txid, hash (wtxid), version, size, vsize, weight, locktime, vin,
+-- vout, hex, and — when confirmed in the active chain — blockhash,
+-- confirmations, time, blocktime.  When a blockhash ARG was supplied
+-- (@blockHashArgGiven@), also emits "in_active_chain" (Core only adds it in
+-- that case; rpc/rawtransaction.cpp:337-340).
+txToVerboseJSON :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> IO Value
+txToVerboseJSON server tx txid mBlockHash blockHashArgGiven = do
   -- Calculate transaction metrics
   let baseSize = txBaseSize tx
       totalSize = txTotalSize tx
@@ -9417,28 +9458,40 @@ txToVerboseJSON server tx txid mBlockHash = do
       vsize = (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
       hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
 
-  -- (baseFields removed: we use the streaming path below for vout.value precision)
-
-  -- Add blockchain context if confirmed
-  blockFields <- case mBlockHash of
-    Nothing -> return []
+  -- Resolve blockchain context.  We need both whether the block exists in the
+  -- header index and whether it is on the ACTIVE chain (Core:
+  -- ActiveChain().Contains(pindex)).  in_active_chain reflects the latter.
+  (inActiveChainEnc, blockEnc) <- case mBlockHash of
+    Nothing -> return (mempty, mempty)
     Just blockHash -> do
-      entries <- readTVarIO (hcEntries (rsHeaderChain server))
-      tip <- readTVarIO (hcTip (rsHeaderChain server))
+      entries  <- readTVarIO (hcEntries (rsHeaderChain server))
+      tip      <- readTVarIO (hcTip (rsHeaderChain server))
       byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
       let mEntry = Map.lookup blockHash entries
+          -- A block is on the active chain iff its stored height maps back to
+          -- its own hash in the active-chain height index.
+          onActiveChain = case mEntry of
+            Just entry -> Map.lookup (ceHeight entry) byHeight == Just blockHash
+            Nothing    -> False
+          iacEnc = if blockHashArgGiven
+                     then pair "in_active_chain" (AE.bool onActiveChain)
+                     else mempty
       case mEntry of
-        Nothing -> return [ "blockhash" .= showHash blockHash ]
+        Nothing -> return (iacEnc, pair "blockhash" (text (showHash blockHash)))
         Just entry -> do
-          let confirmations = computeTxConfirmations
-                                blockHash (ceHeight entry) (ceHeight tip) byHeight
-              blockTime = bhTimestamp (ceHeader entry)
-          return
-            [ "blockhash"      .= showHash blockHash
-            , "confirmations"  .= confirmations
-            , "time"           .= blockTime
-            , "blocktime"      .= blockTime
-            ]
+          let blockTime = bhTimestamp (ceHeader entry)
+              ctx = if onActiveChain
+                      then let confs = fromIntegral (ceHeight tip)
+                                       - fromIntegral (ceHeight entry) + 1 :: Int
+                           in pair "blockhash"     (text (showHash blockHash)) <>
+                              pair "confirmations" (AE.int confs)              <>
+                              pair "time"          (AE.word32 blockTime)       <>
+                              pair "blocktime"     (AE.word32 blockTime)
+                      -- Block exists but is on a side branch: Core emits
+                      -- confirmations 0 and omits time/blocktime.
+                      else pair "blockhash"     (text (showHash blockHash)) <>
+                           pair "confirmations" (AE.int (0 :: Int))
+          return (iacEnc, ctx)
 
   -- Build the response on the streaming path so vout.value uses
   -- Core's fixed-decimal format (btcAmountEnc) instead of Double.
@@ -9453,8 +9506,9 @@ txToVerboseJSON server tx txid mBlockHash = do
         pair "vin"      (AE.list id (map (vinToEnc tx) [0 .. length (txInputs tx) - 1])) <>
         pair "vout"     (AE.list id (zipWith voutToEnc [0..] (txOutputs tx))) <>
         pair "hex"      (text hexTx)
-      blockEnc = foldl' (<>) mempty $ map (\(k, v) -> pair k (toEncoding v)) blockFields
-      finalEnc = pairs (baseEnc <> blockEnc)
+      -- Core pushes in_active_chain into the result object first, then the
+      -- TxToUniv body, then the blockhash/confirmations/time/blocktime tail.
+      finalEnc = pairs (inActiveChainEnc <> baseEnc <> blockEnc)
       rawBs    = encodingToLazyByteString finalEnc
   return $ rawJsonResult rawBs
   where
@@ -9468,10 +9522,11 @@ txToVerboseJSON server tx txid mBlockHash = do
                        then mempty
                        else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witnessStack)
       in if isCoinbaseInput
+         -- Core field order (core_io.cpp): coinbase, txinwitness?, sequence.
          then pairs $
                 pair "coinbase" (text (TE.decodeUtf8 (B16.encode (txInScript inp)))) <>
-                pair "sequence" (AE.word32 (txInSequence inp))                       <>
-                witnessEnc
+                witnessEnc                                                           <>
+                pair "sequence" (AE.word32 (txInSequence inp))
          else pairs $
                 pair "txid"      (text (showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp)))))) <>
                 pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput inp)))                               <>
@@ -9482,25 +9537,15 @@ txToVerboseJSON server tx txid mBlockHash = do
 
     -- | Streaming Encoding for one vout entry.
     -- value uses btcAmountEnc for Core's fixed-decimal format.
+    -- scriptPubKey mirrors core_io.cpp::ScriptToUniv field order:
+    -- asm, desc, hex, address?, type.
     voutToEnc :: Int -> TxOut -> AE.Encoding
     voutToEnc n out =
       let scriptHex = txOutScript out
-          scriptType = case decodeScript scriptHex of
-            Right s -> classifyOutput s
-            Left _ -> NonStandard
-          typeStr = scriptTypeToString scriptType
-          mAddress = scriptToAddress (rsNetwork server) scriptHex scriptType
-          spkPairs =
-            pair "asm"  (text (scriptToAsm scriptHex)) <>
-            pair "hex"  (text (TE.decodeUtf8 (B16.encode scriptHex))) <>
-            pair "type" (text typeStr) <>
-            (case mAddress of
-               Just addr -> pair "address" (text addr)
-               Nothing   -> mempty)
       in pairs $
            pair "value"        (btcAmountEnc (fromIntegral (txOutValue out))) <>
            pair "n"            (AE.int n)                                     <>
-           pair "scriptPubKey" (pairs spkPairs)
+           pair "scriptPubKey" (psbtSpkEnc (rsNetwork server) scriptHex)
 
 
 -- | Convert script bytes to assembly string representation
