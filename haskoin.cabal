@@ -26,6 +26,7 @@ library
                  , Haskoin.BlockTemplate
                  , Haskoin.Rpc
                  , Haskoin.Wallet
+                 , Haskoin.Wallet.Persist
                  , Haskoin.Performance
                  , Haskoin.Index
                  , Haskoin.MuHash
@@ -176,6 +177,7 @@ test-suite haskoin-test
                , W162ChainstateWedgeSpec
                , W163SnapshotRecoverySpec
                , W165ReorgAtomicSpec
+               , W166WalletPersistSpec
                , Paths_haskoin
                , Bip21Spec
                , Fix64TlsSpec
