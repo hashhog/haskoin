@@ -231,7 +231,20 @@ calculateAdjustedVSize tx sigopCost =
 
 -- | Mempool configuration parameters
 data MempoolConfig = MempoolConfig
-  { mpcMaxSize           :: !Int      -- ^ Max pool size in bytes (default 300MB)
+  { mpcMaxSize           :: !Int      -- ^ Max pool size, in vsize-bytes
+                                      --   (default 300M, i.e. "300MB").
+                                      --   W153 BUG-2: this limit is compared
+                                      --   against 'mpSize', which accumulates
+                                      --   transaction *vsize* (vbytes), so both
+                                      --   sides use the same vsize-bytes unit.
+                                      --   This is haskoin's documented proxy for
+                                      --   Bitcoin Core's @DynamicMemoryUsage()@
+                                      --   (RAM bytes) vs @-maxmempool@ comparison
+                                      --   in CTxMemPool::TrimToSize
+                                      --   (txmempool.cpp:868). Core's RAM usage
+                                      --   is larger than raw vsize, so the same
+                                      --   numeric default is conservative
+                                      --   (trims no earlier than Core would).
   , mpcMinFeeRate        :: !FeeRate  -- ^ Min fee rate to accept (sat/vB)
   , mpcMaxOrphans        :: !Int      -- ^ Max orphan transactions
   , mpcRBFEnabled        :: !Bool     -- ^ Allow BIP-125 RBF
@@ -260,7 +273,7 @@ instance NFData MempoolConfig
 -- | Default mempool configuration matching Bitcoin Core defaults
 defaultMempoolConfig :: MempoolConfig
 defaultMempoolConfig = MempoolConfig
-  { mpcMaxSize           = 300 * 1024 * 1024  -- 300 MB
+  { mpcMaxSize           = 300 * 1024 * 1024  -- 300M vsize-bytes (see mpcMaxSize)
   , mpcMinFeeRate        = FeeRate 1          -- 1 sat/vB
   , mpcMaxOrphans        = 100
   , mpcRBFEnabled        = True
@@ -559,7 +572,12 @@ data Mempool = Mempool
   , mpUTXOCache  :: !UTXOCache
     -- ^ UTXO cache for input validation
   , mpSize       :: !(TVar Int)
-    -- ^ Total serialized size in bytes
+    -- ^ Total mempool size, in *vsize-bytes* (sum of each entry's 'meSize',
+    --   i.e. sigop-adjusted vsize).  NOT raw serialized bytes.  Compared
+    --   against 'mpcMaxSize' (same unit) in 'trimToSize' / 'evictLowestFee'.
+    --   W153 BUG-2: 'mpcMaxSize' is documented in the same vsize-bytes unit so
+    --   the limit comparison is unit-consistent.  This is the documented proxy
+    --   for Bitcoin Core's @DynamicMemoryUsage()@ (RAM bytes).
   , mpNetwork    :: !Network
     -- ^ Network configuration
   , mpHeight     :: !(TVar Word32)
@@ -796,9 +814,12 @@ addTransactionWithReplacementInner mp tx txid conflictTxIds = do
               vsize = calculateVSize tx
               feeRate = calculateFeeRate fee vsize
 
-          -- Check minimum fee rate
-          if feeRate < mpcMinFeeRate (mpConfig mp)
-            then return $ Left (ErrFeeBelowMinimum feeRate (mpcMinFeeRate (mpConfig mp)))
+          -- Check minimum fee rate against the effective floor: the maximum of
+          -- the static relay minimum and the (decayed) rolling minimum bumped by
+          -- size-limit evictions (W153 BUG-5 — was: static mpcMinFeeRate only).
+          minFee <- effectiveMinFeeRate mp
+          if feeRate < minFee
+            then return $ Left (ErrFeeBelowMinimum feeRate minFee)
             else do
               -- Attempt replacement with RBF rules
               replaceResult <- attemptReplacement mp tx txid conflictTxIds fee vsize feeRate
@@ -869,9 +890,14 @@ finalizeTransaction mp tx txid inputPairs = do
           fee = baseFee  -- preserve historical name for the body
           feeRate = calculateFeeRate modifiedFee vsize
 
-      -- Check minimum fee rate (uses modified fee — Core parity).
-      if feeRate < mpcMinFeeRate (mpConfig mp)
-        then return $ Left (ErrFeeBelowMinimum feeRate (mpcMinFeeRate (mpConfig mp)))
+      -- Check minimum fee rate (uses modified fee — Core parity) against the
+      -- effective floor = max(static relay min, decayed rolling min).  W153
+      -- BUG-5: previously only the static mpcMinFeeRate was consulted, so the
+      -- eviction-driven rolling minimum (GetMinFee) never gated admission and
+      -- its decay never advanced on the live path.
+      minFee <- effectiveMinFeeRate mp
+      if feeRate < minFee
+        then return $ Left (ErrFeeBelowMinimum feeRate minFee)
         else
           -- W96 Gate (client-maxfeerate): mirrors Bitcoin Core
           -- validation.cpp:1368
@@ -1039,7 +1065,10 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
                , meDescendantFees  = meDescendantFees  e + commitFee
                }) ancId
 
-  -- Evict if mempool is too large
+  -- Evict if mempool is too large.  totalSize (mpSize) and mpcMaxSize are both
+  -- in vsize-bytes (W153 BUG-2 — unit-consistent; see field docs).  evictLowestFee
+  -- delegates to trimToSize, which loops until back under the limit and bumps the
+  -- rolling minimum fee.
   totalSize <- readTVarIO (mpSize mp)
   when (totalSize > mpcMaxSize (mpConfig mp)) $
     evictLowestFee mp
@@ -1085,8 +1114,12 @@ finalizeTransactionDry mp tx txid inputPairs = do
                 in if absD > baseFee then 0 else baseFee - absD
           fee          = baseFee
           modifiedRate = calculateFeeRate modifiedFee vsize
-      if modifiedRate < mpcMinFeeRate (mpConfig mp)
-        then return $ Left (ErrFeeBelowMinimum modifiedRate (mpcMinFeeRate (mpConfig mp)))
+      -- Dry-run gate must mirror the commit path: compare against the effective
+      -- floor = max(static relay min, decayed rolling min) so testmempoolaccept
+      -- reports the same reject as the live admission path (W153 BUG-5).
+      minFee <- effectiveMinFeeRate mp
+      if modifiedRate < minFee
+        then return $ Left (ErrFeeBelowMinimum modifiedRate minFee)
         else case mpcMaxFeeRate (mpConfig mp) of
           Just cap | modifiedRate > cap ->
             return $ Left (ErrMaxFeeRateExceeded modifiedRate cap)
@@ -1237,8 +1270,11 @@ testAcceptWithReplacement mp tx txid conflictTxIds = do
               let fee     = totalIn - totalOut
                   vsize   = calculateVSize tx
                   feeRate = calculateFeeRate fee vsize
-              if feeRate < mpcMinFeeRate (mpConfig mp)
-                then return $ Left (ErrFeeBelowMinimum feeRate (mpcMinFeeRate (mpConfig mp)))
+              -- Effective floor = max(static relay min, decayed rolling min),
+              -- matching the commit-path RBF gate (W153 BUG-5).
+              minFee <- effectiveMinFeeRate mp
+              if feeRate < minFee
+                then return $ Left (ErrFeeBelowMinimum feeRate minFee)
                 else do
                   -- Run the RBF replacement rule-set WITHOUT mutating the pool.
                   rbfCheck <- evaluateReplacementRules mp tx conflictTxIds fee vsize feeRate
@@ -1577,6 +1613,29 @@ getMempoolMinFeeRate mp = do
   let FeeRate minRate = mpcMinFeeRate (mpConfig mp)
       staticKvb = fromIntegral minRate * 1000  -- sat/vB → sat/kvB
   return (max rollingKvb staticKvb)
+
+-- | Admission fee floor as a 'FeeRate', for gating mempool acceptance.
+--
+-- 'FeeRate' here stores sat/kvB (see 'calculateFeeRate': @fee*1000/vsize@), so
+-- the candidate fee rates produced by 'calculateFeeRate' at the admission sites
+-- are also sat/kvB.  'getMempoolMinFeeRate' returns the effective floor — the
+-- maximum of the (decayed) rolling minimum bumped by size-limit evictions and
+-- the static 'mpcMinFeeRate' relay floor — in sat/kvB, so we wrap it directly
+-- in a 'FeeRate' and compare against the candidate's @meFeeRate@/@feeRate@.
+--
+-- Why this is wired here (W153 BUG-5): the static admission gates previously
+-- compared the candidate (sat/kvB) against @mpcMinFeeRate@ (FeeRate 1) directly,
+-- i.e. a 1-sat/kvB floor (effectively zero), and never consulted the rolling
+-- minimum.  Gating on 'effectiveMinFeeRate' instead (a) restores the intended
+-- 1-sat/vB = 1000-sat/kvB static relay floor and (b) enforces the eviction-
+-- driven rolling minimum, whose exponential decay is advanced as a side effect
+-- of 'getMempoolMinFeeRateDecayed' — which had no live caller on the admission
+-- path before this change.  This is relay policy, not consensus
+-- (default-improving / config-gated via 'mpcMinFeeRate').  Mirrors the
+-- @GetMinFee(maxmempool)@ floor Bitcoin Core enforces in
+-- MemPoolAccept::PreChecks (validation.cpp).
+effectiveMinFeeRate :: Mempool -> IO FeeRate
+effectiveMinFeeRate mp = FeeRate <$> getMempoolMinFeeRate mp
 
 --------------------------------------------------------------------------------
 -- Ancestor/Descendant Tracking
@@ -1972,6 +2031,22 @@ blockConnected mp block = do
     -- CTxMemPool::AddTransactionsUpdated, called from ConnectBlock).
     writeTVar (mpBlockSinceLastFeeBump mp) True
 
+  -- Post-connect mempool maintenance — mirrors Bitcoin Core's
+  -- LimitMempoolSize(pool, coins) (validation.cpp:264-277), invoked after each
+  -- block is connected (validation.cpp:387 / 1397 / 1731):
+  --   1. Expire transactions older than the configured window (default 14 days).
+  --      'expireOldTransactions' previously had no live caller (W153 BUG-5) —
+  --      stale low-fee txs lingered forever in the live node's mempool.
+  --   2. Trim to the size limit, bumping the rolling minimum fee.  Runs AFTER
+  --      the mpBlockSinceLastFeeBump flag is set above so any eviction-driven
+  --      bump correctly clears it (trackPackageRemoved), preserving Core's
+  --      decay ordering.
+  -- Both run outside the STM block above: they each manage their own STM
+  -- transactions (loop bodies must not be one giant atomic op) and removal of
+  -- confirmed/conflicting txs has already been committed.
+  _ <- expireOldTransactions mp
+  trimToSize mp
+
 -- | Handle a disconnected block (during reorg)
 -- Re-adds transactions from the disconnected block back to mempool
 blockDisconnected :: Mempool -> Block -> IO ()
@@ -2123,6 +2198,11 @@ getMempoolMinFeeRateDecayed mp = do
 trimToSize :: Mempool -> IO ()
 trimToSize mp = loop
   where
+    -- Both 'totalSize' (mpSize) and 'sizelimit' (mpcMaxSize) are in vsize-bytes
+    -- (W153 BUG-2 — units are now consistent on both sides of the comparison;
+    -- see the mpSize / mpcMaxSize field docs).  Bitcoin Core compares
+    -- DynamicMemoryUsage() (RAM bytes) > max_size_bytes; haskoin uses
+    -- vsize-bytes as a documented proxy (txmempool.cpp:868).
     sizelimit = mpcMaxSize (mpConfig mp)
     loop = do
       totalSize <- readTVarIO (mpSize mp)
