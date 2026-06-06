@@ -138,6 +138,7 @@ import qualified W160SigCacheKeySpec
 import qualified W161WordlistDataFileSpec
 import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
+import qualified W165ReorgAtomicSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22651,6 +22652,12 @@ main = hspec $ do
   -- snapshot-aware startup reconciliation (resume from snapshot base,
   -- not height 1) + BIP-113 MTP parity over the snapshot base
   W163SnapshotRecoverySpec.spec
+
+  -- W165 reorg/invalidateblock disk-pointer atomicity: an active-chain
+  -- disconnect must rewind the ON-DISK best-block pointer + height index
+  -- (not just the in-memory tip) so disk best-block ⇔ disk UTXO set stay
+  -- consistent across a flush+restart (else post-restart false-reject).
+  W165ReorgAtomicSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
