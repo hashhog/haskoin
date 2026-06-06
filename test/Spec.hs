@@ -139,6 +139,7 @@ import qualified W161WordlistDataFileSpec
 import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
+import qualified W166WalletPersistSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22658,6 +22659,12 @@ main = hspec $ do
   -- (not just the in-memory tip) so disk best-block ⇔ disk UTXO set stay
   -- consistent across a flush+restart (else post-restart false-reject).
   W165ReorgAtomicSpec.spec
+
+  -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
+  -- save-on-mutation survives a simulated unclean restart, fault-tolerant
+  -- load (corrupt/partial file does not crash + .bad move), encryption at
+  -- rest (no plaintext key on disk + wrong-key fails gracefully).
+  W166WalletPersistSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec

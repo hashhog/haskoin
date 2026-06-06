@@ -3,6 +3,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | HD Wallet Implementation (BIP-32, BIP-39, BIP-44, BIP-49, BIP-84, BIP-86)
 --
@@ -33,6 +34,14 @@ module Haskoin.Wallet
   , createWallet
   , loadWallet
   , saveWallet
+    -- * Durable persistence (DATA-LOSS fix, sweep wa0fq5wtk)
+  , attachWalletPersistence
+  , snapshotWallet
+  , restoreWalletFromSnapshot
+  , persistWallet
+  , markWalletDirty
+  , flushDirtyWallets
+  , rescanWalletToTip
     -- * Multi-Wallet Manager
   , WalletManager(..)
   , WalletInfo(..)
@@ -300,7 +309,8 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.Char (isSpace, isDigit, isHexDigit, digitToInt, ord)
 import Data.Maybe (listToMaybe, mapMaybe, fromMaybe, isJust)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory)
-import System.FilePath ((</>))
+import System.FilePath ((</>), takeDirectory)
+import Control.Exception (SomeException, catch)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
                        TxIn(..), TxOut(..), Tx(..), BlockHeader(..), Block(..),
@@ -311,6 +321,8 @@ import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encode
 import Haskoin.Mempool (FeeRate(..), signalsOptInRBF)
 import Haskoin.Consensus (Network(..), coinbaseMaturity)
 import qualified Haskoin.Consensus
+import qualified Haskoin.Wallet.Persist as WP
+import Haskoin.Wallet.Persist (WalletSnapshot(..), SnapUtxo(..))
 
 -- For wallet encryption
 import Crypto.Cipher.AES (AES256)
@@ -1233,6 +1245,21 @@ data Wallet = Wallet
       --   analogue for history (vs. walletUTXOs which is the spendable
       --   coin set).  Reference: bitcoin-core/src/wallet/wallet.h
       --   CWallet::mapWallet, rpc/wallet/transactions.cpp ListTransactions.
+  , walletPersistPath  :: !(TVar (Maybe (FilePath, ByteString)))
+      -- ^ DURABILITY: (wallet.dat path, at-rest seal key) for this wallet,
+      --   or 'Nothing' for an in-memory-only wallet (tests / never persisted).
+      --   Set by the WalletManager at create/load/restore time.  Every
+      --   state-changing op calls 'markWalletDirty'; a periodic flusher
+      --   (and clean shutdown) calls 'persistWallet' so a SIGKILL/OOM/
+      --   power-loss cannot lose wallet state.  Reference:
+      --   bitcoin-core/src/wallet/wallet.cpp WalletBatch + fsync flush.
+  , walletDirty        :: !(TVar Bool)
+      -- ^ Set whenever wallet state changes; cleared after a successful
+      --   'persistWallet'.  Drives the periodic save-on-mutation flusher.
+  , walletLastSynced   :: !(TVar Word32)
+      -- ^ Highest chain height whose block has been fed to
+      --   'scanBlockForWallet'.  Persisted so startup rescan knows the gap
+      --   [lastSynced+1 .. tip] to replay (RESCAN/RECONCILE anchor).
   }
 
 -- | A record of an outgoing transaction the wallet has produced.
@@ -1367,15 +1394,180 @@ loadWallet WalletConfig{..} mnemonic = do
   txLabels <- newTVarIO Map.empty
   sentTxs <- newTVarIO Map.empty
   txHistory <- newTVarIO Map.empty
+  persistPath <- newTVarIO Nothing
+  dirty <- newTVarIO False
+  lastSynced <- newTVarIO 0
   return $ Wallet master account recvIdx changeIdx addrs utxos wcNetwork wcGapLimit
-                  addrLabels txLabels sentTxs txHistory
+                  addrLabels txLabels sentTxs txHistory persistPath dirty lastSynced
 
--- | Save wallet state to a file.
--- SECURITY: In production, encrypt private keys with a passphrase.
--- NEVER store mnemonics or private keys unencrypted.
+-- | Save wallet state to a file.  Atomic + durable (temp + fsync +
+-- rename) with the spendable key material AES-sealed at rest.  This is
+-- the standalone form used by callers that hold an explicit at-rest key;
+-- the WalletManager path uses 'persistWallet' which reads the seal key
+-- and path off the wallet's own 'walletPersistPath'.
+--
+-- DATA-LOSS FIX (sweep wa0fq5wtk): previously this @error@ed, so wallet
+-- state lived only in memory and was lost on every restart.
 saveWallet :: Wallet -> FilePath -> IO ()
-saveWallet _wallet _path =
-  error "Wallet persistence not yet implemented - requires encrypted storage"
+saveWallet wallet path = do
+  let dir = takeDirectory path
+  createDirectoryIfMissing True dir
+  atRestKey <- WP.loadOrCreateAtRestKey (dir </> "wallet.key")
+  snap <- snapshotWallet wallet
+  res  <- WP.saveWalletSnapshot atRestKey path snap
+  case res of
+    Right () -> pure ()
+    Left e   -> error ("saveWallet: " ++ e)
+
+--------------------------------------------------------------------------------
+-- Durable persistence (DATA-LOSS fix, sweep wa0fq5wtk)
+--
+-- The wallet keeps its full state (master key, addresses, UTXO ledger,
+-- labels, last-synced height) on disk so a restart — clean OR an unclean
+-- SIGKILL / OOM / power loss — does not lose keys or funds.  Mirrors
+-- bitcoin-core/src/wallet/{wallet,walletdb}.cpp and this node's own
+-- 'Haskoin.Mempool.Persist'.
+--------------------------------------------------------------------------------
+
+-- | Wire a wallet to a concrete on-disk path + at-rest seal key so
+-- subsequent mutations persist.  Called by the WalletManager at
+-- create / load / restore time.
+attachWalletPersistence :: Wallet -> FilePath -> ByteString -> IO ()
+attachWalletPersistence wallet path atRestKey =
+  atomically $ writeTVar (walletPersistPath wallet) (Just (path, atRestKey))
+
+-- | Mark the wallet dirty so the periodic flusher (and clean shutdown)
+-- will re-persist it.  Cheap; safe to call from any mutation.  No-op for
+-- an unattached (in-memory-only) wallet, but still flips the flag so an
+-- attach-then-flush sequence saves the accumulated state.
+markWalletDirty :: Wallet -> IO ()
+markWalletDirty wallet = atomically $ writeTVar (walletDirty wallet) True
+
+-- | Take a consistent on-disk snapshot of the wallet's live state.  Reads
+-- all TVars in a single STM transaction so the snapshot is internally
+-- consistent even under concurrent mutation.  The returned snapshot holds
+-- the master key + chain code in PLAINTEXT; 'WP.saveWalletSnapshot' seals
+-- them before they reach disk.
+snapshotWallet :: Wallet -> IO WalletSnapshot
+snapshotWallet wallet = atomically $ do
+  recvIx  <- readTVar (walletReceiveIndex wallet)
+  chgIx   <- readTVar (walletChangeIndex wallet)
+  addrs   <- readTVar (walletAddresses wallet)
+  utxos   <- readTVar (walletUTXOs wallet)
+  aLabels <- readTVar (walletAddressLabels wallet)
+  tLabels <- readTVar (walletTxLabels wallet)
+  synced  <- readTVar (walletLastSynced wallet)
+  let mk = walletMasterKey wallet
+      snapUtxos =
+        [ SnapUtxo { suOutPoint    = op
+                   , suTxOut       = wueTxOut e
+                   , suBlockHeight = wueBlockHeight e
+                   , suIsCoinbase  = wueIsCoinbase e }
+        | (op, e) <- Map.toList utxos ]
+  pure WalletSnapshot
+    { wsnMasterSecKey = getSecKey (ekKey mk)
+    , wsnMasterChain  = ekChainCode mk
+    , wsnNetworkName  = T.pack (Haskoin.Consensus.netName (walletNetwork wallet))
+    , wsnGapLimit     = fromIntegral (walletGapLimit wallet)
+    , wsnReceiveIndex = recvIx
+    , wsnChangeIndex  = chgIx
+    , wsnAddresses    = addrs
+    , wsnUtxos        = snapUtxos
+    , wsnAddrLabels   = aLabels
+    , wsnTxLabels     = tLabels
+    , wsnLastSynced   = synced
+    }
+
+-- | Persist the wallet to its attached path, if any.  Atomic + durable.
+-- Clears the dirty flag on success.  Returns the path written, or
+-- 'Nothing' if the wallet is not attached to disk.  Errors are returned
+-- as 'Left' (callers log; a save failure must never crash the node).
+persistWallet :: Wallet -> IO (Either String (Maybe FilePath))
+persistWallet wallet = do
+  mPath <- readTVarIO (walletPersistPath wallet)
+  case mPath of
+    Nothing -> pure (Right Nothing)
+    Just (path, atRestKey) -> do
+      snap <- snapshotWallet wallet
+      res  <- WP.saveWalletSnapshot atRestKey path snap
+                `catch` (\(e :: SomeException) ->
+                           pure (Left ("persistWallet: " ++ show e)))
+      case res of
+        Right () -> do
+          atomically $ writeTVar (walletDirty wallet) False
+          pure (Right (Just path))
+        Left e   -> pure (Left e)
+
+-- | Rebuild a live 'Wallet' from a persisted snapshot.  The master key is
+-- reconstructed from the unsealed (secKey, chainCode) — every address the
+-- wallet ever derived re-derives deterministically, so even if the
+-- address/UTXO maps were partially lost a rescan reconstructs them.
+restoreWalletFromSnapshot :: Network -> FilePath -> ByteString -> WalletSnapshot -> IO Wallet
+restoreWalletFromSnapshot net path atRestKey WalletSnapshot{..} = do
+  let master = ExtendedKey
+        { ekKey       = SecKey wsnMasterSecKey
+        , ekChainCode = wsnMasterChain
+        , ekDepth     = 0
+        , ekParentFP  = 0
+        , ekIndex     = 0
+        }
+      account = derivePath master defaultDerivationPath
+      utxoMap = Map.fromList
+        [ (suOutPoint u, WalletUtxoEntry (suTxOut u) (suBlockHeight u) (suIsCoinbase u))
+        | u <- wsnUtxos ]
+  recvIdx     <- newTVarIO wsnReceiveIndex
+  changeIdx   <- newTVarIO wsnChangeIndex
+  addrs       <- newTVarIO wsnAddresses
+  utxos       <- newTVarIO utxoMap
+  addrLabels  <- newTVarIO wsnAddrLabels
+  txLabels    <- newTVarIO wsnTxLabels
+  sentTxs     <- newTVarIO Map.empty
+  txHistory   <- newTVarIO Map.empty
+  persistPath <- newTVarIO (Just (path, atRestKey))
+  dirty       <- newTVarIO False
+  lastSynced  <- newTVarIO wsnLastSynced
+  pure $ Wallet master account recvIdx changeIdx addrs utxos net
+                (fromIntegral wsnGapLimit)
+                addrLabels txLabels sentTxs txHistory persistPath dirty lastSynced
+
+-- | Flush all dirty wallets in a manager to disk.  Intended for the
+-- periodic flusher thread and clean-shutdown hook.  Best-effort: a
+-- per-wallet failure is logged and the others still flush.
+flushDirtyWallets :: [(Text, Wallet)] -> IO ()
+flushDirtyWallets named =
+  forM_ named $ \(name, w) -> do
+    isDirty <- readTVarIO (walletDirty w)
+    when isDirty $ do
+      r <- persistWallet w
+      case r of
+        Left e -> putStrLn $ "[wallet] flush failed for " ++ T.unpack name
+                              ++ ": " ++ e
+        Right _ -> pure ()
+
+-- | RESCAN / RECONCILE on startup.  Replays blocks in the gap
+-- [lastSynced+1 .. tipHeight] through 'scanBlockForWallet' so the UTXO
+-- ledger and tx history are brought up to the chain tip after a restart
+-- (the live wallet may have missed connects while it was down, and a
+-- seed-only recovery starts with an empty ledger).  @getBlockAt@ fetches
+-- a block by height from the chainstate; 'Nothing' for a pruned/missing
+-- height is skipped.  Advances 'walletLastSynced' and persists once at
+-- the end.
+rescanWalletToTip :: Wallet
+                  -> Word32                          -- ^ current chain tip height
+                  -> (Word32 -> IO (Maybe Block))    -- ^ block-by-height accessor
+                  -> IO ()
+rescanWalletToTip wallet tipHeight getBlockAt = do
+  start <- readTVarIO (walletLastSynced wallet)
+  let from = start + 1
+  when (tipHeight >= from) $ do
+    forM_ [from .. tipHeight] $ \h -> do
+      mBlk <- getBlockAt h
+      case mBlk of
+        Just blk -> do
+          scanBlockForWallet wallet blk h
+          atomically $ writeTVar (walletLastSynced wallet) h
+        Nothing  -> pure ()  -- pruned / missing height; gap left for a later full rescan
+    void (persistWallet wallet)
 
 --------------------------------------------------------------------------------
 -- Address Generation
@@ -1400,7 +1592,9 @@ getReceiveAddressAt wallet idx = do
   let key = getReceiveKey wallet idx
       pubKey = derivePubKeyFromPrivate (ekKey key)
       addr = pubKeyToP2WPKH pubKey
-  atomically $ modifyTVar' (walletAddresses wallet) (Map.insert addr (idx, False))
+  atomically $ do
+    modifyTVar' (walletAddresses wallet) (Map.insert addr (idx, False))
+    writeTVar (walletDirty wallet) True
   return addr
 
 -- | Get the next unused receive address.
@@ -1408,7 +1602,9 @@ getReceiveAddress :: Wallet -> IO Address
 getReceiveAddress wallet = do
   idx <- readTVarIO (walletReceiveIndex wallet)
   addr <- getReceiveAddressAt wallet idx
-  atomically $ modifyTVar' (walletReceiveIndex wallet) (+ 1)
+  atomically $ do
+    modifyTVar' (walletReceiveIndex wallet) (+ 1)
+    writeTVar (walletDirty wallet) True
   return addr
 
 -- | Get a new address of the specified type.
@@ -1430,6 +1626,7 @@ getNewAddress addrType wallet = do
   atomically $ do
     modifyTVar' (walletReceiveIndex wallet) (+ 1)
     modifyTVar' (walletAddresses wallet) (Map.insert addr (idx, False))
+    writeTVar (walletDirty wallet) True
 
   return addr
 
@@ -1532,12 +1729,16 @@ addWalletUTXO wallet op txout blockHeight =
 addWalletUTXOFull :: Wallet -> OutPoint -> TxOut -> Word32 -> Bool -> IO ()
 addWalletUTXOFull wallet op txout blockHeight isCoinbase = do
   let entry = WalletUtxoEntry txout blockHeight isCoinbase
-  atomically $ modifyTVar' (walletUTXOs wallet) (Map.insert op entry)
+  atomically $ do
+    modifyTVar' (walletUTXOs wallet) (Map.insert op entry)
+    writeTVar (walletDirty wallet) True
 
 -- | Remove a UTXO from the wallet (when spent).
 removeWalletUTXO :: Wallet -> OutPoint -> IO ()
 removeWalletUTXO wallet op =
-  atomically $ modifyTVar' (walletUTXOs wallet) (Map.delete op)
+  atomically $ do
+    modifyTVar' (walletUTXOs wallet) (Map.delete op)
+    writeTVar (walletDirty wallet) True
 
 -- | Get the total SPENDABLE balance at a given chain-tip height.
 --
@@ -1675,6 +1876,12 @@ scanBlockForWallet wallet block height = do
     writeTVar (walletUTXOs wallet) utxosFinal
     modifyTVar' (walletTxHistory wallet) $ \h ->
       foldr (\(tid, e) m -> Map.insert tid e m) h histEntries
+    -- DURABILITY: record how far the wallet's ledger has scanned (rescan
+    -- anchor) and mark dirty so the block-connect credit/debit survives a
+    -- SIGKILL.  Only advance the synced height forward (a reorg disconnect
+    -- handled separately must not regress it spuriously).
+    modifyTVar' (walletLastSynced wallet) (max height)
+    writeTVar (walletDirty wallet) True
 
 -- | Reverse 'scanBlockForWallet' for a reorg disconnect: remove the
 -- credits this block created (the outputs whose txids belong to this
@@ -1697,6 +1904,11 @@ unscanBlockForWallet wallet block height = do
       foldr (\tid m -> case Map.lookup tid m of
                 Just e | wthBlockHeight e == height -> Map.delete tid m
                 _ -> m) h blockTxIds
+    -- DURABILITY: roll the rescan anchor back to the parent height (the
+    -- disconnected block is no longer part of the wallet's synced view)
+    -- and mark dirty so the reorg disconnect persists across a restart.
+    modifyTVar' (walletLastSynced wallet) (\s -> min s (height - 1))
+    writeTVar (walletDirty wallet) True
 
 -- | Network-aware address rendering for history detail rows.  Mirrors
 -- the dispatch in 'addressToText' / the RPC layer's addressToTextNet so
@@ -3206,7 +3418,9 @@ createWalletState w = do
 -- | Set a label for an address.
 setAddressLabel :: Wallet -> Address -> Text -> IO ()
 setAddressLabel wallet addr label =
-  atomically $ modifyTVar' (walletAddressLabels wallet) (Map.insert addr label)
+  atomically $ do
+    modifyTVar' (walletAddressLabels wallet) (Map.insert addr label)
+    writeTVar (walletDirty wallet) True
 
 -- | Get the label for an address.
 -- Returns empty text if no label is set.
@@ -3218,7 +3432,9 @@ getAddressLabel wallet addr = do
 -- | Set a label for a transaction.
 setTxLabel :: Wallet -> TxId -> Text -> IO ()
 setTxLabel wallet txid label =
-  atomically $ modifyTVar' (walletTxLabels wallet) (Map.insert txid label)
+  atomically $ do
+    modifyTVar' (walletTxLabels wallet) (Map.insert txid label)
+    writeTVar (walletDirty wallet) True
 
 -- | Get the label for a transaction.
 -- Returns empty text if no label is set.
@@ -6453,7 +6669,7 @@ createManagedWallet :: WalletManager
                     -> Bool           -- ^ disable_private_keys (watch-only)
                     -> Bool           -- ^ blank (no keys initially)
                     -> IO (Either Text WalletState)
-createManagedWallet wm name _disablePrivateKeys blank = do
+createManagedWallet wm name _disablePrivateKeys _blank = do
   -- Check if wallet already exists
   existingWallets <- readTVarIO (wmWallets wm)
   if Map.member name existingWallets
@@ -6467,31 +6683,32 @@ createManagedWallet wm name _disablePrivateKeys blank = do
         else do
           createDirectoryIfMissing True walletPath
 
-          -- Create the wallet
-          let config = WalletConfig (wmNetwork wm) 20 ""
-          if blank
-            then do
-              -- For blank wallet, create with a random mnemonic but don't pre-generate addresses
-              (_mnemonic, wallet) <- createWallet config
-              walletState <- createWalletState wallet
-              -- Add to manager
-              atomically $ do
-                modifyTVar' (wmWallets wm) (Map.insert name walletState)
-                -- Set as default if first wallet
-                mDefault <- readTVar (wmDefaultName wm)
-                when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
-              return $ Right walletState
-            else do
-              -- Normal wallet creation
-              (_mnemonic, wallet) <- createWallet config
-              walletState <- createWalletState wallet
-              -- Add to manager
-              atomically $ do
-                modifyTVar' (wmWallets wm) (Map.insert name walletState)
-                -- Set as default if first wallet
-                mDefault <- readTVar (wmDefaultName wm)
-                when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
-              return $ Right walletState
+          -- DURABILITY: every managed wallet gets a wallet.dat under its
+          -- directory + a per-datadir at-rest seal key, attached so all
+          -- mutations persist (sweep wa0fq5wtk).  We persist immediately on
+          -- create so even a wallet that is never touched again survives a
+          -- restart (its master key — and thus full recoverability — is on
+          -- disk from the first instant).
+          let config  = WalletConfig (wmNetwork wm) 20 ""
+              datPath = walletPath </> "wallet.dat"
+          atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
+          -- For blank wallet, create with a random mnemonic but don't
+          -- pre-generate addresses; otherwise normal creation.  Both paths
+          -- are now identical once persistence is attached.
+          (_mnemonic, wallet) <- createWallet config
+          attachWalletPersistence wallet datPath atRestKey
+          saveRes <- persistWallet wallet
+          case saveRes of
+            Left e  -> putStrLn $ "[wallet] initial save failed for "
+                                  ++ T.unpack name ++ ": " ++ e
+            Right _ -> pure ()
+          walletState <- createWalletState wallet
+          atomically $ do
+            modifyTVar' (wmWallets wm) (Map.insert name walletState)
+            -- Set as default if first wallet
+            mDefault <- readTVar (wmDefaultName wm)
+            when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
+          return $ Right walletState
 
 -- | Load an existing wallet by name.
 -- The wallet must exist in the wallet directory.
@@ -6507,14 +6724,29 @@ loadManagedWallet wm name = do
     else do
       -- Check if wallet directory exists
       let walletPath = wmWalletDir wm </> T.unpack name
+          datPath    = walletPath </> "wallet.dat"
       dirExists <- doesDirectoryExist walletPath
       if not dirExists
         then return $ Left $ "Wallet not found: " <> name
         else do
-          -- For now, we create a fresh wallet since we don't have persistence yet
-          -- In a real implementation, we'd load from the SQLite database
-          let config = WalletConfig (wmNetwork wm) 20 ""
-          (_mnemonic, wallet) <- createWallet config
+          -- DURABILITY: load the persisted snapshot from disk and restore
+          -- the live wallet from it (sweep wa0fq5wtk).  A missing file =>
+          -- fresh wallet (newly-created dir before first save, or seed-only
+          -- recovery); a CORRUPT file is moved aside by 'loadWalletSnapshot'
+          -- and we recover to a fresh wallet rather than crashing.
+          atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
+          loaded    <- WP.loadWalletSnapshot atRestKey datPath
+          wallet <- case loaded of
+            Right (Just snap) ->
+              restoreWalletFromSnapshot (wmNetwork wm) datPath atRestKey snap
+            _ -> do
+              -- No snapshot (or corrupt -> moved aside): start fresh and
+              -- attach persistence so the next mutation lands on disk.
+              let config = WalletConfig (wmNetwork wm) 20 ""
+              (_mnemonic, w) <- createWallet config
+              attachWalletPersistence w datPath atRestKey
+              void (persistWallet w)
+              return w
           walletState <- createWalletState wallet
           atomically $ do
             modifyTVar' (wmWallets wm) (Map.insert name walletState)

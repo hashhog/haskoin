@@ -192,7 +192,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
-import System.Directory (doesFileExist, removeFile)
+import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing)
 import System.FilePath ((</>))
 import System.Posix.Files (setFileMode)
 import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
@@ -345,7 +345,10 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- Seed-restore (recovery): mnemonic -> wallet, used by
                         -- 'handleRestoreWallet' (createwallet-with-mnemonic).
                         Mnemonic(..), WalletConfig(..), validateMnemonic,
-                        importMnemonic, createWalletState, getReceiveAddressAt)
+                        importMnemonic, createWalletState, getReceiveAddressAt,
+                        -- Durable persistence (sweep wa0fq5wtk)
+                        attachWalletPersistence, persistWallet)
+import qualified Haskoin.Wallet.Persist as WP
 
 -- FIX-65: BIP-78 PayJoin receiver foundation.  Imports the wai handler
 -- + offer-cache types so 'combinedApp' can route /payjoin POSTs.
@@ -5584,6 +5587,17 @@ handleRestoreWallet server params = withWalletMgr server $ \wm ->
               -- Pre-derive the gap-limit receive addresses so getnewaddress /
               -- listing reflects the restored keychain immediately.
               mapM_ (\i -> void $ getReceiveAddressAt wallet i) [0 .. 19]
+              -- DURABILITY: persist the restored wallet to disk so the
+              -- recovered keychain survives a restart (sweep wa0fq5wtk).
+              -- Without this, restorewallet would re-derive the seed every
+              -- boot but lose the rescanned UTXO ledger and any new
+              -- addresses on the next unclean shutdown.
+              let walletPath = wmWalletDir wm </> T.unpack walletName
+                  datPath    = walletPath </> "wallet.dat"
+              createDirectoryIfMissing True walletPath
+              atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
+              attachWalletPersistence wallet datPath atRestKey
+              void (persistWallet wallet)
               walletState <- createWalletState wallet
               atomically $ do
                 modifyTVar' (wmWallets wm) (Map.insert walletName walletState)

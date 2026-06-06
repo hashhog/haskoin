@@ -1262,6 +1262,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- '_haskoin-unfreeze-plan-2026-05-27.md' (Phase 1, P1-2).
     connectLock <- newMVar () :: IO (MVar ())
 
+    -- DURABILITY (sweep wa0fq5wtk): forward-declared handle to the
+    -- WalletManager so the live P2P/IBD connect loop in
+    -- 'syncMessageHandler' can feed every connected block to the wallet
+    -- (credit/debit + history + persist), not just the mining/RPC path.
+    -- The manager itself is created later (it needs the datadir wired);
+    -- the connect loop reads this IORef each block, so a 'Nothing' before
+    -- the manager exists simply means "no wallet to scan yet".
+    walletMgrRef <- newIORef (Nothing :: Maybe WalletManager)
+
     -- Initialise BlockStore IFF pruning is enabled.  Most haskoin
     -- block I/O still flows through RocksDB, so the BlockStore is
     -- not on the hot path; we only create it when prune RPC /
@@ -1469,7 +1478,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1679,6 +1688,9 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- 2026-05-06: Rpc.hs:3124-3152 returned 200 OK + empty bodies).
     -- The manager owns its wallet directory under {datadir}/wallets/.
     walletMgr <- newWalletManager (dataDir </> "wallets") net
+    -- Publish the manager to the connect loop so live IBD/P2P blocks feed
+    -- the wallet (sweep wa0fq5wtk).
+    writeIORef walletMgrRef (Just walletMgr)
     rpcServer <- startRpcServer rpcConfig db hc pm' mp fe cache net mBlockStore (Just walletMgr) pruneCfg mIdxMgr
     -- W115 FIX-50: inject asmap bytecode into RpcServer for getpeerinfo mapped_as.
     let rpcServer' = rpcServer { rsAsmapData = asmapData }
@@ -1708,6 +1720,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
         writeIORef lastFlushEpochRef now
         writeIORef blocksSinceFlushRef 0
+
+    -- DURABILITY (sweep wa0fq5wtk): periodic wallet flusher.  Wakes every
+    -- 30s and persists any wallet whose dirty flag is set (save-on-mutation
+    -- with a bounded window).  This is what makes wallet state survive a
+    -- SIGKILL/OOM/power-loss — we do NOT rely on a clean-shutdown-only
+    -- save.  Best-effort; a flush failure is logged, not fatal.
+    _walletFlushTid <- forkIO $ forever $ do
+      threadDelay (30 * 1_000_000)
+      (do wallets <- readTVarIO (wmWallets walletMgr)
+          flushDirtyWallets
+            [ (nm, wsWallet ws) | (nm, ws) <- Map.toList wallets ])
+        `catch` (\(e :: SomeException) ->
+          putStrLn $ "wallet flush error: " ++ show e)
 
     -- Start Prometheus metrics server
     when (noMetricsPort > 0) $ do
@@ -2166,8 +2191,15 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- documented in commit 9fda3f4. Cross-ref:
                       -- _chainstate-atomicity-family-2026-05-26.md +
                       -- _haskoin-unfreeze-plan-2026-05-27.md (Phase 1, P1-2).
+                   -> IORef (Maybe WalletManager)
+                      -- ^ DURABILITY (sweep wa0fq5wtk): the WalletManager,
+                      -- once initialised.  Every block connected on the live
+                      -- IBD/P2P path is scanned into the default wallet
+                      -- ('scanBlockForWallet') so wallet balance/history
+                      -- track the chain in real time and persist — not only
+                      -- on the mining/RPC path.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg = case msg of
   MPing (Ping _nonce) ->
     return ()  -- Pong handled at peer level
 
@@ -2431,6 +2463,24 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                       Nothing -> return ())
                 `catch` (\(e :: SomeException) ->
                   putStrLn $ "index mirror error at height "
+                          ++ show height ++ ": " ++ show e)
+              -- DURABILITY (sweep wa0fq5wtk): feed the live-connected block
+              -- to the default wallet so balance/history/UTXO ledger track
+              -- the chain in real time and persist (save-on-mutation).  This
+              -- is THE connect-loop hook that makes wallet state survive an
+              -- unclean restart from the P2P/IBD path, mirroring Core's
+              -- CWallet::blockConnected.  Best-effort: a wallet error must
+              -- never abort block connection.
+              (do mWm <- readIORef walletMgrRef
+                  case mWm of
+                    Nothing -> return ()
+                    Just wm -> do
+                      (mDef, _) <- getDefaultWallet wm
+                      case mDef of
+                        Nothing -> return ()
+                        Just ws -> scanBlockForWallet (wsWallet ws) block height)
+                `catch` (\(e :: SomeException) ->
+                  putStrLn $ "wallet scan error at height "
                           ++ show height ++ ": " ++ show e)
               when (height `mod` 500 == 0) $
                 putStrLn $ "Connected block at height " ++ show height
@@ -2824,7 +2874,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -2930,7 +2980,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()
