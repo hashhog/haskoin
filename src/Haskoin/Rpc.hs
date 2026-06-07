@@ -63,6 +63,9 @@ module Haskoin.Rpc
   , deploymentInfoForEntry
   , softforksFromEntry
   , mempoolErrorToRpcResponse
+    -- * getorphantxs (Bitcoin Core v28) — handler + pure core (exported for testing)
+  , handleGetOrphanTxs
+  , orphanTxsToJSON
   , decodeTxWithFallback
   , handleBatchRequest
   , parseSingleRequest
@@ -299,6 +302,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          isWellFormedPackage, isChildWithParents,
                          isChildWithParentsTree)
 import qualified Haskoin.Mempool.Persist as MPP
+import Haskoin.TxOrphanage (OrphanPool(..))
 import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..),
                               estimateRawFee, RawFeeEstimate(..), RawBucketRange(..))
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
@@ -515,6 +519,14 @@ data RpcServer = RpcServer
     -- returns 400 + "unavailable" until an operator opts in.  When
     -- 'pcEnabled' = True, the route consumes a wallet UTXO per
     -- request via 'processOriginalPsbt'.
+  , rsOrphanPool     :: !(IORef OrphanPool)
+    -- ^ BIP-339 wtxid-keyed orphan transaction pool (see
+    -- 'Haskoin.TxOrphanage').  The same 'IORef' that the P2P
+    -- tx-relay path mutates via 'addOrphan' / 'expireOrphans' /
+    -- 'eraseOrphansForPeer' / 'eraseOrphansForBlock' in @app/Main.hs@.
+    -- Read-only here, consumed by 'handleGetOrphanTxs' to expose the
+    -- orphanage over RPC (Bitcoin Core v28 @getorphantxs@,
+    -- rpc/mempool.cpp).  Threaded in from 'startRpcServer'.
   }
 
 -- | Back-compat accessor: True iff prune mode is on (manual or auto).
@@ -633,6 +645,12 @@ rpcMiscError = -1
 rpcInvalidParameter :: Int
 rpcInvalidParameter = -8
 
+-- | Unexpected type was passed as parameter (Bitcoin Core RPC_TYPE_ERROR, -3).
+-- e.g. ParseVerbosity(allow_bool=false) rejecting a boolean verbosity arg
+-- ("Verbosity was boolean but only integer allowed").
+rpcTypeError :: Int
+rpcTypeError = -3
+
 --------------------------------------------------------------------------------
 -- Bitcoin Core Transaction Error Codes
 --------------------------------------------------------------------------------
@@ -744,8 +762,12 @@ startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
                   -- submitBlock + the regtest miner mirror connects /
                   -- reorgs into the indexes; REST blockfilter
                   -- handlers fast-path through @blockFilterIndexGet@.
+               -> IORef OrphanPool
+                  -- ^ Live BIP-339 orphan pool 'IORef' shared with the
+                  -- P2P tx-relay path (app/Main.hs 'orphanPoolRef').
+                  -- Exposed read-only via the @getorphantxs@ RPC.
                -> IO RpcServer
-startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg mIdxMgr = do
+startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg mIdxMgr orphanRef = do
   threadVar <- newTVarIO Nothing
   mockTimeVar <- newTVarIO Nothing  -- No mock time by default
   startTime <- round <$> getPOSIXTime
@@ -763,7 +785,7 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
   -- 400 + "unavailable" until an operator flips 'pcEnabled' on.
   payjoinOffersVar <- newTVarIO Map.empty
   let payjoinCfg = defaultPayjoinConfig
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty payjoinOffersVar payjoinCfg
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty payjoinOffersVar payjoinCfg orphanRef
   -- Restore persisted banlist at startup (best-effort; absence is fine on
   -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
   -- which loads banlist.json on boot.
@@ -1148,6 +1170,7 @@ handleRpcRequest server req = do
     "savemempool"          -> handleSaveMempool server
     "importmempool"        -> handleImportMempool server params
     "loadmempool"          -> handleImportMempool server params
+    "getorphantxs"         -> handleGetOrphanTxs server params
 
     -- Raw transaction RPCs (new)
     "createrawtransaction"         -> handleCreateRawTransaction server params
@@ -2997,6 +3020,120 @@ handleGetRawMempool server params = do
            pair "spentby"            (AE.list text [])                                <>
            pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
            pair "unbroadcast"        (AE.bool False)
+
+-- | getorphantxs — show transactions in the tx orphanage.
+--
+-- Mirrors Bitcoin Core v28's @getorphantxs@ RPC
+-- (bitcoin-core/src/rpc/mempool.cpp:getorphantxs + OrphanDescription +
+-- OrphanToJSON).  The orphan pool entries come from the live BIP-339
+-- wtxid-keyed pool ('rsOrphanPool'), the same 'IORef' the P2P tx-relay
+-- path mutates (app/Main.hs).
+--
+-- Argument:
+--   * verbosity (optional, integer, default 0).  Core uses
+--     ParseVerbosity(arg, default=0, allow_bool=false): absent → 0; a
+--     BOOLEAN argument is REJECTED (RPC_TYPE_ERROR, "Verbosity was boolean
+--     but only integer allowed") rather than coerced to 0/1; an out-of-range
+--     integer throws RPC_INVALID_PARAMETER (-8) with Core's exact message
+--     "Invalid verbosity value <n>".
+--
+-- Output shape (Core parity, rpc/mempool.cpp:1233-1300 + OrphanToJSON):
+--   * verbosity 0: a JSON array of orphan TXID strings
+--     (Core: orphan.tx->GetHash().ToString() — the NON-witness txid;
+--     "0 for an array of txids (may contain duplicates)").
+--   * verbosity 1: an array of objects with EXACTLY, in this order,
+--       { txid, wtxid, bytes, vsize, weight, from }.  (Core's
+--       OrphanToJSON; there is NO "expiration" field.)
+--   * verbosity 2: the verbosity-1 fields PLUS "hex" (the serialized,
+--       hex-encoded transaction), exactly as Core appends
+--       EncodeHexTx(*orphan.tx) at verbosity 2.
+--
+-- Field notes:
+--   * bytes      = total serialized size including witness (Core's
+--                  CTransaction::ComputeTotalSize()) = 'txTotalSize'.
+--   * vsize      = BIP-141 virtual size = ceil(weight/4).
+--   * weight     = BIP-141 weight = base*3 + total.
+--   * from       = the announcing peer(s).  This node's orphan pool tracks
+--                  a single announcer per entry (a 'SockAddr', not a numeric
+--                  peer id), so we emit a 1-element array containing the
+--                  announcer rendered as a "host:port" string.  Core emits
+--                  numeric peer ids; haskoin has no per-orphan numeric id, so
+--                  this is a best-effort string rendering of the real
+--                  announcer.
+handleGetOrphanTxs :: RpcServer -> Value -> IO RpcResponse
+handleGetOrphanTxs server params =
+  -- Verbosity parse mirrors Core ParseVerbosity(arg, default=0,
+  -- allow_bool=false): absent / JSON null → default 0; a JSON Bool is
+  -- REJECTED (not coerced to 0/1); any other JSON value is interpreted as an
+  -- integer (out-of-range handled downstream by orphanTxsToJSON's
+  -- "Invalid verbosity value <n>" -8 path).
+  case rawParamAt params 0 of
+    Just (Bool _) ->
+      -- Core: allow_bool=false → RPC_TYPE_ERROR.  Bool must NOT be mapped to 0/1.
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcTypeError "Verbosity was boolean but only integer allowed") Null
+    _ -> do
+      let verbosity = fromMaybe 0 (extractParam params 0 :: Maybe Int)
+      op <- readIORef (rsOrphanPool server)
+      case orphanTxsToJSON (rsNetwork server) verbosity op of
+        Left errMsg -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter errMsg) Null
+        Right rawBs -> return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Pure core of the @getorphantxs@ RPC, exported for testing.
+--
+-- Given the active 'Network', a requested verbosity, and an 'OrphanPool'
+-- snapshot, produce either an error message (invalid verbosity, Core's
+-- RPC_INVALID_PARAMETER (-8) text) or the raw JSON result bytes.  Splitting
+-- this out lets the test suite assert the exact shape + fields without
+-- constructing a full 'RpcServer'.  Mirrors Bitcoin Core's getorphantxs
+-- (rpc/mempool.cpp): verbosity 0 → txid array, 1 → object array, 2 → +hex.
+orphanTxsToJSON :: Network -> Int -> OrphanPool -> Either Text BL.ByteString
+orphanTxsToJSON net verbosity op
+  | verbosity < 0 || verbosity > 2 =
+      Left (T.pack ("Invalid verbosity value " ++ show verbosity))
+  | verbosity == 0 =
+      -- Core: orphan.tx->GetHash().ToString() — the NON-witness txid.
+      let txidStrs =
+            [ showHash (BlockHash (getTxIdHash (computeTxId tx)))
+            | (_w, (tx, _t, _a)) <- entries ]
+      in Right (encodingToLazyByteString (AE.list text txidStrs))
+  | otherwise =
+      let objEncs = [ orphanEntryEnc net (verbosity >= 2) tx peerAddr
+                    | (_w, (tx, _addTime, peerAddr)) <- entries ]
+      in Right (encodingToLazyByteString (AE.list id objEncs))
+  where
+    -- Deterministic order by wtxid key (Map.toList is ascending-key ordered).
+    entries = Map.toList (orphanPool op)  -- [(Wtxid, (Tx, addTime, SockAddr))]
+
+    -- | Streaming Encoding for one orphan entry at verbosity >= 1.  The field
+    -- set is EXACTLY Core's OrphanToJSON (rpc/mempool.cpp:1217-1231), in order:
+    -- txid, wtxid, bytes, vsize, weight, from.  When @withHex@ is True
+    -- (verbosity 2) the serialized hex is appended, mirroring Core's
+    -- @o.pushKV("hex", EncodeHexTx(*orphan.tx))@.
+    orphanEntryEnc :: Network -> Bool -> Tx -> SockAddr -> AE.Encoding
+    orphanEntryEnc n withHex tx peerAddr =
+      let txid       = computeTxId tx
+          wtxid      = computeWtxId tx
+          totalSize  = txTotalSize tx
+          baseSize   = txBaseSize tx
+          weight     = baseSize * (witnessScaleFactor - 1) + totalSize
+          vsize      = (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
+          -- Single announcer rendered "host:port" (best-effort: this node
+          -- tracks one SockAddr per orphan, not a numeric peer id).
+          (host, port) = sockAddrToHostPort peerAddr (netDefaultPort n)
+          fromStr      = T.pack (host ++ ":" ++ show port)
+          baseEnc =
+            pair "txid"       (text (showHash (BlockHash (getTxIdHash txid))))  <>
+            pair "wtxid"      (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
+            pair "bytes"      (AE.int totalSize)                               <>
+            pair "vsize"      (AE.int vsize)                                   <>
+            pair "weight"     (AE.int weight)                                  <>
+            pair "from"       (AE.list text [fromStr])
+          hexEnc = if withHex
+                     then pair "hex" (text (TE.decodeUtf8 (B16.encode (S.encode tx))))
+                     else mempty
+      in pairs (baseEnc <> hexEnc)
 
 --------------------------------------------------------------------------------
 -- Network RPC Handlers
@@ -8217,6 +8354,7 @@ allRpcCommands =
   , "getmempooldescendants \"txid\" ( verbose )"
   , "getmempoolentry \"txid\""
   , "getmempoolinfo"
+  , "getorphantxs ( verbosity )"
   , "getrawmempool ( verbose mempool_sequence )"
   , "testmempoolaccept [\"rawtx\",...] ( maxfeerate )"
   , "submitpackage [\"rawtx\",...] ( maxfeerate )"
@@ -8299,6 +8437,8 @@ getCommandHelp cmd = case T.toLower cmd of
     "submitpackage [\"rawtx\",...] ( maxfeerate )\n\nSubmit a package of raw transactions (hex-encoded) to local mempool. The package must be topologically sorted with the child as the last element. Up to MAX_PACKAGE_COUNT (25) transactions. Returns {package_msg, tx-results, replaced-transactions}."
   "getmempoolentry" ->
     "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction."
+  "getorphantxs" ->
+    "getorphantxs ( verbosity )\n\nShows transactions in the tx orphanage.\n\nEXPERIMENTAL warning: this call may be changed in future releases.\n\nArguments:\n1. verbosity    (numeric, optional, default=0) 0 for an array of txids (may contain duplicates), 1 for an array of objects with tx details, and 2 for details from (1) plus tx hex.\n\nResult (for verbosity = 0): an array of txid strings.\nResult (for verbosity = 1): an array of {txid, wtxid, bytes, vsize, weight, from}.\nResult (for verbosity = 2): the verbosity-1 fields plus \"hex\" (the serialized, hex-encoded transaction)."
   "disconnectnode" ->
     "disconnectnode ( \"address\" nodeid )\n\nImmediately disconnects from the specified peer node.\n\nArguments:\n1. address    (string, optional) The IP address/port of the node\n2. nodeid     (numeric, optional) The node ID (see getpeerinfo for node IDs)"
   "getnewaddress" ->
@@ -9275,6 +9415,20 @@ extractParam (Array arr) idx
       Error _   -> Nothing
   | otherwise = Nothing
 extractParam _ _ = Nothing
+
+-- | Raw positional parameter accessor: returns the un-coerced 'Value' at the
+-- given index, treating an out-of-range index OR a JSON 'Null' as absent
+-- ('Nothing').  Mirrors Bitcoin Core treating a null argument the same as an
+-- omitted one (UniValue::isNull()).  Used where the handler must distinguish a
+-- present-but-wrong-type argument (e.g. a boolean verbosity, which Core rejects
+-- under allow_bool=false) from an absent one (which falls back to a default).
+rawParamAt :: Value -> Int -> Maybe Value
+rawParamAt (Array arr) idx
+  | idx < V.length arr = case arr V.! idx of
+      Null -> Nothing
+      v    -> Just v
+  | otherwise = Nothing
+rawParamAt _ _ = Nothing
 
 -- | Extract a Text parameter from the params array by index
 extractParamText :: Value -> Int -> Maybe Text

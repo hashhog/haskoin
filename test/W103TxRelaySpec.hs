@@ -115,10 +115,18 @@ import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import Control.Monad (forM_)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.Text as T
 import Network.Socket (SockAddr(..))
+import Data.Aeson (Value(..), decode)
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Aeson.Key as AKey
+import qualified Data.Vector as Vec
 
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeWtxid)
+import Haskoin.Consensus (regtest, txTotalSize, txBaseSize, witnessScaleFactor)
+import Haskoin.Rpc (orphanTxsToJSON)
 import Haskoin.Network
   ( InvType(..), InvVector(..), Inv(..), GetData(..)
   , maxInvSz
@@ -687,6 +695,153 @@ spec_G13_orphanCleanup = describe "G13 EraseForPeer + EraseForBlock (BUG-12, BUG
       _ -> expectationFailure "Expected 1 entry with 3-tuple"
 
 --------------------------------------------------------------------------------
+-- G31: getorphantxs RPC (Bitcoin Core v28 — rpc/mempool.cpp)
+-- Proven-teeth: insert orphans into the pool, run the pure core of the RPC
+-- (orphanTxsToJSON), and assert the exact Core shape + fields at verbosity 0
+-- and 1, plus the invalid-verbosity (-8) error and verbosity-2 hex field.
+--------------------------------------------------------------------------------
+
+-- | Helper: decode the lazy JSON bytes the RPC core emits into an Aeson Value.
+decodeResult :: Either T.Text BL.ByteString -> Either T.Text Value
+decodeResult (Left e)   = Left e
+decodeResult (Right bs) = case decode bs of
+  Just v  -> Right v
+  Nothing -> Left (T.pack "could not decode JSON result")
+
+-- | Pull a field from a JSON object.
+objField :: T.Text -> Value -> Maybe Value
+objField k (Object o) = KM.lookup (AKey.fromText k) o
+objField _ _          = Nothing
+
+-- | Coerce a JSON string to Text.
+asText :: Value -> Maybe T.Text
+asText (String t) = Just t
+asText _          = Nothing
+
+spec_G31_getOrphanTxsRpc :: Spec
+spec_G31_getOrphanTxsRpc = describe "G31 getorphantxs RPC (Core v28 parity)" $ do
+  let net   = regtest
+      peer0 = SockAddrInet 4321 0x7f000001
+
+  it "verbosity 0: returns a JSON array of orphan TXID strings (NON-witness txid, Core parity)" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    poolRef <- newIORef emptyOrphanPool
+    let txw = makeWitnessTx 11
+    addOrphan poolRef txw now peer0
+    op <- readIORef poolRef
+    -- Core: getorphantxs verbosity 0 pushes orphan.tx->GetHash().ToString()
+    -- = the NON-witness txid (help: "0 for an array of txids").  NOT the
+    -- wtxid.  We assert the v0 string equals the v1 object's "txid" field and
+    -- differs from its "wtxid" field (the tx is segwit, so they differ).
+    let v1Field f = case decodeResult (orphanTxsToJSON net 1 op) of
+          Right (Array vv) | [obj] <- Vec.toList vv -> objField f obj >>= asText
+          _ -> Nothing
+        mTxidV1  = v1Field "txid"
+        mWtxidV1 = v1Field "wtxid"
+    case decodeResult (orphanTxsToJSON net 0 op) of
+      Left e -> expectationFailure ("verbosity 0 errored: " ++ T.unpack e)
+      Right (Array v) -> do
+        Vec.length v `shouldBe` 1
+        case Vec.toList v of
+          [String s] -> do
+            -- 64-char lowercase hex display hash.
+            T.length s `shouldBe` 64
+            T.all (`elem` ("0123456789abcdef" :: String)) s `shouldBe` True
+            -- v0 entry IS the txid, and is NOT the wtxid.
+            Just s `shouldBe` mTxidV1
+            (Just s /= mWtxidV1) `shouldBe` True
+          other -> expectationFailure ("expected 1 txid string, got " ++ show other)
+      Right other -> expectationFailure ("expected JSON array, got " ++ show other)
+
+  it "verbosity 1: emits EXACTLY {txid,wtxid,bytes,vsize,weight,from} (Core OrphanToJSON; NO expiration)" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    poolRef <- newIORef emptyOrphanPool
+    let txw = makeWitnessTx 22
+    addOrphan poolRef txw now peer0
+    op <- readIORef poolRef
+    case decodeResult (orphanTxsToJSON net 1 op) of
+      Left e -> expectationFailure ("verbosity 1 errored: " ++ T.unpack e)
+      Right (Array v) -> case Vec.toList v of
+        [obj] -> do
+          -- The field set is EXACTLY Core's OrphanToJSON, no more, no less:
+          -- txid, wtxid, bytes, vsize, weight, from.  In particular there is
+          -- NO "expiration" field (Core has none) and NO "hex" at verbosity 1.
+          let want = [ "txid", "wtxid", "bytes", "vsize", "weight", "from" ]
+          mapM_ (\k -> (objField k obj == Nothing) `shouldBe` False) want
+          case obj of
+            Object o ->
+              Set.fromList (map AKey.toText (KM.keys o))
+                `shouldBe` Set.fromList want
+            _ -> expectationFailure "expected a JSON object"
+          -- bytes == total serialized size; weight/vsize match BIP-141.
+          let totalSize = txTotalSize txw
+              baseSize  = txBaseSize txw
+              weight    = baseSize * (witnessScaleFactor - 1) + totalSize
+              vsize     = (weight + witnessScaleFactor - 1) `div` witnessScaleFactor
+          objField "bytes" obj  `shouldBe` Just (Number (fromIntegral totalSize))
+          objField "weight" obj `shouldBe` Just (Number (fromIntegral weight))
+          objField "vsize" obj  `shouldBe` Just (Number (fromIntegral vsize))
+          -- There is NO "expiration" field in Core's OrphanToJSON.
+          objField "expiration" obj `shouldBe` Nothing
+          -- wtxid /= txid for a segwit tx (proves wtxid is the witness hash).
+          let mTxid  = objField "txid" obj >>= asText
+              mWtxid = objField "wtxid" obj >>= asText
+          (mTxid /= Nothing) `shouldBe` True
+          (mWtxid /= mTxid)  `shouldBe` True
+          -- 'from' is a 1-element array (single tracked announcer).
+          case objField "from" obj of
+            Just (Array fs) -> Vec.length fs `shouldBe` 1
+            other           -> expectationFailure ("expected 'from' array, got " ++ show other)
+          -- No "hex" field at verbosity 1.
+          objField "hex" obj `shouldBe` Nothing
+        other -> expectationFailure ("expected 1 orphan object, got " ++ show other)
+      Right other -> expectationFailure ("expected JSON array, got " ++ show other)
+
+  it "verbosity 2: adds the serialized 'hex' field on top of the verbosity-1 fields" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    poolRef <- newIORef emptyOrphanPool
+    addOrphan poolRef (makeWitnessTx 33) now peer0
+    op <- readIORef poolRef
+    case decodeResult (orphanTxsToJSON net 2 op) of
+      Left e -> expectationFailure ("verbosity 2 errored: " ++ T.unpack e)
+      Right (Array v) -> case Vec.toList v of
+        [obj] -> do
+          case objField "hex" obj >>= asText of
+            Just h  -> (T.length h > 0) `shouldBe` True
+            Nothing -> expectationFailure "expected 'hex' field at verbosity 2"
+          -- verbosity-1 fields still present.
+          (objField "wtxid" obj == Nothing) `shouldBe` False
+        other -> expectationFailure ("expected 1 orphan object, got " ++ show other)
+      Right other -> expectationFailure ("expected JSON array, got " ++ show other)
+
+  it "empty pool: returns an empty array at every verbosity" $ do
+    poolRef <- newIORef emptyOrphanPool
+    op <- readIORef poolRef
+    let expectEmpty verb =
+          case decodeResult (orphanTxsToJSON net verb op) of
+            Right (Array v) -> Vec.length v `shouldBe` 0
+            other           -> expectationFailure ("expected empty array, got " ++ show other)
+    mapM_ expectEmpty [0, 1, 2]
+
+  it "invalid verbosity (out of 0..2): Core RPC_INVALID_PARAMETER (-8) message" $ do
+    poolRef <- newIORef emptyOrphanPool
+    op <- readIORef poolRef
+    -- Both > 2 and < 0 are rejected with Core's exact message text.
+    orphanTxsToJSON net 3 op
+      `shouldBe` (Left (T.pack "Invalid verbosity value 3") :: Either T.Text BL.ByteString)
+    orphanTxsToJSON net (-1) op
+      `shouldBe` (Left (T.pack "Invalid verbosity value -1") :: Either T.Text BL.ByteString)
+
+  it "multiple orphans: array length tracks pool size at verbosity 0" $ do
+    now <- round . realToFrac <$> getPOSIXTime :: IO Int64
+    poolRef <- newIORef emptyOrphanPool
+    mapM_ (\n -> addOrphan poolRef (makeWitnessTx n) now peer0) [1, 2, 3, 4]
+    op <- readIORef poolRef
+    case decodeResult (orphanTxsToJSON net 0 op) of
+      Right (Array v) -> Vec.length v `shouldBe` 4
+      other           -> expectationFailure ("expected 4-element array, got " ++ show other)
+
+--------------------------------------------------------------------------------
 -- G14: block-relay-only peer isolation (BUG-14: MInv accepts tx inv from all)
 -- Covered in G5 above; additional assertion here.
 --------------------------------------------------------------------------------
@@ -1036,3 +1191,4 @@ spec = do
     spec_G28_duplicateAnnouncement
     spec_G29_mempoolHandler
     spec_G30_summary
+    spec_G31_getOrphanTxsRpc
