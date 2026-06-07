@@ -293,7 +293,8 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
                          addTransaction, testAcceptTransaction,
                          getTransaction, getMempoolTxIds,
-                         getMempoolSize, FeeRate(..), calculateVSize,
+                         getMempoolSize, getPrioritisedTransactions,
+                         FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
                          isRbfReplaceable, blockConnected,
@@ -1103,6 +1104,7 @@ handleRpcRequest server req = do
     "getblocktemplate"     -> handleGetBlockTemplate server params
     "submitblock"          -> handleSubmitBlock server params
     "getmininginfo"        -> handleGetMiningInfo server
+    "getprioritisedtransactions" -> handleGetPrioritisedTransactions server
 
     -- Regtest Mining RPCs
     "generatetoaddress"    -> handleGenerateToAddress server params
@@ -2944,6 +2946,42 @@ handleGetMempoolInfo server = do
               pair "unbroadcastcount"    (AE.int 0)                                 <>
               pair "fullrbf"             (AE.bool True)
       rawBs = encodingToLazyByteString enc
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | getprioritisedtransactions — map of all user-created (see
+-- prioritisetransaction) fee deltas by txid, and whether each tx is present in
+-- the mempool.
+--
+-- Mirrors Bitcoin Core's @getprioritisedtransactions@ RPC
+-- (bitcoin-core/src/rpc/mining.cpp:547).  Takes no parameters.  The data comes
+-- from 'getPrioritisedTransactions', which joins the persisted fee-delta map
+-- (Core's @mapDeltas@) with the live mempool.
+--
+-- Output shape (OBJ_DYN keyed by txid hex):
+--   { "<txid>": { "fee_delta": <i64 satoshis>,
+--                 "in_mempool": <bool>,
+--                 "modified_fee": <i64 satoshis> } , ... }
+-- where "modified_fee" (base modified fee + delta) is present ONLY when
+-- in_mempool is true (Core omits it otherwise — never emits null).
+--
+-- fee_delta / modified_fee are raw satoshi integers (NUM), not BTC amounts, so
+-- they are encoded with 'AE.int64' / 'AE.word64' rather than 'btcAmountEnc'.
+handleGetPrioritisedTransactions :: RpcServer -> IO RpcResponse
+handleGetPrioritisedTransactions server = do
+  prioritised <- getPrioritisedTransactions (rsMempool server)
+  let entryEnc :: Int64 -> Bool -> Maybe Word64 -> AE.Encoding
+      entryEnc delta inMempool mModFee = pairs $
+        pair "fee_delta"  (AE.int64 delta)  <>
+        pair "in_mempool" (AE.bool inMempool) <>
+        (case mModFee of
+           Just modFee | inMempool -> pair "modified_fee" (AE.word64 modFee)
+           _                       -> mempty)
+      pairsEnc = foldl' (<>) mempty
+        [ pair (Key.fromText (showHash (BlockHash (getTxIdHash txid))))
+               (entryEnc delta inMempool mModFee)
+        | (txid, delta, inMempool, mModFee) <- prioritised
+        ]
+      rawBs = encodingToLazyByteString (pairs pairsEnc)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Get all transaction IDs in the mempool
@@ -8362,6 +8400,7 @@ allRpcCommands =
   , "== Mining =="
   , "getblocktemplate ( \"template_request\" )"
   , "getmininginfo"
+  , "getprioritisedtransactions"
   , "submitblock \"hexdata\" ( \"dummy\" )"
   , ""
   , "== Network =="
@@ -8437,6 +8476,8 @@ getCommandHelp cmd = case T.toLower cmd of
     "submitpackage [\"rawtx\",...] ( maxfeerate )\n\nSubmit a package of raw transactions (hex-encoded) to local mempool. The package must be topologically sorted with the child as the last element. Up to MAX_PACKAGE_COUNT (25) transactions. Returns {package_msg, tx-results, replaced-transactions}."
   "getmempoolentry" ->
     "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction."
+  "getprioritisedtransactions" ->
+    "getprioritisedtransactions\n\nReturns a map of all user-created (see prioritisetransaction) fee deltas by txid, and whether the tx is present in mempool.\n\nResult:\n{\n  \"<transactionid>\": {\n    \"fee_delta\": n,        (numeric) transaction fee delta in satoshis\n    \"in_mempool\": true|false, (boolean) whether this transaction is currently in mempool\n    \"modified_fee\": n      (numeric, optional) modified fee in satoshis. Only returned if in_mempool=true\n  },\n  ...\n}"
   "getorphantxs" ->
     "getorphantxs ( verbosity )\n\nShows transactions in the tx orphanage.\n\nEXPERIMENTAL warning: this call may be changed in future releases.\n\nArguments:\n1. verbosity    (numeric, optional, default=0) 0 for an array of txids (may contain duplicates), 1 for an array of objects with tx details, and 2 for details from (1) plus tx hex.\n\nResult (for verbosity = 0): an array of txid strings.\nResult (for verbosity = 1): an array of {txid, wtxid, bytes, vsize, weight, from}.\nResult (for verbosity = 2): the verbosity-1 fields plus \"hex\" (the serialized, hex-encoded transaction)."
   "disconnectnode" ->
