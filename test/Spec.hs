@@ -9123,7 +9123,7 @@ main = hspec $ do
           coinbase = Tx 1 [] [TxOut 5000000000 ""] [[]] 0
           block = Block header [coinbase]
           utxoMap = Map.empty
-          flags = ConsensusFlags False False False False False False
+          flags = ConsensusFlags False False False False False False False
       verifyBlockScriptsParallel block utxoMap flags `shouldBe` Right ()
 
     it "parallelMap preserves order" $ do
@@ -16482,7 +16482,7 @@ main = hspec $ do
       describe "validateTxChunk" $ do
         it "succeeds on empty chunk" $ do
           utxoTVar <- newTVarIO Map.empty
-          let flags = ConsensusFlags False False False False False False
+          let flags = ConsensusFlags False False False False False False False
           result <- validateTxChunk [] utxoTVar flags
           result `shouldBe` PVSuccess
 
@@ -16492,7 +16492,7 @@ main = hspec $ do
               op = OutPoint txid 0
               txin = TxIn op "" 0xffffffff
               tx = Tx 2 [txin] [TxOut 1000 ""] [[]] 0
-              flags = ConsensusFlags False False False False False False
+              flags = ConsensusFlags False False False False False False False
           result <- validateTxChunk [(1, tx)] utxoTVar flags
           case result of
             PVUTXOMissing op' -> op' `shouldBe` op
@@ -16515,7 +16515,7 @@ main = hspec $ do
           let txin = TxIn op "" 0xffffffff
               txout = TxOut 9000 ""  -- 1000 sat fee
               tx = Tx 2 [txin] [txout] [[]] 0
-              flags = ConsensusFlags False False False False False False
+              flags = ConsensusFlags False False False False False False False
           result <- validateTxChunk [(1, tx)] utxoTVar flags
           case result of
             PVFailure 1 _ -> return ()
@@ -16535,7 +16535,7 @@ main = hspec $ do
           let txin = TxIn op "" 0xffffffff
               txout = TxOut 9000 (BS.singleton 0x51)
               tx = Tx 2 [txin] [txout] [[]] 0
-              flags = ConsensusFlags False False False False False False
+              flags = ConsensusFlags False False False False False False False
           result <- validateTxChunk [(1, tx)] utxoTVar flags
           result `shouldBe` PVSuccess
 
@@ -16548,7 +16548,7 @@ main = hspec $ do
           let txin = TxIn op "" 0xffffffff
               txout = TxOut 2000 ""  -- Trying to spend 2000
               tx = Tx 2 [txin] [txout] [[]] 0
-              flags = ConsensusFlags False False False False False False
+              flags = ConsensusFlags False False False False False False False
           result <- validateTxChunk [(1, tx)] utxoTVar flags
           case result of
             PVFailure 1 "Outputs exceed inputs" -> return ()
@@ -16563,7 +16563,7 @@ main = hspec $ do
           let txin = TxIn op "" 0xffffffff
               txout = TxOut 9000 ""
               tx = Tx 2 [txin] [txout] [[]] 0
-              flags = ConsensusFlags False False False False False False
+              flags = ConsensusFlags False False False False False False False
           _ <- validateTxChunk [(1, tx)] utxoTVar flags
           -- Check that the UTXO was removed
           utxoMap' <- atomically $ readTVar utxoTVar
