@@ -135,6 +135,12 @@ module Haskoin.Rpc
     -- * Confirmations helpers (exported for testing — Pattern C1)
   , computeTxConfirmations
   , computeBlockRestConfirmations
+    -- * verifytxoutproof partial-merkle-tree extractor (exported for testing —
+    --   CVE-2012-2459 hardening: mirrors Core merkleblock.cpp
+    --   TraverseAndExtract / ExtractMatches)
+  , w47bExtract
+  , w47bTreeHeight
+  , w47bTreeWidth
   ) where
 
 import Data.Aeson
@@ -11836,9 +11842,19 @@ w47bExtract hashes bits nTx height pos bitRef hashRef = do
                   rightResult <- w47bExtract hashes bits nTx (height - 1) rightPos bitRef hashRef
                   case rightResult of
                     Left e -> return (Left e)
-                    Right (rightH, rightMatched) -> do
-                      let Hash256 root = doubleSHA256 (leftH <> rightH)
-                      return (Right (root, leftMatched <> rightMatched))
+                    Right (rightH, rightMatched)
+                      -- CVE-2012-2459 hardening (Core merkleblock.cpp ~124-128):
+                      -- the left and right branches must never be identical, as
+                      -- the transaction hashes they cover are each unique. An
+                      -- equal pair means the proof was padded with a duplicated
+                      -- subtree to forge an alternate tree with the same root.
+                      -- Core sets fBad here -> ExtractMatches returns uint256()
+                      -- -> verifytxoutproof returns []. We mirror that with Left.
+                      | rightH == leftH ->
+                          return (Left "duplicate branch (CVE-2012-2459)")
+                      | otherwise -> do
+                          let Hash256 root = doubleSHA256 (leftH <> rightH)
+                          return (Right (root, leftMatched <> rightMatched))
                 else do
                   let Hash256 root = doubleSHA256 (leftH <> leftH)
                   return (Right (root, leftMatched))
@@ -12457,16 +12473,43 @@ handleVerifyTxOutProof server params = do
                                       bits = concatMap
                                         (\b -> [ testBit b i | i <- [0..7] ])
                                         (BS.unpack flagBytes)
+                                  -- CVE-2012-2459 hardening: upfront bounds from
+                                  -- Core ExtractMatches (merkleblock.cpp ~156-166).
+                                  -- A malformed proof that fails any of these yields
+                                  -- uint256() in Core -> verifytxoutproof returns [].
+                                  --   * nTransactions > 0           (nTx /= 0 already gated above)
+                                  --   * vHash.size() <= nTransactions
+                                  --   * vBits.size() >= vHash.size()
+                                  -- (The high-tx-count cap MAX_BLOCK_WEIGHT/MIN_TX_WEIGHT
+                                  --  is enforced downstream by the on-chain nTx ==
+                                  --  proof nTx gate; the three relational invariants
+                                  --  above are the structural ones we mirror here.)
+                                  if hashCount > nTx || length bits < hashCount
+                                    then return $ RpcResponse (toJSON ([] :: [Text])) Null Null
+                                    else do
                                   -- Core-style tree height (loop form; matches
                                   -- the builder + ExtractMatches exactly).
-                                  let safeHeight = w47bTreeHeight nTx
-                                  bitRef  <- newIORef 0
-                                  hashRef <- newIORef 0
-                                  result <- w47bExtract hashes bits nTx safeHeight 0 bitRef hashRef
-                                  case result of
+                                   let safeHeight = w47bTreeHeight nTx
+                                   bitRef  <- newIORef 0
+                                   hashRef <- newIORef 0
+                                   result <- w47bExtract hashes bits nTx safeHeight 0 bitRef hashRef
+                                   -- CVE-2012-2459 hardening: all flag bits and all
+                                   -- hashes must be consumed by the traversal (Core
+                                   -- ExtractMatches lines ~177-182). A proof with
+                                   -- leftover bits/hashes is malformed.
+                                   --   CeilDiv(nBitsUsed,8) == CeilDiv(vBits.size(),8)
+                                   --   nHashUsed == vHash.size()
+                                   nBitsUsed <- readIORef bitRef
+                                   nHashUsed <- readIORef hashRef
+                                   let ceilDiv8 x = (x + 7) `div` 8
+                                       allConsumed = ceilDiv8 nBitsUsed == ceilDiv8 (length bits)
+                                                     && nHashUsed == hashCount
+                                   case result of
                                     -- A clean-but-non-matching / fBad proof yields
                                     -- [] in Core (txoutproof.cpp 154-155), not an error.
                                     Left _ -> return $ RpcResponse (toJSON ([] :: [Text])) Null Null
+                                    Right _ | not allConsumed ->
+                                      return $ RpcResponse (toJSON ([] :: [Text])) Null Null
                                     Right (rootBS, matchedRaw) -> do
                                       -- Verify merkle root against header
                                       -- bhMerkleRoot is at bytes 36-67 of the header
