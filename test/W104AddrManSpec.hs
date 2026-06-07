@@ -263,6 +263,7 @@ mkInfo :: SockAddr -> Int64 -> Int -> AddrInfo
 mkInfo a lastSuccess attempts = AddrInfo
   { aiAddress          = a
   , aiServices         = 0x409
+  , aiTime             = lastSuccess
   , aiLastTry          = 0
   , aiLastSuccess      = lastSuccess
   , aiLastCountAttempt = 0

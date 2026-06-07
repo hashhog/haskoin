@@ -269,7 +269,7 @@ import Haskoin.Script (ScriptFlags, emptyFlags)
 --------------------------------------------------------------------------------
 
 nullFlags :: ConsensusFlags
-nullFlags = ConsensusFlags False False False False False False
+nullFlags = ConsensusFlags False False False False False False False
 
 -- A minimal OP_TRUE (0x51) p2pk-style prevout
 op1Prevout :: TxOut
@@ -504,7 +504,7 @@ spec_G7_validateTxChunkFlags = describe "G7 validateTxChunk respects ConsensusFl
            utxoMap = Map.singleton op prevOut
        utxoTVar <- newTVarIO utxoMap
        let tx = mkSpendTx op prevOut 1_000
-           allTrue = ConsensusFlags True True True True True True
+           allTrue = ConsensusFlags True True True True True True True
        r1 <- validateTxChunk [(1, tx)] utxoTVar allTrue
        -- Empty scriptPubKey must fail regardless of flags
        case r1 of
@@ -519,7 +519,7 @@ spec_G7_validateTxChunkFlags = describe "G7 validateTxChunk respects ConsensusFl
            utxoMap = Map.singleton op prevOut
        utxoTVar <- newTVarIO utxoMap
        let tx = mkSpendTx op prevOut 500
-           allTrue = ConsensusFlags True True True True True True
+           allTrue = ConsensusFlags True True True True True True True
        result <- validateTxChunk [(1, tx)] utxoTVar allTrue
        result `shouldBe` PVSuccess
 
@@ -563,7 +563,7 @@ spec_G9_verifyBlockScriptsParallelFlags = describe "G9 verifyBlockScriptsParalle
            spendTx = Tx 2 [txin] [TxOut 9_000 BS.empty] [[]] 0
            block = Block header [mkCoinbaseTx, spendTx]
            utxoMap = Map.singleton op prevOut
-           allTrue = ConsensusFlags True True True True True True
+           allTrue = ConsensusFlags True True True True True True True
        -- OP_TRUE is valid under full consensus flags
        let r1 = verifyBlockScriptsParallel block utxoMap allTrue
        r1 `shouldBe` Right ()
@@ -998,7 +998,7 @@ spec_G29_mempoolEmptyFlags = describe "G29 Mempool script verify uses consensusF
     -- consensusFlagsToScriptFlags (consensusFlagsAtHeight net (height+1)) instead
     -- of Script.emptyFlags.  consensusFlagsToScriptFlags always includes
     -- VerifyP2SH unconditionally, so even nullFlags produces non-empty ScriptFlags.
-    let fullFlags = ConsensusFlags True True True True True True
+    let fullFlags = ConsensusFlags True True True True True True True
         sf = consensusFlagsToScriptFlags fullFlags
     in (sf == emptyFlags) `shouldBe` False
 
@@ -1006,7 +1006,7 @@ spec_G29_mempoolEmptyFlags = describe "G29 Mempool script verify uses consensusF
     -- The fix means emptyFlags is no longer used for script verification at
     -- mempool admission — this test guards against regression.
     let sf_empty = emptyFlags
-        sf_full  = consensusFlagsToScriptFlags (ConsensusFlags True True True True True True)
+        sf_full  = consensusFlagsToScriptFlags (ConsensusFlags True True True True True True True)
     in (sf_empty == sf_full) `shouldBe` False
 
 --------------------------------------------------------------------------------
