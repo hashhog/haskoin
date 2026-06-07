@@ -12020,17 +12020,26 @@ handleScanTxOutSet server params = do
             case Map.lookup script targets of
               Just descTxt -> do
                 modifyIORef' sumRef (+ txOutValue txout)
+                -- Resolve the block hash at the coin's height via the
+                -- on-disk height->hash index (same index handleGetBlockHash
+                -- uses); fall back to the coin's stored height on a miss.
+                mBh <- getBlockHeight (rsDB srv) (coinHeight coin)
                 let sats    = fromIntegral (txOutValue txout) :: Int64
                     txidHex = showHash (BlockHash (getTxIdHash (outPointHash op)))
                     hex     = TE.decodeUtf8 (B16.encode script)
+                    bhHex   = maybe "" showHash mBh
+                    confs   = fromIntegral (ceHeight tip)
+                                - fromIntegral (coinHeight coin) + 1 :: Int
                     enc = pairs $
-                            pair "txid"         (text txidHex)                          <>
-                            pair "vout"         (AE.word32 (outPointIndex op))          <>
-                            pair "scriptPubKey" (text hex)                              <>
-                            pair "desc"         (text descTxt)                          <>
-                            pair "amount"       (btcAmountEnc sats)                     <>
-                            pair "coinbase"     (AE.bool (coinIsCoinbase coin))         <>
-                            pair "height"       (AE.word32 (coinHeight coin))
+                            pair "txid"          (text txidHex)                         <>
+                            pair "vout"          (AE.word32 (outPointIndex op))         <>
+                            pair "scriptPubKey"  (text hex)                             <>
+                            pair "desc"          (text descTxt)                         <>
+                            pair "amount"        (btcAmountEnc sats)                    <>
+                            pair "coinbase"      (AE.bool (coinIsCoinbase coin))        <>
+                            pair "height"        (AE.word32 (coinHeight coin))          <>
+                            pair "blockhash"     (text bhHex)                           <>
+                            pair "confirmations" (AE.int confs)
                 modifyIORef' hitsRef (enc :)
                 return True
               Nothing -> return True
