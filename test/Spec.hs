@@ -140,6 +140,7 @@ import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
 import qualified W166WalletPersistSpec
+import qualified W167VerifyTxOutProofHardeningSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22665,6 +22666,11 @@ main = hspec $ do
   -- load (corrupt/partial file does not crash + .bad move), encryption at
   -- rest (no plaintext key on disk + wrong-key fails gracefully).
   W166WalletPersistSpec.spec
+
+  -- W167 verifytxoutproof CVE-2012-2459 hardening: duplicate-branch detection
+  -- + all-bits/all-hashes consumed + upfront bounds in the partial-merkle-tree
+  -- extractor (mirrors Core merkleblock.cpp TraverseAndExtract/ExtractMatches).
+  W167VerifyTxOutProofHardeningSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
