@@ -1691,7 +1691,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Publish the manager to the connect loop so live IBD/P2P blocks feed
     -- the wallet (sweep wa0fq5wtk).
     writeIORef walletMgrRef (Just walletMgr)
-    rpcServer <- startRpcServer rpcConfig db hc pm' mp fe cache net mBlockStore (Just walletMgr) pruneCfg mIdxMgr
+    rpcServer <- startRpcServer rpcConfig db hc pm' mp fe cache net mBlockStore (Just walletMgr) pruneCfg mIdxMgr orphanPoolRef
     -- W115 FIX-50: inject asmap bytecode into RpcServer for getpeerinfo mapped_as.
     let rpcServer' = rpcServer { rsAsmapData = asmapData }
     putStrLn $ "RPC server listening on port " ++ show noRpcPort
