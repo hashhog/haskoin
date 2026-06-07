@@ -251,6 +251,7 @@ import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
 -- Reference: bitcoin-core/src/rest.cpp rest_block_filter / rest_filter_header.
 import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        blockFilterHash, blockFilterHeader, encodeBlockFilter,
+                       decodeBlockFilter, gcsFilterMatchAny,
                        IndexManager(..), BlockFilterEntry(..),
                        BlockFilterIndexDB(..),
                        blockFilterIndexGet, blockFilterIndexTipHeight,
@@ -1219,6 +1220,7 @@ handleRpcRequest server req = do
     -- W47B: UTXO set / mining stats / proof RPCs
     "gettxoutsetinfo"      -> handleGetTxOutSetInfo server params
     "scantxoutset"         -> handleScanTxOutSet server params
+    "scanblocks"           -> handleScanBlocks server params
     "getnetworkhashps"     -> handleGetNetworkHashPS server params
     "gettxoutproof"        -> handleGetTxOutProof server params
     "verifytxoutproof"     -> handleVerifyTxOutProof server params
@@ -12087,6 +12089,166 @@ handleScanTxOutSet server params = do
                 Nothing -> case B16.decode (TE.encodeUtf8 s) of
                   Right bs | not (BS.null bs) -> Right [(bs, "raw(" <> s <> ")")]
                   _ -> Left ("scantxoutset: unsupported scan object '" ++ T.unpack raw ++
+                             "' (use addr(<address>) or raw(<hexscript>))")
+
+-- | scanblocks "action" ( [scanobjects] start_height stop_height "filtertype" options )
+--
+-- Drives the existing BIP-157 basic block filter index to find blocks whose
+-- GCS filter MATCHES any of the supplied scanobjects' scriptPubKeys, over the
+-- height range [start_height, stop_height].  Returns the Core-shape object:
+--
+--   { "from_height": <int>, "to_height": <int>,
+--     "relevant_blocks": [ <blockhash>... ], "completed": <bool> }
+--
+-- This is the index-side counterpart to 'scantxoutset' (which walks the UTXO
+-- set): scanblocks walks compact block filters, so it can locate the block a
+-- script was funded/spent in even after the coin is gone.  Block filters carry
+-- FALSE POSITIVES (rate ~1/784931), so 'relevant_blocks' may contain extra
+-- blocks; every TRUE match is guaranteed present.
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp scanblocks (action
+-- start/status/abort).
+--   action=status -> null (no async scan; haskoin scans synchronously)
+--   action=abort  -> false (nothing running to abort)
+--   action=start  -> real work
+--   filtertype default "basic".
+--   ERRORS (Core):
+--     unknown action      -> RPC_INVALID_PARAMETER (-8)  [impl-specific code OK]
+--     unknown filtertype  -> RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+--     index disabled      -> RPC_MISC_ERROR (-1) "Index is not enabled ..."
+--     bad start/stop hght -> RPC_MISC_ERROR (-1) "Invalid start_height/stop_height"
+--
+-- The scan resolves height->hash via the on-disk canonical height index
+-- ('getBlockHeight'), reads each height's index 'BlockFilterEntry', decodes its
+-- GCS bytes back into a 'BlockFilter' (basic filter params are keyed by the
+-- block hash), and tests 'gcsFilterMatchAny' against the needle scriptPubKeys —
+-- byte-identical to the filter the index built on connect, hence identical
+-- TRUE-positive results to Core for the same chain.
+handleScanBlocks :: RpcServer -> Value -> IO RpcResponse
+handleScanBlocks server params = do
+  let mAction = extractParamText params 0
+      errCode code msg = return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  case mAction of
+    Nothing ->
+      errCode rpcInvalidParams "scanblocks requires an action ('start')"
+    Just "status" ->
+      -- Synchronous scan: there is never one in progress -> null.
+      return $ RpcResponse Null Null Null
+    Just "abort" ->
+      -- Nothing running to abort -> false.
+      return $ RpcResponse (toJSON False) Null Null
+    Just "start"  -> scanBlocksStart server params
+    Just other    ->
+      errCode rpcInvalidParameter
+        (T.pack ("Invalid action '" ++ T.unpack other ++
+                 "' (expected start/status/abort)"))
+
+-- | The @scanblocks start ...@ path.
+scanBlocksStart :: RpcServer -> Value -> IO RpcResponse
+scanBlocksStart server params = do
+  let errCode code msg = return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  -- (1) filtertype (param 4): default "basic"; unknown -> -5 "Unknown filtertype".
+  -- Resolved BEFORE the index/range checks (mirrors Core ordering).
+  case parseFilterTypeName (fromMaybe "basic" (extractParamText params 4)) of
+    Nothing -> errCode rpcInvalidAddressOrKey "Unknown filtertype"
+    Just _filterType ->
+      -- (2) index-enabled gate: Core RPC_MISC_ERROR "Index is not enabled ...".
+      case rsIndexMgr server >>= imBlockFilterIndex of
+        Nothing -> errCode rpcMiscError
+          "Index is not enabled for filtertype basic"
+        Just bfIdx ->
+          -- (3) scanobjects (param 1): required array for "start".
+          case extractParamArray params 1 of
+            Nothing -> errCode rpcInvalidParams
+              "scanblocks 'start' requires a scanobjects array"
+            Just objs ->
+              case mapM (parseScanBlocksObject (rsNetwork server)) (V.toList objs) of
+                Left err -> errCode rpcInvalidParams (T.pack err)
+                Right targetLists -> do
+                  -- Dedup needle scriptPubKeys.
+                  let needles = Set.toList (Set.fromList (concat targetLists))
+                  -- (4) height range (Core uses RPC_MISC_ERROR (-1) here, NOT -8).
+                  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                  let tipH  = fromIntegral (ceHeight tip) :: Int
+                      start = fromMaybe 0    (extractParam params 2 :: Maybe Int)
+                      stop  = fromMaybe tipH (extractParam params 3 :: Maybe Int)
+                  if start < 0 || start > tipH
+                    then errCode rpcMiscError "Invalid start_height"
+                    else if stop < start || stop > tipH
+                      then errCode rpcMiscError "Invalid stop_height"
+                      else scanBlocksRange server bfIdx needles start stop
+
+-- | Walk [start, stop] over the basic filter index, collecting blocks whose
+-- GCS filter matches any needle scriptPubKey.  Returns the Core-shape object.
+scanBlocksRange :: RpcServer -> BlockFilterIndexDB -> [ByteString] -> Int -> Int
+                -> IO RpcResponse
+scanBlocksRange server bfIdx needles start stop = do
+  result <- goEither start []
+  case result of
+    Left err -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+    Right hashes -> do
+      let relEnc = map (text . showHash) hashes
+          enc = pairs $
+                  pair "from_height"     (AE.int start)            <>
+                  pair "to_height"       (AE.int stop)             <>
+                  pair "relevant_blocks" (AE.list id relEnc)       <>
+                  pair "completed"       (AE.bool True)
+      return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+  where
+    -- Recursive Either-accumulating loop (kept separate from the @go@ doc above
+    -- so the happy path reads cleanly).
+    goEither :: Int -> [BlockHash] -> IO (Either String [BlockHash])
+    goEither !h !acc
+      | h > stop  = return (Right (reverse acc))
+      | otherwise = do
+          mBh <- getBlockHeight (rsDB server) (fromIntegral h)
+          case mBh of
+            Nothing ->
+              return (Left "Block not found at requested height (chainstate lagging)")
+            Just bh -> do
+              mEntry <- blockFilterIndexGet bfIdx (fromIntegral h)
+              case mEntry of
+                Nothing ->
+                  return (Left ("Filter not found. Block filters are still " ++
+                                "in the process of being indexed."))
+                Just entry ->
+                  case decodeBlockFilter BasicBlockFilter bh (bfeEncoded entry) of
+                    Left e   -> return (Left ("filter decode failed: " ++ e))
+                    Right bf ->
+                      let matched = gcsFilterMatchAny (bfFilter bf) needles
+                          acc'    = if matched then bh : acc else acc
+                      in goEither (h + 1) acc'
+
+-- | Parse one scanblocks scan object into a list of needle scriptPubKeys.
+-- Accepts a descriptor string ("addr(..)" / "raw(..)" / bare addr / bare hex)
+-- or a {"desc": "..."} object — the same surface 'handleScanTxOutSet' accepts.
+parseScanBlocksObject :: Network -> Value -> Either String [ByteString]
+parseScanBlocksObject net v = case v of
+  String s -> parseOne net s
+  Object o -> case KM.lookup "desc" o of
+    Just (String s) -> parseOne net s
+    _               -> Left "scan object must have a string 'desc' field"
+  _ -> Left "scan object must be a descriptor string or {desc:..} object"
+  where
+    parseOne :: Network -> Text -> Either String [ByteString]
+    parseOne n raw =
+      let s = T.takeWhile (/= '#') (T.strip raw)
+      in if "addr(" `T.isPrefixOf` s && ")" `T.isSuffixOf` s
+           then let inner = T.drop 5 (T.dropEnd 1 s)
+                in case textToAddress inner of
+                     Just a  -> Right [addressToScript a]
+                     Nothing -> Left ("scanblocks: invalid address in addr(): " ++ T.unpack inner)
+         else if "raw(" `T.isPrefixOf` s && ")" `T.isSuffixOf` s
+           then let inner = T.drop 4 (T.dropEnd 1 s)
+                in case B16.decode (TE.encodeUtf8 inner) of
+                     Right bs -> Right [bs]
+                     Left _   -> Left ("scanblocks: invalid hex in raw(): " ++ T.unpack inner)
+         else case textToAddress s of
+                Just a  -> Right [addressToScript a]
+                Nothing -> case B16.decode (TE.encodeUtf8 s) of
+                  Right bs | not (BS.null bs) -> Right [bs]
+                  _ -> Left ("scanblocks: unsupported scan object '" ++ T.unpack raw ++
                              "' (use addr(<address>) or raw(<hexscript>))")
 
 -- | getnetworkhashps: estimate network hash rate over sliding window.
