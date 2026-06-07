@@ -44,6 +44,7 @@ module Haskoin.Mempool
   , getMempoolWtxids
   , getMempoolSize
   , getMempoolInfo
+  , getPrioritisedTransactions
   , getMempoolMinFeeRate
     -- * Block Handlers
   , blockConnected
@@ -1600,6 +1601,42 @@ getMempoolInfo mp = atomically $ do
       totalFees = sum $ map meFee entryList
       minFee = if null entryList then 0 else minimum $ map meFee entryList
   return (Map.size entries, size, totalFees, minFee)
+
+-- | Enumerate all user-created PrioritiseTransaction fee deltas, joined with
+-- the live mempool to report whether each prioritised tx is currently present
+-- and, if so, its modified fee.
+--
+-- Mirrors @CTxMemPool::GetPrioritisedTransactions()@
+-- (bitcoin-core/src/txmempool.cpp) as consumed by the
+-- @getprioritisedtransactions@ RPC (rpc/mining.cpp:547).  The source of truth
+-- is 'mpFeeDeltas' (Core's @mapDeltas@), populated by PrioritiseTransaction.
+--
+-- For each (txid, delta) the result tuple is
+-- @(txid, delta, in_mempool, modified_fee)@ where:
+--
+--   * @in_mempool@ is whether @txid@ is in 'mpEntries'.
+--   * @modified_fee@ is 'Just' the entry's base fee plus the delta — but only
+--     when the tx is in the mempool; 'Nothing' otherwise (Core only sets
+--     @modified_fee@ when @in_mempool@).  The base fee stored in 'meFee' is the
+--     unmodified fee (see 'finalizeTransaction'), so the modified fee is
+--     @meFee + delta@, applied with the same saturating-at-zero semantics the
+--     admission path uses for a negative delta.
+getPrioritisedTransactions :: Mempool -> IO [(TxId, Int64, Bool, Maybe Word64)]
+getPrioritisedTransactions mp = atomically $ do
+  feeDeltas <- readTVar (mpFeeDeltas mp)
+  entries   <- readTVar (mpEntries mp)
+  let applyDelta :: Word64 -> Int64 -> Word64
+      applyDelta baseFee delta
+        | delta >= 0 = baseFee + fromIntegral delta
+        | otherwise  =
+            let absD = fromIntegral (negate delta) :: Word64
+            in if absD > baseFee then 0 else baseFee - absD
+  return
+    [ case Map.lookup txid entries of
+        Just entry -> (txid, delta, True,  Just (applyDelta (meFee entry) delta))
+        Nothing    -> (txid, delta, False, Nothing)
+    | (txid, delta) <- Map.toList feeDeltas
+    ]
 
 -- | Get the effective minimum fee rate for mempool acceptance (sat/kvB).
 -- Returns the maximum of:

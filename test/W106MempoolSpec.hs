@@ -957,3 +957,50 @@ spec = do
       let tx = makeTx [coinOutPoint 401] [9_000]
           txFinal = tx { txInputs = [ (head (txInputs tx)) { txInSequence = 0xffffffff } ] }
       signalsOptInRBF txFinal `shouldBe` False
+
+  --
+  -- getprioritisedtransactions: join mpFeeDeltas with the live mempool.
+  -- Mirrors Bitcoin Core's getprioritisedtransactions RPC
+  -- (rpc/mining.cpp:547 + CTxMemPool::GetPrioritisedTransactions).
+  --
+  describe "getprioritisedtransactions join (mpFeeDeltas x mpEntries)" $ do
+    it "reports in_mempool + modified_fee for a prioritised tx in the pool" $
+      withFreshMempool $ \mp -> do
+        let txIn   = makeTx [coinOutPoint 500] [9_000]
+            txInId = computeTxId txIn
+            -- baseFee 1000, +5000 delta -> modified_fee 6000
+            entIn  = fakeEntryTx txIn txInId (computeWtxid txIn) 1_000 200 1 200 1 200
+        atomically $ do
+          modifyTVar' (mpEntries mp) (Map.insert txInId entIn)
+          modifyTVar' (mpFeeDeltas mp) (Map.insert txInId 5_000)
+        result <- getPrioritisedTransactions mp
+        lookup3 txInId result `shouldBe` Just (5_000, True, Just 6_000)
+
+    it "omits modified_fee (Nothing) for a prioritised tx not in the pool" $
+      withFreshMempool $ \mp -> do
+        let txOut   = makeTx [coinOutPoint 501] [9_000]
+            txOutId = computeTxId txOut
+        atomically $ modifyTVar' (mpFeeDeltas mp) (Map.insert txOutId 7_000)
+        result <- getPrioritisedTransactions mp
+        lookup3 txOutId result `shouldBe` Just (7_000, False, Nothing)
+
+    it "applies a negative delta with saturation at zero" $
+      withFreshMempool $ \mp -> do
+        let txN   = makeTx [coinOutPoint 502] [9_000]
+            txNId = computeTxId txN
+            entN  = fakeEntryTx txN txNId (computeWtxid txN) 1_000 200 1 200 1 200
+        atomically $ do
+          modifyTVar' (mpEntries mp) (Map.insert txNId entN)
+          -- delta of -3000 against baseFee 1000 saturates to 0
+          modifyTVar' (mpFeeDeltas mp) (Map.insert txNId (-3_000))
+        result <- getPrioritisedTransactions mp
+        lookup3 txNId result `shouldBe` Just (-3_000, True, Just 0)
+  where
+    -- Look up the (delta, in_mempool, modified_fee) triple for a txid in the
+    -- getPrioritisedTransactions result (which is keyed by txid in its 1st slot).
+    lookup3 :: TxId -> [(TxId, Int64, Bool, Maybe Word64)]
+            -> Maybe (Int64, Bool, Maybe Word64)
+    lookup3 k xs =
+      case [ (d, inMp, mf) | (t, d, inMp, mf) <- xs, t == k ] of
+        (r:_) -> Just r
+        []    -> Nothing
