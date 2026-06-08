@@ -607,7 +607,7 @@ processCheckBlock line =
       Left e                            -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
       Right (block, cs, skipScripts, coinMap) -> do
         r <- try (evaluate
-                    (forceEither (validateFullBlock mainnet cs skipScripts block coinMap)))
+                    (forceEither (validateFullBlock mainnet cs skipScripts False block coinMap)))
                :: IO (Either SomeException (Either String ()))
         pure $ case r of
           Left ex          ->
@@ -1280,7 +1280,7 @@ runConnects cache net (c:cs) n = do
               , csMedianTime = prevMtp
               , csFlags      = consensusFlagsAtHeight net height
               }
-  case validateFullBlock net cs0 False block spentCoins of
+  case validateFullBlock net cs0 False False block spentCoins of
     Left err -> pure (n, Just err)
     Right () -> do
       -- (c) applyBlock — spends inputs from the cache, checks coinbase maturity

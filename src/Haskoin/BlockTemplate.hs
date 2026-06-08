@@ -517,12 +517,6 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           parentChainWork = ceChainWork parent
           parentHash = ceHash parent
 
-      -- Build UTXO map for validation. We carry full Core-format
-      -- 'Coin' (TxOut + height + coinbase flag) so 'connectBlock' can
-      -- record byte-identical undo entries, and so validateFullBlock can
-      -- perform BIP-68 SequenceLocks checks (which require per-coin heights).
-      utxoMap <- buildBlockUTXOMap cache block
-
       -- Build chain state for validation, anchored on the BLOCK's
       -- parent (not the active tip).  csHeight carries the parent's
       -- height per the existing convention (validateFullBlock derives
@@ -535,36 +529,62 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
             , csFlags = consensusFlagsAtHeight net height
             }
 
-      -- Validate the block (always verify scripts for locally minted blocks).
-      -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard, requires
-      -- DB IO) followed by the pure 'validateFullBlock' checks, ensuring submitBlock
-      -- and the IBD path share identical BIP-30 enforcement.
-      -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
-      -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs:386.
-      validationResult <- validateFullBlockIO db net cs False block utxoMap
-      case validationResult of
-        Left err -> return $ Left $ "Block validation failed: " ++ err
-        Right () ->
-          -- Pattern Y companion (CORE-PARITY-AUDIT
-          -- _reorg-via-submitblock-fleet-result-2026-05-05.md): the
-          -- earlier Pattern X fix (haskoin 04c0136) corrected the BIP-34
-          -- height-derivation site but stopped short of side-branch
-          -- storage + reorg dispatch.  Pre-fix, parent /= tip was
-          -- surfaced as a distinct rejection so the active UTXO didn't
-          -- get clobbered; post-fix we route side-branch blocks through
-          -- the storage decoupling Core does in
-          -- @BlockManager::AcceptBlock@ (validation.cpp): every accepted
-          -- block gets a 'CBlockIndex' entry regardless of which chain
-          -- it lives on, and 'ActivateBestChain' separately picks the
-          -- best-work tip.
-          --
-          -- Cross-impl reference: nimrod 7196d41
-          -- (putBlockIndexHashOnly + handleSubmitBlock else-arm),
-          -- camlcoin 22667c2 (register_side_branch_header +
-          -- try_attach_side_branch_and_reorg), rustoshi 68a422b.
-          if ceHash parent /= ceHash tip
-            then submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
-            else do
+      -- CORE PARITY (side-branch fork-point fix):
+      -- Bitcoin Core AcceptBlock (validation.cpp:4298-4357) runs only
+      -- CheckBlock + ContextualCheckBlock for ANY block, regardless of
+      -- whether it extends the active chain.  Full UTXO validation
+      -- (BIP-30, input existence, fee computation, BIP-68 sequence locks,
+      -- sigop cost, coinbase value) runs in ConnectBlock (validation.cpp:2295+),
+      -- which is called only during ActivateBestChainStep against the
+      -- fork-point UTXO view rebuilt by DisconnectBlock.
+      --
+      -- Pre-fix: this code built the UTXO map from the active-tip UTXOCache
+      -- (buildBlockUTXOMap) and ran validateFullBlockIO BEFORE the
+      -- parent==tip check.  A side-branch block legitimately spending a UTXO
+      -- present at the fork point but already spent by the active chain above
+      -- the fork was false-rejected "bad-txns-inputs-missingorspent".
+      --
+      -- Fix: check parent==tip FIRST.
+      --   * Side-branch arm: run only context-free + contextual checks
+      --     (validateFullBlock with skipConnectChecks=True, no BIP-30) then
+      --     hand off to submitBlockSideBranch.  The reorg-connect path
+      --     (buildConnectChain / connectChain) re-validates with skipConnectChecks=
+      --     False against the fork-point view after DisconnectBlock rewinds.
+      --   * Active-tip arm: build the UTXO map and run validateFullBlockIO
+      --     (BIP-30 + full UTXO validation) exactly as before.
+      --
+      -- Fleet audit (nimrod 7815d0f fixed the same issue; haskoin is the
+      -- other impl that had it).  Reference: Core validation.cpp:4298-4357
+      -- (AcceptBlock) vs :2295+ (ConnectBlock).
+      if ceHash parent /= ceHash tip
+        then do
+          -- Side-branch block: run only context-free + contextual checks.
+          -- PoW/merkle/weight/witness-commitment/BIP-34/MTP/IsFinalTx still
+          -- run; UTXO-dependent checks (input existence, fee, BIP-68, sigops,
+          -- coinbase value) deferred to connect time.  BIP-30 also deferred:
+          -- Core runs it in ConnectBlock, not AcceptBlock.
+          let sideBranchResult = validateFullBlock net cs False True block Map.empty
+          case sideBranchResult of
+            Left err -> return $ Left $ "Block validation failed: " ++ err
+            Right () -> submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
+        else do
+          -- Active-tip arm: full UTXO validation as before.
+          -- Build UTXO map for validation. We carry full Core-format
+          -- 'Coin' (TxOut + height + coinbase flag) so 'connectBlock' can
+          -- record byte-identical undo entries, and so validateFullBlock can
+          -- perform BIP-68 SequenceLocks checks (which require per-coin heights).
+          utxoMap <- buildBlockUTXOMap cache block
+
+          -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard,
+          -- requires DB IO) followed by the pure 'validateFullBlock' checks,
+          -- ensuring the active-tip submitBlock path shares identical BIP-30
+          -- enforcement with the IBD path.
+          -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
+          -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs.
+          validationResult <- validateFullBlockIO db net cs False block utxoMap
+          case validationResult of
+            Left err -> return $ Left $ "Block validation failed: " ++ err
+            Right () -> do
               -- Apply block to in-memory UTXO cache (drives maturity check + builds
               -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
               -- spend an output created earlier in the same session without round-
@@ -595,10 +615,10 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
                   -- W97/W99-G18: connectBlock now returns Either String ()
                   -- and refuses to overwrite BestBlock when prevHash does
                   -- not extend the current tip.  Here we are inside the
-                  -- `parent == tip` branch (line 565 guard), so the G1
-                  -- gate is structurally guaranteed to pass; if it ever
-                  -- fires we surface as Left rather than silently
-                  -- corrupting the tip.
+                  -- parent==tip arm (early-exited before reaching here
+                  -- when parent /= tip), so the G1 gate is structurally
+                  -- guaranteed to pass; if it ever fires we surface as
+                  -- Left rather than silently corrupting the tip.
                   cbR <- connectBlock db net block height utxoMap
                   case cbR of
                     Left cbErr -> return $ Left $
@@ -641,10 +661,15 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
 
                       return $ Right ()
 
--- | Side-branch arm of 'submitBlock'.  Runs after 'validateFullBlockIO'
+-- | Side-branch arm of 'submitBlock'.  Called after context-free +
+-- contextual validation (validateFullBlock with skipConnectChecks=True)
 -- has approved the block but its parent is NOT the active tip (so a
 -- direct 'connectBlock' would corrupt the active chain's UTXO + best
--- block pointers).
+-- block pointers).  Full UTXO validation (BIP-30, input existence, fee
+-- computation, BIP-68 sequence locks, sigop cost, coinbase value) is
+-- deferred to the reorg-connect path (buildConnectChain /
+-- doSideBranchReorg), which reconstructs the fork-point UTXO view via
+-- DisconnectBlock before re-validating.
 --
 -- Mirrors 'BlockManager::AcceptBlock' + 'ActivateBestChain'
 -- (validation.cpp): persist the block + a side-branch index entry
@@ -1166,7 +1191,7 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                                          (bhPrevBlock (blockHeader blk))
                                          0 parentMTP
                                          (consensusFlagsAtHeight n (ceHeight ce))
-              case validateFullBlock n csReorg False blk spentUtxos of
+              case validateFullBlock n csReorg False False blk spentUtxos of
                 Left err -> return $ Left $
                   "reorg connect: block " ++ show bh
                   ++ " (height " ++ show (ceHeight ce)

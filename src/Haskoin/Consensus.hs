@@ -2501,9 +2501,18 @@ isFinalTxCheck tx blockHeight blockTime
 -- root, coinbase validity, block weight, sigop counts, PoW) still run;
 -- only the per-input script evaluation step is skipped — exactly as in
 -- Bitcoin Core's assumevalid implementation.
-validateFullBlock :: Network -> ChainState -> Bool -> Block -> Map OutPoint Coin
+-- | @skipConnectChecks@: when @True@, skip all UTXO-dependent checks
+-- (coinbase maturity, BIP-68 sequence locks, input existence \/ fee
+-- computation, sigop cost, coinbase value cap).  Pass @True@ ONLY from
+-- the side-branch acceptance arm of @submitBlock@, mirroring Bitcoin
+-- Core's @AcceptBlock@ (validation.cpp:4298-4357): only @CheckBlock@ +
+-- @ContextualCheckBlock@ run for every block at accept time; full UTXO
+-- validation (@ConnectBlock@) runs only during @ActivateBestChainStep@
+-- against the fork-point UTXO view rebuilt by @DisconnectBlock@.
+-- All callers that validate against a real UTXO view pass @False@.
+validateFullBlock :: Network -> ChainState -> Bool -> Bool -> Block -> Map OutPoint Coin
                  -> Either String ()
-validateFullBlock net cs skipScripts block utxoCoinMap = do
+validateFullBlock net cs skipScripts skipConnectChecks block utxoCoinMap = do
   let height = csHeight cs + 1
       flags = consensusFlagsAtHeight net height
       header = blockHeader block
@@ -2526,14 +2535,18 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
   -- mempool-only). Coinbase tx is naturally exempt (its null prevout is absent
   -- from utxoCoinMap); an intra-block coinbase spend is absent too (added to
   -- the UTXO set only after the block connects).
-  let cbMaturity  = fromIntegral (netCoinbaseMaturity net)
-      immatureCb  = [ () | tx   <- tail txns
-                         , txin <- txInputs tx
-                         , Just c <- [Map.lookup (txInPrevOutput txin) utxoCoinMap]
-                         , coinIsCoinbase c
-                         , height - coinHeight c < cbMaturity ]
-  unless (null immatureCb) $
-    Left "bad-txns-premature-spend-of-coinbase"
+  -- Gated on skipConnectChecks: coinbase maturity requires the correct UTXO
+  -- view (fork-point), which is not available at side-branch accept time.
+  -- Core enforces this in ConnectBlock (validation.cpp:2535), not AcceptBlock.
+  unless skipConnectChecks $ do
+    let cbMaturity  = fromIntegral (netCoinbaseMaturity net)
+        immatureCb  = [ () | tx   <- tail txns
+                           , txin <- txInputs tx
+                           , Just c <- [Map.lookup (txInPrevOutput txin) utxoCoinMap]
+                           , coinIsCoinbase c
+                           , height - coinHeight c < cbMaturity ]
+    unless (null immatureCb) $
+      Left "bad-txns-premature-spend-of-coinbase"
 
   -- 0. Verify checkpoint (if one exists at this height)
   case verifyCheckpoint checkpoints height blockHash of
@@ -2619,117 +2632,125 @@ validateFullBlock net cs skipScripts block utxoCoinMap = do
       Left "bad-txns-nonfinal"
     ) txns
 
-  -- 7b. BIP-68 SequenceLocks: check relative lock-times for every non-coinbase
-  --     transaction BEFORE script verification.
-  --     Reference: Bitcoin Core validation.cpp ConnectBlock() ~line 2549:
-  --       prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
-  --       if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex))
-  --         state.Invalid(..., "bad-txns-nonfinal", ...)
-  --     Core fires this BEFORE CheckInputScripts (script-eval) so that the
-  --     rejection is bad-txns-nonfinal, not block-script-verify-flag-failed.
-  --     Ordering fix: clearbit/camlcoin/haskoin all had this after script-eval.
-  when csvActive $ do
-    -- Process transactions in order, accumulating intra-block output heights
-    -- so that same-block spends (height = current block height = 0 confirmations)
-    -- are handled correctly.  Same-block prevouts are NOT in utxoCoinMap (which
-    -- only covers the pre-block chainstate), so we fall back to height for them.
-    --
-    -- BIP-68 IBD-context wiring: we evaluate ONLY the height-based component
-    -- of BIP-68 here and defer the time-based component to the BIP-112
-    -- OP_CSV opcode at script-eval time.  Reason: the IBD-side caller does
-    -- not have a real `getMtpAtHeight` callback wired through
-    -- `validateFullBlock`, so the previous code passed `prevBlockMTP`
-    -- (tip's parent MTP) for every input.  But `calculateSequenceLocks`
-    -- expects the MTP at `coin_height - 1` per input (a different,
-    -- typically much older, value).  With the wrong wiring, any v2 tx
-    -- with a non-zero time-based BIP-68 lock_value is unconditionally
-    -- rejected (`min_time = prev_block_mtp + lock - 1` always exceeds the
-    -- tip's `prev_block_mtp`).  That's a deferred self-wedge: the live
-    -- haskoin chainstate (April 12) was synced before this code path
-    -- existed, but a fresh IBD on this binary will wedge at the first
-    -- post-CSV block carrying a time-based BIP-68 input.
-    --
-    -- Until per-input MTP-at-height is plumbed through, the safe
-    -- parity-with-Core behaviour is to skip the time-based branch here
-    -- and rely on BIP-112 (OP_CSV) inside the script interpreter — which
-    -- has full per-tx context and already runs for every input.
-    -- Height-based locks remain enforced: `coinHeight` from the UTXO row
-    -- is correct for both external and intra-block prevouts, so the
-    -- height comparison is byte-for-byte the same as Core.
-    --
-    -- Reference: clearbit's matching resolution (clearbit 44454c1,
-    -- src/validation.zig) and rustoshi's matching resolution (this wave).
-    -- Cross-impl audit:
-    -- CORE-PARITY-AUDIT/_ibd-context-wiring-cross-impl-2026-05-05.md.
-    -- Bitcoin Core split: validation.cpp::CheckSequenceLocks (full
-    -- chain-access path) + script/interpreter.cpp OP_CSV (script-eval
-    -- with full per-tx sighash context).
-    let prevBlockMTP = csMedianTime cs
-        go :: Map OutPoint Word32 -> [Tx] -> Either String ()
-        go _ [] = Right ()
-        go intrablockHeights (tx:rest)
-          | isCoinbase tx = do
-              -- Add coinbase outputs to intra-block map (height = current block)
-              let txid = computeTxId tx
-                  newOuts = Map.fromList
-                    [ (OutPoint txid (fromIntegral i), height)
-                    | i <- [0 .. length (txOutputs tx) - 1]
-                    ]
-              go (Map.union newOuts intrablockHeights) rest
-          | otherwise = do
-              -- Build prevHeights for the BIP-68 height-based check.  We
-              -- pass MTP=0 for every input because we ONLY consume
-              -- `slMinHeight` from the resulting `SequenceLock`; the
-              -- time-based component is deferred to OP_CSV (see comment
-              -- above).
-              let prevHeights = map (\inp ->
-                    let op = txInPrevOutput inp
-                    in case Map.lookup op utxoCoinMap of
-                         Just coin -> coinHeight coin
-                         Nothing   -> case Map.lookup op intrablockHeights of
-                           Just ih  -> ih
-                           Nothing  -> height -- missing UTXO: fail elsewhere
-                    ) (txInputs tx)
-                  prevMTPs    = map (const 0) prevHeights -- unused (height-only gate)
-                  enforceBIP68 = bip68Active net height
-                  lock = calculateSequenceLocks tx prevHeights prevMTPs enforceBIP68
-                  -- Height-only check: ignore `slMinTime` (see comment
-                  -- above).  Mirrors `checkSequenceLocks` heightOk branch.
-                  heightOk = slMinHeight lock < 0
-                          || fromIntegral height > slMinHeight lock
-              unless heightOk $
-                Left "bad-txns-nonfinal"
-              -- Add this tx's outputs to intra-block height map.
-              let txid = computeTxId tx
-                  newOuts = Map.fromList
-                    [ (OutPoint txid (fromIntegral i), height)
-                    | i <- [0 .. length (txOutputs tx) - 1]
-                    ]
-              go (Map.union newOuts intrablockHeights) rest
-    go Map.empty txns
+  -- Steps 7b, 8, 9 are UTXO-dependent (ConnectBlock-level) checks.  When
+  -- skipConnectChecks=True (side-branch acceptance via submitBlock), they are
+  -- deferred to the reorg-connect path, which reconstructs the fork-point UTXO
+  -- view via DisconnectBlock before calling validateFullBlock again.
+  -- Bitcoin Core AcceptBlock (validation.cpp:4350) runs only CheckBlock +
+  -- ContextualCheckBlock; ConnectBlock (validation.cpp:2295) is called only
+  -- during ActivateBestChainStep against the correct UTXO view.
+  unless skipConnectChecks $ do
+    -- 7b. BIP-68 SequenceLocks: check relative lock-times for every non-coinbase
+    --     transaction BEFORE script verification.
+    --     Reference: Bitcoin Core validation.cpp ConnectBlock() ~line 2549:
+    --       prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+    --       if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex))
+    --         state.Invalid(..., "bad-txns-nonfinal", ...)
+    --     Core fires this BEFORE CheckInputScripts (script-eval) so that the
+    --     rejection is bad-txns-nonfinal, not block-script-verify-flag-failed.
+    --     Ordering fix: clearbit/camlcoin/haskoin all had this after script-eval.
+    when csvActive $ do
+      -- Process transactions in order, accumulating intra-block output heights
+      -- so that same-block spends (height = current block height = 0 confirmations)
+      -- are handled correctly.  Same-block prevouts are NOT in utxoCoinMap (which
+      -- only covers the pre-block chainstate), so we fall back to height for them.
+      --
+      -- BIP-68 IBD-context wiring: we evaluate ONLY the height-based component
+      -- of BIP-68 here and defer the time-based component to the BIP-112
+      -- OP_CSV opcode at script-eval time.  Reason: the IBD-side caller does
+      -- not have a real `getMtpAtHeight` callback wired through
+      -- `validateFullBlock`, so the previous code passed `prevBlockMTP`
+      -- (tip's parent MTP) for every input.  But `calculateSequenceLocks`
+      -- expects the MTP at `coin_height - 1` per input (a different,
+      -- typically much older, value).  With the wrong wiring, any v2 tx
+      -- with a non-zero time-based BIP-68 lock_value is unconditionally
+      -- rejected (`min_time = prev_block_mtp + lock - 1` always exceeds the
+      -- tip's `prev_block_mtp`).  That's a deferred self-wedge: the live
+      -- haskoin chainstate (April 12) was synced before this code path
+      -- existed, but a fresh IBD on this binary will wedge at the first
+      -- post-CSV block carrying a time-based BIP-68 input.
+      --
+      -- Until per-input MTP-at-height is plumbed through, the safe
+      -- parity-with-Core behaviour is to skip the time-based branch here
+      -- and rely on BIP-112 (OP_CSV) inside the script interpreter — which
+      -- has full per-tx context and already runs for every input.
+      -- Height-based locks remain enforced: `coinHeight` from the UTXO row
+      -- is correct for both external and intra-block prevouts, so the
+      -- height comparison is byte-for-byte the same as Core.
+      --
+      -- Reference: clearbit's matching resolution (clearbit 44454c1,
+      -- src/validation.zig) and rustoshi's matching resolution (this wave).
+      -- Cross-impl audit:
+      -- CORE-PARITY-AUDIT/_ibd-context-wiring-cross-impl-2026-05-05.md.
+      -- Bitcoin Core split: validation.cpp::CheckSequenceLocks (full
+      -- chain-access path) + script/interpreter.cpp OP_CSV (script-eval
+      -- with full per-tx sighash context).
+      let prevBlockMTP = csMedianTime cs
+          go :: Map OutPoint Word32 -> [Tx] -> Either String ()
+          go _ [] = Right ()
+          go intrablockHeights (tx:rest)
+            | isCoinbase tx = do
+                -- Add coinbase outputs to intra-block map (height = current block)
+                let txid = computeTxId tx
+                    newOuts = Map.fromList
+                      [ (OutPoint txid (fromIntegral i), height)
+                      | i <- [0 .. length (txOutputs tx) - 1]
+                      ]
+                go (Map.union newOuts intrablockHeights) rest
+            | otherwise = do
+                -- Build prevHeights for the BIP-68 height-based check.  We
+                -- pass MTP=0 for every input because we ONLY consume
+                -- `slMinHeight` from the resulting `SequenceLock`; the
+                -- time-based component is deferred to OP_CSV (see comment
+                -- above).
+                let prevHeights = map (\inp ->
+                      let op = txInPrevOutput inp
+                      in case Map.lookup op utxoCoinMap of
+                           Just coin -> coinHeight coin
+                           Nothing   -> case Map.lookup op intrablockHeights of
+                             Just ih  -> ih
+                             Nothing  -> height -- missing UTXO: fail elsewhere
+                      ) (txInputs tx)
+                    prevMTPs    = map (const 0) prevHeights -- unused (height-only gate)
+                    enforceBIP68 = bip68Active net height
+                    lock = calculateSequenceLocks tx prevHeights prevMTPs enforceBIP68
+                    -- Height-only check: ignore `slMinTime` (see comment
+                    -- above).  Mirrors `checkSequenceLocks` heightOk branch.
+                    heightOk = slMinHeight lock < 0
+                            || fromIntegral height > slMinHeight lock
+                unless heightOk $
+                  Left "bad-txns-nonfinal"
+                -- Add this tx's outputs to intra-block height map.
+                let txid = computeTxId tx
+                    newOuts = Map.fromList
+                      [ (OutPoint txid (fromIntegral i), height)
+                      | i <- [0 .. length (txOutputs tx) - 1]
+                      ]
+                go (Map.union newOuts intrablockHeights) rest
+      go Map.empty txns
 
-  -- 8. Validate all transactions and compute total fees.
-  -- skipScripts=True means per-input script evaluation is bypassed for this
-  -- block (assumevalid ancestor path).  All other checks still run.
-  -- KNOWN PITFALL: Intra-block spending - txs can spend outputs from earlier txs
-  -- We update UTXO set during validation, not after
-  totalFees <- validateBlockTransactions flags skipScripts txns utxoMap
+    -- 8. Validate all transactions and compute total fees.
+    -- skipScripts=True means per-input script evaluation is bypassed for this
+    -- block (assumevalid ancestor path).  All other checks still run.
+    -- KNOWN PITFALL: Intra-block spending - txs can spend outputs from earlier txs
+    -- We update UTXO set during validation, not after
+    totalFees <- validateBlockTransactions flags skipScripts txns utxoMap
 
-  -- 8. Coinbase value must not exceed reward + fees
-  -- Network-aware subsidy: regtest halves at 150 (Core
-  -- kernel/chainparams.cpp:535), mainnet/testnet at 210000 — see
-  -- 'blockRewardForNet'.  Using the value-blind 'blockReward' here computed the
-  -- wrong cap on regtest (a regtest-only bad-cb-amount false-accept).
-  let maxCoinbase = blockRewardForNet net height + totalFees
-      coinbaseValue = sum $ map txOutValue (txOutputs (head txns))
-  when (coinbaseValue > maxCoinbase) $
-    Left "Coinbase value exceeds allowed amount"
+    -- 8. Coinbase value must not exceed reward + fees
+    -- Network-aware subsidy: regtest halves at 150 (Core
+    -- kernel/chainparams.cpp:535), mainnet/testnet at 210000 — see
+    -- 'blockRewardForNet'.  Using the value-blind 'blockReward' here computed the
+    -- wrong cap on regtest (a regtest-only bad-cb-amount false-accept).
+    let maxCoinbase = blockRewardForNet net height + totalFees
+        coinbaseValue = sum $ map txOutValue (txOutputs (head txns))
+    when (coinbaseValue > maxCoinbase) $
+      Left "Coinbase value exceeds allowed amount"
 
-  -- 9. Check sigop cost limit (BIP-141 weight-based counting)
-  -- Legacy/P2SH sigops cost WITNESS_SCALE_FACTOR (4) each, witness sigops cost 1 each
-  let SigOpCost totalSigOpCost = getBlockSigOpCost block utxoMap flags
-  when (totalSigOpCost > maxBlockSigOpsCost) $
-    Left "Block exceeds sigop cost limit"
+    -- 9. Check sigop cost limit (BIP-141 weight-based counting)
+    -- Legacy/P2SH sigops cost WITNESS_SCALE_FACTOR (4) each, witness sigops cost 1 each
+    let SigOpCost totalSigOpCost = getBlockSigOpCost block utxoMap flags
+    when (totalSigOpCost > maxBlockSigOpsCost) $
+      Left "Block exceeds sigop cost limit"
 
   -- 10. Witness commitment / unexpected-witness validation.
   -- Core: ContextualCheckBlock calls CheckWitnessMalleation unconditionally
@@ -2838,7 +2859,7 @@ validateFullBlockIO db net cs skipScripts block utxoCoinMap = do
   bip30Result <- checkBIP30 db net (csHeight cs + 1) block
   case bip30Result of
     Left err -> return (Left err)
-    Right () -> return $ validateFullBlock net cs skipScripts block utxoCoinMap
+    Right () -> return $ validateFullBlock net cs skipScripts False block utxoCoinMap
 
 -- | Convert ConsensusFlags to a Word32 for use as a cache key.
 consensusFlagsToWord32 :: ConsensusFlags -> Word32
@@ -5426,7 +5447,7 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader blk))
                           0 parentMTP
                           (consensusFlagsAtHeight net (ceHeight ce))
-      case validateFullBlock net cs False blk spentUtxos of
+      case validateFullBlock net cs False False blk spentUtxos of
         Left err -> return $ Left $
           "reorg connect: block " ++ show bh
           ++ " (height " ++ show (ceHeight ce)
@@ -5534,7 +5555,7 @@ connectChain net cache db hc fromHash toHash = do
             let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader block))
                                 0 prevBlockMTP
                                 (consensusFlagsAtHeight net (ceHeight ce))
-            case validateFullBlock net cs False block spentCoins of
+            case validateFullBlock net cs False False block spentCoins of
               Left err -> return $ Left $
                 "reorg connect: block " ++ show (ceHash ce)
                 ++ " (height " ++ show (ceHeight ce)
