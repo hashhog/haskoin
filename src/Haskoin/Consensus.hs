@@ -269,6 +269,16 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         CoinsViewDB(..), newCoinsViewDB,
                         CoinsViewCache(..), newCoinsViewCache, cacheFlush, defaultCacheSize,
                         putBlockStatus, newUTXOCache, flushCache)
+-- Secondary-index fan-out on the disconnect/reorg path (txindex /
+-- blockfilterindex / coinstatsindex).  Index.hs depends only on
+-- Types/Crypto/Storage/MuHash (never on Consensus), so importing it here
+-- introduces no module cycle.  This is what lets 'reorgAtomic' revert the
+-- coinstatsindex on every disconnected block (CustomRemove) and re-append
+-- it on every reconnected block (CustomAppend) during an invalidateblock-
+-- triggered reorg, exactly like the submitBlock side-branch reorg path
+-- (BlockTemplate.doSideBranchReorg).
+import Haskoin.Index (IndexManager,
+                      indexManagerConnectBlock, indexManagerDisconnectBlock)
 
 --------------------------------------------------------------------------------
 -- Network Configuration
@@ -5042,8 +5052,9 @@ cacheFindSibling cache txid = atomically $ do
 --   + 'buildConnectBlockOps' (which write the chain pointers + height
 --   index inside the same batch) closes the hole.
 performReorg :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+             -> Maybe IndexManager
              -> BlockHash -> BlockHash -> IO (Either String ())
-performReorg net cache db hc oldTip newTip = do
+performReorg net cache db hc mIdxMgr oldTip newTip = do
   -- Find the fork point
   mFork <- findForkPoint hc oldTip newTip
   case mFork of
@@ -5073,7 +5084,7 @@ performReorg net cache db hc oldTip newTip = do
               case conListRes of
                 Left err -> return (Left err)
                 Right conList ->
-                  reorgAtomic net cache db hc disList conList
+                  reorgAtomic net cache db hc mIdxMgr disList conList
 
 -- | The atomic core shared by 'performReorg' and 'invalidateBlock'.
 --
@@ -5090,10 +5101,22 @@ performReorg net cache db hc oldTip newTip = do
 -- reorg aborts with the batch never committed (disk stays at the
 -- pre-reorg state).
 reorgAtomic :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+            -> Maybe IndexManager
+               -- ^ Secondary indexes (txindex / blockfilterindex /
+               --   coinstatsindex).  When present, each disconnected block
+               --   is reverted from every enabled index
+               --   ('indexManagerDisconnectBlock' ->
+               --   'coinStatsIndexRevertBlock') and each reconnected block
+               --   re-appended ('indexManagerConnectBlock' ->
+               --   'coinStatsIndexAppendBlock'), so the per-height
+               --   coinstatsindex MuHash tracks the ACTIVE chain across an
+               --   invalidateblock-triggered reorg, exactly like the
+               --   submitBlock side-branch path
+               --   ('BlockTemplate.doSideBranchReorg').
             -> [(ChainEntry, Block)]   -- ^ disconnect list (oldTip first)
             -> [(ChainEntry, Block)]   -- ^ connect list (fork-child first)
             -> IO (Either String ())
-reorgAtomic net cache db hc disList conList = do
+reorgAtomic net cache db hc mIdxMgr disList conList = do
   let totalDepth = length disList + length conList
   if totalDepth > maxReorgDepth
     then return $ Left $
@@ -5154,6 +5177,46 @@ reorgAtomic net cache db hc disList conList = do
                         writeTVar (hcTip hc) nt
                         writeTVar (hcHeight hc) (ceHeight nt)
                       Nothing -> return ()
+
+                  -- Phase E — mirror the reorg into any opted-in secondary
+                  -- indexes (txindex / blockfilterindex / coinstatsindex),
+                  -- block-by-block, so they track the ACTIVE chain.  Done
+                  -- AFTER the atomic disk commit (so each reconnected block's
+                  -- undo record is already on disk for the connect-side
+                  -- append) and AFTER the header-chain pointer flip (so the
+                  -- per-height index records line up with the new chain).
+                  --
+                  -- For the invalidateblock case 'conList' is empty, so this
+                  -- is a pure disconnect: every disconnected block calls
+                  -- 'indexManagerDisconnectBlock' -> 'coinStatsIndexRevertBlock',
+                  -- which restores the running MuHash3072 accumulator + counts
+                  -- to the pre-block state.  Without this the index would
+                  -- retain the now-disconnected chain's coins and serve a
+                  -- corrupted 'gettxoutsetinfo muhash H' after the reorg.
+                  --
+                  -- Order matters and mirrors 'doSideBranchReorg':
+                  --   * disconnect oldTip-first -> fork-child last
+                  --     ('disList' order), so each delete pulls the index tip
+                  --     back one height at a time;
+                  --   * connect fork-child first -> newTip last ('conList'
+                  --     order), so each append chains off the previous height.
+                  -- Reference: bitcoin-core/src/index/coinstatsindex.cpp
+                  -- (CustomRemove on disconnect, CustomAppend on reconnect)
+                  -- and blockfilterindex.cpp (chained filter headers).
+                  case mIdxMgr of
+                    Nothing -> return ()
+                    Just im -> do
+                      forM_ disList $ \(ce, _) ->
+                        indexManagerDisconnectBlock im (ceHeight ce)
+                      forM_ conList $ \(ce, blk) -> do
+                        let bh = ceHash ce
+                        mUndo <- getUndoData db bh
+                        case mUndo of
+                          Just u ->
+                            indexManagerConnectBlock im blk
+                              (udBlockUndo u) bh (ceHeight ce)
+                          Nothing -> return ()
+
                   return (Right ())
 
 -- | Resolve the new in-memory tip after a reorg.  For a non-empty
@@ -5812,8 +5875,9 @@ findDescendants hc blockHash = do
 --
 -- Returns Left on error, Right on success (possibly with a new tip).
 invalidateBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
-invalidateBlock net cache db hc blockHash = do
+invalidateBlock net cache db hc mIdxMgr blockHash = do
   entries <- readTVarIO (hcEntries hc)
   tip <- readTVarIO (hcTip hc)
 
@@ -5883,7 +5947,15 @@ invalidateBlock net cache db hc blockHash = do
               case disListRes of
                 Left err -> return $ Left (InvalidateDisconnectFailed err)
                 Right disList -> do
-                  disconnectResult <- reorgAtomic net cache db hc disList []
+                  -- Thread the IndexManager into the atomic disconnect so the
+                  -- coinstatsindex (and blockfilterindex/txindex) is reverted
+                  -- for every disconnected block — the bug this fix closes:
+                  -- the invalidateblock reorg path previously did NOT fan out
+                  -- to the IndexManager, so 'coinStatsIndexRevertBlock' was
+                  -- never called and the running MuHash retained the
+                  -- disconnected chain-A blocks (corrupted muhash@H after a
+                  -- reorg).
+                  disconnectResult <- reorgAtomic net cache db hc mIdxMgr disList []
                   case disconnectResult of
                     Left err -> return $ Left (InvalidateDisconnectFailed err)
                     Right () -> do
@@ -5894,8 +5966,9 @@ invalidateBlock net cache db hc blockHash = do
                       case Map.lookup targetHash entries of
                         Nothing -> return $ Left (InvalidateBlockNotFound targetHash)
                         Just _newTipEntry -> do
-                          -- Try to activate the best valid chain
-                          activateBestChain net cache db hc
+                          -- Try to activate the best valid chain (a heavier
+                          -- side branch, if any) — also index-aware.
+                          activateBestChain net cache db hc mIdxMgr
                           return (Right ())
             else do
               -- Block not on active chain: no UTXO state to rewind, mark all.
@@ -5950,8 +6023,9 @@ isFailedStatus _                 = False
 -- @StatusValid@ in haskoin's status model
 -- ('addSideBranchHeader' is the only path that sets 'StatusValid';
 -- 'addHeader' parks a new header at 'StatusHeaderValid').
-activateBestChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain -> IO ()
-activateBestChain net cache db hc = do
+activateBestChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                  -> Maybe IndexManager -> IO ()
+activateBestChain net cache db hc mIdxMgr = do
   currentTip <- readTVarIO (hcTip hc)
   best       <- findBestCandidate hc
   case best of
@@ -5968,7 +6042,7 @@ activateBestChain net cache db hc = do
               modifyTVar' (hcCandidates hc)
                 (Set.delete (mkCandidateKey bestCe))
           Just _fork ->
-            void $ performReorg net cache db hc (ceHash currentTip) (ceHash bestCe)
+            void $ performReorg net cache db hc mIdxMgr (ceHash currentTip) (ceHash bestCe)
 
 -- | Pull the best valid tip candidate from the sorted set, applying
 -- Core's ancestor-walk @BLOCK_HAVE_DATA@ + invalidation gate
@@ -6057,8 +6131,9 @@ findBestCandidate hc = do
 --
 -- Returns Left on error, Right on success.
 reconsiderBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
-reconsiderBlock net cache db hc blockHash = do
+reconsiderBlock net cache db hc mIdxMgr blockHash = do
   entries <- readTVarIO (hcEntries hc)
   invalidated <- readTVarIO (hcInvalidated hc)
 
@@ -6083,6 +6158,7 @@ reconsiderBlock net cache db hc blockHash = do
           -- Remove from manually-invalidated set
           atomically $ modifyTVar' (hcInvalidated hc) (Set.delete blockHash)
 
-          -- Try to activate the best chain (may include reconsidered blocks)
-          activateBestChain net cache db hc
+          -- Try to activate the best chain (may include reconsidered blocks);
+          -- index-aware so any reorg keeps the secondary indexes in sync.
+          activateBestChain net cache db hc mIdxMgr
           return (Right ())

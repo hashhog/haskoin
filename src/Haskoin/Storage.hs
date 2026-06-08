@@ -184,6 +184,7 @@ module Haskoin.Storage
   , dumpTxOutSetFromDB
   , computeUtxoHash
   , computeUtxoMuHash
+  , putTxOutSer
   , verifySnapshot
   , validateSnapshotCoins
     -- ** Core-compatible compression primitives

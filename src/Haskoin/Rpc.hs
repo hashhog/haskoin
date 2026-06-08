@@ -261,7 +261,9 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        IndexManager(..), BlockFilterEntry(..),
                        BlockFilterIndexDB(..),
                        blockFilterIndexGet, blockFilterIndexTipHeight,
-                       blockFilterIndexLastHeader)
+                       blockFilterIndexLastHeader,
+                       CoinStats(..), CoinStatsEntry(..),
+                       coinStatsIndexGet, coinStatsIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
@@ -2167,7 +2169,7 @@ handleInvalidateBlock server params = do
           (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
         Just bh -> do
           result <- invalidateBlock (rsNetwork server) (rsUTXOCache server)
-                      (rsDB server) (rsHeaderChain server) bh
+                      (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left InvalidateGenesis -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "Cannot invalidate genesis block") Null
@@ -2201,7 +2203,7 @@ handleReconsiderBlock server params = do
           (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
         Just bh -> do
           result <- reconsiderBlock (rsNetwork server) (rsUTXOCache server)
-                      (rsDB server) (rsHeaderChain server) bh
+                      (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left (ReconsiderBlockNotFound _) -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError "Block not found") Null
@@ -2382,8 +2384,9 @@ handleGetIndexInfo server params = do
           return [("basic block filter index", h)]
       csEntry <- case imCoinStatsIndex im of
         Nothing -> return []
-        Just _  -> do
-          h <- readIORef (imSyncHeight im)
+        Just cs -> do
+          mTip <- coinStatsIndexTipHeight cs
+          h <- maybe (readIORef (imSyncHeight im)) return mTip
           return [("coinstatsindex", h)]
       return (txEntry ++ bfEntry ++ csEntry)
   let -- An index is synced when its best height equals (or exceeds) the
@@ -11886,26 +11889,94 @@ handleGetTxOutSetInfo server params = do
         Nothing -> "hash_serialized_3"
       -- Core (rpc/blockchain.cpp::gettxoutsetinfo) treats a present,
       -- non-null @hash_or_height@ (param index 1) as a request for a
-      -- specific block. We have no coinstatsindex, so the only base-mode
-      -- behaviour we must reproduce is the @hash_serialized_3@ rejection:
-      -- @RPC_INVALID_PARAMETER (-8) "hash_serialized_3 hash type cannot be
-      -- queried for a specific block"@.
-      heightGiven = case extractParam params 1 :: Maybe Value of
-        Just Null -> False
-        Just _    -> True
-        Nothing   -> False
-  case hashType of
-    "hash_serialized_3"
-      | heightGiven -> return $ RpcResponse Null
+      -- specific (historical) block, served from the coinstatsindex.
+      mHashOrHeight = case extractParam params 1 :: Maybe Value of
+        Just Null -> Nothing
+        Just v    -> Just v
+        Nothing   -> Nothing
+  case mHashOrHeight of
+    -- ── At-tip path (no hash_or_height) — unchanged. ────────────────────
+    Nothing -> case hashType of
+      "hash_serialized_3" -> compute True False
+      "muhash"            -> compute False True
+      "none"              -> compute False False
+      other               -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParameter
+          (T.pack ("'" ++ other ++ "' is not a valid hash_type"))) Null
+    -- ── At-height path (hash_or_height present) — coinstatsindex. ────────
+    -- Order of guards matches Core rpc/blockchain.cpp::gettxoutsetinfo:
+    --   1. index disabled      -> -8 "Querying specific block heights
+    --                                 requires coinstatsindex"
+    --   2. hash_serialized_3    -> -8 "hash_serialized_3 hash type cannot
+    --                                 be queried for a specific block"
+    --   3. unknown hash_type    -> -8 "'<x>' is not a valid hash_type"
+    --   4. resolve + serve from the per-height index entry.
+    Just hoh -> case rsIndexMgr server >>= imCoinStatsIndex of
+      Nothing -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParameter
+          "Querying specific block heights requires coinstatsindex") Null
+      Just csIdx -> case hashType of
+        "hash_serialized_3" -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParameter
             "hash_serialized_3 hash type cannot be queried for a specific block") Null
-      | otherwise   -> compute True False
-    "muhash"            -> compute False True
-    "none"              -> compute False False
-    other               -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParameter
-        (T.pack ("'" ++ other ++ "' is not a valid hash_type"))) Null
+        "muhash" -> serveAtHeight csIdx hoh True
+        "none"   -> serveAtHeight csIdx hoh False
+        other    -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            (T.pack ("'" ++ other ++ "' is not a valid hash_type"))) Null
   where
+    -- Resolve a hash_or_height JSON value to an active-chain height, then
+    -- serve the per-height coinstatsindex entry as Core would.  Mirrors
+    -- Core's ParseHashOrHeight + g_coin_stats_index->LookUpStats.
+    serveAtHeight csIdx hoh wantMuHash = do
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      let tipH = ceHeight tip
+      mResolved <- case hoh of
+        -- Integer form: a block height.
+        Number _ -> case extractParam params 1 :: Maybe Int of
+          Just h
+            | h < 0 ->
+                return (Left (rpcInvalidParameter, T.pack ("Target block height " ++ show h ++ " is negative")))
+            | fromIntegral h > tipH ->
+                return (Left (rpcInvalidParameter, T.pack ("Target block height " ++ show h ++ " after current tip " ++ show tipH)))
+            | otherwise -> return (Right (fromIntegral h :: Word32))
+          Nothing -> return (Left (rpcInvalidParameter, "Invalid block height"))
+        -- String form: a block hash.  Resolve to its active-chain height.
+        String s -> case parseHash s of
+          Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
+          Just bh -> do
+            entries <- readTVarIO (hcEntries (rsHeaderChain server))
+            case Map.lookup bh entries of
+              Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
+              Just ce -> return (Right (ceHeight ce))
+        _ -> return (Left (rpcInvalidParameter, "hash_or_height must be a height (int) or block hash (hex string)"))
+      case mResolved of
+        Left (code, msg) -> return $ RpcResponse Null
+          (toJSON $ RpcError code msg) Null
+        Right h -> do
+          mEntry <- coinStatsIndexGet csIdx h
+          case mEntry of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInternalError
+                (T.pack ("Unable to read UTXO set from coinstatsindex at height " ++ show h))) Null
+            Just entry -> do
+              let cs        = cseStats entry
+                  muHashEnc =
+                    if wantMuHash
+                      then pair "muhash" (text (showHash256 (cseMuHash entry)))
+                      else mempty
+                  -- Field order mirrors Core's index-served gettxoutsetinfo:
+                  -- height, bestblock, txouts, bogosize, [muhash],
+                  -- total_amount.  The 'transactions'/'disk_size' fields are
+                  -- intentionally omitted (Core omits them when index_used).
+                  enc = pairs $
+                          pair "height"       (AE.word32 h)                                   <>
+                          pair "bestblock"    (text (showHash (cseBlockHash entry)))          <>
+                          pair "txouts"       (AE.word64 (csOutputCount cs))                  <>
+                          pair "bogosize"     (AE.word64 (csBogoSize cs))                     <>
+                          muHashEnc                                                           <>
+                          pair "total_amount" (btcAmountEnc (fromIntegral (csTotalAmount cs)))
+              return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
     compute wantSerialized wantMuHash = do
       tip       <- readTVarIO (hcTip (rsHeaderChain server))
       let tipH    = ceHeight tip
