@@ -57,6 +57,7 @@ import Haskoin.Index (IndexManager(..), IndexConfig(..),
                        indexManagerInitFromDB, indexManagerBackfill,
                        indexManagerConnectBlock,
                        blockFilterIndexTipHeight,
+                       coinStatsIndexTipHeight,
                        -- FIX-86: serving compact filters over P2P.
                        BlockFilterIndexDB(..),
                        BlockFilterEntry(..),
@@ -140,6 +141,20 @@ data NodeOptions = NodeOptions
     -- recompute from stored block + undo data — O(tip_height) per
     -- request from genesis.  Reference:
     -- bitcoin-core/src/index/blockfilterindex.cpp.
+  , noCoinStatsIndex     :: !Bool
+    -- ^ @-coinstatsindex=1@: maintain a per-height UTXO-set statistics
+    -- index (running MuHash3072 + coin counts/amounts) over the active
+    -- chain.  When 'True', every successful @connectBlock@ inserts the
+    -- block's created outputs and removes its spent coins (via real undo
+    -- data) from a running accumulator, finalizes a per-height muhash
+    -- digest + counts snapshot to RocksDB, and on disconnect/reorg
+    -- reverses the block from the previous height's snapshot.  This is
+    -- what lets @gettxoutsetinfo "muhash" <height|hash>@ answer for a
+    -- HISTORICAL block (Bitcoin Core parity), not just the tip.  When
+    -- 'False' (default, Core parity), a non-tip @hash_or_height@ errors
+    -- with @-8 "Querying specific block heights requires coinstatsindex"@.
+    -- Reference: bitcoin-core/src/index/coinstatsindex.cpp +
+    -- kernel/coinstats.cpp.
   , noAsmapFile          :: !(Maybe FilePath)
     -- ^ @-asmap=\<file\>@: path to an ASMap bytecode file for
     -- ASN-based IP bucketing.  When set, haskoin loads the file at
@@ -299,6 +314,14 @@ parseNodeOptions = NodeOptions
                 \through this index in O(1)/O(count). On startup \
                 \haskoin backfills any gap between the index tip \
                 \and the chain tip before opening the network port.")
+  <*> switch (long "coinstatsindex"
+        <> help "Maintain a per-height UTXO-set statistics index \
+                \(Bitcoin Core -coinstatsindex=1, default off). When \
+                \enabled, every connected block updates a running \
+                \MuHash3072 + coin counts/amounts, and gettxoutsetinfo \
+                \can answer for a HISTORICAL block height or hash, not \
+                \just the tip. On startup haskoin backfills any gap \
+                \between the index tip and the chain tip.")
   <*> optional (strOption (long "asmap" <> metavar "FILE"
         <> help "Path to an ASMap bytecode file for ASN-based IP \
                 \bucketing (Bitcoin Core -asmap=<file>). When set, \
@@ -555,6 +578,12 @@ applyConfigOverlay cm n = n
   , noBlockFilterIndex = if not (noBlockFilterIndex n)
                           then Daemon.configLookupBool "blockfilterindex" False cm
                           else noBlockFilterIndex n
+  -- @coinstatsindex = 1@ in haskoin.conf flips on the per-height UTXO
+  -- statistics index just like the CLI flag does (Bitcoin Core
+  -- -coinstatsindex=1).
+  , noCoinStatsIndex = if not (noCoinStatsIndex n)
+                          then Daemon.configLookupBool "coinstatsindex" False cm
+                          else noCoinStatsIndex n
   , noAsmapFile  = case noAsmapFile n of
                      Just _  -> noAsmapFile n
                      Nothing -> Daemon.configLookup "asmap" cm
@@ -1307,49 +1336,53 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- callsite as an opt-in null instead of a global, so the
     -- non-indexed default case stays a single 'Nothing' branch with
     -- zero overhead per block.
-    mIdxMgr <- if noBlockFilterIndex
+    mIdxMgr <- if noBlockFilterIndex || noCoinStatsIndex
       then do
-        let idxConfig = defaultIndexConfig { icBlockFilterIndex = True }
+        let idxConfig = defaultIndexConfig
+              { icBlockFilterIndex = noBlockFilterIndex
+              , icCoinStatsIndex   = noCoinStatsIndex
+              }
         im <- newIndexManager db idxConfig
         indexManagerInitFromDB im
-        -- Seed the GENESIS filter (height 0) when the filter index is
-        -- empty.  BIP-157 chains every block's filter header off the
-        -- PARENT block's filter header, and the genesis block's parent
-        -- header is the all-zero hash.  Core indexes the genesis filter
-        -- (blockfilterindex starts at block 0); if we skip it, height 1
-        -- would (incorrectly) chain off 0x00..00 instead of the genesis
-        -- filter header, breaking every subsequent block's header.  The
-        -- genesis block has no spent prevouts, so its undo data is the
-        -- empty 'BlockUndo []'.  Idempotent: only runs when the index
-        -- has no entry yet (fresh datadir), so a restart never re-seeds.
-        -- Reference: bitcoin-core/src/index/blockfilterindex.cpp
-        -- BlockFilterIndex::CustomAppend (called for the genesis block).
-        case imBlockFilterIndex im of
-          Nothing  -> return ()
-          Just bfIdx0 -> do
-            mTip0 <- blockFilterIndexTipHeight bfIdx0
-            case mTip0 of
-              Just _  -> return ()  -- already has entries (incl. genesis)
-              Nothing -> do
-                -- Use 'netGenesisBlock' directly: the genesis block body
-                -- is NOT persisted via 'putBlock' at chain init (only its
-                -- header is), so 'getBlock db genHash' would return
-                -- Nothing.  The in-memory genesis block carries the
-                -- coinbase output(s) the filter is built over.
-                let genBlk  = netGenesisBlock net
-                    genHash = computeBlockHash (blockHeader genBlk)
-                putStrLn "BlockFilterIndex: seeding genesis filter (height 0)"
-                indexManagerConnectBlock im genBlk (BlockUndo []) genHash 0
-        -- Backfill from index tip to chain tip. We capture the
-        -- pre-backfill height so the operator log line is accurate
-        -- regardless of whether init read genesis or a populated
-        -- meta record. Empty index → start at 1; populated → resume
-        -- at last+1.
-        startTip <- maybe (return 0) (\bf -> fromMaybe 0 <$> blockFilterIndexTipHeight bf)
-                          (imBlockFilterIndex im)
+        -- Seed GENESIS (height 0) for any enabled index that is empty.
+        --
+        -- BlockFilterIndex: BIP-157 chains every block's filter header off
+        -- the PARENT's filter header, and genesis's parent is the all-zero
+        -- hash; Core indexes the genesis filter (blockfilterindex starts at
+        -- block 0), so height 1 must chain off the genesis filter header.
+        --
+        -- CoinStatsIndex: the running accumulator + per-height records must
+        -- have a height-0 base (the EMPTY UTXO set — Core never adds the
+        -- genesis coinbase to the UTXO set; 'coinStatsIndexAppendBlock'
+        -- skips genesis outputs), so height 1 resumes from a correct base.
+        --
+        -- The genesis block has no spent prevouts, so its undo data is the
+        -- empty 'BlockUndo []'.  Idempotent: only runs when an index has no
+        -- entry yet (fresh datadir), so a restart never re-seeds.
+        -- Reference: bitcoin-core/src/index/{blockfilterindex,coinstatsindex}.cpp
+        -- CustomAppend (called for the genesis block).
+        bfEmpty <- case imBlockFilterIndex im of
+          Nothing  -> return False
+          Just bfIdx0 -> maybe True (const False) <$> blockFilterIndexTipHeight bfIdx0
+        csEmpty <- case imCoinStatsIndex im of
+          Nothing  -> return False
+          Just csIdx0 -> maybe True (const False) <$> coinStatsIndexTipHeight csIdx0
+        when (bfEmpty || csEmpty) $ do
+          -- Use 'netGenesisBlock' directly: the genesis block body is NOT
+          -- persisted via 'putBlock' at chain init (only its header is), so
+          -- 'getBlock db genHash' would return Nothing.  The in-memory
+          -- genesis block carries the coinbase output(s) the indexes need.
+          let genBlk  = netGenesisBlock net
+              genHash = computeBlockHash (blockHeader genBlk)
+          putStrLn "Index: seeding genesis (height 0)"
+          indexManagerConnectBlock im genBlk (BlockUndo []) genHash 0
+        -- Backfill from the LOWEST enabled-index tip to the chain tip
+        -- (indexManagerInitFromDB seeded imSyncHeight to that min).
+        -- 'indexManagerBackfill' populates every enabled index per block.
+        startTip <- readIORef (imSyncHeight im)
         bestH <- readTVarIO (hcHeight hc)
         when (bestH > startTip) $
-          putStrLn $ "BlockFilterIndex: backfilling from height "
+          putStrLn $ "Index: backfilling from height "
                   ++ show (startTip + 1) ++ " to " ++ show bestH
         let getBlockData h = do
               mHash <- getBlockHeight db h
@@ -1364,7 +1397,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                     _ -> return Nothing
         finalH <- indexManagerBackfill im getBlockData bestH
         when (bestH > startTip) $
-          putStrLn $ "BlockFilterIndex: backfill complete, indexed up to "
+          putStrLn $ "Index: backfill complete, indexed up to "
                   ++ show finalH
         return (Just im)
       else return Nothing

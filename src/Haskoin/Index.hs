@@ -76,6 +76,9 @@ module Haskoin.Index
   , coinStatsIndexPut
   , coinStatsIndexGet
   , coinStatsIndexAppendBlock
+  , coinStatsIndexRevertBlock
+  , coinStatsIndexInitFromDB
+  , coinStatsIndexTipHeight
   , coinStatsApplyCoin
   , coinStatsRemoveCoin
     -- * Index Manager
@@ -131,12 +134,13 @@ import qualified Data.ByteArray as BA
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256)
 import Haskoin.Storage (HaskoinDB(..), BlockUndo(..), TxUndo(..), TxInUndo(..),
-                         Coin(..), BlockHeight, integerToBS, bsToInteger)
+                         Coin(..), BlockHeight, integerToBS, bsToInteger,
+                         putTxOutSer, isUnspendable)
 import Haskoin.MuHash (MuHash3072(..), Num3072(..),
                        muHashEmpty, muHashInsert, muHashRemove,
                        muHashCombine, muHashFinalize,
                        num3072ToBytes, num3072Multiply, num3072GetInverse,
-                       muHashToNum3072)
+                       muHashToNum3072, muHashSerialize, muHashDeserialize)
 import qualified Haskoin.MuHash as MuHash
 
 -- | Back-compat alias: the old 'Index.num3072FromBytes' was the
@@ -1135,62 +1139,171 @@ instance Serialize CoinStatsEntry where
 -- | CoinStatsIndex database handle
 data CoinStatsIndexDB = CoinStatsIndexDB
   { csiDB     :: !HaskoinDB
-  , csiPrefix :: !Word8             -- ^ Key prefix: 'M'
-  , csiMuHash :: !(IORef MuHash3072)   -- ^ Running MuHash state
+  , csiPrefix :: !Word8             -- ^ Per-height entry key prefix: 'M'
+  , csiMuHash :: !(IORef MuHash3072)   -- ^ Running MuHash3072 accumulator
   , csiStats  :: !(IORef CoinStats)    -- ^ Running statistics
+  , csiTipHeight :: !(IORef (Maybe BlockHeight))
+    -- ^ Highest indexed height (the index "best block"), or 'Nothing'
+    -- when empty.  Mirrors blockfilterindex's @bfiTipHeight@.
   }
 
--- | CoinStatsIndex key prefix
+-- | CoinStatsIndex key prefixes.
+--
+-- @0x4D@ ('M') keys the per-height @CoinStatsEntry@ records (block hash +
+-- finalized muhash digest + counts/amounts), keyed @M || height(BE32)@.
+-- @0x6D@ ('m') keys the per-height MuHash3072 accumulator SNAPSHOT (the
+-- full 768-byte numerator||denominator), keyed @m || height(BE32)@.  The
+-- finalized digest in the entry is one-way, so the accumulator snapshot is
+-- what 'coinStatsIndexRevertBlock' resumes from on a disconnect/reorg.
+-- @0x6E@ ('n') keys a single meta record: tip height + serialized running
+-- accumulator + running stats, read once at startup to resume incremental
+-- maintenance without replaying.
 prefixCoinStats :: Word8
 prefixCoinStats = 0x4D  -- 'M'
+
+prefixCoinStatsMuHash :: Word8
+prefixCoinStatsMuHash = 0x6D  -- 'm'
+
+prefixCoinStatsMeta :: Word8
+prefixCoinStatsMeta = 0x6E  -- 'n'
 
 -- | Empty coin stats
 emptyCoinStats :: CoinStats
 emptyCoinStats = CoinStats 0 0 0 0 0 0 0 0 0 0 0
+
+-- | Big-endian Word32 encoder for height-keyed coin-stats records (ascending
+-- iterator order, same scheme blockfilterindex uses).
+csiToBE32 :: Word32 -> ByteString
+csiToBE32 w = BS.pack
+  [ fromIntegral ((w `shiftR` 24) .&. 0xff)
+  , fromIntegral ((w `shiftR` 16) .&. 0xff)
+  , fromIntegral ((w `shiftR` 8) .&. 0xff)
+  , fromIntegral (w .&. 0xff)
+  ]
 
 -- | Create a new CoinStatsIndex database
 newCoinStatsIndexDB :: HaskoinDB -> IO CoinStatsIndexDB
 newCoinStatsIndexDB db = do
   muHashRef <- newIORef muHashEmpty
   statsRef <- newIORef emptyCoinStats
+  tipRef <- newIORef Nothing
   return CoinStatsIndexDB
     { csiDB = db
     , csiPrefix = prefixCoinStats
     , csiMuHash = muHashRef
     , csiStats = statsRef
+    , csiTipHeight = tipRef
     }
 
 -- | Put a coin stats entry
 coinStatsIndexPut :: CoinStatsIndexDB -> BlockHeight -> CoinStatsEntry -> IO ()
 coinStatsIndexPut CoinStatsIndexDB{..} height entry = do
-  let key = BS.cons csiPrefix (toBE32 height)
+  let key = BS.cons csiPrefix (csiToBE32 height)
   R.put (dbHandle csiDB) (dbWriteOpts csiDB) key (encode entry)
-  where
-    toBE32 w = BS.pack
-      [ fromIntegral ((w `shiftR` 24) .&. 0xff)
-      , fromIntegral ((w `shiftR` 16) .&. 0xff)
-      , fromIntegral ((w `shiftR` 8) .&. 0xff)
-      , fromIntegral (w .&. 0xff)
-      ]
 
 -- | Get a coin stats entry
 coinStatsIndexGet :: CoinStatsIndexDB -> BlockHeight -> IO (Maybe CoinStatsEntry)
 coinStatsIndexGet CoinStatsIndexDB{..} height = do
-  let key = BS.cons csiPrefix (toBE32 height)
+  let key = BS.cons csiPrefix (csiToBE32 height)
   mval <- R.get (dbHandle csiDB) (dbReadOpts csiDB) key
   return $ mval >>= either (const Nothing) Just . decode
-  where
-    toBE32 w = BS.pack
-      [ fromIntegral ((w `shiftR` 24) .&. 0xff)
-      , fromIntegral ((w `shiftR` 16) .&. 0xff)
-      , fromIntegral ((w `shiftR` 8) .&. 0xff)
-      , fromIntegral (w .&. 0xff)
-      ]
 
--- | Serialize an outpoint + coin for MuHash
+-- | Persist the per-height MuHash3072 accumulator snapshot (768 bytes:
+-- numerator||denominator).  Restored by 'coinStatsIndexRevertBlock' to
+-- resume the accumulator as of a previous height (the finalized digest in
+-- the entry is one-way and cannot be resumed).
+coinStatsMuHashPut :: CoinStatsIndexDB -> BlockHeight -> MuHash3072 -> IO ()
+coinStatsMuHashPut CoinStatsIndexDB{..} height mh =
+  let key = BS.cons prefixCoinStatsMuHash (csiToBE32 height)
+  in R.put (dbHandle csiDB) (dbWriteOpts csiDB) key (muHashSerialize mh)
+
+-- | Read back a per-height MuHash3072 accumulator snapshot.
+coinStatsMuHashGet :: CoinStatsIndexDB -> BlockHeight -> IO (Maybe MuHash3072)
+coinStatsMuHashGet CoinStatsIndexDB{..} height = do
+  let key = BS.cons prefixCoinStatsMuHash (csiToBE32 height)
+  mval <- R.get (dbHandle csiDB) (dbReadOpts csiDB) key
+  return $ mval >>= either (const Nothing) Just . muHashDeserialize
+
+-- | Delete a per-height MuHash3072 accumulator snapshot (reorg rewind).
+coinStatsMuHashDelete :: CoinStatsIndexDB -> BlockHeight -> IO ()
+coinStatsMuHashDelete CoinStatsIndexDB{..} height =
+  R.delete (dbHandle csiDB) (dbWriteOpts csiDB)
+    (BS.cons prefixCoinStatsMuHash (csiToBE32 height))
+
+-- | Persisted CoinStatsIndex meta record: tip height + running accumulator
+-- (768 bytes) + running stats.  Read once on startup.
+data CoinStatsMeta = CoinStatsMeta
+  { csmTipHeight :: !BlockHeight
+  , csmMuHash    :: !MuHash3072
+  , csmStats     :: !CoinStats
+  }
+
+instance Serialize CoinStatsMeta where
+  put CoinStatsMeta{..} = do
+    putWord32le csmTipHeight
+    putByteString (muHashSerialize csmMuHash)
+    put csmStats
+  get = do
+    h  <- getWord32le
+    mb <- getBytes (2 * 384)
+    mh <- either fail return (muHashDeserialize mb)
+    st <- get
+    return (CoinStatsMeta h mh st)
+
+-- | Persist the index meta record (tip + running accumulator + stats).
+coinStatsMetaPut :: CoinStatsIndexDB -> BlockHeight -> MuHash3072 -> CoinStats -> IO ()
+coinStatsMetaPut CoinStatsIndexDB{..} height mh stats =
+  let key = BS.singleton prefixCoinStatsMeta
+  in R.put (dbHandle csiDB) (dbWriteOpts csiDB) key
+       (encode (CoinStatsMeta height mh stats))
+
+-- | Read the persisted index meta record.
+coinStatsMetaGet :: CoinStatsIndexDB -> IO (Maybe CoinStatsMeta)
+coinStatsMetaGet CoinStatsIndexDB{..} = do
+  let key = BS.singleton prefixCoinStatsMeta
+  mval <- R.get (dbHandle csiDB) (dbReadOpts csiDB) key
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Read the in-memory index tip height (highest indexed height).
+coinStatsIndexTipHeight :: CoinStatsIndexDB -> IO (Maybe BlockHeight)
+coinStatsIndexTipHeight = readIORef . csiTipHeight
+
+-- | Restore the running accumulator + stats + tip from the persisted meta
+-- record on startup.  Absent (fresh datadir) -> empty/Nothing, and a
+-- subsequent 'indexManagerBackfill' rebuilds from height 1 forward.
+coinStatsIndexInitFromDB :: CoinStatsIndexDB -> IO ()
+coinStatsIndexInitFromDB db@CoinStatsIndexDB{..} = do
+  mMeta <- coinStatsMetaGet db
+  case mMeta of
+    Just CoinStatsMeta{..} -> do
+      writeIORef csiMuHash csmMuHash
+      writeIORef csiStats csmStats
+      writeIORef csiTipHeight (Just csmTipHeight)
+    Nothing -> do
+      writeIORef csiMuHash muHashEmpty
+      writeIORef csiStats emptyCoinStats
+      writeIORef csiTipHeight Nothing
+
+-- | Serialize an outpoint + coin into Bitcoin Core's @TxOutSer@ per-coin
+-- commitment record (kernel/coinstats.cpp): @outpoint || LE32(height<<1 |
+-- coinbase) || LE64(value) || varint(scriptLen) || script@.  This is the
+-- byte-exact element fed to the MuHash3072 accumulator, identical to the
+-- record 'Haskoin.Storage.computeUtxoMuHash' (the @gettxoutsetinfo muhash@
+-- tip path) streams, so the per-height running muhash equals Core's
+-- @gettxoutsetinfo muhash H@ byte-for-byte.
 serializeCoinForHash :: OutPoint -> Coin -> ByteString
-serializeCoinForHash outpoint coin =
-  encode outpoint `BS.append` encode coin
+serializeCoinForHash outpoint coin = runPut (putTxOutSer outpoint coin)
+
+-- | Per-coin bogosize, byte-identical to Bitcoin Core
+-- kernel/coinstats.cpp @GetBogoSize@:
+--   32 (txid) + 4 (vout) + 4 (height|coinbase) + 8 (amount)
+--   + 2 (scriptPubKey len) + scriptPubKey.size().
+-- Must match the @gettxoutsetinfo@ tip path's bogosize formula
+-- ('handleGetTxOutSetInfo' in "Haskoin.Rpc") so historical and tip
+-- queries agree.
+coinBogoSize :: Coin -> Word64
+coinBogoSize coin =
+  fromIntegral (32 + 4 + 4 + 8 + 2 + BS.length (txOutScript (coinTxOut coin)))
 
 -- | Apply a coin to MuHash (when UTXO is created)
 coinStatsApplyCoin :: CoinStatsIndexDB -> OutPoint -> Coin -> IO ()
@@ -1201,7 +1314,7 @@ coinStatsApplyCoin db outpoint coin = do
   modifyIORef' (csiStats db) $ \stats -> stats
     { csOutputCount = csOutputCount stats + 1
     , csTotalAmount = csTotalAmount stats + txOutValue (coinTxOut coin)
-    , csBogoSize = csBogoSize stats + fromIntegral (BS.length (txOutScript (coinTxOut coin)))
+    , csBogoSize = csBogoSize stats + coinBogoSize coin
     }
 
 -- | Remove a coin from MuHash (when UTXO is spent)
@@ -1213,57 +1326,116 @@ coinStatsRemoveCoin db outpoint coin = do
   modifyIORef' (csiStats db) $ \stats -> stats
     { csOutputCount = csOutputCount stats - 1
     , csTotalAmount = csTotalAmount stats - txOutValue (coinTxOut coin)
-    , csBogoSize = csBogoSize stats - fromIntegral (BS.length (txOutScript (coinTxOut coin)))
+    , csBogoSize = csBogoSize stats - coinBogoSize coin
     }
 
--- | Append a block to the coin stats index
+-- | Append a block to the coin stats index, maintaining the running
+-- MuHash3072 accumulator + counts INCREMENTALLY (insert created outputs,
+-- remove spent coins via real undo data) and persisting:
+--
+--   * the per-height @CoinStatsEntry@ (block hash + finalized muhash digest
+--     + counts/amounts) under @M || height@;
+--   * the per-height MuHash3072 accumulator SNAPSHOT under @m || height@
+--     so 'coinStatsIndexRevertBlock' can restore the exact accumulator as
+--     of the previous height on a disconnect/reorg;
+--   * the meta record (tip + running accumulator + running stats) so a
+--     restart resumes incremental maintenance without replaying.
+--
+-- The coin-spendability filter is 'Haskoin.Storage.isUnspendable' — the
+-- SAME predicate 'connectBlockAt' uses to decide what lands in the
+-- @PrefixUTXO@ keyspace — so the index's UTXO set is byte-identical to
+-- what the @gettxoutsetinfo@ tip path iterates.
+--
+-- Genesis (height 0) contributes NOTHING to the commitment: Bitcoin Core's
+-- consensus never adds the genesis coinbase to the UTXO set, so the muhash
+-- and counts at height 0 are over the empty set (matching Core's
+-- coinstatsindex, which starts accumulating at height 1).
 coinStatsIndexAppendBlock :: CoinStatsIndexDB -> Block -> BlockUndo -> BlockHash -> BlockHeight -> IO ()
 coinStatsIndexAppendBlock db block undo blockHash height = do
-  stats <- readIORef (csiStats db)
+  -- Track total block subsidy (informational; not gated).
+  modifyIORef' (csiStats db) $ \s ->
+    s { csTotalSubsidy = csTotalSubsidy s + getBlockSubsidy height }
 
-  -- Calculate block subsidy
-  let subsidy = getBlockSubsidy height
-      newStats = stats { csTotalSubsidy = csTotalSubsidy stats + subsidy }
+  -- Process new outputs (skip unspendable, skip genesis entirely so the
+  -- genesis coinbase is excluded from the UTXO commitment, matching Core).
+  unless (height == 0) $
+    forM_ (zip [0..] (blockTxns block)) $ \(txIdx, tx) -> do
+      let isCoinbase = txIdx == (0 :: Int)
+      forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, txout) -> do
+        unless (isUnspendable (txOutScript txout)) $ do
+          let outpoint = OutPoint (computeTxId tx) (fromIntegral outIdx)
+              coin = Coin txout height isCoinbase
+          coinStatsApplyCoin db outpoint coin
+          modifyIORef' (csiStats db) $ \s ->
+            if isCoinbase
+            then s { csTotalCoinbaseAmount = csTotalCoinbaseAmount s + fromIntegral (txOutValue txout) }
+            else s { csTotalNewOutputs = csTotalNewOutputs s + fromIntegral (txOutValue txout) }
 
-  -- Process new outputs (skip unspendable)
-  forM_ (zip [0..] (blockTxns block)) $ \(txIdx, tx) -> do
-    let isCoinbase = txIdx == (0 :: Int)
-    forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, txout) -> do
-      unless (isUnspendable (txOutScript txout)) $ do
-        let outpoint = OutPoint (computeTxId tx) (fromIntegral outIdx)
-            coin = Coin txout height isCoinbase
-        coinStatsApplyCoin db outpoint coin
+  -- Process spent outputs (from real undo data).  The undo record carries
+  -- the spent coin's creating height + coinbase flag, so the removed
+  -- @TxOutSer@ record is byte-identical to the one inserted when the coin
+  -- was created — required for MuHash exactness.
+  unless (height == 0) $
+    forM_ (zip [1..] (buTxUndo undo)) $ \(txIdx, TxUndo prevOuts) -> do
+      let tx = blockTxns block !! txIdx
+      forM_ (zip [0..] prevOuts) $ \(inputIdx, TxInUndo spentOut spentHeight spentCoinbase) -> do
+        let input = txInputs tx !! inputIdx
+            outpoint = txInPrevOutput input
+            coin = Coin spentOut spentHeight spentCoinbase
+        coinStatsRemoveCoin db outpoint coin
         modifyIORef' (csiStats db) $ \s ->
-          if isCoinbase
-          then s { csTotalCoinbaseAmount = csTotalCoinbaseAmount s + fromIntegral (txOutValue txout) }
-          else s { csTotalNewOutputs = csTotalNewOutputs s + fromIntegral (txOutValue txout) }
+          s { csTotalPrevoutSpent = csTotalPrevoutSpent s + fromIntegral (txOutValue spentOut) }
 
-  -- Process spent outputs (from undo data)
-  forM_ (zip [1..] (buTxUndo undo)) $ \(txIdx, TxUndo prevOuts) -> do
-    let tx = blockTxns block !! txIdx
-    forM_ (zip [0..] prevOuts) $ \(inputIdx, TxInUndo spentOut spentHeight spentCoinbase) -> do
-      let input = txInputs tx !! inputIdx
-          outpoint = txInPrevOutput input
-          coin = Coin spentOut spentHeight spentCoinbase
-      coinStatsRemoveCoin db outpoint coin
-      modifyIORef' (csiStats db) $ \s ->
-        s { csTotalPrevoutSpent = csTotalPrevoutSpent s + fromIntegral (txOutValue spentOut) }
-
-  -- Save entry
+  -- Finalize + persist: per-height entry, per-height accumulator snapshot,
+  -- and the running meta record.  Update the in-memory tip pointer.
   finalMuHash <- readIORef (csiMuHash db)
   finalStats <- readIORef (csiStats db)
   let muHashResult = muHashFinalize finalMuHash
       entry = CoinStatsEntry blockHash muHashResult finalStats
   coinStatsIndexPut db height entry
-  writeIORef (csiStats db) finalStats
+  coinStatsMuHashPut db height finalMuHash
+  coinStatsMetaPut db height finalMuHash finalStats
+  writeIORef (csiTipHeight db) (Just height)
   where
-    isUnspendable script =
-      not (BS.null script) && BS.head script == 0x6a  -- OP_RETURN
-
     getBlockSubsidy h =
       let halvings = h `div` 210000
           subsidy = 5000000000 `shiftR` fromIntegral halvings
       in if halvings >= 64 then 0 else subsidy
+
+-- | Revert a previously-connected block from the coin stats index on a
+-- disconnect/reorg.  Restores the running accumulator + stats to the state
+-- AS OF @height - 1@ from the per-height snapshot + entry, deletes the
+-- @height@ records, and pulls the in-memory tip back to @height - 1@.
+--
+-- Reference: bitcoin-core/src/index/coinstatsindex.cpp
+-- CoinStatsIndex::CustomRewind (which replays per-block reverse-deltas);
+-- here the per-height accumulator snapshot lets us restore in O(1) instead.
+coinStatsIndexRevertBlock :: CoinStatsIndexDB -> BlockHeight -> IO ()
+coinStatsIndexRevertBlock db height = do
+  let prevHeight = height - 1
+  -- Delete this height's per-height records.
+  R.delete (dbHandle (csiDB db)) (dbWriteOpts (csiDB db))
+    (BS.cons (csiPrefix db) (csiToBE32 height))
+  coinStatsMuHashDelete db height
+  if height == 0
+    then do
+      writeIORef (csiMuHash db) muHashEmpty
+      writeIORef (csiStats db) emptyCoinStats
+      writeIORef (csiTipHeight db) Nothing
+      R.delete (dbHandle (csiDB db)) (dbWriteOpts (csiDB db))
+        (BS.singleton prefixCoinStatsMeta)
+    else do
+      -- Restore the accumulator + stats from the previous height's snapshot
+      -- + entry (the finalized digest is one-way, so we resume the full
+      -- 768-byte accumulator).
+      mPrevMh    <- coinStatsMuHashGet db prevHeight
+      mPrevEntry <- coinStatsIndexGet db prevHeight
+      let prevMh    = fromMaybe muHashEmpty mPrevMh
+          prevStats = maybe emptyCoinStats cseStats mPrevEntry
+      writeIORef (csiMuHash db) prevMh
+      writeIORef (csiStats db) prevStats
+      writeIORef (csiTipHeight db) (Just prevHeight)
+      coinStatsMetaPut db prevHeight prevMh prevStats
 
 --------------------------------------------------------------------------------
 -- Index Manager
@@ -1367,6 +1539,13 @@ indexManagerDisconnectBlock im height = do
   case imBlockFilterIndex im of
     Nothing -> return ()
     Just bfIdx -> blockFilterIndexDelete bfIdx height
+  -- CoinStatsIndex: reverse the connected block (restore the running
+  -- accumulator + counts from the previous height's snapshot and rewind the
+  -- index tip). Real undo data is NOT needed on the reverse path because the
+  -- per-height accumulator snapshot already captures the pre-block state.
+  case imCoinStatsIndex im of
+    Nothing -> return ()
+    Just csIdx -> coinStatsIndexRevertBlock csIdx height
   -- Pull imSyncHeight back to (height - 1) so a subsequent
   -- 'indexManagerBackfill' resumes from the correct point. Using
   -- saturating subtraction so disconnecting genesis (an
@@ -1384,14 +1563,26 @@ indexManagerDisconnectBlock im height = do
 -- their accumulator in 'indexManagerBackfill' ('CoinStatsIndex').
 indexManagerInitFromDB :: IndexManager -> IO ()
 indexManagerInitFromDB im = do
-  case imBlockFilterIndex im of
-    Nothing -> return ()
+  -- BlockFilterIndex: load its persisted chain pointer + tip height.
+  bfTip <- case imBlockFilterIndex im of
+    Nothing -> return Nothing
     Just bfIdx -> do
       loadBlockFilterIndexState bfIdx
-      mTip <- blockFilterIndexTipHeight bfIdx
-      case mTip of
-        Just h  -> writeIORef (imSyncHeight im) h
-        Nothing -> writeIORef (imSyncHeight im) 0
+      blockFilterIndexTipHeight bfIdx
+  -- CoinStatsIndex: restore its running accumulator + counts + tip height.
+  csTip <- case imCoinStatsIndex im of
+    Nothing -> return Nothing
+    Just csIdx -> do
+      coinStatsIndexInitFromDB csIdx
+      coinStatsIndexTipHeight csIdx
+  -- 'imSyncHeight' is the lockstep "indexes caught up to here" pointer used
+  -- by 'indexManagerBackfill'.  Seed it to the LOWEST enabled-index tip so a
+  -- lagging index gets backfilled (an index ahead of another would otherwise
+  -- skip the gap).  When no enabled index has any on-disk state, start at 0.
+  let tips = [ t | Just t <- [bfTip, csTip] ]
+  case tips of
+    [] -> writeIORef (imSyncHeight im) 0
+    _  -> writeIORef (imSyncHeight im) (minimum tips)
 
 -- | Walk the active chain forward from @imSyncHeight + 1@ to
 -- @bestHeight@ and populate every enabled index. Used at startup
