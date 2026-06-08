@@ -180,7 +180,7 @@ spec = do
         -- activateBestChain will find orphanEntry as best candidate, call
         -- findForkPoint (returns Nothing), then silently return ().
         -- Tip must not be corrupted.
-        activateBestChain regtest (error "no cache") (error "no db") hc
+        activateBestChain regtest (error "no cache") (error "no db") hc Nothing
           `shouldReturn` ()
         tip1 <- readTVarIO (hcTip hc)
         ceHash tip1 `shouldBe` ceHash tip0
@@ -260,7 +260,7 @@ spec = do
         atomically $ modifyTVar_ (hcEntries hc) (Map.insert h1 e1)
         -- absorb the "no db" exception; in-memory STM already committed
         _ <- (try :: IO (Either InvalidateError ()) -> IO (Either SomeException (Either InvalidateError ()))) $
-               invalidateBlock regtest (error "no cache") (error "no db") hc h1
+               invalidateBlock regtest (error "no cache") (error "no db") hc Nothing h1
         entries <- readTVarIO (hcEntries hc)
         -- FIXED: off-chain target is StatusFailedValid (direct invalidation flag)
         fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusFailedValid
@@ -285,7 +285,7 @@ spec = do
         atomically $ modifyTVar_ (hcEntries hc) (Map.insert h1 e1 . Map.insert h2 e2)
         -- absorb the "no db" exception; STM already committed before DB write
         _ <- (try :: IO (Either InvalidateError ()) -> IO (Either SomeException (Either InvalidateError ()))) $
-               invalidateBlock regtest (error "no cache") (error "no db") hc h1
+               invalidateBlock regtest (error "no cache") (error "no db") hc Nothing h1
         entries <- readTVarIO (hcEntries hc)
         -- FIXED: h1 is directly invalidated → StatusFailedValid
         fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusFailedValid
@@ -313,7 +313,7 @@ spec = do
                 reconsiderBlock regtest
                   (error "no cache")
                   (error "no db")
-                  hc h2
+                  hc Nothing h2
         entries <- readTVarIO (hcEntries hc)
         -- BUG: h1 should be cleared by Core's ancestor walk, but haskoin
         -- only calls findDescendants(h2) which does NOT include h1
@@ -336,7 +336,7 @@ spec = do
                 reconsiderBlock regtest
                   (error "no cache")
                   (error "no db")
-                  hc h1
+                  hc Nothing h1
         entries <- readTVarIO (hcEntries hc)
         -- After reconsider, the status is StatusHeaderValid.
         -- activateBestChain will then pick this as a tip candidate (BUG-3).
@@ -609,7 +609,7 @@ spec = do
         Set.member (mkCandidateKey e1) csBefore `shouldBe` True
         _ <- (try :: IO (Either InvalidateError ())
                    -> IO (Either SomeException (Either InvalidateError ()))) $
-                invalidateBlock regtest (error "no cache") (error "no db") hc h1
+                invalidateBlock regtest (error "no cache") (error "no db") hc Nothing h1
         csAfter <- readTVarIO (hcCandidates hc)
         Set.member (mkCandidateKey e1) csAfter `shouldBe` False
 
@@ -748,7 +748,7 @@ spec = do
             h1 = mkBlockHash 60
             e1 = mkEntry h1 genesisHash 1 genesisWork StatusValid  -- equal work
         insertEntry hc e1
-        activateBestChain regtest (error "no cache") (error "no db") hc
+        activateBestChain regtest (error "no cache") (error "no db") hc Nothing
           `shouldReturn` ()
         tip1 <- readTVarIO (hcTip hc)
         ceHash tip1 `shouldBe` ceHash tip0
@@ -790,13 +790,13 @@ spec = do
     describe "InvalidateBlock: error guards" $ do
       it "genesis block cannot be invalidated" $ do
         hc <- freshChain
-        result <- invalidateBlock regtest (error "no cache") (error "no db") hc genesisHash
+        result <- invalidateBlock regtest (error "no cache") (error "no db") hc Nothing genesisHash
         result `shouldBe` Left InvalidateGenesis
 
       it "unknown block hash returns Left InvalidateBlockNotFound" $ do
         hc <- freshChain
         let unknownHash = mkBlockHash 200
-        result <- invalidateBlock regtest (error "no cache") (error "no db") hc unknownHash
+        result <- invalidateBlock regtest (error "no cache") (error "no db") hc Nothing unknownHash
         result `shouldBe` Left (InvalidateBlockNotFound unknownHash)
 
     ---------------------------------------------------------------------------
@@ -806,12 +806,12 @@ spec = do
       it "block not in index returns Left ReconsiderBlockNotFound" $ do
         hc <- freshChain
         let unknownHash = mkBlockHash 201
-        result <- reconsiderBlock regtest (error "no cache") (error "no db") hc unknownHash
+        result <- reconsiderBlock regtest (error "no cache") (error "no db") hc Nothing unknownHash
         result `shouldBe` Left (ReconsiderBlockNotFound unknownHash)
 
       it "valid (non-invalidated) block returns Left ReconsiderNotInvalidated" $ do
         hc <- freshChain
-        result <- reconsiderBlock regtest (error "no cache") (error "no db") hc genesisHash
+        result <- reconsiderBlock regtest (error "no cache") (error "no db") hc Nothing genesisHash
         result `shouldBe` Left (ReconsiderNotInvalidated genesisHash)
 
     ---------------------------------------------------------------------------
