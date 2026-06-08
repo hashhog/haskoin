@@ -184,7 +184,7 @@ spec = do
 
         cache <- newUTXOCache db 100000
 
-        res <- invalidateBlock net cache db hc b1Hash
+        res <- invalidateBlock net cache db hc Nothing b1Hash
         res `shouldBe` Right ()
 
         -- THE REGRESSION ASSERTION: the on-disk best-block pointer must
@@ -218,7 +218,7 @@ spec = do
         insertActiveTip hc e1
 
         cache <- newUTXOCache db 100000
-        _ <- invalidateBlock net cache db hc b1Hash
+        _ <- invalidateBlock net cache db hc Nothing b1Hash
 
         -- Genesis height entry is untouched; height-1 must no longer name
         -- the invalidated block.  buildDisconnectBlockOps rewrites the
@@ -264,7 +264,7 @@ spec = do
         insertActiveTip hc e1
 
         cache <- newUTXOCache db 100000
-        _ <- invalidateBlock net cache db hc b1Hash
+        _ <- invalidateBlock net cache db hc Nothing b1Hash
 
         mDisk <- getBestBlockHash db
         tip   <- readTVarIO (hcTip hc)
