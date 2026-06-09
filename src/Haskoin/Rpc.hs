@@ -67,6 +67,8 @@ module Haskoin.Rpc
   , handleGetBlockFromPeer
   , decideGetBlockFromPeer
   , lookupPeerByIndex
+    -- * gettxout confirmation depth (exported for testing)
+  , gettxoutConfirmations
     -- * getorphantxs (Bitcoin Core v28) — handler + pure core (exported for testing)
   , handleGetOrphanTxs
   , orphanTxsToJSON
@@ -2000,13 +2002,22 @@ handleGetBlockHeader server params = do
 --
 -- scriptPubKey shape: { "asm", "desc", "hex", "address"?, "type" }
 -- value: Core's fixed-decimal format (8 fractional digits, no sci notation).
--- bestblock / confirmations: stripped by the byte-identity harness; emitted
---   as empty-string / 0 placeholders so the wire shape is complete.
 --
--- When the UTXO is absent from haskoin's chainstate (assumevalid IBD gap),
--- fall back to the W59/W60 Core-proxy pattern: forward to Bitcoin Core
--- (port 8332) and return the raw "result" bytes verbatim so numeric
--- formatting is preserved byte-for-byte.
+-- bestblock: the hash of the active (validated) chain tip — Core reads
+--   @coins_view->GetBestBlock()@ which is the UTXO-set's best block, i.e.
+--   the active tip (rpc/blockchain.cpp:1244-1245).  We read the same
+--   validated tip via 'getValidatedChainTip', matching
+--   'handleGetBestBlockHash'.
+-- confirmations: @tip->nHeight - coin->nHeight + 1@
+--   (rpc/blockchain.cpp:1249), where the coin height is the UTXO's
+--   creation height ('ueHeight').  A freshly-mined-in-tip UTXO therefore
+--   reports 1 confirmation, exactly like Core.
+--
+-- The entire response is served from haskoin's own chainstate: the UTXO
+-- (value / scriptPubKey / coinbase / height) from the UTXO cache and the
+-- tip from the validated header/DB chain.  There is no Bitcoin-Core proxy
+-- fallback — an absent UTXO returns JSON null, exactly as Core's
+-- @UniValue::VNULL@ (rpc/blockchain.cpp:1242).
 --
 -- Reference: bitcoin-core/src/rpc/blockchain.cpp gettxout.
 handleGetTxOut :: RpcServer -> Value -> IO RpcResponse
@@ -2021,19 +2032,22 @@ handleGetTxOut server params = do
               net = rsNetwork server
           mEntry <- lookupUTXO (rsUTXOCache server) op
           case mEntry of
-            Nothing -> do
-              -- Not in local chainstate — try Core proxy.
-              mRaw <- fetchGetTxOutFromCore hexTxid vout
-              case mRaw of
-                Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
-                Nothing  -> return $ RpcResponse Null Null Null
+            -- Not in local chainstate — the UTXO is spent or never existed.
+            -- Core returns JSON null (UniValue::VNULL) in this case.
+            Nothing -> return $ RpcResponse Null Null Null
             Just entry -> do
+              -- Read the active (validated) chain tip for bestblock +
+              -- confirmation depth, entirely from haskoin's own chainstate.
+              tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
               let txout   = ueOutput entry
                   script  = txOutScript txout
                   sats    = fromIntegral (txOutValue txout) :: Int64
+                  -- confirmations = tip_height - coin_height + 1
+                  -- (rpc/blockchain.cpp:1249), via the pure helper.
+                  confs   = gettxoutConfirmations (ceHeight tip) (ueHeight entry)
                   enc     = pairs $
-                              pair "bestblock"    (text ("" :: Text)) <>
-                              pair "confirmations" (AE.int (0 :: Int)) <>
+                              pair "bestblock"    (text (showHash (ceHash tip))) <>
+                              pair "confirmations" (AE.int confs) <>
                               pair "value"        (btcAmountEnc sats) <>
                               pair "scriptPubKey" (psbtSpkEnc net script) <>
                               pair "coinbase"     (AE.bool (ueCoinbase entry))
@@ -2042,52 +2056,21 @@ handleGetTxOut server params = do
     _ -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid or vout parameter") Null
 
--- | Forward a gettxout request to the local Bitcoin Core node (port 8332)
--- and return the raw "result" bytes, preserving numeric formatting exactly.
--- Uses the W59/W60 Core-proxy pattern (raw TCP, extractResultRaw scanner).
-fetchGetTxOutFromCore :: Text -> Word32 -> IO (Maybe BS.ByteString)
-fetchGetTxOutFromCore txidHex vout = do
-  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
-                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
-                    ]
-  mCookie <- tryReadCookies cookiePaths
-  case mCookie of
-    Nothing     -> return Nothing
-    Just cookie -> doFetchGetTxOut txidHex vout cookie
+-- | gettxout confirmation depth: @tip_height - coin_height + 1@.
+--
+-- Mirrors Core @pindex->nHeight - coin->nHeight + 1@
+-- (bitcoin-core/src/rpc/blockchain.cpp:1249).  Both heights are 'Word32';
+-- the subtraction is performed in 'Int' to (a) mirror Core's signed
+-- arithmetic and (b) avoid Word32 underflow if a stale-tip read ever made
+-- @coin_height > tip_height@ (which would otherwise wrap to ~4 billion).
+-- A UTXO created in the current tip block reports exactly 1 confirmation.
+gettxoutConfirmations :: Word32 -> Word32 -> Int
+gettxoutConfirmations tipHeight coinHeight =
+  fromIntegral tipHeight - fromIntegral coinHeight + 1
 
-doFetchGetTxOut :: Text -> Word32 -> BS.ByteString -> IO (Maybe BS.ByteString)
-doFetchGetTxOut txidHex vout cookie =
-  (doFetchGetTxOut' txidHex vout cookie)
-    `catch` \(_ :: SomeException) -> return Nothing
-
-doFetchGetTxOut' :: Text -> Word32 -> BS.ByteString -> IO (Maybe BS.ByteString)
-doFetchGetTxOut' txidHex vout cookie = do
-  let port    = 8332 :: Int
-      credB64 = B64.encode cookie
-      body    = "{\"jsonrpc\":\"1.0\",\"method\":\"gettxout\",\"params\":[\"" <>
-                TE.encodeUtf8 txidHex <> "\"," <> C8.pack (show vout) <> "],\"id\":1}"
-      bodyLen = BS.length body
-      req     = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
-                "\r\nContent-Type: application/json\r\nContent-Length: " <>
-                C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
-                credB64 <> "\r\n\r\n" <> body
-  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
-                       (Just "127.0.0.1") (Just (show port))
-  case addrs of
-    [] -> return Nothing
-    (a:_) -> do
-      sock <- socket AF_INET Stream defaultProtocol
-      mResult <- (do
-        connect sock (addrAddress a)
-        SockBS.sendAll sock req
-        chunks <- recvAllLarge sock
-        close sock
-        let respBody = skipHttpHeaders (BS.concat chunks)
-        return $! extractResultRaw respBody)
-        `catch` \(_ :: SomeException) -> do
-          (close sock) `catch` \(_ :: SomeException) -> return ()
-          return Nothing
-      return mResult
+-- (The former fetchGetTxOutFromCore / doFetchGetTxOut Core-proxy fallback
+-- was removed: gettxout is now served entirely from haskoin's own
+-- chainstate.  See 'handleGetTxOut'.)
 
 -- | Get the current difficulty
 -- Uses Core-parity %.16g formatting (difficultyStr / FFI snprintf) so that

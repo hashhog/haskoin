@@ -142,6 +142,7 @@ import qualified W165ReorgAtomicSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
+import qualified W169GetTxOutConfirmationsSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22837,6 +22838,10 @@ main = hspec $ do
   -- already-downloaded error ladder + a genuine getdata(MSG_BLOCK|WITNESS) sent
   -- to the resolved peer (getpeerinfo id == getConnectedPeers index).
   W168GetBlockFromPeerSpec.spec
+
+  -- W169 gettxout: confirmation depth (tip_height - coin_height + 1) +
+  -- chainstate-served bestblock/confirmations (drops the Core proxy).
+  W169GetTxOutConfirmationsSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
