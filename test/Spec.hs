@@ -141,6 +141,7 @@ import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
+import qualified W168GetBlockFromPeerSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22831,6 +22832,11 @@ main = hspec $ do
   -- + all-bits/all-hashes consumed + upfront bounds in the partial-merkle-tree
   -- extractor (mirrors Core merkleblock.cpp TraverseAndExtract/ExtractMatches).
   W167VerifyTxOutProofHardeningSpec.spec
+
+  -- W168 getblockfrompeer (Bitcoin Core v24): header-missing / peer-not-found /
+  -- already-downloaded error ladder + a genuine getdata(MSG_BLOCK|WITNESS) sent
+  -- to the resolved peer (getpeerinfo id == getConnectedPeers index).
+  W168GetBlockFromPeerSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
