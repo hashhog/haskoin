@@ -179,6 +179,7 @@ test-suite haskoin-test
                , W165ReorgAtomicSpec
                , W166WalletPersistSpec
                , W167VerifyTxOutProofHardeningSpec
+               , W168GetBlockFromPeerSpec
                , Paths_haskoin
                , Bip21Spec
                , Fix64TlsSpec
