@@ -63,6 +63,10 @@ module Haskoin.Rpc
   , deploymentInfoForEntry
   , softforksFromEntry
   , mempoolErrorToRpcResponse
+    -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
+  , handleGetBlockFromPeer
+  , decideGetBlockFromPeer
+  , lookupPeerByIndex
     -- * getorphantxs (Bitcoin Core v28) — handler + pure core (exported for testing)
   , handleGetOrphanTxs
   , orphanTxsToJSON
@@ -283,8 +287,9 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
 import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          PeerState(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
-                         sendMessage,
-                         Message(..), Inv(..), InvVector(..), InvType(..),
+                         sendMessage, requestFromPeer,
+                         Message(..), Inv(..), GetData(..),
+                         InvVector(..), InvType(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, hasService, ServiceFlag(..),
                          disconnectPeer, addNodeConnect, sockAddrToHostPort,
@@ -1106,6 +1111,7 @@ handleRpcRequest server req = do
     -- Network RPCs
     "getnetworkinfo"       -> handleGetNetworkInfo server
     "getpeerinfo"          -> handleGetPeerInfo server
+    "getblockfrompeer"     -> handleGetBlockFromPeer server params
     "getconnectioncount"   -> handleGetConnectionCount server
     "addnode"              -> handleAddNode server params
 
@@ -3321,6 +3327,97 @@ handleGetPeerInfo server = do
            pair "transport_protocol_type" (text "v1")                                   <>
            pair "session_id"              (text "")                                     <>
            mappedASPair
+
+-- | getblockfrompeer "blockhash" peer_id
+--
+-- Ask a specific connected peer for a block we already have the header for.
+-- Mirrors Bitcoin Core's @getblockfrompeer@ (rpc/blockchain.cpp) +
+-- @PeerManagerImpl::FetchBlock@ (net_processing.cpp:1960):
+--
+--   1. The block's header must already be known (Core: @LookupBlockIndex@
+--      miss → @RPC_MISC_ERROR(-1)@ "Block header missing",
+--      blockchain.cpp:547). We test this with 'getBlockHeader' on the DB,
+--      the same lookup 'handleGetBlockHeader' uses.
+--   2. Resolve @peer_id@ to a connected peer (Core: @GetPeerRef@ miss →
+--      @RPC_MISC_ERROR(-1)@ "Peer does not exist", net_processing.cpp:1966).
+--      The peer-id convention matches 'handleGetPeerInfo': the id is the
+--      0-based index into 'getConnectedPeers' (which zips @[0..]@ over the
+--      same list), so an operator's @getpeerinfo@ "id" selects the same peer.
+--   3. If the block body is already stored, short-circuit with
+--      @RPC_MISC_ERROR(-1)@ "Block already downloaded" (Core gates this on
+--      @BLOCK_HAVE_DATA@, blockchain.cpp:558).
+--   4. On success, send a block getdata (MSG_BLOCK | MSG_WITNESS_FLAG — i.e.
+--      'InvWitnessBlock', value 0x40000002, exactly Core's
+--      @CInv(MSG_BLOCK | MSG_WITNESS_FLAG, hash)@) to THAT peer and return
+--      @{}@ (an empty JSON object). Fire-and-forget: Core returns
+--      @UniValue::VOBJ@ once the request is scheduled.
+handleGetBlockFromPeer :: RpcServer -> Value -> IO RpcResponse
+handleGetBlockFromPeer server params =
+  case (extractParamText params 0, extractParam params 1 :: Maybe Int) of
+    (Nothing, _) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
+    (_, Nothing) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing peer_id parameter") Null
+    (Just hexHash, Just peerId) ->
+      case parseHash hexHash of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
+        Just bh -> do
+          -- Gather the three facts the decision depends on:
+          --   (1) is the header known?  Core: LookupBlockIndex.
+          --   (3) is the body already stored?  Core: BLOCK_HAVE_DATA.
+          --   (2) which connected peers exist, in getpeerinfo id order?
+          headerKnown <- isJust <$> getBlockHeader (rsDB server) bh
+          bodyStored  <- isJust <$> getBlock       (rsDB server) bh
+          peers       <- getConnectedPeers (rsPeerMgr server)
+          -- Pure decision (mirrors FetchBlock's error ladder).
+          case decideGetBlockFromPeer headerKnown bodyStored peerId peers bh of
+            Left (code, msg) ->
+              return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+            Right (addr, msg) -> do
+              -- (4) Send a block getdata (MSG_BLOCK | MSG_WITNESS_FLAG) to
+              -- THAT peer; return {} (empty object). Fire-and-forget.
+              requestFromPeer (rsPeerMgr server) addr msg
+              return $ RpcResponse (object []) Null Null
+
+-- | Pure core of 'handleGetBlockFromPeer', mirroring the error ladder of
+-- Bitcoin Core's @PeerManagerImpl::FetchBlock@. Returns either an
+-- @(error code, message)@ to surface as a JSON-RPC error, or the
+-- @(peer SockAddr, getdata message)@ to dispatch on the success path.
+--
+-- All error codes are @rpcMiscError@ (-1), matching Core's
+-- @RPC_MISC_ERROR@ for this RPC. Exported so the unit test can exercise
+-- every branch without a live DB or socket.
+decideGetBlockFromPeer
+  :: Bool                       -- ^ header known? (Core: LookupBlockIndex hit)
+  -> Bool                       -- ^ body already stored? (Core: BLOCK_HAVE_DATA)
+  -> Int                        -- ^ peer_id (getpeerinfo id == getConnectedPeers index)
+  -> [(SockAddr, PeerInfo)]     -- ^ connected peers, in getpeerinfo id order
+  -> BlockHash                  -- ^ the block hash to fetch
+  -> Either (Int, Text) (SockAddr, Message)
+decideGetBlockFromPeer headerKnown bodyStored peerId peers bh
+  -- (1) Core blockchain.cpp:547 — header missing.
+  | not headerKnown = Left (rpcMiscError, "Block header missing")
+  -- (3) Core blockchain.cpp:558 — body already on disk.
+  | bodyStored      = Left (rpcMiscError, "Block already downloaded")
+  | otherwise = case lookupPeerByIndex peerId peers of
+      -- (2) Core net_processing.cpp:1966 — peer not connected.
+      Nothing   -> Left (rpcMiscError, "Peer does not exist")
+      -- (4) Core net_processing.cpp:1981 — CInv(MSG_BLOCK|MSG_WITNESS_FLAG).
+      Just addr ->
+        let inv = InvVector InvWitnessBlock (getBlockHashHash bh)
+        in Right (addr, MGetData (GetData [inv]))
+
+-- | Resolve a getpeerinfo-style peer id (0-based index into the
+-- 'getConnectedPeers' list) to its 'SockAddr'. Returns 'Nothing' for a
+-- negative or out-of-range id, mirroring Core's @GetPeerRef@ miss
+-- ("Peer does not exist"). The ordering here is identical to the one
+-- 'handleGetPeerInfo' assigns ids to, because both consume
+-- 'getConnectedPeers' (which is derived from @Map.toList@) in the same order.
+lookupPeerByIndex :: Int -> [(SockAddr, PeerInfo)] -> Maybe SockAddr
+lookupPeerByIndex idx peers
+  | idx < 0 || idx >= length peers = Nothing
+  | otherwise                      = Just (fst (peers !! idx))
 
 -- | Get the number of connected peers
 handleGetConnectionCount :: RpcServer -> IO RpcResponse
@@ -8382,6 +8479,7 @@ allRpcCommands =
   , "getblock \"blockhash\" ( verbosity )"
   , "getblockchaininfo"
   , "getblockcount"
+  , "getblockfrompeer \"blockhash\" peer_id"
   , "getsyncstate"
   , "getdeploymentinfo ( \"blockhash\" )"
   , "getblockhash height"
