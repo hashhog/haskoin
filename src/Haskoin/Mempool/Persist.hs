@@ -63,7 +63,7 @@ import System.Random (randomRIO)
 
 import Haskoin.Crypto (computeTxId)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), addTransaction,
-                       getTransaction)
+                       getTransaction, prioritiseTransaction)
 import Haskoin.Types (Tx, TxId(..), getVarInt', putVarInt)
 
 --------------------------------------------------------------------------------
@@ -355,6 +355,15 @@ loadMempool mp loadPath expirySecs = do
                   Just _ ->
                     atomically (modifyTVar' already (+ 1))
                   Nothing -> do
+                    -- Core parity (node/mempool_persist.cpp:99-102): re-apply
+                    -- the per-tx prioritisation delta BEFORE acceptance, so
+                    -- admission folds the delta into the entry's rank and the
+                    -- min-fee gate sees the modified fee.  (The later mdDeltas
+                    -- union is left-biased, so this is never double-counted;
+                    -- skipped for already-present txs to avoid re-stacking on
+                    -- repeated importmempool calls.)
+                    when (dtFeeDelta dt /= 0) $
+                      prioritiseTransaction mp txid (dtFeeDelta dt)
                     res <- addTransaction mp (dtTx dt)
                             `catch` (\(_e :: SomeException) ->
                                        return $ Left

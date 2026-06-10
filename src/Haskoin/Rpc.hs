@@ -131,9 +131,11 @@ module Haskoin.Rpc
   , rpcWalletAlreadyLoaded
   , rpcWalletAlreadyExists
   , rpcWalletError
-    -- * importdescriptors RPC gate (exported for testing)
+    -- * importdescriptors (exported for testing)
   , handleImportDescriptors
-  , importDescriptorsGateMessage
+  , importOneDescriptor
+  , handleGetAddressInfo
+  , handlePrioritiseTransaction
     -- * pruneblockchain RPC gate (exported for testing)
   , handlePruneBlockchain
   , pruneblockchainNotEnabledMsg
@@ -313,15 +315,18 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
+                         setOnRemoveTx, prioritiseTransaction,
                          isRbfReplaceable, blockConnected,
                          -- Package relay (BIP-331) — submitpackage RPC
                          TxPackage(..), maxPackageCount, acceptPackage,
                          isWellFormedPackage, isChildWithParents,
                          isChildWithParentsTree)
 import qualified Haskoin.Mempool.Persist as MPP
+import qualified Haskoin.Policy.Standard as PolicyStd
 import Haskoin.TxOrphanage (OrphanPool(..))
 import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..),
-                              estimateRawFee, RawFeeEstimate(..), RawBucketRange(..))
+                              estimateRawFee, RawFeeEstimate(..), RawBucketRange(..),
+                              untrackTransaction)
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
 import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
@@ -329,6 +334,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         deriveScripts, descriptorChecksum, addDescriptorChecksum,
                         validateDescriptorChecksum, isRangeDescriptor,
                         Wallet(..), WalletManager(..), WalletState(..), WalletInfo(..),
+                        ImportedDescriptor(..), markWalletDirty,
                         wifDecode,
                         newWalletManager, createManagedWallet, loadManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
@@ -803,6 +809,14 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
   payjoinOffersVar <- newTVarIO Map.empty
   let payjoinCfg = defaultPayjoinConfig
   let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty payjoinOffersVar payjoinCfg orphanRef
+  -- Subscribe the fee estimator to every NON-BLOCK mempool removal so it stops
+  -- tracking txs that leave the pool unconfirmed (RBF / expiry / size-limit
+  -- eviction / block-conflict).  Mirrors Core registering CBlockPolicyEstimator
+  -- as a CValidationInterface receiving TransactionRemovedFromMempool; without
+  -- this, FeeEstimator.feePending / fbInMempool leak unbounded.  Block-confirmed
+  -- removals bypass this hook (removeTransactionForBlock) and are accounted via
+  -- recordConfirmation, matching Core's BLOCK-reason signal suppression.
+  setOnRemoveTx mp (untrackTransaction fe)
   -- Restore persisted banlist at startup (best-effort; absence is fine on
   -- a fresh datadir).  Reference: bitcoin-core/src/banman.cpp BanMan ctor
   -- which loads banlist.json on boot.
@@ -1121,6 +1135,7 @@ handleRpcRequest server req = do
     "getblocktemplate"     -> handleGetBlockTemplate server params
     "submitblock"          -> handleSubmitBlock server params
     "getmininginfo"        -> handleGetMiningInfo server
+    "prioritisetransaction" -> handlePrioritiseTransaction server params
     "getprioritisedtransactions" -> handleGetPrioritisedTransactions server
 
     -- Regtest Mining RPCs
@@ -1165,6 +1180,7 @@ handleRpcRequest server req = do
     "rescanblockchain"     -> handleRescanBlockchain server params
     "importprivkey"        -> handleImportPrivKey server params
     "dumpprivkey"          -> handleDumpPrivKey server params
+    "getaddressinfo"       -> handleGetAddressInfo server params
 
     -- PSBT RPCs
     "createpsbt"           -> handleCreatePsbt server params
@@ -2948,6 +2964,70 @@ handleGetMempoolInfo server = do
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
+-- | prioritisetransaction "txid" ( dummy ) fee_delta
+--
+-- Accept a transaction into mined blocks at a higher (or lower) priority by
+-- recording an ABSOLUTE fee delta (in SATOSHIS — mining RPCs use satoshi
+-- amounts, not BTC: rpc/mining.cpp:501).  Returns literal @true@.
+--
+-- Core reference: bitcoin-core/src/rpc/mining.cpp:502-545 →
+-- CTxMemPool::PrioritiseTransaction (txmempool.cpp:630-655).
+--
+--   * txid (hex, required).
+--   * dummy (numeric, optional, DEPRECATED): must be 0 or null, else -8
+--     "Priority is no longer supported, dummy argument to
+--     prioritisetransaction must be 0." (mining.cpp:529-531).
+--   * fee_delta (numeric, required, int64 satoshis): an absolute fee delta,
+--     NOT a feerate.  Repeated calls STACK; a delta works for txids not yet
+--     in the mempool (remembered and applied at admission).
+--
+-- The delta DRIVES behavior — mempool admission feerate, block-template
+-- ordering, and eviction ranking all read the modified fee (see
+-- 'Haskoin.Mempool.prioritiseTransaction').  Dust gate (this Core tree,
+-- mining.cpp:535-539): prioritising an in-mempool tx that has dust outputs
+-- is refused with -8 (haskoin enforces TRUC/ephemeral-dust policy, so the
+-- gate applies).
+handlePrioritiseTransaction :: RpcServer -> Value -> IO RpcResponse
+handlePrioritiseTransaction server params =
+  case extractParamText params 0 >>= parseTxIdHex of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParameter
+        ("txid must be a hexadecimal string of length 64" :: Text)) Null
+    Just txid -> do
+      -- dummy (param 1): deprecated; only null or 0 accepted (Core
+      -- mining.cpp:526-531: !isNull && get_real != 0 -> -8).  Use
+      -- 'rawParamAt' so an explicit JSON null counts as absent (aeson's
+      -- Double instance would otherwise decode Null to NaN and trip the
+      -- gate).
+      let dummyOk = case rawParamAt params 1 of
+            Nothing -> True   -- absent / null
+            Just v  -> case fromJSON v :: Result Double of
+              Success 0 -> True
+              _         -> False
+      if not dummyOk
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            ("Priority is no longer supported, dummy argument to prioritisetransaction must be 0." :: Text)) Null
+        else case extractParam params 2 :: Maybe Int64 of
+          Nothing -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcInvalidParams
+              ("Missing or invalid fee_delta parameter (satoshis, integer)" :: Text)) Null
+          Just feeDelta -> do
+            -- Dust gate (mining.cpp:535-539): refuse prioritising an
+            -- in-mempool tx with dust outputs.
+            mEntry <- getTransaction (rsMempool server) txid
+            let hasDust = case mEntry of
+                  Just e  -> any (\o -> PolicyStd.isDust o PolicyStd.dustRelayTxFee)
+                                 (txOutputs (meTransaction e))
+                  Nothing -> False
+            if hasDust
+              then return $ RpcResponse Null
+                (toJSON $ RpcError rpcInvalidParameter
+                  ("Priority is not supported for transactions with dust outputs." :: Text)) Null
+              else do
+                prioritiseTransaction (rsMempool server) txid feeDelta
+                return $ RpcResponse (toJSON True) Null Null
+
 -- | getprioritisedtransactions — map of all user-created (see
 -- prioritisetransaction) fee deltas by txid, and whether each tx is present in
 -- the mempool.
@@ -4589,95 +4669,315 @@ handleCreateMultisig params = do
                 _                  -> Left $ "pubkey must be compressed (33 bytes): " <> hexStr
       _ -> Left "pubkey must be a hex string"
 
--- | The @importdescriptors@ RPC. Refused with @rpcWalletError@ in this
--- build.
+-- | The @importdescriptors@ RPC — the real implementation (replaces the
+-- 2026-05-05 refusal gate; the lying-RPC history lives in git).
 --
--- Background (cross-impl lying-RPC audit 2026-05-05,
--- @CORE-PARITY-AUDIT/_lying-rpc-cross-impl-2026-05-05.md@): the previous
--- handler walked the @requests@ array, parsed each descriptor via
--- 'parseDescriptor', and returned @{"success": true, "warnings": []}@
--- per descriptor without ever storing the descriptor in the wallet
--- database, deriving addresses, or scanning the blockchain. The
--- pre-fix code self-documented the gap at L2624-2628:
+-- Core reference: bitcoin-core/src/wallet/rpc/backup.cpp:302-456
+-- (importdescriptors) + :141-300 (ProcessDescriptorImport) + :127-139
+-- (GetImportTimestamp).
 --
--- @
---   -- In a full implementation, we would:
---   -- 1. Store the descriptor in the wallet database
---   -- 2. Derive addresses based on range
---   -- 3. Scan the blockchain for matching UTXOs
---   -- For now, we validate and acknowledge the import
--- @
+-- Shape contract (backup.cpp:334-350):
+--   * one param: an ARRAY of request objects
+--     {desc(req), active=false, range, next_index, timestamp(req: int|"now"),
+--      internal=false, label=""};
+--   * the result is an ARRAY of the SAME length/order; a per-element failure
+--     NEVER aborts the call (ProcessDescriptorImport catches the thrown
+--     JSONRPCError and converts it to success:false + error:<error object>,
+--     backup.cpp:294-297);
+--   * each element is {"success": bool} [+ "error": {code,message}]
+--     [+ "warnings": [..] only when non-empty (PushWarnings,
+--     rpc/util.cpp:1393-1397)].
 --
--- Operators got a successful JSON-RPC response; nothing actually
--- landed in the wallet. Same lying-RPC pattern as the haskoin
--- @loadtxoutset@ bug closed earlier today (rustoshi @1d0a325@ /
--- hotbuns @e355cd7@ / clearbit @c8866ef@ / nimrod @64a856d@ wave from
--- this morning).
+-- Key per-element gates mirrored here (codes are Core's):
+--   * desc missing                  -> -8  "Descriptor not found."
+--   * checksum REQUIRED (Parse with require_checksum=true,
+--     backup.cpp:158-161; CheckChecksum, script/descriptor.cpp:2838-2846):
+--     no '#'   -> -5 "Missing checksum";
+--     mismatch -> -5 "Provided checksum ... does not match ...".
+--   * timestamp REQUIRED: missing -> -3 "Missing required timestamp field
+--     for key"; wrong type -> -3 'Expected number or "now" ...'
+--     (GetImportTimestamp).
+--   * privkey desc into a disable_private_keys wallet -> -4 "Cannot import
+--     private keys to a wallet with private keys disabled"
+--     (backup.cpp:224-226); watch-only desc into a privkeys-ENABLED wallet
+--     -> -4 "Cannot import descriptor without private keys to a wallet with
+--     private keys enabled" (backup.cpp:259-262).
+--   * range/active/label cross-checks (backup.cpp:173-216), all -8.
 --
--- Wiring real descriptor-wallet support (descriptor → address
--- derivation → wallet DB write → blockchain rescan) is a multi-day
--- project and out of scope. Mirror-gate is the fix; the real
--- implementation is a follow-up.
+-- Rescan semantics (backup.cpp:376-409): timestamp="now" means no rescan;
+-- a NUMERIC timestamp is clamped to max(ts,1) and, after ALL elements are
+-- processed, ONE synchronous rescan runs if any element succeeded.  Core
+-- starts the scan at the first block with time >= lowest_timestamp - 7200
+-- (TIMESTAMP_WINDOW, wallet.cpp:1827-1846); haskoin conservatively rescans
+-- the FULL chain [0, tip] — a superset of Core's window (it can only credit
+-- MORE history, never less), reusing the same synchronous
+-- 'rescanWalletRange' the rescanblockchain/importprivkey RPCs use.  This is
+-- what credits funds received BEFORE the import (the watch-only bar's
+-- load-bearing check).
 --
--- Fix is option (B) from the @loadtxoutset@ wave: refuse the RPC at
--- the gate, leave the wallet untouched, return @rpcWalletError@ (-4)
--- — Core's @RPC_WALLET_ERROR@ from
--- @bitcoin-core\/src\/rpc\/protocol.h@. That's the appropriate code
--- for "wallet RPC the impl can't honour" vs the more generic
--- @rpcInternalError@ we used for @loadtxoutset@ (where the gap was a
--- chainstate-activation issue, not a wallet feature).
---
--- The gate fires AFTER cheap parameter-shape validation (so malformed
--- params still get @rpcInvalidParams@) but BEFORE any wallet state
--- read or write. The handler ignores its 'RpcServer' argument now (the
--- gate closes before any server-state read), so tests can call it
--- with @undefined@ — same justification the existing
--- 'handleLoadTxOutSet' tests use.
---
--- 'handleImportDescriptors' and the new 'importDescriptorsGateMessage'
--- constant are both exported (under "importdescriptors RPC gate
--- (exported for testing)") so the test can pin the wording without
--- copy-paste drift.
+-- The imported addresses are registered in 'walletAddresses' with the same
+-- (maxBound, False) sentinel 'importPrivKeyW' uses, so the block-connect
+-- scan and the rescan credit them; they persist across restart via the
+-- wallet snapshot's address table.  The descriptor records are appended to
+-- 'wsDescriptors' (surfaced by @listdescriptors@; not yet persisted).
 handleImportDescriptors :: RpcServer -> Value -> IO RpcResponse
-handleImportDescriptors _server params =
-  -- Validate parameter shape only; never call 'parseDescriptor' or any
-  -- wallet-state read/write.
+handleImportDescriptors server params =
+  -- Param-shape validation first (malformed params are a TOP-LEVEL error;
+  -- everything past this point reports per-element results).
   case params of
-    Array _ -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletError importDescriptorsGateMessage) Null
+    Array _ ->
+      case extractParamArray params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            ("Expected array of descriptor import requests" :: Text)) Null
+        Just reqs -> withWalletMgr server $ \wm -> do
+          (mWallet, _) <- getDefaultWallet wm
+          case mWallet of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcWalletNotFound
+                "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+            Just ws -> do
+              pkEnabled <- readTVarIO (wsPrivateKeysEnabled ws)
+              now <- (round :: POSIXTime -> Word64) <$> getPOSIXTime
+              results <- mapM (importOneDescriptor ws pkEnabled now)
+                              (V.toList reqs)
+              -- ONE rescan after the whole batch, iff at least one element
+              -- succeeded with a numeric timestamp (Core backup.cpp:399-409;
+              -- "now" elements alone trigger no rescan).
+              when (any snd results) $ do
+                tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                rescanWalletRange server (wsWallet ws) 0 (ceHeight tip)
+              return $ RpcResponse (toJSON (map fst results)) Null Null
     _ -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams ("Expected array of descriptor objects" :: Text)) Null
 
--- | The error message returned by the refused @importdescriptors@ RPC.
--- Exposed as a top-level binding so tests can pin the wording without
--- a copy-paste drift hazard.
-importDescriptorsGateMessage :: Text
-importDescriptorsGateMessage =
-  "importdescriptors not implemented in haskoin; descriptor-wallet "
-  <> "support is not wired (no descriptor→address derivation, no "
-  <> "wallet DB write, no blockchain rescan). The pre-fix handler "
-  <> "returned success without persisting anything. Operator-managed "
-  <> "key import via `importprivkey` / `importaddress` is the "
-  <> "supported path until descriptor wallets are wired end-to-end."
+-- | Process ONE importdescriptors request element against the wallet.
+-- Returns (result element, needs-rescan) where needs-rescan is True only
+-- for a SUCCESSFUL import with a numeric (non-"now") timestamp.
+-- Mirrors ProcessDescriptorImport (backup.cpp:141-300): every per-element
+-- failure is caught and rendered as {"success":false,"error":{...}}.
+importOneDescriptor :: WalletState -> Bool -> Word64 -> Value -> IO (Value, Bool)
+importOneDescriptor ws pkEnabled now reqVal =
+  case reqVal of
+    Object km -> processRequest km
+    _ -> return (importElemErr rpcInvalidParameter
+                   "Descriptor import request must be a JSON object", False)
+  where
+    -- {"success": false, "error": {code, message}} — the error value is the
+    -- full JSON-RPC error object (backup.cpp:296).
+    err :: Int -> Text -> IO (Value, Bool)
+    err code msg = return (importElemErr code msg, False)
+
+    lookupKm :: Text -> KM.KeyMap Value -> Maybe Value
+    lookupKm k = KM.lookup (Key.fromText k)
+
+    boolOpt :: Text -> KM.KeyMap Value -> Bool
+    boolOpt k km = case lookupKm k km of
+      Just (Bool b) -> b
+      _             -> False
+
+    processRequest km = case lookupKm "desc" km of
+      Just (String descText) -> withTimestamp km descText
+      _ -> err rpcInvalidParameter "Descriptor not found."
+
+    -- GetImportTimestamp (backup.cpp:127-139): timestamp is REQUIRED and is
+    -- either a number or the literal string "now".
+    withTimestamp km descText = case lookupKm "timestamp" km of
+      Nothing -> err rpcTypeError "Missing required timestamp field for key"
+      Just (String "now") -> withChecksum km descText False
+      Just (Number _)     -> withChecksum km descText True
+      Just _ -> err rpcTypeError
+        "Expected number or \"now\" timestamp value for key. got wrong type"
+
+    -- Parse with require_checksum=true (backup.cpp:158; CheckChecksum,
+    -- script/descriptor.cpp:2838-2846).
+    withChecksum km descText needsRescan
+      | not (T.any (== '#') descText) =
+          err rpcInvalidAddressOrKey "Missing checksum"
+      | otherwise = case parseDescriptor descText of
+          Left MissingChecksum ->
+            err rpcInvalidAddressOrKey "Missing checksum"
+          Left (InvalidChecksum expected got) ->
+            err rpcInvalidAddressOrKey
+              ("Provided checksum '" <> got
+               <> "' does not match computed checksum '" <> expected <> "'")
+          Left perr ->
+            err rpcInvalidAddressOrKey (T.pack (show perr))
+          Right desc -> withGates km descText desc needsRescan
+
+    withGates km descText desc needsRescan = do
+      let active   = boolOpt "active" km
+          internal = boolOpt "internal" km
+          hasLabel = case lookupKm "label" km of
+                       Just (String _) -> True
+                       _               -> False
+          mLabel   = case lookupKm "label" km of
+                       Just (String l) -> Just l
+                       _               -> Nothing
+          isRanged = isRangeDescriptor desc
+          hasPriv  = descriptorHasPrivateKeys desc
+          mRangeV  = lookupKm "range" km
+      -- Range / active / label cross-checks (backup.cpp:173-216).
+      if not isRanged && isJust mRangeV
+        then err rpcInvalidParameter
+               "Range should not be specified for an un-ranged descriptor"
+        else if active && not isRanged
+          then err rpcInvalidParameter "Active descriptors must be ranged"
+          else if isRanged && hasLabel
+            then err rpcInvalidParameter
+                   "Ranged descriptors should not have a label"
+            else if internal && hasLabel
+              then err rpcInvalidParameter
+                     "Internal addresses should not have a label"
+              else do
+                -- combo + active (backup.cpp:218-221).
+                let isCombo = case desc of { Combo _ -> True; _ -> False }
+                if isCombo && active
+                  then err rpcWalletError "Combo descriptors cannot be set to active"
+                  else do
+                    -- Privkey guards (backup.cpp:224-226, 259-262): watch-only
+                    -- imports only on a disable_private_keys wallet; privkey
+                    -- imports only on a normal wallet.
+                    if hasPriv && not pkEnabled
+                      then err rpcWalletError
+                             "Cannot import private keys to a wallet with private keys disabled"
+                      else if not hasPriv && pkEnabled
+                        then err rpcWalletError
+                               "Cannot import descriptor without private keys to a wallet with private keys enabled"
+                        else withRange km descText desc needsRescan
+                               active internal mLabel isRanged
+
+    -- Resolve the derivation range (warning + default keypool range when a
+    -- ranged descriptor has no range, backup.cpp:180-184), check next_index
+    -- (backup.cpp:188-194), then commit.
+    withRange km descText desc needsRescan active internal mLabel isRanged = do
+      let defaultKeypool = 20 :: Int   -- haskoin wallet gap-limit/keypool size
+          parsedRange
+            | not isRanged = Right ((0, 0), [])
+            | otherwise = case lookupKm "range" km of
+                Nothing -> Right ((0, defaultKeypool - 1),
+                                  ["Range not given, using default keypool range"])
+                Just (Number n) ->
+                  case toBoundedInteger n :: Maybe Int of
+                    Just hi | hi >= 0 -> Right ((0, hi), [])
+                    _ -> Left "End of range is too high"
+                Just (Array rng) | V.length rng == 2 ->
+                  case (rng V.! 0, rng V.! 1) of
+                    (Number lo, Number hi) ->
+                      case (toBoundedInteger lo, toBoundedInteger hi) of
+                        (Just l, Just h)
+                          | l < 0 -> Left "Range should be greater or equal than 0"
+                          | h < l -> Left "Range specified as [begin,end] must not have begin after end"
+                          | h - l >= 1000000 -> Left "Range is too large"
+                          | otherwise -> Right ((l, h), [])
+                        _ -> Left "Range must be of type int"
+                    _ -> Left "Range must be of type int"
+                Just _ -> Left "Range must be of type int or array"
+      case parsedRange of
+        Left rerr -> err rpcInvalidParameter rerr
+        Right ((lo, hi), rangeWarnings) -> do
+          let mNextIndex = case lookupKm "next_index" km of
+                Just (Number n) -> toBoundedInteger n :: Maybe Int
+                _               -> Nothing
+              nextIdx = fromMaybe lo mNextIndex
+          if isRanged && (nextIdx < lo || nextIdx > hi)
+            then err rpcInvalidParameter "next_index is out of range"
+            else do
+              let indices = if isRanged then [lo .. hi] else []
+                  addrs   = deriveAddresses desc indices
+              if null addrs
+                then err rpcWalletError
+                       "Cannot expand descriptor. Probably because of hardened derivations without private keys provided"
+                else do
+                  -- Register every derived address as wallet-watched, with the
+                  -- same sentinel 'importPrivKeyW' uses (Wallet.hs) so the
+                  -- block-connect scan + rescan credit them and getnewaddress
+                  -- never hands them out.
+                  let wallet = wsWallet ws
+                  atomically $ modifyTVar' (walletAddresses wallet) $ \m ->
+                    foldr (\a acc -> Map.insert a (maxBound :: Word32, False) acc)
+                          m addrs
+                  -- Optional label (non-ranged, non-internal only — gated
+                  -- above, matching backup.cpp:202-216).
+                  case mLabel of
+                    Just l | not (T.null l) ->
+                      atomically $ modifyTVar' (walletAddressLabels wallet) $ \m ->
+                        foldr (\a acc -> Map.insert a l acc) m addrs
+                    _ -> return ()
+                  markWalletDirty wallet
+                  -- Record the descriptor (listdescriptors source).
+                  let ts = case lookupKm "timestamp" km of
+                        Just (Number n) ->
+                          -- Core clamps to minimum_timestamp = 1
+                          -- (backup.cpp:376, 390).
+                          case toBoundedInteger n :: Maybe Int64 of
+                            Just v  -> fromIntegral (max 1 v) :: Word64
+                            Nothing -> 1
+                        _ -> now   -- "now"
+                      record = ImportedDescriptor
+                        { idDescriptor = desc
+                        , idDescText   = descText
+                        , idActive     = active
+                        , idInternal   = internal
+                        , idTimestamp  = ts
+                        , idNextIndex  = fromIntegral (max 0 nextIdx)
+                        , idRangeStart = fromIntegral (max 0 lo)
+                        , idRangeEnd   = fromIntegral (max 0 hi)
+                        , idLabel      = mLabel
+                        }
+                  atomically $ modifyTVar' (wsDescriptors ws) (++ [record])
+                  return (importElemOk rangeWarnings, needsRescan)
+
+-- | A successful importdescriptors result element.  "warnings" is emitted
+-- ONLY when non-empty (Core PushWarnings, rpc/util.cpp:1393-1397).
+importElemOk :: [Text] -> Value
+importElemOk warns = object $
+  ("success" .= True)
+  : (if null warns then [] else ["warnings" .= warns])
+
+-- | A failed importdescriptors result element: success:false plus the full
+-- JSON-RPC error object (backup.cpp:294-297).
+importElemErr :: Int -> Text -> Value
+importElemErr code msg = object
+  [ "success" .= False
+  , "error"   .= RpcError code msg
+  ]
 
 -- | List imported descriptors.
--- Reference: Bitcoin Core's listdescriptors RPC
+-- Reference: bitcoin-core/src/wallet/rpc/backup.cpp listdescriptors.
 -- Parameters:
 --   private (boolean, optional): Whether to show private keys (default: false)
 -- Returns:
---   Object with wallet_name and array of descriptor objects
+--   Object with wallet_name and array of descriptor objects, sourced from
+--   the wallet's 'wsDescriptors' (populated by importdescriptors).
 handleListDescriptors :: RpcServer -> Value -> IO RpcResponse
-handleListDescriptors _server params = do
-  let _showPrivate = case extractParam params 0 of
-        Just b -> b
-        Nothing -> False
-  -- In a full implementation, this would return stored descriptors from the wallet
-  -- For now, return empty list
-  let result = object
-        [ "wallet_name" .= ("" :: Text)
-        , "descriptors" .= ([] :: [Value])
-        ]
-  return $ RpcResponse result Null Null
+handleListDescriptors server params = withWalletMgr server $ \wm -> do
+  let _showPrivate = fromMaybe False (extractParam params 0 :: Maybe Bool)
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound
+        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+    Just ws -> do
+      names <- listManagedWallets wm
+      let walletName = fromMaybe "" (listToMaybe names)
+      descs <- readTVarIO (wsDescriptors ws)
+      let descToJson d = object $
+            [ "desc"      .= idDescText d
+            , "timestamp" .= idTimestamp d
+            , "active"    .= idActive d
+            , "internal"  .= idInternal d
+            ] ++
+            (if isRangeDescriptor (idDescriptor d)
+               then [ "range" .= [idRangeStart d, idRangeEnd d]
+                    , "next"  .= idNextIndex d
+                    ]
+               else [])
+      let result = object
+            [ "wallet_name" .= walletName
+            , "descriptors" .= map descToJson descs
+            ]
+      return $ RpcResponse result Null Null
 
 --------------------------------------------------------------------------------
 -- PSBT RPC Handlers
@@ -6126,14 +6426,24 @@ handleImportPrivKey server params = withWalletMgr server $ \wm -> do
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidAddressOrKey "Invalid private key encoding") Null
             Just sk -> do
-              -- Param 2 = rescan flag (default true), matching Core's signature
-              -- importprivkey "privkey" ( "label" rescan ).
-              let doRescan = fromMaybe True (extractParam params 2 :: Maybe Bool)
-              _addrs <- importPrivKeyW (wsWallet ws) sk
-              when doRescan $ do
-                tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-                rescanWalletRange server (wsWallet ws) 0 (ceHeight tip)
-              return $ RpcResponse Null Null Null
+              -- Core parity: a disable_private_keys wallet refuses raw key
+              -- import with -4 (wallet/rpc/backup.cpp importprivkey:
+              -- "Cannot import private keys to a wallet with private keys
+              -- disabled").
+              pkEnabled <- readTVarIO (wsPrivateKeysEnabled ws)
+              if not pkEnabled
+                then return $ RpcResponse Null
+                  (toJSON $ RpcError rpcWalletError
+                    ("Cannot import private keys to a wallet with private keys disabled" :: Text)) Null
+                else do
+                  -- Param 2 = rescan flag (default true), matching Core's
+                  -- signature importprivkey "privkey" ( "label" rescan ).
+                  let doRescan = fromMaybe True (extractParam params 2 :: Maybe Bool)
+                  _addrs <- importPrivKeyW (wsWallet ws) sk
+                  when doRescan $ do
+                    tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                    rescanWalletRange server (wsWallet ws) 0 (ceHeight tip)
+                  return $ RpcResponse Null Null Null
 
 -- | dumpprivkey "address"
 --
@@ -6165,6 +6475,105 @@ handleDumpPrivKey server params = withWalletMgr server $ \wm -> do
                   (toJSON $ RpcError rpcInvalidAddressOrKey
                     "Private key for address is not known") Null
                 Just sk -> return $ RpcResponse (toJSON (wifEncode sk)) Null Null
+
+-- | getaddressinfo "address"
+--
+-- Return information about the given address as known by the (default)
+-- wallet.  Reference: bitcoin-core/src/wallet/rpc/addresses.cpp:441-510.
+--
+-- Descriptor-wallet semantics mirrored here:
+--   * ismine: plain bool — true iff the wallet TRACKS the address's
+--     scriptPubKey (CWallet::IsMine over the descriptor SPKMs,
+--     wallet.cpp:1649-1671; scriptpubkeyman.cpp:863-867).  NO private key is
+--     required: a watch-only addr()/wpkh() import on a
+--     disable_private_keys wallet reports ismine:true.  haskoin's tracked
+--     set is 'walletAddresses' (the same membership test
+--     'scanBlockForWallet' credits against).
+--   * iswatchonly: ALWAYS false — deprecated; descriptor wallets have no
+--     ISMINE_WATCH_ONLY concept (addresses.cpp:383, 478).
+--   * solvable: whether the wallet can produce a solving descriptor.
+--     addr()/raw() imports are NOT solvable (script/descriptor.cpp:1095,
+--     1120) — no "desc" field; pubkey-bearing imports (wpkh/pkh/...) are
+--     solvable and surface "desc" (the imported pubkey-form descriptor) —
+--     addresses.cpp:449-463.  The wallet's own HD-derived addresses are
+--     solvable too.
+--   * parent_desc + timestamp: from the matching imported descriptor
+--     (addresses.cpp:465-476, 485-487).
+handleGetAddressInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetAddressInfo server params = withWalletMgr server $ \wm -> do
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletNotFound
+        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+    Just ws ->
+      case extractParamText params 0 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Missing address parameter") Null
+        Just addrText ->
+          case textToAddress (T.strip addrText) of
+            Nothing -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Invalid address") Null
+            Just addr -> do
+              let wallet = wsWallet ws
+              addrMap <- readTVarIO (walletAddresses wallet)
+              labels  <- readTVarIO (walletAddressLabels wallet)
+              descs   <- readTVarIO (wsDescriptors ws)
+              let mTracked = Map.lookup addr addrMap
+                  ismine   = isJust mTracked
+                  isChange = maybe False snd mTracked
+                  -- HD-derived (non-sentinel) addresses are key-backed.
+                  isHd     = maybe False ((/= (maxBound :: Word32)) . fst) mTracked
+                  spkHex   = case deriveScripts (Addr addr) 0 of
+                               (s:_) -> TE.decodeUtf8 (B16.encode s)
+                               []    -> ""
+                  -- The imported descriptor whose derivations include addr.
+                  descIndices d
+                    | isRangeDescriptor (idDescriptor d) =
+                        [fromIntegral (idRangeStart d) .. fromIntegral (idRangeEnd d)]
+                    | otherwise = []
+                  mParent = find (\d -> addr `elem`
+                                   deriveAddresses (idDescriptor d) (descIndices d))
+                                 descs
+                  solvable = case mParent of
+                    Just d  -> descriptorIsSolvable (idDescriptor d)
+                    Nothing -> isHd
+                  (isScript, isWitness, mWitVer, mWitProg) = case addr of
+                    PubKeyAddress _          -> (False, False, Nothing, Nothing)
+                    ScriptAddress _          -> (True,  False, Nothing, Nothing)
+                    WitnessPubKeyAddress h   -> (False, True,  Just (0 :: Int),
+                                                 Just (TE.decodeUtf8 (B16.encode (getHash160 h))))
+                    WitnessScriptAddress h   -> (True,  True,  Just 0,
+                                                 Just (TE.decodeUtf8 (B16.encode (getHash256 h))))
+                    TaprootAddress h         -> (False, True,  Just 1,
+                                                 Just (TE.decodeUtf8 (B16.encode (getHash256 h))))
+                  labelList = case Map.lookup addr labels of
+                    Just l  -> [l]
+                    Nothing -> [] :: [Text]
+                  witnessFields = case (mWitVer, mWitProg) of
+                    (Just v, Just p) -> [ "witness_version" .= v
+                                        , "witness_program" .= p ]
+                    _                -> []
+                  descFields = case mParent of
+                    Just d ->
+                      [ "parent_desc" .= idDescText d
+                      , "timestamp"   .= idTimestamp d
+                      ] ++ (if solvable then ["desc" .= idDescText d] else [])
+                    Nothing -> []
+                  result = object $
+                    [ "address"      .= addressToTextNet (rsNetwork server) addr
+                    , "scriptPubKey" .= spkHex
+                    , "ismine"       .= ismine
+                    , "solvable"     .= solvable
+                    -- DEPRECATED, always false on descriptor wallets
+                    -- (addresses.cpp:383, 478).
+                    , "iswatchonly"  .= False
+                    , "isscript"     .= isScript
+                    , "iswitness"    .= isWitness
+                    , "ischange"     .= isChange
+                    , "labels"       .= labelList
+                    ] ++ witnessFields ++ descFields
+              return $ RpcResponse result Null Null
 
 --------------------------------------------------------------------------------
 -- Chain Tips RPC Handler
@@ -7597,7 +8006,18 @@ handleSendToAddress server params = do
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
         Just walletState -> do
-          case (extractParamText params 0, extractParam params 1 :: Maybe Double) of
+          -- Core parity: spending is refused outright on a wallet created
+          -- with disable_private_keys (RPC_WALLET_ERROR -4, mirrors Core's
+          -- "Error: Private keys are disabled for this wallet" from
+          -- wallet/rpc/spend.cpp via EnsureWalletIsAvailable/CanGetAddresses
+          -- signing checks).  Watch-only funds are observable, never
+          -- spendable.
+          pkEnabled <- readTVarIO (wsPrivateKeysEnabled walletState)
+          if not pkEnabled
+            then return $ RpcResponse Null
+              (toJSON $ RpcError rpcWalletError
+                ("Error: Private keys are disabled for this wallet" :: Text)) Null
+            else case (extractParamText params 0, extractParam params 1 :: Maybe Double) of
             (Just addrText, Just amountBtc) -> do
               -- Parse address
               case textToAddress addrText of
@@ -8493,6 +8913,7 @@ allRpcCommands =
   , "getblocktemplate ( \"template_request\" )"
   , "getmininginfo"
   , "getprioritisedtransactions"
+  , "prioritisetransaction \"txid\" ( dummy ) fee_delta"
   , "submitblock \"hexdata\" ( \"dummy\" )"
   , ""
   , "== Network =="
@@ -8513,8 +8934,9 @@ allRpcCommands =
   , "signrawtransactionwithwallet \"hexstring\""
   , ""
   , "== Wallet =="
-  , "createwallet \"wallet_name\""
+  , "createwallet \"wallet_name\" ( disable_private_keys blank )"
   , "encryptwallet \"passphrase\""
+  , "getaddressinfo \"address\""
   , "getbalance"
   , "getnewaddress ( \"label\" \"address_type\" )"
   , "getwalletinfo"
@@ -8568,6 +8990,10 @@ getCommandHelp cmd = case T.toLower cmd of
     "submitpackage [\"rawtx\",...] ( maxfeerate )\n\nSubmit a package of raw transactions (hex-encoded) to local mempool. The package must be topologically sorted with the child as the last element. Up to MAX_PACKAGE_COUNT (25) transactions. Returns {package_msg, tx-results, replaced-transactions}."
   "getmempoolentry" ->
     "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction."
+  "prioritisetransaction" ->
+    "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority.\n\nArguments:\n1. txid       (string, required) The transaction id\n2. dummy      (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n3. fee_delta  (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n               Not a fee rate. The transaction selection algorithm considers the tx as it would\n               have paid a higher (or lower) fee.\n\nResult:\ntrue (boolean) Returns true"
+  "getaddressinfo" ->
+    "getaddressinfo \"address\"\n\nReturn information about the given bitcoin address.\nSome of the information will only be present if the address is in the active wallet.\n\nArguments:\n1. address    (string, required) The bitcoin address for which to get information.\n\nResult:\n{\n  \"address\": \"str\",      (string) The bitcoin address validated\n  \"scriptPubKey\": \"hex\", (string) The hex-encoded output script\n  \"ismine\": true|false,    (boolean) If the address is yours\n  \"iswatchonly\": false,    (boolean) (DEPRECATED) Always false\n  \"solvable\": true|false,  (boolean) If we know how to spend coins sent to this address\n  ...\n}"
   "getprioritisedtransactions" ->
     "getprioritisedtransactions\n\nReturns a map of all user-created (see prioritisetransaction) fee deltas by txid, and whether the tx is present in mempool.\n\nResult:\n{\n  \"<transactionid>\": {\n    \"fee_delta\": n,        (numeric) transaction fee delta in satoshis\n    \"in_mempool\": true|false, (boolean) whether this transaction is currently in mempool\n    \"modified_fee\": n      (numeric, optional) modified fee in satoshis. Only returned if in_mempool=true\n  },\n  ...\n}"
   "getorphantxs" ->
