@@ -26,6 +26,7 @@ module Haskoin.FeeEstimator
   , FeeEstimateMode(..)
     -- * Recording Data
   , trackTransaction
+  , untrackTransaction
   , recordConfirmation
     -- * Fee Estimation
   , estimateFee
@@ -212,6 +213,39 @@ trackTransaction fe txid feeRate height = do
     modifyTVar' (feeBuckets fe) $ Map.adjust
       (\b -> b { fbInMempool = fbInMempool b + 1 }) bucketIdx
     modifyTVar' (feeTotalTxs fe) (+ 1)
+
+-- | Stop tracking a transaction that left the mempool WITHOUT being mined
+-- (RBF replacement, expiry, size-limit eviction, conflict with a connected
+-- block, etc.).  Removes the pending entry and decrements the bucket's
+-- in-mempool counter, exactly undoing 'trackTransaction'.
+--
+-- This is the counterpart of Bitcoin Core's
+-- @CBlockPolicyEstimator::removeTx(hash)@, which routes to
+-- @_removeTx(hash, /*inBlock=*/false)@ and is fired by
+-- @TransactionRemovedFromMempool@ for every removal reason except @BLOCK@
+-- (see @bitcoin-core/src/policy/fees/block_policy_estimator.cpp@:522-541,
+-- 586-589 and @txmempool.cpp@ @removeUnchecked@:263-275).  Without this,
+-- @feePending@ (Core's @mapMemPoolTxs@) and @fbInMempool@ (Core's
+-- @unconfTxs@ bucket counter) only ever shrink on block-confirmation, so
+-- every tx that leaves the pool unconfirmed leaks its entry forever.
+--
+-- Note: block-confirmed removals must NOT call this — those go through
+-- 'recordConfirmation' (Core's @processBlockTx@ / @_removeTx(inBlock=true)@),
+-- which records the confirmation rather than treating the exit as a failure.
+-- We do not model Core's @failAvg@ accumulation here because this estimator
+-- does not track per-period failure statistics; the in-mempool counter is the
+-- quantity that would otherwise grow unbounded.
+untrackTransaction :: FeeEstimator -> TxId -> IO ()
+untrackTransaction fe txid =
+  atomically $ do
+    pending <- readTVar (feePending fe)
+    case Map.lookup txid pending of
+      Nothing   -> return ()   -- not tracked (e.g. seen before estimator start)
+      Just info -> do
+        writeTVar (feePending fe) (Map.delete txid pending)
+        modifyTVar' (feeBuckets fe) $ Map.adjust
+          (\b -> b { fbInMempool = max 0 (fbInMempool b - 1) })
+          (ptBucketIdx info)
 
 -- | Record confirmations when a block is connected
 -- Updates the fee buckets with confirmation data and applies decay

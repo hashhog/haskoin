@@ -32,11 +32,16 @@ module Haskoin.Mempool
   , calculateAdjustedVSize
     -- * Mempool Creation
   , newMempool
+  , setOnRemoveTx
   , noopCoinMtp
     -- * Transaction Operations
   , addTransaction
   , testAcceptTransaction
   , removeTransaction
+  , removeTransactionForBlock
+  , prioritiseTransaction
+  , applyFeeDelta
+  , buildMempoolEntry
   , getTransaction
   , getTransactionByWtxid
   , txIdForWtxid
@@ -622,6 +627,18 @@ data Mempool = Mempool
     -- ^ Unix timestamp of the last decay calculation.  Initialised to now.
     -- Updated every time GetMinFee applies a decay step (only if >10s elapsed).
     -- Bitcoin Core: lastRollingFeeUpdate (txmempool.h:195).
+  , mpOnRemoveTx :: !(TVar (TxId -> IO ()))
+    -- ^ Notification fired for every NON-BLOCK mempool removal (RBF replace,
+    -- expiry, size-limit/sibling/ephemeral eviction, block-conflict).  This is
+    -- the analogue of Bitcoin Core's
+    -- @m_opts.signals->TransactionRemovedFromMempool(...)@ call inside
+    -- @CTxMemPool::removeUnchecked@ (txmempool.cpp:263-275), which Core fires
+    -- for every removal reason except @BLOCK@.  The fee estimator subscribes by
+    -- installing 'Haskoin.FeeEstimator.untrackTransaction' here (via
+    -- 'setOnRemoveTx'); without it, txs that leave the pool unconfirmed leak
+    -- their @feePending@/@fbInMempool@ entries forever.  Defaults to a no-op so
+    -- the mempool stays decoupled from the estimator (no module dependency) and
+    -- behaviour is unchanged until a subscriber is installed.
   }
 
 -- | A no-op coin-MTP lookup that returns 0 for every height.
@@ -664,6 +681,26 @@ newMempool net cache config height mtp getCoinMtp = do
     <*> newTVarIO 0.0        -- mpRollingMinFeeRate: starts at 0
     <*> newTVarIO False      -- mpBlockSinceLastFeeBump: no block yet
     <*> newTVarIO now        -- mpLastRollingFeeUpdate: now
+    <*> newTVarIO (\_ -> return ())  -- mpOnRemoveTx: no subscriber by default
+
+-- | Install the non-block removal subscriber.  The wiring layer (the RPC
+-- server, which owns both the 'Mempool' and the 'FeeEstimator') calls this
+-- once at startup with @untrackTransaction feeEst@ so the estimator stops
+-- tracking every tx that leaves the pool unconfirmed.  Mirrors Core
+-- registering @CBlockPolicyEstimator@ as a @CValidationInterface@ that
+-- receives @TransactionRemovedFromMempool@ (init.cpp / validationinterface).
+setOnRemoveTx :: Mempool -> (TxId -> IO ()) -> IO ()
+setOnRemoveTx mp cb = atomically $ writeTVar (mpOnRemoveTx mp) cb
+
+-- | Fire the non-block removal notification for a txid.  Run after the STM
+-- removal commits (the subscriber does its own IO/STM), so it must not be
+-- inside the removal's @atomically@ block.  Counterpart to the
+-- @m_opts.signals->TransactionRemovedFromMempool@ call in Core's
+-- @removeUnchecked@ (txmempool.cpp:269-275).
+fireRemoveNotify :: Mempool -> TxId -> IO ()
+fireRemoveNotify mp txid = do
+  cb <- readTVarIO (mpOnRemoveTx mp)
+  cb txid
 
 --------------------------------------------------------------------------------
 -- Transaction Addition
@@ -1004,14 +1041,23 @@ handleTruc mp tx txid fee vsize txSigOpCost ancestors = do
 -- AddUnchecked (txmempool.cpp) without the side-effecting insertion.
 buildMempoolEntry :: Mempool -> Tx -> TxId -> Word64 -> Int -> Int -> [MempoolEntry] -> IO MempoolEntry
 buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors = do
-  let adjVsize = calculateAdjustedVSize tx txSigOpCost
-      feeRate  = calculateFeeRate fee adjVsize
+  -- Fold any pre-existing prioritisetransaction delta into the entry's RANK
+  -- fields (meFeeRate + the self-component of the ancestor/descendant fee
+  -- aggregates) so a tx prioritised BEFORE it arrived enters the pool with
+  -- its modified rank.  Core: ChangeSet::StageAddition calls ApplyDelta and
+  -- then UpdateModifiedFee + SetTransactionFee (txmempool.cpp:1014-1023).
+  -- meFee itself stays the BASE fee (Core GetFee vs GetModifiedFee).
+  feeDeltas <- readTVarIO (mpFeeDeltas mp)
+  let delta    = Map.findWithDefault 0 txid feeDeltas
+      modFee   = applyFeeDelta fee delta
+      adjVsize = calculateAdjustedVSize tx txSigOpCost
+      feeRate  = calculateFeeRate modFee adjVsize
   now    <- round <$> getPOSIXTime
   height <- readTVarIO (mpHeight mp)
   let rbfOptIn      = signalsOptInRBF tx
       ancestorCount = length ancestors + 1
       ancestorSize  = sum (map meSize ancestors) + adjVsize
-      ancestorFees  = sum (map meFee ancestors) + fee
+      ancestorFees  = sum (map meFee ancestors) + modFee
       ancestorSigOps = sum (map meAncestorSigOps ancestors) + txSigOpCost
       wtxid = computeWtxid tx
   return MempoolEntry
@@ -1029,7 +1075,7 @@ buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors = do
     , meAncestorSigOps = ancestorSigOps
     , meDescendantCount = 1
     , meDescendantSize  = adjVsize
-    , meDescendantFees  = fee
+    , meDescendantFees  = modFee
     , meRBFOptIn       = rbfOptIn
     }
 
@@ -1459,14 +1505,41 @@ checkAncestorLimits mp tx txVsize = do
 -- Transaction Removal
 --------------------------------------------------------------------------------
 
--- | Remove a transaction from the mempool
--- Updates descendant counts for all ancestors and ancestor counts for all descendants
+-- | Remove a transaction from the mempool for a NON-BLOCK reason
+-- (RBF replacement, expiry, size-limit/sibling/ephemeral eviction, or
+-- conflict with a connected block).  Updates descendant counts for all
+-- ancestors and ancestor counts for all descendants, then fires
+-- 'fireRemoveNotify' so subscribers (the fee estimator) can untrack the tx.
+--
+-- This is the analogue of Bitcoin Core's @CTxMemPool::removeUnchecked@
+-- (txmempool.cpp:263), which fires @TransactionRemovedFromMempool@ for every
+-- removal reason except @BLOCK@.  Block-confirmed removals go through
+-- 'removeTransactionForBlock', which omits the notification (Core: the
+-- estimator instead consumes confirmations via @processBlockTx@).
 removeTransaction :: Mempool -> TxId -> IO ()
 removeTransaction mp txid = do
+  removed <- removeTransactionStructural mp txid
+  when removed $ fireRemoveNotify mp txid
+
+-- | Remove a transaction from the mempool because it was confirmed in a
+-- connected block.  Identical structural removal to 'removeTransaction' but
+-- does NOT fire the non-block removal notification: a confirmed tx is not a
+-- fee-estimation "failure" and is accounted for separately (Core's BLOCK
+-- removal reason suppresses the @TransactionRemovedFromMempool@ signal —
+-- txmempool.cpp:269).
+removeTransactionForBlock :: Mempool -> TxId -> IO ()
+removeTransactionForBlock mp txid = () <$ removeTransactionStructural mp txid
+
+-- | Shared structural removal used by both 'removeTransaction' (non-block) and
+-- 'removeTransactionForBlock' (block).  Returns 'True' iff an entry was
+-- actually present and removed, so callers only notify on a real removal
+-- (mirrors Core's @_removeTx@ returning whether the txid was tracked).
+removeTransactionStructural :: Mempool -> TxId -> IO Bool
+removeTransactionStructural mp txid = do
   -- First, get the entry and its related transactions before modifying anything
   mEntry <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
   case mEntry of
-    Nothing -> return ()
+    Nothing -> return False
     Just entry -> do
       -- Get ancestors to update their descendant counts
       ancestors <- getAncestorsOfEntry mp entry
@@ -1504,6 +1577,7 @@ removeTransaction mp txid = do
                      , meAncestorSize = meAncestorSize e - vsize
                      , meAncestorFees = meAncestorFees e - fee
                      }) (meTxId desc)
+      return True
 
 -- | Get ancestors of a mempool entry (helper for removal)
 getAncestorsOfEntry :: Mempool -> MempoolEntry -> IO [MempoolEntry]
@@ -1625,18 +1699,101 @@ getPrioritisedTransactions :: Mempool -> IO [(TxId, Int64, Bool, Maybe Word64)]
 getPrioritisedTransactions mp = atomically $ do
   feeDeltas <- readTVar (mpFeeDeltas mp)
   entries   <- readTVar (mpEntries mp)
-  let applyDelta :: Word64 -> Int64 -> Word64
-      applyDelta baseFee delta
-        | delta >= 0 = baseFee + fromIntegral delta
-        | otherwise  =
-            let absD = fromIntegral (negate delta) :: Word64
-            in if absD > baseFee then 0 else baseFee - absD
   return
     [ case Map.lookup txid entries of
-        Just entry -> (txid, delta, True,  Just (applyDelta (meFee entry) delta))
+        Just entry -> (txid, delta, True,  Just (applyFeeDelta (meFee entry) delta))
         Nothing    -> (txid, delta, False, Nothing)
     | (txid, delta) <- Map.toList feeDeltas
     ]
+
+-- | Apply a prioritisetransaction fee delta to a base fee, clamping the
+-- result into the Word64 range (a negative delta cannot drive the modified
+-- fee below zero).  This is Core's @CTxMemPool::ApplyDelta@
+-- (bitcoin-core/src/txmempool.cpp:657-665) with explicit saturation.
+applyFeeDelta :: Word64 -> Int64 -> Word64
+applyFeeDelta baseFee delta =
+  let v = toInteger baseFee + toInteger delta
+  in if v < 0
+       then 0
+       else if v > toInteger (maxBound :: Word64)
+         then maxBound
+         else fromInteger v
+
+-- | Saturating Int64 addition (Core's @SaturatingAdd@,
+-- bitcoin-core/src/util/overflow.h, as used by PrioritiseTransaction at
+-- txmempool.cpp:634).
+saturatingAddInt64 :: Int64 -> Int64 -> Int64
+saturatingAddInt64 a b
+  | b > 0 && a > maxBound - b = maxBound
+  | b < 0 && a < minBound - b = minBound
+  | otherwise                 = a + b
+
+-- | Record a prioritisetransaction fee delta for a txid and, when the tx is
+-- currently in the mempool, immediately re-rank it by its MODIFIED fee.
+--
+-- Mirrors Bitcoin Core's @CTxMemPool::PrioritiseTransaction@
+-- (bitcoin-core/src/txmempool.cpp:630-655):
+--
+--   * deltas STACK: the new total is @SaturatingAdd(existing, feeDelta)@;
+--   * a total of exactly 0 ERASES the 'mpFeeDeltas' entry (txmempool.cpp:644);
+--   * txids NOT in the mempool are remembered — the delta is applied when
+--     (if) the tx later arrives ('buildMempoolEntry' /
+--     'addTransactionToMempool' fold the stored delta in, Core's
+--     ChangeSet::StageAddition → ApplyDelta, txmempool.cpp:1014-1023);
+--   * for an in-mempool tx the entry's rank is updated in place
+--     (Core: @UpdateModifiedFee@ + @m_txgraph->SetTransactionFee@,
+--     txmempool.cpp:638-641): 'meFeeRate' becomes the modified-fee rate and
+--     the @(feerate, txid)@ key in 'mpByFeeRate' is re-keyed, so both
+--     size-limit EVICTION ('trimToSize' evicts the lowest 'mpByFeeRate' key)
+--     and MINING selection ('selectTransactions' ranks by
+--     meAncestorFees/meAncestorSize) see the delta.
+--
+-- Rank-propagation scope: SINGLE-ENTRY semantics (the fleet bar, rustoshi
+-- FIX-72): the delta moves the prioritised entry's OWN rank fields
+-- ('meFeeRate', and the self-component of 'meAncestorFees' /
+-- 'meDescendantFees').  It is NOT propagated into the aggregate fields of
+-- ancestors/descendants (Core's full mapTx ancestor-state propagation) —
+-- removal bookkeeping ('removeTransactionStructural') subtracts BASE fees
+-- from relatives' aggregates, and those aggregates only ever contained base
+-- fees of relatives, so the invariant stays consistent.
+--
+-- 'meFee' itself always remains the BASE fee: block templates account
+-- coinbase fees from 'meFee' (Core: AddToBlock pushes GetFee(),
+-- node/miner.cpp:262-270) — the delta is a selection-priority fiction, never
+-- an actually-paid amount.
+prioritiseTransaction :: Mempool -> TxId -> Int64 -> IO ()
+prioritiseTransaction mp txid feeDelta = atomically $ do
+  deltas <- readTVar (mpFeeDeltas mp)
+  let oldTotal = Map.findWithDefault 0 txid deltas
+      newTotal = saturatingAddInt64 oldTotal feeDelta
+  writeTVar (mpFeeDeltas mp) $
+    if newTotal == 0
+      then Map.delete txid deltas
+      else Map.insert txid newTotal deltas
+  entries <- readTVar (mpEntries mp)
+  case Map.lookup txid entries of
+    Nothing -> return ()
+    Just e -> do
+      -- INVARIANT: an in-mempool entry's own contribution to its rank
+      -- fields is always base+currentDelta (folded in at admission by
+      -- buildMempoolEntry / addTransactionToMempool and updated here on
+      -- every subsequent prioritise call), so replacing oldMod -> newMod
+      -- is exact.
+      let oldMod  = applyFeeDelta (meFee e) oldTotal
+          newMod  = applyFeeDelta (meFee e) newTotal
+          oldRate = meFeeRate e
+          newRate = calculateFeeRate newMod (meSize e)
+          -- Replace the self-component of an aggregate (saturating).
+          replaceSelf total =
+            let withoutOld = if oldMod > total then 0 else total - oldMod
+            in withoutOld + newMod
+          e' = e { meFeeRate        = newRate
+                 , meAncestorFees   = replaceSelf (meAncestorFees e)
+                 , meDescendantFees = replaceSelf (meDescendantFees e)
+                 }
+      writeTVar (mpEntries mp) (Map.insert txid e' entries)
+      modifyTVar' (mpByFeeRate mp)
+        (Map.insert (newRate, txid) () . Map.delete (oldRate, txid))
 
 -- | Get the effective minimum fee rate for mempool acceptance (sat/kvB).
 -- Returns the maximum of:
@@ -2036,10 +2193,26 @@ blockConnected mp block = do
   -- Get all confirmed transaction IDs
   let confirmedTxIds = Set.fromList $ map computeTxId (blockTxns block)
 
-  -- Remove confirmed transactions
-  forM_ (Set.toList confirmedTxIds) $ removeTransaction mp
+  -- Remove confirmed transactions.  These leave the pool because they were
+  -- MINED — Core's @BLOCK@ removal reason, which suppresses the
+  -- @TransactionRemovedFromMempool@ signal (txmempool.cpp:269).  Use
+  -- 'removeTransactionForBlock' so the fee-estimator subscriber is NOT told to
+  -- untrack them as a failure; confirmations are accounted for separately
+  -- (FeeEstimator.recordConfirmation / Core processBlockTx).
+  forM_ (Set.toList confirmedTxIds) $ removeTransactionForBlock mp
 
-  -- Find and remove conflicting transactions
+  -- Delta lifecycle: a prioritisetransaction fee delta is ERASED for every
+  -- tx confirmed by this block (Core removeForBlock → ClearPrioritisation,
+  -- txmempool.cpp:405-421, cleared for every block tx whether or not it was
+  -- in the pool).  Deltas survive eviction/expiry/RBF replacement — only
+  -- block confirmation and block conflict clear them.
+  atomically $ modifyTVar' (mpFeeDeltas mp) $ \m ->
+    foldr Map.delete m (Set.toList confirmedTxIds)
+
+  -- Find and remove conflicting transactions.  These were NOT mined — they
+  -- spent an outpoint a block tx also spent, so they are now invalid.  This is
+  -- Core's @CONFLICT@ removal reason, which DOES fire the removal signal, so we
+  -- use 'removeWithDescendants' → 'removeTransaction' (notifies the estimator).
   let spentByBlock = Set.fromList
         [ txInPrevOutput inp
         | tx <- tail (blockTxns block)  -- Skip coinbase
@@ -2049,8 +2222,11 @@ blockConnected mp block = do
   entries <- readTVarIO (mpEntries mp)
   forM_ (Map.toList entries) $ \(txid, entry) -> do
     let txSpends = Set.fromList $ map txInPrevOutput (txInputs (meTransaction entry))
-    unless (Set.null $ Set.intersection txSpends spentByBlock) $
+    unless (Set.null $ Set.intersection txSpends spentByBlock) $ do
       removeWithDescendants mp txid
+      -- Core removeConflicts → ClearPrioritisation for the directly
+      -- conflicting tx (txmempool.cpp:388-402; descendants keep theirs).
+      atomically $ modifyTVar' (mpFeeDeltas mp) (Map.delete txid)
 
   -- Update chain height and MTP (BIP-113).
   -- Prepend the new block's timestamp to the rolling window (capped at 11),
@@ -2822,9 +2998,15 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
     Right ancestors -> do
       now <- round <$> getPOSIXTime
       height <- readTVarIO (mpHeight mp)
-      let rbfOptIn = any (\inp -> txInSequence inp < 0xfffffffe) (txInputs tx)
+      -- Fold any pre-existing prioritisetransaction delta into the rank
+      -- fields, exactly as 'buildMempoolEntry' does for the single-tx path
+      -- (Core ChangeSet::StageAddition → ApplyDelta, txmempool.cpp:1014-1023).
+      feeDeltas <- readTVarIO (mpFeeDeltas mp)
+      let delta  = Map.findWithDefault 0 txid feeDeltas
+          modFee = applyFeeDelta fee delta
+          rbfOptIn = any (\inp -> txInSequence inp < 0xfffffffe) (txInputs tx)
           ancestorCount = length ancestors + 1
-          ancestorFees = sum (map meFee ancestors) + fee
+          ancestorFees = sum (map meFee ancestors) + modFee
           -- Include self's own sigop cost (matches Core ancestor sigop accumulation).
           inputMap = Map.fromList inputPairs
           sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
@@ -2833,7 +3015,7 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
           -- Sigop-adjusted virtual size (Core parity).
           -- Reference: bitcoin-core/src/policy/policy.cpp:400-403.
           adjVsize = calculateAdjustedVSize tx selfSigOpCost
-          feeRate = calculateFeeRate fee adjVsize
+          feeRate = calculateFeeRate modFee adjVsize
           ancestorSize = sum (map meSize ancestors) + adjVsize
           wtxid = computeWtxid tx
           entry = MempoolEntry
@@ -2851,7 +3033,7 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
             , meAncestorSigOps = ancestorSigOps
             , meDescendantCount = 1
             , meDescendantSize = adjVsize
-            , meDescendantFees = fee
+            , meDescendantFees = modFee
             , meRBFOptIn = rbfOptIn
             }
 

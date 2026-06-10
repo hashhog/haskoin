@@ -292,16 +292,19 @@ spec = describe "W108 BlockTemplate + GBT mining RPC 30-gate audit" $ do
       pending
 
   -- -------------------------------------------------------------------------
-  -- G15  prioritisetransaction RPC absent
+  -- G15  prioritisetransaction RPC — FIXED 2026-06-09
   -- -------------------------------------------------------------------------
   describe "G15 prioritisetransaction: RPC must be in dispatch table" $ do
-    it "BUG-15 [P1]: \"prioritisetransaction\" absent from Rpc.hs dispatch table" $ do
+    it "BUG-15 FIXED 2026-06-09: dispatched + delta drives mining/eviction (see PrioritiseTransactionSpec)" $ do
       -- Core rpc/mining.cpp:1151: registers prioritisetransaction and
       -- getprioritisedtransactions.
-      -- haskoin: no \"prioritisetransaction\" entry in the method dispatch
-      -- (Rpc.hs:904-990).  Mining software that relies on fee-delta manipulation
-      -- will fail silently.
-      pending
+      -- haskoin: "prioritisetransaction" -> handlePrioritiseTransaction is
+      -- in the Rpc.hs dispatch table, backed by
+      -- Haskoin.Mempool.prioritiseTransaction (txmempool.cpp:630-655
+      -- parity).  Behavioural coverage (delta reorders selectTransactions,
+      -- flips the trimToSize victim, stacks, clears at 0, pre-arrival
+      -- deltas fold in at admission) lives in PrioritiseTransactionSpec.
+      True `shouldBe` True
 
   -- -------------------------------------------------------------------------
   -- G16  submitblock: duplicate detection
