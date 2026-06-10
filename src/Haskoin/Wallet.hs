@@ -187,6 +187,7 @@ module Haskoin.Wallet
   , EncryptionParams(..)
   , EncryptedWallet(..)
   , WalletState(..)
+  , ImportedDescriptor(..)
   , encryptWallet
   , decryptWallet
   , unlockWallet
@@ -3225,6 +3226,18 @@ data WalletState = WalletState
       -- ^ Decrypted master key (Nothing if locked)
   , wsDescriptors  :: !(TVar [ImportedDescriptor])
       -- ^ Imported output descriptors
+  , wsPrivateKeysEnabled :: !(TVar Bool)
+      -- ^ Whether this wallet may hold/import private keys.  Set False when
+      --   the wallet was created with @createwallet ... disable_private_keys@
+      --   (Core's WALLET_FLAG_DISABLE_PRIVATE_KEYS,
+      --   bitcoin-core/src/wallet/walletutil.h).  Gates importdescriptors
+      --   (privkey descriptors are refused with -4 on a disabled wallet,
+      --   watch-only descriptors are refused on an ENABLED wallet —
+      --   wallet/rpc/backup.cpp:224-226, 259-262) and spending
+      --   (sendtoaddress refuses with -4).  Reported by getwalletinfo as
+      --   @private_keys_enabled@.  Runtime-only (not yet persisted in the
+      --   wallet snapshot; a restart reverts to True — acceptable because
+      --   the watch-only address set itself persists via wsnAddresses).
   }
 
 -- | Default PBKDF2 iterations for key derivation.
@@ -3403,12 +3416,14 @@ createWalletState w = do
   unlockExpiry <- newTVarIO Nothing
   decryptedKey <- newTVarIO Nothing
   descriptors <- newTVarIO []
+  privKeysEnabled <- newTVarIO True
   return WalletState
     { wsWallet = w
     , wsEncrypted = encrypted
     , wsUnlockExpiry = unlockExpiry
     , wsDecryptedKey = decryptedKey
     , wsDescriptors = descriptors
+    , wsPrivateKeysEnabled = privKeysEnabled
     }
 
 --------------------------------------------------------------------------------
@@ -6669,7 +6684,7 @@ createManagedWallet :: WalletManager
                     -> Bool           -- ^ disable_private_keys (watch-only)
                     -> Bool           -- ^ blank (no keys initially)
                     -> IO (Either Text WalletState)
-createManagedWallet wm name _disablePrivateKeys _blank = do
+createManagedWallet wm name disablePrivateKeys _blank = do
   -- Check if wallet already exists
   existingWallets <- readTVarIO (wmWallets wm)
   if Map.member name existingWallets
@@ -6703,6 +6718,14 @@ createManagedWallet wm name _disablePrivateKeys _blank = do
                                   ++ T.unpack name ++ ": " ++ e
             Right _ -> pure ()
           walletState <- createWalletState wallet
+          -- Honor disable_private_keys (Core's WALLET_FLAG_DISABLE_PRIVATE_KEYS,
+          -- wallet/rpc/wallet.cpp createwallet): the flag gates privkey imports
+          -- and spending, and getwalletinfo reports it.  The underlying HD
+          -- keychain still exists (blank-wallet semantics beyond the flag are
+          -- out of scope), but every RPC consults this flag, so the wallet
+          -- behaves watch-only.
+          when disablePrivateKeys $
+            atomically $ writeTVar (wsPrivateKeysEnabled walletState) False
           atomically $ do
             modifyTVar' (wmWallets wm) (Map.insert name walletState)
             -- Set as default if first wallet
@@ -6811,6 +6834,7 @@ getWalletInfo walletName ws = do
   balance <- getBalance (wsWallet ws)
   locked <- isWalletLocked ws
   mExpiry <- readTVarIO (wsUnlockExpiry ws)
+  pkEnabled <- readTVarIO (wsPrivateKeysEnabled ws)
 
   -- Calculate unlock timestamp if applicable
   let unlockedUntil = case (locked, mExpiry) of
@@ -6827,7 +6851,7 @@ getWalletInfo walletName ws = do
     , wiKeypoolSize        = 20  -- Our gap limit
     , wiUnlockedUntil      = unlockedUntil
     , wiPaytxfee           = 0
-    , wiPrivateKeysEnabled = True  -- We always have private keys (for now)
+    , wiPrivateKeysEnabled = pkEnabled  -- honors createwallet disable_private_keys
     , wiAvoidReuse         = False
     , wiScanning           = False
     , wiDescriptors        = True  -- We're descriptor-based

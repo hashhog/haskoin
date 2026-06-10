@@ -92,6 +92,7 @@ import Haskoin.Rpc
 import Haskoin.Index
 import qualified Haskoin.Index as Index
 import qualified Haskoin.MuHash as MuHash
+import qualified PrioritiseTransactionSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
@@ -20071,72 +20072,39 @@ main = hspec $ do
               ("expected error :: Object, got " ++ show other)
 
     -- ------------------------------------------------------------------
-    -- importdescriptors RPC gate (cross-impl lying-RPC audit 2026-05-05).
+    -- importdescriptors RPC — REAL implementation (2026-06-09; replaces
+    -- the 2026-05-05 refusal gate, whose tests lived here).
     --
-    -- The pre-fix handler walked the requests array, parsed each
-    -- descriptor via 'parseDescriptor', and returned
-    -- {"success": true, "warnings": []} per descriptor without ever
-    -- storing it in the wallet DB, deriving addresses, or scanning the
-    -- chain. Operators got a successful JSON-RPC response; nothing
-    -- actually landed. Fixed by refusing the RPC at the gate per
-    -- rustoshi 1d0a325 / hotbuns e355cd7 / clearbit + nimrod (lying-RPC
-    -- mirror wave 2026-05-05). Returns rpcWalletError (-4) instead of
-    -- rpcInternalError because the gap is a wallet-feature gap, not a
-    -- chainstate-activation issue.
-    --
-    -- The handler ignores its 'RpcServer' argument (the gate fires
-    -- before any server-state read), so we can pass 'undefined' here
-    -- without a full server fixture — same justification the
-    -- 'handleLoadTxOutSet' suite above uses.
+    -- Per-element semantics (Core wallet/rpc/backup.cpp:141-300
+    -- ProcessDescriptorImport) are unit-tested against a real
+    -- WalletState via the exported 'importOneDescriptor' — no RPC
+    -- server fixture needed.  The end-to-end behaviour (one rescan per
+    -- batch crediting PRE-import funds, getaddressinfo ismine,
+    -- listunspent/balance) is covered by the regtest watch-only
+    -- harness: test-suite/watchonly/haskoin_watchonly.sh.
     -- ------------------------------------------------------------------
-    describe "importdescriptors RPC gate" $ do
-      it "refuses with rpcWalletError and surfaces 'not implemented'" $ do
-        -- A well-formed requests array with one descriptor object.
-        -- Pre-fix code would have parsed the descriptor and returned
-        -- [{"success": true, "warnings": []}].
-        let req = toJSON [object [ "desc"
-                  .= ("wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)" :: T.Text) ]]
-        resp <- handleImportDescriptors undefined req
-        let err = resError resp
-        -- result must be Null (refusal)
-        resResult resp `shouldBe` Null
-        -- error.code must be -4 (rpcWalletError)
-        case err of
-          Object km -> do
-            KM.lookup "code" km `shouldBe` Just (toJSON rpcWalletError)
-            -- error.message must surface the impl gap
-            case KM.lookup "message" km of
-              Just (String t) ->
-                ("importdescriptors not implemented" `T.isInfixOf` t)
-                  `shouldBe` True
-              other ->
-                expectationFailure
-                  ("expected error.message :: Text, got " ++ show other)
-          other ->
-            expectationFailure
-              ("expected error :: Object, got " ++ show other)
+    describe "importdescriptors RPC" $ do
+      let mkWalletState = do
+            m <- generateMnemonic 128
+            w <- loadWallet (WalletConfig mainnet 20 "") m
+            createWalletState w
+          pubDescPlain =
+            "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)" :: T.Text
+          withChk d = case addDescriptorChecksum d of
+            Just c  -> c
+            Nothing -> Prelude.error "addDescriptorChecksum failed in test"
+          elemBool k v = case v of
+            Object km -> KM.lookup k km
+            _         -> Nothing
+          elemErrField k v = case v of
+            Object km -> case KM.lookup "error" km of
+              Just (Object ekm) -> KM.lookup k ekm
+              _                 -> Nothing
+            _ -> Nothing
 
-      it "gate fires before any descriptor parse" $ do
-        -- Pre-fix code would have called 'parseDescriptor' on
-        -- "obviously-not-a-descriptor" and returned a per-element error
-        -- object with rpcInvalidParams. Post-fix the gate must
-        -- short-circuit to the canonical refusal regardless.
-        let req = toJSON [object
-                    [ "desc" .= ("obviously-not-a-descriptor" :: T.Text) ]]
-        resp <- handleImportDescriptors undefined req
-        case resError resp of
-          Object km ->
-            KM.lookup "code" km `shouldBe` Just (toJSON rpcWalletError)
-          other ->
-            expectationFailure
-              ("expected error :: Object, got " ++ show other)
-        -- Result must be Null, NOT a per-element results array (which
-        -- the pre-fix handler always returned).
-        resResult resp `shouldBe` Null
-
-      it "still rejects malformed params before the gate" $ do
-        -- Non-array params → rpcInvalidParams (-32602), NOT
-        -- rpcWalletError. Param-validation comes before the gate.
+      it "rejects malformed (non-array) params with rpcInvalidParams" $ do
+        -- Param-shape validation fires before any wallet/server access,
+        -- so 'undefined' is a safe server here.
         resp <- handleImportDescriptors undefined
                   (toJSON ("not-an-array" :: T.Text))
         case resError resp of
@@ -20146,19 +20114,113 @@ main = hspec $ do
             expectationFailure
               ("expected error :: Object, got " ++ show other)
 
-      it "gate message matches the exported 'importDescriptorsGateMessage'" $ do
-        let req = toJSON [object [ "desc"
-                  .= ("wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)" :: T.Text) ]]
-        resp <- handleImportDescriptors undefined req
-        case resError resp of
-          Object km -> case KM.lookup "message" km of
-            Just (String t) -> t `shouldBe` importDescriptorsGateMessage
-            other ->
-              expectationFailure
-                ("expected error.message :: Text, got " ++ show other)
-          other ->
-            expectationFailure
-              ("expected error :: Object, got " ++ show other)
+      it "missing checksum -> per-element success:false error -5 'Missing checksum'" $ do
+        -- Core parses with require_checksum=true (backup.cpp:158-161);
+        -- the literal message comes from CheckChecksum
+        -- (script/descriptor.cpp:2845-2846).  Per-element, NOT top-level.
+        ws <- mkWalletState
+        (el, needsRescan) <- importOneDescriptor ws False 1000
+          (object ["desc" .= pubDescPlain, "timestamp" .= (0 :: Int)])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-5 :: Int))
+        elemErrField "message" el `shouldBe` Just (String "Missing checksum")
+        needsRescan `shouldBe` False
+
+      it "wrong checksum -> per-element -5 with a checksum-mismatch message" $ do
+        ws <- mkWalletState
+        (el, _) <- importOneDescriptor ws False 1000
+          (object [ "desc" .= (pubDescPlain <> "#00000000")
+                  , "timestamp" .= (0 :: Int) ])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-5 :: Int))
+        case elemErrField "message" el of
+          Just (String t) ->
+            ("checksum" `T.isInfixOf` T.toLower t) `shouldBe` True
+          other -> expectationFailure ("expected message, got " ++ show other)
+
+      it "missing timestamp -> per-element -3 'Missing required timestamp field for key'" $ do
+        ws <- mkWalletState
+        (el, _) <- importOneDescriptor ws False 1000
+          (object ["desc" .= withChk pubDescPlain])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-3 :: Int))
+        elemErrField "message" el
+          `shouldBe` Just (String "Missing required timestamp field for key")
+
+      it "privkey descriptor into a disable_private_keys wallet -> -4" $ do
+        -- backup.cpp:224-226.
+        ws <- mkWalletState
+        let sk  = SecKey (BS.replicate 32 0x07)
+            wif = wifEncode sk
+        (el, _) <- importOneDescriptor ws False 1000
+          (object [ "desc" .= withChk ("wpkh(" <> wif <> ")")
+                  , "timestamp" .= (0 :: Int) ])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-4 :: Int))
+        case elemErrField "message" el of
+          Just (String t) -> t `shouldBe`
+            "Cannot import private keys to a wallet with private keys disabled"
+          other -> expectationFailure ("expected message, got " ++ show other)
+
+      it "watch-only descriptor into a privkeys-ENABLED wallet -> -4 (converse guard)" $ do
+        -- backup.cpp:259-262: watch-only imports are only legal on a
+        -- disable_private_keys wallet.
+        ws <- mkWalletState
+        (el, _) <- importOneDescriptor ws True 1000
+          (object [ "desc" .= withChk pubDescPlain
+                  , "timestamp" .= (0 :: Int) ])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-4 :: Int))
+
+      it "valid watch-only import: success:true, address registered, numeric ts wants rescan" $ do
+        ws <- mkWalletState
+        let chkDesc = withChk pubDescPlain
+        (el, needsRescan) <- importOneDescriptor ws False 1000
+          (object ["desc" .= chkDesc, "timestamp" .= (0 :: Int)])
+        elemBool "success" el `shouldBe` Just (Bool True)
+        needsRescan `shouldBe` True
+        -- The derived address must be registered in walletAddresses with
+        -- the watch-only sentinel so scanBlockForWallet credits it.
+        case parseDescriptor chkDesc of
+          Left e -> expectationFailure ("parseDescriptor: " ++ show e)
+          Right d -> do
+            let addrs = deriveAddresses d []
+            addrs `shouldSatisfy` (not . null)
+            m <- readTVarIO (walletAddresses (wsWallet ws))
+            mapM_ (\a -> Map.lookup a m
+                     `shouldBe` Just (maxBound :: Word32, False)) addrs
+        -- and the descriptor is recorded for listdescriptors
+        descs <- readTVarIO (wsDescriptors ws)
+        Prelude.map idDescText descs `shouldBe` [chkDesc]
+
+      it "timestamp \"now\" imports without requesting a rescan" $ do
+        -- backup.cpp:385: "now" = tip MTP -> nothing before it to scan.
+        ws <- mkWalletState
+        (el, needsRescan) <- importOneDescriptor ws False 1000
+          (object [ "desc" .= withChk pubDescPlain
+                  , "timestamp" .= ("now" :: T.Text) ])
+        elemBool "success" el `shouldBe` Just (Bool True)
+        needsRescan `shouldBe` False
+
+      it "range on an un-ranged descriptor -> -8" $ do
+        ws <- mkWalletState
+        (el, _) <- importOneDescriptor ws False 1000
+          (object [ "desc" .= withChk pubDescPlain
+                  , "timestamp" .= (0 :: Int)
+                  , "range" .= (5 :: Int) ])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-8 :: Int))
+
+      it "active on an un-ranged descriptor -> -8 'Active descriptors must be ranged'" $ do
+        ws <- mkWalletState
+        (el, _) <- importOneDescriptor ws False 1000
+          (object [ "desc" .= withChk pubDescPlain
+                  , "timestamp" .= (0 :: Int)
+                  , "active" .= True ])
+        elemBool "success" el `shouldBe` Just (Bool False)
+        elemErrField "code" el `shouldBe` Just (toJSON (-8 :: Int))
+        elemErrField "message" el
+          `shouldBe` Just (String "Active descriptors must be ranged")
 
   -- BIP-22 submitblock result string mapping (must come before 'where' below)
   -- Reference: Bitcoin Core BIP22ValidationResult() in src/rpc/mining.cpp
@@ -22691,6 +22753,10 @@ main = hspec $ do
 
   -- W106 CTxMemPool descendant/ancestor + RBF + package mempool audit
   W106MempoolSpec.spec
+
+  -- prioritisetransaction (mining/eviction effect) + fee-estimator untrack
+  -- (bundle 2026-06-09)
+  PrioritiseTransactionSpec.spec
 
   -- W107 CompactSize + VarInt 30-gate audit
   W107CompactSizeSpec.spec
