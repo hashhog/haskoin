@@ -139,6 +139,7 @@ module Haskoin.Network
   , addNodeConnect
   , sockAddrToHostPort
   , discoverPeers
+  , fallbackMainnetPeers
   , broadcastMessage
   , requestFromPeer
   , getPeerCount
@@ -594,7 +595,8 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        socket, connect, close, defaultHints,
                        SocketType(..), PortNumber, Family(..),
                        bind, listen, accept, setSocketOption,
-                       SocketOption(..), socketPair, defaultProtocol)
+                       SocketOption(..), socketPair, defaultProtocol,
+                       tupleToHostAddress)
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -3016,11 +3018,64 @@ reachabilityFromConfig cfg = NetworkReachability
 -- DNS Seed Discovery
 --------------------------------------------------------------------------------
 
--- | Hardcoded fallback peer addresses for when DNS seeds fail
--- KNOWN PITFALL: DNS seeds unreliable for testnet4, use fallback addresses
+-- | Hardcoded mainnet last-resort fallback peers, fired by 'discoverPeers'
+-- when every DNS seed errors / returns empty (Core's vFixedSeeds parity:
+-- net.cpp ThreadOpenConnections injects ConvertSeeds(FixedSeeds()) once the
+-- addrman is empty for a reachable network and DNS/-seednode/-addnode have
+-- produced nothing).
+--
+-- 40 Core-vetted IPv4 :8333 nodes copied verbatim from
+-- bitcoin-core/contrib/seeds/nodes_main.txt (the makeseeds-filtered set that
+-- generates chainparamsseeds.h), selected one-per-leading-octet so no two
+-- share a /8 — maximizing netgroup/eclipse diversity for a tiny bootstrap set.
+--
+-- BYTE-ORDER NOTE (this is the trap the old @0x0a000001@ placeholder fell
+-- into): the rest of this module decodes a 'SockAddrInet' 'HostAddress' as
+-- first-octet-in-the-low-byte (see 'isLocalAddr' and 'getNetworkGroup'). To
+-- stay consistent and avoid hand-rolling the Word32, each address is built
+-- with 'tupleToHostAddress', which takes the octets in natural order.
 fallbackMainnetPeers :: [SockAddr]
 fallbackMainnetPeers =
-  [ SockAddrInet 8333 0x0a000001  -- placeholder IPs
+  [ SockAddrInet 8333 (tupleToHostAddress (2,121,116,198))
+  , SockAddrInet 8333 (tupleToHostAddress (3,86,179,235))
+  , SockAddrInet 8333 (tupleToHostAddress (4,2,51,251))
+  , SockAddrInet 8333 (tupleToHostAddress (5,2,23,226))
+  , SockAddrInet 8333 (tupleToHostAddress (12,11,29,34))
+  , SockAddrInet 8333 (tupleToHostAddress (14,49,142,41))
+  , SockAddrInet 8333 (tupleToHostAddress (18,27,125,103))
+  , SockAddrInet 8333 (tupleToHostAddress (23,93,18,82))
+  , SockAddrInet 8333 (tupleToHostAddress (24,16,202,74))
+  , SockAddrInet 8333 (tupleToHostAddress (27,83,109,113))
+  , SockAddrInet 8333 (tupleToHostAddress (31,41,23,249))
+  , SockAddrInet 8333 (tupleToHostAddress (34,65,45,157))
+  , SockAddrInet 8333 (tupleToHostAddress (35,78,97,86))
+  , SockAddrInet 8333 (tupleToHostAddress (37,15,61,236))
+  , SockAddrInet 8333 (tupleToHostAddress (38,52,3,192))
+  , SockAddrInet 8333 (tupleToHostAddress (40,160,1,232))
+  , SockAddrInet 8333 (tupleToHostAddress (44,223,26,178))
+  , SockAddrInet 8333 (tupleToHostAddress (45,19,130,200))
+  , SockAddrInet 8333 (tupleToHostAddress (46,126,216,3))
+  , SockAddrInet 8333 (tupleToHostAddress (47,90,137,13))
+  , SockAddrInet 8333 (tupleToHostAddress (50,4,123,66))
+  , SockAddrInet 8333 (tupleToHostAddress (51,154,0,142))
+  , SockAddrInet 8333 (tupleToHostAddress (52,182,185,242))
+  , SockAddrInet 8333 (tupleToHostAddress (60,241,1,72))
+  , SockAddrInet 8333 (tupleToHostAddress (62,34,57,141))
+  , SockAddrInet 8333 (tupleToHostAddress (63,247,147,166))
+  , SockAddrInet 8333 (tupleToHostAddress (64,23,97,128))
+  , SockAddrInet 8333 (tupleToHostAddress (65,94,134,253))
+  , SockAddrInet 8333 (tupleToHostAddress (66,35,84,14))
+  , SockAddrInet 8333 (tupleToHostAddress (67,4,139,122))
+  , SockAddrInet 8333 (tupleToHostAddress (68,61,69,53))
+  , SockAddrInet 8333 (tupleToHostAddress (69,4,94,226))
+  , SockAddrInet 8333 (tupleToHostAddress (70,44,20,24))
+  , SockAddrInet 8333 (tupleToHostAddress (71,56,178,136))
+  , SockAddrInet 8333 (tupleToHostAddress (72,88,192,74))
+  , SockAddrInet 8333 (tupleToHostAddress (73,42,33,255))
+  , SockAddrInet 8333 (tupleToHostAddress (74,48,195,218))
+  , SockAddrInet 8333 (tupleToHostAddress (75,80,3,4))
+  , SockAddrInet 8333 (tupleToHostAddress (76,124,35,108))
+  , SockAddrInet 8333 (tupleToHostAddress (77,38,72,37))
   ]
 
 fallbackTestnetPeers :: [SockAddr]
