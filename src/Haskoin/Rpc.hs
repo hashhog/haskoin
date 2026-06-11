@@ -295,7 +295,8 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          Message(..), Inv(..), GetData(..),
                          InvVector(..), InvType(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
-                         nodeNetworkLimited, hasService, ServiceFlag(..),
+                         nodeNetworkLimited, nodeP2PV2, bip324V2OutboundEnabled,
+                         hasService, ServiceFlag(..),
                          disconnectPeer, addNodeConnect, sockAddrToHostPort,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList,
@@ -3278,11 +3279,17 @@ handleGetNetworkInfo server = do
                  then xs !! m
                  else (xs !! (m - 1) + xs !! m) `div` 2
   -- Our local services: NODE_NETWORK (1) | NODE_WITNESS (8) |
-  -- NODE_NETWORK_LIMITED (0x400) = 0x409. Matches the wire-advertised
-  -- set (Network.hs) and Core g_local_services (init.cpp:863).
+  -- NODE_NETWORK_LIMITED (0x400) = 0x409, plus NODE_P2P_V2 (0x800) iff
+  -- BIP-324 v2 outbound is enabled -> 0xc09.  Gated on the SAME predicate that
+  -- gates the wire advertisement (Network.hs three sites) so localservices can
+  -- never claim a capability the node will not actually offer (Core binds the
+  -- flag to the action).  Matches Core g_local_services (init.cpp:863) +
+  -- NODE_P2P_V2 when v2 is on.
+  v2adv <- bip324V2OutboundEnabled
   let localServices = getServiceFlag nodeNetwork
                   .|. getServiceFlag nodeWitness
-                  .|. getServiceFlag nodeNetworkLimited :: Word64
+                  .|. getServiceFlag nodeNetworkLimited
+                  .|. (if v2adv then getServiceFlag nodeP2PV2 else 0) :: Word64
       localServicesHex = T.pack $ printf "%016x" localServices
       -- Build human-readable service names
       serviceNames :: [Text]
@@ -3291,6 +3298,7 @@ handleGetNetworkInfo server = do
         , if hasService localServices nodeWitness then Just "WITNESS" else Nothing
         , if hasService localServices nodeBloom then Just "BLOOM" else Nothing
         , if hasService localServices nodeNetworkLimited then Just "NETWORK_LIMITED" else Nothing
+        , if hasService localServices nodeP2PV2 then Just "P2P_V2" else Nothing
         ]
       -- Each network object as a streaming Encoding
       mkNetEnc name limited reachable =
