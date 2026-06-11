@@ -3407,20 +3407,30 @@ isV1Only :: PeerManager -> SockAddr -> IO Bool
 isV1Only pm addr = Set.member addr <$> readTVarIO (pmV1OnlyAddrs pm)
 
 -- | Read the @HASKOIN_BIP324_V2_OUTBOUND@ or generic @HASKOIN_BIP324_V2@
--- environment variable; v2 outbound is OFF by default to match the rest of
--- the fleet's roll-out posture.  Treats any value other than @0@/empty/
--- unset as enabled on either name; the generic @HASKOIN_BIP324_V2@ is the
--- convention used by the cross-impl interop harness
--- (@tools/bip324-interop-matrix.sh@), so accepting both keeps the live
--- interop test wired without forcing harness churn.
+-- environment variable; BIP-324 v2 outbound is now ON by default (matching
+-- Core v31.99, which speaks v2 by default and advertises NODE_P2P_V2). An
+-- operator can still opt OUT by setting either variable to an explicit-off
+-- value (@0@/@false@/@off@); an explicit-off on EITHER variable disables v2.
+-- The generic @HASKOIN_BIP324_V2@ is the convention used by the cross-impl
+-- interop harness, so honouring both keeps the live interop test wired.
+--
+-- This predicate gates BOTH the v2 transport attempt AND the NODE_P2P_V2
+-- (0x800) service-flag advertisement (Core binds the flag to the action:
+-- net.cpp gates every v2 attempt on GetLocalServices()&NODE_P2P_V2), so the
+-- advertised bit can never lie about on-wire capability.
 bip324V2OutboundEnabled :: IO Bool
 bip324V2OutboundEnabled = do
   m1 <- lookupEnv "HASKOIN_BIP324_V2_OUTBOUND"
   m2 <- lookupEnv "HASKOIN_BIP324_V2"
-  return $ enabled m1 || enabled m2
+  -- Default ON: enabled unless an operator explicitly turns it off on either
+  -- variable.  Unset/empty -> on; @0@/@false@/@off@ -> off.
+  return $ varOn m1 && varOn m2
   where
-    enabled (Just s) | s /= "" && s /= "0" = True
-    enabled _                              = False
+    varOn Nothing  = True
+    varOn (Just s) =
+      let v = map lc s
+      in not (v == "0" || v == "false" || v == "off")
+    lc c = if c >= 'A' && c <= 'Z' then toEnum (fromEnum c + 32) else c
 
 -- | Internal: connect to a peer with optional block-relay-only mode.
 --
@@ -3436,6 +3446,11 @@ tryConnectWithType pm addr blockRelayOnly = do
   -- Check if address is discouraged/banned before connecting
   discouraged <- isDiscouraged pm addr
   unless discouraged $ do
+    -- BIP-324: advertise NODE_P2P_V2 (0x800) exactly when v2 outbound is
+    -- enabled — bind the flag to the action so the advertised bit can never
+    -- lie about on-wire capability (Core net.cpp gates every v2 attempt on
+    -- GetLocalServices()&NODE_P2P_V2).
+    v2adv <- bip324V2OutboundEnabled
     let net = pmNetwork pm
         baseFlags = [nodeNetwork, nodeWitness]
         bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
@@ -3449,9 +3464,10 @@ tryConnectWithType pm addr blockRelayOnly = do
         prunedFlags = nodeNetworkLimited : bloomFlags
         -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — advertise when the
         -- operator enabled @-blockfilterindex@ AND the index is usable.
-        flags = if pmcCompactFilters (pmConfig pm)
-                  then nodeCompactFilters : prunedFlags
-                  else prunedFlags
+        filterFlags = if pmcCompactFilters (pmConfig pm)
+                        then nodeCompactFilters : prunedFlags
+                        else prunedFlags
+        flags = (if v2adv then (nodeP2PV2 :) else id) filterFlags
         config = PeerConfig
           { pcfgNetwork     = net
           , pcfgServices    = combineServices flags
@@ -3581,6 +3597,9 @@ attemptProxyOutbound pm config blockRelayOnly addr
 -- (G29 in the W117 audit).  We rely on the peer map for tracking.
 tryConnectByHost :: PeerManager -> String -> Int -> Bool -> IO ()
 tryConnectByHost pm host port blockRelayOnly = do
+  -- BIP-324: advertise NODE_P2P_V2 (0x800) iff v2 outbound is enabled
+  -- (flag bound to the action), matching 'tryConnectWithType'.
+  v2adv <- bip324V2OutboundEnabled
   let net = pmNetwork pm
       baseFlags = [nodeNetwork, nodeWitness]
       bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
@@ -3592,9 +3611,10 @@ tryConnectByHost pm host port blockRelayOnly = do
       -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
       -- decision as 'tryConnectWithType' so the hostname dial path
       -- doesn't accidentally bypass the index gate.
-      flags = if pmcCompactFilters (pmConfig pm)
-                then nodeCompactFilters : prunedFlags
-                else prunedFlags
+      filterFlags = if pmcCompactFilters (pmConfig pm)
+                      then nodeCompactFilters : prunedFlags
+                      else prunedFlags
+      flags = (if v2adv then (nodeP2PV2 :) else id) filterFlags
       config = PeerConfig
         { pcfgNetwork     = net
         , pcfgServices    = combineServices flags
@@ -3919,6 +3939,10 @@ startInboundListener pm port = do
       recvQ <- newTBQueueIO 100
       bufRef <- newIORef BS.empty
       v2Ref  <- newIORef Nothing
+      -- BIP-324: advertise NODE_P2P_V2 (0x800) to inbound peers iff v2 is
+      -- enabled (flag bound to the action), so inbound peers see the same
+      -- honest service-bit picture as outbound dials.
+      v2adv <- bip324V2OutboundEnabled
       let pc = PeerConnection
             { pcSocket      = sock
             , pcInfo        = infoVar
@@ -3942,9 +3966,10 @@ startInboundListener pm port = do
           -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
           -- decision as outbound paths.  Inbound peers must see the
           -- same service-bit picture as outbound dials.
-          flagsIn = if pmcCompactFilters (pmConfig pm)
-                      then nodeCompactFilters : prunedFlagsIn
-                      else prunedFlagsIn
+          filterFlagsIn = if pmcCompactFilters (pmConfig pm)
+                            then nodeCompactFilters : prunedFlagsIn
+                            else prunedFlagsIn
+          flagsIn = (if v2adv then (nodeP2PV2 :) else id) filterFlagsIn
           config = PeerConfig
             { pcfgNetwork     = net
             , pcfgServices    = combineServices flagsIn
@@ -7023,10 +7048,15 @@ v2MaxGarbageLen = 4095
 v2GarbageTerminatorLen :: Int
 v2GarbageTerminatorLen = 16
 
--- | Re-keying interval (2^24 - 1 = 16777215 messages)
--- After this many messages, derive new keys
+-- | Re-keying interval: 224 packets (BIP-324, FSChaCha20/FSChaCha20Poly1305).
+-- After every 224 packets the cipher derives fresh keys. This is the real,
+-- spec-mandated rekey interval, NOT a testing-only value: it matches Bitcoin
+-- Core's BIP324Cipher::REKEY_INTERVAL{224} (src/bip324.h:24). Do NOT change it
+-- to 2^24-1 (16777215) — that would silently desync vs Core after 224 packets
+-- (Core rekeys, we would not). Interop-confirmed: 240+ block packets each way
+-- past the boundary with zero AEAD failures.
 v2RekeyInterval :: Word32
-v2RekeyInterval = 224  -- Actually 2^24 - 1, but Bitcoin Core uses 224 for testing
+v2RekeyInterval = 224  -- spec/Core rekey interval (bip324.h REKEY_INTERVAL{224})
 
 -- | Encrypted length prefix (3 bytes)
 v2LengthLen :: Int
