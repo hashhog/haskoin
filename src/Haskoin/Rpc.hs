@@ -3277,8 +3277,12 @@ handleGetNetworkInfo server = do
               in if odd n
                  then xs !! m
                  else (xs !! (m - 1) + xs !! m) `div` 2
-  -- Our local services: NODE_NETWORK (1) + NODE_WITNESS (8) = 9
-  let localServices = getServiceFlag nodeNetwork .|. getServiceFlag nodeWitness :: Word64
+  -- Our local services: NODE_NETWORK (1) | NODE_WITNESS (8) |
+  -- NODE_NETWORK_LIMITED (0x400) = 0x409. Matches the wire-advertised
+  -- set (Network.hs) and Core g_local_services (init.cpp:863).
+  let localServices = getServiceFlag nodeNetwork
+                  .|. getServiceFlag nodeWitness
+                  .|. getServiceFlag nodeNetworkLimited :: Word64
       localServicesHex = T.pack $ printf "%016x" localServices
       -- Build human-readable service names
       serviceNames :: [Text]
