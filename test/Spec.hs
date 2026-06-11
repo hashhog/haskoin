@@ -144,6 +144,7 @@ import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
 import qualified W169GetTxOutConfirmationsSpec
+import qualified W170FixedSeedsSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22908,6 +22909,11 @@ main = hspec $ do
   -- W169 gettxout: confirmation depth (tip_height - coin_height + 1) +
   -- chainstate-served bestblock/confirmations (drops the Core proxy).
   W169GetTxOutConfirmationsSpec.spec
+
+  -- W170 fixed-seed last-resort fallback (Core vFixedSeeds parity): replaces
+  -- the non-routable 0x0a000001 placeholder in fallbackMainnetPeers with 40
+  -- Core-vetted public :8333 seeds; proves the DNS-empty fallback dispatch.
+  W170FixedSeedsSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
