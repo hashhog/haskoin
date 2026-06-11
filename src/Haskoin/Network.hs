@@ -3441,12 +3441,12 @@ tryConnectWithType pm addr blockRelayOnly = do
         bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
                       then nodeBloom : baseFlags
                       else baseFlags
-        -- BIP-159: signal limited-archive serving when prune mode is on.
-        -- Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in
-        -- the auto-prune case (the node still has the recent-288 window).
-        prunedFlags = if pmcPruneMode (pmConfig pm)
-                        then nodeNetworkLimited : bloomFlags
-                        else bloomFlags
+        -- BIP-159: advertise NODE_NETWORK_LIMITED UNCONDITIONALLY for this
+        -- full node. Core sets g_local_services = NODE_NETWORK_LIMITED |
+        -- NODE_WITNESS unconditionally (init.cpp:863) — a full node always
+        -- serves at least the recent-288 window, so the bit is honest
+        -- regardless of prune mode.
+        prunedFlags = nodeNetworkLimited : bloomFlags
         -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — advertise when the
         -- operator enabled @-blockfilterindex@ AND the index is usable.
         flags = if pmcCompactFilters (pmConfig pm)
@@ -3586,9 +3586,9 @@ tryConnectByHost pm host port blockRelayOnly = do
       bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
                     then nodeBloom : baseFlags
                     else baseFlags
-      prunedFlags = if pmcPruneMode (pmConfig pm)
-                      then nodeNetworkLimited : bloomFlags
-                      else bloomFlags
+      -- BIP-159: advertise NODE_NETWORK_LIMITED UNCONDITIONALLY for this
+      -- full node (Core init.cpp:863), matching 'tryConnectWithType'.
+      prunedFlags = nodeNetworkLimited : bloomFlags
       -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
       -- decision as 'tryConnectWithType' so the hostname dial path
       -- doesn't accidentally bypass the index gate.
@@ -3936,11 +3936,9 @@ startInboundListener pm port = do
           bloomFlagsIn = if pmcPeerBloomFilters (pmConfig pm)
                            then nodeBloom : baseFlagsIn
                            else baseFlagsIn
-          -- BIP-159: same gate as outbound; advertise NODE_NETWORK_LIMITED
-          -- iff prune mode is on.
-          prunedFlagsIn = if pmcPruneMode (pmConfig pm)
-                            then nodeNetworkLimited : bloomFlagsIn
-                            else bloomFlagsIn
+          -- BIP-159: same as outbound; advertise NODE_NETWORK_LIMITED
+          -- UNCONDITIONALLY for this full node (Core init.cpp:863).
+          prunedFlagsIn = nodeNetworkLimited : bloomFlagsIn
           -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
           -- decision as outbound paths.  Inbound peers must see the
           -- same service-bit picture as outbound dials.
