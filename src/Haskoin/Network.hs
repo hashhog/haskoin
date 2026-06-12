@@ -5526,7 +5526,7 @@ maxFeelerConnections = 1
 
 -- | GETADDR response cap as a percentage of addrman size (Core
 -- MAX_PCT_ADDR_TO_SEND = 23, net_processing.cpp).  The getaddr reply is capped
--- at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)) — the primary getaddr
+-- at min(MAX_ADDR_TO_SEND, floor(0.23 * addrman_size)) — the primary getaddr
 -- anti-DoS / anti-fingerprinting guard.
 maxPctAddrToSend :: Int
 maxPctAddrToSend = 23
@@ -5541,20 +5541,22 @@ maxAddrRatePerSecond = 0.1
 maxAddrProcessingTokenBucket :: Double
 maxAddrProcessingTokenBucket = 1000.0
 
--- | GETADDR 23%-cap: min(MAX_ADDR_TO_SEND, max(1, ceil(0.23 * size))).
--- Mirrors Core's GetAddr_ cap (addrman.cpp): the reply is bounded both by the
--- hard 1000-entry MAX_ADDR_TO_SEND ceiling and by 23% of the addrman size.  An
--- empty addrman yields 0 (nothing to send); any non-empty addrman sends at least
--- 1.  Pure + total so it is directly unit-testable.
+-- | GETADDR 23%-cap: min(MAX_ADDR_TO_SEND, floor(0.23 * size)).
+-- Mirrors Core's GetAddr_ cap (addrman.cpp AddrManImpl::GetAddr_):
+--   @nNodes = max_pct * nNodes / 100@ is INTEGER division (floor), then
+--   @nNodes = std::min(nNodes, max_addresses)@ with max_addresses = 1000.
+-- There is NO @max(1, ...)@ in Core: a small addrman where @23*size < 100@
+-- yields 0 (e.g. size=1 -> 0, size=4 -> 0), and size=10 -> floor(2.3)=2.
+-- The reply is bounded both by the hard 1000-entry MAX_ADDR_TO_SEND ceiling
+-- and by the floored 23%-of-addrman-size.  Pure + total, directly unit-testable.
 -- Reference: bitcoin-core/src/addrman.cpp AddrManImpl::GetAddr_ (nNodes cap).
 getAddrCap :: Int -> Int
 getAddrCap size
   | size <= 0 = 0
   | otherwise =
-      let -- ceil(0.23 * size) = ceil(23*size / 100) = (23*size + 99) `div` 100
-          pct  = (maxPctAddrToSend * size + 99) `div` 100
-          pct' = max 1 pct
-      in min (fromIntegral maxAddrToSend) pct'
+      let -- floor(0.23 * size) = floor(23*size / 100) = (23*size) `div` 100
+          pct = (maxPctAddrToSend * size) `div` 100
+      in min (fromIntegral maxAddrToSend) pct
 
 -- | Refill an inbound-addr token bucket given the elapsed time since the last
 -- refill, then clamp to the 1000 ceiling.  Mirrors Core ProcessAddrs:
@@ -5938,7 +5940,7 @@ sockAddrToNetworkAddress _ _ = Nothing
 
 -- | Build the address list for a GETADDR response, applying Core's 23%-cap.
 -- Gathers shareable (routable, non-terrible) addresses from the addrman index,
--- then caps the count at 'getAddrCap' (min(1000, ceil(0.23*size))).  The size
+-- then caps the count at 'getAddrCap' (min(1000, floor(0.23*size))).  The size
 -- the cap is computed over is the addrman size (new + tried), matching Core's
 -- @addrman.GetAddr(MAX_ADDR_TO_SEND, MAX_PCT_ADDR_TO_SEND, ...)@.
 -- Reference: bitcoin-core/src/net_processing.cpp GETADDR handler (~4842) +
