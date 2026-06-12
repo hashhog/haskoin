@@ -107,6 +107,9 @@ mkInfo a = PeerInfo
   , piIsManual            = False
   , piIsLocal             = True
   , piWtxidRelay          = False
+  , piGetaddrRecvd        = False
+  , piAddrTokenBucket     = 1.0
+  , piAddrTokenTimestamp  = 0
   }
 
 -- | The expected success message: a getdata for the block hash with the
