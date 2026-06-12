@@ -267,6 +267,7 @@ module Haskoin.Wallet
   , ParseError(..)
   , parseDescriptor
   , descriptorToText
+  , descriptorToTextNet
   , deriveAddresses
   , deriveScripts
   , descriptorChecksum
@@ -6236,6 +6237,31 @@ descriptorToText desc = case desc of
   Addr addr -> "addr(" <> addressToText addr <> ")"
   Raw script -> "raw(" <> hexEncode' script <> ")"
   Combo key -> "combo(" <> keyExprToText key <> ")"
+
+-- | Network-aware canonical descriptor text.
+--
+-- Identical to 'descriptorToText' EXCEPT the @addr()@ case re-encodes the
+-- embedded address with the node's network HRP/version bytes ('addressToTextW')
+-- rather than the mainnet-hardcoded 'addressToText'.  An @addr(bcrt1q…)@
+-- descriptor on regtest must canonicalise back to @addr(bcrt1q…)@, not the
+-- mainnet @addr(bc1q…)@ that 'descriptorToText' produced (which also broke the
+-- BIP-380 checksum, since the checksum is computed over the canonical text).
+-- Recurses so a nested @addr()@ (e.g. inside @sh()@) is handled too.
+descriptorToTextNet :: Network -> Descriptor -> Text
+descriptorToTextNet net desc = case desc of
+  Addr addr           -> "addr(" <> addressToTextW net addr <> ")"
+  Sh inner            -> "sh(" <> descriptorToTextNet net inner <> ")"
+  Wsh inner           -> "wsh(" <> descriptorToTextNet net inner <> ")"
+  Tr key (Just tree)  -> "tr(" <> keyExprToText key <> "," <>
+                         tapTreeToTextNet net tree <> ")"
+  -- No embedded address in any other form — fall back to the network-agnostic
+  -- canonicaliser (keys/scripts are network-independent in descriptor text).
+  _                   -> descriptorToText desc
+  where
+    tapTreeToTextNet n tree = case tree of
+      TapLeaf d        -> descriptorToTextNet n d
+      TapBranch l r    -> "{" <> tapTreeToTextNet n l <> "," <>
+                          tapTreeToTextNet n r <> "}"
 
 -- | Convert a key expression to text.
 keyExprToText :: KeyExpr -> Text

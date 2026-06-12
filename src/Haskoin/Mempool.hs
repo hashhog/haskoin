@@ -51,6 +51,7 @@ module Haskoin.Mempool
   , getMempoolInfo
   , getPrioritisedTransactions
   , getMempoolMinFeeRate
+  , effectiveMinFeeRate
     -- * Block Handlers
   , blockConnected
   , blockDisconnected
@@ -279,8 +280,13 @@ instance NFData MempoolConfig
 -- | Default mempool configuration matching Bitcoin Core defaults
 defaultMempoolConfig :: MempoolConfig
 defaultMempoolConfig = MempoolConfig
-  { mpcMaxSize           = 300 * 1024 * 1024  -- 300M vsize-bytes (see mpcMaxSize)
-  , mpcMinFeeRate        = FeeRate 1          -- 1 sat/vB
+  { mpcMaxSize           = 300 * 1000 * 1000  -- 300 MB = Core max_size_bytes
+                                              -- (DEFAULT_MAX_MEMPOOL_SIZE_MB * 1e6;
+                                              -- kernel/mempool_options.h:19,40 —
+                                              -- megabytes are 10^6, NOT 2^20, so
+                                              -- getmempoolinfo.maxmempool matches
+                                              -- Core's 300000000 byte-for-byte).
+  , mpcMinFeeRate        = FeeRate 100        -- 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)
   , mpcMaxOrphans        = 100
   , mpcRBFEnabled        = True
   , mpcMaxAncestors      = 25
@@ -1805,7 +1811,10 @@ getMempoolMinFeeRate :: Mempool -> IO Word64
 getMempoolMinFeeRate mp = do
   rollingKvb <- getMempoolMinFeeRateDecayed mp
   let FeeRate minRate = mpcMinFeeRate (mpConfig mp)
-      staticKvb = fromIntegral minRate * 1000  -- sat/vB → sat/kvB
+      -- mpcMinFeeRate now stores the static relay floor sat/kvB-native
+      -- (FeeRate 100 = 100 sat/kvB = Core DEFAULT_MIN_RELAY_TX_FEE), so it is
+      -- consumed directly without the historical sat/vB → sat/kvB *1000 scale.
+      staticKvb = fromIntegral minRate :: Word64
   return (max rollingKvb staticKvb)
 
 -- | Admission fee floor as a 'FeeRate', for gating mempool acceptance.

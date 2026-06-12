@@ -584,9 +584,26 @@ spec = do
   describe "G8 rolling-min-fee dead-helper for RBF admission (BUG-1)" $ do
     it "getMempoolMinFeeRate is defined and returns max(rolling, static)" $
       withFreshMempool $ \mp -> do
-      -- With no eviction, rolling = 0, static = 1 sat/vB = 1000 sat/kvB
+      -- With no eviction, rolling = 0, static = Core DEFAULT_MIN_RELAY_TX_FEE
+      -- = 100 sat/kvB (mpcMinFeeRate stored sat/kvB-native).
       rate <- getMempoolMinFeeRate mp
-      rate `shouldBe` 1_000
+      rate `shouldBe` 100
+
+    -- EXECUTED proof of the lowered relay floor (Core DEFAULT_MIN_RELAY_TX_FEE
+    -- = 100 sat/kvB): the single-tx admission gate is `feeRate < minFee` where
+    -- feeRate = calculateFeeRate (sat/kvB) and minFee = effectiveMinFeeRate.
+    -- A candidate at EXACTLY 100 sat/kvB is ADMITTED (100 < 100 == False); a
+    -- candidate at 99 sat/kvB is REJECTED (99 < 100 == True).
+    it "admission floor is exactly 100 sat/kvB: 100 admitted, 99 rejected" $
+      withFreshMempool $ \mp -> do
+      minFee <- effectiveMinFeeRate mp
+      getFeeRate minFee `shouldBe` 100
+      let at100 = calculateFeeRate 100 1000   -- 100 sat over 1000 vbytes = 100 sat/kvB
+          at99  = calculateFeeRate 99  1000   -- 99 sat over 1000 vbytes  = 99 sat/kvB
+      getFeeRate at100 `shouldBe` 100
+      getFeeRate at99  `shouldBe` 99
+      (at100 < minFee) `shouldBe` False   -- 100 sat/kvB ADMITTED at the floor
+      (at99  < minFee) `shouldBe` True    -- 99 sat/kvB  REJECTED below the floor
 
     it "after a trim-eviction bump, getMempoolMinFeeRate reflects the new floor" $
       withFreshMempool $ \mp -> do
@@ -596,7 +613,7 @@ spec = do
         writeTVar (mpRollingMinFeeRate mp) (fromIntegral bumpedKvb)
         writeTVar (mpBlockSinceLastFeeBump mp) False
       rate <- getMempoolMinFeeRate mp
-      -- max(5000, 1000) == 5000
+      -- max(rolling 5000, static 100) == 5000
       rate `shouldBe` 5_000
 
     it "DEAD-HELPER: addTransaction* admission paths use mpcMinFeeRate, not getMempoolMinFeeRate" $ do
