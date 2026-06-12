@@ -58,6 +58,7 @@ import Haskoin.Index (IndexManager(..), IndexConfig(..),
                        indexManagerConnectBlock,
                        blockFilterIndexTipHeight,
                        coinStatsIndexTipHeight,
+                       txoSpenderIndexTipHeight,
                        -- FIX-86: serving compact filters over P2P.
                        BlockFilterIndexDB(..),
                        BlockFilterEntry(..),
@@ -155,6 +156,19 @@ data NodeOptions = NodeOptions
     -- with @-8 "Querying specific block heights requires coinstatsindex"@.
     -- Reference: bitcoin-core/src/index/coinstatsindex.cpp +
     -- kernel/coinstats.cpp.
+  , noTxoSpenderIndex    :: !Bool
+    -- ^ @-txospenderindex=1@: maintain a spent-outpoint -> spending-tx index
+    -- over the active chain.  When 'True', every successful @connectBlock@
+    -- writes, for each non-coinbase input, @spent outpoint -> spending txid ||
+    -- confirming block hash@; on disconnect/reorg the disconnected block's own
+    -- input keys are re-derived and erased (reorg-safe, no separate undo
+    -- data).  This is the confirmed-spend data source for the
+    -- @gettxspendingprevout@ RPC (the mempool reverse-index serves the
+    -- unconfirmed-spend form regardless).  When 'False' (default, Bitcoin Core
+    -- parity, @DEFAULT_TXOSPENDERINDEX{false}@), @gettxspendingprevout@ can
+    -- only answer from the mempool and errors @-1 "Mempool lacks a relevant
+    -- spend, and txospenderindex is unavailable."@ for the confirmed path.
+    -- Reference: bitcoin-core/src/index/txospenderindex.cpp.
   , noAsmapFile          :: !(Maybe FilePath)
     -- ^ @-asmap=\<file\>@: path to an ASMap bytecode file for
     -- ASN-based IP bucketing.  When set, haskoin loads the file at
@@ -322,6 +336,16 @@ parseNodeOptions = NodeOptions
                 \can answer for a HISTORICAL block height or hash, not \
                 \just the tip. On startup haskoin backfills any gap \
                 \between the index tip and the chain tip.")
+  <*> switch (long "txospenderindex"
+        <> help "Maintain a spent-outpoint -> spending-transaction index \
+                \(Bitcoin Core -txospenderindex=1, default off). When \
+                \enabled, every connected block records, per non-coinbase \
+                \input, the spent outpoint -> spending txid + confirming \
+                \block hash; on disconnect/reorg the disconnected block's \
+                \keys are re-derived from its own inputs and erased. This \
+                \is the confirmed-spend data source for gettxspendingprevout. \
+                \On startup haskoin backfills any gap between the index tip \
+                \and the chain tip.")
   <*> optional (strOption (long "asmap" <> metavar "FILE"
         <> help "Path to an ASMap bytecode file for ASN-based IP \
                 \bucketing (Bitcoin Core -asmap=<file>). When set, \
@@ -584,6 +608,11 @@ applyConfigOverlay cm n = n
   , noCoinStatsIndex = if not (noCoinStatsIndex n)
                           then Daemon.configLookupBool "coinstatsindex" False cm
                           else noCoinStatsIndex n
+  -- @txospenderindex = 1@ in haskoin.conf flips on the spent-outpoint ->
+  -- spending-tx index just like the CLI flag (Bitcoin Core -txospenderindex=1).
+  , noTxoSpenderIndex = if not (noTxoSpenderIndex n)
+                          then Daemon.configLookupBool "txospenderindex" False cm
+                          else noTxoSpenderIndex n
   , noAsmapFile  = case noAsmapFile n of
                      Just _  -> noAsmapFile n
                      Nothing -> Daemon.configLookup "asmap" cm
@@ -1336,11 +1365,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- callsite as an opt-in null instead of a global, so the
     -- non-indexed default case stays a single 'Nothing' branch with
     -- zero overhead per block.
-    mIdxMgr <- if noBlockFilterIndex || noCoinStatsIndex
+    mIdxMgr <- if noBlockFilterIndex || noCoinStatsIndex || noTxoSpenderIndex
       then do
         let idxConfig = defaultIndexConfig
               { icBlockFilterIndex = noBlockFilterIndex
               , icCoinStatsIndex   = noCoinStatsIndex
+              , icTxoSpenderIndex  = noTxoSpenderIndex
               }
         im <- newIndexManager db idxConfig
         indexManagerInitFromDB im
@@ -1367,7 +1397,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         csEmpty <- case imCoinStatsIndex im of
           Nothing  -> return False
           Just csIdx0 -> maybe True (const False) <$> coinStatsIndexTipHeight csIdx0
-        when (bfEmpty || csEmpty) $ do
+        tsEmpty <- case imTxoSpenderIndex im of
+          Nothing  -> return False
+          Just tsIdx0 -> maybe True (const False) <$> txoSpenderIndexTipHeight tsIdx0
+        when (bfEmpty || csEmpty || tsEmpty) $ do
           -- Use 'netGenesisBlock' directly: the genesis block body is NOT
           -- persisted via 'putBlock' at chain init (only its header is), so
           -- 'getBlock db genHash' would return Nothing.  The in-memory

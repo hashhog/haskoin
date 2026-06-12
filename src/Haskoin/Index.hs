@@ -81,6 +81,15 @@ module Haskoin.Index
   , coinStatsIndexTipHeight
   , coinStatsApplyCoin
   , coinStatsRemoveCoin
+    -- * TxoSpenderIndex
+  , TxoSpender(..)
+  , TxoSpenderIndexDB(..)
+  , newTxoSpenderIndexDB
+  , txoSpenderIndexInitFromDB
+  , txoSpenderIndexTipHeight
+  , txoSpenderIndexAppendBlock
+  , txoSpenderIndexRevertBlock
+  , txoSpenderIndexFind
     -- * Index Manager
   , IndexConfig(..)
   , IndexManager(..)
@@ -1438,6 +1447,211 @@ coinStatsIndexRevertBlock db height = do
       coinStatsMetaPut db prevHeight prevMh prevStats
 
 --------------------------------------------------------------------------------
+-- TxoSpenderIndex Database
+--------------------------------------------------------------------------------
+--
+-- Maps a SPENT outpoint -> the SPENDING transaction (txid + confirming block
+-- hash).  For every input of every non-coinbase transaction in a connected
+-- block, write KV: @key = S || txid(32) || vout(BE32)@, @value = spendingTxid
+-- (32) || blockHash(32)@.  On block disconnect, RE-DERIVE the exact same keys
+-- from the disconnected block's OWN inputs and DELETE them — reorg-safe undo
+-- with no separate undo data, exactly like Core's
+-- @TxoSpenderIndex::CustomRemove(BuildSpenderPositions(block))@.
+--
+-- This is the from-scratch, outpoint -> spending-txid form the Core header
+-- comment (txospenderindex.cpp) explicitly allows: Core stores the spending
+-- tx's on-disk LOCATION keyed by a salted siphash(outpoint) so it can serve
+-- the full spending tx and disambiguate siphash collisions; here the spending
+-- txid is stored directly (no salt, no collisions) and the full spending tx —
+-- needed only for @return_spending_tx@ — is read back from the confirming
+-- block recorded in the value.  Default-off, gated by @-txospenderindex@,
+-- mirroring Core's @DEFAULT_TXOSPENDERINDEX{false}@ and exactly how haskoin
+-- gates its coinstatsindex.
+--
+-- Reorg-safety (the rustoshi lesson): the connect/disconnect hooks are wired
+-- into 'indexManagerConnectBlock' / 'indexManagerDisconnectBlock', the SAME
+-- single plumbing the coinstatsindex uses.  Both reorg entry points flow
+-- through it disconnect-BEFORE-connect: the invalidateblock path
+-- ('Haskoin.Consensus.reorgAtomic', conList empty -> pure disconnect) and the
+-- live submitblock/P2P reorg path ('Haskoin.BlockTemplate.doSideBranchReorg').
+-- Disconnecting the orphaned branch first erases its spender keys, THEN the
+-- new branch's connect re-writes any shared outpoint to its own spending tx,
+-- so a reorg that spends the same outpoint by a different tx on each branch
+-- ends with the ACTIVE branch's spender recorded.
+
+-- | Decoded value of a txospender-index entry: the spending transaction's
+-- txid and the hash of the block that confirmed the spend.
+data TxoSpender = TxoSpender
+  { tsSpendingTxId :: !TxId
+  , tsBlockHash    :: !BlockHash
+  } deriving (Show, Eq, Generic)
+
+instance NFData TxoSpender
+
+-- | TxoSpenderIndex database handle.
+data TxoSpenderIndexDB = TxoSpenderIndexDB
+  { tsiDB        :: !HaskoinDB
+  , tsiTipHeight :: !(IORef (Maybe BlockHeight))
+    -- ^ Highest indexed height (the index "best block"), or 'Nothing' when
+    -- empty.  Mirrors coinstatsindex's @csiTipHeight@.
+  }
+
+-- | TxoSpenderIndex key prefixes.
+--
+-- @0x53@ ('S') keys the per-spend records: @S || txid(32) || vout(BE32)@ ->
+-- @spendingTxid(32) || blockHash(32)@.  The prefix byte 'S' echoes Core's
+-- @DB_TXOSPENDERINDEX{'s'}@ (uppercase here to avoid colliding with the
+-- per-height txindex/coinstats namespaces — confirmed distinct from the 't'
+-- (txindex), 'F'/'f' (blockfilter), 'M'/'m'/'n' (coinstats) prefixes above).
+-- @0x73@ ('s') keys a single meta record: tip height + tip block hash, read
+-- once at startup to resume without replaying.
+prefixTxoSpender :: Word8
+prefixTxoSpender = 0x53  -- 'S'
+
+prefixTxoSpenderMeta :: Word8
+prefixTxoSpenderMeta = 0x73  -- 's'
+
+-- | Big-endian Word32 encoder for the outpoint index component of the key.
+tsiToBE32 :: Word32 -> ByteString
+tsiToBE32 w = BS.pack
+  [ fromIntegral ((w `shiftR` 24) .&. 0xff)
+  , fromIntegral ((w `shiftR` 16) .&. 0xff)
+  , fromIntegral ((w `shiftR` 8) .&. 0xff)
+  , fromIntegral (w .&. 0xff)
+  ]
+
+-- | Build the per-spend KV key for a spent outpoint:
+-- @S || outpoint.txid(32) || outpoint.vout(BE32)@.  The txid bytes are the
+-- internal little-endian hash bytes (same as everywhere else in storage); the
+-- vout is big-endian so RocksDB groups keys by spending txid prefix.
+makeTxoSpenderKey :: OutPoint -> ByteString
+makeTxoSpenderKey op =
+  let TxId (Hash256 txidBytes) = outPointHash op
+  in BS.concat [ BS.singleton prefixTxoSpender
+               , txidBytes
+               , tsiToBE32 (outPointIndex op) ]
+
+-- | Serialise the (spending txid, confirming block hash) value as 64 bytes.
+txoSpenderValue :: TxId -> BlockHash -> ByteString
+txoSpenderValue (TxId (Hash256 txid)) (BlockHash (Hash256 bh)) =
+  BS.append txid bh
+
+-- | Decode a 64-byte txospender-index value.
+decodeTxoSpenderValue :: ByteString -> Maybe TxoSpender
+decodeTxoSpenderValue bs
+  | BS.length bs < 64 = Nothing
+  | otherwise =
+      Just TxoSpender
+        { tsSpendingTxId = TxId (Hash256 (BS.take 32 bs))
+        , tsBlockHash    = BlockHash (Hash256 (BS.take 32 (BS.drop 32 bs)))
+        }
+
+-- | Persisted TxoSpenderIndex meta record: tip height + tip block hash.
+data TxoSpenderMeta = TxoSpenderMeta
+  { tsmTipHeight :: !BlockHeight
+  , tsmTipHash   :: !BlockHash
+  }
+
+instance Serialize TxoSpenderMeta where
+  put TxoSpenderMeta{..} = do
+    putWord32le tsmTipHeight
+    put tsmTipHash
+  get = TxoSpenderMeta <$> getWord32le <*> get
+
+-- | Create a new TxoSpenderIndex database handle.
+newTxoSpenderIndexDB :: HaskoinDB -> IO TxoSpenderIndexDB
+newTxoSpenderIndexDB db = do
+  tipRef <- newIORef Nothing
+  return TxoSpenderIndexDB { tsiDB = db, tsiTipHeight = tipRef }
+
+-- | Persist the meta record (tip height + tip hash).
+txoSpenderMetaPut :: TxoSpenderIndexDB -> BlockHeight -> BlockHash -> IO ()
+txoSpenderMetaPut TxoSpenderIndexDB{..} height hash =
+  R.put (dbHandle tsiDB) (dbWriteOpts tsiDB)
+    (BS.singleton prefixTxoSpenderMeta)
+    (encode (TxoSpenderMeta height hash))
+
+-- | Read the persisted meta record.
+txoSpenderMetaGet :: TxoSpenderIndexDB -> IO (Maybe TxoSpenderMeta)
+txoSpenderMetaGet TxoSpenderIndexDB{..} = do
+  mval <- R.get (dbHandle tsiDB) (dbReadOpts tsiDB)
+            (BS.singleton prefixTxoSpenderMeta)
+  return $ mval >>= either (const Nothing) Just . decode
+
+-- | Restore the in-memory tip height from the persisted meta record on
+-- startup.  Absent (fresh datadir) -> 'Nothing', and a subsequent
+-- 'indexManagerBackfill' rebuilds from height 1 forward.
+txoSpenderIndexInitFromDB :: TxoSpenderIndexDB -> IO ()
+txoSpenderIndexInitFromDB db@TxoSpenderIndexDB{..} = do
+  mMeta <- txoSpenderMetaGet db
+  writeIORef tsiTipHeight (fmap tsmTipHeight mMeta)
+
+-- | Read the in-memory index tip height (highest indexed height).
+txoSpenderIndexTipHeight :: TxoSpenderIndexDB -> IO (Maybe BlockHeight)
+txoSpenderIndexTipHeight = readIORef . tsiTipHeight
+
+-- | Index every spend in a newly connected block: for each input of each
+-- non-coinbase transaction, write (spent outpoint -> spending txid ||
+-- confirming block hash).  The undo argument is ignored on purpose — like
+-- Core's @CustomAppend(BuildSpenderPositions(block))@, every key is a pure
+-- function of the block's own inputs.
+--
+-- Genesis (height 0) contributes nothing: its single coinbase tx has the null
+-- prevout, exactly like txindex/coinstatsindex skip it.  We still advance the
+-- tip pointer so a later 'indexManagerBackfill' resumes at height 1.
+txoSpenderIndexAppendBlock :: TxoSpenderIndexDB -> Block -> BlockHash -> BlockHeight -> IO ()
+txoSpenderIndexAppendBlock db block blockHash height = do
+  unless (height == 0) $
+    forM_ (zip [0..] (blockTxns block)) $ \(txIdx, tx) ->
+      unless (txIdx == (0 :: Int)) $ do          -- skip coinbase: null prevout
+        let spendingTxid = computeTxId tx
+            val = txoSpenderValue spendingTxid blockHash
+        forM_ (txInputs tx) $ \inp ->
+          R.put (dbHandle (tsiDB db)) (dbWriteOpts (tsiDB db))
+            (makeTxoSpenderKey (txInPrevOutput inp)) val
+  txoSpenderMetaPut db height blockHash
+  writeIORef (tsiTipHeight db) (Just height)
+
+-- | Erase every spend recorded for a disconnected block.  The keys are
+-- RE-DERIVED from the block's inputs (no undo data needed), mirroring Core's
+-- @CustomRemove(BuildSpenderPositions(block))@.  This is the reorg-safe undo:
+-- on the live-reorg path the orphaned branch is disconnected (this) BEFORE the
+-- new branch is connected, so a shared outpoint ends up keyed to the active
+-- branch's spending tx.  Rewinds the in-memory + persisted tip to @height-1@.
+txoSpenderIndexRevertBlock :: TxoSpenderIndexDB -> Block -> BlockHash -> BlockHeight -> IO ()
+txoSpenderIndexRevertBlock db block _blockHash height = do
+  unless (height == 0) $
+    forM_ (zip [0..] (blockTxns block)) $ \(txIdx, tx) ->
+      unless (txIdx == (0 :: Int)) $
+        forM_ (txInputs tx) $ \inp ->
+          R.delete (dbHandle (tsiDB db)) (dbWriteOpts (tsiDB db))
+            (makeTxoSpenderKey (txInPrevOutput inp))
+  let prevHeight = if height > 0 then height - 1 else 0
+  -- Pull the tip back to the previous height.  We do not have the parent's
+  -- block hash here without a lookup; the meta hash is only used to report
+  -- best_block on getindexinfo, so write the parent header hash from the
+  -- disconnected block's prev pointer.
+  let prevHash = bhPrevBlock (blockHeader block)
+  if height == 0
+    then do
+      R.delete (dbHandle (tsiDB db)) (dbWriteOpts (tsiDB db))
+        (BS.singleton prefixTxoSpenderMeta)
+      writeIORef (tsiTipHeight db) Nothing
+    else do
+      txoSpenderMetaPut db prevHeight prevHash
+      writeIORef (tsiTipHeight db) (Just prevHeight)
+
+-- | Look up the on-chain transaction that spends the given outpoint.
+-- Returns 'Just' the spender (spending txid + confirming block hash) if a
+-- confirmed spend is recorded, or 'Nothing' if the outpoint is unspent
+-- on-chain.  Mirrors Core's @TxoSpenderIndex::FindSpender@ (which returns
+-- @std::nullopt@ when unspent).
+txoSpenderIndexFind :: TxoSpenderIndexDB -> OutPoint -> IO (Maybe TxoSpender)
+txoSpenderIndexFind TxoSpenderIndexDB{..} op = do
+  mval <- R.get (dbHandle tsiDB) (dbReadOpts tsiDB) (makeTxoSpenderKey op)
+  return $ mval >>= decodeTxoSpenderValue
+
+--------------------------------------------------------------------------------
 -- Index Manager
 --------------------------------------------------------------------------------
 
@@ -1446,11 +1660,12 @@ data IndexConfig = IndexConfig
   { icTxIndex          :: !Bool
   , icBlockFilterIndex :: !Bool
   , icCoinStatsIndex   :: !Bool
+  , icTxoSpenderIndex  :: !Bool
   } deriving (Show, Eq)
 
 -- | Default index configuration (all disabled)
 defaultIndexConfig :: IndexConfig
-defaultIndexConfig = IndexConfig False False False
+defaultIndexConfig = IndexConfig False False False False
 
 -- | Index manager
 data IndexManager = IndexManager
@@ -1458,6 +1673,7 @@ data IndexManager = IndexManager
   , imTxIndex         :: !(Maybe TxIndexDB)
   , imBlockFilterIndex :: !(Maybe BlockFilterIndexDB)
   , imCoinStatsIndex  :: !(Maybe CoinStatsIndexDB)
+  , imTxoSpenderIndex :: !(Maybe TxoSpenderIndexDB)
   , imSyncHeight      :: !(IORef BlockHeight)
   }
 
@@ -1476,6 +1692,10 @@ newIndexManager db config = do
            then Just <$> newCoinStatsIndexDB db
            else return Nothing
 
+  tsIdx <- if icTxoSpenderIndex config
+           then Just <$> newTxoSpenderIndexDB db
+           else return Nothing
+
   syncHeightRef <- newIORef 0
 
   return IndexManager
@@ -1483,6 +1703,7 @@ newIndexManager db config = do
     , imTxIndex = txIdx
     , imBlockFilterIndex = bfIdx
     , imCoinStatsIndex = csIdx
+    , imTxoSpenderIndex = tsIdx
     , imSyncHeight = syncHeightRef
     }
 
@@ -1519,6 +1740,11 @@ indexManagerConnectBlock im block undo blockHash height = do
     Nothing -> return ()
     Just csIdx -> coinStatsIndexAppendBlock csIdx block undo blockHash height
 
+  -- TxoSpenderIndex
+  case imTxoSpenderIndex im of
+    Nothing -> return ()
+    Just tsIdx -> txoSpenderIndexAppendBlock tsIdx block blockHash height
+
   -- Update the manager's tracked sync height. This makes
   -- 'imSyncHeight' the canonical "indexes are caught up to here"
   -- pointer, used by 'indexManagerBackfill' to figure out where to
@@ -1526,16 +1752,26 @@ indexManagerConnectBlock im block undo blockHash height = do
   -- normal IBD path.
   writeIORef (imSyncHeight im) height
 
--- | Reverse a previously-connected block from the BlockFilterIndex.
--- Today only the filter index needs disconnect handling — TxIndex
--- entries are intentionally orphan-tolerant (Core leaves stale
--- TxIndex entries for forked-out blocks; reads are idempotent
--- because the active-chain pointer is checked separately), and
--- CoinStatsIndex is recomputed wholesale rather than reverted.
--- Reference: bitcoin-core/src/index/blockfilterindex.cpp
--- BlockFilterIndex::CustomRewind.
-indexManagerDisconnectBlock :: IndexManager -> BlockHeight -> IO ()
-indexManagerDisconnectBlock im height = do
+-- | Reverse a previously-connected block from the disconnect-aware indexes.
+-- The BlockFilterIndex deletes the per-height filter entry; the CoinStatsIndex
+-- restores the running accumulator from the previous-height snapshot; the
+-- TxoSpenderIndex RE-DERIVES the disconnected block's own input keys and
+-- deletes them (Core's CustomRemove).  TxIndex entries are intentionally
+-- orphan-tolerant (Core leaves stale TxIndex entries for forked-out blocks;
+-- reads are idempotent because the active-chain pointer is checked
+-- separately).
+--
+-- The @Block@ + @BlockHash@ are the DISCONNECTED block's own data — required
+-- so the TxoSpenderIndex can re-derive its spender keys without separate undo
+-- data.  Both reorg paths
+-- ('Haskoin.Consensus.reorgAtomic' / invalidateblock and
+-- 'Haskoin.BlockTemplate.doSideBranchReorg' / live submitblock+P2P reorg) call
+-- this disconnect-BEFORE-connect, so the txospender index ends a reorg keyed
+-- to the ACTIVE branch's spending tx.
+-- Reference: bitcoin-core/src/index/{blockfilterindex,coinstatsindex,txospenderindex}.cpp
+-- CustomRewind / CustomRemove.
+indexManagerDisconnectBlock :: IndexManager -> Block -> BlockHash -> BlockHeight -> IO ()
+indexManagerDisconnectBlock im block blockHash height = do
   case imBlockFilterIndex im of
     Nothing -> return ()
     Just bfIdx -> blockFilterIndexDelete bfIdx height
@@ -1546,6 +1782,13 @@ indexManagerDisconnectBlock im height = do
   case imCoinStatsIndex im of
     Nothing -> return ()
     Just csIdx -> coinStatsIndexRevertBlock csIdx height
+  -- TxoSpenderIndex: erase this disconnected block's spender keys, re-derived
+  -- from its own inputs (Core CustomRemove). Reorg-safe: on the live path the
+  -- caller runs disconnect (this) before connect, so a shared outpoint ends
+  -- keyed to the new branch's spending tx.
+  case imTxoSpenderIndex im of
+    Nothing -> return ()
+    Just tsIdx -> txoSpenderIndexRevertBlock tsIdx block blockHash height
   -- Pull imSyncHeight back to (height - 1) so a subsequent
   -- 'indexManagerBackfill' resumes from the correct point. Using
   -- saturating subtraction so disconnecting genesis (an
@@ -1575,11 +1818,17 @@ indexManagerInitFromDB im = do
     Just csIdx -> do
       coinStatsIndexInitFromDB csIdx
       coinStatsIndexTipHeight csIdx
+  -- TxoSpenderIndex: restore its tip height from the persisted meta record.
+  tsTip <- case imTxoSpenderIndex im of
+    Nothing -> return Nothing
+    Just tsIdx -> do
+      txoSpenderIndexInitFromDB tsIdx
+      txoSpenderIndexTipHeight tsIdx
   -- 'imSyncHeight' is the lockstep "indexes caught up to here" pointer used
   -- by 'indexManagerBackfill'.  Seed it to the LOWEST enabled-index tip so a
   -- lagging index gets backfilled (an index ahead of another would otherwise
   -- skip the gap).  When no enabled index has any on-disk state, start at 0.
-  let tips = [ t | Just t <- [bfTip, csTip] ]
+  let tips = [ t | Just t <- [bfTip, csTip, tsTip] ]
   case tips of
     [] -> writeIORef (imSyncHeight im) 0
     _  -> writeIORef (imSyncHeight im) (minimum tips)
