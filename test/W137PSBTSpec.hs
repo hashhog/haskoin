@@ -87,6 +87,7 @@ import Test.Hspec
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word32)
+import Data.Bits ((.&.), shiftR)
 
 import Haskoin.Wallet
   ( Psbt(..)
@@ -112,6 +113,38 @@ zero32 = BS.replicate 32 0
 -- | Minimal PSBT magic — first 5 bytes of any PSBT envelope.
 psbtMagicBytes :: BS.ByteString
 psbtMagicBytes = BS.pack [0x70, 0x73, 0x62, 0x74, 0xff]
+
+-- | Encode a Word32 little-endian as 4 bytes (PSBT version value wire form).
+word32le :: Word32 -> [Word8]
+word32le v =
+  [ fromIntegral (v             .&. 0xff)
+  , fromIntegral ((v `shiftR` 8)  .&. 0xff)
+  , fromIntegral ((v `shiftR` 16) .&. 0xff)
+  , fromIntegral ((v `shiftR` 24) .&. 0xff)
+  ]
+
+-- | Build a minimal PSBT envelope carrying a single PSBT_GLOBAL_VERSION (0xfb)
+-- key set to @v@, then the global-map terminator (0x00) with no unsigned tx.
+--
+-- Wire layout (all single-byte varints here):
+--   magic (5)                         70 73 62 74 ff
+--   keyLen = 1                        01
+--   key    = 0xfb                     fb
+--   valLen = 4                        04
+--   value  = v (LE Word32)            xx xx xx xx
+--   global-map terminator            00
+--
+-- For @v > 0@ the decoder's version clamp fires while parsing the 0xfb key
+-- (before the terminator), so the missing unsigned tx never matters.  For
+-- @v == 0@ the clamp passes and the decoder reaches the terminator, failing
+-- with "PSBT missing unsigned transaction" instead.
+psbtWithGlobalVersion :: Word32 -> BS.ByteString
+psbtWithGlobalVersion v = BS.pack $
+     BS.unpack psbtMagicBytes
+  ++ [0x01, 0xfb]            -- keyLen=1, key type 0xfb (PSBT_GLOBAL_VERSION)
+  ++ [0x04]                 -- valueLen=4
+  ++ word32le v             -- the version value, little-endian
+  ++ [0x00]                 -- global-map terminator (no unsigned tx)
 
 -- | A canonical empty Tx fixture.  Avoids `undefined` so Hspec can
 -- evaluate field-shape assertions without tripping a thunk-force.
@@ -183,11 +216,36 @@ spec = describe "W137 PSBT v0/v2 (BIP-174 / BIP-370 / BIP-371)" $ do
       let g = PsbtGlobal emptyTx Map.empty Nothing Map.empty
       pgVersion g `shouldBe` Nothing
 
-    xit "G4 GATE: decoder rejects version > PSBT_HIGHEST_VERSION" $
-      -- Core's psbt.h:80 const PSBT_HIGHEST_VERSION = 0; psbt.h:1322-1324
-      -- throws "Unsupported version number" on v > 0.  haskoin's
-      -- Wallet.hs:3267-3270 accepts any Word32 and stores it.  BUG-2.
-      pendingWith "BUG-2: no PSBT_HIGHEST_VERSION clamp"
+    -- BUG-2 FIXED: Core's psbt.h:80 const PSBT_HIGHEST_VERSION = 0;
+    -- psbt.h:1322-1324 throws "Unsupported version number" on v > 0, which
+    -- the decodepsbt RPC surfaces as RPC_DESERIALIZATION_ERROR (-22).
+    -- haskoin's getGlobalMap 0xfb arm (Wallet.hs) now rejects v >
+    -- psbtHighestVersion.  These FLIPPED gates (xit -> it) prove the clamp
+    -- is wired and EXECUTES the new code path on a constructed v2 PSBT.
+    it "G4 GATE: decoder rejects PSBT_GLOBAL_VERSION = 2 (PSBTv2) — Core 'Unsupported version number'" $
+      case decodePsbt (psbtWithGlobalVersion 2) of
+        Left err -> err `shouldContain` "Unsupported version number"
+        Right _  -> expectationFailure
+          "expected decoder to reject PSBT global version 2 (> PSBT_HIGHEST_VERSION=0)"
+
+    it "G4 GATE: decoder rejects PSBT_GLOBAL_VERSION = 1 (> PSBT_HIGHEST_VERSION)" $
+      case decodePsbt (psbtWithGlobalVersion 1) of
+        Left err -> err `shouldContain` "Unsupported version number"
+        Right _  -> expectationFailure
+          "expected decoder to reject PSBT global version 1 (> PSBT_HIGHEST_VERSION=0)"
+
+    it "G4 GATE: version 0 (== PSBT_HIGHEST_VERSION) passes the version gate" $
+      -- A version-0 key must NOT trip the version clamp.  This fixture stops
+      -- at the global-map terminator without an unsigned tx, so the decoder
+      -- fails LATER with "missing unsigned transaction" — proving the
+      -- version-0 key cleared the clamp (distinguishes the clamp from a
+      -- blanket reject).
+      case decodePsbt (psbtWithGlobalVersion 0) of
+        Left err -> do
+          err `shouldContain` "missing unsigned transaction"
+          err `shouldNotContain` "Unsupported version number"
+        Right _  -> expectationFailure
+          "expected the version-0 fixture to fail at the missing-tx check, not the version clamp"
 
   describe "G5 PSBT_GLOBAL_PROPRIETARY (0xFC) decoded with subtype + identifier" $ do
     xit "G5 MISSING: 0xFC global proprietary keys are treated as generic unknown" $
