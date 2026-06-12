@@ -228,6 +228,11 @@ import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddres
                         addressToText)
 import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
+                           -- getblockstats: subsidy (regtest-aware), coinbase
+                           -- predicate, varint size, MAX_MONEY.  (isUnspendable
+                           -- comes from Storage, where it is defined.)
+                           blockRewardForNet, isCoinbase,
+                           varIntSize, maxMoney,
                            blockBaseSize, blockTotalSize,
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
                            medianTimePast, maxBlockWeight,
@@ -273,6 +278,7 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        CoinStats(..), CoinStatsEntry(..),
                        coinStatsIndexGet, coinStatsIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
+                         isUnspendable,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
@@ -313,6 +319,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          addTransaction, testAcceptTransaction,
                          getTransaction, getMempoolTxIds,
                          getMempoolSize, getPrioritisedTransactions,
+                         getMempoolMinFeeRate, incrementalRelayFeePerKvb,
                          FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
@@ -331,7 +338,8 @@ import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
 import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
-                        parseDescriptor, descriptorToText, deriveAddresses,
+                        parseDescriptor, descriptorToText, descriptorToTextNet,
+                        deriveAddresses,
                         deriveScripts, descriptorChecksum, addDescriptorChecksum,
                         validateDescriptorChecksum, isRangeDescriptor,
                         Wallet(..), WalletManager(..), WalletState(..), WalletInfo(..),
@@ -1100,6 +1108,7 @@ handleRpcRequest server req = do
     "getblockcount"        -> handleGetBlockCount server
     "getblockhash"         -> handleGetBlockHash server params
     "getblock"             -> handleGetBlock server params
+    "getblockstats"        -> handleGetBlockStats server params
     "getblockheader"       -> handleGetBlockHeader server params
     "gettxout"             -> handleGetTxOut server params
     "getbestblockhash"     -> handleGetBestBlockHash server
@@ -1156,7 +1165,7 @@ handleRpcRequest server req = do
     "getinfo"              -> handleGetInfo server
 
     -- Wallet descriptor RPCs
-    "getdescriptorinfo"    -> handleGetDescriptorInfo params
+    "getdescriptorinfo"    -> handleGetDescriptorInfo server params
     "deriveaddresses"      -> handleDeriveAddresses params
     "createmultisig"       -> handleCreateMultisig params
     "importdescriptors"    -> handleImportDescriptors server params
@@ -1308,12 +1317,15 @@ handleGetBlockchainInfo server = do
   -- For a fully synced node this approaches 1.0
   let progress = computeVerificationProgress (ceHeight tip) (bhTimestamp (ceHeader tip))
       -- Initial block download heuristic: we're in IBD if the tip is older than 24 hours
-      -- or if we're significantly behind the estimated chain height
+      -- or if we're significantly behind the estimated chain height.
+      -- Regtest is never in IBD once past genesis (Core's IsInitialBlockDownload
+      -- clears as soon as the chain advances on regtest's trivial-PoW network);
+      -- the mainnet-timed heuristic would otherwise mis-report IBD=True under a
+      -- pinned-mocktime regtest chain.
       currentTime = bhTimestamp (ceHeader tip)
-      isIBD = estimateIsInitialBlockDownload (ceHeight tip) currentTime
-      -- Soft-fork state: always sourced from the shared softforksFromEntry
-      -- helper so getblockchaininfo and getdeploymentinfo cannot disagree.
-      sforks = softforksFromEntry (rsNetwork server) tip
+      isIBD = if netName (rsNetwork server) == "regtest"
+                then ceHeight tip == 0
+                else estimateIsInitialBlockDownload (ceHeight tip) currentTime
   -- Pruning fields (Bitcoin Core parity).  Reference:
   -- bitcoin-core/src/rpc/blockchain.cpp getblockchaininfo emits
   --   "pruned"            : whether prune mode is enabled
@@ -1357,11 +1369,14 @@ handleGetBlockchainInfo server = do
               pair "mediantime"           (AE.word32 (ceMedianTime tip))               <>
               pair "verificationprogress" (AE.double progress)                        <>
               pair "initialblockdownload" (AE.bool isIBD)                             <>
-              pair "chainwork"            (text (showHex (ceChainWork tip)))           <>
+              -- chainwork: 64-char zero-padded lowercase hex (Core arith_uint256
+              -- GetHex()), NOT bare significant digits.
+              pair "chainwork"            (text (showHex64 (ceChainWork tip)))         <>
               pair "size_on_disk"         (AE.word64 (fromIntegral sizeOnDisk))        <>
               pair "pruned"               (AE.bool pruneOn)                            <>
               pruneEnc                                                                <>
-              pair "softforks"            (toEncoding sforks)                         <>
+              -- Core v31.99 DROPPED getblockchaininfo.softforks (moved to
+              -- getdeploymentinfo); the key is no longer emitted here.
               pair "warnings"             (AE.list text [])
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
@@ -1638,22 +1653,34 @@ handleGetBlock server params = do
                   byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
                   tip      <- readTVarIO (hcTip (rsHeaderChain server))
                   let net      = rsNetwork server
+                      header   = blockHeader block
                       mEntry   = Map.lookup bh entries
                       height   = maybe 0 ceHeight mEntry
                       tipH     = ceHeight tip
-                      confs    = fromIntegral tipH - fromIntegral height + 1 :: Int
-                      bits     = bhBits (blockHeader block)
+                      -- confirmations: tipH-height+1 when on the active chain,
+                      -- else -1 (Core ComputeNextBlockAndDepth).
+                      onActive = Map.lookup height byHeight == Just bh
+                      confs    = if onActive
+                                   then fromIntegral tipH - fromIntegral height + 1
+                                   else -1 :: Int
+                      bits     = bhBits header
                       cwStr    = maybe (T.replicate 64 "0") (showHex64 . ceChainWork) mEntry
                       mTime    = medianTimePast entries bh
                       verHex   = T.pack $ printf "%08x"
-                                   (fromIntegral (bhVersion (blockHeader block)) :: Word32)
-                      mNextBh  = Map.lookup (height + 1) byHeight
+                                   (fromIntegral (bhVersion header) :: Word32)
+                      -- previousblockhash: omitted for genesis (no parent).
+                      mPrevBh  = case mEntry of
+                                   Just ce -> cePrev ce
+                                   Nothing -> let p = bhPrevBlock header
+                                              in if p == BlockHash (Hash256 (BS.replicate 32 0))
+                                                   then Nothing else Just p
+                      mNextBh  = if onActive then Map.lookup (height + 1) byHeight
+                                             else Nothing
                       -- Block size metrics (Core formulas)
                       stripped = blockBaseSize block   -- strippedsize: header+varint+legacy
                       totSize  = blockTotalSize block  -- size: full serialization
                       wt       = 3 * stripped + totSize  -- weight = 3*stripped + size (BIP141)
                       nTx      = length (blockTxns block)
-                      -- coinbase_tx: {coinbase, locktime, sequence, version, witness}
                       coinbaseTxEnc = buildCoinbaseTxEnc block
                   -- For verbosity=2, build per-tx entries with fee from undo data.
                   txArrayEnc <- case verbosity of
@@ -1662,35 +1689,346 @@ handleGetBlock server params = do
                       let undoList = maybe [] (buTxUndo . udBlockUndo) mUndo
                       return $ Just $ buildBlockTxArrayEnc net block undoList
                     _ -> return Nothing
+                  -- Core order (blockheaderToJSON then blockToJSON): hash,
+                  -- confirmations, height, version, versionHex, merkleroot, time,
+                  -- mediantime, nonce, bits, target, difficulty, chainwork, nTx,
+                  -- [previousblockhash], [nextblockhash], strippedsize, size,
+                  -- weight, coinbase_tx, tx.
                   let enc =
                         pair "hash"              (text (showHash bh))                               <>
                         pair "confirmations"     (AE.int confs)                                    <>
-                        pair "size"              (AE.int totSize)                                   <>
-                        pair "strippedsize"      (AE.int stripped)                                  <>
-                        pair "weight"            (AE.int wt)                                        <>
                         pair "height"            (AE.word32 height)                                 <>
-                        pair "version"           (AE.int (fromIntegral (bhVersion (blockHeader block)) :: Int)) <>
+                        pair "version"           (AE.int (fromIntegral (bhVersion header) :: Int)) <>
                         pair "versionHex"        (text verHex)                                      <>
-                        pair "merkleroot"        (text (showHash256 (bhMerkleRoot (blockHeader block)))) <>
-                        pair "tx"                (case txArrayEnc of
-                                                    Just enc2 -> enc2
-                                                    Nothing   -> AE.list (text . showHash . blockHashFromTxId)
-                                                                         (map computeTxId (blockTxns block))) <>
-                        pair "time"              (AE.word32 (bhTimestamp (blockHeader block)))      <>
+                        pair "merkleroot"        (text (showHash256 (bhMerkleRoot header)))         <>
+                        pair "time"              (AE.word32 (bhTimestamp header))                   <>
                         pair "mediantime"        (AE.word32 mTime)                                  <>
-                        pair "nonce"             (AE.word32 (bhNonce (blockHeader block)))          <>
+                        pair "nonce"             (AE.word32 (bhNonce header))                       <>
                         pair "bits"              (text (showBits bits))                             <>
+                        pair "target"            (text (showHex64 (bitsToTarget bits)))             <>
                         pair "difficulty"
                           (unsafeToEncoding (stringUtf8 (difficultyStr bits)))                      <>
                         pair "chainwork"         (text cwStr)                                       <>
-                        pair "nTx"               (AE.int nTx)                                      <>
-                        pair "previousblockhash" (text (showHash (bhPrevBlock (blockHeader block)))) <>
+                        pair "nTx"               (AE.int nTx)                                       <>
+                        (case mPrevBh of
+                           Just ph -> pair "previousblockhash" (text (showHash ph))
+                           Nothing -> mempty)                                                       <>
                         (case mNextBh of
                            Just nh -> pair "nextblockhash" (text (showHash nh))
                            Nothing -> mempty)                                                       <>
-                        pair "coinbase_tx"       coinbaseTxEnc
+                        pair "strippedsize"      (AE.int stripped)                                  <>
+                        pair "size"              (AE.int totSize)                                   <>
+                        pair "weight"            (AE.int wt)                                        <>
+                        pair "coinbase_tx"       coinbaseTxEnc                                      <>
+                        pair "tx"                (case txArrayEnc of
+                                                    Just enc2 -> enc2
+                                                    Nothing   -> AE.list (text . showHash . blockHashFromTxId)
+                                                                         (map computeTxId (blockTxns block)))
                       rawBs = encodingToLazyByteString (pairs enc)
                   return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | getblockstats hash_or_height ( stats )
+--
+-- Per-block statistics — fees, feerates, sizes, weights, UTXO-set deltas — for
+-- the target block.  Faithful port of bitcoin-core/src/rpc/blockchain.cpp
+-- getblockstats.  All amounts in satoshis; feerates are sat/vbyte
+-- (vsize = weight/4).  Fee math (per non-coinbase tx): fee = sum(prevout
+-- values) - sum(output values), prevout values from the block undo data.  The
+-- coinbase is excluded from every fee/feerate stat but still counts toward
+-- txs/outs/utxo_size_inc.  Result keys are emitted in Core's pushKV order.
+--
+-- The optional 2nd arg (stats filter) is supported: an array of stat names
+-- restricts the response to those keys (unknown name -> -8, like Core).  The
+-- bytediff exercises the no-filter (do_all) path with a height argument.
+handleGetBlockStats :: RpcServer -> Value -> IO RpcResponse
+handleGetBlockStats server params = do
+  -- Resolve hash_or_height (param 0): an int height into the active chain, or a
+  -- block-hash hex string.  Mirrors Core ParseHashOrHeight.
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  let tipH = ceHeight tip
+  entries  <- readTVarIO (hcEntries (rsHeaderChain server))
+  byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+  mResolved <- case extractParam params 0 :: Maybe Value of
+    Nothing -> return (Left (rpcInvalidParams, "Missing hash_or_height parameter"))
+    Just Null -> return (Left (rpcInvalidParams, "Missing hash_or_height parameter"))
+    Just (Number _) -> case extractParam params 0 :: Maybe Int of
+      Nothing -> return (Left (rpcInvalidParameter, "Invalid block height"))
+      Just h
+        | h < 0 -> return (Left (rpcInvalidParameter,
+                     T.pack ("Target block height " ++ show h ++ " is negative")))
+        | fromIntegral h > tipH -> return (Left (rpcInvalidParameter,
+                     T.pack ("Target block height " ++ show h ++ " after current tip " ++ show tipH)))
+        | otherwise -> do
+            let hh = fromIntegral h :: Word32
+            mbh <- getBlockHeight (rsDB server) hh
+            case mbh of
+              Just bh -> return (Right bh)
+              Nothing -> case Map.lookup hh byHeight of
+                Just bh -> return (Right bh)
+                Nothing -> return (Left (rpcInvalidParameter, "Block height out of range"))
+    Just (String s) -> case parseHash s of
+      Nothing -> return (Left (rpcInvalidParams, "Invalid block hash format"))
+      Just bh -> case Map.lookup bh entries of
+        Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
+        Just _  -> return (Right bh)
+    Just _ -> return (Left (rpcInvalidParams, "hash_or_height must be a height or block hash"))
+  case mResolved of
+    Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+    Right bh -> do
+      mBlock <- getBlock (rsDB server) bh
+      case mBlock of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcMiscError "Block not found on disk") Null
+        Just block -> do
+          let mEntry = Map.lookup bh entries
+              height = maybe 0 ceHeight mEntry
+          mUndo <- getUndoData (rsDB server) bh
+          let undoList = maybe [] (buTxUndo . udBlockUndo) mUndo
+              net      = rsNetwork server
+              mTime    = medianTimePast entries bh
+              statsEnc = computeBlockStatsEnc net block undoList bh height mTime
+          -- Optional stats filter (param 1).
+          case extractParam params 1 :: Maybe Value of
+            Nothing       -> return $ RpcResponse (rawJsonResult (encodingToLazyByteString statsEnc)) Null Null
+            Just Null     -> return $ RpcResponse (rawJsonResult (encodingToLazyByteString statsEnc)) Null Null
+            Just (Array sel) -> do
+              let names = [ n | String n <- V.toList sel ]
+                  allMap = computeBlockStatsMap net block undoList bh height mTime
+              case [ n | n <- names, not (Map.member n allMap) ] of
+                (bad:_) -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParameter
+                    (T.pack ("Invalid selected statistic '" ++ T.unpack bad ++ "'"))) Null
+                [] -> do
+                  -- Emit selected stats in Core's canonical (sorted) order.
+                  let ordered = [ (n, v) | (n, v) <- blockStatsOrder allMap, n `elem` names ]
+                      enc = pairs $ foldMap (\(n,v) -> pair (Key.fromText n) v) ordered
+                  return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+            Just _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidParams "stats must be an array") Null
+
+-- | GetSerializeSize(CTxOut): 8-byte value + compactSize(scriptLen) + script.
+txOutSerializeSize :: TxOut -> Int
+txOutSerializeSize out =
+  let sl = BS.length (txOutScript out)
+  in 8 + varIntSize sl + sl
+
+-- | PER_UTXO_OVERHEAD (Core rpc/blockchain.cpp): sizeof(COutPoint)=36 +
+-- sizeof(uint32_t)=4 + sizeof(bool)=1 = 41.
+perUtxoOverhead :: Int
+perUtxoOverhead = 41
+
+-- | NUM_GETBLOCKSTATS_PERCENTILES (10th, 25th, 50th, 75th, 90th).
+numBlockStatsPercentiles :: Int
+numBlockStatsPercentiles = 5
+
+-- | MAX_BLOCK_SERIALIZED_SIZE sentinel for mintxsize (rendered 0 when no
+-- non-coinbase tx is present).
+maxBlockSerializedSize :: Int64
+maxBlockSerializedSize = 4000000
+
+-- | Truncated median (Core CalculateTruncatedMedian): empty -> 0; even count ->
+-- integer mean of the two central elements; odd -> central element.
+calcTruncatedMedian :: [Int64] -> Int64
+calcTruncatedMedian xs0 =
+  let xs = sort xs0
+      n  = length xs
+  in if n == 0 then 0
+     else if even n then (xs !! (n `div` 2 - 1) + xs !! (n `div` 2)) `div` 2
+     else xs !! (n `div` 2)
+
+-- | Weight-ranked feerate percentiles (Core CalculatePercentilesByWeight).
+-- @scores@ is a list of (feerate, weight); returns 5 percentiles.
+calcPercentilesByWeight :: [(Int64, Int64)] -> Int64 -> [Int64]
+calcPercentilesByWeight [] _ = replicate numBlockStatsPercentiles 0
+calcPercentilesByWeight scores0 totalWeight =
+  let scores = sortBy (\(r1,w1) (r2,w2) -> compare r1 r2 <> compare w1 w2) scores0
+      tw = fromIntegral totalWeight :: Double
+      ws = [ tw / 10.0, tw / 4.0, tw / 2.0, (tw * 3.0) / 4.0, (tw * 9.0) / 10.0 ]
+      lastRate = fst (last scores)
+      -- Walk the sorted scores accumulating weight; each crossed boundary takes
+      -- the current element's feerate.
+      go _ _ acc | length acc >= numBlockStatsPercentiles = reverse acc
+      go [] _ acc = reverse acc ++ replicate (numBlockStatsPercentiles - length acc) lastRate
+      go ((rate,w):rest) cw acc =
+        let cw' = cw + w
+            crossed = takeWhile (\wbound -> fromIntegral cw' >= wbound)
+                                (drop (length acc) ws)
+            acc' = foldl (\a _ -> rate : a) acc crossed
+        in go rest cw' acc'
+  in take numBlockStatsPercentiles (go scores 0 [])
+
+-- | Compute every getblockstats statistic as a name->Encoding association list
+-- in Core's pushKV order.  Shared by the encoding and the (filtered) map paths.
+blockStatsAssoc :: Network -> Block -> [TxUndo] -> BlockHash -> Word32 -> Word32
+                -> [(Text, AE.Encoding)]
+blockStatsAssoc net block undoList bh height mTime =
+  let txns = blockTxns block
+      nTx  = length txns
+      nNonCoinbase = max 0 (nTx - 1)
+
+      -- Per-tx fold (mirrors Core's loop; coinbase contributes only to
+      -- outputs / utxo_size_inc).
+      step (acc, undoIdx) tx =
+        let isCb       = isCoinbase tx
+            outs       = txOutputs tx
+            txTotalOut = sum (map (fromIntegral . txOutValue) outs) :: Int64
+            -- Outputs: utxo_size_inc for all; utxo_size_inc_actual + utxos only
+            -- for spendable, non-genesis outputs.
+            isGenesis  = height == 0
+            outFold (uInc, uIncA, us) out =
+              let outSize = fromIntegral (txOutSerializeSize out + perUtxoOverhead) :: Int64
+                  uInc'   = uInc + outSize
+              in if isGenesis || isUnspendable (txOutScript out)
+                   then (uInc', uIncA, us)
+                   else (uInc', uIncA + outSize, us + 1)
+            (uIncO, uIncAO, usO) = foldl' outFold (0,0,0) outs
+            acc1 = acc { bsOutputs     = bsOutputs acc + fromIntegral (length outs)
+                       , bsUtxoSizeInc = bsUtxoSizeInc acc + uIncO
+                       , bsUtxoSizeIncA = bsUtxoSizeIncA acc + uIncAO
+                       , bsUtxos       = bsUtxos acc + usO }
+        in if isCb
+             then (acc1, undoIdx)
+             else
+               let txSize = fromIntegral (txTotalSize tx) :: Int64
+                   weight = fromIntegral (txBaseSize tx * (witnessScaleFactor - 1) + txTotalSize tx) :: Int64
+                   hasWit = any (not . null) (txWitness tx)
+                   -- Fee from undo data (one TxUndo per non-coinbase tx).
+                   prevOuts = if undoIdx < length undoList
+                                then tuPrevOutputs (undoList !! undoIdx)
+                                else []
+                   txTotalIn = sum (map (fromIntegral . txOutValue . tuOutput) prevOuts) :: Int64
+                   prevSizeSum = sum [ fromIntegral (txOutSerializeSize (tuOutput p) + perUtxoOverhead)
+                                     | p <- prevOuts ] :: Int64
+                   txFee  = txTotalIn - txTotalOut
+                   feerate = if weight /= 0 then (txFee * fromIntegral witnessScaleFactor) `div` weight else 0
+                   acc2 = acc1
+                     { bsInputs       = bsInputs acc1 + fromIntegral (length (txInputs tx))
+                     , bsTotalOut     = bsTotalOut acc1 + txTotalOut
+                     , bsTotalSize    = bsTotalSize acc1 + txSize
+                     , bsTotalWeight  = bsTotalWeight acc1 + weight
+                     , bsMaxTxSize    = max (bsMaxTxSize acc1) txSize
+                     , bsMinTxSize    = min (bsMinTxSize acc1) txSize
+                     , bsTxSizes      = txSize : bsTxSizes acc1
+                     , bsSwTxs        = bsSwTxs acc1 + (if hasWit then 1 else 0)
+                     , bsSwTotalSize  = bsSwTotalSize acc1 + (if hasWit then txSize else 0)
+                     , bsSwTotalWeight= bsSwTotalWeight acc1 + (if hasWit then weight else 0)
+                     , bsUtxoSizeInc  = bsUtxoSizeInc acc1 - prevSizeSum
+                     , bsUtxoSizeIncA = bsUtxoSizeIncA acc1 - prevSizeSum
+                     , bsTotalFee     = bsTotalFee acc1 + txFee
+                     , bsMaxFee       = max (bsMaxFee acc1) txFee
+                     , bsMinFee       = min (bsMinFee acc1) txFee
+                     , bsFees         = txFee : bsFees acc1
+                     , bsMaxFeeRate   = max (bsMaxFeeRate acc1) feerate
+                     , bsMinFeeRate   = min (bsMinFeeRate acc1) feerate
+                     , bsFeeRates     = (feerate, weight) : bsFeeRates acc1 }
+               in (acc2, undoIdx + 1)
+
+      (st, _) = foldl' step (emptyBlockStats, 0) txns
+      totalWeight = bsTotalWeight st
+      totalFee    = bsTotalFee st
+      totalSize   = bsTotalSize st
+      avgFee      = if nNonCoinbase > 0 then totalFee `div` fromIntegral nNonCoinbase else 0
+      avgTxSize   = if nNonCoinbase > 0 then totalSize `div` fromIntegral nNonCoinbase else 0
+      avgFeeRate  = if totalWeight /= 0 then (totalFee * fromIntegral witnessScaleFactor) `div` totalWeight else 0
+      minFee      = if bsMinFee st == fromIntegral maxMoney then 0 else bsMinFee st
+      minFeeRate  = if bsMinFeeRate st == fromIntegral maxMoney then 0 else bsMinFeeRate st
+      minTxSize   = if bsMinTxSize st == maxBlockSerializedSize then 0 else bsMinTxSize st
+      feeratePcts = calcPercentilesByWeight (reverse (bsFeeRates st)) totalWeight
+      subsidy     = fromIntegral (blockRewardForNet net height) :: Int64
+  in
+    [ ("avgfee",               AE.int64 avgFee)
+    , ("avgfeerate",           AE.int64 avgFeeRate)
+    , ("avgtxsize",            AE.int64 avgTxSize)
+    , ("blockhash",            text (showHash bh))
+    , ("feerate_percentiles",  AE.list AE.int64 feeratePcts)
+    , ("height",               AE.word32 height)
+    , ("ins",                  AE.int64 (bsInputs st))
+    , ("maxfee",               AE.int64 (bsMaxFee st))
+    , ("maxfeerate",           AE.int64 (bsMaxFeeRate st))
+    , ("maxtxsize",            AE.int64 (bsMaxTxSize st))
+    , ("medianfee",            AE.int64 (calcTruncatedMedian (bsFees st)))
+    , ("mediantime",           AE.word32 mTime)
+    , ("mediantxsize",         AE.int64 (calcTruncatedMedian (bsTxSizes st)))
+    , ("minfee",               AE.int64 minFee)
+    , ("minfeerate",           AE.int64 minFeeRate)
+    , ("mintxsize",            AE.int64 minTxSize)
+    , ("outs",                 AE.int64 (bsOutputs st))
+    , ("subsidy",              AE.int64 subsidy)
+    , ("swtotal_size",         AE.int64 (bsSwTotalSize st))
+    , ("swtotal_weight",       AE.int64 (bsSwTotalWeight st))
+    , ("swtxs",                AE.int64 (bsSwTxs st))
+    , ("time",                 AE.word32 (bhTimestamp (blockHeader block)))
+    , ("total_out",            AE.int64 (bsTotalOut st))
+    , ("total_size",           AE.int64 totalSize)
+    , ("total_weight",         AE.int64 totalWeight)
+    , ("totalfee",             AE.int64 totalFee)
+    , ("txs",                  AE.int nTx)
+    , ("utxo_increase",        AE.int64 (bsOutputs st - bsInputs st))
+    , ("utxo_size_inc",        AE.int64 (bsUtxoSizeInc st))
+    , ("utxo_increase_actual", AE.int64 (bsUtxos st - bsInputs st))
+    , ("utxo_size_inc_actual", AE.int64 (bsUtxoSizeIncA st))
+    ]
+
+-- | Full getblockstats result as an ordered Encoding (do_all path).
+computeBlockStatsEnc :: Network -> Block -> [TxUndo] -> BlockHash -> Word32 -> Word32 -> AE.Encoding
+computeBlockStatsEnc net block undoList bh height mTime =
+  pairs $ foldMap (\(n,v) -> pair (Key.fromText n) v)
+            (blockStatsAssoc net block undoList bh height mTime)
+
+-- | Name->Encoding map for the stats-filter path.
+computeBlockStatsMap :: Network -> Block -> [TxUndo] -> BlockHash -> Word32 -> Word32
+                     -> Map Text AE.Encoding
+computeBlockStatsMap net block undoList bh height mTime =
+  Map.fromList (blockStatsAssoc net block undoList bh height mTime)
+
+-- | Canonical (Core pushKV) order for the stats-filter path.
+blockStatsOrder :: Map Text AE.Encoding -> [(Text, AE.Encoding)]
+blockStatsOrder m =
+  [ (n, v) | n <- orderedNames, Just v <- [Map.lookup n m] ]
+  where
+    orderedNames =
+      [ "avgfee","avgfeerate","avgtxsize","blockhash","feerate_percentiles"
+      , "height","ins","maxfee","maxfeerate","maxtxsize","medianfee"
+      , "mediantime","mediantxsize","minfee","minfeerate","mintxsize","outs"
+      , "subsidy","swtotal_size","swtotal_weight","swtxs","time","total_out"
+      , "total_size","total_weight","totalfee","txs","utxo_increase"
+      , "utxo_size_inc","utxo_increase_actual","utxo_size_inc_actual" ]
+
+-- | Mutable-free accumulator for the getblockstats per-tx fold.
+data BlockStatsAcc = BlockStatsAcc
+  { bsOutputs       :: !Int64
+  , bsInputs        :: !Int64
+  , bsTotalOut      :: !Int64
+  , bsTotalSize     :: !Int64
+  , bsTotalWeight   :: !Int64
+  , bsTotalFee      :: !Int64
+  , bsMaxFee        :: !Int64
+  , bsMinFee        :: !Int64
+  , bsMaxFeeRate    :: !Int64
+  , bsMinFeeRate    :: !Int64
+  , bsMaxTxSize     :: !Int64
+  , bsMinTxSize     :: !Int64
+  , bsSwTxs         :: !Int64
+  , bsSwTotalSize   :: !Int64
+  , bsSwTotalWeight :: !Int64
+  , bsUtxos         :: !Int64
+  , bsUtxoSizeInc   :: !Int64
+  , bsUtxoSizeIncA  :: !Int64
+  , bsFees          :: ![Int64]
+  , bsTxSizes       :: ![Int64]
+  , bsFeeRates      :: ![(Int64, Int64)]
+  }
+
+emptyBlockStats :: BlockStatsAcc
+emptyBlockStats = BlockStatsAcc
+  { bsOutputs = 0, bsInputs = 0, bsTotalOut = 0, bsTotalSize = 0
+  , bsTotalWeight = 0, bsTotalFee = 0
+  , bsMaxFee = 0, bsMinFee = fromIntegral maxMoney
+  , bsMaxFeeRate = 0, bsMinFeeRate = fromIntegral maxMoney
+  , bsMaxTxSize = 0, bsMinTxSize = maxBlockSerializedSize
+  , bsSwTxs = 0, bsSwTotalSize = 0, bsSwTotalWeight = 0
+  , bsUtxos = 0, bsUtxoSizeInc = 0, bsUtxoSizeIncA = 0
+  , bsFees = [], bsTxSizes = [], bsFeeRates = [] }
 
 -- | Fetch getblock result from local Bitcoin Core node via HTTP/1.0.
 -- Used as fallback when block body is not in haskoin's local storage.
@@ -1854,11 +2192,13 @@ buildCoinbaseTxEnc block =
           witHex    = case txWitness cb of
             (ws:_) | not (null ws) -> Just $ TE.decodeUtf8 $ B16.encode (head ws)
             _                      -> Nothing
+      -- Core coinbaseTxToJSON pushKV order (rpc/blockchain.cpp):
+      -- version, locktime, sequence, coinbase, [witness].
       in pairs $
-           pair "coinbase" (text scriptHex) <>
+           pair "version"  (AE.int (fromIntegral (txVersion cb) :: Int)) <>
            pair "locktime" (AE.word32 (txLockTime cb)) <>
            pair "sequence" (AE.word32 seqNum) <>
-           pair "version"  (AE.int (fromIntegral (txVersion cb) :: Int)) <>
+           pair "coinbase" (text scriptHex) <>
            (case witHex of
               Just w  -> pair "witness" (text w)
               Nothing -> mempty)
@@ -1900,10 +2240,11 @@ buildBlockTxArrayEnc net block undoList =
            pair "locktime" (AE.word32 (txLockTime tx)) <>
            pair "vin"      (AE.list id (map (decodeRawVinEnc tx) [0 .. length (txInputs tx) - 1])) <>
            pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx))) <>
-           pair "hex"      (text hexStr) <>
+           -- Core TxToUniv tail order: ...vout, [fee], [hex] — fee BEFORE hex.
            (case mFee of
               Just fee -> pair "fee" (btcAmountEnc (fromIntegral fee))
-              Nothing  -> mempty)
+              Nothing  -> mempty) <>
+           pair "hex"      (text hexStr)
 
 -- | Compute the fee for a non-coinbase transaction from its undo data.
 -- fee = sum(input values) - sum(output values). All values in satoshis.
@@ -2282,14 +2623,21 @@ handleGetChainTxStats server params = do
       let height = ceHeight pindex
           -- Default nblocks = one month of 10-minute blocks (Core).
           oneMonth = 30 * 24 * 60 * 60 `div` 600 :: Int
-          nReq = fromMaybe oneMonth mNblocks
-      -- Validate nblocks: Core rejects nblocks < 0 or nblocks > height.
-      -- nblocks == 0 is allowed (drops the window extras).
-      if nReq < 0 || nReq > fromIntegral height
-        then return $ RpcResponse Null
+      -- nblocks handling mirrors Core rpc/blockchain.cpp getchaintxstats:
+      --   * NOT supplied  -> blockcount = max(0, min(oneMonth, height-1))  (CLAMP, no reject)
+      --   * supplied      -> reject if blockcount < 0 or (blockcount > 0 && blockcount >= height)
+      -- The earlier code applied the reject test to the DEFAULT too, so a short
+      -- chain (height < oneMonth) false-rejected the no-arg call with -8.
+      let mValidated = case mNblocks of
+            Nothing -> Right (max 0 (min oneMonth (fromIntegral height - 1)))
+            Just n
+              | n < 0 || (n > 0 && n >= fromIntegral height) -> Left ()
+              | otherwise -> Right n
+      case mValidated of
+        Left () -> return $ RpcResponse Null
                (toJSON $ RpcError rpcInvalidParameter
                   "Invalid block count: should be between 0 and the block's height - 1") Null
-        else do
+        Right nReq -> do
           -- Cumulative tx count genesis..h, by reading stored block bodies.
           -- Coinbase-only blocks → 1 tx each; genesis counts its 1 tx too.
           -- O(height); fine for the regtest differential and any non-archival
@@ -2948,20 +3296,35 @@ handleGetMempoolInfo server = do
   entries <- forM txids $ \txid -> getTransaction (rsMempool server) txid
   let totalFeeSat = sum [meFee e | Just e <- entries]
   let mpCfg = mpConfig (rsMempool server)
-      -- minFeeRate is Word64 sat/vB; convert to BTC/kB for the wire format
-      minFeeRateSatPerVb = getFeeRate (mpcMinFeeRate mpCfg)
-      enc = pairs $
+      -- Static relay floor (sat/kvB-native): mpcMinFeeRate now stores the floor
+      -- directly in sat/kvB (FeeRate 100 = 100 sat/kvB = Core
+      -- DEFAULT_MIN_RELAY_TX_FEE), so minrelaytxfee = btcAmountEnc <floor>.
+      staticFloorKvb = fromIntegral (getFeeRate (mpcMinFeeRate mpCfg)) :: Int64
+      -- incrementalrelayfee = Core DEFAULT_INCREMENTAL_RELAY_FEE (100 sat/kvB).
+      incrementalKvb = fromIntegral incrementalRelayFeePerKvb :: Int64
+  -- mempoolminfee = max(GetMinFee, min_relay_feerate).GetFeePerK() — Core's
+  -- effective floor (rolling minimum bumped by evictions, never below the
+  -- static relay floor).  Reads the REAL floor via getMempoolMinFeeRate.
+  effFloorKvb <- fromIntegral <$> getMempoolMinFeeRate (rsMempool server) :: IO Int64
+  let enc = pairs $
               pair "loaded"              (AE.bool True)                             <>
               pair "size"                (AE.int count)                             <>
               pair "bytes"               (AE.int size)                              <>
               pair "usage"               (AE.int size)                              <>
               pair "total_fee"           (btcAmountEnc (fromIntegral totalFeeSat))  <>
               pair "maxmempool"          (toEncoding (mpcMaxSize mpCfg))            <>
-              pair "mempoolminfee"       (btcAmountEnc (fromIntegral minFeeRateSatPerVb * 1000)) <>
-              pair "minrelaytxfee"       (btcAmountEnc 1000)                        <>
-              pair "incrementalrelayfee" (btcAmountEnc 1000)                        <>
+              pair "mempoolminfee"       (btcAmountEnc effFloorKvb)                 <>
+              pair "minrelaytxfee"       (btcAmountEnc staticFloorKvb)              <>
+              pair "incrementalrelayfee" (btcAmountEnc incrementalKvb)              <>
               pair "unbroadcastcount"    (AE.int 0)                                 <>
-              pair "fullrbf"             (AE.bool True)
+              pair "fullrbf"             (AE.bool True)                             <>
+              -- The 5 policy fields Core v31.99 added after fullrbf, in Core
+              -- pushKV order (src/rpc/mempool.cpp MempoolInfoToJSON).
+              pair "permitbaremultisig"  (AE.bool True)                             <>
+              pair "maxdatacarriersize"  (AE.int 100000)                            <>
+              pair "limitclustercount"   (AE.int 64)                                <>
+              pair "limitclustersize"    (AE.int 101000)                            <>
+              pair "optimal"             (AE.bool True)
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
@@ -3286,7 +3649,10 @@ handleGetNetworkInfo server = do
   -- flag to the action).  Matches Core g_local_services (init.cpp:863) +
   -- NODE_P2P_V2 when v2 is on.
   v2adv <- bip324V2OutboundEnabled
-  let localServices = getServiceFlag nodeNetwork
+  let mpCfg = mpConfig (rsMempool server)
+      relayFloorKvb  = fromIntegral (getFeeRate (mpcMinFeeRate mpCfg)) :: Int64
+      incrementalKvb = fromIntegral incrementalRelayFeePerKvb :: Int64
+      localServices = getServiceFlag nodeNetwork
                   .|. getServiceFlag nodeWitness
                   .|. getServiceFlag nodeNetworkLimited
                   .|. (if v2adv then getServiceFlag nodeP2PV2 else 0) :: Word64
@@ -3307,11 +3673,20 @@ handleGetNetworkInfo server = do
           pair "limited"                    (AE.bool limited)  <>
           pair "reachable"                  (AE.bool reachable)<>
           pair "proxy"                      (text "")          <>
-          pair "proxy_randomize_credentials"(AE.bool True)
+          -- Core default (no proxy / no -proxyrandomize): False
+          -- (rpc/net.cpp GetNetworksInfo, proxy->m_tor_stream_isolation
+          -- absent -> false).
+          pair "proxy_randomize_credentials"(AE.bool False)
+      -- Core emits ALL 5 routable networks (ipv4, ipv6, onion, i2p, cjdns) in
+      -- Network-enum order (rpc/net.cpp GetNetworksInfo iterating NET_IPV4..).
+      -- With no proxy/onion/i2p/cjdns configured, ipv4+ipv6 are reachable and
+      -- onion/i2p/cjdns are removed from g_reachable_nets -> limited+unreachable.
       networksEnc =
         [ mkNetEnc "ipv4"  False True
         , mkNetEnc "ipv6"  False True
         , mkNetEnc "onion" True  False
+        , mkNetEnc "i2p"   True  False
+        , mkNetEnc "cjdns" True  False
         ]
       enc = pairs $
               pair "version"            (AE.int (100000 :: Int))        <>
@@ -3326,8 +3701,11 @@ handleGetNetworkInfo server = do
               pair "connections_in"     (AE.int (0 :: Int))             <>
               pair "connections_out"    (AE.int peerCount)              <>
               pair "networks"           (AE.list id networksEnc)        <>
-              pair "relayfee"           (btcAmountEnc 1000)             <>
-              pair "incrementalfee"     (btcAmountEnc 1000)             <>
+              -- relayfee = static relay floor (sat/kvB-native mpcMinFeeRate,
+              -- 100 sat/kvB = 0.00000100); incrementalfee = incremental relay
+              -- fee (100 sat/kvB).  Coupled to the real floor, not hardcoded.
+              pair "relayfee"           (btcAmountEnc relayFloorKvb)    <>
+              pair "incrementalfee"     (btcAmountEnc incrementalKvb)   <>
               pair "localaddresses"     (AE.list id [])                 <>
               pair "warnings"           (AE.list text [])
       rawBs = encodingToLazyByteString enc
@@ -3893,7 +4271,16 @@ handleSubmitBlockUnpaused server params = do
                   -- string, not as a JSON-RPC error object.
                   let bip22 = T.pack $ bip22ResultString err
                   in return $ RpcResponse (toJSON bip22) Null Null
-                Right () -> return $ RpcResponse Null Null Null
+                Right () -> do
+                  -- Mirror CTxMemPool::removeForBlock: drop the txs this block
+                  -- confirmed (and now-conflicting txs) from the mempool so
+                  -- getrawmempool / getmempoolinfo reflect the connected block.
+                  -- The consensus-only 'submitBlock' does not do this; the P2P
+                  -- connect path (Main.hs) and the regtest miner both call it,
+                  -- so the submitblock RPC must too — otherwise a confirmed spend
+                  -- lingers in the pool.
+                  blockConnected (rsMempool server) block
+                  return $ RpcResponse Null Null Null
 
 -- | Get mining-related information
 -- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
@@ -3913,17 +4300,23 @@ handleGetMiningInfo server = do
                     pair "bits"       (text bitsHex)       <>
                     pair "difficulty" diffEnc              <>
                     pair "target"     (text targetHex)
+      -- Core getmininginfo pushKV order (rpc/mining.cpp): blocks, bits,
+      -- difficulty, target, networkhashps, pooledtx, blockmintxfee, chain,
+      -- next, warnings.  blockmintxfee = blockMinFeeRate.GetFeePerK() where
+      -- blockMinFeeRate defaults to DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB
+      -- (= 0.00000001 BTC/kvB = 1e-08) — a mining-template knob, NOT the relay
+      -- floor.  warnings is a JSON ARRAY in v31.99 (was a string).
       enc = pairs $
               pair "blocks"        (AE.word32 (ceHeight tip)) <>
               pair "bits"          (text bitsHex)             <>
               pair "difficulty"    diffEnc                    <>
               pair "target"        (text targetHex)           <>
-              pair "blockmintxfee" (btcAmountEnc 1000)        <>
               pair "networkhashps" (AE.int 0)                 <>
               pair "pooledtx"      (AE.int pooledTxCount)     <>
+              pair "blockmintxfee" (btcAmountEnc 1)           <>
               pair "chain"         (text (T.pack (netName (rsNetwork server)))) <>
               pair "next"          nextEnc                    <>
-              pair "warnings"      (text "")
+              pair "warnings"      (AE.list text [])
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
@@ -4343,23 +4736,33 @@ handleValidateAddress server params = do
       (toJSON $ RpcError rpcInvalidParams "Missing address") Null
     Just addr ->
       case textToAddress addr of
-        Nothing -> return $ RpcResponse (object
-          [ "isvalid"         .= False
-          , "error"           .= ("Invalid or unsupported Segwit (Bech32) or Base58 encoding." :: Text)
-          , "error_locations" .= ([] :: [Value])
-          ]) Null Null
+        -- Invalid: Core pushKV order is isvalid, error_locations, error
+        -- (rpc/output_script.cpp validateaddress, ret.pushKV after detail).
+        Nothing -> do
+          let enc = pairs $
+                      pair "isvalid"         (AE.bool False)                <>
+                      pair "error_locations" (AE.list id ([] :: [AE.Encoding])) <>
+                      pair "error"           (text "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+        -- Valid: Core pushKV order is isvalid, address, scriptPubKey, then the
+        -- DescribeAddress detail (isscript, iswitness, [witness_version],
+        -- [witness_program]) — emitted via an ordered streaming encoding so the
+        -- byte order matches Core (aeson `object` would sort keys alphabetically).
         Just address -> do
           let (scriptPubKey, isScript, isWitness, witnessVersion, witnessProgram) =
                 addressToScriptInfo (rsNetwork server) address
-          return $ RpcResponse (object $ catMaybes
-            [ Just $ "isvalid"          .= True
-            , Just $ "address"          .= addr
-            , Just $ "scriptPubKey"     .= scriptPubKey
-            , Just $ "isscript"         .= isScript
-            , Just $ "iswitness"        .= isWitness
-            , if isWitness then Just $ "witness_version" .= witnessVersion else Nothing
-            , if isWitness then Just $ "witness_program" .= witnessProgram else Nothing
-            ]) Null Null
+              witEnc = if isWitness
+                         then pair "witness_version" (AE.int witnessVersion) <>
+                              pair "witness_program" (text witnessProgram)
+                         else mempty
+              enc = pairs $
+                      pair "isvalid"      (AE.bool True)        <>
+                      pair "address"      (text addr)           <>
+                      pair "scriptPubKey" (text scriptPubKey)   <>
+                      pair "isscript"     (AE.bool isScript)    <>
+                      pair "iswitness"    (AE.bool isWitness)   <>
+                      witEnc
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 -- | Convert an Address to its scriptPubKey and metadata
 addressToScriptInfo :: Network -> Address -> (Text, Bool, Bool, Int, Text)
@@ -4422,8 +4825,8 @@ handleGetInfo server = do
 --   True only when a WIF private key is embedded in the descriptor.
 --
 -- Reference: bitcoin-core/src/rpc/misc.cpp getdescriptorinfo
-handleGetDescriptorInfo :: Value -> IO RpcResponse
-handleGetDescriptorInfo params =
+handleGetDescriptorInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetDescriptorInfo server params =
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams ("Missing required argument: descriptor" :: Text)) Null
@@ -4432,8 +4835,11 @@ handleGetDescriptorInfo params =
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams (T.pack $ "Invalid descriptor: " ++ show err)) Null
         Right desc -> do
-          -- Canonical form = descriptorToText without checksum, then append checksum.
-          let baseText = descriptorToText desc
+          -- Canonical form = network-aware descriptor text (so addr() keeps the
+          -- node's HRP, not mainnet's), then append the BIP-380 checksum
+          -- (computed OVER the canonical text — so the HRP fix also fixes the
+          -- checksum).
+          let baseText = descriptorToTextNet (rsNetwork server) desc
               canonical = case addDescriptorChecksum baseText of
                             Just c  -> c
                             Nothing -> baseText  -- fallback (should never happen)
@@ -4441,14 +4847,15 @@ handleGetDescriptorInfo params =
               isrange   = isRangeDescriptor desc
               solvable  = descriptorIsSolvable desc
               hasPriv   = descriptorHasPrivateKeys desc
-          let result = object
-                [ "descriptor"    .= canonical
-                , "checksum"      .= checksum
-                , "isrange"       .= isrange
-                , "issolvable"    .= solvable
-                , "hasprivatekeys" .= hasPriv
-                ]
-          return $ RpcResponse result Null Null
+              -- Core pushKV order: descriptor, checksum, isrange, issolvable,
+              -- hasprivatekeys (rpc/output_script.cpp getdescriptorinfo).
+              enc = pairs $
+                      pair "descriptor"     (text canonical)    <>
+                      pair "checksum"       (text checksum)     <>
+                      pair "isrange"        (AE.bool isrange)   <>
+                      pair "issolvable"     (AE.bool solvable)  <>
+                      pair "hasprivatekeys" (AE.bool hasPriv)
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 -- | BIP-380 solvability rule.
 -- Core: addr() and raw() descriptors are not solvable (no script knowledge).
@@ -6613,21 +7020,22 @@ handleGetChainTips server = do
                 then tips
                 else tip : tips
 
-  -- Build result array
-  let tipResults = map (tipToJSON entries tip invalidated) allTips
-  return $ RpcResponse (toJSON tipResults) Null Null
+  -- Build result array (ordered streaming encoding — Core pushKV order is
+  -- height, hash, branchlen, status; aeson `object` would sort alphabetically).
+  let tipResultsEnc = map (tipToJSONEnc entries tip invalidated) allTips
+      rawBs = encodingToLazyByteString (AE.list id tipResultsEnc)
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    tipToJSON :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
-              -> ChainEntry -> Value
-    tipToJSON entries activeTip invalidatedSet entry =
+    tipToJSONEnc :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
+              -> ChainEntry -> AE.Encoding
+    tipToJSONEnc entries activeTip invalidatedSet entry =
       let status = getChainTipStatus entries activeTip invalidatedSet entry
           branchLen = computeBranchLen entries activeTip entry
-      in object
-        [ "height"    .= ceHeight entry
-        , "hash"      .= showHash (ceHash entry)
-        , "branchlen" .= branchLen
-        , "status"    .= status
-        ]
+      in pairs $
+           pair "height"    (AE.word32 (ceHeight entry))          <>
+           pair "hash"      (text (showHash (ceHash entry)))       <>
+           pair "branchlen" (AE.int branchLen)                     <>
+           pair "status"    (text status)
 
     getChainTipStatus :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
                       -> ChainEntry -> Text
@@ -10814,11 +11222,13 @@ decodeRawVinEnc tx idx =
       witness   = if idx < length (txWitness tx) then txWitness tx !! idx else []
       isCoinbase = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
   in if isCoinbase
+     -- Core TxToUniv vin order for a coinbase: coinbase, [txinwitness],
+     -- sequence (sequence is pushed last for ALL inputs; core_io.cpp).
      then pairs $
        pair "coinbase"    (text (TE.decodeUtf8 (B16.encode (txInScript inp)))) <>
-       pair "sequence"    (AE.word32 (txInSequence inp)) <>
        ( if null witness then mempty
-         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) )
+         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) ) <>
+       pair "sequence"    (AE.word32 (txInSequence inp))
      else pairs $
        pair "txid"      (text (showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp)))))) <>
        pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput inp))) <>
@@ -11526,8 +11936,9 @@ handleRestMempoolInfo server pathPart = do
             , "bytes" .= size
             , "usage" .= size
             , "maxmempool" .= mpcMaxSize mpCfg
+            -- Coupled to the real (sat/kvB-native) relay floor (100 sat/kvB).
             , "mempoolminfee" .= getFeeRate (mpcMinFeeRate mpCfg)
-            , "minrelaytxfee" .= (1 :: Int)
+            , "minrelaytxfee" .= getFeeRate (mpcMinFeeRate mpCfg)
             ]
       return $ responseLBS status200
         [(hContentType, "application/json")]
@@ -12528,7 +12939,9 @@ handleGetTxOutSetInfo server params = do
       n        <- readIORef countRef
       totalSat <- readIORef sumRef
       bogo     <- readIORef bogosizeRef
-      diskSize <- readIORef diskRef
+      -- disk_size now reports Core's unflushed-leveldb 0 (see below); the
+      -- accumulated raw byte count is retained for diagnostics only.
+      _diskSize <- readIORef diskRef
       nTxns    <- Set.size <$> readIORef txidsRef
       coins    <- readIORef coinsRef
       -- Build the response on the streaming path so total_amount uses
@@ -12553,7 +12966,15 @@ handleGetTxOutSetInfo server params = do
                   muHashEnc                                                         <>
                   pair "total_amount" (btcAmountEnc (fromIntegral totalSat))        <>
                   pair "transactions" (AE.int nTxns)                               <>
-                  pair "disk_size"    (AE.int diskSize)
+                  -- disk_size mirrors Core's CCoinsViewDB::EstimateSize()
+                  -- (rpc/blockchain.cpp gettxoutsetinfo -> stats.nDiskSize): a
+                  -- leveldb on-disk estimate that is 0 until the chainstate is
+                  -- flushed/compacted to SST files.  In the just-synced /
+                  -- unflushed state (e.g. a short regtest run) Core reports 0,
+                  -- so we report 0 here too rather than the raw key+value byte
+                  -- count (which over-reports an estimate that never matches
+                  -- Core's leveldb figure anyway).
+                  pair "disk_size"    (AE.int (0 :: Int))
       return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 -- | scantxoutset "start" [ scanobjects ]
