@@ -229,6 +229,7 @@ module Haskoin.Network
   , newAddrMan
   , addAddress
   , selectAddress
+  , selectForFeeler
   , markGood
   , markAttempt
   , getNewBucket
@@ -251,6 +252,17 @@ module Haskoin.Network
   , addrmanRetries
   , addrmanMaxFailures
   , addrmanMinFail
+    -- ** P2P anti-eclipse: feeler + getaddr guards
+  , feelerIntervalSecs
+  , maxFeelerConnections
+  , maxPctAddrToSend
+  , maxAddrRatePerSecond
+  , maxAddrProcessingTokenBucket
+  , getAddrCap
+  , refillAddrTokenBucket
+  , admitAddrsByTokenBucket
+  , sockAddrToNetworkAddress
+  , buildGetAddrResponse
     -- ** AddrMan Helpers
   , isRoutable
   , isTerribleAddress
@@ -2052,6 +2064,19 @@ data PeerInfo = PeerInfo
     -- with the txid.  Mirrors Bitcoin Core's m_wtxid_relay field set in
     -- net_processing.cpp:2027 (ProcessMessage "wtxidrelay").
   , piWtxidRelay :: !Bool
+    -- | GETADDR answer-once flag (Core @Peer::m_getaddr_recvd@,
+    -- net_processing.cpp:4833).  Set True the first time we answer a getaddr
+    -- from this peer; subsequent getaddr messages from the same peer are
+    -- ignored to reduce resource waste and discourage addr stamping.
+  , piGetaddrRecvd :: !Bool
+    -- | Inbound-addr rate-limit token bucket (Core @Peer::m_addr_token_bucket@,
+    -- initialised to 1.0).  Refilled by elapsed*MAX_ADDR_RATE_PER_SECOND capped
+    -- at MAX_ADDR_PROCESSING_TOKEN_BUCKET; addresses beyond the bucket in an
+    -- addr/addrv2 message are dropped (rate-limited).
+  , piAddrTokenBucket :: !Double
+    -- | Unix timestamp (seconds) of the last token-bucket refill (Core
+    -- @Peer::m_addr_token_timestamp@).  0 until the first addr message.
+  , piAddrTokenTimestamp :: !Int64
   } deriving (Show, Generic)
 
 instance NFData PeerInfo
@@ -2145,6 +2170,9 @@ connectPeer config host port = do
               , piIsManual = False
               , piIsLocal  = isLocalAddr peerAddr
               , piWtxidRelay = False
+              , piGetaddrRecvd = False
+              , piAddrTokenBucket = 1.0
+              , piAddrTokenTimestamp = 0
               }
         infoVar <- newTVarIO info
         sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
@@ -2892,6 +2920,13 @@ data PeerManager = PeerManager
     -- Empty ByteString when ASMap is disabled (default).
     -- Used by 'computeNetworkGroupWithASMap' for ASN-keyed bucketing.
     -- Reference: bitcoin-core/src/netgroup.cpp NetGroupManager.
+  , pmNextFeeler         :: !(TVar Int64)
+    -- ^ Unix timestamp (seconds) at which the next FEELER connection may be
+    --   opened (Core net.cpp @next_feeler@).  The peer-manager loop opens ONE
+    --   feeler to a NEW-table address when @now >= pmNextFeeler@ and there are
+    --   no auto-outbound slots to fill, then advances this by
+    --   'feelerIntervalSecs'.  Feelers are OFF the full-relay/block-relay
+    --   outbound budget (they dial, handshake, promote NEW->TRIED, disconnect).
   }
 
 -- | Configuration for the peer manager
@@ -3154,6 +3189,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> pure onDisconnect
     <*> pure am
     <*> pure BS.empty   -- pmAsmapData: empty = ASMap disabled; set via pmAsmapData field
+    <*> newTVarIO 0     -- pmNextFeeler: 0 = a feeler may open on the first eligible loop tick
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -3343,6 +3379,26 @@ peerManagerLoop pm = forever $ do
       putStrLn $ "peerManagerLoop: connecting " ++ show (length forBlockRelay) ++ " block-relay-only"
     mapM_ (void . forkIO . tryConnectBlockRelay pm) forBlockRelay
 
+  -- FEELER connection (Core net.cpp ThreadOpenConnections @next_feeler@ branch).
+  -- Independently of the auto-outbound slot fill above, every 'feelerIntervalSecs'
+  -- open ONE short-lived feeler to a NEW-table address: dial, complete the
+  -- handshake (which promotes it NEW->TRIED via markGood), then disconnect.
+  -- Feelers are OFF the outbound budget (not counted in fullRelay/blockRelay,
+  -- never registered in pmPeers) so they keep TRIED fresh — Core's primary
+  -- eclipse-attack mitigation — without consuming relay slots.  Suppressed in
+  -- -connect mode (like all addrman-driven dialing).  Bounded to ONE in flight
+  -- because the feeler is fully synchronous (the forkIO body runs to completion
+  -- before pmNextFeeler is reached again 120s later).
+  unless connectMode $ do
+    nowFeel  <- (round <$> getPOSIXTime :: IO Int64)
+    nextFeel <- readTVarIO (pmNextFeeler pm)
+    when (nowFeel >= nextFeel) $ do
+      -- Advance the timer FIRST (Core advances next_feeler before dialing) so a
+      -- slow/hanging feeler dial can never trigger a second feeler this window.
+      atomically $ writeTVar (pmNextFeeler pm) (nowFeel + feelerIntervalSecs)
+      let connectedNow = Map.keysSet peers
+      void $ forkIO $ tryConnectFeeler pm connectedNow
+
   -- Ping peers and disconnect stale ones
   now <- round <$> getPOSIXTime
   peers' <- readTVarIO (pmPeers pm)
@@ -3388,6 +3444,79 @@ tryConnect pm addr = tryConnectWithType pm addr False
 -- | Try to connect as a block-relay-only peer (no tx relay, no addr exchange)
 tryConnectBlockRelay :: PeerManager -> SockAddr -> IO ()
 tryConnectBlockRelay pm addr = tryConnectWithType pm addr True
+
+-- | Open ONE short-lived FEELER connection (Core net.cpp ThreadOpenConnections
+-- feeler branch).  Unlike 'tryConnectWithType', a feeler:
+--
+--   * selects its target FROM THE NEW TABLE only ('selectForFeeler'), excluding
+--     addresses we are already connected to — the whole point of a feeler is to
+--     probe an as-yet-unconfirmed address so it can be promoted NEW->TRIED;
+--   * is NOT registered in 'pmPeers' and NOT added to the outbound-diversity
+--     set, so it never consumes a full-relay / block-relay outbound slot;
+--   * on a SUCCESSFUL handshake calls 'markGood' (promote NEW->TRIED) and then
+--     immediately disconnects (TRIED stays fresh — Core's primary eclipse-attack
+--     mitigation);
+--   * on a FAILED dial / handshake calls 'markAttempt' only, leaving the TRIED
+--     table unchanged (a failed feeler never promotes).
+--
+-- The dial routes through the operator's SOCKS5 proxy when configured (same as
+-- the auto-outbound path) so a feeler never leaks DNS on a privacy network.
+-- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections (fFeeler branch,
+-- ~2753 + ~2879) and addrman.Good() on the feeler success path.
+tryConnectFeeler :: PeerManager -> Set.Set SockAddr -> IO ()
+tryConnectFeeler pm connected = do
+  mAddr <- selectForFeeler (pmAddrMan pm) connected
+  case mAddr of
+    Nothing   -> return ()   -- NEW table has no eligible candidate this window
+    Just addr -> do
+      -- Never feeler-probe a discouraged/banned address.
+      discouraged <- isDiscouraged pm addr
+      if discouraged
+        then return ()
+        else do
+          let net = pmNetwork pm
+              (host, port) = sockAddrToHostPort addr (netDefaultPort net)
+              config = (defaultPeerConfig net)
+                { pcfgConnTimeout = pmcConnectTimeout (pmConfig pm)
+                , pcfgRelay       = False   -- a feeler exchanges no tx relay
+                }
+          putStrLn $ "peerManagerLoop: feeler probe " ++ host ++ ":" ++ show port
+          result <- case pmcProxy (pmConfig pm) of
+            Just (proxyHost, proxyPort) -> do
+              sockRes <- connectViaProxy proxyHost proxyPort Nothing host port
+              case sockRes of
+                Left _     -> return (Left "proxy connect failed")
+                Right sock -> do
+                  pcRes <- createPeerConnectionFromSocket config sock host
+                  case pcRes of
+                    Left e   -> do
+                      close sock `catch` (\(_ :: SomeException) -> return ())
+                      return (Left e)
+                    Right pc -> do
+                      atomically $ modifyTVar' (pcInfo pc)
+                        (\i -> i { piAddress = addr })
+                      return (Right pc)
+            Nothing -> connectPeer config host port
+          case result of
+            Left _err -> do
+              -- Failed dial/setup: count the attempt, do NOT promote to TRIED.
+              nowFail <- (round <$> getPOSIXTime :: IO Int64)
+              markAttempt (pmAddrMan pm) addr nowFail
+            Right pc -> do
+              hsResult <- performHandshake config pc
+              case hsResult of
+                Left _err -> do
+                  -- Handshake failed: attempt counts, TRIED unchanged.
+                  disconnectPeer pc `catch` (\(_ :: SomeException) -> return ())
+                  nowFail <- (round <$> getPOSIXTime :: IO Int64)
+                  markAttempt (pmAddrMan pm) addr nowFail
+                Right _ver -> do
+                  -- SUCCESS: promote NEW->TRIED, then disconnect immediately.
+                  -- The feeler is never added to pmPeers nor the outbound
+                  -- diversity set, so it consumes no relay slot.
+                  nowOk <- (round <$> getPOSIXTime :: IO Int64)
+                  markGood (pmAddrMan pm) (pmAsmapData pm) addr nowOk
+                  disconnectPeer pc `catch` (\(_ :: SomeException) -> return ())
 
 -- | Try to connect to a pinned @-connect@ peer (full-relay), then mark
 -- the resulting 'PeerInfo' as a manual connection (@piIsManual = True@)
@@ -3958,6 +4087,9 @@ startInboundListener pm port = do
             , piIsManual = False
             , piIsLocal  = isLocalAddr addr
             , piWtxidRelay = False
+            , piGetaddrRecvd = False
+            , piAddrTokenBucket = 1.0
+            , piAddrTokenTimestamp = 0
             }
       infoVar <- newTVarIO info
       sendQ <- newTBQueueIO 100
@@ -5371,6 +5503,89 @@ addrmanMinFail :: Int64
 addrmanMinFail = 7 * 24 * 60 * 60
 
 --------------------------------------------------------------------------------
+-- P2P anti-eclipse: feeler + getaddr anti-DoS guards
+-- Reference: bitcoin-core/src/net.h (FEELER_INTERVAL, MAX_FEELER_CONNECTIONS),
+--            bitcoin-core/src/net.cpp ThreadOpenConnections feeler branch
+--            (~2753), bitcoin-core/src/net_processing.cpp GETADDR handler
+--            (~4816, answer-once + 23%-cap) and ProcessAddrs token bucket (~5644).
+--------------------------------------------------------------------------------
+
+-- | Feeler connection interval in seconds (Core net.h FEELER_INTERVAL = 2min).
+-- Every 'feelerIntervalSecs' the connection-open loop opens ONE short-lived
+-- feeler to a NEW-table address, completes the handshake to promote it
+-- NEW->TRIED, then disconnects.  Keeping TRIED fresh is Core's primary
+-- eclipse-attack mitigation.
+feelerIntervalSecs :: Int64
+feelerIntervalSecs = 120
+
+-- | Maximum simultaneous feeler connections (Core net.h MAX_FEELER_CONNECTIONS = 1).
+-- A feeler is opened only when fewer than this are in flight; the haskoin feeler
+-- is fully synchronous (dial→handshake→disconnect) so at most one runs at a time.
+maxFeelerConnections :: Int
+maxFeelerConnections = 1
+
+-- | GETADDR response cap as a percentage of addrman size (Core
+-- MAX_PCT_ADDR_TO_SEND = 23, net_processing.cpp).  The getaddr reply is capped
+-- at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size)) — the primary getaddr
+-- anti-DoS / anti-fingerprinting guard.
+maxPctAddrToSend :: Int
+maxPctAddrToSend = 23
+
+-- | Inbound-addr token-bucket refill rate (Core MAX_ADDR_RATE_PER_SECOND = 0.1,
+-- net_processing.cpp).  The bucket refills by elapsed_seconds * this rate.
+maxAddrRatePerSecond :: Double
+maxAddrRatePerSecond = 0.1
+
+-- | Inbound-addr token-bucket ceiling (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET =
+-- 1000, net_processing.cpp).  The bucket never refills above this.
+maxAddrProcessingTokenBucket :: Double
+maxAddrProcessingTokenBucket = 1000.0
+
+-- | GETADDR 23%-cap: min(MAX_ADDR_TO_SEND, max(1, ceil(0.23 * size))).
+-- Mirrors Core's GetAddr_ cap (addrman.cpp): the reply is bounded both by the
+-- hard 1000-entry MAX_ADDR_TO_SEND ceiling and by 23% of the addrman size.  An
+-- empty addrman yields 0 (nothing to send); any non-empty addrman sends at least
+-- 1.  Pure + total so it is directly unit-testable.
+-- Reference: bitcoin-core/src/addrman.cpp AddrManImpl::GetAddr_ (nNodes cap).
+getAddrCap :: Int -> Int
+getAddrCap size
+  | size <= 0 = 0
+  | otherwise =
+      let -- ceil(0.23 * size) = ceil(23*size / 100) = (23*size + 99) `div` 100
+          pct  = (maxPctAddrToSend * size + 99) `div` 100
+          pct' = max 1 pct
+      in min (fromIntegral maxAddrToSend) pct'
+
+-- | Refill an inbound-addr token bucket given the elapsed time since the last
+-- refill, then clamp to the 1000 ceiling.  Mirrors Core ProcessAddrs:
+--   increment = max(0, elapsed_seconds) * MAX_ADDR_RATE_PER_SECOND
+--   bucket    = min(bucket + increment, MAX_ADDR_PROCESSING_TOKEN_BUCKET)
+-- (Core does NOT increment a bucket that is already at/over the ceiling; the
+-- min() makes that a no-op here, matching behaviour.)  Pure for unit testing.
+-- Reference: bitcoin-core/src/net_processing.cpp ProcessAddrs (~5644).
+refillAddrTokenBucket :: Double   -- ^ current bucket level
+                      -> Double   -- ^ elapsed seconds since last refill
+                      -> Double
+refillAddrTokenBucket bucket elapsed =
+  let inc = max 0 elapsed * maxAddrRatePerSecond
+  in min (bucket + inc) maxAddrProcessingTokenBucket
+
+-- | Apply the inbound-addr token bucket to a batch of received addresses.
+-- For each address in order: if the bucket has >= 1.0 tokens, admit it and
+-- spend one token; otherwise drop it (rate-limited).  Returns the admitted
+-- prefix-by-token and the post-spend bucket level.  Mirrors Core ProcessAddrs'
+-- per-address loop (the @rate_limited@ branch) for an untrusted (non-Addr-
+-- permission) peer, which is the only kind haskoin has.  Pure for unit testing.
+-- Reference: bitcoin-core/src/net_processing.cpp ProcessAddrs (~5660).
+admitAddrsByTokenBucket :: Double -> [a] -> ([a], Double)
+admitAddrsByTokenBucket bucket0 = go bucket0 []
+  where
+    go bucket acc [] = (reverse acc, bucket)
+    go bucket acc (x:xs)
+      | bucket < 1.0 = (reverse acc, bucket)   -- exhausted: drop the rest
+      | otherwise    = go (bucket - 1.0) (x:acc) xs
+
+--------------------------------------------------------------------------------
 -- AddrInfo - Per-address metadata
 -- Reference: Bitcoin Core addrman_impl.h AddrInfo
 --------------------------------------------------------------------------------
@@ -5670,6 +5885,78 @@ selectFromTable am isNew now = do
     selectByChance r ((info, chance):rest)
       | r <= chance = Just (aiAddress info)
       | otherwise = selectByChance (r - chance) rest
+
+-- | Select a NEW-table address for a feeler probe (Core net.cpp:2818
+-- @addrman.Select(/*newOnly=*/true, ...)@).  Feelers deliberately read from the
+-- NEW table (not TRIED): they probe addresses we have NOT yet confirmed so a
+-- successful handshake can promote them NEW->TRIED, keeping the TRIED table
+-- fresh (the primary eclipse-attack mitigation).  @connected@ is the set of
+-- addresses we are already connected to, which are excluded so a feeler never
+-- redundantly dials a live peer.  Non-terrible, chance-weighted, NEW-only.
+-- Returns 'Nothing' when the NEW table has no eligible candidate.
+-- Reference: bitcoin-core/src/net.cpp ThreadOpenConnections feeler branch.
+selectForFeeler :: AddrMan -> Set.Set SockAddr -> IO (Maybe SockAddr)
+selectForFeeler am connected = do
+  now <- round <$> getPOSIXTime
+  table <- readTVarIO (amNewTable am)
+  let allAddrs   = concatMap snd $ Map.toList table
+      -- NEW-only, not terrible, not already connected.
+      candidates = filter (\a -> not (isTerribleAddress now a)
+                                 && Set.notMember (aiAddress a) connected)
+                          allAddrs
+  if null candidates
+    then return Nothing
+    else do
+      let chances     = map (\a -> (a, getAddressChance now a)) candidates
+          totalChance = sum $ map snd chances
+      if totalChance <= 0
+        then return Nothing
+        else do
+          r <- randomRIO (0, totalChance)
+          return $ pickByChance r chances
+  where
+    pickByChance _ [] = Nothing
+    pickByChance r ((info, chance):rest)
+      | r <= chance = Just (aiAddress info)
+      | otherwise   = pickByChance (r - chance) rest
+
+-- | Convert a 'SockAddr' (IPv4) to a legacy 'NetworkAddress' (16-byte
+-- IPv6-mapped form) for inclusion in an @addr@ message.  Inverse of the
+-- 'handleAddrMessage' decode (which reads the last 4 bytes little-endian-host).
+-- Returns 'Nothing' for non-IPv4 SockAddrs (this impl's addrman only stores
+-- IPv4, mirroring the BUG-1 single-pipeline restriction).
+sockAddrToNetworkAddress :: Word64 -> SockAddr -> Maybe NetworkAddress
+sockAddrToNetworkAddress services (SockAddrInet port hostAddr) =
+  let o1 = fromIntegral (hostAddr            .&. 0xff) :: Word8
+      o2 = fromIntegral ((hostAddr `shiftR` 8)  .&. 0xff) :: Word8
+      o3 = fromIntegral ((hostAddr `shiftR` 16) .&. 0xff) :: Word8
+      o4 = fromIntegral ((hostAddr `shiftR` 24) .&. 0xff) :: Word8
+      ipv4Prefix = BS.pack [0,0,0,0,0,0,0,0,0,0,0xff,0xff]
+      addrBytes  = BS.append ipv4Prefix (BS.pack [o1, o2, o3, o4])
+  in Just $ NetworkAddress services addrBytes (fromIntegral port)
+sockAddrToNetworkAddress _ _ = Nothing
+
+-- | Build the address list for a GETADDR response, applying Core's 23%-cap.
+-- Gathers shareable (routable, non-terrible) addresses from the addrman index,
+-- then caps the count at 'getAddrCap' (min(1000, ceil(0.23*size))).  The size
+-- the cap is computed over is the addrman size (new + tried), matching Core's
+-- @addrman.GetAddr(MAX_ADDR_TO_SEND, MAX_PCT_ADDR_TO_SEND, ...)@.
+-- Reference: bitcoin-core/src/net_processing.cpp GETADDR handler (~4842) +
+-- addrman.cpp AddrManImpl::GetAddr_.
+buildGetAddrResponse :: AddrMan -> IO [AddrEntry]
+buildGetAddrResponse am = do
+  now <- round <$> getPOSIXTime
+  idx <- readTVarIO (amAddrIndex am)
+  let infos      = Map.elems idx
+      -- Only ever share routable, non-terrible addresses.
+      shareable  = [ i | i <- infos
+                       , isRoutable (aiAddress i)
+                       , not (isTerribleAddress now i) ]
+      cap        = getAddrCap (length infos)
+      chosen     = take cap shareable
+      toEntry i  = AddrEntry (fromIntegral (max 0 (aiTime i)))
+                     <$> sockAddrToNetworkAddress (aiServices i) (aiAddress i)
+  return $ mapMaybe toEntry chosen
 
 -- | Mark an address as successfully connected.
 -- @asmapData@ is the raw ASMap bytecode (empty = disabled); used for
@@ -10245,6 +10532,9 @@ createPeerConnectionFromSocket config sock _host = do
           , piIsManual = False
           , piIsLocal  = False  -- proxy addresses are never local
           , piWtxidRelay = False
+          , piGetaddrRecvd = False
+          , piAddrTokenBucket = 1.0
+          , piAddrTokenTimestamp = 0
           }
     infoVar <- newTVarIO info
     sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)

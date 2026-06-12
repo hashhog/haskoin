@@ -145,6 +145,7 @@ import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
 import qualified W169GetTxOutConfirmationsSpec
 import qualified W170FixedSeedsSpec
+import qualified W171FeelerGetAddrSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -10683,6 +10684,9 @@ main = hspec $ do
             , piIsManual = False
             , piIsLocal  = False
             , piWtxidRelay = False
+            , piGetaddrRecvd = False
+            , piAddrTokenBucket = 1.0
+            , piAddrTokenTimestamp = 0
             }
       piWantsHeaders info `shouldBe` False
       -- Toggle the flag (mirrors the inbound MSendHeaders handler in
@@ -11104,6 +11108,9 @@ main = hspec $ do
               , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
               , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
               , piWtxidRelay = False
+              , piGetaddrRecvd = False
+              , piAddrTokenBucket = 1.0
+              , piAddrTokenTimestamp = 0
               }
         insertTestPeer pm addr baseInfo
         -- Even a low-score event (UnsolicitedMessage=1) must immediately discourage
@@ -11186,6 +11193,9 @@ main = hspec $ do
               , piIsManual = False
               , piIsLocal  = False
               , piWtxidRelay = False
+              , piGetaddrRecvd = False
+              , piAddrTokenBucket = 1.0
+              , piAddrTokenTimestamp = 0
               }
         piBanScore info `shouldBe` 0
 
@@ -11219,6 +11229,9 @@ main = hspec $ do
               , piIsManual = False
               , piIsLocal  = False
               , piWtxidRelay = False
+              , piGetaddrRecvd = False
+              , piAddrTokenBucket = 1.0
+              , piAddrTokenTimestamp = 0
               }
         piState info `shouldBe` PeerBanned
         piBanScore info `shouldBe` 100
@@ -11247,6 +11260,9 @@ main = hspec $ do
             , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
             , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
             , piWtxidRelay = False
+            , piGetaddrRecvd = False
+            , piAddrTokenBucket = 1.0
+            , piAddrTokenTimestamp = 0
             }
       insertTestPeer pm addr info
       (_, d1) <- misbehaving pm addr InvalidTransaction
@@ -11520,6 +11536,9 @@ main = hspec $ do
               , piIsManual = False
               , piIsLocal  = False
               , piWtxidRelay = False
+              , piGetaddrRecvd = False
+              , piAddrTokenBucket = 1.0
+              , piAddrTokenTimestamp = 0
               }
             candidate = peerToEvictionCandidate BS.empty addr info
         ecAddress candidate `shouldBe` addr
@@ -22346,6 +22365,9 @@ main = hspec $ do
             , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
             , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
             , piWtxidRelay = False
+            , piGetaddrRecvd = False
+            , piAddrTokenBucket = 1.0
+            , piAddrTokenTimestamp = 0
             }
       insertTestPeer pm addr2 info2
       (_, disc2) <- misbehaving pm addr2 UnsolicitedMessage  -- score=1, still discourages
@@ -22390,6 +22412,9 @@ main = hspec $ do
             , piIsManual = False
             , piIsLocal  = False
             , piWtxidRelay = False
+            , piGetaddrRecvd = False
+            , piAddrTokenBucket = 1.0
+            , piAddrTokenTimestamp = 0
             }
 
       -- Case 1: NoBan peer — misbehaving must be a no-op (score unchanged, not banned).
@@ -22918,6 +22943,12 @@ main = hspec $ do
   -- the non-routable 0x0a000001 placeholder in fallbackMainnetPeers with 40
   -- Core-vetted public :8333 seeds; proves the DNS-empty fallback dispatch.
   W170FixedSeedsSpec.spec
+
+  -- W171 P2P anti-eclipse: feeler connections + getaddr anti-DoS guards
+  -- (axis-pilot port of rustoshi 89c6d7f).  Proves: feeler NEW-select +
+  -- promote-on-success-only + bounded/off-budget; getaddr answer-once;
+  -- getaddr 23%-cap min(1000, ceil(0.23*size)); inbound-addr token bucket.
+  W171FeelerGetAddrSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec

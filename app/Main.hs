@@ -2849,11 +2849,17 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
       requestFromPeer pm addr (MInv (Inv invVecs))
         `catch` (\(_ :: SomeException) -> return ())
 
-  MAddr addrs -> do
-    -- BIP155: Store addresses and relay to 2 random peers
+  MAddr (Haskoin.Network.Addr entries) -> do
+    -- BIP155: Store addresses and relay to 2 random peers.
+    -- Anti-DoS inbound-addr token bucket (Core net_processing.cpp ProcessAddrs,
+    -- ~5644): refill by elapsed*0.1 (cap 1000), admit floor(bucket) entries and
+    -- DROP the rest (rate-limited).  This caps how many addr entries a single
+    -- peer can feed our addrman per second.
     pm <- readIORef pmRef
-    handleAddrMessage pm addrs
-    relayAddrToRandomPeers pm addr (MAddr addrs)
+    admitted <- admitInboundAddrs pmRef addr entries
+    unless (null admitted) $ do
+      handleAddrMessage pm (Haskoin.Network.Addr admitted)
+      relayAddrToRandomPeers pm addr (MAddr (Haskoin.Network.Addr admitted))
 
   MAddrV2 addrv2msg -> do
     -- BIP155: Handle addrv2 message - extract IPv4/IPv6 and store.
@@ -2867,8 +2873,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
     pm <- readIORef pmRef
     let reachRt   = reachabilityFromConfig (pmConfig pm)
         rawList   = getAddrV2List addrv2msg
-        filtered  = filterReachableAddresses reachRt rawList
-        converted = mapMaybe addrV2ToAddrEntry filtered
+        filtered0 = filterReachableAddresses reachRt rawList
+    -- Anti-DoS inbound-addr token bucket (Core ProcessAddrs, ~5644): the same
+    -- per-peer 0.1/sec bucket gates addrv2 too.  Admit floor(bucket) entries,
+    -- drop the rest.
+    filtered <- admitInboundAddrsV2 pmRef addr filtered0
+    let converted = mapMaybe addrV2ToAddrEntry filtered
     -- Only relay the filtered list, never the raw one (W117 DH-2).
     -- If everything was filtered out, no relay happens either.
     unless (null filtered) $ do
@@ -3156,6 +3166,32 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
   MGetCFCheckpt payload ->
     handleGetCFCheckpt pmRef hc mIdxMgr addr payload
 
+  MGetAddr -> do
+    -- Anti-eclipse GETADDR guards (Core net_processing.cpp:4816).
+    --   (1) inbound-only: an outbound peer's getaddr is ignored to mitigate the
+    --       address-stamping fingerprint attack (Core IsInboundConn() gate).
+    --   (2) answer-once: only the FIRST getaddr per connection is answered
+    --       (piGetaddrRecvd); repeats are dropped (Core m_getaddr_recvd).
+    --   (3) 23%-cap: the reply is capped at getAddrCap (min(1000,
+    --       ceil(0.23*addrman_size))) inside buildGetAddrResponse.
+    pm <- readIORef pmRef
+    peerMap <- readTVarIO (pmPeers pm)
+    case Map.lookup addr peerMap of
+      Nothing -> return ()
+      Just pc -> do
+        info <- readTVarIO (pcInfo pc)
+        if not (piInbound info)
+          then return ()                      -- (1) outbound: ignore getaddr
+          else if piGetaddrRecvd info
+            then return ()                     -- (2) already answered once
+            else do
+              atomically $ modifyTVar' (pcInfo pc)
+                (\i -> i { piGetaddrRecvd = True })
+              entries <- buildGetAddrResponse (pmAddrMan pm)   -- (3) 23%-cap inside
+              unless (null entries) $
+                requestFromPeer pm addr (MAddr (Haskoin.Network.Addr entries))
+                  `catch` (\(_ :: SomeException) -> return ())
+
   _other -> return ()  -- Silently ignore other messages
 
 --------------------------------------------------------------------------------
@@ -3421,6 +3457,45 @@ relayAddrToRandomPeers pm sourceAddr msg = do
     forM_ targets $ \targetAddr ->
       requestFromPeer pm targetAddr msg
         `catch` (\(_ :: SomeException) -> return ())
+
+-- | Apply the per-peer inbound-addr token bucket to a received addr/addrv2 list.
+-- Refills the bucket by elapsed*MAX_ADDR_RATE_PER_SECOND (capped at 1000),
+-- admits floor(bucket) entries (spending one token each) and DROPS the rest,
+-- then writes the post-spend bucket + timestamp back onto the peer record —
+-- all atomically so concurrent addr messages from the same peer can't double
+-- spend.  Mirrors Core net_processing.cpp ProcessAddrs (~5644).  When the peer
+-- is unknown (already disconnected) the input list is returned unchanged (no
+-- peer record to charge).
+-- Reference: bitcoin-core/src/net_processing.cpp ProcessAddrs.
+applyAddrTokenBucket :: IORef PeerManager -> SockAddr -> [a] -> IO [a]
+applyAddrTokenBucket pmRef addr xs = do
+  pm <- readIORef pmRef
+  peerMap <- readTVarIO (pmPeers pm)
+  case Map.lookup addr peerMap of
+    Nothing -> return xs   -- peer gone; nothing to rate-limit against
+    Just pc -> do
+      now <- (round <$> getPOSIXTime :: IO Int64)
+      atomically $ do
+        info <- readTVar (pcInfo pc)
+        let lastTs   = piAddrTokenTimestamp info
+            -- 0 timestamp = first addr message: no elapsed refill, bucket
+            -- starts at its 1.0 init (matches Core's m_addr_token_timestamp).
+            elapsed  = if lastTs == 0 then 0 else fromIntegral (max 0 (now - lastTs))
+            refilled = refillAddrTokenBucket (piAddrTokenBucket info) elapsed
+            (admitted, bucket') = admitAddrsByTokenBucket refilled xs
+        writeTVar (pcInfo pc) info
+          { piAddrTokenBucket    = bucket'
+          , piAddrTokenTimestamp = now
+          }
+        return admitted
+
+-- | 'applyAddrTokenBucket' specialised for legacy @addr@ entries.
+admitInboundAddrs :: IORef PeerManager -> SockAddr -> [AddrEntry] -> IO [AddrEntry]
+admitInboundAddrs = applyAddrTokenBucket
+
+-- | 'applyAddrTokenBucket' specialised for @addrv2@ entries.
+admitInboundAddrsV2 :: IORef PeerManager -> SockAddr -> [AddrV2] -> IO [AddrV2]
+admitInboundAddrsV2 = applyAddrTokenBucket
 
 --------------------------------------------------------------------------------
 -- Wallet Commands
