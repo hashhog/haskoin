@@ -14062,7 +14062,7 @@ main = hspec $ do
         withSystemTempDirectory "indexmgr_test" $ \tmpDir -> do
           let dbPath = tmpDir </> "indexmgr.db"
               config = defaultDBConfig dbPath
-              idxConfig = IndexConfig True True True
+              idxConfig = IndexConfig True True True True
           withDB config $ \db -> do
             mgr <- newIndexManager db idxConfig
             isJust (imTxIndex mgr) `shouldBe` True
@@ -14073,7 +14073,7 @@ main = hspec $ do
         withSystemTempDirectory "indexmgr_test2" $ \tmpDir -> do
           let dbPath = tmpDir </> "indexmgr2.db"
               config = defaultDBConfig dbPath
-              idxConfig = IndexConfig False False False
+              idxConfig = IndexConfig False False False False
           withDB config $ \db -> do
             mgr <- newIndexManager db idxConfig
             isJust (imTxIndex mgr) `shouldBe` False

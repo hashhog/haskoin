@@ -5227,8 +5227,8 @@ reorgAtomic net cache db hc mIdxMgr disList conList = do
                   case mIdxMgr of
                     Nothing -> return ()
                     Just im -> do
-                      forM_ disList $ \(ce, _) ->
-                        indexManagerDisconnectBlock im (ceHeight ce)
+                      forM_ disList $ \(ce, blk) ->
+                        indexManagerDisconnectBlock im blk (ceHash ce) (ceHeight ce)
                       forM_ conList $ \(ce, blk) -> do
                         let bh = ceHash ce
                         mUndo <- getUndoData db bh

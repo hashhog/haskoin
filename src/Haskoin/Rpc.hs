@@ -276,7 +276,9 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        blockFilterIndexGet, blockFilterIndexTipHeight,
                        blockFilterIndexLastHeader,
                        CoinStats(..), CoinStatsEntry(..),
-                       coinStatsIndexGet, coinStatsIndexTipHeight)
+                       coinStatsIndexGet, coinStatsIndexTipHeight,
+                       TxoSpender(..), TxoSpenderIndexDB,
+                       txoSpenderIndexFind, txoSpenderIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          isUnspendable,
                          lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
@@ -1216,6 +1218,7 @@ handleRpcRequest server req = do
     "importmempool"        -> handleImportMempool server params
     "loadmempool"          -> handleImportMempool server params
     "getorphantxs"         -> handleGetOrphanTxs server params
+    "gettxspendingprevout" -> handleGetTxSpendingPrevout server params
 
     -- Raw transaction RPCs (new)
     "createrawtransaction"         -> handleCreateRawTransaction server params
@@ -2742,7 +2745,13 @@ handleGetIndexInfo server params = do
           mTip <- coinStatsIndexTipHeight cs
           h <- maybe (readIORef (imSyncHeight im)) return mTip
           return [("coinstatsindex", h)]
-      return (txEntry ++ bfEntry ++ csEntry)
+      tsEntry <- case imTxoSpenderIndex im of
+        Nothing -> return []
+        Just ts -> do
+          mTip <- txoSpenderIndexTipHeight ts
+          h <- maybe (readIORef (imSyncHeight im)) return mTip
+          return [("txospenderindex", h)]
+      return (txEntry ++ bfEntry ++ csEntry ++ tsEntry)
   let -- An index is synced when its best height equals (or exceeds) the
       -- active chain tip height.
       mkPair (name, h) =
@@ -3542,6 +3551,207 @@ handleGetRawMempool server params = do
 --                  numeric peer ids; haskoin has no per-orphan numeric id, so
 --                  this is a best-effort string rendering of the real
 --                  announcer.
+-- | @gettxspendingprevout@ — find the transaction (mempool and/or confirmed)
+-- that spends each of the given outputs.
+--
+-- Matches Bitcoin Core's @rpc/mempool.cpp::gettxspendingprevout@ (v31.99)
+-- exactly:
+--
+--   params[0] outputs  (ARR, required): array of @{"txid": hex, "vout": n>=0}@.
+--     Empty            -> RPC_INVALID_PARAMETER (-8) "Invalid parameter, outputs are missing".
+--     Negative vout    -> "Invalid parameter, vout cannot be negative".
+--     Unknown key      -> rejected (strict: only txid + vout).
+--   params[1] options  (OBJ, optional, strict): @{mempool_only, return_spending_tx}@.
+--     mempool_only default        = (txospenderindex unavailable);
+--     return_spending_tx default  = false.
+--
+-- Algorithm (Core mempool.cpp:937-1039): scan the mempool FIRST via the
+-- outpoint reverse-index ('mpByOutpoint', Core's GetConflictTx).  For each
+-- entry, if a mempool spender is found OR mempool_only is set, emit and drop
+-- from the worklist.  Return early if the worklist is empty.  Otherwise
+-- (mempool_only==false) the txospenderindex must be available AND synced, else
+-- RPC_MISC_ERROR (-1); for each remaining outpoint look it up in the index.
+--
+-- Output: ARR of OBJ, pushKV order per object:
+--   txid, vout, [spendingtxid], [spendingtx (iff return_spending_tx)],
+--   [blockhash (CONFIRMED/index path ONLY)].  Unspent -> bare txid+vout.
+handleGetTxSpendingPrevout :: RpcServer -> Value -> IO RpcResponse
+handleGetTxSpendingPrevout server params = do
+  let mkErr code msg = return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  case rawParamAt params 0 of
+    Nothing -> mkErr rpcInvalidParameter "Invalid parameter, outputs are missing"
+    Just Null -> mkErr rpcInvalidParameter "Invalid parameter, outputs are missing"
+    Just (Array outArr)
+      | V.null outArr -> mkErr rpcInvalidParameter "Invalid parameter, outputs are missing"
+      | otherwise -> do
+          -- Locate the confirmed-spend index (Nothing when -txospenderindex off).
+          let mSpenderIdx = rsIndexMgr server >>= imTxoSpenderIndex
+          -- Parse options (strict: only mempool_only + return_spending_tx).
+          -- mempool_only default = !index-available (Core: !g_txospenderindex).
+          let optsRes = parseSpendingPrevoutOpts (isJust mSpenderIdx) (rawParamAt params 1)
+          case optsRes of
+            Left (code, msg) -> mkErr code msg
+            Right (mempoolOnly, returnSpendingTx) -> do
+              -- Parse the worklist of outpoints (strict {txid,vout}).
+              let parsed = mapM parseSpendingPrevoutEntry (V.toList outArr)
+              case parsed of
+                Left (code, msg) -> mkErr code msg
+                Right worklist -> do
+                  -- Phase 2 (index) availability: synced to tip?
+                  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                  let tipHeight = ceHeight tip
+                  idxSynced <- case mSpenderIdx of
+                    Nothing -> return False
+                    Just idx -> do
+                      mTip <- txoSpenderIndexTipHeight idx
+                      return (maybe False (>= tipHeight) mTip)
+                  results <- mapM (resolveSpendingPrevout server mSpenderIdx
+                                     mempoolOnly returnSpendingTx idxSynced) worklist
+                  case sequence results of
+                    Left (code, msg) -> mkErr code msg
+                    Right encs ->
+                      return $ RpcResponse
+                        (rawJsonResult (encodingToLazyByteString (AE.list id encs)))
+                        Null Null
+    Just _ -> mkErr rpcInvalidParameter "Invalid parameter, outputs must be an array"
+
+-- | A parsed worklist entry: the resolved outpoint plus the original txid
+-- string + vout so the result object copies them verbatim (Core copies
+-- @*prevout.raw@).
+data SpendingPrevoutEntry = SpendingPrevoutEntry
+  { speOutpoint :: !OutPoint
+  , speTxidStr  :: !Text
+  , speVout     :: !Word32
+  }
+
+-- | Parse one @{"txid": hex, "vout": n>=0}@ object (strict: only txid + vout).
+parseSpendingPrevoutEntry :: Value -> Either (Int, Text) SpendingPrevoutEntry
+parseSpendingPrevoutEntry (Object o) = do
+  -- Strict: reject any key other than txid / vout.
+  forM_ (KM.keys o) $ \k ->
+    let kt = Key.toText k
+    in if kt == "txid" || kt == "vout"
+         then Right ()
+         else Left (rpcInvalidParameter, "Invalid parameter " <> kt)
+  txidStr <- case KM.lookup "txid" o of
+    Just (String s) -> Right s
+    _ -> Left (rpcInvalidParameter, "Invalid parameter, missing txid")
+  voutVal <- case KM.lookup "vout" o of
+    Just (Number n) -> Right n
+    _ -> Left (rpcInvalidParameter, "Invalid parameter, missing vout")
+  let voutI = floor voutVal :: Integer
+  if voutI < 0
+    then Left (rpcInvalidParameter, "Invalid parameter, vout cannot be negative")
+    else case parseTxIdHex txidStr of
+      Nothing -> Left (rpcInvalidParameter,
+                       "txid must be hexadecimal string (not '" <> txidStr <> "')")
+      Just txid -> Right SpendingPrevoutEntry
+        { speOutpoint = OutPoint txid (fromIntegral voutI)
+        , speTxidStr  = txidStr
+        , speVout     = fromIntegral voutI
+        }
+parseSpendingPrevoutEntry _ =
+  Left (rpcInvalidParameter, "Invalid parameter, output must be an object")
+
+-- | Parse the strict options object @{mempool_only, return_spending_tx}@.
+-- mempool_only defaults to @not indexAvailable@ (Core: @!g_txospenderindex@).
+parseSpendingPrevoutOpts :: Bool -> Maybe Value
+                         -> Either (Int, Text) (Bool, Bool)
+parseSpendingPrevoutOpts indexAvailable mOpts =
+  case mOpts of
+    Nothing   -> Right (not indexAvailable, False)
+    Just Null -> Right (not indexAvailable, False)
+    Just (Object o) -> do
+      forM_ (KM.keys o) $ \k ->
+        let kt = Key.toText k
+        in if kt == "mempool_only" || kt == "return_spending_tx"
+             then Right ()
+             else Left (rpcInvalidParameter, "Invalid parameter " <> kt)
+      mo <- case KM.lookup "mempool_only" o of
+        Nothing        -> Right (not indexAvailable)
+        Just (Bool b)  -> Right b
+        Just _ -> Left (rpcTypeError,
+                        "JSON value of type X is not of expected type bool")
+      rst <- case KM.lookup "return_spending_tx" o of
+        Nothing        -> Right False
+        Just (Bool b)  -> Right b
+        Just _ -> Left (rpcTypeError,
+                        "JSON value of type X is not of expected type bool")
+      Right (mo, rst)
+    Just _ -> Left (rpcInvalidParams, "Invalid options object")
+
+-- | Resolve a single outpoint: mempool reverse-index first, then (if not
+-- mempool_only and unresolved) the confirmed txospenderindex.  Returns a
+-- per-output streaming 'AE.Encoding' (Right) or an RPC error (Left).
+resolveSpendingPrevout :: RpcServer
+                       -> Maybe TxoSpenderIndexDB
+                       -> Bool       -- ^ mempool_only
+                       -> Bool       -- ^ return_spending_tx
+                       -> Bool       -- ^ index synced to tip
+                       -> SpendingPrevoutEntry
+                       -> IO (Either (Int, Text) AE.Encoding)
+resolveSpendingPrevout server mSpenderIdx mempoolOnly returnSpendingTx idxSynced e = do
+  -- Phase 1: mempool reverse-index ('mpByOutpoint' -> spending txid).
+  let mp = rsMempool server
+  mMemTxId <- atomically $ Map.lookup (speOutpoint e) <$> readTVar (mpByOutpoint mp)
+  mMemTx <- case mMemTxId of
+    Nothing  -> return Nothing
+    Just tid -> fmap meTransaction <$> getTransaction mp tid
+  case mMemTx of
+    Just memTx ->
+      -- Mempool spender found: emit spendingtxid (+spendingtx); NO blockhash.
+      return $ Right (spendingPrevoutObj e (Just (computeTxId memTx))
+                        (if returnSpendingTx then Just memTx else Nothing)
+                        Nothing)
+    Nothing
+      | mempoolOnly ->
+          -- mempool_only and unspent in mempool -> bare txid+vout.
+          return $ Right (spendingPrevoutObj e Nothing Nothing Nothing)
+      | otherwise ->
+          -- Phase 2: confirmed-spend index.  Must be available AND synced.
+          case mSpenderIdx of
+            Just idx | idxSynced -> do
+              mSpender <- txoSpenderIndexFind idx (speOutpoint e)
+              case mSpender of
+                Just (TxoSpender spTxid spBlk) -> do
+                  -- For return_spending_tx, read the full spending tx back from
+                  -- the confirming block recorded in the index value.
+                  mFullTx <- if returnSpendingTx
+                               then fetchConfirmedTx server spTxid spBlk
+                               else return Nothing
+                  return $ Right (spendingPrevoutObj e (Just spTxid) mFullTx (Just spBlk))
+                Nothing ->
+                  -- Unspent on-chain: bare txid+vout.
+                  return $ Right (spendingPrevoutObj e Nothing Nothing Nothing)
+            _ ->
+              return $ Left (rpcMiscError,
+                "Mempool lacks a relevant spend, and txospenderindex is unavailable.")
+
+-- | Read a confirmed transaction by txid from the block that confirmed it
+-- (recorded in the txospenderindex value).  Returns Nothing if the block or
+-- tx cannot be read; the caller then omits the @spendingtx@ field.
+fetchConfirmedTx :: RpcServer -> TxId -> BlockHash -> IO (Maybe Tx)
+fetchConfirmedTx server txid blockHash = do
+  mBlk <- getBlock (rsDB server) blockHash
+  return $ mBlk >>= \blk -> find (\t -> computeTxId t == txid) (blockTxns blk)
+
+-- | Build one per-output object in Core's pushKV order:
+-- txid, vout, [spendingtxid], [spendingtx], [blockhash].
+-- 'mBlockHash' is supplied ONLY on the confirmed/index path.
+spendingPrevoutObj :: SpendingPrevoutEntry
+                   -> Maybe TxId       -- ^ spending txid (if spent)
+                   -> Maybe Tx         -- ^ full spending tx (iff return_spending_tx)
+                   -> Maybe BlockHash  -- ^ confirming block hash (index path only)
+                   -> AE.Encoding
+spendingPrevoutObj e mSpendTxid mSpendTx mBlockHash =
+  pairs $
+       pair "txid" (text (speTxidStr e))
+    <> pair "vout" (AE.word32 (speVout e))
+    <> maybe mempty (\tid -> pair "spendingtxid" (text (showTxIdHex tid))) mSpendTxid
+    <> maybe mempty (\tx -> pair "spendingtx"
+                              (text (TE.decodeUtf8 (B16.encode (S.encode tx))))) mSpendTx
+    <> maybe mempty (\bh -> pair "blockhash" (text (showHash bh))) mBlockHash
+
 handleGetOrphanTxs :: RpcServer -> Value -> IO RpcResponse
 handleGetOrphanTxs server params =
   -- Verbosity parse mirrors Core ParseVerbosity(arg, default=0,

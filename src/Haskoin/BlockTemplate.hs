@@ -973,7 +973,7 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
                           entries <- readTVarIO (hcEntries hc)
                           case Map.lookup bh entries of
                             Just ce ->
-                              indexManagerDisconnectBlock im (ceHeight ce)
+                              indexManagerDisconnectBlock im blk bh (ceHeight ce)
                             Nothing -> return ()
                         -- Connect: fork-child first → newTip last,
                         -- which matches @connectList@'s order.
