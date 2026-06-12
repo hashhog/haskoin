@@ -5876,8 +5876,10 @@ main = hspec $ do
     describe "MempoolConfig" $ do
       it "has sensible defaults" $ do
         let cfg = defaultMempoolConfig
-        mpcMaxSize cfg `shouldBe` 300 * 1024 * 1024  -- 300 MB
-        mpcMinFeeRate cfg `shouldBe` FeeRate 1        -- 1 sat/vB
+        mpcMaxSize cfg `shouldBe` 300 * 1000 * 1000  -- 300 MB (Core 10^6/MB)
+        -- Static relay floor lowered to Core DEFAULT_MIN_RELAY_TX_FEE; the
+        -- value is now stored sat/kvB-native (100 sat/kvB = 0.00000100 BTC/kvB).
+        mpcMinFeeRate cfg `shouldBe` FeeRate 100      -- 100 sat/kvB
         mpcRBFEnabled cfg `shouldBe` True
         mpcMaxAncestors cfg `shouldBe` 25
         mpcMaxDescendants cfg `shouldBe` 25
@@ -6077,14 +6079,16 @@ main = hspec $ do
             after `shouldBe` 1000.0
 
       it "getMempoolMinFeeRate returns static minimum when no evictions" $ do
-        -- With no evictions, rolling min is 0; static min (1 sat/vB = 1000 sat/kvB) wins
+        -- With no evictions, rolling min is 0; the static relay floor wins.
+        -- The floor is now Core DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB
+        -- (mpcMinFeeRate stored sat/kvB-native, consumed without the old *1000).
         withSystemTempDirectory "haskoin-w86-staticmin" $ \tmp -> do
           withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
             cache <- newUTXOCache db 1024
             mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
             minRate <- getMempoolMinFeeRate mp
-            -- static config is 1 sat/vB = 1000 sat/kvB
-            minRate `shouldBe` 1000
+            -- static config is 100 sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)
+            minRate `shouldBe` 100
 
       it "getMempoolMinFeeRate returns rolling minimum when it exceeds static minimum" $ do
         -- After size-limit eviction, rolling min should raise the bar
@@ -6096,7 +6100,7 @@ main = hspec $ do
             trackPackageRemoved mp 5000
             -- blockSince=False -> no decay path, returns max(rolling, incremental)
             minRate <- getMempoolMinFeeRate mp
-            -- max(5000, 100) = 5000, then max(5000, 1000 static) = 5000
+            -- max(rolling 5000, static 100) = 5000
             minRate `shouldBe` 5000
 
       it "blockConnected sets blockSinceLastFeeBump" $ do
