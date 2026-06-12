@@ -3480,6 +3480,15 @@ psbtMagic = BS.pack [0x70, 0x73, 0x62, 0x74, 0xff]  -- "psbt" + 0xff
 -- PSBT Key Types (BIP-174/BIP-370)
 --------------------------------------------------------------------------------
 
+-- | Highest PSBT version we accept on the decode path.  Core's
+-- @PSBT_HIGHEST_VERSION = 0@ (bitcoin-core/src/psbt.h:80): when a
+-- @PSBT_GLOBAL_VERSION@ key carries a value @> PSBT_HIGHEST_VERSION@ the
+-- deserializer throws @ios_base::failure("Unsupported version number")@
+-- (psbt.h:1322), which the @decodepsbt@ RPC surfaces as
+-- @RPC_DESERIALIZATION_ERROR@ (-22).  PSBTv2 (version 2) is therefore rejected.
+psbtHighestVersion :: Word32
+psbtHighestVersion = 0
+
 -- | Global key types
 data PsbtGlobalType
   = GlobalUnsignedTx       -- ^ 0x00: Unsigned transaction
@@ -3881,9 +3890,20 @@ getGlobalMap = go Nothing Map.empty Nothing Map.empty
                 Right keypath ->
                   go mTx (Map.insert keyData keypath xpubs) mVersion unknown
             0xfb -> do  -- PSBT_GLOBAL_VERSION
-              case runGet getWord32le value of
-                Left _ -> fail "Invalid PSBT version"
-                Right v -> go mTx xpubs (Just v) unknown
+              -- Core rejects a PSBT whose global version exceeds
+              -- PSBT_HIGHEST_VERSION (= 0) with "Unsupported version number"
+              -- (bitcoin-core/src/psbt.h:1322); the decodepsbt RPC surfaces
+              -- that as RPC_DESERIALIZATION_ERROR (-22).  Duplicate version
+              -- keys are also rejected (psbt.h:1314).
+              case mVersion of
+                Just _ -> fail "Duplicate Key, version already provided"
+                Nothing ->
+                  case runGet getWord32le value of
+                    Left _ -> fail "Invalid PSBT version"
+                    Right v
+                      | v > psbtHighestVersion ->
+                          fail "Unsupported version number"
+                      | otherwise -> go mTx xpubs (Just v) unknown
             _ -> go mTx xpubs mVersion (Map.insert key value unknown)
 
 -- | Parse input map.  Compatibility wrapper: callers that don't have the

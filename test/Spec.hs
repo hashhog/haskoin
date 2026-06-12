@@ -22947,7 +22947,7 @@ main = hspec $ do
   -- W171 P2P anti-eclipse: feeler connections + getaddr anti-DoS guards
   -- (axis-pilot port of rustoshi 89c6d7f).  Proves: feeler NEW-select +
   -- promote-on-success-only + bounded/off-budget; getaddr answer-once;
-  -- getaddr 23%-cap min(1000, ceil(0.23*size)); inbound-addr token bucket.
+  -- getaddr 23%-cap min(1000, floor(0.23*size)); inbound-addr token bucket.
   W171FeelerGetAddrSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)

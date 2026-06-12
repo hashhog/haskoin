@@ -16,7 +16,8 @@
 --   (1) feeler selects FROM NEW + promotes NEW->TRIED on handshake SUCCESS only
 --       (NOT on failure) + is bounded (1 in-flight / 120s) + off the outbound budget
 --   (2) GETADDR answer-once (a repeated getaddr from the same peer is ignored)
---   (3) GETADDR 23%-cap: min(1000, ceil(0.23 * addrman_size))
+--   (3) GETADDR 23%-cap: min(1000, floor(0.23 * addrman_size)) — Core's
+--       GetAddr_ integer division (addrman.cpp), NOT ceil/round-up.
 --   (4) inbound-addr token-bucket drops excess (0.1/sec refill, cap 1000)
 --
 -- Falsification: pre-impl had no feeler at all (selectForFeeler / tryConnectFeeler
@@ -202,7 +203,7 @@ spec_getaddrOnce = describe "PROVE-2 GETADDR answer-once" $ do
 --------------------------------------------------------------------------------
 
 spec_getaddrCap :: Spec
-spec_getaddrCap = describe "PROVE-3 GETADDR 23%-cap min(1000, ceil(0.23*size))" $ do
+spec_getaddrCap = describe "PROVE-3 GETADDR 23%-cap min(1000, floor(0.23*size))" $ do
   it "MAX_PCT_ADDR_TO_SEND constant is 23" $
     maxPctAddrToSend `shouldBe` 23
 
@@ -212,17 +213,26 @@ spec_getaddrCap = describe "PROVE-3 GETADDR 23%-cap min(1000, ceil(0.23*size))" 
   it "empty addrman → cap 0" $
     getAddrCap 0 `shouldBe` 0
 
-  it "ceil rounding: size=1 → ceil(0.23) = 1" $
-    getAddrCap 1 `shouldBe` 1
+  -- Core's GetAddr_ uses INTEGER division: nNodes = 23 * size / 100 (FLOOR),
+  -- with NO max(1,...) floor and NO ceil/rounding-up.  These sizes are chosen
+  -- so floor /= ceil, distinguishing the two implementations.
+  it "FLOOR (distinguishing): size=1 → floor(0.23) = 0 (NOT 1)" $
+    getAddrCap 1 `shouldBe` 0
 
-  it "ceil rounding: size=10 → ceil(2.3) = 3" $
-    getAddrCap 10 `shouldBe` 3
+  it "FLOOR (distinguishing): size=4 → floor(0.92) = 0 (NOT 1)" $
+    getAddrCap 4 `shouldBe` 0
 
-  it "ceil rounding: size=100 → 23" $
+  it "FLOOR (distinguishing): size=5 → floor(1.15) = 1 (ceil would be 2)" $
+    getAddrCap 5 `shouldBe` 1
+
+  it "FLOOR (distinguishing): size=10 → floor(2.3) = 2 (NOT 3)" $
+    getAddrCap 10 `shouldBe` 2
+
+  it "FLOOR exact: size=100 → 23 (floor==ceil here)" $
     getAddrCap 100 `shouldBe` 23
 
-  it "ceil rounding: size=101 → ceil(23.23) = 24" $
-    getAddrCap 101 `shouldBe` 24
+  it "FLOOR (distinguishing): size=101 → floor(23.23) = 23 (ceil would be 24)" $
+    getAddrCap 101 `shouldBe` 23
 
   it "hard 1000 ceiling: size=10000 (23% = 2300) → capped at 1000" $
     getAddrCap 10000 `shouldBe` 1000
@@ -240,21 +250,21 @@ spec_getaddrCap = describe "PROVE-3 GETADDR 23%-cap min(1000, ceil(0.23*size))" 
     n <- readTVarIO (amNewCount am)
     n `shouldBe` 10
     entries <- buildGetAddrResponse am
-    -- size=10 → ceil(0.23*10)=3, so at most 3 entries are returned.
+    -- size=10 → floor(0.23*10)=2, so at most 2 entries are returned.
     length entries `shouldSatisfy` (<= getAddrCap 10)
-    length entries `shouldSatisfy` (<= 3)
+    length entries `shouldSatisfy` (<= 2)
 
-  it "buildGetAddrResponse returns no more than the addrman holds" $ do
+  it "buildGetAddrResponse with size=5 caps at floor(1.15)=1" $ do
     am  <- newAddrMan
     now <- nowIO
-    _ <- addAddress am BS.empty addr1 srcA 0x409 now
+    -- Insert 5 distinct routable addresses; floor(0.23*5)=1.
+    let addrs = [ mkAddr 70 i 0 1 | i <- [0..4] ]
+    mapM_ (\a -> addAddress am BS.empty a srcA 0x409 now) addrs
+    n <- readTVarIO (amNewCount am)
+    n `shouldBe` 5
     entries <- buildGetAddrResponse am
-    -- size=1 → cap 1; exactly one shareable routable entry.
-    length entries `shouldBe` 1
-    -- The returned entry round-trips the address (16-byte IPv6-mapped form).
-    case entries of
-      [AddrEntry _ na] -> BS.length (naAddress na) `shouldBe` 16
-      _                -> expectationFailure "expected exactly one AddrEntry"
+    length entries `shouldSatisfy` (<= getAddrCap 5)
+    length entries `shouldSatisfy` (<= 1)
 
   it "empty addrman yields an empty getaddr response" $ do
     am <- newAddrMan
