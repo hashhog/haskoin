@@ -234,6 +234,12 @@ module Haskoin.Network
   , getNewBucket
   , getTriedBucket
   , getBucketPosition
+    -- ** AddrMan Persistence (peers.dat-equivalent)
+  , saveAddrMan
+  , loadAddrMan
+  , addrManFilePath
+  , addrManPersistVersion
+  , addrManPersistMaxEntries
     -- ** AddrMan Constants
   , addrmanTriedBucketCount
   , addrmanNewBucketCount
@@ -588,6 +594,7 @@ import qualified Data.Text as T
 import qualified Data.Aeson as Aeson
 import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
 import System.FilePath ((</>))
+import System.Directory (doesFileExist, renameFile, getFileSize)
 import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
 import System.Environment (lookupEnv)
 
@@ -3124,7 +3131,13 @@ startPeerManagerWith :: Network -> PeerManagerConfig
                      -> IO PeerManager
 startPeerManagerWith net config handler onDisconnect = do
   od  <- newOutboundDiversity
-  am  <- newAddrMan
+  -- Restore the persisted bucketed addrman (peers.json) so the address book
+  -- survives restart instead of cold-starting empty.  A missing/corrupt/oversized
+  -- file falls back to a fresh empty addrman + DNS seeds (loadAddrMan never
+  -- raises).  ASMap is empty at boot (set later via pmAsmapData), matching the
+  -- group cached by addAddress for DNS-seed entries.
+  mLoaded <- loadAddrMan (pmcDataDir config) BS.empty
+  am  <- maybe newAddrMan return mLoaded
   pm  <- PeerManager
     <$> newTVarIO Map.empty
     <*> newTVarIO Set.empty
@@ -3171,6 +3184,11 @@ stopPeerManager pm = do
   saveAnchors anchorsPath blockRelayAnchors
   unless (null blockRelayAnchors) $
     putStrLn $ "stopPeerManager: saved " ++ show (length blockRelayAnchors) ++ " anchor(s)"
+
+  -- Persist the bucketed addrman (peers.json) so the address book survives
+  -- restart.  Atomic + best-effort (saveAddrMan never raises).  Mirrors Core's
+  -- CConnman::DumpAddresses on shutdown.
+  saveAddrMan (pmcDataDir (pmConfig pm)) (pmAddrMan pm)
 
   mTid <- readTVarIO (pmManagerThread pm)
   mapM_ killThread mTid
@@ -3351,6 +3369,13 @@ peerManagerLoop pm = forever $ do
       banPeer pm addr
       disconnectPeer pc
       atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
+  -- Periodic addrman dump (Core CConnman::DumpAddresses, DUMP_PEERS_INTERVAL
+  -- = 15min).  The loop ticks every 10s, so the (mod 900 < 10) window fires the
+  -- atomic save once per ~15-minute slot.  Best-effort: saveAddrMan never raises.
+  dumpTs <- (round <$> getPOSIXTime :: IO Int64)
+  when (dumpTs `mod` 900 < 10) $
+    saveAddrMan (pmcDataDir (pmConfig pm)) (pmAddrMan pm)
 
   -- Sleep before next iteration
   threadDelay (10 * 1000000)  -- 10 seconds
@@ -5692,6 +5717,311 @@ markAttempt am addr now = do
             , aiAttempts = aiAttempts info + 1
             }
       atomically $ modifyTVar' (amAddrIndex am) (Map.insert addr updated)
+
+--------------------------------------------------------------------------------
+-- AddrMan Persistence (peers.dat-equivalent)
+--
+-- Reference: Bitcoin Core addrman.cpp CAddrMan::Serialize / Unserialize and
+-- CConnman::DumpAddresses / DumpPeerAddresses (every DUMP_PEERS_INTERVAL = 15min
+-- and on shutdown).  Core serialises the new + tried tables plus nKey so the
+-- bucket layout survives restart; on Unserialize it restores tried placement and
+-- new bucket-membership from the stored bucket-index lists (placement, not a
+-- reshuffled flat list).
+--
+-- This implementation uses an impl-native JSON file (peers.dat is a LOCAL file,
+-- not wire/RPC, so byte-identical Core format is NOT required).  We store every
+-- new + tried entry WITH its bucket index, preserving the per-bucket list order
+-- (which IS the position in this Map Int [AddrInfo] model — entries are prepended
+-- and truncated at addrmanBucketSize, so list order is the slot layout).  The
+-- salt (amKey) and the entry counts are persisted too, so on load the bucket
+-- tables, the address index, the tried-vs-new classification, AND the exact
+-- placement are restored verbatim — not flattened and re-bucketed.  Mirrors the
+-- lunarblock pilot (src/peerman.lua, commit ac3eb03).
+--------------------------------------------------------------------------------
+
+-- | On-disk schema version.  Bump only on an incompatible schema change.
+addrManPersistVersion :: Int
+addrManPersistVersion = 1
+
+-- | Hard ceiling on persisted entries, matching the in-memory addrman capacity
+-- (NEW_BUCKET_COUNT*BUCKET_SIZE + TRIED_BUCKET_COUNT*BUCKET_SIZE).  Load stops at
+-- this cap so a hostile/corrupt file cannot drive unbounded growth.
+addrManPersistMaxEntries :: Int
+addrManPersistMaxEntries =
+  addrmanNewBucketCount * addrmanBucketSize
+  + addrmanTriedBucketCount * addrmanBucketSize
+
+-- | Maximum on-disk peers.dat size we will read (8 MiB).  A larger file is
+-- treated as corrupt and ignored (empty fallback).  Guards against OOM from a
+-- truncated/garbage file claiming to be enormous.
+addrManMaxFileSize :: Integer
+addrManMaxFileSize = 8 * 1024 * 1024
+
+-- | Path to the peers.dat-equivalent file inside the datadir.
+addrManFilePath :: FilePath -> FilePath
+addrManFilePath dataDir = dataDir </> "peers.json"
+
+-- | One serialised AddrMan entry.  Carries every AddrInfo field needed to
+-- round-trip the address plus its bucket index, so placement survives restart.
+-- 'pBucket' is the bucket number in whichever table 'pInTried' selects; the
+-- per-bucket list order is preserved by the order entries appear in the file.
+data PersistedAddr = PersistedAddr
+  { pAddress      :: !SockAddr
+  , pSource       :: !SockAddr
+  , pServices     :: !Word64
+  , pTime         :: !Int64
+  , pLastTry      :: !Int64
+  , pLastSuccess  :: !Int64
+  , pLastCountAtt :: !Int64
+  , pAttempts     :: !Int
+  , pRefCount     :: !Int
+  , pInTried      :: !Bool
+  , pBucket       :: !Int
+  }
+
+instance ToJSON PersistedAddr where
+  toJSON p = Aeson.object
+    [ "addr"        .= sockAddrToString (pAddress p)
+    , "src"         .= sockAddrToString (pSource p)
+    , "services"    .= pServices p
+    , "time"        .= pTime p
+    , "last_try"    .= pLastTry p
+    , "last_succ"   .= pLastSuccess p
+    , "last_count"  .= pLastCountAtt p
+    , "attempts"    .= pAttempts p
+    , "refcount"    .= pRefCount p
+    , "in_tried"    .= pInTried p
+    , "bucket"      .= pBucket p
+    ]
+
+instance FromJSON PersistedAddr where
+  parseJSON = Aeson.withObject "PersistedAddr" $ \o -> do
+    addrStr <- o .: "addr"
+    srcStr  <- o .: "src"
+    case (stringToSockAddr addrStr, stringToSockAddr srcStr) of
+      (Just addr, Just src) -> PersistedAddr addr src
+        <$> o .: "services"
+        <*> o .: "time"
+        <*> o .: "last_try"
+        <*> o .: "last_succ"
+        <*> o .: "last_count"
+        <*> o .: "attempts"
+        <*> o .: "refcount"
+        <*> o .: "in_tried"
+        <*> o .: "bucket"
+      _ -> fail "Invalid address format in PersistedAddr"
+
+-- | The full peers.dat snapshot: version + salt + counts + all entries.
+data PersistedAddrMan = PersistedAddrMan
+  { paVersion :: !Int
+  , paKey     :: !ByteString   -- ^ amKey salt (32 bytes), hex-encoded in JSON
+  , paNew     :: ![PersistedAddr]
+  , paTried   :: ![PersistedAddr]
+  }
+
+instance ToJSON PersistedAddrMan where
+  toJSON pa = Aeson.object
+    [ "version" .= paVersion pa
+    , "nkey"    .= bytesToHex (paKey pa)
+    , "new"     .= paNew pa
+    , "tried"   .= paTried pa
+    ]
+
+instance FromJSON PersistedAddrMan where
+  parseJSON = Aeson.withObject "PersistedAddrMan" $ \o -> PersistedAddrMan
+    <$> o .: "version"
+    <*> (hexToBytes <$> o .: "nkey")
+    <*> o .: "new"
+    <*> o .: "tried"
+
+-- | Lowercase-hex encode a ByteString (for the nKey salt).
+bytesToHex :: ByteString -> String
+bytesToHex = concatMap (\b -> let h = showHexByte b in h) . BS.unpack
+  where
+    showHexByte b =
+      let hi = b `shiftR` 4
+          lo = b .&. 0x0f
+      in [hexDigit hi, hexDigit lo]
+    hexDigit n
+      | n < 10    = toEnum (fromIntegral n + fromEnum '0')
+      | otherwise = toEnum (fromIntegral n - 10 + fromEnum 'a')
+
+-- | Decode a lowercase/uppercase-hex string back to bytes.  Returns empty on a
+-- malformed string; callers treat a non-32-byte result as "regenerate the key".
+hexToBytes :: String -> ByteString
+hexToBytes s
+  | odd (length s) = BS.empty
+  | otherwise      = case mapM pairVal (pairs s) of
+      Just ws -> BS.pack ws
+      Nothing -> BS.empty
+  where
+    pairs (a:b:rest) = (a, b) : pairs rest
+    pairs _          = []
+    pairVal (a, b) = do
+      hi <- nib a
+      lo <- nib b
+      Just (fromIntegral (hi * 16 + lo))
+    nib c
+      | c >= '0' && c <= '9' = Just (fromEnum c - fromEnum '0')
+      | c >= 'a' && c <= 'f' = Just (fromEnum c - fromEnum 'a' + 10)
+      | c >= 'A' && c <= 'F' = Just (fromEnum c - fromEnum 'A' + 10)
+      | otherwise            = Nothing
+
+-- | Build a 'PersistedAddrMan' snapshot from the live AddrMan, preserving the
+-- per-bucket list order (= position) in each table.
+snapshotAddrMan :: AddrMan -> IO PersistedAddrMan
+snapshotAddrMan am = do
+  newTbl   <- readTVarIO (amNewTable am)
+  triedTbl <- readTVarIO (amTriedTable am)
+  let toPersist inTried (bucket, infos) =
+        [ PersistedAddr
+            { pAddress      = aiAddress info
+            , pSource       = aiSource info
+            , pServices     = aiServices info
+            , pTime         = aiTime info
+            , pLastTry      = aiLastTry info
+            , pLastSuccess  = aiLastSuccess info
+            , pLastCountAtt = aiLastCountAttempt info
+            , pAttempts     = aiAttempts info
+            , pRefCount     = aiRefCount info
+            , pInTried      = inTried
+            , pBucket       = bucket
+            }
+        | info <- infos
+        ]
+      newEntries   = concatMap (toPersist False) (Map.toList newTbl)
+      triedEntries = concatMap (toPersist True)  (Map.toList triedTbl)
+  return PersistedAddrMan
+    { paVersion = addrManPersistVersion
+    , paKey     = getHash256 (amKey am)
+    , paNew     = newEntries
+    , paTried   = triedEntries
+    }
+
+-- | Persist the bucketed AddrMan to peers.json (atomic temp-file + rename).
+-- Mirrors the FeeEstimator save pattern.  Never raises — a failed write leaves
+-- the in-memory AddrMan untouched and is swallowed (logged by the caller if
+-- desired).  Call from a periodic dump and on shutdown.
+saveAddrMan :: FilePath -> AddrMan -> IO ()
+saveAddrMan dataDir am = void $ try @SomeException $ do
+  snap <- snapshotAddrMan am
+  let path = addrManFilePath dataDir
+      tmp  = path ++ ".tmp"
+      encoded = C8.unpack $ LBS.toStrict $ Aeson.encode snap
+  withFile tmp WriteMode $ \h -> hPutStr h encoded
+  renameFile tmp path
+
+-- | Reconstruct a fresh AddrMan from a snapshot, restoring bucket tables, the
+-- address index, the salt, the counts, AND the verbatim per-bucket placement.
+--
+-- Tried entries are restored first (mirrors Core: tried placement is
+-- authoritative; a new-table entry for the same addr is suppressed by
+-- aiInTried).  Within a bucket, entries are appended in file order so the list
+-- (= slot) layout is preserved.  Bounded at 'addrManPersistMaxEntries' and at
+-- 'addrmanBucketSize' per bucket; out-of-range buckets are dropped.  Returns a
+-- fully-formed AddrMan that the caller installs in place of the empty one.
+restoreAddrMan :: ByteString -> PersistedAddrMan -> IO AddrMan
+restoreAddrMan asmapData snap = do
+  -- Restore the salt when the persisted key is a valid 32-byte value; otherwise
+  -- fall back to a fresh CSPRNG key so bucketing stays sane.
+  key <- if BS.length (paKey snap) == 32
+           then return (Hash256 (paKey snap))
+           else Hash256 <$> (CryptoRandom.getRandomBytes 32 :: IO BS.ByteString)
+
+  let mkInfo inTried p = AddrInfo
+        { aiAddress          = pAddress p
+        , aiServices         = pServices p
+        , aiTime             = pTime p
+        , aiLastTry          = pLastTry p
+        , aiLastSuccess      = pLastSuccess p
+        , aiLastCountAttempt = pLastCountAtt p
+        , aiAttempts         = pAttempts p
+        , aiSource           = pSource p
+        , aiNetGroup         = computeNetworkGroupWithASMap asmapData (pAddress p)
+        , aiInTried          = inTried
+        , aiRefCount         = pRefCount p
+        }
+
+      validTriedBucket b = b >= 0 && b < addrmanTriedBucketCount
+      validNewBucket   b = b >= 0 && b < addrmanNewBucketCount
+
+      -- Fold entries into (table, index, count), honouring the cap, the bucket
+      -- range, the per-bucket size limit, and tried-vs-new suppression.
+      step inTried validBucket (tbl, idx, cnt, total) p
+        | total >= addrManPersistMaxEntries = (tbl, idx, cnt, total)
+        | not (validBucket (pBucket p))     = (tbl, idx, cnt, total)
+        | Map.member (pAddress p) idx       = (tbl, idx, cnt, total)  -- already placed (tried wins)
+        | length curBucket >= addrmanBucketSize = (tbl, idx, cnt, total)
+        | otherwise =
+            let info = mkInfo inTried p
+                tbl' = Map.insert (pBucket p) (curBucket ++ [info]) tbl
+                idx' = Map.insert (pAddress p) info idx
+            in (tbl', idx', cnt + 1, total + 1)
+        where curBucket = Map.findWithDefault [] (pBucket p) tbl
+
+      -- Tried first so the index suppresses any duplicate new-table entry.
+      (triedTbl, idx1, triedCnt, total1) =
+        foldl' (step True validTriedBucket)
+               (Map.empty, Map.empty, 0, 0)
+               (paTried snap)
+      (newTbl, idx2, newCnt, _total2) =
+        foldl' (step False validNewBucket)
+               (Map.empty, idx1, 0, total1)
+               (paNew snap)
+
+  AddrMan key
+    <$> newTVarIO newTbl
+    <*> newTVarIO triedTbl
+    <*> newTVarIO idx2
+    <*> newTVarIO newCnt
+    <*> newTVarIO triedCnt
+
+-- | Load the bucketed AddrMan from peers.json, replacing the empty cold start.
+-- Graceful on EVERY failure mode (missing / unreadable / oversized / corrupt
+-- JSON / wrong version / wrong shape / mid-restore exception): returns 'Nothing'
+-- so the caller keeps the already-created empty AddrMan and proceeds to DNS
+-- seeds.  NEVER crashes — a truncated file from an unclean shutdown must not
+-- hard-down boot.  @asmapData@ is the live ASMap bytecode (empty = disabled),
+-- used to recompute each entry's cached network group.
+loadAddrMan :: FilePath -> ByteString -> IO (Maybe AddrMan)
+loadAddrMan dataDir asmapData = do
+  let path = addrManFilePath dataDir
+  result <- try @SomeException $ do
+    exists <- doesFileExist path
+    if not exists
+      then return Nothing  -- missing file -> cold start (normal first boot)
+      else do
+        sz <- getFileSize path
+        if sz > addrManMaxFileSize
+          then do
+            putStrLn "loadAddrMan: peers.json oversized -> cold start"
+            return Nothing
+          else do
+            contents <- withFile path ReadMode hGetContents'
+            case Aeson.decodeStrict (C8.pack contents) of
+              Nothing -> do
+                putStrLn "loadAddrMan: peers.json corrupt/unreadable -> cold start"
+                return Nothing
+              Just snap
+                | paVersion snap /= addrManPersistVersion -> do
+                    putStrLn $ "loadAddrMan: peers.json version "
+                            ++ show (paVersion snap) ++ " != "
+                            ++ show addrManPersistVersion ++ " -> cold start"
+                    return Nothing
+                | otherwise -> do
+                    am <- restoreAddrMan asmapData snap
+                    -- Force the restore so a mid-fold error is caught here,
+                    -- inside the try, rather than escaping later.
+                    nc <- readTVarIO (amNewCount am)
+                    tc <- readTVarIO (amTriedCount am)
+                    putStrLn $ "loadAddrMan: loaded peers.json: "
+                            ++ show nc ++ " new + " ++ show tc ++ " tried"
+                    return (Just am)
+  case result of
+    Right mam -> return mam
+    Left e -> do
+      putStrLn $ "loadAddrMan: peers.json load error -> cold start: " ++ show e
+      return Nothing
 
 --------------------------------------------------------------------------------
 -- Outbound Connection Diversity
