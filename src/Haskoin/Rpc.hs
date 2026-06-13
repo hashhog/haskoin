@@ -147,6 +147,12 @@ module Haskoin.Rpc
   , FundOptions(..)
   , defaultFundOptions
   , parseFundOptions
+    -- * signrawtransactionwithkey (exported for testing)
+  , handleSignRawTransactionWithKey
+  , signRawTxWithKeys
+  , SignKeyPrevout(..)
+  , parseSighashType
+  , SignTxResult(..)
     -- * importdescriptors (exported for testing)
   , handleImportDescriptors
   , importOneDescriptor
@@ -363,6 +369,10 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         Wallet(..), WalletManager(..), WalletState(..), WalletInfo(..),
                         ImportedDescriptor(..), markWalletDirty,
                         wifDecode,
+                        -- signrawtransactionwithkey: build a temporary
+                        -- keystore from explicit WIF keys and reuse the
+                        -- SAME PSBT Signer engine the wallet path uses.
+                        ExtendedKey(..), derivePubKeyFromPrivate,
                         newWalletManager, createManagedWallet, loadManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
@@ -1261,6 +1271,9 @@ handleRpcRequest server req = do
     "createrawtransaction"         -> handleCreateRawTransaction server params
     "fundrawtransaction"           -> handleFundRawTransaction server params
     "signrawtransactionwithwallet" -> handleSignRawTransactionWithWallet server params
+    -- signrawtransactionwithkey does NOT need a wallet: it builds a
+    -- temporary keystore from the explicit WIF keys + prevtxs.
+    "signrawtransactionwithkey"    -> handleSignRawTransactionWithKey server params
 
     -- Network RPCs (new)
     "disconnectnode"       -> handleDisconnectNode server params
@@ -8596,6 +8609,302 @@ handleSignRawTransactionWithWallet server params = withWalletMgr server $ \walle
       , txWitness  = []
       , txLockTime = 0
       }
+
+--------------------------------------------------------------------------------
+-- signrawtransactionwithkey
+--
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp
+--   signrawtransactionwithkey (672) + SignTransaction (the shared core
+--   used by signrawtransactionwithwallet too).
+--
+--   signrawtransactionwithkey "hexstring" ["privatekey",...]
+--       ( [{"txid","vout","scriptPubKey","redeemScript","witnessScript","amount"}...]
+--         "sighashtype" )
+--
+-- Unlike 'signrawtransactionwithwallet', this RPC does NOT consult a
+-- wallet — the keystore is built entirely from the explicitly provided
+-- WIF private keys, and the per-input prevout context comes from the
+-- optional @prevtxs@ array.  Everything else is IDENTICAL: the same
+-- BIP-143 / BIP-341 sighash + ECDSA / Schnorr engine the wallet path
+-- uses ('Haskoin.Wallet.signPsbt' → 'signInput' → 'addSignature' →
+-- 'signWithKey' / 'signWithKeyTaproot', which in turn call the real
+-- 'Haskoin.Crypto.signMsg' / 'signSchnorr').  We feed the explicit keys
+-- in by wrapping each WIF-decoded 'SecKey' in a synthetic 'ExtendedKey'
+-- (signPsbt only reads @ekKey@; the BIP-32 chain-code is unused for
+-- signing), and we feed the prevout context in via the standard
+-- BIP-174 Updater ('updatePsbt') exactly as the wallet handler does.
+--------------------------------------------------------------------------------
+
+-- | One @prevtxs@ entry: the spending context for a single outpoint.
+-- Mirrors the fields of Core's prevtxs object array
+-- (txid, vout, scriptPubKey required; redeemScript, witnessScript,
+-- amount optional).
+data SignKeyPrevout = SignKeyPrevout
+  { skpOutPoint      :: !OutPoint
+  , skpScriptPubKey  :: !ByteString
+  , skpAmount        :: !Word64
+  , skpRedeemScript  :: !(Maybe ByteString)
+  , skpWitnessScript :: !(Maybe ByteString)
+  } deriving (Show, Eq)
+
+-- | Result of the signrawtransactionwithkey engine: the (partially)
+-- signed transaction, whether it is fully signed, and a per-input
+-- error list for inputs that could not be signed (Core
+-- TransactionError shape).  @strErrors@ are inputs left unsigned.
+data SignTxResult = SignTxResult
+  { strTx       :: !Tx
+  , strComplete :: !Bool
+  , strErrors   :: ![(Int, OutPoint, Text)]  -- (input index, outpoint, message)
+  } deriving (Show, Eq)
+
+-- | Map a Core sighashtype string to its wire byte.  Defaults to
+-- SIGHASH_ALL (0x01) on an unrecognised / absent value, matching Core's
+-- ParseSighashString default.  "DEFAULT" (0x00) is the BIP-341 Taproot
+-- default.
+parseSighashType :: Maybe Text -> Word32
+parseSighashType mt = case fmap T.toUpper mt of
+  Just "ALL"                  -> 0x01
+  Just "NONE"                 -> 0x02
+  Just "SINGLE"               -> 0x03
+  Just "ALL|ANYONECANPAY"     -> 0x81
+  Just "NONE|ANYONECANPAY"    -> 0x82
+  Just "SINGLE|ANYONECANPAY"  -> 0x83
+  Just "DEFAULT"              -> 0x00
+  _                           -> 0x01
+
+-- | Wrap a raw 'SecKey' (from a WIF) in a synthetic 'ExtendedKey' so it
+-- can be fed to the shared 'signPsbt' Signer.  Only @ekKey@ is read by
+-- the signing path; the chain-code / depth / index fields are inert.
+mkTempSigningKey :: SecKey -> ExtendedKey
+mkTempSigningKey sk = ExtendedKey
+  { ekKey       = sk
+  , ekChainCode = BS.replicate 32 0x00
+  , ekDepth     = 0
+  , ekParentFP  = 0
+  , ekIndex     = 0
+  }
+
+-- | Synthesise a prev-tx wrapping a 'TxOut' so the BIP-174 Updater
+-- ('updatePsbt') can route the non-witness UTXO carrier.  Mirrors the
+-- 'mkSyntheticPrevTx' local helper in the wallet handler.
+mkSyntheticPrevTxRpc :: TxOut -> Tx
+mkSyntheticPrevTxRpc txout = Tx
+  { txVersion  = 1
+  , txInputs   = []
+  , txOutputs  = [txout]
+  , txWitness  = []
+  , txLockTime = 0
+  }
+
+-- | The server-independent signrawtransactionwithkey engine (wrapped by
+-- 'handleSignRawTransactionWithKey').  Builds the temporary keystore
+-- from the WIF keys, merges prevout info from @prevtxs@, runs the
+-- BIP-174 Updater → Signer → Finalizer → Extractor pipeline, and reports
+-- which inputs were left unsigned.
+--
+-- @complete@ is true iff EVERY input finalized (i.e. is fully signed).
+signRawTxWithKeys
+  :: Tx                       -- ^ unsigned (or partially signed) transaction
+  -> [SecKey]                 -- ^ WIF-decoded private keys (temporary keystore)
+  -> [SignKeyPrevout]         -- ^ prevout context from @prevtxs@
+  -> Word32                   -- ^ sighash type (wire byte; default 0x01)
+  -> SignTxResult
+signRawTxWithKeys tx keys prevs shType =
+  let -- (txid LE, vout) -> prevout context.
+      prevMap = Map.fromList [ (skpOutPoint p, p) | p <- prevs ]
+      xkeys   = map mkTempSigningKey keys
+
+      -- BIP-174 Updater lookup: route witness vs non-witness UTXO the
+      -- same way the wallet handler does (synthetic prev-tx for the
+      -- non-witness carrier).
+      lookupUtxo op = case Map.lookup op prevMap of
+        Just p  ->
+          let txout = TxOut (skpAmount p) (skpScriptPubKey p)
+          in Just (mkSyntheticPrevTxRpc txout, txout)
+        Nothing -> Nothing
+
+      -- Strip any existing scriptSigs / witnesses before building the
+      -- PSBT (createPsbt requires empty inputs).
+      bareTx = tx { txInputs  = map (\i -> i { txInScript = BS.empty }) (txInputs tx)
+                  , txWitness = replicate (length (txInputs tx)) []
+                  }
+      psbt0 = case createPsbt bareTx of
+                Right p -> p
+                Left _  -> emptyPsbt bareTx
+      psbt1 = updatePsbt lookupUtxo psbt0
+
+      -- Attach the per-input redeemScript / witnessScript from prevtxs
+      -- so the P2SH / P2WSH branches of the Signer + Finalizer fire.
+      attachScripts = zipWith attach (txInputs bareTx) (psbtInputs psbt1)
+      attach txin pinp = case Map.lookup (txInPrevOutput txin) prevMap of
+        Nothing -> pinp
+        Just p  -> pinp
+          { piRedeemScript  = maybe (piRedeemScript pinp)  Just (skpRedeemScript p)
+          , piWitnessScript = maybe (piWitnessScript pinp) Just (skpWitnessScript p)
+          , piSighashType   = Just shType
+          }
+      psbt2 = psbt1 { psbtInputs = attachScripts }
+
+      -- Sign with every provided key (signPsbt is idempotent on inputs
+      -- it already signed, so folding is safe + order-independent).
+      psbtSigned = foldl' (flip signPsbt) psbt2 xkeys
+      psbtFinal  = case finalizePsbt psbtSigned of
+                     Right p -> p
+                     Left _  -> psbtSigned
+      finalTx    = case extractTransaction psbtFinal of
+                     Right t -> t
+                     Left _  -> tx
+
+      -- Per-input completeness + error list.  An input is "done" iff its
+      -- PsbtInput finalized; otherwise it is reported in errors[].
+      complete   = isPsbtFinalized psbtFinal
+      errs =
+        [ (idx, txInPrevOutput txin, msg)
+        | (idx, txin, pinp) <- zip3 [0 ..] (txInputs bareTx) (psbtInputs psbtFinal)
+        , not (isInputFinalizedRpc pinp)
+        , let msg = if Map.member (txInPrevOutput txin) prevMap
+                      then "Unable to sign input, invalid stack size (possibly missing key)"
+                      else "Input not found or already spent"
+        ]
+  in SignTxResult finalTx complete errs
+
+-- | Local mirror of Wallet.isInputFinalized (not exported): an input is
+-- finalized once it carries a final scriptSig or a non-empty final
+-- witness.
+isInputFinalizedRpc :: PsbtInput -> Bool
+isInputFinalizedRpc pinp =
+  case piFinalScriptSig pinp of
+    Just _  -> True
+    Nothing -> case piFinalScriptWitness pinp of
+      Just ws -> not (null ws)
+      Nothing -> False
+
+-- | signrawtransactionwithkey RPC handler.  Does NOT require a wallet.
+--
+-- Parameters:
+--   0 hexstring   (required): hex-encoded raw transaction
+--   1 privkeys    (required): array of WIF-encoded private keys
+--   2 prevtxs     (optional): array of {txid, vout, scriptPubKey,
+--                             redeemScript?, witnessScript?, amount?}
+--   3 sighashtype (optional): ALL | NONE | SINGLE | *|ANYONECANPAY |
+--                             DEFAULT (default ALL)
+-- Returns: { hex, complete, errors? } — errors omitted when empty,
+-- matching Core (rawtransaction.cpp SignTransaction's RPCResult).
+handleSignRawTransactionWithKey :: RpcServer -> Value -> IO RpcResponse
+handleSignRawTransactionWithKey _server params =
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing hexstring parameter") Null
+    Just hexTx ->
+      case decodeRawTx hexTx of
+        Left err -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError err) Null
+        Right tx ->
+          case parseWifKeyArray params of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey err) Null
+            Right keys ->
+              case parsePrevtxsArray params of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParams err) Null
+                Right prevs -> do
+                  let shType  = parseSighashType (extractParamText params 3)
+                      result  = signRawTxWithKeys tx keys prevs shType
+                      signedHex = TE.decodeUtf8 $ B16.encode $ S.encode (strTx result)
+                      errsJson  =
+                        [ object
+                            [ "txid"      .= showHash (BlockHash (getTxIdHash (outPointHash op)))
+                            , "vout"      .= outPointIndex op
+                            , "witness"   .= ([] :: [Text])
+                            , "scriptSig" .= ("" :: Text)
+                            , "sequence"  .= seqFor idx
+                            , "error"     .= msg
+                            ]
+                        | (idx, op, msg) <- strErrors result
+                        ]
+                      seqFor idx
+                        | idx >= 0 && idx < length (txInputs tx) =
+                            txInSequence (txInputs tx !! idx)
+                        | otherwise = 0xffffffff :: Word32
+                      base = [ "hex"      .= signedHex
+                             , "complete" .= strComplete result
+                             ]
+                      -- Core only emits "errors" when non-empty.
+                      out  = if null errsJson
+                               then base
+                               else base ++ [ "errors" .= errsJson ]
+                  return $ RpcResponse (object out) Null Null
+  where
+    decodeRawTx :: Text -> Either Text Tx
+    decodeRawTx h = case B16.decode (TE.encodeUtf8 h) of
+      Left _      -> Left "TX decode failed"
+      Right bytes -> case S.decode bytes of
+        Left _   -> Left "TX decode failed"
+        Right tx -> Right tx
+
+    -- Parse param 1 (the privkeys array) into a temporary keystore.  A
+    -- malformed WIF is a hard error (-5), matching Core's
+    -- DecodeSecret-fails path.
+    parseWifKeyArray :: Value -> Either Text [SecKey]
+    parseWifKeyArray ps = case extractParamArray ps 1 of
+      Nothing  -> Left "Missing privkeys array (parameter 2)"
+      Just arr -> mapM decodeOne (V.toList arr)
+      where
+        decodeOne v = case v of
+          String wif -> case wifDecode (T.strip wif) of
+            Just sk -> Right sk
+            Nothing -> Left "Invalid private key encoding"
+          _ -> Left "Invalid private key encoding"
+
+    -- Parse the optional param 2 (prevtxs array).  Absent => [].
+    parsePrevtxsArray :: Value -> Either Text [SignKeyPrevout]
+    parsePrevtxsArray ps = case rawParamAt ps 2 of
+      Nothing          -> Right []
+      Just (Array arr) -> mapM parseOne (V.toList arr)
+      Just _           -> Left "Expected prevtxs array (parameter 3)"
+      where
+        parseOne (Object o) = do
+          txidT <- need o "txid"  asText
+          vout  <- need o "vout"  asWord32
+          spkT  <- need o "scriptPubKey" asText
+          -- txid is supplied in display (big-endian) order; parseHash
+          -- reverses to the internal little-endian the OutPoint stores.
+          op    <- case parseHash txidT of
+                     Just (BlockHash h) -> Right (OutPoint (TxId h) vout)
+                     Nothing            -> Left "Invalid txid in prevtxs"
+          spk   <- decodeHexT spkT "scriptPubKey"
+          amt   <- case KM.lookup "amount" o of
+                     Nothing -> Right 0
+                     Just a  -> asAmount a
+          redeem  <- optHex o "redeemScript"
+          witness <- optHex o "witnessScript"
+          Right SignKeyPrevout
+            { skpOutPoint      = op
+            , skpScriptPubKey  = spk
+            , skpAmount        = amt
+            , skpRedeemScript  = redeem
+            , skpWitnessScript = witness
+            }
+        parseOne _ = Left "Each prevtxs entry must be an object"
+
+        need o k f = case KM.lookup k o of
+          Just v  -> f v
+          Nothing -> Left ("Missing '" <> k' <> "' in prevtxs entry")
+          where k' = Key.toText k
+        asText (String s) = Right s
+        asText _          = Left "Expected string"
+        asWord32 (Number n) = Right (truncate n :: Word32)
+        asWord32 _          = Left "Expected number"
+        -- amount is BTC (a JSON number); convert to satoshis.
+        asAmount (Number n) = Right (round (n * 1e8) :: Word64)
+        asAmount _          = Left "Expected numeric amount"
+        decodeHexT t field = case B16.decode (TE.encodeUtf8 t) of
+          Right b -> Right b
+          Left _  -> Left ("Invalid hex in '" <> field <> "'")
+        optHex o k = case KM.lookup k o of
+          Nothing          -> Right Nothing
+          Just (String s)  -> Just <$> decodeHexT s (Key.toText k)
+          Just _           -> Left ("Expected hex string for '" <> Key.toText k <> "'")
 
 --------------------------------------------------------------------------------
 -- Network Disconnect Node RPC Handler

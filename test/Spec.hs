@@ -149,6 +149,7 @@ import qualified W170FixedSeedsSpec
 import qualified W171FeelerGetAddrSpec
 import qualified W172GetChainStatesSpec
 import qualified W175FundRawTransactionSpec
+import qualified W176SignRawTxWithKeySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22964,6 +22965,11 @@ main = hspec $ do
   -- W175 fundrawtransaction — Core v31.99 raw-tx funding via the shared
   -- coin-selection engine (wallet/rpc/spend.cpp fundrawtransaction).
   W175FundRawTransactionSpec.spec
+
+  -- W176 signrawtransactionwithkey — Core v31.99 wallet-less signing via
+  -- the SAME PSBT Signer engine signrawtransactionwithwallet uses
+  -- (rpc/rawtransaction.cpp signrawtransactionwithkey / SignTransaction).
+  W176SignRawTxWithKeySpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
