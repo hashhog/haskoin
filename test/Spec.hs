@@ -148,6 +148,7 @@ import qualified W169GetTxOutConfirmationsSpec
 import qualified W170FixedSeedsSpec
 import qualified W171FeelerGetAddrSpec
 import qualified W172GetChainStatesSpec
+import qualified W175FundRawTransactionSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22959,6 +22960,10 @@ main = hspec $ do
   -- (rpc/blockchain.cpp getchainstates): single validated chainstate,
   -- 1-element array, snapshot_blockhash OPTIONAL, coins-cache budgets.
   W172GetChainStatesSpec.spec
+
+  -- W175 fundrawtransaction — Core v31.99 raw-tx funding via the shared
+  -- coin-selection engine (wallet/rpc/spend.cpp fundrawtransaction).
+  W175FundRawTransactionSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
