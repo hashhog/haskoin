@@ -88,6 +88,7 @@ import System.IO.Temp (createTempDirectory)
 import Test.Hspec
 
 import Haskoin.Types
+import Haskoin.Crypto (computeTxId, computeBlockHash)
 import Haskoin.Consensus
   ( Network(..)
   , regtest, mainnet, testnet4
@@ -99,6 +100,21 @@ import Haskoin.Consensus
   , assumeUtxoForBlockHash
   , checkAssumeutxoWhitelist
   , assumeutxoWhitelistError
+    -- real second-chainstate re-derivation
+  , BackgroundChainstate
+  , SnapshotVerdict(..)
+  , BackgroundValidationError(..)
+  , newBackgroundChainstate
+  , bgStoreId
+  , setBgActiveStoreId
+  , bgCoinCount
+  , bgGetCoin
+  , connectGenesisToBase
+  , registerRegtestAssumeUtxo
+  , clearRegtestAssumeUtxo
+  , assumeUtxoForHeightIO
+  , assumeUtxoForBlockHashIO
+  , checkAssumeutxoWhitelistIO
   )
 import Haskoin.Storage
   ( SnapshotMetadata(..)
@@ -111,8 +127,11 @@ import Haskoin.Storage
   , AssumeUtxoData(..)
   , computeUtxoHash
   , Coin(..)
+  , isUnspendable
   )
 import Haskoin.Rpc (loadTxOutSetGateMessage)
+import Data.List (sortBy)
+import qualified Data.Map.Strict as Map
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -160,6 +179,147 @@ buildRawHeader ver netMagic baseHash coinCount = runPut $ do
   putWord32le   netMagic
   putByteString baseHash
   putWord64le   coinCount
+
+--------------------------------------------------------------------------------
+-- Real second-chainstate (genesis->base) test fixtures
+--
+-- A small regtest-style chain genesis..base=3 containing a REAL spend, so the
+-- background re-derivation must REMOVE a coin (not just add). The genuine final
+-- UTXO set is computed by an INDEPENDENT hand-replay (the oracle) so the accept
+-- test and the reject-falsification are NOT circular against BackgroundChainstate.
+--------------------------------------------------------------------------------
+
+-- | P2PKH script with a distinct 20-byte program seed.
+p2pkhSeed :: Word8 -> BS.ByteString
+p2pkhSeed seed = BS.concat
+  [ BS.pack [0x76, 0xa9, 20], BS.replicate 20 seed, BS.pack [0x88, 0xac] ]
+
+-- | A coinbase tx (null prevout, vout 0xffffffff) carrying a BIP34-style
+-- height in its scriptSig so coinbases at different heights have distinct txids.
+mkCoinbase :: Word32 -> Word64 -> Word8 -> Tx
+mkCoinbase height val spkSeed = Tx
+  { txVersion  = 1
+  , txInputs   = [ TxIn
+      { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+      , txInScript     = BS.pack [ 0x03
+                                 , fromIntegral (height `mod` 256)
+                                 , fromIntegral ((height `div` 256) `mod` 256)
+                                 , fromIntegral ((height `div` 65536) `mod` 256) ]
+      , txInSequence   = 0xffffffff
+      } ]
+  , txOutputs  = [ TxOut val (p2pkhSeed spkSeed) ]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
+-- | A 1-in/1-out spend of @prev@ paying to a new p2pkh.
+mkSpend :: OutPoint -> Word64 -> Word8 -> Tx
+mkSpend prev val spkSeed = Tx
+  { txVersion  = 1
+  , txInputs   = [ TxIn { txInPrevOutput = prev
+                        , txInScript = BS.pack [0x51]  -- OP_1 placeholder
+                        , txInSequence = 0xffffffff } ]
+  , txOutputs  = [ TxOut val (p2pkhSeed spkSeed) ]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
+mkHeader :: BlockHash -> Word32 -> BlockHeader
+mkHeader prev h = BlockHeader
+  { bhVersion    = 1
+  , bhPrevBlock  = prev
+  , bhMerkleRoot = Hash256 (BS.pack ([fromIntegral (h `mod` 256)] ++ replicate 31 0))
+  , bhTimestamp  = 1700000000 + h
+  , bhBits       = 0x207fffff
+  , bhNonce      = h
+  }
+
+-- | A built regtest chain genesis..base ready for re-derivation.
+data BuiltChain = BuiltChain
+  { bcBlocks   :: [Block]            -- ^ bcBlocks !! h == block at height h
+  , bcTipHash  :: BlockHash
+  , bcTipH     :: Word32
+  , bcUtxo     :: [(OutPoint, Coin)] -- ^ INDEPENDENT oracle final UTXO set
+  }
+
+-- | Build the chain:
+--   h0 genesis coinbase (never enters the UTXO set)
+--   h1 coinbase C1 -> output A
+--   h2 coinbase C2 + spend(A) -> output S
+--   h3 coinbase C3
+-- At base=3 the UTXO set = { C1? no (A spent), B(=C2 out), S, C3 } — A is SPENT,
+-- forcing the bg store to REMOVE a coin.
+buildChain :: BuiltChain
+buildChain =
+  let genesisCb = mkCoinbase 0 5000000000 0x00
+      g  = Block (mkHeader (BlockHash (Hash256 (BS.replicate 32 0))) 0) [genesisCb]
+      gH = computeBlockHash (blockHeader g)
+
+      c1   = mkCoinbase 1 5000000000 0x11
+      aTx  = computeTxId c1
+      b1   = Block (mkHeader gH 1) [c1]
+      b1H  = computeBlockHash (blockHeader b1)
+
+      c2     = mkCoinbase 2 5000000000 0x22
+      aOut   = OutPoint aTx 0
+      spendA = mkSpend aOut 4900000000 0x55
+      b2     = Block (mkHeader b1H 2) [c2, spendA]
+      b2H    = computeBlockHash (blockHeader b2)
+
+      c3  = mkCoinbase 3 5000000000 0x33
+      b3  = Block (mkHeader b2H 3) [c3]
+      b3H = computeBlockHash (blockHeader b3)
+
+      blocks = [g, b1, b2, b3]
+
+      -- INDEPENDENT oracle: hand-replay ConnectBlock rules (NOT via
+      -- BackgroundChainstate), so the accept test is non-circular.
+      oracle = foldl applyBlk Map.empty (zip [0 ..] blocks)
+      applyBlk m (h, blk)
+        | h == (0 :: Word32) = m  -- genesis coinbase unspendable
+        | otherwise = foldl (applyTx h) m (blockTxns blk)
+      applyTx h m tx =
+        let isCb = let i = head (txInputs tx)
+                       op = txInPrevOutput i
+                   in length (txInputs tx) == 1
+                      && outPointHash op == TxId (Hash256 (BS.replicate 32 0))
+                      && outPointIndex op == 0xffffffff
+            m1 = if isCb then m
+                 else foldl (\acc i -> Map.delete (txInPrevOutput i) acc) m (txInputs tx)
+            txid = computeTxId tx
+            m2 = foldl (\acc (vout, o) ->
+                          if isUnspendable (txOutScript o) then acc
+                          else Map.insert (OutPoint txid vout)
+                                 (Coin o h isCb) acc)
+                       m1 (zip [0 ..] (txOutputs tx))
+        in m2
+
+      oracleList = sortBy cmpOp (Map.toList oracle)
+      cmpOp (a, _) (b, _) =
+        compare (getHashBytes (outPointHash a), outPointIndex a)
+                (getHashBytes (outPointHash b), outPointIndex b)
+      getHashBytes (TxId (Hash256 bs)) = bs
+  in BuiltChain
+       { bcBlocks  = blocks
+       , bcTipHash = b3H
+       , bcTipH    = 3
+       , bcUtxo    = oracleList
+       }
+
+-- | The genuine (display-order) HASH_SERIALIZED of the chain's final UTXO set,
+-- computed from the INDEPENDENT oracle — the CORRECT commitment.
+oracleHash :: BuiltChain -> Hash256
+oracleHash chain =
+  let Hash256 raw = computeUtxoHash
+                      [ SnapshotCoin op c | (op, c) <- bcUtxo chain ]
+  in Hash256 (BS.reverse raw)
+
+-- | Drive a re-derivation over a chain's blocks.
+runRederive :: BuiltChain -> BackgroundChainstate -> Hash256
+            -> IO (Either BackgroundValidationError SnapshotVerdict)
+runRederive chain bg hash =
+  connectGenesisToBase bg hash
+    (\h -> return (lookup h (zip [0 ..] (bcBlocks chain))))
 
 --------------------------------------------------------------------------------
 -- Spec
@@ -213,13 +373,19 @@ spec = describe "W102 AssumeUTXO snapshot loading gates" $ do
 
   describe "G3 verifySnapshot UTXO hash and block hash checks" $ do
     it "verifySnapshot passes when hash and block hash both match" $ do
+      -- 'verifySnapshot' compares against 'audHashSerialized' in DISPLAY order
+      -- (Bitcoin's reversed uint256 hex), reversing the raw 'computeUtxoHash'
+      -- digest first (see Storage.hs verifySnapshot).  The fixture must
+      -- therefore commit to the DISPLAY-order hash, not the raw digest.
       let coin = SnapshotCoin (OutPoint (mkTxId 0x01) 0) (simpleCoin 100_000)
           snap = UtxoSnapshot
                    (SnapshotMetadata 0 (mkBlockHash 0x11) 1)
                    [coin]
+          Hash256 raw = computeUtxoHash [coin]
+          displayHash = Hash256 (BS.reverse raw)
           aud  = AssumeUtxoData
                    { audHeight         = 0
-                   , audHashSerialized = computeUtxoHash [coin]
+                   , audHashSerialized = displayHash
                    , audChainTxCount   = 1
                    , audBlockHash      = mkBlockHash 0x11
                    }
@@ -455,3 +621,131 @@ spec = describe "W102 AssumeUTXO snapshot loading gates" $ do
           allEntries = concatMap netAssumeUtxo [mainnet, testnet4, regtest]
       forM_ allEntries $ \(_, p) ->
         aupBlockHash p `shouldNotBe` zero
+
+  -- -----------------------------------------------------------------------
+  -- G30+: REAL second-chainstate (genesis->base) re-derivation
+  --
+  -- These prove the background chainstate is a GENUINE independent
+  -- re-derivation in a SEPARATE store, not a counter and not a hash-of-self.
+  -- Reference: bitcoin/src/validation.cpp AddChainstate +
+  --            MaybeCompleteSnapshotValidation.
+  -- -----------------------------------------------------------------------
+
+  describe "G30 separate background store + aliasing guard" $ do
+    it "background store identity differs from the active store" $ do
+      let chain = buildChain
+      bg <- newBackgroundChainstate (bcTipH chain) 0xDEADBEEF
+      own <- bgStoreId bg
+      own `shouldNotBe` 0xDEADBEEF
+
+    it "re-derived coins live in the bg store (separate from active)" $ do
+      let chain = buildChain
+      bg <- newBackgroundChainstate (bcTipH chain) 0xACED1234
+      r  <- runRederive chain bg (oracleHash chain)
+      r `shouldBe` Right SnapshotValid
+      n  <- bgCoinCount bg
+      n `shouldBe` length (bcUtxo chain)
+      -- Every oracle coin is present in the bg store.
+      forM_ (bcUtxo chain) $ \(op, c) -> do
+        mc <- bgGetCoin bg op
+        mc `shouldBe` Just c
+
+    it "aliasing guard REFUSES a hash-of-self (active id == own id)" $ do
+      let chain = buildChain
+      bg  <- newBackgroundChainstate (bcTipH chain) 0
+      own <- bgStoreId bg
+      setBgActiveStoreId bg own          -- force the alias
+      r   <- runRederive chain bg (oracleHash chain)
+      r `shouldBe` Left BgAliasesActiveStore
+
+  describe "G31 REAL connect re-derives the exact set (not empty/counter)" $ do
+    it "removes a SPENT coin (A is spent at h2)" $ do
+      let chain = buildChain
+      bg <- newBackgroundChainstate (bcTipH chain) 0xACED1234
+      _  <- runRederive chain bg (oracleHash chain)
+      -- output A = first output of the h1 coinbase. It is SPENT at h2, so it
+      -- must be ABSENT from the re-derived set.
+      let c1   = mkCoinbase 1 5000000000 0x11
+          aOut = OutPoint (computeTxId c1) 0
+      mc <- bgGetCoin bg aOut
+      mc `shouldBe` Nothing
+      n  <- bgCoinCount bg
+      n `shouldNotBe` 0      -- NOT a stub: real coins were derived
+
+  describe "G32 correct snapshot validates (accept)" $ do
+    it "matching commitment -> SnapshotValid" $ do
+      let chain = buildChain
+      bg <- newBackgroundChainstate (bcTipH chain) 0xACED1234
+      r  <- runRederive chain bg (oracleHash chain)
+      r `shouldBe` Right SnapshotValid
+
+  describe "G33 NON-CIRCULAR reject falsification (hash-of-self trap)" $ do
+    it "tampered snapshot (phantom coin) is REJECTED by re-derivation" $ do
+      let chain = buildChain
+      -- Build a TAMPERED UTXO set: the genuine set PLUS a phantom coin the
+      -- genesis->base replay NEVER creates. This is what a malicious snapshot
+      -- file would contain.
+      let phantomOp = OutPoint (TxId (Hash256 (BS.pack (0xFA : replicate 30 0 ++ [0xCE])))) 0
+          phantom   = (phantomOp, Coin (TxOut 9900000000 (p2pkhSeed 0x77)) 2 False)
+          tampered  = phantom : bcUtxo chain
+          -- The snapshot commits to its OWN (tampered) hash — a hash-of-self
+          -- that PASSES any load-time gate (the file IS the tampered set and
+          -- the commitment is the hash OF it). Display order, as the engine
+          -- compares.
+          Hash256 raw = computeUtxoHash [ SnapshotCoin op c | (op, c) <- tampered ]
+          tamperedCommitment = Hash256 (BS.reverse raw)
+
+      -- Sanity: the tampered commitment genuinely DIFFERS from the real one
+      -- (non-vacuity — otherwise the test would pass for the wrong reason).
+      tamperedCommitment `shouldNotBe` oracleHash chain
+
+      -- The background chainstate NEVER reads the snapshot file. It walks the
+      -- blocks genesis->base and re-derives the GENUINE set, whose hash differs
+      -- from the tampered commitment -> Invalid.
+      bg <- newBackgroundChainstate (bcTipH chain) 0xACED1234
+      r  <- runRederive chain bg tamperedCommitment
+      r `shouldBe` Right SnapshotInvalid
+
+      -- Proof of NON-circularity: the phantom coin must be ABSENT from the
+      -- independent re-derivation (it was never created by any block).
+      mPhantom <- bgGetCoin bg phantomOp
+      mPhantom `shouldBe` Nothing
+      -- And the genuine coins are all present (the re-derivation is real).
+      n <- bgCoinCount bg
+      n `shouldBe` length (bcUtxo chain)
+
+  describe "G34 runtime-registerable regtest AssumeUTXO whitelist" $ do
+    it "registering a regtest base height makes it whitelisted; mainnet untouched" $ do
+      clearRegtestAssumeUtxo
+      -- 777 is not in any static table.
+      r0 <- checkAssumeutxoWhitelistIO regtest 777
+      r0 `shouldSatisfy` isLeft
+      let p = AssumeUtxoParams
+                { aupHeight = 777
+                , aupHashSerialized = Hash256 (fill32 0xab)
+                , aupChainTxCount = 778
+                , aupBlockHash = mkBlockHash 0xcd
+                }
+      registerRegtestAssumeUtxo 777 p
+      r1 <- checkAssumeutxoWhitelistIO regtest 777
+      r1 `shouldBe` Right ()
+      -- hash-first lookup also resolves the runtime entry.
+      mByHash <- assumeUtxoForBlockHashIO regtest (mkBlockHash 0xcd)
+      fmap aupHeight mByHash `shouldBe` Just 777
+      -- MAINNET/TESTNET4 are UNTOUCHED by the regtest registry (IO and pure).
+      rMain <- checkAssumeutxoWhitelistIO mainnet 777
+      rMain `shouldSatisfy` isLeft
+      mMain <- assumeUtxoForBlockHashIO mainnet (mkBlockHash 0xcd)
+      mMain `shouldBe` Nothing
+      mTest <- assumeUtxoForHeightIO testnet4 777
+      mTest `shouldBe` Nothing
+      -- The PURE static lookups never see the runtime entry, by design.
+      assumeUtxoForHeight regtest 777 `shouldBe` Nothing
+      clearRegtestAssumeUtxo
+      -- After clearing, regtest 777 is unrecognized again.
+      r2 <- checkAssumeutxoWhitelistIO regtest 777
+      r2 `shouldSatisfy` isLeft
+
+isLeft :: Either a b -> Bool
+isLeft (Left _) = True
+isLeft _        = False
