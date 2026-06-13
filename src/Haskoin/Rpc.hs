@@ -140,6 +140,13 @@ module Haskoin.Rpc
   , rpcWalletAlreadyLoaded
   , rpcWalletAlreadyExists
   , rpcWalletError
+  , rpcWalletInsufficientFunds
+    -- * fundrawtransaction (exported for testing)
+  , handleFundRawTransaction
+  , fundRawTx
+  , FundOptions(..)
+  , defaultFundOptions
+  , parseFundOptions
     -- * importdescriptors (exported for testing)
   , handleImportDescriptors
   , importOneDescriptor
@@ -774,6 +781,13 @@ rpcWalletEncryptionFailed = -16
 rpcWalletError :: Int
 rpcWalletError = -4
 
+-- | @RPC_WALLET_INSUFFICIENT_FUNDS@ (-6) from
+--   @bitcoin-core/src/rpc/protocol.h@: "Not enough funds in wallet or
+--   account".  Returned by fundrawtransaction / walletcreatefundedpsbt when
+--   the coin selector cannot cover outputs + fee.
+rpcWalletInsufficientFunds :: Int
+rpcWalletInsufficientFunds = -6
+
 -- | Maximum @walletpassphrase@ unlock duration in seconds (~3.17 years).
 --   Matches Bitcoin Core's @MAX_SLEEP_TIME@ in wallet/rpc/encrypt.cpp.
 walletPassphraseMaxSleepTime :: Int
@@ -1245,6 +1259,7 @@ handleRpcRequest server req = do
 
     -- Raw transaction RPCs (new)
     "createrawtransaction"         -> handleCreateRawTransaction server params
+    "fundrawtransaction"           -> handleFundRawTransaction server params
     "signrawtransactionwithwallet" -> handleSignRawTransactionWithWallet server params
 
     -- Network RPCs (new)
@@ -8220,8 +8235,254 @@ handleCreateRawTransaction _server params = do
                               fromIntegral ((BS.length bs `shiftR` 8) .&. 0xff)]
 
 --------------------------------------------------------------------------------
--- Wallet: Sign Raw Transaction With Wallet RPC Handler
+-- fundrawtransaction RPC Handler
 --------------------------------------------------------------------------------
+-- Reference: bitcoin-core/src/wallet/rpc/spend.cpp fundrawtransaction (706)
+--   + FundTransaction (470).
+--
+-- Decodes a raw transaction, then adds wallet inputs (and, if needed, one
+-- change output) so the wallet funds all of the tx's existing outputs plus
+-- the fee.  Existing inputs and outputs are preserved.  The inputs added are
+-- NOT signed (Core: "use signrawtransactionwithwallet for that").
+--
+-- This is the raw-tx sibling of 'handleWalletCreateFundedPsbt' (Rpc.hs:6700):
+-- both run the SAME Core coin-selection engine, 'selectCoinsWithHeight'
+-- (Wallet.hs:2430 — BnB then Knapsack, coinbase-maturity aware).  The only
+-- difference is the output form: this handler serializes the funded 'Tx' to
+-- hex instead of wrapping it in a PSBT.  Coin selection is NOT reimplemented
+-- here — we feed the decoded tx's outputs to the existing selector and merge
+-- its result (selected inputs + change) back onto the original tx.
+--
+-- Parameters (positional, Bitcoin Core compat):
+--   hexstring (required, string) — the raw transaction to fund.
+--   options   (optional, object) — supported keys:
+--       feeRate              (BTC/kvB)  — explicit fee rate
+--       fee_rate             (sat/vB)   — explicit fee rate (takes precedence)
+--       changeAddress / change_address  — explicit change destination
+--       changePosition / change_position (int) — index for the change output
+--       subtractFeeFromOutputs / subtract_fee_from_outputs (array of indices)
+--     Other Core options (includeWatching, lockUnspents, change_type,
+--     conf_target, estimate_mode, add_inputs, …) are accepted but unused.
+--   iswitness (optional, bool) — accepted; decode is format-agnostic.
+-- Returns:
+--   {"hex": <funded raw tx>, "fee": <btc>, "changepos": <int or -1>}
+handleFundRawTransaction :: RpcServer -> Value -> IO RpcResponse
+handleFundRawTransaction server params = withWalletMgr server $ \wm ->
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing hexstring parameter") Null
+    Just hexTx ->
+      case B16.decode (TE.encodeUtf8 hexTx) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+        Right txBytes ->
+          case decodeTxWithFallback txBytes of
+            Left _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+            Right baseTx -> do
+              (mWallet, _) <- getDefaultWallet wm
+              case mWallet of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcWalletNotFound
+                    "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
+                Just walletState -> do
+                  let opts = parseFundOptions params
+                  tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+                  result <- fundRawTx (wsWallet walletState) tipHeight opts baseTx
+                  case result of
+                    Left (code, msg) -> return $ RpcResponse Null
+                      (toJSON $ RpcError code msg) Null
+                    Right (fundedTx, feeSatW, changePos) -> do
+                      let fundedHex = TE.decodeUtf8 $ B16.encode $ S.encode fundedTx
+                          feeSat    = fromIntegral feeSatW :: Int64
+                          enc = pairs $
+                                  pair "hex"       (text fundedHex)        <>
+                                  pair "fee"       (btcAmountEnc feeSat)    <>
+                                  pair "changepos" (AE.int changePos)
+                      return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | Decoded fundrawtransaction options (the @options@ object, index 1).
+--   Mirrors the subset of Core's FundTransaction option set that this impl
+--   honours; everything else is accepted-but-ignored at the JSON layer.
+data FundOptions = FundOptions
+  { foFeeRate    :: !FeeRate         -- ^ resolved fee rate (sat/kvB)
+  , foSffo       :: ![Int]           -- ^ subtractFeeFromOutputs indices
+  , foChangePos  :: !(Maybe Int)     -- ^ requested change position
+  , foChangeAddr :: !(Maybe Address) -- ^ explicit change destination
+  }
+
+-- | Default option set when no @options@ object is supplied.
+--   Fee rate defaults to 10 sat/vB to mirror 'handleWalletCreateFundedPsbt'
+--   (Core falls back to wallet fee estimation; we have a fixed default).
+defaultFundOptions :: FundOptions
+defaultFundOptions = FundOptions (FeeRate 10000) [] Nothing Nothing
+
+-- | Parse the @options@ object from the positional params array.
+parseFundOptions :: Value -> FundOptions
+parseFundOptions params =
+  let optObj = case params of
+        Array arr | V.length arr >= 2 ->
+          case arr V.! 1 of
+            Object o -> Just o
+            _        -> Nothing
+        _ -> Nothing
+      lookupOpt k = optObj >>= KM.lookup k
+
+      feeRate = FeeRate $ case lookupOpt "fee_rate" of
+        Just (Number n) -> max 1 (floor (n * 1000))            -- sat/vB → sat/kvB
+        _ -> case lookupOpt "feeRate" of
+               Just (Number n) -> max 1 (floor (n * 100_000_000)) -- BTC/kvB → sat/kvB
+               _ -> 10000
+
+      sffoFromArr = mapMaybe asInt . V.toList
+        where asInt (Number n) = Just (floor n :: Int)
+              asInt _           = Nothing
+      sffo = case lookupOpt "subtractFeeFromOutputs" of
+        Just (Array a) -> sffoFromArr a
+        _ -> case lookupOpt "subtract_fee_from_outputs" of
+               Just (Array a) -> sffoFromArr a
+               _ -> []
+
+      mChangePos = case lookupOpt "changePosition" of
+        Just (Number n) -> Just (floor n)
+        _ -> case lookupOpt "change_position" of
+               Just (Number n) -> Just (floor n)
+               _ -> Nothing
+
+      mChangeAddr =
+        let txt = case lookupOpt "changeAddress" of
+                    Just (String t) -> Just t
+                    _ -> case lookupOpt "change_address" of
+                           Just (String t) -> Just t
+                           _ -> Nothing
+        in txt >>= textToAddress
+  in FundOptions feeRate sffo mChangePos mChangeAddr
+
+-- | Core fundrawtransaction engine, server-independent and testable.
+--
+-- Funds @baseTx@ by running the existing coin selector
+-- ('selectCoinsWithHeight' — the SAME engine 'handleWalletCreateFundedPsbt'
+-- uses) over the tx's existing outputs, then merging the selected inputs and
+-- the change output back onto the tx.  Existing inputs and outputs are
+-- preserved.  Returns the funded (unsigned) 'Tx', the fee in satoshis, and
+-- the final change-output index (-1 if no change was added).
+--
+-- Left carries (rpc-error-code, message); insufficient funds maps to
+-- @rpcWalletInsufficientFunds@ to match Core.
+fundRawTx :: Wallet -> Word32 -> FundOptions -> Tx
+          -> IO (Either (Int, Text) (Tx, Word64, Int))
+fundRawTx wallet tipHeight FundOptions{..} baseTx =
+  -- Recover an Address for each existing output so the coin selector
+  -- (which works on addresses) can size the funding.
+  case traverse txOutToWto (txOutputs baseTx) of
+    Nothing -> return $ Left
+      ( rpcInvalidParams
+      , "Outputs include addressless / OP_RETURN entries; not yet supported in fundrawtransaction" )
+    Just wtos -> do
+      result <- selectCoinsWithHeight wallet wtos foFeeRate tipHeight
+      case result of
+        Left err ->
+          let code = if "nsufficient" `T.isInfixOf` T.pack err
+                     then rpcWalletInsufficientFunds
+                     else rpcWalletError
+          in return $ Left (code, T.pack err)
+        Right cs -> do
+          -- Resolve the change output (override its address if the caller
+          -- pinned one via changeAddress).
+          let mChange = case (csChange cs, foChangeAddr) of
+                (Just (_, amt), Just a)  -> Just (a, amt)
+                (Just (a, amt), Nothing) -> Just (a, amt)
+                (Nothing, _)             -> Nothing
+
+              -- Selected inputs become unsigned TxIns appended to the tx's
+              -- existing inputs.  Sequence mirrors createTransaction
+              -- (0xfffffffe — RBF-off, BIP-125 non-signalling).
+              addedIns  = [ TxIn op BS.empty 0xfffffffe | (op, _txo) <- csInputs cs ]
+              mergedIns = txInputs baseTx ++ addedIns
+
+              -- subtractFeeFromOutputs: deduct the fee evenly across the named
+              -- outputs (Core SFFO).  Empty (default) leaves outputs untouched;
+              -- the fee then comes out of the selected inputs via change.
+              feeSatW = csFee cs
+              adjOuts = applySffo foSffo feeSatW (txOutputs baseTx)
+
+              -- Build the change TxOut (if any) and decide its final index.
+              -- Core appends change after the existing outputs by default;
+              -- changePosition lets the caller pin it.
+              changeTxOut = fmap (\(a, amt) -> TxOut amt (addressToScript a)) mChange
+              numExisting = length adjOuts
+              (finalOuts, changePos) = case changeTxOut of
+                Nothing -> (adjOuts, -1 :: Int)
+                Just ch ->
+                  let pos = case foChangePos of
+                        Just p | p >= 0 && p <= numExisting -> p
+                        _ -> numExisting   -- default: append
+                      (before, after) = splitAt pos adjOuts
+                  in (before ++ [ch] ++ after, pos)
+
+              fundedTx = baseTx
+                { txInputs  = mergedIns
+                , txOutputs = finalOuts
+                  -- Unsigned: one empty witness stack per input so the Serialize
+                  -- instance emits a legacy (non-witness) tx.
+                , txWitness = replicate (length mergedIns) []
+                }
+
+              -- Core reports the fee as the EXACT residual SelectedValue -
+              -- output_value (spend.cpp:1330), not the selector's pre-change fee
+              -- estimate. On the default path (no caller-supplied inputs, no SFFO)
+              -- compute it from the assembled outputs so the reported fee always
+              -- equals inputs - outputs and the funded tx balances exactly (this
+              -- removes a 1-sat drift between feeWithChange and the change amount).
+              totalSelectedV = sum [ txOutValue txo | (_, txo) <- csInputs cs ]
+              outValueSum    = sum (map txOutValue finalOuts)
+              reportedFee
+                | null foSffo && null (txInputs baseTx) && totalSelectedV >= outValueSum
+                    = totalSelectedV - outValueSum
+                | otherwise = feeSatW
+          return $ Right (fundedTx, reportedFee, changePos)
+  where
+    -- | Recover an Address from a scriptPubKey for the coin selector.
+    --   Reuses the same best-effort P2WPKH/P2PKH/P2SH/P2TR matcher shape as
+    --   handleWalletCreateFundedPsbt's 'scriptToAddress'.
+    txOutToWto :: TxOut -> Maybe WalletTxOutput
+    txOutToWto txout = do
+      addr <- scriptToAddr (txOutScript txout)
+      Just $ WalletTxOutput addr (txOutValue txout)
+
+    scriptToAddr :: ByteString -> Maybe Address
+    scriptToAddr s
+      | BS.length s == 22 && BS.index s 0 == 0x00 && BS.index s 1 == 0x14 =
+          Just $ WitnessPubKeyAddress (Hash160 (BS.drop 2 s))
+      | BS.length s == 25 && BS.index s 0 == 0x76 && BS.index s 1 == 0xa9 &&
+        BS.index s 2 == 0x14 && BS.index s 23 == 0x88 && BS.index s 24 == 0xac =
+          Just $ PubKeyAddress (Hash160 (BS.take 20 (BS.drop 3 s)))
+      | BS.length s == 23 && BS.index s 0 == 0xa9 && BS.index s 1 == 0x14 &&
+        BS.index s 22 == 0x87 =
+          Just $ ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s)))
+      | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
+          Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+      | otherwise = Nothing
+
+    -- | Deduct 'fee' evenly across the SFFO-named outputs (Core's
+    --   SubtractFeeFromOutputs).  Each named, in-range output loses its share;
+    --   the last named output absorbs the rounding remainder.  Outputs not in
+    --   the list are unchanged.  Out-of-range indices are ignored.
+    applySffo :: [Int] -> Word64 -> [TxOut] -> [TxOut]
+    applySffo idxs fee outs
+      | null valid = outs
+      | otherwise =
+          let n         = length valid
+              share     = fee `div` fromIntegral n
+              remainder = fee - share * fromIntegral n
+              lastIdx   = last valid
+          in [ if i `elem` valid
+               then let deduct = share + (if i == lastIdx then remainder else 0)
+                        v      = txOutValue o
+                    in o { txOutValue = if v > deduct then v - deduct else 0 }
+               else o
+             | (i, o) <- zip [0 ..] outs ]
+      where valid = filter (\i -> i >= 0 && i < length outs) idxs
 
 -- | Sign a raw transaction with wallet keys.
 -- Reference: bitcoin-core/src/wallet/rpc/spend.cpp signrawtransactionwithwallet.
