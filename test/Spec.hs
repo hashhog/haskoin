@@ -150,6 +150,7 @@ import qualified W171FeelerGetAddrSpec
 import qualified W172GetChainStatesSpec
 import qualified W175FundRawTransactionSpec
 import qualified W176SignRawTxWithKeySpec
+import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22970,6 +22971,13 @@ main = hspec $ do
   -- the SAME PSBT Signer engine signrawtransactionwithwallet uses
   -- (rpc/rawtransaction.cpp signrawtransactionwithkey / SignTransaction).
   W176SignRawTxWithKeySpec.spec
+
+  -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
+  -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
+  -- full-consumption gate (empty-vin OP_RETURN survives), sigdata->-22,
+  -- blank maps, join <2->-8, full-TxIn-duplicate->-8, same-outpoint-diff-seq
+  -- both kept, set-union max-version/min-locktime, AddInput sig-clearing.
+  ConvertJoinPsbtSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec

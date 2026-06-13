@@ -110,6 +110,13 @@ module Haskoin.Rpc
   , analyzePsbtToJSON
   , psbtInputNextRole
   , psbtRequiredSigCount
+    -- * converttopsbt + joinpsbts (Core v31.99) — handlers + pure cores
+    --   (exported for testing — W177)
+  , handleConvertToPsbt
+  , handleJoinPsbts
+  , convertToPsbt
+  , decodeTxFullConsume
+  , joinPsbts
     -- * ZMQ Notifications
   , ZmqTopic(..)
   , ZmqConfig(..)
@@ -213,7 +220,8 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.Serialize as S
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
-import Control.Monad (forM, forM_, void, when)
+import Control.Monad (forM, forM_, void, when, replicateM, foldM)
+import qualified System.Random as SysRandom
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust)
 import Data.List (find, sort, sortBy, dropWhileEnd)
@@ -391,7 +399,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         selectCoinsWithHeight, createTransaction,
                         -- PSBT types and functions
                         Psbt(..), PsbtGlobal(..), PsbtInput(..), PsbtOutput(..),
-                        KeyPath(..), emptyPsbt, emptyPsbtInput,
+                        KeyPath(..), emptyPsbt, emptyPsbtInput, emptyPsbtOutput,
                         createPsbt, updatePsbt, signPsbt,
                         combinePsbts, finalizePsbt, extractTransaction,
                         decodePsbt, encodePsbt, isPsbtFinalized, getPsbtFee,
@@ -1248,6 +1256,8 @@ handleRpcRequest server req = do
     "finalizepsbt"         -> handleFinalizePsbt server params
     "analyzepsbt"          -> handleAnalyzePsbt server params
     "walletcreatefundedpsbt" -> handleWalletCreateFundedPsbt server params
+    "converttopsbt"        -> handleConvertToPsbt server params
+    "joinpsbts"            -> handleJoinPsbts server params
 
     -- Blockchain RPCs (new)
     "getchaintips"         -> handleGetChainTips server
@@ -6476,6 +6486,301 @@ parsePsbtsFromBase64 = mapM parseOnePsbt
         Left _ -> Left "Invalid base64 encoding"
         Right bs -> Right bs
       decodePsbt bytes
+
+--------------------------------------------------------------------------------
+-- converttopsbt + joinpsbts (Bitcoin Core v31.99)
+--
+-- Reference:
+--   bitcoin-core/src/rpc/rawtransaction.cpp converttopsbt (1663) / joinpsbts (1778)
+--   bitcoin-core/src/core_io.cpp           DecodeTx (156)
+--   bitcoin-core/src/psbt.cpp              AddInput (52)
+--
+-- These reuse the existing PSBT codec ('encodePsbt' / 'decodePsbt' /
+-- 'emptyPsbt' / 'emptyPsbtInput' / 'emptyPsbtOutput') and the existing
+-- tx (de)serialization ('Serialize Tx') — no new PSBT or tx codec.
+--------------------------------------------------------------------------------
+
+-- | A 'Get' for a LEGACY (non-witness) transaction that interprets the
+-- leading bytes as the CompactSize input count (NOT as a 0x00 0x01 segwit
+-- marker/flag).  This is the legacy half of Core's 'DecodeTx' two-way
+-- strategy; the witness half is the stock 'Serialize Tx' decoder (which
+-- treats a leading 0x00 as a segwit marker).  Built from the SAME
+-- exported serialize primitives the stock decoder uses ('getVarInt'',
+-- 'Serialize TxIn' / 'Serialize TxOut', 'getWord32le') — it is decoder
+-- COMPOSITION, not a new codec.
+getLegacyTx :: S.Get Tx
+getLegacyTx = do
+  version  <- fromIntegral <$> S.getWord32le
+  inCount  <- getVarInt'
+  inputs   <- replicateM (fromIntegral inCount) S.get
+  outCount <- getVarInt'
+  outputs  <- replicateM (fromIntegral outCount) S.get
+  lockTime <- S.getWord32le
+  return Tx { txVersion  = version
+            , txInputs   = inputs
+            , txOutputs  = outputs
+            , txWitness  = replicate (length inputs) []
+            , txLockTime = lockTime
+            }
+
+-- | Run a 'Get' over the full input and accept ONLY if it consumes every
+-- byte (Core's @if (ssData.empty()) ok = true@ gate in 'DecodeTx').
+-- 'runGetState' returns the trailing remainder; we require it to be empty.
+runFullConsume :: S.Get a -> ByteString -> Maybe a
+runFullConsume g bs = case S.runGetState g bs 0 of
+  Right (a, rest) | BS.null rest -> Just a
+  _                              -> Nothing
+
+-- | Decode a raw transaction the way Core's 'DecodeTx' does, with the
+-- crucial FULL-CONSUMPTION gate.
+--
+-- ⚠️ Core accepts a candidate decode only when the byte stream is fully
+-- consumed.  An empty-vin legacy tx whose leading 0x00 is mis-read as a
+-- segwit marker leaves trailing bytes UNCONSUMED; accepting the first
+-- witness-parse success without this check silently DROPS outputs (the
+-- bug fixed in sibling impls).
+--
+--   * @tryWit@   — try the witness (extended) decode (stock 'Serialize Tx',
+--     which reads a 0x00 0x01 marker/flag).  Restricted off when
+--     iswitness=false.
+--   * @tryLegacy@ — try the legacy decode ('getLegacyTx').  Restricted off
+--     when iswitness=true.
+--
+-- Only candidates that fully consume the input are eligible.  If both are
+-- eligible, prefer the witness one (Core returns the extended decode when
+-- both succeed and the sanity tie-break does not pick legacy; haskoin has
+-- no script-sanity check, so we always prefer extended on a tie).
+decodeTxFullConsume :: Bool -> Bool -> ByteString -> Either (Int, Text) Tx
+decodeTxFullConsume tryWit tryLegacy bs =
+  let okWit    = if tryWit    then runFullConsume (S.get :: S.Get Tx) bs else Nothing
+      okLegacy = if tryLegacy then runFullConsume getLegacyTx          bs else Nothing
+  in case okWit of
+       Just tx -> Right tx
+       Nothing -> case okLegacy of
+         Just tx -> Right tx
+         Nothing -> Left (rpcDeserializationError, "TX decode failed")
+
+-- | Pure core of converttopsbt.  Decodes a raw tx (with the full-consumption
+-- gate), optionally rejects sigdata, clears all scriptSigs/witnesses, and
+-- builds a blank PSBT.  Returns 'Left' (code, message) on error.
+--
+-- @iswitness@ is 'Maybe Bool': 'Nothing' = heuristic (try both decodes),
+-- 'Just True' = witness-only, 'Just False' = legacy-only — mirroring Core's
+-- @try_witness@ / @try_no_witness@ flags.
+convertToPsbt :: ByteString -> Bool -> Maybe Bool -> Either (Int, Text) Psbt
+convertToPsbt rawBytes permitSigData iswitness = do
+  let tryWit    = maybe True id iswitness
+      tryLegacy = maybe True not iswitness
+  tx <- decodeTxFullConsume tryWit tryLegacy rawBytes
+  -- Reject sigdata unless permitsigdata (Core converttopsbt 1704-1710).
+  -- A scriptSig is sigdata; a non-empty witness stack is sigdata.
+  let witnessOf i = case drop i (txWitness tx) of
+        (w:_) -> w
+        []    -> []
+      hasSig i inp = not (BS.null (txInScript inp)) || not (null (witnessOf i))
+      anySig = or (zipWith hasSig [0 ..] (txInputs tx))
+  if anySig && not permitSigData
+    then Left ( rpcDeserializationError
+              , "Inputs must not have scriptSigs and scriptWitnesses" )
+    else
+      -- 'emptyPsbt' clears all scriptSigs + witnesses on the embedded tx
+      -- and builds one empty per-input + one empty per-output map.
+      Right (emptyPsbt tx)
+
+-- | converttopsbt RPC: convert a network-serialized transaction to a base64
+-- PSBT.  Reference: bitcoin-core/src/rpc/rawtransaction.cpp converttopsbt.
+--
+-- Parameters:
+--   hexstring (required): hex of a raw transaction
+--   permitsigdata (optional, default false): if true, discard signatures;
+--     if false, fail when any input carries a scriptSig or witness
+--   iswitness (optional): true = witness-only decode, false = legacy-only;
+--     absent = heuristic (try both, full-consumption-gated)
+handleConvertToPsbt :: RpcServer -> Value -> IO RpcResponse
+handleConvertToPsbt _server params =
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing hexstring parameter") Null
+    Just hexStr ->
+      case B16.decode (TE.encodeUtf8 hexStr) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+        Right rawBytes -> do
+          let permitSigData = fromMaybe False (extractParam params 1 :: Maybe Bool)
+              -- Distinguish absent (heuristic) from present (forced) — Core
+              -- treats a JSON null the same as omitted.
+              iswitness = case rawParamAt params 2 of
+                Nothing -> Nothing
+                Just _  -> extractParam params 2 :: Maybe Bool
+          case convertToPsbt rawBytes permitSigData iswitness of
+            Left (code, msg) -> return $ RpcResponse Null
+              (toJSON $ RpcError code msg) Null
+            Right psbt ->
+              let base64 = TE.decodeUtf8 $ B64.encode $ encodePsbt psbt
+              in return $ RpcResponse (toJSON base64) Null Null
+
+-- | Pure core of joinpsbts.  Joins >= 2 PSBTs into one, taking the highest
+-- tx version and lowest locktime, concatenating all inputs (clearing
+-- final/partial sig data on each per Core AddInput) and all outputs, and
+-- merging xpubs/unknown globals.  Rejects a FULL-TxIn duplicate (prevout
+-- AND scriptSig AND nSequence all equal — Core CTxIn::operator==).
+--
+-- Returns the merged PSBT in DETERMINISTIC (concatenation) order.  Core
+-- additionally shuffles input/output order for privacy; the IO handler
+-- ('handleJoinPsbts') applies that shuffle.  Because Core shuffles with a
+-- random context, byte-exact output is impossible regardless of our order;
+-- callers comparing two join results must compare the input/output SETS.
+joinPsbts :: [Psbt] -> Either (Int, Text) Psbt
+joinPsbts psbts
+  | length psbts < 2 =
+      Left (rpcInvalidParameter, "At least two PSBTs are required to join PSBTs.")
+  | otherwise =
+      let -- Core picks best_version as an UNSIGNED uint32_t max (rawtransaction.cpp);
+          -- haskoin txVersion is signed Int32, so compare by the Word32 reinterpretation
+          -- (only diverges for a pathological version with the high bit set).
+          bestVersion = foldl
+            (\acc v -> if (fromIntegral v :: Word32) > (fromIntegral acc :: Word32) then v else acc)
+            1 (map (txVersion . pgTx . psbtGlobal) psbts)
+          bestLocktime =
+            minimum (0xffffffff : map (txLockTime . pgTx . psbtGlobal) psbts)
+          base = emptyPsbt Tx
+            { txVersion  = bestVersion
+            , txInputs   = []
+            , txOutputs  = []
+            , txWitness  = []
+            , txLockTime = bestLocktime
+            }
+      in foldM addOnePsbt base psbts
+  where
+    -- Add every input + output + global of one source PSBT into the
+    -- accumulator, in source order.
+    addOnePsbt :: Psbt -> Psbt -> Either (Int, Text) Psbt
+    addOnePsbt acc src = do
+      let srcTx  = pgTx (psbtGlobal src)
+          srcVins = txInputs srcTx
+          srcIns  = psbtInputs src ++ repeat emptyPsbtInput
+      -- Add inputs one at a time so the duplicate check sees prior adds.
+      withIns <- foldM addOneInput acc (zip srcVins srcIns)
+      -- Add outputs (no dedup).
+      let srcVouts = txOutputs srcTx
+          srcOuts  = take (length srcVouts) (psbtOutputs src ++ repeat emptyPsbtOutput)
+          accTx    = pgTx (psbtGlobal withIns)
+          accTx'   = accTx
+            { txOutputs = txOutputs accTx ++ srcVouts
+            -- The global tx is always serialized legacy (witness ignored);
+            -- keep the witness-stack list aligned with the input count.
+            , txWitness = replicate (length (txInputs accTx)) [] }
+          withOuts = withIns
+            { psbtGlobal = (psbtGlobal withIns)
+                { pgTx     = accTx'
+                , pgXpubs  = Map.union (pgXpubs (psbtGlobal withIns))
+                                       (pgXpubs (psbtGlobal src))
+                , pgUnknown = Map.union (pgUnknown (psbtGlobal withIns))
+                                        (pgUnknown (psbtGlobal src)) }
+            , psbtOutputs = psbtOutputs withIns ++ srcOuts }
+      Right withOuts
+
+    -- Core PartiallySignedTransaction::AddInput (psbt.cpp:52):
+    --   * reject when the FULL CTxIn already exists (operator== compares
+    --     prevout AND scriptSig AND nSequence) — two inputs sharing an
+    --     outpoint but differing in nSequence are BOTH kept;
+    --   * UNCONDITIONALLY clear partial_sigs / final_script_sig /
+    --     final_script_witness on the added per-input map.
+    addOneInput :: Psbt -> (TxIn, PsbtInput) -> Either (Int, Text) Psbt
+    addOneInput acc (vin, pin)
+      | any (== vin) (txInputs (pgTx (psbtGlobal acc))) =
+          let op  = txInPrevOutput vin
+              txid = showHash (BlockHash (getTxIdHash (outPointHash op)))
+              n    = outPointIndex op
+          in Left ( rpcInvalidParameter
+                  , "Input " <> txid <> ":" <> T.pack (show n)
+                    <> " exists in multiple PSBTs" )
+      | otherwise =
+          let accTx  = pgTx (psbtGlobal acc)
+              accTx' = accTx { txInputs  = txInputs accTx ++ [vin]
+                             , txWitness = txWitness accTx ++ [[]] }
+              -- AddInput clears the three sig fields on every added input.
+              pinCleared = pin { piPartialSigs        = Map.empty
+                               , piFinalScriptSig     = Nothing
+                               , piFinalScriptWitness = Nothing }
+          in Right acc
+               { psbtGlobal = (psbtGlobal acc) { pgTx = accTx' }
+               , psbtInputs = psbtInputs acc ++ [pinCleared] }
+
+-- | joinpsbts RPC: join multiple distinct PSBTs into one.  Reference:
+-- bitcoin-core/src/rpc/rawtransaction.cpp joinpsbts.
+--
+-- The merge is computed by the pure 'joinPsbts'; this IO handler then
+-- SHUFFLES the merged input + output order (Core privacy parity — Core
+-- shuffles with a FastRandomContext, so the output bytes are not
+-- reproducible regardless of impl, and consumers must compare SETS).
+handleJoinPsbts :: RpcServer -> Value -> IO RpcResponse
+handleJoinPsbts _server params =
+  case extractParamArray params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParameter
+        "At least two PSBTs are required to join PSBTs.") Null
+    Just psbtsArr -> do
+      let psbtTexts = [t | String t <- V.toList psbtsArr]
+      -- Core requires >= 2 BEFORE attempting any decode (joinpsbts 1802).
+      if length psbtTexts < 2
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            "At least two PSBTs are required to join PSBTs.") Null
+        else case parsePsbtsFromBase64 psbtTexts of
+          Left err -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcDeserializationError
+              ("TX decode failed " <> T.pack err)) Null
+          Right psbts -> case joinPsbts psbts of
+            Left (code, msg) -> return $ RpcResponse Null
+              (toJSON $ RpcError code msg) Null
+            Right merged -> do
+              shuffled <- shufflePsbtIO merged
+              let base64 = TE.decodeUtf8 $ B64.encode $ encodePsbt shuffled
+              return $ RpcResponse (toJSON base64) Null Null
+
+-- | Randomly permute the input order and (independently) the output order of
+-- a merged PSBT, keeping each global-tx vin/vout aligned with its per-input /
+-- per-output map.  Core joinpsbts shuffles with a FastRandomContext for
+-- privacy (rawtransaction.cpp 1851-1870); since the permutation is random,
+-- the resulting bytes are not reproducible across runs or impls — consumers
+-- comparing two join results must compare the input/output SETS.
+shufflePsbtIO :: Psbt -> IO Psbt
+shufflePsbtIO psbt = do
+  gen0 <- SysRandom.newStdGen
+  let g       = psbtGlobal psbt
+      tx      = pgTx g
+      nIn     = length (txInputs tx)
+      nOut    = length (txOutputs tx)
+      (inPerm,  gen1) = fisherYates gen0 nIn
+      (outPerm, _   ) = fisherYates gen1 nOut
+      newVins  = applyPerm inPerm  (txInputs tx)
+      newIns   = applyPerm inPerm  (psbtInputs psbt)
+      newVouts = applyPerm outPerm (txOutputs tx)
+      newOuts  = applyPerm outPerm (psbtOutputs psbt)
+      tx'      = tx { txInputs  = newVins
+                    , txOutputs = newVouts
+                    , txWitness = replicate (length newVins) [] }
+  return psbt
+    { psbtGlobal  = g { pgTx = tx' }
+    , psbtInputs  = newIns
+    , psbtOutputs = newOuts }
+  where
+    applyPerm :: [Int] -> [a] -> [a]
+    applyPerm perm xs = let v = V.fromList xs in map (v V.!) perm
+
+-- | Fisher-Yates permutation of @[0 .. n-1]@ using a 'StdGen'.  Returns the
+-- permuted index list and the advanced generator.
+fisherYates :: SysRandom.StdGen -> Int -> ([Int], SysRandom.StdGen)
+fisherYates gen0 n = go gen0 (reverse [1 .. n - 1]) (V.fromList [0 .. n - 1])
+  where
+    go gen []       v = (V.toList v, gen)
+    go gen (i : is) v =
+      let (j, gen') = SysRandom.randomR (0, i) gen
+          vi = v V.! i
+          vj = v V.! j
+          v' = v V.// [(i, vj), (j, vi)]
+      in go gen' is v'
 
 -- | Finalize a PSBT and optionally extract the transaction.
 -- Reference: Bitcoin Core's finalizepsbt RPC
