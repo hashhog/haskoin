@@ -207,6 +207,26 @@ module Haskoin.Consensus
   , runBackgroundValidation
   , getAssumeUtxoProgress
   , isAssumeUtxoValidated
+    -- ** Real second-chainstate (genesis->base) re-derivation
+  , BackgroundChainstate(..)
+  , SnapshotVerdict(..)
+  , BackgroundValidationError(..)
+  , newBackgroundChainstate
+  , bgStoreId
+  , setBgActiveStoreId
+  , bgCoinCount
+  , bgGetCoin
+  , bgTipHeight
+  , connectGenesisToBase
+  , finalizeBackgroundValidation
+  , bgSnapshotCoins
+  , activateSnapshotWithRederivation
+    -- ** Runtime-registerable regtest AssumeUTXO whitelist
+  , registerRegtestAssumeUtxo
+  , clearRegtestAssumeUtxo
+  , assumeUtxoForHeightIO
+  , assumeUtxoForBlockHashIO
+  , checkAssumeutxoWhitelistIO
     -- * Block Invalidation (invalidateblock/reconsiderblock RPCs)
   , InvalidateError(..)
   , invalidateBlock
@@ -241,6 +261,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
 import Control.Exception (try, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
+import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr)
@@ -265,6 +286,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         isUnspendable, Coin(..),
                         -- AssumeUTXO support
                         SnapshotMetadata(..), UtxoSnapshot(..), AssumeUtxoData(..),
+                        SnapshotCoin(..), computeUtxoHash,
                         loadSnapshot, verifySnapshot,
                         CoinsViewDB(..), newCoinsViewDB,
                         CoinsViewCache(..), newCoinsViewCache, cacheFlush, defaultCacheSize,
@@ -335,18 +357,82 @@ data AssumeUtxoParams = AssumeUtxoParams
   , aupBlockHash     :: !BlockHash   -- ^ Block hash at this height
   } deriving (Show, Eq)
 
--- | Look up assumeUTXO data for a specific height.
+-- | Runtime-registerable AssumeUTXO whitelist, REGTEST ONLY.
+--
+-- Bitcoin Core hard-codes its @m_assumeutxo_data@ table per network; for the
+-- mainnet / testnet4 tables we keep that exact behaviour (the entries live in
+-- 'netAssumeUtxo' and are never mutated at runtime).  Regtest, however, has no
+-- canonical snapshot commitment — a functional test mines its OWN short chain,
+-- dumps the UTXO set, and must then load it back.  Core supports this via the
+-- regtest @-assumeutxo@ kernel hooks; haskoin models it with this in-memory
+-- registry so a regtest test (and ONLY a regtest test) can register a
+-- @(base_height, AssumeUtxoParams)@ pair at runtime.
+--
+-- The registry is consulted by 'assumeUtxoForHeight' /
+-- 'assumeUtxoForBlockHash' EXCLUSIVELY when the network is regtest.  Mainnet
+-- and testnet4 lookups never touch it, so their assumeutxo data is untouched.
+{-# NOINLINE regtestAssumeUtxoRegistry #-}
+regtestAssumeUtxoRegistry :: IORef [(Word32, AssumeUtxoParams)]
+regtestAssumeUtxoRegistry = unsafePerformIO (newIORef [])
+
+-- | Register a regtest AssumeUTXO whitelist entry at runtime (idempotent on
+-- height — re-registering a height replaces its params).  No-op semantics for
+-- mainnet/testnet4: there is no API to mutate those tables, by design.
+registerRegtestAssumeUtxo :: Word32 -> AssumeUtxoParams -> IO ()
+registerRegtestAssumeUtxo height params =
+  modifyIORef' regtestAssumeUtxoRegistry $ \tbl ->
+    (height, params) : filter ((/= height) . fst) tbl
+
+-- | Clear the runtime regtest AssumeUTXO whitelist (test teardown).
+clearRegtestAssumeUtxo :: IO ()
+clearRegtestAssumeUtxo = writeIORef regtestAssumeUtxoRegistry []
+
+-- | The runtime regtest whitelist entries (empty unless 'registerRegtestAssumeUtxo'
+-- was called).  Only ever non-empty under regtest.
+regtestRuntimeEntries :: Network -> IO [(Word32, AssumeUtxoParams)]
+regtestRuntimeEntries net
+  | netName net == "regtest" = readIORef regtestAssumeUtxoRegistry
+  | otherwise                = return []
+
+-- | Look up assumeUTXO data for a specific height (STATIC tables only).
+--
+-- This is the pure lookup over the hard-coded 'netAssumeUtxo' table.  The
+-- runtime-registerable regtest whitelist is consulted only by the IO variants
+-- ('assumeUtxoForHeightIO' / 'checkAssumeutxoWhitelistIO'); a pure function
+-- cannot observe a later 'registerRegtestAssumeUtxo' without an
+-- 'unsafePerformIO' CAF-sharing hazard, so the runtime path is kept explicitly
+-- in IO.  Mainnet/testnet4 only ever have static entries, so for them the pure
+-- and IO answers always agree.
 assumeUtxoForHeight :: Network -> Word32 -> Maybe AssumeUtxoParams
 assumeUtxoForHeight net height =
   lookup height (netAssumeUtxo net)
 
--- | Look up assumeUTXO data for a specific block hash.
+-- | Look up assumeUTXO data for a specific block hash (STATIC tables only).
 assumeUtxoForBlockHash :: Network -> BlockHash -> Maybe AssumeUtxoParams
 assumeUtxoForBlockHash net bh =
   listToMaybe [ p | (_, p) <- netAssumeUtxo net, aupBlockHash p == bh ]
   where
     listToMaybe [] = Nothing
     listToMaybe (x:_) = Just x
+
+-- | IO height lookup that ALSO consults the runtime-registerable regtest
+-- whitelist (regtest only).  Runtime entries shadow static ones at the same
+-- height.  Mainnet/testnet4 behave exactly like 'assumeUtxoForHeight'.
+assumeUtxoForHeightIO :: Network -> Word32 -> IO (Maybe AssumeUtxoParams)
+assumeUtxoForHeightIO net height = do
+  runtime <- regtestRuntimeEntries net
+  return $ case lookup height runtime of
+    Just p  -> Just p
+    Nothing -> assumeUtxoForHeight net height
+
+-- | IO block-hash lookup that ALSO consults the runtime-registerable regtest
+-- whitelist (regtest only).
+assumeUtxoForBlockHashIO :: Network -> BlockHash -> IO (Maybe AssumeUtxoParams)
+assumeUtxoForBlockHashIO net bh = do
+  runtime <- regtestRuntimeEntries net
+  return $ case [ p | (_, p) <- runtime, aupBlockHash p == bh ] of
+    (p:_) -> Just p
+    []    -> assumeUtxoForBlockHash net bh
 
 -- | Canonical Bitcoin Core error message for an unrecognized assumeutxo
 -- height in snapshot metadata.
@@ -372,6 +458,17 @@ assumeutxoWhitelistError h =
 checkAssumeutxoWhitelist :: Network -> Word32 -> Either String ()
 checkAssumeutxoWhitelist net height =
   case assumeUtxoForHeight net height of
+    Just _  -> Right ()
+    Nothing -> Left (assumeutxoWhitelistError height)
+
+-- | IO whitelist check that ALSO honours the runtime-registerable regtest
+-- whitelist (regtest only).  The two-stage activation and regtest tests use
+-- this so a freshly registered regtest base height is accepted; mainnet /
+-- testnet4 behave exactly like 'checkAssumeutxoWhitelist'.
+checkAssumeutxoWhitelistIO :: Network -> Word32 -> IO (Either String ())
+checkAssumeutxoWhitelistIO net height = do
+  m <- assumeUtxoForHeightIO net height
+  return $ case m of
     Just _  -> Right ()
     Nothing -> Left (assumeutxoWhitelistError height)
 
@@ -5691,8 +5788,9 @@ data AssumeUtxoState = AssumeUtxoState
   , ausSnapshotHash    :: !BlockHash                -- ^ Block hash of the snapshot
   , ausExpectedHash    :: !Hash256                  -- ^ Expected UTXO hash
   , ausCurrentHeight   :: !(IORef Word32)           -- ^ Current background validation height
-  , ausValidated       :: !(IORef Bool)             -- ^ True when background validation completes
+  , ausValidated       :: !(IORef Bool)             -- ^ True ONLY when the genesis->base re-derivation MATCHED
   , ausError           :: !(IORef (Maybe String))   -- ^ Any error during validation
+  , ausVerdict         :: !(IORef (Maybe SnapshotVerdict)) -- ^ Terminal verdict (Valid / Invalid), Nothing while running
   , ausBackgroundTask  :: !(IORef (Maybe (Async ()))) -- ^ Background validation task
   }
 
@@ -5702,6 +5800,7 @@ initAssumeUtxoState net params = do
   heightRef <- newIORef 0
   validatedRef <- newIORef False
   errorRef <- newIORef Nothing
+  verdictRef <- newIORef Nothing
   taskRef <- newIORef Nothing
   return AssumeUtxoState
     { ausNetwork = net
@@ -5711,6 +5810,7 @@ initAssumeUtxoState net params = do
     , ausCurrentHeight = heightRef
     , ausValidated = validatedRef
     , ausError = errorRef
+    , ausVerdict = verdictRef
     , ausBackgroundTask = taskRef
     }
 
@@ -5728,8 +5828,12 @@ activateSnapshot db net snapshotPath = do
     Left err -> return $ Left $ "Failed to load snapshot: " ++ err
     Right snapshot -> do
       let baseHash = smBaseBlockHash (usMetadata snapshot)
-      -- Look up assumeUtxo data for this block hash
-      case assumeUtxoForBlockHash net baseHash of
+      -- Look up assumeUtxo data for this block hash.  The IO variant also
+      -- consults the runtime-registerable regtest whitelist (regtest only), so
+      -- a regtest test can activate a snapshot whose base hash it registered;
+      -- mainnet/testnet4 still resolve against their static tables only.
+      mParams <- assumeUtxoForBlockHashIO net baseHash
+      case mParams of
         Nothing -> return $ Left $
           "Block hash not recognized as valid assumeUtxo hash: " ++ show baseHash
         Just params -> do
@@ -5747,72 +5851,343 @@ activateSnapshot db net snapshotPath = do
               return $ Right state
 
 -- | Run background validation from genesis to the snapshot height.
--- This validates all blocks from genesis to the snapshot height in a background thread.
--- When complete, it verifies that the UTXO hash matches the expected value.
--- Reference: bitcoin/src/validation.cpp MaybeValidateSnapshot
+-- This re-derives the UTXO set from genesis to the snapshot height in a
+-- background thread, in a SEPARATE store, then verifies that the recomputed
+-- HASH_SERIALIZED matches the snapshot commitment.
+-- Reference: bitcoin/src/validation.cpp MaybeCompleteSnapshotValidation
 runBackgroundValidation :: AssumeUtxoState
                         -> HaskoinDB
                         -> (Word32 -> IO (Maybe Block))  -- ^ Block getter by height
                         -> IO ()
 runBackgroundValidation state db getBlockAtHeight = do
-  task <- async $ backgroundValidationLoop state db getBlockAtHeight
+  -- Identity of the ACTIVE coins store (its RocksDB handle, as a stable
+  -- pointer-ish key) for the aliasing guard.  We model it with the database's
+  -- 'StableName'; the background store is a freshly-allocated 'Map' so it can
+  -- never share identity with the active coins DB.
+  activeId <- activeStoreIdentity db
+  task <- async $ backgroundValidationLoop state activeId getBlockAtHeight
   writeIORef (ausBackgroundTask state) (Just task)
 
--- | Internal background validation loop.
+-- | A stable identity for the ACTIVE coins store, used purely by the aliasing
+-- guard.  Two distinct stores must produce distinct identities; the same store
+-- must produce the same identity.  Backed by 'System.Mem.StableName' over the
+-- live RocksDB handle.
+activeStoreIdentity :: HaskoinDB -> IO Int
+activeStoreIdentity db = hashStableName <$> makeStableName db
+
+-- | Internal background validation loop — the REAL genesis->base re-derivation.
+--
+-- Walks every block from genesis (height 0) to the snapshot base height,
+-- applying its coin updates (spend inputs / add outputs) into a SEPARATE
+-- in-memory store ('BackgroundChainstate'), then recomputes the
+-- @HASH_SERIALIZED@ over THAT store and compares it to the snapshot commitment
+-- ('ausExpectedHash').  MATCH -> 'SnapshotValid' (validated, retire bg
+-- chainstate); MISMATCH -> 'SnapshotInvalid' (flagged, NEVER silently
+-- accepted), Core @MaybeCompleteSnapshotValidation@.
 backgroundValidationLoop :: AssumeUtxoState
-                         -> HaskoinDB
+                         -> Int                         -- ^ active coins-store identity (aliasing guard)
                          -> (Word32 -> IO (Maybe Block))
                          -> IO ()
-backgroundValidationLoop state db getBlockAtHeight = do
+backgroundValidationLoop state activeId getBlockAtHeight = do
   let targetHeight = ausSnapshotHeight state
-      net = ausNetwork state
-
-  -- Create a separate UTXO cache for background validation
-  cache <- newUTXOCache db defaultCacheSize
-
-  -- Validate blocks from genesis (height 1) to snapshot height
-  result <- try $ do
-    forM_ [1..targetHeight] $ \height -> do
-      -- Check if we've been cancelled
-      mBlock <- getBlockAtHeight height
-      case mBlock of
-        Nothing -> fail $ "Block not found at height " ++ show height
-        Just block -> do
-          -- Validate the block
-          -- Note: Full validation would include script verification
-          -- For now, we just apply the block to the UTXO set
-          let prevHash = bhPrevBlock (blockHeader block)
-          medianTime <- return 0  -- Simplified; real impl would compute MTP
-
-          -- Apply block to UTXO cache
-          applyResult <- applyBlock cache net block height medianTime (const $ return 0)
-          case applyResult of
-            Left err -> fail $ "Block validation failed at height " ++
-                              show height ++ ": " ++ err
-            Right _undo -> do
-              -- Update progress
-              writeIORef (ausCurrentHeight state) height
-
-              -- Flush on either interval or entry count limit.
-              -- At height 400K+, each block has ~4000 outputs, so 100 blocks
-              -- = ~400K entries ≈ 120MB. Hard limit at 500K entries catches
-              -- blocks with unusually many outputs.
-              cacheEntries <- readTVarIO (ucSize cache)
-              when (height `mod` 100 == 0 || cacheEntries > 500000) $ do
-                putStrLn $ "Flushing UTXO cache: " ++ show cacheEntries ++ " entries at height " ++ show height
-                flushCache cache
-
+  -- A fresh, EMPTY background chainstate (its own Map store), pre-genesis.
+  bg <- newBackgroundChainstate targetHeight activeId
+  -- 'ausExpectedHash' is the snapshot's HASH_SERIALIZED in DISPLAY order
+  -- (Bitcoin's reversed uint256 hex, as 'verifySnapshot' compares).
+  result <- connectGenesisToBaseProgress bg (ausExpectedHash state)
+              (\h -> writeIORef (ausCurrentHeight state) h)
+              getBlockAtHeight
   case result of
-    Left (e :: SomeException) -> do
-      writeIORef (ausError state) (Just $ show e)
-      writeIORef (ausValidated state) True  -- Mark as "done" even on error
-    Right () -> do
-      -- Validation complete - verify UTXO hash
-      -- Collect all coins and compute hash
-      flushCache cache
-      -- In a full implementation, we would compute MuHash3072 here
-      -- For now, mark as validated
+    Left err -> do
+      -- Hard failure (aliasing, missing block, inconsistent input): NOT
+      -- validated.  The snapshot is never silently accepted.
+      writeIORef (ausError state) (Just (show err))
+      writeIORef (ausVerdict state) (Just SnapshotInvalid)
+      writeIORef (ausValidated state) False
+    Right SnapshotValid -> do
+      writeIORef (ausVerdict state) (Just SnapshotValid)
       writeIORef (ausValidated state) True
+    Right SnapshotInvalid -> do
+      -- The independent re-derivation computed a DIFFERENT hash than the
+      -- snapshot committed to: REJECT.  Never sets ausValidated.
+      writeIORef (ausError state)
+        (Just "AssumeUTXO background re-derivation hash mismatch: snapshot REJECTED")
+      writeIORef (ausVerdict state) (Just SnapshotInvalid)
+      writeIORef (ausValidated state) False
+
+--------------------------------------------------------------------------------
+-- Real second chainstate (genesis->base re-derivation)
+--
+-- This is the genuine background chainstate Bitcoin Core builds in
+-- validation.cpp AddChainstate: a SEPARATE coins store, seeded EMPTY at
+-- genesis, that independently re-derives the UTXO set the loaded snapshot
+-- claims.  When it reaches the base height it recomputes HASH_SERIALIZED and
+-- compares it to au_data.hash_serialized (MaybeCompleteSnapshotValidation).
+--
+-- The store is a plain in-memory @Map OutPoint Coin@ — NOT the active coins
+-- DB.  An aliasing guard refuses to run if the recorded active-store identity
+-- equals THIS store's identity, so it can never become a hash-of-self.
+--------------------------------------------------------------------------------
+
+-- | Terminal verdict of a genesis->base re-derivation.
+data SnapshotVerdict
+  = SnapshotValid    -- ^ The re-derived HASH_SERIALIZED MATCHED the commitment.
+  | SnapshotInvalid  -- ^ It MISMATCHED — the snapshot is rejected.
+  deriving (Show, Eq, Generic)
+
+-- | Hard errors from the background re-derivation.  Every one of these means
+-- "NOT validated" (the snapshot is never silently accepted).
+data BackgroundValidationError
+  = BgAliasesActiveStore
+    -- ^ The background store shares identity with the ACTIVE coins store; a
+    -- hash-of-self is not an independent re-derivation, so refuse to run.
+  | BgMissingBlock !Word32
+    -- ^ A block required by the genesis->base walk was unavailable.
+  | BgMissingInput !TxId !Word32 !Word32
+    -- ^ A tx input's coin was not in the background store (txid, vout,
+    -- block-height) — the replayed chain is internally inconsistent.
+  deriving (Show, Eq, Generic)
+
+-- | The SECOND chainstate used to independently re-derive the snapshot UTXO
+-- set from genesis.  Holds its OWN coins map, seeded EMPTY at genesis,
+-- completely separate from the active chainstate's coins DB.
+data BackgroundChainstate = BackgroundChainstate
+  { bgCoins        :: !(IORef (Map OutPoint Coin))
+    -- ^ The background store's OWN UTXO set.  A freshly-allocated mutable cell,
+    -- distinct from the active coins DB.
+  , bgTipHeightRef :: !(IORef Int)
+    -- ^ Height of the last block connected (-1 == pre-genesis).
+  , bgBaseHeight   :: !Word32
+    -- ^ The snapshot base height this chainstate re-derives to.
+  , bgActiveStoreId :: !(IORef Int)
+    -- ^ Identity of the ACTIVE coins store (for the aliasing guard); 0 == "no
+    -- active store registered" (unit-test construction with no distinct
+    -- active store to alias-check against).
+  , bgStoreIdRef   :: !(IORef Int)
+    -- ^ This background store's OWN identity (a 'StableName' over 'bgCoins').
+  }
+
+-- | Create a fresh background chainstate seeded EMPTY at pre-genesis.
+--
+-- @activeId@ is the identity of the live/active coins store (e.g. from
+-- 'activeStoreIdentity'); pass @0@ only in tests that have no distinct active
+-- store to alias-check against.
+newBackgroundChainstate :: Word32 -> Int -> IO BackgroundChainstate
+newBackgroundChainstate baseHeight activeId = do
+  coinsRef  <- newIORef Map.empty
+  tipRef    <- newIORef (-1)
+  activeRef <- newIORef activeId
+  -- THIS store's identity is a StableName over its own coins cell.
+  ownId     <- hashStableName <$> makeStableName coinsRef
+  ownRef    <- newIORef ownId
+  return BackgroundChainstate
+    { bgCoins         = coinsRef
+    , bgTipHeightRef  = tipRef
+    , bgBaseHeight    = baseHeight
+    , bgActiveStoreId = activeRef
+    , bgStoreIdRef    = ownRef
+    }
+
+-- | This background store's OWN identity (for the aliasing guard / proving the
+-- two stores are distinct).
+bgStoreId :: BackgroundChainstate -> IO Int
+bgStoreId = readIORef . bgStoreIdRef
+
+-- | Record the active coins-store identity for the aliasing guard.  Lets a
+-- test pin the active id AFTER construction — used to deterministically
+-- exercise the guard by setting the active id to THIS store's own id (which
+-- then refuses a tautological hash-of-self).
+setBgActiveStoreId :: BackgroundChainstate -> Int -> IO ()
+setBgActiveStoreId bg = writeIORef (bgActiveStoreId bg)
+
+-- | Number of unspent coins currently in the background store.
+bgCoinCount :: BackgroundChainstate -> IO Int
+bgCoinCount bg = Map.size <$> readIORef (bgCoins bg)
+
+-- | Read-only access to a coin in the background store (for tests proving the
+-- phantom coin is ABSENT from a real re-derivation).
+bgGetCoin :: BackgroundChainstate -> OutPoint -> IO (Maybe Coin)
+bgGetCoin bg op = Map.lookup op <$> readIORef (bgCoins bg)
+
+-- | Height of the last connected block (-1 == pre-genesis).
+bgTipHeight :: BackgroundChainstate -> IO Int
+bgTipHeight = readIORef . bgTipHeightRef
+
+-- | The background store's coins as a list of 'SnapshotCoin', ready to feed
+-- 'computeUtxoHash' (it sorts on (txid,vout) internally, matching Core's
+-- cursor order).
+bgSnapshotCoins :: BackgroundChainstate -> IO [SnapshotCoin]
+bgSnapshotCoins bg = do
+  m <- readIORef (bgCoins bg)
+  return [ SnapshotCoin op c | (op, c) <- Map.toList m ]
+
+-- | Apply ONE block's coin updates to the background store, Core
+-- @ConnectBlock@-style (validation.cpp ConnectBlock mirror):
+--
+--   * genesis (height 0): mutates NOTHING — Core never adds the genesis
+--     coinbase to any chainstate's coins DB (it is unspendable).
+--   * coinbase tx (h>0): no inputs to spend; add its spendable outputs flagged
+--     @coinIsCoinbase=True@.
+--   * every other tx: SPEND each input's coin (must exist), then add its
+--     spendable outputs flagged @coinIsCoinbase=False@.
+--   * provably-unspendable outputs (OP_RETURN / oversize) are SKIPPED — never
+--     inserted, exactly like @CCoinsViewCache::AddCoin@ (isUnspendable).
+--
+-- This is the real state transition (spend/add), NOT a counter.
+bgConnectOneBlock :: BackgroundChainstate
+                  -> Block
+                  -> Word32       -- ^ this block's height in the active chain
+                  -> IO (Either BackgroundValidationError ())
+bgConnectOneBlock _bg _block 0 = return (Right ())   -- genesis: no UTXO mutation
+bgConnectOneBlock bg block height = go (blockTxns block)
+  where
+    go [] = return (Right ())
+    go (tx : rest) = do
+      let txid = computeTxId tx
+          isCb = isCoinbaseTx tx
+      -- Spend inputs (non-coinbase only).
+      spendRes <-
+        if isCb
+          then return (Right ())
+          else spendInputs (txInputs tx) height
+      case spendRes of
+        Left e  -> return (Left e)
+        Right () -> do
+          -- Add this tx's spendable outputs.
+          addOutputs txid isCb height (zip [0 ..] (txOutputs tx))
+          go rest
+
+    spendInputs [] _ = return (Right ())
+    spendInputs (i : is) h = do
+      let op = txInPrevOutput i
+      present <- Map.member op <$> readIORef (bgCoins bg)
+      if not present
+        then return (Left (BgMissingInput (outPointHash op) (outPointIndex op) h))
+        else do
+          modifyIORef' (bgCoins bg) (Map.delete op)
+          spendInputs is h
+
+    addOutputs _ _ _ [] = return ()
+    addOutputs txid isCb h ((vout, o) : os) = do
+      unless (isUnspendable (txOutScript o)) $ do
+        let op   = OutPoint txid vout
+            coin = Coin { coinTxOut = o, coinHeight = h, coinIsCoinbase = isCb }
+        modifyIORef' (bgCoins bg) (Map.insert op coin)
+      addOutputs txid isCb h os
+
+-- | Whether a tx is a coinbase: exactly one input whose prevout is the
+-- all-zero txid with vout 0xffffffff (Core @CTransaction::IsCoinBase@).
+isCoinbaseTx :: Tx -> Bool
+isCoinbaseTx tx =
+  case txInputs tx of
+    [i] -> let op = txInPrevOutput i
+           in outPointHash op == TxId (Hash256 (BS.replicate 32 0))
+              && outPointIndex op == 0xffffffff
+    _   -> False
+
+-- | Run the REAL genesis->base re-derivation into the SEPARATE background
+-- store, then recompute @HASH_SERIALIZED@ over THAT store's coins and compare
+-- to the snapshot commitment.
+--
+-- @assumedHash@ is the snapshot's @HASH_SERIALIZED@ in the same DISPLAY order
+-- that 'verifySnapshot' compares (Bitcoin's reversed uint256 hex).
+--
+-- Returns @Right SnapshotValid@ when the independently re-derived hash MATCHED;
+-- @Right SnapshotInvalid@ when it MISMATCHED (the non-circular reject path: the
+-- snapshot passed the load-time gate because it committed to its own hash, but
+-- the genesis->base replay computes a DIFFERENT hash); @Left@ on a hard failure
+-- (aliasing, missing block, inconsistent input) which also means NOT validated.
+connectGenesisToBase :: BackgroundChainstate
+                     -> Hash256                       -- ^ assumed (display-order) HASH_SERIALIZED
+                     -> (Word32 -> IO (Maybe Block))  -- ^ block getter by height
+                     -> IO (Either BackgroundValidationError SnapshotVerdict)
+connectGenesisToBase bg assumedHash getBlock =
+  connectGenesisToBaseProgress bg assumedHash (const (return ())) getBlock
+
+-- | As 'connectGenesisToBase', but reports per-height progress via a callback.
+connectGenesisToBaseProgress
+  :: BackgroundChainstate
+  -> Hash256
+  -> (Word32 -> IO ())              -- ^ progress callback (height connected)
+  -> (Word32 -> IO (Maybe Block))
+  -> IO (Either BackgroundValidationError SnapshotVerdict)
+connectGenesisToBaseProgress bg assumedHash onProgress getBlock = do
+  -- ALIASING GUARD: refuse to run if the background store IS the active store.
+  -- A hash-of-self is not an independent re-derivation.
+  ownId    <- readIORef (bgStoreIdRef bg)
+  activeId <- readIORef (bgActiveStoreId bg)
+  if activeId /= 0 && ownId == activeId
+    then return (Left BgAliasesActiveStore)
+    else do
+      tip0 <- readIORef (bgTipHeightRef bg)
+      let start = fromIntegral (tip0 + 1) :: Word32
+      walk start
+  where
+    walk height
+      | height > bgBaseHeight bg =
+          -- Reached the base: recompute HASH_SERIALIZED and compare.
+          Right <$> finalizeBackgroundValidation bg assumedHash
+      | otherwise = do
+          mBlock <- getBlock height
+          case mBlock of
+            Nothing -> return (Left (BgMissingBlock height))
+            Just block -> do
+              r <- bgConnectOneBlock bg block height
+              case r of
+                Left e   -> return (Left e)
+                Right () -> do
+                  writeIORef (bgTipHeightRef bg) (fromIntegral height)
+                  onProgress height
+                  walk (height + 1)
+
+-- | Recompute @HASH_SERIALIZED@ over the background store's OWN coins and
+-- compare to the commitment.  MATCH -> 'SnapshotValid', MISMATCH ->
+-- 'SnapshotInvalid'.
+--
+-- REUSES 'computeUtxoHash' / 'putTxOutSer' (the existing Core HASH_SERIALIZED
+-- routine) — it does NOT define a second hasher.  'computeUtxoHash' returns the
+-- raw double-SHA256 digest (internal uint256 byte order); we reverse it into
+-- the DISPLAY order that 'ausExpectedHash' / 'audHashSerialized' hold (exactly
+-- as 'verifySnapshot' does), then compare.
+finalizeBackgroundValidation :: BackgroundChainstate
+                             -> Hash256       -- ^ assumed (display-order) HASH_SERIALIZED
+                             -> IO SnapshotVerdict
+finalizeBackgroundValidation bg assumedHash = do
+  coins <- bgSnapshotCoins bg
+  let Hash256 rawDigest = computeUtxoHash coins
+      recomputed        = Hash256 (BS.reverse rawDigest)
+  return $ if recomputed == assumedHash then SnapshotValid else SnapshotInvalid
+
+-- | Core two-stage AssumeUTXO activation (validation.cpp ActivateSnapshot ->
+-- AddChainstate -> background re-derivation).
+--
+-- Stage 1 (load-time gate, 'activateSnapshot'): authenticate the snapshot FILE
+-- against the whitelist + its committed HASH_SERIALIZED.
+--
+-- Stage 2 (THIS function): kick the REAL genesis->base re-derivation in a
+-- SEPARATE background store, which independently re-derives the UTXO set and
+-- compares its hash to the commitment.  A snapshot that passes the load-time
+-- gate by committing to its OWN tampered hash is STILL rejected here, because
+-- the background store never reads the file — it replays the blocks.
+--
+-- Returns the activated 'AssumeUtxoState' (whose 'ausValidated' / 'ausVerdict'
+-- the spawned background task updates) on a successful load-time gate, or the
+-- load-time error otherwise.
+activateSnapshotWithRederivation
+  :: HaskoinDB
+  -> Network
+  -> FilePath                       -- ^ path to snapshot file
+  -> (Word32 -> IO (Maybe Block))   -- ^ block getter by height (genesis..base)
+  -> IO (Either String AssumeUtxoState)
+activateSnapshotWithRederivation db net snapshotPath getBlock = do
+  -- Stage 1: load-time hash gate.
+  gate <- activateSnapshot db net snapshotPath
+  case gate of
+    Left err    -> return (Left err)
+    Right state -> do
+      -- Stage 2: kick the REAL background genesis->base re-derivation.
+      runBackgroundValidation state db getBlock
+      return (Right state)
 
 -- | Get the progress of background validation (0.0 to 1.0).
 getAssumeUtxoProgress :: AssumeUtxoState -> IO Double
