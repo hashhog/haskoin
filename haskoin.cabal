@@ -189,6 +189,7 @@ test-suite haskoin-test
                , Fix65PayjoinReceiverSpec
                , Fix66PayjoinSenderSpec
                , PrioritiseTransactionSpec
+               , ParseHashVSpec
   -- W161 BUG-8: Paths_haskoin is auto-generated; cabal-version >= 2.0
   -- requires it to appear in autogen-modules whenever it is also listed
   -- in other-modules.  The test imports it (W161WordlistDataFileSpec)
