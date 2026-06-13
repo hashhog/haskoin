@@ -93,6 +93,7 @@ import Haskoin.Index
 import qualified Haskoin.Index as Index
 import qualified Haskoin.MuHash as MuHash
 import qualified PrioritiseTransactionSpec
+import qualified ParseHashVSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
@@ -22841,6 +22842,9 @@ main = hspec $ do
 
   -- W125 JSON-RPC error code parity (30-gate audit)
   W125RPCErrorParitySpec.spec
+
+  -- ParseHashV: malformed txid/blockhash -> -8 (Core v31.99 parity)
+  ParseHashVSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)
   W126BIP152CompactBlocksSpec.spec

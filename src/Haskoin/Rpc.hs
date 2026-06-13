@@ -43,6 +43,11 @@ module Haskoin.Rpc
   , rpcInternalError
   , rpcParseError
   , rpcMiscError
+  , rpcInvalidParameter
+  , rpcInvalidAddressOrKey
+    -- * Hash-argument parsing (Core ParseHashV — exported for testing)
+  , parseHash
+  , parseHashV
     -- * Transaction Error Codes
   , rpcDeserializationError
   , rpcVerifyError
@@ -199,7 +204,7 @@ import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
 import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
-import Data.Char (chr, toLower)
+import Data.Char (chr, toLower, isHexDigit)
 import Data.List (foldl', isInfixOf)
 import Text.Printf (printf)
 -- showFFloat was removed: all difficulty/fee formatting now uses
@@ -1631,10 +1636,12 @@ handleGetBlock server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
     Just hexHash -> do
-      case parseHash hexHash of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
-        Just bh -> do
+      -- Core (rpc/blockchain.cpp getblock) parses the blockhash arg via
+      -- ParseHashV BEFORE LookupBlockIndex: a malformed hash is -8 at the
+      -- parse boundary; a well-formed-but-absent hash is -5 below.
+      case parseHashV "blockhash" hexHash of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           let verbosity = fromMaybe 1 (extractParam params 1 :: Maybe Int)
           mBlock <- getBlock (rsDB server) bh
           case mBlock of
@@ -2277,10 +2284,12 @@ handleGetBlockHeader server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
     Just hexHash -> do
-      case parseHash hexHash of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
-        Just bh -> do
+      -- Core (rpc/blockchain.cpp getblockheader) parses the blockhash arg
+      -- via ParseHashV(params[0], "hash") BEFORE LookupBlockIndex: malformed
+      -- -> -8 here; well-formed-but-absent -> -5 "Block not found" below.
+      case parseHashV "hash" hexHash of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           let verbose = fromMaybe True (extractParam params 1 :: Maybe Bool)
           mHeader <- getBlockHeader (rsDB server) bh
           case mHeader of
@@ -2385,10 +2394,12 @@ handleGetTxOut :: RpcServer -> Value -> IO RpcResponse
 handleGetTxOut server params = do
   case (extractParamText params 0, extractParam params 1) of
     (Just hexTxid, Just vout) -> do
-      case parseHash hexTxid of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
-        Just bh -> do
+      -- Core (rpc/blockchain.cpp gettxout) parses the txid via ParseHashV
+      -- BEFORE the coins-view lookup: a malformed txid is -8 here; a
+      -- well-formed-but-absent txid returns JSON null below (not -5).
+      case parseHashV "txid" hexTxid of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           let op  = OutPoint (TxId (getBlockHashHash bh)) vout
               net = rsNetwork server
           mEntry <- lookupUTXO (rsUTXOCache server) op
@@ -2898,10 +2909,16 @@ handleGetRawTransaction server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
     Just hexTxid -> do
-      case parseHash hexTxid of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
-        Just bh -> do
+      -- Core (rpc/rawtransaction.cpp getrawtransaction) parses the txid arg
+      -- via ParseHashV BEFORE any lookup: a malformed txid is -8 here; a
+      -- well-formed-but-absent txid is -5 in the lookup below.  The optional
+      -- blockhash arg (param 2) is also ParseHashV'd by Core, so a malformed
+      -- blockhash is -8 too.
+      case (parseHashV "parameter 1" hexTxid, extractParamText params 2) of
+        (Left err, _) -> return $ RpcResponse Null (toJSON err) Null
+        (Right _, Just hexBh) | Left err <- parseHashV "parameter 3" hexBh ->
+          return $ RpcResponse Null (toJSON err) Null
+        (Right bh, mBlockHashText) -> do
           let txid = TxId (getBlockHashHash bh)
               -- Parse verbosity parameter: Core's ParseVerbosity accepts bool or int.
               -- bool false → 0, bool true → 1, integer n → n.
@@ -2912,8 +2929,7 @@ handleGetRawTransaction server params = do
                 Nothing    -> case extractParam params 1 :: Maybe Int of
                   Just n  -> n
                   Nothing -> 0
-              -- Parse optional blockhash parameter
-              mBlockHashText  = extractParamText params 2
+              -- Parse optional blockhash parameter (already validated as -8 above)
               mBlockHashParam = mBlockHashText >>= parseHash
               -- Whether a blockhash ARG was explicitly supplied (drives in_active_chain).
               blockHashArgGiven = case mBlockHashText of
@@ -7836,10 +7852,13 @@ handleGetMempoolEntry server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
     Just hexTxid -> do
-      case parseHash hexTxid of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
-        Just bh -> do
+      -- Core (rpc/mempool.cpp getmempoolentry) parses the txid via
+      -- ParseHashV(params[0], "txid") BEFORE the mempool lookup: a
+      -- malformed txid is -8 here; a well-formed-but-absent txid is the
+      -- "Transaction not in mempool" case below.
+      case parseHashV "txid" hexTxid of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           let txid = TxId (getBlockHashHash bh)
           mEntry <- getTransaction (rsMempool server) txid
           case mEntry of
@@ -10856,6 +10875,37 @@ parseHash hex =
     Right bs
       | BS.length bs == 32 -> Just $ BlockHash (Hash256 (BS.reverse bs))
       | otherwise -> Nothing
+
+-- | Parse a txid/blockhash argument exactly like Bitcoin Core's
+-- 'ParseHashV' (bitcoin-core/src/rpc/util.cpp:117).  A MALFORMED hash —
+-- wrong length OR non-hex characters — is rejected at the parse boundary
+-- with 'RPC_INVALID_PARAMETER' (-8) and Core's exact message, BEFORE any
+-- chainstate/mempool lookup.  A WELL-FORMED 64-hex hash that is simply
+-- absent is NOT rejected here; that case falls through to @Right@ and is
+-- handled by the caller's lookup (which returns -5 / null, unchanged).
+--
+-- Core's two messages (util.cpp:122,124), with @name@ the argument label:
+--   wrong length: "<name> must be of length 64 (not N, for '<hex>')"
+--   bad hex chars: "<name> must be hexadecimal string (not '<hex>')"
+--
+-- Core's @uint256::FromHex@ accepts a string iff it is EXACTLY 64
+-- characters, all hex digits; that defines the well-formed predicate
+-- here (and matches the 32-byte success path of 'parseHash').
+parseHashV :: Text -> Text -> Either RpcError BlockHash
+parseHashV name hex =
+  case parseHash hex of
+    Just bh | T.length hex == expectedLen && T.all isHexDigit hex -> Right bh
+    _
+      | T.length hex /= expectedLen ->
+          Left $ RpcError rpcInvalidParameter $
+            name <> " must be of length " <> T.pack (show expectedLen)
+                 <> " (not " <> T.pack (show (T.length hex))
+                 <> ", for '" <> hex <> "')"
+      | otherwise ->
+          Left $ RpcError rpcInvalidParameter $
+            name <> " must be hexadecimal string (not '" <> hex <> "')"
+  where
+    expectedLen = 64 :: Int
 
 -- | Convert TxId to BlockHash (for display purposes)
 blockHashFromTxId :: TxId -> BlockHash
