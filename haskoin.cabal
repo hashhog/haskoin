@@ -185,6 +185,7 @@ test-suite haskoin-test
                , W171FeelerGetAddrSpec
                , W172GetChainStatesSpec
                , W175FundRawTransactionSpec
+               , W176SignRawTxWithKeySpec
                , Paths_haskoin
                , Bip21Spec
                , Fix64TlsSpec
