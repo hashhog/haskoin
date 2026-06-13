@@ -68,6 +68,10 @@ module Haskoin.Rpc
   , deploymentInfoForEntry
   , softforksFromEntry
   , mempoolErrorToRpcResponse
+    -- * getchainstates (Bitcoin Core v23) — handler + pure core (exported for testing)
+  , handleGetChainStates
+  , chainStatesResultEnc
+  , chainStateEntryEnc
     -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
   , handleGetBlockFromPeer
   , decideGetBlockFromPeer
@@ -461,6 +465,18 @@ data RpcConfig = RpcConfig
   , rpcTlsKeyFile  :: !(Maybe FilePath)
     -- ^ @-rpctlskey=\<file\>@: PEM-encoded private key matching
     -- 'rpcTlsCertFile'.  See 'rpcTlsCertFile' for the full contract.
+  , rpcDbCacheMb   :: !Int
+    -- ^ The parsed @-dbcache=N@ budget in MiB (Core
+    -- @DEFAULT_DB_CACHE = 450@).  haskoin sizes its RocksDB block
+    -- cache to exactly @N * 1024 * 1024@ bytes
+    -- (@dbBlockCacheSize@ in 'app/Main.hs', the genuine on-disk
+    -- coins-DB cache) and its in-memory UTXO (coins-tip) cache to
+    -- @N * 1024 * 1024 \`div\` 100@ ENTRIES.  Threaded in from
+    -- @app/Main.hs@'s @noDbCache@ so 'getchainstates' can report the
+    -- real configured coins-cache budgets
+    -- (@cs.m_coinsdb_cache_size_bytes@ /
+    -- @cs.m_coinstip_cache_size_bytes@ in Core's
+    -- @rpc/blockchain.cpp@ make_chain_data).
   } deriving (Show, Generic)
 
 instance NFData RpcConfig
@@ -481,6 +497,7 @@ defaultRpcConfig = RpcConfig
   , rpcRestEnabled = False
   , rpcTlsCertFile = Nothing
   , rpcTlsKeyFile  = Nothing
+  , rpcDbCacheMb   = 450   -- Core DEFAULT_DB_CACHE (init.cpp)
   }
 
 --------------------------------------------------------------------------------
@@ -1125,6 +1142,7 @@ handleRpcRequest server req = do
     "invalidateblock"      -> handleInvalidateBlock server params
     "reconsiderblock"      -> handleReconsiderBlock server params
     "getchaintxstats"      -> handleGetChainTxStats server params
+    "getchainstates"       -> handleGetChainStates server
 
     -- Index status RPC
     "getindexinfo"         -> handleGetIndexInfo server params
@@ -1388,6 +1406,124 @@ handleGetBlockchainInfo server = do
               pair "warnings"             (AE.list text [])
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | @getchainstates@ (Bitcoin Core v23+) — report information about the
+-- node's chainstates.
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp getchainstates
+-- (RPCHelpForChainstate + make_chain_data).  Core emits:
+--
+-- @
+--   { "headers": <int>,                 -- m_best_header->nHeight, or -1 if none
+--     "chainstates": [                  -- ordered by work, ACTIVE (most-work) LAST
+--       { "blocks": <int>,                          -- chain.Height()
+--         "bestblockhash": <hex>,                   -- tip->GetBlockHash()
+--         "bits": <hex>,                            -- strprintf("%08x", tip->nBits)
+--         "target": <hex>,                          -- GetTarget(...).GetHex()
+--         "difficulty": <num>,                      -- GetDifficulty(*tip)
+--         "verificationprogress": <num>,            -- GuessVerificationProgress
+--         "coins_db_cache_bytes": <int>,            -- cs.m_coinsdb_cache_size_bytes
+--         "coins_tip_cache_bytes": <int>,           -- cs.m_coinstip_cache_size_bytes
+--         "snapshot_blockhash": <hex>,              -- OPTIONAL, from-snapshot only
+--         "validated": <bool> } ] }                 -- m_assumeutxo == VALIDATED
+-- @
+--
+-- haskoin runs a SINGLE, fully-validated chainstate: it has no
+-- background-validation / from-snapshot split chainstate (the
+-- @--load-snapshot@ path validates and promotes a snapshot in place
+-- rather than holding an unvalidated one).  So 'chainstates' is always
+-- a 1-element array with @validated = True@, @snapshot_blockhash@
+-- OMITTED, and the active chainstate trivially last (Core's
+-- HistoricalChainstate() is null → only CurrentChainstate() is pushed).
+--
+-- The chainstate-derived fields come from the /validated/ chain tip
+-- ('getValidatedChainTip', @PrefixBestBlock@ → 'ChainEntry'), exactly
+-- as 'handleGetBlockchainInfo' does; @headers@ comes from the in-memory
+-- header tip ('hcHeight'), matching Core's @m_best_header->nHeight@.
+handleGetChainStates :: RpcServer -> IO RpcResponse
+handleGetChainStates server = do
+  -- Validated tip drives every chainstate-derived field.
+  tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  -- Header tip drives the 'headers' field only (Core m_best_header).
+  headerHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+  let net   = rsNetwork server
+      -- Genuine, configured coins-cache budget (MiB → bytes).  See
+      -- 'chainStatesResultEnc' for why both fields use this value.
+      dbCacheMb = rpcDbCacheMb (rsConfig server)
+      rawBs = encodingToLazyByteString (chainStatesResultEnc net tip headerHeight dbCacheMb)
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Pure core of 'handleGetChainStates': build the full getchainstates
+-- result encoding for a given network, validated chain tip, header-tip
+-- height, and configured @-dbcache@ budget (MiB).  Exported for testing.
+--
+-- Emits a 1-element @chainstates@ array (haskoin's single validated
+-- chainstate), most-work/active chainstate trivially last.
+chainStatesResultEnc
+  :: Network    -- ^ active network (for the difficulty target's powLimit shape)
+  -> ChainEntry -- ^ validated chain tip
+  -> Word32     -- ^ header-tip height (Core m_best_header->nHeight)
+  -> Int        -- ^ configured -dbcache budget in MiB
+  -> AE.Encoding
+chainStatesResultEnc net tip headerHeight dbCacheMb =
+  pairs $
+    -- Core: m_best_header ? m_best_header->nHeight : -1.  haskoin always
+    -- has at least the genesis header in memory, so this is the in-memory
+    -- header-chain height (a non-negative Int, like Core's nHeight).
+    pair "headers"     (AE.int (fromIntegral headerHeight)) <>
+    pair "chainstates" (AE.list id [chainStateEntryEnc net tip dbCacheMb True Nothing])
+
+-- | Build one chainstate object (Core make_chain_data).  Exported for
+-- testing.
+--
+-- Cache-budget honesty (Core pushes BOTH unconditionally):
+--
+--   * @coins_db_cache_bytes@ — haskoin sizes its RocksDB block cache to
+--     exactly @dbcache * 1024 * 1024@ bytes (@dbBlockCacheSize@ in
+--     'app/Main.hs'), which IS the on-disk coins-DB cache.  This is a
+--     genuine, tracked byte value.
+--   * @coins_tip_cache_bytes@ — haskoin's in-memory UTXO (coins-tip)
+--     cache is sized by ENTRY COUNT (@dbcache*1024*1024 \`div\` 100@
+--     entries), NOT bytes, so there is no native byte figure to report.
+--     We surface the configured @dbcache@ budget here (same approach as
+--     the ouroboros / blockbrew fleet references), so the field is a
+--     real configured budget rather than a fabricated number.
+--
+-- @snapshot_blockhash@ is OMITTED unless this is a from-snapshot
+-- chainstate (Core only pushKV's it for @cs.m_from_snapshot_blockhash@).
+chainStateEntryEnc
+  :: Network             -- ^ active network
+  -> ChainEntry          -- ^ this chainstate's tip
+  -> Int                 -- ^ configured -dbcache budget in MiB
+  -> Bool                -- ^ validated? (True for haskoin's sole chainstate)
+  -> Maybe BlockHash     -- ^ snapshot base hash, when from-snapshot
+  -> AE.Encoding
+chainStateEntryEnc _net tip dbCacheMb validated mSnapshot =
+  let bits          = bhBits (ceHeader tip)
+      progress      = computeVerificationProgress (ceHeight tip)
+                                                  (bhTimestamp (ceHeader tip))
+      cacheBytes    = fromIntegral dbCacheMb * 1024 * 1024 :: Int64
+      -- OPTIONAL snapshot_blockhash, emitted in Core's field order
+      -- (after the coins-cache pair, before 'validated').
+      snapshotEnc   = case mSnapshot of
+                        Just h  -> pair "snapshot_blockhash" (text (showHash h))
+                        Nothing -> mempty
+  in pairs $
+       pair "blocks"               (AE.word32 (ceHeight tip))                        <>
+       pair "bestblockhash"        (text (showHash (ceHash tip)))                    <>
+       pair "bits"                 (text (showBits bits))                            <>
+       -- target = Core GetTarget(...).GetHex(): the full 64-char
+       -- zero-padded uint256 hex (arith_uint256 base_blob GetHex never
+       -- strips leading zeros), matching getblock / getblockheader here.
+       pair "target"               (text (showHex64 (bitsToTarget bits)))           <>
+       -- difficulty via the Core %.16g FFI formatting (snprintf), same as
+       -- getblockchaininfo, so the bytes match Core's GetDifficulty output.
+       pair "difficulty"           (unsafeToEncoding (stringUtf8 (difficultyStr bits))) <>
+       pair "verificationprogress" (AE.double progress)                             <>
+       pair "coins_db_cache_bytes"  (AE.int64 cacheBytes)                           <>
+       pair "coins_tip_cache_bytes" (AE.int64 cacheBytes)                           <>
+       snapshotEnc                                                                  <>
+       pair "validated"            (AE.bool validated)
 
 -- | Pure helper: build the full getdeploymentinfo result for a given
 -- network configuration and chain entry.
@@ -9537,6 +9673,7 @@ allRpcCommands =
   , "getblockhash height"
   , "getblockheader \"blockhash\" ( verbose )"
   , "getchaintips"
+  , "getchainstates"
   , "getchaintxstats ( nblocks \"blockhash\" )"
   , "getdifficulty"
   , "gettxout \"txid\" n ( include_mempool )"
@@ -9631,6 +9768,8 @@ getCommandHelp cmd = case T.toLower cmd of
     "getblock \"blockhash\" ( verbosity )\n\nIf verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\nIf verbosity is 1, returns an Object with information about block <hash>.\nIf verbosity is 2, returns an Object with information about block <hash> and information about each transaction."
   "getchaintips" ->
     "getchaintips\n\nReturn information about all known tips in the block tree, including the main chain as well as orphaned branches.\n\nResult:\n[\n  {\n    \"height\": n,       (numeric) height of the chain tip\n    \"hash\": \"hash\",   (string) block hash of the tip\n    \"branchlen\": n,    (numeric) length of branch connecting the tip to the main chain\n    \"status\": \"status\" (string) status of the chain\n  },\n  ...\n]"
+  "getchainstates" ->
+    "getchainstates\n\nReturn information about chainstates.\n\nResult:\n{\n  \"headers\": n,           (numeric) the number of headers seen so far\n  \"chainstates\": [        (json array) list of the chainstates ordered by work, with the most-work (active) chainstate last\n    {\n      \"blocks\": n,                  (numeric) number of blocks in this chainstate\n      \"bestblockhash\": \"hex\",      (string) blockhash of the tip\n      \"bits\": \"hex\",               (string) nBits: compact representation of the block difficulty target\n      \"target\": \"hex\",             (string) the difficulty target\n      \"difficulty\": n,              (numeric) difficulty of the tip\n      \"verificationprogress\": n,    (numeric) progress towards the network tip\n      \"snapshot_blockhash\": \"hex\", (string, optional) the base block of the snapshot this chainstate is based on, if any\n      \"coins_db_cache_bytes\": n,    (numeric) size of the coinsdb cache\n      \"coins_tip_cache_bytes\": n,   (numeric) size of the coinstip cache\n      \"validated\": true|false       (boolean) whether the chainstate is fully validated\n    },\n    ...\n  ]\n}"
   "decodescript" ->
     "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. hexstring    (string, required) the hex-encoded script\n\nResult:\n{\n  \"asm\": \"asm\",      (string) Script public key\n  \"type\": \"type\",    (string) The output type\n  \"address\": \"addr\", (string) bitcoin address\n  \"p2sh\": \"addr\",    (string) address of P2SH script wrapping this script\n  \"segwit\": {...}    (object) segwit wrapper info\n}"
   "testmempoolaccept" ->

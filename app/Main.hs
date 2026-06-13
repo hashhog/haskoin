@@ -1741,6 +1741,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           --   Both set => listener runs WarpTLS.runTLS; both unset =>
           --   plain HTTP (backward-compat).  Half-configured TLS
           --   aborts at startup inside startRpcServer.
+          , rpcDbCacheMb   = noDbCache
+          -- ^ The same parsed @-dbcache=N@ (MiB) used at line 752 to
+          --   size @dbBlockCacheSize = noDbCache*1024*1024@ (the
+          --   RocksDB block cache = coins-DB cache) and at line 902 to
+          --   size the UTXO cache.  'getchainstates' reports the real
+          --   configured coins-cache budgets from this value.
           }
     -- Plumb the parsed --prune=N config into the RPC server.  The
     -- 'pruneblockchain' RPC refuses calls when prune mode is off

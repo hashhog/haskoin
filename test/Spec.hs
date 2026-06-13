@@ -147,6 +147,7 @@ import qualified W168GetBlockFromPeerSpec
 import qualified W169GetTxOutConfirmationsSpec
 import qualified W170FixedSeedsSpec
 import qualified W171FeelerGetAddrSpec
+import qualified W172GetChainStatesSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -22953,6 +22954,11 @@ main = hspec $ do
   -- promote-on-success-only + bounded/off-budget; getaddr answer-once;
   -- getaddr 23%-cap min(1000, floor(0.23*size)); inbound-addr token bucket.
   W171FeelerGetAddrSpec.spec
+
+  -- W172 getchainstates — Core make_chain_data JSON-shape parity
+  -- (rpc/blockchain.cpp getchainstates): single validated chainstate,
+  -- 1-element array, snapshot_blockhash OPTIONAL, coins-cache budgets.
+  W172GetChainStatesSpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec
