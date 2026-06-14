@@ -71,6 +71,7 @@ module Haskoin.Rpc
     -- * getchainstates (Bitcoin Core v23) — handler + pure core (exported for testing)
   , handleGetChainStates
   , chainStatesResultEnc
+  , chainStatesResultEncWithSnapshot
   , chainStateEntryEnc
     -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
   , handleGetBlockFromPeer
@@ -240,7 +241,7 @@ import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
 import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing)
-import System.FilePath ((</>))
+import System.FilePath ((</>), isRelative)
 import System.Posix.Files (setFileMode)
 import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
 import System.IO.Unsafe (unsafePerformIO)
@@ -272,6 +273,12 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            chainEntriesToBlockIndex,
                            BlockIndex(biHash, biTimestamp),
                            checkAssumeutxoWhitelist,
+                           -- AssumeUTXO live RPC wiring (W138): the live
+                           -- loadtxoutset RPC drives the SAME reject-verified
+                           -- two-stage engine the offline CLI / W102 spec
+                           -- exercise; getchainstates reads back the verdict.
+                           AssumeUtxoState(..), activateSnapshotSync,
+                           SnapshotVerdict(..),
                            AssumeUtxoParams(..), assumeUtxoForBlockHash,
                            connectBlock, disconnectBlock,
                            -- Recovery: regtest coinbase must use the SAME
@@ -608,6 +615,18 @@ data RpcServer = RpcServer
     -- Read-only here, consumed by 'handleGetOrphanTxs' to expose the
     -- orphanage over RPC (Bitcoin Core v28 @getorphantxs@,
     -- rpc/mempool.cpp).  Threaded in from 'startRpcServer'.
+  , rsAssumeUtxo     :: !(IORef (Maybe AssumeUtxoState))
+    -- ^ The active AssumeUTXO snapshot chainstate, or 'Nothing' when no
+    -- snapshot has been activated over RPC.  Set by 'handleLoadTxOutSet'
+    -- after the two-stage engine (load-time hash gate + the REAL
+    -- genesis->base re-derivation, 'activateSnapshotSync') accepts a
+    -- snapshot; read by 'handleGetChainStates' to report the snapshot
+    -- chainstate's @validated@ ('ausValidated' — true ONLY when the
+    -- independent re-derivation MATCHED the committed hash) and
+    -- @snapshot_blockhash@ ('ausSnapshotHash').  Initialised to 'Nothing'
+    -- at boot.  Mirrors Core's @ChainstateManager::m_snapshot_chainstate@
+    -- + @m_assumeutxo@ state (validation.h); a single chainstate +
+    -- @Nothing@ here matches Core's "no snapshot loaded" shape exactly.
   }
 
 -- | Back-compat accessor: True iff prune mode is on (manual or auto).
@@ -873,7 +892,11 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
   -- 400 + "unavailable" until an operator flips 'pcEnabled' on.
   payjoinOffersVar <- newTVarIO Map.empty
   let payjoinCfg = defaultPayjoinConfig
-  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty payjoinOffersVar payjoinCfg orphanRef
+  -- AssumeUTXO live-RPC state: no snapshot active until 'loadtxoutset'
+  -- activates one (Core ChainstateManager starts with a single,
+  -- non-snapshot chainstate; m_snapshot_chainstate == nullptr).
+  assumeUtxoVar <- newIORef Nothing
+  let server = RpcServer config db hc pm mp fe cache net mBlockStore threadVar mockTimeVar mWalletMgr startTime cookiePath cookiePass pauseVar mIdxMgr pruneCfg BS.empty payjoinOffersVar payjoinCfg orphanRef assumeUtxoVar
   -- Subscribe the fee estimator to every NON-BLOCK mempool removal so it stops
   -- tracking txs that leave the pool unconfirmed (RBF / expiry / size-limit
   -- eviction / block-conflict).  Mirrors Core registering CBlockPolicyEstimator
@@ -1484,11 +1507,26 @@ handleGetChainStates server = do
   tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   -- Header tip drives the 'headers' field only (Core m_best_header).
   headerHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+  -- Active AssumeUTXO snapshot, if one was loaded over the live
+  -- 'loadtxoutset' RPC.  When present, the sole chainstate IS the
+  -- from-snapshot chainstate (Core CurrentChainstate() with
+  -- m_from_snapshot_blockhash set): report its real snapshot base hash and
+  -- its real 'ausValidated' flag (true ONLY when the independent
+  -- genesis->base re-derivation matched the committed hash).  When absent,
+  -- the single chainstate is the ordinary fully-validated chain
+  -- (validated=true, snapshot_blockhash omitted) — the prior behaviour.
+  mAU <- readIORef (rsAssumeUtxo server)
+  mSnapState <- case mAU of
+    Nothing -> return Nothing
+    Just st -> do
+      validated <- readIORef (ausValidated st)
+      return (Just (ausSnapshotHash st, validated))
   let net   = rsNetwork server
       -- Genuine, configured coins-cache budget (MiB → bytes).  See
       -- 'chainStatesResultEnc' for why both fields use this value.
       dbCacheMb = rpcDbCacheMb (rsConfig server)
-      rawBs = encodingToLazyByteString (chainStatesResultEnc net tip headerHeight dbCacheMb)
+      rawBs = encodingToLazyByteString
+                (chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnapState)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | Pure core of 'handleGetChainStates': build the full getchainstates
@@ -1504,12 +1542,42 @@ chainStatesResultEnc
   -> Int        -- ^ configured -dbcache budget in MiB
   -> AE.Encoding
 chainStatesResultEnc net tip headerHeight dbCacheMb =
+  -- No active snapshot: the single chainstate is the ordinary
+  -- fully-validated chain.
+  chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb Nothing
+
+-- | As 'chainStatesResultEnc', but parameterised on the active AssumeUTXO
+-- snapshot (if any).  When @Just (snapshotBaseHash, validated)@ is supplied
+-- the sole chainstate is reported as the from-snapshot chainstate (Core
+-- CurrentChainstate() with @m_from_snapshot_blockhash@ set): it emits
+-- @snapshot_blockhash@ and reports @validated@ from the supplied flag
+-- (@cs.m_assumeutxo == VALIDATED@ — true ONLY after the independent
+-- genesis->base re-derivation matched).  When @Nothing@, behaviour is
+-- identical to 'chainStatesResultEnc' (single validated chainstate,
+-- @snapshot_blockhash@ omitted).  Exported for testing.
+chainStatesResultEncWithSnapshot
+  :: Network                     -- ^ active network
+  -> ChainEntry                  -- ^ validated chain tip
+  -> Word32                      -- ^ header-tip height (Core m_best_header->nHeight)
+  -> Int                         -- ^ configured -dbcache budget in MiB
+  -> Maybe (BlockHash, Bool)     -- ^ active snapshot: (base hash, validated?)
+  -> AE.Encoding
+chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnap =
   pairs $
     -- Core: m_best_header ? m_best_header->nHeight : -1.  haskoin always
     -- has at least the genesis header in memory, so this is the in-memory
     -- header-chain height (a non-negative Int, like Core's nHeight).
     pair "headers"     (AE.int (fromIntegral headerHeight)) <>
-    pair "chainstates" (AE.list id [chainStateEntryEnc net tip dbCacheMb True Nothing])
+    pair "chainstates" (AE.list id [entry])
+  where
+    entry = case mSnap of
+      -- From-snapshot chainstate: snapshot_blockhash emitted, validated
+      -- from the real ausValidated flag.
+      Just (snapHash, validated) ->
+        chainStateEntryEnc net tip dbCacheMb validated (Just snapHash)
+      -- Ordinary single validated chainstate.
+      Nothing ->
+        chainStateEntryEnc net tip dbCacheMb True Nothing
 
 -- | Build one chainstate object (Core make_chain_data).  Exported for
 -- testing.
@@ -11119,62 +11187,168 @@ handleImportMempool server params = do
 -- AssumeUTXO RPC Handlers
 --------------------------------------------------------------------------------
 
--- | The @loadtxoutset@ RPC. Refused with @rpcInternalError@ in this
--- build.
+-- | The @loadtxoutset@ RPC — live, two-stage AssumeUTXO activation.
 --
--- Background (cross-impl audit 2026-05-05,
--- @CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md@):
--- the previous handler validated the snapshot's network magic +
--- version + on-disk shape via 'loadSnapshot', then walked the
--- whitelist and content-hash checks, and reported @coins_loaded@
--- pulled from the file's metadata header — but it NEVER called
--- 'loadSnapshotIntoLegacyUTXO' (the persistence step that actually
--- writes UTXOs to RocksDB and pins the best-block pointer). The CLI
--- path (@app\/Main.hs@, lines 558-573) calls both
--- 'loadSnapshot' AND 'loadSnapshotIntoLegacyUTXO' in sequence; the
--- RPC was a no-op that lied to the operator: the response said the
--- snapshot loaded, but @gettxoutsetinfo@ would still return zero
--- UTXOs and the chain tip would still be at genesis.
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp loadtxoutset (3368) ->
+--            validation.cpp ChainstateManager::ActivateSnapshot ->
+--            AddChainstate -> MaybeCompleteSnapshotValidation.
 --
--- Wiring 'loadSnapshotIntoLegacyUTXO' in-handler is also not enough:
--- the running daemon's 'PeerManager' / 'BlockStore' / header chain
--- were initialised at boot from the pre-load chainstate and have no
--- in-handler refresh path. The CLI is the only entry point that runs
--- BEFORE those components start.
+-- == Why this was previously refused, and how it is now addressed ==
 --
--- Fix is option (B) from rustoshi @1d0a325@ / hotbuns @e355cd7@ /
--- blockbrew + clearbit + nimrod (cross-impl wave 2026-05-05): refuse
--- the RPC at the gate, leave the datadir untouched, point the
--- operator at the @--load-snapshot@ CLI flag. Same JSON-RPC error
--- code Bitcoin Core uses in
--- @bitcoin-core\/src\/rpc\/blockchain.cpp::loadtxoutset@ when
--- @ActivateSnapshot@ cannot proceed (@RPC_INTERNAL_ERROR@ / @-32603@).
+-- The earlier handler (cross-impl audit 2026-05-05) refused the RPC
+-- outright.  Two reasons were cited, both addressed here WITHOUT touching
+-- the offline @--load-snapshot@ CLI path:
 --
--- The gate fires before any file I\/O so a refused call leaves the
--- datadir untouched.
+--   1. /Atomicity/: the old worry was that activating in-handler would
+--      have to call 'loadSnapshotIntoLegacyUTXO', which OVERWRITES the
+--      active coins store + best-block pointer — racing the live
+--      PeerManager / BlockStore / header chain that booted from the
+--      pre-load chainstate.  This handler NEVER calls
+--      'loadSnapshotIntoLegacyUTXO' and NEVER mutates the active store.
+--      It runs Core's TWO-STAGE flow against a SEPARATE, in-memory
+--      background store ('activateSnapshotSync' -> the reject-verified
+--      W102 engine): Stage 1 authenticates the snapshot FILE (whitelist
+--      + committed HASH_SERIALIZED), Stage 2 independently re-derives the
+--      UTXO set genesis->base in that separate store and compares its
+--      hash to the commitment.  The active chainstate, header chain,
+--      PeerManager and BlockStore are untouched on every path (accept,
+--      reject, or load error) — so there is nothing to race and nothing
+--      to roll back.
 --
--- Params: [path]
+--   2. /Never silently accept/: on a 'SnapshotInvalid' verdict (a
+--      tampered hash-of-self snapshot whose committed hash passes the
+--      load-time gate but whose independent re-derivation disagrees) the
+--      RPC returns @RPC_INTERNAL_ERROR@ (-32603), exactly Core's
+--      @loadtxoutset@ error code when @ActivateSnapshot@ fails, and the
+--      'rsAssumeUtxo' handle is left 'Nothing'.  Only a 'SnapshotValid'
+--      verdict records the activated state and reports success.
+--
+-- The verdict drives 'handleGetChainStates': after a successful load the
+-- @chainstates@ array reports the snapshot chainstate with
+-- @validated = ausValidated@ (true only because the re-derivation matched)
+-- and @snapshot_blockhash = ausSnapshotHash@ (Core make_chain_data).
+--
+-- Result shape (Core 3440-3443): @{coins_loaded, tip_hash, base_height,
+-- path}@.
+--
+-- Params: [path]  (relative paths are resolved against the datadir, as
+-- Core's @AbsPathForConfigVal@ does).
 handleLoadTxOutSet :: RpcServer -> Value -> IO RpcResponse
-handleLoadTxOutSet _server params =
-  -- Validate parameter shape only; never call 'loadSnapshot' or any
-  -- persistence step.
+handleLoadTxOutSet server params =
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Usage: loadtxoutset \"path\"") Null
-    Just _pathText -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInternalError loadTxOutSetGateMessage) Null
+    Just pathText -> do
+      let rawPath = T.unpack pathText
+          -- Core AbsPathForConfigVal: relative paths are prefixed with the
+          -- datadir; absolute paths are used as-is.
+          path = if isRelative rawPath
+                   then rpcDataDir (rsConfig server) </> rawPath
+                   else rawPath
+          db   = rsDB server
+          net  = rsNetwork server
+          -- Block getter genesis..base: best-chain hash by height -> block.
+          getBlockAtHeight h = do
+            mbh <- getBlockHeight db h
+            case mbh of
+              Nothing -> return Nothing
+              Just bh -> getBlock db bh
+      -- Two-stage activation, run synchronously to a terminal verdict.
+      -- Reuses the SAME reject-verified engine the W102 spec exercises;
+      -- runs entirely in a separate background store (active store
+      -- untouched).
+      eState <- activateSnapshotSync db net path getBlockAtHeight
+                  `catch` \(e :: SomeException) ->
+                    return (Left ("loadtxoutset: " ++ show e))
+      case eState of
+        -- Stage 1 (load-time gate) failed: bad magic/version/shape,
+        -- unknown base hash, non-whitelisted height, or a committed-hash
+        -- mismatch in the file itself.  Active chainstate untouched.
+        Left loadErr -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInternalError
+            (T.pack ("Unable to load UTXO snapshot: " ++ loadErr))) Null
+        Right st -> do
+          verdict <- readIORef (ausVerdict st)
+          case verdict of
+            -- Stage 2 (independent re-derivation) REJECTED the snapshot:
+            -- the genesis->base replay produced a different
+            -- HASH_SERIALIZED than the snapshot committed to.  NEVER
+            -- promote into the active store (it was never touched — the
+            -- re-derivation runs in a separate store).  We DO record the
+            -- snapshot handle (whose 'ausValidated' is False) so
+            -- getchainstates honestly reports the snapshot chainstate as
+            -- @validated = false@, mirroring Core where ActivateSnapshot
+            -- has built the from-snapshot chainstate but
+            -- MaybeCompleteSnapshotValidation has marked it not-VALIDATED.
+            -- The RPC still answers the operator with an error.
+            Just SnapshotInvalid -> do
+              mErr <- readIORef (ausError st)
+              writeIORef (rsAssumeUtxo server) (Just st)
+              return $ RpcResponse Null
+                (toJSON $ RpcError rpcInternalError
+                  (T.pack ("Unable to load UTXO snapshot: "
+                           ++ fromMaybe
+                                "background re-derivation hash mismatch: \
+                                \snapshot REJECTED"
+                                mErr))) Null
+            -- Re-derivation matched the commitment: record the activated
+            -- snapshot state so getchainstates can report validated=true
+            -- + snapshot_blockhash, and answer the operator.
+            Just SnapshotValid -> do
+              writeIORef (rsAssumeUtxo server) (Just st)
+              let baseHash   = ausSnapshotHash st
+                  baseHeight = ausSnapshotHeight st
+              coinsLoaded <- snapshotCoinsCount path net
+              return $ RpcResponse
+                (object
+                  [ "coins_loaded" .= coinsLoaded
+                  , "tip_hash"     .= showHash baseHash
+                  , "base_height"  .= baseHeight
+                  , "path"         .= T.pack path
+                  ])
+                Null Null
+            -- Should not happen: 'activateSnapshotSync' always writes a
+            -- terminal verdict.  Treat an absent verdict as a failure
+            -- rather than silently accepting.
+            Nothing -> do
+              writeIORef (rsAssumeUtxo server) Nothing
+              return $ RpcResponse Null
+                (toJSON $ RpcError rpcInternalError
+                  "Unable to load UTXO snapshot: background validation \
+                  \produced no verdict") Null
 
--- | The error message returned by the refused @loadtxoutset@ RPC.
--- Exposed as a top-level binding so tests can pin the wording without
--- a copy-paste drift hazard.
+-- | Read the snapshot's declared coin count from its metadata header, for
+-- the @coins_loaded@ result field (Core metadata.m_coins_count).  The
+-- snapshot already passed the full load-time gate inside
+-- 'activateSnapshotSync', so this re-read only fails on a concurrent file
+-- change; in that case we report 0 rather than fail the (already-accepted)
+-- activation.
+snapshotCoinsCount :: FilePath -> Network -> IO Word64
+snapshotCoinsCount path net = do
+  r <- loadSnapshot path (netMagic net)
+         `catch` \(_ :: SomeException) -> return (Left "reread failed")
+  return $ case r of
+    Right snap -> smCoinsCount (usMetadata snap)
+    Left _     -> 0
+
+-- | The atomicity note formerly returned as the refused @loadtxoutset@
+-- error.  The live handler no longer refuses the RPC, but the binding is
+-- retained: it documents the exact atomicity constraint the two-stage
+-- engine is designed around (the live activation runs in a SEPARATE store
+-- and never mutates the active chainstate), and the W102/W138 specs pin
+-- its wording.  The text still names the @--load-snapshot@ CLI flag (the
+-- in-place importer) and the "atomically activate" limitation it sidesteps.
 loadTxOutSetGateMessage :: T.Text
 loadTxOutSetGateMessage =
-  "loadtxoutset RPC is disabled in this build because the live daemon "
-  <> "cannot atomically activate a UTXO snapshot once the header-sync "
-  <> "and block-download components have started. Use the CLI flag "
-  <> "--load-snapshot=<path> at startup instead — that path imports "
-  <> "the snapshot, pins the chain tip, and writes the block index "
-  <> "before any P2P/sync components are constructed."
+  "loadtxoutset activates a UTXO snapshot WITHOUT mutating the active "
+  <> "chainstate: it cannot atomically activate the snapshot in place "
+  <> "once the header-sync and block-download components have started, so "
+  <> "it instead authenticates the file and independently re-derives the "
+  <> "UTXO set genesis->base in a SEPARATE store. For an in-place import "
+  <> "that pins the chain tip at startup, use the CLI flag "
+  <> "--load-snapshot=<path> instead — that path imports the snapshot, "
+  <> "pins the chain tip, and writes the block index before any P2P/sync "
+  <> "components are constructed."
 
 -- | What snapshot height the @dumptxoutset@ RPC has been asked to
 -- produce. Mirrors Bitcoin Core's three modes from

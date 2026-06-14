@@ -221,6 +221,7 @@ module Haskoin.Consensus
   , finalizeBackgroundValidation
   , bgSnapshotCoins
   , activateSnapshotWithRederivation
+  , activateSnapshotSync
     -- ** Runtime-registerable regtest AssumeUTXO whitelist
   , registerRegtestAssumeUtxo
   , clearRegtestAssumeUtxo
@@ -6187,6 +6188,46 @@ activateSnapshotWithRederivation db net snapshotPath getBlock = do
     Right state -> do
       -- Stage 2: kick the REAL background genesis->base re-derivation.
       runBackgroundValidation state db getBlock
+      return (Right state)
+
+-- | Core two-stage AssumeUTXO activation, run SYNCHRONOUSLY to a terminal
+-- verdict.
+--
+-- Identical to 'activateSnapshotWithRederivation' except Stage 2 runs
+-- INLINE (via the very same 'backgroundValidationLoop' the async path uses)
+-- instead of being spawned, so the caller observes the terminal
+-- 'SnapshotValid' / 'SnapshotInvalid' verdict on return.  This is what the
+-- live @loadtxoutset@ RPC needs: the handler must answer the operator with
+-- ACCEPT or REJECT, and must NOT promote a snapshot whose independent
+-- re-derivation disagrees with the committed hash.
+--
+-- The re-derivation walks a SEPARATE in-memory store (never the active
+-- coins DB — the aliasing guard in 'connectGenesisToBaseProgress' enforces
+-- this), so a synchronous run touches NOTHING in the active chainstate.
+-- That is precisely why it is safe to run from the live RPC: the active
+-- store, header chain, PeerManager and BlockStore are all left untouched
+-- regardless of verdict (Core ActivateSnapshot builds the snapshot
+-- chainstate alongside the active one; here we validate-without-promote).
+--
+-- Returns the activated 'AssumeUtxoState' (its 'ausValidated' / 'ausVerdict'
+-- already set to the terminal result) on a successful load-time gate, or the
+-- load-time error otherwise.
+activateSnapshotSync
+  :: HaskoinDB
+  -> Network
+  -> FilePath                       -- ^ path to snapshot file
+  -> (Word32 -> IO (Maybe Block))   -- ^ block getter by height (genesis..base)
+  -> IO (Either String AssumeUtxoState)
+activateSnapshotSync db net snapshotPath getBlock = do
+  -- Stage 1: load-time hash gate (whitelist + committed HASH_SERIALIZED).
+  gate <- activateSnapshot db net snapshotPath
+  case gate of
+    Left err    -> return (Left err)
+    Right state -> do
+      -- Stage 2: run the REAL genesis->base re-derivation INLINE (the same
+      -- loop the async path forks) so the verdict is known on return.
+      activeId <- activeStoreIdentity db
+      backgroundValidationLoop state activeId getBlock
       return (Right state)
 
 -- | Get the progress of background validation (0.0 to 1.0).
