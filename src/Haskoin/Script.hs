@@ -136,6 +136,19 @@ data PushDataType
   | OPDATA4  -- ^ OP_PUSHDATA4 (0x4e)
   deriving (Show, Eq, Generic)
 
+-- | The minimal canonical push-data encoding Bitcoin Core's @CScript::operator<<@
+-- uses for a byte string of the given length (script/script.h). A P2SH-wrapped
+-- witness scriptSig MUST push the redeemScript with exactly this encoding, else
+-- SCRIPT_ERR_WITNESS_MALLEATED_P2SH (interpreter.cpp:2082-2086): e.g. an
+-- OP_PUSHDATA1 of a 22-byte witness program is non-canonical and must be rejected
+-- (MINIMALDATA is policy-only and is NOT enforced under block-validation flags).
+canonicalPushType :: Int -> PushDataType
+canonicalPushType len
+  | len < 0x4c    = OPCODE
+  | len <= 0xff   = OPDATA1
+  | len <= 0xffff = OPDATA2
+  | otherwise     = OPDATA4
+
 -- | Bitcoin Script opcodes
 data ScriptOp
   -- Constants
@@ -2730,7 +2743,8 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
                   when isP2SHWrapped $ do
                     -- scriptSig must be exactly one push that equals the witness program
                     case scriptSig of
-                      Script [OP_PUSHDATA d _] | d == wpBytes -> return ()
+                      Script [OP_PUSHDATA d pt]
+                        | d == wpBytes && pt == canonicalPushType (BS.length d) -> return ()
                       _ -> Left "P2SH witness scriptSig malleated"
                   -- Dispatch on witness version
                   case ver of
