@@ -59,6 +59,10 @@
 module W138AssumeUTXOSpec (spec) where
 
 import Control.Exception (bracket)
+import Control.Concurrent.STM (newTVarIO)
+import Data.IORef (newIORef, readIORef)
+import Data.List (sortBy)
+import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as BS
 import Data.Serialize (encode, decode, runPut)
 import Data.Serialize.Put (putByteString, putWord16le, putWord32le, putWord64le)
@@ -68,7 +72,16 @@ import System.Directory (removeDirectoryRecursive, getTemporaryDirectory)
 import System.IO.Temp (createTempDirectory)
 import Test.Hspec
 
+import Data.Aeson (Value(..))
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Aeson.Key as K
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.Text.Encoding as TE
+import qualified Data.Vector as V
+
 import Haskoin.Types
+import Haskoin.Crypto (computeTxId, computeBlockHash)
 import Haskoin.Consensus
   ( Network(..)
   , regtest, mainnet, testnet4
@@ -79,14 +92,47 @@ import Haskoin.Consensus
   , assumeUtxoForBlockHash
   , checkAssumeutxoWhitelist
   , assumeutxoWhitelistError
+    -- Live loadtxoutset round-trip fixtures
+  , activateSnapshot
+  , registerRegtestAssumeUtxo
+  , clearRegtestAssumeUtxo
+  , initHeaderChain
+  , netMagic
   )
 import Haskoin.Storage
   ( SnapshotMetadata(..)
+  , SnapshotCoin(..)
+  , Coin(..)
   , snapshotMagicBytes
   , snapshotVersion
   , loadSnapshot
+  , serializeCoins
+  , computeUtxoHash
+  , isUnspendable
+  , defaultDBConfig, withDB
+  , newUTXOCache
+  , putBlock, putBlockHeight
+  , HaskoinDB
   )
-import Haskoin.Rpc (loadTxOutSetGateMessage)
+import Haskoin.Mempool (newMempool, defaultMempoolConfig)
+import Haskoin.FeeEstimator (newFeeEstimator)
+import Haskoin.Network
+  ( startPeerManager, Message
+  , defaultPeerManagerConfig, PeerManagerConfig(..)
+  )
+import Haskoin.TxOrphanage (emptyOrphanPool)
+import Haskoin.Rpc
+  ( loadTxOutSetGateMessage
+  , RpcServer(..)
+  , RpcConfig(..)
+  , defaultRpcConfig
+  , RpcResponse(..)
+  , handleLoadTxOutSet
+  , handleGetChainStates
+  )
+import Haskoin.Storage (defaultPruneConfig)
+import Haskoin.Payjoin (defaultPayjoinConfig)
+import System.FilePath ((</>))
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -552,6 +598,93 @@ spec = describe "W138 assumeUTXO snapshots (lifecycle plumbing)" $ do
           && ("12345" `isInfixOfStr` msg)
           && ("refusing to load snapshot" `isSuffixOfStr` msg)
 
+  ------------------------------------------------------------------------------
+  -- AU LIVE : loadtxoutset live RPC round-trip (G22 / G24 wiring closure)
+  --
+  -- Drives a snapshot THROUGH the live 'handleLoadTxOutSet' handler (not
+  -- just 'runBackgroundValidation') and asserts 'handleGetChainStates'
+  -- reports the snapshot chainstate's @validated@ flag.  Reuses the W102
+  -- G33 non-circular tampered-phantom construction so the REJECT is
+  -- exercised through the real handler, end to end.
+  --
+  -- Core: rpc/blockchain.cpp loadtxoutset (3368) -> ActivateSnapshot ->
+  --       MaybeCompleteSnapshotValidation; getchainstates make_chain_data.
+  ------------------------------------------------------------------------------
+  describe "AU LIVE loadtxoutset round-trip through the live RPC handler" $ do
+
+    it "AU-LIVE-1: a correct snapshot -> RPC success; getchainstates validated=true + snapshot_blockhash" $
+      withLiveServer $ \server snapDir -> do
+        -- Build + write a GENUINE snapshot (oracle UTXO set, committed to
+        -- the genuine display-order hash) and register its regtest entry.
+        let chain   = liveChain
+            file    = snapDir </> "good.dat"
+        registerLiveSnapshot (bcLiveBase chain) (bcLiveBaseHash chain) (liveOracleHash chain)
+        writeSnapshotFile file (bcLiveUtxo chain) (bcLiveBaseHash chain)
+        -- Drive the LIVE handler.
+        resp <- handleLoadTxOutSet server (jsonParams [String (T.pack file)])
+        -- Success: error is Null, result carries coins_loaded / tip_hash.
+        resError resp `shouldBe` Null
+        resResult resp `shouldNotBe` Null
+        -- getchainstates now reports the from-snapshot chainstate with
+        -- validated == true (re-derivation MATCHED) + snapshot_blockhash.
+        cs <- getChainStatesEntry server
+        field "validated" cs `shouldBe` Just (Bool True)
+        case field "snapshot_blockhash" cs of
+          Just (String _) -> pure ()
+          other -> expectationFailure
+            ("expected snapshot_blockhash hex, got " ++ show other)
+
+    it "AU-LIVE-2 (THE REJECT): a tampered hash-of-self snapshot -> RPC error; getchainstates validated=false" $
+      withLiveServer $ \server snapDir -> do
+        -- W102 G33 construction, driven THROUGH the live handler.  The
+        -- file = genuine set PLUS a phantom coin the genesis->base replay
+        -- NEVER creates; the snapshot commits to its OWN (tampered) hash —
+        -- a hash-of-self that passes the load-time gate.  The live handler
+        -- then runs the REAL re-derivation, which produces the genuine
+        -- hash != tampered commitment -> REJECT.
+        let chain    = liveChain
+            file     = snapDir </> "tampered.dat"
+            phantomOp = OutPoint (TxId (Hash256 (BS.pack (0xFA : replicate 30 0 ++ [0xCE])))) 0
+            phantom   = (phantomOp, Coin (TxOut 9900000000 (liveP2pkh 0x77)) 2 False)
+            tampered  = phantom : bcLiveUtxo chain
+            tamperedCommitment = displayHash tampered
+        -- Non-vacuity: the tampered commitment differs from the genuine one.
+        tamperedCommitment `shouldNotBe` liveOracleHash chain
+        -- Register the base with the TAMPERED (hash-of-self) commitment so
+        -- the load-time gate passes; the re-derivation is what rejects.
+        registerLiveSnapshot (bcLiveBase chain) (bcLiveBaseHash chain) tamperedCommitment
+        writeSnapshotFile file tampered (bcLiveBaseHash chain)
+        -- Drive the LIVE handler: it must REJECT.
+        resp <- handleLoadTxOutSet server (jsonParams [String (T.pack file)])
+        resError resp `shouldNotBe` Null      -- RPC error returned
+        resResult resp `shouldBe` Null        -- no success payload
+        -- And getchainstates reports the snapshot chainstate validated=false
+        -- (the re-derivation never matched the committed hash).
+        cs <- getChainStatesEntry server
+        field "validated" cs `shouldBe` Just (Bool False)
+        case field "snapshot_blockhash" cs of
+          Just (String _) -> pure ()
+          other -> expectationFailure
+            ("expected snapshot_blockhash hex on the rejected snapshot, got "
+             ++ show other)
+
+    it "AU-LIVE-3: the OFFLINE --load-snapshot gate (activateSnapshot) still accepts the same good snapshot" $
+      withLiveServer $ \server snapDir -> do
+        -- The offline CLI path's authentication helper ('activateSnapshot',
+        -- the same Stage-1 gate app/Main.hs exercises) must STILL accept the
+        -- genuine snapshot file unchanged — the live RPC wiring did not
+        -- regress it.
+        let chain = liveChain
+            file  = snapDir </> "good-offline.dat"
+        registerLiveSnapshot (bcLiveBase chain) (bcLiveBaseHash chain) (liveOracleHash chain)
+        writeSnapshotFile file (bcLiveUtxo chain) (bcLiveBaseHash chain)
+        r <- activateSnapshot (rsDB server) regtest file
+        case r of
+          Right _ -> pure ()
+          Left e  -> expectationFailure
+            ("offline --load-snapshot gate (activateSnapshot) rejected a valid \
+             \snapshot: " ++ e)
+
 -- Local string helpers (avoid haskoin/Data.Text import noise here).
 isPrefixOfStr :: String -> String -> Bool
 isPrefixOfStr p s = take (length p) s == p
@@ -564,3 +697,245 @@ isInfixOfStr p s = any (isPrefixOfStr p) (tails s)
 
 isSuffixOfStr :: String -> String -> Bool
 isSuffixOfStr p s = isPrefixOfStr (reverse p) (reverse s)
+
+--------------------------------------------------------------------------------
+-- AU LIVE round-trip fixtures
+--
+-- A small regtest chain genesis..base=3 with a REAL spend (so the
+-- re-derivation must REMOVE a coin), an INDEPENDENT oracle UTXO set (so the
+-- accept/reject are non-circular), block storage in a temp RocksDB (so the
+-- live handler's by-height block getter finds the blocks), and a minimal
+-- live 'RpcServer' (so 'handleLoadTxOutSet' / 'handleGetChainStates' run for
+-- real).  Mirrors W102's buildChain so the construction is identical.
+--------------------------------------------------------------------------------
+
+liveP2pkh :: Word8 -> BS.ByteString
+liveP2pkh seed = BS.concat
+  [ BS.pack [0x76, 0xa9, 20], BS.replicate 20 seed, BS.pack [0x88, 0xac] ]
+
+liveCoinbase :: Word32 -> Word64 -> Word8 -> Tx
+liveCoinbase height val spkSeed = Tx
+  { txVersion  = 1
+  , txInputs   = [ TxIn
+      { txInPrevOutput = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+      , txInScript     = BS.pack [ 0x03
+                                 , fromIntegral (height `mod` 256)
+                                 , fromIntegral ((height `div` 256) `mod` 256)
+                                 , fromIntegral ((height `div` 65536) `mod` 256) ]
+      , txInSequence   = 0xffffffff
+      } ]
+  , txOutputs  = [ TxOut val (liveP2pkh spkSeed) ]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
+liveSpend :: OutPoint -> Word64 -> Word8 -> Tx
+liveSpend prev val spkSeed = Tx
+  { txVersion  = 1
+  , txInputs   = [ TxIn { txInPrevOutput = prev
+                        , txInScript = BS.pack [0x51]
+                        , txInSequence = 0xffffffff } ]
+  , txOutputs  = [ TxOut val (liveP2pkh spkSeed) ]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
+liveHeader :: BlockHash -> Word32 -> BlockHeader
+liveHeader prev h = BlockHeader
+  { bhVersion    = 1
+  , bhPrevBlock  = prev
+  , bhMerkleRoot = Hash256 (BS.pack ([fromIntegral (h `mod` 256)] ++ replicate 31 0))
+  , bhTimestamp  = 1700000000 + h
+  , bhBits       = 0x207fffff
+  , bhNonce      = h
+  }
+
+-- | A built regtest chain genesis..base=3 + its independent oracle UTXO set.
+data LiveChain = LiveChain
+  { bcLiveBlocks   :: [(Word32, Block)]   -- ^ (height, block), genesis at 0
+  , bcLiveBaseHash :: BlockHash           -- ^ base (height 3) block hash
+  , bcLiveBase     :: Word32              -- ^ base height (3)
+  , bcLiveUtxo     :: [(OutPoint, Coin)]  -- ^ INDEPENDENT oracle final UTXO set
+  }
+
+liveChain :: LiveChain
+liveChain =
+  let genesisCb = liveCoinbase 0 5000000000 0x00
+      g  = Block (liveHeader (BlockHash (Hash256 (BS.replicate 32 0))) 0) [genesisCb]
+      gH = computeBlockHash (blockHeader g)
+
+      c1  = liveCoinbase 1 5000000000 0x11
+      aTx = computeTxId c1
+      b1  = Block (liveHeader gH 1) [c1]
+      b1H = computeBlockHash (blockHeader b1)
+
+      c2     = liveCoinbase 2 5000000000 0x22
+      aOut   = OutPoint aTx 0
+      spendA = liveSpend aOut 4900000000 0x55
+      b2     = Block (liveHeader b1H 2) [c2, spendA]
+      b2H    = computeBlockHash (blockHeader b2)
+
+      c3  = liveCoinbase 3 5000000000 0x33
+      b3  = Block (liveHeader b2H 3) [c3]
+      b3H = computeBlockHash (blockHeader b3)
+
+      blocks = [(0, g), (1, b1), (2, b2), (3, b3)]
+
+      -- INDEPENDENT oracle: hand-replay ConnectBlock rules (NOT via the
+      -- engine), so accept/reject are non-circular.
+      oracle = foldl applyBlk Map.empty blocks
+      applyBlk m (h, blk)
+        | h == (0 :: Word32) = m  -- genesis coinbase unspendable
+        | otherwise = foldl (applyTx h) m (blockTxns blk)
+      applyTx h m tx =
+        let isCb = let i = head (txInputs tx)
+                       op = txInPrevOutput i
+                   in length (txInputs tx) == 1
+                      && outPointHash op == TxId (Hash256 (BS.replicate 32 0))
+                      && outPointIndex op == 0xffffffff
+            m1 = if isCb then m
+                 else foldl (\acc i -> Map.delete (txInPrevOutput i) acc) m (txInputs tx)
+            txid = computeTxId tx
+            m2 = foldl (\acc (vout, o) ->
+                          if isUnspendable (txOutScript o) then acc
+                          else Map.insert (OutPoint txid vout) (Coin o h isCb) acc)
+                       m1 (zip [0 ..] (txOutputs tx))
+        in m2
+
+      oracleList = sortBy cmpOp (Map.toList oracle)
+      cmpOp (a, _) (b, _) =
+        compare (getHashBytes (outPointHash a), outPointIndex a)
+                (getHashBytes (outPointHash b), outPointIndex b)
+      getHashBytes (TxId (Hash256 bs)) = bs
+  in LiveChain
+       { bcLiveBlocks   = blocks
+       , bcLiveBaseHash = b3H
+       , bcLiveBase     = 3
+       , bcLiveUtxo     = oracleList
+       }
+
+-- | Display-order (Bitcoin reversed-hex) HASH_SERIALIZED of a coin set.
+displayHash :: [(OutPoint, Coin)] -> Hash256
+displayHash coins =
+  let Hash256 raw = computeUtxoHash [ SnapshotCoin op c | (op, c) <- coins ]
+  in Hash256 (BS.reverse raw)
+
+-- | The genuine display-order commitment of the live chain (CORRECT value).
+liveOracleHash :: LiveChain -> Hash256
+liveOracleHash = displayHash . bcLiveUtxo
+
+-- | Register a regtest assumeUTXO whitelist entry for the live round-trip.
+registerLiveSnapshot :: Word32 -> BlockHash -> Hash256 -> IO ()
+registerLiveSnapshot baseHeight baseHash commitment =
+  registerRegtestAssumeUtxo baseHeight AssumeUtxoParams
+    { aupHeight         = baseHeight
+    , aupHashSerialized = commitment
+    , aupChainTxCount   = fromIntegral baseHeight + 1
+    , aupBlockHash      = baseHash
+    }
+
+-- | Write a Core-format snapshot file: 51-byte metadata header followed by
+-- 'serializeCoins' (the same wire format 'loadSnapshot' parses).
+writeSnapshotFile :: FilePath -> [(OutPoint, Coin)] -> BlockHash -> IO ()
+writeSnapshotFile path coins baseHash = do
+  let scs  = [ SnapshotCoin op c | (op, c) <- coins ]
+      meta = SnapshotMetadata
+               { smNetworkMagic  = netMagic regtest
+               , smBaseBlockHash = baseHash
+               , smCoinsCount    = fromIntegral (length scs)
+               }
+      bytes = encode meta <> serializeCoins scs
+  BS.writeFile path bytes
+
+-- | Build a minimal live 'RpcServer' over a temp RocksDB seeded with the
+-- live chain's blocks (by hash AND by height, so the handler's by-height
+-- block getter resolves them), then run an action with the server + a
+-- snapshot scratch dir.  Clears the regtest assumeUTXO whitelist around the
+-- action so tests don't leak entries into each other.
+withLiveServer :: (RpcServer -> FilePath -> IO ()) -> IO ()
+withLiveServer action =
+  withLiveTmpDir $ \dir ->
+    withDB (defaultDBConfig (dir </> "chainstate")) $ \db -> do
+      -- Seed blocks: by hash (PrefixBlockData) and by height (PrefixBlockHeight).
+      mapM_ (\(h, blk) -> do
+               let bh = computeBlockHash (blockHeader blk)
+               putBlock db bh blk
+               putBlockHeight db h bh)
+            (bcLiveBlocks liveChain)
+      hc    <- initHeaderChain regtest
+      cache <- newUTXOCache db 1000
+      mp    <- newMempool regtest cache defaultMempoolConfig 0 0 (\_ -> return 0)
+      fe    <- newFeeEstimator
+      let pmCfg = defaultPeerManagerConfig { pmcDataDir = dir, pmcDnsSeed = False }
+      pm    <- startPeerManager regtest pmCfg liveNoopHandler
+      threadVar       <- newTVarIO Nothing
+      mockTimeVar     <- newTVarIO Nothing
+      pauseVar        <- newTVarIO False
+      payjoinOffers   <- newTVarIO Map.empty
+      orphanRef       <- newIORef emptyOrphanPool
+      assumeUtxoVar   <- newIORef Nothing
+      let cfg = defaultRpcConfig { rpcDataDir = dir }
+          server = RpcServer
+            { rsConfig = cfg, rsDB = db, rsHeaderChain = hc, rsPeerMgr = pm
+            , rsMempool = mp, rsFeeEst = fe, rsUTXOCache = cache
+            , rsNetwork = regtest, rsBlockStore = Nothing
+            , rsThread = threadVar, rsMockTime = mockTimeVar
+            , rsWalletMgr = Nothing, rsStartTime = 0
+            , rsCookieFile = dir </> ".cookie", rsCookiePassword = T.empty
+            , rsBlockSubmissionPaused = pauseVar, rsIndexMgr = Nothing
+            , rsPruneConfig = defaultPruneConfig, rsAsmapData = BS.empty
+            , rsPayjoinOffers = payjoinOffers, rsPayjoinConfig = defaultPayjoinConfig
+            , rsOrphanPool = orphanRef, rsAssumeUtxo = assumeUtxoVar
+            }
+      clearRegtestAssumeUtxo
+      action server dir
+      clearRegtestAssumeUtxo
+
+-- | No-op P2P message handler for the test PeerManager.
+liveNoopHandler :: a -> Message -> IO ()
+liveNoopHandler _ _ = return ()
+
+withLiveTmpDir :: (FilePath -> IO ()) -> IO ()
+withLiveTmpDir act = do
+  base <- getTemporaryDirectory
+  bracket
+    (createTempDirectory base "haskoin-w138-live-")
+    removeDirectoryRecursive
+    act
+
+-- | Build a positional JSON params 'Value' (an Array).
+jsonParams :: [Value] -> Value
+jsonParams = Array . V.fromList
+
+-- | Drive 'handleGetChainStates' and return the single chainstate entry as
+-- an aeson 'Object' (decoding the __RAWJSON__ sentinel-wrapped result).
+getChainStatesEntry :: RpcServer -> IO Value
+getChainStatesEntry server = do
+  resp <- handleGetChainStates server
+  v <- decodeRawResult (resResult resp)
+  case field "chainstates" v of
+    Just (Array arr) -> case toList arr of
+      (e:_) -> return e
+      []    -> fail "getchainstates returned an empty chainstates array"
+    other -> fail ("getchainstates chainstates not an array: " ++ show other)
+  where
+    toList = foldr (:) []
+
+-- | Strip the @__RAWJSON__:@ sentinel from a raw-result 'Value' and decode
+-- the embedded JSON.
+decodeRawResult :: Value -> IO Value
+decodeRawResult (String s) =
+  let magic = "__RAWJSON__:"
+      payload = if magic `T.isPrefixOf` s then T.drop (T.length magic) s else s
+  in case Aeson.decode (BL.fromStrict (TE.encodeUtf8 payload)) of
+       Just v  -> return v
+       Nothing -> fail ("could not decode getchainstates raw JSON: " ++ T.unpack payload)
+decodeRawResult v =
+  case v of
+    Object _ -> return v
+    _        -> fail ("unexpected getchainstates result shape: " ++ show v)
+
+-- | Object-field lookup helper.
+field :: T.Text -> Value -> Maybe Value
+field k (Object o) = KM.lookup (K.fromText k) o
+field _ _          = Nothing
