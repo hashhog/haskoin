@@ -150,6 +150,7 @@ import qualified W171FeelerGetAddrSpec
 import qualified W172GetChainStatesSpec
 import qualified W175FundRawTransactionSpec
 import qualified W176SignRawTxWithKeySpec
+import qualified W177SuperfluousWitnessSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -22971,6 +22972,12 @@ main = hspec $ do
   -- the SAME PSBT Signer engine signrawtransactionwithwallet uses
   -- (rpc/rawtransaction.cpp signrawtransactionwithkey / SignTransaction).
   W176SignRawTxWithKeySpec.spec
+
+  -- W177 BUG-4 (P0-CDIV): reject a BIP-144 segwit-framed tx whose every
+  -- witness stack is empty — "Superfluous witness record"
+  -- (primitives/transaction.h:228-231).  Consensus split: haskoin accepted
+  -- this and computed the same txid/merkle as the legacy encoding.
+  W177SuperfluousWitnessSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
