@@ -147,6 +147,7 @@ module Haskoin.Network
   , banPeer
   , addBanScore
   , handleAddrMessage
+  , clampAddrTimestamp
   , buildBlockLocator
     -- ** W117 DH-1 outbound dispatch (proxy / Tor / I2P / CJDNS)
   , tryConnect
@@ -4534,6 +4535,29 @@ loadBanList pm path = do
 -- Addr Message Handling
 --------------------------------------------------------------------------------
 
+-- | Clamp a peer-advertised address timestamp per Core's rule.
+--
+-- Reference: bitcoin-core\/src\/net_processing.cpp:5678-5680
+-- (ProcessAddrs):
+--   if (addr.nTime <= NodeSeconds{100000000s} || addr.nTime > current_time + 10min)
+--       addr.nTime = current_time - 5*24h;
+--
+-- A timestamp that predates 2001-03-05 (unix ≤ 100,000,000) is bogus.
+-- A timestamp more than 10 minutes in the future is also bogus (clock skew /
+-- attacker-provided).  Both cases are clamped to "5 days ago" so the address
+-- is still stored but treated as stale, making it unlikely to be relayed
+-- (Core relays only if nTime > now - 10min).
+clampAddrTimestamp :: Int64  -- ^ current POSIX time (seconds)
+                   -> Word32 -- ^ peer-advertised nTime (wire value)
+                   -> Int64  -- ^ clamped timestamp to store
+clampAddrTimestamp now peerTs =
+  let ts = fromIntegral peerTs :: Int64
+      -- Core: nTime <= 100000000 (pre-2001) OR nTime > now + 10 minutes
+      bogus = ts <= 100_000_000 || ts > now + 600
+  in if bogus
+     then now - 5 * 24 * 60 * 60   -- Core: current_time - 5*24h
+     else ts
+
 -- | Handle an addr message by adding addresses to the known pool
 -- BUG-5 FIX: feed peer-advertised addresses into pmAddrMan (addAddress)
 -- instead of inserting directly into the flat pmKnownAddrs set.
@@ -4541,20 +4565,35 @@ loadBanList pm path = do
 -- eviction, and source-group spread — all of which were bypassed before.
 -- Reference: bitcoin-core/src/net_processing.cpp ProcessMessage("addr")
 --   calls m_addrman.Add(vAddr, pfrom.addr).
+--
+-- 3G FIX: clamp peer-advertised timestamps before storing.
+-- Reference: bitcoin-core/src/net_processing.cpp:5678-5680 (ProcessAddrs).
 handleAddrMessage :: PeerManager -> Addr -> IO ()
 handleAddrMessage pm (Addr entries) = do
   now <- (round <$> getPOSIXTime :: IO Int64)
-  let addrs = mapMaybe (addrToSockAddr . aeAddress) entries
+  -- Process each entry with its own peer-advertised timestamp, clamped per
+  -- Core's rule before being stored in AddrMan (aiTime field).
   -- Each entry's source is the sending peer; we use the address itself as
   -- source here because the Addr type does not carry a per-entry source.
   -- This matches the "source = pfrom.addr" semantics in Core when the peer
   -- is untrusted (no whitelisting in this impl).
-  forM_ addrs $ \a ->
-    addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 now
+  let pairs = mapMaybe (entryToPair now) entries
+  forM_ pairs $ \(a, clampedTs) ->
+    addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 clampedTs
   -- Keep pmKnownAddrs in sync for callers that read it directly.
+  let addrs = map fst pairs
   atomically $ modifyTVar' (pmKnownAddrs pm) $
     Set.union (Set.fromList addrs)
   where
+    -- Combine timestamp clamping + SockAddr conversion for one entry.
+    -- 'now' is captured from the enclosing do-block so all entries in the
+    -- same message share the same reference time (matching Core's use of
+    -- 'current_time' across the entire vAddr loop).
+    entryToPair :: Int64 -> AddrEntry -> Maybe (SockAddr, Int64)
+    entryToPair now_ ae = do
+      a <- addrToSockAddr (aeAddress ae)
+      return (a, clampAddrTimestamp now_ (aeTimestamp ae))
+
     -- Convert NetworkAddress to SockAddr
     addrToSockAddr :: NetworkAddress -> Maybe SockAddr
     addrToSockAddr na =

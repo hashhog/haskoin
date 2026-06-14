@@ -151,6 +151,8 @@ import qualified W172GetChainStatesSpec
 import qualified W175FundRawTransactionSpec
 import qualified W176SignRawTxWithKeySpec
 import qualified W177SuperfluousWitnessSpec
+import qualified W178AddrTimestampClampSpec
+import qualified W179P2SHMalleationSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -22978,6 +22980,17 @@ main = hspec $ do
   -- (primitives/transaction.h:228-231).  Consensus split: haskoin accepted
   -- this and computed the same txid/merkle as the legacy encoding.
   W177SuperfluousWitnessSpec.spec
+
+  -- W178 Finding 3G: ADDR/ADDRV2 peer-timestamp clamping
+  -- Core net_processing.cpp:5678-5680 (ProcessAddrs): timestamps <= 100000000
+  -- (pre-2001) or > now+10min are clamped to now-5d before AddrMan storage.
+  -- Prevents eclipse via future-timestamp injection.
+  W178AddrTimestampClampSpec.spec
+
+  -- W179 WITNESS_MALLEATED_P2SH (findings 3B/4A/5A): a P2SH-wrapped witness
+  -- scriptSig must be the MINIMAL canonical push of the redeemScript
+  -- (interpreter.cpp:2082-2086); a non-canonical OP_PUSHDATA1 push must be rejected.
+  W179P2SHMalleationSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

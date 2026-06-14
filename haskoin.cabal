@@ -187,6 +187,8 @@ test-suite haskoin-test
                , W175FundRawTransactionSpec
                , W176SignRawTxWithKeySpec
                , W177SuperfluousWitnessSpec
+               , W178AddrTimestampClampSpec
+               , W179P2SHMalleationSpec
                , ConvertJoinPsbtSpec
                , Paths_haskoin
                , Bip21Spec
