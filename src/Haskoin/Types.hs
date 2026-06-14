@@ -282,6 +282,9 @@ parseLegacyTx version firstByte = do
             }
 
 -- | Parse a SegWit transaction (after marker and flag have been read)
+-- Core ref: primitives/transaction.h:228-231 — throws "Superfluous witness
+-- record" when the BIP-144 marker+flag are present but no input has a
+-- non-empty witness stack (tx.HasWitness() is false).
 parseSegWitTx :: Int32 -> Get Tx
 parseSegWitTx version = do
   inCount <- getVarInt'
@@ -291,6 +294,12 @@ parseSegWitTx version = do
   witness <- replicateM (length inputs) $ do
     stackSize <- getVarInt'
     replicateM (fromIntegral stackSize) getVarBytes
+  -- BUG-4 (P0-CDIV): Core rejects a tx that carries the segwit marker+flag
+  -- but has no non-empty witness stack ("Superfluous witness record").
+  -- Without this check haskoin accepts the malformed encoding and computes
+  -- the same txid/merkle as the legacy encoding -> consensus split.
+  when (all null witness) $
+    fail "Superfluous witness record"
   lockTime <- getWord32le
   return Tx { txVersion = version
             , txInputs = inputs
