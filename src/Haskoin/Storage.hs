@@ -184,6 +184,7 @@ module Haskoin.Storage
   , dumpTxOutSetFromDB
   , computeUtxoHash
   , computeUtxoMuHash
+  , serializeCoins
   , putTxOutSer
   , verifySnapshot
   , validateSnapshotCoins
