@@ -101,6 +101,7 @@ import Haskoin.Consensus
     -- BIP-68 algorithm
   , SequenceLock(..)
   , calculateSequenceLocks
+  , bip68VersionActive
   , checkSequenceLocks
   , bip68Active
     -- BIP-113 IsFinalTx
@@ -422,3 +423,17 @@ spec = describe "W132 nSequence / OP_CSV / MTP (BIP-68/112/113)" $ do
       bip68Active mainnet 419328 `shouldBe` True
     xit "BUG-8 GATE: caller responsibility — every callsite must pass tipHeight+1 not tipHeight" $
       pendingWith "BUG-8: bip68Active is correct given h = block-being-connected; callers must pass tipHeight+1, not tipHeight, to match Core DeploymentActiveAt(*pindex,...)"
+
+  -- BIP-68 version gate unsigned-compare (differential bug-hunt, 2026-06-14).
+  -- Core stores version as uint32_t and compares fEnforceBIP68 = version >= 2
+  -- UNSIGNED (tx_verify.cpp:51). haskoin stores txVersion as Int32; a signed >= 2
+  -- treats a high-bit version (0x80000002 = -2147483646) as < 2 and SKIPS BIP-68
+  -- (the bug). bip68VersionActive reinterprets as Word32. Non-vacuity is self-evident.
+  describe "BIP-68 version gate compares unsigned (Core uint32_t)" $
+    it "a high-bit version 0x80000002 enables BIP-68" $ do
+      bip68VersionActive (-2147483646 :: Int32) `shouldBe` True  -- 0x80000002
+      bip68VersionActive (-1 :: Int32) `shouldBe` True           -- 0xFFFFFFFF
+      bip68VersionActive (2 :: Int32) `shouldBe` True
+      bip68VersionActive (3 :: Int32) `shouldBe` True
+      bip68VersionActive (1 :: Int32) `shouldBe` False
+      bip68VersionActive (0 :: Int32) `shouldBe` False

@@ -171,6 +171,7 @@ module Haskoin.Consensus
   , sequenceLockTimeGranularity
   , SequenceLock(..)
   , calculateSequenceLocks
+  , bip68VersionActive
   , checkSequenceLocks
   , bip68Active
     -- * BIP9 Version Bits (Soft Fork Deployment)
@@ -1768,6 +1769,16 @@ bip68Active net height = height >= netCSVHeight net
 --   - enforceBIP68: Whether BIP68 is active (tx version >= 2 AND CSV active)
 --
 -- This is a pure function matching Bitcoin Core's CalculateSequenceLocks().
+
+-- | BIP-68 applies only when version >= 2. Core stores version as uint32_t and
+-- compares it UNSIGNED (fEnforceBIP68 = tx.version >= 2, tx_verify.cpp:51), so a
+-- high-bit version (e.g. 0x80000002) STILL enforces BIP-68. haskoin stores the
+-- version as Int32 (signed); a signed comparison treats 0x80000002 as negative and
+-- SKIPS enforcement, false-accepting a tx with an unmet relative timelock (a chain
+-- split). Reinterpret the bits as Word32 -- same as the OP_CSV path (Script.hs:2408).
+bip68VersionActive :: Int32 -> Bool
+bip68VersionActive v = (fromIntegral v :: Word32) >= 2
+
 calculateSequenceLocks :: Tx                -- ^ Transaction to check
                        -> [Word32]          -- ^ Height at which each input's UTXO was confirmed
                        -> [Word32]          -- ^ MTP of block before each input's UTXO was confirmed
@@ -1775,7 +1786,7 @@ calculateSequenceLocks :: Tx                -- ^ Transaction to check
                        -> SequenceLock
 calculateSequenceLocks tx prevHeights prevMTPs enforceBIP68
   | not enforceBIP68 = SequenceLock (-1) (-1)
-  | txVersion tx < 2 = SequenceLock (-1) (-1)  -- BIP68 requires version >= 2
+  | not (bip68VersionActive (txVersion tx)) = SequenceLock (-1) (-1)  -- BIP68 requires version >= 2 (unsigned)
   | otherwise = foldl processInput (SequenceLock (-1) (-1)) indexedInputs
   where
     indexedInputs = zip3 (txInputs tx) prevHeights prevMTPs
@@ -4939,7 +4950,7 @@ applyBlock cache net block height prevBlockMTP getMTP = do
                             writeIORef feesRef accFees1
                             -- BIP68 sequence locks (Core 2549-2561).
                             sequenceLockResult <-
-                              if enforceBIP68 && txVersion tx >= 2
+                              if enforceBIP68 && bip68VersionActive (txVersion tx)
                               then do
                                 let prevHeights = [ueHeight entry | (_, entry) <- utxoEntries]
                                 prevMTPs <- forM prevHeights $ \h ->
