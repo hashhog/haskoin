@@ -81,6 +81,7 @@ module Haskoin.Index
   , coinStatsIndexTipHeight
   , coinStatsApplyCoin
   , coinStatsRemoveCoin
+  , isBIP30UnspendableCS
     -- * TxoSpenderIndex
   , TxoSpender(..)
   , TxoSpenderIndexDB(..)
@@ -1314,6 +1315,39 @@ coinBogoSize :: Coin -> Word64
 coinBogoSize coin =
   fromIntegral (32 + 4 + 4 + 8 + 2 + BS.length (txOutScript (coinTxOut coin)))
 
+-- | Detect the two mainnet BIP30 "unspendable" duplicate-coinbase blocks.
+--
+-- Reference: bitcoin-core/src/validation.cpp IsBIP30Unspendable (line 6195).
+-- Both block hashes are compared in internal (little-endian) byte order, which
+-- is the on-disk representation used by 'BlockHash'.
+--
+-- Blocks 91722 and 91812 had their original coinbase outputs made permanently
+-- unspendable when duplicate coinbases at heights 91842 and 91880 overwrote
+-- them in the UTXO set.  The coinstatsindex must skip their coinbase outputs
+-- (not apply them to MuHash / counts) and instead increment
+-- 'csUnspendablesBIP30', mirroring Core coinstatsindex.cpp line 128-132.
+--
+-- (Cannot import 'Haskoin.Consensus.hashFromHex' here — Consensus imports
+-- Haskoin.Index, so that would be a circular dependency.  The hash bytes are
+-- the displayed hex reversed, matching what @hashFromHex@ produces.)
+isBIP30UnspendableCS :: BlockHash -> BlockHeight -> Bool
+isBIP30UnspendableCS (BlockHash (Hash256 bh)) h =
+  (h == 91722 && bh == h91722) ||
+  (h == 91812 && bh == h91812)
+  where
+    -- "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e" reversed
+    h91722 = BS.pack
+      [ 0x8e, 0xd0, 0x4d, 0x57, 0xf2, 0xf3, 0xcd, 0xc6
+      , 0xa6, 0xe5, 0x55, 0x69, 0xdc, 0x16, 0x54, 0xe1
+      , 0xf2, 0x19, 0x84, 0x7f, 0x66, 0xe7, 0x26, 0xdc
+      , 0xa2, 0x71, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+    -- "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f" reversed
+    h91812 = BS.pack
+      [ 0x2f, 0x6f, 0x30, 0xf9, 0xd6, 0x83, 0xde, 0xb8
+      , 0x5d, 0x93, 0x14, 0xef, 0x5d, 0xcf, 0x36, 0xaf
+      , 0x66, 0xd9, 0xe3, 0xce, 0x1a, 0x2b, 0x79, 0xd4
+      , 0xae, 0xf0, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+
 -- | Apply a coin to MuHash (when UTXO is created)
 coinStatsApplyCoin :: CoinStatsIndexDB -> OutPoint -> Coin -> IO ()
 coinStatsApplyCoin db outpoint coin = do
@@ -1370,15 +1404,24 @@ coinStatsIndexAppendBlock db block undo blockHash height = do
   unless (height == 0) $
     forM_ (zip [0..] (blockTxns block)) $ \(txIdx, tx) -> do
       let isCoinbase = txIdx == (0 :: Int)
-      forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, txout) -> do
-        unless (isUnspendable (txOutScript txout)) $ do
-          let outpoint = OutPoint (computeTxId tx) (fromIntegral outIdx)
-              coin = Coin txout height isCoinbase
-          coinStatsApplyCoin db outpoint coin
-          modifyIORef' (csiStats db) $ \s ->
-            if isCoinbase
-            then s { csTotalCoinbaseAmount = csTotalCoinbaseAmount s + fromIntegral (txOutValue txout) }
-            else s { csTotalNewOutputs = csTotalNewOutputs s + fromIntegral (txOutValue txout) }
+      -- Skip duplicate-txid coinbase outputs at BIP30 unspendable blocks
+      -- (mainnet heights 91722 and 91812).  Their coinbase outputs were made
+      -- permanently unspendable when duplicate coinbases at 91842/91880
+      -- overwrote them in the UTXO set.  Core coinstatsindex.cpp:128-132:
+      --   if (is_coinbase && IsBIP30Unspendable(block.hash, block.height)) {
+      --       m_total_unspendables_bip30 += block_subsidy; continue; }
+      if isCoinbase && isBIP30UnspendableCS blockHash height
+        then modifyIORef' (csiStats db) $ \s ->
+               s { csUnspendablesBIP30 = csUnspendablesBIP30 s + getBlockSubsidy height }
+        else forM_ (zip [0..] (txOutputs tx)) $ \(outIdx, txout) -> do
+               unless (isUnspendable (txOutScript txout)) $ do
+                 let outpoint = OutPoint (computeTxId tx) (fromIntegral outIdx)
+                     coin = Coin txout height isCoinbase
+                 coinStatsApplyCoin db outpoint coin
+                 modifyIORef' (csiStats db) $ \s ->
+                   if isCoinbase
+                   then s { csTotalCoinbaseAmount = csTotalCoinbaseAmount s + fromIntegral (txOutValue txout) }
+                   else s { csTotalNewOutputs = csTotalNewOutputs s + fromIntegral (txOutValue txout) }
 
   -- Process spent outputs (from real undo data).  The undo record carries
   -- the spent coin's creating height + coinbase flag, so the removed
