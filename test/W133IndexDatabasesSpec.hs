@@ -78,6 +78,7 @@ import Haskoin.Index
   , CoinStatsEntry(..)
   , IndexConfig(..)
   , defaultIndexConfig
+  , isBIP30UnspendableCS
   )
 import Haskoin.Types (BlockHash(..), Hash256(..), TxId(..))
 
@@ -232,11 +233,40 @@ spec = describe "W133 Index databases (txindex + coinstatsindex)" $ do
     it "G12 PINS: CoinStats has csUnspendablesBIP30 field" $
       csUnspendablesBIP30 emptyCs `shouldBe` 0
 
-    xit "G12 MISSING: no IsBIP30Unspendable check; field never incremented" $
-      -- Core coinstatsindex.cpp:129-132 has explicit BIP30 branch.
-      -- haskoin's csUnspendablesBIP30 field exists but no writer.
-      -- Mainnet blocks 91842 + 91880 + any regtest BIP30 fuzz diverge.
-      pendingWith "BUG-10: BIP30 detection absent (mainnet 91842/91880 + regtest)"
+    it "G12 PASS: isBIP30UnspendableCS detects both BIP30 unspendable mainnet blocks" $ do
+      -- Reference: bitcoin-core/src/validation.cpp IsBIP30Unspendable (line 6195).
+      -- Heights 91722 and 91812 had their original coinbase outputs made
+      -- permanently unspendable when duplicate coinbases at 91842/91880
+      -- overwrote them.  The coinstatsindex MUST skip their coinbase outputs.
+      --
+      -- Block hashes are in internal (little-endian) byte order: the displayed
+      -- hex string reversed byte-by-byte, matching hashFromHex in Consensus.hs.
+      --
+      -- Height 91722: "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+      let bh91722 = BlockHash $ Hash256 $ BS.pack
+            [ 0x8e, 0xd0, 0x4d, 0x57, 0xf2, 0xf3, 0xcd, 0xc6
+            , 0xa6, 0xe5, 0x55, 0x69, 0xdc, 0x16, 0x54, 0xe1
+            , 0xf2, 0x19, 0x84, 0x7f, 0x66, 0xe7, 0x26, 0xdc
+            , 0xa2, 0x71, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+      -- Height 91812: "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+          bh91812 = BlockHash $ Hash256 $ BS.pack
+            [ 0x2f, 0x6f, 0x30, 0xf9, 0xd6, 0x83, 0xde, 0xb8
+            , 0x5d, 0x93, 0x14, 0xef, 0x5d, 0xcf, 0x36, 0xaf
+            , 0x66, 0xd9, 0xe3, 0xce, 0x1a, 0x2b, 0x79, 0xd4
+            , 0xae, 0xf0, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00 ]
+      -- Both BIP30-unspendable blocks MUST be detected.
+      isBIP30UnspendableCS bh91722 91722 `shouldBe` True
+      isBIP30UnspendableCS bh91812 91812 `shouldBe` True
+      -- Wrong height with correct hash -> NOT detected (hash+height both required).
+      isBIP30UnspendableCS bh91722 91812 `shouldBe` False
+      isBIP30UnspendableCS bh91812 91722 `shouldBe` False
+      -- BIP30-*repeat* blocks (91842/91880) are NOT unspendable — they are the
+      -- duplicates themselves (checked by IsBIP30Repeat, not IsBIP30Unspendable).
+      isBIP30UnspendableCS zeroBlockHash 91842 `shouldBe` False
+      isBIP30UnspendableCS zeroBlockHash 91880 `shouldBe` False
+      -- A normal block is NOT detected.
+      isBIP30UnspendableCS zeroBlockHash 0     `shouldBe` False
+      isBIP30UnspendableCS zeroBlockHash 91722 `shouldBe` False
 
   describe "G13 total_unspendables_unclaimed_rewards arithmetic per Core formula" $ do
     it "G13 PINS: CoinStats has csUnspendablesUnclaimed field" $
