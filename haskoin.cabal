@@ -125,7 +125,12 @@ executable haskoin
                , http-types
                , time
   default-language: Haskell2010
-  ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N"
+  -- -N4 (not bare -N): on a 16C/32T box bare -N spawns 32 capabilities; the node
+  -- uses 1-2, so ~30 idle capabilities busy-spin on the scheduler/GC barrier,
+  -- burning ~4 cores at idle tip. Bounding to 4 dropped steady-state CPU from
+  -- 4.23 to 0.86 cores (measured 2026-06-15) with ample parallelism for block
+  -- validation. (Does NOT address the separate slow at-tip RSS growth.)
+  ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N4"
 
 test-suite haskoin-test
   type:          exitcode-stdio-1.0
