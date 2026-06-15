@@ -28,6 +28,7 @@ module Haskoin.FeeEstimator
   , trackTransaction
   , untrackTransaction
   , recordConfirmation
+  , decayBucket
     -- * Fee Estimation
   , estimateFee
   , estimateSmartFee
@@ -60,7 +61,7 @@ import Data.Word (Word64, Word32)
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import GHC.Generics (Generic)
-import Control.DeepSeq (NFData)
+import Control.DeepSeq (NFData, force)
 import System.Directory (doesFileExist, renameFile)
 
 import Haskoin.Types (TxId)
@@ -264,7 +265,10 @@ recordConfirmation fe blockHeight confirmedTxIds = do
               -- Increment confirmation counts for all targets >= actual blocks
               updated = zipWith (\i c -> if i < blocksToConfirm then c else c + 1)
                           [1..] confs
-          in b { fbConfirmations = updated
+          -- 'force' fully evaluates the [Double] spine+elements. fbConfirmations
+          -- is a strict field, but '!' only forces the head cons; the lazy
+          -- zipWith tail/element thunks below it would otherwise survive.
+          in b { fbConfirmations = force updated
                , fbTotalTxs = fbTotalTxs b + 1
                , fbInMempool = max 0 (fbInMempool b - 1)
                }) bucketIdx
@@ -272,13 +276,28 @@ recordConfirmation fe blockHeight confirmedTxIds = do
       modifyTVar' (feePending fe) (Map.delete (ptTxId info))
 
     -- Apply decay to all buckets
-    modifyTVar' (feeBuckets fe) $ Map.map (\b -> b
-      { fbConfirmations = map (* feeDecay fe) (fbConfirmations b)
-      , fbTotalTxs = fbTotalTxs b * feeDecay fe
-      , fbInMempool = fbInMempool b * feeDecay fe
-      })
+    modifyTVar' (feeBuckets fe) $ Map.map (decayBucket (feeDecay fe))
 
     writeTVar (feeBestHeight fe) blockHeight
+
+-- | Apply exponential decay to one fee bucket.
+--
+-- Memory-leak fix: the decay rebuilds fbConfirmations with @map (* d)@ once per
+-- connected block. fbConfirmations is a strict field ('![Double]'), but a strict
+-- field is only forced to WHNF (its head cons cell) when the FeeBucket is forced;
+-- Data.Map.Strict forces each bucket value to WHNF every block, yet the list SPINE
+-- and ELEMENTS below the head stayed lazy. So the TVar accumulated, per bucket, a
+-- thunk chain @map (* d) (map (* d) (... ))@ of depth = blocks-since-boot, retaining
+-- every prior block's list — a slow, monotonic GHC-heap leak at tip (feeBuckets is
+-- only forced by the estimate*fee RPC and shutdown, so on a node receiving no fee
+-- RPC it was never collapsed). 'force' evaluates the new list to NF each block, so
+-- nothing accumulates. Pure: same values, just evaluated eagerly.
+decayBucket :: Double -> FeeBucket -> FeeBucket
+decayBucket d b = b
+  { fbConfirmations = force (map (* d) (fbConfirmations b))
+  , fbTotalTxs = fbTotalTxs b * d
+  , fbInMempool = fbInMempool b * d
+  }
 
 --------------------------------------------------------------------------------
 -- Fee Estimation

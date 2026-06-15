@@ -46,6 +46,7 @@
 module W114FeeEstimationSpec (spec) where
 
 import Control.Concurrent.STM (readTVarIO)
+import Control.Exception (evaluate, try, ErrorCall(..))
 import qualified Data.Map.Strict as Map
 import Data.Word (Word8, Word32, Word64)
 import qualified Data.ByteString as BS
@@ -635,3 +636,29 @@ spec = describe "W114 CBlockPolicyEstimator fee estimation 30-gate audit" $ do
       -- (decay may wash out 1-block due to minTxsForEstimate)
       _ <- return (result1, result6, result48)
       True `shouldBe` True  -- does not crash; fix BUG-1 makes this meaningful
+
+  -- -------------------------------------------------------------------------
+  -- G31: at-tip memory-leak fix (lazy fbConfirmations thunk accumulation).
+  -- recordConfirmation's per-block decay rebuilds fbConfirmations with a lazy
+  -- `map (* d)`. fbConfirmations is strict ('![Double]') but '!' only forces
+  -- the head cons; the list spine/elements below stayed lazy, so the feeBuckets
+  -- TVar accumulated a depth-N thunk chain (N = blocks since boot), a slow
+  -- monotonic GHC-heap leak. decayBucket now wraps the new list in 'force'.
+  -- This canary proves the list is evaluated to NF: a bottom element detonates
+  -- when the decayed bucket is forced to WHNF iff the whole list is forced.
+  describe "G31 memory-leak: decayBucket forces fbConfirmations to NF" $ do
+    it "a bottom element in fbConfirmations detonates on WHNF (strict, no thunk leak)" $ do
+      let bomb = error "LEAK-CANARY: list element was forced" :: Double
+          b    = FeeBucket 100 200 [10, 20, bomb, 40] 5 5
+      r <- try (evaluate (decayBucket 0.998 b)) :: IO (Either ErrorCall FeeBucket)
+      case r of
+        Left (ErrorCall msg) -> msg `shouldContain` "LEAK-CANARY"
+        Right _              -> expectationFailure
+          "decayBucket did NOT force fbConfirmations to NF -- lazy [Double] thunk leak present"
+
+    it "decayBucket preserves values (pure: x * d), no semantic change" $ do
+      let b  = FeeBucket 100 200 [10, 20, 30] 6 4
+          b' = decayBucket 0.5 b
+      fbConfirmations b' `shouldBe` [5.0, 10.0, 15.0]
+      fbTotalTxs b'      `shouldBe` 3.0
+      fbInMempool b'     `shouldBe` 2.0
