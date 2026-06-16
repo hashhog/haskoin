@@ -14,6 +14,9 @@ import System.IO (hSetBuffering, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory, doesFileExist)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO, killThread)
+import System.Mem (performMajorGC)
+import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -1855,6 +1858,23 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       Daemon.sdNotifyStatus $
         "height=" ++ show h' ++ " peers=" ++ show peers'
       Daemon.sdNotifyWatchdog
+
+    -- task #10 (at-tip RSS leak FIX): at tip haskoin allocates so little that
+    -- GHC's major GC almost never runs, so produced garbage is never collected
+    -- and RSS climbs ~50-65 MB/h unbounded (8h41m -> 2.07G observed; the old
+    -- pre-fix node reached 6.7G). A periodic forced major GC collects it: a 3h
+    -- live soak with this ticker held RSS FLAT (plateau ~1.80G, +0 MB over the
+    -- last 15 min) vs the monotonic no-ticker climb -- proving the "leak" was
+    -- uncollected garbage, not a retained structure. Default ON at 60s; override
+    -- the interval via HASKOIN_GC_TICK_SECS=<n>, or set 0 to disable. (A 60s
+    -- major GC on the ~1.8G heap is a sub-second pause once a minute.)
+    gcTickEnv <- lookupEnv "HASKOIN_GC_TICK_SECS"
+    let gcTickSecs = maybe 60 (\s -> maybe 60 id (readMaybe s)) gcTickEnv :: Int
+    when (gcTickSecs > 0) $ do
+      putStrLn $ "GC ticker: forcing performMajorGC every " ++ show gcTickSecs ++ "s (HASKOIN_GC_TICK_SECS)"
+      void $ forkIO $ forever $ do
+        threadDelay (gcTickSecs * 1_000_000)
+        performMajorGC
 
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
