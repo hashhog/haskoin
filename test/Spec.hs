@@ -153,6 +153,7 @@ import qualified W176SignRawTxWithKeySpec
 import qualified W177SuperfluousWitnessSpec
 import qualified W178AddrTimestampClampSpec
 import qualified W179P2SHMalleationSpec
+import qualified W181GetPeerInfoFieldsSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -22991,6 +22992,12 @@ main = hspec $ do
   -- scriptSig must be the MINIMAL canonical push of the redeemScript
   -- (interpreter.cpp:2082-2086); a non-canonical OP_PUSHDATA1 push must be rejected.
   W179P2SHMalleationSpec.spec
+
+  -- W181 getpeerinfo Core v31.99 wire fields: last_inv_sequence + inv_to_send
+  -- emitted between relaytxes and lastsend (net.cpp:243-244); startingheight
+  -- removed (net.cpp no longer pushes it; presynced_headers follows
+  -- bip152_hb_from directly).
+  W181GetPeerInfoFieldsSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

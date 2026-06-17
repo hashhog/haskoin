@@ -404,12 +404,17 @@ spec = describe "W135 Standardness rules (IsStandardTx)" $ do
       -- 31 + 67 = 98; 98*3000/1000 = 294
       th `shouldBe` 294
 
-    xit "G13 FAIL: ceil-div divergence for non-multiple-of-1000 numerators" $ do
-      -- BUG-3, P0-CDIV under custom -dustrelayfee.
-      -- Example: size=33 bytes (made up), fee=3001 sat/kvB → 33*3001=99033;
-      -- floor(99033/1000)=99 ; ceil(99033/1000)=100.
-      -- For default rate 3000 + standard sizes, no divergence.
-      pendingWith "BUG-3: dustThreshold uses floor div; Core uses EvaluateFeeUp ceil"
+    it "G13 PINS (BUG-3 FIXED): ceil-div divergence for non-multiple-of-1000 numerators" $ do
+      -- BUG-3, P0-CDIV under custom -dustrelayfee. Core's CFeeRate::GetFee
+      -- rounds UP (EvaluateFeeUp / CeilDiv); floor-div under-rejects dust.
+      -- A 31-byte P2WPKH output + 67-byte segwit-spend = 98-byte total cost.
+      -- At a custom 3001 sat/kvB rate: 98 * 3001 = 294098.
+      --   floor(294098 / 1000) = 294   (the OLD, wrong, under-rejecting value)
+      --   ceil (294098 / 1000) = 295   (Core EvaluateFeeUp — the correct value)
+      let p2wpkh = encodeScript (Script
+            [ OP_0, OP_PUSHDATA (BS.replicate 20 0) OPCODE ])
+          out = TxOut 0 p2wpkh
+      dustThreshold out 3001 `shouldBe` 295
 
   describe "G14 IsDust strict-less-than" $ do
     it "G14 PINS: value == threshold is NOT dust" $ do
