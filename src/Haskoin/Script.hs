@@ -4410,13 +4410,22 @@ parseMiniscript input = parseExpr (filter (not . isSpace) input)
     parseOlder s = do
       let inner = extractInner "older(" s
       case reads inner of
-        [(n, "")] -> Right $ MsOlder n
+        -- Core miniscript.h:2034 (older): @if (... *num < 1 || *num >= 0x80000000L) return {};@
+        -- Valid range is 1 <= n < 2^31. n == 0 is invalid, and for older() bit 31
+        -- (0x80000000) collides with the BIP-68 disable flag, so it is rejected too.
+        [(n, "")]
+          | n < 1 || n >= 0x80000000 -> Left $ MsParseError "older() timelock out of range (must be 1 <= n < 2^31)"
+          | otherwise -> Right $ MsOlder n
         _ -> Left $ MsParseError "Invalid number in older()"
 
     parseAfter s = do
       let inner = extractInner "after(" s
       case reads inner of
-        [(n, "")] -> Right $ MsAfter n
+        -- Core miniscript.h:2027 (after): @if (... *num < 1 || *num >= 0x80000000L) return {};@
+        -- Valid range is 1 <= n < 2^31.
+        [(n, "")]
+          | n < 1 || n >= 0x80000000 -> Left $ MsParseError "after() timelock out of range (must be 1 <= n < 2^31)"
+          | otherwise -> Right $ MsAfter n
         _ -> Left $ MsParseError "Invalid number in after()"
 
     parseSha256 s = do

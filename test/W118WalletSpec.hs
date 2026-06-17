@@ -252,7 +252,7 @@ import qualified Data.Text as T
 import Haskoin.Wallet
 import Haskoin.Crypto (SecKey(..), PubKey(..), derivePubKey,
                        serializePubKeyCompressed, hash160, hmacSHA512,
-                       computeTxId, Address(..))
+                       computeTxId, Address(..), bech32Decode, bech32mEncode)
 import Haskoin.Consensus (mainnet, testnet4, Network(..))
 import Haskoin.Types (TxId(..), Hash256(..), Hash160(..), OutPoint(..),
                        TxIn(..), TxOut(..), Tx(..))
@@ -310,6 +310,7 @@ spec = do
     spec_utxo_g27_g30
     spec_two_pipeline
     spec_dead_helpers
+    spec_bech32_charlimit
 
 --------------------------------------------------------------------------------
 -- G1-G6: Descriptors (BIP-380 to BIP-386)
@@ -1430,3 +1431,37 @@ decodeHex' :: T.Text -> Maybe ByteString
 decodeHex' t = case B16.decode (BS8.pack (T.unpack t)) of
   Right bs -> Just bs
   Left  _  -> Nothing
+
+--------------------------------------------------------------------------------
+-- Bech32/Bech32m 90-char CharLimit (BIP-173/BIP-350)
+--------------------------------------------------------------------------------
+
+-- Core parity: bech32::Decode rejects any string longer than the CharLimit
+-- (BECH32 = 90) BEFORE/regardless of checksum validity — beyond an 89-char
+-- window the BCH code no longer guarantees detection of up to 4 errors.
+-- Reference: bitcoin-core/src/bech32.cpp:378 (@if (str.size() > limit) return {};@)
+-- and bech32.h:38-40 (@CharLimit::BECH32 = 90@). The witness program lengths
+-- below are chosen so the *encoded* (valid-checksum) string lands exactly on
+-- the boundary (90 chars) and just past it (92 chars):
+--   total = len("bc") + 1(sep) + 1(witver) + ceil(8*P/5)(prog groups) + 6(checksum)
+--         = 10 + ceil(8*P/5)
+--   P=50 -> 10 + 80 = 90 (at limit, must decode)
+--   P=51 -> 10 + 82 = 92 (over limit, must be rejected despite valid checksum)
+spec_bech32_charlimit :: Spec
+spec_bech32_charlimit = describe "Bech32/Bech32m 90-char CharLimit (Core bech32.cpp:378)" $ do
+
+  let prog50 = BS.pack [fromIntegral (i `mod` 256) | i <- [0 .. 49 :: Int]]
+      prog51 = BS.pack [fromIntegral (i `mod` 256) | i <- [0 .. 50 :: Int]]
+      at90   = bech32mEncode "bc" 1 prog50
+      over90 = bech32mEncode "bc" 1 prog51
+
+  it "an exactly-90-char bech32m string is within the limit and decodes" $ do
+    T.length at90 `shouldBe` 90
+    bech32Decode at90 `shouldSatisfy` (/= Nothing)
+
+  it "a 92-char bech32m string with a VALID checksum is rejected (length, not checksum)" $ do
+    T.length over90 `shouldBe` 92
+    -- The checksum is valid (it was just produced by bech32mEncode); the only
+    -- reason to reject is the 90-char CharLimit. Mutation-proof: dropping the
+    -- guard in bech32Decode makes this decode as Just.
+    bech32Decode over90 `shouldBe` Nothing
