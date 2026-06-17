@@ -78,6 +78,8 @@ module Haskoin.Rpc
   , chainStatesResultEnc
   , chainStatesResultEncWithSnapshot
   , chainStateEntryEnc
+    -- * getpeerinfo per-peer encoder (exported for testing — Core v31.99 wire shape)
+  , peerInfoToEncoding
     -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
   , handleGetBlockFromPeer
   , decideGetBlockFromPeer
@@ -4208,12 +4210,17 @@ handleGetPeerInfo :: RpcServer -> IO RpcResponse
 handleGetPeerInfo server = do
   peers <- getConnectedPeers (rsPeerMgr server)
   let asmapData = rsAsmapData server
-      peerEncs  = zipWith (peerToEnc asmapData) [0..] peers
+      peerEncs  = zipWith (peerInfoToEncoding asmapData) [0..] peers
       rawBs     = encodingToLazyByteString (AE.list id peerEncs)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
-  where
-    peerToEnc :: ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
-    peerToEnc asmapData idx (addr, info) =
+
+-- | Encode a single connected peer as one getpeerinfo array element.
+-- Exported for testing: this is the exact production encoding used by
+-- 'handleGetPeerInfo', so a test over it pins the Core v31.99 wire field
+-- set + ordering (rpc/net.cpp). Field order matters: aeson's 'pairs'
+-- preserves declaration order, mirroring Core's pushKV sequence.
+peerInfoToEncoding :: ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
+peerInfoToEncoding asmapData idx (addr, info) =
       let services = piServices info
           serviceNames :: [Text]
           serviceNames = catMaybes
@@ -4237,6 +4244,11 @@ handleGetPeerInfo server = do
            pair "services"                (text (T.pack (printf "%016x" services)))     <>
            pair "servicesnames"           (AE.list text serviceNames)                   <>
            pair "relaytxes"               (AE.bool (piRelay info))                      <>
+           -- Core v31.99 rpc/net.cpp:243-244 emits these two NUM fields between
+           -- relaytxes and lastsend. haskoin tracks neither at the peer-mgr
+           -- layer, so emit 0 (same pattern as addr_processed/addr_rate_limited).
+           pair "last_inv_sequence"       (AE.word64 0)                                 <>
+           pair "inv_to_send"             (AE.int (0 :: Int))                           <>
            pair "lastsend"                (AE.int64 (piLastSeen info))                  <>
            pair "lastrecv"                (AE.int64 (piLastSeen info))                  <>
            pair "last_transaction"        (AE.int (0 :: Int))                           <>
@@ -4252,7 +4264,10 @@ handleGetPeerInfo server = do
            pair "inbound"                 (AE.bool isInbound)                           <>
            pair "bip152_hb_to"            (AE.bool False)                               <>
            pair "bip152_hb_from"          (AE.bool False)                               <>
-           pair "startingheight"          (AE.int32 (piStartHeight info))               <>
+           -- Core v31.99 removed `startingheight` from getpeerinfo: rpc/net.cpp
+           -- pushes presynced_headers directly after bip152_hb_from (m_starting_
+           -- height is no longer surfaced via RPC). Emitting it is an extra-field
+           -- parity bug, so it is dropped here.
            pair "presynced_headers"       (AE.int (-1 :: Int))                          <>
            pair "synced_headers"          (AE.int (-1 :: Int))                          <>
            pair "synced_blocks"           (AE.int (-1 :: Int))                          <>
