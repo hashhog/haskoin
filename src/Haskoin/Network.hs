@@ -137,6 +137,9 @@ module Haskoin.Network
   , stopPeerManager
   , startInboundListener
   , addNodeConnect
+  , addAddedNode
+  , removeAddedNode
+  , getAddedNodes
   , sockAddrToHostPort
   , discoverPeers
   , fallbackMainnetPeers
@@ -2928,6 +2931,15 @@ data PeerManager = PeerManager
     --   no auto-outbound slots to fill, then advances this by
     --   'feelerIntervalSecs'.  Feelers are OFF the full-relay/block-relay
     --   outbound budget (they dial, handshake, promote NEW->TRIED, disconnect).
+  , pmAddedNodes         :: !(TVar [String])
+    -- ^ The @addnode@-managed list of persistent-peer node strings, keyed by
+    --   the exact string the operator supplied.  Mirrors Core's
+    --   @CConnman::m_added_node_params@ (@src/net.cpp@): membership is what
+    --   @addnode "add"@/"remove" toggle, and the list's contents — not the
+    --   live connection state — decide whether a duplicate "add" or a stale
+    --   "remove" is an error (RPC_CLIENT_NODE_ALREADY_ADDED / NODE_NOT_ADDED).
+    --   Distinct from 'pmAddrMan'/'pmKnownAddrs' (which also hold gossiped/seed
+    --   addresses); only operator-pinned entries live here.
   }
 
 -- | Configuration for the peer manager
@@ -3191,6 +3203,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> pure am
     <*> pure BS.empty   -- pmAsmapData: empty = ASMap disabled; set via pmAsmapData field
     <*> newTVarIO 0     -- pmNextFeeler: 0 = a feeler may open on the first eligible loop tick
+    <*> newTVarIO []    -- pmAddedNodes: empty addnode-managed persistent-peer list
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -4213,6 +4226,45 @@ addNodeConnect pm host port = do
       case Map.lookup addr peers of
         Nothing -> return ()
         Just pc -> atomically $ modifyTVar' (pcInfo pc) (\i -> i { piIsManual = True })
+
+-- | Add a node string to the @addnode@-managed persistent-peer list — the
+-- haskoin equivalent of @CConnman::AddNode@ (@bitcoin-core/src/net.cpp@).
+--
+-- Returns 'False' — and makes NO change — when the node is already on the
+-- list, exactly as Core does (@net.cpp@ returns false on a string collision).
+-- The @addnode@ RPC handler turns that 'False' into
+-- @RPC_CLIENT_NODE_ALREADY_ADDED@ (-23).  Returns 'True' when a fresh entry is
+-- recorded.  The mutation is atomic (read-test-write inside one STM tx) so
+-- concurrent @addnode@ calls cannot both observe absence and double-insert.
+addAddedNode :: PeerManager -> String -> IO Bool
+addAddedNode pm node = atomically $ do
+  nodes <- readTVar (pmAddedNodes pm)
+  if node `elem` nodes
+    then return False
+    else do
+      writeTVar (pmAddedNodes pm) (nodes ++ [node])
+      return True
+
+-- | Remove a node string from the @addnode@-managed persistent-peer list — the
+-- haskoin equivalent of @CConnman::RemoveAddedNode@ (@bitcoin-core/src/net.cpp@).
+--
+-- Returns 'False' when the node was never added (Core returns false after
+-- scanning the whole list), which the @addnode@ RPC handler turns into
+-- @RPC_CLIENT_NODE_NOT_ADDED@ (-24).  Returns 'True' when an entry was found
+-- and erased.  Atomic read-test-write.
+removeAddedNode :: PeerManager -> String -> IO Bool
+removeAddedNode pm node = atomically $ do
+  nodes <- readTVar (pmAddedNodes pm)
+  if node `elem` nodes
+    then do
+      writeTVar (pmAddedNodes pm) (filter (/= node) nodes)
+      return True
+    else return False
+
+-- | Current contents of the @addnode@-managed persistent-peer list (Core's
+-- @getaddednodeinfo@ source).  Exposed for @addnode@ bookkeeping and tests.
+getAddedNodes :: PeerManager -> IO [String]
+getAddedNodes pm = readTVarIO (pmAddedNodes pm)
 
 --------------------------------------------------------------------------------
 -- Peer Manager API

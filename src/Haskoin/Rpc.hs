@@ -45,6 +45,11 @@ module Haskoin.Rpc
   , rpcMiscError
   , rpcInvalidParameter
   , rpcInvalidAddressOrKey
+    -- * P2P client error codes (Core protocol.h RPC_CLIENT_*)
+  , rpcClientNodeNotConnected
+  , rpcClientNodeAlreadyAdded
+  , rpcClientNodeNotAdded
+  , rpcClientInvalidIpOrSubnet
     -- * Hash-argument parsing (Core ParseHashV — exported for testing)
   , parseHash
   , parseHashV
@@ -342,7 +347,9 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, nodeP2PV2, bip324V2OutboundEnabled,
                          hasService, ServiceFlag(..),
-                         disconnectPeer, addNodeConnect, sockAddrToHostPort,
+                         disconnectPeer, addNodeConnect,
+                         addAddedNode, removeAddedNode,
+                         sockAddrToHostPort,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList,
                          getMappedASFromSockAddr,
@@ -1830,8 +1837,18 @@ handleGetBlockHash server params = do
     Just height -> do
       tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
       if height > ceHeight tip
+        -- Core parity: getblockhash height-out-of-range throws
+        -- RPC_INVALID_PARAMETER (-8), not RPC_MISC_ERROR (-1).  See
+        -- bitcoin-core/src/rpc/blockchain.cpp getblockhash:
+        --   if (nHeight < 0 || nHeight > active_chain.Height())
+        --       throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
+        -- (protocol.h RPC_INVALID_PARAMETER = -8).  Message text matches Core
+        -- exactly.  W125 G29 / BUG-3 cross-impl; mirrors rustoshi ee86d76.
+        -- (haskoin parses 'height' as Word32 upstream, so the signed
+        -- 'nHeight < 0' half of Core's guard is unreachable here — a negative
+        -- arg fails 'extractParam' and is rejected before this point.)
         then return $ RpcResponse Null
-          (toJSON $ RpcError rpcMiscError "Block height out of range") Null
+          (toJSON $ RpcError rpcInvalidParameter "Block height out of range") Null
         else do
           mBh <- getBlockHeight (rsDB server) height
           case mBh of
@@ -1846,7 +1863,10 @@ handleGetBlockHash server params = do
               case Map.lookup height heightMap of
                 Just bh -> return $ RpcResponse (toJSON $ showHash bh) Null Null
                 Nothing -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcMiscError "Block height out of range") Null
+                  -- Core parity (-8, see the in-range guard above): an
+                  -- in-range-but-missing height entry on a partially-rebuilt
+                  -- chainstate still maps to RPC_INVALID_PARAMETER.
+                  (toJSON $ RpcError rpcInvalidParameter "Block height out of range") Null
 
 -- | Get block data by hash
 -- | Handle getblock RPC.
@@ -4361,30 +4381,62 @@ handleAddNode server params = do
                     [(portNum, "")] -> (T.unpack (T.init h), portNum)
                     _ -> (T.unpack nodeStr, defaultPort)
                 _ -> (T.unpack nodeStr, defaultPort)
+          -- Core keys the addnode-managed list on the EXACT node string the
+          -- operator supplied (CConnman::m_added_node_params); membership —
+          -- not live-connection state — decides add/remove error parity.
+          let nodeKey = T.unpack nodeStr
           case cmd of
             "onetry" -> do
               void $ forkIO $ addNodeConnect (rsPeerMgr server) host port
               return $ RpcResponse Null Null Null
             "add" -> do
-              void $ forkIO $ addNodeConnect (rsPeerMgr server) host port
-              return $ RpcResponse Null Null Null
+              -- Core parity: AddNode returns false when the node is already on
+              -- the list -> RPC_CLIENT_NODE_ALREADY_ADDED (-23) "Error: Node
+              -- already added" (bitcoin-core/src/rpc/net.cpp:358-362).  Only
+              -- dial when this is a fresh entry, mirroring Core (which records
+              -- then opens the connection).  W125 BUG-3/G26; rustoshi 7b94ef1.
+              added <- addAddedNode (rsPeerMgr server) nodeKey
+              if not added
+                then return $ RpcResponse Null
+                  (toJSON $ RpcError rpcClientNodeAlreadyAdded
+                    "Error: Node already added") Null
+                else do
+                  void $ forkIO $ addNodeConnect (rsPeerMgr server) host port
+                  return $ RpcResponse Null Null Null
             "remove" -> do
-              -- Find and disconnect peers matching the host:port
-              peers <- readTVarIO (pmPeers (rsPeerMgr server))
-              forM_ (Map.toList peers) $ \(addr, pc) -> do
-                let (peerHost, peerPort) = sockAddrToHostPort addr defaultPort
-                when (peerHost == host && peerPort == port) $
-                  disconnectPeer pc
-              return $ RpcResponse Null Null Null
+              -- Core parity: RemoveAddedNode returns false when the node was
+              -- never added -> RPC_CLIENT_NODE_NOT_ADDED (-24) "Error: Node
+              -- could not be removed. It has not been added previously."
+              -- (bitcoin-core/src/rpc/net.cpp:364-368).  W125 BUG-3/G27.
+              removed <- removeAddedNode (rsPeerMgr server) nodeKey
+              if not removed
+                then return $ RpcResponse Null
+                  (toJSON $ RpcError rpcClientNodeNotAdded
+                    "Error: Node could not be removed. It has not been added previously.") Null
+                else do
+                  -- Preserve haskoin's existing observable behavior: also
+                  -- disconnect any currently-connected peer matching the
+                  -- removed node's host:port.
+                  peers <- readTVarIO (pmPeers (rsPeerMgr server))
+                  forM_ (Map.toList peers) $ \(addr, pc) -> do
+                    let (peerHost, peerPort) = sockAddrToHostPort addr defaultPort
+                    when (peerHost == host && peerPort == port) $
+                      disconnectPeer pc
+                  return $ RpcResponse Null Null Null
             _ ->
+              -- BUG-1 fix: return a proper {code, message} RpcError object, not
+              -- a bare JSON string (which conformant JSON-RPC clients reject).
               return $ RpcResponse Null
-                (toJSON $ String "Invalid command, expected onetry/add/remove") Null
+                (toJSON $ RpcError rpcInvalidParams
+                  "Invalid command, expected onetry/add/remove") Null
         _ ->
+          -- BUG-1 fix: proper {code, message} RpcError object, not a string.
           return $ RpcResponse Null
-            (toJSON $ String "Invalid parameter types") Null
+            (toJSON $ RpcError rpcInvalidParams "Invalid parameter types") Null
     _ ->
+      -- BUG-1 fix: proper {code, message} RpcError object, not a string.
       return $ RpcResponse Null
-        (toJSON $ String "Expected [node, command]") Null
+        (toJSON $ RpcError rpcInvalidParams "Expected [node, command]") Null
 
 --------------------------------------------------------------------------------
 -- Mining RPC Handlers
@@ -9358,6 +9410,28 @@ handleDisconnectNode server params = do
 rpcClientNodeNotConnected :: Int
 rpcClientNodeNotConnected = -29
 
+-- | @RPC_CLIENT_NODE_ALREADY_ADDED@ (-23) from
+--   @bitcoin-core/src/rpc/protocol.h:60@.  Raised by @addnode "add"@ when the
+--   node is already on the @addnode@-managed persistent-peer list
+--   (@rpc/net.cpp@: "Error: Node already added").
+rpcClientNodeAlreadyAdded :: Int
+rpcClientNodeAlreadyAdded = -23
+
+-- | @RPC_CLIENT_NODE_NOT_ADDED@ (-24) from
+--   @bitcoin-core/src/rpc/protocol.h:61@.  Raised by @addnode "remove"@ when
+--   the node was never added (@rpc/net.cpp@: "Error: Node could not be removed.
+--   It has not been added previously.").
+rpcClientNodeNotAdded :: Int
+rpcClientNodeNotAdded = -24
+
+-- | @RPC_CLIENT_INVALID_IP_OR_SUBNET@ (-30) from
+--   @bitcoin-core/src/rpc/protocol.h:63@.  Raised by @setban@ when the
+--   subnet/IP argument fails to parse (@rpc/net.cpp:780@: "Error: Invalid
+--   IP/Subnet").  Distinct from the JSON-RPC transport code -32602
+--   (@rpcInvalidParams@) that haskoin previously collapsed it into.
+rpcClientInvalidIpOrSubnet :: Int
+rpcClientInvalidIpOrSubnet = -30
+
 --------------------------------------------------------------------------------
 -- getnodeaddresses / addpeeraddress — addrman dump + inject
 --
@@ -9563,9 +9637,18 @@ handleSetBan server params = do
                            _          -> (subnetStr, 0)
       case parseBanSubnet host port of
         Nothing ->
+          -- Core parity: an un-parseable subnet/IP throws
+          -- RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with the exact static
+          -- message "Error: Invalid IP/Subnet", not the JSON-RPC transport
+          -- code RPC_INVALID_PARAMS (-32602).  See
+          -- bitcoin-core/src/rpc/net.cpp:779-781:
+          --   if (!(... IsValid())) throw JSONRPCError(
+          --       RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet");
+          -- (protocol.h RPC_CLIENT_INVALID_IP_OR_SUBNET = -30).  W125 BUG-3;
+          -- mirrors rustoshi 980a31d.
           return $ RpcResponse Null
-            (toJSON $ RpcError rpcInvalidParams
-              ("Invalid IP/Subnet: " <> T.pack host)) Null
+            (toJSON $ RpcError rpcClientInvalidIpOrSubnet
+              "Error: Invalid IP/Subnet") Null
         Just sockAddr ->
           case cmdStr of
             "add" -> do
