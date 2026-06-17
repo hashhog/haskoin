@@ -57,6 +57,7 @@
 module W131DescriptorsMiniscriptSpec (spec) where
 
 import Test.Hspec
+import Data.Either (isLeft)
 import qualified Data.ByteString as BS
 import qualified Data.Text as T
 import Data.Text (Text)
@@ -427,6 +428,35 @@ spec = describe "W131 Descriptors + Miniscript (BIP-380 / 385) — 30-gate audit
 
     it "G21 PASS: parseMiniscript('older(100)') returns MsOlder 100" $ do
       parseMiniscript "older(100)" `shouldBe` Right (MsOlder 100)
+
+  ------------------------------------------------------------------------------
+  -- G21b  older()/after() timelock bound (Core miniscript.h:2027/2034)
+  --
+  -- Core: @if (!num.has_value() || *num < 1 || *num >= 0x80000000L) return {};@
+  -- Valid range is 1 <= n < 2^31. n == 0 is invalid; for older() bit 31
+  -- (0x80000000) collides with the BIP-68 disable flag. Before this fix
+  -- haskoin's parseOlder/parseAfter accepted any value that 'reads' produced.
+  ------------------------------------------------------------------------------
+  describe "G21b older()/after() timelock bound (Core miniscript.h:2027/2034)" $ do
+    it "G21b PASS: after(1) and older(1) accepted (lower boundary)" $ do
+      parseMiniscript "after(1)" `shouldBe` Right (MsAfter 1)
+      parseMiniscript "older(1)" `shouldBe` Right (MsOlder 1)
+
+    it "G21b PASS: after/older at 0x7fffffff accepted (upper in-range boundary)" $ do
+      parseMiniscript "after(2147483647)" `shouldBe` Right (MsAfter 0x7fffffff)
+      parseMiniscript "older(2147483647)" `shouldBe` Right (MsOlder 0x7fffffff)
+
+    it "G21b GATE: after(0) rejected (n < 1)" $ do
+      parseMiniscript "after(0)" `shouldSatisfy` isLeft
+
+    it "G21b GATE: older(0) rejected (n < 1)" $ do
+      parseMiniscript "older(0)" `shouldSatisfy` isLeft
+
+    it "G21b GATE: after(2147483648) rejected (n >= 0x80000000)" $ do
+      parseMiniscript "after(2147483648)" `shouldSatisfy` isLeft
+
+    it "G21b GATE: older(2147483648) rejected (n >= 0x80000000, BIP-68 disable bit)" $ do
+      parseMiniscript "older(2147483648)" `shouldSatisfy` isLeft
 
   describe "G22 All 11 Core wrappers represented (PRESENT)" $ do
     it "G22 PASS: parseMiniscript('c:pk(hex)') returns MsC (MsPk ...)" $ do

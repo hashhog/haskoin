@@ -39,10 +39,14 @@
 module W159BIP32PrivTweakSpec (spec) where
 
 import Test.Hspec
+import Control.Exception (evaluate, try, SomeException)
+import Control.Monad (foldM)
+import Data.Maybe (fromMaybe)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import Data.ByteString (ByteString)
-import Data.Either (fromRight)
+import Data.Either (fromRight, isLeft)
+import Data.Word (Word8, Word32)
 
 import Haskoin.Crypto (seckeyTweakAdd, SecKey(..))
 import Haskoin.Wallet
@@ -50,7 +54,10 @@ import Haskoin.Wallet
   , derivePrivate
   , deriveHardened
   , deriveChildPriv
+  , deriveChildPub
+  , toExtendedPubKey
   , ExtendedKey(..)
+  , ExtendedPubKey(..)
   )
 
 -- | Hex-decode helper that 'error's on malformed input (test fixtures only).
@@ -144,3 +151,49 @@ spec = describe "W159 BUG-14 BIP-32 CKDpriv via libsecp256k1" $ do
         Nothing    -> expectationFailure "deriveChildPriv m/0 returned Nothing"
         Just viaSafe ->
           getSecKey (ekKey viaPartial) `shouldBe` getSecKey (ekKey viaSafe)
+
+  -- BIP-32 depth-byte overflow guard (Core key.cpp:483 CExtKey::Derive,
+  -- pubkey.cpp:416 CExtPubKey::Derive): once the parent is at the maximum depth
+  -- (the 1-byte depth field == 0xFF), no further child may be derived — the
+  -- depth byte would overflow, producing an extended key whose serialized depth
+  -- no longer reflects its position in the tree. Before this fix the haskoin
+  -- @ekDepth parent + 1@ (a Word8) silently wrapped 255 -> 0, emitting a
+  -- wrong-depth child Core would never produce.
+  describe "BIP-32 depth-byte overflow guard (Core key.cpp:483 / pubkey.cpp:416)" $ do
+    let seed   = hex "000102030405060708090a0b0c0d0e0f"
+        master = masterKey seed
+        -- Walk a real derivation chain to depth N via the safe Maybe variant.
+        deriveToDepth :: Word32 -> ExtendedKey
+        deriveToDepth n =
+          foldl
+            (\k i -> fromMaybe (error "deriveToDepth: unexpected Nothing") (deriveChildPriv k i))
+            master
+            [0 .. n - 1]
+
+    it "G5 deriveChildPriv refuses to derive past depth 255 (returns Nothing)" $ do
+      let parent255 = deriveToDepth 255
+      ekDepth parent255 `shouldBe` 255
+      deriveChildPriv parent255 0 `shouldBe` Nothing
+
+    it "G6 deriveChildPub refuses to derive past depth 255 (returns Nothing)" $ do
+      let parent255  = deriveToDepth 255
+          xpub255    = toExtendedPubKey parent255
+      epkDepth xpub255 `shouldBe` 255
+      deriveChildPub xpub255 0 `shouldBe` Nothing
+
+    it "G7 partial derivePrivate at depth 255 errors (does not silently wrap)" $ do
+      let parent255 = deriveToDepth 255
+      r <- try (evaluate (ekDepth (derivePrivate parent255 0))) :: IO (Either SomeException Word8)
+      isLeft r `shouldBe` True
+
+    it "G8 partial deriveHardened at depth 255 errors (does not silently wrap)" $ do
+      let parent255 = deriveToDepth 255
+      r <- try (evaluate (ekDepth (deriveHardened parent255 0))) :: IO (Either SomeException Word8)
+      isLeft r `shouldBe` True
+
+    it "G9 a depth-254 parent still derives to exactly depth 255 (no off-by-one)" $ do
+      let parent254 = deriveToDepth 254
+      ekDepth parent254 `shouldBe` 254
+      case deriveChildPriv parent254 7 of
+        Nothing    -> expectationFailure "deriveChildPriv at depth 254 must succeed"
+        Just child -> ekDepth child `shouldBe` 255

@@ -560,6 +560,12 @@ masterKey seed =
 derivePrivate :: ExtendedKey -> Word32 -> ExtendedKey
 derivePrivate parent index
   | index >= 0x80000000 = error "derivePrivate: use deriveHardened for index >= 0x80000000"
+  -- Core CExtKey::Derive (key.cpp:483): refuse to derive once the parent is at
+  -- the maximum depth (the 1-byte depth field would overflow). The partial
+  -- variant errors here to mirror Core's @return false@; use 'deriveChildPriv'
+  -- for the safe 'Maybe' variant.
+  | ekDepth parent == maxBound =
+      error "derivePrivate: cannot derive child — depth byte would overflow (parent already at depth 255)"
   | otherwise =
       let pubKey = derivePubKeyFromPrivate (ekKey parent)
           pubBytes = serializePubKeyCompressed pubKey
@@ -587,6 +593,13 @@ derivePrivate parent index
 -- index).  Callers that need the safe Maybe variant should use
 -- 'deriveChildPriv'.
 deriveHardened :: ExtendedKey -> Word32 -> ExtendedKey
+deriveHardened parent index
+  -- Core CExtKey::Derive (key.cpp:483): refuse to derive once the parent is at
+  -- the maximum depth (the 1-byte depth field would overflow). The partial
+  -- variant errors here to mirror Core's @return false@; use 'deriveChildPriv'
+  -- for the safe 'Maybe' variant.
+  | ekDepth parent == maxBound =
+      error "deriveHardened: cannot derive child — depth byte would overflow (parent already at depth 255)"
 deriveHardened parent index =
   let hardenedIndex = index .|. 0x80000000
       dat = BS.cons 0x00 (getSecKey (ekKey parent)) `BS.append` encodeWord32BE' hardenedIndex
@@ -638,6 +651,10 @@ derivePublic parent index = case deriveChildPub parent index of
 deriveChildPub :: ExtendedPubKey -> Word32 -> Maybe ExtendedPubKey
 deriveChildPub parent index
   | index >= 0x80000000 = Nothing
+  -- Core CExtPubKey::Derive (pubkey.cpp:416): refuse to derive once the parent
+  -- is at the maximum depth (the 1-byte depth field would overflow).
+  -- @if (nDepth == std::numeric_limits<unsigned char>::max()) return false;@
+  | epkDepth parent == maxBound = Nothing
   | otherwise =
       let pubBytes   = serializePubKeyCompressed (epkKey parent)
           dat        = BS.append pubBytes (encodeWord32BE' index)
@@ -778,6 +795,12 @@ secp256k1Order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364
 -- This is the canonical BIP-32 CKD_priv predicate; 'derivePrivate' /
 -- 'deriveHardened' are the partial variants that 'error' instead.
 deriveChildPriv :: ExtendedKey -> Word32 -> Maybe ExtendedKey
+deriveChildPriv parent index
+  -- Core CExtKey::Derive (key.cpp:483): refuse to derive once the parent is at
+  -- the maximum depth — the 1-byte depth field would overflow and the child's
+  -- serialized depth byte would no longer reflect its position in the tree.
+  -- @if (nDepth == std::numeric_limits<unsigned char>::max()) return false;@
+  | ekDepth parent == maxBound = Nothing
 deriveChildPriv parent index =
   let isHardened = index >= 0x80000000
       dat = if isHardened
