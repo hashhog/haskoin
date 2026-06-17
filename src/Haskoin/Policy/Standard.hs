@@ -303,7 +303,10 @@ txWeight tx =
 --   * Witness programs (segwit) get the 75%-discounted spend cost
 --     (32 + 4 + 1 + (107 / 4) + 4) = 67.75 bytes added to output size.
 --   * Other outputs get the 148-byte legacy spend cost added.
---   * Threshold = (size * dustRelayFee) / 1000  (sat/kvB units).
+--   * Threshold = ceil(size * dustRelayFee / 1000)  (sat/kvB units).
+--     Core's @CFeeRate::GetFee@ rounds UP (@EvaluateFeeUp@ / @CeilDiv@),
+--     so we must use ceiling division here too: floor-div under-rejects
+--     dust by up to 1 sat under non-default -dustrelayfee rates.
 dustThreshold :: TxOut -> Word64 -> Word64
 dustThreshold txOut dustFeeSatPerKvB
   | isUnspendableScriptPubKey (txOutScript txOut) = 0
@@ -315,7 +318,9 @@ dustThreshold txOut dustFeeSatPerKvB
             -- legacy spend: full 148 bytes
             Nothing -> 32 + 4 + 1 + 107 + 4
           !sz = outSerSize + witExtra
-      in (fromIntegral sz * dustFeeSatPerKvB) `div` 1000
+          !num = fromIntegral sz * dustFeeSatPerKvB
+      -- Core: CFeeRate::GetFee -> EvaluateFeeUp -> CeilDiv(num, 1000).
+      in (num + 999) `div` 1000
 
 -- | An output is "dust" if its value is below the spend-cost threshold.
 isDust :: TxOut -> Word64 -> Bool
