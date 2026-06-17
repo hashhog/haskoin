@@ -12821,6 +12821,7 @@ scriptTypeToString st = case st of
   P2PK _      -> "pubkey"
   P2MultiSig _ _ -> "multisig"
   OpReturn _  -> "nulldata"
+  WitnessUnknown _ _ -> "witness_unknown"
   NonStandard -> "nonstandard"
 
 -- | Extract address from scriptPubKey based on network and script type

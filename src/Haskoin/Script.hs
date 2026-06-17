@@ -704,6 +704,11 @@ data ScriptType
   | P2PK !ByteString                  -- ^ <pubkey> OP_CHECKSIG
   | P2MultiSig !Int ![ByteString]     -- ^ m <keys...> n OP_CHECKMULTISIG
   | OpReturn !ByteString              -- ^ OP_RETURN <data>
+  | WitnessUnknown !Int !ByteString   -- ^ witness program of version != 0 that
+                                      --   is not one of the recognised types
+                                      --   (Core Solver TxoutType::WITNESS_UNKNOWN).
+                                      --   Carries (version, program). Standard to
+                                      --   create, non-standard to spend.
   | NonStandard                       -- ^ anything else
   deriving (Show, Eq)
 
@@ -749,7 +754,20 @@ classifyOutput (Script ops) = case ops of
   -- Multisig: m <keys...> n OP_CHECKMULTISIG
   _ | isMultisig ops -> parseMultisig ops
 
-  _ -> NonStandard
+  -- WITNESS_UNKNOWN: a structurally-valid witness program (OP_0..OP_16 +
+  -- single direct 2-40-byte push) whose version is non-zero and which is
+  -- not one of the recognised types handled above (P2WPKH/P2WSH for v0,
+  -- P2TR for v1+32, P2A for the v1 anchor program). Mirrors Bitcoin Core's
+  -- Solver (script/solver.cpp:154-178): any remaining witness program with
+  -- `witnessversion != 0` is WITNESS_UNKNOWN; a v0 program with a
+  -- non-{20,32} size is NONSTANDARD. This is RELAY standardness only — such
+  -- outputs are standard to create but non-standard to spend
+  -- (validateInputsStandardness rejects them as prevouts).
+  _ -> case isWitnessProgram (Script ops) of
+         Just (ver, prog)
+           | ver /= 0  -> WitnessUnknown ver prog
+           | otherwise -> NonStandard
+         Nothing -> NonStandard
 
 -- | Check if a script is a witness program (BIP-141).
 -- A witness program is: version byte (OP_0 to OP_16) + single direct push of 2-40 bytes.
@@ -787,12 +805,49 @@ isMultisig ops
           lastOp = last ops
       in isSmallNum first && lastOp == OP_CHECKMULTISIG
 
+-- | Is this opcode a data push of a valid-public-key-size payload?
+--
+-- Mirrors the @CPubKey::ValidSize(data)@ gate in Bitcoin Core's
+-- @MatchMultisig@ (script/solver.cpp:97): each key between OP_m and OP_n is
+-- read with @GetScriptOp@ (which already decodes OP_PUSHDATA1/2/4 — in
+-- haskoin the parser does this, so any push opcode is acceptable) and is
+-- only counted as a pubkey when @ValidSize@ holds. @ValidSize@ requires the
+-- payload to be a 33-byte compressed key (header 0x02/0x03) or a 65-byte
+-- uncompressed key (header 0x04/0x06/0x07) — see pubkey.h:60-79.
+--
+-- This is RELAY standardness only (bare-multisig classification); it is
+-- never consulted by block/tx consensus validation.
+isValidPubkeyPush :: ScriptOp -> Bool
+isValidPubkeyPush (OP_PUSHDATA bs _) = validPubKeySize bs
+isValidPubkeyPush _                  = False
+
+-- | @CPubKey::ValidSize@ (pubkey.h): @vch.size() > 0 && GetLen(vch[0]) == size@.
+validPubKeySize :: ByteString -> Bool
+validPubKeySize bs
+  | BS.null bs = False
+  | otherwise  = pubKeyLenForHeader (BS.head bs) == BS.length bs
+
+-- | @CPubKey::GetLen@ (pubkey.h:60): expected length for a given header byte.
+-- 33 for 0x02/0x03 (compressed), 65 for 0x04/0x06/0x07 (uncompressed), else 0.
+pubKeyLenForHeader :: Word8 -> Int
+pubKeyLenForHeader h
+  | h == 0x02 || h == 0x03                = 33
+  | h == 0x04 || h == 0x06 || h == 0x07   = 65
+  | otherwise                             = 0
+
 -- | Parse multisig pattern
 parseMultisig :: [ScriptOp] -> ScriptType
 parseMultisig ops = case ops of
   (m:rest) | isSmallNum m ->
     let mVal = fromSmallNum m
-        (keys, afterKeys) = span isPushData rest
+        -- Walk pubkey pushes between OP_m and OP_n. Core's MatchMultisig
+        -- reads each key via GetScriptOp (decoding OP_PUSHDATA1/2/4) and
+        -- counts it only while CPubKey::ValidSize(data) holds (33-byte
+        -- compressed / 65-byte uncompressed). Matching only valid-size
+        -- pushes here means a PUSHDATA-prefixed pubkey is accepted exactly
+        -- as a direct push, while a non-pubkey-size push stops the walk
+        -- (yielding NonStandard rather than a bogus key count).
+        (keys, afterKeys) = span isValidPubkeyPush rest
         pubkeys = map getPushBytes keys
     in case afterKeys of
          [n, OP_CHECKMULTISIG] | isSmallNum n ->
