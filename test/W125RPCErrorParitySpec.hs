@@ -105,7 +105,33 @@
 module W125RPCErrorParitySpec (spec) where
 
 import Test.Hspec
+import Control.Exception (bracket)
+import Control.Monad (forM_)
+import Control.Concurrent.STM (newTVarIO)
+import Data.IORef (newIORef)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
+import Data.Aeson (Value(..), toJSON)
+import qualified Data.Aeson.KeyMap as KM
+import qualified Data.Aeson.Key as K
+import qualified Data.ByteString as BS
+import qualified Data.Vector as V
+import qualified Data.Scientific as Sci
+import System.Directory
+  (getTemporaryDirectory, createDirectoryIfMissing, removeDirectoryRecursive)
+import System.IO.Temp (createTempDirectory)
+import System.FilePath ((</>))
+
+import Haskoin.Consensus (regtest, initHeaderChain)
+import Haskoin.Storage
+  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, HaskoinDB )
+import Haskoin.Mempool (newMempool, defaultMempoolConfig)
+import Haskoin.FeeEstimator (newFeeEstimator)
+import Haskoin.Network
+  ( startPeerManager, stopPeerManager, Message
+  , defaultPeerManagerConfig, PeerManagerConfig(..) )
+import Haskoin.TxOrphanage (emptyOrphanPool)
+import Haskoin.Payjoin (defaultPayjoinConfig)
 
 import Haskoin.Rpc
   ( RpcError(..)
@@ -117,6 +143,12 @@ import Haskoin.Rpc
   , rpcInternalError
     -- General application errors
   , rpcMiscError
+    -- P2P client error codes
+  , rpcInvalidParameter
+  , rpcClientNodeNotConnected
+  , rpcClientNodeAlreadyAdded
+  , rpcClientNodeNotAdded
+  , rpcClientInvalidIpOrSubnet
     -- Transaction errors
   , rpcDeserializationError
   , rpcVerifyError
@@ -128,10 +160,75 @@ import Haskoin.Rpc
   , rpcWalletAlreadyLoaded
   , rpcWalletAlreadyExists
   , rpcWalletError
+    -- Live RPC plumbing (drive the real handlers end-to-end)
+  , RpcServer(..)
+  , RpcConfig(..)
+  , defaultRpcConfig
+  , RpcResponse(..)
+  , handleBatchRequest
   )
 
 spec :: Spec
 spec = describe "W125 JSON-RPC error code parity (haskoin)" $ do
+
+  ------------------------------------------------------------------------------
+  -- BEHAVIORAL parity (de-staled from xit sentinels): these drive the REAL
+  -- handlers end-to-end through 'handleBatchRequest' against a live regtest
+  -- 'RpcServer' and assert the emitted JSON-RPC error CODE + message, so a
+  -- regression in the handler (not just a renamed constant) fails the gate.
+  -- Ports the verified rustoshi RPC error-code parity fixes into haskoin:
+  --   getblockhash OOR        -> RPC_INVALID_PARAMETER       (-8)  ee86d76
+  --   addnode add-dup         -> RPC_CLIENT_NODE_ALREADY_ADDED(-23) 7b94ef1
+  --   addnode remove-absent   -> RPC_CLIENT_NODE_NOT_ADDED   (-24) 7b94ef1
+  --   setban invalid IP       -> RPC_CLIENT_INVALID_IP_OR_SUBNET(-30) 980a31d
+  --   disconnectnode absent   -> RPC_CLIENT_NODE_NOT_CONNECTED(-29) 845f7e4 (already)
+  ------------------------------------------------------------------------------
+  describe "Behavioral error-code parity (live handlers via handleBatchRequest)" $ do
+
+    it "getblockhash 999999 (out of range) -> code -8 'Block height out of range'" $
+      withLiveServer $ \server -> do
+        (code, msg) <- callErr server "getblockhash" [Number 999999]
+        code `shouldBe` rpcInvalidParameter        -- -8
+        msg  `shouldBe` "Block height out of range"
+
+    it "addnode 'add' of an already-added node -> code -23 'Error: Node already added'" $
+      withLiveServer $ \server -> do
+        -- First add must SUCCEED (no error object).
+        firstAdd <- callMaybeErr server "addnode" [String "1.2.3.4:18444", String "add"]
+        firstAdd `shouldBe` Nothing
+        -- Second add of the same node must be rejected with -23.
+        (code, msg) <- callErr server "addnode" [String "1.2.3.4:18444", String "add"]
+        code `shouldBe` rpcClientNodeAlreadyAdded   -- -23
+        msg  `shouldBe` "Error: Node already added"
+
+    it "addnode 'remove' of a never-added node -> code -24 'Error: Node could not be removed...'" $
+      withLiveServer $ \server -> do
+        (code, msg) <- callErr server "addnode" [String "9.9.9.9:18444", String "remove"]
+        code `shouldBe` rpcClientNodeNotAdded       -- -24
+        msg  `shouldBe`
+          "Error: Node could not be removed. It has not been added previously."
+
+    it "addnode add->remove round-trip succeeds, then remove again is -24" $
+      withLiveServer $ \server -> do
+        a <- callMaybeErr server "addnode" [String "5.6.7.8:18444", String "add"]
+        a `shouldBe` Nothing
+        r <- callMaybeErr server "addnode" [String "5.6.7.8:18444", String "remove"]
+        r `shouldBe` Nothing
+        (code, _) <- callErr server "addnode" [String "5.6.7.8:18444", String "remove"]
+        code `shouldBe` rpcClientNodeNotAdded       -- -24
+
+    it "setban with an invalid IP/subnet string -> code -30 'Error: Invalid IP/Subnet'" $
+      withLiveServer $ \server -> do
+        (code, msg) <- callErr server "setban"
+                         [String "not-an-ip!!!", String "add"]
+        code `shouldBe` rpcClientInvalidIpOrSubnet  -- -30
+        msg  `shouldBe` "Error: Invalid IP/Subnet"
+
+    it "disconnectnode of a not-connected peer -> code -29 (already Core-correct)" $
+      withLiveServer $ \server -> do
+        (code, msg) <- callErr server "disconnectnode" [String "203.0.113.7:18444"]
+        code `shouldBe` rpcClientNodeNotConnected   -- -29
+        msg  `shouldBe` "Node not found in connected nodes"
 
   ------------------------------------------------------------------------------
   -- G1-G5: Standard JSON-RPC 2.0 codes
@@ -465,3 +562,108 @@ spec = describe "W125 JSON-RPC error code parity (haskoin)" $ do
       -- Sanity: code and message both appear in show output
       ("-1" `T.isInfixOf` T.pack shown) `shouldBe` True
       ("\"x\"" `T.isInfixOf` T.pack shown) `shouldBe` True
+
+    it "P2P client error-code constants match Core protocol.h:60-63" $ do
+      rpcClientNodeAlreadyAdded  `shouldBe` (-23)
+      rpcClientNodeNotAdded      `shouldBe` (-24)
+      rpcClientNodeNotConnected  `shouldBe` (-29)
+      rpcClientInvalidIpOrSubnet `shouldBe` (-30)
+
+--------------------------------------------------------------------------------
+-- Live-handler harness (mirrors W138 'withLiveServer'): a minimal regtest
+-- 'RpcServer' over a temp RocksDB + a real (DNS-disabled) PeerManager, so the
+-- behavioral parity tests above exercise the genuine dispatch path.
+--------------------------------------------------------------------------------
+
+-- | Build a minimal live 'RpcServer' (empty regtest chainstate) and run an
+-- action with it, tearing down the PeerManager + temp dir afterwards.
+withLiveServer :: (RpcServer -> IO ()) -> IO ()
+withLiveServer action =
+  withLiveTmpDir $ \dir ->
+    withDB (defaultDBConfig (dir </> "chainstate")) $ \db -> do
+      hc    <- initHeaderChain regtest
+      cache <- newUTXOCache db 1000
+      mp    <- newMempool regtest cache defaultMempoolConfig 0 0 (\_ -> return 0)
+      fe    <- newFeeEstimator
+      let pmCfg = defaultPeerManagerConfig { pmcDataDir = dir, pmcDnsSeed = False }
+      bracket (startPeerManager regtest pmCfg liveNoopHandler) stopPeerManager $ \pm -> do
+        threadVar     <- newTVarIO Nothing
+        mockTimeVar   <- newTVarIO Nothing
+        pauseVar      <- newTVarIO False
+        payjoinOffers <- newTVarIO Map.empty
+        orphanRef     <- newIORef emptyOrphanPool
+        assumeUtxoVar <- newIORef Nothing
+        let cfg = defaultRpcConfig { rpcDataDir = dir }
+            server = RpcServer
+              { rsConfig = cfg, rsDB = db, rsHeaderChain = hc, rsPeerMgr = pm
+              , rsMempool = mp, rsFeeEst = fe, rsUTXOCache = cache
+              , rsNetwork = regtest, rsBlockStore = Nothing
+              , rsThread = threadVar, rsMockTime = mockTimeVar
+              , rsWalletMgr = Nothing, rsStartTime = 0
+              , rsCookieFile = dir </> ".cookie", rsCookiePassword = T.empty
+              , rsBlockSubmissionPaused = pauseVar, rsIndexMgr = Nothing
+              , rsPruneConfig = defaultPruneConfig, rsAsmapData = BS.empty
+              , rsPayjoinOffers = payjoinOffers, rsPayjoinConfig = defaultPayjoinConfig
+              , rsOrphanPool = orphanRef, rsAssumeUtxo = assumeUtxoVar
+              }
+        action server
+
+liveNoopHandler :: a -> Message -> IO ()
+liveNoopHandler _ _ = return ()
+
+withLiveTmpDir :: (FilePath -> IO ()) -> IO ()
+withLiveTmpDir act = do
+  base <- getTemporaryDirectory
+  createDirectoryIfMissing True base
+  bracket
+    (createTempDirectory base "haskoin-w125-live-")
+    removeDirectoryRecursive
+    act
+
+-- | Invoke an RPC method (positional params) through the real batch dispatcher
+-- and return the response.
+callRpc :: RpcServer -> T.Text -> [Value] -> IO RpcResponse
+callRpc server method params = do
+  let req = Object $ KM.fromList
+        [ (K.fromText "jsonrpc", String "2.0")
+        , (K.fromText "id",      Number 1)
+        , (K.fromText "method",  String method)
+        , (K.fromText "params",  Array (V.fromList params))
+        ]
+  resps <- handleBatchRequest server [req]
+  case resps of
+    (r:_) -> return r
+    []    -> fail "handleBatchRequest returned no responses"
+
+-- | Invoke an RPC and require an error object; return its (code, message).
+callErr :: RpcServer -> T.Text -> [Value] -> IO (Int, T.Text)
+callErr server method params = do
+  resp <- callRpc server method params
+  case extractError (resError resp) of
+    Just cm -> return cm
+    Nothing -> fail $ "expected an error from " ++ T.unpack method ++
+                      " but got result=" ++ show (resResult resp) ++
+                      " error=" ++ show (resError resp)
+
+-- | Invoke an RPC and return Just (code,message) if it errored, Nothing on
+-- success (null error field).
+callMaybeErr :: RpcServer -> T.Text -> [Value] -> IO (Maybe (Int, T.Text))
+callMaybeErr server method params = do
+  resp <- callRpc server method params
+  return (extractError (resError resp))
+
+-- | Pull (code, message) out of a JSON error value @{"code":..,"message":..}@.
+-- 'Null' (the success sentinel) yields 'Nothing'.
+extractError :: Value -> Maybe (Int, T.Text)
+extractError (Object o) = do
+  Number c <- KM.lookup (K.fromText "code") o
+  let msg = case KM.lookup (K.fromText "message") o of
+              Just (String s) -> s
+              _               -> T.empty
+  code <- Sci.toBoundedInteger c
+  return (code, msg)
+extractError _ = Nothing
+
+-- Silence -Wunused-imports if 'toJSON' ends up unreferenced across edits.
+_w125UnusedShim :: Value
+_w125UnusedShim = toJSON (RpcError (-1) ("" :: T.Text))
