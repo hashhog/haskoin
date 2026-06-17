@@ -4220,12 +4220,16 @@ validateInputsStandardness tx inputPairs
               Left (idx, "input " ++ show idx ++ " script unknown")
             Right scriptPubKey ->
               case Script.classifyOutput scriptPubKey of
-                -- haskoin's classifier collapses NONSTANDARD and
-                -- WITNESS_UNKNOWN into a single NonStandard bucket.  We
-                -- additionally detect the witness-unknown case by
-                -- inspecting the raw bytes (OP_<n> + 2..40-byte push,
-                -- with n != 0/1) so callers can distinguish — useful
-                -- when Core's RPC string is the comparison point.
+                -- WITNESS_UNKNOWN prevouts (witness program version != 0 of
+                -- an unrecognised shape) are standard to create but
+                -- non-standard to spend. Core:
+                -- @"input N witness program is undefined"@.
+                -- The classifier now reports these directly (Core Solver
+                -- TxoutType::WITNESS_UNKNOWN); the legacy raw-byte
+                -- isUnknownWitnessProgram fallback below is retained as a
+                -- belt-and-braces guard for the v0-wrong-size edge.
+                Script.WitnessUnknown _ _ ->
+                  Left (idx, "input " ++ show idx ++ " witness program is undefined")
                 Script.NonStandard
                   | isUnknownWitnessProgram (txOutScript prevOut) ->
                       Left (idx, "input " ++ show idx ++ " witness program is undefined")

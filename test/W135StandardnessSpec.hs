@@ -263,20 +263,46 @@ spec = describe "W135 Standardness rules (IsStandardTx)" $ do
       pendingWith "BUG-1: OP_RETURN suffix push-only check absent in classifyOutput"
 
   describe "G7 WITNESS_UNKNOWN classification" $ do
-    it "G7 PINS: unknown witness version (2..16) classified NonStandard at script level" $ do
-      -- OP_2 + 2-byte push is a witness v2 program in Core (WITNESS_UNKNOWN);
-      -- haskoin's classifyOutput collapses it to NonStandard.
+    it "G7 PINS (BUG-2 FIXED): unknown witness version (2..16) classified WITNESS_UNKNOWN" $ do
+      -- OP_2 + 2-byte push is a witness v2 program. Core Solver classifies any
+      -- structurally-valid witness program with version != 0 (not P2TR/P2A) as
+      -- TxoutType::WITNESS_UNKNOWN (solver.cpp:172-177). haskoin now returns the
+      -- WitnessUnknown constructor carrying (version, program).
       let prog = encodeScript (Script
             [ OP_2, OP_PUSHDATA (BS.pack [0x00, 0x01]) OPCODE ])
       case decodeScript prog of
-        Right sc -> classifyOutput sc `shouldBe` NonStandard
+        Right sc -> classifyOutput sc `shouldBe` WitnessUnknown 2 (BS.pack [0x00, 0x01])
         Left _ -> expectationFailure "prog must decode"
 
-    xit "G7 GATE: WITNESS_UNKNOWN distinct from NONSTANDARD at classifier" $
-      -- BUG-2. The classifier and validateInputsStandardness re-detect this
-      -- via separate logic (raw-byte structural test in Mempool.hs:3745).
-      -- Single source of truth required.
-      pendingWith "BUG-2: ScriptType lacks a WITNESS_UNKNOWN constructor"
+    it "G7 PINS (BUG-3): a v1 program whose size is not 32 is WITNESS_UNKNOWN, not NonStandard" $ do
+      -- Core does NOT exclude OP_1 (witness v1) from WITNESS_UNKNOWN: a v1
+      -- program whose size is not 32 (and is not the P2A anchor) is
+      -- WITNESS_UNKNOWN, not NONSTANDARD. (Older impls hardcoded OP_2..OP_16,
+      -- dropping the v1 16-byte case to NonStandard.) Program = 16 bytes.
+      let prog16 = BS.replicate 16 0xab
+          spk = encodeScript (Script [ OP_1, OP_PUSHDATA prog16 OPCODE ])
+      case decodeScript spk of
+        Right sc -> classifyOutput sc `shouldBe` WitnessUnknown 1 prog16
+        Left _ -> expectationFailure "v1 16-byte program must decode"
+
+    it "G7 PINS (BUG-2 FIXED): WITNESS_UNKNOWN output is STANDARD to create (Solver=>IsStandard)" $ do
+      -- WITNESS_UNKNOWN is a known witness *shape*, so it is relay-standard to
+      -- create (Core IsStandard true). isStandardScriptPubKey must return Just.
+      let prog = encodeScript (Script
+            [ OP_3, OP_PUSHDATA (BS.replicate 20 0xcd) OPCODE ])
+      case isStandardScriptPubKey prog of
+        Just (WitnessUnknown 3 _) -> return ()
+        other -> expectationFailure $
+          "expected Just (WitnessUnknown 3 _), got " ++ show other
+
+    it "G7 PINS: a v0 program with a non-{20,32} size is NonStandard (Core final NONSTANDARD)" $ do
+      -- Negative control + mutation sentinel: a witness *v0* program whose
+      -- size is neither 20 nor 32 must remain NONSTANDARD (Solver's trailing
+      -- `return NONSTANDARD`), NOT WITNESS_UNKNOWN. A 10-byte v0 push here.
+      let spk = encodeScript (Script [ OP_0, OP_PUSHDATA (BS.replicate 10 0x00) OPCODE ])
+      case decodeScript spk of
+        Right sc -> classifyOutput sc `shouldBe` NonStandard
+        Left _ -> expectationFailure "v0 10-byte program must decode"
 
   describe "G8 MULTISIG n-cap (n in [1..3]) + m-bound (m in [1..n])" $ do
     it "G8 PINS: 1-of-2 multisig classified as standard" $ do
@@ -305,6 +331,44 @@ spec = describe "W135 Standardness rules (IsStandardTx)" $ do
       -- BUG-10 (P2): haskoin folds the n-cap into classifyOutput rather than
       -- into IsStandard. End result is the same: rejected.
       isStandardScriptPubKey ms `shouldBe` Nothing
+
+    it "G8 PINS (BUG-8 FIXED): bare-multisig accepts a PUSHDATA1-prefixed pubkey" $ do
+      -- Core's MatchMultisig reads each key via GetScriptOp, which decodes the
+      -- OP_PUSHDATA1/2/4 push forms identically to a direct push, and accepts
+      -- it iff CPubKey::ValidSize(data) (33/65). A 1-of-1 whose single 33-byte
+      -- compressed key is pushed with OP_PUSHDATA1 must classify as MULTISIG,
+      -- exactly as the direct-push form does.
+      let key = BS.cons 0x02 (BS.replicate 32 0x11)  -- 33B compressed (header 0x02)
+          ms  = encodeScript (Script
+            [ OP_1
+            , OP_PUSHDATA key OPDATA1     -- PUSHDATA1-prefixed pubkey
+            , OP_1
+            , OP_CHECKMULTISIG
+            ])
+      isStandardScriptPubKey ms `shouldBe` Just (P2MultiSig 1 [key])
+
+    it "G8 PINS (BUG-8 control): a PUSHDATA1 push of a non-pubkey size is NOT a key" $ do
+      -- Proves the matcher keys on CPubKey::ValidSize, not "accept any push":
+      -- a 32-byte payload is not a valid pubkey size, so the key-walk stops and
+      -- the script is NonStandard rather than a bogus 1-of-1 multisig.
+      let notKey = BS.replicate 32 0x11           -- 32B: not a valid pubkey size
+          ms = encodeScript (Script
+            [ OP_1
+            , OP_PUSHDATA notKey OPDATA1
+            , OP_1
+            , OP_CHECKMULTISIG
+            ])
+      isStandardScriptPubKey ms `shouldBe` Nothing
+
+    it "G8 PINS (BUG-8): a 65-byte uncompressed key (header 0x04) is accepted" $ do
+      let key65 = BS.cons 0x04 (BS.replicate 64 0x22)  -- 65B uncompressed
+          ms = encodeScript (Script
+            [ OP_1
+            , OP_PUSHDATA key65 OPDATA1
+            , OP_1
+            , OP_CHECKMULTISIG
+            ])
+      isStandardScriptPubKey ms `shouldBe` Just (P2MultiSig 1 [key65])
 
   ------------------------------------------------------------------------------
   -- G9-G16 : OP_RETURN / data carrier / dust
@@ -481,12 +545,12 @@ spec = describe "W135 Standardness rules (IsStandardTx)" $ do
 
   describe "G18 ValidateInputsStandardness rejects WITNESS_UNKNOWN prevouts" $ do
     -- W135 covers the WITNESS_UNKNOWN classifier; W106 covers pipeline behavior.
-    it "G18 PINS: a witness v2 program is NonStandard per haskoin's classifier" $ do
+    it "G18 PINS (BUG-2 FIXED): a witness v2 program classifies WITNESS_UNKNOWN" $ do
       -- OP_2 + 4-byte push = witness v2 program of length 4. Core: WITNESS_UNKNOWN.
-      let prog = encodeScript (Script
-            [ OP_2, OP_PUSHDATA (BS.pack [0xde, 0xad, 0xbe, 0xef]) OPCODE ])
+      let payload = BS.pack [0xde, 0xad, 0xbe, 0xef]
+          prog = encodeScript (Script [ OP_2, OP_PUSHDATA payload OPCODE ])
       case decodeScript prog of
-        Right sc -> classifyOutput sc `shouldBe` NonStandard
+        Right sc -> classifyOutput sc `shouldBe` WitnessUnknown 2 payload
         Left _ -> expectationFailure "prog must decode"
 
   describe "G19 MAX_P2SH_SIGOPS=15 per-redeem-script cap" $ do
