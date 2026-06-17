@@ -1452,6 +1452,14 @@ base58CheckDecode txt
 bech32Charset :: String
 bech32Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
+-- | BIP-173/BIP-350 character limit for Bech32(m)-encoded addresses (90).
+-- The BCH code only guarantees detection of up to 4 errors within an
+-- 89-character window, so strings longer than this are rejected up front in
+-- 'bech32Decode'. Mirrors Bitcoin Core's @CharLimit::BECH32 = 90@
+-- (bech32.h:38-40), enforced in @bech32::Decode@ (bech32.cpp:378).
+bech32CharLimit :: Int
+bech32CharLimit = 90
+
 -- | Bech32 polymod for checksum calculation
 bech32Polymod :: [Int] -> Int
 bech32Polymod values = foldl step 1 values
@@ -1549,6 +1557,15 @@ bech32mEncode hrp witVer witProg =
 -- | Decode a Bech32/Bech32m address
 -- Returns (hrp, witness version, witness program)
 bech32Decode :: Text -> Maybe (String, Int, ByteString)
+bech32Decode addr
+  -- BIP-173/BIP-350 cap Bech32(m) addresses at 90 characters. Beyond an
+  -- 89-character window the underlying BCH code no longer guarantees detection
+  -- of up to 4 errors, so any over-long string must be rejected as malformed
+  -- regardless of whether its checksum verifies. Mirrors Bitcoin Core's
+  -- @if (str.size() > limit) return {};@ in @bech32::Decode@ (bech32.cpp:378)
+  -- with @CharLimit::BECH32 = 90@ (bech32.h:38-40). Length is unaffected by
+  -- the lowercasing below, so the raw input length is the right thing to check.
+  | T.length addr > bech32CharLimit = Nothing
 bech32Decode addr =
   let str = map toLower $ T.unpack addr
   in case break (== '1') (reverse str) of
