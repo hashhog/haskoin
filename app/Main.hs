@@ -1711,15 +1711,46 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                -- Truncate to 16 to match the comment's intent: one
                -- batch, one peer, in-order, no race.
                -- (chainstate-atomicity family — _chainstate-atomicity-family-2026-05-26.md)
-               let windowEnd = min headerTip (nextBlock + 15)
+               -- GAP2 fork-aware download floor.  When a heavier COMPETING
+               -- header chain forks BELOW the connected tip, the connect
+               -- cursor 'nextBlock' (= connected-tip+1) is NOT low enough:
+               -- the heavier branch's bodies between the fork point and the
+               -- connected-tip height have never been downloaded, yet
+               -- 'buildReorgConnectList' needs them on disk before the
+               -- reorg can run.  Drop the request floor to FORK_POINT+1 so
+               -- 'requestBlocks' (reading hashes from hcByHeight = the
+               -- heavier header chain) fetches the whole heavier branch.
+               -- A no-op on the linear path (floor == nextBlock).
+               reqFrom <- forkDownloadFloor db hc nextBlock
+               let windowEnd = min headerTip (reqFrom + 15)
                putStrLn $ "Block-gap kicker: requesting blocks "
-                       ++ show nextBlock ++ "-" ++ show windowEnd
+                       ++ show reqFrom ++ "-" ++ show windowEnd
                        ++ " (UTXO-view tip behind header tip "
                        ++ show headerTip ++ ")"
-               requestBlocks pm' hc nextBlock windowEnd rot
+               requestBlocks pm' hc reqFrom windowEnd rot
+               -- GAP2 fork-aware download.  'requestBlocks' above reads
+               -- hashes from 'hcByHeight', which only points at the heavier
+               -- branch ABOVE the work crossover; below it, it still resolves
+               -- to the OLD chain's hashes (the serving peer answers
+               -- 'notfound').  'requestForkBlocks' walks the heavier branch by
+               -- 'cePrev' over 'hcEntries' and requests its REAL hashes from
+               -- the fork point up, so the lower bodies the reorg needs
+               -- actually arrive.  A no-op on the linear path (no competing
+               -- fork).
+               requestForkBlocks pm' db hc rot
                -- Advance the requested-window marker so the MBlock
                -- handler's fTooFarAhead gate admits these blocks.
                modifyIORef' requestedUpToRef (max windowEnd)
+               -- GAP3 route-through.  If we are wedged behind a heavier
+               -- competing fork and all its bridging bodies have now
+               -- arrived, disconnect the connected branch to the fork
+               -- point and connect the heavier branch (Core
+               -- ActivateBestChain) via the existing reorg engine.  No-op
+               -- on the linear path; retried each tick until the bodies
+               -- are present.
+               tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+                 `catch` (\(e :: SomeException) ->
+                            putStrLn $ "P2P reorg kicker error: " ++ show e)
              kicker (rot + 1)
        in kicker 0)
         `catch` (\(e :: SomeException) ->
@@ -2200,6 +2231,220 @@ requestBlocks pm hc fromHeight toHeight rot = do
               return False)
           unless ok $ return ()
 
+--------------------------------------------------------------------------------
+-- P2P fork-aware download + reorg routing (reorg-drop production blocker)
+--------------------------------------------------------------------------------
+--
+-- BACKGROUND.  The header chain ('hcByHeight' / 'hcTip') is maintained by
+-- 'addHeader' and follows the heaviest-work HEADER chain — Core's
+-- @m_best_header@.  The CONNECTED chain (the UTXO-view tip, @PrefixBestBlock@
+-- = 'getBestBlockHash') is the chain whose bodies have actually been
+-- validated + connected to the UTXO set — Core's @ActiveChain().Tip()@.
+-- During header-first sync these two can diverge: a peer can present a
+-- heavier COMPETING header chain that forks BELOW our connected tip, at
+-- which point 'addHeader' flips 'hcByHeight' / 'hcTip' to the heavier chain
+-- while the connected tip is still on the old (now-lighter) branch.
+--
+-- The pre-fix MBlock arm + block-gap kicker downloaded + connected strictly
+-- by height from connected-tip+1, gating each connect on
+-- @prevHash == GetBestBlock()@ (Core ConnectBlock G1, validation.cpp:2333).
+-- When the heavier header chain forks below the connected tip, the block at
+-- connected-tip+1 belongs to the heavier branch and its parent is NOT the
+-- connected tip, so it fails G1 and is dropped — and the fork's ancestry
+-- BELOW the connected tip is never even requested.  The node stays wedged on
+-- the lighter chain forever (the reorg-drop blocker).
+--
+-- FIX (mirrors beamchain's reorg-drop fix; Core ActivateBestChain):
+--   GAP2 — fork-aware download: download the heavier branch from
+--          FORK_POINT+1 (not connected-tip+1) so every bridging body lands
+--          on disk via 'putBlock', and persist the body of any non-extending
+--          MBlock so the reorg engine can read it back.
+--   GAP3 — route-through: when the header tip is a heavier COMPETING fork,
+--          drive 'performReorg' (disconnect connected-chain → fork, connect
+--          fork → header tip) instead of the linear connectBlock G1 path.
+--          'performReorg' / 'reorgAtomic' are the existing reorg engine
+--          (the connected-chain-aware sibling of
+--          'BlockTemplate.doSideBranchReorg', sharing 'reorgAtomic' with the
+--          invalidateblock path); they find the fork via 'findForkPoint'
+--          over 'hcEntries' (hash-keyed, so it sees BOTH branches), build the
+--          disconnect/connect lists from disk bodies, re-validate every
+--          connect block, and commit the whole reorg in one atomic batch.
+--
+-- IMPORTANT: this path triggers ONLY when the header tip is NOT a descendant
+-- of the connected tip.  Normal linear IBD (header tip extends the connected
+-- tip) takes the unchanged connectBlock path and is byte-for-byte identical.
+
+-- | Classify the current connected-vs-header chain relationship.
+--
+-- Returns @Just (connectedTipEntry, headerTipEntry, forkEntry)@ when the
+-- active HEADER tip is STRICTLY heavier than the connected (UTXO-view) tip
+-- AND forks BELOW it (i.e. the header tip does not descend from the
+-- connected tip) — the reorg-drop case that needs the fork-aware path.
+-- The fork entry is their lowest common ancestor in 'hcEntries'.
+--
+-- Returns 'Nothing' for the normal cases: no connected/header tip yet, the
+-- header tip descends linearly from the connected tip (plain IBD / already
+-- ahead), or the header tip is not heavier (nothing to reorg onto).
+detectP2PFork :: HaskoinDB -> HeaderChain
+              -> IO (Maybe (ChainEntry, ChainEntry, ChainEntry))
+detectP2PFork db hc = do
+  mBest <- getBestBlockHash db
+  case mBest of
+    Nothing -> return Nothing
+    Just bestHash -> do
+      entries   <- readTVarIO (hcEntries hc)
+      headerTip <- readTVarIO (hcTip hc)
+      case Map.lookup bestHash entries of
+        Nothing -> return Nothing   -- connected tip not in header index (shouldn't happen)
+        Just connectedTip
+          -- Header tip must be strictly heavier to be worth a reorg.
+          | ceChainWork headerTip <= ceChainWork connectedTip -> return Nothing
+          | ceHash headerTip == ceHash connectedTip           -> return Nothing
+          | otherwise -> do
+              mFork <- findForkPoint hc bestHash (ceHash headerTip)
+              case mFork of
+                Nothing -> return Nothing
+                Just forkEntry
+                  -- Header tip descends linearly from the connected tip:
+                  -- the fork point IS the connected tip, so this is plain
+                  -- forward IBD — leave it to the unchanged connect path.
+                  | ceHash forkEntry == ceHash connectedTip -> return Nothing
+                  -- Genuine competing fork rooted below the connected tip.
+                  | otherwise -> return (Just (connectedTip, headerTip, forkEntry))
+
+-- | GAP3 route-through.  If the connected chain is wedged behind a heavier
+-- COMPETING header chain (per 'detectP2PFork') and every bridging body of
+-- the heavier branch is already on disk, drive 'performReorg' to disconnect
+-- the connected branch back to the fork point and connect the heavier branch
+-- up to the header tip.  Advances 'nextBlockRef' to the header tip + 1 on a
+-- successful reorg so the connect-by-height cursor tracks the new active tip.
+--
+-- A missing bridging body is NOT an error: the fork-aware download
+-- ('forkDownloadFloor' wired into the block-gap kicker) keeps re-requesting
+-- the gap, and the next kicker tick re-attempts the reorg once the bodies
+-- arrive.  Mirrors Core's @ActivateBestChain@ retrying when a block body is
+-- not yet available.
+tryP2PReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
+            -> Maybe IndexManager -> IORef Word32 -> IO ()
+tryP2PReorg net db hc cache mIdxMgr nextBlockRef = do
+  mFork <- detectP2PFork db hc
+  case mFork of
+    Nothing -> return ()
+    Just (connectedTip, headerTip, forkEntry) -> do
+      -- Verify all heavier-branch bodies from fork+1..headerTip are present
+      -- on disk before attempting the reorg ('buildReorgConnectList' reads
+      -- them back via 'getBlock').  If any are missing, defer — the kicker
+      -- will fetch them and retry.
+      entries <- readTVarIO (hcEntries hc)
+      let forkHash = ceHash forkEntry
+          collectConnect h acc
+            | h == forkHash = Just acc
+            | otherwise = case Map.lookup h entries of
+                Nothing -> Nothing
+                Just ce -> cePrev ce >>= \ph -> collectConnect ph (h : acc)
+      case collectConnect (ceHash headerTip) [] of
+        Nothing -> return ()
+        Just connectHashes -> do
+          missing <- filterM (\h -> isNothing <$> getBlock db h) connectHashes
+          if not (null missing)
+            then putStrLn $ "P2P reorg deferred: " ++ show (length missing)
+                         ++ " heavier-branch body(ies) not yet downloaded "
+                         ++ "(fork@" ++ show (ceHeight forkEntry)
+                         ++ " -> header tip " ++ show (ceHeight headerTip) ++ ")"
+            else do
+              putStrLn $ "P2P reorg: connected tip " ++ show (ceHeight connectedTip)
+                      ++ " is on a lighter branch; reorging to heavier header "
+                      ++ "tip " ++ show (ceHeight headerTip)
+                      ++ " (fork@" ++ show (ceHeight forkEntry) ++ ")"
+              res <- performReorg net cache db hc mIdxMgr
+                                  (ceHash connectedTip) (ceHash headerTip)
+                       `catch` (\(e :: SomeException) ->
+                                  return (Left ("exception: " <> show e)))
+              case res of
+                Left err -> putStrLn $ "P2P reorg failed: " ++ err
+                Right () -> do
+                  writeIORef nextBlockRef (ceHeight headerTip + 1)
+                  putStrLn $ "P2P reorg complete: active tip now "
+                          ++ show (ceHeight headerTip)
+
+-- | GAP2 download floor.  The height the block-gap kicker should start
+-- requesting bodies from.  Normally this is the connected-tip+1 cursor
+-- ('nextBlock').  But when a heavier COMPETING header chain forks BELOW the
+-- connected tip ('detectP2PFork'), the heavier branch's ancestry between the
+-- fork point and the connected-tip height has never been downloaded — those
+-- bodies are required by 'buildReorgConnectList' before the reorg can run.
+-- In that case the floor drops to FORK_POINT+1 so 'requestForkBlocks' fetches
+-- the whole heavier branch.
+forkDownloadFloor :: HaskoinDB -> HeaderChain -> Word32 -> IO Word32
+forkDownloadFloor db hc nextBlock = do
+  mFork <- detectP2PFork db hc
+  return $ case mFork of
+    Just (_connectedTip, _headerTip, forkEntry) ->
+      min nextBlock (ceHeight forkEntry + 1)
+    Nothing -> nextBlock
+
+-- | GAP2 fork-aware download.  Request the bodies of the HEAVIER COMPETING
+-- branch — every block from FORK_POINT+1 up to the header tip — by their
+-- ACTUAL branch hashes.
+--
+-- CRITICAL distinction from 'requestBlocks': 'requestBlocks' reads hashes
+-- from 'hcByHeight', which is the height->hash index for the ACTIVE chain.
+-- But 'addHeader' only rewrites 'hcByHeight' at heights ABOVE the work
+-- crossover — i.e. only for the heavier branch's blocks whose CUMULATIVE
+-- work already exceeds the old connected tip (Consensus.hs:4537,
+-- @when (work > ceChainWork currentTip)@).  The heavier branch's LOWER
+-- blocks (fork_point+1 .. crossover) still resolve through 'hcByHeight' to
+-- the OLD (now-lighter) chain's hashes.  Requesting those wrong hashes makes
+-- the serving peer answer @notfound@ (it never had the lighter chain), so
+-- the heavier branch's lower bodies never arrive and the reorg can never
+-- assemble — the residual wedge the height-indexed download could not see.
+--
+-- Instead we walk 'cePrev' over 'hcEntries' (hash-keyed, sees BOTH branches)
+-- from the header tip back to the fork point, yielding the heavier branch's
+-- real hashes, and request exactly the ones whose body is not yet on disk.
+-- Mirrors Core's @BlockManager@ requesting blocks along the most-work HEADER
+-- chain (CBlockIndex::GetAncestor walks pprev, never the active height map).
+-- A no-op when there is no competing fork ('detectP2PFork' = Nothing).
+requestForkBlocks :: PeerManager -> HaskoinDB -> HeaderChain -> Int -> IO ()
+requestForkBlocks pm db hc rot = do
+  mFork <- detectP2PFork db hc
+  case mFork of
+    Nothing -> return ()
+    Just (_connectedTip, headerTip, forkEntry) -> do
+      entries <- readTVarIO (hcEntries hc)
+      let forkHash = ceHash forkEntry
+          -- Walk the heavier branch from the header tip down to (but not
+          -- including) the fork point, collecting real branch hashes in
+          -- ascending-height order.
+          collect h acc
+            | h == forkHash = acc
+            | otherwise = case Map.lookup h entries of
+                Nothing -> acc
+                Just ce -> case cePrev ce of
+                  Nothing -> h : acc
+                  Just ph -> collect ph (h : acc)
+          branchHashes = collect (ceHash headerTip) []
+      -- Only request the bodies we don't already have, so a re-tick does not
+      -- re-flood already-downloaded blocks.
+      needed <- filterM (\h -> isNothing <$> getBlock db h) branchHashes
+      unless (null needed) $ do
+        peerList <- getConnectedPeerList pm
+        case peerList of
+          [] -> return ()
+          _ -> do
+            let batches  = chunksOf 16 needed
+                numPeers = length peerList
+            putStrLn $ "Fork-aware download: requesting " ++ show (length needed)
+                    ++ " heavier-branch block(s) (fork@" ++ show (ceHeight forkEntry)
+                    ++ " -> header tip " ++ show (ceHeight headerTip)
+                    ++ ") by branch hash from " ++ show numPeers ++ " peer(s)"
+            forM_ (zip [0 ..] batches) $ \(idx :: Int, batch) -> do
+              let pc      = peerList !! ((idx + rot) `mod` numPeers)
+                  invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- batch ]
+              (safeSendMessage pc (MGetData (GetData invVecs)))
+                `catch` (\(e :: SomeException) ->
+                           putStrLn $ "Fork-aware getdata send failed: " ++ show e)
+
 -- | Split a list into chunks of n
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
@@ -2536,6 +2781,28 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               when (height == nb) $
                 putStrLn $ "[W163 diag] next-needed block " ++ show height
                         ++ " rejected by connectBlock: " ++ cbErr
+              -- GAP2/GAP3 reorg-drop fix.  A block whose parent is NOT the
+              -- connected tip fails the linear connect G1 gate
+              -- (@prevHash == GetBestBlock()@).  Pre-fix the body was simply
+              -- dropped, so a heavier COMPETING fork could never be
+              -- assembled.  Persist the body (Core 'SaveBlockToDisk' stores
+              -- every accepted block regardless of which branch wins) so the
+              -- reorg engine's 'buildReorgConnectList' can read it back, then
+              -- attempt a reorg: if this block (or the heavier header tip it
+              -- belongs to) outweighs the connected chain and forks below it,
+              -- 'tryP2PReorg' disconnects the connected branch to the fork
+              -- point and connects the heavier branch.  No-op when the header
+              -- tip is not a heavier competing fork.  The block header is
+              -- already in 'hcEntries' (addHeader above), so 'putBlock' is the
+              -- only missing piece for the engine to find the body.
+              putBlock db bh block
+                `catch` (\(e :: SomeException) ->
+                           putStrLn $ "putBlock (side-branch) error at height "
+                                   ++ show height ++ ": " ++ show e)
+              tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+                `catch` (\(e :: SomeException) ->
+                           putStrLn $ "P2P reorg (MBlock) error at height "
+                                   ++ show height ++ ": " ++ show e)
             Right () -> do
               -- Mirror the connect into any opted-in secondary indexes
               -- (txindex / blockfilterindex / coinstatsindex).  We read
