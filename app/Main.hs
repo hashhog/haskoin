@@ -1282,7 +1282,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- must call fillPartialBlock to complete the two-round-trip path).
     -- Reference: bitcoin-core/src/net_processing.cpp mapBlocksInFlight /
     -- PartiallyDownloadedBlock kept alive across the two messages.
-    cbsPendingVar <- newTVarIO (Map.empty :: Map.Map BlockHash PartiallyDownloadedBlock)
+    cbsPendingVar <- newTVarIO (Map.empty :: Map.Map BlockHash (Int64, PartiallyDownloadedBlock))
     let compactBlockState = CompactBlockState
           { cbsPending = cbsPendingVar
           , cbsConfig  = defaultCompactBlockConfig
@@ -1906,6 +1906,25 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       void $ forkIO $ forever $ do
         threadDelay (gcTickSecs * 1_000_000)
         performMajorGC
+
+    -- BIP-152 cbsPending leak fix (2026-06-20): a getblocktxn whose BLOCKTXN
+    -- reply never arrives (the peer dropped it, a full-block fallback won the
+    -- race, or the peer disconnected mid-reconstruction) strands a near-full
+    -- block of Txs in the cbsPending TVar forever. That data is reachable, so
+    -- even the forced major GC above cannot reclaim it — it is the residual
+    -- at-tip RSS climb the GC ticker alone could not bound. Bitcoin Core reaps
+    -- the equivalent (mapBlocksInFlight) via the block-download timeout + peer
+    -- teardown; haskoin has neither, so sweep entries older than
+    -- cbPendingTimeoutSecs once a minute. (cbsPending is keyed by block hash,
+    -- not peer, so an insertion-age sweep is the natural reaper.) Always on,
+    -- independent of the GC ticker's enable flag.
+    let cbPendingTimeoutSecs = 600 :: Int64  -- ~Core's block-download timeout
+    void $ forkIO $ forever $ do
+      threadDelay (60 * 1_000_000)
+      nowTs    <- (round <$> getPOSIXTime :: IO Int64)
+      cbsSweep <- readIORef compactBlockStateRef
+      atomically $ modifyTVar' (cbsPending cbsSweep) $
+        Map.filter (\(ts, _) -> nowTs - ts < cbPendingTimeoutSecs)
 
     -- Wait forever (or until signal)
     putStrLn "Node is running. Press Ctrl+C to stop."
@@ -3266,7 +3285,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                     -- alive in mapBlocksInFlight keyed by block hash until BLOCKTXN arrives.
                     -- Reference: bitcoin-core/src/net_processing.cpp:3964-3967
                     cbs <- readIORef compactBlockStateRef
-                    atomically $ modifyTVar' (cbsPending cbs) (Map.insert bh pdb)
+                    pdbTs <- (round <$> getPOSIXTime :: IO Int64)
+                    atomically $ modifyTVar' (cbsPending cbs) (Map.insert bh (pdbTs, pdb))
                     pm <- readIORef pmRef
                     let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
                     requestFromPeer pm addr (MGetBlockTxn gbt)
@@ -3319,8 +3339,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
     mPdb <- atomically $ do
       pending <- readTVar (cbsPending cbs)
       case Map.lookup blockHash pending of
-        Nothing  -> return Nothing
-        Just pdb -> do
+        Nothing       -> return Nothing
+        Just (_, pdb) -> do
           -- Remove from pending regardless of outcome (either we reconstruct
           -- successfully and submit, or we fall back to full block getdata).
           writeTVar (cbsPending cbs) (Map.delete blockHash pending)
