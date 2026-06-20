@@ -7398,8 +7398,13 @@ data PartiallyDownloadedBlock = PartiallyDownloadedBlock
 
 -- | Compact block reconstruction state
 data CompactBlockState = CompactBlockState
-  { cbsPending :: !(TVar (Map BlockHash PartiallyDownloadedBlock))
-      -- ^ Partially downloaded blocks waiting for missing txns
+  { cbsPending :: !(TVar (Map BlockHash (Int64, PartiallyDownloadedBlock)))
+      -- ^ Partially downloaded blocks waiting for missing txns, paired with the
+      --   POSIX-second insertion time so a periodic sweep can reap orphaned
+      --   entries whose BLOCKTXN reply never arrives. Without the timestamp +
+      --   sweep (see the cbsPending sweep in app/Main.hs) a never-completing
+      --   reconstruction strands a near-full block of Txs in this live TVar
+      --   forever — reachable data the forced major GC cannot reclaim.
   , cbsConfig  :: !CompactBlockConfig
   }
 
