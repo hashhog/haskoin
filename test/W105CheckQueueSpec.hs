@@ -258,11 +258,17 @@ import Haskoin.Performance
 import Haskoin.Consensus
   ( ConsensusFlags(..)
   , consensusFlagsToScriptFlags
+  , validateBlockTransactions
   , initGlobalSigCache
   , lookupGlobalSigCache
   , insertGlobalSigCache
   )
 import Haskoin.Script (ScriptFlags, emptyFlags)
+import Data.List (isInfixOf)
+
+-- | String-specialised 'isInfixOf' for matching rejection messages.
+isInfixOfStr :: String -> String -> Bool
+isInfixOfStr = isInfixOf
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -528,11 +534,15 @@ spec_G7_validateTxChunkFlags = describe "G7 validateTxChunk respects ConsensusFl
 --------------------------------------------------------------------------------
 
 spec_G8_missingPrevoutSilent :: Spec
-spec_G8_missingPrevoutSilent = describe "G8 verifyBlockScriptsParallel missing prevout silent drop (BUG-19)" $ do
-  it "BUG-19: block with unresolvable input silently passes verifyBlockScriptsParallel" $
-    -- The comprehension in verifyBlockScriptsParallel filters out txs whose
-    -- inputs can't all be found in utxoMap (guard: length prevs == length inputs).
-    -- A tx with a missing prevout is quietly omitted rather than triggering Left.
+spec_G8_missingPrevoutSilent = describe "G8 verifyBlockScriptsParallel missing prevout HARD FAILURE (BUG-19 FIXED)" $ do
+  it "FIXED BUG-19: block with unresolvable input is REJECTED by verifyBlockScriptsParallel, not skipped" $
+    -- Before the fix, the list-comprehension guard
+    --   length prevs == length (txInputs tx)
+    -- in verifyBlockScriptsParallel SILENTLY DROPPED any tx whose prevouts
+    -- could not all be resolved from utxoMap — the tx contributed zero checks
+    -- and the block was accepted as if it had verified (a consensus hole).
+    -- After the fix, an unresolved prevout is a HARD Left ("Missing UTXO: ..."),
+    -- matching the serial connect path's validateSingleTx behaviour.
     do let op = mkOutpoint 99
            header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
                       (Hash256 (BS.replicate 32 0)) 0 0 0
@@ -540,7 +550,26 @@ spec_G8_missingPrevoutSilent = describe "G8 verifyBlockScriptsParallel missing p
            spendTx = Tx 2 [txin] [TxOut 9_000 BS.empty] [[]] 0
            block = Block header [mkCoinbaseTx, spendTx]
            emptyUTXO = Map.empty  -- prevout not in map
-       verifyBlockScriptsParallel block emptyUTXO nullFlags `shouldBe` Right ()
+       verifyBlockScriptsParallel block emptyUTXO nullFlags
+         `shouldSatisfy` \r -> case (r :: Either String ()) of
+           Left msg -> "Missing UTXO" `isInfixOfStr` msg
+           Right () -> False
+
+  it "FIXED BUG-19: a partially-resolvable tx (one of two inputs missing) is rejected" $
+    -- Even when SOME of a tx's prevouts resolve, a single missing prevout must
+    -- reject the whole block — never silently verify only the resolvable inputs.
+    do let opGood = mkOutpoint 70
+           opBad  = mkOutpoint 71
+           header = BlockHeader 1 (BlockHash (Hash256 (BS.replicate 32 0)))
+                      (Hash256 (BS.replicate 32 0)) 0 0 0
+           txins  = [TxIn opGood BS.empty 0xffffffff, TxIn opBad BS.empty 0xffffffff]
+           spendTx = Tx 2 txins [TxOut 9_000 BS.empty] [[], []] 0
+           block = Block header [mkCoinbaseTx, spendTx]
+           utxoMap = Map.singleton opGood op1Prevout  -- only opGood present
+       verifyBlockScriptsParallel block utxoMap nullFlags
+         `shouldSatisfy` \r -> case (r :: Either String ()) of
+           Left msg -> "Missing UTXO" `isInfixOfStr` msg
+           Right () -> False
 
 --------------------------------------------------------------------------------
 -- G9: verifyBlockScriptsParallel uses emptyFlags (BUG-3)
@@ -1033,6 +1062,82 @@ spec_G30_checkQueueControl = describe "G30 CCheckQueueControl RAII equivalent ab
        result `shouldBe` []
 
 --------------------------------------------------------------------------------
+-- G31: parallel script verification is WIRED into the production connect path
+--      (analog of rustoshi's G16 reachability test)
+--------------------------------------------------------------------------------
+--
+-- Core: ConnectBlock collects a std::vector<CScriptCheck> and dispatches it to
+--       the CCheckQueue worker pool (validation.cpp:2581-2584) — every
+--       non-coinbase tx's input scripts are verified in parallel.
+-- Haskoin (now): validateBlockTransactions runs the non-script economic gates +
+--       intra-block UTXO maintenance serially and in order, collects each tx's
+--       resolved per-input script checks, and dispatches the whole block's
+--       checks once via parMap (runScriptChecksParallel) — unless assumevalid
+--       (skipScripts=True), which skips scripts entirely.
+--
+-- These tests prove the parallel path is REACHABLE from the connect entry
+-- point: a block whose only defect is a failing input script must be REJECTED
+-- with skipScripts=False, and ACCEPTED with skipScripts=True (proving
+-- assumevalid still bypasses script evaluation and ONLY script evaluation).
+--------------------------------------------------------------------------------
+
+spec_G31_parallelVerifyWiredIntoConnect :: Spec
+spec_G31_parallelVerifyWiredIntoConnect =
+  describe "G31 parallel script verify WIRED into validateBlockTransactions (reachability)" $ do
+    let -- prevout whose scriptPubKey is OP_0 (0x00): a spendable output that
+        -- always fails script verification (top stack element is false).
+        badScriptPrevout = TxOut 10_000 (BS.singleton 0x00)
+        op = mkOutpoint 800
+        spendTx = Tx 2 [TxIn op BS.empty 0xffffffff]
+                       [TxOut 9_000 BS.empty] [[]] 0
+        -- coinbase is skipped by validateBlockTransactions (it processes tail);
+        -- the prevout's value covers the spend so the ONLY failing gate is the
+        -- script.  Map carries just the spent prevout.
+        utxoMap = Map.singleton op badScriptPrevout
+        txns = [mkCoinbaseTx, spendTx]
+
+    it "REJECTS a block whose only defect is a failing input script (parallel path reached)" $
+      -- If script verification were NOT wired, this block would be accepted
+      -- (Right fees).  Because the parallel verifier runs, it is rejected.
+      validateBlockTransactions nullFlags False txns utxoMap
+        `shouldSatisfy` \r -> case (r :: Either String Word64) of
+          Left msg -> "script verify failed" `isInfixOfStr` msg
+          Right _  -> False
+
+    it "ACCEPTS the same block under assumevalid (skipScripts=True) — scripts skipped" $
+      -- Proves assumevalid bypasses script evaluation (and ONLY that): every
+      -- non-script gate passes, so with scripts skipped the block validates.
+      validateBlockTransactions nullFlags True txns utxoMap
+        `shouldSatisfy` \r -> case (r :: Either String Word64) of
+          Left _  -> False
+          Right _ -> True
+
+    it "ACCEPTS a block with a valid (OP_TRUE) input script under skipScripts=False" $
+      -- The parallel path must not over-reject: a genuinely-valid script passes.
+      let goodPrevout = TxOut 10_000 (BS.singleton 0x51)  -- OP_TRUE
+          op'      = mkOutpoint 801
+          spendTx' = Tx 2 [TxIn op' BS.empty 0xffffffff]
+                          [TxOut 9_000 BS.empty] [[]] 0
+          utxoMap' = Map.singleton op' goodPrevout
+          txns'    = [mkCoinbaseTx, spendTx']
+      in validateBlockTransactions nullFlags False txns' utxoMap'
+           `shouldSatisfy` \r -> case (r :: Either String Word64) of
+             Left _  -> False
+             Right _ -> True
+
+    it "REJECTS a block with an unresolved prevout (BUG-19 class) on the connect path" $
+      -- The connect path resolves prevouts in validateSingleTxCollect; a missing
+      -- prevout is a hard "Missing UTXO" rejection, never a silent skip.
+      let op'      = mkOutpoint 802
+          spendTx' = Tx 2 [TxIn op' BS.empty 0xffffffff]
+                          [TxOut 9_000 BS.empty] [[]] 0
+          txns'    = [mkCoinbaseTx, spendTx']
+      in validateBlockTransactions nullFlags False txns' Map.empty
+           `shouldSatisfy` \r -> case (r :: Either String Word64) of
+             Left msg -> "Missing UTXO" `isInfixOfStr` msg
+             Right _  -> False
+
+--------------------------------------------------------------------------------
 -- Top-level spec
 --------------------------------------------------------------------------------
 
@@ -1080,3 +1185,5 @@ spec = describe "W105 CCheckQueue / parallel script verification" $ do
   spec_G28_scriptExecCache
   spec_G29_mempoolEmptyFlags
   spec_G30_checkQueueControl
+  -- Parallel verify wired into the production connect path (reachability)
+  spec_G31_parallelVerifyWiredIntoConnect
