@@ -253,6 +253,7 @@ import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
 import Data.List (sort, sortBy, foldl')
 import Numeric (showHex)
 import Control.Monad (when, unless, forM, forM_, foldM, forever, void)
+import Control.Parallel.Strategies (withStrategy, parListChunk, rdeepseq)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -2998,19 +2999,162 @@ consensusFlagsToWord32 cf =
 -- the long-form rationale.
 --------------------------------------------------------------------------------
 
+-- | A single resolved per-input script-verification work item — the unit of
+-- parallel work dispatched after the serial economic pass.  Core's
+-- @CScriptCheck@ analog (one entry per non-coinbase input).
+--
+-- Every field is already resolved against the correct UTXO view (including
+-- intra-block prevouts) by 'validateSingleTxCollect', so the worker is a pure
+-- 'verifyScriptWithFlags' call with no further map lookups.  @sciInputIdx@ is
+-- the input index WITHIN ITS TRANSACTION (the @idx@ argument to the verifier
+-- and the number in the rejection message), matching the old serial loop's
+-- @forM_ (zip3 [0..] ...)@ numbering exactly.
+--
+-- NOTE: this is the same shape as 'Haskoin.Performance.ScriptCheck'; it is
+-- duplicated here only because 'Haskoin.Performance' imports
+-- 'Haskoin.Consensus' (for 'ConsensusFlags') — importing it back would form a
+-- module cycle.  The parallel dispatch logic is likewise kept local to this
+-- module ('runScriptChecksParallel') to avoid that cycle.
+data ScriptCheckItem = ScriptCheckItem
+  { sciTx           :: !Tx           -- ^ Spending transaction
+  , sciInputIdx     :: !Int          -- ^ Input index within sciTx
+  , sciPrevScript   :: !ByteString   -- ^ prevout scriptPubKey
+  , sciPrevValue    :: !Word64       -- ^ prevout amount
+  , sciSpentAmounts :: ![Word64]     -- ^ BIP-341 sha_amounts (this tx, in order)
+  , sciSpentScripts :: ![ByteString] -- ^ BIP-341 sha_scriptpubkeys (this tx, in order)
+  }
+
+-- | Verify a single 'ScriptCheckItem', returning @Nothing@ on success or
+-- @Just errmsg@ on failure.  Error strings are byte-identical to the old
+-- serial loop in 'validateSingleTx'.
+verifyScriptCheckItem :: ScriptFlags -> ScriptCheckItem -> Maybe String
+verifyScriptCheckItem scriptFlags ScriptCheckItem{..} =
+  case verifyScriptWithFlags scriptFlags sciTx sciInputIdx
+         sciPrevScript sciPrevValue sciSpentAmounts sciSpentScripts of
+    Left err    -> Just $ "script verify failed (input " ++ show sciInputIdx
+                        ++ "): " ++ err
+    Right False -> Just $ "script verify failed (input " ++ show sciInputIdx
+                        ++ "): script returned false"
+    Right True  -> Nothing
+
+-- | Run a batch of pre-resolved script checks IN PARALLEL, returning the FIRST
+-- failure (if any) — exactly as the equivalent serial loop would have rejected.
+--
+-- This mirrors Bitcoin Core's @CheckInputScripts@ collecting a
+-- @std::vector<CScriptCheck>@ that @ConnectBlock@ dispatches across the
+-- @CCheckQueue@ worker pool (validation.cpp:2581-2584): the non-script
+-- consensus gates and the UTXO mutation sequence already ran serially and in
+-- order; only the embarrassingly-parallel, CPU-bound script verification is
+-- fanned out here.
+--
+-- Semantics are IDENTICAL to the serial loop:
+--   * same 'verifyScriptWithFlags' arguments + 'ScriptFlags';
+--   * the SigCache (read inside @cachedVerify*@ via thread-safe
+--     'atomicModifyIORef'') makes concurrent evaluation safe — a concurrent
+--     miss simply re-runs the deterministic verify, never changing the verdict;
+--     only positive results are cached, so the accept/reject decision is the
+--     same whether checks run serially or in parallel;
+--   * ANY single input check failing rejects the whole block, with the same
+--     per-input error string;
+--   * only non-coinbase inputs are ever in the batch (the caller skips the
+--     coinbase and skips this batch entirely under assumevalid).
+--
+-- Parallelism is bounded by the RTS @-N@ capability count (haskoin runs
+-- @-threaded -N4@).
+--
+-- SPARK-FIZZLE FIX (2026-06-22): the previous body
+--   @let results = parMap rseq (verifyScriptCheckItem f) checks
+--    in case [err | Just err <- results] of ...@
+-- created one spark per check but then scanned @results@ with a lazy list
+-- comprehension.  The main thread's left-to-right scan forced each
+-- @Maybe String@ to WHNF *as it walked the list*, racing ahead of the
+-- worker HECs and evaluating most elements itself before the corresponding
+-- spark could be converted — classic spark fizzle (@+RTS -s@ showed
+-- @converted@ ≈ 0, @fizzled@ ≈ N), so the verifies ran serially on one HEC.
+--
+-- The fix forces the ENTIRE parallel pass to complete BEFORE the sequential
+-- scan, and chunks the checks to amortize spark overhead:
+--
+--   1. @withStrategy (parListChunk chunkSize rdeepseq) results@ sparks one
+--      task per chunk; @rdeepseq@ fully evaluates each chunk's @Maybe String@
+--      list to NF (which runs every @verifyScriptCheckItem@ in it).
+--   2. @withStrategy@ returns the value only after the strategy's own
+--      traversal has driven the spark conversions, so the parallel work is
+--      genuinely handed to the worker HECs (they convert the sparks) rather
+--      than being stolen back by a racing consumer.  Binding the forced
+--      list to @results'@ and scanning THAT means the scan reads
+--      already-evaluated thunks.
+--
+-- Semantics are unchanged: @rdeepseq@ on @Maybe String@ forces the same
+-- @verifyScriptCheckItem@ result it always did (its WHNF — @Just@/@Nothing@ —
+-- already required running the full verify; deep-forcing the wrapped @String@
+-- is harmless and total).  ANY single input failing still rejects the whole
+-- block, and the first-failure scan below preserves the lowest-index error
+-- string byte-for-byte.  The only behavioural difference is that ALL checks
+-- are now evaluated (the old lazy scan could short-circuit after the first
+-- failure) — this is a non-observable change to the verdict (the same
+-- @Left err@ for the same first failure) and matches Core's @CCheckQueue@,
+-- which likewise dispatches the whole batch.
+runScriptChecksParallel :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
+runScriptChecksParallel _scriptFlags [] = Right ()
+runScriptChecksParallel scriptFlags checks =
+  let -- Chunk size amortizes per-spark overhead while keeping enough chunks to
+      -- fill the (N4) HECs on script-heavy blocks.  Powers of ~16-64 are the
+      -- usual sweet spot; 32 keeps thousands-of-input blocks well-distributed.
+      chunkSize = 32
+      results :: [Maybe String]
+      results = map (verifyScriptCheckItem scriptFlags) checks
+      -- Force the whole parallel pass to COMPLETE before scanning.  The
+      -- strategy traversal converts the per-chunk sparks across the HECs and
+      -- only returns once every element is in NF, so the scan below never
+      -- races ahead of (and thus fizzles) a spark.
+      results' = withStrategy (parListChunk chunkSize rdeepseq) results
+  in case [err | Just err <- results'] of
+       []      -> Right ()
+       (err:_) -> Left err
+
+-- | Run a batch of pre-resolved script checks SERIALLY, first failure wins.
+-- Used by 'validateSingleTx' so its standalone contract (and every existing
+-- caller/test) is byte-for-byte unchanged.
+runScriptChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
+runScriptChecksSerial scriptFlags = go
+  where
+    go []     = Right ()
+    go (c:cs) = case verifyScriptCheckItem scriptFlags c of
+                  Just err -> Left err
+                  Nothing  -> go cs
+
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
 -- 'skipScripts' = True means per-input script evaluation is not performed
 -- (assumevalid ancestor path).  UTXO existence, value checks, and structural
 -- transaction validation still run.
 -- KNOWN PITFALL: Handles intra-block spending by updating UTXO map as we go.
+--
+-- PARALLEL SCRIPT VERIFICATION (W105 G16 / CCheckQueue parity): the serial fold
+-- below runs every NON-SCRIPT consensus gate (structural CheckTransaction,
+-- per-input + running-sum MoneyRange, value-in >= value-out, accumulated-fee
+-- range) AND the intra-block UTXO map maintenance IN ORDER, exactly as before —
+-- but it no longer runs the per-input script interpreter inline.  Instead each
+-- tx's resolved per-input script checks are collected
+-- ('validateSingleTxCollect'), and after the fold the whole block's checks are
+-- dispatched ONCE across the RTS capabilities ('runScriptChecksParallel').
+-- Under assumevalid ('skipScripts' = True) no checks are collected or run,
+-- identical to before.  This is Core's @ConnectBlock@ collecting @vChecks@ and
+-- handing them to the @CCheckQueue@ (validation.cpp:2581-2584).
 validateBlockTransactions :: ConsensusFlags -> Bool -> [Tx] -> Map OutPoint TxOut
                          -> Either String Word64
 validateBlockTransactions flags skipScripts txns initialUtxoMap = do
-  -- Process transactions sequentially, updating UTXO map for intra-block spending
-  let go :: (Word64, Map OutPoint TxOut) -> Tx -> Either String (Word64, Map OutPoint TxOut)
-      go (accFees, utxoMap) tx = do
-        fee <- validateSingleTx flags skipScripts utxoMap tx
+  -- Process transactions sequentially, updating UTXO map for intra-block
+  -- spending, accumulating the per-input script checks (in block order) for a
+  -- single parallel dispatch after the fold.
+  let go :: (Word64, Map OutPoint TxOut, [[ScriptCheckItem]]) -> Tx
+         -> Either String (Word64, Map OutPoint TxOut, [[ScriptCheckItem]])
+      go (accFees, utxoMap, accChecks) tx = do
+        -- Economic + structural validation runs in order against the current
+        -- (intra-block-aware) UTXO view; script checks are NOT run here — they
+        -- are returned resolved for the deferred parallel pass.
+        (fee, txChecks) <- validateSingleTxCollect flags utxoMap tx
         -- Accumulated fee range check mirrors Bitcoin Core validation.cpp::ConnectBlock:
         --   nFees += txfee; if (!MoneyRange(nFees)) → "bad-txns-accumulated-fee-outofrange"
         let accFees' = accFees + fee
@@ -3025,9 +3169,21 @@ validateBlockTransactions flags skipScripts txns initialUtxoMap = do
             -- Remove spent outputs
             spentOutpoints = map txInPrevOutput (txInputs tx)
             utxoMap' = foldr Map.delete (Map.union newUtxos utxoMap) spentOutpoints
-        return (accFees', utxoMap')
+        return (accFees', utxoMap', txChecks : accChecks)
 
-  (totalFees, _) <- foldM go (0, initialUtxoMap) (tail txns)  -- Skip coinbase
+  (totalFees, _, revChecks) <- foldM go (0, initialUtxoMap, []) (tail txns)  -- Skip coinbase
+
+  -- Deferred parallel script verification.  All non-script gates and UTXO
+  -- mutations above ran serially and in order; the block's script checks are
+  -- now dispatched once across the RTS capabilities.  Under assumevalid we
+  -- skip this entirely (the old `unless skipScripts` behaviour).  `revChecks`
+  -- is in reverse block order; `concat . reverse` restores block order so the
+  -- first-failure error string matches the lowest-indexed failing input/tx —
+  -- byte-identical to the old serial loop's rejection.
+  unless skipScripts $
+    runScriptChecksParallel (consensusFlagsToScriptFlags flags)
+                            (concat (reverse revChecks))
+
   return totalFees
 
 -- | Validate a single non-coinbase transaction.
@@ -3045,6 +3201,42 @@ validateBlockTransactions flags skipScripts txns initialUtxoMap = do
 validateSingleTx :: ConsensusFlags -> Bool -> Map OutPoint TxOut -> Tx
                  -> Either String Word64
 validateSingleTx flags skipScripts utxoMap tx = do
+  -- Economic + structural validation (always runs), plus the resolved per-input
+  -- script-check work items for this tx.  This is the SAME path the block
+  -- connect fold uses; here we run the collected checks SERIALLY so this
+  -- function's standalone behaviour and error strings are byte-for-byte
+  -- unchanged for its existing callers (checkTxInputsConnect, tests).
+  (fee, txChecks) <- validateSingleTxCollect flags utxoMap tx
+  -- Script / signature verification:
+  -- When skipScripts is True (assumevalid ancestor path) we skip this step,
+  -- matching Bitcoin Core's ConnectBlock behaviour. Otherwise, every input's
+  -- scriptSig + witness must satisfy its scriptPubKey under the consensus
+  -- ScriptFlags for this height.
+  unless skipScripts $
+    runScriptChecksSerial (consensusFlagsToScriptFlags flags) txChecks
+  return fee
+
+-- | Economic + structural validation of a single non-coinbase transaction,
+-- returning the fee (inputs - outputs) AND the resolved per-input script-check
+-- work items (NOT yet executed).  Splitting the resolution/economic checks
+-- from the script execution lets 'validateBlockTransactions' run the per-tx
+-- economic gates + UTXO maintenance serially and in order while deferring the
+-- (independent, CPU-bound) script verification to a single parallel pass.
+--
+-- The economic checks and their error strings are byte-for-byte the same as
+-- the prior inline implementation in 'validateSingleTx':
+--   * 'validateTransaction' (structural CheckTransaction);
+--   * missing prevout -> "Missing UTXO: ..." (HARD failure, never skipped);
+--   * per-input + running-sum MoneyRange -> "bad-txns-inputvalues-outofrange";
+--   * value-in >= value-out -> "Outputs exceed inputs".
+--
+-- W159 BUG-17 / W160 BUG-16: the SigCache lives one level deeper, inside
+-- @cachedVerifyMsgLax@ / @cachedVerifySchnorr@ in Haskoin.Script, keyed on the
+-- actual per-input @(sighash, pubkey, sig)@ triple — matching Core's
+-- @SignatureCache::ComputeEntryECDSA@ (src/script/sigcache.cpp:39-49).
+validateSingleTxCollect :: ConsensusFlags -> Map OutPoint TxOut -> Tx
+                        -> Either String (Word64, [ScriptCheckItem])
+validateSingleTxCollect flags utxoMap tx = do
   -- First, run context-free validation (structure checks always run)
   validateTransaction tx
 
@@ -3076,40 +3268,30 @@ validateSingleTx flags skipScripts utxoMap tx = do
   -- Inputs must cover outputs (always checked, even under assumevalid)
   when (totalIn < totalOut) $ Left "Outputs exceed inputs"
 
-  -- Script / signature verification:
-  -- When skipScripts is True (assumevalid ancestor path) we skip this step,
-  -- matching Bitcoin Core's ConnectBlock behaviour. Otherwise, every input's
-  -- scriptSig + witness must satisfy its scriptPubKey under the consensus
-  -- ScriptFlags for this height.
-  --
-  -- W159 BUG-17 / W160 BUG-16 FIX: the SigCache no longer wraps the entire
-  -- per-input script-verify call.  The prior wrapping passed @txidBytes@
-  -- into the slot named @sighash@ and keyed on (scriptSig, witnessBytes,
-  -- prevoutScript) — for a multi-input tx with two inputs sharing empty
-  -- scriptSig + identical witness + identical prevout scriptPubKey the
-  -- cache hit on input 0 short-circuited input 1's script-verify even
-  -- though its BIP-143 sighash differed.  The cache now lives one level
-  -- deeper, inside @cachedVerifyMsgLax@ / @cachedVerifySchnorr@ in
-  -- Haskoin.Script, keyed on the actual per-input @(sighash, pubkey, sig)@
-  -- triple — matching Core's @SignatureCache::ComputeEntryECDSA@
-  -- (src/script/sigcache.cpp:39-49).
-  unless skipScripts $ do
-    let scriptFlags  = consensusFlagsToScriptFlags flags
-        spentAmounts = inputValues
-        spentScripts = map txOutScript prevOuts
-        inputs       = txInputs tx
-        witnesses    = txWitness tx ++ repeat []  -- pad with empty if needed
-    forM_ (zip3 [0..] prevOuts (zip inputs witnesses)) $ \(idx, prevOut, (_inp, _witStack)) ->
-      case verifyScriptWithFlags scriptFlags tx idx
-                  (txOutScript prevOut) (txOutValue prevOut)
-                  spentAmounts spentScripts of
-             Left err    -> Left $ "script verify failed (input " ++ show idx
-                                 ++ "): " ++ err
-             Right False -> Left $ "script verify failed (input " ++ show idx
-                                 ++ "): script returned false"
-             Right True  -> Right ()
+  -- Build the resolved per-input script-check work items (in input order).
+  -- These are NOT run here; the caller runs them (serially in
+  -- 'validateSingleTx', or in parallel across the whole block in
+  -- 'validateBlockTransactions').  The arguments captured per input are exactly
+  -- those the prior inline serial loop passed to 'verifyScriptWithFlags':
+  -- (tx, idx, prevout script, prevout value, this-tx spentAmounts,
+  -- this-tx spentScripts).  The witness is read inside 'verifyScriptWithFlags'
+  -- from @txWitness tx !! idx@, so no witness field is needed here (the old
+  -- loop's @_witStack@ was already unused).
+  let spentAmounts = inputValues
+      spentScripts = map txOutScript prevOuts
+      txChecks =
+        [ ScriptCheckItem
+            { sciTx           = tx
+            , sciInputIdx     = idx
+            , sciPrevScript   = txOutScript prevOut
+            , sciPrevValue    = txOutValue prevOut
+            , sciSpentAmounts = spentAmounts
+            , sciSpentScripts = spentScripts
+            }
+        | (idx, prevOut) <- zip [0..] prevOuts
+        ]
 
-  return (totalIn - totalOut)
+  return (totalIn - totalOut, txChecks)
 
 -- | Connect-time @Consensus::CheckTxInputs@ composite — the economic verdict
 -- a non-coinbase tx must pass when it is connected into a block at

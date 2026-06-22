@@ -52,6 +52,9 @@ module Haskoin.Performance
     -- * Parallel Validation (Legacy)
   , verifyBlockScriptsParallel
   , parallelMap
+    -- * Parallel Script Verification (production connect path)
+  , ScriptCheck(..)
+  , verifyScriptChecksParallel
     -- * LRU Cache
   , LRUCache(..)
   , newLRUCache
@@ -96,7 +99,7 @@ module Haskoin.Performance
 import Control.Concurrent.Async (mapConcurrently, forConcurrently)
 import Control.Concurrent.STM
 import Control.DeepSeq (NFData(..), force, deepseq)
-import Control.Monad (when, unless)
+import Control.Monad (when, unless, forM)
 import Control.Parallel.Strategies (parMap, rseq, using, parList)
 import qualified Crypto.Hash as H
 import qualified Crypto.Random as CryptoRandom
@@ -119,7 +122,6 @@ import Network.Socket (Socket, SocketOption(..), setSocketOption)
 import System.IO.MMap (mmapFileByteString)
 import System.IO.Unsafe (unsafePerformIO)
 
-import Data.Maybe (mapMaybe)
 import Haskoin.Types
 import Haskoin.Consensus (ConsensusFlags(..), consensusFlagsToScriptFlags)
 import qualified Haskoin.Crypto as Crypto
@@ -479,6 +481,72 @@ data VerifyResult
   | VerifyError !String
   deriving (Show, Eq)
 
+-- | A single resolved script-verification work item.
+--
+-- This is the unit of parallel work dispatched by
+-- 'verifyScriptChecksParallel' — the Core @CScriptCheck@ analog (one entry
+-- per non-coinbase input).  Every field is already resolved against the
+-- correct UTXO view (including intra-block prevouts) by the serial economic
+-- pass, so the parallel worker is a pure call to
+-- 'Script.verifyScriptWithFlags' with no further map lookups.
+--
+-- @scInputIdx@ is the input's index WITHIN ITS TRANSACTION (used both as the
+-- @idx@ argument to the verifier and for the rejection message), matching the
+-- serial loop's @forM_ (zip3 [0..] ...)@ numbering exactly.
+data ScriptCheck = ScriptCheck
+  { scTx            :: !Tx           -- ^ Spending transaction
+  , scInputIdx      :: !Int          -- ^ Input index within scTx
+  , scPrevScript    :: !ByteString   -- ^ prevout scriptPubKey
+  , scPrevValue     :: !Word64       -- ^ prevout amount
+  , scSpentAmounts  :: ![Word64]     -- ^ BIP-341 sha_amounts (this tx's prevout values, in order)
+  , scSpentScripts  :: ![ByteString] -- ^ BIP-341 sha_scriptpubkeys (this tx's prevout scripts, in order)
+  }
+
+-- | Run a batch of pre-resolved 'ScriptCheck' work items in parallel and
+-- return the FIRST failure (if any), exactly as the equivalent serial loop
+-- would have rejected.
+--
+-- This is the production entry point wired into the block-connect path
+-- (Consensus.hs @validateBlockTransactions@).  It mirrors Bitcoin Core's
+-- @CheckInputScripts@ collecting a @std::vector<CScriptCheck>@ that
+-- @ConnectBlock@ then dispatches across the @CCheckQueue@ worker pool
+-- (validation.cpp:2581-2584) — the non-script consensus gates and the UTXO
+-- mutation sequence already ran serially and in order; only the
+-- embarrassingly-parallel, CPU-bound script verification is fanned out here.
+--
+-- Semantics are IDENTICAL to the serial loop:
+--   * same 'Script.verifyScriptWithFlags' arguments + 'ScriptFlags';
+--   * the SigCache (read inside @cachedVerify*@ via thread-safe
+--     'atomicModifyIORef'') makes concurrent evaluation safe — a concurrent
+--     miss simply re-runs the deterministic verify, never changing the verdict;
+--   * ANY single input check failing (Left, or @Right False@) rejects the whole
+--     block with the same per-input error string the serial loop produced;
+--   * the worker is only ever invoked for non-coinbase inputs — the caller
+--     skips the coinbase and skips this batch entirely under assumevalid.
+--
+-- Parallelism is bounded by the RTS @-N@ capability count (haskoin runs
+-- @-threaded -N4@); 'parMap' spawns one spark per check and the RTS schedules
+-- them across the available HECs.  The fold over @results@ short-circuits on
+-- the first 'VerifyError', so 'Left' is returned without forcing the remaining
+-- sparks once an earlier check has failed (lazy left-to-right scan over the
+-- spark results — first failure wins, matching the serial loop which rejected
+-- at the first failing input).
+verifyScriptChecksParallel :: Script.ScriptFlags -> [ScriptCheck] -> Either String ()
+verifyScriptChecksParallel _scriptFlags [] = Right ()
+verifyScriptChecksParallel scriptFlags checks =
+  let results = parMap rseq verifyOne checks
+      verifyOne ScriptCheck{..} =
+        case Script.verifyScriptWithFlags scriptFlags scTx scInputIdx
+               scPrevScript scPrevValue scSpentAmounts scSpentScripts of
+          Left err    -> VerifyError $ "script verify failed (input "
+                                     ++ show scInputIdx ++ "): " ++ err
+          Right False -> VerifyError $ "script verify failed (input "
+                                     ++ show scInputIdx ++ "): script returned false"
+          Right True  -> VerifyOK
+  in case [err | VerifyError err <- results] of
+       []      -> Right ()
+       (err:_) -> Left err
+
 -- | Verify all transaction scripts in a block in parallel.
 --
 -- This is the main CPU bottleneck during IBD. Uses GHC's parallel strategies
@@ -498,41 +566,47 @@ data VerifyResult
 -- silently accepted invalid blocks.  We now delegate to the real
 -- script interpreter via 'Script.verifyScriptWithFlags' so this
 -- entry point is safe to reuse.
+--
+-- BUG-19 FIX (W105 G8): the prior version built @tasks@ with a list-comprehension
+-- guard @length prevs == length (txInputs tx)@ that SILENTLY DROPPED any
+-- transaction whose prevouts could not all be resolved from @utxoMap@ — such a
+-- tx contributed ZERO checks and the block was accepted as if it had verified.
+-- That is a consensus hole (an unresolved prevout must REJECT, never skip).  The
+-- resolution loop below now treats a missing prevout as a hard 'Left' (a
+-- \"Missing UTXO\" rejection), matching the serial connect path's
+-- 'validateSingleTx' behaviour (Consensus.hs: @Nothing -> Left "Missing UTXO: ..."@).
+-- The live connect path uses 'verifyScriptChecksParallel' on already-resolved
+-- prevouts (so a missing prevout is caught earlier, by the serial economic
+-- pass); this entry point keeps the safe behaviour for any direct caller.
 verifyBlockScriptsParallel :: Block
                           -> Map OutPoint TxOut
                           -> ConsensusFlags
                           -> Either String ()
-verifyBlockScriptsParallel block utxoMap flags =
+verifyBlockScriptsParallel block utxoMap flags = do
   let nonCoinbase = case blockTxns block of
         []      -> []
         (_:txs) -> txs  -- Skip coinbase
-      -- Pre-compute per-tx prevouts for BIP-341 sighash (sha_amounts,
-      -- sha_scriptpubkeys).  A missing prevout is itself a verification
-      -- failure (caller must populate utxoMap before this is called).
-      tasks =
-        [ (tx, idx, spentAmounts, spentScripts, prevOut)
-        | tx <- nonCoinbase
-        , let prevs = mapMaybe
-                (\inp -> Map.lookup (txInPrevOutput inp) utxoMap)
-                (txInputs tx)
-        , length prevs == length (txInputs tx)
-        , let spentAmounts = map txOutValue prevs
-              spentScripts = map txOutScript prevs
-        , (idx, prevOut) <- zip [0..] prevs
-        ]
-      -- Execute verifications in parallel using parallel strategies.
-      results = parMap rseq verifyTask tasks
-      verifyTask (!tx, !idx, !spentAmts, !spentScrs, !prevOut) =
-        case Script.verifyScriptWithFlags
-               (consensusFlagsToScriptFlags flags) tx idx
-               (txOutScript prevOut) (txOutValue prevOut)
-               spentAmts spentScrs of
-          Left err    -> VerifyError $ "Input " ++ show idx ++ ": " ++ err
-          Right False -> VerifyError $ "Input " ++ show idx ++ ": script returned false"
-          Right True  -> VerifyOK
-  in case [err | VerifyError err <- results] of
-       []      -> Right ()
-       (err:_) -> Left err
+  -- Resolve every non-coinbase input's prevout.  A missing prevout is a HARD
+  -- FAILURE (BUG-19 fix), not a silent drop.  We build the per-tx ScriptCheck
+  -- list left-to-right and propagate the first unresolved prevout as a Left.
+  checks <- fmap concat $ forM nonCoinbase $ \tx -> do
+    prevs <- forM (txInputs tx) $ \inp ->
+      case Map.lookup (txInPrevOutput inp) utxoMap of
+        Nothing      -> Left $ "Missing UTXO: " ++ show (txInPrevOutput inp)
+        Just prevOut -> Right prevOut
+    let spentAmounts = map txOutValue prevs
+        spentScripts = map txOutScript prevs
+    Right [ ScriptCheck
+              { scTx           = tx
+              , scInputIdx     = idx
+              , scPrevScript   = txOutScript prevOut
+              , scPrevValue    = txOutValue prevOut
+              , scSpentAmounts = spentAmounts
+              , scSpentScripts = spentScripts
+              }
+          | (idx, prevOut) <- zip [0..] prevs
+          ]
+  verifyScriptChecksParallel (consensusFlagsToScriptFlags flags) checks
 
 -- | Generic parallel map with configurable chunk size.
 --
