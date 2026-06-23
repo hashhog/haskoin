@@ -283,7 +283,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         makeKey, KeyPrefix(..), toBE32, TxLocation(..),
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
-                        mkUndoData, lookupUTXO, addUTXO, spendUTXO,
+                        mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear,
                         putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO, getUTXOCoin, getBlockHeight,
                         getBestBlockHash,
                         isUnspendable, Coin(..),
@@ -5458,6 +5458,16 @@ reorgAtomic net cache db hc mIdxMgr disList conList = do
                   -- once it returns the reorg is durable, tip + UTXO +
                   -- undo + height index committed together.
                   writeBatch db (WriteBatch (disOps ++ conOps))
+
+                  -- Class-A dbcache reorg-entry clear: a reorg mutates the
+                  -- on-disk UTXO set non-monotonically (disOps restore/remove +
+                  -- conOps create/spend), so the dedicated read-through mirror
+                  -- must be wiped wholesale. Placed AFTER the disk commit (disk
+                  -- durable first) and BEFORE Phase D so the rcGen bump discards
+                  -- any concurrent read-through populate that read pre-reorg
+                  -- disk. Covers ALL reorg callers (kicker, MBlock side-branch,
+                  -- invalidateblock) by living inside reorgAtomic.
+                  rcClear cache
 
                   -- Phase D — mirror disk into the in-memory cache +
                   -- header-chain pointers.  These are process-local: if

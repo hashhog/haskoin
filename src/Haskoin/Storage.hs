@@ -60,6 +60,7 @@ module Haskoin.Storage
   , getUTXOCoin
   , deleteUTXO
   , buildSpentUtxoMapFromDB
+  , buildSpentUtxoMapCached
   , isUnspendable
     -- * UTXO Cache (Legacy)
   , UTXOEntry(..)
@@ -69,6 +70,10 @@ module Haskoin.Storage
   , addUTXO
   , spendUTXO
   , flushCache
+    -- * Dedicated read-through mirror (IBD connect path)
+  , getUTXOCoinCached
+  , rcInvalidate
+  , rcClear
     -- * CoinsView Type Class Hierarchy
   , Coin(..)
   , CoinEntry(..)
@@ -609,17 +614,32 @@ data UTXOCache = UTXOCache
   , ucDB       :: !HaskoinDB                       -- ^ Database handle
   , ucMaxSize  :: !Int                             -- ^ Maximum cache entries
   , ucSize     :: !(TVar Int)                      -- ^ Current cache size
+  -- | Dedicated read-through mirror for the IBD connect path, keyed
+  -- OutPoint -> full lossless 'Coin' (TxOut + height + coinbase). This is a
+  -- PURE READ MIRROR, physically separate from 'ucEntries'/'ucDirty': it is
+  -- NEVER a write-back source, is NEVER read by 'flushCache', and is NEVER
+  -- written by 'addUTXO'/'spendUTXO'/'lookupUTXO' or the reorg Phase-D mirror.
+  -- Populated only by 'getUTXOCoin' (lossless), invalidated per-spend
+  -- ('rcInvalidate') and wiped at every reorg/disconnect/flush boundary
+  -- ('rcClear'). See 'getUTXOCoinCached'.
+  , rcEntries  :: !(TVar (Map OutPoint Coin))      -- ^ Read-through mirror
+  -- | Generation counter, bumped on every 'rcClear'. Closes the read-through
+  -- TOCTOU vs the lock-free kicker reorg: a reader samples it before its
+  -- lock-free DB read and only populates if it is unchanged at insert time.
+  , rcGen      :: !(TVar Word64)                   -- ^ Read-through generation
   }
 
 -- | Create a new UTXO cache with the given maximum size.
 -- The cache starts empty; entries are loaded on demand from the database.
 newUTXOCache :: HaskoinDB -> Int -> IO UTXOCache
 newUTXOCache db maxSize = UTXOCache
-  <$> newTVarIO Map.empty
-  <*> newTVarIO Map.empty
-  <*> pure db
-  <*> pure maxSize
-  <*> newTVarIO 0
+  <$> newTVarIO Map.empty   -- ucEntries
+  <*> newTVarIO Map.empty   -- ucDirty
+  <*> pure db               -- ucDB
+  <*> pure maxSize          -- ucMaxSize
+  <*> newTVarIO 0           -- ucSize
+  <*> newTVarIO Map.empty   -- rcEntries (dedicated read-through mirror)
+  <*> newTVarIO 0           -- rcGen     (read-through generation counter)
 
 -- | Look up a UTXO, checking cache first then database.
 -- Returns Nothing if the UTXO doesn't exist or is marked as spent.
@@ -692,6 +712,12 @@ flushCache cache = do
   atomically $ do
     writeTVar (ucEntries cache) Map.empty
     writeTVar (ucSize cache) 0
+    -- Keep the dedicated read-through mirror a strict subset of disk across
+    -- the flush boundary. flushCache writes ucDirty (the write cache) to disk,
+    -- which can mutate PrefixUTXO rows the read mirror holds; wiping rcEntries
+    -- + bumping rcGen here guarantees rcEntries can never out-live disk truth.
+    modifyTVar' (rcGen cache) (+ 1)
+    writeTVar (rcEntries cache) Map.empty
 
   -- Force GC to reclaim the old Map's tree nodes
   performGC
@@ -705,6 +731,63 @@ flushCache cache = do
       | ueSpent entry = BatchDelete (makeKey PrefixUTXO (encode op))
       | otherwise     = BatchPut (makeKey PrefixUTXO (encode op))
                                  (encode (entryCoin entry))
+
+-- | Read-through cache lookup for the IBD connect path that PRESERVES full
+-- Core 'Coin' metadata (height + coinbase), unlike 'lookupUTXO' whose DB
+-- fallthrough zeroes the height. Checks the dedicated read mirror first; on a
+-- miss reads 'getUTXOCoin' (lossless) and populates the mirror, GUARDED by the
+-- generation counter so a coin read from pre-reorg disk can never be written
+-- into a post-reorg cache. Negatives are NOT cached (keeps the mirror a strict
+-- subset of the live disk UTXO set). Returns exactly what 'getUTXOCoin' returns.
+getUTXOCoinCached :: UTXOCache -> OutPoint -> IO (Maybe Coin)
+getUTXOCoinCached cache op = do
+  hit <- atomically $ Map.lookup op <$> readTVar (rcEntries cache)
+  case hit of
+    Just coin -> return (Just coin)          -- lossless; identical to getUTXOCoin
+    Nothing -> do
+      g0 <- readTVarIO (rcGen cache)          -- sample BEFORE the lock-free read
+      mc <- getUTXOCoin (ucDB cache) op       -- lossless full Coin; never lookupUTXO
+      case mc of
+        Nothing   -> return Nothing           -- do NOT cache negatives
+        Just coin -> do
+          atomically $ do
+            g1 <- readTVar (rcGen cache)
+            when (g1 == g0) $                  -- discard if a reorg/flush cleared mid-read
+              modifyTVar' (rcEntries cache) (Map.insert op coin)
+          return (Just coin)
+
+-- | Invalidate one coin in the read-through mirror, mirroring a single
+-- @PrefixUTXO@ 'BatchDelete'. Called per spent prevout after a successful
+-- linear connect so the mirror tracks the on-disk delete set exactly.
+rcInvalidate :: UTXOCache -> OutPoint -> IO ()
+rcInvalidate cache op = atomically $
+  modifyTVar' (rcEntries cache) (Map.delete op)
+
+-- | Wipe the read-through mirror and bump its generation counter. Called at
+-- every boundary where the on-disk UTXO set can change non-monotonically or in
+-- bulk (reorg, disconnect, flush, snapshot load), so the mirror can never serve
+-- a coin that no longer matches disk. The generation bump also discards any
+-- in-flight 'getUTXOCoinCached' populate that straddled this clear.
+rcClear :: UTXOCache -> IO ()
+rcClear cache = atomically $ do
+  modifyTVar' (rcGen cache) (+ 1)
+  writeTVar (rcEntries cache) Map.empty
+
+-- | Cache-aware companion to 'buildSpentUtxoMapFromDB' used by the live
+-- IBD/P2P connect arm. Same shape and (byte-identical) result, but each
+-- per-input prevout read goes through the read-through cache
+-- ('getUTXOCoinCached') instead of a cold 'getUTXOCoin'.
+buildSpentUtxoMapCached :: UTXOCache -> Block -> IO (Map OutPoint Coin)
+buildSpentUtxoMapCached cache block = do
+  let nonCoinbaseTxs = drop 1 (blockTxns block)
+      outpoints = [ txInPrevOutput inp
+                  | tx <- nonCoinbaseTxs
+                  , inp <- txInputs tx
+                  ]
+  pairs <- mapM (\op -> do
+                   m <- getUTXOCoinCached cache op
+                   return (op, m)) outpoints
+  return $ Map.fromList [ (op, c) | (op, Just c) <- pairs ]
 
 --------------------------------------------------------------------------------
 -- CoinsView Type Class Hierarchy (Bitcoin Core compatible)

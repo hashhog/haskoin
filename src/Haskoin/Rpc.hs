@@ -325,7 +325,7 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        txoSpenderIndexFind, txoSpenderIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          isUnspendable,
-                         lookupUTXO, UTXOEntry(..), TxLocation(..), getTxIndex,
+                         lookupUTXO, rcClear, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
                          PruneConfig(..), defaultPruneConfig,
@@ -11809,6 +11809,12 @@ handleDumpTxOutSet server params = do
                   -- of whether the dump itself errored — leaving the
                   -- chainstate in a half-rewound state would be worse.
                   rRes <- reconnectChain db net blocksToReplay
+                  -- Class-A dbcache: this rollback path mutates the on-disk
+                  -- UTXO set via the standalone disconnectBlock/reconnect
+                  -- (NOT reorgAtomic), so wipe the read-through mirror once it
+                  -- completes. Block submission is paused throughout this
+                  -- handler, so there are no concurrent connect-arm reads.
+                  rcClear (rsUTXOCache server)
                   case (dumpRes, rRes) of
                     (Left dErr, _) -> return $ RpcResponse Null
                       (toJSON $ RpcError rpcInternalError

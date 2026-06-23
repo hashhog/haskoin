@@ -901,8 +901,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       putStrLn $ "[-reindex-chainstate] Done. Replayed up to height "
               ++ show finalH ++ "."
 
-    -- Initialize UTXO cache
-    cache <- newUTXOCache db (noDbCache * 1024 * 1024 `div` 100)
+    -- Initialize UTXO cache.
+    -- NOTE: ucMaxSize is an ENTRY COUNT (Storage.hs), not a byte budget, and is
+    -- currently dead config (no eviction reads it; the cache is bounded by the
+    -- periodic flushCache). Derive a conservative entry budget from the -dbcache
+    -- MB figure (~200 B/entry) instead of the nonsensical `div 100`-on-bytes.
+    -- Inert w.r.t. validation and current runtime behavior.
+    cache <- newUTXOCache db (noDbCache * 1024 * 1024 `div` 200)
 
     -- --load-snapshot: import a Core-format UTXO snapshot before any
     -- peer or RPC activity. We bail out early on parse / magic mismatch
@@ -990,6 +995,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                       ++ ", height = " ++ show baseHeight
                                       ++ ", coins = " ++ show (smCoinsCount m)
                               n <- loadSnapshotIntoLegacyUTXO db snap
+                              -- Class-A dbcache: defensively wipe the
+                              -- read-through mirror after the snapshot bulk
+                              -- write. rcEntries is empty here (peer/RPC threads
+                              -- have not started), but this keeps it a strict
+                              -- subset of disk by construction.
+                              rcClear cache
                               -- Durably record the snapshot base hash
                               -- (analogue of Core's
                               -- chainstate_snapshot/base_blockhash file,
@@ -2738,7 +2749,13 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
           -- clean, peer announce — those are independently thread-safe
           -- and don't compete with another peer's tip update.
           connectResult <- withMVar connectLock $ \() -> do
-            spent <- buildSpentUtxoMapFromDB db block
+            -- Route the per-input prevout reads through the dedicated
+            -- read-through cache (Class-A dbcache): a coin created at block N
+            -- and spent at block N+k is served from the in-memory mirror
+            -- instead of a cold RocksDB read. Byte-identical Coins to the
+            -- DB-only builder; invalidated per-spend in the Right () branch
+            -- below and wiped at every reorg/disconnect/flush boundary.
+            spent <- buildSpentUtxoMapCached cache block
             -- W164 hollow-live-path fix: run the SAME full consensus gate the
             -- shim (VerifyScriptShim.hs:710) and submitblock (BlockTemplate.hs:544)
             -- use, BEFORE connecting.  connectBlock alone (connectBlockAt)
@@ -2781,6 +2798,16 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
             -- or vice versa.
             case r of
               Right () -> do
+                -- Class-A dbcache coherence: mirror connectBlockAt's PrefixUTXO
+                -- BatchDelete set (the spent prevouts, Consensus.hs:3667) into
+                -- the dedicated read-through cache so a later read-through can
+                -- never serve a just-spent coin as unspent. This generator is
+                -- IDENTICAL to the BatchDelete generator, so the invalidation
+                -- set == the on-disk delete set by construction. Under
+                -- connectLock => atomic vs sibling connects; vs the lock-free
+                -- kicker reorg the rcGen guard protects the populate path.
+                mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
+                      [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
                 nextBlock <- readIORef nextBlockRef
                 when (height >= nextBlock) $
                   writeIORef nextBlockRef (height + 1)
