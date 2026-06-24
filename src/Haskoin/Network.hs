@@ -140,7 +140,10 @@ module Haskoin.Network
   , addAddedNode
   , removeAddedNode
   , getAddedNodes
+  , getNetworkActive
+  , setNetworkActive
   , sockAddrToHostPort
+  , sockAddrToString
   , discoverPeers
   , fallbackMainnetPeers
   , broadcastMessage
@@ -2940,6 +2943,19 @@ data PeerManager = PeerManager
     --   "remove" is an error (RPC_CLIENT_NODE_ALREADY_ADDED / NODE_NOT_ADDED).
     --   Distinct from 'pmAddrMan'/'pmKnownAddrs' (which also hold gossiped/seed
     --   addresses); only operator-pinned entries live here.
+  , pmNetworkActive      :: !(TVar Bool)
+    -- ^ Node-global P2P "network active" flag (Core @CConnman::fNetworkActive@,
+    --   default True).  Toggled by the @setnetworkactive@ RPC.  When False the
+    --   three NEW-connection-establishment gates suppress activity WITHOUT
+    --   dropping existing peers:
+    --     (a) the inbound listener ('startInboundListener') refuses/closes a
+    --         freshly-accepted inbound socket;
+    --     (b) the auto-outbound/feeler/-connect dialer in 'peerManagerLoop'
+    --         opens no new connections;
+    --     (c) the DNS-seed / fixed-seed re-seed pass is held off.
+    --   Surfaced read-only as @networkactive@ in getnetworkinfo.  Not persisted
+    --   (resets to True on restart), matching Core.  Reference: Bitcoin Core
+    --   net.cpp:3361 SetNetworkActive / net.h:1164 GetNetworkActive.
   }
 
 -- | Configuration for the peer manager
@@ -3204,6 +3220,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> pure BS.empty   -- pmAsmapData: empty = ASMap disabled; set via pmAsmapData field
     <*> newTVarIO 0     -- pmNextFeeler: 0 = a feeler may open on the first eligible loop tick
     <*> newTVarIO []    -- pmAddedNodes: empty addnode-managed persistent-peer list
+    <*> newTVarIO True  -- pmNetworkActive: P2P enabled by default (Core fNetworkActive=true)
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -3265,6 +3282,16 @@ peerManagerLoop pm = forever $ do
           putStrLn $ "peerManagerLoop: onDisconnect error for "
                   ++ show addr ++ ": " ++ show e)
 
+  -- setnetworkactive gate (Core CConnman::fNetworkActive, net.cpp:2351/3022/
+  -- 3219): when the operator has disabled networking, suppress ALL new
+  -- connection establishment for this loop tick — auto-outbound dialing, the
+  -- -connect re-dial, the DNS/fixed-seed reseed pass, and the feeler — WITHOUT
+  -- touching existing peers (the disconnected-peer cleanup + ping/ban
+  -- housekeeping above and below still run; Core never force-drops established
+  -- peers on setnetworkactive false).  Each new-connection branch lives inside
+  -- the `when netActive` block below.
+  netActive <- readTVarIO (pmNetworkActive pm)
+
   -- Maintain target outbound connections (8 full-relay + 2 block-relay-only)
   peers <- readTVarIO (pmPeers pm)
 
@@ -3293,7 +3320,7 @@ peerManagerLoop pm = forever $ do
   -- (app/Main.hs), so no host lookup happens here.
   let connectAddrs = pmcConnectAddrs (pmConfig pm)
       connectMode  = not (null connectAddrs)
-  when connectMode $ do
+  when (netActive && connectMode) $ do
     banned   <- readTVarIO (pmBannedAddrs pm)
     nowTs    <- (round <$> getPOSIXTime :: IO Int64)
     let activeBans = Map.filter (> nowTs) banned
@@ -3311,8 +3338,10 @@ peerManagerLoop pm = forever $ do
     mapM_ (void . forkIO . tryConnectManual pm) toDial
 
   -- Normal addrman-driven auto-outbound + DNS.  Suppressed entirely
-  -- in connect mode (Core's @-connect@ disables addrman dialing).
-  when (not connectMode && outboundCount < totalTarget) $ do
+  -- in connect mode (Core's @-connect@ disables addrman dialing) and while
+  -- networking is disabled (setnetworkactive false: net.cpp:2351 holds off
+  -- both the DNS reseed and the auto-outbound dial loop).
+  when (netActive && not connectMode && outboundCount < totalTarget) $ do
     banned   <- readTVarIO (pmBannedAddrs pm)
     lastDNS  <- readTVarIO (pmLastDNSRefresh pm)
     nowTs    <- (round <$> getPOSIXTime :: IO Int64)
@@ -3402,8 +3431,10 @@ peerManagerLoop pm = forever $ do
   -- eclipse-attack mitigation — without consuming relay slots.  Suppressed in
   -- -connect mode (like all addrman-driven dialing).  Bounded to ONE in flight
   -- because the feeler is fully synchronous (the forkIO body runs to completion
-  -- before pmNextFeeler is reached again 120s later).
-  unless connectMode $ do
+  -- before pmNextFeeler is reached again 120s later).  Suppressed while
+  -- networking is disabled (setnetworkactive false) — a feeler is a new
+  -- outbound connection.
+  when (netActive && not connectMode) $ do
     nowFeel  <- (round <$> getPOSIXTime :: IO Int64)
     nextFeel <- readTVarIO (pmNextFeeler pm)
     when (nowFeel >= nextFeel) $ do
@@ -4064,10 +4095,18 @@ startInboundListener pm port = do
     acceptLoop :: Socket -> IO ()
     acceptLoop listenSock = forever $ do
       (clientSock, clientAddr) <- accept listenSock
-      void $ forkIO $ handleInbound clientSock clientAddr
-        `catch` (\(e :: SomeException) -> do
-          putStrLn $ "Inbound connection error from " ++ show clientAddr ++ ": " ++ show e
-          close clientSock)
+      -- setnetworkactive gate (Core net.cpp:1786 — AcceptConnection refuses a
+      -- new inbound while !fNetworkActive): when networking is disabled, drain
+      -- the accepted socket off the listen backlog and close it immediately
+      -- without registering a peer.  Existing peers are untouched.
+      netActive <- readTVarIO (pmNetworkActive pm)
+      if not netActive
+        then close clientSock
+        else
+          void $ forkIO $ handleInbound clientSock clientAddr
+            `catch` (\(e :: SomeException) -> do
+              putStrLn $ "Inbound connection error from " ++ show clientAddr ++ ": " ++ show e
+              close clientSock)
 
     handleInbound :: Socket -> SockAddr -> IO ()
     handleInbound sock addr = do
@@ -4265,6 +4304,26 @@ removeAddedNode pm node = atomically $ do
 -- @getaddednodeinfo@ source).  Exposed for @addnode@ bookkeeping and tests.
 getAddedNodes :: PeerManager -> IO [String]
 getAddedNodes pm = readTVarIO (pmAddedNodes pm)
+
+-- | Read the node-global P2P "network active" flag (Core
+-- @CConnman::GetNetworkActive@, net.h:1164).  True (default) means new
+-- connection establishment proceeds normally; False means the three
+-- new-connection gates ('startInboundListener' / 'peerManagerLoop'
+-- outbound + reseed) are suppressed.  Surfaced read-only by getnetworkinfo.
+getNetworkActive :: PeerManager -> IO Bool
+getNetworkActive pm = readTVarIO (pmNetworkActive pm)
+
+-- | Set the node-global P2P "network active" flag (Core
+-- @CConnman::SetNetworkActive@, net.cpp:3361).  Idempotent: writing the
+-- value it already holds is a no-op.  Does NOT disconnect existing peers —
+-- it only gates NEW inbound accepts / outbound dials / DNS+fixed-seed
+-- reseeds (each gate reads 'pmNetworkActive' at its own callsite).
+-- Returns the read-back value (mirrors Core, which returns
+-- GetNetworkActive() after the toggle).
+setNetworkActive :: PeerManager -> Bool -> IO Bool
+setNetworkActive pm active = atomically $ do
+  writeTVar (pmNetworkActive pm) active
+  readTVar (pmNetworkActive pm)
 
 --------------------------------------------------------------------------------
 -- Peer Manager API
