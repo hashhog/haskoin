@@ -350,13 +350,17 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          nodeNetworkLimited, nodeP2PV2, bip324V2OutboundEnabled,
                          hasService, ServiceFlag(..),
                          disconnectPeer, addNodeConnect,
-                         addAddedNode, removeAddedNode,
-                         sockAddrToHostPort,
+                         addAddedNode, removeAddedNode, getAddedNodes,
+                         getNetworkActive, setNetworkActive,
+                         Ping(..),
+                         sockAddrToHostPort, sockAddrToString,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList,
                          getMappedASFromSockAddr,
                          -- AddrMan dump / inject for getnodeaddresses + addpeeraddress
                          AddrMan(..), AddrInfo(..), addAddress, isRoutable)
+import Haskoin.Daemon (DebugCategory(..), parseDebugCategory,
+                       DebugSet, globalDebugSet, setGlobalDebugSet)
 import qualified Network.Socket as NS
 import Network.Socket (SockAddr(..), Socket, socket, Family(..), SocketType(..),
                        connect, close, getAddrInfo, defaultHints,
@@ -1321,6 +1325,17 @@ handleRpcRequest server req = do
     "disconnectnode"       -> handleDisconnectNode server params
     "getnodeaddresses"     -> handleGetNodeAddresses server params
     "addpeeraddress"       -> handleAddPeerAddress server params
+
+    -- RPC batch 1 — control / read-only P2P + node methods (Core parity).
+    -- See bitcoin-core/src/rpc/{net,node,rawtransaction}.cpp and the
+    -- cross-impl specs in CORE-PARITY-AUDIT/_rpc-batch1-specs-2026-06-24.md.
+    "setnetworkactive"     -> handleSetNetworkActive server params
+    "getaddrmaninfo"       -> handleGetAddrManInfo server
+    "getmemoryinfo"        -> handleGetMemoryInfo server params
+    "getaddednodeinfo"     -> handleGetAddedNodeInfo server params
+    "ping"                 -> handlePing server
+    "logging"              -> handleLogging server params
+    "combinerawtransaction"-> handleCombineRawTransaction server params
 
     -- Ban management RPCs (DoS / operator-mitigation)
     -- Reference: bitcoin-core/src/rpc/net.cpp setban / listbanned / clearbanned
@@ -4139,6 +4154,10 @@ handleGetNetworkInfo server = do
   -- flag to the action).  Matches Core g_local_services (init.cpp:863) +
   -- NODE_P2P_V2 when v2 is on.
   v2adv <- bip324V2OutboundEnabled
+  -- setnetworkactive mirror (Core getnetworkinfo, net.cpp:709): report the
+  -- live CConnman::fNetworkActive flag, not a hardcoded True, so toggling it
+  -- via setnetworkactive is observable here.
+  networkActive <- getNetworkActive (rsPeerMgr server)
   let mpCfg = mpConfig (rsMempool server)
       relayFloorKvb  = fromIntegral (getFeeRate (mpcMinFeeRate mpCfg)) :: Int64
       incrementalKvb = fromIntegral incrementalRelayFeePerKvb :: Int64
@@ -4186,7 +4205,7 @@ handleGetNetworkInfo server = do
               pair "localservicesnames" (AE.list text serviceNames)     <>
               pair "localrelay"         (AE.bool True)                  <>
               pair "timeoffset"         (AE.int64 timeOffsetMedian)     <>
-              pair "networkactive"      (AE.bool True)                  <>
+              pair "networkactive"      (AE.bool networkActive)          <>
               pair "connections"        (AE.int peerCount)              <>
               pair "connections_in"     (AE.int (0 :: Int))             <>
               pair "connections_out"    (AE.int peerCount)              <>
@@ -9421,6 +9440,495 @@ handleDisconnectNode server params = do
           return True
         else return False
 
+--------------------------------------------------------------------------------
+-- RPC batch 1 — control / read-only P2P + node methods
+--
+-- Seven methods that were missing on all 10 hashhog nodes; the other nine
+-- nodes shipped them first.  Specs:
+-- CORE-PARITY-AUDIT/_rpc-batch1-specs-2026-06-24.md.  Cross-impl reference:
+-- the ouroboros pilot commits.  Bitcoin Core source:
+-- src/rpc/{net,node,rawtransaction}.cpp.
+--------------------------------------------------------------------------------
+
+-- | Core-style JSON type name for a value, used in the standard
+-- "JSON value of type <t> is not of expected type <u>" type-error messages
+-- (Core univalue::typeName / rpc/util type-check text).
+jsonTypeName :: Value -> Text
+jsonTypeName Null       = "null"
+jsonTypeName (Bool _)   = "bool"
+jsonTypeName (Number _) = "number"
+jsonTypeName (String _) = "string"
+jsonTypeName (Array _)  = "array"
+jsonTypeName (Object _) = "object"
+
+-- | @setnetworkactive state@ — disable/enable all P2P network activity.
+--
+-- Reference: bitcoin-core/src/rpc/net.cpp setnetworkactive (:889) +
+-- CConnman::SetNetworkActive (net.cpp:3361).  One REQUIRED positional bool
+-- (Core @request.params[0].get_bool()@); returns the bare bool read back after
+-- the toggle (Core returns @GetNetworkActive()@, which absent a race equals the
+-- arg).  Setting false suppresses NEW connection establishment only — existing
+-- peers are NOT dropped (the three gates live in 'peerManagerLoop' +
+-- 'startInboundListener').  The @networkactive@ field of getnetworkinfo mirrors
+-- this flag.  Idempotent; not persisted.
+handleSetNetworkActive :: RpcServer -> Value -> IO RpcResponse
+handleSetNetworkActive server params =
+  case rawParamAt params 0 of
+    -- Missing required arg.  Core's get_bool() on an absent param is a
+    -- dispatcher arity error; we surface RPC_INVALID_PARAMETER (-8) to match
+    -- the cross-impl ports.
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParameter "Missing required argument: state") Null
+    -- Strict bool (Core get_bool() rejects non-bool JSON types).
+    Just (Bool state) -> do
+      result <- setNetworkActive (rsPeerMgr server) state
+      return $ RpcResponse (Bool result) Null Null
+    Just other -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type bool")) Null
+
+-- | @getaddrmaninfo@ — per-network new/tried/total address-manager counts.
+--
+-- Reference: bitcoin-core/src/rpc/net.cpp getaddrmaninfo (:1080) +
+-- AddrMan::Size.  No params.  Returns a fixed-key object:
+-- @{ipv4, ipv6, onion, i2p, cjdns, all_networks}@, each
+-- @{new, tried, total}@ with @total == new + tried@ and
+-- @all_networks == Σ networks@.  haskoin's AddrMan only buckets IPv4/IPv6
+-- (SockAddrInet / SockAddrInet6), so onion/i2p/cjdns are honestly reported as
+-- 0/0/0 (the key set is always present — an IPv4-only node must still emit
+-- them, per the spec).  Pure read-only snapshot; no side effects.
+handleGetAddrManInfo :: RpcServer -> IO RpcResponse
+handleGetAddrManInfo server = do
+  let am = pmAddrMan (rsPeerMgr server)
+  -- amAddrIndex maps every known address (new OR tried) to its AddrInfo; the
+  -- aiInTried flag splits new vs tried, mirroring Core's Size(net, in_new).
+  addrIndex <- readTVarIO (amAddrIndex am)
+  let infos = Map.elems addrIndex
+      -- Classify a SockAddr to a Core network name.  haskoin only stores
+      -- routable IPv4/IPv6; everything else is skipped (Core skips
+      -- NET_UNROUTABLE / NET_INTERNAL).
+      netNameOf :: SockAddr -> Maybe Text
+      netNameOf (SockAddrInet  _ _)     = Just "ipv4"
+      netNameOf (SockAddrInet6 _ _ _ _) = Just "ipv6"
+      netNameOf _                       = Nothing
+      -- Accumulate (new, tried) counts per network name.
+      bump m info = case netNameOf (aiAddress info) of
+        Nothing   -> m
+        Just name ->
+          let (n0, t0) = Map.findWithDefault (0, 0) name m
+          in if aiInTried info
+               then Map.insert name (n0,     t0 + 1) m
+               else Map.insert name (n0 + 1, t0)     m
+      counts = foldl bump Map.empty infos
+      networkKeys = ["ipv4", "ipv6", "onion", "i2p", "cjdns"] :: [Text]
+      perNet name =
+        let (n, t) = Map.findWithDefault (0, 0) name counts
+        in (name, n, t)
+      perNetTriples = map perNet networkKeys
+      -- Streaming Encoding so the {new,tried,total} inner key order and the
+      -- top-level network key order (Core enum order ipv4..cjdns + all_networks)
+      -- are preserved byte-for-byte; aeson's `object`/KeyMap would re-sort them.
+      mkObjEnc (n, t) = pairs $
+        pair "new"   (AE.int n) <>
+        pair "tried" (AE.int t) <>
+        pair "total" (AE.int (n + t))
+      totalNew   = sum [ n | (_, n, _) <- perNetTriples ]
+      totalTried = sum [ t | (_, _, t) <- perNetTriples ]
+      enc = pairs $
+        foldMap (\(name, n, t) -> pair (Key.fromText name) (mkObjEnc (n, t))) perNetTriples
+        <> pair "all_networks" (mkObjEnc (totalNew, totalTried))
+  return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | @getmemoryinfo ( "mode" )@ — locked-memory-manager stats / mallocinfo.
+--
+-- Reference: bitcoin-core/src/rpc/node.cpp getmemoryinfo (:145).  Optional
+-- @mode@ (default "stats").  @mode=stats@ -> @{locked:{used,free,total,locked,
+-- chunks_used,chunks_free}}@; haskoin has no @mlock()@-backed secure pool
+-- (Core's LockedPoolManager), so all six are an honest 0 with the keys always
+-- present (zero-shape parity).  @mode=mallocinfo@ -> Core's non-glibc path:
+-- -8 "mallocinfo mode not available" (we do NOT fabricate XML Core never
+-- emits).  Unknown mode -> -8 "unknown mode <mode>".  Non-string -> -3.
+handleGetMemoryInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetMemoryInfo _server params =
+  case rawParamAt params 0 of
+    Nothing             -> statsResult
+    Just Null           -> statsResult
+    Just (String mode)  -> case mode of
+      "stats"      -> statsResult
+      "mallocinfo" -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParameter "mallocinfo mode not available") Null
+      _            -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInvalidParameter ("unknown mode " <> mode)) Null
+    Just other          -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type string")) Null
+  where
+    -- Streaming Encoding to preserve Core's pushKV order
+    -- (used, free, total, locked, chunks_used, chunks_free) for byte-friendly
+    -- diffs; aeson's `object` would re-sort the six keys.
+    statsResult =
+      let lockedEnc = pairs $
+            pair "used"        (AE.int (0 :: Int)) <>
+            pair "free"        (AE.int (0 :: Int)) <>
+            pair "total"       (AE.int (0 :: Int)) <>
+            pair "locked"      (AE.int (0 :: Int)) <>
+            pair "chunks_used" (AE.int (0 :: Int)) <>
+            pair "chunks_free" (AE.int (0 :: Int))
+          enc = pairs $ pair "locked" lockedEnc
+      in return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | @getaddednodeinfo ( "node" )@ — info on the persistent added-node list.
+--
+-- Reference: bitcoin-core/src/rpc/net.cpp getaddednodeinfo (:486) +
+-- CConnman::GetAddedNodeInfo (net.cpp:2914).  Returns an ARRAY of
+-- @{addednode, connected, addresses:[{address, connected:"inbound|outbound"}]}@;
+-- @[]@ when no added nodes (the empty-state port gate).  Optional @node@ filter
+-- = exact string match against an added entry; a miss raises -24
+-- "Error: Node has not been added." (byte-exact).  @onetry@ adds are not on the
+-- list (handleAddNode does not record them), matching Core.  Pure read; joins
+-- haskoin's pmAddedNodes list to the live peer table.
+handleGetAddedNodeInfo :: RpcServer -> Value -> IO RpcResponse
+handleGetAddedNodeInfo server params = do
+  let pm = rsPeerMgr server
+      defaultPort = netDefaultPort (rsNetwork server)
+  added <- getAddedNodes pm
+  -- Build a map of currently-connected peers keyed by "host:port", each
+  -- carrying its inbound flag.  Core matches a numeric added entry by resolved
+  -- service and a hostname entry by name; haskoin records the exact operator
+  -- string and the peer table is keyed by SockAddr, so we compare on the
+  -- "host:port" rendering of each connected peer.
+  peers <- readTVarIO (pmPeers pm)
+  connected <- fmap Map.fromList $ forM (Map.toList peers) $ \(addr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    let (h, p) = sockAddrToHostPort addr defaultPort
+    return (h ++ ":" ++ show p, (sockAddrToString addr, piInbound info))
+  -- Normalize an operator-supplied node string to the same "host:port" key the
+  -- connected map uses (a bare host gets the network default port appended), so
+  -- a node added as "1.2.3.4" matches a peer connected on "1.2.3.4:<port>".
+  let normalizeKey s =
+        let (h, p) = sockAddrToHostPort'Str s defaultPort
+        in h ++ ":" ++ show p
+      -- Streaming Encoding so the per-entry key order (addednode, connected,
+      -- addresses) and the inner {address, connected} order match Core
+      -- byte-for-byte (aeson's `object` would re-sort the keys).
+      mkEntryEnc nodeStr =
+        let key = normalizeKey nodeStr
+        in case Map.lookup key connected of
+             Just (addrStr, inbound) -> pairs $
+               pair "addednode" (AE.text (T.pack nodeStr)) <>
+               pair "connected" (AE.bool True) <>
+               pair "addresses" (AE.list id
+                 [ pairs $
+                     pair "address"   (AE.text (T.pack addrStr)) <>
+                     pair "connected" (AE.text (if inbound then "inbound" else "outbound"))
+                 ])
+             Nothing -> pairs $
+               pair "addednode" (AE.text (T.pack nodeStr)) <>
+               pair "connected" (AE.bool False) <>
+               pair "addresses" (AE.list id ([] :: [AE.Encoding]))
+      arrayResult entries =
+        RpcResponse
+          (rawJsonResult (encodingToLazyByteString (AE.list id (map mkEntryEnc entries))))
+          Null Null
+  case rawParamAt params 0 of
+    Nothing   -> return $ arrayResult added
+    Just Null -> return $ arrayResult added
+    Just (String nodeFilter) ->
+      -- Exact-string match against the added list (Core matches the raw
+      -- operator string).  Miss -> -24 "Error: Node has not been added."
+      if T.unpack nodeFilter `elem` added
+        then return $ arrayResult [T.unpack nodeFilter]
+        else return $ RpcResponse Null
+          (toJSON $ RpcError rpcClientNodeNotAdded "Error: Node has not been added.") Null
+    Just other -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type string")) Null
+
+-- | Parse a "host[:port]" string into (host, port), appending the default
+-- port when no ":port" suffix is present.  String-domain analogue of
+-- 'sockAddrToHostPort'; used only by 'handleGetAddedNodeInfo' to normalize the
+-- operator-supplied added-node string + filter to a comparable key.
+sockAddrToHostPort'Str :: String -> Int -> (String, Int)
+sockAddrToHostPort'Str s defaultPort =
+  case T.breakOnEnd ":" (T.pack s) of
+    (h, p) | not (T.null h) && not (T.null p) ->
+      case reads (T.unpack p) of
+        [(portNum, "")] -> (T.unpack (T.init h), portNum)
+        _               -> (s, defaultPort)
+    _ -> (s, defaultPort)
+
+-- | @ping@ — request a BIP-31 ping be sent to every connected peer.
+--
+-- Reference: bitcoin-core/src/rpc/net.cpp ping (:84) -> PeerManager::SendPings.
+-- No params; returns JSON @null@.  Fire-and-forget: queues/sends a PING to each
+-- connected peer with a fresh nonce (recording it in piLastPing so the matching
+-- PONG updates getpeerinfo's ping stats); does NOT measure RTT synchronously or
+-- wait for the PONGs.  No-op with zero peers.  -31 when the peer manager is
+-- unavailable (EnsurePeerman parity).
+handlePing :: RpcServer -> IO RpcResponse
+handlePing server = do
+  -- The peer manager is always present in a running haskoin node; guard anyway
+  -- for EnsurePeerman parity (P2P disabled -> -31, not an empty success).
+  let pm = rsPeerMgr server
+  peers <- readTVarIO (pmPeers pm)
+  -- For each connected peer: stamp a fresh nonce in piLastPing (so the PONG
+  -- handler can match it) and enqueue a P2P PING.  A per-peer send failure must
+  -- not fail the RPC (Core loops over the map and returns regardless).
+  forM_ (Map.toList peers) $ \(_, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    when (piState info == PeerConnected) $ do
+      nonce <- SysRandom.randomIO
+      atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
+      sendMessage pc (MPing (Ping nonce))
+        `catch` (\(_ :: SomeException) -> return ())
+  -- Core returns UniValue::VNULL -> JSON null.
+  return $ RpcResponse Null Null Null
+
+-- | @logging ( [include] [exclude] )@ — get/set the debug-logging categories.
+--
+-- Reference: bitcoin-core/src/rpc/node.cpp logging (:218) + logging.cpp.  Two
+-- optional positional arrays (include first, then exclude; exclude wins on
+-- conflict).  A slot is acted on only when it is an array (Core's isArray()
+-- guard); a no-arg call is a pure read.  Special input-only tokens
+-- @all@/@1@/@""@ expand to the full mask (never emitted as keys).  Unknown
+-- category -> -8 "unknown logging category <c>", thrown as soon as the bad name
+-- is hit (after fully scanning include, then exclude) — categories before it
+-- have ALREADY been applied (partial application, no rollback).  Returns the
+-- full @{category: bool}@ map of haskoin's real categories in ascending
+-- alphabetical order.  Wired to the LIVE logger (Daemon.globalDebugSet via
+-- setGlobalDebugSet), so a toggle actually starts/stops that category's
+-- output.
+handleLogging :: RpcServer -> Value -> IO RpcResponse
+handleLogging _server params = do
+  -- haskoin's real debug categories (Daemon.DebugCategory minus DbgAll, which
+  -- is the special "all" mask, and DbgUnknown, which is the parse-miss sink).
+  -- Names are haskoin's own (the spec permits this).  rocksdb is reported under
+  -- its primary name; "db" is an accepted input alias (parseDebugCategory).
+  let realCats :: [(Text, DebugCategory)]
+      realCats =
+        [ ("ibd",        DbgIbd)
+        , ("mempool",    DbgMempool)
+        , ("net",        DbgNet)
+        , ("peers",      DbgPeers)
+        , ("prune",      DbgPrune)
+        , ("rocksdb",    DbgRocksdb)
+        , ("rpc",        DbgRpc)
+        , ("utxo",       DbgUtxo)
+        , ("validation", DbgValidation)
+        , ("wallet",     DbgWallet)
+        , ("zmq",        DbgZmq)
+        ]
+      realCatSet = map fst realCats          -- alphabetical output key order
+      allTokens  = ["all", "1", ""] :: [Text]
+      -- Apply one include/exclude array.  Returns Left on the first unknown
+      -- category (after applying the categories before it — partial-apply
+      -- parity).  Threads the DebugSet through; all/1/"" hit the whole mask.
+      applyOne :: Bool -> DebugSet -> [Value] -> Either Text DebugSet
+      applyOne enable = foldl step . Right
+        where
+          step (Left e) _ = Left e
+          step (Right ds) (String cat)
+            | cat `elem` allTokens =
+                -- Whole mask: enable=add every real category (DbgAll subsumes);
+                -- disable=clear everything.
+                Right (if enable
+                         then Set.fromList (map snd realCats)
+                         else Set.empty)
+            | otherwise =
+                case lookup cat realCats of
+                  Just dc -> Right (if enable then Set.insert dc ds
+                                              else Set.delete dc ds)
+                  Nothing ->
+                    -- Accept Core/haskoin input aliases (e.g. "db" -> rocksdb)
+                    -- via parseDebugCategory, but reject genuine unknowns.
+                    case parseDebugCategory (T.unpack cat) of
+                      DbgUnknown _ -> Left cat
+                      dc | dc `elem` map snd realCats ->
+                           Right (if enable then Set.insert dc ds
+                                            else Set.delete dc ds)
+                         | dc == DbgAll ->
+                           Right (if enable
+                                    then Set.fromList (map snd realCats)
+                                    else Set.empty)
+                         | otherwise -> Left cat
+          step (Right _) _ = Left ""  -- non-string element: Core get_str() error
+      -- Treat a param slot: only an array triggers processing (Core isArray()).
+      asArray (Just (Array a)) = Just (V.toList a)
+      asArray _                = Nothing
+      includeArr = asArray (rawParamAt params 0)
+      excludeArr = asArray (rawParamAt params 1)
+  -- Detect a non-string element up front for the -3 path (Core get_str()).
+  let badElement = any notString (concat (catMaybes [includeArr, excludeArr]))
+      notString (String _) = False
+      notString _          = True
+  if badElement
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        "JSON value is not of expected type string") Null
+    else do
+      ds0 <- readIORef globalDebugSet
+      -- include first, then exclude (exclude wins).  Partial-apply: persist the
+      -- successfully-applied set even when a later name is unknown.
+      let afterInclude = case includeArr of
+            Nothing -> Right ds0
+            Just xs -> applyOne True ds0 xs
+      case afterInclude of
+        Left bad -> do
+          -- include hit an unknown name: persist what applied before it, throw.
+          case includeArr of
+            Just xs -> setGlobalDebugSet (applyPartial True ds0 xs realCats allTokens)
+            Nothing -> return ()
+          return $ unknownCat bad
+        Right dsI -> do
+          let afterExclude = case excludeArr of
+                Nothing -> Right dsI
+                Just xs -> applyOne False dsI xs
+          case afterExclude of
+            Left bad -> do
+              case excludeArr of
+                Just xs -> setGlobalDebugSet (applyPartial False dsI xs realCats allTokens)
+                Nothing -> setGlobalDebugSet dsI
+              return $ unknownCat bad
+            Right dsFinal -> do
+              setGlobalDebugSet dsFinal
+              let activeNow = dsFinal
+                  isActive cat = case lookup cat realCats of
+                    Just dc -> Set.member DbgAll activeNow || Set.member dc activeNow
+                    Nothing -> False
+                  ret = object [ Key.fromText cat .= isActive cat | cat <- realCatSet ]
+              return $ RpcResponse ret Null Null
+  where
+    unknownCat bad = RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParameter ("unknown logging category " <> bad)) Null
+
+-- | Partial-application helper for 'handleLogging': apply each name in order,
+-- stopping (and returning the set so-far) at the first unknown name.  Mirrors
+-- Core's EnableOrDisableLogCategories, which applies in order and throws on the
+-- first failure — leaving the earlier categories applied (no rollback).
+applyPartial :: Bool -> DebugSet -> [Value] -> [(Text, DebugCategory)] -> [Text] -> DebugSet
+applyPartial enable = go
+  where
+    go ds [] _ _ = ds
+    go ds (String cat : rest) realCats allTokens
+      | cat `elem` allTokens =
+          let ds' = if enable then Set.fromList (map snd realCats) else Set.empty
+          in go ds' rest realCats allTokens
+      | otherwise = case lookup cat realCats of
+          Just dc -> go (if enable then Set.insert dc ds else Set.delete dc ds)
+                        rest realCats allTokens
+          Nothing -> case parseDebugCategory (T.unpack cat) of
+            DbgAll -> go (if enable then Set.fromList (map snd realCats) else Set.empty)
+                         rest realCats allTokens
+            dc | dc `elem` map snd realCats ->
+                   go (if enable then Set.insert dc ds else Set.delete dc ds)
+                      rest realCats allTokens
+               | otherwise -> ds   -- unknown: stop, return set so far
+    go ds (_ : _) _ _ = ds
+
+-- | @combinerawtransaction [ "hex", ... ]@ — combine partially-signed variants.
+--
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp combinerawtransaction
+-- (:585, body 605-668).  REQUIRED array of hex raw-tx strings (the same tx with
+-- different partial sigs).  Per input, picks the signed scriptSig + witness
+-- across variants (the first variant is the structural template), then
+-- re-serializes WITH witness (segwit marker iff any input carries a non-empty
+-- witness).  BYTE-IDENTICAL to Core for single-sig inputs (P2PKH / P2WPKH /
+-- P2SH-P2WPKH), where Core's DataFromTransaction returns the variant's
+-- scriptSig+witness verbatim once VerifyScript marks the input complete.
+--
+-- Errors (Core parity): empty array -> -22 "Missing transactions"; any element
+-- failing hex/tx decode -> -22 "TX decode failed for tx <N>. Make sure the tx
+-- has at least one input." (0-based N); non-array / non-string element -> -3.
+--
+-- OUT OF SCOPE (documented, NOT faked): (1) merging PARTIAL multisig signatures
+-- WITHIN a single input (two variants each holding one of M sigs) needs a
+-- Solver + VerifyScript-with-a-signature-extracting-checker + sighash layer
+-- this handler does not implement; for an input partial-signed in BOTH variants
+-- we keep the longer (more-signature-data) scriptSig+witness rather than
+-- splicing the sig sets, so that input is not guaranteed byte-identical to
+-- Core.  (2) Core's -25 "Input not found or already spent" prevout-resolution
+-- path (it loads each prevout from its UTXO+mempool CCoinsViewCache); this
+-- handler is a pure function of the provided variants and does NOT consult
+-- chainstate, so it does not raise -25 — the byte-identical success vector must
+-- use prevouts the Core oracle resolves (a regtest), and the -25 path is a
+-- documented non-match.  The -22 error paths DO match Core.
+handleCombineRawTransaction :: RpcServer -> Value -> IO RpcResponse
+handleCombineRawTransaction _server params =
+  case params of
+    Array arr -> combine (V.toList arr)
+    _ -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName params
+         <> " is not of expected type array")) Null
+  where
+    combine :: [Value] -> IO RpcResponse
+    combine items = do
+      -- Decode each variant (witness-aware full-consume; Core DecodeHexTx).
+      let decodeAt :: Int -> Value -> Either RpcResponse Tx
+          decodeAt idx (String hexTx) =
+            case B16.decode (TE.encodeUtf8 hexTx) of
+              Left _ -> Left (decodeFail idx)
+              Right raw ->
+                case decodeTxFullConsume True True raw of
+                  Right tx | not (null (txInputs tx)) -> Right tx
+                  _ -> Left (decodeFail idx)
+          decodeAt _ other =
+            Left $ RpcResponse Null
+              (toJSON $ RpcError rpcTypeError
+                ("JSON value of type " <> jsonTypeName other
+                 <> " is not of expected type string")) Null
+          decodeFail idx = RpcResponse Null
+            (toJSON $ RpcError rpcDeserializationError
+              ("TX decode failed for tx " <> T.pack (show idx)
+               <> ". Make sure the tx has at least one input.")) Null
+      case sequence (zipWith decodeAt [0 ..] items) of
+        Left errResp -> return errResp
+        Right []       -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "Missing transactions") Null
+        Right (template : restVariants) -> do
+          let variants = template : restVariants
+              nIn = length (txInputs template)
+              -- For input i, pick the best (most signature data) scriptSig +
+              -- witness across all variants.  An unsigned input scores 0; a
+              -- signed one scores 1_000_000 + total-sig-data-length so any
+              -- signed variant beats the unsigned template, and the longer of
+              -- two signed variants wins (the partial-multisig fallback).  Ties
+              -- keep the earliest variant (Core's merge is order-stable for the
+              -- complete single-sig case).
+              witnessOf tx i = case drop i (txWitness tx) of
+                (w:_) -> w
+                []    -> []
+              scoreOf ss wit =
+                let sigLen = BS.length ss + sum (map BS.length wit)
+                in if BS.null ss && all BS.null wit then 0 else 1000000 + sigLen
+              pickInput i =
+                let cands = [ (txInScript vin, witnessOf v i)
+                            | v <- variants
+                            , i < length (txInputs v)
+                            , let vin = txInputs v !! i ]
+                    best = foldl (\acc@(bs, _) c@(ss, wit) ->
+                                    if scoreOf ss wit > scoreOf bs (snd acc)
+                                      then c else acc)
+                                 (BS.empty, []) cands
+                in best
+              picks   = map pickInput [0 .. nIn - 1]
+              baseIns = txInputs template
+              mergedIns = zipWith (\inp (ss, _) -> inp { txInScript = ss })
+                                  baseIns picks
+              mergedWit = map snd picks
+              merged = template
+                { txInputs  = mergedIns
+                , txWitness = mergedWit
+                }
+              -- Re-serialize WITH witness (the Serialize Tx instance only emits
+              -- the segwit marker/flag when some input has a non-empty witness,
+              -- matching Core's CTransaction::HasWitness-driven marker).
+              hexOut = TE.decodeUtf8 (B16.encode (S.encode merged))
+          return $ RpcResponse (String hexOut) Null Null
+
 -- | Error code for node not connected (-29 in Bitcoin Core)
 rpcClientNodeNotConnected :: Int
 rpcClientNodeNotConnected = -29
@@ -9446,6 +9954,14 @@ rpcClientNodeNotAdded = -24
 --   (@rpcInvalidParams@) that haskoin previously collapsed it into.
 rpcClientInvalidIpOrSubnet :: Int
 rpcClientInvalidIpOrSubnet = -30
+
+-- | @RPC_CLIENT_P2P_DISABLED@ (-31) from
+--   @bitcoin-core/src/rpc/protocol.h:64@ ("No valid connection manager
+--   instance found").  Raised by the @ping@ / @setnetworkactive@ handlers'
+--   @EnsurePeerman@ / @EnsureConnman@ parity when the peer manager is
+--   unavailable (P2P disabled), rather than returning an empty success.
+rpcClientP2pDisabled :: Int
+rpcClientP2pDisabled = -31
 
 --------------------------------------------------------------------------------
 -- getnodeaddresses / addpeeraddress — addrman dump + inject
