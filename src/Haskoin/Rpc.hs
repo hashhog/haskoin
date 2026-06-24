@@ -9857,8 +9857,19 @@ applyPartial enable = go
 -- documented non-match.  The -22 error paths DO match Core.
 handleCombineRawTransaction :: RpcServer -> Value -> IO RpcResponse
 handleCombineRawTransaction _server params =
+  -- Core convention: combinerawtransaction takes ONE positional arg, the txs
+  -- array (params = [ [hex,...] ]).  Read the first positional arg as the txs
+  -- array (was: treating the whole positional-args list as txs, off by one
+  -- nesting level — diverged from Core + the other 9 nodes).
   case params of
-    Array arr -> combine (V.toList arr)
+    Array outer -> case V.toList outer of
+      (Array txsArr : _) -> combine (V.toList txsArr)
+      (other : _) -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcTypeError
+          ("JSON value of type " <> jsonTypeName other
+           <> " is not of expected type array")) Null
+      [] -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcDeserializationError "Missing transactions") Null
     _ -> return $ RpcResponse Null
       (toJSON $ RpcError rpcTypeError
         ("JSON value of type " <> jsonTypeName params
