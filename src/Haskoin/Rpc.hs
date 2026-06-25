@@ -186,6 +186,11 @@ module Haskoin.Rpc
   , w47bExtract
   , w47bTreeHeight
   , w47bTreeWidth
+    -- * wait-family RPCs (Core rpc/blockchain.cpp waitfornewblock/waitforblock/
+    --   waitforblockheight) — exported for testing
+  , handleWaitForNewBlock
+  , handleWaitForBlock
+  , handleWaitForBlockHeight
   ) where
 
 import Data.Aeson
@@ -1240,6 +1245,16 @@ handleRpcRequest server req = do
     "getmininginfo"        -> handleGetMiningInfo server
     "prioritisetransaction" -> handlePrioritiseTransaction server params
     "getprioritisedtransactions" -> handleGetPrioritisedTransactions server
+
+    -- Wait-family RPCs (Core rpc/blockchain.cpp).  These block until a
+    -- tip-change predicate holds or the timeout elapses; they share the
+    -- STM generation-counter notifier wired into hcTipGen.
+    -- Reference: bitcoin-core/src/rpc/blockchain.cpp waitfornewblock /
+    -- waitforblock / waitforblockheight (lines 290–469).
+    -- Ouroboros pilot: ouroboros/src/ouroboros/rpc.py lines 1975–2085.
+    "waitfornewblock"      -> handleWaitForNewBlock server params
+    "waitforblock"         -> handleWaitForBlock server params
+    "waitforblockheight"   -> handleWaitForBlockHeight server params
 
     -- Regtest Mining RPCs
     "generatetoaddress"    -> handleGenerateToAddress server params
@@ -10151,6 +10166,268 @@ parseBanSubnet subnetStr port =
     splitOnChar c (x:xs)
       | c == x    = "" : splitOnChar c xs
       | otherwise = let (h:t) = splitOnChar c xs in (x:h) : t
+
+--------------------------------------------------------------------------------
+-- Wait-family RPCs
+--
+-- waitfornewblock / waitforblock / waitforblockheight
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp lines 290–469.
+-- Cross-impl pilot: ouroboros/src/ouroboros/tip_notifier.py +
+--   rpc.py lines 1975–2085 (identical generation-counter shape).
+--
+-- Design (lost-wakeup-safe via STM):
+--
+--   hcTipGen :: TVar Int  — monotonic counter in HeaderChain, bumped in
+--   the SAME atomically block as hcTip at every tip-advance chokepoint:
+--     * addHeaderAt success path  (Consensus.hs) — IBD + active-tip submitblock
+--     * doSideBranchReorg         (BlockTemplate.hs) — side-branch reorg
+--     * performReorg              (Consensus.hs) — invalidateblock/reconsiderblock
+--
+--   The wait loop:
+--     1. Snapshot the generation (gen0) BEFORE checking the predicate.
+--     2. Read the AUTHORITATIVE tip (getValidatedChainTip).
+--     3. If predicate holds → return tip.
+--     4. Build an STM action that retries unless hcTipGen /= gen0.
+--     5. Race it with registerDelay (timeout arm).
+--     6. On either wake → re-check predicate from step 2.
+--
+--   Lost-wakeup-free: if a notify races in between steps 2 and 4,
+--   gen0 is already stale and the STM action succeeds immediately
+--   (no blocked wait), exactly as the ouroboros generation snapshot.
+--
+-- Error codes (byte-match live Core, confirmed against ouroboros pilot):
+--   * malformed blockhash/current_tip → -8 (RPC_INVALID_PARAMETER)
+--   * negative timeout → -1 "Negative timeout" (RPC_MISC_ERROR)
+--   * non-integer timeout/height → -3 (RPC_TYPE_ERROR)
+--   * non-string current_tip (e.g. Number) → -3
+--   * For waitforblock: blockhash is parsed BEFORE timeout (Core order).
+--------------------------------------------------------------------------------
+
+-- | Shared tip-wait loop for the three wait-family RPCs.
+--
+-- @predicate ce@ — return True when the desired tip condition holds.
+-- @timeoutMs@   — 0 = no timeout; positive = deadline in milliseconds.
+-- Always returns the AUTHORITATIVE tip (on match OR timeout).
+waitForTipChange :: RpcServer
+                 -> (ChainEntry -> Bool)  -- ^ Predicate on the tip
+                 -> Int                   -- ^ Timeout (milliseconds); 0 = none
+                 -> IO ChainEntry
+waitForTipChange server predicate timeoutMs = do
+  let hc = rsHeaderChain server
+      db = rsDB server
+      genVar = hcTipGen hc
+  -- Compute an absolute POSIX-microsecond deadline if the caller specified a
+  -- timeout, matching Core's steady_clock deadline approach.
+  mDeadlineUs <- if timeoutMs <= 0
+    then return Nothing
+    else do
+      nowUs <- round . (* 1e6) <$> getPOSIXTime :: IO Int
+      return $ Just (nowUs + timeoutMs * 1000)
+  loop genVar db hc mDeadlineUs
+  where
+    readTip db hc = getValidatedChainTip db hc
+
+    loop genVar db hc mDeadlineUs = do
+      -- Step 1: snapshot generation BEFORE reading the tip (lost-wakeup-free).
+      gen0 <- readTVarIO genVar
+      -- Step 2: read authoritative tip.
+      tip <- readTip db hc
+      -- Step 3: predicate check.
+      if predicate tip
+        then return tip
+        else case mDeadlineUs of
+          -- No timeout: block in STM until the generation advances.
+          Nothing -> do
+            atomically $ do
+              gen' <- readTVar genVar
+              if gen' /= gen0 then return () else retry
+            loop genVar db hc mDeadlineUs
+          -- Bounded timeout: race generation-change against registerDelay.
+          Just deadlineUs -> do
+            nowUs <- round . (* 1e6) <$> getPOSIXTime :: IO Int
+            let remainingUs = deadlineUs - nowUs
+            if remainingUs <= 0
+              then readTip db hc  -- Deadline already past — return current tip.
+              else do
+                -- registerDelay takes microseconds; cap at maxBound to avoid
+                -- overflow on very long timeouts (Core uses ms precision).
+                let delayUs = min remainingUs (maxBound `div` 2)
+                timeoutVar <- registerDelay delayUs
+                -- Race: wake when generation changes OR timeout fires.
+                timedOut <- atomically $
+                  (do gen' <- readTVar genVar
+                      if gen' /= gen0 then return False else retry)
+                  `orElse`
+                  (do t <- readTVar timeoutVar
+                      if t then return True else retry)
+                if timedOut
+                  then readTip db hc  -- Timeout — return current tip (Core behaviour).
+                  else loop genVar db hc (Just deadlineUs)
+
+-- | @waitfornewblock ( timeout current_tip )@
+--
+-- Waits until the active-chain tip hash differs from the reference hash
+-- (@current_tip@ if given, otherwise the tip at call entry), then returns
+-- @{"hash":<hex>,"height":<int>}@.  Timeout is in MILLISECONDS; 0 = no
+-- timeout.  Returns the current tip on timeout.
+--
+-- Error codes (Core-faithful):
+--   * current_tip present but not a string → -3
+--   * current_tip is a malformed 64-hex string → -8
+--   * negative timeout → -1 "Negative timeout"
+--   * non-integer timeout → -3
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp:290.
+handleWaitForNewBlock :: RpcServer -> Value -> IO RpcResponse
+handleWaitForNewBlock server params = do
+  let hc = rsHeaderChain server
+      db = rsDB server
+  -- Parse timeout (param[0]).  Core: @if (!request.params[0].isNull()) timeout = ...@
+  -- Absent / null → 0 (no timeout).  Non-integer → -3.  Negative → -1.
+  timeoutResult <- case rawParamAt params 0 of
+    Nothing           -> return (Right 0)
+    Just (Number n)   -> case toBoundedInteger n :: Maybe Int of
+      Just ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
+      Just ms           -> return $ Right ms
+      Nothing           -> return $ Left $
+        RpcError rpcTypeError
+          ("JSON value of type number is not of expected type integer")
+    Just other -> return $ Left $
+      RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type number")
+  case timeoutResult of
+    Left err -> return $ RpcResponse Null (toJSON err) Null
+    Right timeoutMs -> do
+      -- Parse current_tip (param[1]).  Absent / null → snapshot live tip.
+      -- Non-string → -3.  Malformed 64-hex → -8.
+      refHashResult <- case rawParamAt params 1 of
+        Nothing -> do
+          tip <- getValidatedChainTip db hc
+          return $ Right (showHash (ceHash tip))
+        Just (String s) ->
+          case parseHashV "current_tip" s of
+            Right bh -> return $ Right (showHash bh)
+            Left err -> return $ Left err
+        Just other -> return $ Left $
+          RpcError rpcTypeError
+            ("JSON value of type " <> jsonTypeName other
+             <> " is not of expected type string")
+      case refHashResult of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right refHash -> do
+          let predicate ce = showHash (ceHash ce) /= refHash
+          tip <- waitForTipChange server predicate timeoutMs
+          let enc = pairs $
+                pair "hash"   (text (showHash (ceHash tip))) <>
+                pair "height" (AE.word32 (ceHeight tip))
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | @waitforblock blockhash ( timeout )@
+--
+-- Waits until the active-chain tip hash equals @blockhash@, then returns
+-- @{"hash":<hex>,"height":<int>}@.  Timeout is in MILLISECONDS; 0 = no
+-- timeout.  Returns the current tip on timeout.
+--
+-- Error codes (Core-faithful):
+--   * blockhash is malformed → -8  (parsed BEFORE timeout, matching Core order)
+--   * negative timeout → -1 "Negative timeout"
+--   * non-integer timeout → -3
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp:349.
+handleWaitForBlock :: RpcServer -> Value -> IO RpcResponse
+handleWaitForBlock server params = do
+  -- Core parses blockhash FIRST (before reading timeout).  A malformed
+  -- blockhash errors -8 even when a negative timeout would also error -1.
+  let mBhParam = rawParamAt params 0
+  case mBhParam of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
+    Just (String s) ->
+      case parseHashV "blockhash" s of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right targetBh -> do
+          let targetHex = showHash targetBh
+          -- Parse timeout (param[1]).
+          timeoutResult <- case rawParamAt params 1 of
+            Nothing           -> return (Right 0)
+            Just (Number n)   -> case toBoundedInteger n :: Maybe Int of
+              Just ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
+              Just ms           -> return $ Right ms
+              Nothing           -> return $ Left $
+                RpcError rpcTypeError
+                  "JSON value of type number is not of expected type integer"
+            Just other -> return $ Left $
+              RpcError rpcTypeError
+                ("JSON value of type " <> jsonTypeName other
+                 <> " is not of expected type number")
+          case timeoutResult of
+            Left err -> return $ RpcResponse Null (toJSON err) Null
+            Right timeoutMs -> do
+              let predicate ce = showHash (ceHash ce) == targetHex
+              tip <- waitForTipChange server predicate timeoutMs
+              let enc = pairs $
+                    pair "hash"   (text (showHash (ceHash tip))) <>
+                    pair "height" (AE.word32 (ceHeight tip))
+              return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+    Just other -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type string")) Null
+
+-- | @waitforblockheight height ( timeout )@
+--
+-- Waits until the active-chain tip height >= @height@, then returns
+-- @{"hash":<hex>,"height":<int>}@.  Timeout is in MILLISECONDS; 0 = no
+-- timeout.  Returns the current tip on timeout.
+--
+-- Error codes (Core-faithful):
+--   * non-integer height → -3
+--   * negative timeout → -1 "Negative timeout"
+--   * non-integer timeout → -3
+--
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp:410.
+handleWaitForBlockHeight :: RpcServer -> Value -> IO RpcResponse
+handleWaitForBlockHeight server params = do
+  -- Parse height (param[0]).  Core: @int height = request.params[0].getInt<int>()@.
+  -- Non-integer → -3 (RPC_TYPE_ERROR).
+  let mHeightParam = rawParamAt params 0
+  case mHeightParam of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
+    Just (Number n) ->
+      case toBoundedInteger n :: Maybe Int of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcTypeError
+            "JSON value of type number is not of expected type integer") Null
+        Just targetHeight -> do
+          -- Parse timeout (param[1]).
+          timeoutResult <- case rawParamAt params 1 of
+            Nothing           -> return (Right 0)
+            Just (Number n')  -> case toBoundedInteger n' :: Maybe Int of
+              Just ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
+              Just ms           -> return $ Right ms
+              Nothing           -> return $ Left $
+                RpcError rpcTypeError
+                  "JSON value of type number is not of expected type integer"
+            Just other -> return $ Left $
+              RpcError rpcTypeError
+                ("JSON value of type " <> jsonTypeName other
+                 <> " is not of expected type number")
+          case timeoutResult of
+            Left err -> return $ RpcResponse Null (toJSON err) Null
+            Right timeoutMs -> do
+              let predicate ce = fromIntegral (ceHeight ce) >= targetHeight
+              tip <- waitForTipChange server predicate timeoutMs
+              let enc = pairs $
+                    pair "hash"   (text (showHash (ceHash tip))) <>
+                    pair "height" (AE.word32 (ceHeight tip))
+              return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+    Just other -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type number")) Null
 
 -- | setban "subnet" "command" ( bantime ) ( absolute )
 -- command: "add" | "remove"
