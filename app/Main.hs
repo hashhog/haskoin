@@ -2045,6 +2045,12 @@ initHeaderChainFromDB db net = do
   -- (Core comparator invariant; see node/blockstorage.cpp:174-192).
   candidatesVar <- newTVarIO (Set.singleton (mkCandidateKey genesisEntry))
   seqCounterVar <- newTVarIO (seqIdInitFromDisk + 1)
+  -- Tip-change generation counter for wait-family RPCs (waitfornewblock /
+  -- waitforblock / waitforblockheight).  Starts at 0; bumped at every
+  -- tip advance inside Consensus.hs (addHeaderAt, performReorg) and
+  -- BlockTemplate.hs (doSideBranchReorg) in the same STM transaction
+  -- as hcTip, providing a lost-wakeup-free wake primitive.
+  tipGenVar <- newTVarIO (0 :: Int)
 
   -- Load persisted headers from the height index to rebuild the in-memory chain.
   -- connectBlock writes PrefixBlockHeader and PrefixBlockHeight for every
@@ -2142,6 +2148,7 @@ initHeaderChainFromDB db net = do
     , hcInvalidated = invalidatedVar
     , hcCandidates = candidatesVar
     , hcSeqCounter = seqCounterVar
+    , hcTipGen = tipGenVar
     }
 
 -- | Send a message to a peer.

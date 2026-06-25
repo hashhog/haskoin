@@ -148,6 +148,7 @@ module Haskoin.Consensus
   , seqIdBestChainFromDisk
   , seqIdInitFromDisk
   , initHeaderChain
+  , bumpTipGen
   , headerWork
   , cumulativeWork
   , medianTimePast
@@ -4285,6 +4286,17 @@ data HeaderChain = HeaderChain
   , hcInvalidated :: !(TVar (Set.Set BlockHash))        -- ^ Manually invalidated blocks (via invalidateblock RPC)
   , hcCandidates  :: !(TVar (Set.Set CandidateKey))     -- ^ Sorted candidate tips (Core's setBlockIndexCandidates)
   , hcSeqCounter  :: !(TVar Word64)                     -- ^ Monotonic counter for ceSequenceId on live inserts
+  , hcTipGen      :: !(TVar Int)
+    -- ^ Monotonic tip-change generation counter.  Bumped (in the same STM
+    -- transaction as hcTip) on every successful tip advance — including
+    -- IBD block-connect (addHeader), the active-tip submitblock arm, the
+    -- side-branch reorg arm (doSideBranchReorg), and both halves of the
+    -- invalidateblock/reconsiderblock reorg.  A waiter snapshots the
+    -- generation before checking its predicate so that a notify which
+    -- races in between the check and the STM wait is never lost (lost-
+    -- wakeup-safe, the ouroboros pilot shape — tip_notifier.py).
+    -- Consumed exclusively by the three wait-family RPC handlers
+    -- (waitfornewblock / waitforblock / waitforblockheight).
   }
 
 --------------------------------------------------------------------------------
@@ -4488,6 +4500,7 @@ initHeaderChain net = do
   invalidatedVar <- newTVarIO Set.empty
   candidatesVar <- newTVarIO (Set.singleton (mkCandidateKey genesisEntry))
   seqCounterVar <- newTVarIO (seqIdInitFromDisk + 1)
+  tipGenVar <- newTVarIO 0
   return HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
@@ -4496,7 +4509,22 @@ initHeaderChain net = do
     , hcInvalidated = invalidatedVar
     , hcCandidates = candidatesVar
     , hcSeqCounter = seqCounterVar
+    , hcTipGen = tipGenVar
     }
+
+-- | Bump the tip-change generation counter inside a running STM transaction.
+--
+-- Must be called in the SAME 'atomically' block that updates 'hcTip' so
+-- that a waiter sees a consistent (generation, tip) pair with no torn reads.
+-- All three tip-write sites (addHeaderAt, doSideBranchReorg, performReorg)
+-- include this call.
+--
+-- Consumers: 'handleWaitForNewBlock' / 'handleWaitForBlock' /
+-- 'handleWaitForBlockHeight' in Rpc.hs use 'hcTipGen' as the STM variable
+-- they watch with 'orElse' + 'registerDelay', providing the lost-wakeup-free
+-- wait primitive (ouroboros tip_notifier.py generation-counter shape).
+bumpTipGen :: HeaderChain -> STM ()
+bumpTipGen hc = modifyTVar' (hcTipGen hc) (+ 1)
 
 --------------------------------------------------------------------------------
 -- Header Validation and Insertion
@@ -4720,6 +4748,10 @@ addHeaderAt net hc header minPowChecked mNow = do
                                 modifyTVar' (hcByHeight hc) (Map.insert height hash)
                                 writeTVar (hcTip hc) entry
                                 writeTVar (hcHeight hc) height
+                                -- Notify waitfornewblock/waitforblock/waitforblockheight
+                                -- waiters: bump the generation counter in the SAME
+                                -- atomically block as hcTip so no lost-wakeup is possible.
+                                bumpTipGen hc
 
                             return $ Right entry
 
@@ -5498,6 +5530,9 @@ reorgAtomic net cache db hc mIdxMgr disList conList = do
                       Just nt -> do
                         writeTVar (hcTip hc) nt
                         writeTVar (hcHeight hc) (ceHeight nt)
+                        -- Wake waitfornewblock/waitforblock/waitforblockheight.
+                        -- In the same atomically block as hcTip (lost-wakeup-safe).
+                        bumpTipGen hc
                       Nothing -> return ()
 
                   -- Phase E — mirror the reorg into any opted-in secondary
