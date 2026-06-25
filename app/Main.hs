@@ -924,16 +924,18 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- W102 BUG-9+10: per-coin height ≤ base_height and MoneyRange guards
     --   (Core validation.cpp:5818-5822), enforced via validateSnapshotCoins.
     forM_ noLoadSnapshot $ \snapshotPath -> do
-      putStrLn $ "[--load-snapshot] reading " ++ snapshotPath
+      putStrLn $ "[--load-snapshot] reading header from " ++ snapshotPath
       let magic = netMagic net
-      r <- loadSnapshot snapshotPath magic
-      case r of
+      -- Step 1: Read only the 51-byte header — O(1) regardless of file size.
+      -- The old code used 'loadSnapshot' (BS.readFile of the full ~8.8 GB
+      -- file) which OOMed at ~80 G on the 165 M-coin mainnet snapshot.
+      rMeta <- readSnapshotMetadata snapshotPath magic
+      case rMeta of
         Left err -> do
           putStrLn $ "[--load-snapshot] FATAL: " ++ err
           exitWith (ExitFailure 1)
-        Right snap -> do
-          let m        = usMetadata snap
-              baseHash = smBaseBlockHash m
+        Right meta -> do
+          let baseHash = smBaseBlockHash meta
           -- Snapshot-bootstrap: resolve the base HEIGHT from the hardcoded
           -- assumeutxo whitelist (keyed by base hash), NOT from the in-memory
           -- header chain. Core requires the base header to already appear in
@@ -942,8 +944,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           -- backfills the real header chain AFTER import (the proven
           -- snapshot-bootstrap recipe; nimrod/camlcoin/clearbit do the same).
           -- Validity is still pinned: the base hash must be a known assumeutxo
-          -- base, and verifySnapshot below checks the coin-set hash against the
-          -- hardcoded audHashSerialized.
+          -- base, and streamSnapshotIntoLegacyUTXO verifies the coin-set hash
+          -- against the hardcoded audHashSerialized after writing.
           case assumeUtxoForBlockHash net baseHash of
             Nothing -> do
               putStrLn $ "[--load-snapshot] FATAL: base block "
@@ -961,40 +963,32 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                   exitWith (ExitFailure 1)
                 Right () ->
                   -- BUG-2: hash verification — coin-set hash must match
-                  -- the hardcoded audHashSerialized value.
+                  -- the hardcoded audHashSerialized value.  Performed by
+                  -- 'streamSnapshotIntoLegacyUTXO' after writing all coins
+                  -- to the DB (Core PopulateAndValidateSnapshot order).
                   case assumeUtxoForHeight net baseHeight of
                     Nothing -> do
                       putStrLn "[--load-snapshot] FATAL: internal error: \
                                \whitelist lookup failed after whitelist passed"
                       exitWith (ExitFailure 1)
                     Just params -> do
-                      let aud = AssumeUtxoData
-                                  { audHeight         = baseHeight
-                                  , audHashSerialized = aupHashSerialized params
-                                  , audChainTxCount   = aupChainTxCount   params
-                                  , audBlockHash      = aupBlockHash      params
-                                  }
-                      case verifySnapshot snap aud of
-                        Left vErr -> do
-                          putStrLn $ "[--load-snapshot] FATAL: "
-                                  ++ "snapshot hash verification failed: "
-                                  ++ vErr
+                      putStrLn $ "[--load-snapshot] base hash = "
+                              ++ show baseHash
+                              ++ ", height = " ++ show baseHeight
+                              ++ ", coins = " ++ show (smCoinsCount meta)
+                      putStrLn "[--load-snapshot] streaming coins to DB \
+                               \(bounded memory, 100k-coin batches)..."
+                      -- Step 2: stream coins → validate per-coin → write in
+                      -- batches → verify hash from DB (BUG-9/10 + BUG-2).
+                      -- Memory stays bounded (O(batch) ≈ <5 MB), never
+                      -- materialising the full 165 M-coin list in the heap.
+                      r <- streamSnapshotIntoLegacyUTXO db snapshotPath magic
+                             baseHeight (aupHashSerialized params)
+                      case r of
+                        Left loadErr -> do
+                          putStrLn $ "[--load-snapshot] FATAL: " ++ loadErr
                           exitWith (ExitFailure 1)
-                        Right () -> do
-                          -- BUG-9+10: per-coin height ≤ base_height and
-                          -- MoneyRange guard.
-                          case validateSnapshotCoins baseHeight (usCoins snap) of
-                            Left vErr2 -> do
-                              putStrLn $ "[--load-snapshot] FATAL: "
-                                      ++ "snapshot coin validation failed: "
-                                      ++ vErr2
-                              exitWith (ExitFailure 1)
-                            Right () -> do
-                              putStrLn $ "[--load-snapshot] base hash = "
-                                      ++ show baseHash
-                                      ++ ", height = " ++ show baseHeight
-                                      ++ ", coins = " ++ show (smCoinsCount m)
-                              n <- loadSnapshotIntoLegacyUTXO db snap
+                        Right n -> do
                               -- Class-A dbcache: defensively wipe the
                               -- read-through mirror after the snapshot bulk
                               -- write. rcEntries is empty here (peer/RPC threads
