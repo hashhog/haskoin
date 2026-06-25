@@ -85,7 +85,8 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            encodeBip34Height,
                            Deployment, DeploymentCache,
                            computeBlockVersionFromChain,
-                           taprootDeployment)
+                           taprootDeployment,
+                           bumpTipGen)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -943,6 +944,9 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
                              Nothing -> return ()
                       writeTVar (hcTip hc) newTipEntry
                       writeTVar (hcHeight hc) (ceHeight newTipEntry)
+                      -- Notify wait-family RPC waiters of the tip change.
+                      -- In the same atomically block (lost-wakeup-safe).
+                      bumpTipGen hc
 
                     -- Pattern B — re-admit disconnected non-coinbase
                     -- txs into the mempool against the new tip.  Same
