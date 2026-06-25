@@ -137,6 +137,9 @@ module Haskoin.Consensus
   , performReorg
   , disconnectChain
   , connectChain
+    -- * verifychain (CVerifyDB::VerifyDB levels 2-4)
+  , VerifyDbResult(..)
+  , verifyDbUndoSuffix
     -- * Block Status (re-exported from Storage)
   , BlockStatus(..)
     -- * Header Synchronization
@@ -5806,6 +5809,181 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
                 }
               ov'' = ov' { roAdded = foldr Map.delete (roAdded ov') prevouts }
           reorgConBuild net cache db hc ov'' rest (ops ++ blockOps)
+
+--------------------------------------------------------------------------------
+-- verifychain levels 2-4 — Core CVerifyDB::VerifyDB, undo + reconnect
+--------------------------------------------------------------------------------
+
+-- | Outcome of a 'verifyDbUndoSuffix' run.  Core's @CVerifyDB::VerifyDB@
+-- treats two of these as SUCCESS (the suffix was verified as far as the
+-- data permits) and one as FAILURE:
+--
+--   * 'VerifyDbOk'        — every block in the requested suffix passed the
+--                           disconnect + reconnect at the requested level.
+--   * 'VerifyDbStopped'   — verification stopped early because the
+--                           undo record or block body for some block is
+--                           unavailable on this node (pruned / assume-valid
+--                           IBD range).  Core's @skipped_no_block_data@ /
+--                           @!ReadBlockUndo@ branch (validation.cpp:4652,
+--                           4675): it stops the rewind there and reports
+--                           success for what it could check.  haskoin does
+--                           NOT retain bodies/undo for old assume-valid
+--                           ranges, so this is the normal pruned-node case.
+--   * 'VerifyDbFailed'    — a block that DOES have its data failed a real
+--                           consensus check (undo shape, disconnect, or
+--                           reconnect script verification).  This is the
+--                           only @false@-producing outcome.
+data VerifyDbResult
+  = VerifyDbOk
+  | VerifyDbStopped !String
+  | VerifyDbFailed  !String
+  deriving (Show, Eq)
+
+-- | verifychain levels 2-4, the undo-backed half of Core's
+-- @CVerifyDB::VerifyDB@ (validation.cpp:4611-4720), run against an
+-- IN-MEMORY overlay so the live chainstate is NEVER mutated.
+--
+-- This REUSES the node's real reorg/undo machinery verbatim — the same
+-- functions an actual reorg drives:
+--
+--   * 'loadReorgDisconnectUndo' — read + checksum-verify each block's
+--     'UndoData' (Core @ReadBlockUndo@, validation.cpp:4675).
+--   * 'reorgDisBuildPure'       — DisconnectBlock each suffix block into a
+--     virtual 'ReorgOverlay': restore every spent prevout from the undo
+--     record, mark the block's own created outputs as spent.  This is the
+--     read-only analogue of Core's @DisconnectBlock@ into a sandbox
+--     @CCoinsViewCache@ (validation.cpp:4687).  The resulting 'BatchOp's
+--     are DISCARDED — verifychain never commits them.
+--   * 'reorgConBuild'           — ConnectBlock each block back, resolving
+--     every prevout via the overlay (the just-restored fork-point view)
+--     and running full, script-verifying 'validateFullBlock'
+--     (Core's reconnect + @CheckInputScripts@, validation.cpp:4717).
+--     Again the ops are DISCARDED.
+--
+-- The @level@ selects how far each block is taken:
+--
+--   2  — undo record exists + decodes + checksum-verifies, and its shape
+--        matches the block's non-coinbase inputs.  Implemented by the
+--        disconnect overlay build alone (Phase A + 'reorgDisBuildPure'),
+--        which performs exactly the count/shape gates Core's
+--        @DisconnectBlock@ asserts.
+--   3  — additionally, the full disconnect overlay is reconnected far
+--        enough to restore the fork-point view (same Phase as level 2 here
+--        — the overlay rewind IS the disconnect-into-sandbox; level 3 is
+--        the read-only "a clean DisconnectBlock would succeed" assertion).
+--   4  — additionally, every block is reconnected with FULL script /
+--        signature verification ('reorgConBuild' → 'validateFullBlock'
+--        @skipScripts=False@).
+--
+-- @suffix@ is the list of @(ChainEntry, Block)@ pairs in OLDTIP-FIRST
+-- order (i.e. disconnect order), exactly the shape 'performReorg' feeds
+-- 'reorgAtomic' as its @disList@.
+--
+-- Pruned-node parity: if 'loadReorgDisconnectUndo' reports a missing undo
+-- record for any block, we treat it as 'VerifyDbStopped' (Core's pruned
+-- boundary), NOT a failure.  The caller maps both 'VerifyDbOk' and
+-- 'VerifyDbStopped' to @true@.
+verifyDbUndoSuffix :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                   -> Int                         -- ^ check level (2, 3, or 4)
+                   -> [(ChainEntry, Block)]        -- ^ suffix, oldTip-first
+                   -> IO VerifyDbResult
+verifyDbUndoSuffix net cache db hc level suffix
+  | null suffix = return VerifyDbOk
+  | otherwise = do
+      -- Phase A — read + checksum-verify undo for every block in the
+      -- suffix.  A genuinely-missing undo record is the pruned boundary:
+      -- stop (success), do not fail.  A PRESENT-but-corrupt record (bad
+      -- checksum / undecodable) is a real failure.
+      undoRes <- loadVerifyUndo db suffix []
+      case undoRes of
+        VerifyUndoStop reason     -> return (VerifyDbStopped reason)
+        VerifyUndoFail reason     -> return (VerifyDbFailed reason)
+        VerifyUndoOk disUndos -> do
+          -- Phase B (disconnect) — DisconnectBlock every suffix block into
+          -- a virtual overlay using the SAME pure folder the reorg uses.
+          -- This enforces the level-2/3 undo-shape gates and restores the
+          -- fork-point UTXO view (in roAdded) without touching disk.
+          case reorgDisBuildPure (zip suffix disUndos) ([], reorgEmptyOverlay) of
+            Left err          -> return (VerifyDbFailed err)
+            Right (_disOps, ov) ->
+              if level < 4
+                then return VerifyDbOk
+                else do
+                  -- Phase B (reconnect, level 4 only) — ConnectBlock every
+                  -- block back, fork-child-first, resolving prevouts from
+                  -- the overlay and running full script-verifying
+                  -- 'validateFullBlock'.  The connect list is the suffix
+                  -- REVERSED (oldTip-first -> fork-child-first), matching
+                  -- the disconnect/connect orientation 'reorgAtomic' uses.
+                  --
+                  -- UNLIKE a real reorg (where the disconnect + connect
+                  -- branches are DISJOINT past the fork), verifychain
+                  -- reconnects the SAME blocks it just disconnected.  When the
+                  -- window spans an output's whole lifetime (its creating
+                  -- block AND its spending block are both inside the window —
+                  -- e.g. `verifychain 4 0` over the whole chain), the
+                  -- disconnect phase ends with that outpoint marked
+                  -- 'roSpent' (by its creating block) even though an earlier
+                  -- step restored it to 'roAdded' (by its spending block).
+                  -- The connect phase re-creates such outputs in HEIGHT ORDER
+                  -- before any later block spends them, so the disconnect-side
+                  -- 'roSpent' marks are stale for the reconnect.  Reset
+                  -- 'roSpent' to empty (keeping the restored fork-point coins
+                  -- in 'roAdded') so the in-order reconnect threads its own
+                  -- create/spend bookkeeping cleanly — matching Core's
+                  -- VerifyDB, which reconnects from the fork-point coins view
+                  -- and never carries the disconnect's spent-set into the
+                  -- reconnect.  For a bounded window this is a no-op (the
+                  -- prevouts of in-window spends were created OUTSIDE the
+                  -- window and were never in 'roSpent').
+                  let ovReconnect = ov { roSpent = Set.empty }
+                  conRes <- reorgConBuild net cache db hc ovReconnect
+                                          (reverse suffix) []
+                  case conRes of
+                    Left err -> return (VerifyDbFailed err)
+                    Right _  -> return VerifyDbOk
+
+-- | Internal result of the verifychain undo-load phase, distinguishing a
+-- pruned-boundary stop (missing undo => success) from a real corruption
+-- failure (present-but-bad undo => failure).
+data VerifyUndoResult
+  = VerifyUndoOk   ![UndoData]
+  | VerifyUndoStop !String
+  | VerifyUndoFail !String
+
+-- | Load + checksum-verify undo for the verifychain suffix.  Unlike
+-- 'loadReorgDisconnectUndo' (which fails on any missing undo, because a
+-- reorg genuinely cannot proceed without it), this distinguishes:
+--
+--   * undo record entirely ABSENT  => pruned boundary => 'VerifyUndoStop'
+--     (Core stops the rewind here and returns success for the suffix it
+--     verified — validation.cpp:4675 @!ReadBlockUndo@ break).
+--   * undo record PRESENT but checksum-bad / undecodable => real
+--     corruption => 'VerifyUndoFail'.
+--   * a coinbase-only block legitimately has no spends; its undo is an
+--     empty 'BlockUndo' and verifies trivially.
+loadVerifyUndo :: HaskoinDB -> [(ChainEntry, Block)] -> [UndoData]
+               -> IO VerifyUndoResult
+loadVerifyUndo _  []                acc = return (VerifyUndoOk (reverse acc))
+loadVerifyUndo db ((_, blk) : rest) acc = do
+  let bh  = computeBlockHash (blockHeader blk)
+      prv = bhPrevBlock (blockHeader blk)
+  mRaw <- getUndoData db bh
+  case mRaw of
+    Nothing ->
+      -- No undo record at all: pruned / pre-undo-rewrite range.  Stop the
+      -- rewind here and report success for the suffix verified so far.
+      return $ VerifyUndoStop $
+        "no undo data for block " ++ show bh ++ " (pruned boundary)"
+    Just _ -> do
+      -- Record present: it MUST checksum-verify, else it is real corruption
+      -- (a present-but-bad record is not the pruned case).  Reuse the same
+      -- checksum-verifying loader the reorg disconnect path uses.
+      verifiedR <- getUndoDataVerified db bh prv
+      case verifiedR of
+        Left err   -> return $ VerifyUndoFail $
+          "undo data error for block " ++ show bh ++ ": " ++ err
+        Right undo -> loadVerifyUndo db rest (undo : acc)
 
 -- | Disconnect blocks from current hash back to target hash.
 -- Uses undo data to restore spent UTXOs at each step.
