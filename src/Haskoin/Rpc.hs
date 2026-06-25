@@ -279,6 +279,14 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            blockBaseSize, blockTotalSize,
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
                            medianTimePast, maxBlockWeight,
+                           -- submitheader RPC reuses the headers-first
+                           -- validator (PoW + contextual) that IBD and the
+                           -- submitblock side-branch path already drive; we do
+                           -- NOT write a parallel validator. addHeader returns
+                           -- Right on success/already-known and Left
+                           -- "Unknown previous block: ..." / reject-reason on
+                           -- failure. (Core: ProcessNewBlockHeaders.)
+                           addHeader,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
                            Deployment(..), taprootDeployment,
                            ThresholdState(..), getDeploymentState,
@@ -1242,6 +1250,7 @@ handleRpcRequest server req = do
     -- Mining RPCs
     "getblocktemplate"     -> handleGetBlockTemplate server params
     "submitblock"          -> handleSubmitBlock server params
+    "submitheader"         -> handleSubmitHeader server params
     "getmininginfo"        -> handleGetMiningInfo server
     "prioritisetransaction" -> handlePrioritiseTransaction server params
     "getprioritisedtransactions" -> handleGetPrioritisedTransactions server
@@ -4850,6 +4859,88 @@ handleSubmitBlockUnpaused server params = do
                   -- lingers in the pool.
                   blockConnected (rsMempool server) block
                   return $ RpcResponse Null Null Null
+
+-- | submitheader "hexdata"
+--
+-- Decode @hexdata@ as an 80-byte block header and submit it as a candidate
+-- chain tip if valid.  Throws when the header is invalid.
+--
+-- Reference: bitcoin-core/src/rpc/mining.cpp submitheader() (lines 1108-1146).
+-- Ouroboros pilot: ouroboros/src/ouroboros/rpc.py rpc_submitheader.
+--
+-- Core's exact control flow / error ladder (all byte-identical here):
+--
+--   1. @DecodeHexBlockHeader(h, hexdata)@ failure
+--        → RPC_DESERIALIZATION_ERROR (-22) "Block header decode failed".
+--      "Failure" = bad hex, OR a payload whose length is not exactly 80
+--      bytes (Core's CDataStream deser leaves no trailing bytes — it
+--      throws on both short AND long input).  NOTE: cereal's 'S.decode'
+--      IGNORES trailing bytes, so we MUST check @BS.length == 80@
+--      ourselves before decoding; otherwise an 81-byte payload would
+--      decode to a 80-byte header and silently drop the tail.
+--
+--   2. @!chainman.m_blockman.LookupBlockIndex(h.hashPrevBlock)@
+--        → RPC_VERIFY_ERROR (-25)
+--          "Must submit previous header (<prevhash>) first"
+--      where <prevhash> is @h.hashPrevBlock.GetHex()@ — the big-endian
+--      DISPLAY hex (our 'showHash', which reverses the internal bytes).
+--      We look up the prev hash in 'hcEntries' (haskoin's in-memory block
+--      index == Core's LookupBlockIndex domain).
+--
+--   3. @ProcessNewBlockHeaders({{h}}, min_pow_checked=true, state)@:
+--        * state valid     → UniValue::VNULL  (JSON null)
+--        * state error/bad  → RPC_VERIFY_ERROR (-25) with the reject reason.
+--      We REUSE the existing headers-first validator 'addHeader' (the very
+--      same path IBD and the submitblock side-branch arm drive — PoW +
+--      contextual checks in Consensus.hs addHeaderAt).  No parallel
+--      validator.  'addHeader' returns 'Right' on success/already-known
+--      (Core treats a duplicate header as a valid no-op → null) and 'Left'
+--      with the reject-reason string on failure.  We pass min_pow_checked =
+--      True to mirror Core's literal call.
+handleSubmitHeader :: RpcServer -> Value -> IO RpcResponse
+handleSubmitHeader server params =
+  case extractParamText params 0 of
+    Nothing ->
+      -- Core treats a missing required hexdata as a type/parse error; the
+      -- closest faithful surface is the decode-failure path.  (A real
+      -- client always passes the param; this only fires on a malformed
+      -- request object.)
+      return $ decodeFailed
+    Just hexData ->
+      -- Step 1: decode the hex-encoded 80-byte header.
+      case B16.decode (TE.encodeUtf8 hexData) of
+        Left _ -> return decodeFailed
+        Right raw
+          -- Exactly 80 bytes (cereal ignores trailing bytes — guard it).
+          | BS.length raw /= 80 -> return decodeFailed
+          | otherwise ->
+              case S.decode raw :: Either String BlockHeader of
+                Left _ -> return decodeFailed
+                Right header -> do
+                  let prevHash = bhPrevBlock header
+                  -- Step 2: parent-known check (Core LookupBlockIndex).
+                  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+                  if not (Map.member prevHash entries)
+                    then return $ RpcResponse Null
+                           (toJSON $ RpcError rpcVerifyError
+                              ("Must submit previous header ("
+                               <> showHash prevHash <> ") first")) Null
+                    else do
+                      -- Step 3: run the REAL headers-first validator
+                      -- (PoW + contextual).  min_pow_checked = True
+                      -- mirrors Core's ProcessNewBlockHeaders call.
+                      result <- addHeader (rsNetwork server)
+                                          (rsHeaderChain server)
+                                          header True
+                      case result of
+                        -- Success / already-known → JSON null.
+                        Right _ -> return $ RpcResponse Null Null Null
+                        -- Validation failure → -25 with the reject reason.
+                        Left reason -> return $ RpcResponse Null
+                          (toJSON $ RpcError rpcVerifyError (T.pack reason)) Null
+  where
+    decodeFailed = RpcResponse Null
+      (toJSON $ RpcError rpcDeserializationError "Block header decode failed") Null
 
 -- | Get mining-related information
 -- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
