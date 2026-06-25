@@ -199,7 +199,7 @@ import Data.Aeson.Encoding (unsafeToEncoding, pairs, encodingToLazyByteString,
                              text, pair, list, int, null_, word32)
 import qualified Data.Aeson.Encoding as AE
 import Data.ByteString.Builder (stringUtf8, lazyByteString)
-import Data.Scientific (toBoundedInteger, toRealFloat)
+import Data.Scientific (Scientific, toBoundedInteger, toRealFloat)
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.ByteString (ByteString)
@@ -8730,23 +8730,37 @@ rpcInvalidAddressOrKey = -5
 handleCreateRawTransaction :: RpcServer -> Value -> IO RpcResponse
 handleCreateRawTransaction _server params = do
   let mInputs = extractParamArray params 0
-      mOutputs = extractParamArray params 1
+      mOutputs = rawParamAt params 1   -- OBJECT or ARRAY (Core NormalizeOutputs)
       locktime = fromMaybe 0 (extractParam params 2 :: Maybe Word32)
-      replaceable = fromMaybe False (extractParam params 3 :: Maybe Bool)
+      -- Core ConstructTransaction receives rbf as std::optional<bool>;
+      -- createrawtransaction's RPCArg defaults to true and passes std::nullopt
+      -- when the arg is ABSENT. AddInputs then does rbf.value_or(true), so BOTH
+      -- "arg absent" AND "replaceable=true" select the RBF default sequence.
+      -- (rawtransaction_util.cpp AddInputs lines 49-55.)
+      rbf = fromMaybe True (extractParam params 3 :: Maybe Bool)
+      -- Default per-input sequence when no explicit "sequence" is supplied:
+      --   rbf            -> MAX_BIP125_RBF_SEQUENCE  0xfffffffd
+      --   else locktime≠0 -> MAX_SEQUENCE_NONFINAL    0xfffffffe
+      --   else            -> SEQUENCE_FINAL           0xffffffff
+      defaultSequence :: Word32
+      defaultSequence
+        | rbf            = 0xFFFFFFFD
+        | locktime /= 0  = 0xFFFFFFFE
+        | otherwise      = 0xFFFFFFFF
 
   case (mInputs, mOutputs) of
     (Nothing, _) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing inputs parameter") Null
     (_, Nothing) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
-    (Just inputsArr, Just outputsArr) -> do
+    (Just inputsArr, Just outputsVal) -> do
       -- Parse inputs
       let parseInput v = do
             txidHex <- v .:: "txid" :: Maybe Text
             vout <- v .:: "vout" :: Maybe Word32
             let seqNum = case v .:: "sequence" :: Maybe Word32 of
                   Just s -> s
-                  Nothing -> if replaceable then 0xFFFFFFFD else 0xFFFFFFFE
+                  Nothing -> defaultSequence
             txidBs <- case B16.decode (TE.encodeUtf8 txidHex) of
               Left _ -> Nothing
               Right bs | BS.length bs == 32 -> Just (BS.reverse bs)
@@ -8759,43 +8773,65 @@ handleCreateRawTransaction _server params = do
 
       let inputs = mapMaybe parseInput (V.toList inputsArr)
 
-      -- Parse outputs - each is an object with address:amount or data:hex
-      let parseOutput v = case v of
-            Object obj -> case KM.toList obj of
-              [(k, val)] ->
-                let key = Key.toText k
-                in if key == "data"
-                   then case fromJSON val of
-                     Success (hexStr :: Text) ->
-                       case B16.decode (TE.encodeUtf8 hexStr) of
-                         Left _ -> Nothing
-                         Right dataBs ->
-                           let script = BS.pack [0x6a] <> encodeVarLen dataBs <> dataBs
-                           in Just $ TxOut 0 script
-                     _ -> Nothing
-                   else case fromJSON val of
-                     Success (amount :: Double) ->
-                       let satoshis = round (amount * 100000000)
-                           -- Placeholder script (actual address parsing would go here)
-                           script = BS.pack [0x00, 0x14] <> BS.replicate 20 0
-                       in Just $ TxOut satoshis script
-                     _ -> Nothing
-              _ -> Nothing
-            _ -> Nothing
+      -- Normalize outputs: Core NormalizeOutputs accepts EITHER an object
+      -- {address:amount,...,"data":hex} OR an array of single-key objects
+      -- [{address:amount},{"data":hex}] (the array form permits duplicate
+      -- addresses + explicit ordering). Both collapse to an ordered (key,value)
+      -- list so the downstream address->scriptPubKey / OP_RETURN logic is
+      -- identical. (rawtransaction_util.cpp NormalizeOutputs lines 74-99.)
+      let normalizeOutputs :: Value -> Maybe [(Text, Value)]
+          normalizeOutputs (Object obj) =
+            Just [ (Key.toText k, val) | (k, val) <- KM.toList obj ]
+          normalizeOutputs (Array arr) =
+            mapM entryKV (V.toList arr)
+            where entryKV (Object o) = case KM.toList o of
+                    [(k, val)] -> Just (Key.toText k, val)
+                    _          -> Nothing
+                  entryKV _ = Nothing
+          normalizeOutputs _ = Nothing
 
-      let outputs = mapMaybe parseOutput (V.toList outputsArr)
+      -- Build one TxOut from a (key, value) pair: "data" -> OP_RETURN push,
+      -- anything else -> address decoded via the node's existing decoder
+      -- (textToAddress) and converted to a scriptPubKey via addressToScript --
+      -- the SAME path decodeaddress / addressToScriptInfo use elsewhere.
+      let parseOutput (key, val)
+            | key == "data" =
+                case fromJSON val of
+                  Success (hexStr :: Text) ->
+                    case B16.decode (TE.encodeUtf8 hexStr) of
+                      Left _ -> Nothing
+                      Right dataBs ->
+                        let script = BS.pack [0x6a] <> encodeVarLen dataBs <> dataBs
+                        in Just $ TxOut 0 script
+                  _ -> Nothing
+            | otherwise =
+                case (fromJSON val :: Result Scientific, textToAddress key) of
+                  (Success amount, Just addr) ->
+                    -- BTC -> satoshi from the exact decimal (Scientific), matching
+                    -- Core AmountFromValue's fixed-point parse (no Double drift).
+                    let satoshis = round (amount * 100000000) :: Word64
+                        script   = addressToScript addr
+                    in Just $ TxOut satoshis script
+                  _ -> Nothing
 
-      -- Build the transaction
-      let tx = Tx
-            { txVersion = 2
-            , txInputs = inputs
-            , txOutputs = outputs
-            , txWitness = []
-            , txLockTime = locktime
-            }
-          hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
+      case normalizeOutputs outputsVal of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams
+            "Invalid parameter, output argument must be an object or array") Null
+        Just normOutputs -> do
+          let outputs = mapMaybe parseOutput normOutputs
 
-      return $ RpcResponse (toJSON hexTx) Null Null
+          -- Build the transaction (version 2, unsigned -> legacy serialization).
+          let tx = Tx
+                { txVersion = 2
+                , txInputs = inputs
+                , txOutputs = outputs
+                , txWitness = []
+                , txLockTime = locktime
+                }
+              hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
+
+          return $ RpcResponse (toJSON hexTx) Null Null
   where
     (.::) :: FromJSON a => Value -> Text -> Maybe a
     (.::) (Object obj) key = case KM.lookup (Key.fromText key) obj of
