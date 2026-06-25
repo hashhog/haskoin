@@ -221,7 +221,7 @@ import Network.HTTP.Types (status200, status400, status401, status404, status405
                            status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch, bracket, bracket_, mask_, handle)
+import Control.Exception (try, SomeException, catch, bracket, bracket_, mask_, handle, evaluate)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified System.ZMQ4 as ZMQ
 import Data.IORef
@@ -233,7 +233,7 @@ import qualified Data.ByteString.Base64 as B64
 import qualified Data.Serialize as S
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
-import Control.Monad (forM, forM_, void, when, replicateM, foldM)
+import Control.Monad (forM, forM_, void, when, unless, replicateM, foldM)
 import qualified System.Random as SysRandom
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust)
@@ -255,7 +255,7 @@ import qualified Crypto.Random as CryptoRandom
 import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing)
 import System.FilePath ((</>), isRelative)
 import System.Posix.Files (setFileMode)
-import System.IO (hSetEncoding, hPutStr, utf8, withFile, IOMode(..))
+import System.IO (hSetEncoding, hPutStr, hPutStrLn, stderr, utf8, withFile, IOMode(..))
 import System.IO.Unsafe (unsafePerformIO)
 import Foreign.C (CDouble(..), CInt(..), CChar)
 import Foreign.Ptr (Ptr)
@@ -316,7 +316,16 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            getValidatedChainTip,
                            -- COINBASE_MATURITY (100) for the generate vs.
                            -- immature category split in listtransactions.
-                           coinbaseMaturity)
+                           coinbaseMaturity,
+                           -- verifychain RPC: re-validate the last N blocks
+                           -- from the tip backward at the requested checklevel,
+                           -- reusing the SAME CheckBlock / ConnectBlock-script
+                           -- machinery the node drives during sync.  Reference:
+                           -- bitcoin-core/src/validation.cpp CVerifyDB::VerifyDB.
+                           ConsensusFlags(..), consensusFlagsAtHeight,
+                           validateBlockTransactions, validateTransaction,
+                           computeMerkleRootMutated, blockWeight,
+                           checkProofOfWork, netPowLimit)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 -- BIP-157/158 helpers for the REST blockfilter / blockfilterheaders
@@ -1212,6 +1221,7 @@ handleRpcRequest server req = do
     "getdeploymentinfo"    -> handleGetDeploymentInfo server params
     "getblockcount"        -> handleGetBlockCount server
     "getblockhash"         -> handleGetBlockHash server params
+    "verifychain"          -> handleVerifyChain server params
     "getblock"             -> handleGetBlock server params
     "getblockstats"        -> handleGetBlockStats server params
     "getblockheader"       -> handleGetBlockHeader server params
@@ -1908,6 +1918,218 @@ handleGetBlockHash server params = do
                   -- in-range-but-missing height entry on a partially-rebuilt
                   -- chainstate still maps to RPC_INVALID_PARAMETER.
                   (toJSON $ RpcError rpcInvalidParameter "Block height out of range") Null
+
+-- | verifychain ( checklevel nblocks )
+--
+-- Re-validate the most recent @nblocks@ blocks of the active chain, walking
+-- backward from the validated tip, at the requested @checklevel@.  Faithful
+-- port of bitcoin-core/src/rpc/blockchain.cpp::verifychain →
+-- CVerifyDB::VerifyDB (validation.cpp:4611).  Returns a bare JSON boolean:
+-- @true@ iff every block at every level passes; @false@ on the first failure
+-- (the failing height + reason is logged to stderr, as Core logs to debug.log).
+--
+-- Parameters (positional, both optional):
+--   1. checklevel  default 3, clamped to [0,4]
+--   2. nblocks     default 6;  0 (or > chain height) means the entire chain
+--
+-- Per-level work, MIRRORING Core's CVerifyDB::VerifyDB and REUSING the same
+-- consensus machinery the node runs during sync (NOT a re-implementation):
+--   0  read block from disk            (Storage.getBlock)
+--   1  + CheckBlock (context-free)     — merkle root + CVE-2012-2459 mutation
+--      ('computeMerkleRootMutated'), block weight ('blockWeight'), coinbase
+--      structure, and per-tx structural CheckTransaction ('validateTransaction')
+--      — exactly Core's CheckBlock (validation.cpp:3760-3860), which is all
+--      VerifyDB runs at level 1 (ContextualCheckBlock is NOT part of VerifyDB).
+--   2  + read + decode the block's undo data (Storage.getUndoData); Core
+--      ReadBlockUndo at validation.cpp:4675.
+--   3  + verify undo consistency: the spent-coin records must align with the
+--      block's non-coinbase inputs (one TxUndo per non-coinbase tx, one
+--      TxInUndo per input) — the read-only analogue of Core's
+--      DisconnectBlock-into-a-sandbox-CCoinsViewCache (validation.cpp:4687).
+--      haskoin's live UTXO store is process-global, so a true mutating
+--      DisconnectBlock would corrupt live chainstate; the count/shape check is
+--      what a clean disconnect would assert without touching live state.
+--   4  + re-verify EVERY non-coinbase input's script/signature using the undo
+--      data as the prevout source, via the SAME 'validateBlockTransactions'
+--      (skipScripts=False) the connect path drives — Core's reconnect-and-
+--      CheckInputScripts (validation.cpp:4717).
+--
+-- PoW (the header target check, Core's CheckBlockHeader inside CheckBlock) is
+-- verified at every level >= 1 via 'checkProofOfWork'.
+--
+-- When a block body is absent on disk (haskoin does not retain bodies for
+-- assume-valid IBD ranges — see 'handleGetBlock'), the walk stops at that
+-- height and reports success for the verified suffix, matching Core's
+-- skipped_no_block_data branch (validation.cpp:4652-4658).
+handleVerifyChain :: RpcServer -> Value -> IO RpcResponse
+handleVerifyChain server params = do
+  let checkLevel0 = fromMaybe 3 (extractParam params 0 :: Maybe Int)
+      checkLevel  = max 0 (min 4 checkLevel0)
+      nblocks     = fromMaybe 6 (extractParam params 1 :: Maybe Int)
+      net         = rsNetwork server
+      db          = rsDB server
+  -- Active validated tip + height-by-hash map (for the backward walk via cePrev).
+  tip     <- getValidatedChainTip db (rsHeaderChain server)
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+  let tipHeight = ceHeight tip
+  if tipHeight == 0
+    then
+      -- Only genesis (or empty): nothing to verify. Core returns SUCCESS when
+      -- Tip()->pprev == nullptr (validation.cpp:4619).
+      return $ RpcResponse (toJSON True) Null Null
+    else do
+      -- check_depth: nblocks<=0 or > height means the whole chain (Core 4624).
+      let checkDepth = if nblocks <= 0 || fromIntegral nblocks > tipHeight
+                         then fromIntegral tipHeight
+                         else nblocks
+      hPutStrLn stderr $ "verifychain: verifying last " <> show checkDepth
+                       <> " blocks at level " <> show checkLevel
+      ok <- verifyChainWalk server net db entries checkLevel checkDepth
+                            (ceHash tip) tipHeight
+      return $ RpcResponse (toJSON ok) Null Null
+
+-- | Walk backward from @hash@\/@height@ for @remaining@ blocks, verifying each
+-- at @level@.  Stops (success) at genesis or when a block body is unavailable;
+-- returns 'False' on the first validation failure.
+verifyChainWalk :: RpcServer -> Network -> HaskoinDB
+                -> Map BlockHash ChainEntry
+                -> Int -> Int -> BlockHash -> Word32 -> IO Bool
+verifyChainWalk server net db entries level = go
+  where
+    go :: Int -> BlockHash -> Word32 -> IO Bool
+    go 0 _ _ = return True
+    go remaining hash height = do
+      mBlock <- getBlock db hash
+      case mBlock of
+        Nothing -> do
+          -- No block body on disk (pruned / assume-valid IBD range). Core's
+          -- skipped_no_block_data: stop here, report success for the suffix.
+          hPutStrLn stderr $ "verifychain: stopping at height " <> show height
+                           <> " (block body not on disk)"
+          return True
+        Just block -> do
+          res <- verifyOneBlock server net db level block height
+          case res of
+            Left reason -> do
+              hPutStrLn stderr $ "verifychain: block at height " <> show height
+                               <> " (" <> T.unpack (showHash hash)
+                               <> ") FAILED: " <> reason
+              return False
+            Right () -> do
+              -- Continue to the parent. Use cePrev when the entry is known,
+              -- else fall back to the header's prevBlock.
+              let prevH = case Map.lookup hash entries of
+                            Just ce -> cePrev ce
+                            Nothing -> let p = bhPrevBlock (blockHeader block)
+                                       in if p == BlockHash (Hash256 (BS.replicate 32 0))
+                                            then Nothing else Just p
+              case prevH of
+                Nothing  -> return True               -- reached genesis's parent
+                Just ph
+                  | height == 0 -> return True         -- defensive: at genesis
+                  | otherwise   -> go (remaining - 1) ph (height - 1)
+
+-- | Verify a single block at the requested level, REUSING the node's consensus
+-- functions.  Returns @Right ()@ on success or @Left reason@ on failure.
+verifyOneBlock :: RpcServer -> Network -> HaskoinDB -> Int -> Block -> Word32
+               -> IO (Either String ())
+verifyOneBlock server net db level block height = do
+    let header = blockHeader block
+        txns   = blockTxns block
+    -- Level 0 is implicit: getBlock already read + deserialized the block.
+    if level < 1
+      then return (Right ())
+      else
+        -- Level >= 1: PoW + context-free CheckBlock, then undo-backed levels.
+        case checkBlockContextFree net header txns of
+          Left e  -> return (Left e)
+          Right () ->
+            if level < 2
+              then return (Right ())
+              else do
+                -- Level 2: undo data must exist (for a non-coinbase-bearing
+                -- block) and decode. getUndoData decodes the stored CBlockUndo.
+                mUndo <- getUndoData db (ceHashOf header)
+                let nonCb = drop 1 txns
+                case mUndo of
+                  Nothing
+                    | null nonCb -> return (Right ())  -- only coinbase: no undo
+                    | otherwise  -> return (Left "missing or undecodable undo data")
+                  Just undo -> do
+                    let txUndos = buTxUndo (udBlockUndo undo)
+                    -- Level 3: undo shape must match the block's spent inputs:
+                    -- one TxUndo per non-coinbase tx, one TxInUndo per input.
+                    if length txUndos /= length nonCb
+                      then return (Left $ "undo tx-count mismatch: undo="
+                                          <> show (length txUndos)
+                                          <> " block-noncoinbase=" <> show (length nonCb))
+                      else
+                        case checkUndoShape (zip nonCb txUndos) of
+                          Left e -> return (Left e)
+                          Right () ->
+                            if level < 4
+                              then return (Right ())
+                              else verifyScriptsFromUndo net height txns txUndos
+  where
+    ceHashOf h = computeBlockHash h
+
+    -- Core CheckBlock (validation.cpp:3760) — context-free, NO MTP / coinbase-
+    -- height contextual gates (those live in ContextualCheckBlock, which
+    -- VerifyDB does not run). PoW + merkle(+mutation) + weight + tx structure.
+    checkBlockContextFree :: Network -> BlockHeader -> [Tx] -> Either String ()
+    checkBlockContextFree n hdr ts = do
+      -- Header PoW (CheckBlockHeader → CheckProofOfWork, validation.cpp).
+      unless (checkProofOfWork hdr (netPowLimit n)) $
+        Left "high-hash (proof of work failed)"
+      when (null ts) $ Left "bad-blk-length (no transactions)"
+      unless (isCoinbase (head ts)) $ Left "bad-cb-missing (first tx not coinbase)"
+      when (any isCoinbase (drop 1 ts)) $ Left "bad-cb-multiple"
+      -- Merkle root + CVE-2012-2459 duplicate-txid mutation.
+      let (computedRoot, mutated) = computeMerkleRootMutated (map computeTxId ts)
+      unless (computedRoot == bhMerkleRoot hdr) $ Left "bad-txnmrklroot"
+      when mutated $ Left "bad-txns-duplicate"
+      -- Block weight (BIP141 MAX_BLOCK_WEIGHT).
+      when (blockWeight block > maxBlockWeight) $ Left "bad-blk-weight"
+      -- Per-tx structural CheckTransaction.
+      mapM_ validateTransaction ts
+
+    -- Level-3 undo shape: each non-coinbase tx's input count must equal its
+    -- TxUndo prevout count (one spent coin per input). This is exactly what a
+    -- clean DisconnectBlock would consume, checked without mutating live state.
+    checkUndoShape :: [(Tx, TxUndo)] -> Either String ()
+    checkUndoShape [] = Right ()
+    checkUndoShape ((tx, tu):rest) =
+      if length (txInputs tx) /= length (tuPrevOutputs tu)
+        then Left $ "undo input-count mismatch for tx "
+                    <> T.unpack (showHash (blockHashFromTxId (computeTxId tx)))
+        else checkUndoShape rest
+
+-- | Level 4: re-verify every non-coinbase input's script using the block's undo
+-- data as the prevout (scriptPubKey/value) source, via the SAME
+-- 'validateBlockTransactions' (skipScripts=False) the connect path runs.  This
+-- is Core's reconnect + CheckInputScripts step inside VerifyDB.
+verifyScriptsFromUndo :: Network -> Word32 -> [Tx] -> [TxUndo]
+                      -> IO (Either String ())
+verifyScriptsFromUndo net height txns txUndos = do
+  let flags = consensusFlagsAtHeight net height
+      nonCb = drop 1 txns
+      -- Build the prevout view (OutPoint -> TxOut) from the undo records:
+      -- input i of non-coinbase tx j is spending tuPrevOutputs!!i of TxUndo j.
+      prevoutMap = Map.fromList
+        [ (txInPrevOutput txin, tuOutput txInUndo)
+        | (tx, tu) <- zip nonCb txUndos
+        , (txin, txInUndo) <- zip (txInputs tx) (tuPrevOutputs tu)
+        ]
+  -- validateBlockTransactions runs the full per-tx economic + script gates
+  -- (skipScripts=False => runScriptChecksParallel) against this prevout view.
+  -- Forcing the Either to WHNF runs the checks; any script failure surfaces as
+  -- Left. A pure exception (e.g. a malformed coin) is caught and reported.
+  eRes <- try (evaluate (validateBlockTransactions flags False txns prevoutMap))
+  case eRes of
+    Left (ex :: SomeException) ->
+      return (Left $ "script verification raised: " <> show ex)
+    Right (Left e)  -> return (Left $ "script verification failed: " <> e)
+    Right (Right _) -> return (Right ())
 
 -- | Get block data by hash
 -- | Handle getblock RPC.
