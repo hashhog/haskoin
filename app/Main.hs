@@ -2045,6 +2045,13 @@ initHeaderChainFromDB db net = do
   -- BlockTemplate.hs (doSideBranchReorg) in the same STM transaction
   -- as hcTip, providing a lost-wakeup-free wake primitive.
   tipGenVar <- newTVarIO (0 :: Int)
+  -- preciousblock (Core nBlockReverseSequenceId / nLastPreciousChainwork):
+  -- reverse sequence-id counter handed out by 'preciousBlock' so a precious
+  -- block out-ranks equal-work rivals, plus the tip work at the last call.
+  -- Not retained across restarts (Core: "effects are not retained across
+  -- restarts") — re-seeded on every boot.
+  preciousReverseSeqVar <- newTVarIO preciousReverseSeqInit
+  lastPreciousWorkVar <- newTVarIO 0
 
   -- Load persisted headers from the height index to rebuild the in-memory chain.
   -- connectBlock writes PrefixBlockHeader and PrefixBlockHeight for every
@@ -2143,6 +2150,8 @@ initHeaderChainFromDB db net = do
     , hcCandidates = candidatesVar
     , hcSeqCounter = seqCounterVar
     , hcTipGen = tipGenVar
+    , hcPreciousReverseSeq = preciousReverseSeqVar
+    , hcLastPreciousWork = lastPreciousWorkVar
     }
 
 -- | Send a message to a peer.

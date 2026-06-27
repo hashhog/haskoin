@@ -150,6 +150,7 @@ module Haskoin.Consensus
   , mkCandidateKey
   , seqIdBestChainFromDisk
   , seqIdInitFromDisk
+  , preciousReverseSeqInit
   , initHeaderChain
   , bumpTipGen
   , headerWork
@@ -237,6 +238,9 @@ module Haskoin.Consensus
   , InvalidateError(..)
   , invalidateBlock
   , reconsiderBlock
+    -- * Block Precious (preciousblock RPC)
+  , PreciousError(..)
+  , preciousBlock
   , findDescendants
   , isBlockInvalidated
   , isFailedStatus
@@ -4253,6 +4257,21 @@ seqIdBestChainFromDisk = 0
 seqIdInitFromDisk :: Word64
 seqIdInitFromDisk = 1
 
+-- | Starting (least-favorable) value of the precious reverse-sequence
+-- counter, mirroring Core seeding @nBlockReverseSequenceId = -1@.
+-- haskoin's 'ceSequenceId' is an UNSIGNED 'Word64' in which a LOWER value
+-- wins ties, and live inserts start at @seqIdInitFromDisk + 1@ (== 2).
+-- Seeding the precious counter at 'seqIdInitFromDisk' (== 1) keeps every
+-- precious assignment strictly below that live floor (so a precious block
+-- beats all live rivals at equal work), while the decrement-and-clamp-at-0
+-- in 'preciousBlock' still lets a later precious call out-rank an earlier
+-- one (Core's "a later preciousblock call can override the effect of an
+-- earlier one").  The unsigned floor at 0 is the analogue of Core's
+-- INT32_MIN clamp; full equal-work activation does not rely on the value
+-- alone — 'preciousBlock' drives the reorg onto the block explicitly.
+preciousReverseSeqInit :: Word64
+preciousReverseSeqInit = seqIdInitFromDisk
+
 -- | Sorted-set key for the candidate-tip set.  Mirrors Core's
 -- @CBlockIndexWorkComparator@ (node/blockstorage.cpp:174-192):
 --   * Primary: highest 'ceChainWork' wins.
@@ -4300,6 +4319,17 @@ data HeaderChain = HeaderChain
     -- wakeup-safe, the ouroboros pilot shape — tip_notifier.py).
     -- Consumed exclusively by the three wait-family RPC handlers
     -- (waitfornewblock / waitforblock / waitforblockheight).
+  , hcPreciousReverseSeq :: !(TVar Word64)
+    -- ^ Core's @nBlockReverseSequenceId@ (validation.cpp Chainstate::
+    -- PreciousBlock).  The decreasing sequence-id handed to a block by
+    -- 'preciousBlock' so that it out-ranks equal-work rivals in
+    -- 'hcCandidates'.  Seeded to 'preciousReverseSeqInit' and reset back to
+    -- it whenever the tip work has grown since the last precious call (see
+    -- 'hcLastPreciousWork').
+  , hcLastPreciousWork   :: !(TVar Integer)
+    -- ^ Core's @nLastPreciousChainwork@.  The tip chainwork observed at the
+    -- previous 'preciousBlock' call; a later call made after the tip work
+    -- has grown resets 'hcPreciousReverseSeq'.
   }
 
 --------------------------------------------------------------------------------
@@ -4504,6 +4534,8 @@ initHeaderChain net = do
   candidatesVar <- newTVarIO (Set.singleton (mkCandidateKey genesisEntry))
   seqCounterVar <- newTVarIO (seqIdInitFromDisk + 1)
   tipGenVar <- newTVarIO 0
+  preciousReverseSeqVar <- newTVarIO preciousReverseSeqInit
+  lastPreciousWorkVar <- newTVarIO 0
   return HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
@@ -4513,6 +4545,8 @@ initHeaderChain net = do
     , hcCandidates = candidatesVar
     , hcSeqCounter = seqCounterVar
     , hcTipGen = tipGenVar
+    , hcPreciousReverseSeq = preciousReverseSeqVar
+    , hcLastPreciousWork = lastPreciousWorkVar
     }
 
 -- | Bump the tip-change generation counter inside a running STM transaction.
@@ -7015,3 +7049,125 @@ reconsiderBlock net cache db hc mIdxMgr blockHash = do
           -- index-aware so any reorg keeps the secondary indexes in sync.
           activateBestChain net cache db hc mIdxMgr
           return (Right ())
+
+--------------------------------------------------------------------------------
+-- preciousblock — mark a block as preferred in equal-work chain selection
+--------------------------------------------------------------------------------
+
+-- | Error returned by 'preciousBlock'.  The only failure the RPC surfaces is
+-- an unknown block hash (Core preciousblock → RPC_INVALID_ADDRESS_OR_KEY, -5).
+data PreciousError
+  = PreciousBlockNotFound !BlockHash   -- ^ Hash not present in the block index
+  deriving (Show, Eq)
+
+-- | Treat a block as if it had been received before all others of equal
+-- work, so it WINS chain-selection ties and a reorg activates onto it.
+--
+-- Reference: bitcoin-core/src/validation.cpp Chainstate::PreciousBlock +
+-- src/rpc/blockchain.cpp preciousblock.
+--
+-- Core mechanism (validation.cpp):
+--   * if @pindex->nChainWork < Tip()->nChainWork@ — nothing to do (the block
+--     cannot be at the tip); return success.
+--   * if the tip work grew since the last precious call, reset the reverse
+--     sequence counter (@nBlockReverseSequenceId = -1@) — tracked here with
+--     'hcLastPreciousWork' / 'hcPreciousReverseSeq'.
+--   * erase the block from @setBlockIndexCandidates@, give it the next
+--     (decreasing) reverse sequence-id so it sorts ahead of equal-work
+--     rivals under @CBlockIndexWorkComparator@, then re-insert it if it is a
+--     valid full-data tip.
+--   * call ActivateBestChain — which reorgs onto the now-preferred block.
+--
+-- haskoin mapping: 'ceSequenceId' is the comparator's second key (lower wins,
+-- via 'mkCandidateKey'); the reverse counter hands out values below the live
+-- floor (see 'preciousReverseSeqInit').  Because haskoin's 'activateBestChain'
+-- only reorgs on STRICTLY greater work, the equal-work activation that is the
+-- whole point of preciousblock is driven explicitly here ('preciousReactivate')
+-- by reorging onto the block whenever it is a valid competing tip with
+-- work >= the current tip.
+--
+-- Returns 'Left' 'PreciousBlockNotFound' for an unknown hash; 'Right ()'
+-- otherwise — including every case Core also treats as a successful no-op
+-- (block already on the active chain, less work than the tip, invalid, or a
+-- reorg the node refuses, e.g. past a checkpoint or deeper than
+-- 'maxReorgDepth').
+preciousBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+              -> Maybe IndexManager
+              -> BlockHash -> IO (Either PreciousError ())
+preciousBlock net cache db hc mIdxMgr blockHash = do
+  entries <- readTVarIO (hcEntries hc)
+  case Map.lookup blockHash entries of
+    Nothing -> return $ Left (PreciousBlockNotFound blockHash)
+    Just entry -> do
+      tip <- readTVarIO (hcTip hc)
+      -- Core: "if (pindex->nChainWork < m_chain.Tip()->nChainWork) return true"
+      -- — a block below the tip's work can never be the tip; nothing to do.
+      if ceChainWork entry < ceChainWork tip
+        then return (Right ())
+        else do
+          -- Stamp the favorable reverse sequence-id and refresh the candidate
+          -- key, all under one STM transaction so a concurrent
+          -- 'activateBestChain' / 'addSideBranchHeader' sees a consistent
+          -- candidate set (mirrors Core doing this under cs_main).
+          atomically $ do
+            lastWork <- readTVar (hcLastPreciousWork hc)
+            -- Tip extended since the last precious call → reset the counter
+            -- (Core: "The chain has been extended ... reset the counter").
+            when (ceChainWork tip > lastWork) $
+              writeTVar (hcPreciousReverseSeq hc) preciousReverseSeqInit
+            writeTVar (hcLastPreciousWork hc) (ceChainWork tip)
+            rev <- readTVar (hcPreciousReverseSeq hc)
+            -- Decrement (clamped at 0) so a later precious call out-ranks an
+            -- earlier one — Core decrements down to INT32_MIN; the unsigned
+            -- 'Word64' seqId floors at 0 (the most favorable value).
+            when (rev > 0) $ writeTVar (hcPreciousReverseSeq hc) (rev - 1)
+            invalidated <- readTVar (hcInvalidated hc)
+            -- erase old key, assign reverse seq, persist the updated entry,
+            -- and re-insert the candidate key iff the block is a valid
+            -- full-data tip (Core: BLOCK_VALID_TRANSACTIONS + HaveNumChainTxs).
+            modifyTVar' (hcCandidates hc) (Set.delete (mkCandidateKey entry))
+            let entry' = entry { ceSequenceId = rev }
+            modifyTVar' (hcEntries hc) (Map.insert blockHash entry')
+            when (ceStatus entry' == StatusValid
+                  && not (Set.member blockHash invalidated)) $
+              modifyTVar' (hcCandidates hc) (Set.insert (mkCandidateKey entry'))
+          -- ActivateBestChain: reorg onto the now-preferred block.
+          preciousReactivate net cache db hc mIdxMgr blockHash
+          return (Right ())
+
+-- | The ActivateBestChain step for 'preciousBlock'.  Reorgs onto the precious
+-- block whenever it is a valid competing tip with work >= the current tip and
+-- is not already on the active chain — the equal-work arm that the strict-work
+-- 'activateBestChain' does not cover.  Any case where the block cannot become
+-- the tip (already active, invalid, no fork point, or a refused reorg) falls
+-- back to the ordinary 'activateBestChain', exactly like Core where an
+-- un-activatable precious block leaves the chain in place.
+preciousReactivate :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                   -> Maybe IndexManager
+                   -> BlockHash -> IO ()
+preciousReactivate net cache db hc mIdxMgr blockHash = do
+  entries     <- readTVarIO (hcEntries hc)
+  invalidated <- readTVarIO (hcInvalidated hc)
+  byHeight    <- readTVarIO (hcByHeight hc)
+  tip         <- readTVarIO (hcTip hc)
+  let onActiveChain ce = Map.lookup (ceHeight ce) byHeight == Just (ceHash ce)
+  case Map.lookup blockHash entries of
+    Nothing -> return ()
+    Just entry
+      -- Already on the active chain (tip or an ancestor) → nothing to do.
+      | onActiveChain entry -> return ()
+      -- Not a valid full-data tip, manually invalidated, or below the tip's
+      -- work → cannot reorg onto it; defer to the normal selector.
+      | ceStatus entry /= StatusValid
+        || Set.member blockHash invalidated
+        || ceChainWork entry < ceChainWork tip ->
+          activateBestChain net cache db hc mIdxMgr
+      | otherwise -> do
+          mFork <- findForkPoint hc (ceHash tip) blockHash
+          case mFork of
+            Nothing -> activateBestChain net cache db hc mIdxMgr
+            Just _  -> do
+              res <- performReorg net cache db hc mIdxMgr (ceHash tip) blockHash
+              case res of
+                Right () -> return ()
+                Left _   -> activateBestChain net cache db hc mIdxMgr
