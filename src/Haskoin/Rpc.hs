@@ -288,6 +288,7 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            -- failure. (Core: ProcessNewBlockHeaders.)
                            addHeader,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
+                           preciousBlock, PreciousError(..),
                            Deployment(..), taprootDeployment,
                            ThresholdState(..), getDeploymentState,
                            chainEntriesToBlockIndex,
@@ -1236,6 +1237,7 @@ handleRpcRequest server req = do
     "pruneblockchain"      -> handlePruneBlockchain server params
     "invalidateblock"      -> handleInvalidateBlock server params
     "reconsiderblock"      -> handleReconsiderBlock server params
+    "preciousblock"        -> handlePreciousBlock server params
     "getchaintxstats"      -> handleGetChainTxStats server params
     "getchainstates"       -> handleGetChainStates server
 
@@ -3079,6 +3081,33 @@ handleReconsiderBlock server params = do
               (toJSON $ RpcError rpcMiscError (T.pack $ "Chain activation failed: " ++ err)) Null
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError "Block reconsideration failed") Null
+            Right () -> return $ RpcResponse Null Null Null
+
+-- | Treat a block as if it were received before others with the same work.
+-- Reference: bitcoin/src/rpc/blockchain.cpp preciousblock +
+-- src/validation.cpp Chainstate::PreciousBlock.
+-- Parameters:
+--   blockhash (required): The hash of the block to mark as precious
+-- Returns:
+--   null on success (including the no-ops Core also treats as success:
+--   block already on the active chain, below the tip's work, or invalid)
+-- Errors:
+--   -5: Block not found
+handlePreciousBlock :: RpcServer -> Value -> IO RpcResponse
+handlePreciousBlock server params = do
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
+    Just hexHash -> do
+      case parseHash hexHash of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
+        Just bh -> do
+          result <- preciousBlock (rsNetwork server) (rsUTXOCache server)
+                      (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
+          case result of
+            Left (PreciousBlockNotFound _) -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
             Right () -> return $ RpcResponse Null Null Null
 
 --------------------------------------------------------------------------------
@@ -11850,6 +11879,7 @@ allRpcCommands =
   , "getdifficulty"
   , "gettxout \"txid\" n ( include_mempool )"
   , "invalidateblock \"blockhash\""
+  , "preciousblock \"blockhash\""
   , "pruneblockchain height"
   , "reconsiderblock \"blockhash\""
   , ""
