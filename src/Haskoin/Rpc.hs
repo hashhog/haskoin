@@ -2281,9 +2281,11 @@ handleGetBlockStats server params = do
               Nothing -> case Map.lookup hh byHeight of
                 Just bh -> return (Right bh)
                 Nothing -> return (Left (rpcInvalidParameter, "Block height out of range"))
-    Just (String s) -> case parseHash s of
-      Nothing -> return (Left (rpcInvalidParams, "Invalid block hash format"))
-      Just bh -> case Map.lookup bh entries of
+    Just (String s) -> case parseHashV "hash_or_height" s of
+      -- Core ParseHashV: a malformed hash -> -8 RPC_INVALID_PARAMETER (was
+      -- -32602); a well-formed-but-absent hash stays -5 below.
+      Left e   -> return (Left (errCode e, errMessage e))
+      Right bh -> case Map.lookup bh entries of
         Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
         Just _  -> return (Right bh)
     Just _ -> return (Left (rpcInvalidParams, "hash_or_height must be a height or block hash"))
@@ -16080,12 +16082,16 @@ handleGetTxOutProof server params = do
             Array txArr -> Just (V.toList txArr)
             _ -> Nothing
         _ -> Nothing
+      -- Either a malformed-hash error (-8, Core ParseHashV) or the optional
+      -- blockhash (Nothing = arg absent; Just = a valid 64-hex hash).
       mBlockHashArg = case params of
         Array arr | V.length arr >= 2 ->
           case arr V.! 1 of
-            String s -> parseHash s
-            _        -> Nothing
-        _ -> Nothing
+            String s -> case parseHashV "blockhash" s of
+              Left e   -> Left (errCode e, errMessage e)
+              Right bh -> Right (Just bh)
+            _        -> Right Nothing
+        _ -> Right Nothing
   case mtxidList of
     Nothing -> mkErrCode rpcInvalidParams "gettxoutproof requires [{txids}, blockhash?]"
     Just txidVals | null txidVals ->
@@ -16110,12 +16116,15 @@ handleGetTxOutProof server params = do
           entries <- readTVarIO (hcEntries hc)
           -- Resolve the block hash.
           mBHash <- case mBlockHashArg of
-            Just bh ->
+            Left (c, m) ->
+              -- Malformed blockhash -> -8 RPC_INVALID_PARAMETER (Core ParseHashV).
+              return (Left (c, m))
+            Right (Just bh) ->
               -- Explicit blockhash: must exist in the block index (Core 64-67).
               if Map.member bh entries
                 then return (Right (Just bh))
                 else return (Left (rpcInvalidAddressOrKey, "Block not found"))
-            Nothing -> do
+            Right Nothing -> do
               -- No blockhash: use txindex to locate the first tx's block.
               let firstHit [] = return Nothing
                   firstHit (tid:rest) = do
