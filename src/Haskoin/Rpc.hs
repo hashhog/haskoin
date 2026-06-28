@@ -1094,6 +1094,13 @@ parseSingleRequest val =
 -- Accepts either:
 --   (a) configured rpcUser:rpcPassword, or
 --   (b) __cookie__:<cookie-password> (cookie-based auth for local clients)
+-- | Constant-time Text equality for credentials: compares the UTF-8 byte
+-- images via cryptonite's 'BA.constEq', so the compare time does not depend on
+-- how many leading bytes match (closing the timing oracle plain '==' opens on
+-- RPC auth tokens). Length is low-sensitivity for fixed-format tokens.
+ctEqText :: T.Text -> T.Text -> Bool
+ctEqText a b = BA.constEq (TE.encodeUtf8 a) (TE.encodeUtf8 b)
+
 checkAuth :: RpcServer -> Request -> Bool
 checkAuth server req =
   case lookup hAuthorization (requestHeaders req) of
@@ -1111,10 +1118,11 @@ checkAuth server req =
            Just creds ->
              let (user, rest) = T.breakOn ":" creds
                  pass = T.drop 1 rest  -- drop the leading ':'
-             in -- Cookie auth: username must be exactly "__cookie__"
-                (user == "__cookie__" && pass == rsCookiePassword server)
+                 -- Cookie auth: username must be exactly "__cookie__" (public
+                 -- sentinel). Secrets (cookie/password) use constant-time compare.
+             in (user == "__cookie__" && ctEqText pass (rsCookiePassword server))
                 -- Configured user/password auth
-                || (user == rpcUser config && pass == rpcPassword config)
+                || (ctEqText user (rpcUser config) && ctEqText pass (rpcPassword config))
 
 -- | Read the full request body
 readBody :: Request -> IO ByteString
