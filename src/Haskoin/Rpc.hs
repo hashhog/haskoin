@@ -2155,7 +2155,7 @@ handleGetBlock server params = do
               mRaw <- fetchGetBlockFromCore hexHash verbosity
               case mRaw of
                 Nothing  -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcMiscError "Block not found") Null
+                  (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
                 Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
             Just block -> do
               if verbosity == 0
@@ -3030,17 +3030,19 @@ handleInvalidateBlock server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
     Just hexHash -> do
-      case parseHash hexHash of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
-        Just bh -> do
+      -- ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length
+      -- / non-hex) is -8 RPC_INVALID_PARAMETER at the parse boundary (was -32602
+      -- rpcInvalidParams). A well-formed-but-absent hash stays -5 below.
+      case parseHashV "blockhash" hexHash of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           result <- invalidateBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left InvalidateGenesis -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "Cannot invalidate genesis block") Null
             Left (InvalidateBlockNotFound _) -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError "Block not found") Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
             Left (InvalidateDisconnectFailed err) -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError (T.pack $ "Failed to disconnect: " ++ err)) Null
             Left (InvalidateMissingUndo hash) -> return $ RpcResponse Null
@@ -3064,15 +3066,17 @@ handleReconsiderBlock server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
     Just hexHash -> do
-      case parseHash hexHash of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
-        Just bh -> do
+      -- ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length
+      -- / non-hex) is -8 RPC_INVALID_PARAMETER at the parse boundary (was -32602
+      -- rpcInvalidParams). A well-formed-but-absent hash stays -5 below.
+      case parseHashV "blockhash" hexHash of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           result <- reconsiderBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left (ReconsiderBlockNotFound _) -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError "Block not found") Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
             Left (ReconsiderNotInvalidated _) -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError "Block is not marked as invalid") Null
             Left (ReconsiderValidationFailed _ err) -> return $ RpcResponse Null
@@ -3099,10 +3103,12 @@ handlePreciousBlock server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
     Just hexHash -> do
-      case parseHash hexHash of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
-        Just bh -> do
+      -- ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length
+      -- / non-hex) is -8 RPC_INVALID_PARAMETER at the parse boundary (was -32602
+      -- rpcInvalidParams). A well-formed-but-absent hash stays -5 below.
+      case parseHashV "blockhash" hexHash of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           result <- preciousBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
@@ -4587,10 +4593,12 @@ handleGetBlockFromPeer server params =
     (_, Nothing) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing peer_id parameter") Null
     (Just hexHash, Just peerId) ->
-      case parseHash hexHash of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid block hash") Null
-        Just bh -> do
+      -- ParseHashV (Core rpc/util.cpp:117): a malformed blockhash (wrong-length
+      -- / non-hex) is -8 RPC_INVALID_PARAMETER at the parse boundary (was -32602
+      -- rpcInvalidParams). A well-formed-but-absent hash stays -5 below.
+      case parseHashV "blockhash" hexHash of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right bh -> do
           -- Gather the three facts the decision depends on:
           --   (1) is the header known?  Core: LookupBlockIndex.
           --   (3) is the body already stored?  Core: BLOCK_HAVE_DATA.
