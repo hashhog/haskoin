@@ -5188,6 +5188,9 @@ handleGetMiningInfo :: RpcServer -> IO RpcResponse
 handleGetMiningInfo server = do
   tip <- readTVarIO (hcTip (rsHeaderChain server))
   (pooledTxCount, _) <- getMempoolSize (rsMempool server)
+  -- networkhashps: Core builds this via getnetworkhashps().HandleRequest(request)
+  -- (rpc/mining.cpp), not a hardcoded 0. Default window: 120 blocks ending at tip.
+  netHashPS <- estimateNetworkHashPS server 120 (fromIntegral (ceHeight tip))
   let tipBits   = bhBits (ceHeader tip)
       bitsHex   = showBits tipBits
       targetHex = showHex64 (bitsToTarget tipBits)
@@ -5210,7 +5213,7 @@ handleGetMiningInfo server = do
               pair "bits"          (text bitsHex)             <>
               pair "difficulty"    diffEnc                    <>
               pair "target"        (text targetHex)           <>
-              pair "networkhashps" (AE.int 0)                 <>
+              pair "networkhashps" (AE.double netHashPS)      <>
               pair "pooledtx"      (AE.int pooledTxCount)     <>
               pair "blockmintxfee" (btcAmountEnc 1)           <>
               pair "chain"         (text (T.pack (netName (rsNetwork server)))) <>
@@ -16002,20 +16005,16 @@ parseScanBlocksObject net v = case v of
                   _ -> Left ("scanblocks: unsupported scan object '" ++ T.unpack raw ++
                              "' (use addr(<address>) or raw(<hexscript>))")
 
--- | getnetworkhashps: estimate network hash rate over sliding window.
-handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
-handleGetNetworkHashPS server params = do
-  tip <- readTVarIO (hcTip (rsHeaderChain server))
-  let defaultNBlocks = 120 :: Int
-      nblocks = case extractParam params 0 :: Maybe Int of
-        Just n | n > 0 -> n
-        Just 0 -> fromIntegral (ceHeight tip)  -- nblocks=0 means "since genesis"
-        _      -> defaultNBlocks
-      reqHeight = case extractParam params 1 :: Maybe Int of
-        Just h | h >= 0 -> min h (fromIntegral (ceHeight tip))
-        _               -> fromIntegral (ceHeight tip)
+-- | Shared GetNetworkHashPS estimate (rpc/mining.cpp): chainwork(tip) -
+-- chainwork(tip - nblocks) divided by the elapsed time over that window.
+-- Returns 0.0 on the same edge cases the RPC returns 0 for. Factored out so
+-- that both getnetworkhashps and getmininginfo (which Core builds via
+-- getnetworkhashps().HandleRequest(request), not a hardcoded 0) share one
+-- implementation. `reqHeight` and `nblocks` are already-resolved heights.
+estimateNetworkHashPS :: RpcServer -> Int -> Int -> IO Double
+estimateNetworkHashPS server nblocks reqHeight =
   if reqHeight < 1
-    then return $ RpcResponse (toJSON (0 :: Int)) Null Null
+    then return 0.0
     else do
       let startH = fromIntegral $ max 0 (reqHeight - nblocks)
           endH   = fromIntegral reqHeight
@@ -16029,7 +16028,7 @@ handleGetNetworkHashPS server params = do
             (Just topHdr, Just botHdr) -> do
               let timeDiff = fromIntegral (bhTimestamp topHdr) - fromIntegral (bhTimestamp botHdr) :: Integer
               if timeDiff <= 0
-                then return $ RpcResponse (toJSON (0 :: Int)) Null Null
+                then return 0.0
                 else do
                   -- Get chainwork from in-memory header chain entries
                   entries <- readTVarIO (hcEntries (rsHeaderChain server))
@@ -16040,9 +16039,24 @@ handleGetNetworkHashPS server params = do
                   let hashps = if workDiff > 0
                         then workDiff `div` timeDiff
                         else fromIntegral (endH - fromIntegral startH) * 4294967296 `div` timeDiff
-                  return $ RpcResponse (toJSON (fromIntegral hashps :: Double)) Null Null
-            _ -> return $ RpcResponse (toJSON (0 :: Int)) Null Null
-        _ -> return $ RpcResponse (toJSON (0 :: Int)) Null Null
+                  return (fromIntegral hashps :: Double)
+            _ -> return 0.0
+        _ -> return 0.0
+
+-- | getnetworkhashps: estimate network hash rate over sliding window.
+handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
+handleGetNetworkHashPS server params = do
+  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  let defaultNBlocks = 120 :: Int
+      nblocks = case extractParam params 0 :: Maybe Int of
+        Just n | n > 0 -> n
+        Just 0 -> fromIntegral (ceHeight tip)  -- nblocks=0 means "since genesis"
+        _      -> defaultNBlocks
+      reqHeight = case extractParam params 1 :: Maybe Int of
+        Just h | h >= 0 -> min h (fromIntegral (ceHeight tip))
+        _               -> fromIntegral (ceHeight tip)
+  hashps <- estimateNetworkHashPS server nblocks reqHeight
+  return $ RpcResponse (toJSON hashps) Null Null
 
 -- | Core-style tree height: increment while CalcTreeWidth(h) > 1.
 -- Mirrors merkleblock.cpp CPartialMerkleTree ctor (lines 143-145) and
