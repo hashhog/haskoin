@@ -9,3 +9,7 @@ dist-testnet4/
 dist-newstyle2/
 # Test artifact: stopPeerManager writes anchors.json to its working dir.
 anchors.json
+
+# Project-meta audit artifacts live in the meta-repo (audit-archive/).
+audit/
+CORE-PARITY-AUDIT/
