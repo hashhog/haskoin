@@ -1380,8 +1380,8 @@ testnet3 = Network
           , aupBlockHash = hashFromHex "0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f"
           })
       ]
-  -- Assume-valid (Bitcoin Core v28.0): testnet3 block 123613.
-  , netAssumedValid = Just (hashFromHex "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
+  -- Assume-valid (Bitcoin Core v28.0): testnet3 block 4842348.
+  , netAssumedValid = Just (hashFromHex "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4")
   -- Script-flag exceptions for testnet3.
   -- Source: bitcoin-core/src/kernel/chainparams.cpp (testnet3 constructor).
   , netScriptFlagExceptions =
@@ -1444,7 +1444,7 @@ testnet4 = Network
           })
       ]
   -- Assume-valid (Bitcoin Core v28.0): testnet4 block 4842348.
-  , netAssumedValid = Just (hashFromHex "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4")
+  , netAssumedValid = Just (hashFromHex "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
   -- No script-flag exceptions on testnet4.
   , netScriptFlagExceptions = []
   }
