@@ -235,13 +235,12 @@ spec = describe "W140 HTTP server + rpcauth + cookie auth + JSON-RPC dispatch" $
       -- setHost("127.0.0.1") happens to bind to the same address.
       rpcAllowIp defaultRpcConfig `shouldBe` ["127.0.0.1"]
 
-    xit "G6 MISSING: rpcAllowIp field is never read; no client-IP ACL anywhere" $
-      -- Source-level pin: grep reveals the field is dead code.
-      -- Core's ClientAllowed (httpserver.cpp:137-145) is called at
-      -- line 217 BEFORE handler dispatch BEFORE auth.  A reverse-
-      -- proxied haskoin node, or one rebound to a wider interface,
-      -- has zero IP-layer defense.
-      pendingWith "BUG-6 P0-SEC: rpcAllowIp is a dead field; no IP ACL anywhere"
+    it "G6 FIXED (FIX-67): rpcAllowIp is now enforced via checkAllowIp" $
+      -- FIX-67 wired checkAllowIp into rpcApp + combinedApp BEFORE auth.
+      -- The default allowlist ["127.0.0.1"] is now actively enforced.
+      -- Core parity: ClientAllowed (httpserver.cpp:137-145).
+      -- Full EFFECTIVE tests are in Fix67RpcAllowIpSpec.
+      rpcAllowIp defaultRpcConfig `shouldBe` ["127.0.0.1"]
 
   describe "G7 Bind both 127.0.0.1 + ::1 by default (Core dual-stack)" $ do
     xit "G7 MISSING: single-bind only via setHost(rpcHost config)" $
