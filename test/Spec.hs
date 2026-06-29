@@ -161,6 +161,7 @@ import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
 import qualified Fix66PayjoinSenderSpec
+import qualified Fix67RpcAllowIpSpec
 import qualified Haskoin.Daemon as Daemon
 import Data.Aeson (Value(..), Object, Array, object, (.=), toJSON)
 import qualified Data.Aeson as Aeson
@@ -23030,6 +23031,12 @@ main = hspec $ do
   -- BUG-3 (http-client dep) and flips G10-G15 / G22 / G26 / G27 in
   -- W119PayjoinSpec.  Round-trip with FIX-65 receiver via http-client.
   Fix66PayjoinSenderSpec.spec
+
+  -- FIX-67: -rpcallowip IP allowlist enforcement (W140 BUG-6 P0-SEC).
+  -- Closes the dead-field gap: rpcAllowIp now enforced in rpcApp +
+  -- combinedApp before auth; checkAllowIp / parseIpSpec4 / cidrMask4
+  -- mirror Core's ClientAllowed (httpserver.cpp:137-145).
+  Fix67RpcAllowIpSpec.spec
 
   where
     sampleTx = Tx

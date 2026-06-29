@@ -203,6 +203,7 @@ test-suite haskoin-test
                , Fix64TlsSpec
                , Fix65PayjoinReceiverSpec
                , Fix66PayjoinSenderSpec
+               , Fix67RpcAllowIpSpec
                , PrioritiseTransactionSpec
                , ParseHashVSpec
   -- W161 BUG-8: Paths_haskoin is auto-generated; cabal-version >= 2.0
