@@ -191,6 +191,13 @@ module Haskoin.Rpc
   , handleWaitForNewBlock
   , handleWaitForBlock
   , handleWaitForBlockHeight
+    -- * -rpcallowip IP allowlist enforcement (BUG-6 FIX, exported for testing)
+    -- Core parity: ClientAllowed (httpserver.cpp:137-145).
+  , checkAllowIp
+  , isLoopbackSockAddr
+  , matchIpSpec
+  , parseIpSpec4
+  , cidrMask4
   ) where
 
 import Data.Aeson
@@ -213,11 +220,11 @@ import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
 import Network.Wai (Application, Request, Response, responseLBS, requestBody,
                     requestMethod, requestHeaders, pathInfo, rawPathInfo,
-                    rawQueryString)
+                    rawQueryString, remoteHost)
 import Network.Wai.Handler.Warp (run, runSettings, Settings, defaultSettings, setPort, setHost)
 import qualified Network.Wai.Handler.WarpTLS as WarpTLS
 import Data.String (fromString)
-import Network.HTTP.Types (status200, status400, status401, status404, status405,
+import Network.HTTP.Types (status200, status400, status401, status403, status404, status405,
                            status500, status503, hContentType, hAuthorization)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
@@ -1015,41 +1022,50 @@ stopRpcServer rs = do
 -- Supports both single JSON-RPC requests (object) and batch requests (array)
 rpcApp :: RpcServer -> Application
 rpcApp server req respond = do
-  -- Only accept POST requests
-  if requestMethod req /= "POST"
-    then respond $ responseLBS status405
+  -- (G6 / BUG-6 FIX) Enforce -rpcallowip BEFORE auth — mirrors Core's
+  -- ClientAllowed check (httpserver.cpp:137-145) which fires before any
+  -- handler dispatch.  Non-allowlisted clients get 403 Forbidden immediately.
+  let clientIp = remoteHost req
+  if not (checkAllowIp (rpcAllowIp (rsConfig server)) clientIp)
+    then respond $ responseLBS status403
            [(hContentType, "application/json")]
-           "{\"error\": \"Method not allowed\"}"
+           "{\"error\": \"Forbidden\"}"
     else do
-      -- Check authentication
-      let authOk = checkAuth server req
-      if not authOk
-        then respond $ responseLBS status401
+      -- Only accept POST requests
+      if requestMethod req /= "POST"
+        then respond $ responseLBS status405
                [(hContentType, "application/json")]
-               "{\"error\": \"Unauthorized\"}"
+               "{\"error\": \"Method not allowed\"}"
         else do
-          -- Read request body and parse as generic JSON Value
-          body <- readBody req
-          case eitherDecode (BL.fromStrict body) :: Either String Value of
-            Left err -> respond $ jsonResponse $ RpcResponse
-              Null (toJSON $ RpcError rpcParseError (T.pack err)) Null
+          -- Check authentication
+          let authOk = checkAuth server req
+          if not authOk
+            then respond $ responseLBS status401
+                   [(hContentType, "application/json")]
+                   "{\"error\": \"Unauthorized\"}"
+            else do
+              -- Read request body and parse as generic JSON Value
+              body <- readBody req
+              case eitherDecode (BL.fromStrict body) :: Either String Value of
+                Left err -> respond $ jsonResponse $ RpcResponse
+                  Null (toJSON $ RpcError rpcParseError (T.pack err)) Null
 
-            -- Single request: body is a JSON object
-            Right (Object obj) ->
-              case parseSingleRequest (Object obj) of
-                Left errResp -> respond $ jsonResponse errResp
-                Right rpcReq -> do
-                  result <- handleRpcRequest server rpcReq
-                  respond $ jsonResponse result
+                -- Single request: body is a JSON object
+                Right (Object obj) ->
+                  case parseSingleRequest (Object obj) of
+                    Left errResp -> respond $ jsonResponse errResp
+                    Right rpcReq -> do
+                      result <- handleRpcRequest server rpcReq
+                      respond $ jsonResponse result
 
-            -- Batch request: body is a JSON array
-            Right (Array arr) -> do
-              result <- handleBatchRequest server (V.toList arr)
-              respond $ jsonArrayResponse result
+                -- Batch request: body is a JSON array
+                Right (Array arr) -> do
+                  result <- handleBatchRequest server (V.toList arr)
+                  respond $ jsonArrayResponse result
 
-            -- Invalid: neither object nor array
-            Right _ -> respond $ jsonResponse $ RpcResponse
-              Null (toJSON $ RpcError rpcParseError "Parse error: expected object or array") Null
+                -- Invalid: neither object nor array
+                Right _ -> respond $ jsonResponse $ RpcResponse
+                  Null (toJSON $ RpcError rpcParseError "Parse error: expected object or array") Null
 
 -- | Handle a batch of RPC requests
 -- Returns an array of responses in the same order as requests.
@@ -1123,6 +1139,92 @@ checkAuth server req =
              in (user == "__cookie__" && ctEqText pass (rsCookiePassword server))
                 -- Configured user/password auth
                 || (ctEqText user (rpcUser config) && ctEqText pass (rpcPassword config))
+
+--------------------------------------------------------------------------------
+-- BUG-6 FIX: -rpcallowip IP allowlist enforcement (G6)
+--
+-- Bitcoin Core reference: httpserver.cpp ClientAllowed (lines 137-145) +
+-- InitHTTPAllowList (lines 148-168).
+--
+-- Core always seeds the allowlist with 127.0.0.1/8 + ::1 and then appends
+-- user-specified -rpcallowip entries.  haskoin stores the allowlist in
+-- RpcConfig.rpcAllowIp (default ["127.0.0.1"]).  These functions enforce it.
+--
+-- Byte-order note: haskoin stores IPv4 addresses in WAI's SockAddrInet as
+-- a Word32 where the FIRST octet occupies the LEAST-significant byte (the
+-- raw value returned by accept(2) on a little-endian host is used directly
+-- without ntohl).  All mask arithmetic below is consistent with this layout:
+-- /N prefix → mask = (2^N - 1) (protecting the N least-significant bits,
+-- which correspond to the first N/8 octets).
+--------------------------------------------------------------------------------
+
+-- | Check whether a client's 'SockAddr' is permitted by the IP allowlist.
+-- Mirrors Bitcoin Core's @ClientAllowed@ (httpserver.cpp:137-145).
+--
+-- If the list is empty, only loopback addresses (127.x.x.x, ::1) are
+-- admitted — matching Core's @InitHTTPAllowList@ which unconditionally
+-- seeds 127.0.0.1\/8 + ::1 before any user entries.
+checkAllowIp :: [String] -> SockAddr -> Bool
+checkAllowIp [] addr    = isLoopbackSockAddr addr
+checkAllowIp specs addr = any (matchIpSpec addr) specs
+
+-- | True iff the address is an IPv4 loopback (127.x.x.x) or IPv6 ::1.
+-- Core's @InitHTTPAllowList@ always seeds both unconditionally.
+isLoopbackSockAddr :: SockAddr -> Bool
+isLoopbackSockAddr (SockAddrInet _ host) =
+  -- In haskoin's LE-octet Word32, the first IP octet is the LSB.
+  -- 127.x.x.x ↔ (host .&. 0xFF) == 127.
+  (host .&. 0x000000FF) == 127
+isLoopbackSockAddr (SockAddrInet6 _ _ host6 _) = host6 == (0, 0, 0, 1)
+isLoopbackSockAddr _ = False
+
+-- | Check whether a single 'SockAddr' matches a subnet specification string.
+-- IPv4: supports plain IP, CIDR, and netmask notation.
+-- IPv6: exact-match \"::1\" only (sufficient for default allowlist).
+matchIpSpec :: SockAddr -> String -> Bool
+matchIpSpec (SockAddrInet _ host) spec =
+  case parseIpSpec4 spec of
+    Just (base, mask) -> (host .&. mask) == (base .&. mask)
+    Nothing           -> False
+matchIpSpec (SockAddrInet6 _ _ host6 _) spec =
+  spec == "::1" && host6 == (0, 0, 0, 1)
+matchIpSpec _ _ = False
+
+-- | Parse an IPv4 subnet spec into @(baseIP, mask)@ in haskoin's LE-octet
+-- Word32 format.
+--
+-- Handles:
+--   @\"a.b.c.d\"@          — single host (equivalent to \/32)
+--   @\"a.b.c.d\/N\"@       — CIDR prefix length (0–32)
+--   @\"a.b.c.d\/w.x.y.z\"@ — dotted-decimal netmask
+parseIpSpec4 :: String -> Maybe (Word32, Word32)
+parseIpSpec4 spec =
+  case break (== '/') spec of
+    (ipStr, "") ->
+      fmap (\b -> (b, 0xFFFFFFFF)) (parseIPv4Word ipStr)
+    (ipStr, '/':rest) ->
+      case (reads rest :: [(Int, String)]) of
+        [(n, "")] | n >= 0 && n <= 32 ->
+          fmap (\b -> (b, cidrMask4 n)) (parseIPv4Word ipStr)
+        _ ->
+          do base <- parseIPv4Word ipStr
+             mask <- parseIPv4Word rest
+             return (base, mask)
+
+-- | Convert a CIDR prefix length (0–32) to a mask in haskoin's LE-octet
+-- Word32 format.
+--
+-- In this format, octet 1 is the LSB, so a \/N prefix protecting the first
+-- N octets\' bits maps to the N least-significant bits of the Word32:
+--
+-- > cidrMask4 0  = 0x00000000   (allow-all wildcard)
+-- > cidrMask4 8  = 0x000000FF   (protect first octet, e.g. 127.x.x.x)
+-- > cidrMask4 24 = 0x00FFFFFF   (protect first three octets)
+-- > cidrMask4 32 = 0xFFFFFFFF   (exact host match)
+cidrMask4 :: Int -> Word32
+cidrMask4 0  = 0
+cidrMask4 32 = 0xFFFFFFFF
+cidrMask4 n  = fromIntegral ((1 :: Word64) `shiftL` n) - 1
 
 -- | Read the full request body
 readBody :: Request -> IO ByteString
@@ -15328,24 +15430,34 @@ readMaybe s = case reads s of
 --   @args.GetBoolArg("-rest", DEFAULT_REST_ENABLE)@).
 combinedApp :: RpcServer -> Application
 combinedApp server req respond = do
-  let path = rawPathInfo req
-  if BS.isPrefixOf "/rest/" path
-    then if rpcRestEnabled (rsConfig server)
-           then restApp server req respond
-           else respond $ restError 404 "Not found"
-    -- FIX-65: BIP-78 PayJoin receiver endpoint.  /payjoin and
-    -- /payjoin/ both route to 'payjoinApp'.  Routing is unconditional
-    -- here; the handler itself checks 'pcEnabled' on the static config
-    -- and returns 400 + "unavailable" when PayJoin is off (the
-    -- default).  We resolve a wallet via the same default-wallet
-    -- single-wallet rule as 'getWalletForRequest', falling back to a
-    -- 400 + "unavailable" response if no wallet is loaded.  W118 TP-2
-    -- is NOT a blocker here because 'processOriginalPsbt' uses
-    -- 'signPsbt' (not 'signTransaction') — see the Haskoin.Payjoin
-    -- module-header note.
-    else if path == payjoinRoutePrefix || path == payjoinRoutePrefix <> "/"
-           then routePayjoin server req respond
-    else rpcApp server req respond
+  -- (G6 / BUG-6 FIX) IP allowlist guard — reject non-allowlisted clients
+  -- at the outermost routing layer, before any sub-handler (RPC / REST /
+  -- PayJoin) runs.  Mirrors Core's ClientAllowed called in http_request_cb
+  -- (httpserver.cpp) before handler dispatch.
+  let clientIp = remoteHost req
+  if not (checkAllowIp (rpcAllowIp (rsConfig server)) clientIp)
+    then respond $ responseLBS status403
+           [(hContentType, "application/json")]
+           "{\"error\": \"Forbidden\"}"
+    else do
+      let path = rawPathInfo req
+      if BS.isPrefixOf "/rest/" path
+        then if rpcRestEnabled (rsConfig server)
+               then restApp server req respond
+               else respond $ restError 404 "Not found"
+        -- FIX-65: BIP-78 PayJoin receiver endpoint.  /payjoin and
+        -- /payjoin/ both route to 'payjoinApp'.  Routing is unconditional
+        -- here; the handler itself checks 'pcEnabled' on the static config
+        -- and returns 400 + "unavailable" when PayJoin is off (the
+        -- default).  We resolve a wallet via the same default-wallet
+        -- single-wallet rule as 'getWalletForRequest', falling back to a
+        -- 400 + "unavailable" response if no wallet is loaded.  W118 TP-2
+        -- is NOT a blocker here because 'processOriginalPsbt' uses
+        -- 'signPsbt' (not 'signTransaction') — see the Haskoin.Payjoin
+        -- module-header note.
+        else if path == payjoinRoutePrefix || path == payjoinRoutePrefix <> "/"
+               then routePayjoin server req respond
+        else rpcApp server req respond
 
 -- | Resolve a wallet for the /payjoin route.  If a wallet manager is
 -- present and exactly one wallet is loaded, route through it; else
