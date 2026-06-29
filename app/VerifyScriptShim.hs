@@ -89,6 +89,7 @@ import Haskoin.Consensus
   , computeMerkleRootMutated, blockReward
   , checkTxInputsConnect, consensusFlagsAtHeight
   , validateFullBlock, validateFullBlockIO, ChainState(..)
+  , getMtpAtHeightFromEntries
   , netBIP34Height, netBIP34Hash
   , applyBlock, disconnectBlockAt, DisconnectResult(..)
   , maxReorgDepth
@@ -607,7 +608,7 @@ processCheckBlock line =
       Left e                            -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
       Right (block, cs, skipScripts, coinMap) -> do
         r <- try (evaluate
-                    (forceEither (validateFullBlock mainnet cs skipScripts False block coinMap)))
+                    (forceEither (validateFullBlock mainnet cs (const 0) skipScripts False block coinMap)))
                :: IO (Either SomeException (Either String ()))
         pure $ case r of
           Left ex          ->
@@ -707,7 +708,9 @@ processCheckBIP30 line =
                     putBlockHeight db (netBIP34Height mainnet) (netBIP34Hash mainnet)
                     -- Drive the REAL canonical connect-time entry point:
                     -- checkBIP30 THEN validateFullBlock (Consensus.hs:2802).
-                    res <- validateFullBlockIO db mainnet cs skipScripts block coinMap
+                    -- const 0 for getMtpAtHeight: corpus vectors test height-based
+                    -- BIP-68; a real per-chain MTP walk is not available in the shim.
+                    res <- validateFullBlockIO db mainnet cs (const 0) skipScripts block coinMap
                     evaluate (forceEither res))
                :: IO (Either SomeException (Either String ()))
         pure $ case r of
@@ -1280,12 +1283,13 @@ runConnects cache net (c:cs) n = do
               , csMedianTime = prevMtp
               , csFlags      = consensusFlagsAtHeight net height
               }
-  case validateFullBlock net cs0 False False block spentCoins of
+  -- const 0 for getMtpAtHeight: corpus connectChain vectors test height-based
+  -- BIP-68; a per-chain MTP walk is not available in the shim context.
+  case validateFullBlock net cs0 (const 0) False False block spentCoins of
     Left err -> pure (n, Just err)
     Right () -> do
       -- (c) applyBlock — spends inputs from the cache, checks coinbase maturity
-      -- (R6), sigops, bad-cb-amount, etc. getMTP is unused on these vectors
-      -- (height-based BIP-68 only); return prevMtp as a safe constant.
+      -- (R6), sigops, bad-cb-amount, etc.
       applyRes <- applyBlock cache net block height prevMtp (\_ -> pure prevMtp)
       case applyRes of
         Left err -> pure (n, Just err)

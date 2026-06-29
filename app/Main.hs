@@ -2781,6 +2781,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
             -- still NOT enforced on this arm (TxOut-only view), a residual
             -- false-ACCEPT gap, not a spurious reject.
             blockEntries <- readTVarIO (hcEntries hc)
+            byHeightBg   <- readTVarIO (hcByHeight hc)
             bestHdr      <- readTVarIO (hcTip hc)
             let blockTs     = bhTimestamp hdr
                 parentHash  = bhPrevBlock hdr
@@ -2788,7 +2789,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                 skipScripts = shouldSkipScripts bh height blockTs net blockEntries bestHdr
                 cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
                                 (consensusFlagsAtHeight net height)
-            vr <- (validateFullBlockIO db net cs skipScripts block spent)
+                getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
+            vr <- (validateFullBlockIO db net cs getMtpBg skipScripts block spent)
                     `catch` (\(e :: SomeException) -> do
                                putStrLn $ "ERROR validating block "
                                        ++ show height ++ ": " ++ show e

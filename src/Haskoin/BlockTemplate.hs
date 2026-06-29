@@ -86,7 +86,8 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            Deployment, DeploymentCache,
                            computeBlockVersionFromChain,
                            taprootDeployment,
-                           bumpTipGen)
+                           bumpTipGen,
+                           getMtpAtHeightFromEntries)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -564,7 +565,9 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           -- run; UTXO-dependent checks (input existence, fee, BIP-68, sigops,
           -- coinbase value) deferred to connect time.  BIP-30 also deferred:
           -- Core runs it in ConnectBlock, not AcceptBlock.
-          let sideBranchResult = validateFullBlock net cs False True block Map.empty
+          -- skipConnectChecks=True: BIP-68 gate is inside 'unless skipConnectChecks'
+          -- so getMtp is never invoked here.  Pass const 0 as a harmless placeholder.
+          let sideBranchResult = validateFullBlock net cs (const 0) False True block Map.empty
           case sideBranchResult of
             Left err -> return $ Left $ "Block validation failed: " ++ err
             Right () -> submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
@@ -576,13 +579,19 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           -- perform BIP-68 SequenceLocks checks (which require per-coin heights).
           utxoMap <- buildBlockUTXOMap cache block
 
+          -- Build per-height MTP getter for BIP-68 time enforcement (W183 fix).
+          -- hcEntries / hcByHeight are loaded from the persistent store at startup.
+          entriesSB <- readTVarIO (hcEntries hc)
+          byHeightSB <- readTVarIO (hcByHeight hc)
+          let getMtpSB = getMtpAtHeightFromEntries entriesSB byHeightSB
+
           -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard,
           -- requires DB IO) followed by the pure 'validateFullBlock' checks,
           -- ensuring the active-tip submitBlock path shares identical BIP-30
           -- enforcement with the IBD path.
           -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
           -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs.
-          validationResult <- validateFullBlockIO db net cs False block utxoMap
+          validationResult <- validateFullBlockIO db net cs getMtpSB False block utxoMap
           case validationResult of
             Left err -> return $ Left $ "Block validation failed: " ++ err
             Right () -> do
@@ -1146,7 +1155,8 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                       -> IO (Either String ([BatchOp], ReorgOverlay))
     buildConnectChain _ _   _   _ []           ov ops = return (Right (ops, ov))
     buildConnectChain c dbh hc' n (blk : rest) ov ops = do
-      entries <- readTVarIO (hcEntries hc')
+      entries  <- readTVarIO (hcEntries hc')
+      byHeightCC <- readTVarIO (hcByHeight hc')
       let bh = computeBlockHash (blockHeader blk)
       case Map.lookup bh entries of
         Nothing -> return $ Left $
@@ -1195,7 +1205,8 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                                          (bhPrevBlock (blockHeader blk))
                                          0 parentMTP
                                          (consensusFlagsAtHeight n (ceHeight ce))
-              case validateFullBlock n csReorg False False blk spentUtxos of
+                  getMtpCC  = getMtpAtHeightFromEntries entries byHeightCC
+              case validateFullBlock n csReorg getMtpCC False False blk spentUtxos of
                 Left err -> return $ Left $
                   "reorg connect: block " ++ show bh
                   ++ " (height " ++ show (ceHeight ce)

@@ -126,6 +126,7 @@ import qualified W129CoinSelectionSpec
 import qualified W130BIP125FeeBumperRule3Spec
 import qualified W131DescriptorsMiniscriptSpec
 import qualified W132NSequenceCSVMTPSpec
+import qualified W183BIP68TimeLockBlockSpec
 import qualified W133IndexDatabasesSpec
 import qualified W134BIP37BloomFilterSpec
 import qualified W135StandardnessSpec
@@ -2849,7 +2850,7 @@ main = hspec $ do
           utxoMap = mempty
       -- Should be rejected for non-final tx (bad-txns-nonfinal check is step 6,
       -- after merkle/coinbase/weight/BIP34 checks all pass)
-      case validateFullBlock regtest cs False False block utxoMap of
+      case validateFullBlock regtest cs (const 0) False False block utxoMap of
         Left err -> err `shouldContain` "bad-txns-nonfinal"
         Right () -> expectationFailure "Expected block to be rejected as non-final"
 
@@ -3583,7 +3584,7 @@ main = hspec $ do
           header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           block = Block header []
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "no transactions" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with no transactions"
 
@@ -3596,7 +3597,7 @@ main = hspec $ do
           regularTx = Tx 1 [txin] [TxOut 1000 "script"] [[]] 0
           block = Block header [regularTx]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "not coinbase" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject when first tx is not coinbase"
 
@@ -3610,7 +3611,7 @@ main = hspec $ do
           coinbase2 = Tx 1 [coinbaseIn] [TxOut 1000000000 "out2"] [[]] 0
           block = Block header [coinbase1, coinbase2]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "Multiple coinbase" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with multiple coinbase"
 
@@ -3625,7 +3626,7 @@ main = hspec $ do
           coinbase = Tx 1 [coinbaseIn] [TxOut 5000000000 "out"] [[]] 0
           block = Block header [coinbase]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "Merkle root" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong merkle root"
 
@@ -3645,7 +3646,7 @@ main = hspec $ do
           block = Block header [coinbase]
           -- Chain state at height 500 (BIP-34 active on regtest at 500)
           cs = ChainState 500 prevHash 0 0 (consensusFlagsAtHeight regtest 501)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "height" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Should reject block with wrong coinbase height"
 
@@ -3685,7 +3686,7 @@ main = hspec $ do
           -- Set csHeight = 110 (parent's height); height inside the
           -- validator becomes 110 + 1 = 111, matching the cb encoding.
           cs = ChainState 110 parentHash 0 0 (consensusFlagsAtHeight regtest 111)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Right () -> return ()
         Left msg
           | "height" `T.isInfixOf` T.pack msg ->
@@ -3713,7 +3714,7 @@ main = hspec $ do
           -- height 113 inside the validator. Coinbase encodes 111.
           -- BIP-34 must reject: bad-cb-height.
           cs = ChainState 112 parentHash 0 0 (consensusFlagsAtHeight regtest 113)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left "bad-cb-height" -> return ()
         Left msg | "bad-cb-height" `T.isInfixOf` T.pack msg -> return ()
         Right () -> expectationFailure
@@ -3736,7 +3737,7 @@ main = hspec $ do
           header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           block       = Block header [coinbase]
           cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "size" `T.isInfixOf` T.pack msg -> return ()
         Left msg -> expectationFailure $ "Wrong error: " ++ msg
         Right () -> expectationFailure "Should reject coinbase with 1-byte scriptSig"
@@ -3752,7 +3753,7 @@ main = hspec $ do
           header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           block       = Block header [coinbase]
           cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "size" `T.isInfixOf` T.pack msg -> return ()
         Left msg -> expectationFailure $ "Wrong error: " ++ msg
         Right () -> expectationFailure "Should reject coinbase with 101-byte scriptSig"
@@ -3779,7 +3780,7 @@ main = hspec $ do
           block2      = Block header2 [coinbase2]
           cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
       -- The 2-byte height-encoded scriptSig satisfies both BIP-34 and length range
-      case validateFullBlock regtest cs False False block2 Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block2 Map.empty of
         Right () -> return ()
         Left msg | "size" `T.isInfixOf` T.pack msg ->
           expectationFailure "Should NOT reject coinbase with 2-byte scriptSig (bad-cb-length)"
@@ -3796,7 +3797,7 @@ main = hspec $ do
           header      = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           block       = Block header [coinbase]
           cs          = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "size" `T.isInfixOf` T.pack msg ->
           expectationFailure "Should NOT reject coinbase with 100-byte scriptSig (bad-cb-length)"
         _ -> return ()  -- Other errors expected; bad-cb-length must NOT fire
@@ -3821,7 +3822,7 @@ main = hspec $ do
           header       = BlockHeader 1 prevHash merkle 1700000000 0x207fffff 0
           block        = Block header [coinbase]
           cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "bad-version" `T.isInfixOf` T.pack msg -> return ()
         Left msg -> expectationFailure $ "Wrong error (expected bad-version): " ++ msg
         Right () -> expectationFailure "Should reject nVersion=1 block after BIP-34"
@@ -3838,7 +3839,7 @@ main = hspec $ do
           header       = BlockHeader 2 prevHash merkle 1700000000 0x207fffff 0
           block        = Block header [coinbase]
           cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "bad-version" `T.isInfixOf` T.pack msg -> return ()
         Left msg -> expectationFailure $ "Wrong error (expected bad-version): " ++ msg
         Right () -> expectationFailure "Should reject nVersion=2 block after BIP-66"
@@ -3855,7 +3856,7 @@ main = hspec $ do
           header       = BlockHeader 3 prevHash merkle 1700000000 0x207fffff 0
           block        = Block header [coinbase]
           cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         Left msg | "bad-version" `T.isInfixOf` T.pack msg -> return ()
         Left msg -> expectationFailure $ "Wrong error (expected bad-version): " ++ msg
         Right () -> expectationFailure "Should reject nVersion=3 block after BIP-65"
@@ -3871,7 +3872,7 @@ main = hspec $ do
           header       = BlockHeader 4 prevHash merkle 1700000000 0x207fffff 0
           block        = Block header [coinbase]
           cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 1)
-      case validateFullBlock regtest cs False False block Map.empty of
+      case validateFullBlock regtest cs (const 0) False False block Map.empty of
         -- Should NOT fail with bad-version (may fail for other reasons like subsidy)
         Left msg | "bad-version" `T.isInfixOf` T.pack msg ->
           expectationFailure $ "Should NOT reject nVersion=4 with bad-version: " ++ msg
@@ -3890,7 +3891,7 @@ main = hspec $ do
           block        = Block header [coinbase]
           -- mainnet height 0: flagBIP34 = False (activates at 227931)
           cs           = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight mainnet 0)
-      case validateFullBlock mainnet cs False False block Map.empty of
+      case validateFullBlock mainnet cs (const 0) False False block Map.empty of
         Left msg | "bad-version" `T.isInfixOf` T.pack msg ->
           expectationFailure $ "Should NOT reject nVersion=1 pre-BIP34: " ++ msg
         _ -> return ()  -- Other errors (PoW etc.) are expected; bad-version must not fire
@@ -3942,7 +3943,7 @@ main = hspec $ do
           prevCoin    = Coin prevTxOut 99 False
           utxoMap     = Map.singleton prevOutpoint prevCoin
       -- skipScripts = False: must reject (script verify failure).
-      case validateFullBlock regtest cs False False block utxoMap of
+      case validateFullBlock regtest cs (const 0) False False block utxoMap of
         Left err | "script verify failed" `T.isInfixOf` T.pack err -> return ()
         Left other ->
           expectationFailure $ "Expected script-verify rejection, got: " ++ other
@@ -3982,7 +3983,7 @@ main = hspec $ do
           prevTxOut = TxOut 1000 (encodeScript (Script [OP_CHECKSIG]))
           prevCoin  = Coin prevTxOut 99 False
           utxoMap   = Map.singleton prevOutpoint prevCoin
-      case validateFullBlock regtest cs True False block utxoMap of
+      case validateFullBlock regtest cs (const 0) True False block utxoMap of
         Right () -> return ()
         Left err -> expectationFailure $
           "validateFullBlock with skipScripts=True must accept (got: " ++ err ++ ")"
@@ -4093,7 +4094,7 @@ main = hspec $ do
           block = Block header [coinbase]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
           -- Even with skipScripts=True, merkle check must still fail.
-      case validateFullBlock regtest cs True False block Map.empty of
+      case validateFullBlock regtest cs (const 0) True False block Map.empty of
         Left msg | "Merkle root" `T.isInfixOf` T.pack msg -> return ()
         _ -> expectationFailure "Bad merkle root must still be rejected when skipScripts=True"
 
@@ -4115,8 +4116,8 @@ main = hspec $ do
                        (bhTimestamp header) regtest Map.empty
                        (ChainEntry header (computeBlockHash header)
                          0 0 Nothing StatusHeaderValid 0 0)
-          resultNoSkip = validateFullBlock regtest cs False False block Map.empty
-          resultSkip   = validateFullBlock regtest cs skipFlag False block Map.empty
+          resultNoSkip = validateFullBlock regtest cs (const 0) False False block Map.empty
+          resultSkip   = validateFullBlock regtest cs (const 0) skipFlag False block Map.empty
       -- Both must agree (skipFlag should be False on regtest)
       skipFlag `shouldBe` False
       resultNoSkip `shouldBe` resultSkip
@@ -4178,7 +4179,7 @@ main = hspec $ do
 
       -- Pre-fix behaviour (skipConnectChecks=False, active-tip view): the
       -- missing input causes a false "bad-txns-inputs-missingorspent" reject.
-      case validateFullBlock regtest cs False False block emptyUTXOMap of
+      case validateFullBlock regtest cs (const 0) False False block emptyUTXOMap of
         Left msg | "input" `T.isInfixOf` T.pack msg
                 || "missingorspent" `T.isInfixOf` T.pack msg
                 || "missing" `T.isInfixOf` T.pack msg
@@ -4200,7 +4201,7 @@ main = hspec $ do
       -- contextual checks (PoW-bits/merkle/weight/BIP-34/MTP/IsFinalTx).
       -- This is the CORE of the fix: side-branch blocks must not be
       -- false-rejected due to the active-tip UTXO view.
-      case validateFullBlock regtest cs False True block emptyUTXOMap of
+      case validateFullBlock regtest cs (const 0) False True block emptyUTXOMap of
         Right () -> return ()  -- Accepted: fix works.
         Left err ->
           -- Only acceptable failures are PoW (0x207fffff in test), coinbase
@@ -4227,7 +4228,7 @@ main = hspec $ do
           header       = BlockHeader 4 parentHash badMerkle 1700000100 0x207fffff 0
           block        = Block header [coinbase]
           cs           = ChainState 2 parentHash 0 0 (consensusFlagsAtHeight regtest 3)
-      case validateFullBlock regtest cs False True block Map.empty of
+      case validateFullBlock regtest cs (const 0) False True block Map.empty of
         Left msg | "merkle" `T.isInfixOf` T.toLower (T.pack msg)
                 || "Merkle" `T.isInfixOf` T.pack msg ->
           return ()  -- Correctly rejected on context-free check.
@@ -4270,7 +4271,7 @@ main = hspec $ do
       -- With skipConnectChecks=False and a provided UTXO, the validation
       -- proceeds to script-verify (fails due to empty scriptSig on P2PKH)
       -- but NOT with "missing" — it has the input, just an invalid script.
-      case validateFullBlock regtest cs False False block utxoMap' of
+      case validateFullBlock regtest cs (const 0) False False block utxoMap' of
         Left msg ->
           -- Verify NOT a missing-input error (UTXO was provided correctly).
           when ("missingorspent" `T.isInfixOf` T.pack msg
@@ -22875,6 +22876,9 @@ main = hspec $ do
 
   -- W132 BIP-68 / BIP-112 / BIP-113 nSequence / OP_CSV / MTP — 30-gate audit, discovery
   W132NSequenceCSVMTPSpec.spec
+
+  -- W183 BIP-68 time-based sequence lock enforcement in validateFullBlock (W183 fix)
+  W183BIP68TimeLockBlockSpec.spec
 
   -- W133 Index databases (txindex + coinstatsindex) — 30-gate audit, discovery
   W133IndexDatabasesSpec.spec
