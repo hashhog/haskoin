@@ -861,7 +861,7 @@ findSideBranchForkPoint hc db parent newTipBlock = do
 -- Reference: bitcoin-core/src/validation.cpp ActivateBestChain +
 -- the Pattern D atomicity audit
 -- (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
--- The cap on reorg size is 'maxReorgDepth' (=100) on the SUM of
+-- The cap on reorg size is 'maxReorgDepth' (=288) on the SUM of
 -- disconnect + connect blocks.
 doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
                   -> Mempool     -- ^ Mempool (for refill on disconnect; Pattern B)

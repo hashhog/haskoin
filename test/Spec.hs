@@ -5336,7 +5336,7 @@ main = hspec $ do
   -- into ONE 'writeBatch' that either lands fully or not at all.
   --
   -- Unit-test guards below cover:
-  --   (A) the 'maxReorgDepth' cap (=100, matches Core's reorg safety)
+  --   (A) the 'maxReorgDepth' cap (=288, impl-specific memory-safety bound)
   --   (B) pure 'buildDisconnectBlockOps' / 'buildConnectBlockOps' produce
   --       the same disk image that the per-block 'disconnectBlock' /
   --       'connectBlock' would write — proves the refactor is byte-
@@ -5347,8 +5347,8 @@ main = hspec $ do
   --       'buildDisconnectBlockOps' Left branch — equivalent to
   --       'doSideBranchReorg' bailing out before the single 'writeBatch'.
   describe "Side-branch reorg multi-block atomicity (Pattern D)" $ do
-    it "maxReorgDepth = 100 (matches Core MAX_REORG_DEPTH-equivalent)" $ do
-      maxReorgDepth `shouldBe` 100
+    it "maxReorgDepth = 288 (impl-specific memory-safety bound; 288 = Core MIN_BLOCKS_TO_KEEP)" $ do
+      maxReorgDepth `shouldBe` 288
 
     it "buildConnectBlockOps emits the same on-disk shape as connectBlock" $
       withSystemTempDirectory "haskoin-pd-connect" $ \tmp -> do
