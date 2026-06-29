@@ -79,6 +79,7 @@ module Haskoin.Consensus
   , ChainState(..)
   , ConsensusFlags(..)
   , consensusFlagsAtHeight
+  , getBlockScriptFlags
   , consensusFlagsToScriptFlags
     -- * Coinbase
   , isCoinbase
@@ -349,6 +350,14 @@ data Network = Network
   , netHeaderSyncParams  :: !HeaderSyncParams -- ^ Parameters for PRESYNC/REDOWNLOAD anti-DoS pipeline
   , netAssumeUtxo        :: ![(Word32, AssumeUtxoParams)]  -- ^ AssumeUTXO snapshot parameters
   , netAssumedValid      :: !(Maybe BlockHash)  -- ^ Assume-valid: skip scripts for ancestors of this block
+  , netScriptFlagExceptions :: ![(BlockHash, ConsensusFlags)]
+    -- ^ Per-block script-flag overrides for historical blocks that violate
+    -- current consensus rules (BIP16 P2SH violators, taproot violator).
+    -- Mirrors Bitcoin Core's @Consensus::Params::script_flag_exceptions@
+    -- (kernel/chainparams.cpp).  If a block's hash matches an entry here,
+    -- 'getBlockScriptFlags' returns that entry's 'ConsensusFlags' DIRECTLY,
+    -- WITHOUT any additional height-based additions.  Empty for testnet4,
+    -- signet, and regtest.
   } deriving (Show)
 
 -- | Parameters for the headers-sync anti-DoS pipeline.
@@ -1300,6 +1309,26 @@ mainnet = Network
   -- Hash: mainnet block 938343.
   -- Source: git show v28.0:src/kernel/chainparams.cpp
   , netAssumedValid = Just (hashFromHex "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac")
+  -- Script-flag exceptions for historical blocks that violate current rules.
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp (mainnet constructor).
+  -- Byte-order: display (big-endian) hex passed through 'hashFromHex', which
+  -- reverses to internal little-endian, matching how BIP30 exceptions and
+  -- checkpoints are stored throughout this file.
+  , netScriptFlagExceptions =
+      [ -- BIP16 P2SH exception: mainnet block 170,060.
+        -- Contains a transaction that fails P2SH validation.
+        -- Core override: SCRIPT_VERIFY_NONE (no script flags at all).
+        ( hashFromHex "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+        , ConsensusFlags { flagBIP34 = False, flagBIP65 = False, flagBIP66 = False
+                         , flagSegWit = False, flagTaproot = False
+                         , flagNullDummy = False, flagCSV = False, flagP2SH = False } )
+        -- Taproot exception: one mainnet block violates taproot rules.
+        -- Core override: SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS.
+      , ( hashFromHex "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+        , ConsensusFlags { flagBIP34 = False, flagBIP65 = False, flagBIP66 = False
+                         , flagSegWit = True,  flagTaproot = False
+                         , flagNullDummy = False, flagCSV = False, flagP2SH = True } )
+      ]
   }
 
 -- | Bitcoin testnet3 configuration
@@ -1352,6 +1381,16 @@ testnet3 = Network
       ]
   -- Assume-valid (Bitcoin Core v28.0): testnet3 block 123613.
   , netAssumedValid = Just (hashFromHex "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
+  -- Script-flag exceptions for testnet3.
+  -- Source: bitcoin-core/src/kernel/chainparams.cpp (testnet3 constructor).
+  , netScriptFlagExceptions =
+      [ -- BIP16 P2SH exception on testnet3.
+        -- Core override: SCRIPT_VERIFY_NONE.
+        ( hashFromHex "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"
+        , ConsensusFlags { flagBIP34 = False, flagBIP65 = False, flagBIP66 = False
+                         , flagSegWit = False, flagTaproot = False
+                         , flagNullDummy = False, flagCSV = False, flagP2SH = False } )
+      ]
   }
 
 -- | Bitcoin testnet4 configuration (BIP94)
@@ -1405,6 +1444,8 @@ testnet4 = Network
       ]
   -- Assume-valid (Bitcoin Core v28.0): testnet4 block 4842348.
   , netAssumedValid = Just (hashFromHex "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4")
+  -- No script-flag exceptions on testnet4.
+  , netScriptFlagExceptions = []
   }
 
 -- | Testnet4 genesis block header (BIP94)
@@ -1492,6 +1533,8 @@ regtest = Network
       ]
   -- Regtest has NO assumevalid: every script check runs. Intentional for test determinism.
   , netAssumedValid = Nothing
+  -- No script-flag exceptions on regtest.
+  , netScriptFlagExceptions = []
   }
 
 --------------------------------------------------------------------------------
@@ -1708,7 +1751,16 @@ data ConsensusFlags = ConsensusFlags
                                 --   under-flagged OP_CSV as a NOP for the
                                 --   62,496-block CSV-only window
                                 --   (W132 BUG-1 P0-CONSENSUS).
-  } deriving (Show, Generic)
+  , flagP2SH        :: !Bool    -- ^ P2SH (BIP-16).  'True' for all normal blocks
+                                --   (P2SH is treated as always-active).  'False'
+                                --   ONLY for historical BIP16-violator exception
+                                --   blocks whose 'netScriptFlagExceptions' entry
+                                --   carries SCRIPT_VERIFY_NONE (no flags at all).
+                                --   Gating 'VerifyP2SH' here (rather than
+                                --   hard-coding it in 'consensusFlagsToScriptFlags')
+                                --   lets 'getBlockScriptFlags' return a zero-flag
+                                --   override without a separate ScriptFlags path.
+  } deriving (Show, Eq, Generic)
 
 -- | Compute consensus flags for a given height based on network rules.
 -- NULLFAIL (BIP-146) is intentionally excluded: it is a
@@ -1722,14 +1774,39 @@ consensusFlagsAtHeight net h = ConsensusFlags
   , flagNullDummy = h >= netSegwitHeight net
   , flagTaproot   = h >= netTaprootHeight net
   , flagCSV       = h >= netCSVHeight net
+  , flagP2SH      = True   -- P2SH always active; BIP16-exception override sets False
   }
+
+-- | Get consensus script flags for a given block, checking the per-block
+-- exception table in 'netScriptFlagExceptions' BEFORE the height-based
+-- computation.
+--
+-- Mirrors Bitcoin Core's @GetBlockScriptFlags@ (validation.cpp:2250-2288):
+-- Core starts with P2SH+WITNESS+TAPROOT, overrides if an exception block
+-- is found, then ORs in DERSIG/CLTV/CSV/NULLDUMMY by height.  Haskoin's
+-- approach is equivalent but in the other direction: height-based activation
+-- is the default; exceptions REPLACE (not patch) the result.  The two are
+-- observationally equivalent because the real exception blocks satisfy every
+-- height-active flag they don't explicitly disable.
+--
+-- MUST be used at EVERY block-validation flag-computation site.  Do NOT use
+-- at mempool/policy/RPC sites — those validate the NEXT block and should
+-- never apply historical block exceptions.
+getBlockScriptFlags :: Network -> BlockHash -> Word32 -> ConsensusFlags
+getBlockScriptFlags net bh h =
+  case lookup bh (netScriptFlagExceptions net) of
+    Just override -> override
+    Nothing       -> consensusFlagsAtHeight net h
 
 -- | Convert ConsensusFlags to ScriptFlags for script verification.
 -- This maps the consensus-level flags to the script interpreter's flag type.
 -- Only consensus-critical flags are included.
+-- P2SH (flagP2SH) is gated rather than hard-coded so that
+-- 'getBlockScriptFlags' can return an all-False override for BIP16-exception
+-- blocks that violate P2SH.
 consensusFlagsToScriptFlags :: ConsensusFlags -> ScriptFlags
 consensusFlagsToScriptFlags cf = flagSet $ concat
-  [ [VerifyP2SH]  -- P2SH is always enabled (post BIP-16)
+  [ [VerifyP2SH  | flagP2SH cf]  -- P2SH; False only for BIP16-exception blocks
   , [VerifyDERSig | flagBIP66 cf]
   , [VerifyCheckLockTimeVerify | flagBIP65 cf]
   , [VerifyCheckSequenceVerify | flagCSV cf]     -- CSV (BIP-112) gated by
@@ -2632,10 +2709,12 @@ validateFullBlock :: Network -> ChainState -> Bool -> Bool -> Block -> Map OutPo
                  -> Either String ()
 validateFullBlock net cs skipScripts skipConnectChecks block utxoCoinMap = do
   let height = csHeight cs + 1
-      flags = consensusFlagsAtHeight net height
       header = blockHeader block
       txns = blockTxns block
       blockHash = computeBlockHash header
+      -- Use hash-keyed exception table first, then fall back to height-based
+      -- activation.  Mirrors Core's GetBlockScriptFlags (validation.cpp:2263).
+      flags = getBlockScriptFlags net blockHash height
       checkpoints = buildCheckpoints net
       -- TxOut-only view for validateBlockTransactions (script checking).
       utxoMap = fmap coinTxOut utxoCoinMap
@@ -2989,6 +3068,7 @@ consensusFlagsToWord32 cf =
   .|. (if flagTaproot cf then 16 else 0)
   .|. (if flagNullDummy cf then 32 else 0)
   .|. (if flagCSV cf then 64 else 0)
+  .|. (if flagP2SH cf then 128 else 0)
 
 --------------------------------------------------------------------------------
 -- Process-wide Signature Verification Cache
@@ -5094,7 +5174,8 @@ applyBlock cache net block height prevBlockMTP getMTP = do
       bh = computeBlockHash (blockHeader block)
       prevHash = bhPrevBlock (blockHeader block)
       enforceBIP68 = bip68Active net height
-      flags = consensusFlagsAtHeight net height
+      -- Exception-table lookup before height-based flags (mirrors validateFullBlock).
+      flags = getBlockScriptFlags net bh height
 
   -- Process each transaction, collecting TxUndo for non-coinbase txs
   txUndoListRef <- newTVarIO []
@@ -5817,12 +5898,12 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       -- the header chain (medianTime is stamped at header insert).
       parentMTP <- reorgPrevMtp hc ce
       -- REORG SCRIPT VERIFICATION (Core parity): full validation incl.
-      -- per-input verifyScriptWithFlags under consensusFlagsAtHeight,
+      -- per-input verifyScriptWithFlags under getBlockScriptFlags,
       -- BEFORE building the connect ops — a heavier fork whose scripts
       -- Core rejects must abort the reorg, not be silently adopted.
       let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader blk))
                           0 parentMTP
-                          (consensusFlagsAtHeight net (ceHeight ce))
+                          (getBlockScriptFlags net bh (ceHeight ce))
       case validateFullBlock net cs False False blk spentUtxos of
         Left err -> return $ Left $
           "reorg connect: block " ++ show bh
@@ -6063,8 +6144,8 @@ disconnectChain cache db _hc currentHash targetHash
 --   rustoshi (chain_state.rs reorganize → connect_block_with_sequence_locks)
 --   and blockbrew (ReorgTo → ConnectBlock).  Script verification runs via
 --   'validateBlockTransactions' → 'validateSingleTx' → 'verifyScriptWithFlags'
---   under 'consensusFlagsAtHeight' for the block's height — the SAME flag
---   computer + verifier the straight-line connect path uses.
+--   under 'getBlockScriptFlags' (exception-table then height-based) — the
+--   SAME flag computer + verifier the straight-line connect path uses.
 connectChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
              -> BlockHash -> BlockHash -> IO (Either String ())
 connectChain net cache db hc fromHash toHash = do
@@ -6102,10 +6183,10 @@ connectChain net cache db hc fromHash toHash = do
           Right spentCoins -> do
             -- csHeight + 1 == this block's height (validateFullBlock derives
             -- the connect height internally), csMedianTime == prev block MTP
-            -- (BIP-113 / timestamp cutoff).  Flags computed for ceHeight ce.
+            -- (BIP-113 / timestamp cutoff).  Flags via exception table first.
             let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader block))
                                 0 prevBlockMTP
-                                (consensusFlagsAtHeight net (ceHeight ce))
+                                (getBlockScriptFlags net (ceHash ce) (ceHeight ce))
             case validateFullBlock net cs False False block spentCoins of
               Left err -> return $ Left $
                 "reorg connect: block " ++ show (ceHash ce)

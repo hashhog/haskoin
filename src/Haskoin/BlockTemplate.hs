@@ -72,7 +72,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
                            addHeader, addSideBranchHeader, computeMerkleRoot, ChainState(..),
-                           consensusFlagsAtHeight, connectBlock, disconnectBlock,
+                           consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
                            cumulativeWork, unapplyBlock,
                            getLegacySigOpCount,
                            getTransactionSigOpCost, SigOpCost(..),
@@ -1288,7 +1288,8 @@ applyBlockToCache cache net block height = do
   let bh = computeBlockHash (blockHeader block)
       txns = blockTxns block
       prevHash = bhPrevBlock (blockHeader block)
-      flags = consensusFlagsAtHeight net height
+      -- Exception-table lookup before height-based flags (mirrors validateFullBlock).
+      flags = getBlockScriptFlags net bh height
       enforceBIP68 = bip68Active net height
 
   -- Collect TxUndo for each non-coinbase transaction
