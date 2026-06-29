@@ -4161,16 +4161,12 @@ handleGetRawMempool server params = do
       in pairs $
            pair "vsize"              (AE.int (meSize entry))                          <>
            pair "weight"             (AE.int (meSize entry * witnessScaleFactor))     <>
-           pair "fee"                (btcAmountEnc feeSat)                            <>
-           pair "modifiedfee"        (btcAmountEnc feeSat)                            <>
            pair "time"               (AE.int64 (meTime entry))                        <>
            pair "height"             (AE.word32 (meHeight entry))                     <>
            pair "descendantcount"    (AE.int (meDescendantCount entry))               <>
            pair "descendantsize"     (AE.int (meDescendantSize entry))                <>
-           pair "descendantfees"     (AE.word64 (meDescendantFees entry))             <>
            pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
            pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
-           pair "ancestorfees"       (AE.word64 (meAncestorFees entry))               <>
            pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
            pair "fees"               feesEnc                                          <>
            pair "depends"            (AE.list text [])                                <>
@@ -4627,10 +4623,21 @@ peerInfoToEncoding asmapData idx (addr, info) =
           mappedASPair = if mappedAS /= 0
                            then pair "mapped_as" (AE.word32 mappedAS)
                            else mempty
+          -- Derive Core's GetNetworkName(stats.m_network) from the peer SockAddr.
+          -- SockAddrInet  → "ipv4"; SockAddrInet6 → "cjdns" (fc00::/8) or "ipv6";
+          -- anything else (Unix) → "not_publicly_routable".
+          -- HostAddress6 is stored as four big-endian Word32s; the first byte of
+          -- the IPv6 address is the most-significant byte of the first Word32.
+          networkLabel = case addr of
+            SockAddrInet _ _              -> "ipv4"
+            SockAddrInet6 _ _ (w1,_,_,_) _
+              | w1 .&. 0xff000000 == 0xfc000000 -> "cjdns"
+              | otherwise                        -> "ipv6"
+            _                             -> "not_publicly_routable"
       in pairs $
            pair "id"                      (AE.int idx)                                  <>
            pair "addr"                    (text (T.pack (show addr)))                   <>
-           pair "network"                 (text "ipv4")                                 <>
+           pair "network"                 (text networkLabel)                            <>
            pair "services"                (text (T.pack (printf "%016x" services)))     <>
            pair "servicesnames"           (AE.list text serviceNames)                   <>
            pair "relaytxes"               (AE.bool (piRelay info))                      <>
@@ -8977,16 +8984,12 @@ handleGetMempoolEntry server params = do
                   enc = pairs $
                           pair "vsize"              (AE.int (meSize entry))                           <>
                           pair "weight"             (AE.int weight)                                   <>
-                          pair "fee"                (btcAmountEnc feeSat)                             <>
-                          pair "modifiedfee"        (btcAmountEnc feeSat)                             <>
                           pair "time"               (AE.int64 (meTime entry))                         <>
                           pair "height"             (AE.word32 (meHeight entry))                      <>
                           pair "descendantcount"    (AE.int descendantCount)                          <>
                           pair "descendantsize"     (AE.int descendantSize)                           <>
-                          pair "descendantfees"     (AE.word64 (fromIntegral descendantFees))         <>
                           pair "ancestorcount"      (AE.int ancestorCount)                            <>
                           pair "ancestorsize"       (AE.int ancestorSize)                             <>
-                          pair "ancestorfees"       (AE.word64 (fromIntegral ancestorFees))           <>
                           pair "wtxid"              (text (showHash (BlockHash (getTxIdHash (computeWtxId (meTransaction entry)))))) <>
                           pair "fees"               feesEnc                                           <>
                           pair "depends"            (AE.list text depends)                            <>
