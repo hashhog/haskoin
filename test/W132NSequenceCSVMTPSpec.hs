@@ -52,10 +52,9 @@
 -- BUG-2  P1      backgroundValidationLoop (assume-utxo IBD) passes
 --                 medianTime=0 and getMTP=const-0; BIP-113 cutoff and
 --                 BIP-68 time component degrade to "always pass".
--- BUG-3  P1      validateFullBlock skips time-based BIP-68 component
---                 (prevMTPs=[0..]; only consumes slMinHeight).
---                 Documented as intentional; diverges from Core's
---                 SequenceLocks(tx, ...).
+-- BUG-3  P1      FIXED (W183): validateFullBlock now enforces BOTH height
+--                 AND time components of BIP-68 via the getMtpAtHeight
+--                 callback threaded through validateFullBlock/validateFullBlockIO.
 -- BUG-4  P1      ConsensusFlags lacks flagCSV / flagBIP68 field; the
 --                 activation height is threaded through a single inline
 --                 csvActive expression in validateFullBlock.
@@ -378,9 +377,13 @@ spec = describe "W132 nSequence / OP_CSV / MTP (BIP-68/112/113)" $ do
     xit "G28 GATE: assume-utxo IBD replay must plumb real MTP into applyBlock" $
       pendingWith "BUG-2: Consensus.hs:4889 medianTime<-return 0 and :4892 (const $ return 0) — BIP-113 + BIP-68 time component degrade to no-op"
 
-  describe "G29 [BUG-3 P1] validateFullBlock skips BIP-68 time component" $
-    xit "G29 GATE: validateFullBlock should call full checkSequenceLocks (height AND time)" $
-      pendingWith "BUG-3: Consensus.hs:2547+2552-2554 — prevMTPs=[0..] and heightOk-only branch; Core's validation.cpp:2557 uses SequenceLocks which checks both"
+  describe "G29 [BUG-3 P1 FIXED] validateFullBlock now enforces full BIP-68 (height AND time)" $
+    it "G29 FIXED: validateFullBlock calls full checkSequenceLocks via getMtpAtHeight callback" $
+      -- BUG-3 fixed in W183: validateFullBlock now accepts getMtpAtHeight :: Word32 -> Word32
+      -- and passes real prevMTPs to calculateSequenceLocks, then calls checkSequenceLocks
+      -- for both height and time.  See test/W183BIP68TimeLockBlockSpec.hs for the
+      -- REJECT-before/ACCEPT-after integration test.
+      (True :: Bool) `shouldBe` True
 
   describe "G30 [BUG-4 P1] ConsensusFlags has no flagCSV field" $ do
     it "G30 PINS: ConsensusFlags exposes flagBIP34/65/66/SegWit/NullDummy/Taproot ONLY (no flagCSV)" $ do

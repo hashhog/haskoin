@@ -400,7 +400,11 @@ blockProcessor bd = forever $ do
                   -- guard) then validateFullBlock (all other consensus checks) so
                   -- that both the IBD arm and submitBlock share identical coverage.
                   -- Reference: Bitcoin Core ConnectBlock / IsBIP30Repeat().
-                  validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs skipScripts block utxoMap
+                  -- getMtp supplies per-input MTP-at-height for the BIP-68 time
+                  -- component (W183 fix).  heightMap + blockEntries are already
+                  -- in scope (read above) and are backed by the persistent store.
+                  let getMtp = getMtpAtHeightFromEntries blockEntries heightMap
+                  validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs getMtp skipScripts block utxoMap
 
                   case validationResult of
                     Left err -> do

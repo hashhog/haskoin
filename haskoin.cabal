@@ -167,6 +167,7 @@ test-suite haskoin-test
                , W130BIP125FeeBumperRule3Spec
                , W131DescriptorsMiniscriptSpec
                , W132NSequenceCSVMTPSpec
+               , W183BIP68TimeLockBlockSpec
                , W133IndexDatabasesSpec
                , W134BIP37BloomFilterSpec
                , W135StandardnessSpec
