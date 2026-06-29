@@ -180,6 +180,7 @@ module Haskoin.Consensus
   , bip68VersionActive
   , checkSequenceLocks
   , bip68Active
+  , getMtpAtHeightFromEntries
     -- * BIP9 Version Bits (Soft Fork Deployment)
   , ThresholdState(..)
   , Deployment(..)
@@ -1920,6 +1921,49 @@ checkSequenceLocks blockHeight prevBlockMTP lock =
       timeOk   = slMinTime lock < 0 || fromIntegral prevBlockMTP > slMinTime lock
   in heightOk && timeOk
 
+-- | Compute the median time past at height @h@ from the in-memory header chain.
+--
+-- The header chain (hcEntries / hcByHeight) is rebuilt from the PERSISTENT
+-- RocksDB store at startup (PrefixBlockHeight + PrefixBlockHeader scans in
+-- Main.hs loadHeaderChainFromDB) and is kept in sync with every block connect.
+-- Using it here gives persistent-store semantics — correct during IBD and
+-- after restart — without requiring IO at the call site.
+--
+-- Fast path (O(1)): byHeight[h] → entries[hash] → ceMedianTime, where
+-- ceMedianTime is the pre-computed partial-walk median stamped at header-insert
+-- time by 'computeEntryMtp'.
+--
+-- Defensive fallback (missing entry — should not occur on a well-formed chain):
+-- walk up to 11 ancestors by descending height, collect raw timestamps, take
+-- the median of what was collected.  NEVER returns 0: even a single ancestor
+-- has a positive Unix timestamp.
+--
+-- This mirrors Core's GetMedianTimePast (bitcoin-core/src/chain.h:233-244)
+-- which also collects up to 11 ancestors and returns the median of however
+-- many it found.
+getMtpAtHeightFromEntries
+  :: Map BlockHash ChainEntry  -- ^ hcEntries (loaded from PrefixBlockHeader)
+  -> Map Word32  BlockHash     -- ^ hcByHeight (loaded from PrefixBlockHeight)
+  -> Word32                    -- ^ target height
+  -> Word32
+getMtpAtHeightFromEntries entries byHeight h =
+  case Map.lookup h byHeight >>= (`Map.lookup` entries) of
+    Just ce -> ceMedianTime ce   -- pre-computed; always positive for valid blocks
+    Nothing ->
+      -- Defensive partial walk: collect up to 11 timestamps via height index,
+      -- take median.  Never returns 0 (all block timestamps are positive).
+      let timestamps = collect h 11
+      in case sort timestamps of
+           []     -> 1  -- impossible on a well-formed chain; 1 is safe sentinel
+           sorted -> sorted !! (length sorted `div` 2)
+  where
+    collect _ 0    = []
+    collect curH n =
+      case Map.lookup curH byHeight >>= (`Map.lookup` entries) of
+        Nothing -> []
+        Just ce -> bhTimestamp (ceHeader ce)
+                 : (if curH == 0 then [] else collect (curH - 1) (n - 1))
+
 --------------------------------------------------------------------------------
 -- BIP9 Version Bits (Soft Fork Deployment)
 --------------------------------------------------------------------------------
@@ -2705,9 +2749,9 @@ isFinalTxCheck tx blockHeight blockTime
 -- validation (@ConnectBlock@) runs only during @ActivateBestChainStep@
 -- against the fork-point UTXO view rebuilt by @DisconnectBlock@.
 -- All callers that validate against a real UTXO view pass @False@.
-validateFullBlock :: Network -> ChainState -> Bool -> Bool -> Block -> Map OutPoint Coin
+validateFullBlock :: Network -> ChainState -> (Word32 -> Word32) -> Bool -> Bool -> Block -> Map OutPoint Coin
                  -> Either String ()
-validateFullBlock net cs skipScripts skipConnectChecks block utxoCoinMap = do
+validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxoCoinMap = do
   let height = csHeight cs + 1
       header = blockHeader block
       txns = blockTxns block
@@ -2867,21 +2911,18 @@ validateFullBlock net cs skipScripts skipConnectChecks block utxoCoinMap = do
       -- existed, but a fresh IBD on this binary will wedge at the first
       -- post-CSV block carrying a time-based BIP-68 input.
       --
-      -- Until per-input MTP-at-height is plumbed through, the safe
-      -- parity-with-Core behaviour is to skip the time-based branch here
-      -- and rely on BIP-112 (OP_CSV) inside the script interpreter — which
-      -- has full per-tx context and already runs for every input.
-      -- Height-based locks remain enforced: `coinHeight` from the UTXO row
-      -- is correct for both external and intra-block prevouts, so the
-      -- height comparison is byte-for-byte the same as Core.
+      -- FIX (W183): enforce BOTH height AND time components of BIP-68 here,
+      -- matching Bitcoin Core's SequenceLocks / EvaluateSequenceLocks in
+      -- validation.cpp:2549-2561.  Per-input MTP is computed via the
+      -- getMtpAtHeight callback which reads from the in-memory header chain
+      -- (loaded from RocksDB at startup — persistent-store semantics, never
+      -- empty post-restart).  Core uses chain[max(coinHeight-1,0)]->
+      -- GetMedianTimePast(); we mirror that exactly.
       --
-      -- Reference: clearbit's matching resolution (clearbit 44454c1,
-      -- src/validation.zig) and rustoshi's matching resolution (this wave).
-      -- Cross-impl audit:
-      -- CORE-PARITY-AUDIT/_ibd-context-wiring-cross-impl-2026-05-05.md.
-      -- Bitcoin Core split: validation.cpp::CheckSequenceLocks (full
-      -- chain-access path) + script/interpreter.cpp OP_CSV (script-eval
-      -- with full per-tx sighash context).
+      -- Bitcoin Core reference: validation.cpp ConnectBlock ~2549-2561:
+      --   prevheights[j] = coin.nHeight;
+      --   if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex))
+      --     state.Invalid(..., "bad-txns-nonfinal", ...);
       let prevBlockMTP = csMedianTime cs
           go :: Map OutPoint Word32 -> [Tx] -> Either String ()
           go _ [] = Right ()
@@ -2895,11 +2936,9 @@ validateFullBlock net cs skipScripts skipConnectChecks block utxoCoinMap = do
                       ]
                 go (Map.union newOuts intrablockHeights) rest
             | otherwise = do
-                -- Build prevHeights for the BIP-68 height-based check.  We
-                -- pass MTP=0 for every input because we ONLY consume
-                -- `slMinHeight` from the resulting `SequenceLock`; the
-                -- time-based component is deferred to OP_CSV (see comment
-                -- above).
+                -- Build prevHeights and prevMTPs for the full BIP-68 check.
+                -- prevMTPs[i] = MTP of block at max(coinHeight - 1, 0), matching
+                -- Core's CalculateSequenceLocks (consensus/tx_verify.cpp:74-90).
                 let prevHeights = map (\inp ->
                       let op = txInPrevOutput inp
                       in case Map.lookup op utxoCoinMap of
@@ -2908,14 +2947,13 @@ validateFullBlock net cs skipScripts skipConnectChecks block utxoCoinMap = do
                              Just ih  -> ih
                              Nothing  -> height -- missing UTXO: fail elsewhere
                       ) (txInputs tx)
-                    prevMTPs    = map (const 0) prevHeights -- unused (height-only gate)
+                    prevMTPs = map (\h -> getMtpAtHeight (if h == 0 then 0 else h - 1))
+                                   prevHeights
                     enforceBIP68 = bip68Active net height
                     lock = calculateSequenceLocks tx prevHeights prevMTPs enforceBIP68
-                    -- Height-only check: ignore `slMinTime` (see comment
-                    -- above).  Mirrors `checkSequenceLocks` heightOk branch.
-                    heightOk = slMinHeight lock < 0
-                            || fromIntegral height > slMinHeight lock
-                unless heightOk $
+                -- Full height AND time check, mirroring Core EvaluateSequenceLocks
+                -- (consensus/tx_verify.cpp:97-105).
+                unless (checkSequenceLocks height prevBlockMTP lock) $
                   Left "bad-txns-nonfinal"
                 -- Add this tx's outputs to intra-block height map.
                 let txid = computeTxId tx
@@ -3050,13 +3088,13 @@ checkBIP30 db net height block = do
 --
 -- Reference: Bitcoin Core ConnectBlock() order — IsBIP30Repeat() fires before
 -- any UTXO mutation at validation.cpp.
-validateFullBlockIO :: HaskoinDB -> Network -> ChainState -> Bool -> Block
+validateFullBlockIO :: HaskoinDB -> Network -> ChainState -> (Word32 -> Word32) -> Bool -> Block
                    -> Map OutPoint Coin -> IO (Either String ())
-validateFullBlockIO db net cs skipScripts block utxoCoinMap = do
+validateFullBlockIO db net cs getMtpAtHeight skipScripts block utxoCoinMap = do
   bip30Result <- checkBIP30 db net (csHeight cs + 1) block
   case bip30Result of
     Left err -> return (Left err)
-    Right () -> return $ validateFullBlock net cs skipScripts False block utxoCoinMap
+    Right () -> return $ validateFullBlock net cs getMtpAtHeight skipScripts False block utxoCoinMap
 
 -- | Convert ConsensusFlags to a Word32 for use as a cache key.
 consensusFlagsToWord32 :: ConsensusFlags -> Word32
@@ -5897,6 +5935,11 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       -- as the pre-fix 'connectChain' fed 'prevBlockMTP'.  Read it from
       -- the header chain (medianTime is stamped at header insert).
       parentMTP <- reorgPrevMtp hc ce
+      -- Read header chain for per-input MTP lookups (BIP-68 time enforcement).
+      -- hcEntries / hcByHeight are loaded from the persistent store at startup
+      -- and kept in sync — safe to snapshot here before the validateFullBlock call.
+      entriesRC  <- readTVarIO (hcEntries hc)
+      byHeightRC <- readTVarIO (hcByHeight hc)
       -- REORG SCRIPT VERIFICATION (Core parity): full validation incl.
       -- per-input verifyScriptWithFlags under getBlockScriptFlags,
       -- BEFORE building the connect ops — a heavier fork whose scripts
@@ -5904,7 +5947,8 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader blk))
                           0 parentMTP
                           (getBlockScriptFlags net bh (ceHeight ce))
-      case validateFullBlock net cs False False blk spentUtxos of
+          getMtp = getMtpAtHeightFromEntries entriesRC byHeightRC
+      case validateFullBlock net cs getMtp False False blk spentUtxos of
         Left err -> return $ Left $
           "reorg connect: block " ++ show bh
           ++ " (height " ++ show (ceHeight ce)
@@ -6150,16 +6194,19 @@ connectChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
              -> BlockHash -> BlockHash -> IO (Either String ())
 connectChain net cache db hc fromHash toHash = do
   -- Build list of blocks to connect (from fork to new tip)
-  entries <- readTVarIO (hcEntries hc)
+  entries  <- readTVarIO (hcEntries hc)
+  byHeight <- readTVarIO (hcByHeight hc)
   let path = buildPath entries toHash fromHash []
-      -- Helper to look up MTP for a given height
+      -- getMtpCC: pure per-height MTP lookup for BIP-68 enforcement in
+      -- validateFullBlock.  Reads from persistent-store-backed hcEntries.
+      getMtpCC = getMtpAtHeightFromEntries entries byHeight
+      -- getMTP: IO wrapper used by applyBlock (Word32 -> IO Word32 signature).
+      -- Re-reads TVars so it reflects any concurrent inserts during the loop.
       getMTP :: Word32 -> IO Word32
       getMTP h = do
-        ents <- readTVarIO (hcEntries hc)
-        byHeight <- readTVarIO (hcByHeight hc)
-        case Map.lookup h byHeight >>= (`Map.lookup` ents) of
-          Just ce -> return $ ceMedianTime ce
-          Nothing -> return 0  -- Fallback for missing data
+        ents    <- readTVarIO (hcEntries hc)
+        heights <- readTVarIO (hcByHeight hc)
+        return $ getMtpAtHeightFromEntries ents heights h
   results <- forM path $ \ce -> do
     mBlock <- getBlock db (ceHash ce)
     case mBlock of
@@ -6187,7 +6234,7 @@ connectChain net cache db hc fromHash toHash = do
             let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader block))
                                 0 prevBlockMTP
                                 (getBlockScriptFlags net (ceHash ce) (ceHeight ce))
-            case validateFullBlock net cs False False block spentCoins of
+            case validateFullBlock net cs getMtpCC False False block spentCoins of
               Left err -> return $ Left $
                 "reorg connect: block " ++ show (ceHash ce)
                 ++ " (height " ++ show (ceHeight ce)
