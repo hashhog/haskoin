@@ -4065,18 +4065,21 @@ disconnectBlockAt db height block prevHash = do
 --------------------------------------------------------------------------------
 
 -- | Maximum number of blocks that can be reorganised in a single
--- side-branch reorg.  Mirrors Core's @MAX_REORG_DEPTH@-equivalent
--- guard in @ActivateBestChain@ + the cross-impl cap landed in
--- nimrod / camlcoin / rustoshi during the 2026-05 Pattern D wave.
+-- side-branch reorg.  This is an implementation-specific memory-safety
+-- bound: the entire reorg (disconnect + connect) is staged into ONE
+-- in-memory RocksDB batch before a single @writeBatch@ call.  Bitcoin
+-- Core has NO reorg-depth cap — Core's @ActivateBestChain@ follows
+-- most-work bounded only by undo-data availability.  288 is chosen to
+-- match Core's @MIN_BLOCKS_TO_KEEP@ (the minimum pruned-node undo
+-- retention), ensuring this limit never fires on a network that is
+-- operating within Core's pruned-node assumptions.
 --
 -- The cap is enforced on the SUM of the disconnect + connect lists:
--- a 50-block disconnect followed by a 60-block connect would be
--- rejected at 110 > 100.  Reorgs deeper than this surface as
--- "inconclusive" and require operator intervention
--- (@reconsiderblock@) — same shape Core uses when @ActivateBestChain@
--- bails on an oversized reorg.
+-- a 150-block disconnect followed by a 140-block connect would be
+-- rejected at 290 > 288.  Reorgs deeper than this require operator
+-- intervention (@reconsiderblock@) to process in pieces.
 maxReorgDepth :: Int
-maxReorgDepth = 100
+maxReorgDepth = 288
 
 -- | Pure batch-op builder for a connect-block step.  Computes the
 -- exact same RocksDB ops 'connectBlock' would write, but returns
