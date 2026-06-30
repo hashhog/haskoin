@@ -107,6 +107,7 @@ module Haskoin.Consensus
   , countBlockSigops
   , countTxSigops
   , countScriptSigops
+  , countSigopsBytes
   , getLegacySigOpCount
     -- * Witness Commitment
   , checkWitnessMalleation
@@ -285,7 +286,7 @@ import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       Block(..), putVarInt, putVarBytes)
 import Haskoin.Crypto (doubleSHA256, sha256, computeTxId, computeBlockHash,
                        initGlobalSigCache, lookupGlobalSigCache, insertGlobalSigCache)
-import Haskoin.Script (decodeScript, countScriptSigops,
+import Haskoin.Script (decodeScript, countScriptSigops, countSigopsBytes,
                        ScriptVerifyFlag(..), ScriptFlags, flagSet,
                        verifyScriptWithFlags, isPushOnly, classifyOutput,
                        ScriptType(..), Script(..), ScriptOp(..))
@@ -2528,20 +2529,15 @@ getTransactionSigOpCost tx utxoMap flags =
 -- Reference: Bitcoin Core GetLegacySigOpCount()
 getLegacySigOpCount :: Tx -> Int
 getLegacySigOpCount tx =
-  let -- Sigops in all scriptSig fields
-      scriptSigSigops = sum $ map inputScriptSigops (txInputs tx)
-      -- Sigops in all scriptPubKey fields (outputs)
-      scriptPubKeySigops = sum $ map outputScriptSigops (txOutputs tx)
+  -- Mirror Bitcoin Core GetLegacySigOpCount (consensus/tx_verify.cpp:112-124):
+  -- count sigops in all scriptSig + scriptPubKey bytes using the byte-level
+  -- walker (countSigopsBytes), which matches Core's CScript::GetSigOpCount
+  -- (script/script.cpp:158-180). On a truncated push Core breaks and returns
+  -- the accumulated count (NOT 0); the old decodeScript Left->0 pattern
+  -- silently undercounted malformed scripts, enabling a false-accept chain split.
+  let scriptSigSigops    = sum $ map (\inp -> countSigopsBytes (txInScript inp)  False) (txInputs tx)
+      scriptPubKeySigops = sum $ map (\out -> countSigopsBytes (txOutScript out) False) (txOutputs tx)
   in scriptSigSigops + scriptPubKeySigops
-  where
-    inputScriptSigops inp =
-      case decodeScript (txInScript inp) of
-        Right s -> countScriptSigops s False  -- inaccurate (false)
-        Left _  -> 0
-    outputScriptSigops out =
-      case decodeScript (txOutScript out) of
-        Right s -> countScriptSigops s False  -- inaccurate (false)
-        Left _  -> 0
 
 -- | Count P2SH sigops with WITNESS_SCALE_FACTOR.
 -- Only counts sigops in the redeem script for P2SH inputs.
@@ -2561,13 +2557,13 @@ getP2SHSigOpCost tx utxoMap flags
             Right scriptPubKey ->
               case classifyOutput scriptPubKey of
                 P2SH _ ->
-                  -- Extract redeem script from scriptSig (last push data)
+                  -- Extract redeem script from scriptSig (last push data).
+                  -- Count sigops in the redeem script bytes using the byte-level
+                  -- walker: Core's subscript.GetSigOpCount(true) also byte-walks
+                  -- and does NOT return 0 on malformed trailing bytes.
                   case getRedeemScript (txInScript inp) of
-                    Just redeemScript ->
-                      case decodeScript redeemScript of
-                        Right rs -> countScriptSigops rs True  -- accurate counting
-                        Left _   -> 0
-                    Nothing -> 0
+                    Just redeemScript -> countSigopsBytes redeemScript True
+                    Nothing           -> 0
                 _ -> 0
             Left _ -> 0
 
@@ -2613,12 +2609,12 @@ countWitnessSigOps scriptSigBytes scriptPubKeyBytes witness =
         -- Direct witness output (P2WPKH or P2WSH)
         P2WPKH _ -> 1  -- P2WPKH always counts as 1 sigop
         P2WSH _ ->
-          -- For P2WSH, count sigops in the witness script (last witness item)
+          -- For P2WSH, count sigops in the witness script (last witness item).
+          -- Use countSigopsBytes so that a malformed witness script contributes
+          -- its partial prefix count (not 0), matching Core CountWitnessSigOps.
           if null witness
           then 0
-          else case decodeScript (last witness) of
-                 Right ws -> countScriptSigops ws True  -- accurate counting
-                 Left _   -> 0
+          else countSigopsBytes (last witness) True
         -- P2SH-wrapped witness (P2SH-P2WPKH or P2SH-P2WSH)
         P2SH _ ->
           -- Check if this is a P2SH-wrapped witness program
@@ -2629,11 +2625,11 @@ countWitnessSigOps scriptSigBytes scriptPubKeyBytes witness =
                   case classifyOutput redeemScript of
                     P2WPKH _ -> 1  -- P2SH-P2WPKH counts as 1
                     P2WSH _ ->
+                      -- Same partial-count fix for the witness script in
+                      -- P2SH-P2WSH: byte-walk, don't short-circuit on failure.
                       if null witness
                       then 0
-                      else case decodeScript (last witness) of
-                             Right ws -> countScriptSigops ws True
-                             Left _   -> 0
+                      else countSigopsBytes (last witness) True
                     _ -> 0  -- Not a witness program
                 Left _ -> 0
             Nothing -> 0
@@ -2839,8 +2835,14 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
   unless (computedRoot == bhMerkleRoot header) $ Left "Merkle root mismatch"
   when merkleMutated $ Left "bad-txns-duplicate"
 
-  -- 4. Check block weight (only after SegWit activation)
-  when (flagSegWit flags && blockWeight block > maxBlockWeight) $
+  -- 4. Check block weight (unconditional -- Bitcoin Core validation.cpp:4179).
+  -- Core's bad-blk-weight check is NOT gated on segwit activation; the weight
+  -- formula naturally equals base-size * WITNESS_SCALE_FACTOR for pre-segwit
+  -- blocks (no witness data), so non-segwit blocks pass trivially as long as
+  -- they fit within 1MB (base size ≤ 1,000,000 bytes means weight ≤ 4,000,000).
+  -- Removing the flagSegWit guard closes a false-accept where a pre-segwit
+  -- block with oversized base data was not weight-checked at all.
+  when (blockWeight block > maxBlockWeight) $
     Left "Block exceeds maximum weight"
 
   -- 5. BIP-34: coinbase scriptSig must start with byte-exact canonical encoding

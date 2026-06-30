@@ -65,6 +65,7 @@ module Haskoin.Script
   , taprootControlMaxSize
     -- * Sigop Counting
   , countScriptSigops
+  , countSigopsBytes
     -- * Witness Program Detection
   , isWitnessProgram
     -- * Push-Only Check
@@ -3323,10 +3324,13 @@ countScriptSigops (Script ops) accurate = go ops 0 Nothing
         in go rest (acc + keyCount) (Just op)
       _ -> go rest acc (Just op)
 
-    -- Get the numeric value from a small number opcode for accurate multisig counting
+    -- Get the numeric value from a small number opcode for accurate multisig counting.
+    -- Bitcoin Core (script/script.cpp:172): only OP_1..OP_16 contribute an accurate
+    -- key count; anything else (including OP_0) falls to MAX_PUBKEYS_PER_MULTISIG=20.
+    -- Removing the OP_0->0 arm lets it fall through to the wildcard, fixing the
+    -- undercount: `OP_0 OP_CHECKMULTISIG` must count 20, not 0.
     getPushNum :: ScriptOp -> Int
     getPushNum op = case op of
-      OP_0  -> 0
       OP_1  -> 1
       OP_2  -> 2
       OP_3  -> 3
@@ -3344,6 +3348,74 @@ countScriptSigops (Script ops) accurate = go ops 0 Nothing
       OP_15 -> 15
       OP_16 -> 16
       _     -> 20  -- Default to worst case
+
+-- | Count sigops in raw script bytes, mirroring Bitcoin Core CScript::GetSigOpCount
+-- (script/script.cpp:158-180) byte-by-byte with GetOp.
+--
+-- Critically: on a truncated push (where Core's GetOp returns false), Core BREAKS
+-- out of the loop and returns the count accumulated so far -- NOT 0. The
+-- previous approach (decodeScript Left -> 0) undercounted any script that fails
+-- to fully parse (e.g. two leading OP_CHECKSIGs before a truncated push counts
+-- as 2, not 0).  An attacker could craft a block whose true (Core) sigop cost
+-- exceeds MAX_BLOCK_SIGOPS_COST while this implementation counted ~0, causing a
+-- false-accept chain split.
+--
+-- 'accurate' mirrors Core's fAccurate: when True and the preceding opcode was
+-- OP_1..OP_16, use DecodeOP_N(lastOp) for CHECKMULTISIG; otherwise use 20.
+--
+-- Reference: bitcoin-core/src/script/script.cpp:158-180
+countSigopsBytes :: ByteString -> Bool -> Int
+countSigopsBytes bs accurate = go 0 0 (-1)
+  where
+    n = BS.length bs
+    go :: Int -> Int -> Int -> Int
+    go pos acc lastOp
+      | pos >= n = acc
+      | otherwise =
+          let b  = fromIntegral (BS.index bs pos) :: Int
+              p1 = pos + 1
+          -- Push opcodes with inline data: skip data bytes.
+          -- On truncated push (insufficient bytes) Core's GetOp returns false ->
+          -- break and return the count accumulated so far.
+          in if b >= 0x01 && b <= 0x4b
+             then -- direct N-byte push
+               let end = p1 + b
+               in if end > n then acc else go end acc b
+             else case b of
+               0x4c ->  -- OP_PUSHDATA1: 1-byte length prefix
+                 if p1 >= n then acc
+                 else let dlen = fromIntegral (BS.index bs p1) :: Int
+                          end  = p1 + 1 + dlen
+                      in if end > n then acc else go end acc b
+               0x4d ->  -- OP_PUSHDATA2: 2-byte little-endian length prefix
+                 if p1 + 1 >= n then acc
+                 else let lo   = fromIntegral (BS.index bs p1)       :: Int
+                          hi   = fromIntegral (BS.index bs (p1 + 1)) :: Int
+                          dlen = lo + hi * 256
+                          end  = p1 + 2 + dlen
+                      in if end > n then acc else go end acc b
+               0x4e ->  -- OP_PUSHDATA4: 4-byte little-endian length prefix
+                 if p1 + 3 >= n then acc
+                 else let b0   = fromIntegral (BS.index bs p1)       :: Int
+                          b1'  = fromIntegral (BS.index bs (p1 + 1)) :: Int
+                          b2   = fromIntegral (BS.index bs (p1 + 2)) :: Int
+                          b3   = fromIntegral (BS.index bs (p1 + 3)) :: Int
+                          dlen = b0 + b1' * 256 + b2 * 65536 + b3 * 16777216
+                          end  = p1 + 4 + dlen
+                      in if end > n then acc else go end acc b
+               0xac -> go p1 (acc + 1) b  -- OP_CHECKSIG
+               0xad -> go p1 (acc + 1) b  -- OP_CHECKSIGVERIFY
+               0xae ->  -- OP_CHECKMULTISIG
+                 let kc = if accurate && lastOp >= 0x51 && lastOp <= 0x60
+                           then lastOp - 0x51 + 1  -- DecodeOP_N: OP_1=1..OP_16=16
+                           else 20                  -- MAX_PUBKEYS_PER_MULTISIG
+                 in go p1 (acc + kc) b
+               0xaf ->  -- OP_CHECKMULTISIGVERIFY
+                 let kc = if accurate && lastOp >= 0x51 && lastOp <= 0x60
+                           then lastOp - 0x51 + 1
+                           else 20
+                 in go p1 (acc + kc) b
+               _    -> go p1 acc b  -- any other opcode: no sigops, no push skip
 
 --------------------------------------------------------------------------------
 -- Miniscript: A Structured Subset of Bitcoin Script
