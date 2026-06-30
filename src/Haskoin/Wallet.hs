@@ -4913,7 +4913,7 @@ computeSegwitSighash tx inputIdx script value shType =
       -- For P2WPKH, scriptCode is: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
       pkh = BS.take 20 (BS.drop 2 script)
       scriptCode = BS.pack [0x76, 0xa9, 0x14] <> pkh <> BS.pack [0x88, 0xac]
-  in txSigHashSegWit tx inputIdx scriptCode value shTypeFlag
+  in txSigHashSegWit tx inputIdx scriptCode value shType shTypeFlag
 
 -- | BIP-143 sighash for a P2SH-P2WPKH spend.  Identical to
 -- 'computeSegwitSighash' except the caller hands us the *redeemScript*
@@ -4932,7 +4932,7 @@ computeSegwitSighashScriptCode tx inputIdx scriptCode value shType =
                                (shType .&. 0x1f == 0x02)
                                (shType .&. 0x1f == 0x03)
                                (shType .&. 0x80 /= 0)
-  in txSigHashSegWit tx inputIdx scriptCode value shTypeFlag
+  in txSigHashSegWit tx inputIdx scriptCode value shType shTypeFlag
 
 -- | Compute the BIP-341 Taproot key-path sighash.
 --
