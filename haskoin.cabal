@@ -197,6 +197,7 @@ test-suite haskoin-test
                , W179P2SHMalleationSpec
                , W181GetPeerInfoFieldsSpec
                , W182ScriptFlagExceptionsSpec
+               , W184SigopPartialCountSpec
                , ConvertJoinPsbtSpec
                , Paths_haskoin
                , Bip21Spec
