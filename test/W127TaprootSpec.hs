@@ -99,13 +99,18 @@ module W127TaprootSpec (spec) where
 import Test.Hspec
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Word (Word8)
+import qualified Data.Set as Set
+import Data.Word (Word8, Word64)
 
+import Haskoin.Types
+  ( Tx(..), TxIn(..), TxOut(..), OutPoint(..), TxId(..), Hash256(..), Hash160(..) )
 import Haskoin.Crypto
   ( taggedHash
   , verifySchnorr
   , xonlyPubkeyTweakAdd
   , computeTapTweakHash
+  , hash160
+  , computeTxId
   )
 import Haskoin.Script
   ( isTapscriptSuccess
@@ -124,6 +129,8 @@ import Haskoin.Script
   , Script(..)
   , ScriptOp(..)
   , PushDataType(..)
+  , ScriptVerifyFlag(..)
+  , verifyScriptWithFlags
   )
 import qualified Haskoin.TaprootSighash as TS
 
@@ -254,23 +261,48 @@ spec = describe "W127 Taproot / Schnorr / Tapscript audit (haskoin)" $ do
           parity `shouldSatisfy` (\p -> p == 0 || p == 1)
         Nothing -> pendingWith "tweak failed for test inputs (would indicate libsecp issue)"
 
-  describe "G17 Taproot rejected inside P2SH wrapper (MISSING — BUG-1)" $ do
-    -- Core: interpreter.cpp:1947 — `witversion == 1 && program.size() ==
-    -- WITNESS_V1_TAPROOT_SIZE && !is_p2sh`.  haskoin: Script.hs:2656-2666
-    -- dispatches verifyTaprootWithFlags regardless of isP2SHWrapped.
-    -- This is a P0-CDIV: chain-split potential if a P2SH-wrapped Taproot
-    -- spend reaches mainnet.
+  describe "G17 P2SH-wrapped v1+32 is anyone-can-spend (BUG-1 fix, Core interpreter.cpp:1947)" $ do
+    -- Core: interpreter.cpp:1947 gates Taproot with `!is_p2sh`.  A P2SH-wrapped
+    -- witness-v1 32-byte program falls to the else at :1992 → returns true
+    -- (forward-softfork anyone-can-spend).  The fix adds `&& not isP2SHWrapped`
+    -- to the v1 guard in Script.hs:2814.
     --
-    -- Sentinel: the fix wave must add `&& not isP2SHWrapped` to the
-    -- ver==1 guard.  When the fix lands, flip this `xit` to `it` and
-    -- assert that verifyScriptWithFlags rejects a P2SH-wrapped Taproot
-    -- with a Schnorr verify failure (i.e. it falls through to the
-    -- upgradable-witness-program arm and returns Right True).
-    xit "BUG-1 (P0-CDIV) Taproot dispatch in verifyWitnessProgram must check !isP2SHWrapped" $
-      pendingWith
-        "BUG-1: Script.hs:2664 dispatches verifyTaprootWithFlags regardless of isP2SHWrapped. \
-        \Core (interpreter.cpp:1947) requires !is_p2sh on the v1 guard. \
-        \Fix: add `&& not isP2SHWrapped` to the case ver of 1 | ... pattern."
+    -- Test construction:
+    --   redeemScript = OP_1 <32 zero-bytes>          (witness v1, 34 bytes)
+    --   scriptPubKey = OP_HASH160 <h160(rs)> OP_EQUAL (P2SH)
+    --   scriptSig    = <push of redeemScript>         (canonical 0x22 push)
+    --   witness      = [[0xde, 0xad]]                 (non-empty garbage: still passes)
+    -- Expected: Right True (anyone-can-spend under the forward-compat rule)
+    it "BUG-1 fix: P2SH-wrapped OP_1 <32 bytes> is anyone-can-spend, not full Taproot" $ do
+      let -- redeemScript: OP_1 (0x51) followed by 32-byte push (0x20 + 32 NON-zero
+          -- bytes). Non-zero matters: this impl evaluates the P2SH redeemScript as a
+          -- script before the witness-program check, so an all-zero 32-byte program
+          -- would push a falsey top element and short-circuit to Right False. A real
+          -- witness program (taproot output key) is never all-zero.
+          rs          = BS.pack (0x51 : 0x20 : replicate 32 0x01)  -- 34 bytes total
+          Hash160 h   = hash160 rs
+          -- P2SH scriptPubKey: OP_HASH160 <20-byte hash> OP_EQUAL
+          spk         = BS.pack [0xa9, 0x14] <> h <> BS.pack [0x87]
+          -- scriptSig: canonical direct push of rs (34 bytes → opcode 0x22)
+          ssig        = BS.pack [0x22] <> rs
+          amount      = 100000 :: Word64
+          -- witness: non-empty garbage (proves witness contents are ignored)
+          wit         = [[BS.pack [0xde, 0xad]]]
+          -- Block-validation flags: P2SH + WITNESS + TAPROOT (no DISCOURAGE_UPGRADABLE)
+          flags       = Set.fromList [VerifyP2SH, VerifyWitness, VerifyTaproot]
+          creditTx    = Tx { txVersion  = 1
+                           , txInputs   = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff)
+                                                (BS.pack [0x00, 0x00]) 0xffffffff]
+                           , txOutputs  = [TxOut amount spk]
+                           , txWitness  = [[]]
+                           , txLockTime = 0 }
+          spendTx     = Tx { txVersion  = 1
+                           , txInputs   = [TxIn (OutPoint (computeTxId creditTx) 0) ssig 0xffffffff]
+                           , txOutputs  = [TxOut amount BS.empty]
+                           , txWitness  = wit
+                           , txLockTime = 0 }
+      verifyScriptWithFlags flags spendTx 0 spk amount [amount] [spk]
+        `shouldBe` Right True
 
   ------------------------------------------------------------------------------
   -- G18-G23: BIP-341 / BIP-342 sighash (PRESENT)

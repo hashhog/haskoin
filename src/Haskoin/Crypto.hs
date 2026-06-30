@@ -1247,10 +1247,21 @@ txSigHash tx inputIdx subScript hashTypeW32 shType =
 
 -- | BIP-143 SegWit sighash computation
 -- Fixes quadratic hashing by pre-computing hash of prevouts, sequences, outputs
-txSigHashSegWit :: Tx -> Int -> ByteString -> Word64 -> SigHashType -> Hash256
-txSigHashSegWit tx inputIdx scriptCode amount shType =
-  let hashTypeW32 = sigHashTypeToWord32 shType
-      -- Hash of all prevouts (unless ANYONECANPAY)
+--
+-- 'rawHashType' is the raw 1-byte hashtype value taken from the trailing byte
+-- of the DER-encoded signature (0x00..0xFF cast to Word32).  BIP-143 §"Semantics
+-- of nHashType" and Core interpreter.cpp:1675 append the raw value as a 4-byte
+-- little-endian integer in the preimage, WITHOUT re-canonicalizing it through
+-- SIGHASH_ALL / SIGHASH_NONE / SIGHASH_SINGLE buckets.  'shType' is still used
+-- for the structural decisions (which prevouts / sequences / outputs to hash).
+--
+-- Using sigHashTypeToWord32 shType here is WRONG: it collapses any undefined
+-- base (e.g. 0x04) to 0x01 (SIGHASH_ALL), producing a different sighash than
+-- the signer computed and causing a false-reject.  Core reference:
+-- interpreter.cpp:1702 (nHashType = vchSig.back()) + 1675 (ss << nHashType).
+txSigHashSegWit :: Tx -> Int -> ByteString -> Word64 -> Word32 -> SigHashType -> Hash256
+txSigHashSegWit tx inputIdx scriptCode amount rawHashType shType =
+  let -- Hash of all prevouts (unless ANYONECANPAY)
       hashPrevouts = if shAnyoneCanPay shType
         then Hash256 (BS.replicate 32 0)
         else doubleSHA256 $ runPut $ mapM_ (putOutPoint . txInPrevOutput) (txInputs tx)
@@ -1277,7 +1288,7 @@ txSigHashSegWit tx inputIdx scriptCode amount shType =
         putWord32le (txInSequence inp)
         putByteString (getHash256 hashOutputs)
         putWord32le (txLockTime tx)
-        putWord32le hashTypeW32
+        putWord32le rawHashType   -- raw byte from sig, NOT re-canonicalized (BIP-143 / Core:1675)
   in doubleSHA256 preimage
 
 --------------------------------------------------------------------------------

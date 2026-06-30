@@ -2087,11 +2087,14 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
                               (seCodeSepPos env'')
                               sigBytes
 
-      -- Compute sighash
+      -- Compute sighash.  For segwit-v0 (BIP-143) the raw hashtype byte is
+      -- appended verbatim (Core interpreter.cpp:1675 `ss << nHashType`); we
+      -- must NOT re-canonicalize it through sigHashTypeToWord32, which would
+      -- collapse e.g. byte 0x04 to 0x01 and produce the wrong hash.
       let sigHashW32 = fromIntegral sigHashByte :: Word32
           _sighash = if seIsWitness env''
                     then txSigHashSegWit (seTx env'') (seInputIdx env'')
-                                         scriptCode (seAmount env'') sigHashType
+                                         scriptCode (seAmount env'') sigHashW32 sigHashType
                     else txSigHash (seTx env'') (seInputIdx env'') scriptCode sigHashW32 sigHashType
 
       -- Signature without the sighash type byte for verification
@@ -2383,9 +2386,11 @@ execCheckMultiSig env = do
                              sigWithoutType = BS.init s
                              sigHashType = parseSigHashByte sigHashByte
                              sigHashW32 = fromIntegral sigHashByte :: Word32
+                             -- Pass raw sigHashW32 (not re-canonicalized shType) for the
+                             -- BIP-143 preimage; mirrors Core interpreter.cpp:1675.
                              sighash = if seIsWitness env5
                                        then txSigHashSegWit (seTx env5) (seInputIdx env5)
-                                                             baseScriptCode (seAmount env5) sigHashType
+                                                             baseScriptCode (seAmount env5) sigHashW32 sigHashType
                                        else txSigHash (seTx env5) (seInputIdx env5) baseScriptCode sigHashW32 sigHashType
                          in case parsePubKey pk of
                               Nothing -> False
@@ -2811,8 +2816,11 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
                         else if progLen == 32
                           then verifyP2WSHWithFlags flags tx idx (Hash256 prog) amount
                           else Left "Witness program wrong length"
-                    1 | BS.length prog == 32 && hasFlag flags VerifyTaproot ->
-                      -- BIP-341: Taproot witness v1
+                    1 | BS.length prog == 32 && hasFlag flags VerifyTaproot && not isP2SHWrapped ->
+                      -- BIP-341: Taproot witness v1, native only.
+                      -- Core interpreter.cpp:1947 gates with !is_p2sh; a P2SH-wrapped
+                      -- v1+32 program falls through to the unknown-version arm below
+                      -- (forward-softfork anyone-can-spend), matching Core's else at :1992.
                       verifyTaprootWithFlags flags tx idx prog witness amount spentAmounts spentScripts
                     _ -> do
                       -- Unknown witness version
