@@ -157,6 +157,7 @@ import qualified W179P2SHMalleationSpec
 import qualified W181GetPeerInfoFieldsSpec
 import qualified W182ScriptFlagExceptionsSpec
 import qualified W184SigopPartialCountSpec
+import qualified W185SegwitSighashRawHashtypeSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -584,7 +585,7 @@ main = hspec $ do
             -- P2WPKH scriptCode: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
             scriptCode = BS.pack [0x76, 0xa9, 0x14] <> BS.replicate 20 0xff <> BS.pack [0x88, 0xac]
             amount = 1000000 :: Word64
-            Hash256 sighash = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+            Hash256 sighash = txSigHashSegWit tx 0 scriptCode amount 0x01 sigHashAll
         BS.length sighash `shouldBe` 32
 
       it "is deterministic" $ do
@@ -594,8 +595,8 @@ main = hspec $ do
             tx = Tx 2 [txIn] [txOut] [[]] 0
             scriptCode = BS.replicate 25 0xaa
             amount = 600000 :: Word64
-            Hash256 hash1 = txSigHashSegWit tx 0 scriptCode amount sigHashAll
-            Hash256 hash2 = txSigHashSegWit tx 0 scriptCode amount sigHashAll
+            Hash256 hash1 = txSigHashSegWit tx 0 scriptCode amount 0x01 sigHashAll
+            Hash256 hash2 = txSigHashSegWit tx 0 scriptCode amount 0x01 sigHashAll
         hash1 `shouldBe` hash2
 
       it "produces different hashes for different amounts" $ do
@@ -604,8 +605,8 @@ main = hspec $ do
             txOut = TxOut 500000 ""
             tx = Tx 2 [txIn] [txOut] [[]] 0
             scriptCode = BS.replicate 25 0xbb
-            Hash256 hash1 = txSigHashSegWit tx 0 scriptCode 1000000 sigHashAll
-            Hash256 hash2 = txSigHashSegWit tx 0 scriptCode 2000000 sigHashAll
+            Hash256 hash1 = txSigHashSegWit tx 0 scriptCode 1000000 0x01 sigHashAll
+            Hash256 hash2 = txSigHashSegWit tx 0 scriptCode 2000000 0x01 sigHashAll
         hash1 `shouldNotBe` hash2
 
       it "different sighash types produce different hashes" $ do
@@ -615,9 +616,9 @@ main = hspec $ do
             tx = Tx 2 [txIn] [txOut] [[]] 0
             scriptCode = BS.replicate 25 0xcc
             amount = 600000 :: Word64
-            Hash256 hashAll = txSigHashSegWit tx 0 scriptCode amount sigHashAll
-            Hash256 hashNone = txSigHashSegWit tx 0 scriptCode amount sigHashNone
-            Hash256 hashSingle = txSigHashSegWit tx 0 scriptCode amount sigHashSingle
+            Hash256 hashAll = txSigHashSegWit tx 0 scriptCode amount 0x01 sigHashAll
+            Hash256 hashNone = txSigHashSegWit tx 0 scriptCode amount 0x02 sigHashNone
+            Hash256 hashSingle = txSigHashSegWit tx 0 scriptCode amount 0x03 sigHashSingle
         hashAll `shouldNotBe` hashNone
         hashAll `shouldNotBe` hashSingle
         hashNone `shouldNotBe` hashSingle
@@ -631,8 +632,8 @@ main = hspec $ do
             tx = Tx 2 [txIn] [txOut] [[]] 0
             scriptCode = BS.replicate 25 0xdd
             amount = 600000 :: Word64
-            Hash256 hashNormal = txSigHashSegWit tx 0 scriptCode amount sigHashAll
-            Hash256 hashAcp = txSigHashSegWit tx 0 scriptCode amount (sigHashAnyoneCanPay sigHashAll)
+            Hash256 hashNormal = txSigHashSegWit tx 0 scriptCode amount 0x01 sigHashAll
+            Hash256 hashAcp = txSigHashSegWit tx 0 scriptCode amount 0x81 (sigHashAnyoneCanPay sigHashAll)
         hashNormal `shouldNotBe` hashAcp
 
   describe "computeTxId" $ do
@@ -23018,6 +23019,12 @@ main = hspec $ do
   -- (C) MAX_BLOCK_WEIGHT check ungated from segwit activation.
   -- Reference: bitcoin-core/src/script/script.cpp:158-180 + validation.cpp:4179.
   W184SigopPartialCountSpec.spec
+
+  -- W185 BIP-143 segwit-v0 sighash uses raw hashtype byte (not re-canonicalized).
+  -- Core interpreter.cpp:1702 (nHashType = vchSig.back()) + 1675 (ss << nHashType).
+  -- Pre-fix: sigHashTypeToWord32 collapsed 0x04 → 0x01, causing false-reject of
+  -- consensus-valid txs signed with non-canonical hashtype bytes.
+  W185SegwitSighashRawHashtypeSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
