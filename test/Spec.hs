@@ -156,6 +156,7 @@ import qualified W178AddrTimestampClampSpec
 import qualified W179P2SHMalleationSpec
 import qualified W181GetPeerInfoFieldsSpec
 import qualified W182ScriptFlagExceptionsSpec
+import qualified W184SigopPartialCountSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -23009,6 +23010,14 @@ main = hspec $ do
   -- ConsensusFlags override from netScriptFlagExceptions table, matching
   -- Bitcoin Core GetBlockScriptFlags (validation.cpp:2250-2288).
   W182ScriptFlagExceptionsSpec.spec
+
+  -- W184 sigop partial-count parity (3 sub-fixes):
+  -- (A) countSigopsBytes byte-walk returns partial count on truncated push,
+  --     not 0 (getLegacySigOpCount + P2SH + P2WSH witness sites);
+  -- (B) OP_0 OP_CHECKMULTISIG accurate = 20, not 0 (getPushNum wildcard fix);
+  -- (C) MAX_BLOCK_WEIGHT check ungated from segwit activation.
+  -- Reference: bitcoin-core/src/script/script.cpp:158-180 + validation.cpp:4179.
+  W184SigopPartialCountSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
