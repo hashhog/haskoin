@@ -2673,7 +2673,16 @@ evalScriptWithStack stack (Script ops) env = do
                  _ -> e
       -- Execute the opcode
       e'' <- execOp op e'
-      evalWithPosition rest nextPos (opPos + 1) e''
+      -- Core parity: enforce MAX_STACK_SIZE (1000) at the END of EVERY loop
+      -- iteration, INCLUDING pushes (interpreter.cpp:1221-1223 runs
+      -- `if (stack.size()+altstack.size() > MAX_STACK_SIZE)` after the switch,
+      -- with no continue/break in the push branch). Previously the push
+      -- handlers (OP_0/OP_PUSHDATA/OP_1..OP_16) called pushStack without
+      -- checkStackSize, letting the stack silently exceed 1000 — a
+      -- node-accepts / Core-rejects consensus split. Exactly 1000 is OK; 1001
+      -- fails.
+      e''' <- checkStackSize e''
+      evalWithPosition rest nextPos (opPos + 1) e'''
 
 -- | Main script evaluation (without flags, for backward compatibility)
 evalScript :: Tx -> Int -> Word64 -> Script -> Script -> Either String Bool

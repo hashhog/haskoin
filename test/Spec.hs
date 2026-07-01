@@ -159,6 +159,7 @@ import qualified W182ScriptFlagExceptionsSpec
 import qualified W184SigopPartialCountSpec
 import qualified W185SegwitSighashRawHashtypeSpec
 import qualified W186SubmitBlockHeaderValidationSpec
+import qualified W187MaxStackSizePushSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -23033,6 +23034,9 @@ main = hspec $ do
   -- bad-header block corrupted the on-disk best-block pointer and wedged all
   -- subsequent connects (TRUE differential-fuzz finding vs regtest bitcoind).
   W186SubmitBlockHeaderValidationSpec.spec
+
+  -- W187: MAX_STACK_SIZE enforced after PUSH opcodes (Core interpreter.cpp:1221-1223)
+  W187MaxStackSizePushSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
