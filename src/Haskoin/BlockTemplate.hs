@@ -70,6 +70,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            maxBlockWeight, maxBlockSigops, maxBlockSigOpsCost,
                            witnessScaleFactor,
                            txBaseSize, txTotalSize, difficultyAdjustment,
+                           checkProofOfWork,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
                            addHeader, addSideBranchHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
@@ -567,10 +568,24 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           -- Core runs it in ConnectBlock, not AcceptBlock.
           -- skipConnectChecks=True: BIP-68 gate is inside 'unless skipConnectChecks'
           -- so getMtp is never invoked here.  Pass const 0 as a harmless placeholder.
-          let sideBranchResult = validateFullBlock net cs (const 0) False True block Map.empty
-          case sideBranchResult of
-            Left err -> return $ Left $ "Block validation failed: " ++ err
-            Right () -> submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
+          --
+          -- PoW GATE (submitblock consensus-completeness): 'validateFullBlock'
+          -- runs CheckBlock/ContextualCheckBlock but NOT CheckBlockHeader's
+          -- proof-of-work check, and the side-branch persister
+          -- ('addSideBranchHeader') deliberately skips header re-validation.
+          -- Without this gate a bad-PoW side-branch block would be persisted as
+          -- a candidate index entry (mirroring the active-tip hole this fix
+          -- closes).  Reject it here, before 'submitBlockSideBranch' writes
+          -- anything.  Reference: bitcoin-core/src/pow.cpp CheckProofOfWorkImpl,
+          -- run in CheckBlockHeader for EVERY block regardless of which chain it
+          -- extends.
+          if not (checkProofOfWork (blockHeader block) (netPowLimit net))
+            then return $ Left "Block validation failed: high-hash"
+            else do
+              let sideBranchResult = validateFullBlock net cs (const 0) False True block Map.empty
+              case sideBranchResult of
+                Left err -> return $ Left $ "Block validation failed: " ++ err
+                Right () -> submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
         else do
           -- Active-tip arm: full UTXO validation as before.
           -- Build UTXO map for validation. We carry full Core-format
@@ -595,81 +610,117 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           case validationResult of
             Left err -> return $ Left $ "Block validation failed: " ++ err
             Right () -> do
-              -- Apply block to in-memory UTXO cache (drives maturity check + builds
-              -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
-              -- spend an output created earlier in the same session without round-
-              -- tripping through disk.
-              undoResult <- applyBlockToCache cache net block height
-              case undoResult of
-                Left err -> return $ Left err
-                Right _undo -> do
-                  -- Persist UTXOs + undo data + header + height + best-block in a
-                  -- single atomic write batch via 'connectBlock' (the same path
-                  -- IBD uses; see 'Sync.connectBlock' wiring). This is the FIX
-                  -- for dumptxoutset emitting a 0-coin snapshot: 'applyBlockToCache'
-                  -- only mutates STM TVars and never reaches RocksDB, so the
-                  -- legacy PrefixUTXO keyspace stayed empty unless a periodic
-                  -- 'flushCache' ran. dumptxoutset iterates PrefixUTXO directly,
-                  -- so it saw nothing. Routing through connectBlock writes
-                  -- Core-format Coins to PrefixUTXO immediately, which is also
-                  -- the on-disk format 'getUTXOCoin' / 'dumpTxOutSetFromDB'
-                  -- expect. The Coin map carries height/coinbase metadata so the
-                  -- per-block undo record round-trips through 'disconnectBlock'.
-                  --
-                  -- connectBlock also handles per-block undo data (so we drop the
-                  -- separate 'putUndoData'), block-index keys (so we drop
-                  -- 'putBlockHeader' / 'putBlockHeight'), and best-block pointer.
-                  -- The only thing left for us is the full block body and the
-                  -- in-memory header chain update.
-                  --
-                  -- W97/W99-G18: connectBlock now returns Either String ()
-                  -- and refuses to overwrite BestBlock when prevHash does
-                  -- not extend the current tip.  Here we are inside the
-                  -- parent==tip arm (early-exited before reaching here
-                  -- when parent /= tip), so the G1 gate is structurally
-                  -- guaranteed to pass; if it ever fires we surface as
-                  -- Left rather than silently corrupting the tip.
-                  cbR <- connectBlock db net block height utxoMap
-                  case cbR of
-                    Left cbErr -> return $ Left $
-                      "submitBlock connectBlock failed (should be unreachable "
-                      <> "from the parent==tip arm): " <> cbErr
-                    Right () -> do
-                      -- Mirror the connect into any opted-in secondary
-                      -- indexes.  Read the freshly-persisted undo record
-                      -- back from disk so the BlockFilterIndex sees the
-                      -- exact bytes 'disconnectBlock' would; this keeps
-                      -- the GCS filter byte-for-byte compatible with
-                      -- Bitcoin Core's blockfilterindex.cpp output.
-                      case mIdxMgr of
-                        Nothing -> return ()
-                        Just im -> do
-                          mUndo <- getUndoData db bh
-                          case mUndo of
-                            Just undoData ->
-                              indexManagerConnectBlock im block
-                                (udBlockUndo undoData) bh height
+              -- HEADER VALIDATION MUST PRECEDE PERSISTENCE (submitblock/P2P
+              -- unification fix).  'validateFullBlockIO' above runs CheckBlock +
+              -- ContextualCheckBlock (merkle, weight, BIP-34, MTP/time-too-old,
+              -- checkpoint, BIP-30, full UTXO) but it does NOT run
+              -- CheckBlockHeader's proof-of-work check nor the remaining
+              -- ContextualCheckBlockHeader gates (bad-diffbits / time-too-new /
+              -- too-little-chainwork).  Those live ONLY in 'addHeader' — the SAME
+              -- validator the P2P/IBD headers-first path drives.
+              --
+              -- Pre-fix 'addHeader' ran AFTER 'connectBlock' had already persisted
+              -- the block (UTXOs + best-block pointer) and its 'Either' result was
+              -- discarded with 'void'.  A block with valid body but INVALID header
+              -- (bad PoW, wrong nBits, timestamp > now+2h) was therefore committed
+              -- to the on-disk best-block pointer and the RPC returned success
+              -- (JSON null = accept).  That advanced the DB tip WITHOUT advancing
+              -- the in-memory 'hcTip' (addHeader's Left never fired the tip
+              -- update), desyncing the two.  Every subsequent block then failed
+              -- 'connectBlock's G1 gate (hashPrevBlock == view.GetBestBlock(),
+              -- validation.cpp:2333) because the in-memory parent==tip check chose
+              -- the active-tip arm while the DB best-block had moved on — the exact
+              -- "no block at height N+1 connects" wedge, plus a non-deterministic
+              -- accept/reject (null then rejected) for the SAME bad-PoW block
+              -- depending on submit order.
+              --
+              -- Fix: run 'addHeader' HERE, before touching the UTXO cache or the
+              -- DB, and REJECT the submission on its Left.  This routes the
+              -- submitblock path through the identical header consensus checks the
+              -- P2P path uses (rather than a bespoke weaker submitblock check).
+              -- Reference: bitcoin-core/src/validation.cpp CheckBlockHeader (PoW)
+              -- + ContextualCheckBlockHeader (nBits/time) run in AcceptBlockHeader
+              -- BEFORE ConnectBlock; a header failure never reaches ConnectBlock.
+              hdrResult <- addHeader net hc (blockHeader block) False
+              case hdrResult of
+                Left hdrErr -> return $ Left $ "Block validation failed: " ++ hdrErr
+                Right _ -> do
+                  -- Apply block to in-memory UTXO cache (drives maturity check + builds
+                  -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
+                  -- spend an output created earlier in the same session without round-
+                  -- tripping through disk.
+                  undoResult <- applyBlockToCache cache net block height
+                  case undoResult of
+                    Left err -> return $ Left err
+                    Right _undo -> do
+                      -- Persist UTXOs + undo data + header + height + best-block in a
+                      -- single atomic write batch via 'connectBlock' (the same path
+                      -- IBD uses; see 'Sync.connectBlock' wiring). This is the FIX
+                      -- for dumptxoutset emitting a 0-coin snapshot: 'applyBlockToCache'
+                      -- only mutates STM TVars and never reaches RocksDB, so the
+                      -- legacy PrefixUTXO keyspace stayed empty unless a periodic
+                      -- 'flushCache' ran. dumptxoutset iterates PrefixUTXO directly,
+                      -- so it saw nothing. Routing through connectBlock writes
+                      -- Core-format Coins to PrefixUTXO immediately, which is also
+                      -- the on-disk format 'getUTXOCoin' / 'dumpTxOutSetFromDB'
+                      -- expect. The Coin map carries height/coinbase metadata so the
+                      -- per-block undo record round-trips through 'disconnectBlock'.
+                      --
+                      -- connectBlock also handles per-block undo data (so we drop the
+                      -- separate 'putUndoData'), block-index keys (so we drop
+                      -- 'putBlockHeader' / 'putBlockHeight'), and best-block pointer.
+                      -- The only thing left for us is the full block body and the
+                      -- in-memory header chain update.
+                      --
+                      -- W97/W99-G18: connectBlock now returns Either String ()
+                      -- and refuses to overwrite BestBlock when prevHash does
+                      -- not extend the current tip.  Here we are inside the
+                      -- parent==tip arm (early-exited before reaching here
+                      -- when parent /= tip), so the G1 gate is structurally
+                      -- guaranteed to pass; if it ever fires we surface as
+                      -- Left rather than silently corrupting the tip.
+                      cbR <- connectBlock db net block height utxoMap
+                      case cbR of
+                        Left cbErr -> return $ Left $
+                          "submitBlock connectBlock failed (should be unreachable "
+                          <> "from the parent==tip arm): " <> cbErr
+                        Right () -> do
+                          -- Mirror the connect into any opted-in secondary
+                          -- indexes.  Read the freshly-persisted undo record
+                          -- back from disk so the BlockFilterIndex sees the
+                          -- exact bytes 'disconnectBlock' would; this keeps
+                          -- the GCS filter byte-for-byte compatible with
+                          -- Bitcoin Core's blockfilterindex.cpp output.
+                          case mIdxMgr of
                             Nothing -> return ()
+                            Just im -> do
+                              mUndo <- getUndoData db bh
+                              case mUndo of
+                                Just undoData ->
+                                  indexManagerConnectBlock im block
+                                    (udBlockUndo undoData) bh height
+                                Nothing -> return ()
 
-                      -- 2026-05-24: block body is now persisted as part
-                      -- of the 'connectBlock' write batch (Consensus.hs
-                      -- fix for haskoin-chain-state-inconsistency).
-                      -- The standalone 'putBlock' here is therefore
-                      -- redundant; we removed it to avoid a second
-                      -- non-batched write to the same key.
+                          -- 2026-05-24: block body is now persisted as part
+                          -- of the 'connectBlock' write batch (Consensus.hs
+                          -- fix for haskoin-chain-state-inconsistency).
+                          -- The standalone 'putBlock' here is therefore
+                          -- redundant; we removed it to avoid a second
+                          -- non-batched write to the same key.
+                          --
+                          -- NOTE: 'addHeader' (in-memory index + tip update) is
+                          -- now run and CHECKED at the TOP of this arm, before
+                          -- any persistence, so there is no trailing addHeader
+                          -- here.  Because the parent==tip arm connects strictly
+                          -- sequentially and addHeader already advanced hcTip to
+                          -- this block, the in-memory tip and the on-disk
+                          -- best-block are consistent once connectBlock returns.
 
-                      -- Add header to chain (in-memory index + tip update).
-                      -- minPowChecked=False: validateFullBlockIO has already
-                      -- verified PoW, but we still run the too-little-chainwork
-                      -- gate to reject submitblock calls that would import a
-                      -- low-work fork tip (W97 G8).
-                      void $ addHeader net hc (blockHeader block) False
+                          -- Broadcast to peers
+                          let invVec = InvVector InvBlock (getBlockHashHash bh)
+                          broadcastMessage pm $ MInv $ Inv [invVec]
 
-                      -- Broadcast to peers
-                      let invVec = InvVector InvBlock (getBlockHashHash bh)
-                      broadcastMessage pm $ MInv $ Inv [invVec]
-
-                      return $ Right ()
+                          return $ Right ()
 
 -- | Side-branch arm of 'submitBlock'.  Called after context-free +
 -- contextual validation (validateFullBlock with skipConnectChecks=True)

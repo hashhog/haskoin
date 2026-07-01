@@ -158,6 +158,7 @@ import qualified W181GetPeerInfoFieldsSpec
 import qualified W182ScriptFlagExceptionsSpec
 import qualified W184SigopPartialCountSpec
 import qualified W185SegwitSighashRawHashtypeSpec
+import qualified W186SubmitBlockHeaderValidationSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -23025,6 +23026,13 @@ main = hspec $ do
   -- Pre-fix: sigHashTypeToWord32 collapsed 0x04 → 0x01, causing false-reject of
   -- consensus-valid txs signed with non-canonical hashtype bytes.
   W185SegwitSighashRawHashtypeSpec.spec
+
+  -- W186 submitblock must run full header validation (PoW + nBits + time gates)
+  -- BEFORE persisting the block — the same checks the P2P/IBD path runs. Pre-fix
+  -- addHeader ran AFTER connectBlock persisted and its result was voided, so a
+  -- bad-header block corrupted the on-disk best-block pointer and wedged all
+  -- subsequent connects (TRUE differential-fuzz finding vs regtest bitcoind).
+  W186SubmitBlockHeaderValidationSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

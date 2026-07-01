@@ -29,6 +29,10 @@ module Haskoin.Rpc
   , defaultRpcConfig
   , startRpcServer
   , stopRpcServer
+    -- * Regtest miner helpers (exported for testing)
+  , generateSingleBlock
+  , buildRegtestCoinbase
+  , findRegtestNonce
     -- * TLS (HTTPS) configuration — W119 + FIX-64
   , validateTlsConfig
   , rpcTlsSettings
