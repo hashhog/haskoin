@@ -873,7 +873,7 @@ ibdDBConfig :: FilePath -> (FilePath, Bool, Int, Int, Int, Int, Bool)
 ibdDBConfig path =
   ( path
   , True                        -- createIfMissing
-  , 1000                        -- maxOpenFiles
+  , 16384                       -- maxOpenFiles (was 1000: EMFILE under real P2P; matches ouroboros)
   , 256 * 1024 * 1024           -- writeBufferSize: 256 MB during IBD
   , 512 * 1024 * 1024           -- blockCacheSize: 512 MB
   , 10                          -- bloomFilterBits
