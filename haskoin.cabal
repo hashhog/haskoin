@@ -199,6 +199,7 @@ test-suite haskoin-test
                , W182ScriptFlagExceptionsSpec
                , W184SigopPartialCountSpec
                , W185SegwitSighashRawHashtypeSpec
+               , W186SubmitBlockHeaderValidationSpec
                , ConvertJoinPsbtSpec
                , Paths_haskoin
                , Bip21Spec
