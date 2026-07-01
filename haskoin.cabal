@@ -200,6 +200,7 @@ test-suite haskoin-test
                , W184SigopPartialCountSpec
                , W185SegwitSighashRawHashtypeSpec
                , W186SubmitBlockHeaderValidationSpec
+               , W187MaxStackSizePushSpec
                , ConvertJoinPsbtSpec
                , Paths_haskoin
                , Bip21Spec
