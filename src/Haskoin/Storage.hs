@@ -308,7 +308,7 @@ defaultDBConfig :: FilePath -> DBConfig
 defaultDBConfig path = DBConfig
   { dbPath            = path
   , dbCreateIfMissing = True
-  , dbMaxOpenFiles    = 1000
+  , dbMaxOpenFiles    = 16384  -- was 1000: too few for real P2P (many peers x SST fds -> EMFILE, the un-pin blocker); 16384 matches ouroboros's field-proven value
   , dbWriteBufferSize = 64 * 1024 * 1024    -- 64 MB
   , dbBlockCacheSize  = 256 * 1024 * 1024   -- 256 MB
   , dbBloomFilterBits = 10
