@@ -2168,34 +2168,58 @@ safeSendMessage = sendMessage
 -- | Periodically send getheaders to sync the chain
 getheadersSender :: PeerManager -> HeaderChain -> Network -> IO ()
 getheadersSender pm hc _net = do
-  putStrLn "getheadersSender: starting periodic sync..."
-  forever $ do
-    -- Get a fresh peer snapshot each iteration, filtering for connected peers
-    connectedPeers <- getConnectedPeerList pm
-    if null connectedPeers
-      then threadDelay 1000000  -- 1s wait if no peers
-      else do
-        tip <- getChainTip hc
-        -- Use proper exponential-backoff block locator instead of single hash
-        locator <- buildBlockLocatorFromChain hc
-        let finalLocator = if null locator then [ceHash tip] else locator
-            zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
-            getHdrs = GetHeaders
-              { ghVersion  = fromIntegral protocolVersion
-              , ghLocators = finalLocator
-              , ghHashStop = zeroHash
-              }
-        -- Send to ALL connected peers, not just the first one that works
-        -- This way if some peers are stale we still get headers from others
-        sentCount <- sendToAllPeers connectedPeers (MGetHeaders getHdrs)
-        when (sentCount > 0) $
-          putStrLn $ "getheadersSender: requesting headers from height " ++ show (ceHeight tip)
-            ++ " (locator size " ++ show (length finalLocator) ++ ", sent to " ++ show sentCount ++ " peers)"
-        when (sentCount == 0) $
-          putStrLn "getheadersSender: no reachable peers, will retry..."
-
-    -- Wait 5 seconds before next check
-    threadDelay 5000000
+  putStrLn "getheadersSender: starting periodic backstop sync..."
+  -- BACKSTOP, not the primary driver.  The active header chain is driven by
+  -- the MHeaders handler (each full 2000-batch immediately requests the next),
+  -- so this loop only needs to (a) kick off the very first getheaders and
+  -- (b) recover if that chain stalls (a dropped response / silent peer).
+  --
+  -- Pre-fix this sent a getheaders to ALL peers every 5 s unconditionally,
+  -- which — together with the MHeaders re-request firing on duplicate
+  -- batches — produced the getheaders busy-loop that monopolised the peer
+  -- and starved block download.  Mirror Core's MaybeSendGetHeaders
+  -- (net_processing.cpp:2823): do not send a new getheaders while one is
+  -- still "in flight" (sent < HEADERS_RESPONSE_TIME = 2 min ago).  A received
+  -- headers message advances the tip, which we treat as the response arriving
+  -- (Core resets m_last_getheaders_timestamp to {} on receipt), unlocking the
+  -- next backstop probe immediately.
+  let headersResponseTime = 120 :: Int64   -- Core HEADERS_RESPONSE_TIME (2min)
+      loop lastSentT lastPeerCount = do
+        connectedPeers <- getConnectedPeerList pm
+        now <- (round <$> getPOSIXTime :: IO Int64)
+        let peerCount = length connectedPeers
+        -- Don't send while a getheaders is still "in flight" (< 2 min since
+        -- our last one).  The MHeaders handler drives the active chain; this
+        -- only re-probes after a stall, so a fixed 2-min backstop is enough
+        -- and costs one getheaders every 2 min at the tip.  EXCEPTION: a
+        -- newly-connected peer re-arms the probe immediately (Core sends
+        -- getheaders on connect, net_processing.cpp:5809), so a dropped +
+        -- re-dialed connection recovers header sync at once rather than
+        -- waiting out the 2-min backstop.
+        let newPeer = peerCount > lastPeerCount
+            inFlight = now - lastSentT < headersResponseTime && not newPeer
+        (nextT, nextPC) <-
+          if null connectedPeers || inFlight
+            then return (lastSentT, peerCount)
+            else fmap (\t -> (t, peerCount)) $ do
+              tip <- getChainTip hc
+              locator <- buildBlockLocatorFromChain hc
+              let finalLocator = if null locator then [ceHash tip] else locator
+                  zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+                  getHdrs = GetHeaders
+                    { ghVersion  = fromIntegral protocolVersion
+                    , ghLocators = finalLocator
+                    , ghHashStop = zeroHash
+                    }
+              sentCount <- sendToAllPeers connectedPeers (MGetHeaders getHdrs)
+              when (sentCount > 0) $
+                putStrLn $ "getheadersSender: backstop getheaders from height "
+                  ++ show (ceHeight tip) ++ " (locator size " ++ show (length finalLocator)
+                  ++ ", sent to " ++ show sentCount ++ " peers)"
+              return now
+        threadDelay 2000000   -- 2s poll to notice peers / stalls
+        loop nextT nextPC
+  loop 0 0
   where
     -- Send a message to all peers, return count of successful sends
     sendToAllPeers :: [PeerConnection] -> Message -> IO Int
@@ -2598,6 +2622,15 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
     -- "Block header has no valid parent" -> NonContinuousHeaders
     -- "Invalid proof of work" -> InvalidBlockHeader
     pmRefVal <- readIORef pmRef
+    -- Snapshot the active header-tip height BEFORE processing this batch so
+    -- we can tell whether the batch actually EXTENDED our best header chain.
+    -- 'addHeader' returns 'Right' both for genuinely new headers and for
+    -- headers we already have (Consensus.hs:4749 -> Right existing), so the
+    -- 'added' counter below cannot distinguish "made progress" from "peer
+    -- re-sent 2000 headers we already stored".  Core tracks this via
+    -- 'received_new_header' (net_processing.cpp).  We approximate it by the
+    -- header tip advancing.
+    tipBefore <- readTVarIO (hcHeight hc)
     (added, badPow, badConn) <- foldM (\(count, pow, conn) hdr -> do
         result <- addHeader net hc hdr False
         case result of
@@ -2620,6 +2653,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               | otherwise -> return (count, pow, conn)
         ) (0 :: Int, 0 :: Int, 0 :: Int) hdrs
     putStrLn $ "Added " ++ show added ++ " of " ++ show (length hdrs) ++ " headers"
+    tipAfter <- readTVarIO (hcHeight hc)
+    -- Did this batch extend our best header chain (Core's received_new_header)?
+    let progressed = tipAfter > tipBefore
     -- Attribute misbehavior for any rejected headers.  Reference:
     -- bitcoin-core/src/net_processing.cpp ProcessHeadersMessage —
     -- non-continuous batches are scored 100 (immediate ban); each
@@ -2655,19 +2691,43 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
     -- counter (mirrors Core's nUnconnectingHeaders = 0).
     when (added > 0 && badConn == 0) $
       resetUnconnectingHeaders pmRefVal addr
-    -- If we got a full batch (2000), request more headers immediately
-    when (added >= 2000) $ do
+    -- Core net_processing.cpp:3103-3111 (ProcessHeadersMessage): consider
+    -- fetching more headers ONLY when the message was full-size
+    -- (nCount == MAX_HEADERS_RESULTS = 2000 RECEIVED), and only continue the
+    -- chain while it is genuinely extending our best header (received_new_header).
+    --
+    -- Pre-fix this branch fired on 'added >= 2000'.  Because 'addHeader'
+    -- returns 'Right' for headers we already have (Consensus.hs:4749), a
+    -- batch of 2000 pure DUPLICATES scored added==2000 and re-fired the
+    -- request — and the re-request used a SINGLE-hash locator '[ceHash tip]'.
+    -- A single-hash locator the peer cannot place on its active chain makes
+    -- it resend from a lower height, so the very same 2000 headers were
+    -- re-fetched + re-added on a tight loop.  Those endless full batches kept
+    -- 'lastFullBatchAtRef' hot, which keeps the block-gap kicker's
+    -- 'headerSyncActiveKick' gate closed, so BLOCK DOWNLOAD NEVER RAN — the
+    -- re-IBD header-sync starvation (~1-5 blk/min, blocks stuck at 0 while
+    -- headers churned).  Fix, mirroring Core:
+    --   * gate on RECEIVED count (length hdrs == 2000), not 'added';
+    --   * require the batch to have EXTENDED our chain ('progressed'), so a
+    --     non-extending duplicate flood stops the chain (the 120 s
+    --     getheadersSender backstop re-probes if there really is more);
+    --   * anchor the next getheaders at a full EXPONENTIAL locator
+    --     ('buildBlockLocatorFromChain' == Core GetLocator(pindexLast), since
+    --     addHeader has already advanced the tip to the last received header),
+    --     so the peer always resumes exactly past our tip instead of resending.
+    when (length hdrs == 2000 && progressed) $ do
       -- Headers-first: mark bulk header sync as live so the block-gap
       -- kicker and the post-headers requestBlocks below stay deferred.
       nowFull <- (round <$> getPOSIXTime :: IO Int64)
       writeIORef lastFullBatchAtRef nowFull
       tip <- getChainTip hc
       let tipHeight = ceHeight tip
-          locator = [ceHash tip]
+      locator <- buildBlockLocatorFromChain hc
+      let finalLocator = if null locator then [ceHash tip] else locator
           zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
           getHdrs = GetHeaders
             { ghVersion  = fromIntegral protocolVersion
-            , ghLocators = locator
+            , ghLocators = finalLocator
             , ghHashStop = zeroHash
             }
       pm <- readIORef pmRef
@@ -2682,8 +2742,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                   `catch` (\(_ :: SomeException) -> return False)
                 unless ok $ trySend rest
           trySend connPeers
-    -- Detect when header sync has caught up (peer returned < 2000 headers)
-    when (added > 0 && added < 2000) $ do
+    -- Detect when header sync has caught up: the peer returned a NON-full
+    -- batch (received < 2000 == Core nCount < MAX_HEADERS_RESULTS: "the peer
+    -- has no more headers").  Uses RECEIVED count, not 'added', so a final
+    -- partial batch of already-known headers still ends IBD.
+    when (length hdrs < 2000) $ do
       wasIBD <- readIORef ibdModeRef
       when wasIBD $ do
         putStrLn "Header sync complete — leaving IBD mode"
@@ -2962,14 +3025,27 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
               pm <- readIORef pmRef
               announceTip pm (blockHeader block) bh
-              -- After connecting a new block from a peer, request headers
-              -- to discover any further blocks we might be missing.
+              -- After connecting a block that reaches our best HEADER tip,
+              -- probe for further blocks we might be missing.  Gated on
+              -- 'height >= headerTipH': during bulk IBD the connected block is
+              -- far below the header tip, and firing a getheaders per connected
+              -- block flooded the peer with thousands of requests (each with a
+              -- single-hash '[bh]' locator that the peer answers with 2000
+              -- already-known headers) — a major contributor to the getheaders
+              -- storm that starved block download.  Core only re-probes headers
+              -- on new tips / inv / timeouts, not per connected IBD block.  Use
+              -- a full exponential locator ('buildBlockLocatorFromChain', == the
+              -- tip here) instead of the single hash so the peer resumes past
+              -- our tip rather than resending.
+              headerTipH <- readTVarIO (hcHeight hc)
               connPeers <- getConnectedPeerList pm
-              unless (null connPeers) $ do
-                let zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+              unless (null connPeers || height < headerTipH) $ do
+                locator <- buildBlockLocatorFromChain hc
+                let finalLocator = if null locator then [bh] else locator
+                    zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
                     getHdrs = GetHeaders
                       { ghVersion  = fromIntegral protocolVersion
-                      , ghLocators = [bh]
+                      , ghLocators = finalLocator
                       , ghHashStop = zeroHash
                       }
                 void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
