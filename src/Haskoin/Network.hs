@@ -630,6 +630,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO, randomRIO)
 import qualified Crypto.Random as CryptoRandom
 import Control.Concurrent (ThreadId, forkIO, killThread)
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import System.Timeout (timeout)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException, catch, mask_, IOException)
@@ -2225,7 +2226,13 @@ sendMessage :: PeerConnection -> Message -> IO ()
 sendMessage pc msg = do
   mV2 <- readIORef (pcV2Transport pc)
   case mV2 of
-    Just transport -> do
+    -- Hold the per-connection send mutex across BOTH the cipher advance
+    -- ('v2TransportSend') AND the socket write ('sendAll').  The two steps
+    -- are not otherwise jointly atomic, and 'sendMessage' is called from
+    -- several concurrent threads; without this lock the wire order can
+    -- diverge from the FSChaCha20 cipher-advance order and desync the peer's
+    -- keystream (see 'v2tSendLock').
+    Just transport -> withMVar (v2tSendLock transport) $ \_ -> do
       result <- v2TransportSend transport msg
       case result of
         Left err -> do
@@ -8654,6 +8661,26 @@ data V2Transport = V2Transport
   , v2tInitiator   :: !Bool             -- ^ Are we the initiator?
   , v2tNetMagic    :: !ByteString       -- ^ Network magic (4 bytes)
   , v2tOurGarbage  :: !ByteString       -- ^ Garbage we will send
+  , v2tSendLock    :: !(MVar ())
+                  -- ^ Per-connection send mutex.  The BIP-324 payload/length
+                  -- ciphers are FSChaCha20 *streams*: the receiver applies
+                  -- keystream positions in WIRE order, so the on-wire order of
+                  -- packets MUST match the order in which we advance the send
+                  -- cipher.  'sendMessage' advances the cipher ('v2TransportSend',
+                  -- an STM transaction) and writes the bytes ('sendAll') as two
+                  -- separate steps, and is called concurrently from several
+                  -- threads (the send-queue drainer plus the getheaders sender,
+                  -- the block-gap kicker and 'announceTip', which call it
+                  -- directly).  Without this lock two senders can interleave
+                  -- their 'sendAll' between one another's cipher-advance, so the
+                  -- wire order diverges from the cipher order and the peer's
+                  -- keystream desyncs — it then decrypts our length prefix to
+                  -- garbage, waits forever for a frame that never completes, and
+                  -- silently drops every message after the (single-threaded)
+                  -- handshake.  Holding this MVar across encrypt+write keeps
+                  -- wire order == cipher-advance order.  (v1 peers are immune:
+                  -- each v1 message is self-framed, so out-of-order whole
+                  -- messages still parse.)
   }
 
 -- | Create a new V2 transport
@@ -8674,6 +8701,7 @@ newV2Transport secretKey entropy netMagic initiator garbage = do
         , v2tsGarbageRecv = BS.empty
         }
   stateVar <- newTVarIO initialState
+  sendLock <- newMVar ()
 
   return V2Transport
     { v2tCipher    = cipherVar
@@ -8681,6 +8709,7 @@ newV2Transport secretKey entropy netMagic initiator garbage = do
     , v2tInitiator = initiator
     , v2tNetMagic  = netMagic
     , v2tOurGarbage = BS.take v2MaxGarbageLen garbage
+    , v2tSendLock  = sendLock
     }
 
 -- | Check if V2 transport is ready for application data
