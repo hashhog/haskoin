@@ -1306,6 +1306,20 @@ mainnet = Network
           , aupChainTxCount = 1334000000
           , aupBlockHash = hashFromHex "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"
           })
+      -- hashhog-local near-tip snapshot at h=956407, dumped from the live
+      -- reference Core (`dumptxoutset "latest"`, 2026-07-02) so the final
+      -- haskoin chainstate-corruption recovery re-IBDs a ~0-block tail instead
+      -- of the ~12k-block tail the 944183 snapshot leaves (16h -> minutes).
+      -- NOT a Bitcoin Core chainparams entry (the 840k/880k/910k/935k entries
+      -- above ARE).  aupHashSerialized / aupBlockHash / aupChainTxCount are the
+      -- EXACT txoutset_hash / base_hash / nchaintx values Core's dumptxoutset
+      -- reported for /data/nvme1/haskoin-recovery-snapshot-latest.dat.
+      , (956407, AssumeUtxoParams
+          { aupHeight = 956407
+          , aupHashSerialized = hexToHash256 "078ec10d604ca10cd6455eb2013a77041af8e163ac5fa333bacd69ffba63f62a"
+          , aupChainTxCount = 1389331583
+          , aupBlockHash = hashFromHex "0000000000000000000171f4e09aeadacf7552dd79bec17ee8c9e2ee7d1823e0"
+          })
       ]
   -- Assume-valid (Bitcoin Core v28.0): skip scripts for ancestors of this block.
   -- Hash: mainnet block 938343.
