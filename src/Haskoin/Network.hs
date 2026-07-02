@@ -2634,7 +2634,28 @@ readEncryptedPacket pc transport aad = do
                   case bip324Decrypt cipher1 payload aad of
                     Left err -> return $ Left err
                     Right (cipher2, ignore, contents) -> do
-                      atomically $ writeTVar (v2tCipher transport) cipher2
+                      -- Publish ONLY the receive-direction cipher advance, merged
+                      -- atomically into the latest transport cipher.  The send and
+                      -- receive directions share one 'BIP324Cipher' TVar, but the
+                      -- snapshot we read above ('cipher') was taken BEFORE the
+                      -- (potentially multi-MB, multi-second) blocking payload read.
+                      -- A plain @writeTVar cipher2@ would write back the STALE send
+                      -- sub-cipher captured in that snapshot, rewinding the send
+                      -- keystream whenever a concurrent 'sendMessage' (e.g. a
+                      -- getdata request) advanced it during the read — desyncing
+                      -- the peer, which then drops the connection (surfacing here as
+                      -- "v2: connection closed reading length").  This only bites
+                      -- under block-body load, where the read window is wide enough
+                      -- for a send to interleave; tiny handshake/header frames
+                      -- almost never hit it.  Bitcoin Core keeps the two directions
+                      -- in fully independent state (net.cpp V2Transport
+                      -- m_send_*/m_recv_* under separate m_send_mutex/m_recv_mutex);
+                      -- merging recv-only under STM is the equivalent guarantee.
+                      atomically $ modifyTVar' (v2tCipher transport) $ \latest ->
+                        latest
+                          { b324RecvLCipher = b324RecvLCipher cipher2
+                          , b324RecvPCipher = b324RecvPCipher cipher2
+                          }
                       return $ Right (ignore, contents)
 
 -- | Send an encrypted packet over the wire.
@@ -2650,7 +2671,17 @@ writeEncryptedPacket pc transport aad contents ignore = do
   case bip324Encrypt cipher contents aad ignore of
     Left err -> return (Left err)
     Right (cipher', encrypted) -> do
-      atomically $ writeTVar (v2tCipher transport) cipher'
+      -- Symmetric to the receive path: publish ONLY the send-direction cipher
+      -- advance, merged atomically into the latest transport cipher, so we
+      -- never rewind a concurrently-advanced receive sub-cipher.  (This helper
+      -- currently runs only during the single-threaded handshake, but keeping
+      -- it direction-scoped matches Core's separate send/recv state and is
+      -- race-safe if it is ever called on a concurrent path.)
+      atomically $ modifyTVar' (v2tCipher transport) $ \latest ->
+        latest
+          { b324SendLCipher = b324SendLCipher cipher'
+          , b324SendPCipher = b324SendPCipher cipher'
+          }
       sendAll (pcSocket pc) encrypted
       return (Right ())
 
