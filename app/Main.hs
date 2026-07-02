@@ -1690,9 +1690,30 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       -- one-batch-per-peer anti-churn property (W163) is preserved: we still
       -- request at most one 16-block window at a time and only advance the
       -- floor once the previous window has connected.
-      (let kickerPollUsec  = 400 * 1000 :: Int    -- 0.4 s progress poll
+      (let -- Core net_processing.h download-window constants.
+           --   BLOCK_DOWNLOAD_WINDOW      = 1024 — a block may be requested at
+           --     most this far ahead of the last VALIDATED (connected) block
+           --     (net_processing.cpp FindNextBlocksToDownload:
+           --      "if (pindex->nHeight > nWindowEnd) break").
+           --   maxBlocksInFlight = 128 — the number of DISTINCT blocks kept in
+           --     flight ahead of the connected tip.  Core caps in-flight at
+           --     MAX_BLOCKS_IN_TRANSIT_PER_PEER=16 PER PEER; haskoin's pipelined
+           --     downloader (Sync.hs) is sized for 128, and a single serving
+           --     peer streams the whole pipeline over one ordered TCP
+           --     connection, so 128 keeps the peer's send path saturated and
+           --     hides per-block validation/RTT latency.  It is also the memory
+           --     bound: <=128 * ~2 MB = ~256 MB of bodies in flight worst case.
+           -- The min of the two below binds at 128, so the pipeline never runs
+           -- more than 128 blocks ahead of the connected tip (memory-safe) and
+           -- never beyond BLOCK_DOWNLOAD_WINDOW of it (Core parity).
+           blockDownloadWindow = 1024 :: Word32
+           maxBlocksInFlight   = 128  :: Word32
+           kickerPollUsec  = 400 * 1000 :: Int    -- 0.4 s progress poll
            kickerStallSecs = 12 :: Int64          -- stall re-request cadence
-           kicker rot lastFloor lastReqTime = do
+           -- 'lastConn' = value of 'nextBlock' (connected tip + 1) recorded at
+           -- the previous request; used to detect whether the connected tip
+           -- advanced (drained the pipeline) since we last topped it up.
+           kicker rot lastConn lastReqTime = do
              threadDelay kickerPollUsec
              peers <- getConnectedPeerList pm'
              headerTip <- readTVarIO (hcHeight hc)
@@ -1704,64 +1725,94 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
              lastFullKick <- readIORef lastFullBatchAtRef
              let headerSyncActiveKick = nowKick - lastFullKick < 45
              reqFrom <- forkDownloadFloor db hc nextBlock
-             -- Request when active AND (a window connected since our last
-             -- request -> advance immediately) OR (the window has stalled for
-             -- 'kickerStallSecs' -> retry with a rotated peer). 'lastFloor'
-             -- starts at 'maxBound' so the very first tick always requests.
-             let activeK    = not (null peers) && nextBlock <= headerTip
+             requestedUpTo <- readIORef requestedUpToRef
+             let connectedTip = if nextBlock == 0 then 0 else nextBlock - 1
+                 -- A competing heavier fork drops the floor below the connected
+                 -- tip (forkDownloadFloor); that path needs the fork-aware
+                 -- re-request + reorg engine, NOT the linear pipeline.
+                 isFork     = reqFrom < nextBlock
+                 activeK    = not (null peers) && nextBlock <= headerTip
                               && not headerSyncActiveKick
-                 progressed = reqFrom /= lastFloor
+                 progressed = nextBlock /= lastConn
                  stalled    = nowKick - lastReqTime >= kickerStallSecs
-                 shouldReq  = activeK && (progressed || stalled)
              newSt <-
-               if shouldReq
-                 then do
-                   -- W163 recovery: one 16-block window == exactly one
-                   -- getdata batch, sent to a single peer. That peer serves
-                   -- the batch in request order and haskoin processes one
-                   -- peer's messages sequentially, so the 16 blocks connect
-                   -- in order with no out-of-order churn against
-                   -- connectBlockAt's strict G1 gate. 'rot' rotates the peer
-                   -- on a stall so a non-serving peer cannot wedge IBD.
-                   -- 'reqFrom' is the GAP2 fork-aware download floor
-                   -- (FORK_POINT+1 when a heavier competing header chain
-                   -- forks below the connected tip; else nextBlock).
-                   let windowEnd = min headerTip (reqFrom + 15)
-                   putStrLn $ "Block-gap kicker: requesting blocks "
-                           ++ show reqFrom ++ "-" ++ show windowEnd
-                           ++ " (UTXO-view tip behind header tip "
-                           ++ show headerTip ++ ")"
-                   requestBlocks pm' hc reqFrom windowEnd rot
-                   -- GAP2 fork-aware download.  'requestBlocks' reads hashes
-                   -- from 'hcByHeight' (the heavier header chain above the
-                   -- work crossover only; below it, the OLD chain's hashes —
-                   -- the serving peer answers 'notfound').  'requestForkBlocks'
-                   -- walks the heavier branch by 'cePrev' over 'hcEntries' and
-                   -- requests its REAL hashes from the fork point up, so the
-                   -- lower bodies the reorg needs actually arrive.  A no-op on
-                   -- the linear path (no competing fork).
-                   requestForkBlocks pm' db hc rot
-                   -- Advance the requested-window marker so the MBlock
-                   -- handler's fTooFarAhead gate admits these blocks.
-                   modifyIORef' requestedUpToRef (max windowEnd)
-                   -- GAP3 route-through.  If we are wedged behind a heavier
-                   -- competing fork and all its bridging bodies have now
-                   -- arrived, disconnect the connected branch to the fork
-                   -- point and connect the heavier branch (Core
-                   -- ActivateBestChain) via the existing reorg engine.  No-op
-                   -- on the linear path; retried each tick until the bodies
-                   -- are present.
-                   tryP2PReorg net db hc cache mIdxMgr nextBlockRef
-                     `catch` (\(e :: SomeException) ->
-                                putStrLn $ "P2P reorg kicker error: " ++ show e)
-                   -- Record the requested floor + time so the next tick only
-                   -- re-requests on PROGRESS (floor advanced == window
-                   -- connected) or a genuine STALL — never spamming getdata
-                   -- on every 0.4 s poll.
-                   return (rot + 1, reqFrom, nowKick)
-                 else return (rot, lastFloor, lastReqTime)
-             let (rot', lastFloor', lastReqTime') = newSt
-             kicker rot' lastFloor' lastReqTime'
+               if not activeK
+                 then return (rot, nextBlock, lastReqTime)
+                 else if isFork
+                   then do
+                     -- FORK RECOVERY (unchanged W163/GAP2/GAP3 behaviour): one
+                     -- narrow window from the fork floor + the fork-aware
+                     -- branch fetch + the reorg route-through.  Fires only when
+                     -- a heavier competing header chain forks below the
+                     -- connected tip; the linear pipeline below never runs here.
+                     when (progressed || stalled) $ do
+                       let windowEnd = min headerTip (reqFrom + maxBlocksInFlight - 1)
+                       putStrLn $ "Block-gap kicker (fork): requesting blocks "
+                               ++ show reqFrom ++ "-" ++ show windowEnd
+                       requestBlocks pm' hc reqFrom windowEnd rot
+                       -- 'requestForkBlocks' walks the heavier branch by 'cePrev'
+                       -- over 'hcEntries' and requests its REAL hashes from the
+                       -- fork point up (hcByHeight below the work crossover still
+                       -- resolves to the OLD chain's hashes -> 'notfound').
+                       requestForkBlocks pm' db hc rot
+                       modifyIORef' requestedUpToRef (max windowEnd)
+                       tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+                         `catch` (\(e :: SomeException) ->
+                                    putStrLn $ "P2P reorg kicker error: " ++ show e)
+                     return $ if progressed || stalled
+                                then (rot + 1, nextBlock, nowKick)
+                                else (rot, lastConn, lastReqTime)
+                   else do
+                     -- LINEAR DEEP PIPELINE — Core net_processing.cpp
+                     -- FindNextBlocksToDownload.  Keep up to 'maxBlocksInFlight'
+                     -- DISTINCT blocks in flight ahead of the connected tip,
+                     -- within BLOCK_DOWNLOAD_WINDOW, requesting ONLY blocks not
+                     -- already requested ('requestedUpTo'+1 .. windowEnd) — never
+                     -- the overlapping re-request the old 1-block-slide window
+                     -- did (a de-duping single peer collapsed that to ~1 new
+                     -- block/round -> ~10 blk/min).  As blocks connect the
+                     -- connected tip advances, windowEnd slides up, and the next
+                     -- tick requests exactly the drained slots — a true refilling
+                     -- pipeline (Core "MAX_BLOCKS_IN_TRANSIT_PER_PEER refill on
+                     -- arrival", net_processing.cpp:~6164), not a fixed-rate
+                     -- flat-window slide.
+                     let windowEnd = min headerTip
+                                       (min (connectedTip + blockDownloadWindow)
+                                            (connectedTip + maxBlocksInFlight))
+                         pipeFrom  = requestedUpTo + 1
+                         needNew   = windowEnd >= pipeFrom
+                     if needNew
+                       then do
+                         -- 'requestBlockRange' streams the whole [pipeFrom..windowEnd]
+                         -- to ONE peer (chosen by 'rot') so a single ordered TCP
+                         -- connection delivers the pipeline in request order ->
+                         -- blocks connect strictly in height order against
+                         -- connectBlockAt's G1 gate, with no cross-peer reordering.
+                         requestBlockRange pm' hc pipeFrom windowEnd rot
+                         modifyIORef' requestedUpToRef (max windowEnd)
+                         -- Keep the fork detector hot: a competing fork can appear
+                         -- mid-pipeline (a no-op on the pure linear path).
+                         tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+                           `catch` (\(e :: SomeException) ->
+                                      putStrLn $ "P2P reorg kicker error: " ++ show e)
+                         return (rot, nextBlock, nowKick)
+                       else if stalled && not progressed
+                         then do
+                           -- Pipeline is full (requestedUpTo == windowEnd) but the
+                           -- connected tip has not advanced for 'kickerStallSecs':
+                           -- the in-order connect is wedged on a block the current
+                           -- peer never served (notfound / drop).  Re-fetch the
+                           -- connected frontier window from a ROTATED peer so a
+                           -- single non-serving peer cannot wedge IBD (W163).
+                           let recoverEnd = min headerTip (nextBlock + maxBlocksInFlight - 1)
+                           putStrLn $ "Block-gap kicker (stall recover): re-requesting "
+                                   ++ show nextBlock ++ "-" ++ show recoverEnd
+                                   ++ " from rotated peer"
+                           requestBlockRange pm' hc nextBlock recoverEnd (rot + 1)
+                           return (rot + 1, nextBlock, nowKick)
+                         else return (rot, nextBlock, lastReqTime)
+             let (rot', lastConn', lastReqTime') = newSt
+             kicker rot' lastConn' lastReqTime'
        in kicker 0 maxBound 0)
         `catch` (\(e :: SomeException) ->
                    putStrLn $ "block-gap kicker error: " ++ show e)
@@ -2299,6 +2350,46 @@ requestBlocks pm hc fromHeight toHeight rot = do
               putStrLn $ "Failed to send getdata: " ++ show e
               return False)
           unless ok $ return ()
+
+-- | Request an in-order block range from a SINGLE peer (Core-parity linear
+-- download pipeline; see the block-gap kicker's LINEAR DEEP PIPELINE arm).
+--
+-- Unlike 'requestBlocks' (which round-robins 16-block getdata batches across
+-- ALL peers), this streams the whole [fromHeight..toHeight] range to ONE peer,
+-- chosen by 'rot'.  A single ordered TCP connection then delivers every block
+-- in request order, so the live MBlock handler connects them strictly in height
+-- order against connectBlockAt's G1 gate — no cross-peer reordering, so no
+-- persisted-but-unconnected build-up and no gaps.  Bodies are still chunked
+-- into 16-inv getdata messages (protocol-friendly), all to the same peer, order
+-- preserved.  'rot' is bumped on a stall so a non-serving peer cannot wedge IBD.
+--
+-- Reference: bitcoin-core/src/net_processing.cpp FindNextBlocksToDownload +
+-- MAX_BLOCKS_IN_TRANSIT_PER_PEER (blocks in flight tracked per-peer; a single
+-- peer serves its getdata queue in order).
+requestBlockRange :: PeerManager -> HeaderChain -> Word32 -> Word32 -> Int -> IO ()
+requestBlockRange pm hc fromHeight toHeight rot
+  | fromHeight > toHeight = return ()
+  | otherwise = do
+      peerList <- getConnectedPeerList pm
+      case peerList of
+        [] -> putStrLn "No connected peers to request blocks from"
+        _  -> do
+          heightMap <- readTVarIO (hcByHeight hc)
+          let hashes = [ h | height <- [fromHeight..toHeight]
+                           , Just h <- [Map.lookup height heightMap] ]
+              numPeers = length peerList
+              -- One ordered peer for the entire pipeline range.
+              pc = peerList !! (rot `mod` numPeers)
+              batches = chunksOf 16 hashes
+          unless (null hashes) $ do
+            putStrLn $ "Block-gap kicker: pipelining " ++ show (length hashes)
+                     ++ " blocks (heights " ++ show fromHeight ++ "-"
+                     ++ show toHeight ++ ") to 1 peer"
+            forM_ batches $ \batch -> do
+              let invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- batch ]
+              (safeSendMessage pc (MGetData (GetData invVecs)))
+                `catch` (\(e :: SomeException) ->
+                  putStrLn $ "Failed to send getdata: " ++ show e)
 
 --------------------------------------------------------------------------------
 -- P2P fork-aware download + reorg routing (reorg-drop production blocker)
