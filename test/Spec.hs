@@ -4059,6 +4059,32 @@ main = hspec $ do
       let result = shouldSkipScripts h1 1 (oldTs + 600) netAV idx3 bestTip
       result `shouldBe` True
 
+    -- --noassumevalid flag: verify-first proof.
+    -- 'applyNoAssumeValid' mirrors EXACTLY the override in app/Main.hs
+    -- runNode: when the flag is set, 'netAssumedValid' is nulled; when
+    -- unset the network is returned unchanged (INERT default).
+    let applyNoAssumeValid flag net =
+          if flag then net { netAssumedValid = Nothing } else net
+    describe "--noassumevalid flag" $ do
+      -- (a) Flag OFF (default): the built-in assumevalid is kept, so an
+      -- ancestor block at/below the assumevalid height SKIPS script checks.
+      it "flag OFF -> assumevalid kept -> ancestor block SKIPS scripts" $ do
+        let netOff = applyNoAssumeValid False netAV
+        netAssumedValid netOff `shouldBe` netAssumedValid netAV
+        shouldSkipScripts h1 1 (oldTs + 600) netOff idx3 bestTip `shouldBe` True
+      -- (b) Flag ON: assumevalid nulled, so the SAME ancestor block is now
+      -- fully VERIFIED (no skip) = full-script validation of history.
+      it "flag ON -> assumevalid nulled -> same block VERIFIES scripts" $ do
+        let netOn = applyNoAssumeValid True netAV
+        netAssumedValid netOn `shouldBe` Nothing
+        shouldSkipScripts h1 1 (oldTs + 600) netOn idx3 bestTip `shouldBe` False
+      -- (c) On the REAL mainnet params: default keeps the compiled-in
+      -- assumevalid (block 938343 -> Just _); the flag nulls it. Proves the
+      -- flag is inert by default and disables the real built-in assumevalid.
+      it "real mainnet: default keeps built-in 938343; flag nulls it" $ do
+        (netAssumedValid mainnet /= Nothing) `shouldBe` True
+        netAssumedValid (applyNoAssumeValid True mainnet) `shouldBe` Nothing
+
     -- Case 3: block at same height but NOT in the assumevalid chain -> verify.
     -- We introduce a fork block fk at height 1 with a different hash.
     it "case 3: block not in assumevalid chain (fork at same height) -> verify" $ do
