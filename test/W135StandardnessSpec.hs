@@ -456,6 +456,23 @@ spec = describe "W135 Standardness rules (IsStandardTx)" $ do
       -- should be higher.
       dustThreshold legOut 3000 `shouldSatisfy` (> dustThreshold segOut 3000)
 
+    it "G12 PINS (glass-box 2026-07-01 FIX): unknown-witness (v2) output gets the segwit discount" $ do
+      -- Core GetDustThreshold keys the segwit spend-cost discount off
+      -- CScript::IsWitnessProgram (policy.cpp:55-61), true for ANY witness
+      -- version. A v2 program (OP_2 <32B>) must get the 67-byte segwit cost
+      -- (threshold 330 at 3000 sat/kvB), NOT the 148-byte legacy cost (573).
+      -- Previously haskoin classified it via classifyOutput -> WitnessUnknown
+      -- -> legacy add, inflating the threshold and rejecting a small-value
+      -- output Core relays.
+      let unkWit  = encodeScript (Script [ OP_2, OP_PUSHDATA (BS.replicate 32 0) OPCODE ])
+          out     = TxOut 0 unkWit
+          p2tr    = encodeScript (Script [ OP_1, OP_PUSHDATA (BS.replicate 32 0) OPCODE ])
+          p2trOut = TxOut 0 p2tr
+      -- 8 (value) + 1 (varint) + 34 (script) = 43 ser; 43 + 67 = 110; *3000/1000 = 330.
+      dustThreshold out 3000 `shouldBe` 330
+      -- Same 34-byte witness-program shape => same discounted threshold as P2TR.
+      dustThreshold out 3000 `shouldBe` dustThreshold p2trOut 3000
+
   describe "G13 GetDustThreshold uses CFeeRate ceil-div" $ do
     it "G13 PINS: at the default 3000 sat/kvB rate, exact-multiple sizes match Core" $ do
       -- 31-byte P2WPKH output + 67-byte segwit-spend = 98-byte total cost.
