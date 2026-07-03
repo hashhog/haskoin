@@ -5343,7 +5343,13 @@ main = hspec $ do
   -- into ONE 'writeBatch' that either lands fully or not at all.
   --
   -- Unit-test guards below cover:
-  --   (A) the 'maxReorgDepth' cap (=288, impl-specific memory-safety bound)
+  --   (A) the 'maxReorgDepth' constant (=288 = Core MIN_BLOCKS_TO_KEEP).
+  --       NOTE: this value is NO LONGER enforced as a reorg-depth cap.
+  --       Core has no reorg cap (ActivateBestChainStep disconnects to the
+  --       fork point unbounded); an archive node must follow the most-
+  --       work valid chain to any depth.  The constant is retained only
+  --       as the pruning-retention reference; the real reorg guard is
+  --       Phase A undo-presence verification.  (loop-ledger a3baafad)
   --   (B) pure 'buildDisconnectBlockOps' / 'buildConnectBlockOps' produce
   --       the same disk image that the per-block 'disconnectBlock' /
   --       'connectBlock' would write — proves the refactor is byte-
@@ -5354,7 +5360,7 @@ main = hspec $ do
   --       'buildDisconnectBlockOps' Left branch — equivalent to
   --       'doSideBranchReorg' bailing out before the single 'writeBatch'.
   describe "Side-branch reorg multi-block atomicity (Pattern D)" $ do
-    it "maxReorgDepth = 288 (impl-specific memory-safety bound; 288 = Core MIN_BLOCKS_TO_KEEP)" $ do
+    it "maxReorgDepth = 288 (Core MIN_BLOCKS_TO_KEEP pruning constant; NOT enforced as a reorg cap)" $ do
       maxReorgDepth `shouldBe` 288
 
     it "buildConnectBlockOps emits the same on-disk shape as connectBlock" $
