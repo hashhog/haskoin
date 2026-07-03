@@ -2044,8 +2044,11 @@ checkReplacement _tx directConflicts allEvictions newFee newVsize newFeeRate = d
   -- Formula: (newFee - conflictFee) >= incrementalRelayFee * newVsize / 1000
   -- bitcoin-core/src/policy/rbf.cpp:117-123
   let additionalFee = newFee - conflictTotalFee
-      -- incrementalRelayFeePerKvb is in sat/kvB (1000 sat/kvB = 1 sat/vB)
-      requiredRelayFee = (incrementalRelayFeePerKvb * fromIntegral newVsize) `div` 1000
+      -- incrementalRelayFeePerKvb is in sat/kvB (1000 sat/kvB = 1 sat/vB).
+      -- Core rounds the relay fee UP: CFeeRate::GetFee -> EvaluateFeeUp ->
+      -- CeilDiv (feefrac.h:212). Floor division here would require up to 1 sat
+      -- less than Core and accept a replacement Core rejects, so use CeilDiv.
+      requiredRelayFee = (incrementalRelayFeePerKvb * fromIntegral newVsize + 999) `div` 1000
   when (additionalFee < requiredRelayFee) $
     Left $ RbfInsufficientRelayFee additionalFee requiredRelayFee
 
@@ -3252,8 +3255,10 @@ attemptSiblingEviction newTx newFee newVsize parent mp = do
           -- Sibling eviction is allowed!
           -- For v3, we use a relaxed RBF rule: the new child doesn't need to
           -- pay higher total fees, just enough to cover its own relay cost.
-          let -- The new tx must pay at least the incremental relay fee
-              requiredFee = (incrementalRelayFeePerKvb * fromIntegral newVsize) `div` 1000
+          let -- The new tx must pay at least the incremental relay fee.
+              -- Core rounds the relay fee UP (CFeeRate::GetFee -> CeilDiv);
+              -- use CeilDiv here too so we never require 1 sat less than Core.
+              requiredFee = (incrementalRelayFeePerKvb * fromIntegral newVsize + 999) `div` 1000
 
           if newFee >= requiredFee
             then do

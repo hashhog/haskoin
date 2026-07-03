@@ -545,6 +545,26 @@ spec = do
         Left other -> expectationFailure ("expected RbfInsufficientRelayFee, got: " ++ show other)
         Right () -> expectationFailure "Rule 4 not enforced"
 
+    it "rejects at the CeilDiv boundary for a vsize not a multiple of 10 (glass-box 2026-07-01 FIX)" $ do
+      -- Core rounds the incremental relay fee UP (CFeeRate::GetFee ->
+      -- EvaluateFeeUp -> CeilDiv, feefrac.h:212). For vsize=141:
+      --   required = ceil(100*141 / 1000) = ceil(14.1) = 15   (Core, correct)
+      --   floor(100*141 / 1000)            = 14               (old, under-required)
+      -- A replacement paying exactly 14 additional sat must be REJECTED (14<15);
+      -- the old floor-div accepted it, diverging from Core by 1 sat.
+      let coin = coinOutPoint 61
+          ct = makeTxRbf [coin] [9_000]
+          ce = mkEntry ct 1_000 200 5 True    -- conflict fee 1000, feerate 5
+          replaceTx = makeTxRbf [coin] [8_986]
+          newVsize = 141 :: Int
+          newFee = 1_014 :: Word64            -- additional = 14
+      case checkReplacement replaceTx [ce] [ce] newFee newVsize (FeeRate 50) of
+        Left (RbfInsufficientRelayFee additional required) -> do
+          additional `shouldBe` 14
+          required   `shouldBe` 15            -- CeilDiv(100*141, 1000)
+        Left other -> expectationFailure ("expected RbfInsufficientRelayFee, got: " ++ show other)
+        Right () -> expectationFailure "Rule 4 CeilDiv not enforced (floor-div accepts 14)"
+
   ------------------------------------------------------------------------------
   -- G7: BIP-125 Rule 5 — total evictions <= 100 (MAX_REPLACEMENT_CANDIDATES).
   ------------------------------------------------------------------------------
