@@ -70,6 +70,7 @@ import Haskoin.Script
   , classifyOutput
   , decodeScript
   , isPushOnly
+  , isWitnessProgram
   )
 import Haskoin.Consensus (witnessScaleFactor, txBaseSize, txTotalSize)
 
@@ -334,17 +335,22 @@ isUnspendableScriptPubKey bs
   | BS.head bs == 0x6a = True  -- OP_RETURN
   | otherwise = False
 
--- | Identify a witness program (BIP-141): version byte + direct
--- 2-40-byte push. Returns the witness version on success.
+-- | Identify a witness program (BIP-141): version byte (OP_0..OP_16) + a
+-- single direct 2-40-byte push. Returns the witness version on success.
+--
+-- This must be purely STRUCTURAL to match Core's dust computation: Core's
+-- GetDustThreshold keys the segwit spend-cost discount off
+-- @CScript::IsWitnessProgram@ (policy.cpp:55-61), which is true for ANY
+-- witness version — including unknown v2..v16 and v0 programs of non-{20,32}
+-- size — not only the recognised P2WPKH/P2WSH/P2TR/P2A types. Driving this
+-- off @classifyOutput@ (which returns @WitnessUnknown@/@NonStandard@ for those)
+-- inflated the dust threshold for unknown-witness outputs, so haskoin
+-- rejected small-value outputs Core relays. Delegate to the structural
+-- 'isWitnessProgram' instead.
 isWitnessProgramScript :: ByteString -> Maybe Int
 isWitnessProgramScript bs = case decodeScript bs of
-  Right script -> case classifyOutput script of
-    P2WPKH _ -> Just 0
-    P2WSH  _ -> Just 0
-    P2TR   _ -> Just 1
-    P2A      -> Just 1
-    _        -> Nothing
-  Left _ -> Nothing
+  Right script -> fst <$> isWitnessProgram script
+  Left _       -> Nothing
 
 --------------------------------------------------------------------------------
 -- ScriptPubKey standardness
