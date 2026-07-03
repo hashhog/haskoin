@@ -224,6 +224,16 @@ data NodeOptions = NodeOptions
     --   suppressed regardless of this flag (Core's @-connect@ implies
     --   @-dnsseed=0@).  Mirrors clearbit's standalone @--nodnsseed@.
     --   Default: 'False' (DNS seeding on, Core DEFAULT_DNSSEED = true).
+  , noNoAssumeValid      :: !Bool
+    -- ^ @--noassumevalid@ (Bitcoin Core @-assumevalid=0@): disable the
+    --   built-in assume-valid block for the active network by setting
+    --   'netAssumedValid' to 'Nothing'.  With assume-valid disabled,
+    --   'shouldSkipScripts' returns 'False' for every block, so EVERY
+    --   script (including pre-segwit / pre-taproot history below the
+    --   built-in assumevalid height) is fully verified — a trustless,
+    --   full-script validation of the entire chain.  Default 'False'
+    --   keeps the compiled-in assumevalid (mainnet block 938343), so
+    --   this flag is INERT unless explicitly passed.
   } deriving (Show)
 
 data WalletCommand
@@ -394,6 +404,12 @@ parseNodeOptions = NodeOptions
                 \but DNS seeds are never queried. When --connect peers \
                 \are given, DNS is suppressed regardless of this flag. \
                 \Default: off (DNS seeding on).")
+  <*> switch (long "noassumevalid"
+        <> help "Disable the built-in assume-valid block (Bitcoin Core \
+                \-assumevalid=0). Forces full script verification of \
+                \EVERY block, including pre-segwit/pre-taproot history \
+                \below the compiled-in assumevalid height (mainnet 938343). \
+                \Default: off (assumevalid enabled).")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -523,9 +539,22 @@ runNode net dataDir nodeOptsCli = do
         Just p  -> p
         Nothing -> dataDir </> "haskoin.pid"
 
+  -- --noassumevalid (Bitcoin Core -assumevalid=0): disable the built-in
+  -- assume-valid block by nulling 'netAssumedValid'.  With it set to
+  -- 'Nothing', 'shouldSkipScripts' returns 'False' for every block, so
+  -- all scripts (including pre-segwit/pre-taproot history) are fully
+  -- verified.  INERT by default: when the flag is off we keep the
+  -- compiled-in assumevalid unchanged.
+  let net' = if noNoAssumeValid
+               then net { netAssumedValid = Nothing }
+               else net
+  when noNoAssumeValid $
+    putStrLn "assumevalid disabled (--noassumevalid): full script \
+             \verification of every block"
+
   -- Run the actual node body. Wrapped so daemonize can supply it
   -- as the grandchild's continuation.
-  let nodeMain = runNodeBody net dataDir nodeOpts effectiveLogFile pidFilePath
+  let nodeMain = runNodeBody net' dataDir nodeOpts effectiveLogFile pidFilePath
 
   if noDaemon
     then do
@@ -636,6 +665,13 @@ applyConfigOverlay cm n = n
   , noNoDnsSeed  = if noNoDnsSeed n
                      then True
                      else not (Daemon.configLookupBool "dnsseed" True cm)
+  -- --noassumevalid / -assumevalid=0: conf overlay accepts
+  -- assumevalid=0 (Core naming) when the CLI flag is absent.
+  -- configLookupBool "assumevalid" defaults True (enabled); we invert
+  -- it to the "no assumevalid" flag.
+  , noNoAssumeValid = if noNoAssumeValid n
+                        then True
+                        else not (Daemon.configLookupBool "assumevalid" True cm)
   -- Pass-through (not in conf overlay).
   , noConfFile   = noConfFile n
   }
