@@ -21,6 +21,7 @@ module Haskoin.Network
   , Version(..)
   , Ping(..)
   , Pong(..)
+  , pongForPing
   , Addr(..)
   , AddrEntry(..)
   , Inv(..)
@@ -862,6 +863,21 @@ newtype Pong = Pong { pongNonce :: Word64 }
 instance Serialize Pong where
   put (Pong n) = putWord64le n
   get = Pong <$> getWord64le
+
+-- | BIP-0031 keep-alive reply: build the pong that answers an inbound ping,
+-- echoing the ping's nonce unchanged.
+--
+-- Bitcoin Core answers every ping from a peer whose protocol version is
+-- > BIP0031_VERSION (every peer we speak to) by echoing the nonce straight
+-- back — net_processing.cpp ProcessMessage, PING branch:
+--   @vRecv >> nonce; MakeAndPushMessage(pfrom, NetMsgType::PONG, nonce);@
+-- Echoing the SAME nonce (not a fresh one, not zero) is load-bearing: it lets
+-- the pinging peer match the pong to its outstanding ping and measure the
+-- round-trip latency.  A missing or mismatched pong reads as "no reply", and
+-- the peer disconnects us on its ping timeout (Core TIMEOUT_INTERVAL, 20 min) —
+-- the liveness gap this closes.
+pongForPing :: Ping -> Message
+pongForPing (Ping nonce) = MPong (Pong nonce)
 
 --------------------------------------------------------------------------------
 -- Inventory Types

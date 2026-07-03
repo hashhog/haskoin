@@ -2697,8 +2697,16 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- on the mining/RPC path.
                    -> SockAddr -> Message -> IO ()
 syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg = case msg of
-  MPing (Ping _nonce) ->
-    return ()  -- Pong handled at peer level
+  MPing ping -> do
+    -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
+    -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
+    -- peer manager).  Without this, peers drop us on their ping timeout
+    -- (Bitcoin Core net_processing.cpp: PING -> MakeAndPushMessage(PONG, nonce),
+    -- and TIMEOUT_INTERVAL disconnects a peer that never pongs).  The prior
+    -- `return ()` (comment claimed "handled at peer level") never replied —
+    -- there was no peer-level responder, so inbound pings went unanswered.
+    pm <- readIORef pmRef
+    requestFromPeer pm addr (pongForPing ping)
 
   MHeaders (Headers hdrs) -> do
     putStrLn $ "Received " ++ show (length hdrs) ++ " headers"

@@ -160,6 +160,7 @@ import qualified W184SigopPartialCountSpec
 import qualified W185SegwitSighashRawHashtypeSpec
 import qualified W186SubmitBlockHeaderValidationSpec
 import qualified W187MaxStackSizePushSpec
+import qualified W188InboundPongSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -23043,6 +23044,11 @@ main = hspec $ do
 
   -- W187: MAX_STACK_SIZE enforced after PUSH opcodes (Core interpreter.cpp:1221-1223)
   W187MaxStackSizePushSpec.spec
+
+  -- W188: inbound ping -> pong (BIP-0031 keep-alive); Core net_processing.cpp
+  --       PING -> MakeAndPushMessage(PONG, nonce). Closes the unanswered-ping
+  --       liveness gap (handler used to `return ()`).
+  W188InboundPongSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
