@@ -82,7 +82,6 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            calculateSequenceLocks, checkSequenceLocks,
                            SequenceLock(..),
                            buildConnectBlockOps, buildDisconnectBlockOps,
-                           maxReorgDepth,
                            encodeBip34Height,
                            Deployment, DeploymentCache,
                            computeBlockVersionFromChain,
@@ -921,8 +920,21 @@ findSideBranchForkPoint hc db parent newTipBlock = do
 -- Reference: bitcoin-core/src/validation.cpp ActivateBestChain +
 -- the Pattern D atomicity audit
 -- (CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
--- The cap on reorg size is 'maxReorgDepth' (=288) on the SUM of
--- disconnect + connect blocks.
+--
+-- Core-parity: there is NO reorg-depth cap here.  Core's
+-- 'ActivateBestChainStep' disconnects to the fork point in an UNBOUNDED
+-- @while (m_chain.Tip() != pindexFork)@ loop (validation.cpp:3202) and
+-- follows the most-work valid chain to any depth.  MIN_BLOCKS_TO_KEEP
+-- (=288) is a PRUNING retention constant, not a reorg limit — a pruned
+-- node that lacks the undo for a required disconnect hits a physical
+-- FatalError, it does not "stay on the minority chain".  The real,
+-- pruning-aware guard is Phase A below ('loadDisconnectUndo'), which
+-- pre-loads + checksum-verifies undo for EVERY disconnect block and
+-- fails fast (Left, nothing mutated) if any is missing — exactly Core's
+-- missing-undo → abort model.  On the default archive node undo is
+-- always present, so a >288 reorg to a higher-work valid chain now
+-- succeeds instead of being gratuitously refused (the earlier 288 cap
+-- was a Class-A consensus divergence; loop-ledger a3baafad).
 doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
                   -> Mempool     -- ^ Mempool (for refill on disconnect; Pattern B)
                   -> Maybe IndexManager
@@ -937,15 +949,13 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
   forkRes <- findSideBranchForkPoint hc db parent newTipBlock
   case forkRes of
     Left err -> return (Left err)
-    Right (_forkHash, disconnectList, connectList) -> do
-      let totalDepth = length disconnectList + length connectList
-      if totalDepth > maxReorgDepth
-        then return $ Left $
-          "Reorg too deep: " ++ show totalDepth
-          ++ " blocks (disconnect=" ++ show (length disconnectList)
-          ++ "+connect=" ++ show (length connectList)
-          ++ ") exceeds maxReorgDepth=" ++ show maxReorgDepth
-        else do
+    Right (_forkHash, disconnectList, connectList) ->
+      -- No reorg-depth cap (Core-parity; see the note above the type
+      -- signature).  Phase A's 'loadDisconnectUndo' is the real,
+      -- pruning-aware guard: it fails fast on missing undo, matching
+      -- Core's abort model, while an archive node (undo always present)
+      -- follows the most-work valid chain to any depth.
+      do
           -- Phase A — pre-load undo data for every disconnect block.
           -- Fail fast on missing/corrupt undo before mutating anything.
           undoLoaded <- loadDisconnectUndo db disconnectList

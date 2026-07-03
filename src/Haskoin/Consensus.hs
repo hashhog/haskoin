@@ -5635,15 +5635,22 @@ reorgAtomic :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
             -> [(ChainEntry, Block)]   -- ^ disconnect list (oldTip first)
             -> [(ChainEntry, Block)]   -- ^ connect list (fork-child first)
             -> IO (Either String ())
-reorgAtomic net cache db hc mIdxMgr disList conList = do
-  let totalDepth = length disList + length conList
-  if totalDepth > maxReorgDepth
-    then return $ Left $
-      "Reorg too deep: " ++ show totalDepth
-      ++ " blocks (disconnect=" ++ show (length disList)
-      ++ "+connect=" ++ show (length conList)
-      ++ ") exceeds maxReorgDepth=" ++ show maxReorgDepth
-    else do
+reorgAtomic net cache db hc mIdxMgr disList conList =
+  -- Core-parity: NO reorg-depth cap.  Core's ActivateBestChainStep
+  -- disconnects to the fork point in an UNBOUNDED loop
+  -- (validation.cpp:3202) and follows the most-work valid chain to any
+  -- depth; MIN_BLOCKS_TO_KEEP=288 is a PRUNING retention constant, not
+  -- a reorg limit (a pruned node lacking undo for a required disconnect
+  -- hits a physical FatalError — it does not stay on the minority
+  -- chain).  The real, pruning-aware guard is Phase A below
+  -- ('loadReorgDisconnectUndo'), which pre-loads + checksum-verifies
+  -- undo for EVERY disconnect block and fails fast (Left, nothing
+  -- mutated) if any is missing — exactly Core's missing-undo → abort
+  -- model.  On the default archive node undo is always present, so a
+  -- >288 reorg to a higher-work valid chain now succeeds instead of
+  -- being gratuitously refused (the earlier 288 cap was a Class-A
+  -- consensus divergence; loop-ledger a3baafad).
+  do
       -- Phase A — pre-load + checksum-verify undo for every disconnect
       -- block.  Fail fast before mutating anything.
       undoRes <- loadReorgDisconnectUndo db disList
