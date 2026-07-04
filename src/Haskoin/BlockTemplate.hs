@@ -50,7 +50,7 @@ module Haskoin.BlockTemplate
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
-import Data.Int (Int32)
+import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
 import Control.Monad (forM, forM_, foldM, void, unless)
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
@@ -72,7 +72,8 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            checkProofOfWork,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
-                           addHeader, addSideBranchHeader, computeMerkleRoot, ChainState(..),
+                           addHeader, contextualCheckBlockHeader,
+                           addSideBranchHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
                            cumulativeWork, unapplyBlock,
                            getLegacySigOpCount,
@@ -581,10 +582,30 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           if not (checkProofOfWork (blockHeader block) (netPowLimit net))
             then return $ Left "Block validation failed: high-hash"
             else do
-              let sideBranchResult = validateFullBlock net cs (const 0) False True block Map.empty
-              case sideBranchResult of
-                Left err -> return $ Left $ "Block validation failed: " ++ err
-                Right () -> submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
+              -- CONTEXTUAL HEADER GATES (submitblock/P2P parity fix).
+              -- 'validateFullBlock' (below) runs CheckBlock + ContextualCheckBlock
+              -- but NOT the ContextualCheckBlockHeader gates (bad-diffbits /
+              -- time-too-new / BIP94-timewarp).  On the active-tip arm those are
+              -- enforced by the subsequent 'addHeader' call; the side-branch
+              -- persister ('addSideBranchHeader') deliberately skips header
+              -- re-validation.  Without this call a side-branch block with a
+              -- wrong nBits (nBits != required) but MORE chainwork would reorg
+              -- the tip via submitblock while Core rejects it at AcceptBlockHeader
+              -- ('ContextualCheckBlockHeader' -> bad-diffbits) — a real, reachable
+              -- fork (CORE-PARITY-AUDIT submitblock-pow round; confirmed: haskoin
+              -- reorged to a 0x203fffff side block Core rejected as bad-diffbits).
+              -- Core runs ContextualCheckBlockHeader for EVERY block regardless of
+              -- which chain it extends (validation.cpp AcceptBlockHeader), so the
+              -- side-branch arm must too.  'now' = wall clock, matching Core's
+              -- GetAdjustedTime() argument to the +2h future-time gate.
+              nowSec <- (round <$> getPOSIXTime) :: IO Int64
+              case contextualCheckBlockHeader net entries parent (blockHeader block) nowSec of
+                Left hdrErr -> return $ Left $ "Block validation failed: " ++ hdrErr
+                Right () -> do
+                  let sideBranchResult = validateFullBlock net cs (const 0) False True block Map.empty
+                  case sideBranchResult of
+                    Left err -> return $ Left $ "Block validation failed: " ++ err
+                    Right () -> submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent
         else do
           -- Active-tip arm: full UTXO validation as before.
           -- Build UTXO map for validation. We carry full Core-format
