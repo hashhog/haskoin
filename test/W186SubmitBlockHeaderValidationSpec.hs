@@ -63,7 +63,7 @@ import Haskoin.Types (Block(..), BlockHeader(..))
 import Haskoin.Crypto (computeTxId)
 import Haskoin.Consensus
   ( regtest, initHeaderChain, medianTimePast, blockReward, computeMerkleRoot
-  , netPowLimit, ChainEntry(..), HeaderChain(..) )
+  , netPowLimit, bitsToTarget, ChainEntry(..), HeaderChain(..) )
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig )
 import Haskoin.Mempool (newMempool, defaultMempoolConfig)
@@ -161,6 +161,49 @@ buildBadHeaderBlock server = do
       -- header is invalid.
       return $ Block (solved { bhBits = 0x1d00ffff }) txs
 
+-- | Build a SIDE-BRANCH block: parent = the tip's PARENT (so it competes at
+-- the tip's own height), body valid, but header carrying a HARDER-but-in-range
+-- nBits (0x203fffff, target ~2^254 vs regtest powLimit ~2^255).  It is solved
+-- to meet that harder target, so it passes 'checkProofOfWork' AND carries
+-- strictly MORE chain work than the active tip.  Pre-fix the submitblock
+-- side-branch arm skipped 'contextualCheckBlockHeader' (bad-diffbits), so this
+-- block REORGED the tip while Core rejects it (validation.cpp AcceptBlockHeader
+-- runs ContextualCheckBlockHeader for every block).  Confirmed live: haskoin
+-- reorged to a 0x203fffff side block that the bitcoind regtest oracle rejected
+-- as bad-diffbits.
+buildBadDiffbitsSideBlock :: RpcServer -> IO Block
+buildBadDiffbitsSideBlock server = do
+  let hc = rsHeaderChain server
+  tip     <- readTVarIO (hcTip hc)
+  entries <- readTVarIO (hcEntries hc)
+  let harderBits = 0x203fffff
+      parentHash = case cePrev tip of
+        Just p  -> p
+        Nothing -> error "W186 side: tip has no parent"
+      parentEntry = case Map.lookup parentHash entries of
+        Just e  -> e
+        Nothing -> error "W186 side: parent not in index"
+      height     = ceHeight parentEntry + 1     -- == tip height (competing)
+      mtp        = medianTimePast entries parentHash
+      blockTime  = mtp + 1
+      reward     = blockReward height
+      coinbase   = buildRegtestCoinbase height reward dummyScript blockTime Nothing
+      txs        = [coinbase]
+      merkleRoot = computeMerkleRoot (map computeTxId txs)
+      hdr = BlockHeader
+        { bhVersion    = 0x20000000
+        , bhPrevBlock  = parentHash
+        , bhMerkleRoot = merkleRoot
+        , bhTimestamp  = blockTime
+        , bhBits       = harderBits         -- WRONG nBits (regtest requires 0x207fffff)
+        , bhNonce      = 0
+        }
+  -- Solve against the HARDER target so PoW passes and the block outweighs the tip.
+  mSolved <- findRegtestNonce hdr (bitsToTarget harderBits)
+  case mSolved of
+    Nothing     -> error "W186 side: could not solve harder-nBits nonce"
+    Just solved -> return $ Block solved txs
+
 --------------------------------------------------------------------------------
 spec :: Spec
 spec = describe "W186 submitblock runs full header validation before persisting" $ do
@@ -199,6 +242,32 @@ spec = describe "W186 submitblock runs full header validation before persisting"
       -- this connect failed connectBlock's G1 gate ("no block connects").
       good <- generateSingleBlock server dummyScript []
       good `shouldSatisfy` isRight
+
+  it "rejects a bad-diffbits SIDE-BRANCH block that would reorg the tip (was accepted pre-fix)" $
+    withLiveServer $ \server -> do
+      let hc = rsHeaderChain server
+      _ <- generateSingleBlock server dummyScript []
+      _ <- generateSingleBlock server dummyScript []
+      tipBefore <- ceHash <$> readTVarIO (hcTip hc)
+
+      -- A side-branch block with wrong nBits but MORE work: pre-fix the
+      -- submitblock side-branch arm ran only checkProofOfWork + validateFullBlock
+      -- (neither checks nBits==required) and 'addSideBranchHeader' skips header
+      -- re-validation, so it reorged the tip.  Post-fix
+      -- 'contextualCheckBlockHeader' rejects it as bad-diffbits before any
+      -- persistence — matching Core.
+      sideBad <- buildBadDiffbitsSideBlock server
+      r <- submitBlock regtest (rsDB server) (rsHeaderChain server)
+             (rsUTXOCache server) (rsPeerMgr server) (rsMempool server)
+             (rsIndexMgr server) sideBad
+      r `shouldSatisfy` isLeft
+      case r of
+        Left e  -> T.pack e `shouldSatisfy` T.isInfixOf "bad-diffbits"
+        Right _ -> expectationFailure "side-branch bad-diffbits block was accepted (reorged the tip)"
+
+      -- The tip must NOT have reorged to the bad-diffbits block.
+      tipAfter <- ceHash <$> readTVarIO (hcTip hc)
+      tipAfter `shouldBe` tipBefore
 
   it "the seeded tip advances by exactly one on each valid submitblock" $
     withLiveServer $ \server -> do
