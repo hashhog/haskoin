@@ -162,6 +162,7 @@ module Haskoin.Consensus
   , difficultyAdjustment
   , addHeader
   , addHeaderAt
+  , contextualCheckBlockHeader
   , addSideBranchHeader
   , getChainTip
   , getValidatedChainTip
@@ -4928,6 +4929,58 @@ addHeaderAt net hc header minPowChecked mNow = do
                                 bumpTipGen hc
 
                             return $ Right entry
+
+-- | 'ContextualCheckBlockHeader' — the parent-relative header consensus gates,
+-- factored out so EVERY block-acceptance path enforces the identical set.
+--
+-- Bitcoin Core runs 'ContextualCheckBlockHeader' from 'AcceptBlockHeader' for
+-- every block regardless of which chain it extends (validation.cpp:4080-4121);
+-- a side-branch block is never exempt.  In haskoin these gates live inline in
+-- 'addHeaderAt' (the P2P/IBD headers-first path and the submitblock ACTIVE-tip
+-- arm both drive it).  The submitblock SIDE-BRANCH arm
+-- ('BlockTemplate.submitBlock'), however, persists via 'addSideBranchHeader'
+-- which deliberately skips header re-validation — so without an explicit call
+-- to this function it would skip bad-diffbits / time-too-new / BIP94-timewarp.
+-- That was a real, reachable fork: a side-branch block with a wrong nBits
+-- (nBits != required) but MORE chainwork reorged the tip on submitblock while
+-- Core rejected it as bad-diffbits (CORE-PARITY-AUDIT submitblock-pow round).
+--
+-- Gate order + reject strings match 'addHeaderAt' (keep the two in sync):
+--   1. time-too-old         (timestamp > MTP of prev 11)          validation.cpp:4092
+--   2. time-timewarp-attack (BIP94 retarget-boundary minimum)     validation.cpp:4097
+--   3. time-too-new         (timestamp <= now + MAX_FUTURE)       validation.cpp:4108
+--   4. bad-diffbits         (nBits == GetNextWorkRequired)        validation.cpp:4088
+--   5. checkpoint
+--
+-- The context-free PoW check (CheckBlockHeader), the too-little-chainwork gate
+-- and all storage/tip side-effects stay with the caller.  @now@ is the
+-- wall-clock (adjusted-network) time used by the +2h future gate, mirroring
+-- Core's GetAdjustedTime() argument.
+contextualCheckBlockHeader
+  :: Network -> Map BlockHash ChainEntry -> ChainEntry -> BlockHeader -> Int64
+  -> Either String ()
+contextualCheckBlockHeader net entries parent header now =
+  let prevHash = bhPrevBlock header
+      height   = ceHeight parent + 1
+      hash     = computeBlockHash header
+      mtp      = medianTimePast entries prevHash
+  in if bhTimestamp header <= mtp
+       then Left "time-too-old"
+     else if netEnforceBIP94 net
+             && height `mod` netRetargetInterval net == 0
+             && (fromIntegral (bhTimestamp header) :: Int64)
+                  < (fromIntegral (bhTimestamp (ceHeader parent)) :: Int64) - maxTimewarp
+       then Left "time-timewarp-attack"
+     else if (fromIntegral (bhTimestamp header) :: Int64) > now + maxFutureBlockTime
+       then Left "time-too-new"
+     else if bhBits header /= difficultyAdjustment net entries parent header
+       then Left "bad-diffbits"
+     else case verifyCheckpoint (buildCheckpoints net) height hash of
+            Left (ChainErrCheckpoint h expected actual) ->
+              Left $ "Checkpoint mismatch at height " ++ show h ++
+                     ": expected " ++ show expected ++ " got " ++ show actual
+            Left err -> Left $ "Checkpoint error: " ++ show err
+            Right () -> Right ()
 
 -- | Persist a side-branch header that has already been validated by the
 -- caller (typically 'submitBlock' which runs the full
