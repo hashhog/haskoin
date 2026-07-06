@@ -53,6 +53,7 @@ import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
 import Control.Monad (forM, forM_, foldM, void, unless)
+import Data.List (stripPrefix)
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -821,7 +822,16 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
           -- issue is fixed.  Surface as inconclusive rather than a
           -- hard failure so peers see the partial-accept signal.
           putStrLn $ "submitBlock side-branch reorg failed: " ++ err
-          return $ Left "inconclusive"
+          -- A strictly-heavier side branch that FAILS full connect
+          -- validation is consensus-invalid (bad-cb-amount,
+          -- bad-txns-premature-spend-of-coinbase, ...) and must be
+          -- REJECTED with its real code — not stored as "inconclusive".
+          -- 'buildReorgBatch' tags such connect failures with the
+          -- "invalid-connect: " sentinel; anything else is genuine
+          -- infrastructure failure (missing undo, IO) → inconclusive.
+          case stripPrefix "invalid-connect: " err of
+            Just reason -> return (Left reason)     -- consensus-invalid, surface real code
+            Nothing     -> return (Left "inconclusive")  -- infrastructure failure
         Right () -> do
           -- Reorg succeeded; mempool / peer-broadcast bookkeeping the
           -- happy-path arm normally handles.  Mempool integration
@@ -1290,7 +1300,7 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                   getMtpCC  = getMtpAtHeightFromEntries entries byHeightCC
               case validateFullBlock n csReorg getMtpCC False False blk spentUtxos of
                 Left err -> return $ Left $
-                  "reorg connect: block " ++ show bh
+                  "invalid-connect: reorg connect: block " ++ show bh
                   ++ " (height " ++ show (ceHeight ce)
                   ++ ") failed full validation: " ++ err
                 Right () -> do

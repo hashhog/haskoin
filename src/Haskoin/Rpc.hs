@@ -5131,6 +5131,11 @@ bip22ResultString err
   | "coinbase not yet mature" `isInfixOf` s     = "bad-txns-premature-spend-of-coinbase"
   | "immature coinbase" `isInfixOf` s           = "bad-txns-premature-spend-of-coinbase"
   | "premature spend" `isInfixOf` s             = "bad-txns-premature-spend-of-coinbase"
+  -- Hyphenated canonical token emitted verbatim by validateFullBlock's
+  -- checkTxInputs on the reorg-connect path (surfaced through the
+  -- "invalid-connect: " side-branch sentinel).  Without this rule it
+  -- falls through to "rejected".
+  | "premature-spend-of-coinbase" `isInfixOf` s = "bad-txns-premature-spend-of-coinbase"
 
   -- Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
   | "negative value" `isInfixOf` s              = "bad-txns-vout-negative"
