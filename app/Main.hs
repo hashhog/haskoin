@@ -1908,21 +1908,70 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- is large. The syncMessageHandler also triggers a flush every
     -- flushBlockInterval blocks via doPeriodicFlush — whichever fires
     -- first wins.
-    let flushTimeInterval  = 300  :: Integer  -- seconds
-        flushTimerDelayUs  = 30 * 1_000_000   -- wake every 30s to check
+    -- PERF (FLUSH-CADENCE) — Track-B windowed replay 2026-07-07.
+    --
+    -- Per-block chainstate is ALREADY committed to RocksDB by connectBlockAt's
+    -- own per-block WriteBatch (Consensus.hs:3858 — PrefixUTXO puts/deletes +
+    -- undo + tx-index + best-block + header + block body, atomically per
+    -- block).  So the wall-clock timer's ONLY durability job is to fsync the
+    -- WAL.  We deliberately DECOUPLE that cheap fsync from the expensive
+    -- cache-evicting 'flushCache', which wipes the warm read-through UTXO
+    -- mirror ('rcEntries', the hot path behind buildSpentUtxoMapCached ->
+    -- getUTXOCoinCached) AND forces a stop-the-world 'performGC'
+    -- (Storage.hs:704-727).
+    --
+    -- Before this change the timer ran the full 'flushCache' on a 300s
+    -- wall-clock tick.  During an IO-bound windowed replay only ~5 blocks
+    -- connect per 300s, so the timer nuked the warm mirror + ran a full GC
+    -- every ~5 blocks; every subsequent block then re-read ALL its prevouts
+    -- cold from RocksDB (near-serial random IO).  The Track-B log was
+    -- dominated by "Periodic flush: syncing WAL + UTXO cache" — 485 firings
+    -- across ~2.7k connected blocks (a cache wipe + GC every ~5.5 blocks),
+    -- while the intended block-count evict (every 1000 blocks, connect path
+    -- below) NEVER fired because the timer kept resetting blocksSinceFlushRef.
+    --
+    -- Fix: the timer now does a cheap WAL fsync only, keeping the mirror hot;
+    -- the mirror-evicting 'flushCache' runs on the block-count cadence (every
+    -- flushBlockInterval blocks in the connect path) — i.e. every N blocks
+    -- instead of every ~5.  A much longer IDLE-only backstop still runs one
+    -- full evict to reclaim mirror memory when the node is genuinely idle (no
+    -- blocks connected since the last flush).  Crash-safety is preserved: a
+    -- windowed replay tolerates a looser fsync cadence, per-block writes are
+    -- already durable in the WAL, and the WAL is still fsync'd every 300s.
+    let flushSyncInterval   = 300  :: Integer  -- WAL fsync backstop (seconds)
+        flushIdleEvictAfter = 1800 :: Integer  -- full evict only when idle this long
+        flushTimerDelayUs   = 30 * 1_000_000   -- wake every 30s to check
+    lastEvictEpochRef <- newIORef =<< (round <$> getPOSIXTime :: IO Integer)
     flushThreadId <- forkIO $ forever $ do
       threadDelay flushTimerDelayUs
       now <- round <$> getPOSIXTime
       lastF <- readIORef lastFlushEpochRef
-      when (now - lastF >= flushTimeInterval) $ do
-        h <- readTVarIO (hcHeight hc)
-        putStrLn $ "Periodic flush: syncing WAL + UTXO cache at height=" ++ show h
-        flushCache cache
-          `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
-        syncFlush db
-          `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
+      when (now - lastF >= flushSyncInterval) $ do
+        bsf   <- readIORef blocksSinceFlushRef
+        lastE <- readIORef lastEvictEpochRef
+        h     <- readTVarIO (hcHeight hc)
+        if bsf == 0 && now - lastE >= flushIdleEvictAfter
+          then do
+            -- Genuinely idle: no blocks connected since the last flush, so the
+            -- block-count evict path will not fire.  Do one full evicting
+            -- flush to reclaim the read-through mirror's memory.  Safe — there
+            -- is no active connect whose warm cache we would cold-start, and
+            -- per-block writes are already durable.
+            putStrLn $ "Idle memory flush: evicting UTXO cache at height=" ++ show h
+            flushCache cache
+              `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
+            syncFlush db
+              `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
+            writeIORef lastEvictEpochRef now
+            writeIORef blocksSinceFlushRef 0
+          else do
+            -- Active (or recently active) sync: keep the warm UTXO mirror hot.
+            -- Only fsync the WAL for crash-safety; the block-count cadence
+            -- owns cache eviction.  This is what lifts blk/s in the replay.
+            putStrLn $ "Periodic WAL fsync at height=" ++ show h
+            syncFlush db
+              `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
         writeIORef lastFlushEpochRef now
-        writeIORef blocksSinceFlushRef 0
 
     -- DURABILITY (sweep wa0fq5wtk): periodic wallet flusher.  Wakes every
     -- 30s and persists any wallet whose dirty flag is set (save-on-mutation
