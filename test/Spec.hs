@@ -161,6 +161,7 @@ import qualified W185SegwitSighashRawHashtypeSpec
 import qualified W186SubmitBlockHeaderValidationSpec
 import qualified W187MaxStackSizePushSpec
 import qualified W188InboundPongSpec
+import qualified W189GetBlockVerbosity3Spec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -23150,6 +23151,11 @@ main = hspec $ do
   --       PING -> MakeAndPushMessage(PONG, nonce). Closes the unanswered-ping
   --       liveness gap (handler used to `return ()`).
   W188InboundPongSpec.spec
+
+  -- W189: getblock verbosity=2/3 tx[] JSON shape (Core blockToJSON + TxToUniv).
+  --       v3 adds per-input prevout {generated,height,value,scriptPubKey};
+  --       the local-block path used to drop to the txid list for v3.
+  W189GetBlockVerbosity3Spec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

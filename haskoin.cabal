@@ -202,6 +202,7 @@ test-suite haskoin-test
                , W186SubmitBlockHeaderValidationSpec
                , W187MaxStackSizePushSpec
                , W188InboundPongSpec
+               , W189GetBlockVerbosity3Spec
                , ConvertJoinPsbtSpec
                , Paths_haskoin
                , Bip21Spec
