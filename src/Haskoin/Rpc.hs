@@ -89,6 +89,11 @@ module Haskoin.Rpc
   , handleGetBlockFromPeer
   , decideGetBlockFromPeer
   , lookupPeerByIndex
+    -- * getblock verbose tx[] encoders (exported for testing — Core parity)
+  , buildBlockTxArrayEnc
+  , buildBlockTxArrayEncV3
+  , buildVinEncPrevout
+  , buildPrevoutEnc
     -- * gettxout confirmation depth (exported for testing)
   , gettxoutConfirmations
     -- * getorphantxs (Bitcoin Core v28) — handler + pure core (exported for testing)
@@ -2312,13 +2317,19 @@ handleGetBlock server params = do
                       wt       = 3 * stripped + totSize  -- weight = 3*stripped + size (BIP141)
                       nTx      = length (blockTxns block)
                       coinbaseTxEnc = buildCoinbaseTxEnc block
-                  -- For verbosity=2, build per-tx entries with fee from undo data.
-                  txArrayEnc <- case verbosity of
-                    2 -> do
+                  -- verbosity=2: per-tx entries with fee from undo data.
+                  -- verbosity>=3: same as v2 PLUS per-input "prevout"
+                  -- {generated, height, value, scriptPubKey} from undo data —
+                  -- Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT (blockchain.cpp
+                  -- getblock: any verbosity>2 maps to SHOW_DETAILS_AND_PREVOUT).
+                  txArrayEnc <- if verbosity >= 2
+                    then do
                       mUndo <- getUndoData (rsDB server) bh
                       let undoList = maybe [] (buTxUndo . udBlockUndo) mUndo
-                      return $ Just $ buildBlockTxArrayEnc net block undoList
-                    _ -> return Nothing
+                      return $ Just $ if verbosity >= 3
+                                        then buildBlockTxArrayEncV3 net block undoList
+                                        else buildBlockTxArrayEnc   net block undoList
+                    else return Nothing
                   -- Core order (blockheaderToJSON then blockToJSON): hash,
                   -- confirmations, height, version, versionHex, merkleroot, time,
                   -- mediantime, nonce, bits, target, difficulty, chainwork, nTx,
@@ -2892,6 +2903,97 @@ computeFee tx txUndo =
              totalOut = sum outValues
              fee      = totalIn - totalOut
          in if fee >= 0 then Just fee else Nothing
+
+-- | Build the tx[] array Encoding for getblock verbosity=3.
+-- Identical to verbosity=2 (buildBlockTxArrayEnc) except each non-coinbase
+-- input additionally carries a "prevout" object
+-- {generated, height, value, scriptPubKey} built from the block undo data —
+-- Core's TxVerbosity::SHOW_DETAILS_AND_PREVOUT.  The undo list holds one
+-- 'TxUndo' per non-coinbase tx; within a tx, tuPrevOutputs is one 'TxInUndo'
+-- per input, aligned left-to-right with txInputs.
+-- Reference: bitcoin-core/src/core_io.cpp TxToUniv (SHOW_DETAILS_AND_PREVOUT),
+--            bitcoin-core/src/rpc/blockchain.cpp getblock_vin.
+buildBlockTxArrayEncV3 :: Network -> Block -> [TxUndo] -> AE.Encoding
+buildBlockTxArrayEncV3 net block undoList =
+  AE.list id (case blockTxns block of
+                []        -> []
+                (cb:rest) ->
+                  -- Coinbase (no undo) prepended; each remaining tx paired with
+                  -- its undo entry, extras (should not happen) get no undo.
+                  buildOneTxEncV3 Nothing cb
+                    : zipWith buildOneTxEncV3 (map Just undoList ++ repeat Nothing) rest)
+  where
+    buildOneTxEncV3 :: Maybe TxUndo -> Tx -> AE.Encoding
+    buildOneTxEncV3 mUndo tx =
+      let txid     = computeTxId tx
+          wtxid    = computeWtxId tx
+          txidHex  = showHash (BlockHash (getTxIdHash txid))
+          wtxidHex = showHash (BlockHash (getTxIdHash wtxid))
+          baseSize = txBaseSize tx
+          totSize  = txTotalSize tx
+          wt       = baseSize * (witnessScaleFactor - 1) + totSize
+          vsize    = (wt + witnessScaleFactor - 1) `div` witnessScaleFactor
+          hexStr   = TE.decodeUtf8 $ B16.encode (S.encode tx)
+          -- One TxInUndo per input (aligned to txInputs); Nothing past the end.
+          prevList = maybe [] tuPrevOutputs mUndo
+          mFee     = case mUndo of
+                       Just u  -> computeFee tx u
+                       Nothing -> Nothing
+      in pairs $
+           pair "txid"     (text txidHex) <>
+           pair "hash"     (text wtxidHex) <>
+           pair "version"  (AE.int (fromIntegral (txVersion tx))) <>
+           pair "size"     (AE.int totSize) <>
+           pair "vsize"    (AE.int vsize) <>
+           pair "weight"   (AE.int wt) <>
+           pair "locktime" (AE.word32 (txLockTime tx)) <>
+           pair "vin"      (AE.list id (zipWith3 (buildVinEncPrevout net)
+                                                 (map Just prevList ++ repeat Nothing)
+                                                 (txInputs tx)
+                                                 (txWitness tx ++ repeat []))) <>
+           pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx))) <>
+           -- Core TxToUniv tail order: ...vout, [fee], [hex] — fee BEFORE hex.
+           (case mFee of
+              Just fee -> pair "fee" (btcAmountEnc (fromIntegral fee))
+              Nothing  -> mempty) <>
+           pair "hex"      (text hexStr)
+
+-- | Non-coinbase vin entry with the verbosity=3 "prevout" object inserted
+-- between the (optional) txinwitness and sequence fields, matching Core's
+-- TxToUniv SHOW_DETAILS_AND_PREVOUT field ordering (core_io.cpp: prevout is
+-- pushed after txinwitness, immediately before sequence).  A coinbase input
+-- has no undo entry, so it emits no prevout (mirrors buildVinEnc).
+buildVinEncPrevout :: Network -> Maybe TxInUndo -> TxIn -> [ByteString] -> AE.Encoding
+buildVinEncPrevout net mPrev inp witness =
+  let isCoinbase = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+  in if isCoinbase
+     then pairs $
+       pair "coinbase"    (text (TE.decodeUtf8 (B16.encode (txInScript inp)))) <>
+       ( if null witness then mempty
+         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) ) <>
+       pair "sequence"    (AE.word32 (txInSequence inp))
+     else pairs $
+       pair "txid"      (text (showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp)))))) <>
+       pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput inp))) <>
+       pair "scriptSig" (pairs (pair "asm" (text (scriptToAsmSighashDecodeTop (txInScript inp))) <>
+                                pair "hex" (text (TE.decodeUtf8 (B16.encode (txInScript inp)))))) <>
+       ( if null witness then mempty
+         else pair "txinwitness" (AE.list (text . TE.decodeUtf8 . B16.encode) witness) ) <>
+       ( case mPrev of
+           Just u  -> pair "prevout" (buildPrevoutEnc net u)
+           Nothing -> mempty ) <>
+       pair "sequence"  (AE.word32 (txInSequence inp))
+
+-- | The verbosity=3 "prevout" object for one spent input, built from undo data.
+-- Field names + order match Core getblock_vin / TxToUniv:
+--   generated (spent output was a coinbase), height, value, scriptPubKey{...}.
+buildPrevoutEnc :: Network -> TxInUndo -> AE.Encoding
+buildPrevoutEnc net u =
+  pairs $
+    pair "generated"    (AE.bool (tuCoinbase u)) <>
+    pair "height"       (AE.word32 (tuHeight u)) <>
+    pair "value"        (btcAmountEnc (fromIntegral (txOutValue (tuOutput u)))) <>
+    pair "scriptPubKey" (psbtSpkEnc net (txOutScript (tuOutput u)))
 
 -- | Get block header by hash.
 -- Verbose output is byte-identical to Bitcoin Core 31.99 (W57).
