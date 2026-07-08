@@ -77,6 +77,7 @@ module Haskoin.Rpc
   , deploymentInfoForEntry
   , softforksFromEntry
   , mempoolErrorToRpcResponse
+  , mempoolRejectToken
     -- * getchainstates (Bitcoin Core v23) — handler + pure core (exported for testing)
   , handleGetChainStates
   , chainStatesResultEnc
@@ -3792,7 +3793,13 @@ handleSendRawTransaction server params = do
               -- Attempt to add to mempool
               result <- addTransaction (rsMempool server) tx
               case result of
-                Left err -> return $ mempoolErrorToRpcResponse err
+                Left err ->
+                  -- Emit the bare Core reject token (unified with
+                  -- testmempoolaccept), threading the node's configured static
+                  -- relay floor so the fee-floor sub-token is exact.
+                  let staticFloorKvb =
+                        getFeeRate (mpcMinFeeRate (mpConfig (rsMempool server)))
+                  in return $ mempoolErrorToRpcResponseWith staticFloorKvb err
                 Right txid -> do
                   -- Get the fee from the mempool entry (for maxfeerate check)
                   mEntry <- getTransaction (rsMempool server) txid
@@ -3831,93 +3838,117 @@ decodeTxWithFallback txBytes =
     Right tx -> Right tx
     Left _ -> Left "TX decode failed"
 
--- | Convert MempoolError to appropriate RPC response with correct error codes
+-- | Default static relay floor (sat/kvB), matching 'mpcMinFeeRate' in the
+-- default 'MempoolConfig' (Core DEFAULT_MIN_RELAY_TX_FEE).  Used only by the
+-- back-compat 'mempoolErrorToRpcResponse' wrapper (whose callers care about the
+-- error CODE, not the fee-floor sub-token); live handlers thread the node's
+-- actual configured floor into 'mempoolRejectToken' / 'mempoolErrorToRpcResponseWith'.
+defaultStaticRelayFloorKvb :: Word64
+defaultStaticRelayFloorKvb = 100
+
+-- | Normalise the raw 'validateTransaction' (CheckTransaction) error string to
+-- the bare Bitcoin Core reject token (consensus/tx_check.cpp).  Both mempool
+-- RPC paths surface this so 'testmempoolaccept' and 'sendrawtransaction' agree.
+-- The strings matched here are exactly those produced by
+-- 'Haskoin.Consensus.validateTransaction'; the three that are already canonical
+-- Core tokens ("bad-txns-oversize", "bad-txns-txouttotal-toolarge",
+-- "bad-txns-inputs-duplicate") fall through the last case unchanged.
+checkTxReasonToken :: String -> Text
+checkTxReasonToken s = case s of
+  "Transaction has no inputs"                            -> "bad-txns-vin-empty"
+  "Transaction has no outputs"                           -> "bad-txns-vout-empty"
+  "Transaction output has negative value"                -> "bad-txns-vout-negative"
+  "Transaction output value exceeds MAX_MONEY"           -> "bad-txns-vout-toolarge"
+  "Coinbase scriptSig size out of range (must be 2-100 bytes)" -> "bad-cb-length"
+  "Non-coinbase transaction references null prevout"     -> "bad-txns-prevout-null"
+  other                                                  -> T.pack other
+
+-- | Single source of truth for the bare Bitcoin Core reject token emitted by
+-- BOTH mempool RPC paths ('testmempoolaccept' and 'sendrawtransaction'), so the
+-- differential oracle sees identical reason strings from either entry point.
+--
+-- Token references: consensus/tx_check.cpp (CheckTransaction family),
+-- consensus/tx_verify.cpp ("bad-txns-in-belowout",
+-- "bad-txns-premature-spend-of-coinbase"), validation.cpp PreChecks
+-- ("min relay fee not met", "mempool min fee not met", "insufficient fee",
+-- "bad-txns-spends-conflicting-tx", "too many potential replacements"), and the
+-- rpc/mempool.cpp remap TX_MISSING_INPUTS → "missing-inputs".
+--
+-- The first argument is the node's static relay floor (sat/kvB), needed to
+-- disambiguate the single 'ErrFeeBelowMinimum' variant into Core's two distinct
+-- rejects: the static relay floor ("min relay fee not met") vs. the bumped
+-- rolling minimum ("mempool min fee not met").
+mempoolRejectToken :: Word64 -> MempoolError -> Text
+mempoolRejectToken staticFloorKvb err = case err of
+  -- BIP-339: wtxid exact duplicate.
+  ErrAlreadyInMempool               -> "txn-already-in-mempool"
+  -- BIP-339: same txid, different witness.
+  ErrSameNonwitnessInMempool        -> "txn-same-nonwitness-data-in-mempool"
+  -- Context-free CheckTransaction family — specific token per sub-case.
+  ErrValidationFailed msg           -> checkTxReasonToken msg
+  -- rpc/mempool.cpp remaps TX_MISSING_INPUTS → "missing-inputs".
+  ErrMissingInput _                 -> "missing-inputs"
+  ErrInputSpentInMempool _          -> "txn-mempool-conflict"
+  -- Outputs exceed inputs (consensus/tx_verify.cpp CheckTxInputs).
+  ErrInsufficientFee                -> "bad-txns-in-belowout"
+  -- Relay floor: static relay minimum vs. bumped rolling minimum.
+  ErrFeeBelowMinimum _ minFee
+    | getFeeRate minFee > staticFloorKvb -> "mempool min fee not met"
+    | otherwise                          -> "min relay fee not met"
+  ErrTooManyAncestors _ _           -> "too-long-mempool-chain"
+  ErrTooManyDescendants _ _         -> "too-long-mempool-chain"
+  ErrAncestorSizeTooLarge _ _       -> "too-long-mempool-chain"
+  ErrDescendantSizeTooLarge _ _     -> "too-long-mempool-chain"
+  ErrScriptVerificationFailed _     -> "bad-txns"
+  ErrCoinbaseNotMature _ _          -> "bad-txns-premature-spend-of-coinbase"
+  ErrRBFNotSignaled _               -> "txn-mempool-conflict"
+  -- RBF fee-too-low family → Core "insufficient fee" (space, validation.cpp:1014).
+  ErrRBFFeeTooLow _ _               -> "insufficient fee"
+  ErrMempoolFull                    -> "mempool-full"
+  ErrRBFInsufficientAbsoluteFee _ _ -> "insufficient fee"
+  ErrRBFInsufficientFeeRate _ _     -> "insufficient fee"
+  ErrRBFTooManyReplacements _ _     -> "too-many-potential-replacements"
+  ErrRBFInsufficientRelayFee _ _    -> "insufficient fee"
+  ErrRBFSpendingConflict _          -> "txn-mempool-conflict"
+  ErrRBFNewUnconfirmedInput _       -> "replacement-adds-unconfirmed"
+  ErrTrucViolation _                -> "non-standard"
+  ErrEphemeralViolation _           -> "dust"
+  ErrClusterLimitExceeded _ _       -> "too-long-mempool-chain"
+  -- Standardness tags are already Core reason tokens (Policy.Standard).
+  ErrNonStandard tag                -> T.pack tag
+  ErrInputsNotStandard _ tag        -> T.pack tag
+  ErrNonFinal _                     -> "non-final"
+  ErrSeqLockNotSatisfied            -> "non-BIP68-final"
+  ErrCoinbaseNotAllowed             -> "coinbase"
+  ErrMaxFeeRateExceeded _ _         -> "max-fee-exceeded"
+  ErrSpendsConflictingTx _          -> "bad-txns-spends-conflicting-tx"
+
+-- | RPC error code for a mempool rejection, mirroring Bitcoin Core's
+-- rpc/rawtransaction.cpp: TX_CONFLICT (already-known) → RPC_VERIFY_ALREADY_IN_CHAIN,
+-- TX_MISSING_INPUTS → RPC_VERIFY_ERROR, everything else → RPC_VERIFY_REJECTED.
+mempoolErrorCode :: MempoolError -> Int
+mempoolErrorCode err = case err of
+  ErrAlreadyInMempool        -> rpcVerifyAlreadyInChain
+  ErrSameNonwitnessInMempool -> rpcVerifyAlreadyInChain
+  ErrMissingInput _          -> rpcVerifyError
+  ErrInputSpentInMempool _   -> rpcVerifyError
+  _                          -> rpcVerifyRejected
+
+-- | Convert a 'MempoolError' to an RPC response, emitting the bare Core reject
+-- token as the message (unified with 'testmempoolaccept' via 'mempoolRejectToken').
+-- 'staticFloorKvb' is the node's static relay floor, used to disambiguate the
+-- fee-floor reject.
+mempoolErrorToRpcResponseWith :: Word64 -> MempoolError -> RpcResponse
+mempoolErrorToRpcResponseWith staticFloorKvb err =
+  RpcResponse Null (toJSON (RpcError (mempoolErrorCode err)
+                                     (mempoolRejectToken staticFloorKvb err))) Null
+
+-- | Back-compat wrapper: convert a 'MempoolError' to an RPC response using the
+-- default static relay floor.  Preserved for callers (and tests) that only care
+-- about the error CODE; live handlers use 'mempoolErrorToRpcResponseWith' with
+-- the node's configured floor so the fee-floor sub-token is exact.
 mempoolErrorToRpcResponse :: MempoolError -> RpcResponse
-mempoolErrorToRpcResponse err = RpcResponse Null (toJSON rpcErr) Null
-  where
-    rpcErr = case err of
-      ErrAlreadyInMempool ->
-        -- Exact duplicate (same wtxid). Bitcoin Core: "txn-already-in-mempool".
-        RpcError rpcVerifyAlreadyInChain "Transaction already in mempool"
-
-      ErrSameNonwitnessInMempool ->
-        -- Same txid but different witness (witness mutated).
-        -- Bitcoin Core: TX_CONFLICT, "txn-same-nonwitness-data-in-mempool"
-        -- (validation.cpp:829).
-        RpcError rpcVerifyAlreadyInChain "Transaction with same non-witness data already in mempool"
-
-      ErrMissingInput op ->
-        RpcError rpcVerifyError ("Missing inputs. OutPoint: " <> T.pack (show op))
-
-      ErrInputSpentInMempool conflictTxId ->
-        RpcError rpcVerifyError
-          ("Input already spent by mempool transaction: " <>
-           showHash (BlockHash (getTxIdHash conflictTxId)))
-
-      ErrValidationFailed msg ->
-        RpcError rpcVerifyRejected (T.pack msg)
-
-      ErrInsufficientFee ->
-        RpcError rpcVerifyRejected "Insufficient fee (output value exceeds input)"
-
-      ErrFeeBelowMinimum actual minFee ->
-        RpcError rpcVerifyRejected
-          ("Fee rate too low: " <> T.pack (show (getFeeRate actual)) <>
-           " sat/vB < minimum " <> T.pack (show (getFeeRate minFee)) <> " sat/vB")
-
-      ErrTooManyAncestors actual limit ->
-        RpcError rpcVerifyRejected
-          ("Too many unconfirmed ancestors: " <> T.pack (show actual) <>
-           " > limit " <> T.pack (show limit))
-
-      ErrTooManyDescendants actual limit ->
-        RpcError rpcVerifyRejected
-          ("Too many unconfirmed descendants: " <> T.pack (show actual) <>
-           " > limit " <> T.pack (show limit))
-
-      ErrAncestorSizeTooLarge actual limit ->
-        RpcError rpcVerifyRejected
-          ("Ancestor package too large: " <> T.pack (show actual) <>
-           " vB > limit " <> T.pack (show limit) <> " vB")
-
-      ErrDescendantSizeTooLarge actual limit ->
-        RpcError rpcVerifyRejected
-          ("Descendant package too large: " <> T.pack (show actual) <>
-           " vB > limit " <> T.pack (show limit) <> " vB")
-
-      ErrScriptVerificationFailed msg ->
-        RpcError rpcVerifyRejected ("Script verification failed: " <> T.pack msg)
-
-      ErrCoinbaseNotMature createdAt currentHeight ->
-        RpcError rpcVerifyRejected
-          ("Coinbase not mature: created at height " <> T.pack (show createdAt) <>
-           ", current height " <> T.pack (show currentHeight) <>
-           " (need 100 confirmations)")
-
-      ErrRBFNotSignaled conflictTxId ->
-        RpcError rpcVerifyRejected
-          ("Conflicting transaction does not signal RBF: " <>
-           showHash (BlockHash (getTxIdHash conflictTxId)))
-
-      ErrRBFFeeTooLow newFee oldFee ->
-        RpcError rpcVerifyRejected
-          ("RBF fee too low: " <> T.pack (show newFee) <>
-           " < required " <> T.pack (show oldFee) <> " satoshis")
-
-      ErrRBFNewUnconfirmedInput parent ->
-        RpcError rpcVerifyRejected
-          ("Replacement adds new unconfirmed input (BIP-125 Rule 2). Parent: " <>
-           showHash (BlockHash (getTxIdHash parent)))
-
-      ErrMempoolFull ->
-        RpcError rpcVerifyRejected "Mempool is full"
-
-      _ ->
-        -- Fallback for any MempoolError variant not explicitly mapped above
-        -- (e.g. ErrRBFInsufficient*, ErrTrucViolation, ErrEphemeralViolation,
-        -- ErrClusterLimitExceeded, ErrNonStandard, ErrNonFinal,
-        -- ErrSeqLockNotSatisfied). Keeps the dispatch total.
-        RpcError rpcVerifyRejected (T.pack (show err))
+mempoolErrorToRpcResponse = mempoolErrorToRpcResponseWith defaultStaticRelayFloorKvb
 
 -- | Broadcast a transaction to all connected peers via inv.
 -- BIP-339 / Core PR #18044: select per-peer inv type:
@@ -8660,55 +8691,13 @@ handleTestMempoolAccept server params = do
                                  pair "vsize"   (AE.int vsize)  <>
                                  pair "fees"    feesEnc
 
+    -- Emit the bare Core reject token via the shared 'mempoolRejectToken'
+    -- (single source of truth, also used by sendrawtransaction), threading the
+    -- node's configured static relay floor so the fee-floor sub-token is exact.
     mempoolErrorToText :: MempoolError -> Text
-    mempoolErrorToText err = case err of
-      -- BIP-339: wtxid exact duplicate → "txn-already-in-mempool"
-      ErrAlreadyInMempool -> "txn-already-in-mempool"
-      -- BIP-339: same txid, different witness → "txn-same-nonwitness-data-in-mempool"
-      ErrSameNonwitnessInMempool -> "txn-same-nonwitness-data-in-mempool"
-      ErrValidationFailed _ -> "bad-txns"
-      ErrMissingInput _ -> "missing-inputs"
-      ErrInputSpentInMempool _ -> "txn-mempool-conflict"
-      ErrInsufficientFee -> "min-fee-not-met"
-      ErrFeeBelowMinimum _ _ -> "min-fee-not-met"
-      ErrTooManyAncestors _ _ -> "too-long-mempool-chain"
-      ErrTooManyDescendants _ _ -> "too-long-mempool-chain"
-      ErrAncestorSizeTooLarge _ _ -> "too-long-mempool-chain"
-      ErrDescendantSizeTooLarge _ _ -> "too-long-mempool-chain"
-      ErrScriptVerificationFailed _ -> "bad-txns"
-      ErrCoinbaseNotMature _ _ -> "bad-txns-premature-spend-of-coinbase"
-      ErrRBFNotSignaled _ -> "txn-mempool-conflict"
-      ErrRBFFeeTooLow _ _ -> "insufficient-fee"
-      ErrMempoolFull -> "mempool-full"
-      ErrRBFInsufficientAbsoluteFee _ _ -> "insufficient-fee"
-      ErrRBFInsufficientFeeRate _ _ -> "insufficient-fee"
-      ErrRBFTooManyReplacements _ _ -> "too-many-potential-replacements"
-      ErrRBFInsufficientRelayFee _ _ -> "insufficient-fee"
-      ErrRBFSpendingConflict _ -> "txn-mempool-conflict"
-      ErrRBFNewUnconfirmedInput _ -> "replacement-adds-unconfirmed"
-      ErrTrucViolation _ -> "non-standard"
-      ErrEphemeralViolation _ -> "dust"
-      ErrClusterLimitExceeded _ _ -> "too-long-mempool-chain"
-      -- Relay-policy / standardness rejection (IsStandardTx).  The carried
-      -- tag is already a Core reason token ("dust", "version", "datacarrier",
-      -- "bare-multisig", "tx-size", "scriptpubkey", ...) produced by
-      -- 'renderStdReason' / 'renderWitnessStdReason' in Haskoin.Mempool, so we
-      -- surface it verbatim.  WITHOUT this case 'mempoolErrorToText' was a
-      -- partial function and testmempoolaccept threw a PatternMatchFail
-      -- whenever the standardness gate rejected (dust / bad-version / etc.).
-      ErrNonStandard tag -> T.pack tag
-      -- Inputs-standardness (AreInputsStandard) rejection.
-      ErrInputsNotStandard _ tag -> T.pack tag
-      -- nLockTime not satisfied at tip+1 (BIP-113 IsFinalTx).
-      ErrNonFinal _ -> "non-final"
-      -- BIP-68 relative-locktime sequence lock not met at tip+1.
-      ErrSeqLockNotSatisfied -> "non-BIP68-final"
-      -- A coinbase transaction was submitted directly to the mempool.
-      ErrCoinbaseNotAllowed -> "coinbase"
-      -- Submitted feerate exceeds the caller's maxfeerate ceiling.
-      ErrMaxFeeRateExceeded _ _ -> "max-fee-exceeded"
-      -- Spends an output already spent by another mempool transaction.
-      ErrSpendsConflictingTx _ -> "txn-mempool-conflict"
+    mempoolErrorToText =
+      mempoolRejectToken
+        (getFeeRate (mpcMinFeeRate (mpConfig (rsMempool server))))
 
 --------------------------------------------------------------------------------
 -- Mempool Submit Package RPC Handler (BIP-331)
