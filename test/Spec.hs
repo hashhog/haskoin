@@ -12384,6 +12384,81 @@ main = hspec $ do
             _ -> expectationFailure "Expected code field"
           _ -> expectationFailure "Expected object"
 
+    describe "mempoolRejectToken — bare Core reject tokens (reason-code parity)" $ do
+      -- Static relay floor used by the disambiguating fee-floor branch.
+      let floor100 = 100 :: Word64
+          tok = mempoolRejectToken floor100
+          someTxId = TxId (Hash256 (BS.replicate 32 0xaa))
+
+      -- CheckTransaction family: previously collapsed to generic "bad-txns".
+      it "ErrValidationFailed vin-empty → bad-txns-vin-empty" $
+        tok (ErrValidationFailed "Transaction has no inputs")
+          `shouldBe` "bad-txns-vin-empty"
+      it "ErrValidationFailed vout-empty → bad-txns-vout-empty" $
+        tok (ErrValidationFailed "Transaction has no outputs")
+          `shouldBe` "bad-txns-vout-empty"
+      it "ErrValidationFailed vout-negative → bad-txns-vout-negative" $
+        tok (ErrValidationFailed "Transaction output has negative value")
+          `shouldBe` "bad-txns-vout-negative"
+      it "ErrValidationFailed vout-toolarge → bad-txns-vout-toolarge" $
+        tok (ErrValidationFailed "Transaction output value exceeds MAX_MONEY")
+          `shouldBe` "bad-txns-vout-toolarge"
+      it "ErrValidationFailed oversize passes through → bad-txns-oversize" $
+        tok (ErrValidationFailed "bad-txns-oversize")
+          `shouldBe` "bad-txns-oversize"
+      it "ErrValidationFailed txouttotal passes through → bad-txns-txouttotal-toolarge" $
+        tok (ErrValidationFailed "bad-txns-txouttotal-toolarge")
+          `shouldBe` "bad-txns-txouttotal-toolarge"
+      it "ErrValidationFailed inputs-duplicate passes through → bad-txns-inputs-duplicate" $
+        tok (ErrValidationFailed "bad-txns-inputs-duplicate")
+          `shouldBe` "bad-txns-inputs-duplicate"
+      it "ErrValidationFailed prevout-null → bad-txns-prevout-null" $
+        tok (ErrValidationFailed "Non-coinbase transaction references null prevout")
+          `shouldBe` "bad-txns-prevout-null"
+      it "ErrValidationFailed bad coinbase length → bad-cb-length" $
+        tok (ErrValidationFailed "Coinbase scriptSig size out of range (must be 2-100 bytes)")
+          `shouldBe` "bad-cb-length"
+
+      -- Fee tokens: split of the old shared "min-fee-not-met".
+      it "ErrInsufficientFee (outputs>inputs) → bad-txns-in-belowout" $
+        tok ErrInsufficientFee `shouldBe` "bad-txns-in-belowout"
+      it "ErrFeeBelowMinimum at static floor → min relay fee not met" $
+        tok (ErrFeeBelowMinimum (FeeRate 1) (FeeRate 100))
+          `shouldBe` "min relay fee not met"
+      it "ErrFeeBelowMinimum above static floor (rolling) → mempool min fee not met" $
+        tok (ErrFeeBelowMinimum (FeeRate 1) (FeeRate 500))
+          `shouldBe` "mempool min fee not met"
+
+      -- RBF "insufficient fee" (space, Core token) — was "insufficient-fee".
+      it "ErrRBFFeeTooLow → insufficient fee" $
+        tok (ErrRBFFeeTooLow 1 2) `shouldBe` "insufficient fee"
+      it "ErrRBFInsufficientAbsoluteFee → insufficient fee" $
+        tok (ErrRBFInsufficientAbsoluteFee 1 2) `shouldBe` "insufficient fee"
+      it "ErrRBFInsufficientRelayFee → insufficient fee" $
+        tok (ErrRBFInsufficientRelayFee 1 2) `shouldBe` "insufficient fee"
+
+      -- Conflict token — was "txn-mempool-conflict".
+      it "ErrSpendsConflictingTx → bad-txns-spends-conflicting-tx" $
+        tok (ErrSpendsConflictingTx someTxId)
+          `shouldBe` "bad-txns-spends-conflicting-tx"
+
+      -- Preserved correct tokens (regression guard).
+      it "ErrMissingInput → missing-inputs" $
+        tok (ErrMissingInput (OutPoint someTxId 0)) `shouldBe` "missing-inputs"
+      it "ErrNonFinal → non-final" $
+        tok (ErrNonFinal "x") `shouldBe` "non-final"
+      it "ErrCoinbaseNotAllowed → coinbase" $
+        tok ErrCoinbaseNotAllowed `shouldBe` "coinbase"
+
+      -- sendrawtransaction path emits the SAME bare token as testmempoolaccept.
+      it "sendrawtransaction (mempoolErrorToRpcResponse) emits the bare token, not prose" $ do
+        let response = mempoolErrorToRpcResponse (ErrValidationFailed "Transaction has no inputs")
+        case resError response of
+          Object obj -> case KM.lookup "message" obj of
+            Just (String m) -> m `shouldBe` "bad-txns-vin-empty"
+            _ -> expectationFailure "Expected message field"
+          _ -> expectationFailure "Expected object"
+
     describe "Transaction deserialization" $ do
       it "decodeTxWithFallback decodes a valid legacy transaction" $ do
         -- Simple legacy transaction (no witness)
