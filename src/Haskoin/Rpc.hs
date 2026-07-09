@@ -231,7 +231,7 @@ import Data.Int (Int32, Int64)
 import Network.Wai (Application, Request, Response, responseLBS, requestBody,
                     requestMethod, requestHeaders, pathInfo, rawPathInfo,
                     rawQueryString, remoteHost)
-import Network.Wai.Handler.Warp (run, runSettings, Settings, defaultSettings, setPort, setHost)
+import Network.Wai.Handler.Warp (run, runSettings, Settings, defaultSettings, setPort, setHost, setTimeout)
 import qualified Network.Wai.Handler.WarpTLS as WarpTLS
 import Data.String (fromString)
 import Network.HTTP.Types (status200, status400, status401, status403, status404, status405,
@@ -915,6 +915,15 @@ writeCookieFile cookiePath cookiePass = do
   -- Restrict to owner read+write only: no group or other permissions
   setFileMode cookiePath 0o600
 
+-- | Per-connection timeout (seconds) for the embedded Warp RPC listener.
+-- Warp's default is 30s; a large-block 'getblock <hash> 2' serializes
+-- thousands of decoded txs and is forced up front, which can exceed 30s
+-- and get the connection reaped mid-response.  Bitcoin Core's RPC has no
+-- comparable per-request execution cap, so we use a generous value that
+-- lets large verbose responses complete while still bounding a hung one.
+rpcServerTimeoutSeconds :: Int
+rpcServerTimeoutSeconds = 600
+
 -- | Start the RPC server
 -- Handles both JSON-RPC (POST requests) and REST API (GET /rest/* requests)
 startRpcServer :: RpcConfig -> HaskoinDB -> HeaderChain -> PeerManager
@@ -983,6 +992,16 @@ startRpcServer config db hc pm mp fe cache net mBlockStore mWalletMgr pruneCfg m
     Nothing  -> return ()
   let settings = setPort (rpcPort config)
                $ setHost (fromString (rpcHost config))
+               -- Per-connection timeout.  Warp's default is 30s, which reaps a
+               -- long-running large-block 'getblock <hash> 2' (verbosity=2)
+               -- mid-response: the verbose tx[] for a ~4500-tx block is a heavy
+               -- serialization that is forced up front (rawJsonResult), so no
+               -- bytes stream to tickle the timeout and Warp closes the socket
+               -- before the body is sent (observed as a dropped connection).
+               -- Bitcoin Core's RPC server runs a request to completion; we set
+               -- a generous cap here to match that run-to-completion behaviour
+               -- while still bounding a genuinely hung request.
+               $ setTimeout rpcServerTimeoutSeconds
                $ defaultSettings
   tid <- forkIO $ case rpcTlsSettings config of
     Just tlsSet -> WarpTLS.runTLS tlsSet settings (combinedApp server)
@@ -2852,10 +2871,19 @@ buildCoinbaseTxEnc block =
 -- Reference: bitcoin-core/src/rpc/rawtransaction_util.cpp TxToUniv.
 buildBlockTxArrayEnc :: Network -> Block -> [TxUndo] -> AE.Encoding
 buildBlockTxArrayEnc net block undoList =
-  AE.list id (zipWith buildOneTxEnc [0..] (blockTxns block))
+  AE.list id (case blockTxns block of
+                []        -> []
+                (cb:rest) ->
+                  -- Pair each non-coinbase tx with its undo entry via a single
+                  -- left-to-right zip, instead of 'undoList !! (idx-1)' plus a
+                  -- fresh 'length undoList' per tx (each O(n), O(n^2) over the
+                  -- block).  Coinbase (no undo) is prepended; any tx past the
+                  -- undo list (should not happen) gets no fee.
+                  buildOneTxEnc Nothing cb
+                    : zipWith buildOneTxEnc (map Just undoList ++ repeat Nothing) rest)
   where
-    buildOneTxEnc :: Int -> Tx -> AE.Encoding
-    buildOneTxEnc idx tx =
+    buildOneTxEnc :: Maybe TxUndo -> Tx -> AE.Encoding
+    buildOneTxEnc mUndo tx =
       let txid     = computeTxId tx
           wtxid    = computeWtxId tx
           txidHex  = showHash (BlockHash (getTxIdHash txid))
@@ -2867,12 +2895,11 @@ buildBlockTxArrayEnc net block undoList =
           hexStr   = TE.decodeUtf8 $ B16.encode (S.encode tx)
           -- fee: only for non-coinbase txs, computed from undo data
           -- undoList has one entry per non-coinbase tx (0-based for tx index 1+)
-          mFee     = if idx == 0 then Nothing  -- coinbase has no fee
-                     else
-                       let undoIdx = idx - 1
-                       in if undoIdx < length undoList
-                          then computeFee tx (undoList !! undoIdx)
-                          else Nothing
+          -- fee only when a matching undo entry is present; coinbase and
+          -- any tx without undo emit no "fee" field (identical to before).
+          mFee     = case mUndo of
+                       Just u  -> computeFee tx u
+                       Nothing -> Nothing
       in pairs $
            pair "txid"     (text txidHex) <>
            pair "hash"     (text wtxidHex) <>
@@ -2881,7 +2908,7 @@ buildBlockTxArrayEnc net block undoList =
            pair "vsize"    (AE.int vsize) <>
            pair "weight"   (AE.int wt) <>
            pair "locktime" (AE.word32 (txLockTime tx)) <>
-           pair "vin"      (AE.list id (map (decodeRawVinEnc tx) [0 .. length (txInputs tx) - 1])) <>
+           pair "vin"      (AE.list id (zipWith buildVinEnc (txInputs tx) (txWitness tx ++ repeat []))) <>
            pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx))) <>
            -- Core TxToUniv tail order: ...vout, [fee], [hex] — fee BEFORE hex.
            (case mFee of
@@ -14155,11 +14182,9 @@ scriptToAsmSighashDecodeTop scriptBytes =
 -- Coinbase inputs emit {coinbase, sequence, txinwitness?}.
 -- Non-coinbase inputs emit {txid, vout, scriptSig:{asm,hex}, txinwitness?, sequence}.
 -- Reference: bitcoin-core/src/core_io.cpp TxToUniv (fAttemptSighashDecode=true).
-decodeRawVinEnc :: Tx -> Int -> AE.Encoding
-decodeRawVinEnc tx idx =
-  let inp       = txInputs tx !! idx
-      witness   = if idx < length (txWitness tx) then txWitness tx !! idx else []
-      isCoinbase = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
+buildVinEnc :: TxIn -> [ByteString] -> AE.Encoding
+buildVinEnc inp witness =
+  let isCoinbase = txInPrevOutput inp == OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
   in if isCoinbase
      -- Core TxToUniv vin order for a coinbase: coinbase, [txinwitness],
      -- sequence (sequence is pushed last for ALL inputs; core_io.cpp).
@@ -14200,7 +14225,7 @@ decodeRawTxEnc net tx =
        pair "vsize"    (AE.int vsize) <>
        pair "weight"   (AE.int wt) <>
        pair "locktime" (AE.word32 (txLockTime tx)) <>
-       pair "vin"      (AE.list id (map (decodeRawVinEnc tx) [0 .. length (txInputs tx) - 1])) <>
+       pair "vin"      (AE.list id (zipWith buildVinEnc (txInputs tx) (txWitness tx ++ repeat []))) <>
        pair "vout"     (AE.list id (zipWith (psbtVoutEnc net) [0..] (txOutputs tx)))
 
 -- | Convert ScriptType to string for JSON output
