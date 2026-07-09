@@ -191,6 +191,11 @@ module Haskoin.Network
   , PreHandshakeResult(..)
   , checkPreHandshake
   , shouldRejectConnection
+  , InboundAdmission(..)
+  , inboundAdmissionDecision
+  , checkInboundGroupLimit
+  , countInboundPeers
+  , maxInboundPerGroup
     -- * Connection Eviction
   , EvictionCandidate(..)
   , evictConnection
@@ -4162,8 +4167,41 @@ startInboundListener pm port = do
               putStrLn $ "Inbound connection error from " ++ show clientAddr ++ ": " ++ show e
               close clientSock)
 
+    -- Inbound admission control (Bitcoin Core net.cpp AcceptConnection ladder).
+    -- WITHOUT this the accept path was UNBOUNDED: every inbound socket was
+    -- handshaked and Map.insert'd regardless of ban state or the inbound cap —
+    -- a resource-exhaustion / eclipse DoS surface.  We now consult
+    -- 'inboundAdmissionDecision' (ban -> discouraged -> max-total -> max-inbound
+    -- evict-or-reject -> per-netgroup cap) BEFORE any handshake or registration.
+    -- The 'setnetworkactive' gate is still applied in 'acceptLoop' above.
     handleInbound :: Socket -> SockAddr -> IO ()
     handleInbound sock addr = do
+      decision <- inboundAdmissionDecision pm addr
+      case decision of
+        RejectInbound reason -> do
+          putStrLn $ "Rejecting inbound connection from " ++ show addr
+                  ++ ": " ++ reason
+          close sock
+        AdmitInboundAfterEvicting _ -> do
+          -- Full inbound slots but an eviction candidate exists: evict the
+          -- least-valuable inbound peer (Core AttemptToEvictConnection), then
+          -- admit.  If the eviction races away, refuse rather than overflow.
+          evicted <- evictConnection pm
+          case evicted of
+            Nothing -> do
+              putStrLn $ "Rejecting inbound connection from " ++ show addr
+                      ++ ": max inbound reached, eviction failed"
+              close sock
+            Just ev -> do
+              putStrLn $ "Evicted inbound peer " ++ show ev
+                      ++ " to admit " ++ show addr
+              admitInbound sock addr
+        AdmitInbound -> admitInbound sock addr
+
+    -- Register + handshake an accepted inbound connection.  Only reached after
+    -- 'handleInbound' has approved admission via 'inboundAdmissionDecision'.
+    admitInbound :: Socket -> SockAddr -> IO ()
+    admitInbound sock addr = do
       now <- round <$> getPOSIXTime
       let info = PeerInfo
             { piAddress       = addr
@@ -4865,6 +4903,57 @@ countInboundPeers pm = do
     info <- readTVarIO (pcInfo pc)
     return $ if piInbound info then 1 else 0
   return $ sum counts
+
+-- | Count the inbound peers whose network group matches @addr@.
+-- Reads the count off the live peer map (keyed by SockAddr), so there is no
+-- separate per-group counter to keep in sync with connect/disconnect.
+countInboundPeersInGroup :: PeerManager -> SockAddr -> IO Int
+countInboundPeersInGroup pm addr = do
+  peers <- readTVarIO (pmPeers pm)
+  let targetGroup = computeNetworkGroup addr
+  counts <- forM (Map.toList peers) $ \(paddr, pc) -> do
+    info <- readTVarIO (pcInfo pc)
+    return $ if piInbound info && computeNetworkGroup paddr == targetGroup
+               then 1 else 0
+  return $ sum counts
+
+-- | Per-netgroup inbound admission gate (eclipse protection): 'True' when a
+-- new inbound connection from @addr@ would NOT exceed 'maxInboundPerGroup'
+-- for its /16 (or ASN) network group.  Same policy as the standalone
+-- 'checkInboundLimit'/'InboundLimiter', but computed from the live peer map.
+-- Reference: bitcoin-core/src/net.cpp — per-netgroup inbound limiting.
+checkInboundGroupLimit :: PeerManager -> SockAddr -> IO Bool
+checkInboundGroupLimit pm addr = do
+  n <- countInboundPeersInGroup pm addr
+  return $ n < maxInboundPerGroup
+
+-- | Socket-free inbound admission decision — the accept-path ladder mirroring
+-- Bitcoin Core @CConnman::AcceptConnection@ (@src/net.cpp@).  The
+-- setnetworkactive gate is applied earlier in 'acceptLoop'; here we enforce, in Core
+-- order: banned -> discouraged-with-full-slots -> max-total -> max-inbound
+-- (evict-or-reject) -> per-netgroup inbound cap.  Kept as a pure-ish 'IO'
+-- decision (no socket work) so the accept path is unit-testable.
+data InboundAdmission
+  = AdmitInbound                       -- ^ Proceed: handshake + register the peer.
+  | AdmitInboundAfterEvicting SockAddr -- ^ Evict this victim first, then admit.
+  | RejectInbound String               -- ^ Close the socket; do NOT register.
+  deriving (Show, Eq)
+
+inboundAdmissionDecision :: PeerManager -> SockAddr -> IO InboundAdmission
+inboundAdmissionDecision pm addr = do
+  verdict <- checkPreHandshake pm addr
+  groupOk <- checkInboundGroupLimit pm addr
+  return $ case verdict of
+    RejectBanned         -> RejectInbound "peer is banned"
+    RejectDiscouraged    -> RejectInbound "peer discouraged and inbound slots full"
+    RejectMaxConnections -> RejectInbound "max total connections reached"
+    RejectMaxInbound     -> RejectInbound "max inbound reached, no eviction candidate"
+    AcceptAfterEviction victim
+      | groupOk          -> AdmitInboundAfterEvicting victim
+      | otherwise        -> RejectInbound "per-netgroup inbound limit reached"
+    AcceptConnection
+      | groupOk          -> AdmitInbound
+      | otherwise        -> RejectInbound "per-netgroup inbound limit reached"
 
 --------------------------------------------------------------------------------
 -- Connection Eviction (Phase 16)
