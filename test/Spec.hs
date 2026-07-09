@@ -162,6 +162,7 @@ import qualified W186SubmitBlockHeaderValidationSpec
 import qualified W187MaxStackSizePushSpec
 import qualified W188InboundPongSpec
 import qualified W189GetBlockVerbosity3Spec
+import qualified W190InboundCapSpec
 import qualified ConvertJoinPsbtSpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
@@ -23156,6 +23157,12 @@ main = hspec $ do
   --       v3 adds per-input prevout {generated,height,value,scriptPubKey};
   --       the local-block path used to drop to the txid list for v3.
   W189GetBlockVerbosity3Spec.spec
+
+  -- W190: inbound admission control — max-inbound cap + eviction + ban on the
+  --       accept path (Core net.cpp AcceptConnection). handleInbound used to
+  --       admit every inbound unconditionally (UNBOUNDED DoS surface); now it
+  --       consults inboundAdmissionDecision before any handshake/registration.
+  W190InboundCapSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
