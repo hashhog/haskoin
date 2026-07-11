@@ -1321,6 +1321,19 @@ mainnet = Network
           , aupChainTxCount = 1389331583
           , aupBlockHash = hashFromHex "0000000000000000000171f4e09aeadacf7552dd79bec17ee8c9e2ee7d1823e0"
           })
+      -- hashhog-local Track-B WINDOWED modern-surface replay boundary snapshot
+      -- at h=481823 (last pre-segwit block; segwit activates at 481824). NOT a
+      -- Bitcoin Core chainparams entry (the 840k/880k/910k/935k entries above
+      -- ARE). Mirrors the 944183/956407 fleet-local entries: aupHashSerialized
+      -- (DISPLAY / uint256 order; hexToHash256 does NOT reverse) + aupChainTxCount
+      -- are the txoutset_hash + nchaintx Core dumptxoutset (rollback=481823)
+      -- reported; aupBlockHash is the 481823 block hash.
+      , (481823, AssumeUtxoParams
+          { aupHeight = 481823
+          , aupHashSerialized = hexToHash256 "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4"
+          , aupChainTxCount = 249036369
+          , aupBlockHash = hashFromHex "000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"
+          })
       ]
   -- Assume-valid (Bitcoin Core v28.0): skip scripts for ancestors of this block.
   -- Hash: mainnet block 938343.
@@ -2889,6 +2902,29 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
     unless (isFinalTxCheck tx height lockTimeCutoff) $
       Left "bad-txns-nonfinal"
     ) txns
+
+  -- Context-free legacy sigop budget (Bitcoin Core CheckBlock,
+  -- validation.cpp:3969-3977): sum getLegacySigOpCount over EVERY transaction
+  -- INCLUDING the coinbase, scale by WITNESS_SCALE_FACTOR, and reject if it
+  -- exceeds MAX_BLOCK_SIGOPS_COST. This is the LEGACY term of
+  -- GetTransactionSigOpCost and needs NO UTXO view, so — unlike the full
+  -- getBlockSigOpCost check in the skipConnectChecks block below (which adds
+  -- UTXO-dependent P2SH + witness sigops) — Core runs it context-free in
+  -- CheckBlock on EVERY block before storage, including a non-tip-extending
+  -- side-branch sibling. The submitBlock side-branch arm calls this with
+  -- skipConnectChecks=True and therefore previously ADMITTED (stored as
+  -- 'inconclusive') a coinbase-sigop-bomb block Core rejects outright
+  -- (bad-blk-sigops). Gated to the side-branch arm only: on the connect path
+  -- (skipConnectChecks=False) the stricter full sigop check below subsumes
+  -- this (full cost >= legacy cost), so the P2P/connect path stays
+  -- byte-identical. Legacy count uses inaccurate CHECKMULTISIG=20, matching
+  -- Core GetLegacySigOpCount -> GetSigOpCount(false).
+  -- See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+  when skipConnectChecks $ do
+    let legacyBlockSigOpCost =
+          sum (map (\tx -> getLegacySigOpCount tx * witnessScaleFactor) txns)
+    when (legacyBlockSigOpCost > maxBlockSigOpsCost) $
+      Left "bad-blk-sigops"
 
   -- Steps 7b, 8, 9 are UTXO-dependent (ConnectBlock-level) checks.  When
   -- skipConnectChecks=True (side-branch acceptance via submitBlock), they are
