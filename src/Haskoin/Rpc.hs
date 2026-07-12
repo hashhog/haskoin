@@ -269,7 +269,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
-import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing)
+import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, doesDirectoryExist, listDirectory, getFileSize)
 import System.FilePath ((</>), isRelative)
 import System.Posix.Files (setFileMode)
 import System.IO (hSetEncoding, hPutStr, hPutStrLn, stderr, utf8, withFile, IOMode(..))
@@ -1635,7 +1635,16 @@ handleGetBlockchainInfo server = do
     Just bs -> do
       fileInfos <- readIORef (bsFileInfos bs)
       return (calculateCurrentUsage fileInfos)
-    Nothing -> return 0
+    Nothing ->
+      -- No blk*.dat BlockStore is wired on this run: haskoin persists
+      -- block bodies + undo data + the coins view inside the RocksDB
+      -- chainstate store, so Core's CalculateCurrentUsage (which sums
+      -- blocks/ blk+rev file bytes, rpc/blockchain.cpp getblockchaininfo
+      -- -> BlockManager::CalculateCurrentUsage) has no blk-file analog.
+      -- Report the truthful on-disk footprint of that store instead of a
+      -- 0 stub, so size_on_disk is a real byte count of the node's
+      -- block/chain data on disk.
+      chainstateSizeOnDisk (rpcDataDir (rsConfig server) </> "chainstate")
   -- Build the response on the streaming path so difficulty uses
   -- Core-parity %.16g formatting (difficultyStr / FFI snprintf).
   let bits = bhBits (ceHeader tip)
@@ -1670,6 +1679,31 @@ handleGetBlockchainInfo server = do
               pair "warnings"             (AE.list text [])
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Truthful on-disk byte footprint of a directory tree, used to populate
+-- @getblockchaininfo.size_on_disk@ when no blk*.dat 'BlockStore' is wired
+-- (haskoin keeps block bodies + undo + coins inside the RocksDB chainstate
+-- store).  Sums the sizes of every regular file reachable under @root@.
+--
+-- Robust to concurrent RocksDB compaction: any file/dir that vanishes or
+-- is unreadable mid-walk contributes 0 rather than throwing, so a live
+-- @getblockchaininfo@ never fails on a transient FS race.  Returns 0 when
+-- @root@ does not exist.
+chainstateSizeOnDisk :: FilePath -> IO Int64
+chainstateSizeOnDisk root = do
+  exists <- doesDirectoryExist root
+  if not exists then return 0 else go root
+  where
+    go dir = do
+      entries <- listDirectory dir `catch` \(_ :: SomeException) -> return []
+      sizes <- mapM (measure . (dir </>)) entries
+      return (sum sizes)
+    measure path = do
+      isDir <- doesDirectoryExist path
+      if isDir
+        then go path
+        else (fromIntegral <$> getFileSize path)
+               `catch` \(_ :: SomeException) -> return 0
 
 -- | @getchainstates@ (Bitcoin Core v23+) — report information about the
 -- node's chainstates.
