@@ -1746,10 +1746,20 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
            maxBlocksInFlight   = 128  :: Word32
            kickerPollUsec  = 400 * 1000 :: Int    -- 0.4 s progress poll
            kickerStallSecs = 12 :: Int64          -- stall re-request cadence
+           -- Single-peer HARD-STALL threshold (W-TRACKB): seconds the
+           -- CONNECTED tip may stay frozen, while in active linear catch-up
+           -- against a SINGLE peer, before we force-drop that peer to trigger
+           -- a fresh '-connect' redial.  Chosen well above any legitimate
+           -- per-block validation / periodic-flush pause (blocks connect in
+           -- << 1 s even under --noassumevalid full script verify), so it only
+           -- fires on a genuine download wedge, not on a slow block.
+           hardStallSecs   = 120 :: Int64
            -- 'lastConn' = value of 'nextBlock' (connected tip + 1) recorded at
            -- the previous request; used to detect whether the connected tip
            -- advanced (drained the pipeline) since we last topped it up.
-           kicker rot lastConn lastReqTime = do
+           -- 'lastProgAt' = POSIX time (s) at which the connected tip last
+           -- advanced; drives the single-peer HARD-STALL force-redial below.
+           kicker rot lastConn lastReqTime lastProgAt = do
              threadDelay kickerPollUsec
              peers <- getConnectedPeerList pm'
              headerTip <- readTVarIO (hcHeight hc)
@@ -1848,8 +1858,55 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                            return (rot + 1, nextBlock, nowKick)
                          else return (rot, nextBlock, lastReqTime)
              let (rot', lastConn', lastReqTime') = newSt
-             kicker rot' lastConn' lastReqTime'
-       in kicker 0 maxBound 0)
+             -- SINGLE-PEER DOWNLOAD-STALL RECOVERY (W-TRACKB).  The 'stall
+             -- recover' arm above rotates 'rot' to a "different" peer, but a
+             -- '-connect' replay run has exactly ONE peer, so the rotation is a
+             -- NO-OP.  A peer whose block-serve has silently stalled — its
+             -- session is still alive at the message level (ping/getheaders
+             -- replies keep 'piLastSeen' fresh, so peerManagerLoop's 5-minute
+             -- stale-peer reaper never drops it) but it has stopped answering
+             -- getdata — then wedges block download forever: the next-needed
+             -- body never arrives, 'connectBlock' is never even called for it,
+             -- so NOTHING is logged and the connected tip freezes.  This was
+             -- the Track-B haskoin wedge at 492132 (tip 492131, single
+             -- --connect peer, server serving +0 while the kicker re-requested
+             -- forever).  Detect it by connected-tip PROGRESS (not message
+             -- liveness): if the tip has not advanced for 'hardStallSecs' while
+             -- in active linear catch-up against a SINGLE peer, force-drop that
+             -- peer + remove it from 'pmPeers' so the '-connect' redial spawns
+             -- a FRESH session that re-drains the pipeline.  Self-healing: a
+             -- fresh session that also stalls is dropped again, instead of a
+             -- permanent wedge only a full process restart could clear.
+             let numPeersK   = length peers
+                 hardStalled = not progressed && activeK && not isFork
+                               && numPeersK == 1
+                               && (nowKick - lastProgAt) >= hardStallSecs
+             lastProgAtFinal <-
+               if progressed
+                 then return nowKick
+                 else if hardStalled
+                   then do
+                     putStrLn $ "Block-gap kicker (single-peer HARD STALL): "
+                             ++ "connected tip frozen at " ++ show connectedTip
+                             ++ " for " ++ show (nowKick - lastProgAt)
+                             ++ "s; next-needed block " ++ show nextBlock
+                             ++ " never delivered by the sole peer (session alive"
+                             ++ " but not serving getdata). Dropping the peer to"
+                             ++ " force a fresh -connect redial."
+                     forM_ peers $ \pc -> do
+                       a <- piAddress <$> readTVarIO (pcInfo pc)
+                       disconnectPeer pc
+                         `catch` (\(e :: SomeException) ->
+                                    putStrLn $ "HARD STALL force-drop error: "
+                                            ++ show e)
+                       atomically $ modifyTVar' (pmPeers pm') (Map.delete a)
+                     -- Reset the timer to now: give the fresh session up to
+                     -- another 'hardStallSecs' to reconnect and start serving
+                     -- before we would drop again.
+                     return nowKick
+                   else return lastProgAt
+             kicker rot' lastConn' lastReqTime' lastProgAtFinal
+       in kicker 0 maxBound 0 0)
         `catch` (\(e :: SomeException) ->
                    putStrLn $ "block-gap kicker error: " ++ show e)
 
