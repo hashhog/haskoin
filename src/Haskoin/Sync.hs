@@ -401,9 +401,13 @@ blockProcessor bd = forever $ do
                   -- that both the IBD arm and submitBlock share identical coverage.
                   -- Reference: Bitcoin Core ConnectBlock / IsBIP30Repeat().
                   -- getMtp supplies per-input MTP-at-height for the BIP-68 time
-                  -- component (W183 fix).  heightMap + blockEntries are already
-                  -- in scope (read above) and are backed by the persistent store.
-                  let getMtp = getMtpAtHeightFromEntries blockEntries heightMap
+                  -- component (W183 fix).  Resolved through the VALIDATING
+                  -- block's own ancestry (walk cePrev from its parent), NOT the
+                  -- active-tip height index hcByHeight — haskoin#3 / Core
+                  -- block.GetAncestor (tx_verify.cpp:74).  This is the
+                  -- straight-line IBD arm (block extends the tip), so the
+                  -- ancestry IS the active chain: same value, branch-correct.
+                  let getMtp = getMtpFromAncestry blockEntries (bhPrevBlock (blockHeader block))
                   validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs getMtp skipScripts block utxoMap
 
                   case validationResult of

@@ -89,7 +89,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            computeBlockVersionFromChain,
                            taprootDeployment,
                            bumpTipGen,
-                           getMtpAtHeightFromEntries)
+                           getMtpAtHeightFromEntries, getMtpFromAncestry)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -616,10 +616,14 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           utxoMap <- buildBlockUTXOMap cache block
 
           -- Build per-height MTP getter for BIP-68 time enforcement (W183 fix).
-          -- hcEntries / hcByHeight are loaded from the persistent store at startup.
+          -- hcEntries is loaded from the persistent store at startup.  This is
+          -- the active-tip arm (parent == tip), so the block's ancestry IS the
+          -- active chain; we still resolve the per-coin MTP through that
+          -- ancestry (walk cePrev from its parent) rather than the hcByHeight
+          -- index, for parity with the reorg path and Core's block.GetAncestor
+          -- (tx_verify.cpp:74) — haskoin#3.  Same value here, branch-correct.
           entriesSB <- readTVarIO (hcEntries hc)
-          byHeightSB <- readTVarIO (hcByHeight hc)
-          let getMtpSB = getMtpAtHeightFromEntries entriesSB byHeightSB
+          let getMtpSB = getMtpFromAncestry entriesSB (bhPrevBlock (blockHeader block))
 
           -- 'validateFullBlockIO' sequences BIP-30 (UTXO duplicate-txid guard,
           -- requires DB IO) followed by the pure 'validateFullBlock' checks,
@@ -1248,7 +1252,6 @@ buildReorgBatch net db cache hc disList disUndos conList = do
     buildConnectChain _ _   _   _ []           ov ops = return (Right (ops, ov))
     buildConnectChain c dbh hc' n (blk : rest) ov ops = do
       entries  <- readTVarIO (hcEntries hc')
-      byHeightCC <- readTVarIO (hcByHeight hc')
       let bh = computeBlockHash (blockHeader blk)
       case Map.lookup bh entries of
         Nothing -> return $ Left $
@@ -1297,7 +1300,12 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                                          (bhPrevBlock (blockHeader blk))
                                          0 parentMTP
                                          (consensusFlagsAtHeight n (ceHeight ce))
-                  getMtpCC  = getMtpAtHeightFromEntries entries byHeightCC
+                  -- BIP-68 per-coin TIME-lock MTP resolved from the VALIDATING
+                  -- block's own ancestry (walk cePrev from its parent), NOT the
+                  -- active-tip height index hcByHeight — haskoin#3.  Core
+                  -- tx_verify.cpp:74 uses block.GetAncestor(coinHeight-1); a
+                  -- reorg's hcByHeight can still point at the losing branch.
+                  getMtpCC  = getMtpFromAncestry entries (bhPrevBlock (blockHeader blk))
               case validateFullBlock n csReorg getMtpCC False False blk spentUtxos of
                 Left err -> return $ Left $
                   "invalid-connect: reorg connect: block " ++ show bh
