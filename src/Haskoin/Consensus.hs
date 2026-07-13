@@ -183,6 +183,7 @@ module Haskoin.Consensus
   , checkSequenceLocks
   , bip68Active
   , getMtpAtHeightFromEntries
+  , getMtpFromAncestry
     -- * BIP9 Version Bits (Soft Fork Deployment)
   , ThresholdState(..)
   , Deployment(..)
@@ -1992,6 +1993,65 @@ getMtpAtHeightFromEntries entries byHeight h =
         Nothing -> []
         Just ce -> bhTimestamp (ceHeader ce)
                  : (if curH == 0 then [] else collect (curH - 1) (n - 1))
+
+-- | Median time past at height @h@ resolved through the VALIDATING block's
+-- own ancestry — NOT the active-tip height index 'hcByHeight'.
+--
+-- This is the branch-correct per-coin BIP-68 TIME-lock resolver.  It walks
+-- 'cePrev' from @startHash@ (the parent of the block being connected) back to
+-- the ancestor at height @h@ (== @coinHeight-1@) and returns that ancestor's
+-- pre-computed 'ceMedianTime', mirroring Bitcoin Core's CalculateSequenceLocks
+-- (bitcoin-core/src/consensus/tx_verify.cpp:74):
+--
+-- >   nCoinTime = block.GetAncestor(max(nCoinHeight-1,0))->GetMedianTimePast()
+--
+-- where @block@ is the block being connected — 'GetAncestor' walks its OWN
+-- ancestry, never the active tip.
+--
+-- Why NOT 'getMtpAtHeightFromEntries' / 'hcByHeight' (haskoin#3): during a
+-- reorg the winning branch's headers can still be lighter-or-tied, so
+-- 'addHeaderAt' has not rewritten @hcByHeight[h]@ to the winning branch (see
+-- the note at 'reorgTargetIsBetter' ~5104: this index is unsafe for answering
+-- "what hash sits at height h on the active validated chain?").  A reorg-batch
+-- connect that reads @hcByHeight@ therefore picks up the LOSING branch's MTP at
+-- @coinHeight-1@ and can straddle the 512-second BIP-68 boundary on the wrong
+-- side — a chain-split-class false-reject/false-accept
+-- (tools/reorg-haskoin-bip68-mtp-proof.sh).  Resolving through the validating
+-- block's ancestry is branch-correct by construction, exactly as Core.
+--
+-- For a straight-line tip extension the validating block's ancestry IS the
+-- active chain, so this returns the same value the 'hcByHeight' lookup did —
+-- behaviour on the non-reorg path is unchanged.
+--
+-- @h@ is always @<=@ the parent's height (a spent coin is created at or before
+-- the spending block, so @coinHeight-1 < validatingHeight@), so 'ancestorAtHeight'
+-- always reaches it on a well-formed chain.
+getMtpFromAncestry
+  :: Map BlockHash ChainEntry  -- ^ hcEntries (block index, loaded from store)
+  -> BlockHash                 -- ^ parent hash of the block being connected
+  -> Word32                    -- ^ target height (coinHeight-1)
+  -> Word32
+getMtpFromAncestry entries startHash h =
+  case ancestorAtHeight entries startHash h of
+    Just ce -> ceMedianTime ce   -- pre-computed MTP of the branch-correct ancestor
+    Nothing ->
+      -- Defensive fallback: the ancestry link into 'entries' is incomplete
+      -- (should not occur on a well-formed chain — every ancestor header is
+      -- present).  Walk 'cePrev' from 'startHash', collect up to 11 raw
+      -- timestamps at heights <= h, take the median.  Never returns 0.
+      let timestamps = collect startHash (11 :: Int)
+      in case sort timestamps of
+           []     -> 1  -- impossible on a well-formed chain; safe sentinel
+           sorted -> sorted !! (length sorted `div` 2)
+  where
+    collect _    0 = []
+    collect hash n =
+      case Map.lookup hash entries of
+        Nothing -> []
+        Just ce
+          | ceHeight ce > h -> maybe [] (\p -> collect p n) (cePrev ce)
+          | otherwise       -> bhTimestamp (ceHeader ce)
+                             : maybe [] (\p -> collect p (n - 1)) (cePrev ce)
 
 --------------------------------------------------------------------------------
 -- BIP9 Version Bits (Soft Fork Deployment)
@@ -6048,10 +6108,9 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       -- the header chain (medianTime is stamped at header insert).
       parentMTP <- reorgPrevMtp hc ce
       -- Read header chain for per-input MTP lookups (BIP-68 time enforcement).
-      -- hcEntries / hcByHeight are loaded from the persistent store at startup
-      -- and kept in sync — safe to snapshot here before the validateFullBlock call.
+      -- hcEntries is loaded from the persistent store at startup and kept in
+      -- sync — safe to snapshot here before the validateFullBlock call.
       entriesRC  <- readTVarIO (hcEntries hc)
-      byHeightRC <- readTVarIO (hcByHeight hc)
       -- REORG SCRIPT VERIFICATION (Core parity): full validation incl.
       -- per-input verifyScriptWithFlags under getBlockScriptFlags,
       -- BEFORE building the connect ops — a heavier fork whose scripts
@@ -6059,7 +6118,12 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader blk))
                           0 parentMTP
                           (getBlockScriptFlags net bh (ceHeight ce))
-          getMtp = getMtpAtHeightFromEntries entriesRC byHeightRC
+          -- BIP-68 per-coin TIME-lock MTP resolved from the VALIDATING block's
+          -- own ancestry (walk cePrev from its parent), NOT the active-tip
+          -- height index hcByHeight — haskoin#3.  Core tx_verify.cpp:74 uses
+          -- block.GetAncestor(coinHeight-1); during a reorg hcByHeight can still
+          -- point at the losing branch, giving the wrong-branch MTP.
+          getMtp = getMtpFromAncestry entriesRC (bhPrevBlock (blockHeader blk))
       case validateFullBlock net cs getMtp False False blk spentUtxos of
         Left err -> return $ Left $
           "reorg connect: block " ++ show bh
@@ -6307,18 +6371,7 @@ connectChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
 connectChain net cache db hc fromHash toHash = do
   -- Build list of blocks to connect (from fork to new tip)
   entries  <- readTVarIO (hcEntries hc)
-  byHeight <- readTVarIO (hcByHeight hc)
   let path = buildPath entries toHash fromHash []
-      -- getMtpCC: pure per-height MTP lookup for BIP-68 enforcement in
-      -- validateFullBlock.  Reads from persistent-store-backed hcEntries.
-      getMtpCC = getMtpAtHeightFromEntries entries byHeight
-      -- getMTP: IO wrapper used by applyBlock (Word32 -> IO Word32 signature).
-      -- Re-reads TVars so it reflects any concurrent inserts during the loop.
-      getMTP :: Word32 -> IO Word32
-      getMTP h = do
-        ents    <- readTVarIO (hcEntries hc)
-        heights <- readTVarIO (hcByHeight hc)
-        return $ getMtpAtHeightFromEntries ents heights h
   results <- forM path $ \ce -> do
     mBlock <- getBlock db (ceHash ce)
     case mBlock of
@@ -6328,6 +6381,23 @@ connectChain net cache db hc fromHash toHash = do
         prevBlockMTP <- case cePrev ce >>= (`Map.lookup` entries) of
           Just prevCe -> return $ ceMedianTime prevCe
           Nothing -> return 0  -- Genesis or missing parent
+
+        -- BIP-68 per-coin TIME-lock MTP resolved from THIS block's own
+        -- ancestry (walk cePrev from its parent), NOT the active-tip height
+        -- index hcByHeight — haskoin#3.  Core tx_verify.cpp:74 uses
+        -- block.GetAncestor(coinHeight-1) on the block being connected; during
+        -- a reorg hcByHeight can still point at the losing branch.  Built
+        -- per-block because the connect loop walks each side-branch block.
+        let parentHash = bhPrevBlock (blockHeader block)
+            -- getMtpCC: pure per-height MTP lookup for BIP-68 enforcement in
+            -- validateFullBlock.
+            getMtpCC = getMtpFromAncestry entries parentHash
+            -- getMTP: IO wrapper used by applyBlock (Word32 -> IO Word32).
+            -- Re-reads hcEntries so it reflects any concurrent inserts.
+            getMTP :: Word32 -> IO Word32
+            getMTP h = do
+              ents <- readTVarIO (hcEntries hc)
+              return $ getMtpFromAncestry ents parentHash h
 
         -- FULL SCRIPT-VERIFYING VALIDATION of the side-branch block, BEFORE
         -- 'applyBlock' spends its inputs from the cache.  This is the reorg
