@@ -239,6 +239,10 @@ module Haskoin.Consensus
   , assumeUtxoForHeightIO
   , assumeUtxoForBlockHashIO
   , checkAssumeutxoWhitelistIO
+    -- ** Campaign-only AssumeUTXO entries (HASHHOG_CAMPAIGN_ASSUMEUTXO)
+  , CampaignAssumeutxoEntry(..)
+  , campaignEntryToParams
+  , loadCampaignAssumeutxoFromEnv
     -- * Block Invalidation (invalidateblock/reconsiderblock RPCs)
   , InvalidateError(..)
   , invalidateBlock
@@ -275,13 +279,19 @@ import GHC.Generics (Generic)
 import Control.Concurrent.STM
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
-import Control.Exception (try, SomeException)
+import Control.Exception (try, catch, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
+import Data.Char (isSpace, isHexDigit)
+import System.Environment (lookupEnv)
+import System.Exit (exitWith, ExitCode(..))
+import System.IO (hPutStrLn, stderr)
+import Data.Aeson (FromJSON(..), withObject, (.:), eitherDecode)
+import qualified Data.ByteString.Lazy as LBS
 
 import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
@@ -495,6 +505,131 @@ checkAssumeutxoWhitelistIO net height = do
   return $ case m of
     Just _  -> Right ()
     Nothing -> Left (assumeutxoWhitelistError height)
+
+--------------------------------------------------------------------------------
+-- Campaign-only AssumeUTXO entries — HASHHOG_CAMPAIGN_ASSUMEUTXO
+--
+-- Full spec: receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md. Summary: the M2
+-- boundary campaign boots each impl with "mainnet params" and fast-forwards a
+-- UTXO snapshot to a boundary height that is NOT one of the four
+-- Core-published mainnet AssumeUTXO heights. Rather than widen the
+-- production 'netAssumeUtxo' tables (the v1 mistake this design corrects —
+-- see ONE-WEEK-PLAN.md correction #7), campaign snapshot bases live in a
+-- separate JSON file, named by this env var, read once at startup and merged
+-- into the SELECTED network's in-memory 'netAssumeUtxo' list only.
+--
+-- Hook point: app/Main.hs 'runCommand', immediately after the 'Network' value
+-- is resolved from the CLI '--network' flag and before ANY command
+-- (node/wallet/util) dispatches — every downstream 'assumeUtxoForHeight' /
+-- 'assumeUtxoForBlockHash' / RPC snapshot lookup reads the 'Network' value
+-- returned from there, so mutating it once at that single chokepoint covers
+-- every consumer with zero further wiring.
+--------------------------------------------------------------------------------
+
+-- | One entry of the campaign fixture JSON schema (an array of these).  Hex
+-- fields are accepted in Core DISPLAY order, exactly like the hardcoded
+-- 'mainnet' \/ 'testnet4' \/ 'regtest' tables above; 'campaignEntryToParams'
+-- converts them to haskoin's internal storage convention the same way
+-- 'hexToHash256' \/ 'hashFromHex' already do for those tables. The schema's
+-- three optional keys (@base_mtp@, @base_header@, @chainwork@) are accepted
+-- (aeson's '.:' ignores unconsumed object keys) but not yet read —
+-- 'AssumeUtxoParams' carries no MTP\/header\/chainwork field and nothing on
+-- haskoin's snapshot-load path needs them today.
+data CampaignAssumeutxoEntry = CampaignAssumeutxoEntry
+  { caeHeight         :: !Word32
+  , caeBlockHash      :: !String  -- ^ 64 hex chars, DISPLAY order
+  , caeHashSerialized :: !String  -- ^ 64 hex chars, DISPLAY order
+  , caeChainTxCount   :: !Word64
+  } deriving (Show, Eq)
+
+instance FromJSON CampaignAssumeutxoEntry where
+  parseJSON = withObject "CampaignAssumeutxoEntry" $ \o -> CampaignAssumeutxoEntry
+    <$> o .: "height"
+    <*> o .: "blockhash"
+    <*> o .: "hash_serialized"
+    <*> o .: "m_chain_tx_count"
+
+-- | Validate one parsed campaign entry and convert it to 'AssumeUtxoParams'.
+-- Rejects height 0 and any hex field that is not exactly 64 hex characters
+-- (mirrors the hardcoded tables' 32-byte hash invariant). 'aupBlockHash' goes
+-- through 'hashFromHex' (reversed to internal order); 'aupHashSerialized'
+-- goes through 'hexToHash256' (NOT reversed) — the same convention every
+-- hardcoded 'netAssumeUtxo' entry in this module already uses.
+campaignEntryToParams :: CampaignAssumeutxoEntry -> Either String AssumeUtxoParams
+campaignEntryToParams CampaignAssumeutxoEntry{..}
+  | caeHeight == 0 =
+      Left "campaign entry height must be > 0"
+  | not (isHex64 caeBlockHash) =
+      Left ("campaign entry height " ++ show caeHeight
+            ++ ": blockhash must be 64 hex chars")
+  | not (isHex64 caeHashSerialized) =
+      Left ("campaign entry height " ++ show caeHeight
+            ++ ": hash_serialized must be 64 hex chars")
+  | otherwise =
+      Right AssumeUtxoParams
+        { aupHeight         = caeHeight
+        , aupHashSerialized = hexToHash256 caeHashSerialized
+        , aupChainTxCount   = caeChainTxCount
+        , aupBlockHash      = hashFromHex caeBlockHash
+        }
+  where
+    isHex64 s = length s == 64 && all isHexDigit s
+
+-- | Read @HASHHOG_CAMPAIGN_ASSUMEUTXO@ exactly once and, if set to a
+-- non-empty path, parse + validate its JSON array and append every entry to
+-- @net@'s 'netAssumeUtxo' allowlist. Refuses to start (@exitWith
+-- (ExitFailure 1)@) on any parse error or on a collision (same height OR
+-- same block hash) with a built-in entry for this network — campaign data
+-- may never override a production hash. Emits the greppable
+-- @[CAMPAIGN-ASSUMEUTXO] loaded N entries from \<path\> heights=[...]@ banner
+-- on stderr on success.
+--
+-- When the env var is unset or blank this performs exactly ONE 'lookupEnv'
+-- call and returns @net@ UNCHANGED — no file I\/O, no JSON parsing, no table
+-- mutation, matching the spec's \"bit-identical to today\" invariant.
+loadCampaignAssumeutxoFromEnv :: Network -> IO Network
+loadCampaignAssumeutxoFromEnv net = do
+  mPath <- lookupEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+  case mPath of
+    Nothing -> return net
+    Just path
+      | all isSpace path -> return net
+      | otherwise -> do
+          let fail_ :: String -> IO a
+              fail_ msg = do
+                hPutStrLn stderr
+                  ("[CAMPAIGN-ASSUMEUTXO] FATAL: " ++ msg ++ " (path=" ++ path ++ ")")
+                exitWith (ExitFailure 1)
+
+          eRaw <- (Right <$> LBS.readFile path)
+                    `catch` (\(e :: SomeException) -> return (Left (show e)))
+          contents <- either (\e -> fail_ ("cannot read file: " ++ e)) return eRaw
+
+          entries <- case eitherDecode contents of
+            Left e   -> fail_ ("invalid JSON: " ++ e)
+            Right es -> return (es :: [CampaignAssumeutxoEntry])
+
+          params <- forM entries $ \e -> case campaignEntryToParams e of
+            Left msg -> fail_ msg
+            Right p  -> return p
+
+          let existing = netAssumeUtxo net
+              collides p = any
+                (\(_, q) -> aupHeight q == aupHeight p || aupBlockHash q == aupBlockHash p)
+                existing
+          forM_ params $ \p ->
+            when (collides p) $
+              fail_ ("campaign entry height=" ++ show (aupHeight p)
+                     ++ " collides with a built-in/already-loaded assumeutxo entry"
+                     ++ " for this network — refusing to start (campaign data"
+                     ++ " may never override a production hash)")
+
+          let merged  = existing ++ [ (aupHeight p, p) | p <- params ]
+              heights = map aupHeight params
+          hPutStrLn stderr
+            ("[CAMPAIGN-ASSUMEUTXO] loaded " ++ show (length params)
+             ++ " entries from " ++ path ++ " heights=" ++ show heights)
+          return net { netAssumeUtxo = merged }
 
 --------------------------------------------------------------------------------
 -- AssumeValid: ancestor-check script-skip
@@ -1553,13 +1688,31 @@ regtest = Network
   , netMinimumChainWork  = 0
   -- Regtest headerssync params: bitcoin-core/src/kernel/chainparams.cpp line ~516-518
   , netHeaderSyncParams  = HeaderSyncParams { hspCommitmentPeriod = 620, hspRedownloadBufferSize = 15724 }
-  -- AssumeUTXO snapshot for regtest (used in unit tests)
+  -- AssumeUTXO snapshots for regtest — Core-parity entries verbatim from
+  -- bitcoin-core/src/kernel/chainparams.cpp CRegTestParams::m_assumeutxo_data
+  -- (heights 110 / 200 / 299). 110 predates this comment ("used in unit
+  -- tests"); 200 / 299 added so haskoin's regtest table matches Core's THREE
+  -- entries exactly (200 = fuzz target src/test/fuzz/utxo_snapshot.cpp; 299 =
+  -- test/functional/feature_assumeutxo.py + tool_bitcoin_chainstate.py — this
+  -- is the entry hashhog's boot-smoke fixture (height 299) matches).
   , netAssumeUtxo        =
       [ (110, AssumeUtxoParams
           { aupHeight = 110
           , aupHashSerialized = hexToHash256 "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
           , aupChainTxCount = 111
           , aupBlockHash = hashFromHex "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+          })
+      , (200, AssumeUtxoParams
+          { aupHeight = 200
+          , aupHashSerialized = hexToHash256 "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"
+          , aupChainTxCount = 201
+          , aupBlockHash = hashFromHex "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"
+          })
+      , (299, AssumeUtxoParams
+          { aupHeight = 299
+          , aupHashSerialized = hexToHash256 "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
+          , aupChainTxCount = 334
+          , aupBlockHash = hashFromHex "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"
           })
       ]
   -- Regtest has NO assumevalid: every script check runs. Intentional for test determinism.
