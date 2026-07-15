@@ -458,11 +458,22 @@ main = do
 
 runCommand :: Options -> IO ()
 runCommand Options{..} = do
-  let net = case optNetwork of
+  let net0 = case optNetwork of
               Mainnet  -> mainnet
               Testnet  -> testnet3
               Testnet4 -> testnet4
               Regtest  -> regtest
+
+  -- HASHHOG_CAMPAIGN_ASSUMEUTXO — read exactly once, right here, immediately
+  -- after 'net' is resolved from --network and before ANY command below
+  -- dispatches (CmdNode / CmdWallet / CmdUtil, and everything they call —
+  -- runNode's RPC snapshot handlers, --load-snapshot, dumptxoutset rollback —
+  -- all read the 'net' value threaded from this point, so this is the single
+  -- chokepoint). When the env var is unset (the default / production case)
+  -- this is a single lookupEnv and 'net' comes back unchanged. See
+  -- receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md and
+  -- Haskoin.Consensus.loadCampaignAssumeutxoFromEnv.
+  net <- loadCampaignAssumeutxoFromEnv net0
 
   -- Expand ~ in data directory
   dataDir <- expandPath optDataDir
