@@ -190,6 +190,7 @@ import Control.Exception (bracket, bracket_, catch, try, SomeException)
 import qualified Control.Exception
 import qualified System.Environment as SE
 import System.Environment (lookupEnv, setEnv, unsetEnv)
+import System.Exit (ExitCode(..))
 import qualified Network.Socket as NS
 import qualified Network.Socket.ByteString as NSBS
 import qualified Data.ByteString.Char8 as BS8
@@ -18309,6 +18310,144 @@ main = hspec $ do
           Just v  -> setEnv "NOTIFY_SOCKET" v
           Nothing -> unsetEnv "NOTIFY_SOCKET"
 
+  -- --------------------------------------------------------------------
+  -- Porter wave Change-2: HASHHOG_CAMPAIGN_ASSUMEUTXO
+  -- Spec: receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md
+  -- --------------------------------------------------------------------
+  describe "Haskoin.Consensus: HASHHOG_CAMPAIGN_ASSUMEUTXO (porter wave)" $ do
+    let withCampaignEnv mVal action = do
+          original <- lookupEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+          case mVal of
+            Just v  -> setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" v
+            Nothing -> unsetEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+          result <- action
+          case original of
+            Just v  -> setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" v
+            Nothing -> unsetEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO"
+          return result
+
+    it "unset: loadCampaignAssumeutxoFromEnv returns net UNCHANGED (bit-identical)" $
+      withCampaignEnv Nothing $ do
+        net' <- loadCampaignAssumeutxoFromEnv mainnet
+        netAssumeUtxo net' `shouldBe` netAssumeUtxo mainnet
+
+    it "blank path: also bit-identical (no file I/O, no table mutation)" $
+      withCampaignEnv (Just "   ") $ do
+        net' <- loadCampaignAssumeutxoFromEnv regtest
+        netAssumeUtxo net' `shouldBe` netAssumeUtxo regtest
+
+    it "valid campaign JSON: entry is appended to the network's allowlist" $
+      withSystemTempDirectory "haskoin-campaign-assumeutxo" $ \dir ->
+        withCampaignEnv Nothing $ do
+          let path = dir </> "campaign.json"
+              json = "[{\"height\":123456,\"blockhash\":\""
+                     ++ replicate 64 'a'
+                     ++ "\",\"hash_serialized\":\""
+                     ++ replicate 64 'b'
+                     ++ "\",\"m_chain_tx_count\":42}]"
+          writeFile path json
+          setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path
+          net' <- loadCampaignAssumeutxoFromEnv mainnet
+          length (netAssumeUtxo net')
+            `shouldBe` length (netAssumeUtxo mainnet) + 1
+          fmap aupHeight (lookup 123456 (netAssumeUtxo net'))
+            `shouldBe` Just 123456
+          -- Built-in entries are untouched (append-only).
+          forM_ (netAssumeUtxo mainnet) $ \(h, p) ->
+            lookup h (netAssumeUtxo net') `shouldBe` Just p
+
+    it "colliding height (840000, a mainnet built-in): refuses to start" $
+      withSystemTempDirectory "haskoin-campaign-collide" $ \dir ->
+        withCampaignEnv Nothing $ do
+          let path = dir </> "collide.json"
+              json = "[{\"height\":840000,\"blockhash\":\""
+                     ++ replicate 64 'c'
+                     ++ "\",\"hash_serialized\":\""
+                     ++ replicate 64 'd'
+                     ++ "\",\"m_chain_tx_count\":1}]"
+          writeFile path json
+          setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path
+          r <- try (loadCampaignAssumeutxoFromEnv mainnet)
+                 :: IO (Either ExitCode Network)
+          case r of
+            Left (ExitFailure 1) -> pure ()
+            other -> expectationFailure
+              ("expected ExitFailure 1 on height collision, got " ++ show other)
+
+    it "colliding blockhash (different height, same hash): refuses to start" $
+      withSystemTempDirectory "haskoin-campaign-collide-hash" $ \dir ->
+        withCampaignEnv Nothing $ do
+          let path = dir </> "collide-hash.json"
+              -- regtest 110's blockhash in DISPLAY order (see Consensus.hs).
+              blockhashDisplay = "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+              json = "[{\"height\":999999,\"blockhash\":\""
+                     ++ blockhashDisplay
+                     ++ "\",\"hash_serialized\":\""
+                     ++ replicate 64 'e'
+                     ++ "\",\"m_chain_tx_count\":1}]"
+          writeFile path json
+          setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path
+          r <- try (loadCampaignAssumeutxoFromEnv regtest)
+                 :: IO (Either ExitCode Network)
+          case r of
+            Left (ExitFailure 1) -> pure ()
+            other -> expectationFailure
+              ("expected ExitFailure 1 on blockhash collision, got " ++ show other)
+
+    it "invalid JSON: refuses to start" $
+      withSystemTempDirectory "haskoin-campaign-badjson" $ \dir ->
+        withCampaignEnv Nothing $ do
+          let path = dir </> "bad.json"
+          writeFile path "not json"
+          setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path
+          r <- try (loadCampaignAssumeutxoFromEnv regtest)
+                 :: IO (Either ExitCode Network)
+          case r of
+            Left (ExitFailure 1) -> pure ()
+            other -> expectationFailure
+              ("expected ExitFailure 1 on invalid JSON, got " ++ show other)
+
+    it "missing file: refuses to start" $
+      withCampaignEnv (Just "/nonexistent/path/does-not-exist.json") $ do
+        r <- try (loadCampaignAssumeutxoFromEnv regtest)
+               :: IO (Either ExitCode Network)
+        case r of
+          Left (ExitFailure 1) -> pure ()
+          other -> expectationFailure
+            ("expected ExitFailure 1 on missing file, got " ++ show other)
+
+    it "campaignEntryToParams rejects height 0" $
+      case campaignEntryToParams
+             (CampaignAssumeutxoEntry 0 (replicate 64 'a') (replicate 64 'b') 1) of
+        Left msg -> msg `shouldSatisfy` ("must be > 0" `isInfixOf`)
+        Right _  -> expectationFailure "expected rejection of height 0"
+
+    it "campaignEntryToParams rejects a short blockhash" $
+      case campaignEntryToParams
+             (CampaignAssumeutxoEntry 1 "abcd" (replicate 64 'b') 1) of
+        Left msg -> msg `shouldSatisfy` ("64 hex" `isInfixOf`)
+        Right _  -> expectationFailure "expected rejection of short blockhash"
+
+    it "campaignEntryToParams accepts a well-formed entry (blockhash reversed to internal order)" $
+      case campaignEntryToParams
+             (CampaignAssumeutxoEntry 500000
+               "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+               "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
+               111) of
+        Left msg -> expectationFailure ("expected acceptance, got: " ++ msg)
+        Right p  -> do
+          aupHeight p `shouldBe` 500000
+          -- Matches the hardcoded regtest-110 entry byte-for-byte (same
+          -- convention: hexToHash256 for hash_serialized, hashFromHex/
+          -- reversed for blockhash).
+          aupBlockHash p `shouldBe` hashFromHex
+            "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+          -- 'hexToHash256' is not exported from Haskoin.Consensus (see
+          -- W163SnapshotRecoverySpec.hs); reconstruct it the same way that
+          -- test file does, via the exported 'hexToBS'.
+          aupHashSerialized p `shouldBe` Hash256 (hexToBS
+            "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327")
+
   describe "Haskoin.Daemon: log file SIGHUP reopen" $ do
     it "reopenLogFile re-creates after rename (logrotate path)" $
       withSystemTempDirectory "haskoin-logrotate" $ \dir -> do
@@ -18804,8 +18943,13 @@ main = hspec $ do
       it "returns Nothing when tip is below the lowest entry" $
         latestAvailableSnapshotHeight mainnet 100 `shouldBe` Nothing
 
-      it "regtest has [(110, _)] and tip 200 → 110" $
-        latestAvailableSnapshotHeight regtest 200 `shouldBe` Just 110
+      it "regtest has 110/200/299 (Core parity) and tip 150 → 110" $
+        -- Porter wave Change-1 added Core's 200/299 regtest entries; a tip
+        -- strictly between 110 and 200 still resolves to 110.
+        latestAvailableSnapshotHeight regtest 150 `shouldBe` Just 110
+
+      it "regtest tip 200 now resolves to the 200 entry itself (Core parity)" $
+        latestAvailableSnapshotHeight regtest 200 `shouldBe` Just 200
 
     describe "dumptxoutset resolveDumpTarget" $ do
       let mkEntry h height prev ts = ChainEntry
@@ -20133,8 +20277,9 @@ main = hspec $ do
               \(0) - refusing to load snapshot"
 
       it "accepts a whitelisted regtest height (110)" $
-        -- Sanity-check the positive path: regtest's lone whitelisted
-        -- height (110) must round-trip cleanly through the guard.
+        -- Sanity-check the positive path: regtest's whitelisted height 110
+        -- (one of the three Core-parity entries: 110/200/299) must
+        -- round-trip cleanly through the guard.
         checkAssumeutxoWhitelist regtest 110 `shouldBe` Right ()
 
       it "rejects an arbitrary mainnet non-whitelist height with \

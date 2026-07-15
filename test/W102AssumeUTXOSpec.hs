@@ -612,8 +612,10 @@ spec = describe "W102 AssumeUTXO snapshot loading gates" $ do
     it "testnet4 has at least 1 snapshot entry" $
       length (netAssumeUtxo testnet4) `shouldSatisfy` (>= 1)
 
-    it "regtest has exactly 1 snapshot entry at height 110" $
-      map fst (netAssumeUtxo regtest) `shouldBe` [110]
+    it "regtest has the 3 Core-parity entries (110/200/299)" $
+      -- Verbatim from bitcoin-core/src/kernel/chainparams.cpp
+      -- CRegTestParams::m_assumeutxo_data (porter wave Change-1).
+      map fst (netAssumeUtxo regtest) `shouldBe` [110, 200, 299]
 
   describe "G27 aupBlockHash is non-zero for every table entry" $
     it "no entry has the all-zero block hash" $ do
