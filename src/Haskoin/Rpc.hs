@@ -476,6 +476,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- handleSendPayjoinRequest below.
                         getReceiveAddress, fundTransaction,
                         getReceiveKey, getChangeKey,
+                        getTaprootReceiveKey, getTaprootChangeKey,
                         WalletUtxoEntry(..),
                         walletAddresses, walletUTXOs,
                         -- Seed-restore (recovery): mnemonic -> wallet, used by
@@ -9673,6 +9674,15 @@ handleSignRawTransactionWithWallet server params = withWalletMgr server $ \walle
                 Just walletState -> do
                   -- Per-input prev-output map from the wallet's UTXO store.
                   walletUtxos <- getWalletUTXOs (wsWallet walletState)
+                  -- The set of HD child keys the wallet actually owns.  An
+                  -- input is spent by the derived key m/84'/0'/0'/{0,1}/idx
+                  -- that owns its prevout, NOT the bare master key — so we
+                  -- must fold signPsbt over EVERY known (idx,isChange) key
+                  -- rather than only the master.  This reuses resignViaPsbt's
+                  -- per-derived-key selection (Wallet.hs keyFor over
+                  -- walletAddresses); signPsbt is idempotent on inputs whose
+                  -- signatures a prior key already produced.
+                  addrMap <- readTVarIO (walletAddresses (wsWallet walletState))
                   let utxoMap = Map.fromList
                         [ (op, txout) | (op, txout, _confs) <- walletUtxos ]
                       lookupUtxo op = case Map.lookup op utxoMap of
@@ -9698,13 +9708,30 @@ handleSignRawTransactionWithWallet server params = withWalletMgr server $ \walle
                                                 , txWitness = replicate (length (txInputs tx)) []
                                                 })
                       psbt1   = updatePsbt lookupUtxo psbt0
-                      -- Note: signPsbt requires an ExtendedKey; until
-                      -- secp256k1 is wired this is effectively a no-op
-                      -- for production, but we keep the path so that
-                      -- once 'signWithKey' is fleshed out the handler
-                      -- starts producing real signatures with no
-                      -- additional wiring.
-                      psbtSigned = signPsbt (walletMasterKey (wsWallet walletState)) psbt1
+                      -- Derive each owned HD child key (receive vs change)
+                      -- and fold signPsbt across all of them, mirroring
+                      -- resignViaPsbt.  The correct key for a given input is
+                      -- the one whose pubkey hash matches its prevout's
+                      -- scriptPubKey; signPsbt only signs the inputs a key
+                      -- actually owns, so trying every wallet key signs each
+                      -- input with its rightful key.
+                      w = wsWallet walletState
+                      -- For each owned (idx,isChange) we derive BOTH the
+                      -- BIP-84 (P2WPKH) key AND the BIP-86 (taproot) key,
+                      -- because 'walletAddresses' records only (idx,isChange)
+                      -- — not which script type the address was issued as —
+                      -- so we cannot tell up-front whether an input is a
+                      -- p2wpkh or a p2tr spend.  signPsbt only signs the
+                      -- inputs a given key actually owns (canSign / canSign*
+                      -- gates), so offering both candidates per index is safe
+                      -- and signs each input with its rightful key.
+                      keysFor idx isChange
+                        | isChange  = [getChangeKey w idx,  getTaprootChangeKey w idx]
+                        | otherwise = [getReceiveKey w idx, getTaprootReceiveKey w idx]
+                      ourKeys = [ k
+                                | (_addr, (idx, isChange)) <- Map.toList addrMap
+                                , k <- keysFor idx isChange ]
+                      psbtSigned = foldl' (flip signPsbt) psbt1 ourKeys
                       psbtFinal  = case finalizePsbt psbtSigned of
                                      Right p -> p
                                      Left _  -> psbtSigned

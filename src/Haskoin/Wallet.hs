@@ -114,6 +114,8 @@ module Haskoin.Wallet
     --   bumpfee resign + BIP-78 PayJoin receiver, exported in FIX-65)
   , getReceiveKey
   , getChangeKey
+  , getTaprootReceiveKey
+  , getTaprootChangeKey
     -- * Balance & UTXOs
   , getBalance
   , getSpendableBalance
@@ -1609,6 +1611,28 @@ getReceiveKey wallet idx =
 getChangeKey :: Wallet -> Word32 -> ExtendedKey
 getChangeKey wallet idx =
   let internalChain = derivePrivate (walletAccountKey wallet) 1  -- Internal chain (change)
+  in derivePrivate internalChain idx
+
+-- | Get the private key for a specific TAPROOT (BIP-86) receive index.
+--
+-- 'walletAccountKey' is the BIP-84 (P2WPKH) account @m/84'/0'/0'@, so
+-- 'getReceiveKey' cannot reproduce the key behind a taproot address —
+-- those live on the BIP-86 account @m/86'/0'/0'@.  This mirrors exactly
+-- how 'getNewAddress' 'AddrP2TR' derives (accountPath = @bip86Path 0@,
+-- external chain 0, then the index), so a taproot input funded by a
+-- 'getNewAddress'-issued bech32m address is signable by the fold in
+-- 'signrawtransactionwithwallet'.  Reference: BIP-86 derivation.
+getTaprootReceiveKey :: Wallet -> Word32 -> ExtendedKey
+getTaprootReceiveKey wallet idx =
+  let accountKey    = derivePath (walletMasterKey wallet) (bip86Path 0)
+      externalChain = derivePrivate accountKey 0  -- External chain (receive)
+  in derivePrivate externalChain idx
+
+-- | Get the private key for a specific TAPROOT (BIP-86) change index.
+getTaprootChangeKey :: Wallet -> Word32 -> ExtendedKey
+getTaprootChangeKey wallet idx =
+  let accountKey    = derivePath (walletMasterKey wallet) (bip86Path 0)
+      internalChain = derivePrivate accountKey 1  -- Internal chain (change)
   in derivePrivate internalChain idx
 
 -- | Derive receive address at specific index.
