@@ -269,6 +269,7 @@ module Haskoin.Wallet
   , descriptorToText
   , descriptorToTextNet
   , deriveAddresses
+  , addressToTextW
   , deriveScripts
   , descriptorChecksum
   , addDescriptorChecksum
