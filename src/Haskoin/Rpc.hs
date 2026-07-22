@@ -435,7 +435,7 @@ import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
                                createBlockTemplate, submitBlock)
 import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         parseDescriptor, descriptorToText, descriptorToTextNet,
-                        deriveAddresses,
+                        deriveAddresses, addressToTextW,
                         deriveScripts, descriptorChecksum, addDescriptorChecksum,
                         validateDescriptorChecksum, isRangeDescriptor,
                         Wallet(..), WalletManager(..), WalletState(..), WalletInfo(..),
@@ -1438,7 +1438,7 @@ handleRpcRequest server req = do
 
     -- Wallet descriptor RPCs
     "getdescriptorinfo"    -> handleGetDescriptorInfo server params
-    "deriveaddresses"      -> handleDeriveAddresses params
+    "deriveaddresses"      -> handleDeriveAddresses server params
     "createmultisig"       -> handleCreateMultisig params
     "importdescriptors"    -> handleImportDescriptors server params
     "listdescriptors"      -> handleListDescriptors server params
@@ -6057,15 +6057,25 @@ handleGetDescriptorInfo server params =
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams (T.pack $ "Invalid descriptor: " ++ show err)) Null
         Right desc -> do
-          -- Canonical form = network-aware descriptor text (so addr() keeps the
-          -- node's HRP, not mainnet's), then append the BIP-380 checksum
-          -- (computed OVER the canonical text — so the HRP fix also fixes the
-          -- checksum).
-          let baseText = descriptorToTextNet (rsNetwork server) desc
+          -- The returned `checksum` is the BIP-380 checksum of the INPUT
+          -- descriptor body (any supplied #checksum stripped), NOT of a
+          -- re-serialized canonical form.  Core computes it over the raw request
+          -- string: rpc/output_script.cpp getdescriptorinfo ->
+          -- GetDescriptorChecksum(request.params[0]).  Re-serializing first
+          -- would flip the hardened-marker style (h vs ') or the key encoding
+          -- and yield a checksum that does not round-trip the user's descriptor.
+          -- The `descriptor` field, by contrast, IS the network-aware canonical
+          -- form (so addr() keeps the node's HRP, not mainnet's) with its OWN
+          -- checksum appended — mirroring Core, whose two checksums also differ
+          -- for a tprv input (private body vs. the tpub canonical).
+          let inputBody = T.takeWhile (/= '#') descText
+              checksum  = case descriptorChecksum inputBody of
+                            Just c  -> c
+                            Nothing -> ""       -- unreachable: parse already succeeded
+              baseText  = descriptorToTextNet (rsNetwork server) desc
               canonical = case addDescriptorChecksum baseText of
                             Just c  -> c
                             Nothing -> baseText  -- fallback (should never happen)
-              checksum  = T.drop 1 (T.dropWhile (/= '#') canonical)  -- everything after '#'
               isrange   = isRangeDescriptor desc
               solvable  = descriptorIsSolvable desc
               hasPriv   = descriptorHasPrivateKeys desc
@@ -6147,9 +6157,15 @@ descriptorHasPrivateKeys desc = case desc of
 --   rawtr(XONLY)   -> OP_1 <32-byte>              -> bech32m v1 (no tweak, BIP-386)
 --
 -- Reference: bitcoin-core/src/rpc/misc.cpp deriveaddresses
-handleDeriveAddresses :: Value -> IO RpcResponse
-handleDeriveAddresses params = do
-  let mDesc = extractParamText params 0
+handleDeriveAddresses :: RpcServer -> Value -> IO RpcResponse
+handleDeriveAddresses server params = do
+  -- Encode derived addresses with the NODE's network HRP / version bytes
+  -- (regtest -> bcrt1.../m.../2...), not the mainnet-hardcoded 'addressToText'.
+  -- Core's deriveaddresses honours the active chainparams; a bare
+  -- 'addressToText' silently emits mainnet addresses on a regtest node — a
+  -- fund-loss-class divergence.
+  let addressToTextNet = addressToTextW (rsNetwork server)
+      mDesc = extractParamText params 0
   case mDesc of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams ("Missing required argument: descriptor" :: Text)) Null
@@ -6172,12 +6188,12 @@ handleDeriveAddresses params = do
                   Right (lo, hi) -> do
                     let indices = [lo..hi]
                         addrs   = deriveAddresses desc indices
-                        result  = toJSON (map addressToText addrs)
+                        result  = toJSON (map addressToTextNet addrs)
                     return $ RpcResponse result Null Null
               else do
                 -- Non-ranged: single element
                 let addrs  = deriveAddresses desc []
-                    result = toJSON (map addressToText addrs)
+                    result = toJSON (map addressToTextNet addrs)
                 return $ RpcResponse result Null Null
   where
     -- Parse range param: N (meaning [0,N]) or [begin,end].
