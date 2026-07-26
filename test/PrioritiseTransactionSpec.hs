@@ -103,6 +103,7 @@ mkEntry tx fee sz = MempoolEntry
   , meFee             = fee
   , meFeeRate         = calculateFeeRate fee sz
   , meSize            = sz
+  , meAdjWeight       = sz * 4
   , meTime            = 0
   , meHeight          = 0
   , meAncestorCount   = 1

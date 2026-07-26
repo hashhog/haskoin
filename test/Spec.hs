@@ -268,6 +268,7 @@ mkTestEntry txid fee vsize = MempoolEntry
   , meFee = fee
   , meFeeRate = calculateFeeRate fee vsize
   , meSize = vsize
+  , meAdjWeight = vsize * 4
   , meTime = 0
   , meHeight = 0
   , meAncestorCount = 1
@@ -4487,6 +4488,7 @@ main = hspec $ do
                , meFee = fee
                , meFeeRate = calculateFeeRate fee 200
                , meSize = 200
+               , meAdjWeight = 800
                , meTime = 0
                , meHeight = 0
                , meAncestorCount = 1
@@ -5963,6 +5965,7 @@ main = hspec $ do
               , meFee = 100
               , meFeeRate = FeeRate 10
               , meSize = 150
+              , meAdjWeight = 600
               , meTime = 1234567890
               , meHeight = 500
               , meAncestorCount = 1  -- includes self
@@ -6197,6 +6200,7 @@ main = hspec $ do
                   , meFee            = 1000
                   , meFeeRate        = FeeRate 10
                   , meSize           = 100
+                  , meAdjWeight           = 400
                   , meTime           = t
                   , meHeight         = 0
                   , meAncestorCount  = 1
@@ -6234,6 +6238,7 @@ main = hspec $ do
                   , meFee            = 500
                   , meFeeRate        = FeeRate 5
                   , meSize           = 100
+                  , meAdjWeight           = 400
                   , meTime           = now - 60
                   , meHeight         = 0
                   , meAncestorCount  = 1
@@ -6295,6 +6300,7 @@ main = hspec $ do
                    , meFee = fee
                    , meFeeRate = feeRate
                    , meSize = size
+                   , meAdjWeight = size * 4
                    , meTime = 0
                    , meHeight = 0
                    , meAncestorCount = 1
@@ -6420,6 +6426,7 @@ main = hspec $ do
                    , meFee = fee
                    , meFeeRate = feeRate
                    , meSize = size
+                   , meAdjWeight = size * 4
                    , meTime = 0
                    , meHeight = 0
                    , meAncestorCount = 1
@@ -16164,45 +16171,110 @@ main = hspec $ do
         checkClusterLimit newTx existingEntries byOutpoint 250 `shouldBe` Right ()
 
       -- Gate 6: cluster vbytes limit = 101,000 vB (DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000)
-      it "checkClusterLimit rejects when cluster vbytes would exceed 101000 (vbytes gate)" $ do
-        -- One existing tx of 100,800 vB; new tx of 250 vB → total 101,050 > 101,000
-        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
-            bigEntry = mkTestEntry txid1 1000 100800
-            entries = Map.singleton txid1 bigEntry
-            -- New tx spends txid1 output 0
-            byOutpoint = Map.singleton (OutPoint txid1 0)
-                           (TxId (Hash256 (BS.replicate 32 0x02)))
-            newTx = Tx { txVersion = 2
-                       , txInputs = [TxIn (OutPoint txid1 0) "" 0xffffffff]
-                       , txOutputs = []
-                       , txWitness = []
-                       , txLockTime = 0
-                       }
-        -- total vbytes = 100800 + 250 = 101050 > maxClusterSizeVbytes (101000)
-        case checkClusterLimit newTx entries byOutpoint 250 of
+      -- WAVE A: the size gate is denominated in sigop-adjusted WEIGHT, summed
+      -- with no per-transaction rounding, and compared with a STRICT '>'
+      -- against 404,000 (= cluster_size_vbytes * WITNESS_SCALE_FACTOR;
+      -- txmempool.cpp:181, txgraph.cpp:2059).
+      --
+      -- Shared shape: one existing entry, one candidate spending its output 0.
+      let clusterSizeCase :: Int -> Int -> Either ClusterLimitError ()
+          clusterSizeCase existingAdjWeight candidateAdjWeight =
+            let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
+                bigEntry = (mkTestEntry txid1 1000 100)
+                             { meAdjWeight = existingAdjWeight }
+                entries = Map.singleton txid1 bigEntry
+                byOutpoint = Map.singleton (OutPoint txid1 0)
+                               (TxId (Hash256 (BS.replicate 32 0x02)))
+                newTx = Tx { txVersion = 2
+                           , txInputs = [TxIn (OutPoint txid1 0) "" 0xffffffff]
+                           , txOutputs = []
+                           , txWitness = []
+                           , txLockTime = 0
+                           }
+            in checkClusterLimit newTx entries byOutpoint candidateAdjWeight
+
+      it "checkClusterLimit allows a cluster at exactly 404000 weight units (size gate boundary)" $ do
+        -- 403000 + 1000 = 404000; NOT > 404000 → accepted.
+        clusterSizeCase 403000 1000 `shouldBe` Right ()
+
+      it "checkClusterLimit rejects a cluster at 404001 weight units (size gate boundary)" $ do
+        -- 403001 + 1000 = 404001 > 404000 → rejected.
+        case clusterSizeCase 403001 1000 of
           Left (ClusterSizeExceeded actual lim) -> do
-            actual `shouldBe` 101050
-            lim    `shouldBe` 101000
+            actual `shouldBe` 404001
+            lim    `shouldBe` 404000
           Left (ClusterLimitExceeded _ _) ->
-            expectationFailure "Expected ClusterSizeExceeded (vbytes), got ClusterLimitExceeded"
+            expectationFailure "Expected ClusterSizeExceeded (weight), got ClusterLimitExceeded"
           Right () ->
             expectationFailure "Expected ClusterSizeExceeded, got Right ()"
 
-      it "checkClusterLimit allows cluster at exactly 101000 vbytes (vbytes gate boundary)" $ do
-        -- One existing tx of 100,750 vB; new tx of 250 vB → total 101,000 = limit
-        let txid1 = TxId (Hash256 (BS.replicate 32 0x01))
-            bigEntry = mkTestEntry txid1 1000 100750
-            entries = Map.singleton txid1 bigEntry
-            byOutpoint = Map.singleton (OutPoint txid1 0)
-                           (TxId (Hash256 (BS.replicate 32 0x02)))
-            newTx = Tx { txVersion = 2
-                       , txInputs = [TxIn (OutPoint txid1 0) "" 0xffffffff]
-                       , txOutputs = []
-                       , txWitness = []
-                       , txLockTime = 0
-                       }
-        -- total vbytes = 100750 + 250 = 101000 = maxClusterSizeVbytes → allowed
-        checkClusterLimit newTx entries byOutpoint 250 `shouldBe` Right ()
+      -- THE UNITS TEST.  This is the one that fails if someone swaps the
+      -- constant 101000 → 404000 but keeps summing per-transaction ceil(w/4).
+      --
+      --   member    weight 402999  → ceil(402999/4) = 100750 vB
+      --   candidate weight   1001  → ceil(  1001/4) =    251 vB
+      --   Σ weight = 404000  → NOT > 404000       → Core ACCEPTS
+      --   Σ ceil   = 101001  →     > 101000       → per-tx rounding REJECTS
+      --
+      -- Σceil(wᵢ/4) >= (Σwᵢ)/4 always, so the rounded form is strictly
+      -- harsher and diverges from Core in the reject direction.
+      it "checkClusterLimit sums UNROUNDED weight: 404000 total accepts even though per-tx ceil(w/4) sums to 101001" $ do
+        let existingW  = 402999
+            candidateW = 1001
+            ceilDiv4 n = (n + 3) `div` 4
+        -- Pin the arithmetic so the test cannot silently stop being the units test.
+        (existingW + candidateW) `shouldBe` maxClusterSizeWeight
+        (ceilDiv4 existingW + ceilDiv4 candidateW) `shouldBe` (101001 :: Int)
+        (ceilDiv4 existingW + ceilDiv4 candidateW > maxClusterSizeVbytes) `shouldBe` True
+        clusterSizeCase existingW candidateW `shouldBe` Right ()
+
+      -- Sigop-dominated admission: max(weight, sigops*20) is what trips the gate.
+      it "checkClusterLimit trips on the SIGOP term when sigops*20 exceeds raw weight" $ do
+        -- A candidate whose raw weight is 800 but whose sigop cost is 101:
+        --   max(800, 101*20 = 2020) = 2020.
+        -- Against an existing member of 402000:
+        --   raw-weight form  → 402000 +  800 = 402800 → would ACCEPT (wrong)
+        --   sigop-adjusted   → 402000 + 2020 = 404020 → REJECTS (correct)
+        let candTx = Tx { txVersion = 2
+                        , txInputs = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x01))) 0) "" 0xffffffff]
+                        , txOutputs = []
+                        , txWitness = []
+                        , txLockTime = 0
+                        }
+            rawWeight = calculateAdjustedWeight candTx 0
+            adjWeight = calculateAdjustedWeight candTx 101
+        -- The sigop term must dominate for this test to mean anything.
+        adjWeight `shouldBe` (101 * 20)
+        (adjWeight > rawWeight) `shouldBe` True
+        clusterSizeCase 402000 rawWeight `shouldBe` Right ()
+        case clusterSizeCase 402000 adjWeight of
+          Left (ClusterSizeExceeded actual lim) -> do
+            actual `shouldBe` 404020
+            lim    `shouldBe` 404000
+          _ -> expectationFailure "Expected ClusterSizeExceeded from the sigop-adjusted weight"
+
+      it "maxClusterSizeWeight is 404000 = 101000 vB * WITNESS_SCALE_FACTOR (txmempool.cpp:181)" $ do
+        maxClusterSizeWeight `shouldBe` 404000
+        maxClusterSizeWeight `shouldBe` (maxClusterSizeVbytes * 4)
+
+      -- Reject token: Core emits "too-large-cluster" with an EMPTY debug string
+      -- for BOTH the count and the size violation (validation.cpp:1024, :1116,
+      -- :1343, :1521).  "too-long-mempool-chain" is gone from Core entirely.
+      it "ErrClusterLimitExceeded maps to the Core token \"too-large-cluster\"" $ do
+        mempoolRejectToken 1000 (ErrClusterLimitExceeded 65 64)
+          `shouldBe` ("too-large-cluster" :: T.Text)
+        mempoolRejectToken 1000 (ErrClusterLimitExceeded 404001 404000)
+          `shouldBe` ("too-large-cluster" :: T.Text)
+
+      -- MAX_PACKAGE_COUNT is a DIFFERENT limit and must not move with the
+      -- cluster limits (Core policy/packages.h MAX_PACKAGE_COUNT = 25).
+      it "maxPackageCount stays 25 (independent of the cluster limits)" $ do
+        maxPackageCount `shouldBe` 25
+
+      -- TRUC/v3 is the ONLY surviving ancestor/descendant enforcement.
+      it "TRUC 2-ancestor / 2-descendant limits are untouched (BIP-431)" $ do
+        trucAncestorLimit `shouldBe` 2
+        trucDescendantLimit `shouldBe` 2
 
       -- Ensure the old wrong value 101 is not used as the count limit
       it "cluster count limit is 64, not 101 (W75: fixed off-by-37 bug)" $ do
@@ -17762,6 +17834,7 @@ main = hspec $ do
                 , meFee = 1000
                 , meFeeRate = FeeRate 10
                 , meSize = 100
+                , meAdjWeight = 400
                 , meTime = 1700000000
                 , meHeight = 0
                 , meAncestorCount = 1
@@ -21794,6 +21867,7 @@ main = hspec $ do
             , meFee         = 0
             , meFeeRate     = FeeRate 0
             , meSize        = 100
+            , meAdjWeight        = 400
             , meTime        = 0
             , meHeight      = 0
             , meAncestorCount = 1
@@ -21839,6 +21913,7 @@ main = hspec $ do
             , meFee         = 0
             , meFeeRate     = FeeRate 0
             , meSize        = 100
+            , meAdjWeight        = 400
             , meTime        = 0
             , meHeight      = 0
             , meAncestorCount = 1

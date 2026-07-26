@@ -30,6 +30,7 @@ module Haskoin.Mempool
   , calculateFeeRate
   , calculateVSize
   , calculateAdjustedVSize
+  , calculateAdjustedWeight
     -- * Mempool Creation
   , newMempool
   , setOnRemoveTx
@@ -117,6 +118,7 @@ module Haskoin.Mempool
   , ClusterState(..)
   , maxClusterSize
   , maxClusterSizeVbytes
+  , maxClusterSizeWeight
   , findCluster
   , findAllClusters
   , linearize
@@ -226,11 +228,31 @@ calculateVSize tx =
 -- Reference: bitcoin-core/src/policy/policy.cpp:395-402.
 calculateAdjustedVSize :: Tx -> Int -> Int
 calculateAdjustedVSize tx sigopCost =
+  let adj = calculateAdjustedWeight tx sigopCost
+  in (adj + witnessScaleFactor - 1) `div` witnessScaleFactor
+
+-- | Sigop-adjusted transaction WEIGHT, in weight units, with NO rounding.
+--
+-- @max(tx_weight, sigop_cost * bytes_per_sigop)@ — mirrors
+-- @GetSigOpsAdjustedWeight@ (policy/policy.cpp:390).
+--
+-- This is the exact per-transaction quantity Core hands to TxGraph
+-- (txmempool.cpp:1017 passes @GetSigOpsAdjustedWeight(GetTransactionWeight(tx),
+-- sigops_cost, nBytesPerSigOp)@ as the entry's size), and therefore the
+-- quantity the cluster size limit sums.
+--
+-- Deliberately NOT divided by 'witnessScaleFactor': Core sums raw weights and
+-- compares the total against @cluster_size_vbytes * WITNESS_SCALE_FACTOR@
+-- (txmempool.cpp:181).  Summing per-transaction @ceil(w/4)@ vbytes instead
+-- would be systematically STRICTER than Core, because
+-- @Σ ceil(wᵢ/4) >= (Σ wᵢ)/4@ — up to 3 weight units of drift per member, so
+-- up to ~48 vB over a 64-transaction cluster, always in the reject direction.
+calculateAdjustedWeight :: Tx -> Int -> Int
+calculateAdjustedWeight tx sigopCost =
   let base   = txBaseSize tx
       total  = txTotalSize tx
       weight = base * (witnessScaleFactor - 1) + total
-      adj    = getSigOpsAdjustedWeight weight sigopCost defaultBytesPerSigop
-  in (adj + witnessScaleFactor - 1) `div` witnessScaleFactor
+  in getSigOpsAdjustedWeight weight sigopCost defaultBytesPerSigop
 
 --------------------------------------------------------------------------------
 -- Mempool Configuration
@@ -308,7 +330,11 @@ data MempoolEntry = MempoolEntry
   , meWtxid            :: !Wtxid      -- ^ Witness Transaction ID (BIP-141/339)
   , meFee              :: !Word64     -- ^ Fee in satoshis
   , meFeeRate          :: !FeeRate    -- ^ Fee rate in sat/vB
-  , meSize             :: !Int        -- ^ Virtual size (vB)
+  , meSize             :: !Int        -- ^ Virtual size (vB), sigop-adjusted
+  , meAdjWeight        :: !Int        -- ^ Sigop-adjusted WEIGHT, @max(weight, sigops*20)@.
+                                      --   The unrounded per-tx quantity the cluster
+                                      --   size limit sums (Core txmempool.cpp:1017).
+                                      --   Do NOT use for fee-rate or RPC vsize.
   , meTime             :: !Int64      -- ^ Unix timestamp when added
   , meHeight           :: !Word32     -- ^ Chain height when added
   , meAncestorCount    :: !Int        -- ^ Number of unconfirmed ancestors (including self)
@@ -1014,8 +1040,11 @@ finalizeTransaction mp tx txid inputPairs = do
                                   case scriptResult of
                                     Left err -> return $ Left err
                                     Right () -> do
-                                      -- Check ancestor/descendant limits
-                                      ancestorResult <- checkAncestorLimits mp tx vsize
+                                      -- Check the cluster count/size limits.
+                                      -- Sigop-adjusted WEIGHT, matching the unit
+                                      -- stored in 'meAdjWeight' for pool members.
+                                      ancestorResult <- checkAncestorLimits mp tx
+                                                          (calculateAdjustedWeight tx txSigOpCost)
                                       case ancestorResult of
                                         Left err -> return $ Left err
                                         Right ancestors ->
@@ -1057,6 +1086,7 @@ buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors = do
   let delta    = Map.findWithDefault 0 txid feeDeltas
       modFee   = applyFeeDelta fee delta
       adjVsize = calculateAdjustedVSize tx txSigOpCost
+      adjWeight = calculateAdjustedWeight tx txSigOpCost
       feeRate  = calculateFeeRate modFee adjVsize
   now    <- round <$> getPOSIXTime
   height <- readTVarIO (mpHeight mp)
@@ -1073,6 +1103,7 @@ buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors = do
     , meFee            = fee
     , meFeeRate        = feeRate
     , meSize           = adjVsize
+    , meAdjWeight      = adjWeight
     , meTime           = now
     , meHeight         = height
     , meAncestorCount  = ancestorCount
@@ -1204,7 +1235,8 @@ finalizeTransactionDry mp tx txid inputPairs = do
                                 case scriptResult of
                                   Left err -> return $ Left err
                                   Right () -> do
-                                    ancestorResult <- checkAncestorLimits mp tx vsize
+                                    ancestorResult <- checkAncestorLimits mp tx
+                                                        (calculateAdjustedWeight tx txSigOpCost)
                                     case ancestorResult of
                                       Left err -> return $ Left err
                                       Right ancestors ->
@@ -1457,55 +1489,34 @@ verifyAllScripts mp tx inputMap = do
           Right True -> return $ Right ()
       return $ sequence_ results
 
--- | Check ancestor, descendant, and cluster size limits.
+-- | Check the cluster count and size limits.
 -- Returns the list of ancestors on success.
 --
--- This function enforces both the traditional ancestor/descendant limits
--- (for backward compatibility) and the newer cluster size limit of 101 txs.
--- The ancestor count includes the transaction itself.
+-- As of Core v31 this is the ONLY topology limit on ordinary transactions.
+-- The generic ancestor/descendant count and size limits are gone: Core's
+-- @CheckMemPoolPolicyLimits@ is now just @!IsOversized@ on the TxGraph
+-- (txmempool.cpp:1072-1080), which tests cluster count and cluster size and
+-- nothing else.  @-limitancestorcount@ / @-limitdescendantcount@ survive only
+-- as deprecated wallet coin-selection knobs (init.cpp:650), and the string
+-- "too-long-mempool-chain" no longer appears anywhere in Core's sources.
+--
+-- The only surviving ancestor/descendant enforcement is TRUC/v3's 2-ancestor /
+-- 2-descendant rule ('trucAncestorLimit' / 'trucDescendantLimit'), which is
+-- applied separately by the TRUC checks and is deliberately untouched here.
+--
+-- NOTE the size argument is a sigop-adjusted WEIGHT, not a vsize.  Passing a
+-- vsize here would silently mix units against the weight-denominated members.
 checkAncestorLimits :: Mempool -> Tx -> Int -> IO (Either MempoolError [MempoolEntry])
-checkAncestorLimits mp tx txVsize = do
+checkAncestorLimits mp tx txAdjWeight = do
   ancestors <- getAncestorsRecursive mp tx
   entries <- readTVarIO (mpEntries mp)
   byOutpoint <- readTVarIO (mpByOutpoint mp)
-  let config = mpConfig mp
-      -- Ancestor count includes this transaction (+1)
-      ancestorCount = length ancestors + 1
-      ancestorSize = sum (map meSize ancestors) + txVsize
-
-  -- First, check the new cluster size limit (replaces ancestor/descendant limits)
-  -- Pass txVsize so the vbytes gate is also enforced.
-  case checkClusterLimit tx entries byOutpoint txVsize of
-    Left (ClusterLimitExceeded actual maxSize) ->
-      return $ Left (ErrClusterLimitExceeded actual maxSize)
-    Left (ClusterSizeExceeded actualVb maxVb) ->
-      return $ Left (ErrClusterLimitExceeded actualVb maxVb)
-    Right () -> do
-      -- Also check traditional ancestor count limit for backward compatibility
-      if ancestorCount > mpcMaxAncestors config
-        then return $ Left (ErrTooManyAncestors ancestorCount (mpcMaxAncestors config))
-        else do
-          -- Check ancestor size limit
-          if fromIntegral ancestorSize > mpcMaxAncestorSize config
-            then return $ Left (ErrAncestorSizeTooLarge (fromIntegral ancestorSize) (mpcMaxAncestorSize config))
-            else do
-              -- Check that adding this tx won't violate descendant limits for any ancestor
-              -- Each ancestor's new descendant count = meDescendantCount + 1 (this tx)
-              -- Each ancestor's new descendant size = meDescendantSize + txVsize
-              let descendantViolation = any (wouldViolateDescendantLimit config txVsize) ancestors
-              if descendantViolation
-                then do
-                  -- Find the worst violation for the error message
-                  let findWorstDescCount = maximum $ map (\a -> meDescendantCount a + 1) ancestors
-                  return $ Left (ErrTooManyDescendants findWorstDescCount (mpcMaxDescendants config))
-                else return $ Right ancestors
-  where
-    wouldViolateDescendantLimit :: MempoolConfig -> Int -> MempoolEntry -> Bool
-    wouldViolateDescendantLimit cfg vsize entry =
-      let newDescCount = meDescendantCount entry + 1
-          newDescSize = fromIntegral (meDescendantSize entry) + fromIntegral vsize
-      in newDescCount > mpcMaxDescendants cfg ||
-         newDescSize > mpcMaxDescendantSize cfg
+  case checkClusterLimit tx entries byOutpoint txAdjWeight of
+    Left (ClusterLimitExceeded actual maxCount) ->
+      return $ Left (ErrClusterLimitExceeded actual maxCount)
+    Left (ClusterSizeExceeded actualWu maxWu) ->
+      return $ Left (ErrClusterLimitExceeded actualWu maxWu)
+    Right () -> return $ Right ancestors
 
 --------------------------------------------------------------------------------
 -- Transaction Removal
@@ -3002,14 +3013,21 @@ verifyAllScripts' mp tx inputMap = do
 
 -- | Add a single transaction to the mempool (internal helper)
 addTransactionToMempool :: Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> Word64 -> Int -> IO (Either MempoolError ())
-addTransactionToMempool mp tx txid inputPairs fee vsize = do
-  -- Check ancestor limits
-  ancestorResult <- checkAncestorLimits mp tx vsize
+addTransactionToMempool mp tx txid inputPairs fee _vsize = do
+  height <- readTVarIO (mpHeight mp)
+  -- Sigop cost must be known BEFORE the cluster gate: the gate is denominated
+  -- in sigop-adjusted weight, so the candidate has to be measured in the same
+  -- unit as the pool members it is summed with.
+  let inputMap = Map.fromList inputPairs
+      sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
+      SigOpCost selfSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
+      adjWeight = calculateAdjustedWeight tx selfSigOpCost
+  -- Check cluster count/size limits
+  ancestorResult <- checkAncestorLimits mp tx adjWeight
   case ancestorResult of
     Left err -> return $ Left err
     Right ancestors -> do
       now <- round <$> getPOSIXTime
-      height <- readTVarIO (mpHeight mp)
       -- Fold any pre-existing prioritisetransaction delta into the rank
       -- fields, exactly as 'buildMempoolEntry' does for the single-tx path
       -- (Core ChangeSet::StageAddition → ApplyDelta, txmempool.cpp:1014-1023).
@@ -3020,9 +3038,6 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
           ancestorCount = length ancestors + 1
           ancestorFees = sum (map meFee ancestors) + modFee
           -- Include self's own sigop cost (matches Core ancestor sigop accumulation).
-          inputMap = Map.fromList inputPairs
-          sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
-          SigOpCost selfSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
           ancestorSigOps = sum (map meAncestorSigOps ancestors) + selfSigOpCost
           -- Sigop-adjusted virtual size (Core parity).
           -- Reference: bitcoin-core/src/policy/policy.cpp:400-403.
@@ -3037,6 +3052,7 @@ addTransactionToMempool mp tx txid inputPairs fee vsize = do
             , meFee = fee
             , meFeeRate = feeRate
             , meSize = adjVsize
+            , meAdjWeight = adjWeight
             , meTime = now
             , meHeight = height
             , meAncestorCount = ancestorCount
@@ -3287,8 +3303,23 @@ maxClusterSize = 64
 -- | Maximum total virtual size of a cluster in vbytes.
 -- Bitcoin Core: DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 → 101,000 vbytes
 -- (kernel/mempool_limits.h:22: cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000)
+--
+-- This is the REPORTING unit only: Core's @getmempoolinfo.limitclustersize@
+-- publishes @cluster_size_vbytes@ verbatim (rpc/mempool.cpp:1062), so the RPC
+-- surface keeps saying 101000.  The ENFORCEMENT unit is
+-- 'maxClusterSizeWeight'.
 maxClusterSizeVbytes :: Int
 maxClusterSizeVbytes = 101 * 1000
+
+-- | Maximum total sigop-adjusted WEIGHT of a cluster — the enforced bound.
+--
+-- Core builds its TxGraph with
+-- @max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR@
+-- (txmempool.cpp:181) and rejects on a STRICT @total_size > max_cluster_size@
+-- (txgraph.cpp:2059).  101,000 * 4 = 404,000 weight units: 404000 accepts,
+-- 404001 rejects.
+maxClusterSizeWeight :: Int
+maxClusterSizeWeight = maxClusterSizeVbytes * witnessScaleFactor
 
 -- | A chunk is a set of transactions with the same aggregate fee rate,
 -- representing an atomic unit for mining selection.
@@ -3440,6 +3471,14 @@ buildUnionFind entries byOutpoint = foldl' addTxRelations initial (Map.toList en
 -- (DEFAULT_CLUSTER_LIMIT = 64) or the vbytes limit
 -- (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vB).
 -- Reference: policy/policy.h:72-74, kernel/mempool_limits.h:20-22.
+-- DEAD CODE — DO NOT WIRE UP AS-IS.  This function has no caller anywhere in
+-- src/, app/ or test/; the LIVE cluster gate is 'checkClusterLimit', reached
+-- via 'checkAncestorLimits'.  It is also STALE: it still sums per-transaction
+-- 'meSize' vbytes against 'maxClusterSizeVbytes', which is systematically
+-- stricter than Core (see 'calculateAdjustedWeight').  Deliberately left
+-- unpatched so that no one mistakes a change here for a behavioural fix.
+-- If you ever need it, port it to sigop-adjusted weight vs
+-- 'maxClusterSizeWeight' first.
 wouldExceedClusterLimit :: TxId                   -- ^ New transaction to add
                         -> [TxId]                 -- ^ TxIds it would connect to (neighbors)
                         -> UnionFind              -- ^ Current union-find (for count check)
@@ -3603,19 +3642,33 @@ data ClusterLimitError
 instance NFData ClusterLimitError
 
 -- | Check cluster count and size limits for a new transaction.
+--
 -- Returns Left if adding the transaction would exceed either the count limit
--- (DEFAULT_CLUSTER_LIMIT = 64) or the vbytes size limit
--- (DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 = 101,000 vB).
--- Reference: kernel/mempool_limits.h, policy/policy.h:72-74,
---            txmempool.cpp:1072-1079 (CheckMemPoolPolicyLimits → IsOversized).
+-- (DEFAULT_CLUSTER_LIMIT = 64, policy/policy.h:72) or the size limit
+-- ('maxClusterSizeWeight' = 404,000 weight units).
+--
+-- UNITS: the size gate works entirely in sigop-adjusted WEIGHT.  Each member
+-- contributes 'meAdjWeight' = @max(tx_weight, sigops*20)@ and the candidate
+-- contributes @txAdjWeight@; the sum is compared against 404,000.  There is no
+-- per-transaction division and no per-transaction rounding, matching Core: the
+-- quantity TxGraph sums is the unrounded adjusted weight (txmempool.cpp:1017)
+-- and the bound is @cluster_size_vbytes * WITNESS_SCALE_FACTOR@
+-- (txmempool.cpp:181).  Summing per-tx @ceil(w/4)@ against 101,000 instead
+-- would be systematically stricter, since @Σ ceil(wᵢ/4) >= (Σ wᵢ)/4@.
+--
+-- Both comparisons are STRICT @>@ (txgraph.cpp:2059:
+-- @total_count > max_count || total_size > max_size@), so 64 txs and 404,000
+-- weight units are both ACCEPTED; 65 and 404,001 are rejected.
+--
+-- Reference: kernel/mempool_limits.h:20-22, policy/policy.h:72-74,
+--            txmempool.cpp:181/1017, txgraph.cpp:2059.
 checkClusterLimit :: Tx                      -- ^ Transaction being added
                   -> Map TxId MempoolEntry   -- ^ Current mempool entries
                   -> Map OutPoint TxId       -- ^ Outpoint index
-                  -> Int                     -- ^ Virtual size of the new transaction in vbytes
+                  -> Int                     -- ^ Sigop-adjusted WEIGHT of the new transaction
                   -> Either ClusterLimitError ()
-checkClusterLimit tx entries byOutpoint txVsize =
-  let txid = computeTxId tx
-      -- Find all mempool transactions this tx connects to (parents only — children
+checkClusterLimit tx entries byOutpoint txAdjWeight =
+  let -- Find all mempool transactions this tx connects to (parents only — children
       -- cannot exist yet since this tx is not yet in the pool).
       parentIds = [ parentId
                   | inp <- txInputs tx
@@ -3630,21 +3683,21 @@ checkClusterLimit tx entries byOutpoint txVsize =
        let -- Count check: sum distinct cluster sizes + 1 for this tx
            clusterTxCounts = getDistinctClusterSizes parentIds uf
            totalTxCount    = sum clusterTxCounts + 1
-           -- Vbytes check: sum vsizes of all distinct cluster members + this tx's vsize
-           distinctRoots   = Set.toList $ Set.fromList
+           -- Size check: sum the sigop-adjusted weight of every member of every
+           -- distinct cluster this tx would merge, plus the candidate's own.
+           distinctRoots   = Set.fromList
                                [fst (ufFind parentId uf) | parentId <- parentIds]
-           clusterMemberIds = [ txid'
-                               | (txid', _) <- Map.toList entries
-                               , let (root, _) = ufFind txid' uf
-                               , root `elem` distinctRoots
-                               ]
-           totalVbytes = sum [meSize e | txid' <- clusterMemberIds
-                                       , Just e <- [Map.lookup txid' entries]]
-                         + txVsize
+           totalWeight = Map.foldlWithKey'
+                           (\acc txid' e ->
+                              if fst (ufFind txid' uf) `Set.member` distinctRoots
+                                then acc + meAdjWeight e
+                                else acc)
+                           0 entries
+                         + txAdjWeight
        in if totalTxCount > maxClusterSize
           then Left $ ClusterLimitExceeded totalTxCount maxClusterSize
-          else if totalVbytes > maxClusterSizeVbytes
-          then Left $ ClusterSizeExceeded totalVbytes maxClusterSizeVbytes
+          else if totalWeight > maxClusterSizeWeight
+          then Left $ ClusterSizeExceeded totalWeight maxClusterSizeWeight
           else Right ()
 
 --------------------------------------------------------------------------------
