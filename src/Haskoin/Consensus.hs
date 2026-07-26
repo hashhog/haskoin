@@ -369,9 +369,16 @@ data Network = Network
     -- current consensus rules (BIP16 P2SH violators, taproot violator).
     -- Mirrors Bitcoin Core's @Consensus::Params::script_flag_exceptions@
     -- (kernel/chainparams.cpp).  If a block's hash matches an entry here,
-    -- 'getBlockScriptFlags' returns that entry's 'ConsensusFlags' DIRECTLY,
-    -- WITHOUT any additional height-based additions.  Empty for testnet4,
-    -- signet, and regtest.
+    -- 'getBlockScriptFlags' REPLACES the unconditional P2SH|WITNESS|TAPROOT
+    -- base with this entry's 'ConsensusFlags' — and then still ORs the four
+    -- height-gated flags (DERSIG/CLTV/CSV/NULLDUMMY) on top, exactly like
+    -- Core's GetBlockScriptFlags (validation.cpp:2262-2286).  An entry is
+    -- therefore a REPLACEMENT OF THE BASE, *not* an early return.
+    -- Empty for testnet4, signet, and regtest.
+    --
+    -- Byte-order: keys are stored in INTERNAL (little-endian) orientation,
+    -- produced by 'hashFromHex' from Core's display-order hex.  That is the
+    -- same orientation 'computeBlockHash' returns, so the lookup matches.
   } deriving (Show)
 
 -- | Parameters for the headers-sync anti-DoS pipeline.
@@ -1946,7 +1953,20 @@ data ConsensusFlags = ConsensusFlags
                                 --   override without a separate ScriptFlags path.
   } deriving (Show, Eq, Generic)
 
--- | Compute consensus flags for a given height based on network rules.
+-- | Compute DEPLOYMENT-ACTIVATION flags for a given height.
+--
+-- NOT the per-block script-verify flag set — use 'getBlockScriptFlags' for
+-- that.  This function answers \"which deployments are active at height h\",
+-- which is what Core's @DeploymentActiveAfter@ \/ @DeploymentActiveAt@
+-- answer: it drives the nVersion gates and the BIP-34 coinbase-height check
+-- in @ContextualCheckBlockHeader@ (validation.cpp:4112-4118), the
+-- @CheckWitnessMalleation@ @expect_witness_commitment@ argument
+-- (validation.cpp:4169), and mempool\/policy sigop counting for the NEXT
+-- block.  It is deliberately hash-blind: deployment activation is a pure
+-- function of height and the @script_flag_exceptions@ table must NOT change
+-- it.  Do NOT use it to compute block script-verify flags — it cannot honour
+-- the exception table and would hard-fork on the two historical violators.
+--
 -- NULLFAIL (BIP-146) is intentionally excluded: it is a
 -- STANDARD_SCRIPT_VERIFY_FLAG (policy only) per Core policy/policy.h:125.
 consensusFlagsAtHeight :: Network -> Word32 -> ConsensusFlags
@@ -1961,26 +1981,74 @@ consensusFlagsAtHeight net h = ConsensusFlags
   , flagP2SH      = True   -- P2SH always active; BIP16-exception override sets False
   }
 
--- | Get consensus script flags for a given block, checking the per-block
--- exception table in 'netScriptFlagExceptions' BEFORE the height-based
--- computation.
+-- | Per-block SCRIPT-VERIFY flags — a faithful port of Bitcoin Core's
+-- @GetBlockScriptFlags@ (bitcoin-core/src/validation.cpp:2249-2289).
 --
--- Mirrors Bitcoin Core's @GetBlockScriptFlags@ (validation.cpp:2250-2288):
--- Core starts with P2SH+WITNESS+TAPROOT, overrides if an exception block
--- is found, then ORs in DERSIG/CLTV/CSV/NULLDUMMY by height.  Haskoin's
--- approach is equivalent but in the other direction: height-based activation
--- is the default; exceptions REPLACE (not patch) the result.  The two are
--- observationally equivalent because the real exception blocks satisfy every
--- height-active flag they don't explicitly disable.
+-- Core's sequence is THREE steps and the ORDER IS LOAD-BEARING:
 --
--- MUST be used at EVERY block-validation flag-computation site.  Do NOT use
--- at mempool/policy/RPC sites — those validate the NEXT block and should
--- never apply historical block exceptions.
+--   1. BASE      — seed @SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS |
+--                  SCRIPT_VERIFY_TAPROOT@ UNCONDITIONALLY, for every block
+--                  (validation.cpp:2262).  Core has had no @BIP16Height@ and
+--                  no taproot height in this path since v23: P2SH, WITNESS
+--                  and TAPROOT are always on, and the only blocks that ever
+--                  violated them are handled by step 2.  Height-gating any
+--                  of these three is a consensus bug.
+--   2. EXCEPTION — on a block-hash hit in @script_flag_exceptions@, REPLACE
+--                  the whole flag set with the table's value
+--                  (validation.cpp:2264-2267).  This is a replacement of the
+--                  BASE, *not* an early return.
+--   3. HEIGHT    — OR the four still-height-gated flags ON TOP of step 2's
+--                  result (validation.cpp:2268-2286): DERSIG (BIP66),
+--                  CHECKLOCKTIMEVERIFY (BIP65), CHECKSEQUENCEVERIFY
+--                  (BIP68\/112\/113) and NULLDUMMY (BIP147, rides SegWit).
+--
+-- Why step 3 MUST run after step 2 (this is the bug this function used to
+-- have): mainnet block 692261's exception value is @P2SH | WITNESS@.
+-- Returning it directly yields @P2SH | WITNESS@ alone and DROPS
+-- @DERSIG | CLTV | CSV | NULLDUMMY@, all four of which are active at that
+-- height — a FALSE-ACCEPT of scripts Core rejects under BIP-66\/65\/112\/147.
+--
+-- Note on 'flagBIP34': BIP-34 is not a script-verify flag in Core, so it is
+-- never set here.  Callers that need deployment activation (nVersion gates,
+-- the coinbase-height check, @CheckWitnessMalleation@) must use
+-- 'consensusFlagsAtHeight', which is height-based and hash-blind.
+--
+-- No policy flags may ever appear here: NULLFAIL, CLEANSTACK, LOW_S,
+-- STRICTENC, MINIMALDATA, MINIMALIF and WITNESS_PUBKEYTYPE are
+-- STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:125) and are not consensus.
+--
+-- MUST be used at EVERY block-validation script-flag / sigop-counting site.
+-- Do NOT use at mempool\/policy\/RPC sites — those validate the NEXT block
+-- and must never apply historical block exceptions.
 getBlockScriptFlags :: Network -> BlockHash -> Word32 -> ConsensusFlags
-getBlockScriptFlags net bh h =
-  case lookup bh (netScriptFlagExceptions net) of
-    Just override -> override
-    Nothing       -> consensusFlagsAtHeight net h
+getBlockScriptFlags net bh h = heightStep afterException
+  where
+    -- Step 1: P2SH | WITNESS | TAPROOT, unconditionally, for every block.
+    base = ConsensusFlags
+      { flagBIP34     = False   -- not a script-verify flag in Core
+      , flagBIP65     = False   -- OR'd in by step 3
+      , flagBIP66     = False   -- OR'd in by step 3
+      , flagSegWit    = True    -- SCRIPT_VERIFY_WITNESS  (unconditional)
+      , flagTaproot   = True    -- SCRIPT_VERIFY_TAPROOT  (unconditional)
+      , flagNullDummy = False   -- OR'd in by step 3
+      , flagCSV       = False   -- OR'd in by step 3
+      , flagP2SH      = True    -- SCRIPT_VERIFY_P2SH     (unconditional)
+      }
+
+    -- Step 2: hash-keyed exception REPLACES the base (not an early return).
+    -- Keys are internal (little-endian) orientation, matching
+    -- 'computeBlockHash' (raw double-SHA256 digest).
+    afterException = case lookup bh (netScriptFlagExceptions net) of
+      Just override -> override
+      Nothing       -> base
+
+    -- Step 3: OR the four height-gated flags on top of step 2's result.
+    heightStep cf = cf
+      { flagBIP66     = flagBIP66 cf     || h >= netBIP66Height net
+      , flagBIP65     = flagBIP65 cf     || h >= netBIP65Height net
+      , flagCSV       = flagCSV cf       || h >= netCSVHeight net
+      , flagNullDummy = flagNullDummy cf || h >= netSegwitHeight net
+      }
 
 -- | Convert ConsensusFlags to ScriptFlags for script verification.
 -- This maps the consensus-level flags to the script interpreter's flag type.
@@ -2782,11 +2850,21 @@ getLegacySigOpCount tx =
 
 -- | Count P2SH sigops with WITNESS_SCALE_FACTOR.
 -- Only counts sigops in the redeem script for P2SH inputs.
--- Reference: Bitcoin Core GetP2SHSigOpCount()
+-- Reference: Bitcoin Core GetTransactionSigOpCost
+-- (consensus/tx_verify.cpp:150-152):
+--
+--   if (flags & SCRIPT_VERIFY_P2SH) {
+--       nSigOps += GetP2SHSigOpCount(tx, inputs) * WITNESS_SCALE_FACTOR;
+--   }
+--
+-- The gate is the FINAL exception-aware flag, not a height boolean and not a
+-- hard-coded True.  On the BIP16-violator blocks the exception table yields
+-- SCRIPT_VERIFY_NONE, and Core therefore counts NO P2SH sigops for them;
+-- hard-coding the gate open double-counted those blocks' redeem-script
+-- sigops and could spuriously trip MAX_BLOCK_SIGOPS_COST (a false REJECT).
 getP2SHSigOpCost :: Tx -> Map OutPoint TxOut -> ConsensusFlags -> SigOpCost
 getP2SHSigOpCost tx utxoMap flags
-  -- P2SH flag must be active (always is after BIP-16)
-  | not (True) = SigOpCost 0  -- P2SH always active in our implementation
+  | not (flagP2SH flags) = SigOpCost 0
   | isCoinbase tx = SigOpCost 0
   | otherwise = SigOpCost $ witnessScaleFactor * sum (map countP2SHInput (txInputs tx))
   where
@@ -2993,9 +3071,24 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
       header = blockHeader block
       txns = blockTxns block
       blockHash = computeBlockHash header
-      -- Use hash-keyed exception table first, then fall back to height-based
-      -- activation.  Mirrors Core's GetBlockScriptFlags (validation.cpp:2263).
+      -- SCRIPT-VERIFY flags for THIS block: unconditional P2SH|WITNESS|TAPROOT
+      -- base, replaced wholesale on a script_flag_exceptions hash hit, then
+      -- DERSIG/CLTV/CSV/NULLDUMMY OR'd on by height.  Faithful port of Core's
+      -- GetBlockScriptFlags (validation.cpp:2249-2289).  Drives per-input
+      -- script evaluation AND sigop counting (Core gates P2SH sigops on
+      -- SCRIPT_VERIFY_P2SH and witness sigops on SCRIPT_VERIFY_WITNESS —
+      -- consensus/tx_verify.cpp:150-152, script/interpreter.cpp:2141-2143).
       flags = getBlockScriptFlags net blockHash height
+      -- DEPLOYMENT-ACTIVATION flags for THIS block: hash-blind, height only.
+      -- Core does NOT route these through GetBlockScriptFlags — the nVersion
+      -- gates and the BIP-34 coinbase-height check live in
+      -- ContextualCheckBlockHeader (validation.cpp:4112-4118) and
+      -- CheckWitnessMalleation's expect_witness_commitment argument comes from
+      -- DeploymentActiveAt(DEPLOYMENT_SEGWIT) (validation.cpp:4169).  Using
+      -- the exception-aware set for these would silently disable the version
+      -- gates and the witness-commitment requirement on the two historical
+      -- exception blocks.
+      dflags = consensusFlagsAtHeight net height
       checkpoints = buildCheckpoints net
       -- TxOut-only view for validateBlockTransactions (script checking).
       utxoMap = fmap coinTxOut utxoCoinMap
@@ -3055,12 +3148,15 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
   --   nVersion < 4 rejected after BIP65 (DEPLOYMENT_CLTV) activation.
   -- DeploymentActiveAfter(pindexPrev, ...) = (pindexPrev.height+1) >= activation,
   -- which maps to `height >= netBIPNNHeight net` in our scheme.
+  -- Height-based (dflags), NOT the exception-aware script flags: Core runs
+  -- these in ContextualCheckBlockHeader, which never consults
+  -- script_flag_exceptions.
   let blockVer = bhVersion header
-  when (flagBIP34 flags && blockVer < 2) $
+  when (flagBIP34 dflags && blockVer < 2) $
     Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
-  when (flagBIP66 flags && blockVer < 3) $
+  when (flagBIP66 dflags && blockVer < 3) $
     Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
-  when (flagBIP65 flags && blockVer < 4) $
+  when (flagBIP65 dflags && blockVer < 4) $
     Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
 
   -- 3. Verify merkle root + CVE-2012-2459 mutation detection.
@@ -3092,7 +3188,8 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
   --   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
   -- Using validateCoinbaseHeightConsensus (strict byte-prefix) rather than
   -- coinbaseHeight (lenient value-decoder) to match Core parity exactly.
-  when (flagBIP34 flags) $
+  -- Height-based (dflags): BIP-34 is a deployment, not a script-verify flag.
+  when (flagBIP34 dflags) $
     unless (validateCoinbaseHeightConsensus height (head txns)) $
       Left "bad-cb-height"
 
@@ -3255,9 +3352,14 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
 
   -- 10. Witness commitment / unexpected-witness validation.
   -- Core: ContextualCheckBlock calls CheckWitnessMalleation unconditionally
-  -- (validation.cpp:4169) with expect_witness_commitment = segwit_active.
-  -- This means the unexpected-witness check also runs for pre-segwit blocks.
-  checkWitnessMalleation (flagSegWit flags) block
+  -- (validation.cpp:4169) with expect_witness_commitment = segwit_active,
+  -- where segwit_active = DeploymentActiveAt(*pindex, DEPLOYMENT_SEGWIT) —
+  -- a HEIGHT predicate, not the script-verify flag set.  Hence dflags: the
+  -- script-flag base now carries WITNESS unconditionally (Core parity), so
+  -- reading flagSegWit off 'flags' here would demand a witness commitment
+  -- from every pre-segwit block, and the taproot-exception block (whose
+  -- override happens to clear it) would skip the check entirely.
+  checkWitnessMalleation (flagSegWit dflags) block
 
   Right ()
 
