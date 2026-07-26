@@ -563,7 +563,8 @@ prepareConnTx req = do
 --              "prevouts":[{"txid":"<display-hex>","vout":N,
 --                           "scriptPubKey_hex":"...","value_sats":<u64>,
 --                           "height":N,"is_coinbase":bool}, ...],
---              "spend_height":<int>,"skip_pow":<bool>,"skip_scripts":<bool>}
+--              "spend_height":<int>,"skip_pow":<bool>,"skip_scripts":<bool>,
+--              "prev_mtp":<u32>}              -- OPTIONAL; see below
 --   response: {"valid":true}                    (CheckBlock chain accepts)
 --             {"valid":false,"reason":"..."}    (some gate rejects)
 --             {"error":"..."}                   (could not evaluate -> SKIP)
@@ -575,6 +576,14 @@ data CheckBlockRequest = CheckBlockRequest
   , cbSpendHeight  :: Word32
   , cbSkipPow      :: Bool
   , cbSkipScripts  :: Bool
+  -- | nLockTimeCutoff: Core's ContextualCheckBlock uses
+  -- @pindexPrev->GetMedianTimePast()@ once CSV is active. Defaults to 0 for
+  -- older corpus rows, whose transactions are all locktime=0 or HEIGHT-based
+  -- and therefore MTP-independent. REQUIRED for the script_flag_exceptions
+  -- rows: block 692261's COINBASE carries a TIME-based nLockTime
+  -- (1221476453) with a non-final nSequence, so against a cutoff of 0 it is
+  -- not final and the whole block FALSE-REJECTS as bad-txns-nonfinal.
+  , cbPrevMtp      :: Word32
   }
 
 instance A.FromJSON CheckBlockRequest where
@@ -584,6 +593,7 @@ instance A.FromJSON CheckBlockRequest where
     <*> (toW32 <$> o .:? "spend_height" A..!= (0 :: Double))
     <*> o .:? "skip_pow"     A..!= True
     <*> o .:? "skip_scripts" A..!= False
+    <*> (toW32 <$> o .:? "prev_mtp" A..!= (0 :: Double))
     where toW32 d = round (d :: Double)
 
 -- | Build a @Map OutPoint Coin@ from the prevout set (same view shape
@@ -635,7 +645,7 @@ prepareCheckBlock req = do
                { csHeight     = sh - 1
                , csBestBlock  = prev
                , csChainWork  = 0
-               , csMedianTime = 0
+               , csMedianTime = cbPrevMtp req
                , csFlags      = consensusFlagsAtHeight mainnet sh
                }
   Right (block, cs, cbSkipScripts req, coinMap)
