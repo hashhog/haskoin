@@ -289,6 +289,7 @@ mkEntry tx fee sz feeRateKvb rbf = MempoolEntry
   , meFee             = fee
   , meFeeRate         = FeeRate feeRateKvb
   , meSize            = sz
+  , meAdjWeight       = sz * 4
   , meTime            = 0
   , meHeight          = 0
   , meAncestorCount   = 1

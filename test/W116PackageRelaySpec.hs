@@ -379,6 +379,7 @@ fakeEntryTx tx txid wtxid fee sz ancCnt ancSz descCnt descSz = MempoolEntry
   , meFee           = fee
   , meFeeRate       = FeeRate (fee * 1000 `div` fromIntegral sz)
   , meSize          = sz
+  , meAdjWeight     = sz * 4
   , meTime          = 0
   , meHeight        = 0
   , meAncestorCount = ancCnt

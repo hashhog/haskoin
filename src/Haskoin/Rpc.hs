@@ -4077,7 +4077,11 @@ mempoolRejectToken staticFloorKvb err = case err of
   ErrRBFNewUnconfirmedInput _       -> "replacement-adds-unconfirmed"
   ErrTrucViolation _                -> "non-standard"
   ErrEphemeralViolation _           -> "dust"
-  ErrClusterLimitExceeded _ _       -> "too-long-mempool-chain"
+  -- Core v31 emits "too-large-cluster" with an EMPTY debug string for both the
+  -- cluster COUNT and cluster SIZE violation (validation.cpp:1024, :1116,
+  -- :1343, :1521).  "too-long-mempool-chain" no longer exists anywhere in
+  -- Core's sources — the generic ancestor/descendant limits it named are gone.
+  ErrClusterLimitExceeded _ _       -> "too-large-cluster"
   -- Standardness tags are already Core reason tokens (Policy.Standard).
   ErrNonStandard tag                -> T.pack tag
   ErrInputsNotStandard _ tag        -> T.pack tag
