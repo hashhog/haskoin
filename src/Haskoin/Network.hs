@@ -2739,9 +2739,11 @@ v2InboundHandshake pc net = do
       -- Step 2: build our cipher + our garbage.  Use 32 bytes of garbage
       -- by default (a small but non-zero amount, well within the 4095
       -- cap) — the size is opaque to the protocol.
-      seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-      auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-      garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+      -- W98 G1/G26: key/garbage material MUST come from a CSPRNG (Core
+      -- uses GetStrongRandBytes); System.Random is not crypto-secure.
+      seckey  <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
+      auxRnd  <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
+      garbage <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
 
       transport <- newV2Transport seckey auxRnd (netMagicBytes net) False garbage
       respRes <- v2HandshakeResponder transport (EllSwiftPubKey theirPubBs)
@@ -2802,9 +2804,10 @@ v2OutboundHandshake
   -> Network
   -> IO (Either String V2Transport)
 v2OutboundHandshake pc net = do
-  seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-  auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-  garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+  -- W98 G1/G26: CSPRNG key/garbage material (Core: GetStrongRandBytes).
+  seckey  <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
+  auxRnd  <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
+  garbage <- CryptoRandom.getRandomBytes 32 :: IO BS.ByteString
 
   transport <- newV2Transport seckey auxRnd (netMagicBytes net) True garbage
 

@@ -600,14 +600,16 @@ spec = describe "W102 AssumeUTXO snapshot loading gates" $ do
   -- -----------------------------------------------------------------------
 
   describe "G26 netAssumeUtxo table entries" $ do
-    it "mainnet has the 4 Core entries + the 944183 hashhog-recovery entry" $
+    it "mainnet has the 4 Core entries + the 3 hashhog-local entries" $
       -- The four 840000/880000/910000/935000 entries are the upstream
-      -- Bitcoin Core m_assumeutxo_data values.  944183 is a hashhog-local
-      -- snapshot added (W163) to recover haskoin's mainnet chainstate
-      -- from the W162 corruption via '--load-snapshot'; it is NOT a Core
-      -- chainparams entry.  See Consensus.hs netAssumeUtxo (mainnet).
+      -- Bitcoin Core m_assumeutxo_data values.  The rest are hashhog-local
+      -- snapshots (NOT Core chainparams entries):
+      --   944183 — W163 mainnet chainstate recovery ('--load-snapshot')
+      --   956407 — near-tip recovery snapshot (2026-07-02 dumptxoutset)
+      --   481823 — Track-B windowed replay boundary (last pre-segwit block)
+      -- See Consensus.hs netAssumeUtxo (mainnet).
       map fst (netAssumeUtxo mainnet)
-        `shouldBe` [840000, 880000, 910000, 935000, 944183]
+        `shouldBe` [840000, 880000, 910000, 935000, 944183, 956407, 481823]
 
     it "testnet4 has at least 1 snapshot entry" $
       length (netAssumeUtxo testnet4) `shouldSatisfy` (>= 1)

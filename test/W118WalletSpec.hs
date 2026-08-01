@@ -248,6 +248,9 @@ import Data.Bits ((.&.), (.|.))
 import Control.Concurrent.STM (readTVarIO)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
+import System.IO.Temp (withSystemTempDirectory)
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
 
 import Haskoin.Wallet
 import Haskoin.Crypto (SecKey(..), PubKey(..), derivePubKey,
@@ -1383,10 +1386,16 @@ spec_dead_helpers = describe "W118 dead-helper findings" $ do
     epkKey epk42 `shouldNotBe` epkKey epkRoot
     epkKey epk0  `shouldNotBe` epkKey epk42
 
-  it "DH-2: saveWallet always throws \"not yet implemented\"" $ do
+  it "DH-2: [CLOSED] saveWallet persists wallet state to disk" $ do
+    -- Was: saveWallet always threw "not yet implemented".  Wallet.hs's
+    -- DATA-LOSS fix made it a real atomic (temp + fsync + rename),
+    -- AES-sealed-at-rest snapshot writer — assert the file materializes.
     m <- generateMnemonic 128
     w <- loadWallet (WalletConfig mainnet 20 "") m
-    evaluate (saveWallet w "/tmp/w118-test-wallet") `shouldThrow` anyErrorCall
+    withSystemTempDirectory "w118-save" $ \dir -> do
+      let path = dir </> "test-wallet"
+      saveWallet w path
+      doesFileExist path `shouldReturn` True
 
   it "DH-3: signTransaction stub returns empty witnesses (see G25)" $ do
     -- The body of the per-input fold falls through to `let ... in []`.
