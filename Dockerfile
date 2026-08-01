@@ -2,7 +2,7 @@
 FROM haskell:9.8-slim AS builder
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    librocksdb-dev pkg-config zlib1g-dev \
+    librocksdb-dev pkg-config zlib1g-dev libzmq5 \
     build-essential autoconf automake libtool git && \
     rm -rf /var/lib/apt/lists/*
 
@@ -35,7 +35,7 @@ RUN cabal install --install-method=copy --installdir=/build/bin
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates librocksdb-dev && \
+    ca-certificates librocksdb-dev libzmq5 && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/bin/haskoin /usr/local/bin/haskoin
 COPY --from=builder /usr/local/lib/libminisketch* /usr/local/lib/
