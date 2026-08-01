@@ -46,7 +46,10 @@ cd "$TMPDIR"
 gcc -shared -fPIC -O2 -o librocksdb_compat.so rocksdb_compat.c -lrocksdb
 
 echo "Installing to /usr/local/lib..."
-sudo cp librocksdb_compat.so /usr/local/lib/
-sudo ldconfig
+# sudo is absent in root-run containers (Docker builder); use it only when
+# needed and available.
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+$SUDO cp librocksdb_compat.so /usr/local/lib/
+$SUDO ldconfig
 
 echo "Done. librocksdb_compat.so installed to /usr/local/lib"

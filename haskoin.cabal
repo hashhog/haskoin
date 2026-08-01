@@ -1,6 +1,6 @@
 cabal-version: 3.0
 name:          haskoin
-version:       0.1.0.0
+version:       1.0.0.0
 synopsis:      Bitcoin full node in Haskell
 build-type:    Simple
 
@@ -8,7 +8,7 @@ build-type:    Simple
 -- package so 'Haskoin.Wallet.loadBip39WordList' resolves it via
 -- Paths_haskoin.getDataFileName, independent of the caller's CWD.
 -- Cabal copies this file under the package's data dir at install time
--- (e.g. ~/.cabal/store/.../haskoin-0.1.0.0/resources/bip39-english.txt).
+-- (e.g. ~/.cabal/store/.../haskoin-1.0.0.0/resources/bip39-english.txt).
 data-files:    resources/bip39-english.txt
 
 library
@@ -88,7 +88,10 @@ library
                  , cbits/zmq_stubs.c
                  , cbits/format_double.c
   cc-options:       -O2
-  -- System dependencies: sudo apt install -y librocksdb-dev libsecp256k1-dev
+  -- System dependencies: sudo apt install -y librocksdb-dev
+  -- libsecp256k1 must be built from source (v0.7.1+ with the ellswift,
+  -- schnorrsig, extrakeys, recovery and ecdh modules) — distro packages
+  -- predate ElligatorSwift (BIP-324). See .github/workflows/ci.yml.
   -- Also requires libminisketch (build from https://github.com/sipa/minisketch)
   -- RocksDB 9.x removed rocksdb_filterpolicy_create; rocksdb_compat is a shim
   -- that provides it. Build the shim with: scripts/build-rocksdb-compat.sh

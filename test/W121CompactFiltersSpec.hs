@@ -320,6 +320,7 @@ import Test.Hspec
 import qualified Data.ByteString as BS
 import Data.Word (Word8, Word32, Word64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
+import Control.Exception (evaluate)
 
 import Haskoin.Types
   ( Hash256(..)
@@ -946,28 +947,33 @@ spec = do
           bw0     = bitWriterWrite bitWriterNew 64 payload
           encoded = bitWriterFlush bw0
           br0     = bitReaderNew encoded
-      -- A read of 56 bits succeeds (the max load-buffer size).
+      -- A read of 56 bits succeeds (the max load-buffer size). The stream
+      -- is MSB-first (Core streams.h parity, post-FIX-69), so the first
+      -- 56 bits read are the TOP 56 bits of the payload.
       let (decoded56, _) = bitReaderRead br0 56
-      decoded56 `shouldBe` (payload .&. 0x00FFFFFFFFFFFFFF)
-      -- Multiple smaller reads can recover the full 64 bits:
-      let (lo, br1) = bitReaderRead br0 32
-          (hi, _)   = bitReaderRead br1 32
-          combined  = lo .|. (hi `shiftL` 32)
+      decoded56 `shouldBe` (payload `shiftR` 8)
+      -- Multiple smaller reads can recover the full 64 bits (MSB-first:
+      -- the first read yields the HIGH 32 bits):
+      let (hi, br1) = bitReaderRead br0 32
+          (lo, _)   = bitReaderRead br1 32
+          combined  = (hi `shiftL` 32) .|. lo
       combined `shouldBe` payload
 
-    -- 9. bitWriterWrite numBits=0 / negative — guard path.  Pre-FIX-69
-    --    this was already correct, but a defense-in-depth assertion.
-    --    A no-op write must NOT advance bwBits, must NOT modify buffer.
-    it "W122-9 bitWriterWrite numBits<=0 is a no-op (no state change)" $ do
+    -- 9. bitWriterWrite numBits=0 / negative — guard path.  numBits=0 is a
+    --    no-op (must NOT advance bwBits, must NOT modify buffer).
+    --    Negative numBits fails loud, exactly like Core's
+    --    BitStreamWriter::Write which throws std::ios_base::failure for
+    --    nbits outside 0..64 (bitcoin-core/src/streams.h).
+    it "W122-9 bitWriterWrite numBits=0 is a no-op; negative fails loud" $ do
       let bw0 = bitWriterWrite bitWriterNew 5 0x15
           bw1 = bitWriterWrite bw0 0 0xFF
-          bw2 = bitWriterWrite bw1 (-3) 0xFF
-      -- Round-trip the 5-bit write through flush; the 0/negative writes
+      -- Round-trip the 5-bit write through flush; the 0-bit write
       -- must not have corrupted the buffer or bit-count.
-      let encoded = bitWriterFlush bw2
+      let encoded = bitWriterFlush bw1
           br      = bitReaderNew encoded
           (v, _)  = bitReaderRead br 5
       v `shouldBe` 0x15
+      evaluate (BS.length (bitWriterFlush (bitWriterWrite bw0 (-3) 0xFF))) `shouldThrow` anyErrorCall
 
     -- 10. mask helper at n=64 must yield maxBound (0xFFFFFFFFFFFFFFFF).
     --     Core uses ~0ULL; the haskoin FIX-69 implementation spells this
