@@ -1,6 +1,6 @@
 cabal-version: 3.0
 name:          haskoin
-version:       0.1.0.0
+version:       1.0.0.0
 synopsis:      Bitcoin full node in Haskell
 build-type:    Simple
 
@@ -8,7 +8,7 @@ build-type:    Simple
 -- package so 'Haskoin.Wallet.loadBip39WordList' resolves it via
 -- Paths_haskoin.getDataFileName, independent of the caller's CWD.
 -- Cabal copies this file under the package's data dir at install time
--- (e.g. ~/.cabal/store/.../haskoin-0.1.0.0/resources/bip39-english.txt).
+-- (e.g. ~/.cabal/store/.../haskoin-1.0.0.0/resources/bip39-english.txt).
 data-files:    resources/bip39-english.txt
 
 library

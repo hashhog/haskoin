@@ -3093,6 +3093,13 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
       -- TxOut-only view for validateBlockTransactions (script checking).
       utxoMap = fmap coinTxOut utxoCoinMap
 
+  -- 1. Block must have at least one transaction (coinbase). This guard MUST
+  -- precede every use of 'tail txns' / 'head txns' below (0a coinbase
+  -- maturity, checkpoint, coinbase checks) — an empty block otherwise throws
+  -- Prelude.tail: empty list instead of a clean rejection. Core CheckBlock
+  -- rejects empty vtx first (validation.cpp "bad-cb-missing").
+  when (null txns) $ Left "Block has no transactions"
+
   -- 0a. COINBASE_MATURITY (W164 follow-up). A tx may not spend a coinbase
   -- output until it is netCoinbaseMaturity (100) blocks deep. validateFullBlock
   -- receives the full Map OutPoint Coin (coinHeight + coinIsCoinbase), but the
@@ -3126,9 +3133,6 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
              ": expected " ++ show expected ++ " got " ++ show actual
     Left err -> Left $ "Checkpoint error: " ++ show err
     Right () -> pure ()
-
-  -- 1. Block must have at least one transaction (coinbase)
-  when (null txns) $ Left "Block has no transactions"
 
   -- 2. First transaction must be coinbase, no others
   unless (isCoinbase (head txns)) $ Left "First transaction is not coinbase"

@@ -453,7 +453,7 @@ main = do
   opts <- execParser $ info (parseOptions <**> helper)
     ( fullDesc
       <> progDesc "Haskoin - Bitcoin Full Node"
-      <> header "haskoin v0.1.0.0 - a Bitcoin full node in Haskell" )
+      <> header "haskoin v1.0.0.0 - a Bitcoin full node in Haskell" )
   runCommand opts
 
 runCommand :: Options -> IO ()
