@@ -5282,6 +5282,34 @@ bip22ResultString err
   -- Reference: bitcoin-core/src/validation.cpp:4088-4089
   | "does not meet proof of work" `isInfixOf` s = "high-hash"
   | "proof of work check failed" `isInfixOf` s  = "high-hash"
+  -- First transaction is not a coinbase. Core CheckBlock
+  -- (validation.cpp:3952) emits "bad-cb-missing" / "first tx is not coinbase".
+  -- Consensus.hs:3134 returns the bare prose "First transaction is not
+  -- coinbase" and no rule matched it, so it fell through to the generic
+  -- "rejected".
+  --
+  -- Note Rpc.hs:2277 ALREADY produced "bad-cb-missing (first tx not coinbase)"
+  -- on its own path — but that is not the path submitblock's failures take, so
+  -- the correct string existed and was never reached. Same shape as clearbit,
+  -- which had THREE mappers (cc0f1b2), and rustoshi, which needed two sites
+  -- (db23aec). A correct mapping existing is not evidence the RPC uses it.
+  --
+  -- Placed before the looser rules below so nothing steals the match; the
+  -- ordering hazard bit ouroboros, hotbuns and lunarblock while applying this
+  -- same fix.
+  --
+  -- Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull: a
+  -- coinbase with a non-null prevout fails isCoinbase(). SEVEN of ten impls
+  -- answered the generic form. Equivalents: blockbrew 72a5519,
+  -- ouroboros a8f40ab, hotbuns 7c8a950, nimrod 5736da6, lunarblock 91a7ed4,
+  -- clearbit cc0f1b2.
+  --
+  -- Decision unchanged (rejected either way): R2 reason-code parity.
+  | "bad-cb-missing" `isInfixOf` s               = "bad-cb-missing"
+  | "first transaction is not coinbase" `isInfixOf` map toLower s
+                                                = "bad-cb-missing"
+  | "first tx is not coinbase" `isInfixOf` map toLower s
+                                                = "bad-cb-missing"
   | "bad-diffbits" `isInfixOf` s                = "bad-diffbits"
   | "incorrect difficulty target" `isInfixOf` s = "bad-diffbits"
 
