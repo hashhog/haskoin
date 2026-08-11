@@ -2306,46 +2306,92 @@ initHeaderChainFromDB db net = do
                     -- here, not entries-including-self; reading the TVar
                     -- BEFORE the insert below gives exactly that.
                     entriesSoFar <- readTVarIO entriesVar
-                    let work = ceChainWork prevEntry + headerWork header
-                        newMtp = computeEntryMtp entriesSoFar
-                                                 (ceHash prevEntry)
-                                                 (bhTimestamp header)
-                        -- P2-2: every reloaded entry IS on the best chain
-                        -- (we walk PrefixBlockHeight, which only stores
-                        -- the active chain — side-branch headers go
-                        -- through 'addSideBranchHeader' on the live path
-                        -- and are not persisted via this prefix).  So
-                        -- each loaded entry gets Core's
-                        -- 'seqIdBestChainFromDisk' value (0), matching
-                        -- @LoadBlockIndex@'s @SEQ_ID_BEST_CHAIN_FROM_DISK@
-                        -- assignment for active-chain tips
-                        -- (validation.cpp:4566-4576).
-                        entry = ChainEntry
-                          { ceHeader = header
-                          , ceHash = bh
-                          , ceHeight = height
-                          , ceChainWork = work
-                          , cePrev = Just (ceHash prevEntry)
-                          , ceStatus = StatusValid
-                          , ceMedianTime = newMtp
-                          , ceSequenceId = seqIdBestChainFromDisk
-                          }
-                    atomically $ do
-                      modifyTVar' entriesVar (Map.insert bh entry)
-                      modifyTVar' byHeightVar (Map.insert height bh)
-                      writeTVar tipVar entry
-                      writeTVar heightVar height
-                      -- P2-2 + P2-3: every reloaded StatusValid entry is a
-                      -- candidate.  PruneBlockIndexCandidates-style cleanup
-                      -- (Core validation.cpp:3173-3183) happens lazily
-                      -- inside 'findBestCandidate' on the next
-                      -- 'activateBestChain' call — we don't need a
-                      -- separate post-load pruning sweep.
-                      modifyTVar' candidatesVar
-                        (Set.insert (mkCandidateKey entry))
-                    when (height `mod` 100000 == 0) $
-                      putStrLn $ "  loaded headers up to height " ++ show height
-                    go (height + 1) entry
+                    -- RESTART-PATH HEADER RE-VALIDATION (bad-diffbits audit
+                    -- 2026-08-09, REFUTED[material]).  Pre-fix this loop
+                    -- admitted whatever the on-disk height index named as
+                    -- 'StatusValid' with NO checks at all — no prev-hash
+                    -- linkage, no hash identity, no PoW, no difficulty gate.
+                    -- A poisoned/corrupted PrefixBlockHeight/PrefixBlockHeader
+                    -- row (e.g. a min-difficulty 0x1d00ffff header forking off
+                    -- a real-difficulty parent — the camlcoin exploit shape)
+                    -- was laundered into a fully-valid in-memory ChainEntry on
+                    -- every restart, bypassing the live addHeaderAt Gate 4.
+                    --
+                    -- Re-run the structural + difficulty gates the live path
+                    -- enforces.  Ancestor resolution inside
+                    -- 'difficultyAdjustment' walks cePrev POINTERS over
+                    -- entriesSoFar — which this loop has built as a fully
+                    -- linked chain genesis..prev (the linkage check below is
+                    -- what guarantees that invariant inductively) — never the
+                    -- height->hash index, so it cannot be poisoned and cannot
+                    -- fail to resolve here (Core pow.cpp:44 GetAncestor shape).
+                    --
+                    -- On the first failing height we REFUSE the remainder:
+                    -- stop loading (truncate), keep the validated prefix, and
+                    -- let headers-first P2P sync re-fetch the tail through the
+                    -- full live gate.  Truncation is fail-closed — the bad
+                    -- header is never admitted; there is no permissive
+                    -- fallback.  (Core analogue: LoadBlockIndexGuts re-checks
+                    -- CheckProofOfWork on every loaded index entry and errors
+                    -- out, node/blockstorage.cpp; Core's stored index is
+                    -- additionally only ever written post-AcceptBlockHeader.)
+                    let refuse reason = putStrLn $
+                          "WARNING: header reload REFUSED at height "
+                          ++ show height ++ " (" ++ reason ++ "); "
+                          ++ "truncating in-memory chain at height "
+                          ++ show (ceHeight prevEntry)
+                          ++ " — tail will re-sync from peers through the "
+                          ++ "live validation gate."
+                    if bhPrevBlock header /= ceHash prevEntry
+                      then refuse "prev-hash does not link to loaded parent"
+                    else if computeBlockHash header /= bh
+                      then refuse "stored hash does not match header hash"
+                    else if not (checkProofOfWork header (netPowLimit net))
+                      then refuse "proof of work check failed"
+                    else if bhBits header
+                            /= difficultyAdjustment net entriesSoFar prevEntry header
+                      then refuse "bad-diffbits"
+                    else do
+                     let work = ceChainWork prevEntry + headerWork header
+                         newMtp = computeEntryMtp entriesSoFar
+                                                  (ceHash prevEntry)
+                                                  (bhTimestamp header)
+                         -- P2-2: every reloaded entry IS on the best chain
+                         -- (we walk PrefixBlockHeight, which only stores
+                         -- the active chain — side-branch headers go
+                         -- through 'addSideBranchHeader' on the live path
+                         -- and are not persisted via this prefix).  So
+                         -- each loaded entry gets Core's
+                         -- 'seqIdBestChainFromDisk' value (0), matching
+                         -- @LoadBlockIndex@'s @SEQ_ID_BEST_CHAIN_FROM_DISK@
+                         -- assignment for active-chain tips
+                         -- (validation.cpp:4566-4576).
+                         entry = ChainEntry
+                           { ceHeader = header
+                           , ceHash = bh
+                           , ceHeight = height
+                           , ceChainWork = work
+                           , cePrev = Just (ceHash prevEntry)
+                           , ceStatus = StatusValid
+                           , ceMedianTime = newMtp
+                           , ceSequenceId = seqIdBestChainFromDisk
+                           }
+                     atomically $ do
+                       modifyTVar' entriesVar (Map.insert bh entry)
+                       modifyTVar' byHeightVar (Map.insert height bh)
+                       writeTVar tipVar entry
+                       writeTVar heightVar height
+                       -- P2-2 + P2-3: every reloaded StatusValid entry is a
+                       -- candidate.  PruneBlockIndexCandidates-style cleanup
+                       -- (Core validation.cpp:3173-3183) happens lazily
+                       -- inside 'findBestCandidate' on the next
+                       -- 'activateBestChain' call — we don't need a
+                       -- separate post-load pruning sweep.
+                       modifyTVar' candidatesVar
+                         (Set.insert (mkCandidateKey entry))
+                     when (height `mod` 100000 == 0) $
+                       putStrLn $ "  loaded headers up to height " ++ show height
+                     go (height + 1) entry
       go 1 genesisEntry
       finalHeight <- readTVarIO heightVar
       putStrLn $ "Loaded " ++ show finalHeight ++ " headers from database"
