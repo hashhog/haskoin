@@ -119,6 +119,7 @@ module Haskoin.Consensus
   , connectBlockAt
   , disconnectBlock
   , disconnectBlockAt
+  , rewindChainstateToPrefix
   , DisconnectResult(..)
   , bip30ExceptionHeight
   , applyTxInUndo
@@ -307,7 +308,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear,
-                        putUndoData, getUndoData, getUndoDataVerified, getBlock, getUTXO, getUTXOCoin, getBlockHeight,
+                        putUndoData, getUndoData, getUndoDataVerified, deleteUndoData, getBlock, getUTXO, getUTXOCoin, getBlockHeight,
                         getBestBlockHash,
                         isUnspendable, Coin(..),
                         -- AssumeUTXO support
@@ -4545,6 +4546,122 @@ disconnectBlockAt db height block prevHash = do
               writeBatch db (WriteBatch (ops ++ [bestOp]))
               -- Gate 11.
               return $ Right $ if clean then DisconnectOk else DisconnectUnclean
+
+-- | Boot-time chainstate rewind to a validated header prefix.
+--
+-- Restart-path repair primitive for the header reload gate
+-- (app/Main.hs initHeaderChainFromDB).  When the reload gate refuses a
+-- torn/poisoned on-disk header row at height H and truncates the
+-- in-memory header chain at P = H-1, a node whose CONNECTED (UTXO)
+-- tip U is at or above H is left in an inconsistent state: the UTXO
+-- set reflects blocks the header chain no longer contains.
+--
+-- The 2026-08 mainnet deploy of the truncate-only gate (haskoin
+-- b6694c4, reverted in add06bd) wedged exactly here: the boot
+-- reconciliation (Main.hs "Chainstate reconciliation") caps its
+-- undo-record binary search at the LOADED header tip, so it reported
+-- connectedTip = P and re-stamped the PrefixBestBlock pointer
+-- BACKWARD to hash(P) — without rewinding the UTXO set, which still
+-- reflected height U.  Every re-downloaded block P+1.. then failed
+-- validation/connect (its inputs were spent when the block first
+-- connected — G19 missing-prevout shape), nextBlockRef never
+-- advanced, and the connected tip froze ~U-P behind the network
+-- forever while the kicker cycled stall-recovery.
+--
+-- This function restores the state a NORMAL boot of a P-high node
+-- would have — the shape block download is proven to re-engage from:
+-- walk the on-disk best-block pointer chain downward BY HASH POINTERS
+-- (bhPrevBlock — poison-immune, Core GetAncestor shape, never the
+-- height index), 'disconnectBlockAt' each block (restores the spent
+-- prevouts and re-stamps PrefixBestBlock to the parent atomically),
+-- and delete the disconnected block's undo record + height-index row
+-- so the reconciliation's "undo record exists <=> block connected"
+-- probe cannot resurrect the rewound tip on this or any later boot.
+-- Crash-safe by idempotence: each step commits disconnect-then-delete
+-- for one block; a crash mid-rewind resumes from the new best pointer
+-- on the next boot's gate refusal.
+--
+-- Returns @Right n@ (n blocks disconnected; 0 = chainstate already
+-- inside the prefix, nothing to do) or @Left err@ when the rewind is
+-- impossible — missing block body/undo record, undo checksum failure,
+-- linkage that never joins the prefix, or a chainstate resting on an
+-- assumeutxo snapshot base below the truncation point (no undo
+-- records exist at or below a snapshot base BY DESIGN, so the state
+-- cannot be rewound in place).  Callers MUST treat Left as fatal and
+-- refuse to start (Core analogue: "Error loading block database" →
+-- shutdown + reindex), never fall through to the reconciliation —
+-- proceeding is exactly the wedge described above.
+--
+-- Reference: bitcoin-core/src/validation.cpp DisconnectBlock +
+-- net_processing.cpp FindNextBlocksToDownload (block download walks
+-- the header chain from the validated tip; it can only re-engage when
+-- the chainstate tip is AT OR BELOW the loaded header tip).
+rewindChainstateToPrefix
+  :: HaskoinDB
+  -> (BlockHash -> Bool)  -- ^ membership in the validated header prefix
+  -> Word32               -- ^ height of the validated prefix tip (P)
+  -> Maybe BlockHash      -- ^ assumeutxo snapshot base marker, if any
+  -> IO (Either String Int)
+rewindChainstateToPrefix db inPrefix prefixHeight mSnapBase = go (0 :: Int)
+  where
+    go n = do
+      mBest <- getBestBlockHash db
+      case mBest of
+        -- No chainstate at all: nothing to rewind.
+        Nothing -> return (Right n)
+        Just cur
+          | inPrefix cur -> return (Right n)
+          | mSnapBase == Just cur -> return $ Left $
+              "chainstate rests on the assumeutxo snapshot base "
+              <> show cur <> ", which is above/outside the validated "
+              <> "header prefix (height " <> show prefixHeight
+              <> "); no undo records exist at or below a snapshot base, "
+              <> "so the chainstate cannot be rewound in place — "
+              <> "re-snapshot or reindex required"
+          | otherwise -> do
+              mBlk  <- getBlock db cur
+              mUndo <- getUndoData db cur
+              case (mBlk, mUndo) of
+                (Nothing, _) -> return $ Left $
+                  "missing block body for connected block "
+                  <> show cur <> " — cannot rewind; reindex required"
+                (_, Nothing) -> return $ Left $
+                  "missing undo record for connected block "
+                  <> show cur <> " — cannot rewind; reindex required"
+                (Just blk, Just undoData) -> do
+                  let h    = udHeight undoData
+                      prev = bhPrevBlock (blockHeader blk)
+                  if h <= prefixHeight
+                    -- Descended to/below the prefix tip height without
+                    -- ever joining the validated prefix: the chainstate
+                    -- is on a chain the header prefix does not contain.
+                    then return $ Left $
+                      "chainstate at height " <> show h
+                      <> " (" <> show cur <> ") does not connect to the "
+                      <> "validated header prefix (tip height "
+                      <> show prefixHeight <> ") — reindex required"
+                    else do
+                      r <- disconnectBlockAt db h blk prev
+                      case r of
+                        Left err -> return (Left err)
+                        Right DisconnectFailed -> return $ Left $
+                          "disconnect failed for block " <> show cur
+                          <> " at height " <> show h
+                        Right _ -> do
+                          -- DisconnectOk / DisconnectUnclean (Core logs
+                          -- but proceeds on UNCLEAN).  The block is now
+                          -- off the chainstate; its undo record and
+                          -- height-index row are stale — remove both so
+                          -- the boot reconciliation's undo probe and the
+                          -- next reload cannot see the rewound tip.
+                          -- (Only the row at h > prefixHeight is
+                          -- touched; validated-prefix rows are never
+                          -- deleted.)
+                          deleteUndoData db cur
+                          writeBatch db (WriteBatch
+                            [ BatchDelete
+                                (makeKey PrefixBlockHeight (toBE32 h)) ])
+                          go (n + 1)
 
 --------------------------------------------------------------------------------
 -- Pure Batch Builders — Pattern D Multi-Block Atomicity

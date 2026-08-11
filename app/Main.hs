@@ -2292,63 +2292,176 @@ initHeaderChainFromDB db net = do
     Nothing -> return ()
     Just _ -> do
       putStrLn "Loading persisted headers from database..."
-      let go height prevEntry = do
+      -- RESTART-PATH HEADER RE-VALIDATION (bad-diffbits audit 2026-08-09;
+      -- rework of the reverted b6694c4 gate).  Pre-gate this loop admitted
+      -- whatever the on-disk height index named as 'StatusValid' with NO
+      -- checks at all — no prev-hash linkage, no hash identity, no PoW,
+      -- no difficulty gate.  A poisoned or corrupted
+      -- PrefixBlockHeight/PrefixBlockHeader row (e.g. a min-difficulty
+      -- 0x1d00ffff header forking off a real-difficulty parent — the
+      -- camlcoin exploit shape) was laundered into a fully-valid
+      -- in-memory ChainEntry on every restart, bypassing the live
+      -- addHeaderAt gate.
+      --
+      -- Re-run the structural + difficulty gates the live path enforces.
+      -- Ancestor resolution inside 'difficultyAdjustment' walks cePrev
+      -- POINTERS over entriesSoFar — which this loop has built as a fully
+      -- linked chain genesis..prev (the linkage check below guarantees
+      -- that invariant inductively) — never the height->hash index, so it
+      -- cannot be poisoned (Core pow.cpp GetAncestor shape).
+      --
+      -- On the first failing height we REFUSE the remainder: stop loading
+      -- (truncate), keep the validated prefix, and let headers-first P2P
+      -- sync re-fetch the tail through the full live gate.  Fail-closed —
+      -- the bad header is never admitted.  (Core analogue:
+      -- LoadBlockIndexGuts re-checks CheckProofOfWork on every loaded
+      -- index entry and errors out, node/blockstorage.cpp.)
+      --
+      -- 'go' returns the truncation evidence: @Nothing@ = the height
+      -- index was exhausted normally (clean full load); @Just prefixTip@
+      -- = the load REFUSED a row (gate failure, or an indexed header row
+      -- whose body is missing — same torn-DB class) and truncated with
+      -- 'prefixTip' as the last validated entry.
+      --
+      -- WEDGE PREVENTION (why truncation alone is NOT enough — the
+      -- b6694c4 mainnet wedge): height-index rows are written at block
+      -- CONNECT time, so a refused row is always at or below the
+      -- connected (UTXO) tip U.  Truncating only the header chain leaves
+      -- U ABOVE the loaded header tip P; the chainstate reconciliation
+      -- below this function then caps its undo-record search at P and
+      -- re-stamps the best-block pointer BACKWARD to hash(P) without
+      -- rewinding the UTXO set — after which every re-downloaded block
+      -- P+1.. fails validation (its inputs were already spent when it
+      -- first connected), nextBlockRef never advances, and the connected
+      -- tip freezes U-P behind the network forever (observed live:
+      -- ~380 behind, kicker cycling stall-recovery, nothing inflight).
+      -- So on truncation we MUST also rewind the chainstate to the
+      -- validated prefix ('rewindChainstateToPrefix': disconnect via
+      -- undo records, delete stale undo + height rows).  The resulting
+      -- state — headers P, UTXO P, best-block hash(P) — is exactly a
+      -- normal boot of a P-high node, the shape from which headers-first
+      -- sync + the block-gap kicker provably re-engage block download to
+      -- the tip.  If the rewind is impossible (missing undo/body, or an
+      -- assumeutxo snapshot base above the truncation point), REFUSE TO
+      -- START (Core: "Error loading block database") instead of booting
+      -- into the wedge.
+      let refuse height prevEntry reason = do
+            putStrLn $
+              "WARNING: header reload REFUSED at height "
+              ++ show height ++ " (" ++ reason ++ "); "
+              ++ "truncating in-memory chain at height "
+              ++ show (ceHeight prevEntry)
+              ++ " — tail will re-sync from peers through the "
+              ++ "live validation gate."
+            return (Just prevEntry)
+          go height prevEntry = do
             mHash <- getBlockHeight db height
             case mHash of
-              Nothing -> return ()
+              Nothing -> return Nothing
               Just bh -> do
                 mHeader <- getBlockHeader db bh
                 case mHeader of
-                  Nothing -> return ()
+                  Nothing ->
+                    -- The height index names a header whose body row is
+                    -- missing: same torn-DB class as a gate failure.
+                    -- Pre-rework this silently truncated with NO signal,
+                    -- leaving the same header-tip < connected-tip wedge.
+                    refuse height prevEntry
+                      "height index names a missing header row"
                   Just header -> do
                     -- Snapshot the entries-so-far map so 'computeEntryMtp'
                     -- can walk parent ancestors.  We need entries-up-to-prev
                     -- here, not entries-including-self; reading the TVar
                     -- BEFORE the insert below gives exactly that.
                     entriesSoFar <- readTVarIO entriesVar
-                    let work = ceChainWork prevEntry + headerWork header
-                        newMtp = computeEntryMtp entriesSoFar
-                                                 (ceHash prevEntry)
-                                                 (bhTimestamp header)
-                        -- P2-2: every reloaded entry IS on the best chain
-                        -- (we walk PrefixBlockHeight, which only stores
-                        -- the active chain — side-branch headers go
-                        -- through 'addSideBranchHeader' on the live path
-                        -- and are not persisted via this prefix).  So
-                        -- each loaded entry gets Core's
-                        -- 'seqIdBestChainFromDisk' value (0), matching
-                        -- @LoadBlockIndex@'s @SEQ_ID_BEST_CHAIN_FROM_DISK@
-                        -- assignment for active-chain tips
-                        -- (validation.cpp:4566-4576).
-                        entry = ChainEntry
-                          { ceHeader = header
-                          , ceHash = bh
-                          , ceHeight = height
-                          , ceChainWork = work
-                          , cePrev = Just (ceHash prevEntry)
-                          , ceStatus = StatusValid
-                          , ceMedianTime = newMtp
-                          , ceSequenceId = seqIdBestChainFromDisk
-                          }
-                    atomically $ do
-                      modifyTVar' entriesVar (Map.insert bh entry)
-                      modifyTVar' byHeightVar (Map.insert height bh)
-                      writeTVar tipVar entry
-                      writeTVar heightVar height
-                      -- P2-2 + P2-3: every reloaded StatusValid entry is a
-                      -- candidate.  PruneBlockIndexCandidates-style cleanup
-                      -- (Core validation.cpp:3173-3183) happens lazily
-                      -- inside 'findBestCandidate' on the next
-                      -- 'activateBestChain' call — we don't need a
-                      -- separate post-load pruning sweep.
-                      modifyTVar' candidatesVar
-                        (Set.insert (mkCandidateKey entry))
-                    when (height `mod` 100000 == 0) $
-                      putStrLn $ "  loaded headers up to height " ++ show height
-                    go (height + 1) entry
-      go 1 genesisEntry
+                    if bhPrevBlock header /= ceHash prevEntry
+                      then refuse height prevEntry
+                             "prev-hash does not link to loaded parent"
+                    else if computeBlockHash header /= bh
+                      then refuse height prevEntry
+                             "stored hash does not match header hash"
+                    else if not (checkProofOfWork header (netPowLimit net))
+                      then refuse height prevEntry
+                             "proof of work check failed"
+                    else if bhBits header
+                            /= difficultyAdjustment net entriesSoFar
+                                 prevEntry header
+                      then refuse height prevEntry "bad-diffbits"
+                    else do
+                     let work = ceChainWork prevEntry + headerWork header
+                         newMtp = computeEntryMtp entriesSoFar
+                                                  (ceHash prevEntry)
+                                                  (bhTimestamp header)
+                         -- P2-2: every reloaded entry IS on the best chain
+                         -- (we walk PrefixBlockHeight, which only stores
+                         -- the active chain — side-branch headers go
+                         -- through 'addSideBranchHeader' on the live path
+                         -- and are not persisted via this prefix).  So
+                         -- each loaded entry gets Core's
+                         -- 'seqIdBestChainFromDisk' value (0), matching
+                         -- @LoadBlockIndex@'s @SEQ_ID_BEST_CHAIN_FROM_DISK@
+                         -- assignment for active-chain tips
+                         -- (validation.cpp:4566-4576).
+                         entry = ChainEntry
+                           { ceHeader = header
+                           , ceHash = bh
+                           , ceHeight = height
+                           , ceChainWork = work
+                           , cePrev = Just (ceHash prevEntry)
+                           , ceStatus = StatusValid
+                           , ceMedianTime = newMtp
+                           , ceSequenceId = seqIdBestChainFromDisk
+                           }
+                     atomically $ do
+                       modifyTVar' entriesVar (Map.insert bh entry)
+                       modifyTVar' byHeightVar (Map.insert height bh)
+                       writeTVar tipVar entry
+                       writeTVar heightVar height
+                       -- P2-2 + P2-3: every reloaded StatusValid entry is a
+                       -- candidate.  PruneBlockIndexCandidates-style cleanup
+                       -- (Core validation.cpp:3173-3183) happens lazily
+                       -- inside 'findBestCandidate' on the next
+                       -- 'activateBestChain' call — we don't need a
+                       -- separate post-load pruning sweep.
+                       modifyTVar' candidatesVar
+                         (Set.insert (mkCandidateKey entry))
+                     when (height `mod` 100000 == 0) $
+                       putStrLn $ "  loaded headers up to height " ++ show height
+                     go (height + 1) entry
+      mTruncated <- go 1 genesisEntry
       finalHeight <- readTVarIO heightVar
       putStrLn $ "Loaded " ++ show finalHeight ++ " headers from database"
+      case mTruncated of
+        Nothing -> return ()
+        Just prefixTip -> do
+          -- Truncated reload: bring the chainstate back onto the
+          -- validated prefix before the reconciliation below runs (see
+          -- the WEDGE PREVENTION note above).
+          entriesNow <- readTVarIO entriesVar
+          mSnapBase <- getSnapshotBaseHash db
+          rewound <- rewindChainstateToPrefix db
+                       (`Map.member` entriesNow)
+                       (ceHeight prefixTip)
+                       mSnapBase
+          case rewound of
+            Right 0 -> return ()  -- chainstate already inside the prefix
+            Right n ->
+              putStrLn $ "Header reload truncation: rewound " ++ show n
+                      ++ " connected block(s) to the validated prefix tip "
+                      ++ "(height " ++ show (ceHeight prefixTip)
+                      ++ ") — headers-first sync + block download will "
+                      ++ "re-fetch the tail through the live gate."
+            Left err -> do
+              putStrLn $ "FATAL: header reload truncated at height "
+                      ++ show (ceHeight prefixTip)
+                      ++ " but the chainstate cannot be rewound to the "
+                      ++ "validated prefix: " ++ err
+              putStrLn $ "Refusing to start — booting in this state "
+                      ++ "wedges block download (connected tip above the "
+                      ++ "validated header chain). Reindex or restore "
+                      ++ "the datadir."
+              ioError (userError
+                ("header reload: chainstate rewind failed: " ++ err))
 
   return HeaderChain
     { hcEntries = entriesVar
