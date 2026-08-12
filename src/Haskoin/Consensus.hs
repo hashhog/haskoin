@@ -3110,9 +3110,18 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
   -- Gated on skipConnectChecks: coinbase maturity requires the correct UTXO
   -- view (fork-point), which is not available at side-branch accept time.
   -- Core enforces this in ConnectBlock (validation.cpp:2535), not AcceptBlock.
+  -- NOTE 'drop 1' not 'tail': an EMPTY block (vtx = []) must fall through to
+  -- the bad-blk-length check below (Core validation.cpp:3947-3948), but
+  -- 'tail []' throws an imprecise "Prelude.tail: empty list" exception the
+  -- moment 'null immatureCb' forces the comprehension — crashing the
+  -- submitblock RPC handler before any reason string is produced (the bwmc
+  -- corpus A2-empty-block "ambiguous" divergence, artifact 20260809T172259Z).
+  -- Core never reaches its maturity check for an empty block because
+  -- CheckBlock rejects first; 'drop 1' is semantically identical for every
+  -- non-empty block and total for the empty one.
   unless skipConnectChecks $ do
     let cbMaturity  = fromIntegral (netCoinbaseMaturity net)
-        immatureCb  = [ () | tx   <- tail txns
+        immatureCb  = [ () | tx   <- drop 1 txns
                            , txin <- txInputs tx
                            , Just c <- [Map.lookup (txInPrevOutput txin) utxoCoinMap]
                            , coinIsCoinbase c
@@ -3128,12 +3137,23 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
     Left err -> Left $ "Checkpoint error: " ++ show err
     Right () -> pure ()
 
-  -- 1. Block must have at least one transaction (coinbase)
-  when (null txns) $ Left "Block has no transactions"
+  -- 1. Block must have at least one transaction (coinbase).
+  -- Core CheckBlock (validation.cpp:3947-3948) folds vtx.empty() into the
+  -- SIZE-LIMITS check — "bad-blk-length" / "size limits failed" — NOT the
+  -- coinbase-presence check (which also tests vtx.empty() at :3951 but is
+  -- unreachable for the empty case because :3947 fires first).  Emitting the
+  -- canonical token here keeps bwmc A2-empty-block reason-parity.
+  when (null txns) $ Left "bad-blk-length"
 
-  -- 2. First transaction must be coinbase, no others
+  -- 2. First transaction must be coinbase, no others.
+  -- Core validation.cpp:3951-3955: "bad-cb-missing" ("first tx is not
+  -- coinbase") then "bad-cb-multiple" ("more than one coinbase").  The prose
+  -- for the first is mapped to bad-cb-missing by bip22ResultString; the
+  -- multiple-coinbase arm emits Core's exact token directly (bwmc A5/A6 —
+  -- the prose "Multiple coinbase transactions" previously fell through to
+  -- the generic "rejected").
   unless (isCoinbase (head txns)) $ Left "First transaction is not coinbase"
-  when (any isCoinbase (tail txns)) $ Left "Multiple coinbase transactions"
+  when (any isCoinbase (drop 1 txns)) $ Left "bad-cb-multiple"
 
   -- 2a. Run context-free validation on the coinbase (CheckTransaction analog).
   -- validateBlockTransactions processes tail txns only (skipping coinbase), so

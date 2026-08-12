@@ -1354,8 +1354,13 @@ buildReorgBatch net db cache hc disList disUndos conList = do
 -- block originally created the output at.
 buildBlockUTXOMap :: UTXOCache -> Block -> IO (Map OutPoint Coin)
 buildBlockUTXOMap cache block = do
-  -- Collect all inputs from non-coinbase transactions
-  let inputs = concatMap txInputs (tail $ blockTxns block)
+  -- Collect all inputs from non-coinbase transactions.
+  -- 'drop 1' not 'tail': submitBlock builds this map BEFORE
+  -- validateFullBlockIO runs, so an EMPTY block (vtx = []) reached
+  -- 'tail []' here and crashed the RPC handler with an imprecise
+  -- exception instead of the Core "bad-blk-length" rejection
+  -- (bwmc corpus A2-empty-block "ambiguous" divergence).
+  let inputs = concatMap txInputs (drop 1 (blockTxns block))
       outpoints = map txInPrevOutput inputs
 
   -- Look up each outpoint, lifting UTXOEntry → Coin so the metadata
