@@ -2262,9 +2262,12 @@ initHeaderChainFromDB db net = do
   preciousReverseSeqVar <- newTVarIO preciousReverseSeqInit
   lastPreciousWorkVar <- newTVarIO 0
 
-  -- Load persisted headers from the height index to rebuild the in-memory chain.
-  -- connectBlock writes PrefixBlockHeader and PrefixBlockHeight for every
-  -- connected block, so we can walk the height index sequentially.
+  -- Load persisted headers to rebuild the in-memory chain.  Since 2026-08-12
+  -- the ACTIVE chain is discovered by walking bhPrevBlock hash pointers DOWN
+  -- from the persisted best-block pointer (Core LoadBlockIndexGuts shape:
+  -- hash-keyed, pprev-linked — node/blockstorage.cpp:120-164); the
+  -- PrefixBlockHeight height index is only a self-heal TARGET and a fallback
+  -- source, never the source of truth.  See the reload-gate note below.
   --
   -- Phase 2 step P2-5 (rewrite-design haskoin §5; unfreeze plan
   -- _haskoin-unfreeze-plan-2026-05-27.md): closes W101 BUG-7 /
@@ -2290,7 +2293,7 @@ initHeaderChainFromDB db net = do
   mBestHash <- getBestBlockHash db
   case mBestHash of
     Nothing -> return ()
-    Just _ -> do
+    Just bestHash -> do
       putStrLn "Loading persisted headers from database..."
       -- RESTART-PATH HEADER RE-VALIDATION (bad-diffbits audit 2026-08-09;
       -- rework of the reverted b6694c4 gate).  Pre-gate this loop admitted
@@ -2345,6 +2348,37 @@ initHeaderChainFromDB db net = do
       -- assumeutxo snapshot base above the truncation point), REFUSE TO
       -- START (Core: "Error loading block database") instead of booting
       -- into the wedge.
+      --
+      -- 2026-08-12 REWORK (the 898abe6/0128704 mainnet crash-loop): the
+      -- first rework WALKED THE HEIGHT INDEX ascending and checked
+      -- prev-hash linkage row-to-row.  But the height index is NOT
+      -- guaranteed to describe the active chain after a reorg — haskoin's
+      -- own design states it is "unsafe for answering 'what hash sits at
+      -- height h on the active validated chain?'" (Consensus.hs
+      -- getMtpFromAncestry note, ~2234).  The live mainnet datadir carried
+      -- a tolerated 4-row stale orphaned-reorg pocket (heights
+      -- 961632-961635; tip and every other height == Core), the gate
+      -- tripped its own linkage check on the pocket, refused, and handed a
+      -- healthy chainstate to the rewind — which then died on a torn undo
+      -- record from the same orphaned region.  add06bd (no gate) booted
+      -- the identical datadir to the correct tip.
+      --
+      -- Fix: discover the active chain the way Core loads its block index
+      -- (LoadBlockIndexGuts, node/blockstorage.cpp:120-164 — hash-keyed,
+      -- pprev-linked, PoW re-checked): walk bhPrevBlock pointers DOWN from
+      -- the persisted best-block pointer ('collectActive'), then validate
+      -- ASCENDING with the same gates ('loadAscending' — hash identity,
+      -- PoW, diffbits, MTP; prev-linkage holds by construction of the
+      -- walk).  A gate failure on the ACTIVE chain still truncates +
+      -- rewinds exactly as before (the camlcoin-poison shape stays
+      -- fail-closed).  Stale/missing height-index rows are SELF-HEALED
+      -- from the validated active chain (putBlockHeight batch after the
+      -- load) so getblockhash — which reads the persisted index
+      -- (Rpc.hs handleGetBlockHash) — stops serving orphaned hashes.
+      -- The pre-rework ascending height-index walk is kept verbatim as
+      -- 'goFallback', used ONLY when the pointer walk itself finds a torn
+      -- active chain (missing header body mid-walk) — there the maximal
+      -- validated prefix + truncate + rewind is the correct recovery.
       let refuse height prevEntry reason = do
             putStrLn $
               "WARNING: header reload REFUSED at height "
@@ -2354,7 +2388,7 @@ initHeaderChainFromDB db net = do
               ++ " — tail will re-sync from peers through the "
               ++ "live validation gate."
             return (Just prevEntry)
-          go height prevEntry = do
+          goFallback height prevEntry = do
             mHash <- getBlockHeight db height
             case mHash of
               Nothing -> return Nothing
@@ -2427,8 +2461,102 @@ initHeaderChainFromDB db net = do
                          (Set.insert (mkCandidateKey entry))
                      when (height `mod` 100000 == 0) $
                        putStrLn $ "  loaded headers up to height " ++ show height
-                     go (height + 1) entry
-      mTruncated <- go 1 genesisEntry
+                     goFallback (height + 1) entry
+
+          -- Phase A: discover the ACTIVE chain by walking bhPrevBlock hash
+          -- pointers DOWN from the best-block pointer (poison-immune —
+          -- Core GetAncestor / LoadBlockIndexGuts shape; never the height
+          -- index).  Returns the chain ASCENDING (genesis excluded; the
+          -- genesis entry is pre-seeded above).  Left = the active chain
+          -- itself is torn (missing header body / pointer cycle) — the
+          -- caller falls back to the height-index walk + truncate + rewind.
+          collectActive cur steps acc
+            | cur == genesisHash = return (Right acc)
+            | steps > (20000000 :: Int) =
+                return (Left "active-chain pointer walk exceeded 20M steps (prev-pointer cycle?)")
+            | otherwise = do
+                mHeader <- getBlockHeader db cur
+                case mHeader of
+                  Nothing -> return (Left
+                    ("missing header body for active-chain block " ++ show cur))
+                  Just header ->
+                    collectActive (bhPrevBlock header) (steps + 1)
+                                  ((cur, header) : acc)
+
+          -- Phase B: validate + admit the active chain ASCENDING with the
+          -- same gates the height-index walk enforced (hash identity, PoW,
+          -- diffbits, MTP).  Prev-hash linkage holds by construction of
+          -- the pointer walk.  A gate failure truncates exactly like the
+          -- old walk (returns Just prefixTip -> rewind).  Also accumulates
+          -- the height-index rows that disagree with the validated active
+          -- chain, for the self-heal batch after the load.
+          loadAscending [] _ _ heals = return (Nothing, heals)
+          loadAscending ((bh, header) : rest) height prevEntry heals = do
+            entriesSoFar <- readTVarIO entriesVar
+            if computeBlockHash header /= bh
+              then do r <- refuse height prevEntry
+                             "stored hash does not match header hash"
+                      return (r, heals)
+            else if not (checkProofOfWork header (netPowLimit net))
+              then do r <- refuse height prevEntry "proof of work check failed"
+                      return (r, heals)
+            else if bhBits header
+                    /= difficultyAdjustment net entriesSoFar prevEntry header
+              then do r <- refuse height prevEntry "bad-diffbits"
+                      return (r, heals)
+            else do
+              let work = ceChainWork prevEntry + headerWork header
+                  newMtp = computeEntryMtp entriesSoFar
+                                           (ceHash prevEntry)
+                                           (bhTimestamp header)
+                  entry = ChainEntry
+                    { ceHeader = header
+                    , ceHash = bh
+                    , ceHeight = height
+                    , ceChainWork = work
+                    , cePrev = Just (ceHash prevEntry)
+                    , ceStatus = StatusValid
+                    , ceMedianTime = newMtp
+                    , ceSequenceId = seqIdBestChainFromDisk
+                    }
+              atomically $ do
+                modifyTVar' entriesVar (Map.insert bh entry)
+                modifyTVar' byHeightVar (Map.insert height bh)
+                writeTVar tipVar entry
+                writeTVar heightVar height
+                modifyTVar' candidatesVar
+                  (Set.insert (mkCandidateKey entry))
+              when (height `mod` 100000 == 0) $
+                putStrLn $ "  loaded headers up to height " ++ show height
+              mIdx <- getBlockHeight db height
+              let heals' = case mIdx of
+                             Just idxHash | idxHash == bh -> heals
+                             _ -> (height, bh) : heals
+              loadAscending rest (height + 1) entry heals'
+
+      walked <- collectActive bestHash (0 :: Int) []
+      mTruncated <- case walked of
+        Left werr -> do
+          putStrLn $ "WARNING: active-chain pointer walk failed ("
+                  ++ werr ++ ") — the active chain itself is torn; "
+                  ++ "falling back to the height-index reload "
+                  ++ "(maximal validated prefix + truncate + rewind)."
+          goFallback 1 genesisEntry
+        Right chainAsc -> do
+          (mTrunc, heals) <- loadAscending chainAsc (1 :: Word32) genesisEntry []
+          -- Self-heal the height index from the VALIDATED active chain.
+          -- Rows below a truncation point are still-valid repairs; rows at
+          -- or above it were never admitted, so they are never written.
+          unless (null heals) $ do
+            putStrLn $ "height-index self-heal: rewriting "
+                    ++ show (length heals)
+                    ++ " stale/missing active-chain row(s):"
+            forM_ (take 20 (reverse heals)) $ \(h, hh) ->
+              putStrLn $ "  h=" ++ show h ++ " -> " ++ show hh
+            when (length heals > 20) $
+              putStrLn $ "  ... and " ++ show (length heals - 20) ++ " more"
+            forM_ heals $ \(h, hh) -> putBlockHeight db h hh
+          return mTrunc
       finalHeight <- readTVarIO heightVar
       putStrLn $ "Loaded " ++ show finalHeight ++ " headers from database"
       case mTruncated of
