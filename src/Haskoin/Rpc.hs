@@ -5259,11 +5259,21 @@ bip22ResultString err
   --      bad-txns-inputvalues-outofrange (Core: consensus/tx_verify.cpp:185-188),
   --      bad-txns-accumulated-fee-outofrange (Core: validation.cpp:2537-2540),
   --      bad-txns-fee-outofrange (Core: consensus/tx_verify.cpp:200-203).
-  -- Removed stale "bad-txns-duplicate" (not a Core string; was a mapping target,
-  -- now replaced by the canonical bad-txns-inputs-duplicate).
+  -- "bad-txns-duplicate" IS a Core string — the CVE-2012-2459 mutated-merkle
+  -- rejection (validation.cpp:3856), emitted verbatim by validateFullBlock
+  -- step 3.  (An earlier note here claimed it was stale/non-Core — wrong: the
+  -- non-Core one was a legacy mapping TARGET for duplicate-vin, which is
+  -- bad-txns-inputs-duplicate.  The token itself must pass through.)
+  -- bwmc reason-parity (2026-08-11): added bad-blk-length (empty block /
+  -- size limits, validation.cpp:3948), bad-cb-missing (:3952), bad-cb-multiple
+  -- (:3955), bad-cb-length (consensus/tx_check.cpp), bad-txns-duplicate —
+  -- Consensus.hs now emits several of these verbatim and they previously fell
+  -- through to the generic "rejected" (bwmc A2/A5/A6 divergences).
   | err `elem` ["duplicate", "inconclusive", "duplicate-invalid",
                 "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
                 "bad-witness-nonce-size", "unexpected-witness",
+                "bad-blk-length", "bad-cb-missing", "bad-cb-multiple",
+                "bad-cb-length", "bad-txns-duplicate",
                 "bad-cb-amount", "bad-blk-sigops", "bad-cb-height",
                 "bad-txns-nonfinal", "bad-txns-inputs-duplicate", "rejected",
                 "block-script-verify-flag-failed",
@@ -5339,6 +5349,26 @@ bip22ResultString err
                                                 = "bad-cb-missing"
   | "first tx is not coinbase" `isInfixOf` map toLower s
                                                 = "bad-cb-missing"
+
+  -- More than one coinbase (Core validation.cpp:3955 "bad-cb-multiple" /
+  -- "more than one coinbase").  Consensus.hs emits the canonical token
+  -- (handled by the pass-through above); these infix forms catch decorated
+  -- or legacy-prose variants from other paths.  bwmc A5/A6 reason-parity.
+  | "bad-cb-multiple" `isInfixOf` s             = "bad-cb-multiple"
+  | "multiple coinbase" `isInfixOf` s           = "bad-cb-multiple"
+  | "more than one coinbase" `isInfixOf` s      = "bad-cb-multiple"
+
+  -- Size-limits failure incl. the EMPTY block (Core validation.cpp:3947-3948
+  -- "bad-blk-length" / "size limits failed").  Catches the decorated
+  -- "bad-blk-length (no transactions)" emitted by the block-proposal checker
+  -- and any legacy prose.  bwmc A2 reason-parity.
+  | "bad-blk-length" `isInfixOf` s              = "bad-blk-length"
+  | "block has no transactions" `isInfixOf` s   = "bad-blk-length"
+
+  -- CVE-2012-2459 mutated-merkle (Core validation.cpp:3856
+  -- "bad-txns-duplicate", debug "duplicate transaction").  Decorated forms.
+  | "bad-txns-duplicate" `isInfixOf` s          = "bad-txns-duplicate"
+
   | "bad-diffbits" `isInfixOf` s                = "bad-diffbits"
   | "incorrect difficulty target" `isInfixOf` s = "bad-diffbits"
 

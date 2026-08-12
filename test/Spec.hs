@@ -3595,7 +3595,11 @@ main = hspec $ do
           block = Block header []
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
       case validateFullBlock regtest cs (const 0) False False block Map.empty of
-        Left msg | "no transactions" `T.isInfixOf` T.pack msg -> return ()
+        -- Core folds vtx.empty() into the size-limits check:
+        -- validation.cpp:3947-3948 "bad-blk-length" (bwmc A2 reason-parity).
+        Left msg | "bad-blk-length" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $
+          "Wrong error (expected bad-blk-length): " ++ msg
         _ -> expectationFailure "Should reject block with no transactions"
 
     it "rejects block when first transaction is not coinbase" $ do
@@ -3622,7 +3626,10 @@ main = hspec $ do
           block = Block header [coinbase1, coinbase2]
           cs = ChainState 0 prevHash 0 0 (consensusFlagsAtHeight regtest 0)
       case validateFullBlock regtest cs (const 0) False False block Map.empty of
-        Left msg | "Multiple coinbase" `T.isInfixOf` T.pack msg -> return ()
+        -- Core validation.cpp:3955 "bad-cb-multiple" (bwmc A5/A6 reason-parity).
+        Left msg | "bad-cb-multiple" `T.isInfixOf` T.pack msg -> return ()
+        Left msg -> expectationFailure $
+          "Wrong error (expected bad-cb-multiple): " ++ msg
         _ -> expectationFailure "Should reject block with multiple coinbase"
 
     it "rejects block with mismatched merkle root" $ do
