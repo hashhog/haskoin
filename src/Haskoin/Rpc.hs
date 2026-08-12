@@ -260,7 +260,7 @@ import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
 import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
 import Data.Char (chr, toLower, isHexDigit)
-import Data.List (foldl', isInfixOf)
+import Data.List (foldl', isInfixOf, isPrefixOf, tails)
 import Text.Printf (printf)
 -- showFFloat was removed: all difficulty/fee formatting now uses
 -- formatDoubleG16 (FFI snprintf) or btcAmountEnc (fixed-decimal).
@@ -5268,6 +5268,8 @@ bip22ResultString err
                 "bad-txns-nonfinal", "bad-txns-inputs-duplicate", "rejected",
                 "block-script-verify-flag-failed",
                 "bad-txns-inputs-missingorspent",
+                "bad-txns-vout-empty", "bad-txns-vin-empty",
+                "bad-txns-BIP30",
                 "bad-txns-oversize",
                 "bad-txns-txouttotal-toolarge",
                 "bad-txns-inputvalues-outofrange",
@@ -5275,6 +5277,33 @@ bip22ResultString err
                 "bad-txns-fee-outofrange",
                 -- Header contextual errors (Core validation.cpp:4089,4093,4102,4109)
                 "bad-diffbits", "time-too-old", "time-too-new", "time-timewarp-attack"] = err
+
+  -- BIP34/66/65 outdated block nVersion (Core validation.cpp:4116
+  -- ContextualCheckBlockHeader strprintf("bad-version(0x%08x)", nVersion)).
+  -- Consensus.hs emits the fully-formatted, zero-padded token
+  -- ("bad-version(0x00000001)" ... "bad-version(0xffffffff)"); extract it
+  -- verbatim so the parameterized suffix survives the submitBlock
+  -- "block validation failed: " wrapper. Without this it fell through to the
+  -- generic "rejected" (the version-dup corpus divergence).
+  | "bad-version(0x" `isInfixOf` s =
+      let suffix = head (dropWhile (not . ("bad-version(" `isPrefixOf`)) (tails s))
+      in takeWhile (/= ')') suffix ++ ")"
+
+  -- BIP30 duplicate-txid overwrite (Core validation.cpp ConnectBlock
+  -- "bad-txns-BIP30"). Consensus.hs emits the descriptive
+  -- "bad-txns-BIP30: tried to overwrite transaction"; collapse to the bare
+  -- Core token. Distinct from CheckTransaction's dup-vin
+  -- ("bad-txns-inputs-duplicate") — different rule, different reason.
+  | "bad-txns-bip30" `isInfixOf` s              = "bad-txns-BIP30"
+
+  -- Empty output / input vectors (Core consensus/tx_check.cpp CheckTransaction:
+  -- "bad-txns-vout-empty" / "bad-txns-vin-empty"). Consensus.hs
+  -- validateTransaction returns the prose "Transaction has no outputs/inputs".
+  -- Must reject at CheckTransaction (pre-script), which validateFullBlock does
+  -- via validateTransaction on the coinbase and validateBlockTransactions on
+  -- the rest; the harness previously saw an unmapped/ambiguous reason.
+  | "transaction has no outputs" `isInfixOf` s  = "bad-txns-vout-empty"
+  | "transaction has no inputs" `isInfixOf` s   = "bad-txns-vin-empty"
 
   -- PoW / difficulty (from validateFullBlock / submitBlock)
   -- "high-hash"  = block hash does not meet claimed target (wrong nonce answer)

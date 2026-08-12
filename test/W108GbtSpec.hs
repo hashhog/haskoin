@@ -487,6 +487,35 @@ spec = describe "W108 BlockTemplate + GBT mining RPC 30-gate audit" $ do
     it "\"outputs exceed inputs\" → \"bad-txns-in-belowout\"" $ do
       bip22ResultString "outputs exceed inputs" `shouldBe` "bad-txns-in-belowout"
 
+    -- version-dup corpus parity (Core validation.cpp:4116 bad-version(0x%08x),
+    -- ConnectBlock bad-txns-BIP30, tx_check.cpp bad-txns-vout-empty).
+    it "\"bad-version(0x00000001)\" passes through verbatim" $ do
+      bip22ResultString "bad-version(0x00000001)" `shouldBe` "bad-version(0x00000001)"
+
+    it "high-bit version prints unsigned → \"bad-version(0x80000000)\"" $ do
+      bip22ResultString "bad-version(0x80000000)" `shouldBe` "bad-version(0x80000000)"
+
+    it "nVersion -1 prints unsigned → \"bad-version(0xffffffff)\"" $ do
+      bip22ResultString "bad-version(0xffffffff)" `shouldBe` "bad-version(0xffffffff)"
+
+    it "bad-version survives the submitBlock wrapper" $ do
+      bip22ResultString "Block validation failed: bad-version(0x00000003)"
+        `shouldBe` "bad-version(0x00000003)"
+
+    it "descriptive BIP30 string → bare \"bad-txns-BIP30\"" $ do
+      bip22ResultString "bad-txns-BIP30: tried to overwrite transaction"
+        `shouldBe` "bad-txns-BIP30"
+
+    it "BIP30 survives the submitBlock wrapper" $ do
+      bip22ResultString "Block validation failed: bad-txns-BIP30: tried to overwrite transaction"
+        `shouldBe` "bad-txns-BIP30"
+
+    it "\"Transaction has no outputs\" → \"bad-txns-vout-empty\"" $ do
+      bip22ResultString "Transaction has no outputs" `shouldBe` "bad-txns-vout-empty"
+
+    it "\"Transaction has no inputs\" → \"bad-txns-vin-empty\"" $ do
+      bip22ResultString "Transaction has no inputs" `shouldBe` "bad-txns-vin-empty"
+
     it "unknown error → \"rejected\"" $ do
       bip22ResultString "completely unknown reason xyz" `shouldBe` "rejected"
 
