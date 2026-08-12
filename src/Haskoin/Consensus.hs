@@ -3153,12 +3153,20 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
   -- these in ContextualCheckBlockHeader, which never consults
   -- script_flag_exceptions.
   let blockVer = bhVersion header
+      -- Core validation.cpp:4116 strprintf("bad-version(0x%08x)", block.nVersion):
+      -- the signed int32 nVersion is reinterpreted as uint32 and printed
+      -- zero-padded to EXACTLY 8 lowercase hex digits. showHex alone does NOT
+      -- zero-pad (0x1 vs 0x00000001) and the high-bit / -1 cases must print
+      -- unsigned (0x80000000 / 0xffffffff), which the Word32 reinterpret gives.
+      badVersionReason =
+        let h = showHex (fromIntegral blockVer :: Word32) ""
+        in "bad-version(0x" ++ replicate (8 - length h) '0' ++ h ++ ")"
   when (flagBIP34 dflags && blockVer < 2) $
-    Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
+    Left badVersionReason
   when (flagBIP66 dflags && blockVer < 3) $
-    Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
+    Left badVersionReason
   when (flagBIP65 dflags && blockVer < 4) $
-    Left $ "bad-version(0x" ++ showHex (fromIntegral blockVer :: Word32) ")"
+    Left badVersionReason
 
   -- 3. Verify merkle root + CVE-2012-2459 mutation detection.
   -- Bitcoin Core CheckBlock (validation.cpp:3850-3858) calls
