@@ -82,7 +82,10 @@ import qualified Control.Concurrent.STM as STM
 import Haskoin.Types
   ( Tx(..), TxIn(..), TxOut(..), OutPoint(..), TxId(..), Hash256(..)
   , BlockHeader(..), BlockHash(..), Block(..) )
-import Haskoin.Crypto (computeTxId, computeBlockHash, sha256)
+import Haskoin.Crypto
+  ( computeTxId, computeBlockHash, sha256
+  -- sighash op: the REAL legacy SignatureHash the CHECKSIG path calls.
+  , txSigHash, SigHashType )
 import Haskoin.Consensus
   ( validateTransaction, getNextWorkRequired, BlockIndex(..)
   , Network, mainnet, testnet3, testnet4, regtest
@@ -105,7 +108,10 @@ import Haskoin.Storage
   , TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData, putUndoData )
 import Haskoin.Script
   ( ScriptFlags, ScriptVerifyFlag(..), emptyFlags, flagSet
-  , verifyScriptWithFlags )
+  , verifyScriptWithFlags
+  -- sighash op: the interpreter's OWN hashtype-byte -> SigHashType parser
+  -- (the &0x1f / &0x80 split execCheckSig performs; Script.hs:2209).
+  , parseSigHashByte )
 
 ------------------------------------------------------------------------------
 -- Hex helpers
@@ -232,6 +238,7 @@ processLine line =
                  _          -> "verifyscript"
       in case op of
            "verifytx"   -> processVerifyTx line
+           "sighash"    -> processSigHash line
            "checktx"    -> processCheckTx line
            "connecttx"  -> processConnectTx line
            "checkblock" -> processCheckBlock line
@@ -403,6 +410,98 @@ verifyAllInputs flags tx spentScripts spentAmounts =
     -- spentScripts/spentAmounts are derived 1:1 from txInputs, so the
     -- ragged case is unreachable; close it explicitly rather than crash.
     go i _ _ = Left (i, "internal: input/prevout length mismatch")
+
+------------------------------------------------------------------------------
+-- sighash op (byte-exact legacy SignatureHash conformance — Core's
+-- sighash.json, 500 randomized vectors; sighash_tests.cpp +
+-- interpreter.cpp:1518 SignatureHash).
+--
+-- Calls haskoin's REAL legacy sighash — 'Haskoin.Crypto.txSigHash'
+-- (Crypto.hs:1205), the EXACT function the interpreter's CHECKSIG path
+-- invokes for non-witness inputs (Script.hs:2098): opcode-aware
+-- OP_CODESEPARATOR strip via 'removeCodeSeparators', the
+-- ANYONECANPAY / NONE / SINGLE serialization rules incl. the
+-- SIGHASH_SINGLE nIn>=nOuts "hash of one" bug (0x01 + 31 zero bytes,
+-- internal order), and the raw Word32 nHashType appended verbatim as the
+-- 4-byte LE preimage footer. The shim reimplements NOTHING.
+--
+-- hashtype arrives as a SIGNED int (Core generates it as a raw
+-- InsecureRand32 cast to int). txSigHash factors Core's single nHashType
+-- int into its two call-site arguments, and we reconstruct BOTH from the
+-- raw value exactly as Core's SignatureHash consumes it:
+--   * hashTypeW32 = hashtype & 0xFFFFFFFF — serialized verbatim into the
+--     preimage footer (interpreter.cpp:1675 `ss << nHashType`, un-masked);
+--   * the structural mode bits (nHashTypeIn & SIGHASH_ANYONECANPAY /
+--     & 0x1f == SINGLE/NONE, interpreter.cpp:1267-1269) via the
+--     interpreter's OWN 'parseSigHashByte' (Script.hs:2209) on the LOW
+--     byte — both masks live inside the low byte, so this is the same
+--     split execCheckSig performs on the signature's trailing byte.
+--
+-- tx_hex is deserialized with the SAME 'Tx' 'Serialize' instance the
+-- verifytx op uses (sighash.json txs are legacy-serialized). The returned
+-- digest is reversed ONCE, internal -> Core GetHex/display order — the
+-- ONLY reversal at this boundary (prevout txids inside the tx stay
+-- internal/wire order).
+--
+--   request:  {"op":"sighash","tx_hex":"...","script_hex":"...",
+--              "input_index":N,"hashtype":<signed int>}
+--   response: {"sighash":"<64-hex display order>"}
+--             {"error":"..."}   (could not evaluate -> harness scores FAIL)
+------------------------------------------------------------------------------
+
+data SigHashRequest = SigHashRequest
+  { srqTxHex      :: T.Text
+  , srqScriptHex  :: T.Text
+  , srqInputIndex :: Int
+  , srqHashType   :: Int64   -- SIGNED, passed through verbatim
+  }
+
+instance A.FromJSON SigHashRequest where
+  parseJSON = A.withObject "SigHashRequest" $ \o -> SigHashRequest
+    <$> o .:? "tx_hex"     A..!= ""
+    <*> o .:? "script_hex" A..!= ""
+    <*> (toInt <$> o .:? "input_index" A..!= (0 :: Double))
+    <*> (toI64 <$> o .:? "hashtype"    A..!= (0 :: Double))
+    where
+      toInt d = round (d :: Double) :: Int
+      toI64 d = round (d :: Double) :: Int64
+
+processSigHash :: BL.ByteString -> IO String
+processSigHash line =
+  case A.eitherDecode line of
+    Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
+    Right req -> case prepareSigHash req of
+      Left e                                -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
+      Right (tx, script, nIn, htW32, htTyp) -> do
+        r <- try (evaluate (forceDigest (txSigHash tx nIn script htW32 htTyp)))
+               :: IO (Either SomeException Hash256)
+        pure $ case r of
+          Left ex           ->
+            "{\"error\":\"exception: " <> escapeJson (show ex) <> "\"}"
+          Right (Hash256 d) ->
+            -- internal -> display order: the ONE reversal at the boundary.
+            "{\"sighash\":\""
+              <> T.unpack (TE.decodeUtf8 (B16.encode (BS.reverse d)))
+              <> "\"}"
+  where
+    forceDigest h@(Hash256 bs) = BS.length bs `seq` h
+
+-- | Decode the sighash request: hex-decode + deserialize the tx with
+-- haskoin's own 'Tx' 'Serialize' (same path verifytx uses), then split the
+-- raw signed hashtype into txSigHash's (footer Word32, mode-bit
+-- 'SigHashType') pair exactly as documented in the section header.
+prepareSigHash :: SigHashRequest
+               -> Either String (Tx, BS.ByteString, Int, Word32, SigHashType)
+prepareSigHash req = do
+  txBytes <- decodeHex (srqTxHex req)
+  tx      <- case S.decode txBytes :: Either String Tx of
+               Right t -> Right t
+               Left e  -> Left ("tx deserialize: " <> e)
+  script  <- decodeHex (srqScriptHex req)
+  let ht    = srqHashType req
+      htW32 = fromIntegral ht :: Word32           -- (hashtype & 0xFFFFFFFF) footer
+      htTyp = parseSigHashByte (fromIntegral ht)  -- &0x1f / &0x80 mode bits (low byte)
+  Right (tx, script, srqInputIndex req, htW32, htTyp)
 
 ------------------------------------------------------------------------------
 -- connecttx op (REAL connect-time Consensus::CheckTxInputs — the ECONOMIC

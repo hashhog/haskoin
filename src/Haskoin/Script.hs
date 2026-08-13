@@ -97,6 +97,7 @@ module Haskoin.Script
   , execCheckSig
   , execCheckSigAdd
   , execCheckMultiSig
+  , parseSigHashByte
   , compactSizeLen
   , getSerializeSizeOfWitnessStack
   , evalScriptWithStack
