@@ -834,6 +834,20 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         let genesis = netGenesisBlock net
             genesisHash = computeBlockHash (blockHeader genesis)
         putBlockHeader db genesisHash (blockHeader genesis)
+        -- Persist the genesis BODY too, not just its header + height index.
+        -- Core's LoadGenesisBlock writes the full block (AcceptBlock ->
+        -- SaveBlockToDisk), and several readers resolve a height to a hash and
+        -- then demand the body:
+        --   * assumeutxo background validation — Rpc.hs:12952 getBlockAtHeight
+        --     does getBlockHeight >>= getBlock, so at h=0 it found the hash and
+        --     then nothing, failing the whole walk with BgMissingBlock 0;
+        --   * the getblock RPC (Rpc.hs:2233) reads bodies via Storage.getBlock.
+        -- Without this, a FRESH datadir has a height index entry pointing at a
+        -- body that does not exist. Long-lived nodes hide it because the body
+        -- gets written by other paths, which is why the live mainnet node
+        -- answers getblock(genesis) correctly while the boot-smoke gate — which
+        -- always starts from a fresh regtest datadir — failed its `load` stage.
+        putBlock db genesisHash genesis
         putBlockHeight db 0 genesisHash
         putBestBlockHash db genesisHash
       Just bestHash ->
@@ -1456,10 +1470,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           Nothing  -> return False
           Just tsIdx0 -> maybe True (const False) <$> txoSpenderIndexTipHeight tsIdx0
         when (bfEmpty || csEmpty || tsEmpty) $ do
-          -- Use 'netGenesisBlock' directly: the genesis block body is NOT
-          -- persisted via 'putBlock' at chain init (only its header is), so
-          -- 'getBlock db genHash' would return Nothing.  The in-memory
-          -- genesis block carries the coinbase output(s) the indexes need.
+          -- Use 'netGenesisBlock' directly. This no longer HAS to avoid the DB
+          -- (chain init now persists the genesis body via 'putBlock', 2026-08-17
+          -- — previously only its header was written, so 'getBlock db genHash'
+          -- returned Nothing on a fresh datadir), but reading the in-memory
+          -- genesis is still the right call here: it is the authoritative
+          -- constant, needs no IO, and works on a datadir written by an older
+          -- build that predates the fix.
           let genBlk  = netGenesisBlock net
               genHash = computeBlockHash (blockHeader genBlk)
           putStrLn "Index: seeding genesis (height 0)"
