@@ -142,6 +142,7 @@ import qualified W161WordlistDataFileSpec
 import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
+import qualified ReorgIntraBlockChainSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23277,6 +23278,13 @@ main = hspec $ do
   -- (not just the in-memory tip) so disk best-block ⇔ disk UTXO set stay
   -- consistent across a flush+restart (else post-restart false-reject).
   W165ReorgAtomicSpec.spec
+
+  -- Reorg connect path vs INTRA-BLOCK transaction chains (P0, mainnet
+  -- 963853, 2026-08-24): a block on the winning branch may spend an output
+  -- created by an earlier tx in the SAME block.  That prevout is absent from
+  -- overlay/cache/disk by construction; reorgConBuild used to hard-fail on
+  -- it ("Reorg connect: missing prevout"), wedging every reorg attempt.
+  ReorgIntraBlockChainSpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant

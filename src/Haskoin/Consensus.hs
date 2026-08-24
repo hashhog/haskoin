@@ -6488,18 +6488,43 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
       txns        = blockTxns blk
       nonCoinbase = drop 1 txns
       prevouts    = [ txInPrevOutput inp | tx <- nonCoinbase, inp <- txInputs tx ]
-  spentRes <- foldM
-    (\acc op -> case acc of
-        Left e  -> return (Left e)
-        Right m -> do
-          mc <- reorgLookup ov cache op
-          case mc of
-            Just c' -> return $ Right (Map.insert op c' m)
-            Nothing -> return $ Left $
-              "Reorg connect: missing prevout " ++ show op
-              ++ " for block " ++ show bh)
-    (Right Map.empty)
+  -- Resolve what we can and OMIT what we cannot -- exactly as the LIVE
+  -- connect arm's builders do ('buildSpentUtxoMapFromDB' Storage.hs:569 and
+  -- 'buildSpentUtxoMapCached' Storage.hs:784: "Inputs with no entry in the
+  -- UTXO set ... are silently omitted from the result. The caller is the
+  -- place that decides whether that's a fatal error").
+  --
+  -- An outpoint created by an EARLIER transaction in this SAME block is
+  -- legitimately absent from overlay/cache/disk: it has never been in the
+  -- persistent UTXO set and never will be if it is also spent here.  Bitcoin
+  -- permits such intra-block chains (the only ordering rule is that the
+  -- creator precede the spender) and real blocks are full of them -- 6,084
+  -- chained inputs in mainnet block 963853 alone.  'validateBlockTransactions'
+  -- is already intra-block-aware (:3671, "updating UTXO map for intra-block
+  -- spending"), so it resolves them itself and reports a genuinely missing
+  -- prevout as Core does, via bad-txns-inputs-missingorspent.
+  --
+  -- Hard-failing here instead was the 2026-08-24 wedge: haskoin lost a routine
+  -- 1-block race at height 963853, and every reorg attempt aborted on the
+  -- first intra-block chain -- 15,681 identical failures over ~7h, with no
+  -- possible recovery, because the condition is structural rather than
+  -- transient.  Regtest reorg tests could not catch it: W165ReorgAtomicSpec
+  -- builds coinbase-only blocks, so 'prevouts' is empty and this loop ran
+  -- zero times.
+  --
+  -- NOTE: intra-block-created coins are deliberately NOT inserted into the
+  -- returned map.  It flows on to 'buildConnectBlockOps', which derives this
+  -- block's UNDO record from it; a coin that never existed on disk must not
+  -- be restorable by a later disconnect, or the disconnect would materialise
+  -- a phantom UTXO.  Omitting them is what the live arm already does, so the
+  -- reorg path and the live path write byte-identical undo data.
+  spentUtxos0 <- foldM
+    (\m op -> do
+        mc <- reorgLookup ov cache op
+        return $ maybe m (\c' -> Map.insert op c' m) mc)
+    Map.empty
     prevouts
+  let spentRes = Right spentUtxos0 :: Either String (Map OutPoint Coin)
   case spentRes of
     Left e           -> return (Left e)
     Right spentUtxos -> do
