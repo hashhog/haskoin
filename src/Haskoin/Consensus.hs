@@ -6565,12 +6565,38 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
                 , (i, txout) <- zip [0..] (txOutputs tx)
                 , not (isUnspendable (txOutScript txout))
                 ]
+              prevoutSet = Set.fromList prevouts
               ov' = ov
                 { roAdded = foldr (\(op, c') m -> Map.insert op c' m)
                                   (roAdded ov) created
                 , roSpent = foldr Set.insert (roSpent ov) prevouts
                 }
-              ov'' = ov' { roAdded = foldr Map.delete (roAdded ov') prevouts }
+              -- A coin this block CREATES and does not itself spend must shadow
+              -- any overlay-spent tombstone the DISCONNECT phase left for the
+              -- same outpoint -- the mirror of 'reorgDisBuildPure''s "a restored
+              -- prevout shadows any prior overlay-spent mark". That asymmetry
+              -- was a live bug: 'reorgLookup' tests 'roSpent' BEFORE 'roAdded',
+              -- so a tombstoned outpoint stays invisible no matter what the
+              -- connect side adds.
+              --
+              -- It bites because COMPETING BLOCKS SHARE TRANSACTIONS. The
+              -- branch being disconnected and the branch being connected are
+              -- built from the same mempool, so the disconnect marks coins dead
+              -- that the connect immediately re-creates. Observed on mainnet
+              -- 2026-08-24: tx 80b0673e..., index 2 of BOTH haskoin's stale
+              -- 963853 and Core's 963853; the disconnect tombstoned its vout 3,
+              -- the connect re-created it, and block 963854 -- which spends it
+              -- -- failed "Missing UTXO", aborting the reorg one block further
+              -- along than the intra-block-chain defect did.
+              --
+              -- Excluding this block's own prevouts is what keeps a coin that is
+              -- created AND spent inside this same block correctly dead.
+              ov'' = ov'
+                { roAdded = foldr Map.delete (roAdded ov') prevouts
+                , roSpent = foldr Set.delete (roSpent ov')
+                                  [ op | (op, _) <- created
+                                       , not (Set.member op prevoutSet) ]
+                }
           reorgConBuild net cache db hc ov'' rest (ops ++ blockOps)
 
 --------------------------------------------------------------------------------
