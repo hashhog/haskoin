@@ -1262,17 +1262,24 @@ buildReorgBatch net db cache hc disList disUndos conList = do
               prevouts    = [ txInPrevOutput inp
                             | tx <- nonCoinbase, inp <- txInputs tx ]
           -- Resolve every prevout via overlay → cache → disk.
-          spentRes <- foldM
-            (\acc op -> case acc of
-                Left e -> return (Left e)
-                Right m -> do
-                  mc <- lookupOverlay ov c dbh op
-                  case mc of
-                    Just c' -> return $ Right (Map.insert op c' m)
-                    Nothing -> return $ Left $
-                      "Connect build: missing prevout "
-                      ++ show op ++ " for block " ++ show bh)
-            (Right Map.empty)
+          -- Resolve what we can and OMIT what we cannot, exactly as the LIVE
+          -- connect arm does ('buildSpentUtxoMapFromDB' Storage.hs:569 /
+          -- 'buildSpentUtxoMapCached' :784, which silently omit inputs with no
+          -- UTXO entry). A coin created by an EARLIER transaction in this SAME
+          -- block is legitimately absent from overlay/cache/disk, and Bitcoin
+          -- permits such intra-block chains; 'validateBlockTransactions' is
+          -- already intra-block-aware (Consensus.hs:3671) and reports a
+          -- genuinely missing prevout as bad-txns-inputs-missingorspent.
+          --
+          -- This is the TWIN of the defect fixed in 'Consensus.reorgConBuild'
+          -- (bea8d11) — the doc comment there already points here. That fix
+          -- covered the P2P reorg door; this one is the submitblock door, and
+          -- leaving it meant the same wedge was still reachable.
+          spentRes <- (Right <$>) $ foldM
+            (\m op -> do
+                mc <- lookupOverlay ov c dbh op
+                return $ maybe m (\c' -> Map.insert op c' m) mc)
+            Map.empty
             prevouts
           case spentRes of
             Left e        -> return (Left e)
@@ -1334,10 +1341,26 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                         , overlaySpent =
                             foldr Set.insert (overlaySpent ov) prevouts
                         }
+                      -- A coin this block CREATES and does not itself spend
+                      -- must shadow any overlay-spent tombstone the DISCONNECT
+                      -- side left for the same outpoint. 'lookupOverlay' tests
+                      -- overlaySpent BEFORE overlayAdded (:1146), so without
+                      -- this a tombstoned outpoint stays invisible however much
+                      -- the connect side adds. Competing blocks share
+                      -- transactions, so the disconnected branch routinely
+                      -- created the very coins this branch re-creates.
+                      -- Twin of the same fix in Consensus.reorgConBuild
+                      -- (cabe8e8). Excluding this block's own prevouts keeps a
+                      -- coin created AND spent here correctly dead.
+                      prevoutSet = Set.fromList prevouts
                       ov'' = ov'
                         { overlayAdded =
                             foldr (\op m -> Map.delete op m)
                                   (overlayAdded ov') prevouts
+                        , overlaySpent =
+                            foldr Set.delete (overlaySpent ov')
+                                  [ op | (op, _) <- created
+                                       , not (Set.member op prevoutSet) ]
                         }
                   buildConnectChain c dbh hc' n rest ov'' (ops ++ blockOps)
 
