@@ -143,6 +143,7 @@ import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
 import qualified ReorgIntraBlockChainSpec
+import qualified ReorgSharedTxRecreatedCoinSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23285,6 +23286,14 @@ main = hspec $ do
   -- overlay/cache/disk by construction; reorgConBuild used to hard-fail on
   -- it ("Reorg connect: missing prevout"), wedging every reorg attempt.
   ReorgIntraBlockChainSpec.spec
+
+  -- Reorg connect must REVIVE a coin the disconnect tombstoned (P0, mainnet
+  -- 963853/963854, 2026-08-24): competing blocks share transactions, so the
+  -- disconnected block routinely CREATED the very coins the connected blocks
+  -- re-create.  reorgLookup tests roSpent before roAdded and the connect arm
+  -- never cleared the tombstone, so a later connected block spending such a
+  -- coin failed "Missing UTXO" and aborted the reorg.
+  ReorgSharedTxRecreatedCoinSpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant
