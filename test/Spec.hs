@@ -5557,6 +5557,60 @@ main = hspec $ do
   --
   -- Reference: camlcoin lib/sync.ml:2354-2363 (Mempool.add_transaction
   -- per disconnected non-coinbase tx after disconnect loop completes).
+  -- ================================================================
+  -- lookupUTXO must preserve on-disk coin metadata (haskoin #48)
+  --
+  -- On a cache miss lookupUTXO used to call the lossy 'getUTXO', which
+  -- projects away height and the coinbase flag, and then fabricate
+  -- @UTXOEntry txout 0 False False@ -- and CACHE it. Both invented values
+  -- are consensus-relevant, and the metadata was never actually missing:
+  -- connectBlock writes it with putUTXOCoin and getUTXOCoin reads it back.
+  --
+  -- Reached mempool acceptance (coinbase maturity, Mempool.hs:923), block
+  -- template assembly, and the submitblock validation arm via
+  -- buildBlockUTXOMap. The P2P block-download path was never affected --
+  -- it builds its map with getUTXOCoin directly (Sync.hs:511).
+  -- ================================================================
+  describe "lookupUTXO metadata fidelity (#48)" $ do
+    it "returns the real height and coinbase flag on a cache miss" $ do
+      withSystemTempDirectory "haskoin-48-meta" $ \tmp -> do
+        withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+          let op    = OutPoint (TxId (Hash256 (BS.replicate 32 0x48))) 0
+              txout = TxOut 5000000000 (BS.pack [0x51])
+          -- A COINBASE output created at height 700000, written exactly as
+          -- connectBlock writes it.
+          putUTXOCoin db op (Coin txout 700000 True)
+          cache <- newUTXOCache db 1024
+          -- Cold cache: this read goes to disk.
+          mEntry <- lookupUTXO cache op
+          case mEntry of
+            Nothing -> expectationFailure "coin should be found on disk"
+            Just e  -> do
+              ueOutput e   `shouldBe` txout
+              -- Pre-fix these were 0 and False, which defeats the
+              -- coinbase-maturity check and makes every BIP-68 relative
+              -- lock trivially satisfiable.
+              ueHeight e   `shouldBe` 700000
+              ueCoinbase e `shouldBe` True
+
+    it "caches the real metadata, not a fabricated default" $ do
+      withSystemTempDirectory "haskoin-48-cached" $ \tmp -> do
+        withDB (defaultDBConfig (tmp </> "db")) $ \db -> do
+          let op    = OutPoint (TxId (Hash256 (BS.replicate 32 0x49))) 0
+              txout = TxOut 2500000000 (BS.pack [0x52])
+          putUTXOCoin db op (Coin txout 123456 True)
+          cache <- newUTXOCache db 1024
+          _ <- lookupUTXO cache op          -- populate via the DB fall-through
+          -- Second read is served from ucEntries. The bad values used to
+          -- persist here until the next flush, so the poisoning outlived
+          -- the single lookup that caused it.
+          mSecond <- lookupUTXO cache op
+          case mSecond of
+            Nothing -> expectationFailure "coin should still be cached"
+            Just e  -> do
+              ueHeight e   `shouldBe` 123456
+              ueCoinbase e `shouldBe` True
+
   describe "Mempool refill on reorg disconnect (Pattern B)" $ do
     it "blockDisconnected re-admits non-coinbase txs to mempool" $ do
       -- Construct a "disconnected" block that paid out two non-

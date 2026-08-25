@@ -658,15 +658,40 @@ lookupUTXO cache op = do
     Just entry | not (ueSpent entry) -> return (Just entry)
     Just _     -> return Nothing  -- marked as spent in cache
     Nothing    -> do
-      -- Fall through to database
-      mTxOut <- getUTXO (ucDB cache) op
-      case mTxOut of
+      -- Fall through to database.
+      --
+      -- Read the FULL Coin (TxOut + height + coinbase flag). This used to
+      -- call 'getUTXO', which projects the metadata away, and then fabricate
+      -- @UTXOEntry txout 0 False False@ — height 0 and not-coinbase — and
+      -- cache it. Both invented values are consensus-relevant:
+      --
+      --   * @ueCoinbase = False@ defeats the coinbase-maturity check
+      --     (Mempool.hs:923, :1434, :2822; BlockTemplate.hs:1494), so an
+      --     output could be spent before its 100 confirmations.
+      --   * @ueHeight = 0@ makes every BIP-68 relative lock trivially
+      --     satisfied, because the input's apparent age is the full chain
+      --     height (BlockTemplate.hs:1531 via 'calculateSequenceLocks').
+      --
+      -- The metadata was never missing — 'connectBlock' writes it via
+      -- 'putUTXOCoin' and 'getUTXOCoin' reads it back. Only this one lossy
+      -- call site discarded it, and then cached the fabrication so the bad
+      -- values persisted until the next flush. That reached mempool
+      -- acceptance, block-template assembly, and — through
+      -- 'buildBlockUTXOMap' — the submitblock validation arm. The P2P
+      -- block-download path was never affected: it builds its map with
+      -- 'getUTXOCoin' directly (Sync.hs:511).
+      --
+      -- 'putUTXO' still writes height=0/coinbase=False, but it has no
+      -- production callers (tests only); production writes go through
+      -- 'putUTXOCoin'.
+      mCoin <- getUTXOCoin (ucDB cache) op
+      case mCoin of
         Nothing -> return Nothing
-        Just txout -> do
-          -- We don't have the full UTXOEntry metadata from just TxOut
-          -- In production, store UTXOEntry in DB instead of TxOut
-          -- For now, use default metadata (height 0, not coinbase)
-          let entry = UTXOEntry txout 0 False False
+        Just coin -> do
+          let entry = UTXOEntry (coinTxOut coin)
+                                (coinHeight coin)
+                                (coinIsCoinbase coin)
+                                False
           -- Add to cache for future lookups
           atomically $ modifyTVar' (ucEntries cache) (Map.insert op entry)
           return (Just entry)

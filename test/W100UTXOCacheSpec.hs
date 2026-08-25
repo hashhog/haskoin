@@ -521,16 +521,25 @@ spec = do
         -- Document the bug: zombie coin persists
         mc `shouldBe` Just simpleCoin  -- BUG confirmed: should be Nothing after spend+flush
 
-  describe "W100 G20 — legacy UTXOCache: height/coinbase lost on DB read-through" $ do
+  describe "W100 G20 — legacy UTXOCache: height/coinbase preserved on DB read-through" $ do
 
-    -- BUG-10 (CONSENSUS-DIVERGENT): lookupUTXO constructs UTXOEntry with
-    -- height=0 and coinbase=False for coins loaded from RocksDB (line 644).
-    -- This destroys the metadata needed for coinbase maturity enforcement:
+    -- BUG-10 (CONSENSUS-DIVERGENT) — FIXED.
+    --
+    -- lookupUTXO used to construct UTXOEntry with height=0 and coinbase=False
+    -- for coins loaded from RocksDB, destroying the metadata that coinbase
+    -- maturity enforcement depends on:
     --   height - ueHeight entry < netCoinbaseMaturity
-    -- With height=0, a coinbase UTXO re-loaded after a cache flush will ALWAYS
-    -- appear mature (current_height - 0 >= 100 for any reasonable chain height).
-    -- A coinbase UTXO that is actually immature can be spent after a cache flush.
-    it "BUG-10: lookupUTXO sets height=0 coinbase=False for DB-loaded coins — coinbase maturity broken after flush" $ do
+    -- With height=0 a coinbase UTXO re-loaded after a cache flush ALWAYS
+    -- appeared mature (current_height - 0 >= 100 at any real chain height), so
+    -- an immature coinbase could be spent after a flush. The same zeroed height
+    -- made every BIP-68 relative lock trivially satisfiable.
+    --
+    -- This test used to ASSERT the broken values — a characterization test that
+    -- pinned a consensus defect in place rather than failing on it. It now
+    -- asserts the correct behaviour. The metadata was never actually missing:
+    -- connectBlock writes it with putUTXOCoin, and lookupUTXO now reads it back
+    -- with getUTXOCoin instead of the lossy getUTXO (Storage.hs).
+    it "lookupUTXO preserves height and coinbase for DB-loaded coins (BUG-10 fixed)" $ do
       withSystemTempDirectory "haskoin-w100-legacy" $ \dir ->
         withDB (defaultDBConfig (dir </> "legacy")) $ \db -> do
           let op     = mkOutPoint 0xC0 0
@@ -545,11 +554,9 @@ spec = do
           case me of
             Nothing -> expectationFailure "expected coin to be found"
             Just entry -> do
-              -- BUG: height and coinbase should be from the stored Coin,
-              -- but lookupUTXO reads via getUTXO (projects away height/cb)
-              -- then constructs UTXOEntry txout 0 False False.
-              ueHeight entry `shouldBe` 0      -- BUG: should be 840000
-              ueCoinbase entry `shouldBe` False -- BUG: should be True
+              -- The stored Coin's metadata must survive the read-through.
+              ueHeight entry `shouldBe` 840000
+              ueCoinbase entry `shouldBe` True
 
   describe "W100 G21 — legacy flushCache: no syncFlush after dirty write" $ do
 
