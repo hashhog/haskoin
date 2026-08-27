@@ -320,8 +320,18 @@ downloadWorker bd addr = forever $ do
         -- Send getdata for witness blocks (MSG_WITNESS_BLOCK = 0x40000002)
         let invVectors = map (\bh ->
               InvVector InvWitnessBlock (getBlockHashHash bh)) hashes
-        requestFromPeer (bdPeerMgr bd) addr (MGetData (GetData invVectors))
-          `catch` (\(_ :: SomeException) -> return ())
+        ok <- requestFromPeerChecked (bdPeerMgr bd) addr (MGetData (GetData invVectors))
+                `catch` (\(e :: SomeException) -> do
+                  putStrLn $ "downloadWorker: getdata send threw: " ++ show e
+                  return False)
+        -- #74: if the getdata never left the process, revert the
+        -- assignment and put the hashes back at once — the old code
+        -- stranded them (popped off the queue, stamped brRequested,
+        -- never on the wire) until bdBaseTimeout's stall sweep.
+        unless ok $ atomically $ forM_ hashes $ \bh -> do
+          modifyTVar' (bdPendingBlocks bd) $
+            Map.adjust (\r -> r { brPeer = Nothing }) bh
+          writeTBQueue (bdDownloadQueue bd) bh
 
   threadDelay (100 * 1000)  -- 100ms between checks
 

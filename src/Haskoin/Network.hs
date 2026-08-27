@@ -149,6 +149,7 @@ module Haskoin.Network
   , fallbackMainnetPeers
   , broadcastMessage
   , requestFromPeer
+  , requestFromPeerChecked
   , getPeerCount
   , getConnectedPeers
   , banPeer
@@ -4430,13 +4431,31 @@ broadcastMessage pm msg = do
     when (piState info == PeerConnected) $
       sendMessage pc msg `catch` (\(_ :: IOException) -> return ())
 
--- | Send a message to a specific peer
+-- | Send a message to a specific peer, best-effort: failures are LOGGED
+-- but not reported. For request-tracking callers (getdata/getheaders with
+-- in-flight state) use requestFromPeerChecked and revert on False (#74).
 requestFromPeer :: PeerManager -> SockAddr -> Message -> IO ()
 requestFromPeer pm addr msg = do
+  _ <- requestFromPeerChecked pm addr msg
+  return ()
+
+-- | Like requestFromPeer but reports whether the message was actually
+-- handed to the transport. False means the message NEVER LEFT the process
+-- (unknown peer, or the send threw) — the silent version of this was the
+-- blockbrew-wedge shape: in-flight state stranded against a request that
+-- was never sent (#74, 2026-08-27).
+requestFromPeerChecked :: PeerManager -> SockAddr -> Message -> IO Bool
+requestFromPeerChecked pm addr msg = do
   peers <- readTVarIO (pmPeers pm)
   case Map.lookup addr peers of
-    Nothing -> return ()
-    Just pc -> sendMessage pc msg `catch` (\(_ :: IOException) -> return ())
+    Nothing -> do
+      putStrLn $ "requestFromPeer: unknown peer " ++ show addr ++ " — message DROPPED"
+      return False
+    Just pc ->
+      (sendMessage pc msg >> return True)
+        `catch` (\(e :: IOException) -> do
+          putStrLn $ "requestFromPeer: send to " ++ show addr ++ " FAILED: " ++ show e
+          return False)
 
 -- | Get the number of connected peers
 getPeerCount :: PeerManager -> IO Int
