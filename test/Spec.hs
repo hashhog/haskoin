@@ -5268,6 +5268,111 @@ main = hspec $ do
       tip' <- getChainTip hc
       ceHash tip' `shouldBe` genesisHash
 
+    -- #47 (2026-08-27): work-vs-length pins on the addHeaderAt tip-move
+    -- guard (work > ceChainWork currentTip).  Regtest cannot express
+    -- divergent per-block work through mining (bad-diffbits binds every
+    -- header to the same bits), so the heavy fork's entries are
+    -- hand-inserted with hand-set ceChainWork — the REAL addHeaderAt then
+    -- extends each fork and its cumulativeWork/tip-move logic decides.
+    -- Binding verified during authoring: substituting height for work in
+    -- the tip-move guard fails both directions (#47 ledger entry).
+    it "heavier-but-shorter fork captures the header tip (#47 work-vs-length)" $ do
+      hc <- initHeaderChain regtest
+      genesisTip <- getChainTip hc
+      let genesisHash = ceHash genesisTip
+          gts = bhTimestamp (ceHeader genesisTip)
+          mineOn prevHash marker ts = mineRegtestHeader
+            (BlockHeader 1 prevHash (Hash256 (BS.replicate 32 marker)) ts 0x207fffff 0)
+          extend prev 0 _ = pure prev
+          extend prev n marker = do
+            r <- addHeaderAt regtest hc
+                   (mineOn (ceHash prev) marker
+                      (gts + 600 * (fromIntegral (ceHeight prev) + 1)))
+                   True Nothing
+            case r of
+              Right e  -> extend e (n - 1 :: Int) (marker + 1)
+              Left err -> error ("addHeaderAt light-fork failed: " ++ err)
+      -- Real light chain L1..L5 on genesis (regtest work per block).
+      l5 <- extend genesisTip 5 0xb1
+      ceHeight l5 `shouldBe` 5
+      tipL <- getChainTip hc
+      ceHash tipL `shouldBe` ceHash l5
+      -- Hand-inserted heavy fork H1..H2 off genesis: ceChainWork set 2^50
+      -- above anything the light chain can accumulate.
+      let bigStep = 1125899906842624 -- 2^50
+          hh1 = mineOn genesisHash 0xc1 (gts + 600)
+          hh1Hash = computeBlockHash hh1
+          eH1 = ChainEntry
+            { ceHeader = hh1, ceHash = hh1Hash, ceHeight = 1
+            , ceChainWork = ceChainWork genesisTip + bigStep
+            , cePrev = Just genesisHash, ceStatus = StatusHeaderValid
+            , ceMedianTime = gts, ceSequenceId = 1000 }
+          hh2 = mineOn hh1Hash 0xc2 (gts + 1200)
+          hh2Hash = computeBlockHash hh2
+          eH2 = ChainEntry
+            { ceHeader = hh2, ceHash = hh2Hash, ceHeight = 2
+            , ceChainWork = ceChainWork genesisTip + 2 * bigStep
+            , cePrev = Just hh1Hash, ceStatus = StatusHeaderValid
+            , ceMedianTime = gts + 600, ceSequenceId = 1001 }
+      atomically $ modifyTVar' (hcEntries hc)
+        (Map.insert hh2Hash eH2 . Map.insert hh1Hash eH1)
+      -- One REAL extension of the heavy fork through the production path:
+      -- height 3 < 5, but cumulative work dwarfs the light tip.
+      r3 <- addHeaderAt regtest hc (mineOn hh2Hash 0xc3 (gts + 1800)) True Nothing
+      e3 <- case r3 of
+        Right e  -> pure e
+        Left err -> error ("addHeaderAt heavy-fork failed: " ++ err)
+      ceHeight e3 `shouldBe` 3
+      tip <- getChainTip hc
+      ceHash tip `shouldBe` ceHash e3
+
+    it "longer-but-lighter fork never displaces a heavier short tip (#47)" $ do
+      hc <- initHeaderChain regtest
+      genesisTip <- getChainTip hc
+      let genesisHash = ceHash genesisTip
+          gts = bhTimestamp (ceHeader genesisTip)
+          mineOn prevHash marker ts = mineRegtestHeader
+            (BlockHeader 1 prevHash (Hash256 (BS.replicate 32 marker)) ts 0x207fffff 0)
+          extend prev 0 _ = pure prev
+          extend prev n marker = do
+            r <- addHeaderAt regtest hc
+                   (mineOn (ceHash prev) marker
+                      (gts + 600 * (fromIntegral (ceHeight prev) + 1)))
+                   True Nothing
+            case r of
+              Right e  -> extend e (n - 1 :: Int) (marker + 1)
+              Left err -> error ("addHeaderAt light-fork failed: " ++ err)
+          bigStep = 1125899906842624 -- 2^50
+          hh1 = mineOn genesisHash 0xd1 (gts + 600)
+          hh1Hash = computeBlockHash hh1
+          eH1 = ChainEntry
+            { ceHeader = hh1, ceHash = hh1Hash, ceHeight = 1
+            , ceChainWork = ceChainWork genesisTip + bigStep
+            , cePrev = Just genesisHash, ceStatus = StatusHeaderValid
+            , ceMedianTime = gts, ceSequenceId = 2000 }
+          hh2 = mineOn hh1Hash 0xd2 (gts + 1200)
+          hh2Hash = computeBlockHash hh2
+          eH2 = ChainEntry
+            { ceHeader = hh2, ceHash = hh2Hash, ceHeight = 2
+            , ceChainWork = ceChainWork genesisTip + 2 * bigStep
+            , cePrev = Just hh1Hash, ceStatus = StatusHeaderValid
+            , ceMedianTime = gts + 600, ceSequenceId = 2001 }
+      -- Make the heavy 2-block fork the active header tip (surgery, as in
+      -- the #53b test above).
+      atomically $ do
+        modifyTVar' (hcEntries hc)
+          (Map.insert hh2Hash eH2 . Map.insert hh1Hash eH1)
+        writeTVar (hcTip hc) eH2
+        writeTVar (hcHeight hc) 2
+      -- Real light chain L1..L6 through addHeaderAt: every insert compares
+      -- against the heavy tip and must refuse the move (6 > 2 in length,
+      -- but ~12 work vs ~2^51).
+      l6 <- extend genesisTip 6 0xe1
+      ceHeight l6 `shouldBe` 6
+      tip <- getChainTip hc
+      ceHash tip `shouldBe` hh2Hash
+      ceHeight tip `shouldBe` 2
+
   -- Pattern Y companion (CORE-PARITY-AUDIT
   -- _reorg-via-submitblock-fleet-result-2026-05-05.md): the
   -- side-branch-aware addHeader / addSideBranchHeader split is the
