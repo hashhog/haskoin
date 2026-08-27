@@ -5378,13 +5378,25 @@ addHeaderAt net hc header minPowChecked mNow = do
                               n <- readTVar (hcSeqCounter hc)
                               writeTVar (hcSeqCounter hc) (n + 1)
                               return n
-                            let entry = ChainEntry
+                            -- #53(b) (2026-08-27): a child of a failed block
+                            -- inherits the poison (Core BLOCK_FAILED_CHILD /
+                            -- m_failed_blocks): the header is still STORED
+                            -- (reconsiderblock stays workable) but must never
+                            -- become a tip candidate. Pre-fix every entry was
+                            -- born StatusHeaderValid and the tip-move below
+                            -- checked only work, so the header tip could walk
+                            -- onto an invalidated branch.
+                            let inheritedStatus =
+                                  if isFailedStatus (ceStatus parent)
+                                    then StatusFailedChild
+                                    else StatusHeaderValid
+                                entry = ChainEntry
                                   { ceHeader = header
                                   , ceHash = hash
                                   , ceHeight = height
                                   , ceChainWork = work
                                   , cePrev = Just prevHash
-                                  , ceStatus = StatusHeaderValid
+                                  , ceStatus = inheritedStatus
                                   , ceMedianTime = newEntryMtp
                                   , ceSequenceId = seqId
                                   }
@@ -5415,7 +5427,8 @@ addHeaderAt net hc header minPowChecked mNow = do
                             atomically $ do
                               modifyTVar' (hcEntries hc) (Map.insert hash entry)
                               currentTip <- readTVar (hcTip hc)
-                              when (work > ceChainWork currentTip) $ do
+                              when (work > ceChainWork currentTip
+                                    && not (isFailedStatus inheritedStatus)) $ do
                                 modifyTVar' (hcByHeight hc) (Map.insert height hash)
                                 writeTVar (hcTip hc) entry
                                 writeTVar (hcHeight hc) height

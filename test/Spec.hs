@@ -5232,6 +5232,42 @@ main = hspec $ do
       ancestor <- getAncestor hc (ceHash tip) 100
       ancestor `shouldBe` Nothing
 
+    -- #53(b) (2026-08-27): the header tip must never move onto an
+    -- INVALIDATED branch. Pre-fix, addHeaderAt built every entry as
+    -- StatusHeaderValid and the tip-move compared only work, so a child
+    -- of a failed block became the header tip. Core poisons descendants
+    -- (BLOCK_FAILED_CHILD / m_failed_blocks). FAILS AT PARENT: the tip
+    -- walked onto the failed lineage and h2's status was HeaderValid.
+    it "header tip never moves onto an invalidated branch (#53b)" $ do
+      hc <- initHeaderChain regtest
+      genesisTip <- getChainTip hc
+      let genesisHash = ceHash genesisTip
+          gts = bhTimestamp (ceHeader genesisTip)
+          h1 = mineRegtestHeader (BlockHeader 1 genesisHash
+                 (Hash256 (BS.replicate 32 0xa1)) (gts + 600) 0x207fffff 0)
+      r1 <- addHeaderAt regtest hc h1 True Nothing
+      e1 <- case r1 of
+        Right e  -> pure e
+        Left err -> error ("addHeaderAt h1 failed: " ++ err)
+      -- Simulate invalidateblock on h1: mark it failed and rewind the
+      -- tip to genesis (the invalidation machinery's end state).
+      atomically $ do
+        modifyTVar' (hcEntries hc)
+          (Map.insert (ceHash e1) e1 { ceStatus = StatusInvalid })
+        writeTVar (hcTip hc) genesisTip
+        writeTVar (hcHeight hc) 0
+      -- h2 extends the FAILED h1 with more cumulative work than genesis.
+      let h2 = mineRegtestHeader (BlockHeader 1 (ceHash e1)
+                 (Hash256 (BS.replicate 32 0xa2)) (gts + 1200) 0x207fffff 0)
+      r2 <- addHeaderAt regtest hc h2 True Nothing
+      e2 <- case r2 of
+        Right e  -> pure e
+        Left err -> error ("addHeaderAt h2 failed: " ++ err)
+      -- The child inherits the poison and the tip stays on genesis.
+      ceStatus e2 `shouldBe` StatusFailedChild
+      tip' <- getChainTip hc
+      ceHash tip' `shouldBe` genesisHash
+
   -- Pattern Y companion (CORE-PARITY-AUDIT
   -- _reorg-via-submitblock-fleet-result-2026-05-05.md): the
   -- side-branch-aware addHeader / addSideBranchHeader split is the
