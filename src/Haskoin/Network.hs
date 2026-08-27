@@ -7217,9 +7217,16 @@ checkStalePeer spt addr isCompact = do
 
 -- | Start the periodic eviction check thread
 -- Reference: Bitcoin Core net_processing.cpp SendMessages
-startEvictionThread :: StalePeerTracker -> PeerManager -> IO ThreadId
-startEvictionThread spt pm = do
-  tid <- forkIO $ evictionLoop spt pm
+-- The locator action MUST build a real block locator from the chain
+-- (buildBlockLocatorFromChain) — the pre-2026-08-27 evictionLoop sent a
+-- single-hash [ourTip] locator, the exact degenerate shape that wedged
+-- clearbit on a stale tip (peers serve from genesis when they recognize
+-- nothing in the locator). This path is currently NOT wired from the
+-- production entrypoint; the signature forces any future wiring to
+-- supply a real locator source (meta #72 row 5).
+startEvictionThread :: IO [BlockHash] -> StalePeerTracker -> PeerManager -> IO ThreadId
+startEvictionThread buildLocator spt pm = do
+  tid <- forkIO $ evictionLoop buildLocator spt pm
   atomically $ writeTVar (sptEvictionThread spt) (Just tid)
   return tid
 
@@ -7234,8 +7241,8 @@ stopEvictionThread spt = do
 
 -- | Main eviction check loop
 -- Runs every staleCheckInterval / 4 to catch issues promptly
-evictionLoop :: StalePeerTracker -> PeerManager -> IO ()
-evictionLoop spt pm = forever $ do
+evictionLoop :: IO [BlockHash] -> StalePeerTracker -> PeerManager -> IO ()
+evictionLoop buildLocator spt pm = forever $ do
   -- Sleep for a fraction of the stale check interval
   threadDelay (fromIntegral staleCheckInterval * 250000)  -- 25% of interval in microseconds
 
@@ -7266,12 +7273,17 @@ evictionLoop spt pm = forever $ do
       unless shouldDisconnect $ do
         (_, needsGetheaders, _) <- considerEviction spt addr now
         when needsGetheaders $ do
-          -- Build block locator from our tip
+          -- Real exponential locator from the chain (#72 row 5). The old
+          -- code sent [ourTip] — a single stale hash no peer recognizes,
+          -- which makes peers serve headers from GENESIS (the clearbit
+          -- 7b97bce wedge shape). Fall back to the bare tip only if the
+          -- provided builder yields nothing.
+          locator <- buildLocator
           ourTip <- readTVarIO (sptOurTipHash spt)
-          -- Send getheaders with locator starting from tip
-          let getHeaders = GetHeaders
+          let finalLocator = if null locator then [ourTip] else locator
+              getHeaders = GetHeaders
                 { ghVersion = fromIntegral protocolVersion
-                , ghLocators = [ourTip]
+                , ghLocators = finalLocator
                 , ghHashStop = BlockHash (Hash256 (BS.replicate 32 0))
                 }
           sendMessage pc (MGetHeaders getHeaders)
