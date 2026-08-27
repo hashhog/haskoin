@@ -127,7 +127,6 @@ module Haskoin.Network
     -- * Peer Threads
   , startPeerThreads
   , startPeerThreadsWithMisbehavior
-  , queueMessage
       -- * Peer Manager Types
   , PeerManager(..)
   , PeerManagerConfig(..)
@@ -2115,7 +2114,13 @@ instance NFData PeerInfo
 data PeerConnection = PeerConnection
   { pcSocket      :: !Socket              -- ^ TCP socket
   , pcInfo        :: !(TVar PeerInfo)     -- ^ Peer info (mutable)
-  , pcSendQueue   :: !(TBQueue Message)   -- ^ Outbound message queue
+  , pcSendLock    :: !(MVar ())           -- ^ Per-connection send mutex.
+                  -- Serializes ALL sends on this socket.  sendMessage runs
+                  -- from several concurrent threads (recv-handler, ping
+                  -- timer, sync driver); without this the v1 sendAll
+                  -- interleaved bytes on the wire.  (The former outbound
+                  -- queue + its parked reader thread had ZERO enqueuers —
+                  -- dead since inception; removed.)
   , pcRecvQueue   :: !(TBQueue Message)   -- ^ Inbound message queue
   , pcSendThread  :: !(Maybe ThreadId)    -- ^ Send thread ID
   , pcRecvThread  :: !(Maybe ThreadId)    -- ^ Receive thread ID
@@ -2205,14 +2210,14 @@ connectPeer config host port = do
               , piAddrTokenTimestamp = 0
               }
         infoVar <- newTVarIO info
-        sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
+        sendLock <- newMVar ()
         recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
         bufRef <- newIORef BS.empty
         v2Ref  <- newIORef Nothing
         return PeerConnection
           { pcSocket      = sock
           , pcInfo        = infoVar
-          , pcSendQueue   = sendQ
+          , pcSendLock    = sendLock
           , pcRecvQueue   = recvQ
           , pcSendThread  = Nothing
           , pcRecvThread  = Nothing
@@ -2245,7 +2250,7 @@ disconnectPeer pc = do
 -- 'v2TransportSend' and write the resulting bytes; otherwise fall through
 -- to the v1 framing path (network magic + 24-byte header + payload).
 sendMessage :: PeerConnection -> Message -> IO ()
-sendMessage pc msg = do
+sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
   mV2 <- readIORef (pcV2Transport pc)
   case mV2 of
     -- Hold the per-connection send mutex across BOTH the cipher advance
@@ -2883,10 +2888,8 @@ startPeerThreadsWithMisbehavior
   -- text from 'receiveMessage'.
   -> IO PeerConnection
 startPeerThreadsWithMisbehavior pc handler onMisbehave = do
-  -- Send thread: reads from queue and sends to socket
-  sendTid <- forkIO $ forever $ do
-    msg <- atomically $ readTBQueue (pcSendQueue pc)
-    sendMessage pc msg `catch` (\(_ :: SomeException) -> disconnectPeer pc)
+  -- (The former send thread read a queue with zero enqueuers — removed.
+  -- Sends go directly via sendMessage, serialized by pcSendLock.)
 
   -- Receive thread: reads from socket and calls handler
   recvTid <- forkIO $ fix $ \loop -> do
@@ -2930,7 +2933,7 @@ startPeerThreadsWithMisbehavior pc handler onMisbehave = do
         -- Do NOT loop after disconnect: socket is closed, further reads
         -- would spin indefinitely.
 
-  return pc { pcSendThread = Just sendTid, pcRecvThread = Just recvTid }
+  return pc { pcSendThread = Nothing, pcRecvThread = Just recvTid }
   where
     isInfixOfStr :: String -> String -> Bool
     isInfixOfStr needle haystack =
@@ -2939,9 +2942,6 @@ startPeerThreadsWithMisbehavior pc handler onMisbehave = do
       in nlen <= hlen
          && any (\i -> take nlen (drop i haystack) == needle) [0..hlen - nlen]
 
--- | Queue a message to be sent by the send thread
-queueMessage :: PeerConnection -> Message -> STM ()
-queueMessage pc msg = writeTBQueue (pcSendQueue pc) msg
 
 --------------------------------------------------------------------------------
 -- Peer Manager
@@ -4238,7 +4238,7 @@ startInboundListener pm port = do
             , piAddrTokenTimestamp = 0
             }
       infoVar <- newTVarIO info
-      sendQ <- newTBQueueIO 100
+      sendLock <- newMVar ()
       recvQ <- newTBQueueIO 100
       bufRef <- newIORef BS.empty
       v2Ref  <- newIORef Nothing
@@ -4249,7 +4249,7 @@ startInboundListener pm port = do
       let pc = PeerConnection
             { pcSocket      = sock
             , pcInfo        = infoVar
-            , pcSendQueue   = sendQ
+            , pcSendLock    = sendLock
             , pcRecvQueue   = recvQ
             , pcSendThread  = Nothing
             , pcRecvThread  = Nothing
@@ -4642,14 +4642,14 @@ insertTestPeer pm addr info = do
   (sock, sock2) <- socketPair AF_UNIX Stream defaultProtocol
   close sock2
   infoVar <- newTVarIO info
-  sendQ   <- newTBQueueIO 16
+  sendLock <- newMVar ()
   recvQ   <- newTBQueueIO 16
   bufRef  <- newIORef BS.empty
   v2Ref   <- newIORef Nothing
   let pc = PeerConnection
         { pcSocket      = sock
         , pcInfo        = infoVar
-        , pcSendQueue   = sendQ
+        , pcSendLock    = sendLock
         , pcRecvQueue   = recvQ
         , pcSendThread  = Nothing
         , pcRecvThread  = Nothing
@@ -10890,14 +10890,14 @@ createPeerConnectionFromSocket config sock _host = do
           , piAddrTokenTimestamp = 0
           }
     infoVar <- newTVarIO info
-    sendQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
+    sendLock <- newMVar ()
     recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
     bufRef <- newIORef BS.empty
     v2Ref  <- newIORef Nothing
     return PeerConnection
       { pcSocket     = sock
       , pcInfo       = infoVar
-      , pcSendQueue  = sendQ
+      , pcSendLock   = sendLock
       , pcRecvQueue  = recvQ
       , pcSendThread = Nothing
       , pcRecvThread = Nothing

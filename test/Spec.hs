@@ -321,6 +321,23 @@ mkTestTxId = TxId $ Hash256 $ BS.replicate 32 0xcd
 
 main :: IO ()
 main = hspec $ do
+  describe "Network send serialization (audit v1-sendAll row)" $ do
+    -- The v1 sendMessage path called sendAll with no lock, while sendMessage
+    -- is invoked from several concurrent threads — interleaving bytes on the
+    -- wire.  The old pcSendQueue + its parked reader thread were meant to
+    -- serialize sends but had ZERO enqueuers (dead since inception).  Fixed
+    -- by wrapping sendMessage in the per-connection pcSendLock and removing
+    -- the dead queue/thread/queueMessage.  Structural pin (a runtime
+    -- interleave race is non-deterministic and would pass at parent by luck):
+    it "sendMessage acquires the per-connection send lock" $ do
+      src <- readFile "src/Haskoin/Network.hs"
+      (("sendMessage pc msg = withMVar (pcSendLock pc)" `isInfixOf` src)
+        `shouldBe` True)
+    it "the dead outbound queue and its enqueuer are gone" $ do
+      src <- readFile "src/Haskoin/Network.hs"
+      ("queueMessage pc msg = writeTBQueue" `isInfixOf` src) `shouldBe` False
+      ("readTBQueue (pcSendQueue" `isInfixOf` src) `shouldBe` False
+
   describe "VarInt" $ do
     it "encodes single-byte values (< 0xfd)" $ do
       encode (VarInt 0) `shouldBe` "\x00"

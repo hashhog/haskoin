@@ -28,6 +28,7 @@
 --     different nonce yields different bytes.
 module W188InboundPongSpec (spec) where
 
+import Control.Concurrent.MVar (newMVar)
 import Test.Hspec
 
 import Control.Concurrent.STM (atomically, newTVarIO, modifyTVar', newTBQueueIO)
@@ -99,14 +100,14 @@ mkLiveConn :: SockAddr -> IO (PeerConnection, Socket)
 mkLiveConn a = do
   (writerEnd, readerEnd) <- socketPair AF_UNIX Stream 0
   infoVar <- newTVarIO (mkInfo a)
-  sendQ   <- newTBQueueIO 100
+  sendLock <- newMVar ()
   recvQ   <- newTBQueueIO 100
   bufRef  <- newIORef BS.empty
   v2Ref   <- newIORef Nothing
   let pc = PeerConnection
              { pcSocket      = writerEnd
              , pcInfo        = infoVar
-             , pcSendQueue   = sendQ
+             , pcSendLock    = sendLock
              , pcRecvQueue   = recvQ
              , pcSendThread  = Nothing
              , pcRecvThread  = Nothing
