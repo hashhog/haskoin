@@ -543,6 +543,13 @@ data ConnPrevout = ConnPrevout
   , cpValue          :: Word64
   , cpHeight         :: Word32
   , cpIsCoinbase     :: Bool
+    -- | OPTIONAL lock-start MTP for time-based BIP-68 locks on this coin:
+    -- Core CalculateSequenceLocks uses
+    -- @GetAncestor(coinHeight-1)->GetMedianTimePast()@.  'Nothing' (field
+    -- absent) keeps the previous fail-closed behavior — the checkblock
+    -- getMtpAtHeight callback then resolves the height to 0, exactly as the
+    -- old hardwired @const 0@.
+  , cpMtp            :: Maybe Word32
   }
 
 instance A.FromJSON ConnPrevout where
@@ -553,6 +560,7 @@ instance A.FromJSON ConnPrevout where
     <*> (toW64 <$> o .:? "value_sats" A..!= (0 :: Double))
     <*> (toW32 <$> o .:? "height" A..!= (0 :: Double))
     <*> o .:? "is_coinbase"      A..!= False
+    <*> (fmap toW32 <$> (o .:? "mtp" :: A.Parser (Maybe Double)))
     where
       toW32 d = round (d :: Double)
       toW64 d = round (d :: Double)
@@ -640,9 +648,10 @@ prepareConnTx req = do
 --
 -- ChainState: csHeight = spend_height-1 (validateFullBlock derives the connect
 -- height as csHeight+1 internally), csBestBlock = the block's prev hash,
--- csChainWork = 0 (inert here), csMedianTime = 0 (a 0x7FFFFF* sentinel-timed
--- real mainnet block always satisfies @bhTimestamp > csMedianTime@; the corpus
--- blocks are real accepted blocks whose timestamps are far above 0),
+-- csChainWork = 0 (inert here), csMedianTime = prev_mtp — falling back to the
+-- median of the raw "timestamps" window, then to 0 when the request carries no
+-- chain-time context at all (a 0 cutoff still accepts every real mainnet
+-- header time and FAIL-CLOSES time-based BIP-113 finality, exactly as before),
 -- csFlags = consensusFlagsAtHeight mainnet spend_height (mirrors
 -- connectChain's @consensusFlagsAtHeight net (ceHeight ce)@).
 --
@@ -661,9 +670,11 @@ prepareConnTx req = do
 --   request:  {"op":"checkblock","block_hex":"<FINAL block bytes>",
 --              "prevouts":[{"txid":"<display-hex>","vout":N,
 --                           "scriptPubKey_hex":"...","value_sats":<u64>,
---                           "height":N,"is_coinbase":bool}, ...],
+--                           "height":N,"is_coinbase":bool,
+--                           "mtp":<u32>}, ...]        -- mtp OPTIONAL; see below
 --              "spend_height":<int>,"skip_pow":<bool>,"skip_scripts":<bool>,
---              "prev_mtp":<u32>}              -- OPTIONAL; see below
+--              "prev_mtp":<u32>,              -- OPTIONAL; see below
+--              "timestamps":[<u32> x 11]}     -- OPTIONAL; prev_mtp fallback
 --   response: {"valid":true}                    (CheckBlock chain accepts)
 --             {"valid":false,"reason":"..."}    (some gate rejects)
 --             {"error":"..."}                   (could not evaluate -> SKIP)
@@ -683,6 +694,10 @@ data CheckBlockRequest = CheckBlockRequest
   -- (1221476453) with a non-final nSequence, so against a cutoff of 0 it is
   -- not final and the whole block FALSE-REJECTS as bad-txns-nonfinal.
   , cbPrevMtp      :: Word32
+  -- | OPTIONAL raw times of the parent's 11 ancestors (median == prev_mtp,
+  -- Core @CBlockIndex::GetMedianTimePast@).  Consulted only when "prev_mtp"
+  -- is absent; both absent keeps the fail-closed cutoff of 0.
+  , cbTimestamps   :: [Word32]
   }
 
 instance A.FromJSON CheckBlockRequest where
@@ -693,6 +708,7 @@ instance A.FromJSON CheckBlockRequest where
     <*> o .:? "skip_pow"     A..!= True
     <*> o .:? "skip_scripts" A..!= False
     <*> (toW32 <$> o .:? "prev_mtp" A..!= (0 :: Double))
+    <*> (map toW32 <$> o .:? "timestamps" A..!= ([] :: [Double]))
     where toW32 d = round (d :: Double)
 
 -- | Build a @Map OutPoint Coin@ from the prevout set (same view shape
@@ -715,9 +731,9 @@ processCheckBlock line =
     Left e    -> pure ("{\"error\":\"json parse: " <> escapeJson e <> "\"}")
     Right req -> case prepareCheckBlock req of
       Left e                            -> pure ("{\"error\":\"" <> escapeJson e <> "\"}")
-      Right (block, cs, skipScripts, coinMap) -> do
+      Right (block, cs, skipScripts, coinMap, getMtpAtHeight) -> do
         r <- try (evaluate
-                    (forceEither (validateFullBlock mainnet cs (const 0) skipScripts False block coinMap)))
+                    (forceEither (validateFullBlock mainnet cs getMtpAtHeight skipScripts False block coinMap)))
                :: IO (Either SomeException (Either String ()))
         pure $ case r of
           Left ex          ->
@@ -731,7 +747,8 @@ processCheckBlock line =
       Right () -> Right ()
 
 prepareCheckBlock :: CheckBlockRequest
-                  -> Either String (Block, ChainState, Bool, Map.Map OutPoint Coin)
+                  -> Either String ( Block, ChainState, Bool
+                                   , Map.Map OutPoint Coin, Word32 -> Word32 )
 prepareCheckBlock req = do
   blockBytes <- decodeHex (cbBlockHex req)
   block      <- case S.decode blockBytes :: Either String Block of
@@ -740,14 +757,43 @@ prepareCheckBlock req = do
   coinMap    <- prevoutsToCoinMap (cbPrevouts req)
   let sh   = cbSpendHeight req
       prev = bhPrevBlock (blockHeader block)
+      -- BIP-113 nLockTimeCutoff + time-too-old cutoff (csMedianTime): the
+      -- explicit "prev_mtp" wins; when absent, fall back to the median of the
+      -- raw 11-ancestor "timestamps" window (Core CBlockIndex::
+      -- GetMedianTimePast — sort, take element [n/2]).  Both absent -> 0,
+      -- the previous fail-closed behavior, unchanged.
+      prevMtp
+        | cbPrevMtp req /= 0            = cbPrevMtp req
+        | not (null (cbTimestamps req)) =
+            let ts = sortBy compare (cbTimestamps req)
+            in ts !! (length ts `div` 2)
+        | otherwise                     = 0
+      -- Per-coin lock-start MTPs for time-based BIP-68.  validateFullBlock's
+      -- sequence-lock gate calls @getMtpAtHeight (coinHeight - 1)@ (mirroring
+      -- Core CalculateSequenceLocks:
+      -- @GetAncestor(coinHeight-1)->GetMedianTimePast()@), so each supplied
+      -- per-prevout "mtp" is keyed by coinHeight-1.  An intra-block spend
+      -- resolves to coinHeight == connect height, whose lock-start MTP is the
+      -- parent's own MTP — seed (sh-1) -> prevMtp for that case (Core parity;
+      -- intra-block prevouts are never in the corpus prevout list).  Heights
+      -- with no supplied value resolve to 0 — byte-identical to the previous
+      -- hardwired @const 0@ callback, so requests without the optional fields
+      -- keep today's fail-closed decisions.
+      coinMtps = Map.fromList
+        [ (if cpHeight p == 0 then 0 else cpHeight p - 1, m)
+        | p <- cbPrevouts req, Just m <- [cpMtp p] ]
+      mtpByHeight
+        | prevMtp /= 0 && sh > 0 = Map.insert (sh - 1) prevMtp coinMtps
+        | otherwise              = coinMtps
+      getMtpAtHeight h = Map.findWithDefault 0 h mtpByHeight
       cs   = ChainState
                { csHeight     = sh - 1
                , csBestBlock  = prev
                , csChainWork  = 0
-               , csMedianTime = cbPrevMtp req
+               , csMedianTime = prevMtp
                , csFlags      = consensusFlagsAtHeight mainnet sh
                }
-  Right (block, cs, cbSkipScripts req, coinMap)
+  Right (block, cs, cbSkipScripts req, coinMap, getMtpAtHeight)
 
 ------------------------------------------------------------------------------
 -- checkbip30 op (BIP-30 / CVE-2012-1909 duplicate-txid coin-overwrite
@@ -804,7 +850,7 @@ processCheckBIP30 line =
     Right req -> case prepareCheckBlock req of
       Left e                                  ->
         pure ("{\"error\":\"" <> escapeJson e <> "\"}")
-      Right (block, cs, skipScripts, coinMap) -> do
+      Right (block, cs, skipScripts, coinMap, getMtpAtHeight) -> do
         r <- try (withTempDB $ \db -> do
                     -- Seed the DB UTXO set from the prevout list — this is the
                     -- view 'checkBIP30' scans via getUTXO. The seeded (T,0)
@@ -817,9 +863,10 @@ processCheckBIP30 line =
                     putBlockHeight db (netBIP34Height mainnet) (netBIP34Hash mainnet)
                     -- Drive the REAL canonical connect-time entry point:
                     -- checkBIP30 THEN validateFullBlock (Consensus.hs:2802).
-                    -- const 0 for getMtpAtHeight: corpus vectors test height-based
-                    -- BIP-68; a real per-chain MTP walk is not available in the shim.
-                    res <- validateFullBlockIO db mainnet cs (const 0) skipScripts block coinMap
+                    -- getMtpAtHeight: per-prevout "mtp" lookup built by
+                    -- prepareCheckBlock (0 for unsupplied heights — the old
+                    -- @const 0@ behavior when the field is absent).
+                    res <- validateFullBlockIO db mainnet cs getMtpAtHeight skipScripts block coinMap
                     evaluate (forceEither res))
                :: IO (Either SomeException (Either String ()))
         pure $ case r of
