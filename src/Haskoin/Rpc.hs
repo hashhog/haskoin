@@ -423,6 +423,10 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          getAncestors, getDescendants, removeTransaction,
                          setOnRemoveTx, prioritiseTransaction,
                          isRbfReplaceable, blockConnected,
+                         -- BIP-125 opt-in predicate (Core util/rbf.cpp
+                         -- SignalsOptInRBF); reused by createrawtransaction's
+                         -- "sequence contradicts replaceable" check.
+                         signalsOptInRBF,
                          -- Package relay (BIP-331) — submitpackage RPC
                          TxPackage(..), maxPackageCount, acceptPackage,
                          isWellFormedPackage, isChildWithParents,
@@ -9410,7 +9414,21 @@ handleCreateRawTransactionChecked _server params = do
       -- when the arg is ABSENT. AddInputs then does rbf.value_or(true), so BOTH
       -- "arg absent" AND "replaceable=true" select the RBF default sequence.
       -- (rawtransaction_util.cpp AddInputs lines 49-55.)
-      rbf = fromMaybe True (extractParam params 3 :: Maybe Bool)
+      --
+      -- 'mRbf' keeps the optional-ness Core keeps.  The two readings are NOT
+      -- interchangeable and the difference is load-bearing:
+      --   * choosing the default sequence uses rbf.value_or(true)  -> absent
+      --     behaves like true;
+      --   * the contradiction check below uses rbf.has_value() && rbf.value()
+      --     -> absent behaves like "caller expressed no opinion", so there is
+      --     nothing to contradict.
+      -- Keep 'rbf' byte-identical to what it was; only the new check reads
+      -- 'mRbf'.  (extractParam returns Nothing for an out-of-range index AND
+      -- for a JSON null, which is exactly Core's isNull() test at
+      -- rawtransaction.cpp:398-401.)
+      mRbf :: Maybe Bool
+      mRbf = extractParam params 3
+      rbf = fromMaybe True mRbf
       -- Default per-input sequence when no explicit "sequence" is supplied:
       --   rbf            -> MAX_BIP125_RBF_SEQUENCE  0xfffffffd
       --   else locktime≠0 -> MAX_SEQUENCE_NONFINAL    0xfffffffe
@@ -9556,7 +9574,62 @@ handleCreateRawTransactionChecked _server params = do
                   }
                 hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
 
-            return $ RpcResponse (toJSON hexTx) Null Null
+            -- Core ConstructTransaction's LAST act, run only after AddInputs
+            -- AND AddOutputs have both succeeded
+            -- (rpc/rawtransaction_util.cpp:166-168):
+            --
+            -- >  if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+            -- >      !SignalsOptInRBF(CTransaction(rawTx))) {
+            -- >      throw JSONRPCError(RPC_INVALID_PARAMETER,
+            -- >          "Invalid parameter combination: Sequence number(s) "
+            -- >          "contradict replaceable option");
+            -- >  }
+            --
+            -- WHY THIS EXISTS.  `replaceable` and an explicit `sequence` are two
+            -- ways of saying the same thing, and a caller can set them to say
+            -- OPPOSITE things: "make this fee-bumpable" plus a final sequence
+            -- (0xffffffff) that makes it not.  Nine of the ten nodes in this
+            -- repo — haskoin included, until now — silently ACCEPT that.  They
+            -- resolve the contradiction in favour of the sequence and hand back
+            -- a transaction that CANNOT be fee-bumped, with error=null.  The
+            -- caller asked for RBF, was told nothing, and finds out only when
+            -- the fee is too low and bumpfee refuses.  Core does not guess which
+            -- half of a self-contradicting request the caller meant; it refuses
+            -- the request.  Same fabrication shape as the dropped input and the
+            -- silently-zeroed locktime above: a plausible result manufactured
+            -- from input that could not be honoured as stated.
+            --
+            -- THE ABSENT-vs-EXPLICIT ASYMMETRY IS REAL, not an oversight.  Core
+            -- builds `std::optional<bool> rbf` that stays nullopt when the
+            -- param isNull() (rpc/rawtransaction.cpp:398-401), then reads it
+            -- TWO different ways: AddInputs uses `rbf.value_or(true)` (absent
+            -- == true, so the default sequence is the RBF one), while THIS
+            -- check uses `rbf.has_value() && rbf.value()` (absent == no
+            -- opinion).  So `createrawtransaction [{...,"sequence":4294967295}]
+            -- {}` is ACCEPTED — the caller never asked for replaceability, so
+            -- there is no contradiction — but adding an explicit `true` in
+            -- position 3 makes the very same request an error.  Collapsing the
+            -- two readings in either direction is wrong: `fromMaybe True mRbf`
+            -- here would reject row 1 of the oracle table (a plain final-
+            -- sequence tx with no rbf arg), which is ordinary, legal usage.
+            --
+            -- 'signalsOptInRBF' is Haskoin.Mempool's existing BIP-125 predicate
+            -- (Mempool.hs:449) — the same `any (\i -> txInSequence i <=
+            -- 0xfffffffd)` the mempool's replacement logic uses, mirroring
+            -- util/rbf.cpp SignalsOptInRBF, with MAX_BIP125_RBF_SEQUENCE =
+            -- 0xfffffffd (util/rbf.h:12).  ANY ONE signalling input is enough:
+            -- BIP-125 deliberately does not let a single party in a multi-party
+            -- transaction opt the whole thing out.  'txInSequence' is a Word32,
+            -- so `<=` is the unsigned comparison Core does.
+            --
+            -- Placement mirrors Core: after outputs, so an output error still
+            -- wins over this one, and after the empty-vin escape (a transaction
+            -- with no inputs signals nothing, and Core lets it through).
+            if mRbf == Just True && not (null inputs) && not (signalsOptInRBF tx)
+              then return $ RpcResponse Null
+                (toJSON $ RpcError rpcInvalidParameter
+                  "Invalid parameter combination: Sequence number(s) contradict replaceable option") Null
+              else return $ RpcResponse (toJSON hexTx) Null Null
   where
     -- Raw (unconverted) lookup of a field on a JSON object, so callers can
     -- tell "absent / wrong type" apart from "present but out of range" --

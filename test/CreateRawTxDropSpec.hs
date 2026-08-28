@@ -44,6 +44,8 @@ import Data.Aeson.Types (Result(..), fromJSON)
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KM
 import Data.Scientific (toBoundedInteger)
+import Data.Char (digitToInt, isHexDigit)
+import Data.Word (Word32)
 import qualified Data.Text as T
 
 import Haskoin.Rpc
@@ -92,7 +94,12 @@ errorOf resp = case resError resp of
     return (0, "")
 
 spec :: Spec
-spec = describe "createrawtransaction: malformed input is rejected, not dropped" $ do
+spec = do
+  dropSpec
+  rbfContradictionSpec
+
+dropSpec :: Spec
+dropSpec = describe "createrawtransaction: malformed input is rejected, not dropped" $ do
 
   -- THE REGRESSION.  At the parent commit this returned
   -- result="02000000000000000000", error=null.
@@ -194,3 +201,234 @@ spec = describe "createrawtransaction: malformed input is rejected, not dropped"
     resp <- callWith (oneInput
       [("txid", String goodTxid), ("vout", Number 0), ("sequence", String "nope")])
     resError resp `shouldBe` Null
+
+--------------------------------------------------------------------------------
+-- ConstructTransaction's LAST check: replaceable vs. the sequence numbers
+--------------------------------------------------------------------------------
+
+-- A second well-formed txid, so the two-input row has two distinct outpoints
+-- and the assertion on the decoded sequence list is order-revealing.
+otherTxid :: T.Text
+otherTxid = T.replicate 64 "b"
+
+-- createrawtransaction params: [inputs, outputs, locktime, replaceable].
+-- Outputs are empty and locktime is pinned to 0, so the ONLY things varying
+-- across the rows below are the replaceable argument and the per-input
+-- sequences — which is the whole point of the table.
+callRbf :: Value -> Value -> IO RpcResponse
+callRbf inputsArr rbfArg =
+  handleCreateRawTransaction (error "RpcServer must not be touched")
+    (toJSON [inputsArr, object [], Number 0, rbfArg])
+
+-- Build an inputs array from N field-lists ('oneInput' is the N = 1 case).
+inputsOf :: [[(T.Text, Value)]] -> Value
+inputsOf entries =
+  toJSON [ object [Key.fromText k .= v | (k, v) <- fields] | fields <- entries ]
+
+-- | Decode one big-endian pair of hex characters.
+hexByte :: T.Text -> Word32
+hexByte t = case T.unpack t of
+  [a, b] | isHexDigit a && isHexDigit b ->
+    fromIntegral (16 * digitToInt a + digitToInt b)
+  _ -> error ("not a hex byte: " ++ show t)
+
+-- | Decode a little-endian 4-byte hex field (8 characters) to its value.
+leWord32 :: T.Text -> Word32
+leWord32 t = sum [ hexByte b * (256 ^ i)
+                 | (i, b) <- zip [(0 :: Int) ..] (chunk2 t) ]
+  where
+    chunk2 s | T.null s  = []
+             | otherwise = let (h, r) = T.splitAt 2 s in h : chunk2 r
+
+-- | Pull the nSequence of every input out of a serialized legacy transaction.
+--
+-- Deliberately minimal: it understands exactly the shapes this spec builds
+-- (fewer than 0xfd inputs, empty scriptSigs) and REPORTS anything else instead
+-- of guessing, so a malformed decode can never masquerade as a passing
+-- assertion.  Layout: version(4) | varint nIn | [ txid(32) vout(4) varint
+-- scriptLen script nSequence(4) ] | varint nOut | ... | nLockTime(4).
+sequencesOf :: T.Text -> Either String [Word32]
+sequencesOf hex
+  | T.length hex < 10 = Left ("transaction hex too short: " ++ T.unpack hex)
+  | nIn >= 0xfd       = Left "input-count varint too large for this helper"
+  | otherwise         = go nIn afterCount []
+  where
+    afterVersion = T.drop 8 hex
+    nIn          = fromIntegral (hexByte (T.take 2 afterVersion)) :: Int
+    afterCount   = T.drop 2 afterVersion
+
+    go :: Int -> T.Text -> [Word32] -> Either String [Word32]
+    go 0 _ acc = Right (reverse acc)
+    go k rest acc
+      | T.length rest < 64 + 8 + 2 = Left "truncated input"
+      | otherwise =
+          let afterOutpoint   = T.drop (64 + 8) rest        -- txid(32) + vout(4)
+              scriptLen       = fromIntegral (hexByte (T.take 2 afterOutpoint)) :: Int
+              afterScript     = T.drop (2 + 2 * scriptLen) afterOutpoint
+              (seqHex, rest') = T.splitAt 8 afterScript
+          in if T.length seqHex < 8
+               then Left "truncated input (no nSequence)"
+               else go (k - 1) rest' (leWord32 seqHex : acc)
+
+-- | Assert the call SUCCEEDED and that the transaction it returned carries
+-- exactly these nSequence values, in order.
+--
+-- The ACCEPT rows are the controls, and "no error was returned" is too weak a
+-- control: it would also pass if the handler had quietly rewritten the caller's
+-- sequence to resolve the contradiction — the exact fabrication this whole file
+-- exists to forbid.  So decode the bytes and pin the real values.
+expectSequences :: RpcResponse -> [Word32] -> IO ()
+expectSequences resp expected = do
+  resError resp `shouldBe` Null
+  case fromJSON (resResult resp) :: Result T.Text of
+    Error m -> expectationFailure ("expected a hex transaction: " ++ m)
+    Success hex -> case sequencesOf hex of
+      Left e      -> expectationFailure
+                       ("could not decode " ++ T.unpack hex ++ ": " ++ e)
+      Right seqs  -> seqs `shouldBe` expected
+
+-- | Assert the call was REJECTED with Core's contradiction error, and that no
+-- transaction leaked out alongside it.
+expectContradiction :: RpcResponse -> IO ()
+expectContradiction resp = do
+  (code, msg) <- errorOf resp
+  code `shouldBe` rpcInvalidParameter
+  msg `shouldBe`
+    "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+  resResult resp `shouldBe` Null
+
+-- | createrawtransaction must REFUSE a request that says "replaceable" and
+-- "not replaceable" at the same time.
+--
+-- `replaceable` and a per-input `sequence` are two ways of expressing the same
+-- property, and a caller can set them to contradict each other: ask for
+-- @replaceable=true@ while pinning every input to a FINAL sequence
+-- (0xffffffff), which is precisely opting OUT of BIP-125.  Nine of the ten
+-- nodes in this repo — haskoin included, before this commit — silently accept
+-- that.  They resolve the contradiction in favour of the sequence, return a
+-- transaction that CANNOT be fee-bumped, and report error=null.  The caller
+-- asked for replaceability, was told nothing, and discovers the truth only when
+-- the fee turns out too low and the bump is refused.  Core does not pick a
+-- winner between two halves of a self-contradicting request; it rejects the
+-- request with RPC_INVALID_PARAMETER (-8).
+--
+-- The check is ConstructTransaction's last act, run only after AddInputs AND
+-- AddOutputs have both succeeded (rpc/rawtransaction_util.cpp:166-168):
+--
+-- >  if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+-- >      !SignalsOptInRBF(CTransaction(rawTx))) {
+-- >      throw JSONRPCError(RPC_INVALID_PARAMETER,
+-- >          "Invalid parameter combination: Sequence number(s) contradict "
+-- >          "replaceable option");
+-- >  }
+--
+-- so it fires only when ALL THREE hold: `replaceable` was EXPLICITLY given as
+-- true, there is at least one input, and NO input signals opt-in RBF
+-- (util/rbf.cpp SignalsOptInRBF: any nSequence <= MAX_BIP125_RBF_SEQUENCE,
+-- 0xfffffffd, util/rbf.h:12).
+--
+-- THE ASYMMETRY IS DELIBERATE.  Core keeps rbf as std::optional<bool> that
+-- stays nullopt when the argument isNull() (rpc/rawtransaction.cpp:398-401),
+-- then reads it two different ways: AddInputs uses `rbf.value_or(true)`, so an
+-- ABSENT argument still selects the RBF default sequence, while this check uses
+-- `rbf.has_value() && rbf.value()`, so an absent argument expresses no opinion
+-- and there is nothing to contradict.  Row 1 below is that distinction, and it
+-- is the easiest one to break: a check written against `fromMaybe True` would
+-- reject an ordinary final-sequence transaction that never mentioned
+-- replaceability at all.
+--
+-- Every row was verified against a LIVE Bitcoin Core node before being written
+-- down.  The four ACCEPT rows matter as much as the rejects — they are what
+-- stops an over-eager check from breaking normal RBF usage.
+rbfContradictionSpec :: Spec
+rbfContradictionSpec =
+  describe "createrawtransaction: replaceable must not contradict the sequences" $ do
+
+    -- Row 1.  Rule 1 fails: no EXPLICIT rbf, so nothing was contradicted.
+    -- The sequence the caller supplied must survive untouched.
+    it "row 1: rbf ABSENT + sequence 0xffffffff -> ACCEPT" $ do
+      resp <- callWith (oneInput
+        [("txid", String goodTxid), ("vout", Number 0),
+         ("sequence", Number 4294967295)])
+      expectSequences resp [0xffffffff]
+
+    -- Row 2.  Rule 3 fails: 0xfffffffd IS MAX_BIP125_RBF_SEQUENCE, the
+    -- canonical opt-in signal.  The comparison is <=, not <.
+    it "row 2: replaceable=true + sequence 0xfffffffd -> ACCEPT (that IS the signal)" $ do
+      resp <- callRbf
+        (oneInput [("txid", String goodTxid), ("vout", Number 0),
+                   ("sequence", Number 4294967293)])
+        (toJSON True)
+      expectSequences resp [0xfffffffd]
+
+    -- Row 3.  0xfffffffe is one above MAX_BIP125_RBF_SEQUENCE — the
+    -- non-final-but-not-replaceable sequence.  Off-by-one boundary.
+    it "row 3: replaceable=true + sequence 0xfffffffe -> REJECT -8" $ do
+      resp <- callRbf
+        (oneInput [("txid", String goodTxid), ("vout", Number 0),
+                   ("sequence", Number 4294967294)])
+        (toJSON True)
+      expectContradiction resp
+
+    -- Row 4.  THE HEADLINE CASE: "make it fee-bumpable" plus a final
+    -- sequence.  This is what the live node used to answer with a
+    -- non-replaceable transaction and error=null.
+    it "row 4: replaceable=true + sequence 0xffffffff -> REJECT -8" $ do
+      resp <- callRbf
+        (oneInput [("txid", String goodTxid), ("vout", Number 0),
+                   ("sequence", Number 4294967295)])
+        (toJSON True)
+      expectContradiction resp
+
+    -- Row 5.  Rule 2 fails: vin.size() > 0 is false.  A transaction with no
+    -- inputs signals nothing, and Core lets it through rather than treating
+    -- "nothing to signal with" as a contradiction.
+    it "row 5: replaceable=true + NO inputs -> ACCEPT" $ do
+      resp <- callRbf (toJSON ([] :: [Value])) (toJSON True)
+      expectSequences resp []
+
+    -- Row 6.  Rule 3 fails: SignalsOptInRBF is ANY, not ALL.  BIP-125 is
+    -- explicit that one party in a multi-party transaction must not be able
+    -- to opt the whole thing out, so a single signalling input is enough
+    -- even though the other input is final.  Easy to get wrong as `all`.
+    it "row 6: replaceable=true + one final input and one signalling input -> ACCEPT" $ do
+      resp <- callRbf
+        (inputsOf
+          [ [("txid", String goodTxid),  ("vout", Number 0),
+             ("sequence", Number 4294967295)]
+          , [("txid", String otherTxid), ("vout", Number 1),
+             ("sequence", Number 0)]
+          ])
+        (toJSON True)
+      expectSequences resp [0xffffffff, 0]
+
+    -- Row 7.  Rule 1 fails the other way: replaceable=false plus a final
+    -- sequence is agreement, not contradiction.
+    it "row 7: replaceable=false + sequence 0xffffffff -> ACCEPT" $ do
+      resp <- callRbf
+        (oneInput [("txid", String goodTxid), ("vout", Number 0),
+                   ("sequence", Number 4294967295)])
+        (toJSON False)
+      expectSequences resp [0xffffffff]
+
+    -- Row 8.  No explicit sequence at all, so AddInputs' rbf.value_or(true)
+    -- picks MAX_BIP125_RBF_SEQUENCE — the default already agrees with the
+    -- request.  Pins that the new check did not disturb defaultSequence.
+    it "row 8: replaceable=true + NO explicit sequence -> ACCEPT with 0xfffffffd" $ do
+      resp <- callRbf
+        (oneInput [("txid", String goodTxid), ("vout", Number 0)])
+        (toJSON True)
+      expectSequences resp [0xfffffffd]
+
+    -- Beyond the table, guarding the subtlety row 1 depends on: Core treats an
+    -- explicit JSON null exactly like an omitted argument (UniValue::isNull()),
+    -- so null must behave as row 1 does — no check, but still the RBF default
+    -- sequence for inputs that do not name one.
+    it "explicit JSON null replaceable behaves as ABSENT, not as false" $ do
+      resp <- callRbf
+        (oneInput [("txid", String goodTxid), ("vout", Number 0),
+                   ("sequence", Number 4294967295)])
+        Null
+      expectSequences resp [0xffffffff]
+      resp2 <- callRbf (oneInput [("txid", String goodTxid), ("vout", Number 0)]) Null
+      expectSequences resp2 [0xfffffffd]
