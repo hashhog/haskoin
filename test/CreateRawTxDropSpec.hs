@@ -156,6 +156,37 @@ spec = describe "createrawtransaction: malformed input is rejected, not dropped"
         T.replicate 64 "a" `T.isInfixOf` hex `shouldBe` True
       Error m -> expectationFailure ("expected a hex transaction: " ++ m)
 
+  -- The locktime argument had the SAME shape as the dropped input, and I
+  -- missed it on the first pass: `fromMaybe 0 (extractParam params 2 ::
+  -- Maybe Word32)` turned a negative locktime into Nothing and then into 0.
+  -- The live node answered a transaction with nLockTime = 0 and no error.
+  -- Core rejects with -8 "Invalid parameter, locktime out of range"
+  -- (rawtransaction_util.cpp ConstructTransaction:151-155). The same
+  -- expression appears in createpsbt and walletcreatefundedpsbt, which share
+  -- ConstructTransaction in Core; all three now go through parseLocktimeArg.
+  it "locktime:-1 -> -8, NOT a silent nLockTime of 0" $ do
+    resp <- handleCreateRawTransaction (error "RpcServer must not be touched")
+      (toJSON [oneInput [("txid", String goodTxid), ("vout", Number 0)],
+               object [], Number (-1)])
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcInvalidParameter
+    msg `shouldBe` "Invalid parameter, locktime out of range"
+
+  it "locktime beyond LOCKTIME_MAX -> -8" $ do
+    resp <- handleCreateRawTransaction (error "RpcServer must not be touched")
+      (toJSON [oneInput [("txid", String goodTxid), ("vout", Number 0)],
+               object [], Number 4294967296])
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcInvalidParameter
+    msg `shouldBe` "Invalid parameter, locktime out of range"
+
+  -- CONTROL: LOCKTIME_MAX itself is legal.
+  it "locktime = 0xFFFFFFFF is accepted (control)" $ do
+    resp <- handleCreateRawTransaction (error "RpcServer must not be touched")
+      (toJSON [oneInput [("txid", String goodTxid), ("vout", Number 0)],
+               object [], Number 4294967295])
+    resError resp `shouldBe` Null
+
   -- Core ignores a NON-numeric sequence rather than erroring
   -- (rawtransaction_util.cpp: `if (sequenceObj.isNum())`).  Pinned so a
   -- later "tighten everything" pass cannot silently diverge from Core.

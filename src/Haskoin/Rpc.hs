@@ -6743,15 +6743,20 @@ handleListDescriptors server params = withWalletMgr server $ \wm -> do
 -- Returns:
 --   Base64-encoded PSBT string
 handleCreatePsbt :: RpcServer -> Value -> IO RpcResponse
-handleCreatePsbt _server params = do
+handleCreatePsbt server params = case parseLocktimeArg params of
+  Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  Right _ -> handleCreatePsbtChecked server params
+
+handleCreatePsbtChecked :: RpcServer -> Value -> IO RpcResponse
+handleCreatePsbtChecked _server params = do
   case (extractParamArray params 0, extractParamArray params 1) of
     (Nothing, _) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing inputs parameter") Null
     (_, Nothing) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
     (Just inputsArr, Just outputsArr) -> do
-      -- Parse locktime (optional, default 0)
-      let locktime = fromMaybe 0 (extractParam params 2 :: Maybe Word32)
+      -- Validated by the guard in handleCreatePsbt; Left is unreachable here.
+      let locktime = either (const 0) id (parseLocktimeArg params)
 
       -- Parse inputs
       case parseInputs (V.toList inputsArr) of
@@ -7963,7 +7968,12 @@ analyzePsbtToJSON psbt =
 -- Returns:
 --   {"psbt": <base64>, "fee": <btc>, "changepos": <int>}
 handleWalletCreateFundedPsbt :: RpcServer -> Value -> IO RpcResponse
-handleWalletCreateFundedPsbt server params = withWalletMgr server $ \wm -> do
+handleWalletCreateFundedPsbt server params = case parseLocktimeArg params of
+  Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  Right _ -> handleWalletCreateFundedPsbtChecked server params
+
+handleWalletCreateFundedPsbtChecked :: RpcServer -> Value -> IO RpcResponse
+handleWalletCreateFundedPsbtChecked server params = withWalletMgr server $ \wm -> do
   case (extractParamArray params 0, extractParamArray params 1) of
     (Nothing, _) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing inputs parameter") Null
@@ -7976,7 +7986,8 @@ handleWalletCreateFundedPsbt server params = withWalletMgr server $ \wm -> do
           (toJSON $ RpcError rpcWalletNotFound
             "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
         Just walletState -> do
-          let locktime = fromMaybe 0 (extractParam params 2 :: Maybe Word32)
+          -- Validated by the guard in handleWalletCreateFundedPsbt.
+          let locktime = either (const 0) id (parseLocktimeArg params)
               -- Parse optional fee rate from options (sat/vB).  Default to
               -- 10 sat/vB to mirror Core's smart-fee fallback when no
               -- estimator is configured.
@@ -9353,11 +9364,47 @@ rpcInvalidAddressOrKey = -5
 --   replaceable (optional): BIP125 replaceable flag
 -- Returns:
 --   Hex-encoded raw transaction
+-- | Core ConstructTransaction's locktime check (rawtransaction_util.cpp:151-155).
+--
+-- Shared by createrawtransaction / createpsbt / walletcreatefundedpsbt, all
+-- three of which read the locktime from param 2 and all three of which used
+--
+-- > fromMaybe 0 (extractParam params 2 :: Maybe Word32)
+--
+-- so a NEGATIVE or oversized locktime failed the Word32 parse, became
+-- 'Nothing', and was silently replaced by 0.  On the live mainnet node,
+-- @createrawtransaction [...] {} -1@ returned a transaction with
+-- nLockTime = 0 and no error; Core rejects it with -8 "Invalid parameter,
+-- locktime out of range".  Same fabrication shape as the dropped input:
+-- a value the caller supplied, quietly replaced by a default it never asked
+-- for.
+--
+-- LOCKTIME_MAX is 0xFFFFFFFF.  Core checks locktime BEFORE parsing inputs,
+-- so callers must too.
+parseLocktimeArg :: Value -> Either (Int, Text) Word32
+parseLocktimeArg params = case rawParamAt params 2 of
+  Nothing -> Right 0
+  Just (Number n) -> case toBoundedInteger n :: Maybe Int64 of
+    Nothing -> Left (rpcMiscError, "JSON integer out of range")
+    Just i
+      | i < 0 || i > 4294967295 ->
+          Left (rpcInvalidParameter, "Invalid parameter, locktime out of range")
+      | otherwise -> Right (fromIntegral i)
+  -- Core: getInt<int64_t>() on a non-number throws from checkType, which the
+  -- RPC layer reports as RPC_MISC_ERROR.
+  Just _ -> Left (rpcMiscError, "JSON value is not an integer as expected")
+
 handleCreateRawTransaction :: RpcServer -> Value -> IO RpcResponse
-handleCreateRawTransaction _server params = do
+handleCreateRawTransaction server params = case parseLocktimeArg params of
+  Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  Right _ -> handleCreateRawTransactionChecked server params
+
+handleCreateRawTransactionChecked :: RpcServer -> Value -> IO RpcResponse
+handleCreateRawTransactionChecked _server params = do
   let mInputs = extractParamArray params 0
       mOutputs = rawParamAt params 1   -- OBJECT or ARRAY (Core NormalizeOutputs)
-      locktime = fromMaybe 0 (extractParam params 2 :: Maybe Word32)
+      -- Validated by the guard above; the Left case cannot be reached here.
+      locktime = either (const 0) id (parseLocktimeArg params)
       -- Core ConstructTransaction receives rbf as std::optional<bool>;
       -- createrawtransaction's RPCArg defaults to true and passes std::nullopt
       -- when the arg is ABSENT. AddInputs then does rbf.value_or(true), so BOTH
