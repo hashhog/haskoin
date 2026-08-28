@@ -94,6 +94,7 @@ import qualified Haskoin.Index as Index
 import qualified Haskoin.MuHash as MuHash
 import qualified PrioritiseTransactionSpec
 import qualified ParseHashVSpec
+import qualified CreateRawTxDropSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
@@ -23411,6 +23412,10 @@ main = hspec $ do
 
   -- ParseHashV: malformed txid/blockhash -> -8 (Core v31.99 parity)
   ParseHashVSpec.spec
+
+  -- createrawtransaction: a malformed input is REJECTED, never dropped
+  -- (the fabrication failure mode -- see the module header).
+  CreateRawTxDropSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)
   W126BIP152CompactBlocksSpec.spec

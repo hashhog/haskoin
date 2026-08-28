@@ -57,6 +57,8 @@ module Haskoin.Rpc
     -- * Hash-argument parsing (Core ParseHashV — exported for testing)
   , parseHash
   , parseHashV
+    -- * Raw-transaction construction (exported for testing)
+  , handleCreateRawTransaction
     -- * Transaction Error Codes
   , rpcDeserializationError
   , rpcVerifyError
@@ -9378,24 +9380,73 @@ handleCreateRawTransaction _server params = do
     (_, Nothing) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
     (Just inputsArr, Just outputsVal) -> do
-      -- Parse inputs
-      let parseInput v = do
-            txidHex <- v .:: "txid" :: Maybe Text
-            vout <- v .:: "vout" :: Maybe Word32
-            let seqNum = case v .:: "sequence" :: Maybe Word32 of
-                  Just s -> s
-                  Nothing -> defaultSequence
+      -- Parse inputs.  parseInput returns Either so that a malformed input is
+      -- REPORTED, never dropped.
+      --
+      -- It used to return Maybe and the caller used `mapMaybe`, which DISCARDS
+      -- whatever could not be parsed.  createrawtransaction with vout:-1 then
+      -- returned SUCCESS with the outpoint simply missing: haskoin answered
+      -- 02000000000000000000 -- version 2, ZERO inputs -- to a request naming
+      -- one input, where Core rejects with RPC_INVALID_PARAMETER (-8)
+      -- "Invalid parameter, vout cannot be negative".  Handing back a
+      -- transaction that spends nothing, with no error, is the fabrication
+      -- failure mode: a plausible result manufactured from input we could not
+      -- honour.  (`vout` parsed as Word32, so any negative value yielded
+      -- Nothing.)  An out-of-range `sequence` had the same shape one step
+      -- further on -- it fell back to defaultSequence instead of erroring.
+      -- Found 2026-08-28 by the fleet sweep that began with clearbit's
+      -- unchecked-cast node-kill; haskoin was the silent-accept twin.
+      --
+      -- Codes and wording mirror Core AddInputs (rpc/rawtransaction_util.cpp
+      -- lines 33-70) and ParseHashV (rpc/util.cpp lines 117-125).
+      let parseInput :: Value -> Either (Int, Text) TxIn
+          parseInput v = do
+            txidHex <- case v .:: "txid" :: Maybe Text of
+              Just t  -> Right t
+              Nothing -> Left (rpcMiscError,
+                "JSON value of type null is not of expected type string")
             txidBs <- case B16.decode (TE.encodeUtf8 txidHex) of
-              Left _ -> Nothing
-              Right bs | BS.length bs == 32 -> Just (BS.reverse bs)
-                       | otherwise -> Nothing
-            Just TxIn
+              Right bs | BS.length bs == 32 -> Right (BS.reverse bs)
+              _ | T.length txidHex /= 64 -> Left (rpcInvalidParameter,
+                      "txid must be of length 64 (not "
+                      <> T.pack (show (T.length txidHex)) <> ", for '"
+                      <> txidHex <> "')")
+                | otherwise -> Left (rpcInvalidParameter,
+                      "txid must be hexadecimal string (not '" <> txidHex <> "')")
+            -- Core reads vout with getInt<int>: not-a-number -> "missing vout
+            -- key", negative -> "vout cannot be negative", beyond int32 ->
+            -- univalue's own "JSON integer out of range" at RPC_MISC_ERROR.
+            voutRaw <- case rawField v "vout" of
+              Just (Number n) -> Right n
+              _ -> Left (rpcInvalidParameter, "Invalid parameter, missing vout key")
+            -- Core's `int` is 32-bit and univalue's from_chars fails on
+            -- anything that does not fit it OR is not integral, so the range
+            -- error fires BEFORE the negative check.  Haskell's Int is
+            -- 64-bit, so the int32 bound has to be written out; using Int
+            -- here silently accepted vout = 2^31 (caught by the pin).
+            vout <- case toBoundedInteger voutRaw :: Maybe Int64 of
+              Nothing -> Left (rpcMiscError, "JSON integer out of range")
+              Just n
+                | n < -2147483648 || n > 2147483647 ->
+                    Left (rpcMiscError, "JSON integer out of range")
+                | n < 0 -> Left (rpcInvalidParameter,
+                    "Invalid parameter, vout cannot be negative")
+                | otherwise -> Right (fromIntegral n :: Word32)
+            -- Core only range-checks `sequence` when it IS a number; a
+            -- non-numeric sequence is ignored and the default applies.
+            seqNum <- case rawField v "sequence" of
+              Just (Number sn) -> case toBoundedInteger sn :: Maybe Int64 of
+                Just s | s >= 0 && s <= 4294967295 -> Right (fromIntegral s :: Word32)
+                _ -> Left (rpcInvalidParameter,
+                       "Invalid parameter, sequence number is out of range")
+              _ -> Right defaultSequence
+            Right TxIn
               { txInPrevOutput = OutPoint (TxId (Hash256 txidBs)) vout
               , txInScript = BS.empty
               , txInSequence = seqNum
               }
 
-      let inputs = mapMaybe parseInput (V.toList inputsArr)
+      let eInputs = mapM parseInput (V.toList inputsArr)
 
       -- Normalize outputs: Core NormalizeOutputs accepts EITHER an object
       -- {address:amount,...,"data":hex} OR an array of single-key objects
@@ -9442,21 +9493,31 @@ handleCreateRawTransaction _server params = do
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams
             "Invalid parameter, output argument must be an object or array") Null
-        Just normOutputs -> do
-          let outputs = mapMaybe parseOutput normOutputs
+        Just normOutputs -> case eInputs of
+          Left (code, msg) -> return $ RpcResponse Null
+            (toJSON $ RpcError code msg) Null
+          Right inputs -> do
+            let outputs = mapMaybe parseOutput normOutputs
 
-          -- Build the transaction (version 2, unsigned -> legacy serialization).
-          let tx = Tx
-                { txVersion = 2
-                , txInputs = inputs
-                , txOutputs = outputs
-                , txWitness = []
-                , txLockTime = locktime
-                }
-              hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
+            -- Build the transaction (version 2, unsigned -> legacy serialization).
+            let tx = Tx
+                  { txVersion = 2
+                  , txInputs = inputs
+                  , txOutputs = outputs
+                  , txWitness = []
+                  , txLockTime = locktime
+                  }
+                hexTx = TE.decodeUtf8 $ B16.encode $ S.encode tx
 
-          return $ RpcResponse (toJSON hexTx) Null Null
+            return $ RpcResponse (toJSON hexTx) Null Null
   where
+    -- Raw (unconverted) lookup of a field on a JSON object, so callers can
+    -- tell "absent / wrong type" apart from "present but out of range" --
+    -- a distinction (.::) erases by collapsing both to Nothing.
+    rawField :: Value -> Text -> Maybe Value
+    rawField (Object obj) key = KM.lookup (Key.fromText key) obj
+    rawField _ _ = Nothing
+
     (.::) :: FromJSON a => Value -> Text -> Maybe a
     (.::) (Object obj) key = case KM.lookup (Key.fromText key) obj of
       Nothing -> Nothing
