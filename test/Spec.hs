@@ -95,6 +95,7 @@ import qualified Haskoin.MuHash as MuHash
 import qualified PrioritiseTransactionSpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
+import qualified RpcIntArgBoundsSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
@@ -23416,6 +23417,7 @@ main = hspec $ do
   -- createrawtransaction: a malformed input is REJECTED, never dropped
   -- (the fabrication failure mode -- see the module header).
   CreateRawTxDropSpec.spec
+  RpcIntArgBoundsSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)
   W126BIP152CompactBlocksSpec.spec

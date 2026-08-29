@@ -203,6 +203,11 @@ module Haskoin.Rpc
   , handleWaitForNewBlock
   , handleWaitForBlock
   , handleWaitForBlockHeight
+    -- * #81 round 2: handlers whose integer arguments are bounded at Core's
+    --   width (getInt<T>) — exported for testing
+  , handleEstimateSmartFee
+  , handleGetNodeAddresses
+  , handleCreatePsbt
     -- * -rpcallowip IP allowlist enforcement (BUG-6 FIX, exported for testing)
     -- Core parity: ClientAllowed (httpserver.cpp:137-145).
   , checkAllowIp
@@ -6046,10 +6051,22 @@ addressToScript addr = case addr of
 -- | Estimate smart fee for confirmation in N blocks
 handleEstimateSmartFee :: RpcServer -> Value -> IO RpcResponse
 handleEstimateSmartFee server params = do
-  case extractParam params 0 of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Missing conf_target") Null
-    Just (confTarget :: Int) -> do
+  -- Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with getInt<int>
+  -- and then REJECTS anything outside [1, HighestTargetTracked] -- it does not
+  -- clamp -- and estimate_mode is validated by FeeModeFromString. Neither was
+  -- checked here, so any conf_target and any mode got an estimate.
+  let confTargetOrErr = case rawParamAt params 0 of
+        Nothing   -> Left (rpcInvalidParams, "Missing conf_target")
+        Just Null -> Left (rpcInvalidParams, "Missing conf_target")
+        Just v    -> case parseCoreInt32 v of
+          Left e -> Left e
+          Right t
+            | t < 1 || t > 1008 ->
+                Left (rpcInvalidParameter, "Invalid conf_target, must be between 1 and 1008")
+            | otherwise -> Right t
+  case (,) <$> confTargetOrErr <*> checkEstimateMode params 1 of
+   Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+   Right (confTarget, ()) -> do
       (feeRate, blocks) <- estimateSmartFee (rsFeeEst server) confTarget FeeConservative
       if feeRate <= 0
         then return $ RpcResponse (object
@@ -6769,7 +6786,15 @@ handleListDescriptors server params = withWalletMgr server $ \wm -> do
 -- Returns:
 --   Base64-encoded PSBT string
 handleCreatePsbt :: RpcServer -> Value -> IO RpcResponse
-handleCreatePsbt server params = case parseLocktimeArg params of
+-- Core builds createrawtransaction AND createpsbt from one ConstructTransaction
+-- (rawtransaction_util.cpp), so createpsbt takes the same 5th @version@
+-- argument under the same [1,3] bound. Only createrawtransaction checked it.
+handleCreatePsbt server params = case parseVersionArg params of
+  Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+  Right _ -> handleCreatePsbtLocktimeChecked server params
+
+handleCreatePsbtLocktimeChecked :: RpcServer -> Value -> IO RpcResponse
+handleCreatePsbtLocktimeChecked server params = case parseLocktimeArg params of
   Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
   Right _ -> handleCreatePsbtChecked server params
 
@@ -9440,6 +9465,51 @@ parseLocktimeArg params = case rawParamAt params 2 of
 -- Haskell's 'Int' is 64-bit here, so bounding through it would silently accept
 -- values Core's 32-bit parse refuses; the explicit uint32 comparison below is
 -- what actually enforces Core's range.
+-- | Read a numeric RPC argument the way Core's @UniValue::getInt<int>()@ does.
+--
+-- Core parses the raw JSON token with @std::from_chars@ INTO THE DESTINATION
+-- WIDTH, so the width check lives inside the CONVERSION and fires BEFORE the
+-- handler's own domain test: out of width is RPC_MISC_ERROR (-1)
+-- \"JSON integer out of range\", and only values that survive reach a -8 range
+-- check.
+--
+-- Haskell's 'Int' is SIXTY-FOUR bits, so @toBoundedInteger n :: Maybe Int@
+-- happily accepts 2147483648 and every handler below then acted on it. This is
+-- the bound Core's @int@ actually imposes.
+parseCoreInt32 :: Value -> Either (Int, Text) Int
+parseCoreInt32 v = case v of
+  Number n -> case toBoundedInteger n :: Maybe Int of
+    Nothing -> Left (rpcMiscError, "JSON integer out of range")
+    Just i
+      | i < -2147483648 || i > 2147483647 ->
+          Left (rpcMiscError, "JSON integer out of range")
+      | otherwise -> Right i
+  other -> Left ( rpcTypeError
+                , "JSON value of type " <> jsonTypeName other
+                  <> " is not of expected type number" )
+
+-- | 'parseCoreInt32' for an optional positional argument with a default.
+parseCoreInt32At :: Value -> Int -> Int -> Either (Int, Text) Int
+parseCoreInt32At params idx def = case rawParamAt params idx of
+  Nothing   -> Right def
+  Just Null -> Right def
+  Just v    -> parseCoreInt32 v
+
+-- | Core validates estimate_mode with @FeeModeFromString@
+-- (common/messages.cpp), comparing after @ToUpper@, so the match is
+-- case-insensitive and anything else is RPC_INVALID_PARAMETER.
+checkEstimateMode :: Value -> Int -> Either (Int, Text) ()
+checkEstimateMode params idx = case rawParamAt params idx of
+  Nothing   -> Right ()
+  Just Null -> Right ()
+  Just (String m)
+    | T.toUpper m `elem` ["UNSET", "ECONOMICAL", "CONSERVATIVE"] -> Right ()
+    | otherwise -> Left ( rpcInvalidParameter
+                        , "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"" )
+  Just other -> Left ( rpcTypeError
+                     , "JSON value of type " <> jsonTypeName other
+                       <> " is not of expected type string" )
+
 parseVersionArg :: Value -> Either (Int, Text) Word32
 parseVersionArg params = case rawParamAt params 4 of
   Nothing -> Right 2
@@ -11064,10 +11134,14 @@ sockAddrNetworkName _ = "not_publicly_routable"
 
 handleGetNodeAddresses :: RpcServer -> Value -> IO RpcResponse
 handleGetNodeAddresses server params = do
-  let mCount = extractParam params 0 :: Maybe Int
-      count  = fromMaybe 1 mCount
-      mNetwork = extractParamText params 1
-  if count < 0
+  let mNetwork = extractParamText params 1
+  -- Core: getInt<int> BEFORE the handler's own -8 range test, so an
+  -- out-of-int32 count fails the CONVERSION (-1) while an in-range negative
+  -- one reaches the domain error (-8).
+  case parseCoreInt32At params 0 1 of
+   Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+   Right count ->
+    if count < 0
     then return $ RpcResponse Null
            (toJSON $ RpcError rpcInvalidParameter "Address count out of range") Null
     else case mNetwork of
@@ -11414,21 +11488,21 @@ handleWaitForBlockHeight server params = do
   case mHeightParam of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
-    Just (Number n) ->
-      case toBoundedInteger n :: Maybe Int of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcTypeError
-            "JSON value of type number is not of expected type integer") Null
-        Just targetHeight -> do
+    Just hv@(Number _) ->
+      -- getInt<int> is a THIRTY-TWO bit parse; Haskell's Int is 64-bit, so
+      -- without this bound the node waited on a height Core rejects outright.
+      case parseCoreInt32 hv of
+        Left (code, msg) -> return $ RpcResponse Null
+          (toJSON $ RpcError code msg) Null
+        Right targetHeight -> do
           -- Parse timeout (param[1]).
           timeoutResult <- case rawParamAt params 1 of
             Nothing           -> return (Right 0)
-            Just (Number n')  -> case toBoundedInteger n' :: Maybe Int of
-              Just ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
-              Just ms           -> return $ Right ms
-              Nothing           -> return $ Left $
-                RpcError rpcTypeError
-                  "JSON value of type number is not of expected type integer"
+            Just tv@(Number _) -> case parseCoreInt32 tv of
+              -- The width check runs BEFORE the negative-timeout test.
+              Left (code, msg) -> return $ Left $ RpcError code msg
+              Right ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
+              Right ms -> return $ Right ms
             Just other -> return $ Left $
               RpcError rpcTypeError
                 ("JSON value of type " <> jsonTypeName other
