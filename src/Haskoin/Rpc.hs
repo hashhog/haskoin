@@ -9420,10 +9420,46 @@ parseLocktimeArg params = case rawParamAt params 2 of
   -- RPC layer reports as RPC_MISC_ERROR.
   Just _ -> Left (rpcMiscError, "JSON value is not an integer as expected")
 
+-- | Core's @version@ argument for the createrawtransaction family.
+--
+-- Core reads it as @self.Arg\<uint32_t\>("version")@ -- a THIRTY-TWO BIT
+-- UNSIGNED parse, unlike the int32 used for @vout@ -- then bounds it against
+-- [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+-- (policy\/policy.h:152-153) inside ConstructTransaction
+-- (rawtransaction_util.cpp:158-161) and ASSIGNS it to the transaction.
+--
+-- The UNSIGNED width is what decides which error you get: 2147483648 fits a
+-- uint32, survives the conversion and reaches the DOMAIN error (-8), while -1
+-- and 4294967296 fail the CONVERSION first (-1).
+--
+-- Absent means Core's DEFAULT_RAWTX_VERSION (CTransaction::CURRENT_VERSION =
+-- 2), which these handlers used to hardcode unconditionally -- so a caller
+-- asking for version 3 received a version 2 transaction and a success reply.
+--
+-- NOTE ON WIDTH: 'toBoundedInteger' is asked for an 'Int64', not an 'Int'.
+-- Haskell's 'Int' is 64-bit here, so bounding through it would silently accept
+-- values Core's 32-bit parse refuses; the explicit uint32 comparison below is
+-- what actually enforces Core's range.
+parseVersionArg :: Value -> Either (Int, Text) Word32
+parseVersionArg params = case rawParamAt params 4 of
+  Nothing -> Right 2
+  Just Null -> Right 2
+  Just (Number n) -> case toBoundedInteger n :: Maybe Int64 of
+    Nothing -> Left (rpcMiscError, "JSON integer out of range")
+    Just i
+      | i < 0 || i > 4294967295 ->
+          Left (rpcMiscError, "JSON integer out of range")
+      | i < 1 || i > 3 ->
+          Left (rpcInvalidParameter, "Invalid parameter, version out of range(1~3)")
+      | otherwise -> Right (fromIntegral i)
+  Just _ -> Left (rpcMiscError, "JSON value is not an integer as expected")
+
 handleCreateRawTransaction :: RpcServer -> Value -> IO RpcResponse
 handleCreateRawTransaction server params = case parseLocktimeArg params of
   Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
-  Right _ -> handleCreateRawTransactionChecked server params
+  Right _ -> case parseVersionArg params of
+    Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+    Right _ -> handleCreateRawTransactionChecked server params
 
 handleCreateRawTransactionChecked :: RpcServer -> Value -> IO RpcResponse
 handleCreateRawTransactionChecked _server params = do
@@ -9431,6 +9467,8 @@ handleCreateRawTransactionChecked _server params = do
       mOutputs = rawParamAt params 1   -- OBJECT or ARRAY (Core NormalizeOutputs)
       -- Validated by the guard above; the Left case cannot be reached here.
       locktime = either (const 0) id (parseLocktimeArg params)
+      -- Validated by the guard above; the Left case cannot be reached here.
+      txVersionArg = either (const 2) id (parseVersionArg params)
       -- Core ConstructTransaction receives rbf as std::optional<bool>;
       -- createrawtransaction's RPCArg defaults to true and passes std::nullopt
       -- when the arg is ABSENT. AddInputs then does rbf.value_or(true), so BOTH
@@ -9588,7 +9626,7 @@ handleCreateRawTransactionChecked _server params = do
 
             -- Build the transaction (version 2, unsigned -> legacy serialization).
             let tx = Tx
-                  { txVersion = 2
+                  { txVersion = fromIntegral txVersionArg
                   , txInputs = inputs
                   , txOutputs = outputs
                   , txWitness = []

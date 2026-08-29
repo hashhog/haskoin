@@ -97,6 +97,7 @@ spec :: Spec
 spec = do
   dropSpec
   rbfContradictionSpec
+  versionSpec
 
 dropSpec :: Spec
 dropSpec = describe "createrawtransaction: malformed input is rejected, not dropped" $ do
@@ -432,3 +433,116 @@ rbfContradictionSpec =
       expectSequences resp [0xffffffff]
       resp2 <- callRbf (oneInput [("txid", String goodTxid), ("vout", Number 0)]) Null
       expectSequences resp2 [0xfffffffd]
+
+-- ---------------------------------------------------------------------------
+-- createrawtransaction must HONOUR the `version` argument, not ignore it.
+--
+-- THE DEFECT.  Core's createrawtransaction takes a 5th argument, `version`
+-- (rpc/rawtransaction.cpp:122), reads it as self.Arg<uint32_t>("version"),
+-- bounds it to [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+-- (policy/policy.h:152-153) and ASSIGNS it (rawtransaction_util.cpp:158-161).
+--
+-- haskoin hardcoded `txVersion = 2` and ignored the argument. Asked for
+-- version 1, 2 or 3 it returned 02000000 every time, and version 4 -- which
+-- Core rejects -- was accepted. A success reply for a request that was not
+-- honoured. Version 3 is TRUC (BIP 431), so a caller who asked for v3 and got
+-- v2 holds a transaction with different relay behaviour than the one
+-- requested, with nothing in the reply saying so.
+--
+-- THE UNSIGNED WIDTH DECIDES WHICH ERROR YOU GET: `version` is uint32, unlike
+-- the int32 used for vout, so 2147483648 survives the conversion and reaches
+-- the DOMAIN error (-8), while -1 and 4294967296 fail the CONVERSION first
+-- (-1). Both directions are asserted below.
+--
+-- A HASKELL-SPECIFIC HAZARD: `Int` here is 64-bit where Core's `int` is 32, so
+-- bounding through `Int` would silently accept values Core refuses. The parser
+-- compares against the uint32 range explicitly; the 2^32 case is what pins it.
+--
+-- THE ASSERTIONS DECODE THE VERSION BYTES from the returned hex. Checking only
+-- that the call was accepted is exactly the pre-fix behaviour.
+
+-- | createrawtransaction with an explicit version argument.
+callWithVersion :: Maybe Value -> IO RpcResponse
+callWithVersion mv =
+  handleCreateRawTransaction (error "RpcServer must not be touched") $
+    case mv of
+      Nothing -> toJSON [inputs, object [], Number 0, Bool False]
+      Just v  -> toJSON [inputs, object [], Number 0, Bool False, v]
+  where
+    inputs = oneInput [("txid", String goodTxid), ("vout", Number 0)]
+
+-- | The transaction version is the first 4 bytes of the hex, little-endian.
+versionOf :: RpcResponse -> IO Int
+versionOf resp = case resResult resp of
+  String h | T.length h >= 8 ->
+    let byteAt i = case readHexByte (T.take 2 (T.drop (i * 2) h)) of
+                     Just b  -> b
+                     Nothing -> 0
+    in return (byteAt 0 + byteAt 1 * 256 + byteAt 2 * 65536 + byteAt 3 * 16777216)
+  other -> do
+    expectationFailure ("expected a transaction hex, got result=" ++ show other
+                        ++ " error=" ++ show (resError resp))
+    return 0
+  where
+    readHexByte t = case T.unpack t of
+      [a, b] -> (\x y -> x * 16 + y) <$> hexDigit a <*> hexDigit b
+      _      -> Nothing
+    hexDigit c
+      | c >= '0' && c <= '9' = Just (fromEnum c - fromEnum '0')
+      | c >= 'a' && c <= 'f' = Just (fromEnum c - fromEnum 'a' + 10)
+      | c >= 'A' && c <= 'F' = Just (fromEnum c - fromEnum 'A' + 10)
+      | otherwise            = Nothing
+
+versionSpec :: Spec
+versionSpec = describe "createrawtransaction: the version argument is honoured" $ do
+
+  -- THE REGRESSION. At the parent commit all three returned 02000000.
+  it "versions 1, 2 and 3 are emitted, not forced to 2" $
+    mapM_ (\want -> do
+             resp <- callWithVersion (Just (Number (fromIntegral (want :: Int))))
+             got <- versionOf resp
+             got `shouldBe` want)
+          [1, 2, 3]
+
+  it "version 0 -> -8 out of range(1~3)" $ do
+    resp <- callWithVersion (Just (Number 0))
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcInvalidParameter
+    msg `shouldBe` "Invalid parameter, version out of range(1~3)"
+
+  it "version 4 -> -8 out of range(1~3), NOT accepted" $ do
+    resp <- callWithVersion (Just (Number 4))
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcInvalidParameter
+    msg `shouldBe` "Invalid parameter, version out of range(1~3)"
+    resResult resp `shouldBe` Null
+
+  it "version 2147483648 fits uint32 -> DOMAIN error (-8), not -1" $ do
+    resp <- callWithVersion (Just (Number 2147483648))
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcInvalidParameter
+    msg `shouldBe` "Invalid parameter, version out of range(1~3)"
+
+  it "version 4294967296 is outside uint32 -> CONVERSION error (-1), not -8" $ do
+    resp <- callWithVersion (Just (Number 4294967296))
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcMiscError
+    msg `shouldBe` "JSON integer out of range"
+
+  it "version -1 is outside uint32 -> CONVERSION error (-1)" $ do
+    resp <- callWithVersion (Just (Number (-1)))
+    (code, msg) <- errorOf resp
+    code `shouldBe` rpcMiscError
+    msg `shouldBe` "JSON integer out of range"
+
+  -- CONTROLS. Without these a handler that rejected every version would
+  -- satisfy every rejection above.
+  it "CONTROL absent version defaults to 2 (Core DEFAULT_RAWTX_VERSION)" $ do
+    resp <- callWithVersion Nothing
+    got <- versionOf resp
+    got `shouldBe` 2
+
+  it "CONTROL explicit null version defaults to 2" $ do
+    resp <- callWithVersion (Just Null)
+    got <- versionOf resp
+    got `shouldBe` 2
