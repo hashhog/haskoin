@@ -5487,13 +5487,35 @@ handleSubmitBlockUnpaused server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing block hex") Null
     Just hexBlock -> do
+      -- Core DecodeHexBlk (rpc/mining.cpp:1079-1081).  BOTH arms below are
+      -- the same Core call: DecodeHexBlk does IsHex() + deserialize and
+      -- returns a bare bool, so submitblock answers either failure with the
+      -- identical error:
+      --     throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Block decode failed");
+      -- Two divergences lived here:
+      --   1. code rpcMiscError (-1) where Core uses
+      --      rpcDeserializationError (-22);
+      --   2. cereal's decoder text was appended to the message.  Core never
+      --      leaks it — the std::ios_base::failure from ReadCompactSize
+      --      ("non-canonical ReadCompactSize()", serialize.h:344/:350/:356)
+      --      is swallowed by DecodeHexBlk.
+      -- (2) is what the diff-test normalizer read as reject:non-canonical
+      -- against Core's reject:block-decode-failed on all 4 rows of corpus
+      -- _tierc-guards-2026-07-06/C1-noncanonical-compactsize.  Both nodes
+      -- REJECTED and the tip never moved: R2 reason parity, not a split.
+      -- Identical ladder to handleSubmitHeader's -22
+      -- "Block header decode failed" arm below.
       case B16.decode (TE.encodeUtf8 hexBlock) of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcMiscError (T.pack $ "Hex decode error: " ++ err)) Null
+        Left err -> do
+          hPutStrLn stderr $ "submitblock: hex decode failed: " ++ err
+          return $ RpcResponse Null
+            (toJSON $ RpcError rpcDeserializationError "Block decode failed") Null
         Right blockBytes -> do
           case S.decode blockBytes of
-            Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError (T.pack $ "Block decode error: " ++ err)) Null
+            Left err -> do
+              hPutStrLn stderr $ "submitblock: block decode failed: " ++ err
+              return $ RpcResponse Null
+                (toJSON $ RpcError rpcDeserializationError "Block decode failed") Null
             Right block -> do
               result <- submitBlock (rsNetwork server) (rsDB server)
                           (rsHeaderChain server) (rsUTXOCache server)
