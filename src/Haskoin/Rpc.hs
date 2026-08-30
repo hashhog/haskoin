@@ -202,6 +202,15 @@ module Haskoin.Rpc
     --   waitforblockheight) — exported for testing
   , handleWaitForNewBlock
   , handleWaitForBlock
+  -- #41: exported so the conversion-before-lookup pins can drive the real
+  -- handlers.  Each of these validates its integer argument BEFORE any
+  -- RpcServer field is forced, which is what lets the specs pass 'noServer'
+  -- and prove the ordering rather than assume it.
+  , handleGetBlockHash
+  , handleGetBlock
+  , handleGetTxOut
+  , handleGetRawTransaction
+  , handleWaitForNewBlock
   , handleWaitForBlockHeight
     -- * #81 round 2: handlers whose integer arguments are bounded at Core's
     --   width (getInt<T>) — exported for testing
@@ -2073,12 +2082,24 @@ handleGetSyncState server = do
 -- @m_chainman->ActiveChain()[nHeight]@.
 handleGetBlockHash :: RpcServer -> Value -> IO RpcResponse
 handleGetBlockHash server params = do
-  case extractParam params 0 of
+  -- Core reads height as getInt<int> (rpc/blockchain.cpp).  haskoin read it
+  -- as a Word32, so an out-of-int32 height failed the PARSE and was reported
+  -- as "Missing height parameter" (-32602) -- an argument that was supplied
+  -- reported as absent.  Core answers -1 "JSON integer out of range" from
+  -- inside the conversion, before the range test below.
+  case rawParamAt params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
-    Just height -> do
+    Just Null -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
+    Just raw -> case parseCoreInt32 raw of
+     Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+     Right heightI -> do
       tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-      if height > ceHeight tip
+      let height = fromIntegral (max 0 heightI) :: Word32
+      -- The signed half of Core's guard is now REACHABLE: parseCoreInt32
+      -- returns an Int, so a negative height is -8 rather than a parse miss.
+      if heightI < 0 || height > ceHeight tip
         -- Core parity: getblockhash height-out-of-range throws
         -- RPC_INVALID_PARAMETER (-8), not RPC_MISC_ERROR (-1).  See
         -- bitcoin-core/src/rpc/blockchain.cpp getblockhash:
@@ -2086,9 +2107,6 @@ handleGetBlockHash server params = do
         --       throw JSONRPCError(RPC_INVALID_PARAMETER, "Block height out of range");
         -- (protocol.h RPC_INVALID_PARAMETER = -8).  Message text matches Core
         -- exactly.  W125 G29 / BUG-3 cross-impl; mirrors rustoshi ee86d76.
-        -- (haskoin parses 'height' as Word32 upstream, so the signed
-        -- 'nHeight < 0' half of Core's guard is unreachable here — a negative
-        -- arg fails 'extractParam' and is rejected before this point.)
         then return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParameter "Block height out of range") Null
         else do
@@ -2332,106 +2350,110 @@ handleGetBlock server params = do
       case parseHashV "blockhash" hexHash of
         Left err -> return $ RpcResponse Null (toJSON err) Null
         Right bh -> do
-          let verbosity = fromMaybe 1 (extractParam params 1 :: Maybe Int)
-          mBlock <- getBlock (rsDB server) bh
-          case mBlock of
-            Nothing -> do
-              -- Block body not in local storage — proxy to Bitcoin Core.
-              mRaw <- fetchGetBlockFromCore hexHash verbosity
-              case mRaw of
-                Nothing  -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
-                Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
-            Just block -> do
-              if verbosity == 0
-                then do
-                  let rawHex = TE.decodeUtf8 $ B16.encode (S.encode block)
-                  return $ RpcResponse (toJSON rawHex) Null Null
-                else do
-                  -- Build Core-parity verbose response from local block.
-                  entries  <- readTVarIO (hcEntries (rsHeaderChain server))
-                  byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
-                  tip      <- readTVarIO (hcTip (rsHeaderChain server))
-                  let net      = rsNetwork server
-                      header   = blockHeader block
-                      mEntry   = Map.lookup bh entries
-                      height   = maybe 0 ceHeight mEntry
-                      tipH     = ceHeight tip
-                      -- confirmations: tipH-height+1 when on the active chain,
-                      -- else -1 (Core ComputeNextBlockAndDepth).
-                      onActive = Map.lookup height byHeight == Just bh
-                      confs    = if onActive
-                                   then fromIntegral tipH - fromIntegral height + 1
-                                   else -1 :: Int
-                      bits     = bhBits header
-                      cwStr    = maybe (T.replicate 64 "0") (showHex64 . ceChainWork) mEntry
-                      mTime    = medianTimePast entries bh
-                      verHex   = T.pack $ printf "%08x"
-                                   (fromIntegral (bhVersion header) :: Word32)
-                      -- previousblockhash: omitted for genesis (no parent).
-                      mPrevBh  = case mEntry of
-                                   Just ce -> cePrev ce
-                                   Nothing -> let p = bhPrevBlock header
-                                              in if p == BlockHash (Hash256 (BS.replicate 32 0))
-                                                   then Nothing else Just p
-                      mNextBh  = if onActive then Map.lookup (height + 1) byHeight
-                                             else Nothing
-                      -- Block size metrics (Core formulas)
-                      stripped = blockBaseSize block   -- strippedsize: header+varint+legacy
-                      totSize  = blockTotalSize block  -- size: full serialization
-                      wt       = 3 * stripped + totSize  -- weight = 3*stripped + size (BIP141)
-                      nTx      = length (blockTxns block)
-                      coinbaseTxEnc = buildCoinbaseTxEnc block
-                  -- verbosity=2: per-tx entries with fee from undo data.
-                  -- verbosity>=3: same as v2 PLUS per-input "prevout"
-                  -- {generated, height, value, scriptPubKey} from undo data —
-                  -- Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT (blockchain.cpp
-                  -- getblock: any verbosity>2 maps to SHOW_DETAILS_AND_PREVOUT).
-                  txArrayEnc <- if verbosity >= 2
-                    then do
-                      mUndo <- getUndoData (rsDB server) bh
-                      let undoList = maybe [] (buTxUndo . udBlockUndo) mUndo
-                      return $ Just $ if verbosity >= 3
-                                        then buildBlockTxArrayEncV3 net block undoList
-                                        else buildBlockTxArrayEnc   net block undoList
-                    else return Nothing
-                  -- Core order (blockheaderToJSON then blockToJSON): hash,
-                  -- confirmations, height, version, versionHex, merkleroot, time,
-                  -- mediantime, nonce, bits, target, difficulty, chainwork, nTx,
-                  -- [previousblockhash], [nextblockhash], strippedsize, size,
-                  -- weight, coinbase_tx, tx.
-                  let enc =
-                        pair "hash"              (text (showHash bh))                               <>
-                        pair "confirmations"     (AE.int confs)                                    <>
-                        pair "height"            (AE.word32 height)                                 <>
-                        pair "version"           (AE.int (fromIntegral (bhVersion header) :: Int)) <>
-                        pair "versionHex"        (text verHex)                                      <>
-                        pair "merkleroot"        (text (showHash256 (bhMerkleRoot header)))         <>
-                        pair "time"              (AE.word32 (bhTimestamp header))                   <>
-                        pair "mediantime"        (AE.word32 mTime)                                  <>
-                        pair "nonce"             (AE.word32 (bhNonce header))                       <>
-                        pair "bits"              (text (showBits bits))                             <>
-                        pair "target"            (text (showHex64 (bitsToTarget bits)))             <>
-                        pair "difficulty"
-                          (unsafeToEncoding (stringUtf8 (difficultyStr bits)))                      <>
-                        pair "chainwork"         (text cwStr)                                       <>
-                        pair "nTx"               (AE.int nTx)                                       <>
-                        (case mPrevBh of
-                           Just ph -> pair "previousblockhash" (text (showHash ph))
-                           Nothing -> mempty)                                                       <>
-                        (case mNextBh of
-                           Just nh -> pair "nextblockhash" (text (showHash nh))
-                           Nothing -> mempty)                                                       <>
-                        pair "strippedsize"      (AE.int stripped)                                  <>
-                        pair "size"              (AE.int totSize)                                   <>
-                        pair "weight"            (AE.int wt)                                        <>
-                        pair "coinbase_tx"       coinbaseTxEnc                                      <>
-                        pair "tx"                (case txArrayEnc of
-                                                    Just enc2 -> enc2
-                                                    Nothing   -> AE.list (text . showHash . blockHashFromTxId)
-                                                                         (map computeTxId (blockTxns block)))
-                      rawBs = encodingToLazyByteString (pairs enc)
-                  return $ RpcResponse (rawJsonResult rawBs) Null Null
+          -- getInt<int> before the block lookup: an out-of-int32 verbosity
+          -- answered -5 "Block not found" where Core answers -1.
+          case parseCoreInt32At params 1 1 of
+           Left (vcode, vmsg) -> return $ RpcResponse Null (toJSON $ RpcError vcode vmsg) Null
+           Right verbosity -> do
+            mBlock <- getBlock (rsDB server) bh
+            case mBlock of
+              Nothing -> do
+                -- Block body not in local storage — proxy to Bitcoin Core.
+                mRaw <- fetchGetBlockFromCore hexHash verbosity
+                case mRaw of
+                  Nothing  -> return $ RpcResponse Null
+                    (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
+                  Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
+              Just block -> do
+                if verbosity == 0
+                  then do
+                    let rawHex = TE.decodeUtf8 $ B16.encode (S.encode block)
+                    return $ RpcResponse (toJSON rawHex) Null Null
+                  else do
+                    -- Build Core-parity verbose response from local block.
+                    entries  <- readTVarIO (hcEntries (rsHeaderChain server))
+                    byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+                    tip      <- readTVarIO (hcTip (rsHeaderChain server))
+                    let net      = rsNetwork server
+                        header   = blockHeader block
+                        mEntry   = Map.lookup bh entries
+                        height   = maybe 0 ceHeight mEntry
+                        tipH     = ceHeight tip
+                        -- confirmations: tipH-height+1 when on the active chain,
+                        -- else -1 (Core ComputeNextBlockAndDepth).
+                        onActive = Map.lookup height byHeight == Just bh
+                        confs    = if onActive
+                                     then fromIntegral tipH - fromIntegral height + 1
+                                     else -1 :: Int
+                        bits     = bhBits header
+                        cwStr    = maybe (T.replicate 64 "0") (showHex64 . ceChainWork) mEntry
+                        mTime    = medianTimePast entries bh
+                        verHex   = T.pack $ printf "%08x"
+                                     (fromIntegral (bhVersion header) :: Word32)
+                        -- previousblockhash: omitted for genesis (no parent).
+                        mPrevBh  = case mEntry of
+                                     Just ce -> cePrev ce
+                                     Nothing -> let p = bhPrevBlock header
+                                                in if p == BlockHash (Hash256 (BS.replicate 32 0))
+                                                     then Nothing else Just p
+                        mNextBh  = if onActive then Map.lookup (height + 1) byHeight
+                                               else Nothing
+                        -- Block size metrics (Core formulas)
+                        stripped = blockBaseSize block   -- strippedsize: header+varint+legacy
+                        totSize  = blockTotalSize block  -- size: full serialization
+                        wt       = 3 * stripped + totSize  -- weight = 3*stripped + size (BIP141)
+                        nTx      = length (blockTxns block)
+                        coinbaseTxEnc = buildCoinbaseTxEnc block
+                    -- verbosity=2: per-tx entries with fee from undo data.
+                    -- verbosity>=3: same as v2 PLUS per-input "prevout"
+                    -- {generated, height, value, scriptPubKey} from undo data —
+                    -- Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT (blockchain.cpp
+                    -- getblock: any verbosity>2 maps to SHOW_DETAILS_AND_PREVOUT).
+                    txArrayEnc <- if verbosity >= 2
+                      then do
+                        mUndo <- getUndoData (rsDB server) bh
+                        let undoList = maybe [] (buTxUndo . udBlockUndo) mUndo
+                        return $ Just $ if verbosity >= 3
+                                          then buildBlockTxArrayEncV3 net block undoList
+                                          else buildBlockTxArrayEnc   net block undoList
+                      else return Nothing
+                    -- Core order (blockheaderToJSON then blockToJSON): hash,
+                    -- confirmations, height, version, versionHex, merkleroot, time,
+                    -- mediantime, nonce, bits, target, difficulty, chainwork, nTx,
+                    -- [previousblockhash], [nextblockhash], strippedsize, size,
+                    -- weight, coinbase_tx, tx.
+                    let enc =
+                          pair "hash"              (text (showHash bh))                               <>
+                          pair "confirmations"     (AE.int confs)                                    <>
+                          pair "height"            (AE.word32 height)                                 <>
+                          pair "version"           (AE.int (fromIntegral (bhVersion header) :: Int)) <>
+                          pair "versionHex"        (text verHex)                                      <>
+                          pair "merkleroot"        (text (showHash256 (bhMerkleRoot header)))         <>
+                          pair "time"              (AE.word32 (bhTimestamp header))                   <>
+                          pair "mediantime"        (AE.word32 mTime)                                  <>
+                          pair "nonce"             (AE.word32 (bhNonce header))                       <>
+                          pair "bits"              (text (showBits bits))                             <>
+                          pair "target"            (text (showHex64 (bitsToTarget bits)))             <>
+                          pair "difficulty"
+                            (unsafeToEncoding (stringUtf8 (difficultyStr bits)))                      <>
+                          pair "chainwork"         (text cwStr)                                       <>
+                          pair "nTx"               (AE.int nTx)                                       <>
+                          (case mPrevBh of
+                             Just ph -> pair "previousblockhash" (text (showHash ph))
+                             Nothing -> mempty)                                                       <>
+                          (case mNextBh of
+                             Just nh -> pair "nextblockhash" (text (showHash nh))
+                             Nothing -> mempty)                                                       <>
+                          pair "strippedsize"      (AE.int stripped)                                  <>
+                          pair "size"              (AE.int totSize)                                   <>
+                          pair "weight"            (AE.int wt)                                        <>
+                          pair "coinbase_tx"       coinbaseTxEnc                                      <>
+                          pair "tx"                (case txArrayEnc of
+                                                      Just enc2 -> enc2
+                                                      Nothing   -> AE.list (text . showHash . blockHashFromTxId)
+                                                                           (map computeTxId (blockTxns block)))
+                        rawBs = encodingToLazyByteString (pairs enc)
+                    return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | getblockstats hash_or_height ( stats )
 --
@@ -3189,8 +3211,21 @@ handleGetBlockHeader server params = do
 -- Reference: bitcoin-core/src/rpc/blockchain.cpp gettxout.
 handleGetTxOut :: RpcServer -> Value -> IO RpcResponse
 handleGetTxOut server params = do
-  case (extractParamText params 0, extractParam params 1) of
-    (Just hexTxid, Just vout) -> do
+  -- Core reads n as getInt<uint32_t> (rpc/blockchain.cpp), and from_chars
+  -- accepts NO SIGN for an unsigned destination -- so a negative vout is a
+  -- CONVERSION failure (-1), not a lookup miss, and 2147483648 is a VALID
+  -- vout.  haskoin parsed it as a Word32, so a negative or oversized value
+  -- failed the parse and was reported as "Missing txid or vout parameter"
+  -- (-32602): an argument that was supplied, reported as absent.
+  case (case rawParamAt params 1 of
+          Just (Number n) -> case toBoundedInteger n :: Maybe Int64 of
+            Just i | i >= 0 && i <= 4294967295 -> Nothing
+            _ -> Just (rpcMiscError, "JSON integer out of range" :: Text)
+          _ -> Nothing) of
+   Just (vcode, vmsg) -> return $ RpcResponse Null (toJSON $ RpcError vcode vmsg) Null
+   Nothing ->
+    case (extractParamText params 0, extractParam params 1) of
+     (Just hexTxid, Just vout) -> do
       -- Core (rpc/blockchain.cpp gettxout) parses the txid via ParseHashV
       -- BEFORE the coins-view lookup: a malformed txid is -8 here; a
       -- well-formed-but-absent txid returns JSON null below (not -5).
@@ -3222,8 +3257,8 @@ handleGetTxOut server params = do
                               pair "coinbase"     (AE.bool (ueCoinbase entry))
                   rawBs   = encodingToLazyByteString enc
               return $ RpcResponse (rawJsonResult rawBs) Null Null
-    _ -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Missing txid or vout parameter") Null
+     _ -> return $ RpcResponse Null
+       (toJSON $ RpcError rpcInvalidParams "Missing txid or vout parameter") Null
 
 -- | gettxout confirmation depth: @tip_height - coin_height + 1@.
 --
@@ -3440,7 +3475,15 @@ handlePreciousBlock server params = do
 --------------------------------------------------------------------------------
 handleGetChainTxStats :: RpcServer -> Value -> IO RpcResponse
 handleGetChainTxStats server params = do
-  let mNblocks = extractParam params 0 :: Maybe Int
+  -- getInt<int> fails in the CONVERSION, so an out-of-int32 nblocks never
+  -- reaches the domain test, which answered -8 where Core answers -1.
+  let eNblocks = case rawParamAt params 0 of
+        Nothing   -> Right Nothing
+        Just Null -> Right Nothing
+        Just raw  -> Just <$> parseCoreInt32 raw
+      mNblocks = case eNblocks of
+        Right mv -> mv
+        Left _   -> Nothing
       mBlockHashTxt = extractParamText params 1
   tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   entries <- readTVarIO (hcEntries (rsHeaderChain server))
@@ -3461,9 +3504,12 @@ handleGetChainTxStats server params = do
           if canon == Just (ceHash ce)
             then return (Right ce)
             else return (Left (rpcInvalidParameter, "Block is not in main chain"))
-  case mResolved of
-    Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
-    Right pindex -> do
+  case eNblocks of
+   Left (ncode, nmsg) -> return $ RpcResponse Null (toJSON $ RpcError ncode nmsg) Null
+   Right _ ->
+    case mResolved of
+     Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+     Right pindex -> do
       let height = ceHeight pindex
           -- Default nblocks = one month of 10-minute blocks (Core).
           oneMonth = 30 * 24 * 60 * 60 `div` 600 :: Int
@@ -3744,11 +3790,26 @@ handleGetRawTransaction server params = do
       -- well-formed-but-absent txid is -5 in the lookup below.  The optional
       -- blockhash arg (param 2) is also ParseHashV'd by Core, so a malformed
       -- blockhash is -8 too.
-      case (parseHashV "parameter 1" hexTxid, extractParamText params 2) of
-        (Left err, _) -> return $ RpcResponse Null (toJSON err) Null
-        (Right _, Just hexBh) | Left err <- parseHashV "parameter 3" hexBh ->
-          return $ RpcResponse Null (toJSON err) Null
-        (Right bh, mBlockHashText) -> do
+      -- Core's getInt<int> for verbosity fails in the CONVERSION, before the
+      -- tx lookup: an out-of-int32 value answered -5 "No such mempool or
+      -- blockchain transaction" where Core answers -1.  Haskell's Int is
+      -- 64-bit, so the value parsed cleanly and rode into the lookup.  A BOOL
+      -- verbosity is legal and must not go through the integer conversion.
+      -- ORDER: Core does ParseHashV(params[0]) at rawtransaction.cpp:70 and
+      -- ParseVerbosity(params[1]) at :78, so a malformed txid still wins the
+      -- -8 even when the verbosity is also out of range.
+      case (case parseHashV "parameter 1" hexTxid of
+              Left _  -> Nothing
+              Right _ -> case rawParamAt params 1 of
+                Just n@(Number _) -> either Just (const Nothing) (parseCoreInt32 n)
+                _                 -> Nothing) of
+       Just (vcode, vmsg) -> return $ RpcResponse Null (toJSON $ RpcError vcode vmsg) Null
+       Nothing ->
+        case (parseHashV "parameter 1" hexTxid, extractParamText params 2) of
+         (Left err, _) -> return $ RpcResponse Null (toJSON err) Null
+         (Right _, Just hexBh) | Left err <- parseHashV "parameter 3" hexBh ->
+           return $ RpcResponse Null (toJSON err) Null
+         (Right bh, mBlockHashText) -> do
           let txid = TxId (getBlockHashHash bh)
               -- Parse verbosity parameter: Core's ParseVerbosity accepts bool or int.
               -- bool false → 0, bool true → 1, integer n → n.
@@ -11380,6 +11441,8 @@ handleWaitForNewBlock server params = do
   timeoutResult <- case rawParamAt params 0 of
     Nothing           -> return (Right 0)
     Just (Number n)   -> case toBoundedInteger n :: Maybe Int of
+      Just ms | ms < -2147483648 || ms > 2147483647 ->
+        return $ Left $ RpcError rpcMiscError "JSON integer out of range"
       Just ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
       Just ms           -> return $ Right ms
       Nothing           -> return $ Left $
@@ -11444,7 +11507,13 @@ handleWaitForBlock server params = do
           -- Parse timeout (param[1]).
           timeoutResult <- case rawParamAt params 1 of
             Nothing           -> return (Right 0)
+            -- Core's getInt<int> fails in the CONVERSION, so an out-of-int32
+            -- timeout is "JSON integer out of range" -- NOT the handler's own
+            -- "Negative timeout", which shares the -1 code and so looked
+            -- correct until the messages were compared.
             Just (Number n)   -> case toBoundedInteger n :: Maybe Int of
+              Just ms | ms < -2147483648 || ms > 2147483647 ->
+                return $ Left $ RpcError rpcMiscError "JSON integer out of range"
               Just ms | ms < 0 -> return $ Left $ RpcError rpcMiscError "Negative timeout"
               Just ms           -> return $ Right ms
               Nothing           -> return $ Left $
@@ -11568,14 +11637,25 @@ handleSetBan server params = do
                   durationFinal   = if durationSeconds == 0
                                       then defaultBanDuration
                                       else durationSeconds
-                  expiry = if fromMaybe False mAbs
+                  isAbs  = fromMaybe False mAbs
+                  expiry = if isAbs
                              then durationFinal      -- absolute unix ts
                              else now + durationFinal
-              -- Refuse duplicate bans (Core matches this behavior)
+              -- Refuse duplicate bans.  Core answers RPC_CLIENT_NODE_ALREADY_ADDED
+              -- (-23) "Error: IP/Subnet already banned" (rpc/net.cpp), not the
+              -- generic -1 with a message missing its "Error: " prefix.
               banned <- getBanList (rsPeerMgr server)
               if Map.member sockAddr banned
                 then return $ RpcResponse Null
-                  (toJSON $ RpcError rpcMiscError "IP/Subnet already banned") Null
+                  (toJSON $ RpcError rpcClientNodeAlreadyAdded
+                    "Error: IP/Subnet already banned") Null
+                else if isAbs && durationFinal < now
+                -- Core refuses an ABSOLUTE bantime already in the past
+                -- (strictly banTime < GetTime()) instead of recording an
+                -- already-expired ban.  Found by the differential CONTROL.
+                then return $ RpcResponse Null
+                  (toJSON $ RpcError rpcInvalidParameter
+                    "Error: Absolute timestamp is in the past") Null
                 else do
                   -- Insert into ban map directly so we control the expiry.
                   atomically $ modifyTVar' (pmBannedAddrs (rsPeerMgr server))

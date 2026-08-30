@@ -96,6 +96,7 @@ import qualified PrioritiseTransactionSpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
+import qualified RpcConversionBeforeLookupSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
@@ -23418,6 +23419,7 @@ main = hspec $ do
   -- (the fabrication failure mode -- see the module header).
   CreateRawTxDropSpec.spec
   RpcIntArgBoundsSpec.spec
+  RpcConversionBeforeLookupSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)
   W126BIP152CompactBlocksSpec.spec
