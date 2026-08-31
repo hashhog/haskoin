@@ -5,6 +5,7 @@
 module Main where
 
 import Test.Hspec
+import qualified CoreAritySpec
 import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_, when, unless, void)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -324,6 +325,7 @@ mkTestTxId = TxId $ Hash256 $ BS.replicate 32 0xcd
 
 main :: IO ()
 main = hspec $ do
+  CoreAritySpec.spec
   describe "Network send serialization (audit v1-sendAll row)" $ do
     -- The v1 sendMessage path called sendAll with no lock, while sendMessage
     -- is invoked from several concurrent threads — interleaving bytes on the

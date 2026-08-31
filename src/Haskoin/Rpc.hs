@@ -49,6 +49,9 @@ module Haskoin.Rpc
   , rpcMiscError
   , rpcInvalidParameter
   , rpcInvalidAddressOrKey
+    -- * Core's central argument-count gate (#103); exported for testing.
+  , coreArityViolation
+  , haskoinMethodNames
     -- * P2P client error codes (Core protocol.h RPC_CLIENT_*)
   , rpcClientNodeNotConnected
   , rpcClientNodeAlreadyAdded
@@ -281,6 +284,7 @@ import Text.Printf (printf)
 -- showFFloat was removed: all difficulty/fee formatting now uses
 -- formatDoubleG16 (FFI snprintf) or btcAmountEnc (fixed-decimal).
 import qualified Data.Vector as V
+import Haskoin.CoreArity (lookupCoreArity)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
@@ -1373,6 +1377,52 @@ getWalletForRequest server req = do
 -- Request Dispatcher
 --------------------------------------------------------------------------------
 
+-- | Core's central argument-count gate (#103).
+--
+-- Core validates argument COUNT in one place, after the method lookup and
+-- before any handler runs (rpc\/util.cpp:644 -> IsValidNumArgs, :733):
+-- @required <= n <= declared@, else it throws the help text as error -1.
+-- haskoin dispatched straight into the handler case, so surplus positional
+-- arguments were silently dropped. Live evidence from the running mainnet
+-- node on 2026-08-31:
+--
+-- > savemempool ["ARITY-WRITER-PROBE-haskoin"] -> {"result":{"filename":...}}
+--
+-- Core answers that with -1; savemempool takes no arguments at all.
+--
+-- ORDERING. Core resolves the method first, so an unknown name must stay
+-- -32601 and never become -1. The case below both resolves AND executes, so
+-- the gate cannot simply run first for every name: it fires only for methods
+-- haskoin actually serves (the intersection of 'allRpcCommands' with Core's
+-- table). A method Core declares but haskoin does not implement still falls
+-- through to the -32601 branch.
+--
+-- Only positional (array) params are checked. A named-params object is
+-- resolved by name in Core, not by position, so it is exempt.
+coreArityViolation :: Text -> Value -> Bool
+coreArityViolation method params =
+  case params of
+    Array arr
+      | method `elem` haskoinMethodNames ->
+          case lookupCoreArity method of
+            -- Absent from the table (coverage is 87 of 103) -- fail OPEN.
+            Nothing -> False
+            Just (required, declared) ->
+              let n = V.length arr
+              in n < required || n > declared
+    _ -> False
+
+-- | The method names haskoin serves, taken from the same listing the @help@
+-- RPC prints, so the two cannot drift apart. Section headers (@== ... ==@) are
+-- dropped and each signature is reduced to its bare name.
+haskoinMethodNames :: [Text]
+haskoinMethodNames =
+  [ name
+  | line <- allRpcCommands
+  , not ("==" `T.isPrefixOf` line)
+  , name <- take 1 (T.words line)
+  ]
+
 -- | Handle an RPC request and dispatch to the appropriate handler
 handleRpcRequest :: RpcServer -> RpcRequest -> IO RpcResponse
 handleRpcRequest server req = do
@@ -1380,7 +1430,9 @@ handleRpcRequest server req = do
       mkOk result = RpcResponse result Null (reqId req)
       mkErr code msg = RpcResponse Null (toJSON $ RpcError code msg) (reqId req)
 
-  result <- case reqMethod req of
+  result <- if coreArityViolation (reqMethod req) params
+    then return $ mkErr rpcMiscError "Wrong number of arguments"
+    else case reqMethod req of
     -- Blockchain RPCs
     "getblockchaininfo"    -> handleGetBlockchainInfo server
     "getdeploymentinfo"    -> handleGetDeploymentInfo server params
@@ -12796,6 +12848,42 @@ allRpcCommands =
   , "verifymessage \"address\" \"signature\" \"message\""
   , "walletlock"
   , "walletpassphrase \"passphrase\" timeout"
+  -- #103 help-rot: these 31 methods were DISPATCHED but absent from this
+  -- list, so `help` did not mention them and the argument-count gate --
+  -- which only fires for methods this list says we serve -- skipped them.
+  -- Signatures are Core's own where Core declares the method.
+  , "== Previously unlisted =="
+  , "bumpfee"
+  , "clearbanned"
+  , "combinerawtransaction [\"hexstring\",...]"
+  , "createmultisig nrequired [\"key\",...] ( \"address_type\" )"
+  , "deriveaddresses \"descriptor\" ( range )"
+  , "dumpprivkey"
+  , "dumptxoutset"
+  , "fundrawtransaction"
+  , "generate"
+  , "generateblock"
+  , "generatetoaddress"
+  , "getdescriptorinfo \"descriptor\""
+  , "getinfo"
+  , "getnetworkhashps ( nblocks height )"
+  , "getpayjoinrequest"
+  , "gettransaction"
+  , "gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )"
+  , "importmempool \"filepath\" ( options )"
+  , "importprivkey"
+  , "joinpsbts [\"psbt\",...]"
+  , "loadmempool"
+  , "loadtxoutset"
+  , "psbtbumpfee"
+  , "rescanblockchain"
+  , "restorewallet"
+  , "savemempool"
+  , "scantxoutset \"action\" ( [scanobjects,...] )"
+  , "sendpayjoinrequest"
+  , "setmocktime"
+  , "verifytxoutproof \"proof\""
+  , "walletcreatefundedpsbt"
   ]
 
 -- | Get help text for a specific command

@@ -25,6 +25,7 @@ library
                  , Haskoin.FeeEstimator
                  , Haskoin.BlockTemplate
                  , Haskoin.Rpc
+                 , Haskoin.CoreArity
                  , Haskoin.Wallet
                  , Haskoin.Wallet.Persist
                  , Haskoin.Performance
@@ -135,7 +136,8 @@ executable haskoin
 test-suite haskoin-test
   type:          exitcode-stdio-1.0
   main-is:       Spec.hs
-  other-modules: W100UTXOCacheSpec
+  other-modules: CoreAritySpec
+               , W100UTXOCacheSpec
                , W101ActivateBestChainSpec
                , W102AssumeUTXOSpec
                , W103TxRelaySpec
