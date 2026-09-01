@@ -239,6 +239,9 @@ module W118WalletSpec (spec) where
 
 import Test.Hspec
 import Control.Exception (evaluate)
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
@@ -1383,10 +1386,13 @@ spec_dead_helpers = describe "W118 dead-helper findings" $ do
     epkKey epk42 `shouldNotBe` epkKey epkRoot
     epkKey epk0  `shouldNotBe` epkKey epk42
 
-  it "DH-2: saveWallet always throws \"not yet implemented\"" $ do
-    m <- generateMnemonic 128
-    w <- loadWallet (WalletConfig mainnet 20 "") m
-    evaluate (saveWallet w "/tmp/w118-test-wallet") `shouldThrow` anyErrorCall
+  it "DH-2 FIXED (c806c5e): saveWallet persists the wallet instead of throwing" $
+    withSystemTempDirectory "w118-save" $ \tmp -> do
+      m <- generateMnemonic 128
+      w <- loadWallet (WalletConfig mainnet 20 "") m
+      let path = tmp </> "w118-test-wallet"
+      saveWallet w path
+      doesFileExist path `shouldReturn` True
 
   it "DH-3: signTransaction stub returns empty witnesses (see G25)" $ do
     -- The body of the per-input fold falls through to `let ... in []`.

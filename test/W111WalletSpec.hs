@@ -141,6 +141,9 @@ module W111WalletSpec (spec) where
 
 import Test.Hspec
 import Control.Exception (evaluate)
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
@@ -467,35 +470,44 @@ spec = do
       bal `shouldBe` 0
 
   describe "W111 wallet storage" $ do
-    -- G23 saveWallet
-    it "G23 [BUG-8] saveWallet throws 'not yet implemented' error" $ do
-      m <- generateMnemonic 128
-      w <- loadWallet (WalletConfig mainnet 20 "") m
-      evaluate (saveWallet w "/tmp/test-wallet") `shouldThrow` anyErrorCall
+    -- G23 saveWallet -- BUG-8 FIXED (c806c5e): saveWallet persists an
+    -- encrypted snapshot instead of erroring "not yet implemented".
+    it "G23 [BUG-8 FIXED] saveWallet writes the wallet file" $
+      withSystemTempDirectory "w111-save" $ \tmp -> do
+        m <- generateMnemonic 128
+        w <- loadWallet (WalletConfig mainnet 20 "") m
+        let path = tmp </> "test-wallet"
+        saveWallet w path
+        doesFileExist path `shouldReturn` True
+        doesFileExist (tmp </> "wallet.key") `shouldReturn` True
 
-    -- G25 WalletManager
-    it "G25 createManagedWallet succeeds and returns wallet state" $ do
-      -- Use a fresh in-memory manager (no persistent wallet dir needed for this test)
-      wm <- newWalletManager "/tmp/w111-wm-fresh-1" mainnet
-      result <- createManagedWallet wm "test-wallet-1" False False
-      case result of
-        Left err -> expectationFailure ("createManagedWallet failed: " ++ T.unpack err)
-        Right ws -> wsWallet ws `seq` pure ()
+    -- G25 WalletManager.  Fresh temp dirs: createManagedWallet correctly
+    -- refuses a wallet directory that already exists (Wallet.hs), so a
+    -- hard-coded /tmp path only passed on a pristine box.
+    it "G25 createManagedWallet succeeds and returns wallet state" $
+      withSystemTempDirectory "w111-wm-fresh-1" $ \tmp -> do
+        wm <- newWalletManager tmp mainnet
+        result <- createManagedWallet wm "test-wallet-1" False False
+        case result of
+          Left err -> expectationFailure ("createManagedWallet failed: " ++ T.unpack err)
+          Right ws -> wsWallet ws `seq` pure ()
 
-    it "G25 listManagedWallets returns created wallet names" $ do
-      wm <- newWalletManager "/tmp/w111-wm-fresh-2" mainnet
-      _ <- createManagedWallet wm "wallet-a" False False
-      _ <- createManagedWallet wm "wallet-b" False False
-      names <- listManagedWallets wm
-      names `shouldSatisfy` elem "wallet-a"
-      names `shouldSatisfy` elem "wallet-b"
+    it "G25 listManagedWallets returns created wallet names" $
+      withSystemTempDirectory "w111-wm-fresh-2" $ \tmp -> do
+        wm <- newWalletManager tmp mainnet
+        _ <- createManagedWallet wm "wallet-a" False False
+        _ <- createManagedWallet wm "wallet-b" False False
+        names <- listManagedWallets wm
+        names `shouldSatisfy` elem "wallet-a"
+        names `shouldSatisfy` elem "wallet-b"
 
-    it "G25 unloadManagedWallet removes wallet from list" $ do
-      wm <- newWalletManager "/tmp/w111-wm-fresh-3" mainnet
-      _ <- createManagedWallet wm "wallet-to-unload" False False
-      _ <- unloadManagedWallet wm "wallet-to-unload"
-      names <- listManagedWallets wm
-      names `shouldSatisfy` notElem "wallet-to-unload"
+    it "G25 unloadManagedWallet removes wallet from list" $
+      withSystemTempDirectory "w111-wm-fresh-3" $ \tmp -> do
+        wm <- newWalletManager tmp mainnet
+        _ <- createManagedWallet wm "wallet-to-unload" False False
+        _ <- unloadManagedWallet wm "wallet-to-unload"
+        names <- listManagedWallets wm
+        names `shouldSatisfy` notElem "wallet-to-unload"
 
     it "G25 [BUG-8] loadManagedWallet creates fresh wallet not from disk" $ do
       pending -- loadManagedWallet ignores the wallet dir and creates a random new wallet

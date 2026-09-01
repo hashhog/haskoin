@@ -317,6 +317,7 @@
 module W121CompactFiltersSpec (spec) where
 
 import Test.Hspec
+import Control.Exception (evaluate)
 import qualified Data.ByteString as BS
 import Data.Word (Word8, Word32, Word64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
@@ -936,38 +937,46 @@ spec = do
     --
     --    Audit verdict: documented limitation; add an assertion so any
     --    future caller passing numBits > 56 fails loud at the call site.
-    it "W122-8 bitReaderRead at numBits>56 fails loud (reader pre-loads <= 56 bits)" $ do
-      -- W122 AUDIT FINDING: bitReaderRead numBits=64 is UNSUPPORTED.
-      -- Pin the current behavior: it throws 'Not enough bits in reader'
-      -- (BIP-158 production code never triggers this, but this assertion
-      -- documents the invariant so future drive-by changes can't quietly
-      -- "support" numBits>56 in a half-working state).
+    it "W122-8 bitReaderRead supports the full 0..64 range, MSB-first (Core streams.h:281-300)" $ do
+      -- Since the W164 MSB-first port (Index.hs) the reader is a direct
+      -- port of Core's BitStreamReader::Read: any nbits in 0..64 works,
+      -- and bits come back most-significant-first.  (The pre-W164 reader
+      -- capped at 56 bits and was LSB-first; this test used to pin that.)
       let payload = 0xDEADBEEFCAFEBABE :: Word64
           bw0     = bitWriterWrite bitWriterNew 64 payload
           encoded = bitWriterFlush bw0
           br0     = bitReaderNew encoded
-      -- A read of 56 bits succeeds (the max load-buffer size).
+      BS.length encoded `shouldBe` 8
+      -- One 64-bit read round-trips the whole word.
+      let (decoded64, _) = bitReaderRead br0 64
+      decoded64 `shouldBe` payload
+      -- A 56-bit read returns the 56 MOST significant bits.
       let (decoded56, _) = bitReaderRead br0 56
-      decoded56 `shouldBe` (payload .&. 0x00FFFFFFFFFFFFFF)
-      -- Multiple smaller reads can recover the full 64 bits:
-      let (lo, br1) = bitReaderRead br0 32
-          (hi, _)   = bitReaderRead br1 32
-          combined  = lo .|. (hi `shiftL` 32)
-      combined `shouldBe` payload
+      decoded56 `shouldBe` (payload `shiftR` 8)
+      -- Two 32-bit reads: high half first, then low half.
+      let (hi, br1) = bitReaderRead br0 32
+          (lo, _)   = bitReaderRead br1 32
+      hi `shouldBe` (payload `shiftR` 32)
+      lo `shouldBe` (payload .&. 0xFFFFFFFF)
+      ((hi `shiftL` 32) .|. lo) `shouldBe` payload
+      -- Core streams.h:283 throws out_of_range for nbits outside 0..64.
+      evaluate (fst (bitReaderRead br0 65)) `shouldThrow` anyErrorCall
+      evaluate (fst (bitReaderRead br0 (-1))) `shouldThrow` anyErrorCall
 
-    -- 9. bitWriterWrite numBits=0 / negative — guard path.  Pre-FIX-69
-    --    this was already correct, but a defense-in-depth assertion.
-    --    A no-op write must NOT advance bwBits, must NOT modify buffer.
-    it "W122-9 bitWriterWrite numBits<=0 is a no-op (no state change)" $ do
+    -- 9. bitWriterWrite numBits=0 is a no-op; a NEGATIVE count is an error,
+    --    exactly like Core streams.h:330-332
+    --    (`if (nbits < 0 || nbits > 64) throw std::out_of_range`).
+    it "W122-9 bitWriterWrite numBits=0 is a no-op; numBits<0 or >64 errors (Core streams.h:330)" $ do
       let bw0 = bitWriterWrite bitWriterNew 5 0x15
           bw1 = bitWriterWrite bw0 0 0xFF
-          bw2 = bitWriterWrite bw1 (-3) 0xFF
-      -- Round-trip the 5-bit write through flush; the 0/negative writes
-      -- must not have corrupted the buffer or bit-count.
-      let encoded = bitWriterFlush bw2
+      -- Round-trip the 5-bit write through flush; the 0-bit write must not
+      -- have corrupted the buffer or bit-count.
+      let encoded = bitWriterFlush bw1
           br      = bitReaderNew encoded
           (v, _)  = bitReaderRead br 5
       v `shouldBe` 0x15
+      evaluate (bitWriterWrite bw1 (-3) 0xFF) `shouldThrow` anyErrorCall
+      evaluate (bitWriterWrite bw1 65 0xFF)   `shouldThrow` anyErrorCall
 
     -- 10. mask helper at n=64 must yield maxBound (0xFFFFFFFFFFFFFFFF).
     --     Core uses ~0ULL; the haskoin FIX-69 implementation spells this

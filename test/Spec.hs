@@ -9,7 +9,7 @@ import qualified CoreAritySpec
 import Test.QuickCheck hiding ((.&.))
 import Control.Monad (forM_, when, unless, void)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Data.Serialize (encode, decode, runPut, runGet, putWord32le, put)
+import Data.Serialize (encode, decode, runPut, runGet, putWord32le, putWord32be, put)
 import Data.Serialize.Put (putByteString, putWord8, putWord64le)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -251,6 +251,21 @@ mineRegtestHeader :: BlockHeader -> BlockHeader
 mineRegtestHeader base =
   head [ base { bhNonce = k } | k <- [0..]
                               , checkProofOfWork (base { bhNonce = k }) (netPowLimit regtest) ]
+
+-- | The body of one top-level message-handler arm in app/Main.hs, located by
+-- its anchor text rather than a line number.  The W97/W99 source-grep gates
+-- used to hard-code @drop 1352@ (the MBlock arm's 2026-04 position) and went
+-- stale every time Main.hs grew (the arm sits near line 3278 now).  The
+-- window runs from the anchor line up to the next 2-space-indented code arm.
+mainArm :: String -> String -> [String]
+mainArm anchor src =
+  case dropWhile (not . isPrefixOf ("  " ++ anchor)) (lines src) of
+    []       -> []
+    (l:rest) -> l : takeWhile (not . nextArm) rest
+  where
+    nextArm ln = case ln of
+      (' ':' ':c:_) -> c /= ' ' && c /= '-'
+      _             -> False
 
 -- Helper: Check if substring is in string
 isInfixOf :: String -> String -> Bool
@@ -2872,7 +2887,10 @@ main = hspec $ do
           -- Use nVersion=4 to pass bad-version gate (all BIPs active at
           -- regtest height 100); focus of this test is bad-txns-nonfinal.
           realMerkle = computeMerkleRoot (map computeTxId txns)
-          blkHdr   = BlockHeader 4 prevH realMerkle 0 0 0
+          -- Timestamp 1 > csMedianTime 0: Core validation.cpp:4092
+          -- (GetBlockTime() <= MTP -> "time-too-old") runs BEFORE the
+          -- finality check, so a timestamp-0 header never reaches it.
+          blkHdr   = BlockHeader 4 prevH realMerkle 1 0 0
           block    = Block blkHdr txns
           cs = ChainState
                 { csHeight     = 99   -- next block = 100
@@ -3967,7 +3985,9 @@ main = hspec $ do
           realMerkle  = computeMerkleRoot (map computeTxId txns)
           -- Use nVersion=4 to pass bad-version gate (all BIPs active at
           -- regtest height 100); the focus of this test is script verification.
-          blkHdr      = BlockHeader 4 prevH realMerkle 0 0 0
+          -- Timestamp 1 > csMedianTime 0 (Core validation.cpp:4092 time-too-old
+          -- fires first otherwise; the script gate is what this test targets).
+          blkHdr      = BlockHeader 4 prevH realMerkle 1 0 0
           block       = Block blkHdr txns
           cs = ChainState
                 { csHeight     = 99
@@ -4012,7 +4032,9 @@ main = hspec $ do
           txns        = [coinbase, spendingTx]
           realMerkle  = computeMerkleRoot (map computeTxId txns)
           -- Use nVersion=4 to pass bad-version gate.
-          blkHdr      = BlockHeader 4 prevH realMerkle 0 0 0
+          -- Timestamp 1 > csMedianTime 0 (Core validation.cpp:4092 time-too-old
+          -- fires first otherwise; the script gate is what this test targets).
+          blkHdr      = BlockHeader 4 prevH realMerkle 1 0 0
           block       = Block blkHdr txns
           cs = ChainState
                 { csHeight     = 99
@@ -4386,10 +4408,11 @@ main = hspec $ do
       let script = Script [OP_PUSHDATA "some_data" OPCODE, OP_CHECKMULTISIG]
       countScriptSigops script True `shouldBe` 20
 
-    it "OP_CHECKMULTISIG with preceding OP_0 counts as 0 (accurate)" $ do
-      -- OP_0 is in the small-num range; Core: DecodeOP_N(OP_0) = 0.
+    it "OP_CHECKMULTISIG with preceding OP_0 counts as 20 (accurate; OP_0 is not OP_1..OP_16)" $ do
+      -- Core script.cpp:172-175: only `lastOpcode >= OP_1 && lastOpcode <= OP_16`
+      -- is decoded; OP_0 (0x00) falls to MAX_PUBKEYS_PER_MULTISIG = 20.
       let script = Script [OP_0, OP_CHECKMULTISIG]
-      countScriptSigops script True `shouldBe` 0
+      countScriptSigops script True `shouldBe` 20
 
     it "OP_CHECKMULTISIG with preceding OP_16 counts as 16 (accurate)" $ do
       let script = Script [OP_16, OP_CHECKMULTISIG]
@@ -5788,13 +5811,17 @@ main = hspec $ do
           mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
 
           -- Pre-populate two prevouts in the UTXO cache as if a
-          -- prior disconnect just restored them.  P2WPKH-style
-          -- scriptPubKey so the standardness check passes.
+          -- prior disconnect just restored them.  Re-admission runs the
+          -- full script check (Core validation.cpp:1135 PolicyScriptChecks
+          -- is on every ATMP path, incl. the disconnectpool one), so the
+          -- prevouts are P2WSH(OP_TRUE): standard, and spendable with a
+          -- one-item witness [OP_TRUE] and no signature.
           let prevTx1 = TxId (Hash256 (BS.replicate 32 0x71))
               prevTx2 = TxId (Hash256 (BS.replicate 32 0x72))
               prevOp1 = OutPoint prevTx1 0
               prevOp2 = OutPoint prevTx2 0
-              prevScript = BS.pack [0x00, 0x14] <> BS.replicate 20 0x55
+              witnessScript = BS.pack [0x51]                       -- OP_TRUE
+              prevScript = BS.pack [0x00, 0x20] <> sha256 witnessScript
               prevTxOut = TxOut 5_000_000 prevScript
               -- Mature non-coinbase entries so resolveInput / coinbase-maturity
               -- check both pass.
@@ -5808,7 +5835,7 @@ main = hspec $ do
                 let tin   = TxIn op BS.empty 0xfffffffe
                     tout  = TxOut 4_900_000
                               (BS.pack [0x00, 0x14] <> BS.replicate 20 0xaa)
-                in Tx 2 [tin] [tout] [[]] 0
+                in Tx 2 [tin] [tout] [[witnessScript]] 0
               t1 = mkSpend prevOp1
               t2 = mkSpend prevOp2
               t1id = computeTxId t1
@@ -6921,11 +6948,15 @@ main = hspec $ do
               cache <- newUTXOCache db 1024
               mp <- newMempool regtest cache defaultMempoolConfig 0 0 noopCoinMtp
 
-              -- Pre-populate one confirmed prevout in the UTXO cache. P2WPKH
-              -- script keeps standardness checks happy.
+              -- Pre-populate one confirmed prevout in the UTXO cache.
+              -- P2WSH(OP_TRUE): standard, and spendable with the one-item
+              -- witness [OP_TRUE] and no signature -- acceptPackage runs the
+              -- full script check on every tx (Core validation.cpp:1538
+              -- PolicyScriptChecks inside AcceptMultipleTransactions).
               let confirmedTxId = TxId (Hash256 (BS.replicate 32 0x91))
                   confirmedOp   = OutPoint confirmedTxId 0
-                  spkBytes      = BS.pack [0x00, 0x14] <> BS.replicate 20 0x77
+                  witnessScript = BS.pack [0x51]                   -- OP_TRUE
+                  spkBytes      = BS.pack [0x00, 0x20] <> sha256 witnessScript
                   prevTxOut     = TxOut 10_000_000 spkBytes
                   prevEntry     = UTXOEntry prevTxOut 1 False False
               atomically $
@@ -6935,13 +6966,13 @@ main = hspec $ do
               -- (vout=0) of value 9_000_000 sat to the same dummy script.
               let parentIn  = TxIn confirmedOp BS.empty 0xfffffffd
                   parentOut = TxOut 9_000_000 spkBytes
-                  parent    = Tx 2 [parentIn] [parentOut] [[]] 0
+                  parent    = Tx 2 [parentIn] [parentOut] [[witnessScript]] 0
                   parentId  = computeTxId parent
 
               -- Child spends parent's output[0].
               let childIn  = TxIn (OutPoint parentId 0) BS.empty 0xfffffffd
                   childOut = TxOut 8_000_000 spkBytes
-                  child    = Tx 2 [childIn] [childOut] [[]] 0
+                  child    = Tx 2 [childIn] [childOut] [[witnessScript]] 0
                   childId  = computeTxId child
 
               let pkg = TxPackage [parent] child
@@ -9591,7 +9622,8 @@ main = hspec $ do
             ibdDBConfig "/tmp/test"
       path `shouldBe` "/tmp/test"
       createIfMissing `shouldBe` True
-      maxFiles `shouldBe` 1000
+      -- 16384 since Performance.hs 263080d (was 1000: EMFILE under real P2P).
+      maxFiles `shouldBe` 16384
       writeBuffer `shouldBe` 256 * 1024 * 1024  -- 256 MB
       blockCache `shouldBe` 512 * 1024 * 1024   -- 512 MB
       bloomBits `shouldBe` 10
@@ -11951,7 +11983,9 @@ main = hspec $ do
 
       it "addAddress adds to new table" $ do
         am <- newAddrMan
-        let addr = SockAddrInet 8333 0x0100007f
+        -- 1.2.3.4: Core addrman.cpp:534 AddSingle rejects non-routable
+        -- addresses (127.0.0.1 is IsLocal), so the fixture must be routable.
+        let addr = SockAddrInet 8333 0x04030201
             source = SockAddrInet 8333 0x0100000a
         result <- addAddress am BS.empty addr source 0x409 1700000000
         result `shouldBe` True
@@ -11960,7 +11994,9 @@ main = hspec $ do
 
       it "addAddress is idempotent for same source" $ do
         am <- newAddrMan
-        let addr = SockAddrInet 8333 0x0100007f
+        -- 1.2.3.4: Core addrman.cpp:534 AddSingle rejects non-routable
+        -- addresses (127.0.0.1 is IsLocal), so the fixture must be routable.
+        let addr = SockAddrInet 8333 0x04030201
             source = SockAddrInet 8333 0x0100000a
         _ <- addAddress am BS.empty addr source 0x409 1700000000
         _ <- addAddress am BS.empty addr source 0x409 1700000001
@@ -11974,7 +12010,9 @@ main = hspec $ do
 
       it "selectAddress returns address after adding" $ do
         am <- newAddrMan
-        let addr = SockAddrInet 8333 0x0100007f
+        -- 1.2.3.4: Core addrman.cpp:534 AddSingle rejects non-routable
+        -- addresses (127.0.0.1 is IsLocal), so the fixture must be routable.
+        let addr = SockAddrInet 8333 0x04030201
             source = SockAddrInet 8333 0x0100000a
         _ <- addAddress am BS.empty addr source 0x409 1700000000
         result <- selectAddress am True
@@ -11982,7 +12020,9 @@ main = hspec $ do
 
       it "markGood moves address to tried table" $ do
         am <- newAddrMan
-        let addr = SockAddrInet 8333 0x0100007f
+        -- 1.2.3.4: Core addrman.cpp:534 AddSingle rejects non-routable
+        -- addresses (127.0.0.1 is IsLocal), so the fixture must be routable.
+        let addr = SockAddrInet 8333 0x04030201
             source = SockAddrInet 8333 0x0100000a
         _ <- addAddress am BS.empty addr source 0x409 1700000000
         markGood am BS.empty addr 1700000001
@@ -11993,7 +12033,9 @@ main = hspec $ do
 
       it "markAttempt increments attempt count" $ do
         am <- newAddrMan
-        let addr = SockAddrInet 8333 0x0100007f
+        -- 1.2.3.4: Core addrman.cpp:534 AddSingle rejects non-routable
+        -- addresses (127.0.0.1 is IsLocal), so the fixture must be routable.
+        let addr = SockAddrInet 8333 0x04030201
             source = SockAddrInet 8333 0x0100000a
         _ <- addAddress am BS.empty addr source 0x409 1700000000
         markAttempt am addr 1700000001
@@ -13664,7 +13706,9 @@ main = hspec $ do
             bw3 = bitWriterWrite bw2 1 1 -- Write 1 bit = 1
             encoded = bitWriterFlush bw3
         BS.length encoded `shouldBe` 1
-        BS.head encoded `shouldBe` 0x05  -- binary: 101
+        -- MSB-first (Core streams.h:329-344 BitStreamWriter::Write): the
+        -- first bit written lands in the MSB, so 1,0,1 -> 1010_0000.
+        BS.head encoded `shouldBe` 0xA0
 
       it "writes multi-bit values" $ do
         let bw = bitWriterNew
@@ -13675,7 +13719,9 @@ main = hspec $ do
 
     describe "bitReaderRead" $ do
       it "reads single bits" $ do
-        let bs = BS.singleton 0x05  -- binary: 00000101
+        -- MSB-first (Core streams.h:281-300 BitStreamReader::Read): the
+        -- first bit read is the MSB, so 1010_0000 reads back as 1,0,1.
+        let bs = BS.singleton 0xA0  -- binary: 10100000
             br = bitReaderNew bs
             (b1, br1) = bitReaderRead br 1
             (b2, br2) = bitReaderRead br1 1
@@ -15238,7 +15284,11 @@ main = hspec $ do
 
       it "still accepts a well-formed keypath (4 + 4 = 8 bytes)" $ do
         -- Sanity: positive case still works after the rewrite
-        let bs8 = runPut (putWord32le 0xdeadbeef >> putWord32le 0x8000002c)
+        -- Core script/keyorigin.h:13 stores the fingerprint as raw
+        -- `unsigned char fingerprint[4]`; haskoin reads those bytes
+        -- big-endian (Wallet.hs parseKeyPath) and writes them back the same
+        -- way (serializeKeyPath), so the wire bytes must be BE here.
+        let bs8 = runPut (putWord32be 0xdeadbeef >> putWord32le 0x8000002c)
         case parseKeyPath bs8 of
           Right kp -> do
             kpFingerprint kp `shouldBe` 0xdeadbeef
@@ -17588,10 +17638,11 @@ main = hspec $ do
           Right _ -> expectationFailure "expected length validation failure"
 
     describe "BIP-324 v2 outbound enable + v1-only fallback" $ do
-      it "bip324V2OutboundEnabled is OFF when env var is unset" $ do
+      it "bip324V2OutboundEnabled is ON when env var is unset (Core net.h:101 DEFAULT_V2_TRANSPORT=true)" $ do
         SE.unsetEnv "HASKOIN_BIP324_V2_OUTBOUND"
+        SE.unsetEnv "HASKOIN_BIP324_V2"
         on <- bip324V2OutboundEnabled
-        on `shouldBe` False
+        on `shouldBe` True
 
       it "bip324V2OutboundEnabled treats '0' as OFF" $ do
         SE.setEnv "HASKOIN_BIP324_V2_OUTBOUND" "0"
@@ -17782,22 +17833,20 @@ main = hspec $ do
     -- (probability ~1/2^32) would be WRONGLY classified as V1.
     -- This test documents the bug: a prefix that has the right magic but wrong
     -- "version\0" continuation should be V2 per Core but is V1 per haskoin.
-    it "G13/G14 BUG: detectTransportVersion checks only 4B (not 16B V1_PREFIX_LEN)" $ do
-      -- Construct a 16-byte prefix: magic OK, but bytes 4-15 != "version\0\0\0\0\0"
-      -- Bitcoin Core would classify this as V2 (full 16B mismatch).
-      -- Haskoin classifies it as V1 (first 4B magic match).
+    it "G13/G14 FIXED: detectTransportVersion checks the full 16B V1_PREFIX_LEN (Core net.h:465)" $ do
+      -- Construct a 16-byte prefix: magic OK, but bytes 4-15 != "version\0\0\0\0\0".
+      -- Core (net.h:465 V1_PREFIX_LEN = 16) only commits to V1 when all 16
+      -- bytes match; a mismatch anywhere in the prefix is V2.  Fixed in
+      -- Network.hs detectTransportVersion (7c825e9).
       let spoofedV2Start = mainnetMagic `BS.append` BS.replicate 12 0x42
-      -- Haskoin says V1 — this is the BUG
       detectTransportVersion spoofedV2Start mainnetMagic
-        `shouldBe` Just TransportV1
-      -- If haskoin were correct, it should be TransportV2 for this input
-      -- (because the full 16-byte V1 prefix is magic || "version\0\0\0\0\0",
-      -- not magic || 0x424242...)
-      -- We document this as a failing assertion to pin the incorrect behavior:
-      let correctClassification = Just TransportV2
-      let haskoinsAnswer        = detectTransportVersion spoofedV2Start mainnetMagic
-      -- The two should differ — haskoin says V1, spec says V2
-      haskoinsAnswer `shouldNotBe` correctClassification
+        `shouldBe` Just TransportV2
+      -- Control: the genuine 16-byte V1 prefix is still V1.
+      let v1Prefix = mainnetMagic `BS.append`
+                       BS.pack [0x76,0x65,0x72,0x73,0x69,0x6f,0x6e,0,0,0,0,0]
+      detectTransportVersion v1Prefix mainnetMagic `shouldBe` Just TransportV1
+      -- Control: fewer than 16 bytes cannot be classified yet.
+      detectTransportVersion (BS.take 15 v1Prefix) mainnetMagic `shouldBe` Nothing
 
     -- G16 BUG: readGarbageUntilTerminator uses BS.breakSubstring (first match),
     -- but BIP-324 / Bitcoin Core scan the TRAILING 16 bytes of the accumulated
@@ -17936,15 +17985,16 @@ main = hspec $ do
     -- NOT a CSPRNG. Bitcoin Core uses GetStrongRandBytes for all key material.
     -- We document the bug by confirming the v2TransportSend cipher requires a
     -- secret key whose quality determines forward secrecy.
-    it "G1/G26 BUG: newBIP324Cipher accepts weak key (no CSPRNG enforcement)" $ do
-      -- A key of all zeros is accepted — no entropy check exists.
-      -- Bitcoin Core validates key material via secp256k1's scalar checks but
-      -- the randomness quality is enforced by caller using CSPRNG.
-      let weakKey  = BS.replicate 32 0x00  -- all-zero, not random
+    it "G1/G26 FIXED: newBIP324Cipher rejects the all-zero scalar (real secp256k1 ellswift)" $ do
+      -- newBIP324Cipher (Network.hs) now calls secp256k1_ellswift_create,
+      -- which fails for an invalid scalar (zero / >= curve order) exactly as
+      -- Core's CKey::EllSwiftCreate does (key.cpp asserts a valid key).
+      let weakKey  = BS.replicate 32 0x00  -- zero scalar: not a valid seckey
           weakEnt  = BS.replicate 32 0x00
-      cipher0 <- newBIP324Cipher weakKey weakEnt
-      -- The cipher is created without error (no entropy quality check)
-      BS.length (getEllSwiftPubKey (b324OurPubKey cipher0)) `shouldBe` 64
+      newBIP324Cipher weakKey weakEnt `shouldThrow` anyIOException
+      -- Control: a valid nonzero scalar yields a 64-byte ElligatorSwift key.
+      cipher1 <- newBIP324Cipher (BS.replicate 32 0x11) weakEnt
+      BS.length (getEllSwiftPubKey (b324OurPubKey cipher1)) `shouldBe` 64
 
     -- G10 FIXED: Key zeroization — Bitcoin Core calls memory_cleanse after ECDH
     -- (bip324.cpp:67-70). Haskoin now wraps the 32-byte ECDH output in
@@ -22417,11 +22467,41 @@ main = hspec $ do
     -- addHeader now accepts a minPowChecked :: Bool parameter.
     -- netMinimumChainWork was previously only consulted on the assumevalid
     -- path (shouldSkipScripts); it is now wired into addHeader directly.
-    it "G8a minPowChecked=False + low chainwork => too-little-chainwork (W97 G8)" $ do
-      -- Craft a regtest variant with a very high minimum chainwork threshold
-      -- (1000) — far above the ~2 units of work a single regtest block adds
-      -- (target ≈ 2^255 → work ≈ 2^256/2^255 = 2).  With minPowChecked=False
-      -- the gate should fire and reject the header.
+    it "G8a minPowChecked=False + low-work side branch once tip >= threshold => too-little-chainwork (W97 G8)" $ do
+      -- Since 653e476 (Consensus.hs addHeader Gate 7) the gate fires only
+      -- once OUR OWN tip work has reached netMinimumChainWork -- Core's
+      -- "extending an already-high-work chain" case (validation.cpp:4229;
+      -- from-genesis sync is covered by headerssync.cpp PRESYNC, which
+      -- haskoin lacks, so gating header 1 on its own work wedged IBD).
+      -- Build genesis -> h1 -> h2 (vouched, minPowChecked=True), set the
+      -- threshold to work(h2), then offer a SIBLING of h1: its cumulative
+      -- work == work(h1) < threshold while the tip is at threshold.
+      hc <- initHeaderChain regtest
+      let genesisHdr = blockHeader (netGenesisBlock regtest)
+          genesisHsh = computeBlockHash genesisHdr
+          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 0x01))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+          hdr2 = mineRegtestHeader $ BlockHeader 1 (computeBlockHash hdr1)
+                   (Hash256 (BS.replicate 32 0x04))
+                   (bhTimestamp genesisHdr + 1200) 0x207fffff 0
+          sibling1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+                   (Hash256 (BS.replicate 32 0x05))
+                   (bhTimestamp genesisHdr + 600) 0x207fffff 0
+      Right e1 <- addHeader regtest hc hdr1 True
+      Right e2 <- addHeader regtest hc hdr2 True
+      ceChainWork e2 `shouldSatisfy` (> ceChainWork e1)
+      let gatedNet = regtest { netMinimumChainWork = ceChainWork e2 }
+      r <- addHeader gatedNet hc sibling1 False
+      case r of
+        Left err -> err `shouldContain` "too-little-chainwork"
+        Right _  -> expectationFailure
+          "should reject: side-branch work == work(h1) < threshold == work(h2)"
+
+    it "G8a-bootstrap minPowChecked=False below threshold from genesis => accepted (653e476 design)" $ do
+      -- The deliberate divergence: with the tip still below the threshold
+      -- (a from-genesis sync) the gate is skipped, otherwise header 1 can
+      -- never be accepted and the sync wedges (Consensus.hs Gate 7 comment).
       let highWorkNet = regtest { netMinimumChainWork = 1000 }
       hc <- initHeaderChain highWorkNet
       let genesisHdr = blockHeader (netGenesisBlock highWorkNet)
@@ -22431,9 +22511,9 @@ main = hspec $ do
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       r <- addHeader highWorkNet hc hdr1 False
       case r of
-        Left err -> err `shouldContain` "too-little-chainwork"
-        Right _  -> expectationFailure
-          "should reject: cumulative work after genesis+1 block is ~2, threshold is 1000"
+        Right entry -> ceHeight entry `shouldBe` 1
+        Left err    -> expectationFailure $
+          "bootstrap header must be accepted below threshold, got: " ++ err
 
     it "G8b minPowChecked=True + low chainwork => accepted (caller vouches for work) (W97 G8)" $ do
       -- Same setup but minPowChecked=True: the caller asserts the chain has
@@ -22600,7 +22680,7 @@ main = hspec $ do
       -- exists in chain params (Consensus.hs:269) but is never
       -- consulted on the header path.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 80 (drop 1247 (lines contents)))
+      let block = unlines (mainArm "MHeaders (Headers hdrs) -> do" contents)
       ("PowTargetSpacing" `isInfixOf` block) `shouldBe` False
       ("powTargetSpacing" `isInfixOf` block) `shouldBe` False
 
@@ -22610,7 +22690,7 @@ main = hspec $ do
       -- Core: line 4308 — AcceptBlock calls AcceptBlockHeader first.
       -- haskoin's MBlock handler at app/Main.hs:1359 does the same.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 30 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       ("addHeader net hc hdr" `isInfixOf` block) `shouldBe` True
 
     it "G18 BUG: fAlreadyHave / BLOCK_HAVE_DATA short-circuit MISSING on MBlock (W97 DOS)" $ do
@@ -22623,7 +22703,7 @@ main = hspec $ do
       -- and returns the existing entry, but the *block-write* path is
       -- NOT short-circuited.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       -- No "HAVE_DATA" / "alreadyHave" / "BlockStatus" gate guards
       -- the connectBlock call.
       ("HAVE_DATA"   `isInfixOf` block) `shouldBe` False
@@ -22646,9 +22726,13 @@ main = hspec $ do
       -- gate checks; we run the gate and reject after, but we still
       -- pay the validation cost.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       ("fHasMoreOrSameWork" `isInfixOf` block) `shouldBe` False
-      ("ChainWork"          `isInfixOf` block) `shouldBe` False
+      -- The arm reads `ceChainWork entry` only to build the ChainState it
+      -- hands to validateFullBlockIO; what is still absent is a work
+      -- COMPARISON against the active tip (Core validation.cpp:4319).
+      ("ChainWork >=" `isInfixOf` block) `shouldBe` False
+      ("ChainWork <"  `isInfixOf` block) `shouldBe` False
 
     it "G19c unrequested too-far-ahead block is dropped (W97 G19c active)" $ do
       -- Core: validation.cpp:4325 — for unrequested blocks, reject when
@@ -22658,7 +22742,7 @@ main = hspec $ do
       -- Case 1: unrequested block at tip+289 → dropped (fTooFarAhead=True,
       -- fRequested=False → unless condition is True → body is skipped).
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       -- Gate must be present in the MBlock handler window.
       ("minBlocksToKeep" `isInfixOf` block) `shouldBe` True
       ("fTooFarAhead"    `isInfixOf` block) `shouldBe` True
@@ -22669,7 +22753,7 @@ main = hspec $ do
       -- not > 288) → gate does NOT fire → block proceeds to connectBlock.
       -- Verify the guard uses strict '>' (not '>='), matching Core line 4325.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       -- The comparison must be strict greater-than, not >=.
       ("height > activeTipHeight + minBlocksToKeep" `isInfixOf` block) `shouldBe` True
 
@@ -22680,7 +22764,7 @@ main = hspec $ do
       -- early-return sub-gates (4320 nTx, 4327 fHasMoreOrSameWork, 4325
       -- fTooFarAhead, 4345 nMinimumChainWork).
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       ("not fRequested" `isInfixOf` block) `shouldBe` True
 
     it "G19d BUG: nMinimumChainWork gate MISSING on MBlock (W97 DOS)" $ do
@@ -22689,22 +22773,18 @@ main = hspec $ do
       -- for header-flood scenarios; haskoin's MBlock handler does
       -- NOT consult netMinimumChainWork.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       ("MinimumChainWork" `isInfixOf` block) `shouldBe` False
       ("minChainWork"      `isInfixOf` block) `shouldBe` False
 
-    it "G20+G21 BUG: CheckBlock + ContextualCheckBlock MISSING on MBlock (W97 CONSENSUS-DIVERGENT)" $ do
-      -- Core: lines 4350-4351 — AcceptBlock calls
+    it "G20+G21 FIXED: CheckBlock + ContextualCheckBlock run on MBlock before connect (W97)" $ do
+      -- Core: validation.cpp:4350-4351 — AcceptBlock calls
       --   CheckBlock(block, …) && ContextualCheckBlock(block, …, pprev)
-      -- BEFORE any disk write.  haskoin's MBlock pipeline (app/Main.hs:1374)
-      -- builds the spent-utxo map and calls 'connectBlock' directly.
-      -- 'connectBlock' delegates to 'connectBlockAt' which runs only
-      -- W93 gates G1+G19 (prev-hash match + per-input prevout existence),
-      -- NOT CheckBlock (size, coinbase, merkle, sigops cap) or
-      -- ContextualCheckBlock (BIP-34/65/66 nVersion gates, BIP-113
-      -- finality, BIP-141 witness commitment).  The IBD pipeline
-      -- (Sync.hs:403) calls 'validateFullBlockIO' which DOES cover
-      -- these — TWO-PIPELINE GAP.
+      -- BEFORE any disk write.  The MBlock arm now calls
+      -- 'validateFullBlockIO' (the same full-block gate the IBD pipeline
+      -- in Sync.hs uses) and only reaches 'connectBlock' on Right.  The
+      -- pre-fix assertion pinned the gap; it passed after the fix only
+      -- because its hard-coded line window no longer covered the arm.
       contents <- readFile "app/Main.hs"
       -- Strip line comments so we don't match prose like
       -- "CheckBlock failure -> Misbehaving(100, …)".
@@ -22712,11 +22792,12 @@ main = hspec $ do
             case break (== '-') l of
               (pre, '-' : '-' : _) -> pre
               _                    -> l
-          mblockBody = take 130 (drop 1352 (lines contents))
+          mblockBody = mainArm "MBlock block -> do" contents
           codeOnly   = unlines (map stripComment mblockBody)
-      ("validateFullBlock" `isInfixOf` codeOnly) `shouldBe` False
-      -- The actual function-call form (lowercase Haskell) is absent.
-      ("validateFullBlockIO" `isInfixOf` codeOnly) `shouldBe` False
+      -- The actual function-call form is present in CODE (not just prose),
+      -- and its result gates the connect.
+      ("validateFullBlockIO" `isInfixOf` codeOnly) `shouldBe` True
+      ("Left verr" `isInfixOf` codeOnly) `shouldBe` True
 
     it "G22 InvalidBlockFound: peer is banned on validation failure (W97)" $ do
       -- Core: lines 4352-4354 — InvalidBlockFound(pindex, state).
@@ -22784,7 +22865,7 @@ main = hspec $ do
       -- in the cache unflushed; a crash loses up to ~1000 blocks of
       -- work even though Core would have flushed each one.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       ("flushBlockInterval = 1000" `isInfixOf` block) `shouldBe` True
 
     it "G27 CheckBlockIndex final invariant is ABSENT (W97 OBSERVABILITY)" $ do
@@ -22807,7 +22888,7 @@ main = hspec $ do
       -- (Main.hs:1445-1452), including for duplicates accepted via
       -- connectBlockUnchecked fallback.
       contents <- readFile "app/Main.hs"
-      let block = unlines (take 130 (drop 1352 (lines contents)))
+      let block = unlines (mainArm "MBlock block -> do" contents)
       ("fNewBlock" `isInfixOf` block) `shouldBe` False
       ("isNewBlock" `isInfixOf` block) `shouldBe` False
 
@@ -22828,15 +22909,15 @@ main = hspec $ do
       ("difficultyAdjustment" `isInfixOf` block) `shouldBe` False
       ("verifyCheckpoint"    `isInfixOf` block) `shouldBe` False
 
-    it "TWO-PIPELINE: MBlock vs IBD blockProcessor — validateFullBlockIO presence (W97 CONSENSUS-DIVERGENT)" $ do
-      -- Sync.hs:403 — IBD calls
-      --   validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs skipScripts block utxoMap
-      -- before connectBlockAt.  app/Main.hs MBlock handler does NOT.
+    it "TWO-PIPELINE CLOSED: MBlock and IBD blockProcessor both call validateFullBlockIO (W97)" $ do
+      -- Sync.hs — IBD calls validateFullBlockIO before connectBlockAt, and
+      -- the app/Main.hs MBlock arm now does the same (see G20+G21).  Core
+      -- has one AcceptBlock (validation.cpp:4298) for both paths.
       ibd <- readFile "src/Haskoin/Sync.hs"
       ("validateFullBlockIO" `isInfixOf` ibd) `shouldBe` True
       app <- readFile "app/Main.hs"
-      let mblock = unlines (take 130 (drop 1352 (lines app)))
-      ("validateFullBlockIO" `isInfixOf` mblock) `shouldBe` False
+      let mblock = unlines (mainArm "MBlock block -> do" app)
+      ("validateFullBlockIO" `isInfixOf` mblock) `shouldBe` True
 
     it "TWO-PIPELINE: connectBlock surfaces gate failure as Left — BestBlock NOT overwritten on prevHash mismatch (W97 CONSENSUS-DIVERGENT P0 FIXED)" $
       -- Pre-fix bug (haskoin commit a28a65a, W97 audit):
@@ -23202,7 +23283,7 @@ main = hspec $ do
       ("connectBlockUnchecked" `isInfixOf` consensusSrc) `shouldBe` False
       mainSrc <- readFile "app/Main.hs"
       -- The MBlock handler must now pattern-match the Either.
-      let mblockLines = take 130 (drop 1352 (lines mainSrc))
+      let mblockLines = mainArm "MBlock block -> do" mainSrc
           mblockBody  = unlines mblockLines
       -- Left arm fires misbehaving InvalidBlock.
       ("Left cbErr"      `isInfixOf` mblockBody) `shouldBe` True
