@@ -17,6 +17,12 @@ This starts haskoin on mainnet with data persisted to a Docker volume. Ports 833
 ```bash
 # Install dependencies (Debian/Ubuntu)
 sudo apt-get install -y librocksdb-dev pkg-config libsecp256k1-dev zlib1g-dev
+# Also required (not packaged on Debian): libminisketch, built from
+# https://github.com/sipa/minisketch, and the rocksdb_compat shim for RocksDB 9.x:
+#   bash scripts/build-rocksdb-compat.sh     (see haskoin.cabal extra-libraries)
+# Toolchain: haskoin.cabal pins no GHC (base >= 4.14 && < 5); the Dockerfile
+# builds with GHC 9.8 (haskell:9.8-slim) and the fleet builds with GHC 9.6.7 /
+# cabal-install 3.14.2.0 (cabal-version 3.0).
 
 # Build
 cabal update
