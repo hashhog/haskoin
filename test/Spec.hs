@@ -20655,38 +20655,37 @@ main = hspec $ do
     -- 'checkAssumeutxoWhitelist' suite above uses for testing the
     -- policy function directly.
     -- ------------------------------------------------------------------
+    -- Since 22f273a the RPC performs the real two-stage snapshot load
+    -- (activateSnapshotSync); the 2026-05 refusal gate is gone and
+    -- 'loadTxOutSetGateMessage' is retained as documentation only.  A path
+    -- that cannot be opened is Core rpc/blockchain.cpp:3412-3416:
+    --   throw JSONRPCError(RPC_INVALID_PARAMETER,
+    --                      "Couldn't open file " + path + " for reading.");
     describe "loadtxoutset RPC gate" $ do
-      it "refuses with rpcInternalError and points at --load-snapshot" $ do
+      it "unreadable path: RPC_INVALID_PARAMETER (-8) with Core's message" $ do
         resp <- handleLoadTxOutSet undefined
                   (toJSON ["/some/snapshot.dat" :: T.Text])
         let err = resError resp
         -- result must be Null (refusal)
         resResult resp `shouldBe` Null
-        -- error.code must be -32603 (rpcInternalError)
         case err of
           Object km -> do
-            KM.lookup "code" km `shouldBe` Just (toJSON rpcInternalError)
-            -- error.message must direct the operator at the CLI flag
-            case KM.lookup "message" km of
-              Just (String t) ->
-                ("--load-snapshot" `T.isInfixOf` t) `shouldBe` True
-              other ->
-                expectationFailure
-                  ("expected error.message :: Text, got " ++ show other)
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcInvalidParameter)
+            KM.lookup "message" km `shouldBe`
+              Just (String "Couldn't open file /some/snapshot.dat for reading.")
           other ->
             expectationFailure
               ("expected error :: Object, got " ++ show other)
 
-      it "gate fires before any file I/O (non-existent path)" $ do
-        -- Pre-fix code would have called 'loadSnapshot' which opens
-        -- the path on disk. With a non-existent path the previous
-        -- behaviour was an OSError-flavoured message; the gate must
-        -- short-circuit to the canonical refusal regardless.
+      it "missing-file check runs before any snapshot parsing (non-existent path)" $ do
+        -- Core opens the file first (rpc/blockchain.cpp:3411) and only then
+        -- parses SnapshotMetadata; a non-existent path never reaches the
+        -- loader, so the answer is -8, not the loader's -32603.
         resp <- handleLoadTxOutSet undefined
                   (toJSON ["/definitely/does/not/exist.dat" :: T.Text])
         case resError resp of
           Object km ->
-            KM.lookup "code" km `shouldBe` Just (toJSON rpcInternalError)
+            KM.lookup "code" km `shouldBe` Just (toJSON rpcInvalidParameter)
           other ->
             expectationFailure
               ("expected error :: Object, got " ++ show other)
@@ -20702,18 +20701,28 @@ main = hspec $ do
             expectationFailure
               ("expected error :: Object, got " ++ show other)
 
-      it "gate message matches the exported 'loadTxOutSetGateMessage'" $ do
-        resp <- handleLoadTxOutSet undefined
-                  (toJSON ["/some/snapshot.dat" :: T.Text])
-        case resError resp of
-          Object km -> case KM.lookup "message" km of
-            Just (String t) -> t `shouldBe` loadTxOutSetGateMessage
+      it "an existing but malformed file reaches the loader and is refused (-32603)" $
+        -- A readable file that is not a snapshot passes Core's fopen check
+        -- and fails inside the loader (bad magic).  haskoin reports loader
+        -- failures as rpcInternalError; the historical gate text
+        -- ('loadTxOutSetGateMessage') is no longer what the RPC answers.
+        withSystemTempDirectory "haskoin-loadtxoutset" $ \tmp -> do
+          let path = tmp </> "not-a-snapshot.dat"
+          BS.writeFile path (BS.replicate 64 0x00)
+          resp <- handleLoadTxOutSet undefined (toJSON [T.pack path])
+          case resError resp of
+            Object km -> do
+              KM.lookup "code" km `shouldBe` Just (toJSON rpcInternalError)
+              case KM.lookup "message" km of
+                Just (String t) -> do
+                  ("Unable to load UTXO snapshot" `T.isInfixOf` t) `shouldBe` True
+                  t `shouldNotBe` loadTxOutSetGateMessage
+                other ->
+                  expectationFailure
+                    ("expected error.message :: Text, got " ++ show other)
             other ->
               expectationFailure
-                ("expected error.message :: Text, got " ++ show other)
-          other ->
-            expectationFailure
-              ("expected error :: Object, got " ++ show other)
+                ("expected error :: Object, got " ++ show other)
 
     -- ------------------------------------------------------------------
     -- importdescriptors RPC — REAL implementation (2026-06-09; replaces

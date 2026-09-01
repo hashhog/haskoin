@@ -13437,6 +13437,20 @@ handleLoadTxOutSet server params =
             case mbh of
               Nothing -> return Nothing
               Just bh -> getBlock db bh
+      -- Core rpc/blockchain.cpp:3411-3416 opens the file BEFORE parsing
+      -- anything and answers RPC_INVALID_PARAMETER (-8) when it cannot:
+      --   throw JSONRPCError(RPC_INVALID_PARAMETER,
+      --                      "Couldn't open file " + path + " for reading.");
+      -- Previously a missing path fell through to the loader and came back
+      -- as -32603 "Unable to load UTXO snapshot: ... does not exist".
+      readable <- doesFileExist path
+      if not readable
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            (T.pack ("Couldn't open file " ++ path ++ " for reading."))) Null
+        else loadSnapshotFile db net path getBlockAtHeight
+  where
+    loadSnapshotFile db net path getBlockAtHeight = do
       -- Two-stage activation, run synchronously to a terminal verdict.
       -- Reuses the SAME reject-verified engine the W102 spec exercises;
       -- runs entirely in a separate background store (active store
