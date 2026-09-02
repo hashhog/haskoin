@@ -43,7 +43,7 @@ itself.
 suite (5052 examples, 466 pending) went 34 failing → 0 with no skips and no gaps
 carried; one of those was a real bug, mutation-verified — `26f71d7`, so that
 `loadtxoutset` answers `-8 "Couldn't open file … for reading."` before any
-snapshot parsing, matching Core's `rpc/blockchain.cpp:3411-3416`. The assumeUTXO
+snapshot parsing, matching Core's `bitcoin-core/src/rpc/blockchain.cpp:3411-3416`. The assumeUTXO
 snapshot-boot gate was red for haskoin from 2026-08-11; the genesis-body defect
 behind it was fixed in `b1d1d43`
 (`receipts/boot-smoke-4-red-triaged-2026-08-16.md:76-90`).
@@ -53,6 +53,12 @@ behind it was fixed in `b1d1d43`
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 
