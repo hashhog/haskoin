@@ -2,6 +2,58 @@
 
 A Bitcoin full node written from scratch in Haskell. Part of the [Hashhog](https://github.com/hashhog/hashhog) project.
 
+## Status — v1.0.0
+
+**Label: "Pending — genesis rig running; label not assignable from a committed
+artifact"** (`receipts/RELEASE-v1.0-SCORECARD.md`). haskoin is the one node the
+release scorecard declines to grade: a from-genesis rig is running, but its height
+is not recorded in any committed artifact — the only source is an uncommitted live
+log. The git tag `v0.1.0-beta1` (`receipts/RELEASE-v1.0-FREEZE.md`) says the same
+from the other side: `rc` is reserved for an independent from-genesis
+`--assumevalid=0` reproduction of Core's UTXO-set commitment, and `beta` means that
+receipt does not exist (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither
+label certifies wallet or fund-custody readiness — see `SECURITY.md`.
+
+**haskoin has not been shown to validate the chain from genesis.** There is no
+haskoin row in the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and
+no haskoin replay ledger in `CORE-PARITY-AUDIT/replay-ledgers/`.
+`receipts/SYNCS.md:30` records the live mainnet chainstate as having been created
+by `--load-snapshot` (base height 956407, 166,119,542 coins, 2026-07-02
+recovery), with "from-genesis full script validation **UNKNOWN** — no banked
+AV=0/genesis replay found". The node honours assumevalid (`skipScripts`), so
+being at Core's tip with a matching best-block hash is not by itself evidence
+that it verified the scripts below the assumevalid height. A from-genesis rig is
+in flight, but the release scorecard records its height as NOT PROVEN — the only
+source is an uncommitted live log, and a download pointer is not a validated
+height. A reader of this repository alone should assume haskoin's from-genesis
+validation is untested.
+
+**Operator RPC parity: 57 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): haskoin 57 PASS /
+28 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core. Failures are largely error-code
+mismatches (`decoderawtransaction` on non-hex returns `-1` where Core returns
+`-22`; `getmempoolentry` on an absent transaction returns `-1` where Core returns
+`-5`). Until `ccfa0f2`, 31 methods were dispatched but absent from
+`allRpcCommands`, so `help` never listed them — the RPC surface under-reported
+itself.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+suite (5052 examples, 466 pending) went 34 failing → 0 with no skips and no gaps
+carried; one of those was a real bug, mutation-verified — `26f71d7`, so that
+`loadtxoutset` answers `-8 "Couldn't open file … for reading."` before any
+snapshot parsing, matching Core's `rpc/blockchain.cpp:3411-3416`. The assumeUTXO
+snapshot-boot gate was red for haskoin from 2026-08-11; the genesis-body defect
+behind it was fixed in `b1d1d43`
+(`receipts/boot-smoke-4-red-triaged-2026-08-16.md:76-90`).
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Docker
@@ -210,7 +262,7 @@ P2P networking is managed through an async peer manager that handles DNS seed di
 
 The mempool supports Replace-By-Fee (RBF) and a cluster mempool design for more accurate mining score computation. Fee estimation tracks confirmation times across fee-rate buckets. Block template construction selects transactions by ancestor feerate for optimal miner revenue. The wallet module provides BIP-32/39/44/84 HD key derivation with mnemonic generation, PSBT workflows (BIP-174/370), and output descriptor support (BIP-380-386).
 
-The RPC server exposes a Bitcoin Core-compatible JSON-RPC interface with HTTP Basic Auth. It supports blockchain queries, raw transaction operations, mempool inspection, mining (block templates and regtest generation), wallet operations, and PSBT handling. The CLI provides three subcommands: `node` for running the full node, `wallet` for offline wallet operations, and `util` for transaction/script/address utilities.
+The RPC server exposes a JSON-RPC interface with HTTP Basic Auth, modelled on Bitcoin Core's. It is not yet behaviourally compatible: on the 2026-09-01 operator probe haskoin answers 57 of the 103 probed methods correctly against Core's 85, with 28 failures, largely error-code mismatches. Until `ccfa0f2`, 31 methods were dispatched but missing from `allRpcCommands`, so `help` did not list them. It supports blockchain queries, raw transaction operations, mempool inspection, mining (block templates and regtest generation), wallet operations, and PSBT handling. The CLI provides three subcommands: `node` for running the full node, `wallet` for offline wallet operations, and `util` for transaction/script/address utilities.
 
 ## Project Structure
 
