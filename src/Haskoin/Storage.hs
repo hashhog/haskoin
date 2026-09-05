@@ -2728,15 +2728,20 @@ loadSnapshotIntoLegacyUTXO db snapshot = do
 --   - @coin.nHeight > base_height@ → fatal
 --   - @!MoneyRange(coin.out.nValue)@ → fatal
 --
--- The @expectedHash@ parameter is accepted but not used to verify the
--- UTXO-set digest after writing.  Rationale: the existing 'computeUtxoHash'
--- sorts coins by @(TxId, vout_numeric)@, but that sort requires all 165 M
--- coins in memory (defeating the purpose of this function).  The DB-cursor
--- order uses @LE32(vout)@ in key position, which differs from numeric vout
--- order for vout >= 256, producing a different digest.  Per-coin height and
--- MoneyRange validation still catches corrupted coin data; the
--- @audHashSerialized@ gate in 'verifySnapshot' was already cleared when the
--- whitelist entry was established from a previously-loaded copy of this file.
+-- After the coins are written, the UTXO-set digest is verified against
+-- @expectedHash@ (Core validation.cpp PopulateAndValidateSnapshot L5920) via
+-- 'computeUtxoHashFromDB', which reproduces Core's ordering -- txid-major
+-- from the DB cursor, ascending numeric vout within each txid -- while
+-- holding only one transaction's coins in memory.  A mismatch is fatal
+-- ('Left'); an all-zero @expectedHash@ means "no trust anchor" (the
+-- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT development bypass) and skips the check.
+--
+-- This gate was previously dead: @expectedHash@ was accepted and discarded,
+-- on the rationale that the in-memory 'computeUtxoHash' could not run here
+-- without OOMing on the 165 M-coin mainnet set.  That left every
+-- @--load-snapshot@ / @loadtxoutset@ import accepting ANY coin data whose
+-- base blockhash happened to be whitelisted -- exactly the forgery the
+-- hardcoded anchors exist to prevent.
 --
 -- Reference: bitcoin/src/validation.cpp PopulateAndValidateSnapshot
 streamSnapshotIntoLegacyUTXO
@@ -2744,7 +2749,8 @@ streamSnapshotIntoLegacyUTXO
   -> FilePath    -- ^ Path to snapshot file (Core @dumptxoutset@ format)
   -> Word32      -- ^ Expected network magic (LE32)
   -> Word32      -- ^ Snapshot base height (for per-coin height guard)
-  -> Hash256     -- ^ Expected audHashSerialized (accepted but not re-verified; see note above)
+  -> Hash256     -- ^ Expected audHashSerialized, in Core DISPLAY byte order
+                 --   (all-zero = no trust anchor, gate skipped)
   -> IO (Either String Int)
 streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
   result <- try (openBinaryFile path ReadMode) :: IO (Either IOException Handle)
@@ -2870,15 +2876,53 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
           -- 2. Write best-block pointer and sync.
           putBestBlockHash db (smBaseBlockHash meta)
           syncFlush db
-          -- Note: no post-load UTXO-set hash check here.  The existing
-          -- 'computeUtxoHash' sorts coins numerically by vout but the DB
-          -- cursor iterates by LE32(vout) lexicographic order; for same-txid
-          -- coins with vout >= 256 these orderings diverge, producing a
-          -- different digest.  Streaming with per-coin validation is
-          -- sufficient for data integrity; the whitelist 'audHashSerialized'
-          -- was cleared when the snapshot entry was established.
           n <- readIORef imported
-          return $ Right n
+          -- 3. BUG-2 gate: the UTXO set just written must hash to the
+          --    commitment carried by the assumeutxo entry that authorised
+          --    this base (Core validation.cpp PopulateAndValidateSnapshot
+          --    L5920).  'computeUtxoHashFromDB' walks the RocksDB cursor in
+          --    Core's order with O(widest-tx) memory, so this runs on the
+          --    165 M-coin mainnet snapshot without the OOM that originally
+          --    forced the in-memory 'computeUtxoHash' off this path.
+          --
+          --    ORIENTATION (do not "fix" by flipping): 'computeUtxoHashFromDB'
+          --    returns the RAW double-SHA256 digest, i.e. a Core uint256's
+          --    INTERNAL byte order.  'expectedHash' reached us through
+          --    'hexToHash256', which does NOT reverse, so it holds Core's
+          --    DISPLAY bytes.  Reverse the computed digest into display order
+          --    before comparing -- byte-for-byte the same convention as
+          --    'verifySnapshot' and as 'showHash256' uses to render
+          --    @hash_serialized_3@ for gettxoutsetinfo.
+          --
+          --    The all-zero sentinel means "no trust anchor": it is what
+          --    app/Main.hs synthesises for the development-only
+          --    HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass, where by construction
+          --    there is no commitment to check.  Skip the gate there rather
+          --    than fail it, and say so out loud.
+          if expectedHash == Hash256 (BS.replicate 32 0)
+            then do
+              putStrLn "[snapshot] hash gate SKIPPED -- no trust anchor \
+                       \(HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass)"
+              return $ Right n
+            else do
+              Hash256 rawDigest <- computeUtxoHashFromDB db
+              let actualHash = Hash256 (BS.reverse rawDigest)
+              if actualHash == expectedHash
+                then do
+                  putStrLn $ "[snapshot] hash gate PASSED: hash_serialized = "
+                          ++ displayHexOfHash256 actualHash
+                  return $ Right n
+                else return $ Left $
+                       "UTXO hash mismatch: expected "
+                       ++ displayHexOfHash256 expectedHash
+                       ++ ", got " ++ displayHexOfHash256 actualHash
+
+-- | Render a 'Hash256' that already holds Core DISPLAY-order bytes as hex.
+-- No reversal: both operands of the snapshot hash gate are in display order,
+-- so this is purely a rendering step (contrast 'showHash256' in Haskoin.Rpc,
+-- which reverses because it is handed an internal-order digest).
+displayHexOfHash256 :: Hash256 -> String
+displayHexOfHash256 (Hash256 bs) = concatMap (printf "%02x") (BS.unpack bs)
 
 -- | Compute the @HASH_SERIALIZED@ digest over the UTXO set stored on disk,
 -- by walking the @PrefixUTXO@ keyspace with a RocksDB cursor.
@@ -2896,8 +2940,38 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
 -- @TxOutSer@ / @FinalizeHash@.
 computeUtxoHashFromDB :: HaskoinDB -> IO Hash256
 computeUtxoHashFromDB db = do
-  -- Pass 1: accumulate the SHA256 state over every coin in cursor order.
+  -- Pass 1: accumulate the SHA256 state over every coin in Core's order.
   ctxRef <- newIORef (Hash.hashInit :: Hash.Context Hash.SHA256)
+  -- Core buffers ONE txid's coins at a time in a @std::map<uint32_t, Coin>@
+  -- and hashes that group in ascending NUMERIC vout order
+  -- (kernel/coinstats.cpp 'ComputeUTXOStats' L115-128 -> 'ApplyHash' L87-92).
+  -- The RocksDB cursor hands us txid-major order for free (the key is
+  -- @prefix || txid || LE32 vout@, so it orders by txid exactly as
+  -- 'sortCoinsForHash' does), but WITHIN one txid it yields LE32
+  -- *lexicographic* order, which diverges from numeric order at vout >= 256
+  -- (vout 256 = @00 01 00 00@ sorts before vout 1 = @01 00 00 00@).  So each
+  -- txid's coins are regrouped through a 'Map' before hashing, exactly as
+  -- Core does.  Memory stays bounded by the widest single transaction rather
+  -- than by the size of the UTXO set -- which is what lets the snapshot hash
+  -- gate run over the 165 M-coin mainnet set without the OOM that forced the
+  -- in-memory 'computeUtxoHash' off this path.
+  groupRef <- newIORef (Nothing :: Maybe TxId, Map.empty :: Map Word32 Coin)
+  let hashCoin op coin =
+        modifyIORef' ctxRef (\c -> Hash.hashUpdate c (runPut (putTxOutSer op coin)))
+      -- Hash the buffered txid group in ascending numeric vout order.
+      flushGroup = do
+        (mTid, outs) <- readIORef groupRef
+        forM_ mTid $ \tid ->
+          forM_ (Map.toAscList outs) $ \(n, coin) -> hashCoin (OutPoint tid n) coin
+        writeIORef groupRef (Nothing, Map.empty)
+      addCoin op coin = do
+        (mTid, outs) <- readIORef groupRef
+        let tid = outPointHash op
+        if mTid == Just tid
+          then writeIORef groupRef (mTid, Map.insert (outPointIndex op) coin outs)
+          else do
+            flushGroup
+            writeIORef groupRef (Just tid, Map.singleton (outPointIndex op) coin)
   let prefixBS = BS.singleton (prefixByte PrefixUTXO)
   runResourceT $ R.withIterator (dbHandle db) (dbReadOpts db) $ \iter -> do
     R.iterSeek iter prefixBS
@@ -2921,15 +2995,17 @@ computeUtxoHashFromDB db = do
                           case decode val of
                             Left _ -> R.iterNext iter >> loop  -- skip malformed
                             Right (coin :: Coin) -> do
-                              -- Serialise the TxOutSer payload:
-                              --   outpoint (36 bytes) ||
-                              --   LE32((height << 1) | coinbase) ||
-                              --   TxOut (LE64 value + varint scriptLen + script)
-                              let payload = runPut (putTxOutSer op coin)
-                              liftIO $ modifyIORef' ctxRef
-                                (\c -> Hash.hashUpdate c payload)
+                              -- Buffer into the current txid group.  The
+                              -- group is streamed to the hash (TxOutSer
+                              -- payload: outpoint (36 bytes) ||
+                              -- LE32((height << 1) | coinbase) ||
+                              -- TxOut (LE64 value + varint scriptLen +
+                              -- script)) when the txid changes.
+                              liftIO $ addCoin op coin
                               R.iterNext iter >> loop
     loop
+  -- Flush the final txid group -- the loop only flushes on a txid change.
+  flushGroup
   -- Pass 2 (finalise): inner SHA256d = SHA256(SHA256(payload_stream)).
   innerCtx  <- readIORef ctxRef
   let innerDigest = Hash.hashFinalize innerCtx
