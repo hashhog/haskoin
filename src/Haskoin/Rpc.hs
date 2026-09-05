@@ -13796,7 +13796,34 @@ handleDumpTxOutSet server params = do
           let net   = rsNetwork server
               magic = netMagic net
               hc    = rsHeaderChain server
-          tip       <- readTVarIO (hcTip hc)
+          -- The ACTIVE VALIDATED chain tip, never 'hcTip'.  Core takes
+          -- @tip = chainman.ActiveChain().Tip()@ (rpc/blockchain.cpp:3112);
+          -- @"latest"@ resolves to exactly that tip (:3126-3127), the
+          -- "do we need to roll back at all?" test compares against it
+          -- (@if (target_index != tip)@, :3161), and the height/hash written
+          -- into BOTH the on-disk snapshot header and the RPC response come
+          -- from @PrepareUTXOSnapshot(ActiveChainstate())@ (:3211).  Absent
+          -- an explicit rollback target it is the active tip — never the
+          -- header index.
+          --
+          -- 'hcTip' is haskoin's @m_best_header@: 'addHeader' advances it the
+          -- moment a header's PoW and contextual gates pass, long before (or
+          -- entirely without) the body connecting — see the "two can differ
+          -- during header-first sync" note on 'getValidatedChainTip'
+          -- (Consensus.hs:5570).  Reading it here stamped the dump with the
+          -- header height, which on a node whose peers serve headers ahead of
+          -- bodies is an arbitrary moving number far above the chain the
+          -- coins actually came from: at the M2 6316 boundary the dump
+          -- reported 107232 with the validated tip pinned at 6332, while the
+          -- dumped bytes themselves matched Core's oracle exactly.  It also
+          -- mis-bounded the rollback targets, which Core bounds by
+          -- @ActiveChain().Height()@ — an entry between the validated tip and
+          -- the header tip is not a block we could roll back to.
+          --
+          -- Same shape and same remedy as camlcoin 57ae4b0 and as the
+          -- validated-tip correction already made in 'handleGetBlockchainInfo',
+          -- 'handleGetTxOut' and BlockTemplate's 'submitBlock' (c2457e8).
+          tip       <- getValidatedChainTip (rsDB server) hc
           entries   <- readTVarIO (hcEntries hc)
           byHeight  <- readTVarIO (hcByHeight hc)
           case resolveDumpTarget net entries byHeight tip target of
@@ -16569,7 +16596,21 @@ handleGetTxOutSetInfo server params = do
                           pair "total_amount" (btcAmountEnc (fromIntegral (csTotalAmount cs)))
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
     compute wantSerialized wantMuHash = do
-      tip       <- readTVarIO (hcTip (rsHeaderChain server))
+      -- Core reports @stats.nHeight@ / @stats.hashBlock@, which
+      -- 'GetUTXOStats' takes from the coins view's best block — the ACTIVE
+      -- VALIDATED chainstate tip, never the header index.  The set iterated
+      -- below is 'PrefixUTXO', which only 'connectBlockAt' writes, so the
+      -- coins are the validated chain's; labelling them with 'hcTip' claimed
+      -- they were a chain whose bodies had never been connected.  The
+      -- 'serveAtHeight' arm above already resolves against
+      -- 'getValidatedChainTip'; this arm was the inconsistency.
+      --
+      -- The mislabelled height is not cosmetic: the boundary harness
+      -- cross-checks @height@/@bestblock@ against the node's own tip before
+      -- trusting @hash_serialized_3@, so a header-tip label made haskoin's
+      -- (correct) hash read as an unsupported surface.  Same root cause as
+      -- 'handleDumpTxOutSet' above; see camlcoin 57ae4b0, which had both.
+      tip       <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
       let tipH    = ceHeight tip
       countRef  <- newIORef (0 :: Int)
       sumRef    <- newIORef (0 :: Word64)
@@ -16695,7 +16736,13 @@ handleScanTxOutSet server params = do
     -- Walk the whole UTXO set and collect matches.
     runScan :: RpcServer -> Map ByteString Text -> IO RpcResponse
     runScan srv targets = do
-      tip      <- readTVarIO (hcTip (rsHeaderChain srv))
+      -- Third member of the UTXO-reporting family, and the same defect as
+      -- 'handleDumpTxOutSet' / 'handleGetTxOutSetInfo': this walks
+      -- 'PrefixUTXO' — the VALIDATED chainstate — but stamped the result's
+      -- @height@/@bestblock@, and every per-coin @confirmations@ depth, with
+      -- the header tip.  Core's scantxoutset reports
+      -- @ActiveChain().Tip()@ (rpc/blockchain.cpp scantxoutset).
+      tip      <- getValidatedChainTip (rsDB srv) (rsHeaderChain srv)
       countRef <- newIORef (0 :: Int)
       sumRef   <- newIORef (0 :: Word64)
       hitsRef  <- newIORef ([] :: [AE.Encoding])
