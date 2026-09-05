@@ -73,6 +73,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            checkProofOfWork,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
+                           getValidatedChainTip,
                            addHeader, contextualCheckBlockHeader,
                            addSideBranchHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
@@ -509,7 +510,48 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
   --
   -- Cross-impl reference: camlcoin 22667c2, rustoshi 68a422b.
   entries <- readTVarIO (hcEntries hc)
-  tip <- readTVarIO (hcTip hc)
+  -- THE ACTIVE CHAIN TIP IS THE *VALIDATED* TIP, NOT THE HEADER TIP.
+  --
+  -- Core's submitblock runs ProcessNewBlock -> AcceptBlock (store) ->
+  -- ActivateBestChain, and every "does this block extend the chain we are
+  -- on?" decision in that path is taken against @m_chain.Tip()@ — the
+  -- ACTIVE chain, i.e. the highest block whose body has been connected to
+  -- the coins view.  @m_chainman.m_best_header@ never participates:
+  -- header-only index entries carry no BLOCK_HAVE_DATA, so
+  -- 'TryAddBlockIndexCandidate' (validation.cpp:3732-3763) is only ever
+  -- reached from 'ReceivedBlockTransactions' / 'LoadBlockIndex' for an
+  -- entry that HAS data, and it compares against @m_chain.Tip()@ (:3746);
+  -- 'FindMostWorkChain' additionally drops any candidate whose path has
+  -- @fMissingData@ (validation.cpp:3140-3145).
+  --
+  -- haskoin is headers-first: 'addHeader' advances 'hcTip' / 'hcHeight' /
+  -- 'hcByHeight' as soon as a header's PoW + contextual gates pass, long
+  -- before (or entirely without) the body connecting.  'hcTip' is
+  -- therefore haskoin's @m_best_header@, and 'getValidatedChainTip'
+  -- (PrefixBestBlock -> ChainEntry, written by 'connectBlock's atomic
+  -- batch) is its @m_chain.Tip()@.  Reading 'hcTip' here conflated the
+  -- two, and the arm chosen below is exactly the ProcessNewBlock decision
+  -- Core takes against the active chain.
+  --
+  -- Consequence of the conflation: whenever headers ran ahead of connected
+  -- blocks, @ceHash parent /= ceHash tip@ was true for EVERY submitted
+  -- block — including one that extends the connected tip perfectly — so
+  -- submitblock always took the side-branch arm, where the new block's
+  -- cumulative work is compared against the header chain's and can never
+  -- win.  'submitBlockSideBranch' then returned Left "inconclusive"
+  -- (BIP-22's opaque "stored, not on the best chain"), instantly and
+  -- permanently.  On an assumeUTXO-bootstrapped node that state is not a
+  -- transient IBD window but the steady state: the snapshot pins the
+  -- connected tip at the base while header sync backfills genesis->real
+  -- tip, so base+1 could NEVER be connected via submitblock.  That is the
+  -- 2026-09-05 boundary-campaign failure at block 6300 (the campaign feeds
+  -- its window with submitblock), reported as a 305 s "STALL" only because
+  -- the harness re-submits an inconclusive block for 300 s.
+  --
+  -- Using the validated tip is a no-op on a synced node and on regtest
+  -- (there 'hcTip' == PrefixBestBlock, since the active-tip arm below
+  -- advances both), and restores Core's semantics everywhere else.
+  tip <- getValidatedChainTip db hc
   case Map.lookup prevHash entries of
     Nothing -> return $ Left $
       "Block validation failed: parent " ++ show prevHash ++
@@ -798,6 +840,21 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
   _sideEntry <- addSideBranchHeader hc header
 
   -- Step 2: best-chain selection.
+  --
+  -- KNOWN REMAINING DIVERGENCE (deliberately out of scope, documented so
+  -- the next reader does not mistake it for the same bug): this reads the
+  -- HEADER tip, not the validated tip, so during headers-ahead-of-blocks a
+  -- genuine side branch that Core would reorg to (more work than
+  -- @m_chain.Tip()@, less than @m_best_header@) still answers
+  -- "inconclusive".  Flipping this alone would not fix that — the reorg it
+  -- would then attempt walks the disconnect list from 'hcTip' via
+  -- 'findSideBranchForkPoint', and the bodies above the validated tip do
+  -- not exist, so 'doSideBranchReorg' would fail and land on the same
+  -- "inconclusive" through the infrastructure-failure arm.  Both reads plus
+  -- the 'hcByHeight' fork-point walk have to move together; that is a
+  -- separate change with its own reorg test matrix.  Unreachable from the
+  -- snapshot-base case this commit fixes: base+1..base+n each extend the
+  -- validated tip and take the active-tip arm.
   currentTip     <- readTVarIO (hcTip hc)
   let activeWork = ceChainWork currentTip
   if newWork <= activeWork
