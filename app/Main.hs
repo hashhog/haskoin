@@ -1007,7 +1007,59 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           -- Validity is still pinned: the base hash must be a known assumeutxo
           -- base, and streamSnapshotIntoLegacyUTXO verifies the coin-set hash
           -- against the hardcoded audHashSerialized after writing.
-          case assumeUtxoForBlockHash net baseHash of
+          -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+          -- chainparams assumeutxo whitelist.  --load-snapshot / loadtxoutset
+          -- is a TRUST SHORTCUT for end users -- that is exactly why Core
+          -- hardcodes the anchors: an operator loading an unanchored snapshot
+          -- has no way to tell a genuine UTXO set from a fabricated one.  This
+          -- project needs to validate arbitrary block ranges IN PARALLEL from
+          -- a locally generated snapshot ladder, where correctness is
+          -- established by checking each range's OUTPUT utxo hash against an
+          -- independent commitment, not by trusting the input snapshot.
+          -- Setting this variable to the snapshot's base height accepts ANY
+          -- snapshot and takes that height on faith.  UNSET (the default, and
+          -- what ships) = one 'lookupEnv' and byte-for-byte unchanged
+          -- behaviour; production trust semantics are intact.
+          mUnsafeHeight <- lookupEnv "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
+          let mWhitelisted = assumeUtxoForBlockHash net baseHash
+          mBaseParams <- case (mWhitelisted, mUnsafeHeight) of
+            (Just p, _)         -> return (Just p)
+            (Nothing, Nothing)  -> return Nothing
+            (Nothing, Just rawUnsafe) -> case readMaybe rawUnsafe :: Maybe Word32 of
+              Nothing -> do
+                putStrLn $ "[--load-snapshot] FATAL: "
+                        ++ "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT is not a valid "
+                        ++ "block height: " ++ show rawUnsafe
+                exitWith (ExitFailure 1)
+              Just unsafeHeight -> do
+                putStrLn $ "[--load-snapshot] WARNING: "
+                        ++ "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=" ++ show unsafeHeight
+                        ++ " -- accepting an UNVERIFIED snapshot whose base "
+                        ++ "blockhash " ++ show baseHash ++ " is NOT a "
+                        ++ "chainparams trust anchor. The whitelist lookup "
+                        ++ "and its hardcoded hash_serialized comparison are "
+                        ++ "BYPASSED and the base height is taken on faith "
+                        ++ "from the environment. DEVELOPMENT USE ONLY -- "
+                        ++ "never enable this in production."
+                -- Synthesized stand-in for the missing whitelist entry.  Only
+                -- 'aupHeight' is load-bearing here: 'aupHashSerialized' is
+                -- handed to 'streamSnapshotIntoLegacyUTXO', which accepts but
+                -- does NOT re-verify it (see its haddock), so the zero hash
+                -- honestly records "no trust anchor" rather than pretending
+                -- to one.  Every other guard (magic, header shape, per-coin
+                -- height <= base_height, MoneyRange) still runs unchanged.
+                return $ Just AssumeUtxoParams
+                  { aupHeight         = unsafeHeight
+                  , aupHashSerialized = Hash256 (BS.replicate 32 0)
+                  , aupChainTxCount   = 0
+                  , aupBlockHash      = baseHash
+                  }
+          -- True only on the development-only bypass path (the base hash is
+          -- absent from the hardcoded table AND the env var supplied a
+          -- height); the two whitelist gates below are then skipped, since by
+          -- construction neither can be satisfied.
+          let unsafeBypass = isNothing mWhitelisted
+          case mBaseParams of
             Nothing -> do
               putStrLn $ "[--load-snapshot] FATAL: base block "
                       ++ show baseHash
@@ -1018,7 +1070,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               let baseHeight = aupHeight baseParams
               -- BUG-1: whitelist check — height must be in the
               -- hardcoded assumeutxo table.
-              case checkAssumeutxoWhitelist net baseHeight of
+              case (if unsafeBypass then Right () else checkAssumeutxoWhitelist net baseHeight) of
                 Left wlErr -> do
                   putStrLn $ "[--load-snapshot] FATAL: " ++ wlErr
                   exitWith (ExitFailure 1)
@@ -1027,7 +1079,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                   -- the hardcoded audHashSerialized value.  Performed by
                   -- 'streamSnapshotIntoLegacyUTXO' after writing all coins
                   -- to the DB (Core PopulateAndValidateSnapshot order).
-                  case assumeUtxoForHeight net baseHeight of
+                  case (if unsafeBypass then Just baseParams else assumeUtxoForHeight net baseHeight) of
                     Nothing -> do
                       putStrLn "[--load-snapshot] FATAL: internal error: \
                                \whitelist lookup failed after whitelist passed"
@@ -1216,7 +1268,18 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           entries <- readTVarIO (hcEntries hc)
           case Map.lookup baseHash entries of
             Just ce -> return (Just (ceHeight ce))
-            Nothing -> return (aupHeight <$> assumeUtxoForBlockHash net baseHash)
+            Nothing -> case aupHeight <$> assumeUtxoForBlockHash net baseHash of
+              Just h  -> return (Just h)
+              -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: a snapshot imported under the
+              -- development-only whitelist bypass has NO table entry to
+              -- resolve its base height from, so honour the same env var
+              -- here.  Without it the undo-record search floor would fall
+              -- back to 1 and the node would wedge at the snapshot base on
+              -- the next restart (the W164 forward-sync wedge below).  UNSET
+              -- = one 'lookupEnv' and the previous 'Nothing', unchanged.
+              Nothing -> do
+                mUnsafe <- lookupEnv "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
+                return (mUnsafe >>= (readMaybe :: String -> Maybe Word32))
     connectedTipHeight <-
       case mSnapshotBaseHeight of
         -- Snapshot-bootstrapped chainstate: undo records (if any) start

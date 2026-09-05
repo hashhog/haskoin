@@ -289,6 +289,7 @@ import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
 import Data.Char (isSpace, isHexDigit)
 import System.Environment (lookupEnv)
+import Text.Read (readMaybe)
 import System.Exit (exitWith, ExitCode(..))
 import System.IO (hPutStrLn, stderr)
 import Data.Aeson (FromJSON(..), withObject, (.:), eitherDecode)
@@ -7061,10 +7062,55 @@ activateSnapshot db net snapshotPath = do
       -- a regtest test can activate a snapshot whose base hash it registered;
       -- mainnet/testnet4 still resolve against their static tables only.
       mParams <- assumeUtxoForBlockHashIO net baseHash
-      case mParams of
-        Nothing -> return $ Left $
+      -- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+      -- chainparams assumeutxo whitelist.  loadtxoutset is a TRUST SHORTCUT
+      -- for end users -- that is exactly why Core hardcodes the anchors: an
+      -- operator loading an unanchored snapshot has no way to tell a genuine
+      -- UTXO set from a fabricated one.  This project needs to validate
+      -- arbitrary block ranges IN PARALLEL from a locally generated snapshot
+      -- ladder, where correctness is established by checking each range's
+      -- OUTPUT utxo hash against an independent commitment, not by trusting
+      -- the input snapshot.  Setting this variable to the snapshot's base
+      -- height accepts ANY snapshot and takes that height on faith.  UNSET
+      -- (the default, and what ships) = one 'lookupEnv' and byte-for-byte
+      -- unchanged Core-equivalent behaviour; production trust semantics are
+      -- intact.
+      mUnsafeHeight <- lookupEnv "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
+      case (mParams, mUnsafeHeight) of
+        (Nothing, Nothing) -> return $ Left $
           "Block hash not recognized as valid assumeUtxo hash: " ++ show baseHash
-        Just params -> do
+        (Nothing, Just rawUnsafe) -> case readMaybe rawUnsafe :: Maybe Word32 of
+          Nothing -> return $ Left $
+            "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT is not a valid block height: "
+            ++ show rawUnsafe
+          Just unsafeHeight -> do
+            hPutStrLn stderr $
+              "WARNING: HASHHOG_UNSAFE_SNAPSHOT_HEIGHT=" ++ show unsafeHeight
+              ++ " -- accepting an UNVERIFIED UTXO snapshot whose base "
+              ++ "blockhash " ++ show baseHash ++ " is NOT a chainparams "
+              ++ "trust anchor. The whitelist lookup and its hardcoded "
+              ++ "hash_serialized comparison are BYPASSED and the base "
+              ++ "height is taken on faith from the environment. "
+              ++ "DEVELOPMENT USE ONLY -- never enable this in production."
+            -- ONLY the whitelist membership + its hardcoded hash_serialized
+            -- comparison are bypassed.  Format, magic, version, coin count
+            -- and per-coin parsing were all enforced by 'loadSnapshot'
+            -- above, and Stage 2 (the genesis->base re-derivation driven by
+            -- 'ausExpectedHash') still runs -- here against the digest of
+            -- THIS file, so a replay that disagrees with the snapshot is
+            -- still rejected.  'verifySnapshot' is not called on this path
+            -- only because both of its checks (base hash, hash_serialized)
+            -- would be tautologies against these synthesized params.
+            let Hash256 rawDigest = computeUtxoHash (usCoins snapshot)
+                unsafeParams = AssumeUtxoParams
+                  { aupHeight         = unsafeHeight
+                  , aupHashSerialized = Hash256 (BS.reverse rawDigest)
+                  , aupChainTxCount   = 0
+                  , aupBlockHash      = baseHash
+                  }
+            state <- initAssumeUtxoState net unsafeParams
+            return $ Right state
+        (Just params, _) -> do
           -- Verify the snapshot against expected parameters
           case verifySnapshot snapshot (AssumeUtxoData
                 { audHeight = aupHeight params
