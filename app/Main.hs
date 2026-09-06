@@ -1042,11 +1042,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                         ++ "from the environment. DEVELOPMENT USE ONLY -- "
                         ++ "never enable this in production."
                 -- Synthesized stand-in for the missing whitelist entry.  Only
-                -- 'aupHeight' is load-bearing here: 'aupHashSerialized' is
-                -- handed to 'streamSnapshotIntoLegacyUTXO', which accepts but
-                -- does NOT re-verify it (see its haddock), so the zero hash
-                -- honestly records "no trust anchor" rather than pretending
-                -- to one.  Every other guard (magic, header shape, per-coin
+                -- 'aupHeight' is load-bearing here.  'aupHashSerialized' is
+                -- NEVER compared on this branch: the call below hands
+                -- 'streamSnapshotIntoLegacyUTXO' 'Nothing' ("no trust
+                -- anchor") whenever 'unsafeBypass' holds, so the zero here is
+                -- an inert placeholder, not a sentinel the loader interprets.
+                -- Every other guard (magic, header shape, per-coin
                 -- height <= base_height, MoneyRange) still runs unchanged.
                 return $ Just AssumeUtxoParams
                   { aupHeight         = unsafeHeight
@@ -1077,8 +1078,9 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                 Right () ->
                   -- BUG-2: hash verification — coin-set hash must match
                   -- the hardcoded audHashSerialized value.  Performed by
-                  -- 'streamSnapshotIntoLegacyUTXO' after writing all coins
-                  -- to the DB (Core PopulateAndValidateSnapshot order).
+                  -- 'streamSnapshotIntoLegacyUTXO' over its STAGING area
+                  -- before anything reaches the live UTXO set; a refused
+                  -- snapshot leaves the chainstate byte-identical.
                   case (if unsafeBypass then Just baseParams else assumeUtxoForHeight net baseHeight) of
                     Nothing -> do
                       putStrLn "[--load-snapshot] FATAL: internal error: \
@@ -1095,8 +1097,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                       -- batches → verify hash from DB (BUG-9/10 + BUG-2).
                       -- Memory stays bounded (O(batch) ≈ <5 MB), never
                       -- materialising the full 165 M-coin list in the heap.
+                      -- 'Nothing' ONLY on the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
+                      -- branch.  A whitelisted or campaign entry always
+                      -- travels as 'Just' -- no value it can carry waives
+                      -- the gate.
                       r <- streamSnapshotIntoLegacyUTXO db snapshotPath magic
-                             baseHeight (aupHashSerialized params)
+                             baseHeight
+                             (if unsafeBypass
+                                then Nothing
+                                else Just (aupHashSerialized params))
                       case r of
                         Left loadErr -> do
                           putStrLn $ "[--load-snapshot] FATAL: " ++ loadErr
@@ -1164,6 +1173,22 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     fe <- newFeeEstimator
     let feeEstimatesPath = dataDir </> "fee_estimates.json"
     loadFeeEstimates fe feeEstimatesPath
+
+    -- A snapshot import that died inside its commit phase (live UTXO set
+    -- already dropped, verified staging set not yet fully copied in) leaves
+    -- a PARTIAL coin set next to an intact header chain and intact undo
+    -- records -- exactly the shape the reconciliation below would resume
+    -- from without complaint.  'streamSnapshotIntoLegacyUTXO' brackets that
+    -- window with an on-disk flag; a successful import (including one on
+    -- this very boot) clears it, and so does '-reindex-chainstate'.  If it
+    -- is still set here, refuse to start.
+    interruptedImport <- getSnapshotImportInProgress db
+    when interruptedImport $ do
+      putStrLn "FATAL: an assumeutxo snapshot import was interrupted during \
+               \its commit phase; the on-disk UTXO set is partial. Re-run \
+               \--load-snapshot with the same file (the import is redone \
+               \from scratch), or run -reindex-chainstate."
+      exitWith (ExitFailure 1)
 
     -- Startup chainstate reconciliation (Core: Chainstate::LoadChainTip
     -- + Chainstate::ReplayBlocks, bitcoin-core/src/validation.cpp:4546

@@ -574,6 +574,18 @@ campaignEntryToParams CampaignAssumeutxoEntry{..}
   | not (isHex64 caeHashSerialized) =
       Left ("campaign entry height " ++ show caeHeight
             ++ ": hash_serialized must be 64 hex chars")
+  -- An all-zero commitment is not a commitment.  Before this guard a fixture
+  -- carrying 64 zeros was accepted as a whitelisted entry, and the snapshot
+  -- loader's former in-band "no trust anchor" sentinel then skipped the hash
+  -- gate for it -- with no HASHHOG_UNSAFE_SNAPSHOT_HEIGHT set and no warning.
+  -- The sentinel is gone (the loader takes 'Maybe Hash256' now), so zeros
+  -- would merely fail to match; refusing at the fixture boundary makes a
+  -- generator bug fail at startup instead of at the end of a multi-hour load.
+  | all (== '0') caeHashSerialized =
+      Left ("campaign entry height " ++ show caeHeight
+            ++ ": hash_serialized is all-zero -- a campaign entry must carry"
+            ++ " the real HASH_SERIALIZED commitment (an all-zero value would"
+            ++ " leave the snapshot unverified); refusing to start")
   | otherwise =
       Right AssumeUtxoParams
         { aupHeight         = caeHeight

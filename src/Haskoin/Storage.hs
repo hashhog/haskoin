@@ -187,6 +187,8 @@ module Haskoin.Storage
   , loadSnapshotIntoLegacyUTXO
   , streamSnapshotIntoLegacyUTXO
   , computeUtxoHashFromDB
+  , computeUtxoHashFromDBPrefix
+  , deleteKeysWithPrefix
   , newSnapshotChainstate
   , writeSnapshot
   , dumpTxOutSetFromDB
@@ -218,6 +220,8 @@ module Haskoin.Storage
   , putSnapshotBaseHash
   , getSnapshotBaseHash
   , deleteSnapshotBaseHash
+  , getSnapshotImportInProgress
+  , clearSnapshotImportInProgress
   ) where
 
 import qualified Database.RocksDB as R
@@ -335,6 +339,12 @@ data KeyPrefix
   | PrefixAddrHistory    -- ^ 0x09: Address -> [(TxId, height)]
   | PrefixAddrBalance    -- ^ 0x0A: Address -> balance
   | PrefixAddrUTXO       -- ^ 0x0B: Address ++ OutPoint -> TxOut
+  | PrefixSnapshotStaging
+    -- ^ 0x0C: OutPoint -> Coin, the assumeutxo import STAGING area.  Only
+    -- 'streamSnapshotIntoLegacyUTXO' writes here: a snapshot's coins land
+    -- under this prefix, are hashed here, and are promoted into
+    -- 'PrefixUTXO' only after the hash gate passes.  Validation never reads
+    -- it.  Purged at the start of every import and by 'wipeChainstate'.
   deriving (Show, Eq, Enum, Generic)
 
 -- | Get the byte value for a key prefix
@@ -350,6 +360,7 @@ prefixByte PrefixBlockStatus = 0x08
 prefixByte PrefixAddrHistory = 0x09
 prefixByte PrefixAddrBalance = 0x0A
 prefixByte PrefixAddrUTXO    = 0x0B
+prefixByte PrefixSnapshotStaging = 0x0C
 
 -- | Create a database key with prefix.
 -- Keys are formatted as: [1-byte prefix][payload]
@@ -1732,9 +1743,32 @@ getUTXOCount db = do
 -- O(N) scan + batched delete is the cleanest portable approach.
 -- 'returnedCount' is the number of keys deleted across all prefixes
 -- (useful for the operator-visible progress log).
+-- | Delete every key under @prefix@, in 4096-key batches.  Returns the number
+-- of keys deleted.  RocksDB iterators read from a consistent snapshot, so
+-- deleting underneath the live iterator is safe -- the same idiom
+-- 'wipeChainstate' uses.
+deleteKeysWithPrefix :: HaskoinDB -> KeyPrefix -> IO Int
+deleteKeysWithPrefix db p = do
+  pendingRef <- newIORef ([] :: [BatchOp])
+  countRef   <- newIORef (0 :: Int)
+  let flushBatch = do
+        ops <- atomicModifyIORef' pendingRef (\xs -> ([], xs))
+        unless (null ops) $ writeBatch db (WriteBatch ops)
+  iterateWithPrefix db p $ \key _val -> do
+    modifyIORef' pendingRef (BatchDelete key :)
+    n <- atomicModifyIORef' countRef (\x -> (x + 1, x + 1))
+    when (n `mod` 4096 == 0) flushBatch
+    return True
+  flushBatch
+  readIORef countRef
+
 wipeChainstate :: HaskoinDB -> IO Int
 wipeChainstate db = do
   totalRef <- newIORef (0 :: Int)
+  -- A wipe supersedes any interrupted snapshot import (the rebuild that
+  -- follows starts from genesis), so drop the in-progress flag too.  Made
+  -- durable by the 'syncFlush' at the bottom.
+  clearSnapshotImportInProgress db
   let wipeBatchSize = 4096 :: Int
       prefixes :: [KeyPrefix]
       prefixes =
@@ -1746,6 +1780,7 @@ wipeChainstate db = do
         , PrefixAddrHistory
         , PrefixAddrBalance
         , PrefixAddrUTXO
+        , PrefixSnapshotStaging  -- leftovers of an interrupted snapshot import
         ]
   -- The 'syncFlush' sentinel key (PrefixBestBlock + 0xFF) is a
   -- reserved no-data marker used to force an fsync of the WAL.
@@ -2728,13 +2763,27 @@ loadSnapshotIntoLegacyUTXO db snapshot = do
 --   - @coin.nHeight > base_height@ → fatal
 --   - @!MoneyRange(coin.out.nValue)@ → fatal
 --
--- After the coins are written, the UTXO-set digest is verified against
--- @expectedHash@ (Core validation.cpp PopulateAndValidateSnapshot L5920) via
--- 'computeUtxoHashFromDB', which reproduces Core's ordering -- txid-major
--- from the DB cursor, ascending numeric vout within each txid -- while
--- holding only one transaction's coins in memory.  A mismatch is fatal
--- ('Left'); an all-zero @expectedHash@ means "no trust anchor" (the
--- HASHHOG_UNSAFE_SNAPSHOT_HEIGHT development bypass) and skips the check.
+-- The coins are streamed into the 'PrefixSnapshotStaging' keyspace, NOT the
+-- live UTXO set, and the UTXO-set digest is computed over that staging area
+-- ('computeUtxoHashFromDBPrefix', which reproduces Core's ordering --
+-- txid-major from the DB cursor, ascending numeric vout within each txid --
+-- while holding only one transaction's coins in memory) and compared with
+-- @expectedHash@ (Core validation.cpp PopulateAndValidateSnapshot L5920).
+--
+--   * Mismatch: the staging area is dropped and 'Left' is returned.  The
+--     live chainstate ('PrefixUTXO', 'PrefixBestBlock', the snapshot base
+--     marker) was never written, so it is byte-identical to before the call.
+--     This is haskoin's analogue of Core loading into a separate
+--     @chainstate_snapshot@ directory and deleting it on failure.
+--   * Match (or @expectedHash == Nothing@, the HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
+--     development bypass, where the caller has no commitment to check): the
+--     live 'PrefixUTXO' set is REPLACED by the verified staging set -- not
+--     unioned with it, so the set that was hashed is exactly the set
+--     validation will read -- then the best-block pointer and the snapshot
+--     base marker are written.  The commit window is bracketed by an
+--     on-disk in-progress flag ('getSnapshotImportInProgress'); a process
+--     that dies inside it leaves a partial set, and app/Main.hs refuses to
+--     boot on that flag rather than resume over it.
 --
 -- This gate was previously dead: @expectedHash@ was accepted and discarded,
 -- on the rationale that the in-memory 'computeUtxoHash' could not run here
@@ -2749,8 +2798,12 @@ streamSnapshotIntoLegacyUTXO
   -> FilePath    -- ^ Path to snapshot file (Core @dumptxoutset@ format)
   -> Word32      -- ^ Expected network magic (LE32)
   -> Word32      -- ^ Snapshot base height (for per-coin height guard)
-  -> Hash256     -- ^ Expected audHashSerialized, in Core DISPLAY byte order
-                 --   (all-zero = no trust anchor, gate skipped)
+  -> Maybe Hash256
+                 -- ^ Expected audHashSerialized in Core DISPLAY byte order.
+                 --   'Nothing' = the caller holds no trust anchor at all
+                 --   (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass); the gate is
+                 --   skipped and says so.  There is deliberately no in-band
+                 --   sentinel: an all-zero 'Just' simply fails to match.
   -> IO (Either String Int)
 streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
   result <- try (openBinaryFile path ReadMode) :: IO (Either IOException Handle)
@@ -2772,6 +2825,48 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
     maxMoneyVal :: Word64
     maxMoneyVal = 2100000000000000  -- 21M BTC in satoshis
 
+    -- Commit phase: the verified staging set becomes THE live UTXO set.
+    -- Runs only after the hash gate passed (or was explicitly waived).
+    -- Ordering, and why each step is where it is:
+    --   1. in-progress flag ON (durable)   -- from here until step 6 the
+    --      live set is partial; app/Main.hs refuses to boot on this flag.
+    --   2. drop the pre-existing live set  -- REPLACE, not union: the set
+    --      that was hashed must be exactly the set validation reads.
+    --   3. move staging -> live in batches; each batch deletes the staging
+    --      key it promotes, so staging ∪ live is always the full set.
+    --   4. best-block pointer + snapshot base marker (the reconciliation
+    --      floor) in one durable step.
+    --   5. flag OFF, durable.
+    commitStaged :: SnapshotMetadata -> Int -> IO ()
+    commitStaged meta n = do
+      putSnapshotImportInProgress db
+      syncFlush db
+      dropped <- deleteKeysWithPrefix db PrefixUTXO
+      when (dropped > 0) $
+        putStrLn $ "[snapshot] replacing " ++ show dropped
+                ++ " pre-existing live coin(s) with the verified snapshot set"
+      pendingRef <- newIORef ([] :: [BatchOp])
+      countRef   <- newIORef (0 :: Int)
+      let flushBatch = do
+            ops <- atomicModifyIORef' pendingRef (\xs -> ([], xs))
+            unless (null ops) $ writeBatch db (WriteBatch ops)
+      iterateWithPrefix db PrefixSnapshotStaging $ \key val -> do
+        let liveKey = makeKey PrefixUTXO (BS.drop 1 key)
+        modifyIORef' pendingRef (\ops -> BatchDelete key : BatchPut liveKey val : ops)
+        c <- atomicModifyIORef' countRef (\x -> (x + 1, x + 1))
+        when (c `mod` batchSize == 0) flushBatch
+        return True
+      flushBatch
+      moved <- readIORef countRef
+      putBestBlockHash db (smBaseBlockHash meta)
+      putSnapshotBaseHash db (smBaseBlockHash meta)
+      syncFlush db
+      clearSnapshotImportInProgress db
+      syncFlush db
+      putStrLn $ "[snapshot] committed " ++ show moved
+              ++ " coin(s) to the live UTXO set (" ++ show n
+              ++ " parsed from the file); best-block pinned to the snapshot base"
+
     go :: Handle -> IO (Either String Int)
     go h = do
       -- 1. Read and validate the 51-byte header.
@@ -2788,6 +2883,12 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
 
     streamCoins :: Handle -> SnapshotMetadata -> IO (Either String Int)
     streamCoins h meta = do
+      -- Start from an empty staging area: a previous import that died
+      -- mid-stream leaves keys here, and they must not be hashed as ours.
+      stale <- deleteKeysWithPrefix db PrefixSnapshotStaging
+      when (stale > 0) $
+        putStrLn $ "[snapshot] purged " ++ show stale
+                ++ " stale staging key(s) left by an interrupted import"
       let totalCoins = fromIntegral (smCoinsCount meta) :: Int
       imported      <- newIORef (0 :: Int)
       coinsLeft     <- newIORef totalCoins
@@ -2841,7 +2942,9 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
                                      "bad tx out value: coin value " ++ show v
                                      ++ " > MAX_MONEY " ++ show maxMoneyVal
                               else do
-                                let key = makeKey PrefixUTXO (encode scOutPoint)
+                                -- Staging, not the live set: nothing under
+                                -- PrefixUTXO changes until the gate passes.
+                                let key = makeKey PrefixSnapshotStaging (encode scOutPoint)
                                     val = encode scCoin
                                 modifyIORef' batchOps (BatchPut key val :)
                                 modifyIORef' batchCount (+1)
@@ -2873,49 +2976,67 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
       case merr of
         Just err -> return $ Left err
         Nothing  -> do
-          -- 2. Write best-block pointer and sync.
-          putBestBlockHash db (smBaseBlockHash meta)
+          -- 2. Make the staged coins durable.  NOTHING under PrefixUTXO or
+          --    PrefixBestBlock has been touched yet.
           syncFlush db
           n <- readIORef imported
-          -- 3. BUG-2 gate: the UTXO set just written must hash to the
-          --    commitment carried by the assumeutxo entry that authorised
-          --    this base (Core validation.cpp PopulateAndValidateSnapshot
-          --    L5920).  'computeUtxoHashFromDB' walks the RocksDB cursor in
+          -- 3. BUG-2 gate: the staged set must hash to the commitment
+          --    carried by the assumeutxo entry that authorised this base
+          --    (Core validation.cpp PopulateAndValidateSnapshot L5920).
+          --    'computeUtxoHashFromDBPrefix' walks the RocksDB cursor in
           --    Core's order with O(widest-tx) memory, so this runs on the
           --    165 M-coin mainnet snapshot without the OOM that originally
           --    forced the in-memory 'computeUtxoHash' off this path.
           --
-          --    ORIENTATION (do not "fix" by flipping): 'computeUtxoHashFromDB'
-          --    returns the RAW double-SHA256 digest, i.e. a Core uint256's
-          --    INTERNAL byte order.  'expectedHash' reached us through
-          --    'hexToHash256', which does NOT reverse, so it holds Core's
-          --    DISPLAY bytes.  Reverse the computed digest into display order
-          --    before comparing -- byte-for-byte the same convention as
+          --    ORIENTATION (do not "fix" by flipping): the walk returns the
+          --    RAW double-SHA256 digest, i.e. a Core uint256's INTERNAL byte
+          --    order.  'expectedHash' reached us through 'hexToHash256',
+          --    which does NOT reverse, so it holds Core's DISPLAY bytes.
+          --    Reverse the computed digest into display order before
+          --    comparing -- byte-for-byte the same convention as
           --    'verifySnapshot' and as 'showHash256' uses to render
-          --    @hash_serialized_3@ for gettxoutsetinfo.
+          --    @hash_serialized_3@ for gettxoutsetinfo.  Proven against
+          --    Core's own published regtest-299 value (d2b051ff...5e2).
           --
-          --    The all-zero sentinel means "no trust anchor": it is what
-          --    app/Main.hs synthesises for the development-only
-          --    HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass, where by construction
-          --    there is no commitment to check.  Skip the gate there rather
-          --    than fail it, and say so out loud.
-          if expectedHash == Hash256 (BS.replicate 32 0)
-            then do
-              putStrLn "[snapshot] hash gate SKIPPED -- no trust anchor \
-                       \(HASHHOG_UNSAFE_SNAPSHOT_HEIGHT bypass)"
-              return $ Right n
-            else do
-              Hash256 rawDigest <- computeUtxoHashFromDB db
+          --    'Nothing' is only ever constructed by app/Main.hs on the
+          --    HASHHOG_UNSAFE_SNAPSHOT_HEIGHT branch, so naming that
+          --    variable here is accurate.  A whitelisted or campaign entry
+          --    always arrives as 'Just'; there is no value it can carry that
+          --    waives the check.
+          gate <- case expectedHash of
+            Nothing -> do
+              putStrLn "[snapshot] hash gate SKIPPED -- the caller supplied no \
+                       \trust anchor (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT development \
+                       \bypass); the staged set is committed UNVERIFIED"
+              return (Right ())
+            Just expected -> do
+              Hash256 rawDigest <- computeUtxoHashFromDBPrefix db PrefixSnapshotStaging
               let actualHash = Hash256 (BS.reverse rawDigest)
-              if actualHash == expectedHash
+              if actualHash == expected
                 then do
                   putStrLn $ "[snapshot] hash gate PASSED: hash_serialized = "
                           ++ displayHexOfHash256 actualHash
-                  return $ Right n
+                  return (Right ())
                 else return $ Left $
                        "UTXO hash mismatch: expected "
-                       ++ displayHexOfHash256 expectedHash
+                       ++ displayHexOfHash256 expected
                        ++ ", got " ++ displayHexOfHash256 actualHash
+          case gate of
+            Left err -> do
+              -- 4a. REFUSED: discard the staging area.  The live chainstate
+              --     was never written, so it is byte-identical to before
+              --     this call -- no forged coin, no moved best-block pointer,
+              --     no base marker.  Previously the coins were already live
+              --     at this point and a plain restart served them.
+              discarded <- deleteKeysWithPrefix db PrefixSnapshotStaging
+              syncFlush db
+              putStrLn $ "[snapshot] REFUSED -- discarded " ++ show discarded
+                      ++ " staged coin(s); the live chainstate was not modified"
+              return (Left err)
+            Right () -> do
+              -- 4b. ACCEPTED: promote staging to the live UTXO set.
+              commitStaged meta n
+              return (Right n)
 
 -- | Render a 'Hash256' that already holds Core DISPLAY-order bytes as hex.
 -- No reversal: both operands of the snapshot hash gate are in display order,
@@ -2939,7 +3060,14 @@ displayHexOfHash256 (Hash256 bs) = concatMap (printf "%02x") (BS.unpack bs)
 -- Reference: bitcoin/src/kernel/coinstats.cpp @ApplyCoinHash@ /
 -- @TxOutSer@ / @FinalizeHash@.
 computeUtxoHashFromDB :: HaskoinDB -> IO Hash256
-computeUtxoHashFromDB db = do
+computeUtxoHashFromDB db = computeUtxoHashFromDBPrefix db PrefixUTXO
+
+-- | 'computeUtxoHashFromDB' over an arbitrary coin keyspace.  The keys under
+-- @coinPrefix@ must have the 'PrefixUTXO' layout (@prefix || encode OutPoint@
+-- -> @encode Coin@).  The snapshot loader hashes its 'PrefixSnapshotStaging'
+-- area with this BEFORE anything reaches the live UTXO set.
+computeUtxoHashFromDBPrefix :: HaskoinDB -> KeyPrefix -> IO Hash256
+computeUtxoHashFromDBPrefix db coinPrefix = do
   -- Pass 1: accumulate the SHA256 state over every coin in Core's order.
   ctxRef <- newIORef (Hash.hashInit :: Hash.Context Hash.SHA256)
   -- Core buffers ONE txid's coins at a time in a @std::map<uint32_t, Coin>@
@@ -2972,7 +3100,7 @@ computeUtxoHashFromDB db = do
           else do
             flushGroup
             writeIORef groupRef (Just tid, Map.singleton (outPointIndex op) coin)
-  let prefixBS = BS.singleton (prefixByte PrefixUTXO)
+  let prefixBS = BS.singleton (prefixByte coinPrefix)
   runResourceT $ R.withIterator (dbHandle db) (dbReadOpts db) $ \iter -> do
     R.iterSeek iter prefixBS
     let loop = do
@@ -3708,3 +3836,26 @@ deleteSnapshotBaseHash :: HaskoinDB -> IO ()
 deleteSnapshotBaseHash db =
   let key = BS.singleton prefixSnapshotBase
   in R.delete (dbHandle db) (dbWriteOpts db) key
+
+-- | Single-byte key that exists ONLY while 'streamSnapshotIntoLegacyUTXO' is
+-- inside its commit phase (live UTXO set dropped, verified staging set being
+-- copied in).  If it is present at startup the process died in that window
+-- and the on-disk coin set is partial; app/Main.hs refuses to boot rather
+-- than let the undo-record reconciliation resume over it.
+prefixSnapshotImportInProgress :: Word8
+prefixSnapshotImportInProgress = 0x0D
+
+putSnapshotImportInProgress :: HaskoinDB -> IO ()
+putSnapshotImportInProgress db =
+  R.put (dbHandle db) (dbWriteOpts db)
+        (BS.singleton prefixSnapshotImportInProgress) (BS.singleton 1)
+
+-- | Is a snapshot import commit phase recorded as in progress?
+getSnapshotImportInProgress :: HaskoinDB -> IO Bool
+getSnapshotImportInProgress db =
+  maybe False (const True)
+    <$> R.get (dbHandle db) (dbReadOpts db) (BS.singleton prefixSnapshotImportInProgress)
+
+clearSnapshotImportInProgress :: HaskoinDB -> IO ()
+clearSnapshotImportInProgress db =
+  R.delete (dbHandle db) (dbWriteOpts db) (BS.singleton prefixSnapshotImportInProgress)
