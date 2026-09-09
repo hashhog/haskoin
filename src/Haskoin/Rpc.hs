@@ -403,7 +403,8 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          getUndoData, UndoData(..), TxUndo(..), TxInUndo(..), BlockUndo(..),
                          getUTXOCount, getBlockHeight,
                          iterateWithPrefix, KeyPrefix(..), Coin(..),
-                         SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash)
+                         SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash,
+                         computeUtxoHashFromDBPrefix)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          PeerState(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
@@ -16616,7 +16617,27 @@ handleGetTxOutSetInfo server params = do
       sumRef    <- newIORef (0 :: Word64)
       bogosizeRef <- newIORef (0 :: Int)
       diskRef   <- newIORef (0 :: Int)
-      txidsRef  <- newIORef (Set.empty :: Set.Set TxId)
+      -- Bounded walk. The previous version collected EVERY coin into a
+      -- Haskell list ('coinsRef') and every txid into a 'Set' before hashing,
+      -- so on mainnet (166M coins) the RPC needed tens of GB of live heap plus
+      -- GHC's copying-GC headroom on top. On 2026-09-09 a single
+      -- gettxoutsetinfo drove the from-genesis rig to a 94.9 GB peak and the
+      -- kernel OOM-killed it 41 minutes in, while it sat frozen on the
+      -- C(958794) anchor waiting for exactly this call. The bounded hasher
+      -- ('computeUtxoHashFromDBPrefix', a RocksDB cursor walk holding one
+      -- txid's outputs at a time) already existed and was only used by the
+      -- snapshot-load verifier. It is used here now.
+      --
+      -- transactions (distinct txids): keys under PrefixUTXO are
+      -- prefix ++ encode OutPoint = txid(32) ++ vout, and RocksDB iterates
+      -- bytewise, so all outputs of one txid are adjacent. Counting txid
+      -- CHANGES along the walk equals the size of the Set it replaces.
+      nTxnsRef  <- newIORef (0 :: Int)
+      lastTxRef <- newIORef (Nothing :: Maybe TxId)
+      -- muhash still materialises: 'computeUtxoMuHash' takes the list. It is
+      -- only requested explicitly (hash_type=muhash), never by default, and it
+      -- is left as the one known unbounded path rather than pretending
+      -- otherwise. Collected only when asked for.
       coinsRef  <- newIORef ([] :: [SnapshotCoin])
       iterateWithPrefix (rsDB server) PrefixUTXO $ \key val -> do
         let opBytes = BS.drop 1 key
@@ -16629,13 +16650,17 @@ handleGetTxOutSetInfo server params = do
             --   + 2 (scriptPubKey len) + scriptPubKey.size().
             modifyIORef' bogosizeRef (+ (32 + 4 + 4 + 8 + 2 + BS.length (txOutScript (coinTxOut coin))))
             -- transactions: number of DISTINCT txids with unspent outputs
-            -- (Core CCoinsStats::nTransactions). Count via the outpoint hash.
-            modifyIORef' txidsRef (Set.insert (outPointHash op))
+            -- (Core CCoinsStats::nTransactions), counted as txid changes.
+            lastTx <- readIORef lastTxRef
+            let tid = outPointHash op
+            when (lastTx /= Just tid) $ do
+              writeIORef lastTxRef (Just tid)
+              modifyIORef' nTxnsRef (+1)
             -- disk_size: impl-specific estimate of the chainstate footprint.
             -- We approximate Core's view->EstimateSize() with the on-disk
             -- key+value byte count (outpoint key 33B + serialized coin value).
             modifyIORef' diskRef (+ (1 + BS.length opBytes + BS.length val))
-            modifyIORef' coinsRef (SnapshotCoin op coin :)
+            when wantMuHash $ modifyIORef' coinsRef (SnapshotCoin op coin :)
             return True
           _ -> return True
       n        <- readIORef countRef
@@ -16644,14 +16669,20 @@ handleGetTxOutSetInfo server params = do
       -- disk_size now reports Core's unflushed-leveldb 0 (see below); the
       -- accumulated raw byte count is retained for diagnostics only.
       _diskSize <- readIORef diskRef
-      nTxns    <- Set.size <$> readIORef txidsRef
+      nTxns    <- readIORef nTxnsRef
       coins    <- readIORef coinsRef
-      -- Build the response on the streaming path so total_amount uses
-      -- Core's fixed-decimal format (btcAmountEnc) instead of Double.
+      -- hash_serialized_3 via the bounded cursor walk. It returns the raw
+      -- double-SHA256 digest in Core's INTERNAL byte order, exactly as the
+      -- list-based 'computeUtxoHash' did, and 'showHash256' renders that in
+      -- display order — the same convention the snapshot verifier relies on.
+      -- Proven against Core's regtest-299 value (d2b051ff…) at commit time.
+      serialized <- if wantSerialized
+                      then Just <$> computeUtxoHashFromDBPrefix (rsDB server) PrefixUTXO
+                      else return Nothing
       let serializedEnc =
-            if wantSerialized
-              then pair "hash_serialized_3" (text (showHash256 (computeUtxoHash coins)))
-              else mempty
+            case serialized of
+              Just h  -> pair "hash_serialized_3" (text (showHash256 h))
+              Nothing -> mempty
           muHashEnc =
             if wantMuHash
               then pair "muhash" (text (showHash256 (computeUtxoMuHash coins)))
