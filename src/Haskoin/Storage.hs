@@ -192,6 +192,7 @@ module Haskoin.Storage
   , newSnapshotChainstate
   , writeSnapshot
   , dumpTxOutSetFromDB
+  , streamUTXOSnapshotGroups
   , computeUtxoHash
   , computeUtxoMuHash
   , serializeCoins
@@ -3221,12 +3222,82 @@ collectAllCoins cache = do
   -- For now, just return cached coins (full implementation would iterate DB)
   return cachedCoins
 
+-- | STREAMING-DUMP: walk 'PrefixUTXO' and invoke @writeGroup@ once per
+-- txid, with that txid's outputs in ascending numeric vout order. The
+-- 'Map' is discarded after the callback returns, so peak memory is the
+-- widest single transaction — the same bound Core's @WriteUTXOSnapshot@
+-- keeps with @std::vector<std::pair<uint32_t, Coin>>@
+-- (@rpc/blockchain.cpp@) and that 'computeUtxoHashFromDBPrefix' keeps
+-- for hashing.
+--
+-- RocksDB yields keys in lexicographic order of
+-- @prefix || txid || LE32 vout@. That is txid-major (so one txid's
+-- outputs are adjacent) but WITHIN a txid it is LE32 *byte* order,
+-- which diverges from numeric vout order at @vout >= 256@
+-- (@256 = 00 01 00 00@ sorts before @1 = 01 00 00 00@). Each group is
+-- therefore regrouped through a 'Map' before the callback, matching
+-- Core's @std::map<uint32_t, Coin>@.
+--
+-- Returns @(coins_emitted, peak_group_size)@. Malformed rows are
+-- skipped (same policy as the previous materialising dump).
+streamUTXOSnapshotGroups
+  :: HaskoinDB
+  -> (TxId -> Map Word32 Coin -> IO ())
+  -> IO (Word64, Int)
+streamUTXOSnapshotGroups db writeGroup = do
+  countRef <- newIORef (0 :: Word64)
+  peakRef  <- newIORef (0 :: Int)
+  -- One txid at a time. Never a list of the whole coin set.
+  groupRef <- newIORef (Nothing :: Maybe TxId, Map.empty :: Map Word32 Coin)
+  let flush = do
+        (mTid, outs) <- readIORef groupRef
+        forM_ mTid $ \tid -> do
+          let n = Map.size outs
+          when (n > 0) $ do
+            modifyIORef' peakRef (\p -> max p n)
+            writeGroup tid outs
+            modifyIORef' countRef (+ fromIntegral n)
+        writeIORef groupRef (Nothing, Map.empty)
+      addCoin op coin = do
+        (mTid, outs) <- readIORef groupRef
+        let tid = outPointHash op
+        if mTid == Just tid
+          then writeIORef groupRef
+                 (mTid, Map.insert (outPointIndex op) coin outs)
+          else do
+            flush
+            writeIORef groupRef
+              (Just tid, Map.singleton (outPointIndex op) coin)
+  iterateWithPrefix db PrefixUTXO $ \key val -> do
+    -- Key layout: [prefix=0x05][outpoint = 32-byte txid + 4-byte vout LE].
+    -- Value layout: full Core-format @Coin@ (varint code + TxOut).
+    let opBytes = BS.drop 1 key
+    case (decode opBytes :: Either String OutPoint,
+          decode val :: Either String Coin) of
+      (Right op, Right coin) -> do
+        addCoin op coin
+        return True
+      _ -> return True   -- skip malformed entries; don't abort the dump
+  flush
+  (,) <$> readIORef countRef <*> readIORef peakRef
+
 -- | Iterate the legacy 'PrefixUTXO' (0x05) keyspace and emit a
 -- Core-format @utxo.dat@ file at @path@.
 --
 -- On-disk @PrefixUTXO@ values are full Core-format 'Coin's (varint @code@
 -- + 'TxOut'), so the per-coin @height@ and @isCoinbase@ metadata round-
 -- trips faithfully into the snapshot's per-coin record.
+--
+-- Streaming: coins are written a txid-group at a time via
+-- 'streamUTXOSnapshotGroups'. The previous implementation collected
+-- every coin into @[SnapshotCoin]@ and then @serializeCoins@ — that is
+-- 166 M boxed values plus GC headroom on mainnet, the same OOM that
+-- forced 'gettxoutsetinfo' onto 'computeUtxoHashFromDBPrefix'.
+--
+-- @smCoinsCount@ sits at the end of the 51-byte metadata header. Core
+-- fills it up front from @GetUTXOStats@ (@PrepareUTXOSnapshot@ in
+-- @rpc/blockchain.cpp@). We write a placeholder and patch the count
+-- after the single streaming pass so we do not walk PrefixUTXO twice.
 --
 -- Atomic write protocol: bytes go to @<path>.incomplete@, the fd is
 -- fsynced via @fileSynchronise@, then renamed to @<path>@. Mirrors
@@ -3247,35 +3318,32 @@ dumpTxOutSetFromDB db path networkMagic tipHash = do
         (do exists <- doesFileExist tmpPath
             when exists (removeFile tmpPath))
   result <- try $ do
-    coinsRef <- newIORef ([] :: [SnapshotCoin])
-    countRef <- newIORef (0 :: Word64)
-    iterateWithPrefix db PrefixUTXO $ \key val -> do
-      -- Key layout: [prefix=0x05][outpoint = 32-byte txid + 4-byte vout LE].
-      -- Value layout: full Core-format @Coin@ (varint code + TxOut) — see
-      -- Storage.hs Coin Serialize instance and connectBlock above.
-      let opBytes = BS.drop 1 key
-      case (decode opBytes :: Either String OutPoint, decode val :: Either String Coin) of
-        (Right op, Right coin) -> do
-          modifyIORef' coinsRef (SnapshotCoin op coin :)
-          modifyIORef' countRef (+ 1)
-          return True
-        _ -> return True   -- skip malformed entries; don't abort the dump
-    coins <- readIORef coinsRef
-    cnt   <- readIORef countRef
-    let metadata = SnapshotMetadata
-          { smNetworkMagic = networkMagic
-          , smBaseBlockHash = tipHash
-          , smCoinsCount = cnt
-          }
-        bytes = encode metadata <> serializeCoins coins
-    -- Open the .incomplete temp, write all bytes, fsync, close, rename.
-    -- The bracket-style structure ensures the handle is closed even if
-    -- an exception fires partway through (e.g. ENOSPC on hPutStr).
-    Exc.bracketOnError
+    cnt <- Exc.bracketOnError
       (openBinaryFile tmpPath WriteMode)
       (\h -> hClose h >> cleanupTemp)
       (\h -> do
-         BS.hPut h bytes
+         -- Placeholder count; patched below after the cursor walk.
+         let placeholder = SnapshotMetadata
+               { smNetworkMagic = networkMagic
+               , smBaseBlockHash = tipHash
+               , smCoinsCount = 0
+               }
+             header = encode placeholder
+         BS.hPut h header
+         (n, _peak) <- streamUTXOSnapshotGroups db $ \tid outs -> do
+           -- One Core txid group: 32-byte txid, compact-size count,
+           -- then (compact-size vout, Coin)* in numeric vout order.
+           -- Reference: rpc/blockchain.cpp write_coins_to_file.
+           let body = runPut $ do
+                 put (tid :: TxId)
+                 put (VarInt (fromIntegral (Map.size outs)))
+                 forM_ (Map.toAscList outs) $ \(vout, coin) -> do
+                   put (VarInt (fromIntegral vout))
+                   putCoreCoin coin
+           BS.hPut h body
+         -- Patch coins_count (trailing Word64le of the 51-byte header).
+         hSeek h AbsoluteSeek (fromIntegral (BS.length header - 8))
+         BS.hPut h (runPut (putWord64le n))
          hFlush h
          -- Durability barrier: hand the underlying fd to fsync()
          -- before the atomic rename. Without this, a power loss
@@ -3286,7 +3354,8 @@ dumpTxOutSetFromDB db path networkMagic tipHash = do
          -- subsequent hClose on h is a no-op and we close via
          -- closeFd instead.
          PosixUnistd.fileSynchronise fd
-         PosixIO.closeFd fd)
+         PosixIO.closeFd fd
+         return n)
     -- Atomic rename: temp -> final. After this point the snapshot
     -- file is visible to any concurrent reader.
     renameFile tmpPath path

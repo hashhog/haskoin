@@ -74,11 +74,12 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          SnapshotMetadata(..), SnapshotCoin(..),
                          UtxoSnapshot(..), snapshotMagicBytes,
                          snapshotVersion, loadSnapshot, parseSnapshotCoin,
-                         dumpTxOutSetFromDB, loadSnapshotIntoLegacyUTXO,
+                         dumpTxOutSetFromDB, streamUTXOSnapshotGroups,
+                         loadSnapshotIntoLegacyUTXO,
                          compressAmount, decompressAmount,
                          putCompressedScript, getCompressedScript,
                          putCoreVarInt, getCoreVarInt,
-                         serializeSnapshotCoin)
+                         serializeCoins, serializeSnapshotCoin)
 import Haskoin.Network hiding (computeWtxid)
 import Haskoin.Sync
 import Haskoin.Mempool
@@ -19197,6 +19198,104 @@ main = hspec $ do
                        | (OutPoint txid vout, TxOut val scr) <- entries
                        ]
                 got `shouldBe` expected
+
+      it "dumpTxOutSetFromDB streams; does not materialise the coin set" $ do
+        -- Revert control for QUEUES.md haskoin item 1. The pre-fix body
+        -- (Storage.hs:3250) collected every coin into
+        --   coinsRef <- newIORef ([] :: [SnapshotCoin])
+        --   modifyIORef' coinsRef (SnapshotCoin op coin :)
+        --   bytes = encode metadata <> serializeCoins coins
+        -- which is 166 M boxed values on mainnet. Restoring those three
+        -- lines — or dropping the STREAMING-DUMP walker — must fail here.
+        src <- readFile "src/Haskoin/Storage.hs"
+        let dumpSrc =
+              let ls = dropWhile (not . isPrefixOf "dumpTxOutSetFromDB ::")
+                                 (lines src)
+              in unlines $ takeWhile (not . isPrefixOf "serializeCoins ::") ls
+            walkSrc =
+              let ls = dropWhile (not . isPrefixOf "streamUTXOSnapshotGroups")
+                                 (lines src)
+                  -- Stop at dump's Haddock; do not scan comments that
+                  -- describe the old materialising walk.
+              in unlines $ takeWhile (not . isPrefixOf "-- | Iterate the legacy") ls
+        -- Whole-file: restoring the materialising walk must fail.
+        ("coinsRef <- newIORef ([] :: [SnapshotCoin])" `isInfixOf` src)
+          `shouldBe` False
+        ("modifyIORef' coinsRef (SnapshotCoin op coin :)" `isInfixOf` src)
+          `shouldBe` False
+        ("bytes = encode metadata <> serializeCoins coins" `isInfixOf` src)
+          `shouldBe` False
+        ("streamUTXOSnapshotGroups" `isInfixOf` dumpSrc) `shouldBe` True
+        ("STREAMING-DUMP" `isInfixOf` src) `shouldBe` True
+        -- The walker itself must not accumulate SnapshotCoin of the set.
+        ("[SnapshotCoin]" `isInfixOf` walkSrc) `shouldBe` False
+        ("Map.empty :: Map Word32 Coin" `isInfixOf` walkSrc) `shouldBe` True
+
+      it "streamUTXOSnapshotGroups peak is the widest txid, not the set" $
+        -- Runtime proof of the RAM bound: 50 singleton txids + one txid
+        -- with 80 outputs + one txid with vouts {0,1,256} (LE-key order
+        -- != numeric). Peak live group must be 80, not 50+80+3. A dump
+        -- that materialises the set and then reports length as "peak"
+        -- fails this; so does a walker that never flushes.
+        withSystemTempDirectory "haskoin-dump-stream-peak" $ \tmp -> do
+          let dbDir = tmp </> "db"
+          Dir.createDirectoryIfMissing True dbDir
+          let cfg = (defaultDBConfig dbDir)
+                { dbCreateIfMissing = True
+                , dbCompression     = False
+                }
+          bracket (openDB cfg) closeDB $ \db -> do
+            let txo = TxOut 1 sampleP2PKH
+                singletons = [ OutPoint (mkTxId b) 0 | b <- [1..50] ]
+                wideTid = mkTxId 0xAA
+                wide = [ OutPoint wideTid n | n <- [0..79] ]
+                leTid = mkTxId 0xBB
+                leOrder = [ OutPoint leTid n | n <- [0, 1, 256] ]
+            forM_ (singletons ++ wide ++ leOrder) $ \op -> putUTXO db op txo
+            (n, peak) <- streamUTXOSnapshotGroups db $ \_tid _outs ->
+              return ()
+            n `shouldBe` (50 + 80 + 3)
+            peak `shouldBe` 80
+
+      it "dumpTxOutSetFromDB bytes match serializeCoins (vout 256 numeric order)" $
+        -- Streaming must stay byte-identical to the list encoder, including
+        -- the LE-vs-numeric vout trap: RocksDB visits vout 256 before vout 1
+        -- (LE32 key order) but the snapshot group is numeric, matching
+        -- Core write_coins_to_file / std::map<uint32_t, Coin>.
+        withSystemTempDirectory "haskoin-dump-stream-bytes" $ \tmp -> do
+          let dbDir = tmp </> "db"
+              snapPath = tmp </> "out.utxo.dat"
+          Dir.createDirectoryIfMissing True dbDir
+          let cfg = (defaultDBConfig dbDir)
+                { dbCreateIfMissing = True
+                , dbCompression     = False
+                }
+          bracket (openDB cfg) closeDB $ \db -> do
+            let entries =
+                  [ (OutPoint (mkTxId 0x01) 0,   TxOut 1 sampleP2PKH)
+                  , (OutPoint (mkTxId 0x01) 256, TxOut 2 sampleP2SH)
+                  , (OutPoint (mkTxId 0x01) 1,   TxOut 3 sampleP2PKH)
+                  , (OutPoint (mkTxId 0x02) 0,   TxOut 4 sampleP2SH)
+                  ]
+                tip = BlockHash (Hash256 (BS.replicate 32 0x55))
+                coins =
+                  [ SnapshotCoin op Coin
+                      { coinTxOut = txo
+                      , coinHeight = 0
+                      , coinIsCoinbase = False
+                      }
+                  | (op, txo) <- entries
+                  ]
+                meta = SnapshotMetadata
+                  { smNetworkMagic = mainnetMagic
+                  , smBaseBlockHash = tip
+                  , smCoinsCount = 4
+                  }
+            forM_ entries $ \(op, txo) -> putUTXO db op txo
+            r <- dumpTxOutSetFromDB db snapPath mainnetMagic tip
+            r `shouldBe` Right 4
+            raw <- BS.readFile snapPath
+            raw `shouldBe` (encode meta <> serializeCoins coins)
 
     -- ------------------------------------------------------------------
     -- dumptxoutset rollback parameter parsing + target resolution
