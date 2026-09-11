@@ -1,6 +1,12 @@
 # Changelog
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-11
+
+- 30cccf3 fix: dumpTxOutSetFromDB streams one txid group instead of the whole coin set
+- 5b59a06 fix: gettxoutsetinfo hashed the set from a materialised list of every coin
+
+
+## v1.0.2 — 2026-09-11
 
 Changes since `v1.0.0`:
 
