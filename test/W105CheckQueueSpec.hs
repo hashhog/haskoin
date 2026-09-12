@@ -262,9 +262,10 @@ import Haskoin.Consensus
   , initGlobalSigCache
   , lookupGlobalSigCache
   , insertGlobalSigCache
+  , readScriptChecksTotal
   )
 import Haskoin.Script (ScriptFlags, emptyFlags)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf)
 
 -- | String-specialised 'isInfixOf' for matching rejection messages.
 isInfixOfStr :: String -> String -> Bool
@@ -1144,6 +1145,56 @@ spec_G31_parallelVerifyWiredIntoConnect =
              Right _  -> False
 
 --------------------------------------------------------------------------------
+-- Script-verification counter (QUEUES.md haskoin item 2)
+--
+-- Revert control: runScriptChecksParallel / runScriptChecksSerial must
+-- record every check they actually execute.  A restore of the pre-fix
+-- bodies (no recordScriptChecks) fails the source scan; a counter that
+-- does not move when skipScripts=False fails the runtime delta.
+--------------------------------------------------------------------------------
+
+functionSrc :: String -> String -> String
+functionSrc src name =
+  let ls = dropWhile (not . isPrefixOf (name ++ " ::")) (lines src)
+  in unlines $ take 40 ls
+
+spec_scriptVerificationCounter :: Spec
+spec_scriptVerificationCounter =
+  describe "script-verification counter" $ do
+    it "runScriptChecksParallel records the checks it actually executes" $ do
+      src <- readFile "src/Haskoin/Consensus.hs"
+      let body = functionSrc src "runScriptChecksParallel"
+      ("recordScriptChecks" `isInfixOf` body) `shouldBe` True
+
+    it "runScriptChecksSerial records the checks it actually executes" $ do
+      src <- readFile "src/Haskoin/Consensus.hs"
+      let body = functionSrc src "runScriptChecksSerial"
+      ("recordScriptChecks" `isInfixOf` body) `shouldBe` True
+
+    it "increments by the number of input scripts actually verified" $ do
+      -- One OP_TRUE input: skipScripts=False must bump the counter by 1.
+      -- skipScripts=True must not.  Restoring a no-op recordScriptChecks,
+      -- or wiring it only on the skip path, fails this.
+      let goodPrevout = TxOut 10_000 (BS.singleton 0x51)
+          op'      = mkOutpoint 901
+          spendTx' = Tx 2 [TxIn op' BS.empty 0xffffffff]
+                          [TxOut 9_000 BS.empty] [[]] 0
+          utxoMap' = Map.singleton op' goodPrevout
+          txns'    = [mkCoinbaseTx, spendTx']
+      beforeSkip <- readScriptChecksTotal
+      case validateBlockTransactions nullFlags True txns' utxoMap' of
+        Left err -> expectationFailure ("skipScripts=True rejected: " ++ err)
+        Right _  -> return ()
+      afterSkip <- readScriptChecksTotal
+      (afterSkip - beforeSkip) `shouldBe` 0
+      beforeRun <- readScriptChecksTotal
+      case validateBlockTransactions nullFlags False txns' utxoMap' of
+        Left err -> expectationFailure ("skipScripts=False rejected: " ++ err)
+        Right _  -> return ()
+      afterRun <- readScriptChecksTotal
+      (afterRun - beforeRun) `shouldBe` 1
+
+--------------------------------------------------------------------------------
 -- Top-level spec
 --------------------------------------------------------------------------------
 
@@ -1193,3 +1244,5 @@ spec = describe "W105 CCheckQueue / parallel script verification" $ do
   spec_G30_checkQueueControl
   -- Parallel verify wired into the production connect path (reachability)
   spec_G31_parallelVerifyWiredIntoConnect
+  -- QUEUES.md haskoin item 2: process-wide script-verification counter.
+  spec_scriptVerificationCounter

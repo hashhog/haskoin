@@ -2165,6 +2165,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         height <- readTVarIO (hcHeight hc)
         peers <- Map.size <$> readTVarIO (pmPeers pm)
         mempoolCount <- Map.size <$> readTVarIO (mpEntries mp)
+        scriptChecks <- readScriptChecksTotal
         let body = BL8.pack $ unlines
               [ "# HELP bitcoin_blocks_total Current block height"
               , "# TYPE bitcoin_blocks_total gauge"
@@ -2175,6 +2176,9 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               , "# HELP bitcoin_mempool_size Mempool transaction count"
               , "# TYPE bitcoin_mempool_size gauge"
               , "bitcoin_mempool_size " ++ show mempoolCount
+              , "# HELP bitcoin_script_checks_total Input scripts actually verified (not skipped via assumevalid)"
+              , "# TYPE bitcoin_script_checks_total counter"
+              , "bitcoin_script_checks_total " ++ show scriptChecks
               ]
         respond $ Wai.responseLBS HTTP.status200
           [(HTTP.hContentType, "text/plain; version=0.0.4; charset=utf-8")]

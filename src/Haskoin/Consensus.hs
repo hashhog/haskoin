@@ -65,6 +65,12 @@ module Haskoin.Consensus
   , computeMerkleRootMutated
     -- * AssumeValid
   , shouldSkipScripts
+    -- * Script-verification counter (process-wide; not persistable)
+    --   Incremented only when input scripts actually run (skipScripts=False).
+    --   Read by getchainstates / Prometheus so a range can prove scripts ran
+    --   without grepping a log banner.
+  , readScriptChecksTotal
+  , resetScriptChecksTotal
     -- * Transaction Finality
   , isFinalTxCheck
   , locktimeThresholdConsensus
@@ -3573,6 +3579,39 @@ verifyScriptCheckItem scriptFlags ScriptCheckItem{..} =
                         ++ "): script returned false"
     Right True  -> Nothing
 
+--------------------------------------------------------------------------------
+-- Script-verification counter
+--
+-- Process-wide count of input scripts actually executed (not skipped via
+-- assumevalid).  Range-runner / getchainstates read this instead of grepping
+-- a log banner.  Not persisted; resets on process start.
+--------------------------------------------------------------------------------
+
+{-# NOINLINE scriptChecksTotalRef #-}
+scriptChecksTotalRef :: IORef Word64
+scriptChecksTotalRef = unsafePerformIO (newIORef 0)
+
+-- | Force an increment of the process-wide script-check counter.  Called
+-- from the pure 'runScriptChecksParallel' / 'runScriptChecksSerial' paths
+-- via 'unsafePerformIO'; NOINLINE so GHC cannot float or duplicate the
+-- effect.  n<=0 is a no-op.
+{-# NOINLINE recordScriptChecks #-}
+recordScriptChecks :: Int -> ()
+recordScriptChecks n = unsafePerformIO $ do
+  when (n > 0) $
+    atomicModifyIORef' scriptChecksTotalRef $ \x ->
+      (x + fromIntegral n, ())
+  return ()
+
+-- | Read the process-wide count of input scripts actually verified.
+readScriptChecksTotal :: IO Word64
+readScriptChecksTotal = readIORef scriptChecksTotalRef
+
+-- | Test helper: zero the counter.
+resetScriptChecksTotal :: IO ()
+resetScriptChecksTotal =
+  atomicModifyIORef' scriptChecksTotalRef $ \_ -> (0, ())
+
 -- | Run a batch of pre-resolved script checks IN PARALLEL, returning the FIRST
 -- failure (if any) — exactly as the equivalent serial loop would have rejected.
 --
@@ -3634,7 +3673,8 @@ verifyScriptCheckItem scriptFlags ScriptCheckItem{..} =
 runScriptChecksParallel :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
 runScriptChecksParallel _scriptFlags [] = Right ()
 runScriptChecksParallel scriptFlags checks =
-  let -- Chunk size amortizes per-spark overhead while keeping enough chunks to
+  let !_ = recordScriptChecks (length checks)
+      -- Chunk size amortizes per-spark overhead while keeping enough chunks to
       -- fill the (N4) HECs on script-heavy blocks.  Powers of ~16-64 are the
       -- usual sweet spot; 32 keeps thousands-of-input blocks well-distributed.
       chunkSize = 32
@@ -3653,7 +3693,9 @@ runScriptChecksParallel scriptFlags checks =
 -- Used by 'validateSingleTx' so its standalone contract (and every existing
 -- caller/test) is byte-for-byte unchanged.
 runScriptChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
-runScriptChecksSerial scriptFlags = go
+runScriptChecksSerial scriptFlags checks =
+  let !_ = recordScriptChecks (length checks)
+  in go checks
   where
     go []     = Right ()
     go (c:cs) = case verifyScriptCheckItem scriptFlags c of

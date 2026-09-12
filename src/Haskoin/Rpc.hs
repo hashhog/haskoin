@@ -88,6 +88,7 @@ module Haskoin.Rpc
   , chainStatesResultEnc
   , chainStatesResultEncWithSnapshot
   , chainStateEntryEnc
+  , chainstateSnapshotReport
     -- * getpeerinfo per-peer encoder (exported for testing — Core v31.99 wire shape)
   , peerInfoToEncoding
     -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
@@ -367,7 +368,8 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            -- verifychain levels 2-4 (CVerifyDB::VerifyDB undo +
                            -- reconnect) run against an in-memory overlay via the
                            -- SAME reorg/disconnect machinery an actual reorg uses.
-                           verifyDbUndoSuffix, VerifyDbResult(..))
+                           verifyDbUndoSuffix, VerifyDbResult(..),
+                           readScriptChecksTotal)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
                         ScriptOp(..), encodeScriptOps)
 -- BIP-157/158 helpers for the REST blockfilter / blockfilterheaders
@@ -404,7 +406,8 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          getUTXOCount, getBlockHeight,
                          iterateWithPrefix, KeyPrefix(..), Coin(..),
                          SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash,
-                         computeUtxoHashFromDBPrefix)
+                         computeUtxoHashFromDBPrefix,
+                         getSnapshotBaseHash)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          PeerState(..), Version(..),
                          getPeerCount, getConnectedPeers, broadcastMessage,
@@ -1800,13 +1803,22 @@ chainstateSizeOnDisk root = do
 --         "validated": <bool> } ] }                 -- m_assumeutxo == VALIDATED
 -- @
 --
--- haskoin runs a SINGLE, fully-validated chainstate: it has no
--- background-validation / from-snapshot split chainstate (the
--- @--load-snapshot@ path validates and promotes a snapshot in place
--- rather than holding an unvalidated one).  So 'chainstates' is always
--- a 1-element array with @validated = True@, @snapshot_blockhash@
--- OMITTED, and the active chainstate trivially last (Core's
--- HistoricalChainstate() is null → only CurrentChainstate() is pushed).
+-- haskoin has a single chainstate.  @validated@ follows Core
+-- (@cs.m_assumeutxo == Assumeutxo::VALIDATED@, rpc/blockchain.cpp
+-- make_chain_data):
+--
+--   * live @loadtxoutset@ ('rsAssumeUtxo') wins when present — its
+--     @ausValidated@ flag is the independent genesis->base re-derivation
+--     verdict (true ONLY on a matching HASH_SERIALIZED);
+--   * CLI @--load-snapshot@ persists a snapshot-base marker
+--     ('getSnapshotBaseHash') but does not run that re-derivation, so
+--     the marker with no live AssumeUtxoState is reported as
+--     @validated = false@ + @snapshot_blockhash@;
+--   * neither marker is the ordinary from-genesis chainstate
+--     (@validated = true@, snapshot_blockhash omitted).
+--
+-- @script_checks@ is a haskoin extension: the process-wide count of
+-- input scripts actually executed (not skipped via assumevalid).
 --
 -- The chainstate-derived fields come from the /validated/ chain tip
 -- ('getValidatedChainTip', @PrefixBestBlock@ → 'ChainEntry'), exactly
@@ -1818,27 +1830,36 @@ handleGetChainStates server = do
   tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   -- Header tip drives the 'headers' field only (Core m_best_header).
   headerHeight <- readTVarIO (hcHeight (rsHeaderChain server))
-  -- Active AssumeUTXO snapshot, if one was loaded over the live
-  -- 'loadtxoutset' RPC.  When present, the sole chainstate IS the
-  -- from-snapshot chainstate (Core CurrentChainstate() with
-  -- m_from_snapshot_blockhash set): report its real snapshot base hash and
-  -- its real 'ausValidated' flag (true ONLY when the independent
-  -- genesis->base re-derivation matched the committed hash).  When absent,
-  -- the single chainstate is the ordinary fully-validated chain
-  -- (validated=true, snapshot_blockhash omitted) — the prior behaviour.
   mAU <- readIORef (rsAssumeUtxo server)
-  mSnapState <- case mAU of
+  live <- case mAU of
     Nothing -> return Nothing
     Just st -> do
       validated <- readIORef (ausValidated st)
       return (Just (ausSnapshotHash st, validated))
+  persisted <- getSnapshotBaseHash (rsDB server)
+  scriptChecks <- readScriptChecksTotal
   let net   = rsNetwork server
-      -- Genuine, configured coins-cache budget (MiB → bytes).  See
-      -- 'chainStatesResultEnc' for why both fields use this value.
       dbCacheMb = rpcDbCacheMb (rsConfig server)
+      mSnapState = chainstateSnapshotReport live persisted
       rawBs = encodingToLazyByteString
-                (chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnapState)
+                (chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnapState scriptChecks)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | Decide how getchainstates reports snapshot_blockhash / validated.
+--
+-- Core: @cs.m_assumeutxo == Assumeutxo::VALIDATED@.  A chainstate
+-- constructed from a snapshot starts UNVALIDATED until
+-- MaybeCompleteSnapshotValidation.  The live @loadtxoutset@ path wins
+-- when present; a persisted @--load-snapshot@ marker with no live
+-- AssumeUtxoState is UNVALIDATED; neither is the ordinary from-genesis
+-- chainstate.  Exported for testing.
+chainstateSnapshotReport
+  :: Maybe (BlockHash, Bool)  -- ^ live loadtxoutset (hash, ausValidated)
+  -> Maybe BlockHash          -- ^ persisted --load-snapshot base
+  -> Maybe (BlockHash, Bool)
+chainstateSnapshotReport (Just live) _ = Just live
+chainstateSnapshotReport Nothing (Just base) = Just (base, False)
+chainstateSnapshotReport Nothing Nothing = Nothing
 
 -- | Pure core of 'handleGetChainStates': build the full getchainstates
 -- result encoding for a given network, validated chain tip, header-tip
@@ -1854,26 +1875,29 @@ chainStatesResultEnc
   -> AE.Encoding
 chainStatesResultEnc net tip headerHeight dbCacheMb =
   -- No active snapshot: the single chainstate is the ordinary
-  -- fully-validated chain.
-  chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb Nothing
+  -- fully-validated chain.  script_checks=0 in the pure helper; the
+  -- live handler supplies the process-wide counter.
+  chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb Nothing 0
 
 -- | As 'chainStatesResultEnc', but parameterised on the active AssumeUTXO
--- snapshot (if any).  When @Just (snapshotBaseHash, validated)@ is supplied
--- the sole chainstate is reported as the from-snapshot chainstate (Core
--- CurrentChainstate() with @m_from_snapshot_blockhash@ set): it emits
--- @snapshot_blockhash@ and reports @validated@ from the supplied flag
--- (@cs.m_assumeutxo == VALIDATED@ — true ONLY after the independent
--- genesis->base re-derivation matched).  When @Nothing@, behaviour is
--- identical to 'chainStatesResultEnc' (single validated chainstate,
--- @snapshot_blockhash@ omitted).  Exported for testing.
+-- snapshot (if any) and the process-wide script-check counter.  When
+-- @Just (snapshotBaseHash, validated)@ is supplied the sole chainstate is
+-- reported as the from-snapshot chainstate (Core CurrentChainstate() with
+-- @m_from_snapshot_blockhash@ set): it emits @snapshot_blockhash@ and
+-- reports @validated@ from the supplied flag (@cs.m_assumeutxo ==
+-- VALIDATED@ — true ONLY after the independent genesis->base re-derivation
+-- matched).  When @Nothing@, behaviour is identical to
+-- 'chainStatesResultEnc' (single validated chainstate, @snapshot_blockhash@
+-- omitted).  Exported for testing.
 chainStatesResultEncWithSnapshot
   :: Network                     -- ^ active network
   -> ChainEntry                  -- ^ validated chain tip
   -> Word32                      -- ^ header-tip height (Core m_best_header->nHeight)
   -> Int                         -- ^ configured -dbcache budget in MiB
   -> Maybe (BlockHash, Bool)     -- ^ active snapshot: (base hash, validated?)
+  -> Word64                      -- ^ process-wide script-checks counter
   -> AE.Encoding
-chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnap =
+chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnap scriptChecks =
   pairs $
     -- Core: m_best_header ? m_best_header->nHeight : -1.  haskoin always
     -- has at least the genesis header in memory, so this is the in-memory
@@ -1885,10 +1909,10 @@ chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnap =
       -- From-snapshot chainstate: snapshot_blockhash emitted, validated
       -- from the real ausValidated flag.
       Just (snapHash, validated) ->
-        chainStateEntryEnc net tip dbCacheMb validated (Just snapHash)
+        chainStateEntryEnc net tip dbCacheMb validated (Just snapHash) scriptChecks
       -- Ordinary single validated chainstate.
       Nothing ->
-        chainStateEntryEnc net tip dbCacheMb True Nothing
+        chainStateEntryEnc net tip dbCacheMb True Nothing scriptChecks
 
 -- | Build one chainstate object (Core make_chain_data).  Exported for
 -- testing.
@@ -1908,14 +1932,17 @@ chainStatesResultEncWithSnapshot net tip headerHeight dbCacheMb mSnap =
 --
 -- @snapshot_blockhash@ is OMITTED unless this is a from-snapshot
 -- chainstate (Core only pushKV's it for @cs.m_from_snapshot_blockhash@).
+-- @script_checks@ is a haskoin extension (after Core's last field) so a
+-- range can prove scripts actually ran without grepping a log banner.
 chainStateEntryEnc
   :: Network             -- ^ active network
   -> ChainEntry          -- ^ this chainstate's tip
   -> Int                 -- ^ configured -dbcache budget in MiB
   -> Bool                -- ^ validated? (True for haskoin's sole chainstate)
   -> Maybe BlockHash     -- ^ snapshot base hash, when from-snapshot
+  -> Word64              -- ^ process-wide script-checks counter
   -> AE.Encoding
-chainStateEntryEnc _net tip dbCacheMb validated mSnapshot =
+chainStateEntryEnc _net tip dbCacheMb validated mSnapshot scriptChecks =
   let bits          = bhBits (ceHeader tip)
       progress      = computeVerificationProgress (ceHeight tip)
                                                   (bhTimestamp (ceHeader tip))
@@ -1940,7 +1967,8 @@ chainStateEntryEnc _net tip dbCacheMb validated mSnapshot =
        pair "coins_db_cache_bytes"  (AE.int64 cacheBytes)                           <>
        pair "coins_tip_cache_bytes" (AE.int64 cacheBytes)                           <>
        snapshotEnc                                                                  <>
-       pair "validated"            (AE.bool validated)
+       pair "validated"            (AE.bool validated)                              <>
+       pair "script_checks"        (AE.word64 scriptChecks)
 
 -- | Pure helper: build the full getdeploymentinfo result for a given
 -- network configuration and chain entry.
@@ -12897,7 +12925,7 @@ getCommandHelp cmd = case T.toLower cmd of
   "getchaintips" ->
     "getchaintips\n\nReturn information about all known tips in the block tree, including the main chain as well as orphaned branches.\n\nResult:\n[\n  {\n    \"height\": n,       (numeric) height of the chain tip\n    \"hash\": \"hash\",   (string) block hash of the tip\n    \"branchlen\": n,    (numeric) length of branch connecting the tip to the main chain\n    \"status\": \"status\" (string) status of the chain\n  },\n  ...\n]"
   "getchainstates" ->
-    "getchainstates\n\nReturn information about chainstates.\n\nResult:\n{\n  \"headers\": n,           (numeric) the number of headers seen so far\n  \"chainstates\": [        (json array) list of the chainstates ordered by work, with the most-work (active) chainstate last\n    {\n      \"blocks\": n,                  (numeric) number of blocks in this chainstate\n      \"bestblockhash\": \"hex\",      (string) blockhash of the tip\n      \"bits\": \"hex\",               (string) nBits: compact representation of the block difficulty target\n      \"target\": \"hex\",             (string) the difficulty target\n      \"difficulty\": n,              (numeric) difficulty of the tip\n      \"verificationprogress\": n,    (numeric) progress towards the network tip\n      \"snapshot_blockhash\": \"hex\", (string, optional) the base block of the snapshot this chainstate is based on, if any\n      \"coins_db_cache_bytes\": n,    (numeric) size of the coinsdb cache\n      \"coins_tip_cache_bytes\": n,   (numeric) size of the coinstip cache\n      \"validated\": true|false       (boolean) whether the chainstate is fully validated\n    },\n    ...\n  ]\n}"
+    "getchainstates\n\nReturn information about chainstates.\n\nResult:\n{\n  \"headers\": n,           (numeric) the number of headers seen so far\n  \"chainstates\": [        (json array) list of the chainstates ordered by work, with the most-work (active) chainstate last\n    {\n      \"blocks\": n,                  (numeric) number of blocks in this chainstate\n      \"bestblockhash\": \"hex\",      (string) blockhash of the tip\n      \"bits\": \"hex\",               (string) nBits: compact representation of the block difficulty target\n      \"target\": \"hex\",             (string) the difficulty target\n      \"difficulty\": n,              (numeric) difficulty of the tip\n      \"verificationprogress\": n,    (numeric) progress towards the network tip\n      \"snapshot_blockhash\": \"hex\", (string, optional) the base block of the snapshot this chainstate is based on, if any\n      \"coins_db_cache_bytes\": n,    (numeric) size of the coinsdb cache\n      \"coins_tip_cache_bytes\": n,   (numeric) size of the coinstip cache\n      \"validated\": true|false       (boolean) whether the chainstate is fully validated\n      \"script_checks\": n            (numeric) input scripts actually verified (haskoin; not skipped via assumevalid)\n    },\n    ...\n  ]\n}"
   "decodescript" ->
     "decodescript \"hexstring\"\n\nDecode a hex-encoded script.\n\nArguments:\n1. hexstring    (string, required) the hex-encoded script\n\nResult:\n{\n  \"asm\": \"asm\",      (string) Script public key\n  \"type\": \"type\",    (string) The output type\n  \"address\": \"addr\", (string) bitcoin address\n  \"p2sh\": \"addr\",    (string) address of P2SH script wrapping this script\n  \"segwit\": {...}    (object) segwit wrapper info\n}"
   "testmempoolaccept" ->

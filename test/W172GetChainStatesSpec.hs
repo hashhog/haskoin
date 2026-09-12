@@ -34,21 +34,51 @@ module W172GetChainStatesSpec (spec) where
 
 import Test.Hspec
 
+import Control.Concurrent.STM (newTVarIO)
+import Control.Exception (bracket)
 import Data.Aeson (Value(..), decode)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Aeson.Key as K
 import Data.Aeson.Encoding (encodingToLazyByteString)
+import qualified Data.Aeson as Aeson
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BL
+import Data.IORef (newIORef)
+import Data.List (isInfixOf, isPrefixOf)
+import qualified Data.Map.Strict as Map
 import qualified Data.Scientific as Sci
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 import Data.Word (Word32)
+import System.Directory (removeDirectoryRecursive, getTemporaryDirectory)
+import System.FilePath ((</>))
+import System.IO.Temp (createTempDirectory)
 
 import Haskoin.Types (Block(..), BlockHeader(..))
 import Haskoin.Crypto (computeBlockHash)
 import Haskoin.Consensus
   ( regtest, netGenesisBlock, headerWork, seqIdBestChainFromDisk
   , ChainEntry(..), BlockStatus(..)
+  , initHeaderChain
   )
-import Haskoin.Rpc (chainStatesResultEnc, chainStateEntryEnc)
+import Haskoin.Storage
+  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig
+  , putSnapshotBaseHash
+  )
+import Haskoin.Mempool (newMempool, defaultMempoolConfig)
+import Haskoin.FeeEstimator (newFeeEstimator)
+import Haskoin.Network
+  ( startPeerManager, stopPeerManager, Message
+  , defaultPeerManagerConfig, PeerManagerConfig(..)
+  )
+import Haskoin.TxOrphanage (emptyOrphanPool)
+import Haskoin.Payjoin (defaultPayjoinConfig)
+import Haskoin.Rpc
+  ( chainStatesResultEnc, chainStateEntryEnc
+  , chainStatesResultEncWithSnapshot, chainstateSnapshotReport
+  , handleGetChainStates, RpcServer(..), RpcConfig(..), defaultRpcConfig
+  , RpcResponse(..)
+  )
 
 -- | Build the regtest genesis 'ChainEntry' exactly the way
 -- 'Haskoin.Consensus.initHeaderChain' does, so the test exercises the
@@ -182,7 +212,7 @@ spec = describe "W172 getchainstates — Core make_chain_data shape parity" $ do
 
     it "the entry helper EMITS snapshot_blockhash when a snapshot base is given" $ do
       let snapHash = ceHash genesisEntry
-          enc      = chainStateEntryEnc regtest genesisEntry dbCacheMb False (Just snapHash)
+          enc      = chainStateEntryEnc regtest genesisEntry dbCacheMb False (Just snapHash) 0
           bs       = encodingToLazyByteString enc
           v        = maybe (error "snapshot entry parse fail") id (decode bs)
       isString (field "snapshot_blockhash" v) `shouldBe` True
@@ -190,8 +220,123 @@ spec = describe "W172 getchainstates — Core make_chain_data shape parity" $ do
       field "validated" v `shouldBe` Just (Bool False)
 
     it "the entry helper OMITS snapshot_blockhash when no snapshot base" $ do
-      let enc = chainStateEntryEnc regtest genesisEntry dbCacheMb True Nothing
+      let enc = chainStateEntryEnc regtest genesisEntry dbCacheMb True Nothing 0
           bs  = encodingToLazyByteString enc
           v   = maybe (error "no-snapshot entry parse fail") id (decode bs)
       field "snapshot_blockhash" v `shouldBe` Nothing
       field "validated" v          `shouldBe` Just (Bool True)
+
+  -- QUEUES.md haskoin item 2.  Core: validated = (cs.m_assumeutxo ==
+  -- VALIDATED).  --load-snapshot promotes in place without
+  -- MaybeCompleteSnapshotValidation, so a persisted snapshot-base marker
+  -- must surface as snapshot_blockhash + validated=false until the live
+  -- loadtxoutset path records a matching re-derivation.
+  describe "getchainstates validated" $ do
+
+    it "handleGetChainStates consults getSnapshotBaseHash for --load-snapshot" $ do
+      src <- readFile "src/Haskoin/Rpc.hs"
+      let ls = dropWhile (not . isPrefixOf "handleGetChainStates ::") (lines src)
+          body = unlines $ take 50 ls
+      ("getSnapshotBaseHash" `isInfixOf` body) `shouldBe` True
+      ("chainstateSnapshotReport" `isInfixOf` body) `shouldBe` True
+
+    it "is true for a from-genesis chainstate (no snapshot marker)" $
+      withLiveServer $ \server -> do
+        cs <- getChainStatesEntry server
+        field "validated" cs `shouldBe` Just (Bool True)
+        field "snapshot_blockhash" cs `shouldBe` Nothing
+        isIntegral (field "script_checks" cs) `shouldBe` True
+
+    it "is false for a --load-snapshot chainstate until independent re-derivation" $
+      withLiveServer $ \server -> do
+        putSnapshotBaseHash (rsDB server) (ceHash genesisEntry)
+        cs <- getChainStatesEntry server
+        field "validated" cs `shouldBe` Just (Bool False)
+        case field "snapshot_blockhash" cs of
+          Just (String s) | T.length s == 64 -> return ()
+          other -> expectationFailure
+            ("expected snapshot_blockhash 64-char hex, got " ++ show other)
+
+    it "is true after snapshot re-derivation (live AssumeUtxo wins over the marker)" $ do
+      let h = ceHash genesisEntry
+      chainstateSnapshotReport (Just (h, True)) (Just h)
+        `shouldBe` Just (h, True)
+      chainstateSnapshotReport Nothing (Just h)
+        `shouldBe` Just (h, False)
+      chainstateSnapshotReport Nothing Nothing
+        `shouldBe` Nothing
+
+    it "emits script_checks from the supplied counter" $ do
+      let enc = chainStatesResultEncWithSnapshot
+                  regtest genesisEntry 0 dbCacheMb Nothing 42
+          bs  = encodingToLazyByteString enc
+          v   = maybe (error "script_checks parse fail") id (decode bs)
+          e   = case field "chainstates" v of
+                  Just (Array arr) -> case foldr (:) [] arr of
+                    (x:_) -> x
+                    []    -> error "empty chainstates"
+                  _ -> error "chainstates not an array"
+      field "script_checks" e `shouldSatisfy` \mv -> case mv of
+        Just (Number n) -> Sci.toBoundedInteger n == Just (42 :: Int)
+        _               -> False
+
+-- | Minimal live RpcServer over a temp RocksDB (mirrors W186).
+liveNoopHandler :: a -> Message -> IO ()
+liveNoopHandler _ _ = return ()
+
+withLiveServer :: (RpcServer -> IO ()) -> IO ()
+withLiveServer action = do
+  base <- getTemporaryDirectory
+  bracket
+    (createTempDirectory base "haskoin-w172-")
+    removeDirectoryRecursive $ \dir ->
+    withDB (defaultDBConfig (dir </> "chainstate")) $ \db -> do
+      hc    <- initHeaderChain regtest
+      cache <- newUTXOCache db 1000
+      mp    <- newMempool regtest cache defaultMempoolConfig 0 0 (\_ -> return 0)
+      fe    <- newFeeEstimator
+      let pmCfg = defaultPeerManagerConfig { pmcDataDir = dir, pmcDnsSeed = False }
+      bracket (startPeerManager regtest pmCfg liveNoopHandler) stopPeerManager $ \pm -> do
+        threadVar     <- newTVarIO Nothing
+        mockTimeVar   <- newTVarIO Nothing
+        pauseVar      <- newTVarIO False
+        payjoinOffers <- newTVarIO Map.empty
+        orphanRef     <- newIORef emptyOrphanPool
+        assumeUtxoVar <- newIORef Nothing
+        let cfg = defaultRpcConfig { rpcDataDir = dir }
+            server = RpcServer
+              { rsConfig = cfg, rsDB = db, rsHeaderChain = hc, rsPeerMgr = pm
+              , rsMempool = mp, rsFeeEst = fe, rsUTXOCache = cache
+              , rsNetwork = regtest, rsBlockStore = Nothing
+              , rsThread = threadVar, rsMockTime = mockTimeVar
+              , rsWalletMgr = Nothing, rsStartTime = 0
+              , rsCookieFile = dir </> ".cookie", rsCookiePassword = T.empty
+              , rsBlockSubmissionPaused = pauseVar, rsIndexMgr = Nothing
+              , rsPruneConfig = defaultPruneConfig, rsAsmapData = BS.empty
+              , rsPayjoinOffers = payjoinOffers, rsPayjoinConfig = defaultPayjoinConfig
+              , rsOrphanPool = orphanRef, rsAssumeUtxo = assumeUtxoVar
+              }
+        action server
+
+-- | Drive handleGetChainStates and return the single chainstate entry.
+getChainStatesEntry :: RpcServer -> IO Value
+getChainStatesEntry server = do
+  resp <- handleGetChainStates server
+  v <- decodeRawResult (resResult resp)
+  case field "chainstates" v of
+    Just (Array arr) -> case foldr (:) [] arr of
+      (e:_) -> return e
+      []    -> fail "getchainstates returned an empty chainstates array"
+    other -> fail ("getchainstates chainstates not an array: " ++ show other)
+
+decodeRawResult :: Value -> IO Value
+decodeRawResult (String s) =
+  let magic = "__RAWJSON__:"
+      payload = if magic `T.isPrefixOf` s then T.drop (T.length magic) s else s
+  in case Aeson.decode (BL.fromStrict (TE.encodeUtf8 payload)) of
+       Just v  -> return v
+       Nothing -> fail ("could not decode getchainstates raw JSON: " ++ T.unpack payload)
+decodeRawResult v =
+  case v of
+    Object _ -> return v
+    _        -> fail ("unexpected getchainstates result shape: " ++ show v)
