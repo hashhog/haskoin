@@ -171,6 +171,7 @@ import qualified W188InboundPongSpec
 import qualified W189GetBlockVerbosity3Spec
 import qualified W190InboundCapSpec
 import qualified ConvertJoinPsbtSpec
+import qualified T2R5Spec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -23826,6 +23827,7 @@ main = hspec $ do
   -- blank maps, join <2->-8, full-TxIn-duplicate->-8, same-outpoint-diff-seq
   -- both kept, set-union max-version/min-locktime, AddInput sig-clearing.
   ConvertJoinPsbtSpec.spec
+  T2R5Spec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec

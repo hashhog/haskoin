@@ -165,6 +165,7 @@ module Haskoin.Consensus
   , headerWork
   , cumulativeWork
   , medianTimePast
+  , ancestorAtHeight
   , computeEntryMtp
   , difficultyAdjustment
   , addHeader

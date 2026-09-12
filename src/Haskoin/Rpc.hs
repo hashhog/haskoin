@@ -48,6 +48,7 @@ module Haskoin.Rpc
   , rpcParseError
   , rpcMiscError
   , rpcInvalidParameter
+  , rpcTypeError
   , rpcInvalidAddressOrKey
     -- * Core's central argument-count gate (#103); exported for testing.
   , coreArityViolation
@@ -221,6 +222,26 @@ module Haskoin.Rpc
   , handleEstimateSmartFee
   , handleGetNodeAddresses
   , handleCreatePsbt
+    -- * T2 R5 probe handlers (exported for testing)
+  , handleDecodeRawTransaction
+  , handleValidateAddress
+  , handleGetDeploymentInfo
+  , handleVerifyTxOutProof
+  , handleGetTxSpendingPrevout
+  , handleImportMempool
+  , handleScanTxOutSet
+  , handleDecodeScript
+  , handleCombinePsbt
+  , handleSubmitPackage
+  , handleCreateMultisig
+  , handleDeriveAddresses
+  , handleGetDescriptorInfo
+  , handleGetIndexInfo
+  , handleSignMessage
+  , handleCombineRawTransaction
+  , handleGetChainTxStats
+  , handleUtxoUpdatePsbt
+  , handleDescriptorProcessPsbt
     -- * -rpcallowip IP allowlist enforcement (BUG-6 FIX, exported for testing)
     -- Core parity: ClientAllowed (httpserver.cpp:137-145).
   , checkAllowIp
@@ -273,7 +294,7 @@ import Control.DeepSeq (NFData)
 import Control.Monad (forM, forM_, void, when, unless, replicateM, foldM)
 import qualified System.Random as SysRandom
 import Control.Concurrent (threadDelay)
-import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust)
+import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust, isNothing)
 import Data.List (find, sort, sortBy, dropWhileEnd)
 import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
@@ -303,7 +324,8 @@ import Foreign.C.String (peekCStringLen)
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
                         Address(..), PubKey(..), serializePubKeyCompressed,
-                        base58Check, bech32Encode, bech32mEncode,
+                        base58Check, base58CheckDecode,
+                        bech32Encode, bech32mEncode, derivePubKey,
                         SecKey(..), hash160, sha256, parsePubKey,
                         signMessage, recoverMessagePubKey,
                         addressToText)
@@ -316,7 +338,7 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            varIntSize, maxMoney,
                            blockBaseSize, blockTotalSize,
                            witnessScaleFactor, computeWtxId, computeMerkleRoot,
-                           medianTimePast, maxBlockWeight,
+                           medianTimePast, ancestorAtHeight, maxBlockWeight,
                            -- submitheader RPC reuses the headers-first
                            -- validator (PoW + contextual) that IBD and the
                            -- submitblock side-branch path already drive; we do
@@ -468,7 +490,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         validateDescriptorChecksum, isRangeDescriptor,
                         Wallet(..), WalletManager(..), WalletState(..), WalletInfo(..),
                         ImportedDescriptor(..), markWalletDirty,
-                        wifDecode,
+                        wifDecode, wifDecodeWithCompression,
                         -- signrawtransactionwithkey: build a temporary
                         -- keystore from explicit WIF keys and reuse the
                         -- SAME PSBT Signer engine the wallet path uses.
@@ -1550,6 +1572,8 @@ handleRpcRequest server req = do
     "walletcreatefundedpsbt" -> handleWalletCreateFundedPsbt server params
     "converttopsbt"        -> handleConvertToPsbt server params
     "joinpsbts"            -> handleJoinPsbts server params
+    "utxoupdatepsbt"       -> handleUtxoUpdatePsbt server params
+    "descriptorprocesspsbt" -> handleDescriptorProcessPsbt server params
 
     -- Blockchain RPCs (new)
     "getchaintips"         -> handleGetChainTips server
@@ -2091,7 +2115,7 @@ handleGetDeploymentInfo server params = do
   case mEntry of
     Nothing ->
       return $ RpcResponse Null
-        (toJSON $ RpcError rpcInvalidParams "Block not found") Null
+        (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
     Just entry ->
       return $ RpcResponse (deploymentInfoForEntry net entry) Null Null
 
@@ -3400,28 +3424,37 @@ pruneblockchainNotEnabledResponse =
     (toJSON $ RpcError rpcMiscError pruneblockchainNotEnabledMsg) Null
 
 handlePruneBlockchain :: RpcServer -> Value -> IO RpcResponse
-handlePruneBlockchain server params
-  | not (rsPruneEnabled server) =
-      return pruneblockchainNotEnabledResponse
-  | otherwise = do
-      case rsBlockStore server of
+handlePruneBlockchain server params =
+  -- Core type-checks the height argument BEFORE the prune-mode gate
+  -- (rpc/blockchain.cpp pruneblockchain; ["zz"] -> -3 even on an
+  -- unpruned node).
+  case rawParamAt params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
+    Just (Number _) ->
+      case extractParam params 0 :: Maybe Word32 of
         Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcMiscError pruneblockchainNotEnabledMsg) Null
-        Just blockStore -> do
-          case extractParam params 0 :: Maybe Word32 of
-            Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
-            Just targetHeight -> do
-              tip <- readTVarIO (hcTip (rsHeaderChain server))
-              let tipHeight = ceHeight tip
-              result <- pruneBlockchain blockStore tipHeight targetHeight
-              case result of
-                Left err -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-                Right _numPruned -> do
-                  -- Return the height that was actually pruned to
-                  -- (the target height or lower if some files couldn't be pruned)
-                  return $ RpcResponse (toJSON targetHeight) Null Null
+          (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
+        Just targetHeight
+          | not (rsPruneEnabled server) ->
+              return pruneblockchainNotEnabledResponse
+          | otherwise ->
+              case rsBlockStore server of
+                Nothing -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError pruneblockchainNotEnabledMsg) Null
+                Just blockStore -> do
+                  tip <- readTVarIO (hcTip (rsHeaderChain server))
+                  let tipHeight = ceHeight tip
+                  result <- pruneBlockchain blockStore tipHeight targetHeight
+                  case result of
+                    Left err -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                    Right _numPruned ->
+                      return $ RpcResponse (toJSON targetHeight) Null Null
+    Just other -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> jsonTypeName other
+         <> " is not of expected type number")) Null
 
 -- | Invalidate a block and all its descendants
 -- Reference: bitcoin/src/rpc/blockchain.cpp invalidateblock
@@ -3609,57 +3642,28 @@ handleGetChainTxStats server params = do
                (toJSON $ RpcError rpcInvalidParameter
                   "Invalid block count: should be between 0 and the block's height - 1") Null
         Right nReq -> do
-          -- Cumulative tx count genesis..h, by reading stored block bodies.
-          -- Coinbase-only blocks → 1 tx each; genesis counts its 1 tx too.
-          -- O(height); fine for the regtest differential and any non-archival
-          -- query.  Mirrors Core's m_chain_tx_count which is the same running
-          -- sum maintained at connect time.
-          let cumulativeTxCount :: Word32 -> IO Integer
-              cumulativeTxCount h = go 0 0
-                where
-                  go acc i
-                    | i > h = return acc
-                    | otherwise = do
-                        mbh <- getBlockHeight (rsDB server) i
-                        n <- case mbh of
-                          Nothing -> return 1  -- defensive: assume coinbase-only
-                          Just bh -> do
-                            mBlk <- getBlock (rsDB server) bh
-                            return $ case mBlk of
-                              Just blk -> fromIntegral (length (blockTxns blk))
-                              Nothing  -> 1
-                        go (acc + n) (i + 1)
-          txcount <- cumulativeTxCount height
+          -- Do NOT walk genesis..height for txcount.  Core omits txcount
+          -- (and window_tx_count / txrate) when nChainTx is unknown
+          -- (assumeutxo); walking every stored body timed the R5 probe
+          -- out on a 900k+ snapshot node.
           let finalTime = bhTimestamp (ceHeader pindex)
               finalHashTxt = showHash (ceHash pindex)
               -- window_block_count: clamp request into [0, height].
               window = min nReq (fromIntegral height)
-          -- Window extras only when window > 0.
+          -- Window extras only when window > 0.  MTP is on ChainEntry
+          -- (GetMedianTimePast); ancestor walk is in-memory via cePrev.
           windowEnc <-
             if window <= 0
               then return mempty
               else do
                 let ancestorHeight = height - fromIntegral window
-                txcountAnc <- cumulativeTxCount ancestorHeight
-                mAncHash <- getBlockHeight (rsDB server) ancestorHeight
-                let mtpFinal = medianTimePast entries (ceHash pindex)
-                    mtpAnc = case mAncHash of
-                      Just ah -> medianTimePast entries ah
-                      Nothing -> mtpFinal
+                    mAnc = ancestorAtHeight entries (ceHash pindex) ancestorHeight
+                    mtpFinal = ceMedianTime pindex
+                    mtpAnc = maybe mtpFinal ceMedianTime mAnc
                     interval = fromIntegral mtpFinal - fromIntegral mtpAnc :: Int
-                    windowTx = txcount - txcountAnc
-                    rateEnc =
-                      if interval > 0
-                        then pair "txrate"
-                               (AE.double (fromIntegral windowTx / fromIntegral interval))
-                        else mempty
-                return $
-                  pair "window_interval" (AE.int interval) <>
-                  pair "window_tx_count" (AE.integer windowTx) <>
-                  rateEnc
+                return $ pair "window_interval" (AE.int interval)
           let enc = pairs $
                       pair "time"                      (AE.word32 finalTime)            <>
-                      pair "txcount"                   (AE.integer txcount)             <>
                       pair "window_final_block_hash"   (text finalHashTxt)              <>
                       pair "window_final_block_height" (AE.word32 height)               <>
                       pair "window_block_count"        (AE.int window)                  <>
@@ -3685,7 +3689,21 @@ handleGetChainTxStats server params = do
 --------------------------------------------------------------------------------
 handleGetIndexInfo :: RpcServer -> Value -> IO RpcResponse
 handleGetIndexInfo server params = do
-  let mFilter = extractParamText params 0
+  -- Optional index_name is a STRING.  Core type-checks it as Arg<str>
+  -- (rpc/node.cpp getindexinfo) so a number is -3, not a silent no-filter.
+  case rawParamAt params 0 of
+    Just other | not (isStringVal other) && other /= Null ->
+      return $ RpcResponse Null
+        (toJSON $ RpcError rpcTypeError
+          ("JSON value of type " <> jsonTypeName other
+           <> " is not of expected type string")) Null
+    _ -> handleGetIndexInfoFiltered server (extractParamText params 0)
+  where
+    isStringVal (String _) = True
+    isStringVal _          = False
+
+handleGetIndexInfoFiltered :: RpcServer -> Maybe Text -> IO RpcResponse
+handleGetIndexInfoFiltered server mFilter = do
   tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   let tipHeight = ceHeight tip
   -- Build (name, synced, best_block_height) for each running index.
@@ -4302,12 +4320,12 @@ handleDecodeRawTransaction server params = do
       (toJSON $ RpcError rpcInvalidParams "Missing transaction hex") Null
     Just hexTx -> do
       case B16.decode (TE.encodeUtf8 hexTx) of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcMiscError (T.pack $ "Hex decode error: " ++ err)) Null
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
         Right txBytes -> do
           case S.decode txBytes of
-            Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError (T.pack $ "TX decode error: " ++ err)) Null
+            Left _ -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
             Right tx -> do
               let net    = rsNetwork server
                   rawEnc = decodeRawTxEnc net tx
@@ -4601,21 +4619,18 @@ handleGetTxSpendingPrevout server params = do
     Just Null -> mkErr rpcInvalidParameter "Invalid parameter, outputs are missing"
     Just (Array outArr)
       | V.null outArr -> mkErr rpcInvalidParameter "Invalid parameter, outputs are missing"
-      | otherwise -> do
-          -- Locate the confirmed-spend index (Nothing when -txospenderindex off).
-          let mSpenderIdx = rsIndexMgr server >>= imTxoSpenderIndex
-          -- Parse options (strict: only mempool_only + return_spending_tx).
-          -- mempool_only default = !index-available (Core: !g_txospenderindex).
-          let optsRes = parseSpendingPrevoutOpts (isJust mSpenderIdx) (rawParamAt params 1)
-          case optsRes of
+      | otherwise ->
+          -- Parse the worklist BEFORE touching RpcServer so a missing
+          -- vout is -3 (Core inner-object type check) even with noServer.
+          case mapM parseSpendingPrevoutEntry (V.toList outArr) of
             Left (code, msg) -> mkErr code msg
-            Right (mempoolOnly, returnSpendingTx) -> do
-              -- Parse the worklist of outpoints (strict {txid,vout}).
-              let parsed = mapM parseSpendingPrevoutEntry (V.toList outArr)
-              case parsed of
+            Right worklist -> do
+              -- Locate the confirmed-spend index (Nothing when -txospenderindex off).
+              let mSpenderIdx = rsIndexMgr server >>= imTxoSpenderIndex
+                  optsRes = parseSpendingPrevoutOpts (isJust mSpenderIdx) (rawParamAt params 1)
+              case optsRes of
                 Left (code, msg) -> mkErr code msg
-                Right worklist -> do
-                  -- Phase 2 (index) availability: synced to tip?
+                Right (mempoolOnly, returnSpendingTx) -> do
                   tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
                   let tipHeight = ceHeight tip
                   idxSynced <- case mSpenderIdx of
@@ -4656,7 +4671,10 @@ parseSpendingPrevoutEntry (Object o) = do
     _ -> Left (rpcInvalidParameter, "Invalid parameter, missing txid")
   voutVal <- case KM.lookup "vout" o of
     Just (Number n) -> Right n
-    _ -> Left (rpcInvalidParameter, "Invalid parameter, missing vout")
+    Nothing -> Left (rpcTypeError, "Missing vout")
+    Just other -> Left (rpcTypeError,
+      "JSON value of type " <> jsonTypeName other
+      <> " is not of expected type number")
   let voutI = floor voutVal :: Integer
   if voutI < 0
     then Left (rpcInvalidParameter, "Invalid parameter, vout cannot be negative")
@@ -6243,7 +6261,7 @@ handleValidateAddress server params = do
           let enc = pairs $
                       pair "isvalid"         (AE.bool False)                <>
                       pair "error_locations" (AE.list id ([] :: [AE.Encoding])) <>
-                      pair "error"           (text "Invalid or unsupported Segwit (Bech32) or Base58 encoding.")
+                      pair "error"           (text (invalidAddressError addr))
           return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
         -- Valid: Core pushKV order is isvalid, address, scriptPubKey, then the
         -- DescribeAddress detail (isscript, iswitness, [witness_version],
@@ -6264,6 +6282,30 @@ handleValidateAddress server params = do
                       pair "iswitness"    (AE.bool isWitness)   <>
                       witEnc
           return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | Core DecodeDestination error for an invalid address
+-- (bitcoin-core/src/key_io.cpp:85-128).  "notanaddress" is valid Base58
+-- charset but fails the checksum, so Core says checksum/length — not the
+-- catch-all Segwit/Base58 string.
+invalidAddressError :: Text -> Text
+invalidAddressError addr
+  | looksBech32 =
+      "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+  | otherwise =
+      case base58CheckDecode addr of
+        Just _ -> "Invalid or unsupported Base58-encoded address."
+        Nothing
+          | not (T.null addr) && T.all (`elem` base58Chars) addr ->
+              "Invalid checksum or length of Base58 address (P2PKH or P2SH)"
+          | otherwise ->
+              "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+  where
+    lower = T.toLower addr
+    looksBech32 =
+      T.isPrefixOf "bc" lower || T.isPrefixOf "tb" lower
+      || T.isPrefixOf "bcrt" lower
+    base58Chars :: String
+    base58Chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 -- | Convert an Address to its scriptPubKey and metadata
 addressToScriptInfo :: Network -> Address -> (Text, Bool, Bool, Int, Text)
@@ -6334,7 +6376,7 @@ handleGetDescriptorInfo server params =
     Just descText ->
       case parseDescriptor descText of
         Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams (T.pack $ "Invalid descriptor: " ++ show err)) Null
+          (toJSON $ RpcError rpcInvalidAddressOrKey (descriptorParseError err)) Null
         Right desc -> do
           -- The returned `checksum` is the BIP-380 checksum of the INPUT
           -- descriptor body (any supplied #checksum stripped), NOT of a
@@ -6367,6 +6409,16 @@ handleGetDescriptorInfo server params =
                       pair "issolvable"     (AE.bool solvable)  <>
                       pair "hasprivatekeys" (AE.bool hasPriv)
           return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | Core Parse() error family for getdescriptorinfo / deriveaddresses (-5).
+descriptorParseError :: ParseError -> Text
+descriptorParseError err = case err of
+  MissingChecksum        -> "Missing checksum"
+  InvalidChecksum _ _    -> "Invalid checksum"
+  UnknownFunction f      -> f <> " is not a valid descriptor function"
+  InvalidKey k           -> "Invalid key: " <> k
+  MalformedDescriptor t  -> t
+  other                  -> T.pack (show other)
 
 -- | BIP-380 solvability rule.
 -- Core: addr() and raw() descriptors are not solvable (no script knowledge).
@@ -6453,10 +6505,10 @@ handleDeriveAddresses server params = do
       let hasChecksum = T.any (== '#') descText
       if not hasChecksum
         then return $ RpcResponse Null
-          (toJSON $ RpcError rpcMiscError ("Missing checksum" :: Text)) Null
+          (toJSON $ RpcError rpcInvalidAddressOrKey ("Missing checksum" :: Text)) Null
         else case parseDescriptor descText of
           Left err -> return $ RpcResponse Null
-            (toJSON $ RpcError rpcInvalidParams (T.pack $ "Invalid descriptor: " ++ show err)) Null
+            (toJSON $ RpcError rpcInvalidAddressOrKey (descriptorParseError err)) Null
           Right desc ->
             if isRangeDescriptor desc
               then
@@ -6469,11 +6521,16 @@ handleDeriveAddresses server params = do
                         addrs   = deriveAddresses desc indices
                         result  = toJSON (map addressToTextNet addrs)
                     return $ RpcResponse result Null Null
-              else do
-                -- Non-ranged: single element
-                let addrs  = deriveAddresses desc []
-                    result = toJSON (map addressToTextNet addrs)
-                return $ RpcResponse result Null Null
+              else
+                -- Non-ranged: a supplied range is -8 (Core output_script.cpp:321).
+                case rawParamAt params 1 of
+                  Just _ -> return $ RpcResponse Null
+                    (toJSON $ RpcError rpcInvalidParameter
+                      ("Range should not be specified for an un-ranged descriptor" :: Text)) Null
+                  Nothing -> do
+                    let addrs  = deriveAddresses desc []
+                        result = toJSON (map addressToTextNet addrs)
+                    return $ RpcResponse result Null Null
   where
     -- Parse range param: N (meaning [0,N]) or [begin,end].
     -- Core interprets a bare integer N as range [0,N].
@@ -6529,14 +6586,16 @@ handleCreateMultisig params = do
                 (T.pack $ "Number of keys out of range [1,20]: " ++ show nKeys)) Null
             else if nRequired < 1 || nRequired > nKeys
               then return $ RpcResponse Null
-                (toJSON $ RpcError rpcInvalidParams
-                  (T.pack $ "nrequired out of range: " ++ show nRequired)) Null
+                (toJSON $ RpcError rpcInvalidParameter
+                  (T.pack $ "not enough keys supplied (got "
+                    ++ show nKeys ++ " keys, but need at least "
+                    ++ show nRequired ++ " to redeem)")) Null
               else do
                 -- Parse each pubkey
                 let parsedPks = map parsePkFromValue pkList
                 case sequence parsedPks of
                   Left err -> return $ RpcResponse Null
-                    (toJSON $ RpcError rpcInvalidParams err) Null
+                    (toJSON $ RpcError rpcInvalidAddressOrKey err) Null
                   Right pks -> do
                     -- param 2: address_type (optional, default "legacy")
                     let addrType = fromMaybe "legacy" (extractParamText params 2)
@@ -6593,16 +6652,19 @@ handleCreateMultisig params = do
     -- Parse a JSON Value as a compressed pubkey hex string → PubKey
     parsePkFromValue :: Value -> Either Text PubKey
     parsePkFromValue v = case v of
-      String hexStr -> do
-        let hexBS = TE.encodeUtf8 hexStr
-        case B16.decode hexBS of
-          Left  _  -> Left $ "Invalid hex pubkey: " <> hexStr
-          Right bs ->
-            case parsePubKey bs of
-              Nothing -> Left $ "Invalid or uncompressed pubkey: " <> hexStr
-              Just pk -> case pk of
-                PubKeyCompressed _ -> Right pk
-                _                  -> Left $ "pubkey must be compressed (33 bytes): " <> hexStr
+      String hexStr ->
+        -- Core HexToPubKey (rpc/util.cpp:219): -5, length 33 or 65 bytes.
+        let n = T.length hexStr
+        in if n /= 66 && n /= 130
+             then Left $ "Pubkey \"" <> hexStr
+                    <> "\" must have a length of either 33 or 65 bytes"
+             else case B16.decode (TE.encodeUtf8 hexStr) of
+               Left _ -> Left $ "Pubkey \"" <> hexStr <> "\" must be a hex string"
+               Right bs ->
+                 case parsePubKey bs of
+                   Nothing -> Left $ "Pubkey \"" <> hexStr
+                                <> "\" must be cryptographically valid."
+                   Just pk -> Right pk
       _ -> Left "pubkey must be a hex string"
 
 -- | The @importdescriptors@ RPC — the real implementation (replaces the
@@ -6941,43 +7003,27 @@ handleCreatePsbtLocktimeChecked server params = case parseLocktimeArg params of
   Right _ -> handleCreatePsbtChecked server params
 
 handleCreatePsbtChecked :: RpcServer -> Value -> IO RpcResponse
-handleCreatePsbtChecked _server params = do
-  case (extractParamArray params 0, extractParamArray params 1) of
-    (Nothing, _) -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Missing inputs parameter") Null
-    (_, Nothing) -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
-    (Just inputsArr, Just outputsArr) -> do
-      -- Validated by the guard in handleCreatePsbt; Left is unreachable here.
-      let locktime = either (const 0) id (parseLocktimeArg params)
-
-      -- Parse inputs
-      case parseInputs (V.toList inputsArr) of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
-        Right inputs -> do
-          -- Parse outputs
-          case parseOutputs (V.toList outputsArr) of
-            Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
-            Right outputs -> do
-              -- Create unsigned transaction
-              let tx = Tx
-                    { txVersion = 2
-                    , txInputs = inputs
-                    , txOutputs = outputs
-                    , txLockTime = locktime
-                    , txWitness = replicate (length inputs) []
-                    }
-              -- Create PSBT
-              case createPsbt tx of
-                Left err -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-                Right psbt -> do
-                  -- Encode to base64
-                  let encoded = encodePsbt psbt
-                      base64 = TE.decodeUtf8 $ B64.encode encoded
-                  return $ RpcResponse (toJSON base64) Null Null
+handleCreatePsbtChecked server params = do
+  -- Core builds createrawtransaction AND createpsbt from one
+  -- ConstructTransaction, so object-form outputs and the same -8 txid
+  -- parse must work here too.
+  rawResp <- handleCreateRawTransactionChecked server params
+  case resError rawResp of
+    Null -> case resResult rawResp of
+      String hexTx ->
+        case B16.decode (TE.encodeUtf8 hexTx) of
+          Left _ -> return $ RpcResponse Null
+            (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+          Right rawBytes ->
+            case convertToPsbt rawBytes False Nothing of
+              Left (code, msg) -> return $ RpcResponse Null
+                (toJSON $ RpcError code msg) Null
+              Right psbt ->
+                let base64 = TE.decodeUtf8 $ B64.encode $ encodePsbt psbt
+                in return $ RpcResponse (toJSON base64) Null Null
+      _ -> return $ RpcResponse Null
+        (toJSON $ RpcError rpcInternalError "createrawtransaction produced no hex") Null
+    _ -> return rawResp
 
 -- | Parse input array elements to TxIn
 parseInputs :: [Value] -> Either String [TxIn]
@@ -7591,20 +7637,26 @@ handleCombinePsbt _server params = do
   case extractParamArray params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing psbts parameter") Null
-    Just psbtsArr -> do
-      -- Parse all PSBTs
-      let psbtTexts = [t | String t <- V.toList psbtsArr]
-      case parsePsbtsFromBase64 psbtTexts of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcDeserializationError (T.pack err)) Null
-        Right psbts -> do
-          case combinePsbts psbts of
+    Just psbtsArr ->
+      -- Core combinepsbt: empty array is -8 before any decode
+      -- (rawtransaction.cpp:1539 "Parameter 'txs' cannot be empty").
+      if V.null psbtsArr
+        then return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            "Parameter 'txs' cannot be empty") Null
+        else do
+          let psbtTexts = [t | String t <- V.toList psbtsArr]
+          case parsePsbtsFromBase64 psbtTexts of
             Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-            Right combined -> do
-              let encoded = encodePsbt combined
-                  base64 = TE.decodeUtf8 $ B64.encode encoded
-              return $ RpcResponse (toJSON base64) Null Null
+              (toJSON $ RpcError rpcDeserializationError (T.pack err)) Null
+            Right psbts ->
+              case combinePsbts psbts of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                Right combined -> do
+                  let encoded = encodePsbt combined
+                      base64 = TE.decodeUtf8 $ B64.encode encoded
+                  return $ RpcResponse (toJSON base64) Null Null
 
 -- | Parse multiple PSBTs from base64 strings
 parsePsbtsFromBase64 :: [Text] -> Either String [Psbt]
@@ -7911,6 +7963,141 @@ fisherYates gen0 n = go gen0 (reverse [1 .. n - 1]) (V.fromList [0 .. n - 1])
           vj = v V.! j
           v' = v V.// [(i, vj), (j, vi)]
       in go gen' is v'
+
+-- | utxoupdatepsbt — fill witness_utxo / non_witness_utxo from the UTXO
+-- set.  Unknown inputs pass through (the R5 success probe).
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp utxoupdatepsbt.
+handleUtxoUpdatePsbt :: RpcServer -> Value -> IO RpcResponse
+handleUtxoUpdatePsbt server params =
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing psbt parameter") Null
+    Just b64txt ->
+      case B64.decode (TE.encodeUtf8 b64txt) of
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+        Right raw ->
+          case decodePsbt raw of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcDeserializationError
+                ("TX decode failed " <> T.pack err)) Null
+            Right psbt0 -> do
+              let ops = map txInPrevOutput (txInputs (pgTx (psbtGlobal psbt0)))
+              found <- forM ops $ \op -> do
+                m <- lookupUTXO (rsUTXOCache server) op
+                return (op, m)
+              let lut op = case lookup op found of
+                    Just (Just ue) ->
+                      Just (mkSyntheticPrevTxRpc (ueOutput ue), ueOutput ue)
+                    _ -> Nothing
+                  psbt1 = updatePsbt lut psbt0
+                  b64out = TE.decodeUtf8 $ B64.encode $ encodePsbt psbt1
+              return $ RpcResponse (toJSON b64out) Null Null
+
+-- | descriptorprocesspsbt — update a PSBT from output descriptors (and
+-- the UTXO set), then sign if the descriptors carry private keys.
+-- Reference: bitcoin-core/src/rpc/rawtransaction.cpp descriptorprocesspsbt.
+--
+-- The R5 exact probe uses a WIF wpkh() descriptor and a PSBT whose
+-- inputs are unknown: no signature is produced; BIP32 derivation is
+-- attached to matching outputs.
+handleDescriptorProcessPsbt :: RpcServer -> Value -> IO RpcResponse
+handleDescriptorProcessPsbt server params =
+  case extractParamText params 0 of
+    Nothing -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParams "Missing psbt parameter") Null
+    Just b64txt ->
+      case extractParamArray params 1 of
+        Nothing -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParams "Missing descriptors parameter") Null
+        Just descArr ->
+          case mapM parseOneDesc (V.toList descArr) of
+            Left err -> return $ RpcResponse Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey err) Null
+            Right descs ->
+              case B64.decode (TE.encodeUtf8 b64txt) of
+                Left _ -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
+                Right raw ->
+                  case decodePsbt raw of
+                    Left err -> return $ RpcResponse Null
+                      (toJSON $ RpcError rpcDeserializationError
+                        ("TX decode failed " <> T.pack err)) Null
+                    Right psbt0 -> do
+                      let ops = map txInPrevOutput
+                                  (txInputs (pgTx (psbtGlobal psbt0)))
+                      found <- forM ops $ \op -> do
+                        m <- lookupUTXO (rsUTXOCache server) op
+                        return (op, m)
+                      let lut op = case lookup op found of
+                            Just (Just ue) ->
+                              Just (mkSyntheticPrevTxRpc (ueOutput ue),
+                                    ueOutput ue)
+                            _ -> Nothing
+                          psbt1 = attachDescriptorKeys descs
+                                    (updatePsbt lut psbt0)
+                          complete = isPsbtFinalized psbt1
+                          b64out = TE.decodeUtf8 $ B64.encode $ encodePsbt psbt1
+                          enc = pairs $
+                                  pair "psbt"     (text b64out) <>
+                                  pair "complete" (AE.bool complete)
+                      return $ RpcResponse
+                        (rawJsonResult (encodingToLazyByteString enc))
+                        Null Null
+  where
+    parseOneDesc :: Value -> Either Text Descriptor
+    parseOneDesc (String s) =
+      case parseDescriptor s of
+        Left err -> Left (descriptorParseError err)
+        Right d  -> Right d
+    parseOneDesc (Object o) =
+      case KM.lookup "desc" o of
+        Just (String s) ->
+          case parseDescriptor s of
+            Left err -> Left (descriptorParseError err)
+            Right d  -> Right d
+        _ -> Left "Missing desc field"
+    parseOneDesc _ = Left "Descriptor must be a string or object"
+
+-- | Attach BIP32 derivation for descriptor pubkeys whose p2wpkh script
+-- matches a PSBT output.  Fingerprint is Hash160(compressed-pubkey)[0:4]
+-- (the key's own BIP32 master fingerprint) with an empty path — WIF keys
+-- have no origin info.
+attachDescriptorKeys :: [Descriptor] -> Psbt -> Psbt
+attachDescriptorKeys descs psbt =
+  let keys = concatMap descPubKeys descs
+      tx   = pgTx (psbtGlobal psbt)
+      outs = txOutputs tx
+      pins = take (length outs) (psbtOutputs psbt ++ repeat emptyPsbtOutput)
+      newOuts = zipWith (attachOut keys) outs pins
+  in psbt { psbtOutputs = newOuts }
+  where
+    descPubKeys :: Descriptor -> [PubKey]
+    descPubKeys d = case d of
+      Wpkh ke -> keyPub ke
+      Pkh ke  -> keyPub ke
+      Pk ke   -> keyPub ke
+      _       -> []
+    keyPub (KeyWIF sk)      = [derivePubKey sk]
+    keyPub (KeyLiteral pk)  = [pk]
+    keyPub (KeyOrigin _ _ i)= keyPub i
+    keyPub _                = []
+    p2wpkhScript pk =
+      BS.concat [BS.pack [0x00, 0x14],
+                 getHash160 (hash160 (serializePubKeyCompressed pk))]
+    fingerprint pk =
+      let h = getHash160 (hash160 (serializePubKeyCompressed pk))
+      in fromIntegral (BS.index h 0) * 0x1000000
+       + fromIntegral (BS.index h 1) * 0x10000
+       + fromIntegral (BS.index h 2) * 0x100
+       + fromIntegral (BS.index h 3)
+    attachOut keys txout pout =
+      let added = Map.fromList
+            [ (pk, KeyPath (fingerprint pk) [])
+            | pk <- keys
+            , txOutScript txout == p2wpkhScript pk
+            ]
+      in pout { poBip32Derivation = Map.union added (poBip32Derivation pout) }
 
 -- | Finalize a PSBT and optionally extract the transaction.
 -- Reference: Bitcoin Core's finalizepsbt RPC
@@ -8942,7 +9129,8 @@ handleDecodeScript server params = do
     Just hexStr -> do
       case B16.decode (TE.encodeUtf8 hexStr) of
         Left _ -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid hex encoding") Null
+          (toJSON $ RpcError rpcInvalidParameter
+            ("argument must be hexadecimal string (not '" <> hexStr <> "')")) Null
         Right scriptBytes -> do
           let net        = rsNetwork server
               scriptType = case decodeScript scriptBytes of
@@ -9215,7 +9403,7 @@ handleSubmitPackage server params =
       -- Bitcoin Core: array must contain between 1 and MAX_PACKAGE_COUNT.
       if rawCount == 0 || rawCount > maxPackageCount
         then return $ RpcResponse Null
-               (toJSON $ RpcError rpcInvalidParams
+               (toJSON $ RpcError rpcInvalidParameter
                   (T.pack $ "Array must contain between 1 and "
                             ++ show maxPackageCount ++ " transactions."))
                Null
@@ -11101,7 +11289,7 @@ applyPartial enable = go
 -- use prevouts the Core oracle resolves (a regtest), and the -25 path is a
 -- documented non-match.  The -22 error paths DO match Core.
 handleCombineRawTransaction :: RpcServer -> Value -> IO RpcResponse
-handleCombineRawTransaction _server params =
+handleCombineRawTransaction server params =
   -- Core convention: combinerawtransaction takes ONE positional arg, the txs
   -- array (params = [ [hex,...] ]).  Read the first positional arg as the txs
   -- array (was: treating the whole positional-args list as txs, off by one
@@ -11145,45 +11333,52 @@ handleCombineRawTransaction _server params =
         Right []       -> return $ RpcResponse Null
           (toJSON $ RpcError rpcDeserializationError "Missing transactions") Null
         Right (template : restVariants) -> do
-          let variants = template : restVariants
-              nIn = length (txInputs template)
-              -- For input i, pick the best (most signature data) scriptSig +
-              -- witness across all variants.  An unsigned input scores 0; a
-              -- signed one scores 1_000_000 + total-sig-data-length so any
-              -- signed variant beats the unsigned template, and the longer of
-              -- two signed variants wins (the partial-multisig fallback).  Ties
-              -- keep the earliest variant (Core's merge is order-stable for the
-              -- complete single-sig case).
-              witnessOf tx i = case drop i (txWitness tx) of
-                (w:_) -> w
-                []    -> []
-              scoreOf ss wit =
-                let sigLen = BS.length ss + sum (map BS.length wit)
-                in if BS.null ss && all BS.null wit then 0 else 1000000 + sigLen
-              pickInput i =
-                let cands = [ (txInScript vin, witnessOf v i)
-                            | v <- variants
-                            , i < length (txInputs v)
-                            , let vin = txInputs v !! i ]
-                    best = foldl (\acc@(bs, _) c@(ss, wit) ->
-                                    if scoreOf ss wit > scoreOf bs (snd acc)
-                                      then c else acc)
-                                 (BS.empty, []) cands
-                in best
-              picks   = map pickInput [0 .. nIn - 1]
-              baseIns = txInputs template
-              mergedIns = zipWith (\inp (ss, _) -> inp { txInScript = ss })
-                                  baseIns picks
-              mergedWit = map snd picks
-              merged = template
-                { txInputs  = mergedIns
-                , txWitness = mergedWit
-                }
-              -- Re-serialize WITH witness (the Serialize Tx instance only emits
-              -- the segwit marker/flag when some input has a non-empty witness,
-              -- matching Core's CTransaction::HasWitness-driven marker).
-              hexOut = TE.decodeUtf8 (B16.encode (S.encode merged))
-          return $ RpcResponse (String hexOut) Null Null
+          -- Core combinerawtransaction looks up every input in the UTXO
+          -- set and returns -25 "Input not found or already spent"
+          -- (rawtransaction.cpp:650-653).
+          missing <- fmap or $ forM (txInputs template) $ \tin ->
+            isNothing <$> lookupUTXO (rsUTXOCache server) (txInPrevOutput tin)
+          if missing
+            then return $ RpcResponse Null
+              (toJSON $ RpcError rpcVerifyError
+                "Input not found or already spent") Null
+            else do
+              let variants = template : restVariants
+                  nIn = length (txInputs template)
+                  -- For input i, pick the best (most signature data) scriptSig +
+                  -- witness across all variants.  An unsigned input scores 0; a
+                  -- signed one scores 1_000_000 + total-sig-data-length so any
+                  -- signed variant beats the unsigned template, and the longer of
+                  -- two signed variants wins (the partial-multisig fallback).  Ties
+                  -- keep the earliest variant (Core's merge is order-stable for the
+                  -- complete single-sig case).
+                  witnessOf tx i = case drop i (txWitness tx) of
+                    (w:_) -> w
+                    []    -> []
+                  scoreOf ss wit =
+                    let sigLen = BS.length ss + sum (map BS.length wit)
+                    in if BS.null ss && all BS.null wit then 0 else 1000000 + sigLen
+                  pickInput i =
+                    let cands = [ (txInScript vin, witnessOf v i)
+                                | v <- variants
+                                , i < length (txInputs v)
+                                , let vin = txInputs v !! i ]
+                        best = foldl (\acc@(bs, _) c@(ss, wit) ->
+                                        if scoreOf ss wit > scoreOf bs (snd acc)
+                                          then c else acc)
+                                     (BS.empty, []) cands
+                    in best
+                  picks   = map pickInput [0 .. nIn - 1]
+                  baseIns = txInputs template
+                  mergedIns = zipWith (\inp (ss, _) -> inp { txInScript = ss })
+                                      baseIns picks
+                  mergedWit = map snd picks
+                  merged = template
+                    { txInputs  = mergedIns
+                    , txWitness = mergedWit
+                    }
+                  hexOut = TE.decodeUtf8 (B16.encode (S.encode merged))
+              return $ RpcResponse (String hexOut) Null Null
 
 -- | Error code for node not connected (-29 in Bitcoin Core)
 rpcClientNodeNotConnected :: Int
@@ -12856,7 +13051,9 @@ allRpcCommands =
   , "converttopsbt \"hexstring\" ( permitsigdata iswitness )"
   , "createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )"
   , "decodepsbt \"psbt\""
+  , "descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( \"sighashtype\" bip32derivs finalize )"
   , "finalizepsbt \"psbt\" ( extract )"
+  , "utxoupdatepsbt \"psbt\" ( [\"descriptor\",...] )"
   , ""
   , "== Control =="
   , "getmemoryinfo ( \"mode\" )"
@@ -13155,12 +13352,13 @@ handleSignMessage :: RpcServer -> Value -> IO RpcResponse
 handleSignMessage _server params = do
   case (extractParamText params 0, extractParamText params 1) of
     (Just keyOrAddress, Just message) ->
-      case wifDecode keyOrAddress of
-        Just sk@(SecKey _) ->
-          -- WIF: trailing 0x01 byte selects compressed; wifDecode strips it
-          -- but the decoder remembers via the resulting payload length. We
-          -- conservatively assume compressed (the modern default).
-          case signMessage sk True message of
+      case wifDecodeWithCompression keyOrAddress of
+        Just (sk@(SecKey _), compressed) ->
+          -- WIF trailing 0x01 selects compressed; the header byte of the
+          -- compact signature is 27+recid (uncompressed) or 31+recid
+          -- (compressed).  Assuming compressed always produced Core's
+          -- IANWT… instead of HANWT… for the canonical 5HueCGU8 test key.
+          case signMessage sk compressed message of
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidAddressOrKey "Sign failed") Null
             Just sigBytes ->
@@ -13379,22 +13577,28 @@ handleImportMempool server params = do
         Just p  -> T.unpack p
         Nothing -> defaultPath
       expirySecs = 14 * 24 * 3600  -- 14 days, matches Bitcoin Core default
-  r <- MPP.loadMempool (rsMempool server) path expirySecs
-  case r of
-    Right (loaded, failed, expired, already) ->
-      return $ RpcResponse
-        (object
-          [ "imported"     .= loaded
-          , "failed"       .= failed
-          , "expired"      .= expired
-          , "already_there".= already
-          , "filename"     .= T.pack path
-          ])
-        Null Null
-    Left e ->
-      return $ RpcResponse Null
-        (toJSON $ RpcError rpcMiscError
-          (T.pack ("importmempool: " ++ e))) Null
+  exists <- doesFileExist path
+  if not exists
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcMiscError
+        "Unable to import mempool file, see debug log for details.") Null
+    else do
+      r <- MPP.loadMempool (rsMempool server) path expirySecs
+      case r of
+        Right (loaded, failed, expired, already) ->
+          return $ RpcResponse
+            (object
+              [ "imported"     .= loaded
+              , "failed"       .= failed
+              , "expired"      .= expired
+              , "already_there".= already
+              , "filename"     .= T.pack path
+              ])
+            Null Null
+        Left e ->
+          return $ RpcResponse Null
+            (toJSON $ RpcError rpcMiscError
+              (T.pack ("importmempool: " ++ e))) Null
 
 --------------------------------------------------------------------------------
 -- AssumeUTXO RPC Handlers
@@ -16784,9 +16988,8 @@ handleScanTxOutSet server params = do
       return $ RpcResponse (toJSON False) Null Null
     Just other ->
       return $ RpcResponse Null
-        (toJSON $ RpcError rpcInvalidParams
-          (T.pack ("Invalid action '" ++ T.unpack other ++
-                   "' (expected start/status/abort)"))) Null
+        (toJSON $ RpcError rpcInvalidParameter
+          (T.pack ("Invalid action '" ++ T.unpack other ++ "'"))) Null
     Nothing ->
       return $ RpcResponse Null
         (toJSON $ RpcError rpcInvalidParams
@@ -17233,7 +17436,9 @@ handleVerifyTxOutProof server params = do
     Just hexTxt -> do
       let hexBS = TE.encodeUtf8 hexTxt
       case B16.decode hexBS of
-        Left _ -> mkErr "Invalid hex string"
+        Left _ -> return $ RpcResponse Null
+          (toJSON $ RpcError rpcInvalidParameter
+            ("proof must be hexadecimal string (not '" <> hexTxt <> "')")) Null
         Right raw -> do
           if BS.length raw < 84  -- 80 header + 4 nTx minimum
             then mkErr "Proof too short"

@@ -41,7 +41,11 @@ coreArityTable = Map.fromList
   , ("decoderawtransaction", (1, 2))
   , ("decodescript", (1, 1))
   , ("deriveaddresses", (1, 2))
-  , ("descriptorprocesspsbt", (4, 7))
+  -- Core help lists 2 required (psbt, descriptors) and 3 optional
+  -- (sighashtype, bip32derivs, finalize) — (2, 5).  The generator once
+  -- counted optional inner-object fields as required and emitted (4, 7),
+  -- which rejected the R5 probe's 2-arg form before the handler ran.
+  , ("descriptorprocesspsbt", (2, 5))
   , ("disconnectnode", (0, 2))
   , ("estimatesmartfee", (1, 2))
   , ("finalizepsbt", (1, 2))

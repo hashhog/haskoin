@@ -15,6 +15,7 @@ module Haskoin.Types
   , TxIn(..)
   , TxOut(..)
   , Tx(..)
+  , decodeLegacyTx
   , BlockHeader(..)
   , Block(..)
   , VarInt(..)
@@ -35,7 +36,7 @@ import qualified Data.ByteString as BS
 import Data.Serialize (Serialize(..), Get, Put, getBytes,
                        putByteString, getWord8, putWord8, getWord16le,
                        putWord16le, getWord32le, putWord32le, getWord64le,
-                       putWord64le, getWord16be, putWord16be)
+                       putWord64le, getWord16be, putWord16be, runGetState)
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32)
 import GHC.Generics (Generic)
@@ -247,6 +248,36 @@ instance Serialize Tx where
         unless (flag == 0x01) $ fail "Invalid witness flag"
         parseSegWitTx version
       else parseLegacyTx version (fromIntegral marker)
+
+-- | Decode a transaction as LEGACY (no BIP-144 marker/flag).  The PSBT
+-- unsigned-tx field is always serialized this way (Core TX_NO_WITNESS);
+-- the stock 'Serialize Tx' getter treats a leading 0x00 vin-count as a
+-- segwit marker and rejects a 0-input tx ("Invalid witness flag").
+decodeLegacyTx :: ByteString -> Either String Tx
+decodeLegacyTx bs =
+  case runGetState getLegacyTxFull bs 0 of
+    Right (tx, rest)
+      | BS.null rest -> Right tx
+      | otherwise    -> Left "Failed to parse unsigned tx"
+    Left err -> Left err
+
+-- | Legacy tx getter starting at version (vin count is a CompactSize, not
+-- a leftover first-byte from the witness-aware decoder).
+getLegacyTxFull :: Get Tx
+getLegacyTxFull = do
+  version  <- fromIntegral <$> getWord32le
+  inCount  <- getVarInt'
+  inputs   <- replicateM (fromIntegral inCount) get
+  outCount <- getVarInt'
+  outputs  <- replicateM (fromIntegral outCount) get
+  lockTime <- getWord32le
+  return Tx
+    { txVersion  = version
+    , txInputs   = inputs
+    , txOutputs  = outputs
+    , txWitness  = replicate (length inputs) []
+    , txLockTime = lockTime
+    }
 
 -- | Parse a legacy (non-SegWit) transaction
 parseLegacyTx :: Int32 -> Word64 -> Get Tx

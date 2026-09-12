@@ -280,6 +280,7 @@ module Haskoin.Wallet
   , expandCombo
     -- * WIF (private-key text encoding)
   , wifDecode
+  , wifDecodeWithCompression
   , wifEncode
   , isWifKey
   ) where
@@ -318,7 +319,8 @@ import System.FilePath ((</>), takeDirectory)
 import Control.Exception (SomeException, catch)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
-                       TxIn(..), TxOut(..), Tx(..), BlockHeader(..), Block(..),
+                       TxIn(..), TxOut(..), Tx(..), decodeLegacyTx,
+                       BlockHeader(..), Block(..),
                        putVarInt, getVarInt', putVarBytes, getVarBytes)
 import Haskoin.Crypto
 import qualified Haskoin.TaprootSighash as TS
@@ -3927,7 +3929,10 @@ getGlobalMap = go Nothing Map.empty Nothing Map.empty
               keyData = BS.tail key
           case keyType of
             0x00 -> do  -- PSBT_GLOBAL_UNSIGNED_TX
-              case decode value of
+              -- Core serialises this field TX_NO_WITNESS.  A 0-input tx
+              -- starts vin-count 0x00, which the witness-aware decoder
+              -- treats as a BIP-144 marker and rejects.
+              case decodeLegacyTx value of
                 Left err -> fail $ "Failed to parse unsigned tx: " ++ err
                 Right tx -> go (Just tx) xpubs mVersion unknown
             0x01 -> do  -- PSBT_GLOBAL_XPUB
@@ -6140,14 +6145,20 @@ parseWifKey keyText st =
 -- WIF format: Base58Check(version || key || [0x01 if compressed])
 -- Mainnet version: 0x80, Testnet version: 0xef
 wifDecode :: Text -> Maybe SecKey
-wifDecode txt =
+wifDecode = fmap fst . wifDecodeWithCompression
+
+-- | Decode WIF and report whether the payload carried the compressed
+-- suffix (trailing 0x01).  Core's CKey::SignCompact uses that flag for
+-- the recoverable-signature header byte (27+recid vs 31+recid).
+wifDecodeWithCompression :: Text -> Maybe (SecKey, Bool)
+wifDecodeWithCompression txt =
   case base58CheckDecode txt of
     Nothing -> Nothing
     Just (version, payload)
       | version /= 0x80 && version /= 0xef -> Nothing  -- Invalid version
-      | BS.length payload == 32 -> Just (SecKey payload)  -- Uncompressed
+      | BS.length payload == 32 -> Just (SecKey payload, False)  -- Uncompressed
       | BS.length payload == 33 && BS.last payload == 0x01 ->
-          Just (SecKey (BS.init payload))  -- Compressed (strip 0x01 suffix)
+          Just (SecKey (BS.init payload), True)  -- Compressed (strip 0x01 suffix)
       | otherwise -> Nothing
 
 -- | Parse an extended public key with optional derivation path.

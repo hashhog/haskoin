@@ -209,6 +209,7 @@ test-suite haskoin-test
                , W189GetBlockVerbosity3Spec
                , W190InboundCapSpec
                , ConvertJoinPsbtSpec
+               , T2R5Spec
                , Paths_haskoin
                , Bip21Spec
                , Fix64TlsSpec
