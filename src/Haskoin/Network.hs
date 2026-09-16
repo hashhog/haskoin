@@ -101,6 +101,11 @@ module Haskoin.Network
   , nodeNetworkLimited
   , combineServices
   , hasService
+  , nodeNetworkLimitedMinBlocks
+  , maxBlocksInTransitPerPeer
+  , peerCanServeBlock
+  , ForkGetDataPeer(..)
+  , planForkGetData
     -- * Protocol Constants
   , protocolVersion
   , minProtocolVersion
@@ -764,6 +769,82 @@ combineServices = foldl (\acc (ServiceFlag s) -> acc .|. s) 0
 -- | Check if a service flag is set in a bitmask
 hasService :: Word64 -> ServiceFlag -> Bool
 hasService flags (ServiceFlag s) = flags .&. s == s
+
+-- | BIP-159 / Core @NODE_NETWORK_LIMITED_MIN_BLOCKS@ (net_processing.cpp).
+-- A NETWORK_LIMITED peer only serves this many most-recent blocks.
+nodeNetworkLimitedMinBlocks :: Word32
+nodeNetworkLimitedMinBlocks = 288
+
+-- | Core @MAX_BLOCKS_IN_TRANSIT_PER_PEER@ (net_processing.h).
+maxBlocksInTransitPerPeer :: Int
+maxBlocksInTransitPerPeer = 16
+
+-- | Whether @services@ can serve a block at @blockHeight@ given header
+-- tip @headerTipHeight@.
+--
+-- Mirrors Core FindNextBlocksToDownload:
+--   * no NODE_WITNESS → cannot serve post-segwit blocks
+--   * NODE_NETWORK → any height
+--   * NODE_NETWORK_LIMITED only → last (@NODE_NETWORK_LIMITED_MIN_BLOCKS@-2)
+--     blocks (two-block race buffer, net_processing.cpp:1533)
+--   * neither NETWORK nor LIMITED → cannot serve blocks
+peerCanServeBlock :: Word64 -> Word32 -> Word32 -> Bool
+peerCanServeBlock services headerTipHeight blockHeight
+  | not (hasService services nodeWitness) = False
+  | hasService services nodeNetwork = True
+  | hasService services nodeNetworkLimited =
+      headerTipHeight >= blockHeight
+        && (headerTipHeight - blockHeight)
+             < (nodeNetworkLimitedMinBlocks - 2)
+  | otherwise = False
+
+-- | A connected peer as seen by the fork-aware getdata planner.
+data ForkGetDataPeer = ForkGetDataPeer
+  { fgdpId       :: !Int
+  , fgdpServices :: !Word64
+  } deriving (Show, Eq)
+
+-- | Assign missing heavier-branch bodies to connected peers.
+--
+-- Core FindNextBlocksToDownload:
+--   * skip peers that cannot serve the height (BIP-159 LIMITED window,
+--     missing NODE_WITNESS)
+--   * at most 'maxBlocksInTransitPerPeer' (16) hashes per peer
+--   * oldest missing hashes first (ascending height)
+--
+-- Pre-fix this round-robined every missing hash onto every connected
+-- peer.  Historical hashes (deeper than 286 from the header tip) went
+-- to NODE_NETWORK_LIMITED peers that NOTFOUND them; that is the live
+-- "requesting 297 heavier-branch block(s) from 9 peer(s)" stall.
+planForkGetData :: [ForkGetDataPeer]
+                -> [(BlockHash, Word32)]  -- ^ needed (hash, height), ascending
+                -> Word32                 -- ^ header-tip height
+                -> Int                    -- ^ rotation
+                -> [(Int, [BlockHash])]   -- ^ peer id → hashes
+planForkGetData peers needed headerTip rot
+  | null peers || null needed = []
+  | otherwise =
+      let n = length peers
+          -- Fold oldest-first; each hash goes to the first capable peer
+          -- (from 'rot') that still has a free in-flight slot.
+          assign acc [] = acc
+          assign acc ((h, ht):rest) =
+            case findPeer acc h ht 0 of
+              Nothing  -> assign acc rest
+              Just pid ->
+                assign (Map.insertWith (flip (++)) pid [h] acc) rest
+          findPeer acc _ht _height i
+            | i >= n = Nothing
+          findPeer acc h ht i =
+            let p   = peers !! ((rot + i) `mod` n)
+                pid = fgdpId p
+                used = length (Map.findWithDefault [] pid acc)
+            in if used < maxBlocksInTransitPerPeer
+                  && peerCanServeBlock (fgdpServices p) headerTip ht
+                 then Just pid
+                 else findPeer acc h ht (i + 1)
+          raw = assign Map.empty needed
+      in Map.toList raw
 
 --------------------------------------------------------------------------------
 -- Message Header (24 bytes)

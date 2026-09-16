@@ -175,6 +175,8 @@ module Haskoin.Consensus
   , getChainTip
   , getValidatedChainTip
   , findForkPoint
+  , heavierBranchHashes
+  , connectableForkTip
   , getAncestor
   , buildLocatorHeights
   , buildBlockLocatorFromChain
@@ -5701,6 +5703,57 @@ findForkPoint hc h1 h2 = do
           p1 <- cePrev a >>= (`Map.lookup` ents)
           p2 <- cePrev b >>= (`Map.lookup` ents)
           go ents p1 p2
+
+-- | Hashes of the competing branch from @forkHash@ (exclusive) to
+-- @tipHash@ (inclusive), in ascending height order.  'Nothing' if the
+-- parent-walk from the tip does not reach the fork (broken header
+-- index).  Empty list when @tipHash == forkHash@.
+--
+-- Walks 'cePrev' over the hash-keyed index, never 'hcByHeight': below
+-- the work crossover the height index still names the LOSING branch
+-- (see 'requestForkBlocks' in app/Main.hs).
+heavierBranchHashes :: Map BlockHash ChainEntry
+                    -> BlockHash -> BlockHash
+                    -> Maybe [BlockHash]
+heavierBranchHashes entries forkHash tipHash = go tipHash []
+  where
+    go h acc
+      | h == forkHash = Just acc
+      | otherwise = case Map.lookup h entries of
+          Nothing -> Nothing
+          Just ce -> case cePrev ce of
+            Nothing -> Nothing
+            Just ph -> go ph (h : acc)
+
+-- | Highest hash on the heavier branch that (1) has a contiguous
+-- run of bodies from the fork child up to itself and (2) has
+-- STRICTLY more chainwork than @connectedHash@.
+--
+-- Core ActivateBestChain connects whatever prefix is already
+-- downloaded; it does not wait for the header tip.  Waiting for
+-- every body fork+1..header-tip is the live mainnet stall (receipt
+-- haskoin-fork-reorg-download-stuck-966499): hundreds of heavier-
+-- branch bodies can sit on disk while the reorg stays deferred.
+connectableForkTip :: Map BlockHash ChainEntry
+                   -> BlockHash      -- ^ fork (common ancestor)
+                   -> BlockHash      -- ^ header tip (heavier branch)
+                   -> BlockHash      -- ^ connected (UTXO-view) tip
+                   -> (BlockHash -> Bool)  -- ^ body present on disk?
+                   -> Maybe BlockHash
+connectableForkTip entries forkHash tipHash connectedHash hasBody =
+  case Map.lookup connectedHash entries of
+    Nothing -> Nothing
+    Just connected ->
+      case heavierBranchHashes entries forkHash tipHash of
+        Nothing -> Nothing
+        Just hs ->
+          let prefix  = takeWhile hasBody hs
+              heavier = [ h | h <- prefix
+                            , Just ce <- [Map.lookup h entries]
+                            , ceChainWork ce > ceChainWork connected ]
+          in case reverse heavier of
+               []    -> Nothing
+               (t:_) -> Just t
 
 -- | Get the ancestor at a specific height.
 -- Returns Nothing if the target height is higher than the block's height

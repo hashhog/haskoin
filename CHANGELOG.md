@@ -2,6 +2,7 @@
 
 ## v1.0.2 — 2026-09-11
 
+- fix: fork-aware download serves historical getdata only to NODE_NETWORK peers and reorgs a downloaded heavier prefix (does not wait for the header tip)
 - feat: T2 R5 probe parity (error codes, createpsbt object outputs, WIF sign header, utxoupdatepsbt / descriptorprocesspsbt)
 - feat: script-verification counter; getchainstates validated is honest for --load-snapshot
 - 30cccf3 fix: dumpTxOutSetFromDB streams one txid group instead of the whole coin set

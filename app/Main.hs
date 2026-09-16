@@ -23,7 +23,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
-import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust)
+import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
 import Control.Exception (bracket, catch, SomeException)
 import Data.Word (Word8, Word16, Word32, Word64)
@@ -1908,16 +1908,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                      -- a heavier competing header chain forks below the
                      -- connected tip; the linear pipeline below never runs here.
                      when (progressed || stalled) $ do
-                       let windowEnd = min headerTip (reqFrom + maxBlocksInFlight - 1)
-                       putStrLn $ "Block-gap kicker (fork): requesting blocks "
-                               ++ show reqFrom ++ "-" ++ show windowEnd
-                       requestBlocks pm' hc reqFrom windowEnd rot
-                       -- 'requestForkBlocks' walks the heavier branch by 'cePrev'
-                       -- over 'hcEntries' and requests its REAL hashes from the
-                       -- fork point up (hcByHeight below the work crossover still
-                       -- resolves to the OLD chain's hashes -> 'notfound').
+                       -- Do NOT 'requestBlocks' (height-indexed via hcByHeight)
+                       -- here: below the work crossover that map still names
+                       -- the LOSING branch, so the getdata is a notfound /
+                       -- already-have flood.  Fork bodies are requested by
+                       -- hash only, and only from peers that can serve them
+                       -- (BIP-159).
                        requestForkBlocks pm' db hc rot
-                       modifyIORef' requestedUpToRef (max windowEnd)
                        tryP2PReorg net db hc cache mIdxMgr nextBlockRef
                          `catch` (\(e :: SomeException) ->
                                     putStrLn $ "P2P reorg kicker error: " ++ show e)
@@ -2994,41 +2991,44 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef = do
   case mFork of
     Nothing -> return ()
     Just (connectedTip, headerTip, forkEntry) -> do
-      -- Verify all heavier-branch bodies from fork+1..headerTip are present
-      -- on disk before attempting the reorg ('buildReorgConnectList' reads
-      -- them back via 'getBlock').  If any are missing, defer — the kicker
-      -- will fetch them and retry.
+      -- Core ActivateBestChain: reorg onto the highest downloaded PREFIX
+      -- of the heavier branch that already out-works the connected tip.
+      -- Waiting for every body through the header tip is the live stall
+      -- (receipt haskoin-fork-reorg-download-stuck-966499) — the rest of
+      -- the suffix then becomes ordinary linear IBD.
       entries <- readTVarIO (hcEntries hc)
       let forkHash = ceHash forkEntry
-          collectConnect h acc
-            | h == forkHash = Just acc
-            | otherwise = case Map.lookup h entries of
-                Nothing -> Nothing
-                Just ce -> cePrev ce >>= \ph -> collectConnect ph (h : acc)
-      case collectConnect (ceHash headerTip) [] of
+      case heavierBranchHashes entries forkHash (ceHash headerTip) of
         Nothing -> return ()
         Just connectHashes -> do
-          missing <- filterM (\h -> isNothing <$> getBlock db h) connectHashes
-          if not (null missing)
-            then putStrLn $ "P2P reorg deferred: " ++ show (length missing)
-                         ++ " heavier-branch body(ies) not yet downloaded "
-                         ++ "(fork@" ++ show (ceHeight forkEntry)
-                         ++ " -> header tip " ++ show (ceHeight headerTip) ++ ")"
-            else do
+          present <- filterM (\h -> isJust <$> getBlock db h) connectHashes
+          let have = Set.fromList present
+              nMissing = length connectHashes - Set.size have
+          case connectableForkTip entries forkHash (ceHash headerTip)
+                                  (ceHash connectedTip) (`Set.member` have) of
+            Nothing ->
+              putStrLn $ "P2P reorg deferred: " ++ show nMissing
+                      ++ " heavier-branch body(ies) not yet downloaded "
+                      ++ "(fork@" ++ show (ceHeight forkEntry)
+                      ++ " -> header tip " ++ show (ceHeight headerTip) ++ ")"
+            Just newTipHash -> do
+              let newTipHeight = maybe (ceHeight headerTip) ceHeight
+                                       (Map.lookup newTipHash entries)
               putStrLn $ "P2P reorg: connected tip " ++ show (ceHeight connectedTip)
-                      ++ " is on a lighter branch; reorging to heavier header "
-                      ++ "tip " ++ show (ceHeight headerTip)
-                      ++ " (fork@" ++ show (ceHeight forkEntry) ++ ")"
+                      ++ " is on a lighter branch; reorging to heavier prefix "
+                      ++ show newTipHeight
+                      ++ " (header tip " ++ show (ceHeight headerTip)
+                      ++ ", fork@" ++ show (ceHeight forkEntry) ++ ")"
               res <- performReorg net cache db hc mIdxMgr
-                                  (ceHash connectedTip) (ceHash headerTip)
+                                  (ceHash connectedTip) newTipHash
                        `catch` (\(e :: SomeException) ->
                                   return (Left ("exception: " <> show e)))
               case res of
                 Left err -> putStrLn $ "P2P reorg failed: " ++ err
                 Right () -> do
-                  writeIORef nextBlockRef (ceHeight headerTip + 1)
+                  writeIORef nextBlockRef (newTipHeight + 1)
                   putStrLn $ "P2P reorg complete: active tip now "
-                          ++ show (ceHeight headerTip)
+                          ++ show newTipHeight
 
 -- | GAP2 download floor.  The height the block-gap kicker should start
 -- requesting bodies from.  Normally this is the connected-tip+1 cursor
@@ -3076,37 +3076,46 @@ requestForkBlocks pm db hc rot = do
     Just (_connectedTip, headerTip, forkEntry) -> do
       entries <- readTVarIO (hcEntries hc)
       let forkHash = ceHash forkEntry
-          -- Walk the heavier branch from the header tip down to (but not
-          -- including) the fork point, collecting real branch hashes in
-          -- ascending-height order.
-          collect h acc
-            | h == forkHash = acc
-            | otherwise = case Map.lookup h entries of
-                Nothing -> acc
-                Just ce -> case cePrev ce of
-                  Nothing -> h : acc
-                  Just ph -> collect ph (h : acc)
-          branchHashes = collect (ceHash headerTip) []
-      -- Only request the bodies we don't already have, so a re-tick does not
-      -- re-flood already-downloaded blocks.
-      needed <- filterM (\h -> isNothing <$> getBlock db h) branchHashes
-      unless (null needed) $ do
-        peerList <- getConnectedPeerList pm
-        case peerList of
-          [] -> return ()
-          _ -> do
-            let batches  = chunksOf 16 needed
-                numPeers = length peerList
-            putStrLn $ "Fork-aware download: requesting " ++ show (length needed)
-                    ++ " heavier-branch block(s) (fork@" ++ show (ceHeight forkEntry)
-                    ++ " -> header tip " ++ show (ceHeight headerTip)
-                    ++ ") by branch hash from " ++ show numPeers ++ " peer(s)"
-            forM_ (zip [0 ..] batches) $ \(idx :: Int, batch) -> do
-              let pc      = peerList !! ((idx + rot) `mod` numPeers)
-                  invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- batch ]
-              (safeSendMessage pc (MGetData (GetData invVecs)))
-                `catch` (\(e :: SomeException) ->
-                           putStrLn $ "Fork-aware getdata send failed: " ++ show e)
+      case heavierBranchHashes entries forkHash (ceHash headerTip) of
+        Nothing -> return ()
+        Just branchHashes -> do
+          -- Only request the bodies we don't already have, so a re-tick
+          -- does not re-flood already-downloaded blocks.
+          neededPairs <- fmap catMaybes $ forM branchHashes $ \h -> do
+            miss <- isNothing <$> getBlock db h
+            if not miss
+              then return Nothing
+              else return $ fmap (\ce -> (h, ceHeight ce)) (Map.lookup h entries)
+          unless (null neededPairs) $ do
+            peerList <- getConnectedPeerList pm
+            case peerList of
+              [] -> return ()
+              _ -> do
+                peerSvcs <- forM peerList $ \pc -> do
+                  info <- readTVarIO (pcInfo pc)
+                  return (piServices info)
+                let peers = [ ForkGetDataPeer i svc
+                            | (i, svc) <- zip [0..] peerSvcs ]
+                    plan  = planForkGetData peers neededPairs
+                                            (ceHeight headerTip) rot
+                    nReq  = sum (map (length . snd) plan)
+                    nCap  = length [ p | p <- peers
+                                       , hasService (fgdpServices p) nodeNetwork ]
+                unless (null plan) $ do
+                  putStrLn $ "Fork-aware download: requesting " ++ show nReq
+                          ++ " heavier-branch block(s) (fork@"
+                          ++ show (ceHeight forkEntry)
+                          ++ " -> header tip " ++ show (ceHeight headerTip)
+                          ++ ") by branch hash from " ++ show nCap
+                          ++ " NODE_NETWORK peer(s) ("
+                          ++ show (length neededPairs) ++ " still missing)"
+                  forM_ plan $ \(idx, batch) -> do
+                    let pc      = peerList !! idx
+                        invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h)
+                                  | h <- batch ]
+                    (safeSendMessage pc (MGetData (GetData invVecs)))
+                      `catch` (\(e :: SomeException) ->
+                                 putStrLn $ "Fork-aware getdata send failed: " ++ show e)
 
 -- | Split a list into chunks of n
 chunksOf :: Int -> [a] -> [[a]]

@@ -170,6 +170,7 @@ import qualified W187MaxStackSizePushSpec
 import qualified W188InboundPongSpec
 import qualified W189GetBlockVerbosity3Spec
 import qualified W190InboundCapSpec
+import qualified W191ForkReorgDownloadSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23820,6 +23821,12 @@ main = hspec $ do
   --       admit every inbound unconditionally (UNBOUNDED DoS surface); now it
   --       consults inboundAdmissionDecision before any handshake/registration.
   W190InboundCapSpec.spec
+
+  -- W191: fork-aware download + prefix reorg.  Live stall: header tip
+  -- ahead of a minority connected tip, kicker requests heavier-branch
+  -- bodies from LIMITED peers and waits for the entire suffix before
+  -- reorging (receipt haskoin-fork-reorg-download-stuck-966499).
+  W191ForkReorgDownloadSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
