@@ -234,6 +234,10 @@ data NodeOptions = NodeOptions
     --   full-script validation of the entire chain.  Default 'False'
     --   keeps the compiled-in assumevalid (mainnet block 938343), so
     --   this flag is INERT unless explicitly passed.
+  , noBind :: ![String]
+    -- ^ @--bind=ADDR[:PORT]@ (repeatable).  Empty (default) means bind
+    --   all interfaces (@0.0.0.0@ and @[::]@).  Passing --bind restricts
+    --   the P2P listener to the given address(es).  Bitcoin Core @-bind@.
   } deriving (Show)
 
 data WalletCommand
@@ -410,6 +414,9 @@ parseNodeOptions = NodeOptions
                 \EVERY block, including pre-segwit/pre-taproot history \
                 \below the compiled-in assumevalid height (mainnet 938343). \
                 \Default: off (assumevalid enabled).")
+  <*> many (strOption (long "bind" <> metavar "ADDR[:PORT]"
+        <> help "Bind P2P listen socket (repeatable; default 0.0.0.0 and [::]). \
+                \Passing --bind restricts the listener. Bitcoin Core -bind."))
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -683,6 +690,10 @@ applyConfigOverlay cm n = n
   , noNoAssumeValid = if noNoAssumeValid n
                         then True
                         else not (Daemon.configLookupBool "assumevalid" True cm)
+  -- --bind: conf overlay is a comma-separated list when CLI is empty.
+  , noBind = if null (noBind n)
+               then maybe [] splitCsv (Daemon.configLookup "bind" cm)
+               else noBind n
   -- Pass-through (not in conf overlay).
   , noConfFile   = noConfFile n
   }
@@ -1672,6 +1683,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
 
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
+          , pmcMaxBlockRelayOnly = min 2 (max 0 (noMaxPeers - min 8 noMaxPeers))
+          , pmcMaxInbound  = inboundSlotsFromMaxConnections noMaxPeers
+          , pmcMaxTotal    = noMaxPeers
+          , pmcBindHosts   = noBind
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
           , pmcPruneMode   = pruneOn
@@ -2188,7 +2203,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           else noListenPort
     when noListen $ do
       startInboundListener pm listenPort
+      let bindDesc = case noBind of
+            [] -> "0.0.0.0 and [::]"
+            hs -> unwords hs
       putStrLn $ "P2P listener started on port " ++ show listenPort
+              ++ " bind " ++ bindDesc
 
     -- Notify systemd we're up. No-op when NOTIFY_SOCKET is unset
     -- (typical for non-systemd launches via nohup, supervisord, etc).

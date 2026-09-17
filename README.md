@@ -149,6 +149,7 @@ cabal run haskoin -- +RTS -N -A64m -H2G -I0 -RTS -n Mainnet node
 | `--dbcache ARG` | DB cache size in MB | |
 | `--listen ARG` | Accept incoming connections | `True` |
 | `--port ARG` | P2P listen port | network default |
+| `--bind ADDR[:PORT]` | P2P listen address (repeatable; default all interfaces) | `0.0.0.0` and `[::]` |
 
 ### Wallet Subcommands
 

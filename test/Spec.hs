@@ -171,6 +171,7 @@ import qualified W188InboundPongSpec
 import qualified W189GetBlockVerbosity3Spec
 import qualified W190InboundCapSpec
 import qualified W191ForkReorgDownloadSpec
+import qualified W192InboundReadinessSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23827,6 +23828,12 @@ main = hspec $ do
   -- bodies from LIMITED peers and waits for the entire suffix before
   -- reorging (receipt haskoin-fork-reorg-download-stuck-966499).
   W191ForkReorgDownloadSpec.spec
+
+  -- W192: inbound P2P readiness (CHARTER full P2P, outbound AND inbound).
+  -- Configurable --bind (default 0.0.0.0 and [::]), getpeerinfo inbound:true,
+  -- inbound slots reserved from maxconnections, half-open handshake reaped,
+  -- getheaders/getdata served to inbound.
+  W192InboundReadinessSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

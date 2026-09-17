@@ -141,6 +141,13 @@ module Haskoin.Network
   , startPeerManagerWith
   , stopPeerManager
   , startInboundListener
+  , startInboundListenerOn
+  , getListeningBinds
+  , defaultBindHosts
+  , BindSpec (..)
+  , parseBindSpec
+  , resolveListenBinds
+  , inboundSlotsFromMaxConnections
   , addNodeConnect
   , addAddedNode
   , removeAddedNode
@@ -200,6 +207,7 @@ module Haskoin.Network
   , inboundAdmissionDecision
   , checkInboundGroupLimit
   , countInboundPeers
+  , countOutboundPeers
   , maxInboundPerGroup
     -- * Connection Eviction
   , EvictionCandidate(..)
@@ -615,7 +623,7 @@ import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe)
-import Data.List (sortBy, groupBy, partition, foldl', nub)
+import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
 import Control.Concurrent (threadDelay)
@@ -633,7 +641,8 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        SocketType(..), PortNumber, Family(..),
                        bind, listen, accept, setSocketOption,
                        SocketOption(..), socketPair, defaultProtocol,
-                       tupleToHostAddress)
+                       tupleToHostAddress, getSocketName,
+                       AddrInfoFlag(..))
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -644,7 +653,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import System.Timeout (timeout)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch, mask_, IOException)
+import Control.Exception (try, SomeException, catch, mask_, IOException, finally)
 import Data.Hashable (Hashable(..))
 
 import Haskoin.Types
@@ -3097,6 +3106,10 @@ data PeerManager = PeerManager
     --   Surfaced read-only as @networkactive@ in getnetworkinfo.  Not persisted
     --   (resets to True on restart), matching Core.  Reference: Bitcoin Core
     --   net.cpp:3361 SetNetworkActive / net.h:1164 GetNetworkActive.
+  , pmListenSocks        :: !(TVar [Socket])
+    -- ^ Live P2P listen sockets created by 'startInboundListenerOn'.
+    --   Closed by 'stopPeerManager' so tests (and a clean shutdown) do
+    --   not leak the bind.
   }
 
 -- | Configuration for the peer manager
@@ -3167,6 +3180,17 @@ data PeerManagerConfig = PeerManagerConfig
     --   never called.  Mirrors clearbit's standalone @--nodnsseed@
     --   (sets @dns_seed=false@).  Connect mode ('pmcConnectAddrs'
     --   non-empty) additionally forces DNS off regardless of this flag.
+  , pmcHandshakeTimeout :: !Int
+    -- ^ Seconds to wait for an inbound VERSION/VERACK handshake before
+    --   disconnecting the peer and freeing the inbound slot.  Default 60
+    --   (the same bound 'recvExact' already uses).  Tests pass 1.
+    --   Reference: Bitcoin Core net.cpp InactivityCheck first-message
+    --   timeout (TIMEOUT_INTERVAL); we use a tighter default so a
+    --   half-open inbound cannot hold a slot for 20 minutes.
+  , pmcBindHosts        :: ![String]
+    -- ^ Operator @--bind@ hosts.  Empty (the default) means bind all
+    --   interfaces ('defaultBindHosts' = 0.0.0.0 and ::).  A non-empty
+    --   list restricts the listener to those addresses.
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -3193,6 +3217,8 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcCompactFilters   = False  -- FIX-86: NODE_COMPACT_FILTERS off by default
   , pmcConnectAddrs     = []     -- -connect: empty = normal addrman-driven outbound
   , pmcDnsSeed          = True   -- -dnsseed (Core DEFAULT_DNSSEED = true)
+  , pmcHandshakeTimeout = 60     -- inbound VERSION/VERACK timeout (seconds)
+  , pmcBindHosts        = []     -- empty = defaultBindHosts (0.0.0.0 and ::)
   }
 
 -- | W117 DH-2 wiring: derive a 'NetworkReachability' record from the
@@ -3362,6 +3388,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTVarIO 0     -- pmNextFeeler: 0 = a feeler may open on the first eligible loop tick
     <*> newTVarIO []    -- pmAddedNodes: empty addnode-managed persistent-peer list
     <*> newTVarIO True  -- pmNetworkActive: P2P enabled by default (Core fNetworkActive=true)
+    <*> newTVarIO []    -- pmListenSocks: filled by startInboundListenerOn
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -3400,6 +3427,11 @@ stopPeerManager pm = do
 
   mTid <- readTVarIO (pmManagerThread pm)
   mapM_ killThread mTid
+  listenSocks <- atomically $ do
+    ss <- readTVar (pmListenSocks pm)
+    writeTVar (pmListenSocks pm) []
+    return ss
+  mapM_ (\s -> close s `catch` (\(_ :: IOException) -> return ())) listenSocks
   mapM_ disconnectPeer (Map.elems peers)
 
 -- | Main peer manager loop - maintains connections and handles timeouts
@@ -4218,36 +4250,159 @@ sockAddrToHostPort addr defaultPort = case addr of
         fromIntegral port)
   _ -> ("127.0.0.1", defaultPort)  -- Fallback for IPv6, etc.
 
--- | Start a TCP listener for inbound P2P connections
-startInboundListener :: PeerManager -> Int -> IO ()
-startInboundListener pm port = do
-  let hints = defaultHints { NS.addrSocketType = Stream }
-  addrInfos <- getAddrInfo (Just hints) (Just "0.0.0.0") (Just (show port))
-  case addrInfos of
-    [] -> putStrLn $ "startInboundListener: cannot resolve bind address for port " ++ show port
-    (addrInfo:_) -> do
-      sock <- socket (NS.addrFamily addrInfo) (NS.addrSocketType addrInfo) (NS.addrProtocol addrInfo)
-      setSocketOption sock ReuseAddr 1
-      bind sock (NS.addrAddress addrInfo)
-      listen sock 128
-      putStrLn $ "P2P listener started on port " ++ show port
-      void $ forkIO $ acceptLoop sock
+-- | Default P2P bind hosts when the operator does not pass --bind.
+-- All interfaces, not loopback.  IPv6 [::] is bound with IPV6_V6ONLY so
+-- it does not collide with 0.0.0.0 on Linux dual-stack sockets.
+defaultBindHosts :: [String]
+defaultBindHosts = ["0.0.0.0", "::"]
+
+-- | One resolved listen endpoint (host + port).
+data BindSpec = BindSpec
+  { bindSpecHost :: !String
+  , bindSpecPort :: !Int
+  } deriving (Show, Eq)
+
+-- | Parse a Core-style @-bind@ spec: @0.0.0.0@, @127.0.0.1:8334@,
+-- @[::]@, @[::1]:18444@, or bare IPv6 (@::@, @::1@).  A spec without an
+-- explicit port inherits @defaultPort@.
+parseBindSpec :: String -> Int -> Either String BindSpec
+parseBindSpec spec defaultPort
+  | null spec = Left "empty bind spec"
+  | "[" `isPrefixOf` spec =
+      case break (== ']') (drop 1 spec) of
+        (host, ']':rest)
+          | null host -> Left $ "empty IPv6 host in bind spec: " ++ spec
+          | otherwise -> case rest of
+              ""      -> Right (BindSpec host defaultPort)
+              ':':ps  -> parsePort host ps spec
+              _       -> Left $ "invalid bind spec: " ++ spec
+        _ -> Left $ "unterminated IPv6 bind spec: " ++ spec
+  | length (filter (== ':') spec) >= 2 =
+      -- Bare IPv6 (e.g. ::, ::1).  A port requires the [addr]:port form.
+      Right (BindSpec spec defaultPort)
+  | otherwise =
+      case break (== ':') spec of
+        (host, "") ->
+          if null host
+            then Left $ "empty host in bind spec: " ++ spec
+            else Right (BindSpec host defaultPort)
+        (host, ':':ps) -> parsePort host ps spec
+        _ -> Left $ "invalid bind spec: " ++ spec
   where
+    parsePort host ps full =
+      case reads ps of
+        [(p, "")] | p > 0 && p < 65536 && not (null host) ->
+          Right (BindSpec host p)
+        _ -> Left $ "invalid port in bind spec: " ++ full
+
+-- | Resolve operator --bind values against the listen port.  Empty input
+-- means 'defaultBindHosts'.
+resolveListenBinds :: [String] -> Int -> Either String [BindSpec]
+resolveListenBinds [] port =
+  Right [BindSpec h port | h <- defaultBindHosts]
+resolveListenBinds specs port =
+  mapM (`parseBindSpec` port) specs
+
+sockAddrListenPort :: SockAddr -> Int
+sockAddrListenPort (SockAddrInet p _)      = fromIntegral p
+sockAddrListenPort (SockAddrInet6 p _ _ _) = fromIntegral p
+sockAddrListenPort _                       = 0
+
+-- | Currently bound listen addresses (best-effort; a closed socket is skipped).
+getListeningBinds :: PeerManager -> IO [SockAddr]
+getListeningBinds pm = do
+  socks <- readTVarIO (pmListenSocks pm)
+  fmap concat $ forM socks $ \s -> do
+    r <- try @SomeException (getSocketName s)
+    case r of
+      Left _  -> return []
+      Right a -> return [a]
+
+bindListenSocket :: BindSpec -> IO (Maybe (Socket, SockAddr))
+bindListenSocket (BindSpec host port) = do
+  let hints = defaultHints
+        { NS.addrSocketType = Stream
+        , NS.addrFlags      = [AI_PASSIVE]
+        }
+  infos <- getAddrInfo (Just hints) (Just host) (Just (show port))
+            `catch` (\(_ :: IOException) -> return [])
+  case infos of
+    [] -> do
+      putStrLn $ "P2P bind: cannot resolve " ++ host ++ ":" ++ show port
+      return Nothing
+    (ai:_) -> do
+      sock <- socket (NS.addrFamily ai) (NS.addrSocketType ai) (NS.addrProtocol ai)
+      setSocketOption sock ReuseAddr 1
+      when (NS.addrFamily ai == AF_INET6) $
+        setSocketOption sock IPv6Only 1
+          `catch` (\(_ :: IOException) -> return ())
+      bind sock (NS.addrAddress ai)
+      listen sock 128
+      name <- getSocketName sock
+      return (Just (sock, name))
+
+-- | Start a TCP listener for inbound P2P connections on @port@, using
+-- 'pmcBindHosts' (empty = all interfaces).
+startInboundListener :: PeerManager -> Int -> IO ()
+startInboundListener pm port =
+  case resolveListenBinds (pmcBindHosts (pmConfig pm)) port of
+    Left err    -> putStrLn $ "startInboundListener: " ++ err
+    Right specs -> void $ startInboundListenerOn pm specs
+
+-- | Bind each 'BindSpec' and fork an accept loop.  Port 0 (ephemeral)
+-- on the first successful bind is reused for the remaining specs so
+-- dual-stack 0.0.0.0 + [::] share a port.  IPv6 bind failures (no
+-- IPv6 on the host) are skipped so IPv4-only boxes still listen.
+startInboundListenerOn :: PeerManager -> [BindSpec] -> IO [SockAddr]
+startInboundListenerOn pm specs = do
+  bound <- go Nothing specs []
+  atomically $ modifyTVar' (pmListenSocks pm) (++ map fst bound)
+  forM_ bound $ \(_, addr) ->
+    putStrLn $ "P2P listener started on " ++ show addr
+  return (map snd bound)
+  where
+    go _ [] acc = return (reverse acc)
+    go chosenPort (s:ss) acc = do
+      let spec = case chosenPort of
+            Just p | bindSpecPort s == 0 -> s { bindSpecPort = p }
+            _ -> s
+      mBound <- bindListenSocket spec
+                  `catch` (\(e :: SomeException) -> do
+                     putStrLn $ "P2P bind " ++ bindSpecHost spec ++ ":"
+                             ++ show (bindSpecPort spec)
+                             ++ " failed: " ++ show e
+                     return Nothing)
+      case mBound of
+        Nothing -> go chosenPort ss acc
+        Just (sock, addr) -> do
+          void $ forkIO $ acceptLoop sock
+          go (Just (sockAddrListenPort addr)) ss ((sock, addr) : acc)
+
     acceptLoop :: Socket -> IO ()
-    acceptLoop listenSock = forever $ do
-      (clientSock, clientAddr) <- accept listenSock
-      -- setnetworkactive gate (Core net.cpp:1786 — AcceptConnection refuses a
-      -- new inbound while !fNetworkActive): when networking is disabled, drain
-      -- the accepted socket off the listen backlog and close it immediately
-      -- without registering a peer.  Existing peers are untouched.
-      netActive <- readTVarIO (pmNetworkActive pm)
-      if not netActive
-        then close clientSock
-        else
-          void $ forkIO $ handleInbound clientSock clientAddr
-            `catch` (\(e :: SomeException) -> do
-              putStrLn $ "Inbound connection error from " ++ show clientAddr ++ ": " ++ show e
-              close clientSock)
+    acceptLoop listenSock = loop
+      where
+        loop = do
+          -- Stop cleanly when stopPeerManager closes the listen socket
+          -- (a bare 'accept' otherwise dies with threadWait EBADF).
+          er <- try @SomeException (accept listenSock)
+          case er of
+            Left _ -> return ()
+            Right (clientSock, clientAddr) -> do
+              -- setnetworkactive gate (Core net.cpp:1786 — AcceptConnection
+              -- refuses a new inbound while !fNetworkActive): when networking
+              -- is disabled, drain the accepted socket off the listen backlog
+              -- and close it immediately without registering a peer.
+              netActive <- readTVarIO (pmNetworkActive pm)
+              if not netActive
+                then close clientSock
+                else
+                  void $ forkIO $ handleInbound clientSock clientAddr
+                    `catch` (\(e :: SomeException) -> do
+                      putStrLn $ "Inbound connection error from "
+                              ++ show clientAddr ++ ": " ++ show e
+                      close clientSock
+                        `catch` (\(_ :: IOException) -> return ()))
+              loop
 
     -- Inbound admission control (Bitcoin Core net.cpp AcceptConnection ladder).
     -- WITHOUT this the accept path was UNBOUNDED: every inbound socket was
@@ -4280,8 +4435,19 @@ startInboundListener pm port = do
               admitInbound sock addr
         AdmitInbound -> admitInbound sock addr
 
-    -- Register + handshake an accepted inbound connection.  Only reached after
-    -- 'handleInbound' has approved admission via 'inboundAdmissionDecision'.
+    -- Drop a half-open (or failed-handshake) inbound and free its slot.
+    dropInbound :: SockAddr -> PeerConnection -> IO ()
+    dropInbound addr pc = do
+      disconnectPeer pc
+        `catch` (\(_ :: IOException) -> return ())
+        `catch` (\(_ :: SomeException) -> return ())
+      atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
+
+    -- Register + handshake an accepted inbound connection.  The peer is
+    -- inserted into pmPeers BEFORE the handshake so a half-open connection
+    -- occupies an inbound slot (Core AcceptConnection increments nInbound
+    -- on accept).  An incomplete handshake is then reaped by
+    -- 'pmcHandshakeTimeout' and the slot is freed.
     admitInbound :: Socket -> SockAddr -> IO ()
     admitInbound sock addr = do
       now <- round <$> getPOSIXTime
@@ -4364,59 +4530,63 @@ startInboundListener pm port = do
             , pcfgQueueSize   = 100
             }
 
-      -- BIP-324 transport-version classification: peek the first 4 bytes
-      -- and dispatch to v1 (network magic) or v2 (random ElligatorSwift
-      -- pubkey) handshake.  Peeked bytes are pushed back into the read
-      -- buffer so the v1 path's existing 24-byte header read still works.
-      mVer <- peekTransportVersion pc
-      case mVer of
-        Nothing -> do
-          putStrLn $ "Inbound peer " ++ show addr ++ " closed before sending data"
-          close sock
-        Just TransportV1 -> do
-          hsResult <- performHandshake config pc
-          case hsResult of
-            Left err -> do
-              putStrLn $ "Inbound v1 handshake failed from " ++ show addr ++ ": " ++ err
-              close sock
-            Right _ver -> do
-              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
-              pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
-                   (\reason err -> do
-                      putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
-                              ++ show reason ++ " (" ++ err ++ ")"
-                      void $ misbehaving pm addr reason)
-              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
-              putStrLn $ "Accepted inbound v1 connection from " ++ show addr
-        Just TransportV2 -> do
-          -- BIP-324 v2 inbound handshake.  Once the cipher handshake
-          -- completes we attach the V2Transport to the PeerConnection so
-          -- subsequent 'sendMessage' / 'receiveMessage' use the encrypted
-          -- v2 framing.  performHandshake then drives the application
-          -- version/verack exchange over the encrypted transport.
-          hsResult <- v2InboundHandshake pc net
-          case hsResult of
-            Left err -> do
-              putStrLn $ "Inbound v2 handshake failed from " ++ show addr ++ ": " ++ err
-              close sock
-            Right transport -> do
-              writeIORef (pcV2Transport pc) (Just transport)
-              appRes <- performHandshake config pc
-              case appRes of
-                Left err -> do
-                  putStrLn $ "Inbound v2 app-handshake failed from " ++ show addr
-                    ++ ": " ++ err
-                  close sock
-                Right _ver -> do
-                  atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
-                  pc' <- startPeerThreadsWithMisbehavior pc (pmMessageHandler pm addr)
-                   (\reason err -> do
-                      putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
-                              ++ show reason ++ " (" ++ err ++ ")"
-                      void $ misbehaving pm addr reason)
-                  atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
-                  putStrLn $ "Accepted inbound v2 (encrypted) connection from "
-                    ++ show addr
+      -- Occupy the inbound slot immediately (before VERSION/VERACK) so a
+      -- flood of half-open sockets is counted against pmcMaxInbound.
+      atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+      -- Watchdog (not System.Timeout.timeout around recv): closing the
+      -- socket unblocks peek/recv so a nested timeout cannot swallow the
+      -- exception or stall the IO manager.  Core's equivalent is the
+      -- InactivityCheck first-message timer.
+      let hsMicros = max 1 (pmcHandshakeTimeout (pmConfig pm)) * 1_000_000
+          onMisbehave reason err = do
+            putStrLn $ "Peer " ++ show addr ++ " misbehavior: "
+                    ++ show reason ++ " (" ++ err ++ ")"
+            void $ misbehaving pm addr reason
+          runHandshake = do
+            -- BIP-324 transport-version classification: peek the first
+            -- 16 bytes and dispatch to v1 (network magic) or v2 (random
+            -- ElligatorSwift pubkey).  Peeked bytes are pushed back into
+            -- the read buffer so the v1 path's 24-byte header read still
+            -- works.
+            mVer <- peekTransportVersion pc
+            case mVer of
+              Nothing -> return (Left "closed before sending data")
+              Just TransportV1 -> do
+                hsResult <- performHandshake config pc
+                case hsResult of
+                  Left err -> return (Left err)
+                  Right _  -> do
+                    pc' <- startPeerThreadsWithMisbehavior pc
+                             (pmMessageHandler pm addr) onMisbehave
+                    return (Right pc')
+              Just TransportV2 -> do
+                hsResult <- v2InboundHandshake pc net
+                case hsResult of
+                  Left err -> return (Left err)
+                  Right transport -> do
+                    writeIORef (pcV2Transport pc) (Just transport)
+                    appRes <- performHandshake config pc
+                    case appRes of
+                      Left err -> return (Left err)
+                      Right _  -> do
+                        pc' <- startPeerThreadsWithMisbehavior pc
+                                 (pmMessageHandler pm addr) onMisbehave
+                        return (Right pc')
+      watchdog <- forkIO $ do
+        threadDelay hsMicros
+        st <- readTVarIO (pcInfo pc)
+        when (piState st == PeerConnecting
+              || piState st == PeerHandshaking) $ do
+          putStrLn $ "Inbound handshake timeout from " ++ show addr
+          dropInbound addr pc
+      result <- runHandshake `finally` killThread watchdog
+      case result of
+        Left err -> do
+          putStrLn $ "Inbound handshake failed from " ++ show addr ++ ": " ++ err
+          dropInbound addr pc
+        Right pc' -> do
+          atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
+          putStrLn $ "Accepted inbound connection from " ++ show addr
 
 -- | Connect to a peer by host:port string (for addnode RPC).
 -- Marks the resulting PeerInfo entry as a manual connection
@@ -5003,6 +5173,27 @@ countInboundPeers pm = do
     info <- readTVarIO (pcInfo pc)
     return $ if piInbound info then 1 else 0
   return $ sum counts
+
+-- | Count outbound peer connections (the complement of 'countInboundPeers').
+countOutboundPeers :: PeerManager -> IO Int
+countOutboundPeers pm = do
+  total <- getPeerCount pm
+  inbound <- countInboundPeers pm
+  return (total - inbound)
+
+-- | Core @nMaxInbound = max(0, nMaxConnections - nMaxOutbound)@ where
+-- outbound is full-relay (8) plus block-relay-only (2), each clamped to
+-- the remaining budget.  A flood of inbound therefore cannot consume the
+-- slots reserved for outbound sync.
+--
+-- Reference: bitcoin-core/src/net.cpp CConnman::Init
+--   m_max_inbound = max(nMaxConnections - m_max_outbound, 0)
+inboundSlotsFromMaxConnections :: Int -> Int
+inboundSlotsFromMaxConnections n =
+  let n'         = max 0 n
+      fullRelay  = min 8 n'
+      blockRelay = min 2 (max 0 (n' - fullRelay))
+  in max 0 (n' - fullRelay - blockRelay)
 
 -- | Count the inbound peers whose network group matches @addr@.
 -- Reads the count off the live peer map (keyed by SockAddr), so there is no

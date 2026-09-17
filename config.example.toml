@@ -26,6 +26,9 @@ rpcpassword = "haskoin"
 port = 8333
 # Accept inbound connections
 listen = true
+# Bind addresses (comma-separated). Empty = all interfaces (0.0.0.0 and [::]).
+# Passing bind restricts the listener (Bitcoin Core -bind).
+# bind = "0.0.0.0,::"
 # Maximum peer connections
 maxpeers = 125
 

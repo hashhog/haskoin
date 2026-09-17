@@ -209,6 +209,7 @@ test-suite haskoin-test
                , W189GetBlockVerbosity3Spec
                , W190InboundCapSpec
                , W191ForkReorgDownloadSpec
+               , W192InboundReadinessSpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , Paths_haskoin
