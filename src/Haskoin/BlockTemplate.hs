@@ -85,6 +85,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            calculateSequenceLocks, checkSequenceLocks,
                            SequenceLock(..),
                            buildConnectBlockOps, buildDisconnectBlockOps,
+                           blockCreatedOutpoints, disconnectRestoredPrevouts,
                            encodeBip34Height,
                            Deployment, DeploymentCache,
                            computeBlockVersionFromChain,
@@ -1265,39 +1266,30 @@ buildReorgBatch net db cache hc disList disUndos conList = do
       in case buildDisconnectBlockOps blk prevHash u of
         Left e   -> Left e
         Right bo ->
-          let txns        = blockTxns blk
-              nonCoinbase = drop 1 txns
-              txUndos     = buTxUndo (udBlockUndo u)
-              -- Restored prevouts go into the overlay (post-
-              -- disconnect they're spendable again).
-              restored =
-                [ (txInPrevOutput inp,
-                   Coin (tuOutput tin) (tuHeight tin) (tuCoinbase tin))
-                | (tx, txUndo) <- zip nonCoinbase txUndos
-                , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
-                ]
-              -- The block's own outputs cease to exist on the new
-              -- chain — mark them spent in the overlay.
-              created =
-                [ OutPoint (computeTxId tx) (fromIntegral i)
-                | tx       <- txns
-                , (i, _)   <- zip [0 :: Int ..] (txOutputs tx)
-                ]
-              ov' = ov
-                { overlayAdded =
-                    foldr (\(op, c) m -> Map.insert op c m)
-                          (overlayAdded ov)
-                          restored
-                , overlaySpent =
-                    foldr Set.insert (overlaySpent ov) created
-                }
-              -- A restored prevout shadows any prior overlaySpent.
-              ov'' = ov'
-                { overlaySpent =
-                    foldr (\(op, _) -> Set.delete op)
-                          (overlaySpent ov') restored
-                }
-          in disBuildPure rest (opsAcc ++ bo, ov'')
+          case disconnectRestoredPrevouts blk u of
+            Left e -> Left e
+            Right restored ->
+              -- Twin of Consensus.reorgDisBuildPure: pair undo with vin
+              -- (legacy intra-block-omitted records included) and hide
+              -- this block's created outputs, including intra-block
+              -- coins a complete undo would otherwise resurrect.
+              let createdSet = blockCreatedOutpoints blk
+                  ov' = ov
+                    { overlayAdded =
+                        foldr (\(op, c) m -> Map.insert op c m)
+                              (overlayAdded ov)
+                              restored
+                    , overlaySpent =
+                        foldr Set.insert (overlaySpent ov) createdSet
+                    }
+                  ov'' = ov'
+                    { overlayAdded =
+                        foldr Map.delete (overlayAdded ov') createdSet
+                    , overlaySpent =
+                        foldr (\(op, _) -> Set.delete op)
+                              (overlaySpent ov') restored
+                    }
+              in disBuildPure rest (opsAcc ++ bo, ov'')
 
     -- IO-flavoured folder for the connect side: needs cache reads
     -- to populate the spent-UTXO map for inputs that aren't in the

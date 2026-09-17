@@ -19,7 +19,7 @@ import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
-import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
@@ -1414,6 +1414,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- connected-block tip (true UTXO-view tip), NOT the header tip.
     let loadedHeight = connectedTipHeight
     nextBlockRef <- newIORef (loadedHeight + 1)
+    -- Consecutive full-validation reorg failures of the same
+    -- (oldTip, newTip).  tryP2PReorg backs off exponentially so a
+    -- structural Missing-UTXO abort cannot retry into the 12 G cap
+    -- (mainnet 966500, 2026-09-17).
+    reorgFailRef <- newIORef (Nothing :: Maybe (BlockHash, BlockHash, Int, POSIXTime))
     -- Track highest block we've requested (for sliding window)
     requestedUpToRef <- newIORef loadedHeight
     -- IBD mode flag: skip block inv requests until header sync catches up
@@ -1719,7 +1724,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1930,7 +1935,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                        -- hash only, and only from peers that can serve them
                        -- (BIP-159).
                        requestForkBlocks pm' db hc rot
-                       tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+                       tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef
                          `catch` (\(e :: SomeException) ->
                                     putStrLn $ "P2P reorg kicker error: " ++ show e)
                      return $ if progressed || stalled
@@ -1966,7 +1971,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                          modifyIORef' requestedUpToRef (max windowEnd)
                          -- Keep the fork detector hot: a competing fork can appear
                          -- mid-pipeline (a no-op on the pure linear path).
-                         tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+                         tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef
                            `catch` (\(e :: SomeException) ->
                                       putStrLn $ "P2P reorg kicker error: " ++ show e)
                          return (rot, nextBlock, nowKick)
@@ -3004,8 +3009,10 @@ detectP2PFork db hc = do
 -- arrive.  Mirrors Core's @ActivateBestChain@ retrying when a block body is
 -- not yet available.
 tryP2PReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
-            -> Maybe IndexManager -> IORef Word32 -> IO ()
-tryP2PReorg net db hc cache mIdxMgr nextBlockRef = do
+            -> Maybe IndexManager -> IORef Word32
+            -> IORef (Maybe (BlockHash, BlockHash, Int, POSIXTime))
+            -> IO ()
+tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef = do
   mFork <- detectP2PFork db hc
   case mFork of
     Nothing -> return ()
@@ -3033,21 +3040,41 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef = do
             Just newTipHash -> do
               let newTipHeight = maybe (ceHeight headerTip) ceHeight
                                        (Map.lookup newTipHash entries)
-              putStrLn $ "P2P reorg: connected tip " ++ show (ceHeight connectedTip)
-                      ++ " is on a lighter branch; reorging to heavier prefix "
-                      ++ show newTipHeight
-                      ++ " (header tip " ++ show (ceHeight headerTip)
-                      ++ ", fork@" ++ show (ceHeight forkEntry) ++ ")"
-              res <- performReorg net cache db hc mIdxMgr
-                                  (ceHash connectedTip) newTipHash
-                       `catch` (\(e :: SomeException) ->
-                                  return (Left ("exception: " <> show e)))
-              case res of
-                Left err -> putStrLn $ "P2P reorg failed: " ++ err
-                Right () -> do
-                  writeIORef nextBlockRef (newTipHeight + 1)
-                  putStrLn $ "P2P reorg complete: active tip now "
+              let oldH = ceHash connectedTip
+              now0 <- getPOSIXTime
+              lastFail <- readIORef reorgFailRef
+              if not (reorgShouldRetry oldH newTipHash now0 lastFail)
+                then do
+                  let waitS = case lastFail of
+                        Just (_, _, k, _) -> reorgValidationBackoffSecs k
+                        Nothing           -> 0
+                  putStrLn $ "P2P reorg backoff: last validation failure of this prefix; wait "
+                          ++ show waitS ++ "s"
+                else do
+                  putStrLn $ "P2P reorg: connected tip " ++ show (ceHeight connectedTip)
+                          ++ " is on a lighter branch; reorging to heavier prefix "
                           ++ show newTipHeight
+                          ++ " (header tip " ++ show (ceHeight headerTip)
+                          ++ ", fork@" ++ show (ceHeight forkEntry) ++ ")"
+                  res <- performReorg net cache db hc mIdxMgr
+                                      oldH newTipHash
+                           `catch` (\(e :: SomeException) ->
+                                      return (Left ("exception: " <> show e)))
+                  case res of
+                    Left err -> do
+                      now1 <- getPOSIXTime
+                      let k' = case lastFail of
+                            Just (o, n, k, _) | o == oldH && n == newTipHash -> k + 1
+                            _ -> 1
+                      writeIORef reorgFailRef (Just (oldH, newTipHash, k', now1))
+                      putStrLn $ "P2P reorg failed: " ++ err
+                              ++ " (backing off "
+                              ++ show (reorgValidationBackoffSecs k') ++ "s)"
+                    Right () -> do
+                      writeIORef reorgFailRef Nothing
+                      writeIORef nextBlockRef (newTipHeight + 1)
+                      putStrLn $ "P2P reorg complete: active tip now "
+                              ++ show newTipHeight
 
 -- | GAP2 download floor.  The height the block-gap kicker should start
 -- requesting bodies from.  Normally this is the connected-tip+1 cursor
@@ -3192,7 +3219,9 @@ infixOfStr needle haystack =
 -- | Sync-aware message handler
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
-                   -> IORef PeerManager -> IORef Word32 -> IORef Word32
+                   -> IORef PeerManager -> IORef Word32
+                   -> IORef (Maybe (BlockHash, BlockHash, Int, POSIXTime))
+                   -> IORef Word32
                    -> IORef Bool -> IORef Int64 -> IORef (Set.Set TxId)
                    -> IORef Word32 -> IORef Integer
                    -> PruneConfig -> Maybe BlockStore
@@ -3227,7 +3256,7 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- track the chain in real time and persist — not only
                       -- on the mining/RPC path.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg = case msg of
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -3555,7 +3584,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
                 `catch` (\(e :: SomeException) ->
                            putStrLn $ "putBlock (side-branch) error at height "
                                    ++ show height ++ ": " ++ show e)
-              tryP2PReorg net db hc cache mIdxMgr nextBlockRef
+              tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef
                 `catch` (\(e :: SomeException) ->
                            putStrLn $ "P2P reorg (MBlock) error at height "
                                    ++ show height ++ ": " ++ show e)
@@ -4037,7 +4066,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -4144,7 +4173,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef 
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()

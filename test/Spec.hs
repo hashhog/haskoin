@@ -149,6 +149,7 @@ import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
 import qualified ReorgIntraBlockChainSpec
 import qualified ReorgSharedTxRecreatedCoinSpec
+import qualified ReorgSharedTxPreforkSpendSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23709,6 +23710,13 @@ main = hspec $ do
   -- never cleared the tombstone, so a later connected block spending such a
   -- coin failed "Missing UTXO" and aborted the reorg.
   ReorgSharedTxRecreatedCoinSpec.spec
+
+  -- Reorg connect must see a pre-fork coin that BOTH branches spend when
+  -- the shared tx also spends an INTRA-BLOCK prevout first (P0, mainnet
+  -- 966500, 2026-09-17).  Live-path undo omits intra-block vins; positional
+  -- zip then drops the pre-fork coin and validateFullBlock reports
+  -- Missing UTXO.  Control: C1 passes pre-fix; C2 fails pre-fix.
+  ReorgSharedTxPreforkSpendSpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant

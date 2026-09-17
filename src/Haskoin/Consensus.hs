@@ -146,6 +146,11 @@ module Haskoin.Consensus
   , performReorg
   , disconnectChain
   , connectChain
+  , pairTxInputsWithUndo
+  , blockCreatedOutpoints
+  , disconnectRestoredPrevouts
+  , reorgValidationBackoffSecs
+  , reorgShouldRetry
     -- * verifychain (CVerifyDB::VerifyDB levels 2-4)
   , VerifyDbResult(..)
   , verifyDbUndoSuffix
@@ -293,7 +298,7 @@ import Control.Exception (try, catch, SomeException)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
-import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Network.Socket (SockAddr)
 import Data.Maybe (mapMaybe)
 import Data.Char (isSpace, isHexDigit)
@@ -4222,14 +4227,19 @@ connectBlockAt db net block height spentUtxos = do
               <> " (Core G19 — validation.cpp:2007 assert(is_spent))"
             Nothing -> do
               -- All gates passed; build and commit the WriteBatch.
+              -- Undo is Core-complete: one CTxInUndo per vin, including
+              -- intra-block spends synthesised from this block's own
+              -- created coins.  Pre-fix, mapMaybe over spentUtxos (the
+              -- pre-block UTXO set) dropped intra-block vins and a
+              -- later positional zip on disconnect silently dropped the
+              -- remaining pre-fork coins (mainnet 966500).
               let txids = map computeTxId txns
-                  mkTxInUndo inp = case Map.lookup (txInPrevOutput inp) spentUtxos of
-                    Just c  -> Just (TxInUndo (coinTxOut c)
-                                              (coinHeight c)
-                                              (coinIsCoinbase c))
-                    Nothing -> Nothing  -- caller's responsibility; logged below
+                  createdCoins = blockCreatedCoins height txns
                   mkTxUndo tx = TxUndo
-                    { tuPrevOutputs = mapMaybe mkTxInUndo (txInputs tx) }
+                    { tuPrevOutputs =
+                        mapMaybe (txInUndoFor spentUtxos createdCoins)
+                                 (txInputs tx)
+                    }
                   blockUndo = BlockUndo
                     { buTxUndo = map mkTxUndo (drop 1 txns)  -- skip coinbase
                     }
@@ -4586,21 +4596,19 @@ disconnectBlockAt db height block prevHash = do
                 -- Gates 7-9: restore inputs (skipped for coinbase).
                 case mUndo of
                   Nothing -> walk rest  -- coinbase has no input undo
-                  Just txundo -> do
-                    let inputs   = txInputs tx
-                        prevouts = tuPrevOutputs txundo
-                    -- Gate 7: vprevout.size() != vin.size() → FAILED.
-                    if length prevouts /= length inputs
-                      then return $ Left $
+                  Just txundo ->
+                    -- Gate 7: pair undo with vin.  Accepts Core-complete
+                    -- undo (one entry per vin) AND the historical haskoin
+                    -- shape that omitted intra-block spends (one entry per
+                    -- external vin).  Any other length is FAILED, matching
+                    -- Core's vprevout.size() != vin.size() (validation.cpp:2228).
+                    case pairTxInputsWithUndo (blockCreatedOutpoints block) tx txundo of
+                      Left err -> return $ Left $
                         "disconnectBlockAt " <> show bh
-                        <> ": tx " <> show i
-                        <> " has " <> show (length inputs)
-                        <> " inputs but undo has " <> show (length prevouts)
-                        <> " prevouts"
-                      else do
+                        <> ": tx " <> show i <> ": " <> err
+                      Right paired -> do
                         -- Gate 8: reverse-iterate inputs.
-                        let pairsIn = reverse (zip inputs prevouts)
-                        rIn <- applyInputs pairsIn
+                        rIn <- applyInputs (reverse paired)
                         case rIn of
                           Left e  -> return (Left e)
                           Right _ -> walk rest
@@ -4770,6 +4778,125 @@ rewindChainstateToPrefix db inPrefix prefixHeight mSnapBase = go (0 :: Int)
 maxReorgDepth :: Int
 maxReorgDepth = 288
 
+-- | Outpoints this block's transactions create (every vout, including
+-- unspendable).  Used to distinguish intra-block spends from pre-block
+-- spends when pairing a (possibly short) undo record with vin.
+blockCreatedOutpoints :: Block -> Set.Set OutPoint
+blockCreatedOutpoints blk = Set.fromList
+  [ OutPoint (computeTxId tx) (fromIntegral i)
+  | tx     <- blockTxns blk
+  , (i, _) <- zip [0 :: Int ..] (txOutputs tx)
+  ]
+
+-- | Coins this block creates at @height@, skipping provably-unspendable
+-- outputs (they are never inserted by 'connectBlockAt').  Intra-block
+-- spends look these up to write a Core-complete undo record (one
+-- CTxInUndo per vin, validation.cpp ConnectBlock / UpdateCoins).
+blockCreatedCoins :: Word32 -> [Tx] -> Map OutPoint Coin
+blockCreatedCoins height txns = Map.fromList
+  [ (OutPoint txid (fromIntegral i),
+     Coin txout height (txIdx == 0))
+  | (txIdx, txid, tx) <- zip3 [0 :: Int ..] (map computeTxId txns) txns
+  , (i, txout) <- zip [0..] (txOutputs tx)
+  , not (isUnspendable (txOutScript txout))
+  ]
+
+-- | Undo entry for one input: pre-block @spentUtxos@ first, then coins
+-- this block itself created (intra-block spends).
+txInUndoFor :: Map OutPoint Coin -> Map OutPoint Coin -> TxIn -> Maybe TxInUndo
+txInUndoFor spent created inp =
+  case Map.lookup (txInPrevOutput inp) spent of
+    Just c  -> Just (TxInUndo (coinTxOut c) (coinHeight c) (coinIsCoinbase c))
+    Nothing ->
+      case Map.lookup (txInPrevOutput inp) created of
+        Just c  -> Just (TxInUndo (coinTxOut c) (coinHeight c) (coinIsCoinbase c))
+        Nothing -> Nothing
+
+-- | Pair each input with its undo coin.
+--
+-- Core writes one CTxInUndo per vin, including intra-block spends, and
+-- DisconnectBlock requires @vprevout.size() == vin.size()@
+-- (validation.cpp:2228-2236).  haskoin's live connect path historically
+-- omitted intra-block prevouts from the undo record (@spentUtxos@ is the
+-- pre-block UTXO set; @mapMaybe mkTxInUndo@ drops misses), so
+-- @tuPrevOutputs@ is shorter than @txInputs@.  A positional zip then
+-- binds the first N inputs to the N external-undo coins and silently
+-- drops the rest.  Observed mainnet 966500: tx b587dffb has
+-- vin = [intra, intra, f8ee1cc1:0, intra]; undo had one entry (the
+-- pre-fork coin); zip restored it onto vin0 and the connect-side lookup
+-- of f8ee1cc1:0 returned Nothing ("Missing UTXO").
+--
+-- Two on-disk shapes:
+--   * complete: length undo == length inputs     → zip 1:1 (Core)
+--   * legacy:   length undo == length external   → zip those
+--     (external = vin whose prevout was NOT created in this block)
+-- Anything else is a real undo-shape error.
+pairTxInputsWithUndo :: Set.Set OutPoint -> Tx -> TxUndo
+                     -> Either String [(TxIn, TxInUndo)]
+pairTxInputsWithUndo created tx txUndo
+  | nUndo == nIn  = Right (zip inputs undos)
+  | nUndo == nExt = Right (zip extInputs undos)
+  | otherwise     = Left $
+      "tx undo has " ++ show nUndo ++ " prevouts, tx has "
+      ++ show nIn ++ " inputs (" ++ show nExt
+      ++ " not created in this block)"
+  where
+    inputs    = txInputs tx
+    undos     = tuPrevOutputs txUndo
+    nIn       = length inputs
+    nUndo     = length undos
+    extInputs = [ inp | inp <- inputs
+                      , not (Set.member (txInPrevOutput inp) created) ]
+    nExt      = length extInputs
+
+-- | Prevouts this block's undo restores, as (OutPoint, Coin).  Fails if
+-- the per-block TxUndo count does not match the non-coinbase tx count,
+-- or if any tx's undo cannot be paired with its inputs.
+disconnectRestoredPrevouts :: Block -> UndoData
+                           -> Either String [(OutPoint, Coin)]
+disconnectRestoredPrevouts blk undo = do
+  let created     = blockCreatedOutpoints blk
+      nonCoinbase = drop 1 (blockTxns blk)
+      txUndos     = buTxUndo (udBlockUndo undo)
+  if length txUndos /= length nonCoinbase
+    then Left $
+      "undo data has " ++ show (length txUndos)
+      ++ " TxUndo entries, but block has "
+      ++ show (length nonCoinbase) ++ " non-coinbase txs"
+    else fmap concat $ forM (zip nonCoinbase txUndos) $ \(tx, tu) -> do
+      pairs <- pairTxInputsWithUndo created tx tu
+      return
+        [ (txInPrevOutput inp,
+           Coin (tuOutput tin) (tuHeight tin) (tuCoinbase tin))
+        | (inp, tin) <- pairs
+        ]
+
+-- | Seconds to wait after @n@ consecutive full-validation reorg failures
+-- of the same (oldTip, newTip).  15s, 30s, 60s, 120s, then cap at 300s.
+-- A missing-body deferral is NOT a validation failure and does not go
+-- through this — the download path must keep filling the gap.
+reorgValidationBackoffSecs :: Int -> Int
+reorgValidationBackoffSecs n
+  | n <= 0    = 0
+  | n >= 5    = 300
+  | otherwise = 15 * (2 ^ (n - 1))
+
+-- | Whether to attempt a reorg now.  A different (oldTip, newTip) always
+-- attempts (new fork / new downloaded prefix).  The same pair waits until
+-- @lastFail + backoff(failCount)@.
+reorgShouldRetry
+  :: BlockHash -> BlockHash
+  -> POSIXTime
+  -> Maybe (BlockHash, BlockHash, Int, POSIXTime)
+  -> Bool
+reorgShouldRetry old new now mLast =
+  case mLast of
+    Nothing -> True
+    Just (o, ntip, k, t)
+      | o /= old || ntip /= new -> True
+      | otherwise ->
+          now >= t + fromIntegral (reorgValidationBackoffSecs k)
+
 -- | Pure batch-op builder for a connect-block step.  Computes the
 -- exact same RocksDB ops 'connectBlock' would write, but returns
 -- them instead of invoking 'writeBatch'.  The companion 'BlockUndo'
@@ -4800,13 +4927,11 @@ buildConnectBlockOps _net block height spentUtxos =
       prevHash = bhPrevBlock (blockHeader block)
       txns = blockTxns block
       txids = map computeTxId txns
-      mkTxInUndo inp = case Map.lookup (txInPrevOutput inp) spentUtxos of
-        Just c  -> Just (TxInUndo (coinTxOut c)
-                                  (coinHeight c)
-                                  (coinIsCoinbase c))
-        Nothing -> Nothing
+      createdCoins = blockCreatedCoins height txns
       mkTxUndo tx = TxUndo
-        { tuPrevOutputs = mapMaybe mkTxInUndo (txInputs tx) }
+        { tuPrevOutputs =
+            mapMaybe (txInUndoFor spentUtxos createdCoins) (txInputs tx)
+        }
       blockUndo = BlockUndo
         { buTxUndo = map mkTxUndo (drop 1 txns)
         }
@@ -4877,34 +5002,23 @@ buildConnectBlockOps _net block height spentUtxos =
 buildDisconnectBlockOps :: Block -> BlockHash -> UndoData
                         -> Either String [BatchOp]
 buildDisconnectBlockOps block prevHash undoData =
-  let txns = blockTxns block
-      txUndos = buTxUndo (udBlockUndo undoData)
-      nonCoinbase = drop 1 txns
-  in if length txUndos /= length nonCoinbase
-     then Left $
-       "buildDisconnectBlockOps: undo data has "
-       <> show (length txUndos)
-       <> " TxUndo entries, but block has "
-       <> show (length nonCoinbase)
-       <> " non-coinbase txs"
-     else
-       let txids = map computeTxId txns
-           restoreOps =
-             [ BatchPut (makeKey PrefixUTXO (encode (txInPrevOutput inp)))
-                        (encode (Coin { coinTxOut = tuOutput tin
-                                      , coinHeight = tuHeight tin
-                                      , coinIsCoinbase = tuCoinbase tin }))
-             | (tx, txUndo) <- zip nonCoinbase txUndos
-             , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
-             ]
-           removeOps =
-             [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
-             | (txid, tx) <- zip txids txns
-             , (i, _) <- zip [0..] (txOutputs tx)
-             ]
-           bestBlockOp =
-             [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
-       in Right (restoreOps ++ removeOps ++ bestBlockOp)
+  case disconnectRestoredPrevouts block undoData of
+    Left e -> Left e
+    Right restored ->
+      let txns  = blockTxns block
+          txids = map computeTxId txns
+          restoreOps =
+            [ BatchPut (makeKey PrefixUTXO (encode op)) (encode c)
+            | (op, c) <- restored
+            ]
+          removeOps =
+            [ BatchDelete (makeKey PrefixUTXO (encode (OutPoint txid (fromIntegral i))))
+            | (txid, tx) <- zip txids txns
+            , (i, _) <- zip [0..] (txOutputs tx)
+            ]
+          bestBlockOp =
+            [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode prevHash) ]
+      in Right (restoreOps ++ removeOps ++ bestBlockOp)
 
 --------------------------------------------------------------------------------
 -- Header Chain Types
@@ -6153,12 +6267,22 @@ unapplyBlock cache block undo = do
 
     -- Restore inputs (only for non-coinbase txs).  Walk inputs in
     -- REVERSE so block-internal restorations land bytewise-identical
-    -- to Core (validation.cpp:2233).
+    -- to Core (validation.cpp:2233).  Pair undo with vin via
+    -- 'pairTxInputsWithUndo' so a legacy (intra-block-omitted) undo
+    -- restores the EXTERNAL coins instead of positionally mis-binding
+    -- them onto the first N vins (mainnet 966500).
     case mUndo of
       Nothing -> return ()
       Just txUndo ->
-        let restorePairs = reverse $
-              zip (txInputs tx) (tuPrevOutputs txUndo)
+        let created = blockCreatedOutpoints block
+            restorePairs = reverse $ case pairTxInputsWithUndo created tx txUndo of
+              Right ps -> ps
+              Left _   ->
+                -- Shape mismatch: best-effort zip of external vins
+                -- with the undo list (truncates to the shorter).
+                let ext = [ inp | inp <- txInputs tx
+                                , not (Set.member (txInPrevOutput inp) created) ]
+                in zip ext (tuPrevOutputs txUndo)
         in forM_ restorePairs $ \(inp, inUndo) -> do
           let op = txInPrevOutput inp
           -- AccessByTxid sibling-recovery for legacy undo records.
@@ -6572,29 +6696,32 @@ reorgDisBuildPure (((_, blk), u) : rest) (opsAcc, ov) =
   in case buildDisconnectBlockOps blk prevHash u of
     Left e   -> Left e
     Right bo ->
-      let txns        = blockTxns blk
-          nonCoinbase = drop 1 txns
-          txUndos     = buTxUndo (udBlockUndo u)
-          restored =
-            [ (txInPrevOutput inp,
-               Coin (tuOutput tin) (tuHeight tin) (tuCoinbase tin))
-            | (tx, txUndo) <- zip nonCoinbase txUndos
-            , (inp, tin)   <- zip (txInputs tx) (tuPrevOutputs txUndo)
-            ]
-          created =
-            [ OutPoint (computeTxId tx) (fromIntegral i)
-            | tx     <- txns
-            , (i, _) <- zip [0 :: Int ..] (txOutputs tx)
-            ]
-          ov' = ov
-            { roAdded = foldr (\(op, c) m -> Map.insert op c m)
-                              (roAdded ov) restored
-            , roSpent = foldr Set.insert (roSpent ov) created
-            }
-          -- A restored prevout shadows any prior overlay-spent mark.
-          ov'' = ov' { roSpent = foldr (\(op, _) -> Set.delete op)
-                                       (roSpent ov') restored }
-      in reorgDisBuildPure rest (opsAcc ++ bo, ov'')
+      case disconnectRestoredPrevouts blk u of
+        Left e -> Left e
+        Right restored ->
+          -- createdSet hides this block's own outputs (they cease to
+          -- exist).  Restored prevouts are the spends this block
+          -- undoes — including, with Core-complete undo, intra-block
+          -- spends.  Net per outpoint:
+          --   * created (not restored): gone  (in spent, not in added)
+          --   * restored (not created): back  (in added, not in spent)
+          --   * both (intra-block):     gone  (deleted from both; disk
+          --     still has the pre-reorg spent coin, so lookup misses)
+          -- The last case is why we delete created from roAdded rather
+          -- than only deleting restored from roSpent: a complete undo
+          -- would otherwise resurrect an intra-block coin.
+          let createdSet = blockCreatedOutpoints blk
+              ov' = ov
+                { roAdded = foldr (\(op, c) m -> Map.insert op c m)
+                                  (roAdded ov) restored
+                , roSpent = foldr Set.insert (roSpent ov) createdSet
+                }
+              ov'' = ov'
+                { roAdded = foldr Map.delete (roAdded ov') createdSet
+                , roSpent = foldr (\(op, _) -> Set.delete op)
+                                  (roSpent ov') restored
+                }
+          in reorgDisBuildPure rest (opsAcc ++ bo, ov'')
 
 -- | IO folder for the connect side (Phase B/connect).  Mirrors
 -- 'BlockTemplate.buildReorgBatch's @buildConnectChain@: resolve every
