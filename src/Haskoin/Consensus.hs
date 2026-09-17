@@ -151,6 +151,9 @@ module Haskoin.Consensus
   , disconnectRestoredPrevouts
   , reorgValidationBackoffSecs
   , reorgShouldRetry
+  , readReorgPeakBatchOps
+  , readReorgPeakBatchBytes
+  , resetReorgPeakStats
     -- * verifychain (CVerifyDB::VerifyDB levels 2-4)
   , VerifyDbResult(..)
   , verifyDbUndoSuffix
@@ -3620,6 +3623,52 @@ resetScriptChecksTotal :: IO ()
 resetScriptChecksTotal =
   atomicModifyIORef' scriptChecksTotalRef $ \_ -> (0, ())
 
+--------------------------------------------------------------------------------
+-- Reorg peak-WriteBatch counters (test-visible)
+--
+-- 'reorgAtomic' used to concatenate every disconnect+connect BatchOp into
+-- ONE RocksDB write.  An 844-block mainnet reorg then OOM-killed the unit
+-- at the 12 G ceiling (2026-09-17, after the Missing-UTXO fix).  These
+-- counters record the largest single writeBatch issued by the last
+-- 'reorgAtomic' so a deep-reorg spec can assert peak memory is O(block)
+-- not O(depth).
+--------------------------------------------------------------------------------
+
+{-# NOINLINE reorgPeakBatchOpsRef #-}
+reorgPeakBatchOpsRef :: IORef Int
+reorgPeakBatchOpsRef = unsafePerformIO (newIORef 0)
+
+{-# NOINLINE reorgPeakBatchBytesRef #-}
+reorgPeakBatchBytesRef :: IORef Int
+reorgPeakBatchBytesRef = unsafePerformIO (newIORef 0)
+
+resetReorgPeakStats :: IO ()
+resetReorgPeakStats = do
+  writeIORef reorgPeakBatchOpsRef 0
+  writeIORef reorgPeakBatchBytesRef 0
+
+readReorgPeakBatchOps :: IO Int
+readReorgPeakBatchOps = readIORef reorgPeakBatchOpsRef
+
+readReorgPeakBatchBytes :: IO Int
+readReorgPeakBatchBytes = readIORef reorgPeakBatchBytesRef
+
+reorgBatchPayloadBytes :: [BatchOp] -> Int
+reorgBatchPayloadBytes ops =
+  sum
+    [ case op of
+        BatchPut k v  -> BS.length k + BS.length v
+        BatchDelete k -> BS.length k
+    | op <- ops
+    ]
+
+noteReorgBatch :: [BatchOp] -> IO ()
+noteReorgBatch ops = do
+  let !n = length ops
+      !b = reorgBatchPayloadBytes ops
+  atomicModifyIORef' reorgPeakBatchOpsRef $ \p -> (max p n, ())
+  atomicModifyIORef' reorgPeakBatchBytesRef $ \p -> (max p b, ())
+
 -- | Run a batch of pre-resolved script checks IN PARALLEL, returning the FIRST
 -- failure (if any) — exactly as the equivalent serial loop would have rejected.
 --
@@ -6337,34 +6386,30 @@ cacheFindSibling cache txid = atomically $ do
 -- CHECKPOINT PROTECTION: Reorganizations that would go past the last checkpoint
 -- are rejected. This prevents alternative chain attacks during IBD.
 --
--- ATOMICITY (consensus, 2026-06-06):
---   The whole reorg — every disconnect UTXO restore, every connect UTXO
---   mutation, every per-block undo record, the height index AND the
---   @PrefixBestBlock@ tip pointer — commits in ONE RocksDB 'writeBatch'.
---   This mirrors Bitcoin Core's @CCoinsViewDB::BatchWrite@
---   (txdb.cpp:100-159), which writes the entire coin batch and
---   @DB_BEST_BLOCK@ together so the on-disk coins view and the best-block
---   pointer can never disagree across a crash/flush boundary.  It is the
---   exact Phase A/B/C/D shape the live MBlock-arm reorg dispatcher
---   ('BlockTemplate.doSideBranchReorg') uses, replicated here because
---   Consensus.hs cannot import BlockTemplate.hs (module cycle).
+-- ATOMICITY (consensus, 2026-06-06, updated 2026-09-17):
+--   Each disconnect and each connect is its own RocksDB 'writeBatch':
+--   that block's UTXO mutations, undo record, height index AND the
+--   @PrefixBestBlock@ tip pointer commit together, same as the
+--   straight-line 'connectBlockAt' / 'disconnectBlockAt' path and
+--   Core's @CCoinsViewDB::BatchWrite@ (txdb.cpp:100-159).  Crash
+--   mid-reorg leaves disk at the last fully committed block;
+--   PrefixBestBlock is the resume pointer.  Peak memory is O(one
+--   block), not O(reorg depth) — the single-batch design OOM-killed
+--   an 844-block mainnet catch-up at the 12 G ceiling (2026-09-17).
+--   Core's ActivateBestChainStep is the same shape: one DisconnectTip
+--   / ConnectTip per step, FlushStateToDisk IF_NEEDED
+--   (validation.cpp).
 --
---   PRE-FIX BUG: the old 'performReorg' drove the disconnect via
---   'disconnectChain' (cache-only 'unapplyBlock') and the connect via
---   'connectChain' (cache-only 'applyBlock' + a bare 'putUndoData').
---   Neither path updated the on-disk @PrefixBestBlock@ pointer OR the
---   @PrefixBlockHeight@ active-chain index.  After a 'flushCache' +
---   restart the persisted UTXO set reflected the NEW chain while the
---   best-block pointer + height index still named the OLD chain.  The
---   startup reconciliation (Main.hs:1009-1180) reloads the active chain
---   from @PrefixBlockHeight@ and re-stamps @PrefixBestBlock@ from undo
---   records — but undo records existed for BOTH branches (the old ones
---   were never deleted), so it re-anchored to the stale old tip.  The
---   next connect then failed the ConnectBlock G1 gate
---   (@hashPrevBlock == GetBestBlock()@, validation.cpp:2333) — a
---   post-restart false-reject.  Routing through 'buildDisconnectBlockOps'
---   + 'buildConnectBlockOps' (which write the chain pointers + height
---   index inside the same batch) closes the hole.
+--   PRE-FIX BUG (2026-06-06): the old 'performReorg' drove the
+--   disconnect via 'disconnectChain' (cache-only 'unapplyBlock') and
+--   the connect via 'connectChain' (cache-only 'applyBlock' + a bare
+--   'putUndoData').  Neither path updated the on-disk @PrefixBestBlock@
+--   pointer OR the @PrefixBlockHeight@ active-chain index.  Routing
+--   through 'buildDisconnectBlockOps' + 'buildConnectBlockOps' (which
+--   write the chain pointers + height index inside the same batch)
+--   closed that hole.  PRE-FIX BUG (2026-09-17): those builders were
+--   then concatenated into ONE batch for the whole reorg, which is
+--   what exhausted 12 G.
 performReorg :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
              -> Maybe IndexManager
              -> BlockHash -> BlockHash -> IO (Either String ())
@@ -6400,20 +6445,21 @@ performReorg net cache db hc mIdxMgr oldTip newTip = do
                 Right conList ->
                   reorgAtomic net cache db hc mIdxMgr disList conList
 
--- | The atomic core shared by 'performReorg' and 'invalidateBlock'.
+-- | Incremental reorg core shared by 'performReorg' and 'invalidateBlock'.
 --
--- Accumulates the disconnect ops + connect ops into a single
--- 'WriteBatch' (Phase B), commits once (Phase C), then mirrors the
--- result into the in-memory cache + header-chain pointers (Phase D).
--- A 'connList' with the SAME hash as the fork (empty connect side) is
--- a pure disconnect (the invalidateblock case).
+-- One block per 'writeBatch' (disconnect then connect), matching Core
+-- ActivateBestChainStep (validation.cpp: one DisconnectTip / ConnectTip
+-- per step).  Each batch carries that block's UTXO mutations AND the
+-- @PrefixBestBlock@ tip pointer, so a crash mid-reorg resumes from the
+-- last committed tip rather than corrupting.  Peak memory is O(block)
+-- not O(depth) — the previous single-batch concatenation OOM-killed an
+-- 844-block mainnet catch-up at 12 G (2026-09-17).
 --
--- The connect side runs full, script-verifying 'validateFullBlock' on
--- each side-branch block BEFORE building its ops, exactly as the
--- straight-line connect path and 'BlockTemplate.buildReorgBatch' do —
--- a heavier fork whose scripts Core would reject is refused and the
--- reorg aborts with the batch never committed (disk stays at the
--- pre-reorg state).
+-- A 'conList' with no entries is a pure disconnect (invalidateblock).
+-- The connect side still runs full, script-verifying 'validateFullBlock'
+-- on each side-branch block BEFORE committing that block.  An invalid
+-- connect leaves disk at the last successful step (the fork, if none
+-- have committed) so a later kicker can resume.
 reorgAtomic :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
             -> Maybe IndexManager
                -- ^ Secondary indexes (txindex / blockfilterindex /
@@ -6438,120 +6484,141 @@ reorgAtomic net cache db hc mIdxMgr disList conList =
   -- a reorg limit (a pruned node lacking undo for a required disconnect
   -- hits a physical FatalError — it does not stay on the minority
   -- chain).  The real, pruning-aware guard is Phase A below
-  -- ('loadReorgDisconnectUndo'), which pre-loads + checksum-verifies
-  -- undo for EVERY disconnect block and fails fast (Left, nothing
-  -- mutated) if any is missing — exactly Core's missing-undo → abort
-  -- model.  On the default archive node undo is always present, so a
-  -- >288 reorg to a higher-work valid chain now succeeds instead of
-  -- being gratuitously refused (the earlier 288 cap was a Class-A
-  -- consensus divergence; loop-ledger a3baafad).
+  -- ('verifyReorgDisconnectUndo'), which checksum-verifies undo for
+  -- EVERY disconnect block (one at a time, so the undo set is not
+  -- retained) and fails fast (Left, nothing mutated) if any is missing
+  -- — exactly Core's missing-undo → abort model.
   do
-      -- Phase A — pre-load + checksum-verify undo for every disconnect
-      -- block.  Fail fast before mutating anything.
-      undoRes <- loadReorgDisconnectUndo db disList
+      resetReorgPeakStats
+      -- Phase A — checksum-verify undo for every disconnect block.
+      -- Fail fast before mutating anything.  Undo records are not
+      -- retained: each disconnect step re-reads its own.
+      undoRes <- verifyReorgDisconnectUndo db disList
       case undoRes of
         Left err -> return (Left err)
-        Right disUndos -> do
-          -- Phase B — pure batch build with a virtual UTXO overlay.
-          let disBuild = reorgDisBuildPure (zip disList disUndos)
-                                           ([], reorgEmptyOverlay)
-          case disBuild of
+        Right () -> do
+          -- Persist any dirty cache so disk is the pre-reorg source of
+          -- truth, then drop the in-memory maps.  Subsequent steps
+          -- resolve prevouts from disk (the last committed tip) so
+          -- peak RSS is one block's WriteBatch, not the overlay of
+          -- the whole reorg.
+          flushCache cache
+          disR <- reorgDisconnectIncremental cache db hc mIdxMgr disList
+          case disR of
             Left err -> return (Left err)
-            Right (disOps, ov1) -> do
-              conBuild <- reorgConBuild net cache db hc ov1 conList []
-              case conBuild of
-                Left err -> return (Left err)
-                Right conOps -> do
-                  -- Phase C — single atomic disk commit.  A crash before
-                  -- this point leaves disk fully at the pre-reorg state;
-                  -- once it returns the reorg is durable, tip + UTXO +
-                  -- undo + height index committed together.
-                  writeBatch db (WriteBatch (disOps ++ conOps))
+            Right () ->
+              reorgConnectIncremental net cache db hc mIdxMgr conList
 
-                  -- Class-A dbcache reorg-entry clear: a reorg mutates the
-                  -- on-disk UTXO set non-monotonically (disOps restore/remove +
-                  -- conOps create/spend), so the dedicated read-through mirror
-                  -- must be wiped wholesale. Placed AFTER the disk commit (disk
-                  -- durable first) and BEFORE Phase D so the rcGen bump discards
-                  -- any concurrent read-through populate that read pre-reorg
-                  -- disk. Covers ALL reorg callers (kicker, MBlock side-branch,
-                  -- invalidateblock) by living inside reorgAtomic.
-                  rcClear cache
+-- | Checksum-verify undo for every disconnect block without retaining
+-- the decoded records.  Peak undo memory is one block.
+verifyReorgDisconnectUndo :: HaskoinDB -> [(ChainEntry, Block)]
+                          -> IO (Either String ())
+verifyReorgDisconnectUndo _  [] = return (Right ())
+verifyReorgDisconnectUndo db ((_, blk) : rest) = do
+  let bh  = computeBlockHash (blockHeader blk)
+      prv = bhPrevBlock (blockHeader blk)
+  undoR <- getUndoDataVerified db bh prv
+  case undoR of
+    Left err -> return $ Left $
+      "Undo data error for " ++ show bh ++ ": " ++ err
+    Right !_u -> verifyReorgDisconnectUndo db rest
 
-                  -- Phase D — mirror disk into the in-memory cache +
-                  -- header-chain pointers.  These are process-local: if
-                  -- the process dies between Phase C and here, the next
-                  -- incarnation re-derives the cache from disk and the
-                  -- header chain from PrefixBlockHeight — no split-brain.
-                  forM_ (zip disList disUndos) $ \((_, blk), undo) ->
-                    unapplyBlock cache blk undo
-                  forM_ conList $ \(ce, blk) -> do
-                    prevMTP <- reorgPrevMtp hc ce
-                    void $ applyBlock cache net blk (ceHeight ce) prevMTP
-                                      (reorgGetMtp hc)
+-- | Disconnect oldTip-first, one writeBatch per block.  Tip pointer is
+-- in the same batch as the UTXO rewind ('buildDisconnectBlockOps').
+reorgDisconnectIncremental
+  :: UTXOCache -> HaskoinDB -> HeaderChain -> Maybe IndexManager
+  -> [(ChainEntry, Block)]
+  -> IO (Either String ())
+reorgDisconnectIncremental _     _  _  _       [] = return (Right ())
+reorgDisconnectIncremental cache db hc mIdxMgr ((ce, blk) : rest) = do
+  let bh  = computeBlockHash (blockHeader blk)
+      prv = bhPrevBlock (blockHeader blk)
+  undoR <- getUndoDataVerified db bh prv
+  case undoR of
+    Left err -> return $ Left $
+      "Undo data error for " ++ show bh ++ ": " ++ err
+    Right u ->
+      case buildDisconnectBlockOps blk prv u of
+        Left e -> return (Left e)
+        Right ops -> do
+          noteReorgBatch ops
+          writeBatch db (WriteBatch ops)
+          rcClear cache
+          atomically $ do
+            modifyTVar' (hcByHeight hc) (Map.delete (ceHeight ce))
+            case cePrev ce of
+              Nothing -> return ()
+              Just ph -> do
+                entries <- readTVar (hcEntries hc)
+                case Map.lookup ph entries of
+                  Nothing -> return ()
+                  Just parent -> do
+                    writeTVar (hcTip hc) parent
+                    writeTVar (hcHeight hc) (ceHeight parent)
+                    bumpTipGen hc
+          case mIdxMgr of
+            Just im ->
+              indexManagerDisconnectBlock im blk (ceHash ce) (ceHeight ce)
+            Nothing -> return ()
+          reorgDisconnectIncremental cache db hc mIdxMgr rest
 
-                  -- Header-chain pointer flip: rewind disconnected
-                  -- heights out of the active-height index, fold in the
-                  -- connected heights, and set the new tip.  The new tip
-                  -- is the last connect entry, or — for a pure disconnect
-                  -- (empty connect list) — the parent of the deepest
-                  -- disconnected block (the fork).
-                  newTipEntry <- reorgNewTip hc disList conList
-                  atomically $ do
-                    forM_ disList $ \(ce, _) ->
-                      modifyTVar' (hcByHeight hc) (Map.delete (ceHeight ce))
-                    forM_ conList $ \(ce, _) ->
-                      modifyTVar' (hcByHeight hc)
-                        (Map.insert (ceHeight ce) (ceHash ce))
-                    case newTipEntry of
-                      Just nt -> do
-                        writeTVar (hcTip hc) nt
-                        writeTVar (hcHeight hc) (ceHeight nt)
-                        -- Wake waitfornewblock/waitforblock/waitforblockheight.
-                        -- In the same atomically block as hcTip (lost-wakeup-safe).
-                        bumpTipGen hc
-                      Nothing -> return ()
-
-                  -- Phase E — mirror the reorg into any opted-in secondary
-                  -- indexes (txindex / blockfilterindex / coinstatsindex),
-                  -- block-by-block, so they track the ACTIVE chain.  Done
-                  -- AFTER the atomic disk commit (so each reconnected block's
-                  -- undo record is already on disk for the connect-side
-                  -- append) and AFTER the header-chain pointer flip (so the
-                  -- per-height index records line up with the new chain).
-                  --
-                  -- For the invalidateblock case 'conList' is empty, so this
-                  -- is a pure disconnect: every disconnected block calls
-                  -- 'indexManagerDisconnectBlock' -> 'coinStatsIndexRevertBlock',
-                  -- which restores the running MuHash3072 accumulator + counts
-                  -- to the pre-block state.  Without this the index would
-                  -- retain the now-disconnected chain's coins and serve a
-                  -- corrupted 'gettxoutsetinfo muhash H' after the reorg.
-                  --
-                  -- Order matters and mirrors 'doSideBranchReorg':
-                  --   * disconnect oldTip-first -> fork-child last
-                  --     ('disList' order), so each delete pulls the index tip
-                  --     back one height at a time;
-                  --   * connect fork-child first -> newTip last ('conList'
-                  --     order), so each append chains off the previous height.
-                  -- Reference: bitcoin-core/src/index/coinstatsindex.cpp
-                  -- (CustomRemove on disconnect, CustomAppend on reconnect)
-                  -- and blockfilterindex.cpp (chained filter headers).
-                  case mIdxMgr of
-                    Nothing -> return ()
-                    Just im -> do
-                      forM_ disList $ \(ce, blk) ->
-                        indexManagerDisconnectBlock im blk (ceHash ce) (ceHeight ce)
-                      forM_ conList $ \(ce, blk) -> do
-                        let bh = ceHash ce
-                        mUndo <- getUndoData db bh
-                        case mUndo of
-                          Just u ->
-                            indexManagerConnectBlock im blk
-                              (udBlockUndo u) bh (ceHeight ce)
-                          Nothing -> return ()
-
-                  return (Right ())
+-- | Connect fork-child-first, one writeBatch per block.  Prevouts are
+-- read from disk (the last committed tip); intra-block creates are
+-- omitted here and resolved inside 'validateFullBlock', same as the
+-- live connect arm.  Tip pointer is in the same batch as the UTXO
+-- mutations ('buildConnectBlockOps').
+reorgConnectIncremental
+  :: Network -> UTXOCache -> HaskoinDB -> HeaderChain -> Maybe IndexManager
+  -> [(ChainEntry, Block)]
+  -> IO (Either String ())
+reorgConnectIncremental _   _     _  _  _       [] = return (Right ())
+reorgConnectIncremental net cache db hc mIdxMgr ((ce, blk) : rest) = do
+  let bh          = computeBlockHash (blockHeader blk)
+      txns        = blockTxns blk
+      nonCoinbase = drop 1 txns
+      prevouts    = [ txInPrevOutput inp | tx <- nonCoinbase, inp <- txInputs tx ]
+  -- Disk is the last committed tip (fork-point UTXO after the
+  -- disconnect loop, then each connected block).  Omit what is not
+  -- yet on disk — intra-block creates — exactly as the live connect
+  -- arm and the overlay-era 'reorgConBuild' do.
+  spentUtxos0 <- foldM
+    (\m op -> do
+        mc <- getUTXOCoin db op
+        return $ maybe m (\c' -> Map.insert op c' m) mc)
+    Map.empty
+    prevouts
+  parentMTP <- reorgPrevMtp hc ce
+  entriesRC <- readTVarIO (hcEntries hc)
+  let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader blk))
+                      0 parentMTP
+                      (getBlockScriptFlags net bh (ceHeight ce))
+      getMtp = getMtpFromAncestry entriesRC (bhPrevBlock (blockHeader blk))
+  case validateFullBlock net cs getMtp False False blk spentUtxos0 of
+    Left err -> return $ Left $
+      "reorg connect: block " ++ show bh
+      ++ " (height " ++ show (ceHeight ce)
+      ++ ") failed full validation: " ++ err
+    Right () -> do
+      let blockOps = buildConnectBlockOps net blk (ceHeight ce) spentUtxos0
+      noteReorgBatch blockOps
+      writeBatch db (WriteBatch blockOps)
+      rcClear cache
+      atomically $ do
+        modifyTVar' (hcByHeight hc)
+          (Map.insert (ceHeight ce) (ceHash ce))
+        writeTVar (hcTip hc) ce
+        writeTVar (hcHeight hc) (ceHeight ce)
+        bumpTipGen hc
+      case mIdxMgr of
+        Just im -> do
+          mUndo <- getUndoData db bh
+          case mUndo of
+            Just u ->
+              indexManagerConnectBlock im blk
+                (udBlockUndo u) bh (ceHeight ce)
+            Nothing -> return ()
+        Nothing -> return ()
+      reorgConnectIncremental net cache db hc mIdxMgr rest
 
 -- | Resolve the new in-memory tip after a reorg.  For a non-empty
 -- connect list it's the last (highest) connected entry.  For a pure

@@ -150,6 +150,7 @@ import qualified W165ReorgAtomicSpec
 import qualified ReorgIntraBlockChainSpec
 import qualified ReorgSharedTxRecreatedCoinSpec
 import qualified ReorgSharedTxPreforkSpendSpec
+import qualified ReorgDeepIncrementalSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23717,6 +23718,11 @@ main = hspec $ do
   -- zip then drops the pre-fork coin and validateFullBlock reports
   -- Missing UTXO.  Control: C1 passes pre-fix; C2 fails pre-fix.
   ReorgSharedTxPreforkSpendSpec.spec
+
+  -- Deep reorg peak memory is O(block) not O(depth).  Live 844-block
+  -- catch-up after 09b27ba was OOM-killed at 12 G because reorgAtomic
+  -- concatenated every disconnect+connect BatchOp into one WriteBatch.
+  ReorgDeepIncrementalSpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant
