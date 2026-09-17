@@ -1935,7 +1935,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                        -- hash only, and only from peers that can serve them
                        -- (BIP-159).
                        requestForkBlocks pm' db hc rot
-                       tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef
+                       tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
                          `catch` (\(e :: SomeException) ->
                                     putStrLn $ "P2P reorg kicker error: " ++ show e)
                      return $ if progressed || stalled
@@ -1971,7 +1971,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                          modifyIORef' requestedUpToRef (max windowEnd)
                          -- Keep the fork detector hot: a competing fork can appear
                          -- mid-pipeline (a no-op on the pure linear path).
-                         tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef
+                         tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
                            `catch` (\(e :: SomeException) ->
                                       putStrLn $ "P2P reorg kicker error: " ++ show e)
                          return (rot, nextBlock, nowKick)
@@ -3011,8 +3011,15 @@ detectP2PFork db hc = do
 tryP2PReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
             -> Maybe IndexManager -> IORef Word32
             -> IORef (Maybe (BlockHash, BlockHash, Int, POSIXTime))
+            -> MVar ()
             -> IO ()
-tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef = do
+tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock =
+  -- Serialize against linear connectBlockAt AND overlapping kicker /
+  -- MBlock reorgs.  Two concurrent performReorgs of an 844-block
+  -- prefix loaded every body twice (24 G) and interleaved UTXO
+  -- writeBatches (Missing UTXO / bad-txns-nonfinal on f317c18).
+  -- Core holds cs_main across ActivateBestChainStep.
+  withMVar connectLock $ \() -> do
   mFork <- detectP2PFork db hc
   case mFork of
     Nothing -> return ()
@@ -3584,7 +3591,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 `catch` (\(e :: SomeException) ->
                            putStrLn $ "putBlock (side-branch) error at height "
                                    ++ show height ++ ": " ++ show e)
-              tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef
+              tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
                 `catch` (\(e :: SomeException) ->
                            putStrLn $ "P2P reorg (MBlock) error at height "
                                    ++ show height ++ ": " ++ show e)

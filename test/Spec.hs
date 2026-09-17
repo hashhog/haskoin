@@ -151,6 +151,7 @@ import qualified ReorgIntraBlockChainSpec
 import qualified ReorgSharedTxRecreatedCoinSpec
 import qualified ReorgSharedTxPreforkSpendSpec
 import qualified ReorgDeepIncrementalSpec
+import qualified ReorgConnectFinalitySpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23723,6 +23724,13 @@ main = hspec $ do
   -- catch-up after 09b27ba was OOM-killed at 12 G because reorgAtomic
   -- concatenated every disconnect+connect BatchOp into one WriteBatch.
   ReorgDeepIncrementalSpec.spec
+
+  -- Reorg connect finality (P0, mainnet 2026-09-17, deployed f317c18):
+  -- bad-txns-nonfinal on Core's 966500 was BIP-68 treating a missing
+  -- prefork coin as coinHeight=connecting-block; Missing UTXO at 966501
+  -- was a shared tx re-created by 966500 and spent by 966501.  Peak RSS
+  -- of a padded deep reorg is in ReorgDeepIncrementalSpec.
+  ReorgConnectFinalitySpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant

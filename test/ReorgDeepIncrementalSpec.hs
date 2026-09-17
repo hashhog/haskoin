@@ -44,10 +44,12 @@ import Control.Concurrent (forkIO, killThread, threadDelay)
 import Control.Concurrent.STM (atomically, modifyTVar', writeTVar)
 import Control.Exception (bracket)
 import Control.Monad (foldM, unless)
+import Data.Bits (shiftR)
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import Data.List (isPrefixOf)
 import Data.Word (Word8, Word32, Word64)
 import qualified Data.ByteString as BS
+import System.Mem (performGC)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 
@@ -224,6 +226,87 @@ setupDeepFork depth db = do
     , dfWinTip  = OutPoint (computeTxId (coinbaseTxAt (depth + 1) 0x0b)) 0
     }
 
+-- | Live 844-block bodies are megabytes each.  A 2 MiB OP_RETURN output
+-- makes holding the whole connect list obviously larger than one block.
+-- CheckTransaction rejects a tx whose base size exceeds 1 MB
+-- (bad-txns-oversize).  700 KiB leaves headroom for the coinbase
+-- wrapper; 40 bodies * 700 KiB is ~27 MiB if they are all retained.
+fatPadBytes :: Int
+fatPadBytes = 700 * 1024
+
+fatDepth :: Word32
+fatDepth = 40
+
+opReturnPad :: Int -> Word8 -> BS.ByteString
+opReturnPad n tag =
+  let n32 = fromIntegral n :: Word32
+      lenBytes = BS.pack
+        [ fromIntegral n32
+        , fromIntegral (n32 `shiftR` 8)
+        , fromIntegral (n32 `shiftR` 16)
+        , fromIntegral (n32 `shiftR` 24)
+        ]
+  in BS.singleton 0x6a <> BS.singleton 0x4e <> lenBytes
+     <> BS.replicate n tag
+
+fatCoinbaseTxAt :: Word32 -> Word8 -> Tx
+fatCoinbaseTxAt h tag = Tx
+  { txVersion  = 1
+  , txInputs   = [ TxIn
+      { txInPrevOutput = nullOutPoint
+      , txInScript     = encodeBip34Height h `BS.snoc` tag
+      , txInSequence   = 0xffffffff
+      } ]
+  , txOutputs  =
+      [ TxOut { txOutValue = blockRewardForNet regtest h, txOutScript = opTrue }
+      , TxOut { txOutValue = 0, txOutScript = opReturnPad fatPadBytes tag }
+      ]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
+setupFatFork :: Word32 -> S.HaskoinDB -> IO DeepFork
+setupFatFork depth db = do
+  let net     = regtest
+      genesis = netGenesisBlock net
+      gHash   = computeBlockHash (blockHeader genesis)
+      gWork   = headerWork (blockHeader genesis)
+
+  hc <- initHeaderChain net
+  rG <- connectBlockAt db net genesis 0 Map.empty
+  rG `shouldBe` Right ()
+
+  let stepLose (prevHash, work) h = do
+        let blk   = mkBlock prevHash (baseTime + h) h [fatCoinbaseTxAt h 0x0a]
+            work' = work + headerWork (blockHeader blk)
+            ce    = mkEntry blk h prevHash work' (fromIntegral h)
+        r <- connectBlockAt db net blk h Map.empty
+        r `shouldBe` Right ()
+        insertActiveTip hc ce
+        return (ceHash ce, work')
+  (loseHash, loseWork) <- foldM stepLose (gHash, gWork) [1 .. depth]
+
+  let stepWin (prevHash, work, seq0) h = do
+        let blk   = mkBlock prevHash (baseTime + 10000 + h) (h + 100000)
+                          [fatCoinbaseTxAt h 0x0b]
+            work' = work + headerWork (blockHeader blk)
+            ce    = mkEntry blk h prevHash work' seq0
+            bh    = ceHash ce
+        putBlock db bh blk
+        insertSideEntry hc ce
+        return (bh, work', seq0 + 1)
+  (winHash, winWork, _) <-
+    foldM stepWin (gHash, gWork, 10000) [1 .. depth + 1]
+
+  (winWork > loseWork) `shouldBe` True
+  return DeepFork
+    { dfHc      = hc
+    , dfLosing  = loseHash
+    , dfWinning = winHash
+    , dfLoseCb  = OutPoint (computeTxId (fatCoinbaseTxAt 1 0x0a)) 0
+    , dfWinTip  = OutPoint (computeTxId (fatCoinbaseTxAt (depth + 1) 0x0b)) 0
+    }
+
 -- | /proc/self/status VmRSS in kB.  The production unit's MemoryMax is
 -- 12 G; a few hundred coinbase blocks must not approach it.
 readVmRssKb :: IO Int
@@ -334,6 +417,34 @@ spec = do
           -- Pre-fix 256-deep is ~8x 32-deep.  Post-fix both are one block.
           ops256 `shouldSatisfy` (<= max 32 (ops32 * 2))
           bytes256 `shouldSatisfy` (<= max 4096 (bytes32 * 2))
+
+    -- The live 24 G was NOT the WriteBatch.  performReorg preloaded every
+    -- disconnect+connect body into [(ChainEntry, Block)] and held them for
+    -- the whole 844-block walk.  Coinbase-only blocks are too small to
+    -- trip the 512 MiB RSS cap; these padded bodies are not.
+    it "40-block padded reorg peak RSS is O(one block), not O(depth)" $ do
+      withTestDB "fat-40" $ \db -> do
+        fk <- setupFatFork fatDepth db
+        performGC
+        threadDelay 20000
+        base <- readVmRssKb
+        cache <- newUTXOCache db 100000
+        resetReorgPeakStats
+        (res, peakRss) <- withPeakRss $
+          performReorg regtest cache db (dfHc fk) Nothing
+                       (dfLosing fk) (dfWinning fk)
+        case res of
+          Right () -> return ()
+          Left err -> expectationFailure $
+            "fat reorg aborted: " ++ err
+        getBestBlockHash db `shouldReturn` Just (dfWinning fk)
+        let delta = peakRss - base
+        -- 40 bodies * 700 KiB ≈ 27 MiB of payload, ~90 MiB RSS if the
+        -- connect list retains every decoded body (pre-fix: 93576 kB).
+        -- Post-fix one body is loaded per step; RocksDB/GHC slop for
+        -- the UTXO writes is a few tens of MiB, not O(depth) of
+        -- decoded blocks.  Bound sits between those two.
+        delta `shouldSatisfy` (< 32 * 1024)
 
 isBestBlockPut :: BatchOp -> Bool
 isBestBlockPut (BatchPut k _) = k == makeKey PrefixBestBlock BS.empty

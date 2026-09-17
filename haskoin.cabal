@@ -189,6 +189,7 @@ test-suite haskoin-test
                , ReorgSharedTxRecreatedCoinSpec
                , ReorgSharedTxPreforkSpendSpec
                , ReorgDeepIncrementalSpec
+               , ReorgConnectFinalitySpec
                , W166WalletPersistSpec
                , W167VerifyTxOutProofHardeningSpec
                , W168GetBlockFromPeerSpec
