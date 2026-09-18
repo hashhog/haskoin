@@ -137,6 +137,9 @@ module Haskoin.Storage
   , batchPutBlockHeight
     -- * Iterator
   , iterateWithPrefix
+  , iterateWithPrefixOpts
+  , withDBSnapshot
+  , getBestBlockHashWithOpts
   , getUTXOCount
     -- * Chainstate reset (for -reindex-chainstate)
   , wipeChainstate
@@ -190,6 +193,7 @@ module Haskoin.Storage
   , streamSnapshotIntoLegacyUTXO
   , computeUtxoHashFromDB
   , computeUtxoHashFromDBPrefix
+  , computeUtxoHashFromDBPrefixWithOpts
   , deleteKeysWithPrefix
   , newSnapshotChainstate
   , writeSnapshot
@@ -464,9 +468,16 @@ putBestBlockHash db bh =
 
 -- | Retrieve the best block hash
 getBestBlockHash :: HaskoinDB -> IO (Maybe BlockHash)
-getBestBlockHash db = do
+getBestBlockHash db = getBestBlockHashWithOpts db (dbReadOpts db)
+
+-- | 'getBestBlockHash' against an explicit 'R.ReadOptions' (a RocksDB
+-- snapshot, typically).  Core's @CCoinsViewDB::GetBestBlock@ is what a
+-- coins-view cursor reports for the same snapshot
+-- (@kernel/coinstats.cpp@ ComputeUTXOStats).
+getBestBlockHashWithOpts :: HaskoinDB -> R.ReadOptions -> IO (Maybe BlockHash)
+getBestBlockHashWithOpts db opts = do
   let key = makeKey PrefixBestBlock BS.empty
-  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  mval <- R.get (dbHandle db) opts key
   return $ mval >>= either (const Nothing) Just . decode
 
 --------------------------------------------------------------------------------
@@ -1799,9 +1810,16 @@ batchPutBlockHeight height bh =
 -- Keys are visited in sorted order.
 iterateWithPrefix :: HaskoinDB -> KeyPrefix
                   -> (ByteString -> ByteString -> IO Bool) -> IO ()
-iterateWithPrefix db prefix callback = runResourceT $ do
+iterateWithPrefix db = iterateWithPrefixOpts db (dbReadOpts db)
+
+-- | 'iterateWithPrefix' against an explicit 'R.ReadOptions'.  Pass the
+-- options from 'withDBSnapshot' so a long walk sees a frozen coin set
+-- rather than whatever 'connectBlockAt' writes while it runs.
+iterateWithPrefixOpts :: HaskoinDB -> R.ReadOptions -> KeyPrefix
+                      -> (ByteString -> ByteString -> IO Bool) -> IO ()
+iterateWithPrefixOpts db opts prefix callback = runResourceT $ do
   let prefixBS = BS.singleton (prefixByte prefix)
-  R.withIterator (dbHandle db) (dbReadOpts db) $ \iter -> do
+  R.withIterator (dbHandle db) opts $ \iter -> do
     R.iterSeek iter prefixBS
     let loop = do
           valid <- R.iterValid iter
@@ -1818,6 +1836,21 @@ iterateWithPrefix db prefix callback = runResourceT $ do
                       continue <- liftIO $ callback key val
                       when continue $ R.iterNext iter >> loop
     loop
+
+-- | Pin a RocksDB snapshot and run @action@ against ReadOptions that
+-- see only that snapshot.  Core's @CCoinsViewDB::Cursor@ (txdb.cpp) is
+-- a leveldb snapshot; @ComputeUTXOStats@ (kernel/coinstats.cpp) labels
+-- the walk with @pcursor->GetBestBlock()@ of the SAME snapshot, then
+-- iterates unlocked.  Without this, 'gettxoutsetinfo' reads
+-- 'PrefixBestBlock' live, walks 'PrefixUTXO' on a later implicit
+-- iterator snapshot, and reports (stale height, advanced hash) —
+-- the 2026-09-18 BAD-BASE-READ at rung 940000.
+withDBSnapshot :: HaskoinDB -> (R.ReadOptions -> IO a) -> IO a
+withDBSnapshot db action =
+  R.withSnapshot (dbHandle db) $ \snap ->
+    action (R.defaultReadOptions { R.useSnapshot = Just snap
+                                 , R.fillCache   = False
+                                 })
 
 -- | Get count of UTXOs in the database.
 -- Useful for debugging and statistics.
@@ -3178,7 +3211,15 @@ computeUtxoHashFromDB db = computeUtxoHashFromDBPrefix db PrefixUTXO
 -- -> @encode Coin@).  The snapshot loader hashes its 'PrefixSnapshotStaging'
 -- area with this BEFORE anything reaches the live UTXO set.
 computeUtxoHashFromDBPrefix :: HaskoinDB -> KeyPrefix -> IO Hash256
-computeUtxoHashFromDBPrefix db coinPrefix = do
+computeUtxoHashFromDBPrefix db =
+  computeUtxoHashFromDBPrefixWithOpts db (dbReadOpts db)
+
+-- | 'computeUtxoHashFromDBPrefix' against an explicit 'R.ReadOptions'
+-- (a RocksDB snapshot).  Pair with 'getBestBlockHashWithOpts' on the
+-- same options so the hash and the height label describe one coin set.
+computeUtxoHashFromDBPrefixWithOpts :: HaskoinDB -> R.ReadOptions -> KeyPrefix
+                                    -> IO Hash256
+computeUtxoHashFromDBPrefixWithOpts db opts coinPrefix = do
   -- Pass 1: accumulate the SHA256 state over every coin in Core's order.
   ctxRef <- newIORef (Hash.hashInit :: Hash.Context Hash.SHA256)
   -- Core buffers ONE txid's coins at a time in a @std::map<uint32_t, Coin>@
@@ -3212,7 +3253,7 @@ computeUtxoHashFromDBPrefix db coinPrefix = do
             flushGroup
             writeIORef groupRef (Just tid, Map.singleton (outPointIndex op) coin)
   let prefixBS = BS.singleton (prefixByte coinPrefix)
-  runResourceT $ R.withIterator (dbHandle db) (dbReadOpts db) $ \iter -> do
+  runResourceT $ R.withIterator (dbHandle db) opts $ \iter -> do
     R.iterSeek iter prefixBS
     let loop = do
           valid <- R.iterValid iter

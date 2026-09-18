@@ -153,6 +153,7 @@ import qualified ReorgSharedTxPreforkSpendSpec
 import qualified ReorgDeepIncrementalSpec
 import qualified ReorgConnectFinalitySpec
 import qualified HealTipCreatedCoinSpec
+import qualified GetTxOutSetInfoSnapshotSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23739,6 +23740,11 @@ main = hspec $ do
   -- tip-created coins; N-restore asserts disconnect still restores every
   -- shared prefork spend.
   HealTipCreatedCoinSpec.spec
+
+  -- gettxoutsetinfo must pin height+hash to one RocksDB snapshot so a
+  -- mid-scan connect cannot reproduce the 2026-09-18 BAD-BASE-READ
+  -- (height frozen at the snapshot base, hash of a later coin set).
+  GetTxOutSetInfoSnapshotSpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant

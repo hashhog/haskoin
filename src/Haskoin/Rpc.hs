@@ -84,6 +84,11 @@ module Haskoin.Rpc
   , softforksFromEntry
   , mempoolErrorToRpcResponse
   , mempoolRejectToken
+    -- * gettxoutsetinfo (exported for testing — snapshot-consistent height/hash)
+  , handleGetTxOutSetInfo
+  , handleGetBlockCount
+  , handleGetBlockchainInfo
+  , computeTxOutSetAtTip
     -- * getchainstates (Bitcoin Core v23) — handler + pure core (exported for testing)
   , handleGetChainStates
   , chainStatesResultEnc
@@ -375,6 +380,7 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            -- report the validated tip ('PrefixBestBlock'
                            -- on disk), not the in-memory header tip.
                            getValidatedChainTip,
+                           getValidatedChainTipFromBest,
                            -- COINBASE_MATURITY (100) for the generate vs.
                            -- immature category split in listtransactions.
                            coinbaseMaturity,
@@ -426,9 +432,10 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          buildSpentUtxoMapFromDB,
                          getUndoData, UndoData(..), TxUndo(..), TxInUndo(..), BlockUndo(..),
                          getUTXOCount, getBlockHeight,
-                         iterateWithPrefix, KeyPrefix(..), Coin(..),
+                         iterateWithPrefix, iterateWithPrefixOpts, KeyPrefix(..), Coin(..),
                          SnapshotCoin(..), computeUtxoHash, computeUtxoMuHash,
-                         computeUtxoHashFromDBPrefix,
+                         computeUtxoHashFromDBPrefixWithOpts,
+                         withDBSnapshot, getBestBlockHashWithOpts,
                          getSnapshotBaseHash)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          PeerState(..), Version(..),
@@ -16748,9 +16755,9 @@ handleGetTxOutSetInfo server params = do
   case mHashOrHeight of
     -- ── At-tip path (no hash_or_height) — unchanged. ────────────────────
     Nothing -> case hashType of
-      "hash_serialized_3" -> compute True False
-      "muhash"            -> compute False True
-      "none"              -> compute False False
+      "hash_serialized_3" -> computeTxOutSetAtTip server True False (return ())
+      "muhash"            -> computeTxOutSetAtTip server False True (return ())
+      "none"              -> computeTxOutSetAtTip server False False (return ())
       other               -> return $ RpcResponse Null
         (toJSON $ RpcError rpcInvalidParameter
           (T.pack ("'" ++ other ++ "' is not a valid hash_type"))) Null
@@ -16828,119 +16835,135 @@ handleGetTxOutSetInfo server params = do
                           muHashEnc                                                           <>
                           pair "total_amount" (btcAmountEnc (fromIntegral (csTotalAmount cs)))
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
-    compute wantSerialized wantMuHash = do
-      -- Core reports @stats.nHeight@ / @stats.hashBlock@, which
-      -- 'GetUTXOStats' takes from the coins view's best block — the ACTIVE
-      -- VALIDATED chainstate tip, never the header index.  The set iterated
-      -- below is 'PrefixUTXO', which only 'connectBlockAt' writes, so the
-      -- coins are the validated chain's; labelling them with 'hcTip' claimed
-      -- they were a chain whose bodies had never been connected.  The
-      -- 'serveAtHeight' arm above already resolves against
-      -- 'getValidatedChainTip'; this arm was the inconsistency.
-      --
-      -- The mislabelled height is not cosmetic: the boundary harness
-      -- cross-checks @height@/@bestblock@ against the node's own tip before
-      -- trusting @hash_serialized_3@, so a header-tip label made haskoin's
-      -- (correct) hash read as an unsupported surface.  Same root cause as
-      -- 'handleDumpTxOutSet' above; see camlcoin 57ae4b0, which had both.
-      tip       <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-      let tipH    = ceHeight tip
-      countRef  <- newIORef (0 :: Int)
-      sumRef    <- newIORef (0 :: Word64)
-      bogosizeRef <- newIORef (0 :: Int)
-      diskRef   <- newIORef (0 :: Int)
-      -- Bounded walk. The previous version collected EVERY coin into a
-      -- Haskell list ('coinsRef') and every txid into a 'Set' before hashing,
-      -- so on mainnet (166M coins) the RPC needed tens of GB of live heap plus
-      -- GHC's copying-GC headroom on top. On 2026-09-09 a single
-      -- gettxoutsetinfo drove the from-genesis rig to a 94.9 GB peak and the
-      -- kernel OOM-killed it 41 minutes in, while it sat frozen on the
-      -- C(958794) anchor waiting for exactly this call. The bounded hasher
-      -- ('computeUtxoHashFromDBPrefix', a RocksDB cursor walk holding one
-      -- txid's outputs at a time) already existed and was only used by the
-      -- snapshot-load verifier. It is used here now.
-      --
-      -- transactions (distinct txids): keys under PrefixUTXO are
-      -- prefix ++ encode OutPoint = txid(32) ++ vout, and RocksDB iterates
-      -- bytewise, so all outputs of one txid are adjacent. Counting txid
-      -- CHANGES along the walk equals the size of the Set it replaces.
-      nTxnsRef  <- newIORef (0 :: Int)
-      lastTxRef <- newIORef (Nothing :: Maybe TxId)
-      -- muhash still materialises: 'computeUtxoMuHash' takes the list. It is
-      -- only requested explicitly (hash_type=muhash), never by default, and it
-      -- is left as the one known unbounded path rather than pretending
-      -- otherwise. Collected only when asked for.
-      coinsRef  <- newIORef ([] :: [SnapshotCoin])
-      iterateWithPrefix (rsDB server) PrefixUTXO $ \key val -> do
-        let opBytes = BS.drop 1 key
-        case (S.decode opBytes :: Either String OutPoint, S.decode val :: Either String Coin) of
-          (Right op, Right coin) -> do
-            modifyIORef' countRef (+1)
-            modifyIORef' sumRef   (+ txOutValue (coinTxOut coin))
-            -- bogosize: Core kernel/coinstats.cpp GetBogoSize ==
-            --   32 (txid) + 4 (vout) + 4 (height|coinbase) + 8 (amount)
-            --   + 2 (scriptPubKey len) + scriptPubKey.size().
-            modifyIORef' bogosizeRef (+ (32 + 4 + 4 + 8 + 2 + BS.length (txOutScript (coinTxOut coin))))
-            -- transactions: number of DISTINCT txids with unspent outputs
-            -- (Core CCoinsStats::nTransactions), counted as txid changes.
-            lastTx <- readIORef lastTxRef
-            let tid = outPointHash op
-            when (lastTx /= Just tid) $ do
-              writeIORef lastTxRef (Just tid)
-              modifyIORef' nTxnsRef (+1)
-            -- disk_size: impl-specific estimate of the chainstate footprint.
-            -- We approximate Core's view->EstimateSize() with the on-disk
-            -- key+value byte count (outpoint key 33B + serialized coin value).
-            modifyIORef' diskRef (+ (1 + BS.length opBytes + BS.length val))
-            when wantMuHash $ modifyIORef' coinsRef (SnapshotCoin op coin :)
-            return True
-          _ -> return True
-      n        <- readIORef countRef
-      totalSat <- readIORef sumRef
-      bogo     <- readIORef bogosizeRef
-      -- disk_size now reports Core's unflushed-leveldb 0 (see below); the
-      -- accumulated raw byte count is retained for diagnostics only.
-      _diskSize <- readIORef diskRef
-      nTxns    <- readIORef nTxnsRef
-      coins    <- readIORef coinsRef
-      -- hash_serialized_3 via the bounded cursor walk. It returns the raw
-      -- double-SHA256 digest in Core's INTERNAL byte order, exactly as the
-      -- list-based 'computeUtxoHash' did, and 'showHash256' renders that in
-      -- display order — the same convention the snapshot verifier relies on.
-      -- Proven against Core's regtest-299 value (d2b051ff…) at commit time.
-      serialized <- if wantSerialized
-                      then Just <$> computeUtxoHashFromDBPrefix (rsDB server) PrefixUTXO
-                      else return Nothing
-      let serializedEnc =
-            case serialized of
-              Just h  -> pair "hash_serialized_3" (text (showHash256 h))
-              Nothing -> mempty
-          muHashEnc =
-            if wantMuHash
-              then pair "muhash" (text (showHash256 (computeUtxoMuHash coins)))
-              else mempty
-          -- Field order mirrors Core rpc/blockchain.cpp::gettxoutsetinfo:
-          -- height, bestblock, txouts, bogosize, [hash_serialized_3|muhash],
-          -- total_amount, transactions, disk_size.
-          enc = pairs $
-                  pair "height"       (AE.word32 tipH)                              <>
-                  pair "bestblock"    (text (showHash (ceHash tip)))                 <>
-                  pair "txouts"       (AE.int n)                                    <>
-                  pair "bogosize"     (AE.int bogo)                                 <>
-                  serializedEnc                                                     <>
-                  muHashEnc                                                         <>
-                  pair "total_amount" (btcAmountEnc (fromIntegral totalSat))        <>
-                  pair "transactions" (AE.int nTxns)                               <>
-                  -- disk_size mirrors Core's CCoinsViewDB::EstimateSize()
-                  -- (rpc/blockchain.cpp gettxoutsetinfo -> stats.nDiskSize): a
-                  -- leveldb on-disk estimate that is 0 until the chainstate is
-                  -- flushed/compacted to SST files.  In the just-synced /
-                  -- unflushed state (e.g. a short regtest run) Core reports 0,
-                  -- so we report 0 here too rather than the raw key+value byte
-                  -- count (which over-reports an estimate that never matches
-                  -- Core's leveldb figure anyway).
-                  pair "disk_size"    (AE.int (0 :: Int))
-      return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
+
+-- | At-tip gettxoutsetinfo body.  @midScan@ runs after the height label
+-- is captured and before the coin-set hash is computed; production
+-- passes @return ()@.  The regression suite injects a burst of connects
+-- here to prove the label and the hash describe the same frozen set.
+--
+-- Core: kernel/coinstats.cpp ComputeUTXOStats takes cs_main only to
+-- create the coins-view cursor (a leveldb snapshot) and to read
+-- @pcursor->GetBestBlock()@; the walk then proceeds unlocked against
+-- that snapshot.  A live 'PrefixBestBlock' read paired with a later
+-- 'PrefixUTXO' walk is how the 2026-09-18 940000 gate saw height
+-- 940000 with hash 118da7d0… while the node's own importer had printed
+-- the rung value 7cfc16fc… an hour earlier and getblockcount was
+-- already at 940062.
+computeTxOutSetAtTip :: RpcServer -> Bool -> Bool -> IO () -> IO RpcResponse
+computeTxOutSetAtTip server wantSerialized wantMuHash midScan =
+  -- Core reports @stats.nHeight@ / @stats.hashBlock@ from the coins
+  -- view's best block.  ComputeUTXOStats (kernel/coinstats.cpp) takes
+  -- cs_main only to create the coins-view cursor (a leveldb snapshot)
+  -- and to read pcursor->GetBestBlock(); the walk then proceeds
+  -- unlocked against that snapshot.  We do the same with a RocksDB
+  -- snapshot: PrefixBestBlock and PrefixUTXO are read from one frozen
+  -- view, so a connect that lands while the 165 M-coin walk runs cannot
+  -- pair a stale height with an advanced hash (the 2026-09-18
+  -- BAD-BASE-READ at rung 940000).
+  withDBSnapshot (rsDB server) $ \opts -> do
+    mBest <- getBestBlockHashWithOpts (rsDB server) opts
+    tip   <- getValidatedChainTipFromBest (rsHeaderChain server) mBest
+    -- Test seam: production passes @return ()@.  The snapshot-consistency
+    -- suite connects further blocks here; they must not change this
+    -- scan's height or hash_serialized_3.
+    midScan
+    let tipH    = ceHeight tip
+    countRef  <- newIORef (0 :: Int)
+    sumRef    <- newIORef (0 :: Word64)
+    bogosizeRef <- newIORef (0 :: Int)
+    diskRef   <- newIORef (0 :: Int)
+    -- Bounded walk. The previous version collected EVERY coin into a
+    -- Haskell list ('coinsRef') and every txid into a 'Set' before hashing,
+    -- so on mainnet (166M coins) the RPC needed tens of GB of live heap plus
+    -- GHC's copying-GC headroom on top. On 2026-09-09 a single
+    -- gettxoutsetinfo drove the from-genesis rig to a 94.9 GB peak and the
+    -- kernel OOM-killed it 41 minutes in, while it sat frozen on the
+    -- C(958794) anchor waiting for exactly this call. The bounded hasher
+    -- ('computeUtxoHashFromDBPrefix', a RocksDB cursor walk holding one
+    -- txid's outputs at a time) already existed and was only used by the
+    -- snapshot-load verifier. It is used here now.
+    --
+    -- transactions (distinct txids): keys under PrefixUTXO are
+    -- prefix ++ encode OutPoint = txid(32) ++ vout, and RocksDB iterates
+    -- bytewise, so all outputs of one txid are adjacent. Counting txid
+    -- CHANGES along the walk equals the size of the Set it replaces.
+    nTxnsRef  <- newIORef (0 :: Int)
+    lastTxRef <- newIORef (Nothing :: Maybe TxId)
+    -- muhash still materialises: 'computeUtxoMuHash' takes the list. It is
+    -- only requested explicitly (hash_type=muhash), never by default, and it
+    -- is left as the one known unbounded path rather than pretending
+    -- otherwise. Collected only when asked for.
+    coinsRef  <- newIORef ([] :: [SnapshotCoin])
+    iterateWithPrefixOpts (rsDB server) opts PrefixUTXO $ \key val -> do
+      let opBytes = BS.drop 1 key
+      case (S.decode opBytes :: Either String OutPoint, S.decode val :: Either String Coin) of
+        (Right op, Right coin) -> do
+          modifyIORef' countRef (+1)
+          modifyIORef' sumRef   (+ txOutValue (coinTxOut coin))
+          -- bogosize: Core kernel/coinstats.cpp GetBogoSize ==
+          --   32 (txid) + 4 (vout) + 4 (height|coinbase) + 8 (amount)
+          --   + 2 (scriptPubKey len) + scriptPubKey.size().
+          modifyIORef' bogosizeRef (+ (32 + 4 + 4 + 8 + 2 + BS.length (txOutScript (coinTxOut coin))))
+          -- transactions: number of DISTINCT txids with unspent outputs
+          -- (Core CCoinsStats::nTransactions), counted as txid changes.
+          lastTx <- readIORef lastTxRef
+          let tid = outPointHash op
+          when (lastTx /= Just tid) $ do
+            writeIORef lastTxRef (Just tid)
+            modifyIORef' nTxnsRef (+1)
+          -- disk_size: impl-specific estimate of the chainstate footprint.
+          -- We approximate Core's view->EstimateSize() with the on-disk
+          -- key+value byte count (outpoint key 33B + serialized coin value).
+          modifyIORef' diskRef (+ (1 + BS.length opBytes + BS.length val))
+          when wantMuHash $ modifyIORef' coinsRef (SnapshotCoin op coin :)
+          return True
+        _ -> return True
+    n        <- readIORef countRef
+    totalSat <- readIORef sumRef
+    bogo     <- readIORef bogosizeRef
+    -- disk_size now reports Core's unflushed-leveldb 0 (see below); the
+    -- accumulated raw byte count is retained for diagnostics only.
+    _diskSize <- readIORef diskRef
+    nTxns    <- readIORef nTxnsRef
+    coins    <- readIORef coinsRef
+    -- hash_serialized_3 via the bounded cursor walk. It returns the raw
+    -- double-SHA256 digest in Core's INTERNAL byte order, exactly as the
+    -- list-based 'computeUtxoHash' did, and 'showHash256' renders that in
+    -- display order — the same convention the snapshot verifier relies on.
+    -- Proven against Core's regtest-299 value (d2b051ff…) at commit time.
+    serialized <- if wantSerialized
+                    then Just <$> computeUtxoHashFromDBPrefixWithOpts (rsDB server) opts PrefixUTXO
+                    else return Nothing
+    let serializedEnc =
+          case serialized of
+            Just h  -> pair "hash_serialized_3" (text (showHash256 h))
+            Nothing -> mempty
+        muHashEnc =
+          if wantMuHash
+            then pair "muhash" (text (showHash256 (computeUtxoMuHash coins)))
+            else mempty
+        -- Field order mirrors Core rpc/blockchain.cpp::gettxoutsetinfo:
+        -- height, bestblock, txouts, bogosize, [hash_serialized_3|muhash],
+        -- total_amount, transactions, disk_size.
+        enc = pairs $
+                pair "height"       (AE.word32 tipH)                              <>
+                pair "bestblock"    (text (showHash (ceHash tip)))                 <>
+                pair "txouts"       (AE.int n)                                    <>
+                pair "bogosize"     (AE.int bogo)                                 <>
+                serializedEnc                                                     <>
+                muHashEnc                                                         <>
+                pair "total_amount" (btcAmountEnc (fromIntegral totalSat))        <>
+                pair "transactions" (AE.int nTxns)                               <>
+                -- disk_size mirrors Core's CCoinsViewDB::EstimateSize()
+                -- (rpc/blockchain.cpp gettxoutsetinfo -> stats.nDiskSize): a
+                -- leveldb on-disk estimate that is 0 until the chainstate is
+                -- flushed/compacted to SST files.  In the just-synced /
+                -- unflushed state (e.g. a short regtest run) Core reports 0,
+                -- so we report 0 here too rather than the raw key+value byte
+                -- count (which over-reports an estimate that never matches
+                -- Core's leveldb figure anyway).
+                pair "disk_size"    (AE.int (0 :: Int))
+    return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 -- | scantxoutset "start" [ scanobjects ]
 --

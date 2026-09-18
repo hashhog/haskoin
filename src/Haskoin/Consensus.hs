@@ -182,6 +182,7 @@ module Haskoin.Consensus
   , addSideBranchHeader
   , getChainTip
   , getValidatedChainTip
+  , getValidatedChainTipFromBest
   , findForkPoint
   , heavierBranchHashes
   , connectableForkTip
@@ -5840,8 +5841,15 @@ getChainTip hc = readTVarIO (hcTip hc)
 -- full root-cause analysis (fuzzamoto IR-corpus replay surfaced the
 -- divergence as @getblockhash(getblockcount) != getbestblockhash@).
 getValidatedChainTip :: HaskoinDB -> HeaderChain -> IO ChainEntry
-getValidatedChainTip db hc = do
-  mBest <- getBestBlockHash db
+getValidatedChainTip db hc =
+  getBestBlockHash db >>= getValidatedChainTipFromBest hc
+
+-- | Resolve a best-block hash (from live 'PrefixBestBlock' or from a
+-- RocksDB snapshot of it) to its 'ChainEntry'.  Same fallbacks as
+-- 'getValidatedChainTip'.  Used by 'gettxoutsetinfo' so the height
+-- label is the snapshot's best block, not a later live tip.
+getValidatedChainTipFromBest :: HeaderChain -> Maybe BlockHash -> IO ChainEntry
+getValidatedChainTipFromBest hc mBest =
   case mBest of
     Nothing -> readTVarIO (hcTip hc)
     Just bh -> do
