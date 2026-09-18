@@ -326,7 +326,9 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear,
-                        putUndoData, getUndoData, getUndoDataVerified, deleteUndoData, getBlock, getUTXO, getUTXOCoin, getBlockHeight,
+                        putUndoData, getUndoData, getUndoDataVerified, deleteUndoData,
+                        getBlock, getUTXO, getUTXOCoin, getUTXOCoinHealingTip,
+                        getBlockHeight,
                         getBestBlockHash,
                         isUnspendable, Coin(..),
                         -- AssumeUTXO support
@@ -4273,7 +4275,7 @@ connectBlockAt db net block height spentUtxos = do
                   case Map.lookup (txInPrevOutput inp) spentUtxos of
                     Just _  -> return Nothing
                     Nothing -> do
-                      mc <- getUTXOCoin db (txInPrevOutput inp)
+                      mc <- getUTXOCoinHealingTip db (txInPrevOutput inp)
                       case mc of
                         Just _  -> return Nothing
                         Nothing -> return (Just (txInPrevOutput inp))
@@ -6623,7 +6625,7 @@ reorgConnectIncremental net cache db hc mIdxMgr (ce : rest) = do
       -- arm and the overlay-era 'reorgConBuild' do.
       spentUtxos0 <- foldM
         (\m op -> do
-            mc <- getUTXOCoin db op
+            mc <- getUTXOCoinHealingTip db op
             return $ maybe m (\c' -> Map.insert op c' m) mc)
         Map.empty
         prevouts

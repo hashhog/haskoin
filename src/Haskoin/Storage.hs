@@ -58,6 +58,8 @@ module Haskoin.Storage
   , getUTXO
   , putUTXOCoin
   , getUTXOCoin
+  , getUTXOCoinHealingTip
+  , healTipCreatedCoin
   , deleteUTXO
   , buildSpentUtxoMapFromDB
   , buildSpentUtxoMapCached
@@ -265,7 +267,7 @@ import qualified Data.ByteArray as BA
 import Haskoin.Types
 import qualified Haskoin.MuHash as MuHash
 import Haskoin.MuHash (MuHash3072)
-import Haskoin.Crypto (decompressPubKey)
+import Haskoin.Crypto (decompressPubKey, computeTxId)
 
 --------------------------------------------------------------------------------
 -- Cryptographic Helpers (local to avoid circular imports)
@@ -556,6 +558,107 @@ getUTXOCoin db outpoint = do
   mval <- R.get (dbHandle db) (dbReadOpts db) key
   return $ mval >>= either (const Nothing) Just . decode
 
+-- | If @op@ is a spendable output created by the current tip block and
+-- not spent by any later transaction in that block, write it into
+-- PrefixUTXO.
+--
+-- Live mainnet 966499 (2026-09-18, deployed 042d357): after disconnect
+-- of the stale 966500, PrefixUTXO held vouts 0-5 and 7 of tx
+-- @5bcc4f93…@ and not vout 6 (the only P2PKH sibling).  The stale
+-- block spent only :2, so disconnect could not restore :6 — it was
+-- never inserted when 966499 first connected.  Linear connect of
+-- Core's 966500 then failed Missing UTXO on :6.
+--
+-- Returns True iff a coin was written.
+healTipCreatedCoin :: HaskoinDB -> OutPoint -> IO Bool
+healTipCreatedCoin db op = do
+  existing <- getUTXOCoin db op
+  case existing of
+    Just _  -> return False
+    Nothing -> do
+      mBest <- getBestBlockHash db
+      case mBest of
+        Nothing -> return False
+        Just bh -> do
+          mBlk <- getBlock db bh
+          case mBlk of
+            Nothing  -> return False
+            Just blk ->
+              case createdUnspentInBlock blk op of
+                Nothing -> return False
+                Just (txout, isCB) -> do
+                  mh <- resolveTipCoinHeight db bh op
+                  case mh of
+                    Nothing -> return False
+                    Just h  -> do
+                      putUTXOCoin db op Coin
+                        { coinTxOut      = txout
+                        , coinHeight     = h
+                        , coinIsCoinbase = isCB
+                        }
+                      putStrLn $
+                        "[heal] omitted tip output restored: " ++ show op
+                        ++ " height=" ++ show h
+                      return True
+
+-- | 'getUTXOCoin' that repairs a tip-created hole before returning
+-- Nothing.  Used by the connect spent-map builders and G19 so a
+-- historical omitted output of the current tip is visible to the
+-- next block.
+getUTXOCoinHealingTip :: HaskoinDB -> OutPoint -> IO (Maybe Coin)
+getUTXOCoinHealingTip db op = do
+  mc <- getUTXOCoin db op
+  case mc of
+    Just c  -> return (Just c)
+    Nothing -> do
+      did <- healTipCreatedCoin db op
+      if did then getUTXOCoin db op else return Nothing
+
+-- | @Just (txout, isCoinbase)@ when @op@ is a spendable output of a
+-- transaction in @blk@ that no later transaction in the same block
+-- spends.
+createdUnspentInBlock :: Block -> OutPoint -> Maybe (TxOut, Bool)
+createdUnspentInBlock blk op = go (0 :: Int) (blockTxns blk)
+  where
+    go _ [] = Nothing
+    go idx (tx : rest)
+      | computeTxId tx == outPointHash op =
+          case atVout (txOutputs tx) (outPointIndex op) of
+            Nothing -> Nothing
+            Just txout
+              | isUnspendable (txOutScript txout) -> Nothing
+              | any (inputSpends op) rest         -> Nothing
+              | otherwise                         -> Just (txout, idx == 0)
+      | otherwise = go (idx + 1) rest
+
+inputSpends :: OutPoint -> Tx -> Bool
+inputSpends op tx =
+  any (\inp -> txInPrevOutput inp == op) (txInputs tx)
+
+atVout :: [a] -> Word32 -> Maybe a
+atVout xs n =
+  case drop (fromIntegral n) xs of
+    (x : _) -> Just x
+    []      -> Nothing
+
+-- | Height of the tip coin: undo record first, else a sibling output
+-- of the same txid that is already in PrefixUTXO.
+resolveTipCoinHeight :: HaskoinDB -> BlockHash -> OutPoint -> IO (Maybe Word32)
+resolveTipCoinHeight db bh op = do
+  mUndo <- getUndoData db bh
+  case mUndo of
+    Just u  -> return (Just (udHeight u))
+    Nothing -> siblingHeight 0
+  where
+    siblingHeight i
+      | i > 15 = return Nothing
+      | i == outPointIndex op = siblingHeight (i + 1)
+      | otherwise = do
+          mc <- getUTXOCoin db (OutPoint (outPointHash op) i)
+          case mc of
+            Just c  -> return (Just (coinHeight c))
+            Nothing -> siblingHeight (i + 1)
+
 -- | Delete a UTXO (when it gets spent).
 -- This is called when a transaction input references this output.
 deleteUTXO :: HaskoinDB -> OutPoint -> IO ()
@@ -587,7 +690,7 @@ buildSpentUtxoMapFromDB db block = do
                   , inp <- txInputs tx
                   ]
   pairs <- mapM (\op -> do
-                   m <- getUTXOCoin db op
+                   m <- getUTXOCoinHealingTip db op
                    return (op, m)) outpoints
   return $ Map.fromList [ (op, c) | (op, Just c) <- pairs ]
 
@@ -787,7 +890,14 @@ getUTXOCoinCached cache op = do
     Just coin -> return (Just coin)          -- lossless; identical to getUTXOCoin
     Nothing -> do
       g0 <- readTVarIO (rcGen cache)          -- sample BEFORE the lock-free read
-      mc <- getUTXOCoin (ucDB cache) op       -- lossless full Coin; never lookupUTXO
+      mc0 <- getUTXOCoin (ucDB cache) op      -- lossless full Coin; never lookupUTXO
+      mc <- case mc0 of
+        Just c  -> return (Just c)
+        Nothing -> do
+          -- Tip-created hole (live 5bcc4f93:6): repair from the tip body
+          -- before treating the miss as a real missing prevout.
+          did <- healTipCreatedCoin (ucDB cache) op
+          if did then getUTXOCoin (ucDB cache) op else return Nothing
       case mc of
         Nothing   -> return Nothing           -- do NOT cache negatives
         Just coin -> do

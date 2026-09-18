@@ -152,6 +152,7 @@ import qualified ReorgSharedTxRecreatedCoinSpec
 import qualified ReorgSharedTxPreforkSpendSpec
 import qualified ReorgDeepIncrementalSpec
 import qualified ReorgConnectFinalitySpec
+import qualified HealTipCreatedCoinSpec
 import qualified W166WalletPersistSpec
 import qualified W167VerifyTxOutProofHardeningSpec
 import qualified W168GetBlockFromPeerSpec
@@ -23731,6 +23732,13 @@ main = hspec $ do
   -- was a shared tx re-created by 966500 and spent by 966501.  Peak RSS
   -- of a padded deep reorg is in ReorgDeepIncrementalSpec.
   ReorgConnectFinalitySpec.spec
+
+  -- Live 966499/966500 (2026-09-18, 042d357): P2PKH vout 6 of a tip-created
+  -- 8-output tx was never in PrefixUTXO, so linear connect of Core's 966500
+  -- failed Missing UTXO after a clean disconnect.  Heal restores omitted
+  -- tip-created coins; N-restore asserts disconnect still restores every
+  -- shared prefork spend.
+  HealTipCreatedCoinSpec.spec
 
   -- W166 durable wallet persistence (sweep wa0fq5wtk): atomic+fsync save,
   -- save-on-mutation survives a simulated unclean restart, fault-tolerant
