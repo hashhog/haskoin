@@ -1421,6 +1421,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     reorgFailRef <- newIORef (Nothing :: Maybe (BlockHash, BlockHash, Int, POSIXTime))
     -- Track highest block we've requested (for sliding window)
     requestedUpToRef <- newIORef loadedHeight
+    -- Linear download inflight: hash -> (peerIdx, height, requestedAt).
+    -- The kicker spreads getdata across peers (16 cap) and times out
+    -- mute pipeline heads only (adda3c0). Completion is inferred from
+    -- nextBlock advancing; out-of-order bodies drain from disk.
+    linearInflightRef <- newIORef (Map.empty :: Map.Map BlockHash (Int, Word32, Int64))
+    linearFailedRef <- newIORef (Set.empty :: Set.Set Int)
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
     -- Headers-first IBD: POSIX time of the last full (>=2000) header
@@ -1867,17 +1873,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
            --     most this far ahead of the last VALIDATED (connected) block
            --     (net_processing.cpp FindNextBlocksToDownload:
            --      "if (pindex->nHeight > nWindowEnd) break").
-           --   maxBlocksInFlight = 128 — the number of DISTINCT blocks kept in
-           --     flight ahead of the connected tip.  Core caps in-flight at
-           --     MAX_BLOCKS_IN_TRANSIT_PER_PEER=16 PER PEER; haskoin's pipelined
-           --     downloader (Sync.hs) is sized for 128, and a single serving
-           --     peer streams the whole pipeline over one ordered TCP
-           --     connection, so 128 keeps the peer's send path saturated and
-           --     hides per-block validation/RTT latency.  It is also the memory
-           --     bound: <=128 * ~2 MB = ~256 MB of bodies in flight worst case.
-           -- The min of the two below binds at 128, so the pipeline never runs
-           -- more than 128 blocks ahead of the connected tip (memory-safe) and
-           -- never beyond BLOCK_DOWNLOAD_WINDOW of it (Core parity).
+           --   maxBlocksInFlight = 128 — DISTINCT blocks kept in flight
+           --     ahead of the connected tip. Core caps in-flight at
+           --     MAX_BLOCKS_IN_TRANSIT_PER_PEER=16 PER PEER; we do the
+           --     same via planLinearGetData (7 peers → 112 in flight).
+           --     Pinning all 128 to one peer was the 910023 stall.
            blockDownloadWindow = 1024 :: Word32
            maxBlocksInFlight   = 128  :: Word32
            kickerPollUsec  = 400 * 1000 :: Int    -- 0.4 s progress poll
@@ -1942,54 +1942,99 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                 then (rot + 1, nextBlock, nowKick)
                                 else (rot, lastConn, lastReqTime)
                    else do
-                     -- LINEAR DEEP PIPELINE — Core net_processing.cpp
-                     -- FindNextBlocksToDownload.  Keep up to 'maxBlocksInFlight'
-                     -- DISTINCT blocks in flight ahead of the connected tip,
-                     -- within BLOCK_DOWNLOAD_WINDOW, requesting ONLY blocks not
-                     -- already requested ('requestedUpTo'+1 .. windowEnd) — never
-                     -- the overlapping re-request the old 1-block-slide window
-                     -- did (a de-duping single peer collapsed that to ~1 new
-                     -- block/round -> ~10 blk/min).  As blocks connect the
-                     -- connected tip advances, windowEnd slides up, and the next
-                     -- tick requests exactly the drained slots — a true refilling
-                     -- pipeline (Core "MAX_BLOCKS_IN_TRANSIT_PER_PEER refill on
-                     -- arrival", net_processing.cpp:~6164), not a fixed-rate
-                     -- flat-window slide.
+                     -- LINEAR DEEP PIPELINE — Core FindNextBlocksToDownload.
+                     -- Spread getdata across capable peers (16 each), skip
+                     -- mute/LIMITED, first-byte-timeout the pipeline HEAD
+                     -- only. Pinning the whole window to one peer was the
+                     -- 910023 stall (7 peers connected, 128 hashes to 1).
                      let windowEnd = min headerTip
                                        (min (connectedTip + blockDownloadWindow)
                                             (connectedTip + maxBlocksInFlight))
                          pipeFrom  = requestedUpTo + 1
                          needNew   = windowEnd >= pipeFrom
-                     if needNew
+                     inf0 <- readIORef linearInflightRef
+                     failed0 <- readIORef linearFailedRef
+                     -- Drop connected heights; restart the mute-clock on a
+                     -- peer whose pipeline head just connected (adda3c0).
+                     let infPruned = Map.filter (\(_, ht, _) -> ht >= nextBlock) inf0
+                         oldMin = Map.fromListWith min
+                                    [ (pid, ht) | (_, (pid, ht, _)) <- Map.toList inf0 ]
+                         newMin = Map.fromListWith min
+                                    [ (pid, ht) | (_, (pid, ht, _)) <- Map.toList infPruned ]
+                         infRestarted =
+                           Map.map (\(pid, ht, reqAt) ->
+                             case (Map.lookup pid oldMin, Map.lookup pid newMin) of
+                               (Just oh, Just nh) | nh > oh -> (pid, ht, nowKick)
+                               _ -> (pid, ht, reqAt)) infPruned
+                     -- Completing a head restarts the next head's mute-clock:
+                     -- drop the stale first-byte stamp so siblings are not
+                     -- treated as already-live.
+                     forM_ (zip [0 :: Int ..] peers) $ \(i, pc) ->
+                       case (Map.lookup i oldMin, Map.lookup i newMin) of
+                         (Just oh, Just nh) | nh > oh ->
+                           writeIORef (pcBlockFirstByteAt pc) Nothing
+                         _ -> return ()
+                     -- First-byte stamps from the live sockets.
+                     fbByPeer <- fmap Map.fromList $
+                       forM (zip [0 :: Int ..] peers) $ \(i, pc) -> do
+                         fb <- readIORef (pcBlockFirstByteAt pc)
+                         return (i, fb)
+                     let pipeline =
+                           [ PipelineInflight
+                               { pifPeer = pid
+                               , pifHeight = ht
+                               , pifRequestedAt = reqAt
+                               , pifFirstByteAt =
+                                   let isHead = Map.lookup pid newMin == Just ht
+                                    in if isHead then Map.findWithDefault Nothing pid fbByPeer
+                                       else Nothing
+                               }
+                           | (_, (pid, ht, reqAt)) <- Map.toList infRestarted
+                           ]
+                         (mutePids, muteHs) = mutePipelineHeads nowKick pipeline
+                         muteSet = Set.fromList mutePids
+                         infAfterMute =
+                           Map.filter (\(pid, ht, _) ->
+                             pid `Set.notMember` muteSet && ht `notElem` muteHs)
+                             infRestarted
+                         failed1 = failed0 `Set.union` muteSet
+                         -- If every connected peer is failed, start over
+                         -- rather than stop requesting.
+                         nPeersKicker = length peers
+                         failed2 | nPeersKicker > 0 && Set.size failed1 >= nPeersKicker
+                                   = Set.empty
+                                 | otherwise = failed1
+                     when (not (null mutePids)) $ do
+                       putStrLn $ "Block-gap kicker (stall recover): re-requesting "
+                               ++ show (length muteHs) ++ " mute-head hash(es) "
+                               ++ show nextBlock ++ "-"
+                               ++ show (if null muteHs then nextBlock
+                                        else maximum muteHs)
+                               ++ " from other peers (mute peer idx "
+                               ++ show mutePids ++ ")"
+                       -- Restart the first-byte stamp on rotated peers.
+                       forM_ (zip [0 :: Int ..] peers) $ \(i, pc) ->
+                         when (i `Set.member` muteSet) $
+                           writeIORef (pcBlockFirstByteAt pc) Nothing
+                     writeIORef linearFailedRef failed2
+                     writeIORef linearInflightRef infAfterMute
+                     let refillFrom = min pipeFrom nextBlock
+                         wantFill = needNew || not (null mutePids)
+                                     || Map.size infAfterMute < fromIntegral maxBlocksInFlight
+                     if wantFill && (progressed || stalled || needNew || not (null mutePids))
                        then do
-                         -- 'requestBlockRange' streams the whole [pipeFrom..windowEnd]
-                         -- to ONE peer (chosen by 'rot') so a single ordered TCP
-                         -- connection delivers the pipeline in request order ->
-                         -- blocks connect strictly in height order against
-                         -- connectBlockAt's G1 gate, with no cross-peer reordering.
-                         requestBlockRange pm' hc pipeFrom windowEnd rot
-                         modifyIORef' requestedUpToRef (max windowEnd)
-                         -- Keep the fork detector hot: a competing fork can appear
-                         -- mid-pipeline (a no-op on the pure linear path).
+                         inf' <- requestBlockRange pm' hc refillFrom windowEnd
+                                   rot failed2 infAfterMute nowKick
+                         writeIORef linearInflightRef inf'
+                         let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
+                         unless (null assignedH) $
+                           modifyIORef' requestedUpToRef (max (maximum assignedH))
                          tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
                            `catch` (\(e :: SomeException) ->
                                       putStrLn $ "P2P reorg kicker error: " ++ show e)
-                         return (rot, nextBlock, nowKick)
-                       else if stalled && not progressed
-                         then do
-                           -- Pipeline is full (requestedUpTo == windowEnd) but the
-                           -- connected tip has not advanced for 'kickerStallSecs':
-                           -- the in-order connect is wedged on a block the current
-                           -- peer never served (notfound / drop).  Re-fetch the
-                           -- connected frontier window from a ROTATED peer so a
-                           -- single non-serving peer cannot wedge IBD (W163).
-                           let recoverEnd = min headerTip (nextBlock + maxBlocksInFlight - 1)
-                           putStrLn $ "Block-gap kicker (stall recover): re-requesting "
-                                   ++ show nextBlock ++ "-" ++ show recoverEnd
-                                   ++ " from rotated peer"
-                           requestBlockRange pm' hc nextBlock recoverEnd (rot + 1)
-                           return (rot + 1, nextBlock, nowKick)
-                         else return (rot, nextBlock, lastReqTime)
+                         let rot' = if null mutePids then rot else rot + 1
+                         return (rot', nextBlock, nowKick)
+                       else return (rot, nextBlock, lastReqTime)
              let (rot', lastConn', lastReqTime') = newSt
              -- SINGLE-PEER DOWNLOAD-STALL RECOVERY (W-TRACKB).  The 'stall
              -- recover' arm above rotates 'rot' to a "different" peer, but a
@@ -2875,45 +2920,80 @@ requestBlocks pm hc fromHeight toHeight rot = do
               return False)
           unless ok $ return ()
 
--- | Request an in-order block range from a SINGLE peer (Core-parity linear
--- download pipeline; see the block-gap kicker's LINEAR DEEP PIPELINE arm).
+-- | Request an in-order block range, spread across capable peers.
 --
--- Unlike 'requestBlocks' (which round-robins 16-block getdata batches across
--- ALL peers), this streams the whole [fromHeight..toHeight] range to ONE peer,
--- chosen by 'rot'.  A single ordered TCP connection then delivers every block
--- in request order, so the live MBlock handler connects them strictly in height
--- order against connectBlockAt's G1 gate — no cross-peer reordering, so no
--- persisted-but-unconnected build-up and no gaps.  Bodies are still chunked
--- into 16-inv getdata messages (protocol-friendly), all to the same peer, order
--- preserved.  'rot' is bumped on a stall so a non-serving peer cannot wedge IBD.
+-- Pre-fix this pinned the whole [fromHeight..toHeight] window (up to 128
+-- hashes) onto ONE peer ('peerList !! rot'). Live log after the 910000
+-- rebuild: 7 peers connected, "pipelining 128 blocks … to 1 peer", tip
+-- frozen at 910023. Now 'planLinearGetData' assigns at most 16 hashes
+-- per peer, skips NODE_NETWORK_LIMITED for historical heights, and skips
+-- mute/failed peer ids. Out-of-order bodies persist via the G1-fail
+-- putBlock path and drain onto the connected tip once the next-needed
+-- block connects.
 --
--- Reference: bitcoin-core/src/net_processing.cpp FindNextBlocksToDownload +
--- MAX_BLOCKS_IN_TRANSIT_PER_PEER (blocks in flight tracked per-peer; a single
--- peer serves its getdata queue in order).
-requestBlockRange :: PeerManager -> HeaderChain -> Word32 -> Word32 -> Int -> IO ()
-requestBlockRange pm hc fromHeight toHeight rot
-  | fromHeight > toHeight = return ()
+-- Reference: bitcoin-core/src/net_processing.cpp FindNextBlocksToDownload
+-- + MAX_BLOCKS_IN_TRANSIT_PER_PEER; blockbrew 9ccaa90 / adda3c0.
+requestBlockRange
+  :: PeerManager
+  -> HeaderChain
+  -> Word32 -> Word32
+  -> Int
+  -> Set.Set Int
+  -> Map.Map BlockHash (Int, Word32, Int64)
+  -> Int64
+  -> IO (Map.Map BlockHash (Int, Word32, Int64))
+requestBlockRange pm hc fromHeight toHeight rot failed inflight now
+  | fromHeight > toHeight = return inflight
   | otherwise = do
       peerList <- getConnectedPeerList pm
       case peerList of
-        [] -> putStrLn "No connected peers to request blocks from"
+        [] -> do
+          putStrLn "No connected peers to request blocks from"
+          return inflight
         _  -> do
           heightMap <- readTVarIO (hcByHeight hc)
-          let hashes = [ h | height <- [fromHeight..toHeight]
-                           , Just h <- [Map.lookup height heightMap] ]
-              numPeers = length peerList
-              -- One ordered peer for the entire pipeline range.
-              pc = peerList !! (rot `mod` numPeers)
-              batches = chunksOf 16 hashes
-          unless (null hashes) $ do
-            putStrLn $ "Block-gap kicker: pipelining " ++ show (length hashes)
-                     ++ " blocks (heights " ++ show fromHeight ++ "-"
-                     ++ show toHeight ++ ") to 1 peer"
-            forM_ batches $ \batch -> do
-              let invVecs = [ InvVector InvWitnessBlock (getBlockHashHash h) | h <- batch ]
-              (safeSendMessage pc (MGetData (GetData invVecs)))
-                `catch` (\(e :: SomeException) ->
-                  putStrLn $ "Failed to send getdata: " ++ show e)
+          headerTip <- readTVarIO (hcHeight hc)
+          peerSvcs <- forM peerList $ \pc -> do
+            info <- readTVarIO (pcInfo pc)
+            return (piServices info)
+          let needed =
+                [ (h, ht)
+                | ht <- [fromHeight .. toHeight]
+                , Just h <- [Map.lookup ht heightMap]
+                , not (Map.member h inflight)
+                ]
+              heightByHash = Map.fromList needed
+              peers = [ ForkGetDataPeer i svc
+                      | (i, svc) <- zip [0 ..] peerSvcs ]
+              used = Map.fromListWith (+)
+                       [ (pid, 1) | (pid, _, _) <- Map.elems inflight ]
+              plan = planLinearGetData peers needed headerTip rot failed used
+              nReq = sum (map (length . snd) plan)
+          if null plan
+            then return inflight
+            else do
+              putStrLn $ "Block-gap kicker: pipelining " ++ show nReq
+                       ++ " blocks (heights " ++ show fromHeight ++ "-"
+                       ++ show toHeight ++ ") to " ++ show (length plan)
+                       ++ " peer(s)"
+              inf' <- foldM
+                (\acc (idx, hashes) -> do
+                   let pc = peerList !! idx
+                       batches = chunksOf 16 hashes
+                   forM_ batches $ \batch -> do
+                     let invVecs =
+                           [ InvVector InvWitnessBlock (getBlockHashHash h)
+                           | h <- batch ]
+                     (safeSendMessage pc (MGetData (GetData invVecs)))
+                       `catch` (\(e :: SomeException) ->
+                         putStrLn $ "Failed to send getdata: " ++ show e)
+                   let added = Map.fromList
+                         [ (h, (idx, Map.findWithDefault 0 h heightByHash, now))
+                         | h <- hashes ]
+                   return (Map.union added acc))
+                inflight
+                plan
+              return inf'
 
 --------------------------------------------------------------------------------
 -- P2P fork-aware download + reorg routing (reorg-drop production blocker)
@@ -3716,6 +3796,22 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                       }
                 void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
                   `catch` (\(_ :: SomeException) -> return ())
+              -- Drain already-persisted next blocks. Multi-peer download
+              -- stores out-of-order bodies on the G1-fail putBlock path;
+              -- once the next-needed block connects, walk hcByHeight and
+              -- connect anything already on disk so RATE is not "wait
+              -- until we re-receive them".
+              do
+                nbDrain <- readIORef nextBlockRef
+                hmapDrain <- readTVarIO (hcByHeight hc)
+                case Map.lookup nbDrain hmapDrain of
+                  Just bhDrain -> do
+                    mBlkDrain <- getBlock db bhDrain
+                    case mBlkDrain of
+                      Just blkDrain ->
+                        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock blkDrain)
+                      Nothing -> return ()
+                  Nothing -> return ()
 
   MTx tx -> do
     let txid = computeTxId tx

@@ -215,6 +215,7 @@ test-suite haskoin-test
                , W190InboundCapSpec
                , W191ForkReorgDownloadSpec
                , W192InboundReadinessSpec
+               , W193LinearDownloadSpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , Paths_haskoin

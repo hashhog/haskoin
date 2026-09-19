@@ -118,6 +118,7 @@ addInbound pm a connectedAt noban = do
   recvQ   <- newTBQueueIO 100
   bufRef  <- newIORef BS.empty
   v2Ref   <- newIORef Nothing
+  fbRef   <- newIORef Nothing
   let pc = PeerConnection
              { pcSocket      = writerEnd
              , pcInfo        = infoVar
@@ -128,6 +129,7 @@ addInbound pm a connectedAt noban = do
              , pcNetwork     = regtest
              , pcReadBuffer  = bufRef
              , pcV2Transport = v2Ref
+             , pcBlockFirstByteAt = fbRef
              }
   atomically $ modifyTVar' (pmPeers pm) (Map.insert a pc)
 

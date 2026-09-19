@@ -106,6 +106,12 @@ module Haskoin.Network
   , peerCanServeBlock
   , ForkGetDataPeer(..)
   , planForkGetData
+  , planLinearGetData
+  , PipelineInflight(..)
+  , blockFirstByteTimeout
+  , mutePipelineHeads
+  , LinearDownloadState(..)
+  , simulateLinearDownloadRate
     -- * Protocol Constants
   , protocolVersion
   , minProtocolVersion
@@ -622,8 +628,8 @@ import Data.ByteArray (convert, ScrubbedBytes)
 import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
-import Data.Maybe (mapMaybe, listToMaybe)
-import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf)
+import Data.Maybe (mapMaybe, listToMaybe, isNothing)
+import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, minimumBy)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
 import Control.Concurrent (threadDelay)
@@ -854,6 +860,189 @@ planForkGetData peers needed headerTip rot
                  else findPeer acc h ht (i + 1)
           raw = assign Map.empty needed
       in Map.toList raw
+
+-- | Linear IBD getdata planner.
+--
+-- Live kicker ('requestBlockRange' in app/Main.hs) used to pin the whole
+-- [from..to] window (up to 128 hashes) onto ONE peer:
+--   peerList !! (rot `mod` n)
+-- That is the 910023 stall: 7 peers connected, log
+-- "pipelining 128 blocks … to 1 peer". A mute or LIMITED peer then holds
+-- the entire pipeline hostage.
+--
+-- Target behaviour (Core FindNextBlocksToDownload / blockbrew 9ccaa90):
+--   * at most 'maxBlocksInTransitPerPeer' (16) hashes per peer
+--   * skip peers that cannot serve the height (BIP-159 LIMITED window)
+--   * skip peer ids in 'failed' (mute / first-byte timeout)
+--   * oldest missing hashes first
+planLinearGetData
+  :: [ForkGetDataPeer]
+  -> [(BlockHash, Word32)]  -- ^ needed (hash, height), ascending
+  -> Word32                 -- ^ header-tip height
+  -> Int                    -- ^ rotation
+  -> Set.Set Int            -- ^ failed / mute peer ids
+  -> Map Int Int            -- ^ already in-flight count per peer id
+  -> [(Int, [BlockHash])]   -- ^ peer id → hashes
+planLinearGetData peers needed headerTip rot failed already
+  | null peers || null needed = []
+  | otherwise =
+      let n = length peers
+          assign acc [] = acc
+          assign acc ((h, ht):rest) =
+            case findPeer acc h ht 0 of
+              Nothing  -> assign acc rest
+              Just pid ->
+                assign (Map.insertWith (flip (++)) pid [h] acc) rest
+          findPeer _acc _h _ht i
+            | i >= n = Nothing
+          findPeer acc h ht i =
+            let p    = peers !! ((rot + i) `mod` n)
+                pid  = fgdpId p
+                used = length (Map.findWithDefault [] pid acc)
+                       + Map.findWithDefault 0 pid already
+            in if pid `Set.notMember` failed
+                  && used < maxBlocksInTransitPerPeer
+                  && peerCanServeBlock (fgdpServices p) headerTip ht
+                 then Just pid
+                 else findPeer acc h ht (i + 1)
+          raw = assign Map.empty needed
+      in Map.toList raw
+
+-- | One in-flight body on the linear download pipeline.
+data PipelineInflight = PipelineInflight
+  { pifPeer        :: !Int
+  , pifHeight      :: !Word32
+  , pifRequestedAt :: !Int64
+  , pifFirstByteAt :: !(Maybe Int64)
+  } deriving (Show, Eq)
+
+-- | Mute (no first byte of the body) timeout. Bitcoin P2P is one message
+-- per connection, so this applies to the pipeline HEAD only — siblings
+-- queued behind a live head are waiting on the same TCP stream, not mute
+-- (blockbrew adda3c0). 16s, not the complete-transfer window.
+blockFirstByteTimeout :: Int64
+blockFirstByteTimeout = 16
+
+-- | Peers whose PIPELINE HEAD has produced no first byte within
+-- 'blockFirstByteTimeout'. Siblings queued behind a live head are not
+-- mute (Bitcoin P2P is one message per connection). A mute head rotates
+-- the whole peer pipeline so siblings are not pinned on a non-head clock.
+mutePipelineHeads :: Int64 -> [PipelineInflight] -> ([Int], [Word32])
+mutePipelineHeads now xs
+  | null xs = ([], [])
+  | otherwise =
+      let byPeer = Map.fromListWith (++) [(pifPeer x, [x]) | x <- xs]
+          mutePids =
+            [ pid
+            | (pid, ys) <- Map.toList byPeer
+            , -- Wire head = oldest request (Bitcoin P2P is one message
+              -- per connection). Lowest height is the connect head, not
+              -- the socket head: reassigned next-needed hashes sit
+              -- behind an in-flight body and must not look mute.
+              let headX = minimumBy
+                    (comparing pifRequestedAt <> comparing pifHeight) ys
+            , isNothing (pifFirstByteAt headX)
+            , now - pifRequestedAt headX >= blockFirstByteTimeout
+            ]
+          muteSet = Set.fromList mutePids
+          heights =
+            [ pifHeight x | x <- xs, pifPeer x `Set.member` muteSet ]
+       in (mutePids, heights)
+
+-- | Deterministic IBD-download simulator used by the RATE control.
+-- Each tick: live peers stamp first-byte on their pipeline head or
+-- complete a previously-stamped head (one message per connection);
+-- mute peers deliver nothing; timed-out heads are reassigned;
+-- bodies already received connect in height order (disk drain).
+data LinearDownloadState = LinearDownloadState
+  { ldsTip      :: !Word32
+  , ldsInflight :: ![PipelineInflight]
+  , ldsHaveBody :: !(Set.Set Word32)
+  , ldsFailed   :: !(Set.Set Int)
+  } deriving (Show, Eq)
+
+linearSimHash :: Word32 -> BlockHash
+linearSimHash h =
+  BlockHash (Hash256 (BS.replicate 28 0 <> encode h))
+
+simulateLinearDownloadRate
+  :: [Bool]   -- ^ mute flag per peer id (index = fgdpId)
+  -> Word32   -- ^ blocks to download (heights 1..n)
+  -> Int      -- ^ ticks (1 tick = 1s)
+  -> LinearDownloadState
+simulateLinearDownloadRate muteFlags nBlocks nTicks =
+  foldl' tick initState [1 .. nTicks]
+  where
+    nPeers = length muteFlags
+    peers =
+      [ ForkGetDataPeer i (combineServices [nodeNetwork, nodeWitness])
+      | i <- [0 .. nPeers - 1]
+      ]
+    headerTip = nBlocks
+    initState =
+      LinearDownloadState
+        { ldsTip = 0
+        , ldsInflight = []
+        , ldsHaveBody = Set.empty
+        , ldsFailed = Set.empty
+        }
+    tick st t =
+      let now = fromIntegral t :: Int64
+          (inf1, have1) = deliverLive muteFlags now (ldsInflight st) (ldsHaveBody st)
+          (mutePids, _muteHs) = mutePipelineHeads now inf1
+          inf2 = [ x | x <- inf1, pifPeer x `notElem` mutePids ]
+          failed' = ldsFailed st `Set.union` Set.fromList mutePids
+          tip' = drainTip (ldsTip st) have1
+          inflightHs = Set.fromList (map pifHeight inf2)
+          assigned = inflightHs `Set.union` have1
+          windowEnd = min nBlocks (tip' + 128)
+          needed =
+            [ (linearSimHash h, h)
+            | h <- [tip' + 1 .. windowEnd]
+            , h `Set.notMember` assigned
+            ]
+          rot = Set.size failed'
+          used = Map.fromListWith (+) [ (pifPeer x, 1) | x <- inf2 ]
+          plan = planLinearGetData peers needed headerTip rot failed' used
+          heightOf = Map.fromList [ (linearSimHash h, h) | h <- [1 .. nBlocks] ]
+          newInf =
+            [ PipelineInflight
+                { pifPeer = pid
+                , pifHeight = ht
+                , pifRequestedAt = now
+                , pifFirstByteAt = Nothing
+                }
+            | (pid, hs) <- plan
+            , bh <- hs
+            , Just ht <- [Map.lookup bh heightOf]
+            ]
+       in LinearDownloadState
+            { ldsTip = tip'
+            , ldsInflight = inf2 ++ newInf
+            , ldsHaveBody = have1
+            , ldsFailed = failed'
+            }
+
+    drainTip tip have
+      | Set.member (tip + 1) have = drainTip (tip + 1) have
+      | otherwise = tip
+
+    deliverLive flags _now inflight have =
+      let grouped = Map.fromListWith (++) [(pifPeer x, [x]) | x <- inflight]
+          step (infAcc, haveAcc) (pid, xs) =
+            if pid >= 0 && pid < length flags && flags !! pid
+              then (infAcc ++ xs, haveAcc)
+              else
+                -- Wire order: oldest request first (one message / connection).
+                let ordered = sortBy (comparing pifRequestedAt <> comparing pifHeight) xs
+                 in case ordered of
+                      [] -> (infAcc, haveAcc)
+                      (h : rest) ->
+                        -- One body per tick per live peer (stamp+complete).
+                        ( infAcc ++ rest
+                        , Set.insert (pifHeight h) haveAcc
+                        )
+       in foldl' step ([], have) (Map.toList grouped)
 
 --------------------------------------------------------------------------------
 -- Message Header (24 bytes)
@@ -2220,6 +2409,12 @@ data PeerConnection = PeerConnection
                   -- ^ BIP-324 v2 cipher state once handshake completes.
                   -- 'Nothing' for v1 peers; 'sendMessage' / 'receiveMessage'
                   -- dispatch on this to apply v2 framing/encryption.
+  , pcBlockFirstByteAt :: !(IORef (Maybe Int64))
+                  -- ^ POSIX seconds when the current inbound 'block'
+                  -- message header was decoded (v1) — the pipeline-head
+                  -- first-byte stamp. Nothing = no block payload in
+                  -- flight on this socket. adda3c0: siblings queued
+                  -- behind a live head are not mute.
   }
 
 -- | Configuration for establishing peer connections
@@ -2304,6 +2499,7 @@ connectPeer config host port = do
         recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
         bufRef <- newIORef BS.empty
         v2Ref  <- newIORef Nothing
+        fbRef  <- newIORef Nothing
         return PeerConnection
           { pcSocket      = sock
           , pcInfo        = infoVar
@@ -2314,6 +2510,7 @@ connectPeer config host port = do
           , pcNetwork     = pcfgNetwork config
           , pcReadBuffer  = bufRef
           , pcV2Transport = v2Ref
+          , pcBlockFirstByteAt = fbRef
           }
   case result of
     Left e   -> return $ Left (show e)
@@ -2429,18 +2626,28 @@ receiveMessage pc = do
               | mhLength header > fromIntegral maxProtocolMessageLength ->
                   return $ Left "Payload too large"
               | otherwise -> do
+                  -- Pipeline-head first-byte: the 24-byte header has the
+                  -- command. A 'block' payload then streams; siblings
+                  -- queued behind it are not mute (adda3c0).
+                  when (mhCommand header == "block") $ do
+                    nowFB <- round <$> getPOSIXTime
+                    writeIORef (pcBlockFirstByteAt pc) (Just nowFB)
                   -- Read payload
                   let payloadLen = fromIntegral (mhLength header)
                   mPayload <- recvExact pc payloadLen
                   case mPayload of
-                    Nothing -> return $ Left "Connection closed during payload"
+                    Nothing -> do
+                      writeIORef (pcBlockFirstByteAt pc) Nothing
+                      return $ Left "Connection closed during payload"
                     Just payload -> do
                       -- Verify checksum
                       let checkBytes = BS.take 4 $ getHash256 $ doubleSHA256 payload
                           checksumOk = either (const False) (== mhChecksum header)
                                          (runGet getWord32le checkBytes)
                       if not checksumOk
-                        then return $ Left "Checksum mismatch"
+                        then do
+                          writeIORef (pcBlockFirstByteAt pc) Nothing
+                          return $ Left "Checksum mismatch"
                         else do
                           -- Update stats
                           atomically $ modifyTVar' (pcInfo pc) $ \i ->
@@ -4489,6 +4696,7 @@ startInboundListenerOn pm specs = do
       recvQ <- newTBQueueIO 100
       bufRef <- newIORef BS.empty
       v2Ref  <- newIORef Nothing
+      fbRef  <- newIORef Nothing
       -- BIP-324: advertise NODE_P2P_V2 (0x800) to inbound peers iff v2 is
       -- enabled (flag bound to the action), so inbound peers see the same
       -- honest service-bit picture as outbound dials.
@@ -4503,6 +4711,7 @@ startInboundListenerOn pm specs = do
             , pcNetwork     = pmNetwork pm
             , pcReadBuffer  = bufRef
             , pcV2Transport = v2Ref
+            , pcBlockFirstByteAt = fbRef
             }
       -- Perform inbound handshake (receive version first, then send ours)
       let net = pmNetwork pm
@@ -4897,6 +5106,7 @@ insertTestPeer pm addr info = do
   recvQ   <- newTBQueueIO 16
   bufRef  <- newIORef BS.empty
   v2Ref   <- newIORef Nothing
+  fbRef   <- newIORef Nothing
   let pc = PeerConnection
         { pcSocket      = sock
         , pcInfo        = infoVar
@@ -4907,6 +5117,7 @@ insertTestPeer pm addr info = do
         , pcNetwork     = pmNetwork pm
         , pcReadBuffer  = bufRef
         , pcV2Transport = v2Ref
+        , pcBlockFirstByteAt = fbRef
         }
   atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
 
@@ -11166,6 +11377,7 @@ createPeerConnectionFromSocket config sock _host = do
     recvQ <- newTBQueueIO (fromIntegral $ pcfgQueueSize config)
     bufRef <- newIORef BS.empty
     v2Ref  <- newIORef Nothing
+    fbRef  <- newIORef Nothing
     return PeerConnection
       { pcSocket     = sock
       , pcInfo       = infoVar
@@ -11176,6 +11388,7 @@ createPeerConnectionFromSocket config sock _host = do
       , pcNetwork    = pcfgNetwork config
       , pcReadBuffer = bufRef
       , pcV2Transport = v2Ref
+      , pcBlockFirstByteAt = fbRef
       }
   case result of
     Left e   -> return $ Left (show e)
