@@ -286,6 +286,21 @@ test-suite service-flags
   default-language: Haskell2010
   ghc-options:     -Wall -O2
 
+-- QUEUES.md 2026-09-19: persistent CCheckQueue + --par. Dedicated target so
+-- the before-control (`cabal run parallel-script`) is compile-red (unknown
+-- target) rather than 0 matching hspec examples.
+test-suite parallel-script
+  type:          exitcode-stdio-1.0
+  main-is:       ParallelScriptSpec.hs
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , time
+  default-language: Haskell2010
+  ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+
 test-suite sighash-vectors
   type:          exitcode-stdio-1.0
   main-is:       SighashVectors.hs

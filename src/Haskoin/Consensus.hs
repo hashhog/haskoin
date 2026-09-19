@@ -290,6 +290,31 @@ module Haskoin.Consensus
   , initGlobalSigCache
   , lookupGlobalSigCache
   , insertGlobalSigCache
+    -- * Parallel script verification (CCheckQueue)
+    --   Persistent worker pool. --par mapping matches Core
+    --   chainstatemanager_args.cpp:53-60 (0=auto, 1=serial, <0 leave cores
+    --   free) WITHOUT Core's MAX_SCRIPTCHECK_THREADS=15 cap — the point of
+    --   this change on a 32-core box is to use the cores. The connecting
+    --   thread joins as master. Failure is the LOWEST-INDEX reason so
+    --   worker count cannot change the decision.
+  , ScriptCheckItem(..)
+  , ScriptCheckResult(..)
+  , ScriptCheckQueue
+  , scriptCheckBatchSize
+  , defaultScriptCheckThreads
+  , cpuCount
+  , resolveScriptCheckWorkers
+  , setConfiguredPar
+  , getConfiguredPar
+  , extraWorkers
+  , hasThreads
+  , maxInFlight
+  , newScriptCheckQueue
+  , shutdownScriptCheckQueue
+  , runScriptCheckQueue
+  , startGlobalScriptCheckQueue
+  , stopGlobalScriptCheckQueue
+  , scriptCheckResultToEither
   ) where
 
 import Data.ByteString (ByteString)
@@ -300,17 +325,20 @@ import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
 import Data.List (sort, sortBy, foldl')
 import Numeric (showHex)
-import Control.Monad (when, unless, forM, forM_, foldM, forever, void)
-import Control.Parallel.Strategies (withStrategy, parListChunk, rdeepseq)
+import Control.Monad (when, unless, forM, forM_, foldM, forever, void, replicateM)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.Vector as V
+import Data.Vector (Vector)
 import qualified Data.Set as Set
 import Data.Serialize (encode, runPut, putWord32le, putWord64le, putByteString)
 import GHC.Generics (Generic)
 import Control.Concurrent.STM
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
-import Control.Exception (try, catch, SomeException)
+import Control.Exception (try, catch, SomeException, bracket_, evaluate)
+import GHC.Conc (getNumProcessors, getNumCapabilities, setNumCapabilities)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
@@ -3693,82 +3721,298 @@ noteReorgBatch ops = do
   atomicModifyIORef' reorgPeakBatchOpsRef $ \p -> (max p n, ())
   atomicModifyIORef' reorgPeakBatchBytesRef $ \p -> (max p b, ())
 
+--------------------------------------------------------------------------------
+-- Persistent ScriptCheckQueue (Core CCheckQueue)
+--
+-- Bitcoin Core: -par (init.cpp:513), CCheckQueue (src/checkqueue.h),
+-- CScriptCheck batched per-input in ConnectBlock (validation.cpp). Extra
+-- worker threads drain a bounded job vector; the connecting thread joins as
+-- the master; the block is accepted only if every check returns true.
+--
+-- GHC sparks (parListChunk) were the previous dispatch. Live measurement
+-- on 2026-09-19 showed haskoin at 0.99 cores during bulk validation on a
+-- 32-core box — sparks fizzle, threads exist, parallel verification does
+-- not. This pool uses real forkIO workers + STM wake, batch size 128,
+-- and reports the LOWEST-INDEX failure so 1 worker and N cannot disagree.
+--
+-- We do not apply Core's MAX_SCRIPTCHECK_THREADS=15 cap.
+--------------------------------------------------------------------------------
+
+-- | Core CCheckQueue nBatchSize (validation.cpp:6136).
+scriptCheckBatchSize :: Int
+scriptCheckBatchSize = 128
+
+-- | Core DEFAULT_SCRIPTCHECK_THREADS = 0 (auto).
+defaultScriptCheckThreads :: Int
+defaultScriptCheckThreads = 0
+
+-- | Hardware thread count. Cached; getNumProcessors does not change.
+{-# NOINLINE cpuCount #-}
+cpuCount :: Int
+cpuCount = unsafePerformIO $ do
+  n <- getNumProcessors
+  return (max 1 n)
+
+-- | Core node/chainstatemanager_args.cpp:53-60:
+--   par=0  → auto: NumCPU()-1 extra workers (master + extras == every core)
+--   par=1  → serial: 0 extra workers
+--   par=n>1 → n-1 extra workers
+--   par=-n → NumCPU()-n-1 extra workers (leave |n| cores free)
+resolveScriptCheckWorkers :: Int -> Int
+resolveScriptCheckWorkers par =
+  let scriptThreads = if par <= 0 then par + cpuCount else par
+      extra = scriptThreads - 1
+  in max 0 extra
+
+{-# NOINLINE configuredParRef #-}
+configuredParRef :: IORef Int
+configuredParRef = unsafePerformIO (newIORef defaultScriptCheckThreads)
+
+setConfiguredPar :: Int -> IO ()
+setConfiguredPar n = writeIORef configuredParRef n
+
+getConfiguredPar :: IO Int
+getConfiguredPar = readIORef configuredParRef
+
+-- | Result of one queue drain. 'scfIndex' is the job index (block-order
+-- concatenation of per-input checks), not sciInputIdx. The reason string
+-- is byte-identical to the serial loop's 'verifyScriptCheckItem' error.
+data ScriptCheckResult
+  = ScriptCheckOK
+  | ScriptCheckFail { scfIndex :: !Int, scfReason :: !String }
+  deriving (Eq, Show)
+
+scriptCheckResultToEither :: ScriptCheckResult -> Either String ()
+scriptCheckResultToEither ScriptCheckOK = Right ()
+scriptCheckResultToEither (ScriptCheckFail _ reason) = Left reason
+
+-- | One in-flight batch. IORefs are the mutable claim/result state;
+-- the vector is shared read-only across workers.
+data ActiveJob = ActiveJob
+  { ajFlags    :: !ScriptFlags
+  , ajItems    :: !(Vector ScriptCheckItem)
+  , ajNext     :: !(IORef Int)
+  , ajInFlight :: !(IORef Int)
+  , ajFails    :: !(IORef (Map Int String))
+  }
+
+data QCtl = QCtl
+  { qcGen  :: !Int
+  , qcStop :: !Bool
+  , qcJob  :: !(Maybe ActiveJob)
+  }
+
+-- | Persistent CCheckQueue analog. extraWorkers extra threads plus the
+-- connecting thread as master. In-flight is bounded by
+-- 'scriptCheckBatchSize' * (extra + 1), not by the job count.
+data ScriptCheckQueue = ScriptCheckQueue
+  { scqExtra       :: !Int
+  , scqControl     :: !(MVar ())
+  , scqCtl         :: !(TVar QCtl)
+  , scqWorkersDone :: !(TVar Int)
+  , scqMaxInFlight :: !(IORef Int)
+  , scqWorkers     :: ![Async ()]
+  }
+
+extraWorkers :: ScriptCheckQueue -> Int
+extraWorkers = scqExtra
+
+hasThreads :: ScriptCheckQueue -> Bool
+hasThreads q = scqExtra q > 0
+
+maxInFlight :: ScriptCheckQueue -> IO Int
+maxInFlight = readIORef . scqMaxInFlight
+
+bumpMaxInFlight :: ScriptCheckQueue -> Int -> IO ()
+bumpMaxInFlight q n =
+  atomicModifyIORef' (scqMaxInFlight q) $ \m -> (max m n, ())
+
+-- | Claim up to nBatchSize items (Core checkqueue.h:121) and run them.
+-- In-flight is the number of currently-claimed items across all workers.
+claimAndRun :: ScriptCheckQueue -> ActiveJob -> IO ()
+claimAndRun q job = loop
+  where
+    n = V.length (ajItems job)
+    extra = scqExtra q
+    loop = do
+      claimed <- atomicModifyIORef' (ajNext job) $ \i ->
+        if i >= n
+          then (i, Nothing)
+          else
+            let remaining = n - i
+                denom = extra + 2
+                raw = remaining `div` denom
+                nNow = min remaining (max 1 (min scriptCheckBatchSize raw))
+            in (i + nNow, Just (i, nNow))
+      case claimed of
+        Nothing -> return ()
+        Just (start, nNow) -> do
+          old <- atomicModifyIORef' (ajInFlight job) $ \x -> (x + nNow, x)
+          bumpMaxInFlight q (old + nNow)
+          forM_ [start .. start + nNow - 1] $ \i -> do
+            let item = ajItems job V.! i
+            er <- try (evaluate (verifyScriptCheckItem (ajFlags job) item))
+                    :: IO (Either SomeException (Maybe String))
+            case er of
+              Left ex ->
+                atomicModifyIORef' (ajFails job) $ \m ->
+                  ( Map.insert i
+                      ("script verify failed (input "
+                       ++ show (sciInputIdx item) ++ "): " ++ show ex)
+                      m
+                  , ()
+                  )
+              Right Nothing -> return ()
+              Right (Just err) ->
+                atomicModifyIORef' (ajFails job) $ \m ->
+                  (Map.insert i err m, ())
+          atomicModifyIORef' (ajInFlight job) $ \x -> (x - nNow, ())
+          loop
+
+scriptCheckWorkerLoop :: ScriptCheckQueue -> Int -> IO ()
+scriptCheckWorkerLoop q lastGen = do
+  ctl <- atomically $ do
+    c <- readTVar (scqCtl q)
+    when (not (qcStop c) && qcGen c == lastGen) retry
+    return c
+  if qcStop ctl
+    then return ()
+    else do
+      case qcJob ctl of
+        Nothing -> return ()
+        Just job ->
+          claimAndRun q job
+            `catch` \(_ :: SomeException) -> return ()
+      atomically $ modifyTVar' (scqWorkersDone q) (+1)
+      scriptCheckWorkerLoop q (qcGen ctl)
+
+newScriptCheckQueue :: Int -> IO ScriptCheckQueue
+newScriptCheckQueue extraWorkersNum = do
+  let extra = max 0 extraWorkersNum
+  control <- newMVar ()
+  ctl <- newTVarIO (QCtl 0 False Nothing)
+  done <- newTVarIO 0
+  maxIF <- newIORef 0
+  let q0 =
+        ScriptCheckQueue
+          { scqExtra = extra
+          , scqControl = control
+          , scqCtl = ctl
+          , scqWorkersDone = done
+          , scqMaxInFlight = maxIF
+          , scqWorkers = []
+          }
+  workers <-
+    if extra == 0
+      then return []
+      else replicateM extra (async (scriptCheckWorkerLoop q0 0))
+  return q0 { scqWorkers = workers }
+
+shutdownScriptCheckQueue :: ScriptCheckQueue -> IO ()
+shutdownScriptCheckQueue q = do
+  takeMVar (scqControl q)
+  atomically $ modifyTVar' (scqCtl q) $ \c ->
+    c { qcStop = True, qcGen = qcGen c + 1, qcJob = Nothing }
+  mapM_ waitCatch (scqWorkers q)
+  putMVar (scqControl q) ()
+
+-- | Drain 'items' on the persistent pool. The connecting thread joins as
+-- master (Core CCheckQueue::Complete). After every claimed job finishes,
+-- the LOWEST-INDEX failure is the result — worker count cannot change it.
+runScriptCheckQueue :: ScriptCheckQueue -> ScriptFlags -> [ScriptCheckItem]
+                    -> IO ScriptCheckResult
+runScriptCheckQueue q flags items =
+  bracket_ (takeMVar (scqControl q)) (putMVar (scqControl q) ()) $ do
+    writeIORef (scqMaxInFlight q) 0
+    let vec = V.fromList items
+        n = V.length vec
+    if n == 0
+      then return ScriptCheckOK
+      else do
+        job <-
+          ActiveJob flags vec
+            <$> newIORef 0
+            <*> newIORef 0
+            <*> newIORef Map.empty
+        atomically $ writeTVar (scqWorkersDone q) 0
+        atomically $ modifyTVar' (scqCtl q) $ \c ->
+          c { qcGen = qcGen c + 1, qcJob = Just job }
+        -- Master joins as the Nth worker.
+        claimAndRun q job
+        when (scqExtra q > 0) $
+          atomically $ do
+            d <- readTVar (scqWorkersDone q)
+            when (d < scqExtra q) retry
+        atomically $ modifyTVar' (scqCtl q) $ \c -> c { qcJob = Nothing }
+        fails <- readIORef (ajFails job)
+        case Map.lookupMin fails of
+          Nothing -> return ScriptCheckOK
+          Just (i, err) -> return (ScriptCheckFail i err)
+
+{-# NOINLINE globalScriptCheckQueueRef #-}
+globalScriptCheckQueueRef :: IORef (Maybe ScriptCheckQueue)
+globalScriptCheckQueueRef = unsafePerformIO (newIORef Nothing)
+
+-- | Start the process-wide pool from 'getConfiguredPar'. Returns the extra
+-- worker count. Bumps GHC capabilities so extra workers can actually run
+-- (the executable's @-N4@ RTS default is not enough for --par=0 on this box).
+startGlobalScriptCheckQueue :: IO Int
+startGlobalScriptCheckQueue = do
+  mq <- readIORef globalScriptCheckQueueRef
+  case mq of
+    Just q -> return (scqExtra q)
+    Nothing -> do
+      par <- getConfiguredPar
+      let extra = resolveScriptCheckWorkers par
+          want = extra + 1
+      have <- getNumCapabilities
+      when (want > have) $ setNumCapabilities want
+      q <- newScriptCheckQueue extra
+      writeIORef globalScriptCheckQueueRef (Just q)
+      return extra
+
+stopGlobalScriptCheckQueue :: IO ()
+stopGlobalScriptCheckQueue = do
+  mq <- readIORef globalScriptCheckQueueRef
+  case mq of
+    Nothing -> return ()
+    Just q -> do
+      shutdownScriptCheckQueue q
+      writeIORef globalScriptCheckQueueRef Nothing
+
+evalChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
+evalChecksSerial scriptFlags = go
+  where
+    go [] = Right ()
+    go (c:cs) = case verifyScriptCheckItem scriptFlags c of
+      Just err -> Left err
+      Nothing  -> go cs
+
+{-# NOINLINE dispatchScriptChecks #-}
+dispatchScriptChecks :: ScriptFlags -> [ScriptCheckItem] -> IO (Either String ())
+dispatchScriptChecks scriptFlags checks = do
+  mq <- readIORef globalScriptCheckQueueRef
+  case mq of
+    Just q -> do
+      r <- runScriptCheckQueue q scriptFlags checks
+      return (scriptCheckResultToEither r)
+    Nothing -> return (evalChecksSerial scriptFlags checks)
+
 -- | Run a batch of pre-resolved script checks IN PARALLEL, returning the FIRST
 -- failure (if any) — exactly as the equivalent serial loop would have rejected.
 --
--- This mirrors Bitcoin Core's @CheckInputScripts@ collecting a
--- @std::vector<CScriptCheck>@ that @ConnectBlock@ dispatches across the
--- @CCheckQueue@ worker pool (validation.cpp:2581-2584): the non-script
--- consensus gates and the UTXO mutation sequence already ran serially and in
--- order; only the embarrassingly-parallel, CPU-bound script verification is
--- fanned out here.
---
--- Semantics are IDENTICAL to the serial loop:
---   * same 'verifyScriptWithFlags' arguments + 'ScriptFlags';
---   * the SigCache (read inside @cachedVerify*@ via thread-safe
---     'atomicModifyIORef'') makes concurrent evaluation safe — a concurrent
---     miss simply re-runs the deterministic verify, never changing the verdict;
---     only positive results are cached, so the accept/reject decision is the
---     same whether checks run serially or in parallel;
---   * ANY single input check failing rejects the whole block, with the same
---     per-input error string;
---   * only non-coinbase inputs are ever in the batch (the caller skips the
---     coinbase and skips this batch entirely under assumevalid).
---
--- Parallelism is bounded by the RTS @-N@ capability count (haskoin runs
--- @-threaded -N4@).
---
--- SPARK-FIZZLE FIX (2026-06-22): the previous body
---   @let results = parMap rseq (verifyScriptCheckItem f) checks
---    in case [err | Just err <- results] of ...@
--- created one spark per check but then scanned @results@ with a lazy list
--- comprehension.  The main thread's left-to-right scan forced each
--- @Maybe String@ to WHNF *as it walked the list*, racing ahead of the
--- worker HECs and evaluating most elements itself before the corresponding
--- spark could be converted — classic spark fizzle (@+RTS -s@ showed
--- @converted@ ≈ 0, @fizzled@ ≈ N), so the verifies ran serially on one HEC.
---
--- The fix forces the ENTIRE parallel pass to complete BEFORE the sequential
--- scan, and chunks the checks to amortize spark overhead:
---
---   1. @withStrategy (parListChunk chunkSize rdeepseq) results@ sparks one
---      task per chunk; @rdeepseq@ fully evaluates each chunk's @Maybe String@
---      list to NF (which runs every @verifyScriptCheckItem@ in it).
---   2. @withStrategy@ returns the value only after the strategy's own
---      traversal has driven the spark conversions, so the parallel work is
---      genuinely handed to the worker HECs (they convert the sparks) rather
---      than being stolen back by a racing consumer.  Binding the forced
---      list to @results'@ and scanning THAT means the scan reads
---      already-evaluated thunks.
---
--- Semantics are unchanged: @rdeepseq@ on @Maybe String@ forces the same
--- @verifyScriptCheckItem@ result it always did (its WHNF — @Just@/@Nothing@ —
--- already required running the full verify; deep-forcing the wrapped @String@
--- is harmless and total).  ANY single input failing still rejects the whole
--- block, and the first-failure scan below preserves the lowest-index error
--- string byte-for-byte.  The only behavioural difference is that ALL checks
--- are now evaluated (the old lazy scan could short-circuit after the first
--- failure) — this is a non-observable change to the verdict (the same
--- @Left err@ for the same first failure) and matches Core's @CCheckQueue@,
--- which likewise dispatches the whole batch.
+-- Production path: 'validateBlockTransactions' collects per-input
+-- 'ScriptCheckItem's then calls this. When the global ScriptCheckQueue has
+-- been started (--par), work is drained by the persistent pool; otherwise
+-- this is serial (tests / before node start). The error string is the
+-- lowest-index 'verifyScriptCheckItem' failure, byte-identical at 1 worker
+-- and at N.
 runScriptChecksParallel :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
 runScriptChecksParallel _scriptFlags [] = Right ()
 runScriptChecksParallel scriptFlags checks =
   let !_ = recordScriptChecks (length checks)
-      -- Chunk size amortizes per-spark overhead while keeping enough chunks to
-      -- fill the (N4) HECs on script-heavy blocks.  Powers of ~16-64 are the
-      -- usual sweet spot; 32 keeps thousands-of-input blocks well-distributed.
-      chunkSize = 32
-      results :: [Maybe String]
-      results = map (verifyScriptCheckItem scriptFlags) checks
-      -- Force the whole parallel pass to COMPLETE before scanning.  The
-      -- strategy traversal converts the per-chunk sparks across the HECs and
-      -- only returns once every element is in NF, so the scan below never
-      -- races ahead of (and thus fizzles) a spark.
-      results' = withStrategy (parListChunk chunkSize rdeepseq) results
-  in case [err | Just err <- results'] of
-       []      -> Right ()
-       (err:_) -> Left err
+      !res = unsafePerformIO (dispatchScriptChecks scriptFlags checks)
+  in res
 
 -- | Run a batch of pre-resolved script checks SERIALLY, first failure wins.
 -- Used by 'validateSingleTx' so its standalone contract (and every existing
@@ -3776,12 +4020,7 @@ runScriptChecksParallel scriptFlags checks =
 runScriptChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
 runScriptChecksSerial scriptFlags checks =
   let !_ = recordScriptChecks (length checks)
-  in go checks
-  where
-    go []     = Right ()
-    go (c:cs) = case verifyScriptCheckItem scriptFlags c of
-                  Just err -> Left err
-                  Nothing  -> go cs
+  in evalChecksSerial scriptFlags checks
 
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
@@ -3790,17 +4029,17 @@ runScriptChecksSerial scriptFlags checks =
 -- transaction validation still run.
 -- KNOWN PITFALL: Handles intra-block spending by updating UTXO map as we go.
 --
--- PARALLEL SCRIPT VERIFICATION (W105 G16 / CCheckQueue parity): the serial fold
--- below runs every NON-SCRIPT consensus gate (structural CheckTransaction,
--- per-input + running-sum MoneyRange, value-in >= value-out, accumulated-fee
--- range) AND the intra-block UTXO map maintenance IN ORDER, exactly as before —
--- but it no longer runs the per-input script interpreter inline.  Instead each
--- tx's resolved per-input script checks are collected
--- ('validateSingleTxCollect'), and after the fold the whole block's checks are
--- dispatched ONCE across the RTS capabilities ('runScriptChecksParallel').
--- Under assumevalid ('skipScripts' = True) no checks are collected or run,
--- identical to before.  This is Core's @ConnectBlock@ collecting @vChecks@ and
--- handing them to the @CCheckQueue@ (validation.cpp:2581-2584).
+-- PARALLEL SCRIPT VERIFICATION (CCheckQueue): the serial fold below runs
+-- every NON-SCRIPT consensus gate (structural CheckTransaction, per-input +
+-- running-sum MoneyRange, value-in >= value-out, accumulated-fee range) AND
+-- the intra-block UTXO map maintenance IN ORDER — but it no longer runs the
+-- per-input script interpreter inline.  Each tx's resolved per-input script
+-- checks are collected ('validateSingleTxCollect'), and after the fold the
+-- whole block's checks are dispatched once through 'runScriptChecksParallel'
+-- (persistent ScriptCheckQueue when started, serial otherwise).  Under
+-- assumevalid ('skipScripts' = True) no checks are collected or run.  This is
+-- Core's @ConnectBlock@ collecting @vChecks@ and handing them to the
+-- @CCheckQueue@ (validation.cpp:2581-2584).
 validateBlockTransactions :: ConsensusFlags -> Bool -> [Tx] -> Map OutPoint TxOut
                          -> Either String Word64
 validateBlockTransactions flags skipScripts txns initialUtxoMap = do

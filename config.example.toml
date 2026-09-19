@@ -5,6 +5,9 @@
 [network]
 # Network: Mainnet, Testnet, Testnet4, Regtest
 network = "Mainnet"
+# Script verification threads (Bitcoin Core -par). 0=auto (every core),
+# 1=serial, N=N threads (N-1 extra workers), <0=leave that many cores free.
+# par = 0
 
 [storage]
 # Data directory

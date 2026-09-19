@@ -238,6 +238,12 @@ data NodeOptions = NodeOptions
     -- ^ @--bind=ADDR[:PORT]@ (repeatable).  Empty (default) means bind
     --   all interfaces (@0.0.0.0@ and @[::]@).  Passing --bind restricts
     --   the P2P listener to the given address(es).  Bitcoin Core @-bind@.
+  , noPar :: !Int
+    -- ^ @--par=N@ (Bitcoin Core @-par@, init.cpp:513 /
+    --   chainstatemanager_args.cpp:53-60).  Script-verification thread
+    --   count: 0 = auto (every core; extra workers = CPU-1, master joins),
+    --   1 = serial (0 extra workers), N>1 = N-1 extra workers, <0 = leave
+    --   that many cores free.  No 15-thread cap.  Default 0.
   } deriving (Show)
 
 data WalletCommand
@@ -417,6 +423,11 @@ parseNodeOptions = NodeOptions
   <*> many (strOption (long "bind" <> metavar "ADDR[:PORT]"
         <> help "Bind P2P listen socket (repeatable; default 0.0.0.0 and [::]). \
                 \Passing --bind restricts the listener. Bitcoin Core -bind."))
+  <*> option auto (long "par" <> metavar "N" <> value 0
+        <> help "Script verification threads (Bitcoin Core -par). \
+                \0=auto (every core), 1=serial, N=N threads \
+                \(N-1 extra workers; connecting thread joins as master), \
+                \<0=leave that many cores free. No 15-thread cap.")
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -694,6 +705,11 @@ applyConfigOverlay cm n = n
   , noBind = if null (noBind n)
                then maybe [] splitCsv (Daemon.configLookup "bind" cm)
                else noBind n
+  -- --par / par= (Bitcoin Core -par). CLI default 0 is also the Core
+  -- default, so a conf value overlays when the CLI left it at 0.
+  , noPar = if noPar n == 0
+              then Daemon.configLookupInt "par" 0 cm
+              else noPar n
   -- Pass-through (not in conf overlay).
   , noConfFile   = noConfFile n
   }
@@ -769,6 +785,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
   -- Core equivalent: SignatureCache construction in AppInitMain (init.cpp).
   initGlobalSigCache
   putStrLn "Signature cache initialised (50000 entries)"
+
+  -- Persistent CCheckQueue (QUEUES.md 2026-09-19). Core logs
+  -- "Script verification uses %d additional threads" from the CCheckQueue
+  -- ctor (checkqueue.h:147). --par mapping is chainstatemanager_args.cpp:53-60.
+  setConfiguredPar noPar
+  extraScriptWorkers <- startGlobalScriptCheckQueue
+  putStrLn $ "Script verification uses "
+          ++ show extraScriptWorkers
+          ++ " additional threads (par=" ++ show noPar ++ ")"
 
   -- W115 FIX-50: load ASMap file if -asmap=<file> is configured.
   -- Reference: bitcoin-core/src/init.cpp:1587-1628 (DecodeAsmap call).
