@@ -125,6 +125,15 @@ module Haskoin.Consensus
   , connectBlockAt
   , disconnectBlock
   , disconnectBlockAt
+    -- * UpdateTip log (operator progress; not consensus)
+    --   One INFO line per connected block at the tip; every
+    --   'updateTipBulkInterval' during bulk IBD. Mirrors Core's
+    --   Chainstate::UpdateTip (validation.cpp).
+  , updateTipBulkInterval
+  , shouldLogUpdateTip
+  , formatUpdateTip
+  , blockInputCount
+  , blockHashToHex
   , rewindChainstateToPrefix
   , DisconnectResult(..)
   , bip30ExceptionHeight
@@ -4090,6 +4099,71 @@ computeWtxId tx = TxId (doubleSHA256 (encode tx))
 --------------------------------------------------------------------------------
 -- Block Connection and Disconnection
 --------------------------------------------------------------------------------
+
+-- | During bulk IBD, emit UpdateTip every this many connected heights.
+-- At the tip (headers complete, or connected height >= header tip) we
+-- log every block: the live 910k catch-up was invisible because the
+-- previous log was @height `mod` 500 == 0@ with no hash or timing.
+-- 100 is ~28s at 12k blk/h and still a line every few minutes at
+-- 30 blk/h if someone is somehow still in IBD.
+updateTipBulkInterval :: Word32
+updateTipBulkInterval = 100
+
+-- | Decide whether this connected block gets an INFO UpdateTip line.
+--
+-- * @isIBD == False@ (header sync complete): every block. This is the
+--   live post-snapshot catch-up and the steady-state tip.
+-- * Connected height has caught the header tip: every block.
+-- * Otherwise (bulk IBD, headers still ahead): every
+--   'updateTipBulkInterval' heights, including height 0.
+shouldLogUpdateTip
+  :: Bool -- ^ still in IBD (headers not complete)
+  -> Word32 -- ^ connected height
+  -> Word32 -- ^ header-chain tip height
+  -> Bool
+shouldLogUpdateTip isIBD height headerHeight
+  | not isIBD || height >= headerHeight = True
+  | otherwise = height `mod` updateTipBulkInterval == 0
+
+-- | Display-order (byte-reversed) hex of a block hash, matching
+-- 'Haskoin.Rpc.showHash' and Core's @uint256.ToString()@.
+blockHashToHex :: BlockHash -> String
+blockHashToHex (BlockHash (Hash256 bs)) =
+  concatMap padHex (BS.unpack (BS.reverse bs))
+  where
+    padHex w =
+      let s = showHex (fromIntegral w :: Word8) ""
+       in if length s == 1 then '0' : s else s
+
+-- | Input count of a block (every vin, including the coinbase).
+blockInputCount :: Block -> Int
+blockInputCount Block {blockTxns = txs} = sum (map (length . txInputs) txs)
+
+-- | Core-style UpdateTip INFO line. Prefix is @UpdateTip:@ so a grep
+-- for that token finds every connected-block event. Carries height,
+-- hash, validate+connect elapsed ms, tx count, and input count.
+--
+-- Reference: bitcoin-core/src/validation.cpp @UpdateTipLog@
+--   @UpdateTip: new best=%s height=%d ... tx=%lu ...@
+formatUpdateTip
+  :: Word32 -- ^ connected height
+  -> BlockHash -- ^ block hash (internal byte order)
+  -> Int -- ^ validate+connect elapsed milliseconds
+  -> Int -- ^ transaction count
+  -> Int -- ^ input count
+  -> String
+formatUpdateTip height bh elapsedMs txCount inputCount =
+  "UpdateTip: new best="
+    ++ blockHashToHex bh
+    ++ " height="
+    ++ show height
+    ++ " connect="
+    ++ show elapsedMs
+    ++ "ms"
+    ++ " tx="
+    ++ show txCount
+    ++ " inputs="
+    ++ show inputCount
 
 -- | Connect a block to the chain state, updating UTXO set and indexes,
 -- and writing per-block undo data for future rewinds.

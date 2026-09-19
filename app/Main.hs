@@ -3619,6 +3619,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           -- It is RELEASED before secondary-index mirror, flush, mempool
           -- clean, peer announce — those are independently thread-safe
           -- and don't compete with another peer's tip update.
+          t0 <- getPOSIXTime
           connectResult <- withMVar connectLock $ \() -> do
             -- Route the per-input prevout reads through the dedicated
             -- read-through cache (Class-A dbcache): a coin created at block N
@@ -3686,6 +3687,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   writeIORef nextBlockRef (height + 1)
               Left _ -> return ()
             return r
+          t1 <- getPOSIXTime
+          let elapsedMs = max 0 (round ((t1 - t0) * 1000) :: Int)
           case connectResult of
             Left cbErr -> do
               -- W163 diagnostic: log every connectBlock rejection of the
@@ -3723,6 +3726,21 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                            putStrLn $ "P2P reorg (MBlock) error at height "
                                    ++ show height ++ ": " ++ show e)
             Right () -> do
+              -- Operator progress: Core logs UpdateTip on every active
+              -- chainstate connect (validation.cpp). The previous
+              -- `height mod 500` line had no hash, no timing, and was
+              -- silent for 499/500 blocks — grepping `Connected` on a
+              -- node that WAS connecting returned 0.
+              isIBD <- readIORef ibdModeRef
+              utiHeaderTip <- readTVarIO (hcHeight hc)
+              when (shouldLogUpdateTip isIBD height utiHeaderTip) $
+                putStrLn $
+                  formatUpdateTip
+                    height
+                    bh
+                    elapsedMs
+                    (length (blockTxns block))
+                    (blockInputCount block)
               -- Mirror the connect into any opted-in secondary indexes
               -- (txindex / blockfilterindex / coinstatsindex).  We read
               -- the freshly-persisted undo record back from disk so the
@@ -3760,8 +3778,6 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 `catch` (\(e :: SomeException) ->
                   putStrLn $ "wallet scan error at height "
                           ++ show height ++ ": " ++ show e)
-              when (height `mod` 500 == 0) $
-                putStrLn $ "Connected block at height " ++ show height
               -- Durability: flush WAL + UTXO cache every flushBlockInterval
               -- blocks. This bounds the data-loss window on a non-graceful
               -- shutdown. Reference: Bitcoin Core src/validation.cpp

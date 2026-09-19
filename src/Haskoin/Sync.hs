@@ -355,7 +355,8 @@ flushTBQueueN q n = do
 --   2. Validate the full block against consensus rules
 --   3. Connect the block (update UTXO set, indexes, chain tip)
 --
--- Progress is logged every 1000 blocks.
+-- Progress is logged via UpdateTip (every block at the header tip,
+-- every updateTipBulkInterval during bulk IBD).
 blockProcessor :: BlockDownloader -> IO ()
 blockProcessor bd = forever $ do
   active <- readTVarIO (bdIBDActive bd)
@@ -418,6 +419,7 @@ blockProcessor bd = forever $ do
                   -- straight-line IBD arm (block extends the tip), so the
                   -- ancestry IS the active chain: same value, branch-correct.
                   let getMtp = getMtpFromAncestry blockEntries (bhPrevBlock (blockHeader block))
+                  t0 <- getPOSIXTime
                   validationResult <- validateFullBlockIO (bdDB bd) (bdNetwork bd) cs getMtp skipScripts block utxoMap
 
                   case validationResult of
@@ -440,6 +442,8 @@ blockProcessor bd = forever $ do
                       -- @InvalidBlockFound@ on @ConnectBlock@ failure).
                       cbResult <- connectBlockAt (bdDB bd) (bdNetwork bd)
                                                  block nextHeight utxoMap
+                      t1 <- getPOSIXTime
+                      let elapsedMs = max 0 (round ((t1 - t0) * 1000) :: Int)
                       case cbResult of
                         Left cbErr -> do
                           putStrLn $ "connectBlockAt failed at height "
@@ -488,9 +492,20 @@ blockProcessor bd = forever $ do
                           -- Note: RocksDB handles flushing internally
                           -- In production, might want explicit sync here
 
-                          -- Log progress
-                          when (nextHeight `mod` 1000 == 0) $
-                            putStrLn $ "Connected block " ++ show nextHeight
+                          -- startIBD is unused from Main.hs (the kicker is
+                          -- the sole requester) but this path still needs
+                          -- an UpdateTip line if it ever runs. Treat as
+                          -- IBD=True; log every block once we catch the
+                          -- header tip.
+                          headerTipH <- readTVarIO (hcHeight (bdHeaderChain bd))
+                          when (shouldLogUpdateTip True nextHeight headerTipH) $
+                            putStrLn $
+                              formatUpdateTip
+                                nextHeight
+                                bh
+                                elapsedMs
+                                (length (blockTxns block))
+                                (blockInputCount block)
 
             _ -> threadDelay (100 * 1000)  -- Block not yet downloaded
 

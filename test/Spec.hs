@@ -179,6 +179,7 @@ import qualified W191ForkReorgDownloadSpec
 import qualified W192InboundReadinessSpec
 import qualified W193LinearDownloadSpec
 import qualified W194PostSnapshotDownloadSpec
+import qualified W195UpdateTipSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23884,6 +23885,11 @@ main = hspec $ do
   -- then re-fetched 57k headers; v2 never stamped first-byte so every
   -- pipeline head looked mute at 16s. Gap-kicker is the sole requester.
   W194PostSnapshotDownloadSpec.spec
+
+  -- W195: UpdateTip connect log. Live 2026-09-19 the MBlock success
+  -- path logged only height%500 with no hash/timing/tx/inputs, so a
+  -- grep for Connected on a node that WAS connecting returned 0.
+  W195UpdateTipSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
