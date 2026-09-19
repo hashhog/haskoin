@@ -114,6 +114,10 @@ module Haskoin.Network
   , mutePipelineHeads
   , LinearDownloadState(..)
   , simulateLinearDownloadRate
+  , simulateLinearDownloadRateChurn
+  , simulateLinearDownloadRateChurnByIndex
+  , projectStableInflight
+  , storeStableInflight
     -- * Protocol Constants
   , protocolVersion
   , minProtocolVersion
@@ -877,6 +881,12 @@ planForkGetData peers needed headerTip rot
 --   * skip peers that cannot serve the height (BIP-159 LIMITED window)
 --   * skip peer ids in 'failed' (mute / first-byte timeout)
 --   * oldest missing hashes first
+--
+-- Cost (rate-verdict 2026-09-19): this is a walk of 'needed' × nPeers
+-- with needed already excluding in-flight hashes. 128 × 6 is a few
+-- hundred Map lookups, not the 110% core. Re-planning from scratch
+-- every kicker tick is a caller bug (storing zip [0..] across ticks),
+-- not this function.
 planLinearGetData
   :: [ForkGetDataPeer]
   -> [(BlockHash, Word32)]  -- ^ needed (hash, height), ascending
@@ -909,6 +919,42 @@ planLinearGetData peers needed headerTip rot failed already
                  else findPeer acc h ht (i + 1)
           raw = assign Map.empty needed
       in Map.toList raw
+
+-- | Project inflight stored under a STABLE peer key onto this tick's
+-- planner ids (zip [0..] of the current connected list).
+--
+-- 2ab99af stored the zip [0..] id itself. getConnectedPeerList is
+-- Map.elems, so a newly-connected lower address becomes index 0 and
+-- silently reattributes every in-flight hash to a different socket.
+-- That is the 4.4× RATE drop (stall-and-kick, 16-minute flats): mute
+-- clocks and first-byte stamps land on the wrong peer, live transfers
+-- look mute, the kicker rotates, v2 connections die.
+--
+-- Hashes whose key is not in the current list (peer dropped) are
+-- returned as orphaned so the caller re-requests them.
+projectStableInflight
+  :: Ord k
+  => Map k Int
+  -> Map BlockHash (k, Word32, Int64)
+  -> (Map BlockHash (Int, Word32, Int64), [BlockHash])
+projectStableInflight keyToId stored =
+  Map.foldlWithKey' step (Map.empty, []) stored
+  where
+    step (view, gone) h (k, ht, t) =
+      case Map.lookup k keyToId of
+        Just pid -> (Map.insert h (pid, ht, t) view, gone)
+        Nothing  -> (view, h : gone)
+
+-- | Store a this-tick planner-id inflight map back under stable keys.
+storeStableInflight
+  :: Ord k
+  => Map Int k
+  -> Map BlockHash (Int, Word32, Int64)
+  -> Map BlockHash (k, Word32, Int64)
+storeStableInflight idToKey view =
+  Map.mapMaybe
+    (\(pid, ht, t) -> (\k -> (k, ht, t)) <$> Map.lookup pid idToKey)
+    view
 
 -- | One in-flight body on the linear download pipeline.
 data PipelineInflight = PipelineInflight
@@ -1060,6 +1106,172 @@ simulateLinearDownloadRate muteFlags nBlocks nTicks =
                         ( infAcc ++ rest
                         , Set.insert (pifHeight h) haveAcc
                         )
+       in foldl' step ([], have) (Map.toList grouped)
+
+-- | RATE control under peer-list churn. A new ghost peer is prepended
+-- every tick, the way Map.elems grows when AddrMan connects a lower
+-- address. Ghosts never deliver.
+--
+-- Inflight is stored by STABLE live-peer id (0..nLive-1) and ghost id
+-- (1000+), then projected onto this tick's zip [0..] only for
+-- 'planLinearGetData'. Storing the zip id across ticks (2ab99af) makes
+-- this stall: live pipelines are reattributed to ghosts and the tip
+-- does not move.
+simulateLinearDownloadRateChurn
+  :: [Bool]   -- ^ mute flag per STABLE live peer id
+  -> Word32   -- ^ blocks to download (heights 1..n)
+  -> Int      -- ^ ticks (1 tick = 1s)
+  -> LinearDownloadState
+simulateLinearDownloadRateChurn = simulateLinearChurn True
+
+-- | Negative control: same churn, but inflight pids are the zip [0..]
+-- index stored across ticks — 2ab99af's kicker. The tip must not
+-- advance; if it does, the RATE instrument is not seeing the hole.
+simulateLinearDownloadRateChurnByIndex
+  :: [Bool]
+  -> Word32
+  -> Int
+  -> LinearDownloadState
+simulateLinearDownloadRateChurnByIndex = simulateLinearChurn False
+
+simulateLinearChurn
+  :: Bool
+  -> [Bool]
+  -> Word32
+  -> Int
+  -> LinearDownloadState
+simulateLinearChurn storeStable muteFlags nBlocks nTicks =
+  foldl' tick initState [1 .. nTicks]
+  where
+    nLive = length muteFlags
+    liveIds = [0 .. nLive - 1]
+    headerTip = nBlocks
+    initState =
+      LinearDownloadState
+        { ldsTip = 0
+        , ldsInflight = []
+        , ldsHaveBody = Set.empty
+        , ldsFailed = Set.empty
+        }
+    ghostId n = 1000 + n
+    tick st t =
+      let now = fromIntegral t :: Int64
+          -- One new lower-address peer per tick, never settling: a cap
+          -- lets Map.elems order freeze and the index-stored path
+          -- recovers, which hid the 2ab99af hole (tip 128 in 40 ticks).
+          nGhosts = t
+          ghosts = [ghostId g | g <- [0 .. nGhosts - 1]]
+          order = ghosts ++ liveIds
+          keyToId = Map.fromList [(k, i) | (i, k) <- zip [0 ..] order]
+          idToKey = Map.fromList [(i, k) | (i, k) <- zip [0 ..] order]
+          peers =
+            [ ForkGetDataPeer i (combineServices [nodeNetwork, nodeWitness])
+            | (i, _) <- zip [0 ..] order
+            ]
+          (inf1, have1) =
+            if storeStable
+              then deliverStable muteFlags nLive now (ldsInflight st) (ldsHaveBody st)
+              else deliverIndex order muteFlags nLive now (ldsInflight st) (ldsHaveBody st)
+          infPlanner =
+            if storeStable
+              then
+                [ x { pifPeer = eid }
+                | x <- inf1
+                , Just eid <- [Map.lookup (pifPeer x) keyToId]
+                ]
+              else inf1
+          (muteEids, _muteHs) = mutePipelineHeads now infPlanner
+          muteStored =
+            if storeStable
+              then [ k | eid <- muteEids, Just k <- [Map.lookup eid idToKey] ]
+              else muteEids
+          inf2 = [ x | x <- inf1, pifPeer x `notElem` muteStored ]
+          failed' = ldsFailed st `Set.union` Set.fromList muteStored
+          tip' = drainTip (ldsTip st) have1
+          inflightHs = Set.fromList (map pifHeight inf2)
+          assigned = inflightHs `Set.union` have1
+          windowEnd = min nBlocks (tip' + 128)
+          needed =
+            [ (linearSimHash h, h)
+            | h <- [tip' + 1 .. windowEnd]
+            , h `Set.notMember` assigned
+            ]
+          rot = Set.size failed'
+          used =
+            Map.fromListWith (+)
+              [ (eid, 1)
+              | x <- inf2
+              , Just eid <-
+                  [ if storeStable then Map.lookup (pifPeer x) keyToId else Just (pifPeer x)
+                  ]
+              ]
+          -- Ghosts never serve; skip them so they only exist to shift
+          -- list indices (the 2ab99af hole) instead of eating the window.
+          ghostEids = Set.fromList [0 .. nGhosts - 1]
+          failedEid0 =
+            if storeStable
+              then
+                Set.fromList
+                  [ eid
+                  | sid <- Set.toList failed'
+                  , Just eid <- [Map.lookup sid keyToId]
+                  ]
+              else failed'
+          failedEid = failedEid0 `Set.union` ghostEids
+          plan = planLinearGetData peers needed headerTip rot failedEid used
+          heightOf = Map.fromList [(linearSimHash h, h) | h <- [1 .. nBlocks]]
+          newInf =
+            [ PipelineInflight
+                { pifPeer = if storeStable then k else eid
+                , pifHeight = ht
+                , pifRequestedAt = now
+                , pifFirstByteAt = Nothing
+                }
+            | (eid, hs) <- plan
+            , Just k <- [Map.lookup eid idToKey]
+            , bh <- hs
+            , Just ht <- [Map.lookup bh heightOf]
+            ]
+       in LinearDownloadState
+            { ldsTip = tip'
+            , ldsInflight = inf2 ++ newInf
+            , ldsHaveBody = have1
+            , ldsFailed = failed'
+            }
+
+    drainTip tip have
+      | Set.member (tip + 1) have = drainTip (tip + 1) have
+      | otherwise = tip
+
+    deliverOne (infAcc, haveAcc) xs =
+      let ordered = sortBy (comparing pifRequestedAt <> comparing pifHeight) xs
+       in case ordered of
+            [] -> (infAcc, haveAcc)
+            (h : rest) ->
+              ( infAcc ++ rest
+              , Set.insert (pifHeight h) haveAcc
+              )
+
+    deliverStable flags nLive' _now inflight have =
+      let grouped = Map.fromListWith (++) [(pifPeer x, [x]) | x <- inflight]
+          step acc (pid, xs)
+            | pid < 0 || pid >= nLive' || (pid < length flags && flags !! pid) =
+                (fst acc ++ xs, snd acc)
+            | otherwise = deliverOne acc xs
+       in foldl' step ([], have) (Map.toList grouped)
+
+    -- 2ab99af: stored pid is an index into THIS tick's peer list.
+    deliverIndex order flags nLive' _now inflight have =
+      let grouped = Map.fromListWith (++) [(pifPeer x, [x]) | x <- inflight]
+          step acc (pid, xs) =
+            let mSid
+                  | pid >= 0 && pid < length order = Just (order !! pid)
+                  | otherwise = Nothing
+             in case mSid of
+                  Just sid
+                    | sid >= 0 && sid < nLive' && not (flags !! sid) ->
+                        deliverOne acc xs
+                  _ -> (fst acc ++ xs, snd acc)
        in foldl' step ([], have) (Map.toList grouped)
 
 --------------------------------------------------------------------------------

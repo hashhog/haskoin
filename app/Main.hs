@@ -1421,12 +1421,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     reorgFailRef <- newIORef (Nothing :: Maybe (BlockHash, BlockHash, Int, POSIXTime))
     -- Track highest block we've requested (for sliding window)
     requestedUpToRef <- newIORef loadedHeight
-    -- Linear download inflight: hash -> (peerIdx, height, requestedAt).
-    -- The kicker spreads getdata across peers (16 cap) and times out
-    -- mute pipeline heads only (adda3c0). Completion is inferred from
-    -- nextBlock advancing; out-of-order bodies drain from disk.
-    linearInflightRef <- newIORef (Map.empty :: Map.Map BlockHash (Int, Word32, Int64))
-    linearFailedRef <- newIORef (Set.empty :: Set.Set Int)
+    -- Linear download inflight: hash -> (stable SockAddr, height, requestedAt).
+    -- NEVER store zip [0..] of getConnectedPeerList across ticks:
+    -- Map.elems order shifts when AddrMan connects a lower address, and
+    -- that reattribution is the 2ab99af 4.4× RATE drop (rate-verdict
+    -- 2026-09-19). Planner ids are rebound each tick via
+    -- projectStableInflight. Completion is inferred from nextBlock
+    -- advancing; out-of-order bodies drain from disk.
+    linearInflightRef <- newIORef (Map.empty :: Map.Map BlockHash (SockAddr, Word32, Int64))
+    linearFailedRef <- newIORef (Set.empty :: Set.Set SockAddr)
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
     -- Headers-first IBD: POSIX time of the last full (>=2000) header
@@ -1959,8 +1962,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                             (connectedTip + maxBlocksInFlight))
                          pipeFrom  = requestedUpTo + 1
                          needNew   = windowEnd >= pipeFrom
-                     inf0 <- readIORef linearInflightRef
-                     failed0 <- readIORef linearFailedRef
+                     infStored <- readIORef linearInflightRef
+                     failedKeys0 <- readIORef linearFailedRef
+                     peerKeys <- mapM (\pc -> piAddress <$> readTVarIO (pcInfo pc)) peers
+                     let keyToId = Map.fromList (zip peerKeys [0 :: Int ..])
+                         idToKey = Map.fromList (zip [0 :: Int ..] peerKeys)
+                         (inf0, orphanedHs) = projectStableInflight keyToId infStored
+                         -- Drop failed keys whose peer is gone (reconnect =
+                         -- a new chance). Remaining keys map to this-tick ids.
+                         failed0 = Set.fromList
+                           [ pid
+                           | k <- Set.toList failedKeys0
+                           , Just pid <- [Map.lookup k keyToId]
+                           ]
                      -- Drop connected heights; restart the mute-clock on a
                      -- peer whose pipeline head just connected (adda3c0).
                      let infPruned = Map.filter (\(_, ht, _) -> ht >= nextBlock) inf0
@@ -2023,16 +2037,22 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                        forM_ (zip [0 :: Int ..] peers) $ \(i, pc) ->
                          when (i `Set.member` muteSet) $
                            writeIORef (pcBlockFirstByteAt pc) Nothing
-                     writeIORef linearFailedRef failed2
-                     writeIORef linearInflightRef infAfterMute
+                     writeIORef linearFailedRef $
+                       Set.fromList
+                         [ k
+                         | pid <- Set.toList failed2
+                         , Just k <- [Map.lookup pid idToKey]
+                         ]
+                     writeIORef linearInflightRef (storeStableInflight idToKey infAfterMute)
                      let refillFrom = min pipeFrom nextBlock
                          wantFill = needNew || not (null mutePids)
                                      || Map.size infAfterMute < fromIntegral maxBlocksInFlight
-                     if wantFill && (progressed || stalled || needNew || not (null mutePids))
+                                     || not (null orphanedHs)
+                     if wantFill && (progressed || stalled || needNew || not (null mutePids) || not (null orphanedHs))
                        then do
                          inf' <- requestBlockRange pm' hc refillFrom windowEnd
                                    rot failed2 infAfterMute nowKick
-                         writeIORef linearInflightRef inf'
+                         writeIORef linearInflightRef (storeStableInflight idToKey inf')
                          let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
                          unless (null assignedH) $
                            modifyIORef' requestedUpToRef (max (maximum assignedH))

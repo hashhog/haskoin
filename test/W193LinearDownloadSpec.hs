@@ -42,6 +42,10 @@ import Haskoin.Network
   , mutePipelineHeads
   , LinearDownloadState (..)
   , simulateLinearDownloadRate
+  , simulateLinearDownloadRateChurn
+  , simulateLinearDownloadRateChurnByIndex
+  , projectStableInflight
+  , storeStableInflight
   )
 
 --------------------------------------------------------------------------------
@@ -142,3 +146,78 @@ spec = do
           st   = simulateLinearDownloadRate mute 128 40
       ldsTip st `shouldSatisfy` (>= 32)
       Set.member 0 (ldsFailed st) `shouldBe` True
+
+  describe "linear-download re-plan is incremental, not from-scratch" $ do
+    -- Rate-verdict 2026-09-19: "does planLinearGetData re-plan from
+    -- scratch on every kicker tick, and what is the cost at 128 × 6?"
+    -- Answer: no. needed already excludes in-flight; a second plan
+    -- with `already` filled does not reshuffle the first window.
+    -- 128 × 6 is a few hundred lookups, not the 110% core.
+    it "does not reshuffle hashes already in flight on a second plan" $ do
+      let plan1 = planLinearGetData sevenFull (neededN 128) 967625 0 Set.empty Map.empty
+          used = Map.fromList [(pid, length hs) | (pid, hs) <- plan1]
+          assigned = Set.fromList [h | (_, hs) <- plan1, h <- hs]
+          leftover = [x | x <- neededN 128, fst x `Set.notMember` assigned]
+          plan2 = planLinearGetData sevenFull leftover 967625 0 Set.empty used
+          reshuffled =
+            Set.fromList [h | (_, hs) <- plan2, h <- hs] `Set.intersection` assigned
+      sum (map (length . snd) plan1) `shouldBe` 7 * maxBlocksInTransitPerPeer
+      -- 7 peers × 16 = 112 of 128; leftover 16 cannot be placed (all
+      -- peers at cap), so the second plan is empty — not a reshuffle.
+      plan2 `shouldBe` []
+      reshuffled `shouldBe` Set.empty
+      Set.size assigned `shouldBe` 112
+
+    it "a 128-hash × 6-peer plan fills at most 16 slots per peer" $ do
+      let six = take 6 sevenFull
+          plan = planLinearGetData six (neededN 128) 967625 0 Set.empty Map.empty
+          counts = map (length . snd) plan
+      sum counts `shouldBe` 6 * maxBlocksInTransitPerPeer
+      maximum counts `shouldBe` maxBlocksInTransitPerPeer
+
+  describe "linear-download inflight identity survives peer-list prepend" $ do
+    -- 2ab99af stored zip [0..] of Map.elems across kicker ticks. A
+    -- newly-connected lower address becomes index 0 and reattributes
+    -- every in-flight hash. Live 2026-09-19: stall-and-kick, 16-minute
+    -- flats, 4.4× slower than 53fe052 on a matched window.
+    it "projectStableInflight keeps a hash on the same peer after a prepend" $ do
+      let h = mkH 42
+          stored = Map.singleton h (20 :: Int, 42, 0)
+          keyToId0 = Map.fromList [(10, 0), (20, 1), (30, 2)]
+          keyToId1 = Map.fromList [(99, 0), (10, 1), (20, 2), (30, 3)]
+          (view0, gone0) = projectStableInflight keyToId0 stored
+          (view1, gone1) = projectStableInflight keyToId1 stored
+      gone0 `shouldBe` []
+      gone1 `shouldBe` []
+      Map.lookup h view0 `shouldBe` Just (1, 42, 0)
+      Map.lookup h view1 `shouldBe` Just (2, 42, 0)
+
+    it "a dropped peer's in-flight hashes are orphaned for re-request" $ do
+      let h = mkH 7
+          stored = Map.singleton h (20 :: Int, 7, 0)
+          keyToId = Map.fromList [(10, 0), (30, 1)]  -- 20 gone
+          (view, gone) = projectStableInflight keyToId stored
+      Map.null view `shouldBe` True
+      gone `shouldBe` [h]
+
+    it "store then project is identity on a stable peer list" $ do
+      let h = mkH 9
+          view = Map.singleton h (1, 9, 3)
+          idToKey = Map.fromList [(0, 10), (1, 20), (2, 30)] :: Map.Map Int Int
+          stored = storeStableInflight idToKey view
+          keyToId = Map.fromList [(10, 0), (20, 1), (30, 2)]
+          (view', gone) = projectStableInflight keyToId stored
+      gone `shouldBe` []
+      view' `shouldBe` view
+
+    it "index-stored inflight under prepend is the 2ab99af RATE hole" $ do
+      -- Negative control: the instrument must see the stall. If this
+      -- ever passes (>= 32) the churn model is not modelling production.
+      let mute = replicate 6 False
+          st = simulateLinearDownloadRateChurnByIndex mute 128 40
+      ldsTip st `shouldSatisfy` (< 32)
+
+    it "stable-key inflight under prepend advances the connected tip" $ do
+      let mute = replicate 6 False
+          st = simulateLinearDownloadRateChurn mute 128 40
+      ldsTip st `shouldSatisfy` (>= 32)
