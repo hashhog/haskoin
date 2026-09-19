@@ -178,6 +178,7 @@ import qualified W190InboundCapSpec
 import qualified W191ForkReorgDownloadSpec
 import qualified W192InboundReadinessSpec
 import qualified W193LinearDownloadSpec
+import qualified W194PostSnapshotDownloadSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23877,6 +23878,12 @@ main = hspec $ do
   -- at 910023. Planner must spread across peers; first-byte timeout is
   -- pipeline-head only; a mute peer must not stall the connected tip.
   W193LinearDownloadSpec.spec
+
+  -- W194: post-snapshot catch-up. Live 2026-09-19 after 2ab99af:
+  -- reload walked from PrefixBestBlock only ("Loaded 910120 headers")
+  -- then re-fetched 57k headers; v2 never stamped first-byte so every
+  -- pipeline head looked mute at 16s. Gap-kicker is the sole requester.
+  W194PostSnapshotDownloadSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

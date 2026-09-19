@@ -1825,7 +1825,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     void $ forkIO $ getheadersSender pm' hc net
       `catch` (\(e :: SomeException) -> putStrLn $ "getheadersSender error: " ++ show e)
 
-    -- Block downloading is done from the MHeaders and MBlock handlers.
+    -- Block download is driven SOLELY by this gap-kicker.
+    -- Sync.startIBD is never started (dead code). MHeaders only extends
+    -- the header chain; MInv skips bodies while ibdModeRef is True.
+    -- Log line proving the path: "Block-gap kicker: pipelining …".
     --
     -- W162 P0 chainstate-wedge fix — gap re-download kicker.
     --
@@ -1846,6 +1849,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- never permanently stalls catch-up.  It is a no-op once the UTXO
     -- tip reaches the header tip (nextBlock > headerTip), so it costs
     -- nothing in steady state.
+    putStrLn $ "Block download: gap-kicker is the sole requester "
+            ++ "(Sync.startIBD is not started); connected tip "
+            ++ show loadedHeight
+            ++ ", will pipeline once peers are up"
     void $ forkIO $
       -- Event-driven block-gap kicker (Bitcoin Core net_processing.cpp
       -- SendMessages / FindNextBlocksToDownload model): keep the download
@@ -2718,7 +2725,27 @@ initHeaderChainFromDB db net = do
                   ++ "(maximal validated prefix + truncate + rewind)."
           goFallback 1 genesisEntry
         Right chainAsc -> do
-          (mTrunc, heals) <- loadAscending chainAsc (1 :: Word32) genesisEntry []
+          (mTrunc0, heals0) <- loadAscending chainAsc (1 :: Word32) genesisEntry []
+          -- Headers-first: PrefixBlockHeight holds headers ABOVE the
+          -- connected (best-block) tip. collectActive only walks from
+          -- PrefixBestBlock, so a restart used to reload the UTXO prefix
+          -- ("Loaded 910120 headers") and re-fetch 57k headers while the
+          -- gap-kicker stayed gated on lastFullBatchAtRef. Extend with
+          -- the persisted rows; stop at a hole or prev-unlink.
+          (mTrunc, heals) <-
+            case mTrunc0 of
+              Just _  -> return (mTrunc0, heals0)
+              Nothing -> do
+                loadedH <- readTVarIO heightVar
+                tipNow  <- readTVarIO tipVar
+                above   <- collectPersistedHeadersAbove db loadedH (ceHash tipNow)
+                if null above
+                  then return (mTrunc0, heals0)
+                  else do
+                    putStrLn $ "Loading " ++ show (length above)
+                            ++ " persisted header(s) above connected tip "
+                            ++ show loadedH
+                    loadAscending above (loadedH + 1) tipNow heals0
           -- Self-heal the height index from the VALIDATED active chain.
           -- Rows below a truncation point are still-valid repairs; rows at
           -- or above it were never admitted, so they are never written.

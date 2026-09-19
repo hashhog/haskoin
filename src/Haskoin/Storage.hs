@@ -48,6 +48,7 @@ module Haskoin.Storage
   , getBestBlockHash
   , putBlockHeight
   , getBlockHeight
+  , collectPersistedHeadersAbove
     -- * Transaction Index
   , TxLocation(..)
   , putTxIndex
@@ -523,6 +524,48 @@ getBlockHeight db height = do
   let key = makeKey PrefixBlockHeight (toBE32 height)
   mval <- R.get (dbHandle db) (dbReadOpts db) key
   return $ mval >>= either (const Nothing) Just . decode
+
+-- | Headers persisted ABOVE the connected (best-block) tip.
+--
+-- haskoin is headers-first: the MHeaders handler writes
+-- PrefixBlockHeader + PrefixBlockHeight for every accepted header,
+-- which can sit tens of thousands of heights above PrefixBestBlock.
+-- 'initHeaderChainFromDB' discovers the active chain by walking
+-- bhPrevBlock down from PrefixBestBlock, so a restart used to reload
+-- only the connected prefix and re-fetch the rest from peers (live
+-- 2026-09-19: "Loaded 910120 headers" then 29×2000-header batches
+-- while the gap-kicker stayed gated on lastFullBatchAtRef).
+--
+-- Walk PrefixBlockHeight from lastHeight+1 until a hole or a header
+-- whose prev-hash does not link (stale reorg pocket). Caller validates
+-- PoW/diffbits before admitting the rows into the in-memory chain.
+--
+-- Pre-fix this function returned [] (connected-only reload).
+collectPersistedHeadersAbove
+  :: HaskoinDB
+  -> Word32       -- ^ last loaded height (best-block / connected tip)
+  -> BlockHash    -- ^ hash at that height (prev-link check)
+  -> IO [(BlockHash, BlockHeader)]
+collectPersistedHeadersAbove db lastHeight lastHash =
+  go (lastHeight + 1) lastHash [] (0 :: Int)
+  where
+    go h prev acc steps
+      | steps >= 20000000 = return (reverse acc)
+      | otherwise = do
+          mHash <- getBlockHeight db h
+          case mHash of
+            Nothing -> return (reverse acc)
+            Just bh -> do
+              mHdr <- getBlockHeader db bh
+              case mHdr of
+                Nothing -> return (reverse acc)
+                Just hdr
+                  | bhPrevBlock hdr /= prev ->
+                      -- Stale height-index pocket (orphaned-reorg row).
+                      -- Stop; P2P headers-first will re-fetch the tail.
+                      return (reverse acc)
+                  | otherwise ->
+                      go (h + 1) bh ((bh, hdr) : acc) (steps + 1)
 
 --------------------------------------------------------------------------------
 -- UTXO Operations

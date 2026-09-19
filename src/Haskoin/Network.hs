@@ -109,6 +109,8 @@ module Haskoin.Network
   , planLinearGetData
   , PipelineInflight(..)
   , blockFirstByteTimeout
+  , v2BlockFirstByteMinLen
+  , v2PacketLooksLikeBlock
   , mutePipelineHeads
   , LinearDownloadState(..)
   , simulateLinearDownloadRate
@@ -922,6 +924,22 @@ data PipelineInflight = PipelineInflight
 -- (blockbrew adda3c0). 16s, not the complete-transfer window.
 blockFirstByteTimeout :: Int64
 blockFirstByteTimeout = 16
+
+-- | A v2 packet this large is a block (bigger than a 2000-header
+-- batch: 2000 * 81 + overhead < 200_000). receiveV1 stamps
+-- pcBlockFirstByteAt when the 24-byte header's command is "block",
+-- BEFORE the payload streams. receiveV2 decrypts the length prefix
+-- first; without a stamp here, mutePipelineHeads treats every v2 peer
+-- as mute at 16s while a 1–2 MB block is still on the wire (live
+-- 2026-09-19: all pipeline heads mute, HARD STALL, "v2: connection
+-- closed reading payload" / "thread killed").
+v2BlockFirstByteMinLen :: Int
+v2BlockFirstByteMinLen = 200000
+
+-- | True when a decrypted v2 length prefix should stamp first-byte
+-- before the payload read, matching v1's command=="block" stamp.
+v2PacketLooksLikeBlock :: Int -> Bool
+v2PacketLooksLikeBlock len = len >= v2BlockFirstByteMinLen
 
 -- | Peers whose PIPELINE HEAD has produced no first byte within
 -- 'blockFirstByteTimeout'. Siblings queued behind a live head are not
@@ -2672,11 +2690,20 @@ receiveMessage pc = do
               -- (length-prefix + header + payload + tag).  Use plaintext
               -- size + 20 byte fixed overhead as a reasonable approximation.
               let approxWire = BS.length contents + 20
+                  decoded    = decodeV2Message contents
+              -- Small blocks (empty / early-chain) are under the length
+              -- threshold; stamp after decode so they still count as a
+              -- live pipeline head.
+              case decoded of
+                Right (MBlock _) -> do
+                  nowFB <- round <$> getPOSIXTime
+                  writeIORef (pcBlockFirstByteAt pc) (Just nowFB)
+                _ -> return ()
               atomically $ modifyTVar' (pcInfo pc) $ \i ->
                 i { piBytesRecv = piBytesRecv i + fromIntegral approxWire
                   , piMsgsRecv = piMsgsRecv i + 1
                   }
-              return $ decodeV2Message contents
+              return decoded
 
 --------------------------------------------------------------------------------
 -- Transport-Version Classification (BIP-324 vs v1)
@@ -2950,10 +2977,20 @@ readEncryptedPacket pc transport aad = do
           if fromIntegral len > maxProtocolMessageLength
             then return $ Left "v2: payload too large"
             else do
+              -- Pipeline-head first-byte: v1 stamps when the 24-byte
+              -- header's command is "block", BEFORE the payload streams.
+              -- v2 only knows the decrypted length here. A packet bigger
+              -- than a 2000-header batch is a block; stamp now so
+              -- mutePipelineHeads does not rotate the peer mid-transfer.
+              when (v2PacketLooksLikeBlock (fromIntegral len)) $ do
+                nowFB <- round <$> getPOSIXTime
+                writeIORef (pcBlockFirstByteAt pc) (Just nowFB)
               let payloadLen = fromIntegral len + v2HeaderLen + 16  -- header + payload + tag
               mPayload <- recvExact pc payloadLen
               case mPayload of
-                Nothing -> return $ Left "v2: connection closed reading payload"
+                Nothing -> do
+                  writeIORef (pcBlockFirstByteAt pc) Nothing
+                  return $ Left "v2: connection closed reading payload"
                 Just payload ->
                   case bip324Decrypt cipher1 payload aad of
                     Left err -> return $ Left err
