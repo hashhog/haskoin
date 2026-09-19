@@ -180,6 +180,7 @@ import qualified W192InboundReadinessSpec
 import qualified W193LinearDownloadSpec
 import qualified W194PostSnapshotDownloadSpec
 import qualified W195UpdateTipSpec
+import qualified W196SyncProgressSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23890,6 +23891,11 @@ main = hspec $ do
   -- path logged only height%500 with no hash/timing/tx/inputs, so a
   -- grep for Connected on a node that WAS connecting returned 0.
   W195UpdateTipSpec.spec
+
+  -- W196: sync-progress heartbeat. Live 2026-09-19 WAL logged hcHeight
+  -- (headers 967684) as height= while getblockcount was 910150, so a
+  -- log-based blk/h after 2ab99af was unusable.
+  W196SyncProgressSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

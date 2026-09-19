@@ -132,6 +132,9 @@ module Haskoin.Consensus
   , updateTipBulkInterval
   , shouldLogUpdateTip
   , formatUpdateTip
+  , syncProgressIntervalSecs
+  , syncProgressBlkPerHour
+  , formatSyncProgress
   , blockInputCount
   , blockHashToHex
   , rewindChainstateToPrefix
@@ -4164,6 +4167,60 @@ formatUpdateTip height bh elapsedMs txCount inputCount =
     ++ show txCount
     ++ " inputs="
     ++ show inputCount
+
+-- | Heartbeat interval for the sync-progress line, in POSIX seconds.
+-- Dense enough that a 16-minute stall is 16 consecutive zero-delta
+-- lines; sparse enough not to drown UpdateTip. The live 2ab99af
+-- catch-up had no connect log and the WAL heartbeat printed the
+-- *header* tip, so a log-based blk/h was unusable.
+syncProgressIntervalSecs :: Integer
+syncProgressIntervalSecs = 60
+
+-- | Blocks per hour from a measured window. Uses elapsed POSIX
+-- seconds (two samples of the same clock). Never a program's
+-- timestamp minus the operator's clock — that produced a 2.8×-wrong
+-- published figure on this box (EDT logs vs UTC `date -u`).
+-- A zero or negative window is 0, not Infinity.
+syncProgressBlkPerHour
+  :: Word32 -- ^ blocks connected in the window
+  -> Integer -- ^ window length in POSIX seconds
+  -> Double
+syncProgressBlkPerHour delta windowSecs
+  | windowSecs <= 0 = 0
+  | otherwise = (fromIntegral delta * 3600) / fromIntegral windowSecs
+
+-- | One decimal place, half-up. Enough to tell 7.9 from 34; not a
+-- locale-dependent printf.
+formatBlkPerHour :: Double -> String
+formatBlkPerHour x =
+  let c = floor (x * 10 + 0.5) :: Integer
+      (w, d) = c `divMod` 10
+   in show w ++ "." ++ show d
+
+-- | One INFO heartbeat. Prefix is @Sync progress:@ so a grep finds
+-- every sample. @validated=@ is getblockcount (UTXO-view / connected
+-- tip), NEVER the header-chain height — the live WAL line logged
+-- @height=967684@ while getblockcount was 910150, which made
+-- log-based rate unusable. @rate=@ is 'syncProgressBlkPerHour' of
+-- the same window.
+formatSyncProgress
+  :: Word32 -- ^ validated (connected) height
+  -> Word32 -- ^ header-chain tip
+  -> Word32 -- ^ blocks connected since last sample
+  -> Integer -- ^ window length in POSIX seconds
+  -> String
+formatSyncProgress validated headers delta windowSecs =
+  "Sync progress: validated="
+    ++ show validated
+    ++ " headers="
+    ++ show headers
+    ++ " delta="
+    ++ show delta
+    ++ " window="
+    ++ show windowSecs
+    ++ "s rate="
+    ++ formatBlkPerHour (syncProgressBlkPerHour delta windowSecs)
+    ++ " blk/h"
 
 -- | Connect a block to the chain state, updating UTXO set and indexes,
 -- and writing per-block undo data for future rewinds.

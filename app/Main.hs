@@ -2204,6 +2204,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         flushIdleEvictAfter = 1800 :: Integer  -- full evict only when idle this long
         flushTimerDelayUs   = 30 * 1_000_000   -- wake every 30s to check
     lastEvictEpochRef <- newIORef =<< (round <$> getPOSIXTime :: IO Integer)
+    -- Sync-progress heartbeat. Seeded from the connected tip (not
+    -- hcHeight). Rate is POSIX elapsed time between samples — the same
+    -- clock at both ends. See formatSyncProgress.
+    lastProgressEpochRef <- newIORef =<< (round <$> getPOSIXTime :: IO Integer)
+    lastProgressHeightRef <- newIORef loadedHeight
+    let connectedHeight nextB = if nextB == 0 then 0 else nextB - 1
     flushThreadId <- forkIO $ forever $ do
       threadDelay flushTimerDelayUs
       now <- round <$> getPOSIXTime
@@ -2212,6 +2218,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         bsf   <- readIORef blocksSinceFlushRef
         lastE <- readIORef lastEvictEpochRef
         h     <- readTVarIO (hcHeight hc)
+        nextB <- readIORef nextBlockRef
+        let validated = connectedHeight nextB
         if bsf == 0 && now - lastE >= flushIdleEvictAfter
           then do
             -- Genuinely idle: no blocks connected since the last flush, so the
@@ -2219,7 +2227,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
             -- flush to reclaim the read-through mirror's memory.  Safe — there
             -- is no active connect whose warm cache we would cold-start, and
             -- per-block writes are already durable.
-            putStrLn $ "Idle memory flush: evicting UTXO cache at height=" ++ show h
+            putStrLn $ "Idle memory flush: evicting UTXO cache at validated="
+                    ++ show validated ++ " headers=" ++ show h
             flushCache cache
               `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
             syncFlush db
@@ -2230,10 +2239,25 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
             -- Active (or recently active) sync: keep the warm UTXO mirror hot.
             -- Only fsync the WAL for crash-safety; the block-count cadence
             -- owns cache eviction.  This is what lifts blk/s in the replay.
-            putStrLn $ "Periodic WAL fsync at height=" ++ show h
+            -- Log validated= (getblockcount), not hcHeight: the live
+            -- 2ab99af run printed height=967684 while the UTXO tip was
+            -- 910150, which made a log-based blk/h unusable.
+            putStrLn $ "Periodic WAL fsync at validated="
+                    ++ show validated ++ " headers=" ++ show h
             syncFlush db
               `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
         writeIORef lastFlushEpochRef now
+      lastP <- readIORef lastProgressEpochRef
+      when (now - lastP >= syncProgressIntervalSecs) $ do
+        nextB <- readIORef nextBlockRef
+        let validated = connectedHeight nextB
+        headers <- readTVarIO (hcHeight hc)
+        prev <- readIORef lastProgressHeightRef
+        let delta = if validated >= prev then validated - prev else 0
+            window = now - lastP
+        putStrLn $ formatSyncProgress validated headers delta window
+        writeIORef lastProgressHeightRef validated
+        writeIORef lastProgressEpochRef now
 
     -- DURABILITY (sweep wa0fq5wtk): periodic wallet flusher.  Wakes every
     -- 30s and persists any wallet whose dirty flag is set (save-on-mutation
@@ -2251,12 +2275,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Start Prometheus metrics server
     when (noMetricsPort > 0) $ do
       void $ forkIO $ Warp.run noMetricsPort $ \_ respond -> do
-        height <- readTVarIO (hcHeight hc)
+        nextB <- readIORef nextBlockRef
+        let height = connectedHeight nextB
         peers <- Map.size <$> readTVarIO (pmPeers pm)
         mempoolCount <- Map.size <$> readTVarIO (mpEntries mp)
         scriptChecks <- readScriptChecksTotal
         let body = BL8.pack $ unlines
-              [ "# HELP bitcoin_blocks_total Current block height"
+              [ "# HELP bitcoin_blocks_total Current validated (connected) block height"
               , "# TYPE bitcoin_blocks_total gauge"
               , "bitcoin_blocks_total " ++ show height
               , "# HELP bitcoin_peers_connected Number of connected peers"
@@ -2293,17 +2318,23 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     do
       h0 <- readTVarIO (hcHeight hc)
       Daemon.sdNotifyStatus $
-        "Started on " ++ netName net ++ " at height " ++ show h0
+        "Started on " ++ netName net
+          ++ " at validated=" ++ show loadedHeight
+          ++ " headers=" ++ show h0
       Daemon.sdNotifyReady
     -- Background watchdog/status pinger: keeps systemd's
     -- WatchdogSec= alive (no-op if unset) and refreshes the
-    -- STATUS string with the current tip every 30s.
+    -- STATUS string with the connected tip every 30s. Do not
+    -- report hcHeight as "height=" — that is the header tip.
     statusTid <- forkIO $ forever $ do
       threadDelay (30 * 1_000_000)
+      nextB <- readIORef nextBlockRef
       h' <- readTVarIO (hcHeight hc)
       peers' <- Map.size <$> readTVarIO (pmPeers pm)
       Daemon.sdNotifyStatus $
-        "height=" ++ show h' ++ " peers=" ++ show peers'
+        "validated=" ++ show (connectedHeight nextB)
+          ++ " headers=" ++ show h'
+          ++ " peers=" ++ show peers'
       Daemon.sdNotifyWatchdog
 
     -- task #10 (at-tip RSS leak FIX): at tip haskoin allocates so little that
