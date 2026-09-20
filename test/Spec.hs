@@ -181,6 +181,7 @@ import qualified W193LinearDownloadSpec
 import qualified W194PostSnapshotDownloadSpec
 import qualified W195UpdateTipSpec
 import qualified W196SyncProgressSpec
+import qualified W197DownloadInstrumentSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23896,6 +23897,11 @@ main = hspec $ do
   -- (headers 967684) as height= while getblockcount was 910150, so a
   -- log-based blk/h after 2ab99af was unusable.
   W196SyncProgressSpec.spec
+
+  -- W197: download-path instrumentation after e8a03a9's 8x RATE
+  -- regression (106 -> 13 blk/min). Name the branch on every issued
+  -- getdata window; count bodies that arrive and are not connected.
+  W197DownloadInstrumentSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

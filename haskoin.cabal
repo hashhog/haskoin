@@ -219,6 +219,7 @@ test-suite haskoin-test
                , W194PostSnapshotDownloadSpec
                , W195UpdateTipSpec
                , W196SyncProgressSpec
+               , W197DownloadInstrumentSpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , Paths_haskoin

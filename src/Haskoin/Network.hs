@@ -125,6 +125,10 @@ module Haskoin.Network
   , simulateLinearReceipt
   , projectStableInflight
   , storeStableInflight
+  , LinearFillBranch(..)
+  , linearFillBranchTag
+  , selectLinearFillBranch
+  , formatKickerWindow
     -- * Protocol Constants
   , protocolVersion
   , minProtocolVersion
@@ -835,6 +839,72 @@ resolveBlocksInFlightPerPeer nConnect mEnv =
     Just n | n >= 1 && n <= maxBlocksInFlightTotal -> n
     _ | nConnect == 1 -> singleConnectBlocksInFlightPerPeer
       | otherwise -> maxBlocksInTransitPerPeer
+
+-- | Which path issued a linear-download getdata window.
+--
+-- Live 2026-09-20: e8a03a9 made receipt-refill fire and throughput
+-- dropped 106 -> 13 blk/min. Receipt and kicker both logged
+-- "Block-gap kicker: pipelining …" with no branch, so 18 windows/60s
+-- could not say which path issued them. Tag every issued window.
+-- This is instrumentation, not a refill-policy change.
+data LinearFillBranch
+  = FillProgress  -- ^ connected tip advanced; kicker topping up
+  | FillStall     -- ^ no progress for kickerStallSecs; re-request
+  | FillReceipt   -- ^ MBlock success path (fillLinearPipeline)
+  | FillMute      -- ^ first-byte timeout rotated a mute head
+  | FillOrphaned  -- ^ inflight keys whose peer dropped out of the list
+  | FillNeedNew   -- ^ window has hashes not yet requested
+  deriving (Eq, Show)
+
+linearFillBranchTag :: LinearFillBranch -> String
+linearFillBranchTag FillProgress = "progress"
+linearFillBranchTag FillStall    = "stall"
+linearFillBranchTag FillReceipt  = "receipt"
+linearFillBranchTag FillMute     = "mute"
+linearFillBranchTag FillOrphaned = "orphaned"
+linearFillBranchTag FillNeedNew  = "need-new"
+
+-- | Precedence: receipt > progress > stall > mute > orphaned > need-new.
+-- Receipt is a different caller (MBlock), not a kicker poll flag, so it
+-- wins even if the tip also advanced on this tick.
+selectLinearFillBranch
+  :: Bool -- ^ receipt path (fillLinearPipeline)
+  -> Bool -- ^ connected tip advanced since last request
+  -> Bool -- ^ stall timer elapsed
+  -> Bool -- ^ mute-head rotation
+  -> Bool -- ^ inflight keys orphaned by peer-list change
+  -> Bool -- ^ window has hashes not yet requested
+  -> LinearFillBranch
+selectLinearFillBranch receipt progressed stalled mute orphaned needNew
+  | receipt    = FillReceipt
+  | progressed = FillProgress
+  | stalled    = FillStall
+  | mute       = FillMute
+  | orphaned   = FillOrphaned
+  | needNew    = FillNeedNew
+  | otherwise  = FillNeedNew
+
+-- | Operator line for an issued getdata window. Keeps the
+-- "Block-gap kicker: pipelining" prefix so existing greps still hit,
+-- and appends @branch=@ so progress / stall / receipt are separable.
+formatKickerWindow
+  :: LinearFillBranch
+  -> Int    -- ^ hashes in this getdata
+  -> Word32 -- ^ window from-height
+  -> Word32 -- ^ window to-height
+  -> Int    -- ^ peers assigned
+  -> String
+formatKickerWindow branch nReq fromH toH nPeers =
+  "Block-gap kicker: pipelining "
+    ++ show nReq
+    ++ " blocks (heights "
+    ++ show fromH
+    ++ "-"
+    ++ show toH
+    ++ ") to "
+    ++ show nPeers
+    ++ " peer(s) branch="
+    ++ linearFillBranchTag branch
 
 -- | Whether @services@ can serve a block at @blockHeight@ given header
 -- tip @headerTipHeight@.

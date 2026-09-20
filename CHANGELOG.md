@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- feat: name the branch on every linear-download getdata window (`branch=progress|stall|receipt`) and count MBlock bodies that arrive without connecting (`Block arrived unconnected`, with reason + running count). Instrumentation only — e8a03a9 refill/cap behaviour is unchanged. The kicker line keeps the `Block-gap kicker: pipelining` prefix and appends `branch=`; UpdateTip is untouched.
 - feat: single `--connect` peer defaults the per-peer in-flight cap to 128 (`HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` overrides); MBlock refills the pipeline on receipt so a local feeder does not wait for the 0.4s kicker poll
 
 ## v1.0.2 — 2026-09-11

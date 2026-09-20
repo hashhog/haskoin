@@ -1463,6 +1463,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- after a successful connect so the pipeline refills without waiting
     -- for the 0.4s kicker poll.
     receiptRefillRef <- newIORef (return () :: IO ())
+    -- Bodies that arrived and were not connected (G1 / G19 / validation /
+    -- too-far-ahead / header-reject). e8a03a9's 8x RATE drop issued 3x
+    -- the windows and connected 1/8 the blocks; out-of-order G1 was
+    -- silent except for the next-needed height. Count every miss.
+    unconnectedCountRef <- newIORef (0 :: Word64)
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
     -- Headers-first IBD: POSIX time of the last full (>=2000) header
@@ -1772,7 +1777,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -2092,8 +2097,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                      || not (null orphanedHs)
                      if wantFill && (progressed || stalled || needNew || not (null mutePids) || not (null orphanedHs))
                        then do
+                         let branch = selectLinearFillBranch
+                                        False
+                                        progressed
+                                        stalled
+                                        (not (null mutePids))
+                                        (not (null orphanedHs))
+                                        needNew
                          inf' <- requestBlockRange pm' hc refillFrom windowEnd
-                                   rot failed2 infAfterMute nowKick perPeerCap
+                                   rot failed2 infAfterMute nowKick perPeerCap branch
                          writeIORef linearInflightRef (storeStableInflight idToKey inf')
                          let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
                          unless (null assignedH) $
@@ -3062,8 +3074,9 @@ requestBlockRange
   -> Map.Map BlockHash (Int, Word32, Int64)
   -> Int64
   -> Int
+  -> LinearFillBranch
   -> IO (Map.Map BlockHash (Int, Word32, Int64))
-requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap
+requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch
   | fromHeight > toHeight = return inflight
   | otherwise = do
       peerList <- getConnectedPeerList pm
@@ -3094,10 +3107,8 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap
           if null plan
             then return inflight
             else do
-              putStrLn $ "Block-gap kicker: pipelining " ++ show nReq
-                       ++ " blocks (heights " ++ show fromHeight ++ "-"
-                       ++ show toHeight ++ ") to " ++ show (length plan)
-                       ++ " peer(s)"
+              putStrLn $ formatKickerWindow
+                           branch nReq fromHeight toHeight (length plan)
               inf' <- foldM
                 (\acc (idx, hashes) -> do
                    let pc = peerList !! idx
@@ -3159,7 +3170,7 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
                           (min (connectedTip + 1024)
                                (connectedTip + fromIntegral maxBlocksInFlightTotal))
         inf' <- requestBlockRange pm hc nextBlock windowEnd
-                  rot failed0 infPruned nowKick cap
+                  rot failed0 infPruned nowKick cap FillReceipt
         writeIORef linearInflightRef (storeStableInflight idToKey inf')
         let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
         unless (null assignedH) $
@@ -3516,8 +3527,12 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- ^ Receipt refill: after a successful connect, refill
                       -- the linear getdata pipeline without waiting for the
                       -- 0.4s kicker poll (single-feeder RATE hole).
+                   -> IORef Word64
+                      -- ^ Running count of MBlock bodies that arrived and
+                      -- were not connected. e8a03a9's 8x RATE drop was
+                      -- silent on out-of-order G1 (only next-needed logged).
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr msg = case msg of
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -3697,6 +3712,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     case addResult of
       Left err -> do
         isIBD <- readIORef ibdModeRef
+        nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
+        nbUnc <- readIORef nextBlockRef
+        putStrLn $ formatUnconnectedArrival Nothing nbUnc UnconnHeaderRejected nUnc
         unless isIBD $
           putStrLn $ "Block header rejected: " ++ err
         -- Attribute misbehavior: block whose header fails consensus
@@ -3716,7 +3734,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         activeTipHeight <- readTVarIO (hcHeight hc)
         let fRequested    = height <= requestedUpTo
             fTooFarAhead  = height > activeTipHeight + minBlocksToKeep
-        unless (not fRequested && fTooFarAhead) $ do
+        if not fRequested && fTooFarAhead then do
+            nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
+            nbUnc <- readIORef nextBlockRef
+            putStrLn $ formatUnconnectedArrival (Just height) nbUnc UnconnTooFarAhead nUnc
+        else do
           -- W97/W99-G18 P0 fix: 'connectBlock' now surfaces a Left when the
           -- block fails the W93 G1 (prevHash != BestBlock) or G19 (missing
           -- prevout) gates.  A peer sending an unsolicited side-branch
@@ -3818,15 +3840,18 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           let elapsedMs = max 0 (round ((t1 - t0) * 1000) :: Int)
           case connectResult of
             Left cbErr -> do
-              -- W163 diagnostic: log every connectBlock rejection of the
-              -- NEXT-NEEDED block so the IBD wedge cause is visible.
-              -- Out-of-order rejections of higher blocks stay quiet (the
-              -- gap kicker re-fetches them in order). No peer ban while
-              -- diagnosing — a wrongly-rejected valid block is not the
-              -- peer's fault. NOTE: the earlier guard matched "Core G1"
-              -- which is ALSO a prefix of "Core G19" (missing-prevout),
-              -- so genuine G19 failures were silently swallowed.
+              -- Count every unconnected arrival, not only next-needed.
+              -- e8a03a9's 8x RATE drop (106 -> 13 blk/min) issued 3x the
+              -- getdata windows; out-of-order G1 against the in-order
+              -- connect gate was the obvious candidate and was silent.
               nb <- readIORef nextBlockRef
+              nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
+              putStrLn $ formatUnconnectedArrival
+                           (Just height) nb (classifyConnectReject cbErr) nUnc
+              -- W163 diagnostic: extra detail for the next-needed block.
+              -- NOTE: the earlier guard matched "Core G1" which is ALSO
+              -- a prefix of "Core G19" (missing-prevout); classifyConnectReject
+              -- checks G19 first.
               when (height == nb) $
                 putStrLn $ "[W163 diag] next-needed block " ++ show height
                         ++ " rejected by connectBlock: " ++ cbErr
@@ -4005,7 +4030,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                     mBlkDrain <- getBlock db bhDrain
                     case mBlkDrain of
                       Just blkDrain ->
-                        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr (MBlock blkDrain)
+                        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr (MBlock blkDrain)
                       Nothing -> return ()
                   Nothing -> return ()
 
@@ -4365,7 +4390,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -4472,7 +4497,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()

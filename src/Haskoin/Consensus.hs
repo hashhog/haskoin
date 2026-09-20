@@ -135,6 +135,10 @@ module Haskoin.Consensus
   , syncProgressIntervalSecs
   , syncProgressBlkPerHour
   , formatSyncProgress
+  , UnconnectedReason(..)
+  , unconnectedReasonTag
+  , classifyConnectReject
+  , formatUnconnectedArrival
   , blockInputCount
   , blockHashToHex
   , rewindChainstateToPrefix
@@ -323,7 +327,7 @@ import qualified Data.ByteString.Base16 as B16
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
-import Data.List (sort, sortBy, foldl')
+import Data.List (sort, sortBy, foldl', isInfixOf)
 import Numeric (showHex)
 import Control.Monad (when, unless, forM, forM_, foldM, forever, void, replicateM)
 import qualified Data.Map.Strict as Map
@@ -4460,6 +4464,59 @@ formatSyncProgress validated headers delta windowSecs =
     ++ "s rate="
     ++ formatBlkPerHour (syncProgressBlkPerHour delta windowSecs)
     ++ " blk/h"
+
+-- | Why an MBlock body was not connected to the active tip.
+--
+-- Live 2026-09-20: e8a03a9 issued 3x the getdata windows and connected
+-- 1/8 the blocks. Out-of-order arrivals against connectBlockAt's G1
+-- gate are the obvious candidate, but they were silent (only the
+-- next-needed height logged). Count every unconnected arrival and
+-- name the reason. Instrumentation, not a connect-policy change.
+data UnconnectedReason
+  = UnconnHeaderRejected
+  | UnconnTooFarAhead
+  | UnconnG1OutOfOrder
+  | UnconnG19MissingPrevout
+  | UnconnValidation
+  | UnconnOther
+  deriving (Eq, Show)
+
+unconnectedReasonTag :: UnconnectedReason -> String
+unconnectedReasonTag UnconnHeaderRejected    = "header-rejected"
+unconnectedReasonTag UnconnTooFarAhead       = "too-far-ahead"
+unconnectedReasonTag UnconnG1OutOfOrder      = "g1-out-of-order"
+unconnectedReasonTag UnconnG19MissingPrevout = "g19-missing-prevout"
+unconnectedReasonTag UnconnValidation        = "validation"
+unconnectedReasonTag UnconnOther             = "other"
+
+-- | Classify a connectBlock / validateFullBlock Left. G19 is checked
+-- before G1 because "Core G1" is a prefix of "Core G19" (W163 paid
+-- for matching the shorter needle and swallowing genuine G19).
+classifyConnectReject :: String -> UnconnectedReason
+classifyConnectReject err
+  | "Core G19" `isInfixOf` err = UnconnG19MissingPrevout
+  | "Core G1" `isInfixOf` err = UnconnG1OutOfOrder
+  | "Core full-block validation" `isInfixOf` err = UnconnValidation
+  | otherwise = UnconnOther
+
+-- | Operator line for a body that arrived and was not connected.
+-- @count=@ is the process-lifetime running total so a flood is a
+-- rising number, not 10,000 identical lines with no magnitude.
+formatUnconnectedArrival
+  :: Maybe Word32 -- ^ height if known (header-reject has none)
+  -> Word32       -- ^ next-needed connected height + 1
+  -> UnconnectedReason
+  -> Word64       -- ^ running unconnected-arrival count
+  -> String
+formatUnconnectedArrival mHeight nextNeeded reason count =
+  "Block arrived unconnected: height="
+    ++ maybe "?" show mHeight
+    ++ " next-needed="
+    ++ show nextNeeded
+    ++ " reason="
+    ++ unconnectedReasonTag reason
+    ++ " count="
+    ++ show count
 
 -- | Connect a block to the chain state, updating UTXO set and indexes,
 -- and writing per-block undo data for future rewinds.
