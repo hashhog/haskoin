@@ -1455,6 +1455,14 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- advancing; out-of-order bodies drain from disk.
     linearInflightRef <- newIORef (Map.empty :: Map.Map BlockHash (SockAddr, Word32, Int64))
     linearFailedRef <- newIORef (Set.empty :: Set.Set SockAddr)
+    -- Serialise kicker + MBlock receipt-refill against the same inflight
+    -- map. Without this, a connect-side refill can overwrite a mute
+    -- rotation the kicker just computed.
+    linearLock <- newMVar ()
+    -- Installed after PeerManager starts (needs pm'). MBlock calls this
+    -- after a successful connect so the pipeline refills without waiting
+    -- for the 0.4s kicker poll.
+    receiptRefillRef <- newIORef (return () :: IO ())
     -- IBD mode flag: skip block inv requests until header sync catches up
     ibdModeRef <- newIORef True
     -- Headers-first IBD: POSIX time of the last full (>=2000) header
@@ -1715,6 +1723,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               ++ show (length resolvedConnectAddrs)
               ++ " clearnet addr(s) resolved); DNS seeds + auto-outbound "
               ++ "disabled, dialing only pinned peers"
+    envCap <- lookupEnv "HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER"
+    let perPeerCap = resolveBlocksInFlightPerPeer (length noConnect) envCap
+    putStrLn $ "linear-download per-peer in-flight cap " ++ show perPeerCap
+            ++ (if length noConnect == 1
+                  then " (single --connect; HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER overrides)"
+                  else "")
     -- --nodnsseed (or -connect) suppresses DNS seed resolution.
     let dnsSeedEnabled = not noNoDnsSeed && not connectModeActive
     when (noNoDnsSeed && not connectModeActive) $
@@ -1758,7 +1772,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr msg
           `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1771,6 +1785,9 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- computeNetworkGroupWithASMap can use ASN-keyed bucketing.
     let pm' = pm { pmAsmapData = asmapData }
     writeIORef pmRef pm'
+    writeIORef receiptRefillRef $
+      fillLinearPipeline pm' hc db nextBlockRef requestedUpToRef
+        linearInflightRef linearFailedRef 0 perPeerCap linearLock
 
     -- W117 DH-1: hidden-service / SAM-session announcement at startup.
     --
@@ -1976,7 +1993,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                      return $ if progressed || stalled
                                 then (rot + 1, nextBlock, nowKick)
                                 else (rot, lastConn, lastReqTime)
-                   else do
+                   else withMVar linearLock $ \() -> do
                      -- LINEAR DEEP PIPELINE — Core FindNextBlocksToDownload.
                      -- Spread getdata across capable peers (16 each), skip
                      -- mute/LIMITED, first-byte-timeout the pipeline HEAD
@@ -2076,7 +2093,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                      if wantFill && (progressed || stalled || needNew || not (null mutePids) || not (null orphanedHs))
                        then do
                          inf' <- requestBlockRange pm' hc refillFrom windowEnd
-                                   rot failed2 infAfterMute nowKick
+                                   rot failed2 infAfterMute nowKick perPeerCap
                          writeIORef linearInflightRef (storeStableInflight idToKey inf')
                          let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
                          unless (null assignedH) $
@@ -3044,8 +3061,9 @@ requestBlockRange
   -> Set.Set Int
   -> Map.Map BlockHash (Int, Word32, Int64)
   -> Int64
+  -> Int
   -> IO (Map.Map BlockHash (Int, Word32, Int64))
-requestBlockRange pm hc fromHeight toHeight rot failed inflight now
+requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap
   | fromHeight > toHeight = return inflight
   | otherwise = do
       peerList <- getConnectedPeerList pm
@@ -3070,8 +3088,9 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now
                       | (i, svc) <- zip [0 ..] peerSvcs ]
               used = Map.fromListWith (+)
                        [ (pid, 1) | (pid, _, _) <- Map.elems inflight ]
-              plan = planLinearGetData peers needed headerTip rot failed used
+              plan = planLinearGetDataWithCap cap peers needed headerTip rot failed used
               nReq = sum (map (length . snd) plan)
+              batchSz = max 1 cap
           if null plan
             then return inflight
             else do
@@ -3082,7 +3101,7 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now
               inf' <- foldM
                 (\acc (idx, hashes) -> do
                    let pc = peerList !! idx
-                       batches = chunksOf 16 hashes
+                       batches = chunksOf batchSz hashes
                    forM_ batches $ \batch -> do
                      let invVecs =
                            [ InvVector InvWitnessBlock (getBlockHashHash h)
@@ -3097,6 +3116,54 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now
                 inflight
                 plan
               return inf'
+
+-- | Refill the linear getdata pipeline after a connected block.
+-- Called from the MBlock success path so a single local feeder does
+-- not wait for the 0.4s kicker poll with an empty window. Core
+-- FindNextBlocksToDownload / rustoshi block_received.
+fillLinearPipeline
+  :: PeerManager
+  -> HeaderChain
+  -> HaskoinDB
+  -> IORef Word32
+  -> IORef Word32
+  -> IORef (Map.Map BlockHash (SockAddr, Word32, Int64))
+  -> IORef (Set.Set SockAddr)
+  -> Int
+  -> Int
+  -> MVar ()
+  -> IO ()
+fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock =
+  withMVar linearLock $ \() -> do
+    peers <- getConnectedPeerList pm
+    unless (null peers) $ do
+      nextBlock <- readIORef nextBlockRef
+      headerTip <- readTVarIO (hcHeight hc)
+      reqFrom <- forkDownloadFloor db hc nextBlock
+      unless (nextBlock > headerTip || reqFrom < nextBlock) $ do
+        nowKick <- round <$> getPOSIXTime :: IO Int64
+        infStored <- readIORef linearInflightRef
+        failedKeys0 <- readIORef linearFailedRef
+        peerKeys <- mapM (\pc -> piAddress <$> readTVarIO (pcInfo pc)) peers
+        let keyToId = Map.fromList (zip peerKeys [0 :: Int ..])
+            idToKey = Map.fromList (zip [0 :: Int ..] peerKeys)
+            (inf0, _orphaned) = projectStableInflight keyToId infStored
+            failed0 = Set.fromList
+              [ pid
+              | k <- Set.toList failedKeys0
+              , Just pid <- [Map.lookup k keyToId]
+              ]
+            infPruned = Map.filter (\(_, ht, _) -> ht >= nextBlock) inf0
+            connectedTip = if nextBlock == 0 then 0 else nextBlock - 1
+            windowEnd = min headerTip
+                          (min (connectedTip + 1024)
+                               (connectedTip + fromIntegral maxBlocksInFlightTotal))
+        inf' <- requestBlockRange pm hc nextBlock windowEnd
+                  rot failed0 infPruned nowKick cap
+        writeIORef linearInflightRef (storeStableInflight idToKey inf')
+        let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
+        unless (null assignedH) $
+          modifyIORef' requestedUpToRef (max (maximum assignedH))
 
 --------------------------------------------------------------------------------
 -- P2P fork-aware download + reorg routing (reorg-drop production blocker)
@@ -3445,8 +3512,12 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- ('scanBlockForWallet') so wallet balance/history
                       -- track the chain in real time and persist — not only
                       -- on the mining/RPC path.
+                   -> IORef (IO ())
+                      -- ^ Receipt refill: after a successful connect, refill
+                      -- the linear getdata pipeline without waiting for the
+                      -- 0.4s kicker poll (single-feeder RATE hole).
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr msg = case msg of
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -3797,6 +3868,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                     elapsedMs
                     (length (blockTxns block))
                     (blockInputCount block)
+              -- Receipt refill: keep the linear pipeline full without
+              -- waiting for the 0.4s kicker poll. Live 2026-09-20
+              -- bottom-chain: 16 pipelined, kicker every 14 UpdateTips,
+              -- 96 blk/min vs nimrod 3,260 on the same feeder.
+              fillLinearPipelineAction <- readIORef receiptRefillRef
+              fillLinearPipelineAction
               -- Mirror the connect into any opted-in secondary indexes
               -- (txindex / blockfilterindex / coinstatsindex).  We read
               -- the freshly-persisted undo record back from disk so the
@@ -3928,7 +4005,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                     mBlkDrain <- getBlock db bhDrain
                     case mBlkDrain of
                       Just blkDrain ->
-                        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock blkDrain)
+                        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr (MBlock blkDrain)
                       Nothing -> return ()
                   Nothing -> return ()
 
@@ -4288,7 +4365,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -4395,7 +4472,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()

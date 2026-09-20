@@ -23,6 +23,7 @@
 module W193LinearDownloadSpec (spec) where
 
 import Test.Hspec
+import Data.List (isInfixOf)
 import Data.Word (Word32, Word64)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -36,7 +37,11 @@ import Haskoin.Network
   , combineServices
   , ForkGetDataPeer (..)
   , planLinearGetData
+  , planLinearGetDataWithCap
   , maxBlocksInTransitPerPeer
+  , maxBlocksInFlightTotal
+  , singleConnectBlocksInFlightPerPeer
+  , resolveBlocksInFlightPerPeer
   , PipelineInflight (..)
   , blockFirstByteTimeout
   , mutePipelineHeads
@@ -44,6 +49,9 @@ import Haskoin.Network
   , simulateLinearDownloadRate
   , simulateLinearDownloadRateChurn
   , simulateLinearDownloadRateChurnByIndex
+  , linearFillPipeline
+  , linearDropReceived
+  , simulateLinearReceipt
   , projectStableInflight
   , storeStableInflight
   )
@@ -221,3 +229,60 @@ spec = do
       let mute = replicate 6 False
           st = simulateLinearDownloadRateChurn mute 128 40
       ldsTip st `shouldSatisfy` (>= 32)
+
+  describe "single-feeder in-flight cap and receipt refill" $ do
+    -- Campaign: one --connect replay peer. rustoshi 57df6634 /
+    -- receipts/feeder-cap-ab-rustoshi-2026-09-11.md. Live haskoin
+    -- 2026-09-20 bottom-chain 6299→12650: cap 16, kicker-only refill,
+    -- 96 blk/min vs nimrod 3,260 / beamchain 2,590 on the same feeder.
+    it "single --connect defaults the per-peer cap to 128" $ do
+      resolveBlocksInFlightPerPeer 1 Nothing
+        `shouldBe` singleConnectBlocksInFlightPerPeer
+      resolveBlocksInFlightPerPeer 0 Nothing
+        `shouldBe` maxBlocksInTransitPerPeer
+      resolveBlocksInFlightPerPeer 2 Nothing
+        `shouldBe` maxBlocksInTransitPerPeer
+      resolveBlocksInFlightPerPeer 1 (Just "16") `shouldBe` 16
+      resolveBlocksInFlightPerPeer 1 (Just "64") `shouldBe` 64
+      resolveBlocksInFlightPerPeer 1 (Just "999")
+        `shouldBe` singleConnectBlocksInFlightPerPeer
+      resolveBlocksInFlightPerPeer 1 (Just "nope")
+        `shouldBe` singleConnectBlocksInFlightPerPeer
+      singleConnectBlocksInFlightPerPeer `shouldBe` maxBlocksInFlightTotal
+
+    it "a 128-cap on one peer fills 128 hashes, not 16" $ do
+      let one = [ForkGetDataPeer 0 fullNode]
+          plan = planLinearGetDataWithCap 128 one (neededN 128) 967625 0 Set.empty Map.empty
+          counts = map (length . snd) plan
+      sum counts `shouldBe` 128
+      maximum counts `shouldBe` 128
+
+    it "dropping a received height without refill is the kicker-only hole" $ do
+      -- Negative control: MBlock used to only advance nextBlockRef.
+      -- Inflight goes 16 → 15 until the 0.4s kicker poll. If this ever
+      -- passes (length == 16) the drop helper is refilling and the
+      -- instrument is not seeing the hole.
+      let filled = linearFillPipeline maxBlocksInTransitPerPeer 32
+          dropped = linearDropReceived 1 filled
+      length (ldsInflight filled) `shouldBe` maxBlocksInTransitPerPeer
+      length (ldsInflight dropped) `shouldBe` maxBlocksInTransitPerPeer - 1
+      ldsTip dropped `shouldBe` 1
+
+    it "a received block refills in-flight without a kicker tick" $ do
+      -- rustoshi received_block_refills_in_flight_without_a_tick:
+      -- after one body arrives, inflight is still at cap. The caller
+      -- does not invoke the kicker poll.
+      let st = simulateLinearReceipt maxBlocksInTransitPerPeer 32
+      length (ldsInflight st) `shouldBe` maxBlocksInTransitPerPeer
+      ldsTip st `shouldBe` 1
+      Set.member 1 (ldsHaveBody st) `shouldBe` True
+
+    it "MBlock success path refills the pipeline (not kicker-only)" $ do
+      -- Production wiring: the MBlock Right () arm must call
+      -- fillLinearPipeline so a local feeder does not wait for the
+      -- 0.4s poll (live: 19 kicker lines / 274 UpdateTips).
+      src <- readFile "app/Main.hs"
+      let afterTip =
+            dropWhile (not . ("formatUpdateTip" `isInfixOf`)) (lines src)
+      unlines (take 40 afterTip)
+        `shouldSatisfy` ("fillLinearPipeline" `isInfixOf`)

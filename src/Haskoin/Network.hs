@@ -103,10 +103,14 @@ module Haskoin.Network
   , hasService
   , nodeNetworkLimitedMinBlocks
   , maxBlocksInTransitPerPeer
+  , maxBlocksInFlightTotal
+  , singleConnectBlocksInFlightPerPeer
+  , resolveBlocksInFlightPerPeer
   , peerCanServeBlock
   , ForkGetDataPeer(..)
   , planForkGetData
   , planLinearGetData
+  , planLinearGetDataWithCap
   , PipelineInflight(..)
   , blockFirstByteTimeout
   , v2BlockFirstByteMinLen
@@ -116,6 +120,9 @@ module Haskoin.Network
   , simulateLinearDownloadRate
   , simulateLinearDownloadRateChurn
   , simulateLinearDownloadRateChurnByIndex
+  , linearFillPipeline
+  , linearDropReceived
+  , simulateLinearReceipt
   , projectStableInflight
   , storeStableInflight
     -- * Protocol Constants
@@ -636,6 +643,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe, isNothing)
 import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, minimumBy)
+import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
 import Control.Concurrent (threadDelay)
@@ -800,6 +808,34 @@ nodeNetworkLimitedMinBlocks = 288
 maxBlocksInTransitPerPeer :: Int
 maxBlocksInTransitPerPeer = 16
 
+-- | Distinct hashes kept in flight ahead of the connected tip (kicker
+-- window). Also the max accepted value of
+-- @HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER@.
+maxBlocksInFlightTotal :: Int
+maxBlocksInFlightTotal = 128
+
+-- | Per-peer cap when the node has exactly one @--connect@ peer (the
+-- campaign replay feeder). rustoshi measured 2.3× at 930k from 16→128
+-- on a matched clock (receipts/feeder-cap-ab-rustoshi-2026-09-11.md).
+-- Live haskoin 2026-09-20: the same feeder, cap 16, kicker-only refill
+-- → 96 blk/min vs nimrod 3,260 on 6299→12650.
+singleConnectBlocksInFlightPerPeer :: Int
+singleConnectBlocksInFlightPerPeer = maxBlocksInFlightTotal
+
+-- | Resolve the per-peer in-flight cap.
+--
+-- @HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER@ wins when it parses as 1..128.
+-- Otherwise a node with exactly one @--connect@ peer defaults to 128;
+-- every other topology keeps Core's 16. Mainnet haskoin has no
+-- @--connect@ (public peers), so this does not reopen the 910023
+-- "128 hashes to 1 of 7 peers" stall.
+resolveBlocksInFlightPerPeer :: Int -> Maybe String -> Int
+resolveBlocksInFlightPerPeer nConnect mEnv =
+  case mEnv >>= readMaybe of
+    Just n | n >= 1 && n <= maxBlocksInFlightTotal -> n
+    _ | nConnect == 1 -> singleConnectBlocksInFlightPerPeer
+      | otherwise -> maxBlocksInTransitPerPeer
+
 -- | Whether @services@ can serve a block at @blockHeight@ given header
 -- tip @headerTipHeight@.
 --
@@ -895,8 +931,22 @@ planLinearGetData
   -> Set.Set Int            -- ^ failed / mute peer ids
   -> Map Int Int            -- ^ already in-flight count per peer id
   -> [(Int, [BlockHash])]   -- ^ peer id → hashes
-planLinearGetData peers needed headerTip rot failed already
-  | null peers || null needed = []
+planLinearGetData =
+  planLinearGetDataWithCap maxBlocksInTransitPerPeer
+
+-- | 'planLinearGetData' with an explicit per-peer cap. Campaign
+-- single-feeder runs use 128; public-peer topologies keep 16.
+planLinearGetDataWithCap
+  :: Int
+  -> [ForkGetDataPeer]
+  -> [(BlockHash, Word32)]
+  -> Word32
+  -> Int
+  -> Set.Set Int
+  -> Map Int Int
+  -> [(Int, [BlockHash])]
+planLinearGetDataWithCap cap peers needed headerTip rot failed already
+  | null peers || null needed || cap <= 0 = []
   | otherwise =
       let n = length peers
           assign acc [] = acc
@@ -913,7 +963,7 @@ planLinearGetData peers needed headerTip rot failed already
                 used = length (Map.findWithDefault [] pid acc)
                        + Map.findWithDefault 0 pid already
             in if pid `Set.notMember` failed
-                  && used < maxBlocksInTransitPerPeer
+                  && used < cap
                   && peerCanServeBlock (fgdpServices p) headerTip ht
                  then Just pid
                  else findPeer acc h ht (i + 1)
@@ -1107,6 +1157,111 @@ simulateLinearDownloadRate muteFlags nBlocks nTicks =
                         , Set.insert (pifHeight h) haveAcc
                         )
        in foldl' step ([], have) (Map.toList grouped)
+
+-- | Fill the linear pipeline from an empty inflight set up to 'cap'
+-- hashes on one live peer. This is the first kicker/getdata window.
+linearFillPipeline :: Int -> Word32 -> LinearDownloadState
+linearFillPipeline cap nBlocks =
+  let peers =
+        [ ForkGetDataPeer 0 (combineServices [nodeNetwork, nodeWitness])
+        ]
+      headerTip = nBlocks
+      -- Pull a window of 128 so a cap-16 fill still has leftover hashes
+      -- for the receipt-refill step (rustoshi: remainder stays queued).
+      neededWindow =
+        [ (linearSimHash h, h)
+        | h <- [1 .. min nBlocks (fromIntegral maxBlocksInFlightTotal)]
+        ]
+      plan =
+        planLinearGetDataWithCap
+          cap
+          peers
+          neededWindow
+          headerTip
+          0
+          Set.empty
+          Map.empty
+      heightOf = Map.fromList [(linearSimHash h, h) | h <- [1 .. nBlocks]]
+      inf =
+        [ PipelineInflight
+            { pifPeer = pid
+            , pifHeight = ht
+            , pifRequestedAt = 0
+            , pifFirstByteAt = Nothing
+            }
+        | (pid, hs) <- plan
+        , bh <- hs
+        , Just ht <- [Map.lookup bh heightOf]
+        ]
+   in LinearDownloadState
+        { ldsTip = 0
+        , ldsInflight = inf
+        , ldsHaveBody = Set.empty
+        , ldsFailed = Set.empty
+        }
+
+-- | What MBlock did alone before receipt-refill: drop the connected
+-- height from inflight and advance the tip. The freed slot stays empty
+-- until the 0.4s kicker poll. Live 2026-09-20: 16 pipelined, kicker
+-- every ~14 blocks, 96 blk/min.
+linearDropReceived :: Word32 -> LinearDownloadState -> LinearDownloadState
+linearDropReceived ht st =
+  let have = Set.insert ht (ldsHaveBody st)
+      inf = [x | x <- ldsInflight st, pifHeight x /= ht]
+   in st
+        { ldsInflight = inf
+        , ldsHaveBody = have
+        , ldsTip = drainTipLinear (ldsTip st) have
+        }
+
+drainTipLinear :: Word32 -> Set.Set Word32 -> Word32
+drainTipLinear tip have
+  | Set.member (tip + 1) have = drainTipLinear (tip + 1) have
+  | otherwise = tip
+
+-- | One receive, then refill the freed slot WITHOUT a kicker tick.
+-- Core FindNextBlocksToDownload / rustoshi block_received. The
+-- kicker-only path (linearDropReceived) leaves inflight at cap-1.
+simulateLinearReceipt :: Int -> Word32 -> LinearDownloadState
+simulateLinearReceipt cap nBlocks =
+  let filled = linearFillPipeline cap nBlocks
+      dropped = linearDropReceived 1 filled
+      peers =
+        [ ForkGetDataPeer 0 (combineServices [nodeNetwork, nodeWitness])
+        ]
+      headerTip = nBlocks
+      inflightHs = Set.fromList (map pifHeight (ldsInflight dropped))
+      assigned = inflightHs `Set.union` ldsHaveBody dropped
+      windowEnd = min nBlocks (ldsTip dropped + fromIntegral maxBlocksInFlightTotal)
+      needed =
+        [ (linearSimHash h, h)
+        | h <- [ldsTip dropped + 1 .. windowEnd]
+        , h `Set.notMember` assigned
+        ]
+      used =
+        Map.fromListWith (+) [(pifPeer x, 1) | x <- ldsInflight dropped]
+      plan =
+        planLinearGetDataWithCap
+          cap
+          peers
+          needed
+          headerTip
+          0
+          Set.empty
+          used
+      heightOf = Map.fromList [(linearSimHash h, h) | h <- [1 .. nBlocks]]
+      newInf =
+        [ PipelineInflight
+            { pifPeer = pid
+            , pifHeight = ht
+            , pifRequestedAt = 1
+            , pifFirstByteAt = Nothing
+            }
+        | (pid, hs) <- plan
+        , bh <- hs
+        , Just ht <- [Map.lookup bh heightOf]
+        ]
+   in dropped {ldsInflight = ldsInflight dropped ++ newInf}
 
 -- | RATE control under peer-list churn. A new ghost peer is prepended
 -- every tick, the way Map.elems grows when AddrMan connects a lower

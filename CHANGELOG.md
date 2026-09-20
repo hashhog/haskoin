@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- feat: single `--connect` peer defaults the per-peer in-flight cap to 128 (`HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` overrides); MBlock refills the pipeline on receipt so a local feeder does not wait for the 0.4s kicker poll
+
 ## v1.0.2 — 2026-09-11
 
 - fix: fork-aware download serves historical getdata only to NODE_NETWORK peers and reorgs a downloaded heavier prefix (does not wait for the header tip)
