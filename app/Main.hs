@@ -1456,6 +1456,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- advancing; out-of-order bodies drain from disk.
     linearInflightRef <- newIORef (Map.empty :: Map.Map BlockHash (SockAddr, Word32, Int64))
     linearFailedRef <- newIORef (Set.empty :: Set.Set SockAddr)
+    -- Heights whose bodies are on disk but not yet connected (AcceptBlock
+    -- of an ahead MBlock). Core BLOCK_HAVE_DATA: do not re-getdata them.
+    haveBodyRef <- newIORef (Set.empty :: Set.Set Word32)
+    -- Installed after PeerManager starts (needs linearLock). Ahead-store
+    -- drops the hash from inflight so the slot can be next-needed.
+    bodyStoredRef <- newIORef ((\_ _ -> return ()) :: BlockHash -> Word32 -> IO ())
     -- Serialise kicker + MBlock receipt-refill against the same inflight
     -- map. Without this, a connect-side refill can overwrite a mute
     -- rotation the kicker just computed.
@@ -1778,7 +1784,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr msg
           `catchSync` (\e -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1793,7 +1799,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     writeIORef pmRef pm'
     writeIORef receiptRefillRef $
       fillLinearPipeline pm' hc db nextBlockRef requestedUpToRef
-        linearInflightRef linearFailedRef 0 perPeerCap linearLock
+        linearInflightRef linearFailedRef 0 perPeerCap linearLock haveBodyRef
+    writeIORef bodyStoredRef $ \bh ht -> withMVar linearLock $ \() -> do
+      modifyIORef' linearInflightRef (Map.delete bh)
+      modifyIORef' haveBodyRef (Set.insert ht)
 
     -- W117 DH-1: hidden-service / SAM-session announcement at startup.
     --
@@ -2061,29 +2070,37 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                            | (_, (pid, ht, reqAt)) <- Map.toList infRestarted
                            ]
                          (mutePids, muteHs) = mutePipelineHeads nowKick pipeline
+                         (stallPids, stallHs) = stallingNextNeeded nowKick nextBlock pipeline
                          muteSet = Set.fromList mutePids
+                         stallSet = Set.fromList stallPids
+                         rotateSet = muteSet `Set.union` stallSet
                          infAfterMute =
-                           Map.filter (\(pid, ht, _) ->
-                             pid `Set.notMember` muteSet && ht `notElem` muteHs)
+                           Map.filter (\(pid, _, _) ->
+                             pid `Set.notMember` rotateSet)
                              infRestarted
-                         failed1 = failed0 `Set.union` muteSet
+                         failed1 = failed0 `Set.union` rotateSet
                          -- If every connected peer is failed, start over
                          -- rather than stop requesting.
                          nPeersKicker = length peers
                          failed2 | nPeersKicker > 0 && Set.size failed1 >= nPeersKicker
                                    = Set.empty
                                  | otherwise = failed1
-                     when (not (null mutePids)) $ do
+                     when (not (null mutePids) || not (null stallPids)) $ do
+                       let rotatedHs = muteHs ++ stallHs
+                           kind | not (null stallPids) = " stalling-next-needed hash(es) "
+                                | otherwise = " mute-head hash(es) "
                        putStrLn $ "Block-gap kicker (stall recover): re-requesting "
-                               ++ show (length muteHs) ++ " mute-head hash(es) "
+                               ++ show (length rotatedHs) ++ kind
                                ++ show nextBlock ++ "-"
-                               ++ show (if null muteHs then nextBlock
-                                        else maximum muteHs)
+                               ++ show (if null rotatedHs then nextBlock
+                                        else maximum rotatedHs)
                                ++ " from other peers (mute peer idx "
-                               ++ show mutePids ++ ")"
+                               ++ show mutePids
+                               ++ " stalling-next-needed idx "
+                               ++ show stallPids ++ ")"
                        -- Restart the first-byte stamp on rotated peers.
                        forM_ (zip [0 :: Int ..] peers) $ \(i, pc) ->
-                         when (i `Set.member` muteSet) $
+                         when (i `Set.member` rotateSet) $
                            writeIORef (pcBlockFirstByteAt pc) Nothing
                      writeIORef linearFailedRef $
                        Set.fromList
@@ -2092,22 +2109,25 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                          , Just k <- [Map.lookup pid idToKey]
                          ]
                      writeIORef linearInflightRef (storeStableInflight idToKey infAfterMute)
+                     haveBody0 <- readIORef haveBodyRef
+                     let haveBody = Set.filter (>= nextBlock) haveBody0
+                     writeIORef haveBodyRef haveBody
                      let refillFrom = min pipeFrom nextBlock
-                         wantFill = needNew || not (null mutePids)
+                         wantFill = needNew || not (null mutePids) || not (null stallPids)
                                      || Map.size infAfterMute < fromIntegral maxBlocksInFlight
                                      || not (null orphanedHs)
-                     if wantFill && (progressed || stalled || needNew || not (null mutePids) || not (null orphanedHs))
+                     if wantFill && (progressed || stalled || needNew || not (null mutePids) || not (null stallPids) || not (null orphanedHs))
                        then do
                          let branch = selectLinearFillBranch
                                         False
                                         progressed
                                         stalled
-                                        (not (null mutePids))
+                                        (not (null mutePids) || not (null stallPids))
                                         (not (null orphanedHs))
                                         needNew
                          inf' <- requestBlockRange pm' hc refillFrom windowEnd
                                    rot failed2 infAfterMute nowKick perPeerCap branch
-                                   nextBlock
+                                   nextBlock haveBody
                          writeIORef linearInflightRef (storeStableInflight idToKey inf')
                          let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
                          unless (null assignedH) $
@@ -2115,7 +2135,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                          tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
                            `catch` (\(e :: SomeException) ->
                                       putStrLn $ "P2P reorg kicker error: " ++ show e)
-                         let rot' = if null mutePids then rot else rot + 1
+                         let rot' = if null mutePids && null stallPids then rot else rot + 1
                          return (rot', nextBlock, nowKick)
                        else return (rot, nextBlock, lastReqTime)
              let (rot', lastConn', lastReqTime') = newSt
@@ -3078,8 +3098,9 @@ requestBlockRange
   -> Int
   -> LinearFillBranch
   -> Word32 -- ^ next-needed height (connected tip + 1)
+  -> Set.Set Word32 -- ^ heights whose bodies are already stored
   -> IO (Map.Map BlockHash (Int, Word32, Int64))
-requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch nextNeeded
+requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch nextNeeded haveBody
   | fromHeight > toHeight = do
       putStrLn $ formatNextNeededAssignment branch nextNeeded NextNeededNotRequested
       return inflight
@@ -3099,11 +3120,7 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch n
           peerAddrs <- forM peerList $ \pc ->
             piAddress <$> readTVarIO (pcInfo pc)
           let needed =
-                [ (h, ht)
-                | ht <- [fromHeight .. toHeight]
-                , Just h <- [Map.lookup ht heightMap]
-                , not (Map.member h inflight)
-                ]
+                neededLinearHashes fromHeight toHeight heightMap inflight haveBody
               heightByHash = Map.fromList needed
               peers = [ ForkGetDataPeer i svc
                       | (i, svc) <- zip [0 ..] peerSvcs ]
@@ -3202,8 +3219,9 @@ fillLinearPipeline
   -> Int
   -> Int
   -> MVar ()
+  -> IORef (Set.Set Word32)
   -> IO ()
-fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock =
+fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock haveBodyRef =
   withMVar linearLock $ \() -> do
     peers <- getConnectedPeerList pm
     unless (null peers) $ do
@@ -3214,6 +3232,7 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
         nowKick <- round <$> getPOSIXTime :: IO Int64
         infStored <- readIORef linearInflightRef
         failedKeys0 <- readIORef linearFailedRef
+        haveBody0 <- readIORef haveBodyRef
         peerKeys <- mapM (\pc -> piAddress <$> readTVarIO (pcInfo pc)) peers
         let keyToId = Map.fromList (zip peerKeys [0 :: Int ..])
             idToKey = Map.fromList (zip [0 :: Int ..] peerKeys)
@@ -3224,12 +3243,14 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
               , Just pid <- [Map.lookup k keyToId]
               ]
             infPruned = Map.filter (\(_, ht, _) -> ht >= nextBlock) inf0
+            haveBody = Set.filter (>= nextBlock) haveBody0
             connectedTip = if nextBlock == 0 then 0 else nextBlock - 1
             windowEnd = min headerTip
                           (min (connectedTip + 1024)
                                (connectedTip + fromIntegral maxBlocksInFlightTotal))
+        writeIORef haveBodyRef haveBody
         inf' <- requestBlockRange pm hc nextBlock windowEnd
-                  rot failed0 infPruned nowKick cap FillReceipt nextBlock
+                  rot failed0 infPruned nowKick cap FillReceipt nextBlock haveBody
         writeIORef linearInflightRef (storeStableInflight idToKey inf')
         let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
         unless (null assignedH) $
@@ -3586,12 +3607,16 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- ^ Receipt refill: after a successful connect, refill
                       -- the linear getdata pipeline without waiting for the
                       -- 0.4s kicker poll (single-feeder RATE hole).
+                   -> IORef (BlockHash -> Word32 -> IO ())
+                      -- ^ Ahead-store: drop the hash from inflight and
+                      -- remember the height as BLOCK_HAVE_DATA so it is
+                      -- not re-getdata'd. Core AcceptBlock.
                    -> IORef Word64
                       -- ^ Running count of MBlock bodies that arrived and
                       -- were not connected. e8a03a9's 8x RATE drop was
                       -- silent on out-of-order G1 (only next-needed logged).
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr msg = case msg of
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -3831,272 +3856,315 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           -- clean, peer announce — those are independently thread-safe
           -- and don't compete with another peer's tip update.
           t0 <- getPOSIXTime
-          connectResult <- withMVar connectLock $ \() -> do
-            -- Route the per-input prevout reads through the dedicated
-            -- read-through cache (Class-A dbcache): a coin created at block N
-            -- and spent at block N+k is served from the in-memory mirror
-            -- instead of a cold RocksDB read. Byte-identical Coins to the
-            -- DB-only builder; invalidated per-spend in the Right () branch
-            -- below and wiped at every reorg/disconnect/flush boundary.
-            spent <- buildSpentUtxoMapCached cache block
-            -- W164 hollow-live-path fix: run the SAME full consensus gate the
-            -- shim (VerifyScriptShim.hs:710) and submitblock (BlockTemplate.hs:544)
-            -- use, BEFORE connecting.  connectBlock alone (connectBlockAt)
-            -- enforces only G1/G2/G19; this adds scripts, sigops, BIP30, merkle +
-            -- CVE-2012-2459, bad-cb-amount, value-conservation, BIP34/65/66/68/113,
-            -- witness commitment, weight, coinbase structure, and checkpoints.
-            -- Mirrors the dead Sync.hs:382-403 IBD template, with the PARENT-hash
-            -- MTP (NOT Sync.hs:387's own-hash, one block too deep because addHeader
-            -- at :2271 already inserted bh into hcEntries).  assumevalid skip is
-            -- fail-closed: best-header lag => shouldSkipScripts=False => scripts
-            -- verified.  validateFullBlock is pure; checkBIP30's only IO is
-            -- read-only DB lookups on the same db.  NOTE: coinbase-maturity is
-            -- still NOT enforced on this arm (TxOut-only view), a residual
-            -- false-ACCEPT gap, not a spurious reject.
-            blockEntries <- readTVarIO (hcEntries hc)
-            byHeightBg   <- readTVarIO (hcByHeight hc)
-            bestHdr      <- readTVarIO (hcTip hc)
-            let blockTs     = bhTimestamp hdr
-                parentHash  = bhPrevBlock hdr
-                prevMTP     = medianTimePast blockEntries parentHash
-                skipScripts = shouldSkipScripts bh height blockTs net blockEntries bestHdr
-                cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
-                                (consensusFlagsAtHeight net height)
-                getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
-            vr <- (validateFullBlockIO db net cs getMtpBg skipScripts block spent)
-                    `catch` (\(e :: SomeException) -> do
-                               putStrLn $ "ERROR validating block "
-                                       ++ show height ++ ": " ++ show e
-                               return (Left ("Core full-block validation: exception: " <> show e)))
-            r <- case vr of
-                   Left verr -> return (Left ("Core full-block validation: " <> verr))
-                   Right () ->
-                     (connectBlock db net block height spent)
-                       `catch` (\(e :: SomeException) -> do
-                                  putStrLn $ "ERROR connecting block "
-                                          ++ show height ++ ": " ++ show e
-                                  return (Left ("exception: " <> show e)))
-            -- Advance the next-block pointer IF the connect succeeded.
-            -- Done inside the lock so the @BestBlock / nextBlockRef@
-            -- pair stays consistent end-to-end — a concurrent kicker
-            -- read of 'nextBlockRef' won't see a "tip without cursor"
-            -- or vice versa.
-            case r of
-              Right () -> do
-                -- Class-A dbcache coherence: mirror connectBlockAt's PrefixUTXO
-                -- BatchDelete set (the spent prevouts, Consensus.hs:3667) into
-                -- the dedicated read-through cache so a later read-through can
-                -- never serve a just-spent coin as unspent. This generator is
-                -- IDENTICAL to the BatchDelete generator, so the invalidation
-                -- set == the on-disk delete set by construction. Under
-                -- connectLock => atomic vs sibling connects; vs the lock-free
-                -- kicker reorg the rcGen guard protects the populate path.
-                mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
-                      [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
-                nextBlock <- readIORef nextBlockRef
-                when (height >= nextBlock) $
-                  writeIORef nextBlockRef (height + 1)
-              Left _ -> return ()
-            return r
+          aheadOrConnect <- withMVar connectLock $ \() -> do
+            -- Live 2026-09-24: height=911889 next-needed=911874
+            -- reason=validation err=Missing UTXO. ConnectBlock against
+            -- the current UTXO MUST fail for an ahead body. Core
+            -- ProcessNewBlock: CheckBlock + AcceptBlock (store),
+            -- ConnectBlock only from ActivateBestChain when the parent
+            -- is the tip. Discriminator: stored=yes invalid=no — do
+            -- not insert hcInvalidated (that set is RPC invalidateblock).
+            nextNeededNow <- readIORef nextBlockRef
+            if height > nextNeededNow
+              then do
+                nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
+                blockEntries <- readTVarIO (hcEntries hc)
+                byHeightBg   <- readTVarIO (hcByHeight hc)
+                let parentHash  = bhPrevBlock hdr
+                    prevMTP     = medianTimePast blockEntries parentHash
+                    cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
+                                    (consensusFlagsAtHeight net height)
+                    getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
+                    acceptR     = validateFullBlock net cs getMtpBg False True block Map.empty
+                case acceptR of
+                  Left err ->
+                    return (Left (nextNeededNow, nUnc, Just err))
+                  Right () -> do
+                    putBlock db bh block
+                      `catchSync` (\e ->
+                                 putStrLn $ "putBlock (ahead) error at height "
+                                         ++ show height ++ ": " ++ show e)
+                    return (Left (nextNeededNow, nUnc, Nothing))
+              else do
+                -- Route the per-input prevout reads through the dedicated
+                -- read-through cache (Class-A dbcache): a coin created at block N
+                -- and spent at block N+k is served from the in-memory mirror
+                -- instead of a cold RocksDB read. Byte-identical Coins to the
+                -- DB-only builder; invalidated per-spend in the Right () branch
+                -- below and wiped at every reorg/disconnect/flush boundary.
+                spent <- buildSpentUtxoMapCached cache block
+                -- W164 hollow-live-path fix: run the SAME full consensus gate the
+                -- shim (VerifyScriptShim.hs:710) and submitblock (BlockTemplate.hs:544)
+                -- use, BEFORE connecting.  connectBlock alone (connectBlockAt)
+                -- enforces only G1/G2/G19; this adds scripts, sigops, BIP30, merkle +
+                -- CVE-2012-2459, bad-cb-amount, value-conservation, BIP34/65/66/68/113,
+                -- witness commitment, weight, coinbase structure, and checkpoints.
+                -- Mirrors the dead Sync.hs:382-403 IBD template, with the PARENT-hash
+                -- MTP (NOT Sync.hs:387's own-hash, one block too deep because addHeader
+                -- at :2271 already inserted bh into hcEntries).  assumevalid skip is
+                -- fail-closed: best-header lag => shouldSkipScripts=False => scripts
+                -- verified.  validateFullBlock is pure; checkBIP30's only IO is
+                -- read-only DB lookups on the same db.  NOTE: coinbase-maturity is
+                -- still NOT enforced on this arm (TxOut-only view), a residual
+                -- false-ACCEPT gap, not a spurious reject.
+                blockEntries <- readTVarIO (hcEntries hc)
+                byHeightBg   <- readTVarIO (hcByHeight hc)
+                bestHdr      <- readTVarIO (hcTip hc)
+                let blockTs     = bhTimestamp hdr
+                    parentHash  = bhPrevBlock hdr
+                    prevMTP     = medianTimePast blockEntries parentHash
+                    skipScripts = shouldSkipScripts bh height blockTs net blockEntries bestHdr
+                    cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
+                                    (consensusFlagsAtHeight net height)
+                    getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
+                vr <- (validateFullBlockIO db net cs getMtpBg skipScripts block spent)
+                        `catch` (\(e :: SomeException) -> do
+                                   putStrLn $ "ERROR validating block "
+                                           ++ show height ++ ": " ++ show e
+                                   return (Left ("Core full-block validation: exception: " <> show e)))
+                r <- case vr of
+                       Left verr -> return (Left ("Core full-block validation: " <> verr))
+                       Right () ->
+                         (connectBlock db net block height spent)
+                           `catch` (\(e :: SomeException) -> do
+                                      putStrLn $ "ERROR connecting block "
+                                              ++ show height ++ ": " ++ show e
+                                      return (Left ("exception: " <> show e)))
+                -- Advance the next-block pointer IF the connect succeeded.
+                -- Done inside the lock so the @BestBlock / nextBlockRef@
+                -- pair stays consistent end-to-end — a concurrent kicker
+                -- read of 'nextBlockRef' won't see a "tip without cursor"
+                -- or vice versa.
+                case r of
+                  Right () -> do
+                    -- Class-A dbcache coherence: mirror connectBlockAt's PrefixUTXO
+                    -- BatchDelete set (the spent prevouts, Consensus.hs:3667) into
+                    -- the dedicated read-through cache so a later read-through can
+                    -- never serve a just-spent coin as unspent. This generator is
+                    -- IDENTICAL to the BatchDelete generator, so the invalidation
+                    -- set == the on-disk delete set by construction. Under
+                    -- connectLock => atomic vs sibling connects; vs the lock-free
+                    -- kicker reorg the rcGen guard protects the populate path.
+                    mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
+                          [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
+                    nextBlock <- readIORef nextBlockRef
+                    when (height >= nextBlock) $
+                      writeIORef nextBlockRef (height + 1)
+                  Left _ -> return ()
+                return (Right r)
           t1 <- getPOSIXTime
           let elapsedMs = max 0 (round ((t1 - t0) * 1000) :: Int)
-          case connectResult of
-            Left cbErr -> do
-              -- Count every unconnected arrival, not only next-needed.
-              -- e8a03a9's 8x RATE drop (106 -> 13 blk/min) issued 3x the
-              -- getdata windows; out-of-order G1 against the in-order
-              -- connect gate was the obvious candidate and was silent.
-              nb <- readIORef nextBlockRef
-              nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
-              -- err= on every connect-reject, not only height == next-needed.
-              -- Live 2026-09-24: heights 48–63 ahead were reason=validation
-              -- with no string, and that tag is the classifier catch-all.
-              putStrLn $ formatUnconnectedArrivalDetail (Just height) nb (classifyConnectReject cbErr) nUnc cbErr
-              -- W163 diagnostic: extra detail for the next-needed block.
-              -- NOTE: the earlier guard matched "Core G1" which is ALSO
-              -- a prefix of "Core G19" (missing-prevout); classifyConnectReject
-              -- checks G19 first.
-              when (height == nb) $
-                putStrLn $ "[W163 diag] next-needed block " ++ show height
-                        ++ " rejected by connectBlock: " ++ cbErr
-              -- GAP2/GAP3 reorg-drop fix.  A block whose parent is NOT the
-              -- connected tip fails the linear connect G1 gate
-              -- (@prevHash == GetBestBlock()@).  Pre-fix the body was simply
-              -- dropped, so a heavier COMPETING fork could never be
-              -- assembled.  Persist the body (Core 'SaveBlockToDisk' stores
-              -- every accepted block regardless of which branch wins) so the
-              -- reorg engine's 'buildReorgConnectList' can read it back, then
-              -- attempt a reorg: if this block (or the heavier header tip it
-              -- belongs to) outweighs the connected chain and forks below it,
-              -- 'tryP2PReorg' disconnects the connected branch to the fork
-              -- point and connects the heavier branch.  No-op when the header
-              -- tip is not a heavier competing fork.  The block header is
-              -- already in 'hcEntries' (addHeader above), so 'putBlock' is the
-              -- only missing piece for the engine to find the body.
-              putBlock db bh block
-                `catchSync` (\e ->
-                           putStrLn $ "putBlock (side-branch) error at height "
-                                   ++ show height ++ ": " ++ show e)
-              tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
-                `catchSync` (\e ->
-                           putStrLn $ "P2P reorg (MBlock) error at height "
-                                   ++ show height ++ ": " ++ show e)
-            Right () -> do
-              -- Operator progress: Core logs UpdateTip on every active
-              -- chainstate connect (validation.cpp). The previous
-              -- `height mod 500` line had no hash, no timing, and was
-              -- silent for 499/500 blocks — grepping `Connected` on a
-              -- node that WAS connecting returned 0.
-              isIBD <- readIORef ibdModeRef
-              utiHeaderTip <- readTVarIO (hcHeight hc)
-              when (shouldLogUpdateTip isIBD height utiHeaderTip) $
-                putStrLn $
-                  formatUpdateTip
-                    height
-                    bh
-                    elapsedMs
-                    (length (blockTxns block))
-                    (blockInputCount block)
-              -- Receipt refill: keep the linear pipeline full without
-              -- waiting for the 0.4s kicker poll. Live 2026-09-20
-              -- bottom-chain: 16 pipelined, kicker every 14 UpdateTips,
-              -- 96 blk/min vs nimrod 3,260 on the same feeder.
-              fillLinearPipelineAction <- readIORef receiptRefillRef
-              fillLinearPipelineAction
-              -- Mirror the connect into any opted-in secondary indexes
-              -- (txindex / blockfilterindex / coinstatsindex).  We read
-              -- the freshly-persisted undo record back from disk so the
-              -- BlockFilterIndex sees the byte-identical 'BlockUndo' that
-              -- 'disconnectBlock' would replay — keeping the GCS filter
-              -- byte-for-byte compatible with Bitcoin Core's
-              -- blockfilterindex.cpp::CustomAppend output.
-              (case mIdxMgr of
-                  Nothing -> return ()
-                  Just im -> do
-                    mUndo <- getUndoData db bh
-                    case mUndo of
-                      Just undoData ->
-                        indexManagerConnectBlock im block
-                          (udBlockUndo undoData) bh height
-                      Nothing -> return ())
-                `catch` (\(e :: SomeException) ->
-                  putStrLn $ "index mirror error at height "
-                          ++ show height ++ ": " ++ show e)
-              -- DURABILITY (sweep wa0fq5wtk): feed the live-connected block
-              -- to the default wallet so balance/history/UTXO ledger track
-              -- the chain in real time and persist (save-on-mutation).  This
-              -- is THE connect-loop hook that makes wallet state survive an
-              -- unclean restart from the P2P/IBD path, mirroring Core's
-              -- CWallet::blockConnected.  Best-effort: a wallet error must
-              -- never abort block connection.
-              (do mWm <- readIORef walletMgrRef
-                  case mWm of
+          case aheadOrConnect of
+            Left (nb, nUnc, Nothing) -> do
+              storedAct <- readIORef bodyStoredRef
+              storedAct bh height
+              putStrLn $ formatOutOfOrderStored (Just height) nb nUnc
+            Left (nb, nUnc, Just err) ->
+              putStrLn $
+                formatUnconnectedArrivalDetail
+                  (Just height)
+                  nb
+                  (classifyConnectReject ("Core full-block validation: " ++ err))
+                  nUnc
+                  err
+                  ++ " stored=no invalid=no"
+            Right connectResult -> case connectResult of
+              Left cbErr -> do
+                -- Count every unconnected arrival, not only next-needed.
+                -- e8a03a9's 8x RATE drop (106 -> 13 blk/min) issued 3x the
+                -- getdata windows; out-of-order G1 against the in-order
+                -- connect gate was the obvious candidate and was silent.
+                nb <- readIORef nextBlockRef
+                nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
+                -- err= on every connect-reject, not only height == next-needed.
+                -- Live 2026-09-24: heights 48–63 ahead were reason=validation
+                -- with no string, and that tag is the classifier catch-all.
+                putStrLn $ formatUnconnectedArrivalDetail (Just height) nb (classifyConnectReject cbErr) nUnc cbErr
+                -- W163 diagnostic: extra detail for the next-needed block.
+                -- NOTE: the earlier guard matched "Core G1" which is ALSO
+                -- a prefix of "Core G19" (missing-prevout); classifyConnectReject
+                -- checks G19 first.
+                when (height == nb) $
+                  putStrLn $ "[W163 diag] next-needed block " ++ show height
+                          ++ " rejected by connectBlock: " ++ cbErr
+                -- GAP2/GAP3 reorg-drop fix.  A block whose parent is NOT the
+                -- connected tip fails the linear connect G1 gate
+                -- (@prevHash == GetBestBlock()@).  Pre-fix the body was simply
+                -- dropped, so a heavier COMPETING fork could never be
+                -- assembled.  Persist the body (Core 'SaveBlockToDisk' stores
+                -- every accepted block regardless of which branch wins) so the
+                -- reorg engine's 'buildReorgConnectList' can read it back, then
+                -- attempt a reorg: if this block (or the heavier header tip it
+                -- belongs to) outweighs the connected chain and forks below it,
+                -- 'tryP2PReorg' disconnects the connected branch to the fork
+                -- point and connects the heavier branch.  No-op when the header
+                -- tip is not a heavier competing fork.  The block header is
+                -- already in 'hcEntries' (addHeader above), so 'putBlock' is the
+                -- only missing piece for the engine to find the body.
+                putBlock db bh block
+                  `catchSync` (\e ->
+                             putStrLn $ "putBlock (side-branch) error at height "
+                                     ++ show height ++ ": " ++ show e)
+                tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
+                  `catchSync` (\e ->
+                             putStrLn $ "P2P reorg (MBlock) error at height "
+                                     ++ show height ++ ": " ++ show e)
+              Right () -> do
+                -- Operator progress: Core logs UpdateTip on every active
+                -- chainstate connect (validation.cpp). The previous
+                -- `height mod 500` line had no hash, no timing, and was
+                -- silent for 499/500 blocks — grepping `Connected` on a
+                -- node that WAS connecting returned 0.
+                isIBD <- readIORef ibdModeRef
+                utiHeaderTip <- readTVarIO (hcHeight hc)
+                when (shouldLogUpdateTip isIBD height utiHeaderTip) $
+                  putStrLn $
+                    formatUpdateTip
+                      height
+                      bh
+                      elapsedMs
+                      (length (blockTxns block))
+                      (blockInputCount block)
+                -- Receipt refill: keep the linear pipeline full without
+                -- waiting for the 0.4s kicker poll. Live 2026-09-20
+                -- bottom-chain: 16 pipelined, kicker every 14 UpdateTips,
+                -- 96 blk/min vs nimrod 3,260 on the same feeder.
+                fillLinearPipelineAction <- readIORef receiptRefillRef
+                fillLinearPipelineAction
+                -- Mirror the connect into any opted-in secondary indexes
+                -- (txindex / blockfilterindex / coinstatsindex).  We read
+                -- the freshly-persisted undo record back from disk so the
+                -- BlockFilterIndex sees the byte-identical 'BlockUndo' that
+                -- 'disconnectBlock' would replay — keeping the GCS filter
+                -- byte-for-byte compatible with Bitcoin Core's
+                -- blockfilterindex.cpp::CustomAppend output.
+                (case mIdxMgr of
                     Nothing -> return ()
-                    Just wm -> do
-                      (mDef, _) <- getDefaultWallet wm
-                      case mDef of
-                        Nothing -> return ()
-                        Just ws -> scanBlockForWallet (wsWallet ws) block height)
-                `catch` (\(e :: SomeException) ->
-                  putStrLn $ "wallet scan error at height "
-                          ++ show height ++ ": " ++ show e)
-              -- Durability: flush WAL + UTXO cache every flushBlockInterval
-              -- blocks. This bounds the data-loss window on a non-graceful
-              -- shutdown. Reference: Bitcoin Core src/validation.cpp
-              -- FlushStateToDisk (50 MB of UTXO changes / 24h).
-              let flushBlockInterval = 1000 :: Word32
-              cnt <- atomicModifyIORef' blocksSinceFlushRef (\c -> (c + 1, c + 1))
-              when (cnt >= flushBlockInterval) $ do
-                putStrLn $ "Block-count flush at height=" ++ show height
-                           ++ " (" ++ show cnt ++ " blocks since last flush)"
-                flushCache cache
-                  `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
-                syncFlush db
-                  `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
-                writeIORef blocksSinceFlushRef 0
-                nowE <- round <$> getPOSIXTime
-                writeIORef lastFlushEpochRef nowE
-                -- Auto-prune trigger.  Mirrors Bitcoin Core's
-                -- @FlushStateToDisk -> PruneBlockFiles@ branch in
-                -- bitcoin-core/src/validation.cpp: pruning fires only on a
-                -- flush boundary (not every block), only when prune mode is
-                -- on and the target is finite (not manual / disabled).
-                -- Best-effort; pruning errors must never abort the block
-                -- connection or the flush path.
-                case mBlockStore of
-                  Just bs -> do
-                    n <- autoPruneIfNeeded bs height pruneCfg
-                           `catch` (\(e :: SomeException) -> do
-                                      putStrLn $ "auto-prune error: " ++ show e
-                                      return 0)
-                    when (n > 0) $
-                      putStrLn $ "auto-prune: pruned " ++ show n
-                              ++ " block file(s) at height=" ++ show height
-                  Nothing -> return ()
-              -- Remove confirmed txs from mempool and clear rejection filter
-              blockConnected mp block
-              writeIORef recentlyRejectedRef Set.empty
-              -- BUG-13 FIX: EraseForBlock — remove confirmed txs from the
-              -- orphan pool.  Core calls TxOrphanage::EraseForBlock after
-              -- each block is connected so that orphans whose parents are
-              -- now on-chain do not linger until expiry.
-              -- Reference: bitcoin-core/src/node/txorphanage.h:89
-              let confirmedTxIds = map computeTxId (blockTxns block)
-              eraseOrphansForBlock confirmedTxIds orphanPoolRef
-              -- BUG-1 FIX (W114): record confirmation heights for all txs in
-              -- this block so the fee estimator can compute how long they took
-              -- to confirm.  Reference: bitcoin-core/src/policy/fees.cpp
-              -- CBlockPolicyEstimator::processBlock — called from
-              -- CTxMemPool::removeForBlock after each valid block.
-              recordConfirmation fe height confirmedTxIds
-              -- Announce the new tip honouring BIP-130 sendheaders
-              -- preference: peers that requested 'sendheaders' get an
-              -- MHeaders, the rest get the legacy MInv.  Reference:
-              -- announceTip helper +
-              -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
-              pm <- readIORef pmRef
-              announceTip pm (blockHeader block) bh
-              -- After connecting a block that reaches our best HEADER tip,
-              -- probe for further blocks we might be missing.  Gated on
-              -- 'height >= headerTipH': during bulk IBD the connected block is
-              -- far below the header tip, and firing a getheaders per connected
-              -- block flooded the peer with thousands of requests (each with a
-              -- single-hash '[bh]' locator that the peer answers with 2000
-              -- already-known headers) — a major contributor to the getheaders
-              -- storm that starved block download.  Core only re-probes headers
-              -- on new tips / inv / timeouts, not per connected IBD block.  Use
-              -- a full exponential locator ('buildBlockLocatorFromChain', == the
-              -- tip here) instead of the single hash so the peer resumes past
-              -- our tip rather than resending.
-              headerTipH <- readTVarIO (hcHeight hc)
-              connPeers <- getConnectedPeerList pm
-              unless (null connPeers || height < headerTipH) $ do
-                locator <- buildBlockLocatorFromChain hc
-                let finalLocator = if null locator then [bh] else locator
-                    zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
-                    getHdrs = GetHeaders
-                      { ghVersion  = fromIntegral protocolVersion
-                      , ghLocators = finalLocator
-                      , ghHashStop = zeroHash
-                      }
-                void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
-                  `catch` (\(_ :: SomeException) -> return ())
-              -- Drain already-persisted next blocks. Multi-peer download
-              -- stores out-of-order bodies on the G1-fail putBlock path;
-              -- once the next-needed block connects, walk hcByHeight and
-              -- connect anything already on disk so RATE is not "wait
-              -- until we re-receive them".
-              do
-                nbDrain <- readIORef nextBlockRef
-                hmapDrain <- readTVarIO (hcByHeight hc)
-                case Map.lookup nbDrain hmapDrain of
-                  Just bhDrain -> do
-                    mBlkDrain <- getBlock db bhDrain
-                    case mBlkDrain of
-                      Just blkDrain ->
-                        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr (MBlock blkDrain)
+                    Just im -> do
+                      mUndo <- getUndoData db bh
+                      case mUndo of
+                        Just undoData ->
+                          indexManagerConnectBlock im block
+                            (udBlockUndo undoData) bh height
+                        Nothing -> return ())
+                  `catch` (\(e :: SomeException) ->
+                    putStrLn $ "index mirror error at height "
+                            ++ show height ++ ": " ++ show e)
+                -- DURABILITY (sweep wa0fq5wtk): feed the live-connected block
+                -- to the default wallet so balance/history/UTXO ledger track
+                -- the chain in real time and persist (save-on-mutation).  This
+                -- is THE connect-loop hook that makes wallet state survive an
+                -- unclean restart from the P2P/IBD path, mirroring Core's
+                -- CWallet::blockConnected.  Best-effort: a wallet error must
+                -- never abort block connection.
+                (do mWm <- readIORef walletMgrRef
+                    case mWm of
                       Nothing -> return ()
-                  Nothing -> return ()
+                      Just wm -> do
+                        (mDef, _) <- getDefaultWallet wm
+                        case mDef of
+                          Nothing -> return ()
+                          Just ws -> scanBlockForWallet (wsWallet ws) block height)
+                  `catch` (\(e :: SomeException) ->
+                    putStrLn $ "wallet scan error at height "
+                            ++ show height ++ ": " ++ show e)
+                -- Durability: flush WAL + UTXO cache every flushBlockInterval
+                -- blocks. This bounds the data-loss window on a non-graceful
+                -- shutdown. Reference: Bitcoin Core src/validation.cpp
+                -- FlushStateToDisk (50 MB of UTXO changes / 24h).
+                let flushBlockInterval = 1000 :: Word32
+                cnt <- atomicModifyIORef' blocksSinceFlushRef (\c -> (c + 1, c + 1))
+                when (cnt >= flushBlockInterval) $ do
+                  putStrLn $ "Block-count flush at height=" ++ show height
+                             ++ " (" ++ show cnt ++ " blocks since last flush)"
+                  flushCache cache
+                    `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e)
+                  syncFlush db
+                    `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e)
+                  writeIORef blocksSinceFlushRef 0
+                  nowE <- round <$> getPOSIXTime
+                  writeIORef lastFlushEpochRef nowE
+                  -- Auto-prune trigger.  Mirrors Bitcoin Core's
+                  -- @FlushStateToDisk -> PruneBlockFiles@ branch in
+                  -- bitcoin-core/src/validation.cpp: pruning fires only on a
+                  -- flush boundary (not every block), only when prune mode is
+                  -- on and the target is finite (not manual / disabled).
+                  -- Best-effort; pruning errors must never abort the block
+                  -- connection or the flush path.
+                  case mBlockStore of
+                    Just bs -> do
+                      n <- autoPruneIfNeeded bs height pruneCfg
+                             `catch` (\(e :: SomeException) -> do
+                                        putStrLn $ "auto-prune error: " ++ show e
+                                        return 0)
+                      when (n > 0) $
+                        putStrLn $ "auto-prune: pruned " ++ show n
+                                ++ " block file(s) at height=" ++ show height
+                    Nothing -> return ()
+                -- Remove confirmed txs from mempool and clear rejection filter
+                blockConnected mp block
+                writeIORef recentlyRejectedRef Set.empty
+                -- BUG-13 FIX: EraseForBlock — remove confirmed txs from the
+                -- orphan pool.  Core calls TxOrphanage::EraseForBlock after
+                -- each block is connected so that orphans whose parents are
+                -- now on-chain do not linger until expiry.
+                -- Reference: bitcoin-core/src/node/txorphanage.h:89
+                let confirmedTxIds = map computeTxId (blockTxns block)
+                eraseOrphansForBlock confirmedTxIds orphanPoolRef
+                -- BUG-1 FIX (W114): record confirmation heights for all txs in
+                -- this block so the fee estimator can compute how long they took
+                -- to confirm.  Reference: bitcoin-core/src/policy/fees.cpp
+                -- CBlockPolicyEstimator::processBlock — called from
+                -- CTxMemPool::removeForBlock after each valid block.
+                recordConfirmation fe height confirmedTxIds
+                -- Announce the new tip honouring BIP-130 sendheaders
+                -- preference: peers that requested 'sendheaders' get an
+                -- MHeaders, the rest get the legacy MInv.  Reference:
+                -- announceTip helper +
+                -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
+                pm <- readIORef pmRef
+                announceTip pm (blockHeader block) bh
+                -- After connecting a block that reaches our best HEADER tip,
+                -- probe for further blocks we might be missing.  Gated on
+                -- 'height >= headerTipH': during bulk IBD the connected block is
+                -- far below the header tip, and firing a getheaders per connected
+                -- block flooded the peer with thousands of requests (each with a
+                -- single-hash '[bh]' locator that the peer answers with 2000
+                -- already-known headers) — a major contributor to the getheaders
+                -- storm that starved block download.  Core only re-probes headers
+                -- on new tips / inv / timeouts, not per connected IBD block.  Use
+                -- a full exponential locator ('buildBlockLocatorFromChain', == the
+                -- tip here) instead of the single hash so the peer resumes past
+                -- our tip rather than resending.
+                headerTipH <- readTVarIO (hcHeight hc)
+                connPeers <- getConnectedPeerList pm
+                unless (null connPeers || height < headerTipH) $ do
+                  locator <- buildBlockLocatorFromChain hc
+                  let finalLocator = if null locator then [bh] else locator
+                      zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
+                      getHdrs = GetHeaders
+                        { ghVersion  = fromIntegral protocolVersion
+                        , ghLocators = finalLocator
+                        , ghHashStop = zeroHash
+                        }
+                  void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
+                    `catch` (\(_ :: SomeException) -> return ())
+                -- Drain already-persisted next blocks. Multi-peer download
+                -- stores out-of-order bodies on the G1-fail putBlock path;
+                -- once the next-needed block connects, walk hcByHeight and
+                -- connect anything already on disk so RATE is not "wait
+                -- until we re-receive them".
+                do
+                  nbDrain <- readIORef nextBlockRef
+                  hmapDrain <- readTVarIO (hcByHeight hc)
+                  case Map.lookup nbDrain hmapDrain of
+                    Just bhDrain -> do
+                      mBlkDrain <- getBlock db bhDrain
+                      case mBlkDrain of
+                        Just blkDrain ->
+                          syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr (MBlock blkDrain)
+                        Nothing -> return ()
+                    Nothing -> return ()
 
   MTx tx -> do
     let txid = computeTxId tx
@@ -4454,7 +4522,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -4561,7 +4629,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()

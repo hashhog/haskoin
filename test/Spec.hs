@@ -184,6 +184,7 @@ import qualified W196SyncProgressSpec
 import qualified W197DownloadInstrumentSpec
 import qualified W198PeerIdleSpec
 import qualified W199StallDiscriminatorSpec
+import qualified W200OutOfOrderStallSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23916,6 +23917,12 @@ main = hspec $ do
   -- next-needed had no error string, and requestFromPeer failures
   -- did not name the message. Logs only — not a rate change.
   W199StallDiscriminatorSpec.spec
+
+  -- W200: out-of-order AcceptBlock + next-needed stall reassignment.
+  -- Live 2026-09-24: ahead bodies fully validated against the current
+  -- UTXO (Missing UTXO) and next-needed stuck already-inflight on one
+  -- peer that stamped first-byte by sending later heights.
+  W200OutOfOrderStallSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

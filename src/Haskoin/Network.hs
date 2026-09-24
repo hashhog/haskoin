@@ -116,6 +116,10 @@ module Haskoin.Network
   , v2BlockFirstByteMinLen
   , v2PacketLooksLikeBlock
   , mutePipelineHeads
+  , blockStallingTimeout
+  , stallingNextNeeded
+  , neededLinearHashes
+  , simulateStallingNextNeeded
   , LinearDownloadState(..)
   , simulateLinearDownloadRate
   , simulateLinearDownloadRateChurn
@@ -656,7 +660,7 @@ import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe, isNothing)
-import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy)
+import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
 import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
@@ -1278,6 +1282,58 @@ mutePipelineHeads now xs
             [ pifHeight x | x <- xs, pifPeer x `Set.member` muteSet ]
        in (mutePids, heights)
 
+-- | Core net_processing.cpp BLOCK_STALLING_TIMEOUT_DEFAULT. The
+-- first-byte mute (16s) is "this peer is sending no block data". A
+-- peer that streams later heights stamps first-byte and never looks
+-- mute, while next-needed stays already-inflight (live 2026-09-24:
+-- 71.191.251.202:8333, 6 of 8 fates). Stalling is "the window cannot
+-- move": next-needed has been charged to that peer for this long.
+blockStallingTimeout :: Int64
+blockStallingTimeout = 2
+
+-- | Peers holding next-needed inflight past 'blockStallingTimeout'.
+-- The whole pipeline on those peers is rotated (Core disconnects the
+-- staller). First-byte does not excuse them.
+stallingNextNeeded
+  :: Int64
+  -> Word32
+  -> [PipelineInflight]
+  -> ([Int], [Word32])
+stallingNextNeeded now nextNeeded xs
+  | null xs = ([], [])
+  | otherwise =
+      let stallSet =
+            Set.fromList
+              [ pifPeer x
+              | x <- xs
+              , pifHeight x == nextNeeded
+              , now - pifRequestedAt x >= blockStallingTimeout
+              ]
+          heights =
+            [ pifHeight x | x <- xs, pifPeer x `Set.member` stallSet ]
+       in (Set.toList stallSet, heights)
+
+-- | Heights the linear planner still needs to getdata. Inflight and
+-- already-stored bodies (Core BLOCK_HAVE_DATA) are skipped so an
+-- AcceptBlock'd ahead hash is not re-requested and does not occupy a
+-- slot.
+neededLinearHashes
+  :: Word32
+  -> Word32
+  -> Map.Map Word32 BlockHash
+  -> Map.Map BlockHash a
+  -> Set.Set Word32
+  -> [(BlockHash, Word32)]
+neededLinearHashes fromH toH heightMap inflight haveBody
+  | fromH > toH = []
+  | otherwise =
+      [ (h, ht)
+      | ht <- [fromH .. toH]
+      , ht `Set.notMember` haveBody
+      , Just h <- [Map.lookup ht heightMap]
+      , not (Map.member h inflight)
+      ]
+
 -- | Deterministic IBD-download simulator used by the RATE control.
 -- Each tick: live peers stamp first-byte on their pipeline head or
 -- complete a previously-stamped head (one message per connection);
@@ -1368,6 +1424,101 @@ simulateLinearDownloadRate muteFlags nBlocks nTicks =
                       [] -> (infAcc, haveAcc)
                       (h : rest) ->
                         -- One body per tick per live peer (stamp+complete).
+                        ( infAcc ++ rest
+                        , Set.insert (pifHeight h) haveAcc
+                        )
+       in foldl' step ([], have) (Map.toList grouped)
+
+-- | Two peers, 16 each. Peer 0 is assigned next-needed first and
+-- delivers only heights ABOVE it (stamping first-byte on the rest).
+-- mutePipelineHeads therefore never fires. stallingNextNeeded rotates
+-- peer 0 at 2s so peer 1 can take the head.
+simulateStallingNextNeeded :: Int -> Word32 -> LinearDownloadState
+simulateStallingNextNeeded nTicks _nBlocks =
+  foldl' tick initState [1 .. nTicks]
+  where
+    -- Live shape, miniaturised: peer 0 holds next-needed AND one later
+    -- hash. It only delivers the later hash (first-byte stamps). Peer 1
+    -- starts empty so a stall rotation has a free slot for the head.
+    initState =
+      LinearDownloadState
+        { ldsTip = 0
+        , ldsInflight =
+            [ PipelineInflight 0 1 0 Nothing
+            , PipelineInflight 0 2 0 Nothing
+            ]
+        , ldsHaveBody = Set.empty
+        , ldsFailed = Set.empty
+        }
+    tick st t =
+      let now = fromIntegral t :: Int64
+          nextNeeded = ldsTip st + 1
+          (inf1, have1) =
+            deliverSkipNextNeeded now nextNeeded (ldsInflight st) (ldsHaveBody st)
+          (mutePids, _) = mutePipelineHeads now inf1
+          (stallPids, _) = stallingNextNeeded now nextNeeded inf1
+          rotateSet = Set.fromList mutePids `Set.union` Set.fromList stallPids
+          inf2 = [x | x <- inf1, pifPeer x `Set.notMember` rotateSet]
+          failed' = ldsFailed st `Set.union` rotateSet
+          tip' = drainTipSim (ldsTip st) have1
+          hasNext =
+            any (\x -> pifHeight x == tip' + 1) inf2
+              || Set.member (tip' + 1) have1
+          assignee =
+            [ pid
+            | pid <- [0, 1]
+            , pid `Set.notMember` failed'
+            ]
+          newInf =
+            [ PipelineInflight
+                { pifPeer = pid
+                , pifHeight = tip' + 1
+                , pifRequestedAt = now
+                , pifFirstByteAt = Nothing
+                }
+            | not hasNext
+            , pid <- take 1 assignee
+            ]
+       in LinearDownloadState
+            { ldsTip = tip'
+            , ldsInflight = inf2 ++ newInf
+            , ldsHaveBody = have1
+            , ldsFailed = failed'
+            }
+
+    drainTipSim tip have
+      | Set.member (tip + 1) have = drainTipSim (tip + 1) have
+      | otherwise = tip
+
+    -- Peer 0 completes its highest inflight height > next-needed and
+    -- stamps first-byte on the rest. Peer 1 completes its oldest
+    -- request (in-order).
+    deliverSkipNextNeeded now nextNeeded inflight have =
+      let grouped = Map.fromListWith (++) [(pifPeer x, [x]) | x <- inflight]
+          step (infAcc, haveAcc) (pid, xs)
+            | pid == 0 =
+                let later = [x | x <- xs, pifHeight x > nextNeeded]
+                 in case later of
+                      [] ->
+                        ( infAcc ++ map (\x -> x { pifFirstByteAt = Just now }) xs
+                        , haveAcc
+                        )
+                      _ ->
+                        let completed = maximumBy (comparing pifHeight) later
+                            rest =
+                              [ x { pifFirstByteAt = Just now }
+                              | x <- xs
+                              , pifHeight x /= pifHeight completed
+                              ]
+                         in ( infAcc ++ rest
+                            , Set.insert (pifHeight completed) haveAcc
+                            )
+            | otherwise =
+                let ordered =
+                      sortBy (comparing pifRequestedAt <> comparing pifHeight) xs
+                 in case ordered of
+                      [] -> (infAcc, haveAcc)
+                      (h : rest) ->
                         ( infAcc ++ rest
                         , Set.insert (pifHeight h) haveAcc
                         )

@@ -140,6 +140,7 @@ module Haskoin.Consensus
   , classifyConnectReject
   , formatUnconnectedArrival
   , formatUnconnectedArrivalDetail
+  , formatOutOfOrderStored
   , blockInputCount
   , blockHashToHex
   , rewindChainstateToPrefix
@@ -4479,6 +4480,7 @@ data UnconnectedReason
   | UnconnG1OutOfOrder
   | UnconnG19MissingPrevout
   | UnconnValidation
+  | UnconnAwaitingParent
   | UnconnOther
   deriving (Eq, Show)
 
@@ -4488,6 +4490,7 @@ unconnectedReasonTag UnconnTooFarAhead       = "too-far-ahead"
 unconnectedReasonTag UnconnG1OutOfOrder      = "g1-out-of-order"
 unconnectedReasonTag UnconnG19MissingPrevout = "g19-missing-prevout"
 unconnectedReasonTag UnconnValidation        = "validation"
+unconnectedReasonTag UnconnAwaitingParent    = "awaiting-parent"
 unconnectedReasonTag UnconnOther             = "other"
 
 -- | Classify a connectBlock / validateFullBlock Left. G19 is checked
@@ -4552,6 +4555,22 @@ formatUnconnectedArrivalDetail mHeight nextNeeded reason count err =
    in if all isSpace flat
         then base
         else base ++ " err=" ++ flat
+
+-- | Ahead of next-needed: AcceptBlock stored the body, ConnectBlock
+-- did not run. Live 2026-09-24 logged these as reason=validation
+-- Missing UTXO because validateFullBlockIO (skipConnectChecks=False)
+-- ran against the current tip. Core ProcessNewBlock stores via
+-- AcceptBlock and connects only from ActivateBestChain when the
+-- parent is the tip. Discriminator: stored=yes invalid=no — the hash
+-- is not entered in hcInvalidated (that set is RPC invalidateblock).
+formatOutOfOrderStored
+  :: Maybe Word32
+  -> Word32
+  -> Word64
+  -> String
+formatOutOfOrderStored mHeight nextNeeded count =
+  formatUnconnectedArrival mHeight nextNeeded UnconnAwaitingParent count
+    ++ " stored=yes invalid=no"
 
 -- | Connect a block to the chain state, updating UTXO set and indexes,
 -- and writing per-block undo data for future rewinds.
