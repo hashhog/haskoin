@@ -182,6 +182,7 @@ import qualified W194PostSnapshotDownloadSpec
 import qualified W195UpdateTipSpec
 import qualified W196SyncProgressSpec
 import qualified W197DownloadInstrumentSpec
+import qualified W198PeerIdleSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23902,6 +23903,12 @@ main = hspec $ do
   -- regression (106 -> 13 blk/min). Name the branch on every issued
   -- getdata window; count bodies that arrive and are not connected.
   W197DownloadInstrumentSpec.spec
+
+  -- W198: do not ban a peer for a v2 hangup or a 60 s idle. Live
+  -- 2026-09-24 getconnectioncount 0: every "connection closed reading
+  -- length" was MalformedMessage + 24 h ban, and the stale check was
+  -- 300 s (shorter than one block connect at height ~910 k).
+  W198PeerIdleSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

@@ -25,7 +25,8 @@ import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
-import Control.Exception (bracket, catch, SomeException)
+import Control.Exception
+  ( AsyncException, SomeException, bracket, catch, fromException, throwIO )
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
@@ -1778,12 +1779,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
         syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef unconnectedCountRef addr msg
-          `catch` (\(e :: SomeException) -> putStrLn $ "Handler error: " ++ show e))
+          `catchSync` (\e -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
       -- net_processing.cpp FinalizeNode when a peer disconnects.
       (\addr -> eraseOrphansForPeer addr orphanPoolRef
-          `catch` (\(e :: SomeException) ->
+          `catchSync` (\e ->
             putStrLn $ "eraseOrphansForPeer error: " ++ show e))
     writeIORef pmRef pm
     -- W115 FIX-50: inject asmap bytecode into PeerManager so that
@@ -3870,11 +3871,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               -- already in 'hcEntries' (addHeader above), so 'putBlock' is the
               -- only missing piece for the engine to find the body.
               putBlock db bh block
-                `catch` (\(e :: SomeException) ->
+                `catchSync` (\e ->
                            putStrLn $ "putBlock (side-branch) error at height "
                                    ++ show height ++ ": " ++ show e)
               tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock
-                `catch` (\(e :: SomeException) ->
+                `catchSync` (\e ->
                            putStrLn $ "P2P reorg (MBlock) error at height "
                                    ++ show height ++ ": " ++ show e)
             Right () -> do
@@ -5055,3 +5056,17 @@ addressTypeName (ScriptAddress _) = "P2SH (script hash)"
 addressTypeName (WitnessPubKeyAddress _) = "P2WPKH (native SegWit)"
 addressTypeName (WitnessScriptAddress _) = "P2WSH (native SegWit script)"
 addressTypeName (TaprootAddress _) = "P2TR (Taproot)"
+
+-- | 'catch' that rethrows async exceptions (ThreadKilled, UserInterrupt).
+--
+-- The peer recv loop used to swallow ThreadKilled. peerManagerLoop's stale
+-- disconnect killThread'd the handler mid-block, the catch printed
+-- "Handler error: thread killed" / "P2P reorg (MBlock) error ... thread
+-- killed", and the loop then read the closed socket. On v2 that read is
+-- "connection closed reading length", which was scored as misbehavior and
+-- banned the peer for 24 h.
+catchSync :: IO a -> (SomeException -> IO a) -> IO a
+catchSync act h = act `catch` \e ->
+  case fromException e of
+    Just (_ :: AsyncException) -> throwIO e
+    Nothing -> h e

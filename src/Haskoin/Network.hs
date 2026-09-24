@@ -339,6 +339,10 @@ module Haskoin.Network
   , staleCheckInterval
   , headersResponseTime
   , pingTimeout
+  , recvIdleTimeoutMicros
+  , peerSilentTooLong
+  , recvErrorIsMisbehavior
+  , scoreRecvError
   , blockStallTimeout
   , blockStallTimeoutCompact
   , blockStallTimeoutMax
@@ -646,7 +650,7 @@ import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe, isNothing)
-import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, minimumBy)
+import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy)
 import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
@@ -3025,8 +3029,15 @@ sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
           , piMsgsSent = piMsgsSent i + 1
           }
 
--- | Receive exactly n bytes from the socket, buffering partial reads
--- Uses a 60-second timeout to detect dead connections
+-- | Receive exactly n bytes from the socket, buffering partial reads.
+--
+-- The idle budget is 'recvIdleTimeoutMicros' (Core TIMEOUT_INTERVAL,
+-- 20 min), not 60 s. A peer's keepalive ping arrives every
+-- 'pmcPingInterval' (120 s); treating 60 s of silence as a dead socket
+-- dropped the connection, and the v2 read error
+-- ("connection closed reading length") was then banned for 24 h.
+-- Handshake paths that must fail faster wrap 'performHandshake' in
+-- 'performHandshakeWithin' (inbound uses the 60 s watchdog).
 recvExact :: PeerConnection -> Int -> IO (Maybe ByteString)
 recvExact pc n = do
   buf <- readIORef (pcReadBuffer pc)
@@ -3036,8 +3047,9 @@ recvExact pc n = do
       writeIORef (pcReadBuffer pc) rest
       return (Just result)
     else do
-      -- Need more data - use timeout to avoid blocking forever on dead connections
-      mResult <- timeout (60 * 1000000) $  -- 60 second timeout
+      -- Need more data. Timeout matches Core's inactivity window so a
+      -- quiet-but-alive peer is not declared dead between pings.
+      mResult <- timeout recvIdleTimeoutMicros $
         (Just <$> recv (pcSocket pc) (max 4096 (n - BS.length buf)))
           `catch` (\(_ :: IOException) -> return Nothing)
       case mResult of
@@ -3244,6 +3256,21 @@ performHandshake config pc = do
           Right _other        -> recvVersion (n - 1)
   recvVersion preVersionSkipMax
 
+-- | 'performHandshake' bounded by @secs@.
+--
+-- 'recvExact' waits 'pingTimeout' (20 min) so an established peer survives
+-- the gap between 120 s pings. A handshake that inherited that budget would
+-- pin a connector thread on a blackhole that completed TCP and then sent
+-- nothing. On timeout this returns 'Left' and leaves the socket open; the
+-- caller already disconnects on 'Left'. Inbound handshakes do not use this
+-- — their 60 s watchdog closes the socket instead.
+performHandshakeWithin :: Int -> PeerConfig -> PeerConnection -> IO (Either String Version)
+performHandshakeWithin secs config pc = do
+  m <- timeout (max 1 secs * 1000000) (performHandshake config pc)
+  case m of
+    Nothing -> return (Left "Handshake timed out")
+    Just r  -> return r
+
 -- | Continue handshake after version exchange, handling pre-verack feature messages
 -- BIP155 requires handling sendaddrv2 between version and verack
 continueHandshake :: PeerConnection -> Version -> IO (Either String Version)
@@ -3365,7 +3392,7 @@ readGarbageUntilTerminator pc terminator maxBytes = loop
               return Nothing  -- ran past the cap without seeing the terminator
           | otherwise -> do
               -- Pull more bytes from the wire.
-              mChunk <- timeout (60 * 1000000) $
+              mChunk <- timeout recvIdleTimeoutMicros $
                 (Just <$> recv (pcSocket pc) 4096)
                   `catch` (\(_ :: IOException) -> return Nothing)
               case mChunk of
@@ -3675,43 +3702,64 @@ startPeerThreadsWithMisbehavior pc handler onMisbehave = do
         handler msg
         loop
       Left err -> do
-        -- Classify the wire-decode error so misbehavior is attributed to
-        -- the peer.  Reference: Bitcoin Core net.cpp ProcessMessages —
-        -- "Drop the message but don't disconnect" applies to unknown
-        -- commands; framing/checksum/decoder failures DO get scored.
-        let reason
-              | "Wrong network magic" `isInfixOfStr` err = WrongNetworkMagic
-              | "Checksum mismatch"   `isInfixOfStr` err = ChecksumMismatch
-              | "Payload too large"   `isInfixOfStr` err = PayloadTooLarge
-              | "exceeds wire-decode cap" `isInfixOfStr` err =
-                  -- Pick the most common varint-cap class; the watchdog
-                  -- logs the underlying message for forensics.
-                  if "headers"     `isInfixOfStr` err then TooLargeHeadersMessage
-                  else if "addr"   `isInfixOfStr` err then TooLargeAddrMessage
-                  else if "inv"    `isInfixOfStr` err
-                       || "getdata"  `isInfixOfStr` err
-                       || "notfound" `isInfixOfStr` err then TooLargeInvMessage
-                  else MalformedMessage
-              | "Header parse error" `isInfixOfStr` err = MalformedMessage
-              -- Connection-closed errors are not peer misbehavior.
-              | "Connection closed" `isInfixOfStr` err = MalformedMessage  -- treated as 0 below
-              | otherwise = MalformedMessage
-        -- Skip purely network-level errors (peer hung up cleanly): the
-        -- recv loop already disconnects, no score attribution needed.
-        unless ("Connection closed" `isInfixOfStr` err) $
-          (onMisbehave reason err) `catch` (\(_ :: SomeException) -> return ())
+        -- Hangup / idle-timeout is not misbehavior. v1 says
+        -- "Connection closed"; v2 says "v2: connection closed reading
+        -- length" (lowercase). The old check looked for the capitalised
+        -- v1 spelling only, so every v2 hangup was MalformedMessage and
+        -- banPeer'd for 24 h — live 2026-09-24, getconnectioncount 0.
+        -- Checksum / magic / oversize still score. Core disconnects a
+        -- quiet peer; it does not discourage them.
+        when (recvErrorIsMisbehavior err) $
+          (onMisbehave (classifyRecvFailure err) err)
+            `catch` (\(_ :: SomeException) -> return ())
         disconnectPeer pc
         -- Do NOT loop after disconnect: socket is closed, further reads
         -- would spin indefinitely.
 
   return pc { pcSendThread = Nothing, pcRecvThread = Just recvTid }
+
+-- | True when a 'receiveMessage' error should add ban score.
+--
+-- A peer that hung up, or a read that hit the inactivity budget, is not
+-- misbehavior. Match is case-insensitive: v2 errors are lowercase
+-- ("connection closed reading length") and the v1 path says
+-- "Connection closed". Anything else (checksum, magic, oversize,
+-- decode) still scores.
+recvErrorIsMisbehavior :: String -> Bool
+recvErrorIsMisbehavior err =
+  let low = map asciiLower err
+  in not ("connection closed" `isInfixOf` low)
+     && not ("closed before sending" `isInfixOf` low)
   where
-    isInfixOfStr :: String -> String -> Bool
-    isInfixOfStr needle haystack =
-      let nlen = length needle
-          hlen = length haystack
-      in nlen <= hlen
-         && any (\i -> take nlen (drop i haystack) == needle) [0..hlen - nlen]
+    asciiLower c
+      | c >= 'A' && c <= 'Z' = toEnum (fromEnum c + 32)
+      | otherwise = c
+
+-- | Map a receive-thread error string to a ban reason. Only called when
+-- 'recvErrorIsMisbehavior' is true; transport hangups never reach it.
+classifyRecvFailure :: String -> MisbehaviorReason
+classifyRecvFailure err
+  | "Wrong network magic" `isInfixOf` err = WrongNetworkMagic
+  | "Checksum mismatch"   `isInfixOf` err = ChecksumMismatch
+  | "Payload too large"   `isInfixOf` err = PayloadTooLarge
+  | "exceeds wire-decode cap" `isInfixOf` err =
+      if "headers" `isInfixOf` err then TooLargeHeadersMessage
+      else if "addr" `isInfixOf` err then TooLargeAddrMessage
+      else if "inv" `isInfixOf` err
+           || "getdata" `isInfixOf` err
+           || "notfound" `isInfixOf` err then TooLargeInvMessage
+      else MalformedMessage
+  | "Header parse error" `isInfixOf` err = MalformedMessage
+  | otherwise = MalformedMessage
+
+-- | Score one receive-thread error the way the recv loop does.
+-- Transport hangups are a no-op (no ban, no disconnect — the caller
+-- closes). A checksum / magic / oversize error goes through
+-- 'misbehaving', which discourages on the first hit.
+scoreRecvError :: PeerManager -> SockAddr -> String -> IO ()
+scoreRecvError pm addr err =
+  when (recvErrorIsMisbehavior err) $
+    void $ misbehaving pm addr (classifyRecvFailure err)
 
 
 --------------------------------------------------------------------------------
@@ -4311,9 +4359,13 @@ peerManagerLoop pm = forever $ do
         atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
         sendMessage pc (MPing (Ping nonce)) `catch` (\(_ :: IOException) -> return ())
 
-      -- Disconnect if no response for 5 minutes
-      -- KNOWN PITFALL: Re-queue in-flight blocks immediately on disconnect
-      when (now - piLastSeen info > 300) $ do
+      -- Core InactivityCheck: TIMEOUT_INTERVAL (pingTimeout, 20 min)
+      -- since the last received message. The old 300 s cutoff fired
+      -- during a single block connect at height ~910 k (measured
+      -- several minutes) and killThread'd the recv thread mid-handler
+      -- ("P2P reorg (MBlock) error ... thread killed"). A hangup is
+      -- not a ban — see 'recvErrorIsMisbehavior'.
+      when (peerSilentTooLong (piLastSeen info) now) $ do
         disconnectPeer pc
         atomically $ modifyTVar' (pmPeers pm) (Map.delete addr)
 
@@ -4402,7 +4454,8 @@ tryConnectFeeler pm connected = do
               nowFail <- (round <$> getPOSIXTime :: IO Int64)
               markAttempt (pmAddrMan pm) addr nowFail
             Right pc -> do
-              hsResult <- performHandshake config pc
+              hsResult <- performHandshakeWithin
+                            (pmcHandshakeTimeout (pmConfig pm)) config pc
               case hsResult of
                 Left _err -> do
                   -- Handshake failed: attempt counts, TRIED unchanged.
@@ -4606,7 +4659,8 @@ attemptProxyOutbound pm config blockRelayOnly addr
           -- Stamp the real SockAddr we wanted (createPeerConnectionFromSocket
           -- writes a 0.0.0.0:0 dummy because the proxy is transparent).
           atomically $ modifyTVar' (pcInfo pc) (\i -> i { piAddress = addr })
-          hsResult <- performHandshake config pc
+          hsResult <- performHandshakeWithin
+                        (pmcHandshakeTimeout (pmConfig pm)) config pc
           case hsResult of
             Left err -> do
               putStrLn $ "proxy outbound: handshake failed with "
@@ -4739,7 +4793,8 @@ finalizeHostConnect pm config host port blockRelayOnly res = case res of
         synthAddr0 = SockAddrInet (fromIntegral port) synthHost
     atomically $ modifyTVar' (pcInfo pc)
       (\i -> i { piAddress = synthAddr0 })
-    hsResult <- performHandshake config pc
+    hsResult <- performHandshakeWithin
+                  (pmcHandshakeTimeout (pmConfig pm)) config pc
     case hsResult of
       Left err -> do
         putStrLn $ "tryConnectByHost: handshake failed with "
@@ -4862,7 +4917,8 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
       markAttempt (pmAddrMan pm) addr nowFail
     Right pc -> do
       putStrLn $ "tryConnect: connected to " ++ host ++ ", starting handshake..."
-      hsResult <- performHandshake config pc
+      hsResult <- performHandshakeWithin
+                    (pmcHandshakeTimeout (pmConfig pm)) config pc
       case hsResult of
         Left err -> do
           putStrLn $ "tryConnect: handshake failed with " ++ host ++ ": " ++ err
@@ -7875,6 +7931,18 @@ headersResponseTime = 120  -- 2 minutes in seconds
 -- Reference: Bitcoin Core net.h TIMEOUT_INTERVAL
 pingTimeout :: Int64
 pingTimeout = 1200  -- 20 minutes in seconds
+
+-- | 'recvExact' idle budget. Same window as 'pingTimeout': a socket
+-- with no bytes for 20 minutes is dead. 60 s was shorter than the
+-- peer's 120 s ping, so every quiet peer was dropped and (on v2) banned.
+recvIdleTimeoutMicros :: Int
+recvIdleTimeoutMicros = fromIntegral pingTimeout * 1000000
+
+-- | True when @now - lastSeen@ exceeds 'pingTimeout'. This is the
+-- predicate 'peerManagerLoop' uses. 301 s of silence must NOT be
+-- stale (the old hardcoded 300 s cutoff); 1201 s must.
+peerSilentTooLong :: Int64 -> Int64 -> Bool
+peerSilentTooLong lastSeen now = now - lastSeen > pingTimeout
 
 -- | Block download stall timeout for full blocks (30 seconds)
 -- Reference: Bitcoin Core BLOCK_STALLING_TIMEOUT_DEFAULT
