@@ -183,6 +183,7 @@ import qualified W195UpdateTipSpec
 import qualified W196SyncProgressSpec
 import qualified W197DownloadInstrumentSpec
 import qualified W198PeerIdleSpec
+import qualified W199StallDiscriminatorSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23909,6 +23910,12 @@ main = hspec $ do
   -- length" was MalformedMessage + 24 h ban, and the stale check was
   -- 300 s (shorter than one block connect at height ~910 k).
   W198PeerIdleSpec.spec
+
+  -- W199: stall discriminator. Live 2026-09-24 with 10 peers the tip
+  -- moved 2 blocks in 30 min; validation-tagged arrivals ahead of
+  -- next-needed had no error string, and requestFromPeer failures
+  -- did not name the message. Logs only — not a rate change.
+  W199StallDiscriminatorSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

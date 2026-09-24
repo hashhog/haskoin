@@ -129,6 +129,12 @@ module Haskoin.Network
   , linearFillBranchTag
   , selectLinearFillBranch
   , formatKickerWindow
+  , peerConnectedAtSend
+  , formatWindowPeerSend
+  , NextNeededFate(..)
+  , formatNextNeededAssignment
+  , formatRequestSendFailure
+  , formatRequestUnknownPeer
     -- * Protocol Constants
   , protocolVersion
   , minProtocolVersion
@@ -909,6 +915,141 @@ formatKickerWindow branch nReq fromH toH nPeers =
     ++ show nPeers
     ++ " peer(s) branch="
     ++ linearFillBranchTag branch
+
+-- | Re-read at send time, not the planner's earlier snapshot.
+--
+-- True only when the address is still in @pmPeers@ AND the state is
+-- 'PeerConnected'. @send=fail@ with @connected-at-send=yes@ is a dead
+-- socket the map still lists (the live "resource vanished" shape).
+-- @send=fail@ with @connected-at-send=no@ is the stale-list shape: the
+-- snapshot peer had already left, or was no longer connected.
+-- This predicate does not decide whether to send.
+peerConnectedAtSend :: Bool -> PeerState -> Bool
+peerConnectedAtSend listed PeerConnected = listed
+peerConnectedAtSend _ _ = False
+
+-- | Flatten newlines and cap a log field. Local to the window lines;
+-- the unconnected-arrival helper lives next to its own formatter.
+oneLineField :: String -> String
+oneLineField = take 500 . map flatten
+  where
+    flatten '\n' = ' '
+    flatten '\r' = ' '
+    flatten c = c
+
+yesNo :: Bool -> String
+yesNo True = "yes"
+yesNo False = "no"
+
+errSuffixUnlessOk :: Bool -> String -> String
+errSuffixUnlessOk sendOk err
+  | sendOk = ""
+  | otherwise =
+      case oneLineField err of
+        flat | null flat || all (== ' ') flat -> ""
+             | otherwise -> " err=" ++ flat
+
+-- | One peer's slice of an issued getdata window. Self-contained
+-- (branch + height range) because the kicker and the receipt refill
+-- log from different threads. @connectedAtSend@ is 'peerConnectedAtSend'
+-- of a re-read immediately before the send, not the list the planner
+-- walked. @sendOk@ is whether every batch send returned.
+formatWindowPeerSend
+  :: LinearFillBranch
+  -> Word32 -- ^ window from-height
+  -> Word32 -- ^ window to-height
+  -> Int    -- ^ planner index into this tick's connected list
+  -> String -- ^ address at send time
+  -> Int    -- ^ hashes assigned to this peer
+  -> Bool   -- ^ still in pmPeers and PeerConnected
+  -> Bool   -- ^ every batch send returned
+  -> Bool   -- ^ slice contains the next-needed height
+  -> String -- ^ send error; ignored when send succeeded
+  -> String
+formatWindowPeerSend branch fromH toH idx addr nHashes connectedAtSend sendOk hasNext err =
+  "Block-gap kicker peer: branch="
+    ++ linearFillBranchTag branch
+    ++ " heights="
+    ++ show fromH
+    ++ "-"
+    ++ show toH
+    ++ " idx="
+    ++ show idx
+    ++ " addr="
+    ++ addr
+    ++ " hashes="
+    ++ show nHashes
+    ++ " connected-at-send="
+    ++ yesNo connectedAtSend
+    ++ " send="
+    ++ (if sendOk then "ok" else "fail")
+    ++ " next-needed="
+    ++ yesNo hasNext
+    ++ errSuffixUnlessOk sendOk err
+
+-- | What this window did with the next-needed height.
+--
+-- Assigned: a getdata for that height was handed to a peer in this
+-- window, and @send@ says whether it left the process.
+-- Already-inflight: the hash is still charged to a peer from an
+-- earlier window, so this window did not send it again.
+-- Not-requested: no peer was asked, and it is not in the inflight map.
+data NextNeededFate
+  = NextNeededAssigned !Int !String !Bool !Bool !String
+  | NextNeededAlreadyInflight !Int !String
+  | NextNeededNotRequested
+  deriving (Eq, Show)
+
+formatNextNeededAssignment
+  :: LinearFillBranch
+  -> Word32
+  -> NextNeededFate
+  -> String
+formatNextNeededAssignment branch height fate =
+  "Block-gap kicker next-needed: branch="
+    ++ linearFillBranchTag branch
+    ++ " height="
+    ++ show height
+    ++ case fate of
+         NextNeededAssigned idx addr conn ok err ->
+           " fate=assigned peer="
+             ++ show idx
+             ++ " addr="
+             ++ addr
+             ++ " connected-at-send="
+             ++ yesNo conn
+             ++ " send="
+             ++ (if ok then "ok" else "fail")
+             ++ errSuffixUnlessOk ok err
+         NextNeededAlreadyInflight idx addr ->
+           " fate=already-inflight peer="
+             ++ show idx
+             ++ " addr="
+             ++ addr
+         NextNeededNotRequested ->
+           " fate=not-requested"
+
+-- | 'requestFromPeer' could not find @addr@ in @pmPeers@. Prefix is
+-- unchanged so existing greps still hit; @msg=@ names what was dropped.
+-- The live "resource vanished" lines are the OTHER branch (peer was
+-- still in the map). Without @msg=@ those lines cannot be told apart
+-- from a getdata.
+formatRequestUnknownPeer :: String -> String -> String
+formatRequestUnknownPeer addr msgType =
+  "requestFromPeer: unknown peer " ++ addr
+    ++ " msg=" ++ msgType
+    ++ " — message DROPPED"
+
+-- | 'requestFromPeer' found the peer and the send threw. @state=@ is
+-- the peer state read just before the send. @PeerConnected@ plus
+-- @resource vanished@ means the socket was already dead while the
+-- address was still listed — not an unknown-peer drop.
+formatRequestSendFailure :: String -> String -> String -> String -> String
+formatRequestSendFailure addr msgType state err =
+  "requestFromPeer: send to " ++ addr
+    ++ " msg=" ++ msgType
+    ++ " state=" ++ state
+    ++ " FAILED: " ++ oneLineField err
 
 -- | Whether @services@ can serve a block at @blockHeight@ given header
 -- tip @headerTipHeight@.
@@ -5439,12 +5580,16 @@ requestFromPeerChecked pm addr msg = do
   peers <- readTVarIO (pmPeers pm)
   case Map.lookup addr peers of
     Nothing -> do
-      putStrLn $ "requestFromPeer: unknown peer " ++ show addr ++ " — message DROPPED"
+      putStrLn $ formatRequestUnknownPeer (show addr) (msgTypeName msg)
       return False
-    Just pc ->
+    Just pc -> do
+      -- State at send time. Do not skip the send: a PeerDisconnecting
+      -- peer that is still in the map used to be attempted, and the
+      -- log is how a vanished socket is told apart from a stale index.
+      info <- readTVarIO (pcInfo pc)
       (sendMessage pc msg >> return True)
         `catch` (\(e :: IOException) -> do
-          putStrLn $ "requestFromPeer: send to " ++ show addr ++ " FAILED: " ++ show e
+          putStrLn $ formatRequestSendFailure (show addr) (msgTypeName msg) (show (piState info)) (show e)
           return False)
 
 -- | Get the number of connected peers

@@ -139,6 +139,7 @@ module Haskoin.Consensus
   , unconnectedReasonTag
   , classifyConnectReject
   , formatUnconnectedArrival
+  , formatUnconnectedArrivalDetail
   , blockInputCount
   , blockHashToHex
   , rewindChainstateToPrefix
@@ -4517,6 +4518,40 @@ formatUnconnectedArrival mHeight nextNeeded reason count =
     ++ unconnectedReasonTag reason
     ++ " count="
     ++ show count
+
+-- | One log field. Newlines become spaces so a multi-line reject stays
+-- one grep hit; capped so a Show of an exception cannot flood the line.
+-- Whitespace-only input is treated as "no error" by
+-- 'formatUnconnectedArrivalDetail'.
+sanitizeLogField :: String -> String
+sanitizeLogField = take 500 . map flatten
+  where
+    flatten '\n' = ' '
+    flatten '\r' = ' '
+    flatten c = c
+
+-- | 'formatUnconnectedArrival' plus the underlying reject string.
+--
+-- Live 2026-09-24: blocks 48–63 ahead of next-needed were logged
+-- @reason=validation@ and nothing else. That tag is the classifier's
+-- catch-all for "Core full-block validation: …", and the raw string
+-- was printed only when height == next-needed (the W163 line). @err=@
+-- is the rest of this line, on every arrival that has an error,
+-- including ones that are not the next-needed height. Empty / blank
+-- detail omits the field (too-far-ahead has no reject string).
+formatUnconnectedArrivalDetail
+  :: Maybe Word32
+  -> Word32
+  -> UnconnectedReason
+  -> Word64
+  -> String
+  -> String
+formatUnconnectedArrivalDetail mHeight nextNeeded reason count err =
+  let base = formatUnconnectedArrival mHeight nextNeeded reason count
+      flat = sanitizeLogField err
+   in if all isSpace flat
+        then base
+        else base ++ " err=" ++ flat
 
 -- | Connect a block to the chain state, updating UTXO set and indexes,
 -- and writing per-block undo data for future rewinds.

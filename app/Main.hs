@@ -2107,6 +2107,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                         needNew
                          inf' <- requestBlockRange pm' hc refillFrom windowEnd
                                    rot failed2 infAfterMute nowKick perPeerCap branch
+                                   nextBlock
                          writeIORef linearInflightRef (storeStableInflight idToKey inf')
                          let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
                          unless (null assignedH) $
@@ -3076,14 +3077,18 @@ requestBlockRange
   -> Int64
   -> Int
   -> LinearFillBranch
+  -> Word32 -- ^ next-needed height (connected tip + 1)
   -> IO (Map.Map BlockHash (Int, Word32, Int64))
-requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch
-  | fromHeight > toHeight = return inflight
+requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch nextNeeded
+  | fromHeight > toHeight = do
+      putStrLn $ formatNextNeededAssignment branch nextNeeded NextNeededNotRequested
+      return inflight
   | otherwise = do
       peerList <- getConnectedPeerList pm
       case peerList of
         [] -> do
           putStrLn "No connected peers to request blocks from"
+          putStrLn $ formatNextNeededAssignment branch nextNeeded NextNeededNotRequested
           return inflight
         _  -> do
           heightMap <- readTVarIO (hcByHeight hc)
@@ -3091,6 +3096,8 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch
           peerSvcs <- forM peerList $ \pc -> do
             info <- readTVarIO (pcInfo pc)
             return (piServices info)
+          peerAddrs <- forM peerList $ \pc ->
+            piAddress <$> readTVarIO (pcInfo pc)
           let needed =
                 [ (h, ht)
                 | ht <- [fromHeight .. toHeight]
@@ -3105,28 +3112,79 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch
               plan = planLinearGetDataWithCap cap peers needed headerTip rot failed used
               nReq = sum (map (length . snd) plan)
               batchSz = max 1 cap
+              addrAt pid
+                | pid >= 0 && pid < length peerAddrs = show (peerAddrs !! pid)
+                | otherwise = "?"
+              fateFromInflight =
+                case [ pid | (_, (pid, ht, _)) <- Map.toList inflight, ht == nextNeeded ] of
+                  (pid:_) -> NextNeededAlreadyInflight pid (addrAt pid)
+                  [] -> NextNeededNotRequested
           if null plan
-            then return inflight
+            then do
+              -- Nothing new to send. Say whether next-needed is still
+              -- charged to an earlier peer (not re-requested) or absent.
+              putStrLn $ formatNextNeededAssignment branch nextNeeded fateFromInflight
+              return inflight
             else do
               putStrLn $ formatKickerWindow
                            branch nReq fromHeight toHeight (length plan)
-              inf' <- foldM
-                (\acc (idx, hashes) -> do
+              -- outcomes are (idx, addr, connectedAtSend, sendOk, hasNext, err)
+              (outcomes, inf') <- foldM
+                (\(outs, acc) (idx, hashes) -> do
                    let pc = peerList !! idx
                        batches = chunksOf batchSz hashes
-                   forM_ batches $ \batch -> do
-                     let invVecs =
-                           [ InvVector InvWitnessBlock (getBlockHashHash h)
-                           | h <- batch ]
-                     (safeSendMessage pc (MGetData (GetData invVecs)))
-                       `catch` (\(e :: SomeException) ->
-                         putStrLn $ "Failed to send getdata: " ++ show e)
+                       heightsHere =
+                         [ Map.findWithDefault 0 h heightByHash | h <- hashes ]
+                       hasNext = nextNeeded `elem` heightsHere
+                   -- Re-read at send time. The planner walked `peerList`
+                   -- from the start of this call; a peer can leave
+                   -- pmPeers, or stop being PeerConnected, before its
+                   -- batch is written. connected-at-send=yes + send=fail
+                   -- is a dead socket still listed. connected-at-send=no
+                   -- is the stale-snapshot case. Either way the send is
+                   -- still attempted, and a failure still records inflight
+                   -- — same as before this log existed.
+                   infoNow <- readTVarIO (pcInfo pc)
+                   peersNow <- readTVarIO (pmPeers pm)
+                   let addrNow = piAddress infoNow
+                       listed = Map.member addrNow peersNow
+                       connectedAtSend = peerConnectedAtSend listed (piState infoNow)
+                       addrTxt = show addrNow
+                   (sendOk, errS) <- foldM
+                     (\(okSoFar, errSoFar) batch -> do
+                        let invVecs =
+                              [ InvVector InvWitnessBlock (getBlockHashHash h)
+                              | h <- batch ]
+                        r <- (safeSendMessage pc (MGetData (GetData invVecs)) >> return Nothing)
+                               `catch` (\(e :: SomeException) -> do
+                                  putStrLn $ "Failed to send getdata: " ++ show e
+                                  return (Just (show e)))
+                        case r of
+                          Nothing -> return (okSoFar, errSoFar)
+                          Just e ->
+                            return (False, if null errSoFar then e else errSoFar))
+                     (True, "")
+                     batches
+                   putStrLn $ formatWindowPeerSend
+                                branch fromHeight toHeight idx addrTxt
+                                (length hashes) connectedAtSend sendOk hasNext errS
                    let added = Map.fromList
                          [ (h, (idx, Map.findWithDefault 0 h heightByHash, now))
                          | h <- hashes ]
-                   return (Map.union added acc))
-                inflight
+                       out = (idx, addrTxt, connectedAtSend, sendOk, hasNext, errS)
+                   return (out : outs, Map.union added acc))
+                ([], inflight)
                 plan
+              let assigned =
+                    [ (idx, addrTxt, conn, ok, errS)
+                    | (idx, addrTxt, conn, ok, hasNext, errS) <- reverse outcomes
+                    , hasNext
+                    ]
+              putStrLn $ formatNextNeededAssignment branch nextNeeded $
+                case assigned of
+                  ((idx, addrTxt, conn, ok, errS):_) ->
+                    NextNeededAssigned idx addrTxt conn ok errS
+                  [] -> fateFromInflight
               return inf'
 
 -- | Refill the linear getdata pipeline after a connected block.
@@ -3171,7 +3229,7 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
                           (min (connectedTip + 1024)
                                (connectedTip + fromIntegral maxBlocksInFlightTotal))
         inf' <- requestBlockRange pm hc nextBlock windowEnd
-                  rot failed0 infPruned nowKick cap FillReceipt
+                  rot failed0 infPruned nowKick cap FillReceipt nextBlock
         writeIORef linearInflightRef (storeStableInflight idToKey inf')
         let assignedH = [ ht | (_, ht, _) <- Map.elems inf' ]
         unless (null assignedH) $
@@ -3715,7 +3773,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         isIBD <- readIORef ibdModeRef
         nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
         nbUnc <- readIORef nextBlockRef
-        putStrLn $ formatUnconnectedArrival Nothing nbUnc UnconnHeaderRejected nUnc
+        -- err= on the arrival line itself. The "Block header rejected"
+        -- line below is suppressed for the whole of IBD, which is when
+        -- this path actually runs.
+        putStrLn $ formatUnconnectedArrivalDetail Nothing nbUnc UnconnHeaderRejected nUnc err
         unless isIBD $
           putStrLn $ "Block header rejected: " ++ err
         -- Attribute misbehavior: block whose header fails consensus
@@ -3847,8 +3908,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               -- connect gate was the obvious candidate and was silent.
               nb <- readIORef nextBlockRef
               nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
-              putStrLn $ formatUnconnectedArrival
-                           (Just height) nb (classifyConnectReject cbErr) nUnc
+              -- err= on every connect-reject, not only height == next-needed.
+              -- Live 2026-09-24: heights 48–63 ahead were reason=validation
+              -- with no string, and that tag is the classifier catch-all.
+              putStrLn $ formatUnconnectedArrivalDetail (Just height) nb (classifyConnectReject cbErr) nUnc cbErr
               -- W163 diagnostic: extra detail for the next-needed block.
               -- NOTE: the earlier guard matched "Core G1" which is ALSO
               -- a prefix of "Core G19" (missing-prevout); classifyConnectReject
