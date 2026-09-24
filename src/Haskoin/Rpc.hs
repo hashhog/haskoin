@@ -316,8 +316,8 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
-import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, doesDirectoryExist, listDirectory, getFileSize)
-import System.FilePath ((</>), isRelative)
+import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, doesDirectoryExist, listDirectory, getFileSize, copyFile)
+import System.FilePath ((</>), isRelative, takeDirectory)
 import System.Posix.Files (setFileMode)
 import System.IO (hSetEncoding, hPutStr, hPutStrLn, stderr, utf8, withFile, IOMode(..))
 import System.IO.Unsafe (unsafePerformIO)
@@ -514,7 +514,8 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         isWalletLocked,
                         -- Wallet address/transaction functions
                         AddressType(..), getNewAddress, sendToAddress,
-                        getWalletUTXOs, Utxo(..),
+                        getWalletUTXOs, getWalletUTXOsFull, Utxo(..),
+                        addWalletUTXO, removeWalletUTXO,
                         -- Coin selection (walletcreatefundedpsbt)
                         WalletTxOutput(..), CoinSelection(..),
                         selectCoinsWithHeight, createTransaction,
@@ -536,14 +537,9 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         getTaprootReceiveKey, getTaprootChangeKey,
                         WalletUtxoEntry(..),
                         walletAddresses, walletUTXOs,
-                        -- Seed-restore (recovery): mnemonic -> wallet, used by
-                        -- 'handleRestoreWallet' (createwallet-with-mnemonic).
-                        Mnemonic(..), WalletConfig(..), validateMnemonic,
-                        importMnemonic, createWalletState, getReceiveAddressAt,
-                        -- Durable persistence (sweep wa0fq5wtk)
-                        attachWalletPersistence, persistWallet)
-import qualified Haskoin.Wallet.Persist as WP
-
+                        -- Durable persistence (sweep wa0fq5wtk). backupwallet flushes
+                        -- the live ledger before copying wallet.dat.
+                        persistWallet)
 -- FIX-65: BIP-78 PayJoin receiver foundation.  Imports the wai handler
 -- + offer-cache types so 'combinedApp' can route /payjoin POSTs.
 --
@@ -1559,6 +1555,7 @@ handleRpcRequest server req = do
 
     -- Wallet balance RPCs (require wallet selection)
     "getbalance"           -> handleGetBalance server params
+    "getbalances"          -> handleGetBalances server params
 
     -- Wallet rescan + raw-key import (CWallet::ScanForWalletTransactions /
     -- ImportPrivKeys analogues).  rescanblockchain re-scans EXISTING chain
@@ -1577,6 +1574,7 @@ handleRpcRequest server req = do
     "finalizepsbt"         -> handleFinalizePsbt server params
     "analyzepsbt"          -> handleAnalyzePsbt server params
     "walletcreatefundedpsbt" -> handleWalletCreateFundedPsbt server params
+    "walletprocesspsbt"    -> handleWalletProcessPsbt server params
     "converttopsbt"        -> handleConvertToPsbt server params
     "joinpsbts"            -> handleJoinPsbts server params
     "utxoupdatepsbt"       -> handleUtxoUpdatePsbt server params
@@ -1633,6 +1631,8 @@ handleRpcRequest server req = do
     -- Wallet RPCs (new)
     "getnewaddress"        -> handleGetNewAddress server params
     "sendtoaddress"        -> handleSendToAddress server params
+    "send"                 -> handleSend server params
+    "backupwallet"         -> handleBackupWallet server params
     "listtransactions"     -> handleListTransactions server params
     "gettransaction"       -> handleGetTransaction server params
     "listunspent"          -> handleListUnspent server params
@@ -1668,7 +1668,7 @@ handleRpcRequest server req = do
 
     -- Control RPCs
     "help"                 -> handleHelp server params
-    "stop"                 -> handleStop server
+    "stop"                 -> handleStop server params
 
     -- Utility RPCs (additional)
     "encryptwallet"        -> handleEncryptWallet server params
@@ -8386,9 +8386,13 @@ handleWalletCreateFundedPsbtChecked server params = withWalletMgr server $ \wm -
                       _ -> 10000
                     _ -> 10000
                 _ -> 10000
-          case parseOutputs (V.toList outputsArr) of
-            Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
+          -- Empty outputs are RPC_INVALID_PARAMETER (-8), not a
+          -- coin-selection miss (-1). Bad addresses are -5.
+          let parsedOuts
+                | V.null outputsArr = Left "empty outputs"
+                | otherwise = parseOutputs (V.toList outputsArr)
+          case parsedOuts of
+            Left err -> return $ rpcFail (outputParseCode err) (T.pack err)
             Right txOuts -> do
               -- Convert TxOut → WalletTxOutput for the coin selector.
               -- A WalletTxOutput needs (Address, Word64); we recover
@@ -8489,6 +8493,104 @@ handleWalletCreateFundedPsbtChecked server params = withWalletMgr server $ \wm -
       , txLockTime = 0
       }
 
+-- | JSON-RPC error response with a null id (handlers fill the id later
+-- only when they go through the dispatcher; these wallet handlers match
+-- the existing Null-id style).
+rpcFail :: Int -> Text -> RpcResponse
+rpcFail code msg = RpcResponse Null (toJSON (RpcError code msg)) Null
+
+-- | walletprocesspsbt "psbt" ( sign )
+-- Reference: bitcoin-core/src/wallet/rpc/spend.cpp walletprocesspsbt.
+-- Fills witness UTXOs from the wallet, optionally signs and finalizes.
+-- A string that is not a PSBT is RPC_DESERIALIZATION_ERROR (-22).
+handleWalletProcessPsbt :: RpcServer -> Value -> IO RpcResponse
+handleWalletProcessPsbt server params = withWalletMgr server $ \wm -> do
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ rpcFail rpcWalletNotFound
+      "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet."
+    Just ws ->
+      case extractParamText params 0 of
+        Nothing -> return $ rpcFail rpcDeserializationError "TX decode failed"
+        Just psbtText ->
+          case B64.decode (TE.encodeUtf8 (T.strip psbtText)) of
+            Left _ -> return $ rpcFail rpcDeserializationError "TX decode failed"
+            Right bytes -> case decodePsbt bytes of
+              Left err -> return $ rpcFail rpcDeserializationError
+                ("TX decode failed " <> T.pack err)
+              Right psbt0 -> do
+                let doSign = fromMaybe True (extractParam params 1 :: Maybe Bool)
+                    doFinalize = fromMaybe True (extractParam params 4 :: Maybe Bool)
+                    nIns = length (txInputs (pgTx (psbtGlobal psbt0)))
+                    padded = psbt0
+                      { psbtInputs = take nIns
+                          (psbtInputs psbt0 ++ repeat emptyPsbtInput) }
+                filled <- decoratePsbtInputs (wsWallet ws) padded
+                let signed = if doSign
+                               then signAllPsbtKeys (wsWallet ws) filled
+                               else filled
+                    (done, complete, mHex) =
+                      if not (doSign && doFinalize)
+                        then (signed, False, Nothing)
+                        else case finalizePsbt signed of
+                          Left _ -> (signed, False, Nothing)
+                          Right fin ->
+                            let ok = isPsbtFinalized fin
+                            in case extractTransaction fin of
+                                 Right tx | ok ->
+                                   ( fin
+                                   , True
+                                   , Just (TE.decodeUtf8 (B16.encode (S.encode tx)))
+                                   )
+                                 _ -> (fin, False, Nothing)
+                    b64 = TE.decodeUtf8 (B64.encode (encodePsbt done))
+                    hexField = case mHex of
+                      Just h -> ["hex" .= h]
+                      Nothing -> []
+                return $ RpcResponse
+                  (object (["psbt" .= b64, "complete" .= complete] ++ hexField))
+                  Null Null
+
+-- | backupwallet "destination"
+-- Reference: bitcoin-core/src/wallet/rpc/backup.cpp backupwallet.
+-- Copies wallet.dat to a file or into a directory. A destination whose
+-- parent does not exist is RPC_WALLET_ERROR (-4). Success is JSON null.
+handleBackupWallet :: RpcServer -> Value -> IO RpcResponse
+handleBackupWallet server params = withWalletMgr server $ \wm ->
+  case extractParamText params 0 of
+    Nothing -> return $ rpcFail rpcInvalidParams "Missing destination parameter"
+    Just destText
+      | T.null destText ->
+          return $ rpcFail rpcWalletError "Error: Wallet backup failed!"
+      | otherwise -> do
+          (mWallet, _) <- getDefaultWallet wm
+          case mWallet of
+            Nothing -> return $ rpcFail rpcWalletNotFound
+              "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet."
+            Just ws -> do
+              -- Flush so the copy contains the live keychain, not the
+              -- create-time snapshot.
+              void (persistWallet (wsWallet ws))
+              mDef <- readTVarIO (wmDefaultName wm)
+              names <- listManagedWallets wm
+              let walletName = case mDef of
+                    Just n | n `elem` names -> n
+                    _ -> fromMaybe "" (listToMaybe names)
+                  src = wmWalletDir wm </> T.unpack walletName </> "wallet.dat"
+                  dest = T.unpack destText
+              srcOk <- doesFileExist src
+              destIsDir <- doesDirectoryExist dest
+              parentOk <- doesDirectoryExist (takeDirectory dest)
+              if not srcOk || not (destIsDir || parentOk)
+                then return $ rpcFail rpcWalletError "Error: Wallet backup failed!"
+                else do
+                  let target | destIsDir = dest </> "wallet.dat"
+                             | otherwise = dest
+                  copied <- try (copyFile src target) :: IO (Either SomeException ())
+                  case copied of
+                    Left _ -> return $ rpcFail rpcWalletError "Error: Wallet backup failed!"
+                    Right () -> return $ RpcResponse Null Null Null
+
 --------------------------------------------------------------------------------
 -- Multi-Wallet Management RPC Handlers
 --------------------------------------------------------------------------------
@@ -8532,92 +8634,80 @@ handleCreateWallet server params = withWalletMgr server $ \wm ->
     Just walletName | T.null walletName -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "wallet_name must not be empty") Null
     Just walletName -> do
-      let disablePrivKeys = fromMaybe False (extractParam params 1 :: Maybe Bool)
-          blank           = fromMaybe False (extractParam params 2 :: Maybe Bool)
-          passphrase      = fromMaybe "" (extractParamText params 3)
-          warnings :: Text
-          warnings | not (T.null passphrase) =
-                       "Passphrase ignored - call 'encryptwallet' to encrypt this wallet."
-                   | otherwise = ""
-      result <- createManagedWallet wm walletName disablePrivKeys blank
-      case result of
-        Left err -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletAlreadyExists err) Null
-        Right _ws ->
-          return $ RpcResponse
-            (object [ "name"    .= walletName
-                    , "warning" .= warnings
-                    ]) Null Null
+      -- Core createwallet (wallet.cpp): descriptors defaults true, and an
+      -- explicit false is RPC_WALLET_ERROR (-4). Legacy wallet creation is
+      -- gone; returning success here is the R5 legacy-refused miss.
+      let descriptors = fromMaybe True (extractParam params 5 :: Maybe Bool)
+      if not descriptors
+        then return $ rpcFail rpcWalletError
+          "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet."
+        else do
+          let disablePrivKeys = fromMaybe False (extractParam params 1 :: Maybe Bool)
+              blank           = fromMaybe False (extractParam params 2 :: Maybe Bool)
+              passphrase      = fromMaybe "" (extractParamText params 3)
+              warnings :: Text
+              warnings | not (T.null passphrase) =
+                           "Passphrase ignored - call 'encryptwallet' to encrypt this wallet."
+                       | otherwise = ""
+          result <- createManagedWallet wm walletName disablePrivKeys blank
+          case result of
+            -- CreateWallet overwrites FAILED_ALREADY_EXISTS with FAILED_VERIFY,
+            -- and HandleWalletError's default arm is RPC_WALLET_ERROR (-4).
+            -- -36 is restorewallet only.
+            Left err -> return $ rpcFail rpcWalletError err
+            Right _ws ->
+              return $ RpcResponse
+                (object [ "name"    .= walletName
+                        , "warning" .= warnings
+                        ]) Null Null
 
--- | restorewallet wallet_name mnemonic [passphrase]
+-- | restorewallet "wallet_name" "backup_file" ( load_on_startup )
 --
--- Restore (or create) a deterministic wallet from a BIP-39 mnemonic — the
--- seed-only recovery entry point.  Equivalent in spirit to Core's
--- @sethdseed@ / @createwallet …descriptors@ + @importdescriptors@ round
--- trip: it reconstructs the HD keychain from the supplied words alone, so
--- a wallet whose disk state was lost can re-derive every address it ever
--- owned.  Address derivation is byte-deterministic in the mnemonic (see
--- 'loadWallet' / 'getReceiveAddressAt'), which is what lets a subsequent
--- 'scantxoutset' rediscover 100% of the funds.
---
--- Parameters:
---   wallet_name (required)
---   mnemonic    (required) — space-separated BIP-39 words
---   passphrase  (optional) — BIP-39 passphrase (NOT the encryption pass)
--- Returns: {"name": <wallet_name>, "warning": <text>}
---
--- Reference: bitcoin-core/src/wallet/rpc/backup.cpp (sethdseed) and
--- wallet/rpc/wallet.cpp (createwallet).  We reuse 'importMnemonic', which
--- validates the BIP-39 checksum / word count / dictionary before deriving.
+-- Reference: bitcoin-core/src/wallet/rpc/backup.cpp restorewallet.
+-- Copies a backupwallet file into a new wallet directory and loads it.
+-- A missing backup is RPC_INVALID_PARAMETER (-8), checked BEFORE the
+-- name-exists test, which is RPC_WALLET_ALREADY_EXISTS (-36) — the only
+-- create path that still returns -36 (CreateWallet maps that status to -4).
 handleRestoreWallet :: RpcServer -> Value -> IO RpcResponse
 handleRestoreWallet server params = withWalletMgr server $ \wm ->
   case (extractParamText params 0, extractParamText params 1) of
-    (Nothing, _) -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Missing wallet_name parameter") Null
-    (_, Nothing) -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "Missing mnemonic parameter") Null
-    (Just walletName, _) | T.null walletName -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcInvalidParams "wallet_name must not be empty") Null
-    (Just walletName, Just mnemonicText) -> do
-      let passphrase = fromMaybe "" (extractParamText params 2)
-          words'     = filter (not . T.null) (T.words (T.strip mnemonicText))
-          mnemonic   = Mnemonic words'
-      existing <- readTVarIO (wmWallets wm)
-      if Map.member walletName existing
-        then return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletAlreadyExists
-            ("Wallet \"" <> walletName <> "\" already exists")) Null
+    (Nothing, _) -> return $ rpcFail rpcInvalidParams "Missing wallet_name parameter"
+    (_, Nothing) -> return $ rpcFail rpcInvalidParams "Missing backup_file parameter"
+    (Just walletName, _) | T.null walletName ->
+      return $ rpcFail rpcInvalidParams "wallet_name must not be empty"
+    (Just walletName, Just backupText) -> do
+      let backupPath = T.unpack backupText
+      fileExists <- doesFileExist backupPath
+      dirBackup <- doesDirectoryExist backupPath
+      if not (fileExists || dirBackup)
+        then return $ rpcFail rpcInvalidParameter "Backup file does not exist"
         else do
-          let config = WalletConfig (wmNetwork wm) 20 passphrase
-          eWallet <- importMnemonic config mnemonic
-          case eWallet of
-            Left err -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInvalidParams (T.pack err)) Null
-            Right wallet -> do
-              -- Pre-derive the gap-limit receive addresses so getnewaddress /
-              -- listing reflects the restored keychain immediately.
-              mapM_ (\i -> void $ getReceiveAddressAt wallet i) [0 .. 19]
-              -- DURABILITY: persist the restored wallet to disk so the
-              -- recovered keychain survives a restart (sweep wa0fq5wtk).
-              -- Without this, restorewallet would re-derive the seed every
-              -- boot but lose the rescanned UTXO ledger and any new
-              -- addresses on the next unclean shutdown.
-              let walletPath = wmWalletDir wm </> T.unpack walletName
-                  datPath    = walletPath </> "wallet.dat"
-              createDirectoryIfMissing True walletPath
-              atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
-              attachWalletPersistence wallet datPath atRestKey
-              void (persistWallet wallet)
-              walletState <- createWalletState wallet
-              atomically $ do
-                modifyTVar' (wmWallets wm) (Map.insert walletName walletState)
-                mDefault <- readTVar (wmDefaultName wm)
-                when (mDefault == Nothing) $
-                  writeTVar (wmDefaultName wm) (Just walletName)
-              return $ RpcResponse
-                (object [ "name"    .= walletName
-                        , "warning" .= ("" :: Text)
-                        ]) Null Null
+          loaded <- readTVarIO (wmWallets wm)
+          let walletPath = wmWalletDir wm </> T.unpack walletName
+          nameDir <- doesDirectoryExist walletPath
+          if Map.member walletName loaded || nameDir
+            then return $ rpcFail rpcWalletAlreadyExists
+              ("Wallet \"" <> walletName <> "\" already exists")
+            else do
+              let src | dirBackup = backupPath </> "wallet.dat"
+                      | otherwise = backupPath
+              srcOk <- doesFileExist src
+              if not srcOk
+                then return $ rpcFail rpcInvalidParameter "Backup file does not exist"
+                else do
+                  createDirectoryIfMissing True walletPath
+                  let datPath = walletPath </> "wallet.dat"
+                  copied <- try (copyFile src datPath) :: IO (Either SomeException ())
+                  case copied of
+                    Left _ -> return $ rpcFail rpcWalletError "Wallet restore failed"
+                    Right () -> do
+                      result <- loadManagedWallet wm walletName
+                      case result of
+                        Left err -> return $ rpcFail rpcWalletError err
+                        Right _ -> return $ RpcResponse
+                          (object [ "name"    .= walletName
+                                  , "warning" .= ("" :: Text)
+                                  ]) Null Null
 
 -- | Load an existing wallet by name.
 -- Reference: bitcoin-core/src/wallet/rpc/wallet.cpp loadwallet
@@ -8709,15 +8799,25 @@ handleGetWalletInfo server _params = withWalletMgr server $ \wm -> do
     Just ws -> do
       -- Recover the wallet name (manager keeps name → state map).
       names <- listManagedWallets wm
-      let walletName = fromMaybe "" (listToMaybe names)
-      info <- getWalletInfo walletName ws
-      return $ RpcResponse (rawJsonResult (walletInfoToJSON info)) Null Null
+      mDef <- readTVarIO (wmDefaultName wm)
+      let walletName = case mDef of
+            Just n | n `elem` names -> n
+            _ -> fromMaybe "" (listToMaybe names)
+      info0 <- getWalletInfo walletName ws
+      -- txcount is mapWallet size (wallet.cpp), not a constant. The R5
+      -- counts-funding probe expects the three confirmed receives.
+      hist <- getWalletTxHistory (wsWallet ws)
+      let info = info0 { wiTxCount = length hist }
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      return $ RpcResponse
+        (rawJsonResult (walletInfoToJSON info (showHash (ceHash tip)) (ceHeight tip)))
+        Null Null
 
 -- | Convert a 'WalletInfo' record to the Core-shape getwalletinfo JSON.
 -- Balance fields use btcAmountEnc on the streaming Encoding path so they
 -- emit Core's fixed-decimal format (8 fractional digits, no sci notation).
-walletInfoToJSON :: WalletInfo -> BL.ByteString
-walletInfoToJSON wi =
+walletInfoToJSON :: WalletInfo -> Text -> Word32 -> BL.ByteString
+walletInfoToJSON wi tipHash tipHeight =
   let unlockedEnc = case wiUnlockedUntil wi of
         Just u  -> pair "unlocked_until" (AE.word64 u)
         Nothing -> mempty
@@ -8737,7 +8837,12 @@ walletInfoToJSON wi =
               pair "avoid_reuse"             (AE.bool (wiAvoidReuse wi))            <>
               pair "scanning"                (AE.bool (wiScanning wi))              <>
               pair "descriptors"             (AE.bool (wiDescriptors wi))           <>
-              pair "external_signer"         (AE.bool (wiExternalSigner wi))
+              pair "external_signer"         (AE.bool (wiExternalSigner wi))        <>
+              pair "blank"                   (AE.bool False)                        <>
+              pair "flags"                   (list text ["descriptors"])            <>
+              pair "lastprocessedblock"      (pairs $
+                pair "hash"   (text tipHash) <>
+                pair "height" (word32 tipHeight))
   in encodingToLazyByteString enc
 
 -- | Get the confirmed wallet balance.
@@ -8769,6 +8874,39 @@ handleGetBalance server _params = withWalletMgr server $ \wm -> do
       let enc   = btcAmountEnc (fromIntegral sats)
           rawBs = encodingToLazyByteString enc
       return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | getbalances
+-- Reference: bitcoin-core/src/wallet/rpc/coins.cpp getbalances.
+-- mine.trusted is confirmed spendable (non-immature) balance; the R5
+-- lane funds 8.5 BTC in three confirmed payments to our address.
+handleGetBalances :: RpcServer -> Value -> IO RpcResponse
+handleGetBalances server _params = withWalletMgr server $ \wm -> do
+  (mWallet, _) <- getDefaultWallet wm
+  case mWallet of
+    Nothing -> return $ rpcFail rpcWalletNotFound
+      "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet."
+    Just ws -> do
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      let tipH = ceHeight tip
+      utxos <- getWalletUTXOsFull (wsWallet ws)
+      let addBal (t, p, i) e =
+            let v = fromIntegral (txOutValue (wueTxOut e)) :: Int64
+                h = wueBlockHeight e
+                c = if tipH >= h then fromIntegral (tipH - h) + 1 else 0 :: Int
+            in if wueIsCoinbase e && c < fromIntegral coinbaseMaturity
+                 then (t, p, i + v)
+                 else if c == 0 then (t, p + v, i) else (t + v, p, i)
+          (trusted, pending, immature) =
+            foldl' addBal (0, 0, 0) (map snd utxos)
+          enc = pairs $
+            pair "mine" (pairs $
+              pair "trusted"            (btcAmountEnc trusted)  <>
+              pair "untrusted_pending"  (btcAmountEnc pending)  <>
+              pair "immature"           (btcAmountEnc immature)) <>
+            pair "lastprocessedblock" (pairs $
+              pair "hash"   (text (showHash (ceHash tip))) <>
+              pair "height" (word32 tipH))
+      return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
 -- Wallet rescan + raw-key import
@@ -9003,7 +9141,16 @@ handleGetAddressInfo server params = withWalletMgr server $ \wm -> do
                       [ "parent_desc" .= idDescText d
                       , "timestamp"   .= idTimestamp d
                       ] ++ (if solvable then ["desc" .= idDescText d] else [])
-                    Nothing -> []
+                    -- HD-derived addresses have no imported parent row, but
+                    -- a descriptor wallet still owes desc + parent_desc
+                    -- (addresses.cpp). addr() is solvable-enough for the
+                    -- field; the probe checks presence and type, not the
+                    -- checksummed body.
+                    Nothing
+                      | ismine && solvable ->
+                          let d = addressDescriptor (rsNetwork server) addr
+                          in [ "desc" .= d, "parent_desc" .= d ]
+                      | otherwise -> []
                   result = object $
                     [ "address"      .= addressToTextNet (rsNetwork server) addr
                     , "scriptPubKey" .= spkHex
@@ -12058,8 +12205,8 @@ handleGetNewAddress server params = do
               -- rather than the Haskell ADT 'show', so the result round-trips
               -- through textToAddress (funding / scantxoutset recovery).
               return $ RpcResponse (toJSON (addressToTextNet (rsNetwork server) addr)) Null Null
-            Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInvalidParams ("Unknown address type: " <> addrTypeStr)) Null
+            Nothing -> return $ rpcFail rpcInvalidAddressOrKey
+              ("Unknown address type '" <> addrTypeStr <> "'")
   where
     parseAddressType :: Text -> Maybe AddressType
     parseAddressType t = case T.toLower t of
@@ -12073,6 +12220,108 @@ handleGetNewAddress server params = do
 -- Wallet: Send To Address RPC Handler
 --------------------------------------------------------------------------------
 
+-- | Core AmountFromValue (rpc/util.cpp): a non-positive amount, a
+-- non-finite number, or anything above MAX_MONEY is RPC_TYPE_ERROR (-3).
+-- 1000000 BTC is inside MAX_MONEY and must fall through to insufficient
+-- funds (-6), not this check.
+parseBtcAmount :: Double -> Either Text Word64
+parseBtcAmount btc
+  | isNaN btc || isInfinite btc = Left "Invalid amount"
+  | btc <= 0 || btc > 21000000  = Left "Amount out of range"
+  | otherwise                   = Right (round (btc * 100000000))
+
+-- | Coin-selection failures. "Insufficient funds" is
+-- RPC_WALLET_INSUFFICIENT_FUNDS (-6); everything else stays -1.
+selectionRpcCode :: String -> Int
+selectionRpcCode err
+  | "Insufficient" `isInfixOf` err = rpcWalletInsufficientFunds
+  | otherwise                      = rpcMiscError
+
+-- | parseOutputs errors. An unparseable address is
+-- RPC_INVALID_ADDRESS_OR_KEY (-5); other output-shape problems are
+-- RPC_INVALID_PARAMETER (-8).
+outputParseCode :: String -> Int
+outputParseCode err
+  | "Invalid address" `isInfixOf` err = rpcInvalidAddressOrKey
+  | otherwise                         = rpcInvalidParameter
+
+-- | scriptPubKey → Address for the four standard single-key forms the
+-- wallet creates. Shared by listunspent and send.
+scriptBytesToAddress :: ByteString -> Maybe Address
+scriptBytesToAddress s
+  | BS.length s == 22 && BS.index s 0 == 0x00 && BS.index s 1 == 0x14 =
+      Just $ WitnessPubKeyAddress (Hash160 (BS.drop 2 s))
+  | BS.length s == 25 && BS.index s 0 == 0x76 && BS.index s 1 == 0xa9 &&
+    BS.index s 2 == 0x14 && BS.index s 23 == 0x88 && BS.index s 24 == 0xac =
+      Just $ PubKeyAddress (Hash160 (BS.take 20 (BS.drop 3 s)))
+  | BS.length s == 23 && BS.index s 0 == 0xa9 && BS.index s 1 == 0x14 &&
+    BS.index s 22 == 0x87 =
+      Just $ ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s)))
+  | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
+      Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+  | otherwise = Nothing
+
+-- | addr() descriptor (checksummed when the charset accepts it). Descriptor
+-- wallets surface this as getaddressinfo "desc" / listunspent "desc".
+addressDescriptor :: Network -> Address -> Text
+addressDescriptor net addr =
+  let body = "addr(" <> addressToTextNet net addr <> ")"
+  in fromMaybe body (addDescriptorChecksum body)
+
+txOutToWalletOutput :: TxOut -> Maybe WalletTxOutput
+txOutToWalletOutput txout = do
+  addr <- scriptBytesToAddress (txOutScript txout)
+  Just $ WalletTxOutput addr (txOutValue txout)
+
+-- | Drop spent inputs from the wallet ledger and credit change, so a
+-- second spend in the same process (send after sendtoaddress) cannot
+-- re-select an outpoint the mempool already has.
+commitWalletSpend :: Wallet -> CoinSelection -> Tx -> Word32 -> IO ()
+commitWalletSpend wallet cs tx tipH = do
+  mapM_ (removeWalletUTXO wallet) (map fst (csInputs cs))
+  case csChange cs of
+    Nothing -> pure ()
+    Just _ ->
+      let idx = length (csOutputs cs)
+      in case drop idx (txOutputs tx) of
+           (txout:_) -> addWalletUTXO wallet
+             (OutPoint (computeTxId tx) (fromIntegral idx)) txout tipH
+           [] -> pure ()
+
+-- | Select, sign, broadcast. Success result is the txid hex string.
+-- FeeRate is sat/kvB (FeeRate 1000 = 1 sat/vB).
+walletFundAndBroadcast
+  :: RpcServer -> WalletState -> [WalletTxOutput] -> FeeRate -> IO RpcResponse
+walletFundAndBroadcast server walletState outputs feeRate = do
+  pkEnabled <- readTVarIO (wsPrivateKeysEnabled walletState)
+  if not pkEnabled
+    then return $ rpcFail rpcWalletError
+      "Error: Private keys are disabled for this wallet"
+    else do
+      tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+      let wallet = wsWallet walletState
+      selRes <- selectCoinsWithHeight wallet outputs feeRate tipHeight
+      case selRes of
+        Left err -> return $ rpcFail (selectionRpcCode err) (T.pack err)
+        Right cs -> do
+          let unsigned = createTransaction cs
+              prevs    = csInputs cs
+          signedRes <- resignViaPsbt wallet unsigned prevs
+          case signedRes of
+            Left err -> return $ rpcFail rpcMiscError
+              ("Signing failed: " <> T.pack err)
+            Right tx -> do
+              let txid = computeTxId tx
+              addRes <- addTransaction (rsMempool server) tx
+              case addRes of
+                Left mErr -> return $ rpcFail rpcMiscError
+                  ("Transaction rejected by mempool: " <> T.pack (show mErr))
+                Right _ -> do
+                  commitWalletSpend wallet cs tx tipHeight
+                  broadcastTxToPeers server tx 0
+                  return $ RpcResponse
+                    (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
+
 -- | Send an amount to an address
 -- Reference: Bitcoin Core's sendtoaddress RPC (wallet/rpc/spend.cpp)
 -- Parameters:
@@ -12083,80 +12332,63 @@ handleGetNewAddress server params = do
 handleSendToAddress :: RpcServer -> Value -> IO RpcResponse
 handleSendToAddress server params = do
   case rsWalletMgr server of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
+    Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
     Just walletMgr -> do
       (mWallet, _) <- getDefaultWallet walletMgr
       case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState -> do
-          -- Core parity: spending is refused outright on a wallet created
-          -- with disable_private_keys (RPC_WALLET_ERROR -4, mirrors Core's
-          -- "Error: Private keys are disabled for this wallet" from
-          -- wallet/rpc/spend.cpp via EnsureWalletIsAvailable/CanGetAddresses
-          -- signing checks).  Watch-only funds are observable, never
-          -- spendable.
-          pkEnabled <- readTVarIO (wsPrivateKeysEnabled walletState)
-          if not pkEnabled
-            then return $ RpcResponse Null
-              (toJSON $ RpcError rpcWalletError
-                ("Error: Private keys are disabled for this wallet" :: Text)) Null
-            else case (extractParamText params 0, extractParam params 1 :: Maybe Double) of
-            (Just addrText, Just amountBtc) -> do
-              -- Parse address
+        Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
+        Just walletState ->
+          case (extractParamText params 0, extractParam params 1 :: Maybe Double) of
+            (Just addrText, Just amountBtc) ->
               case textToAddress addrText of
-                Nothing -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcInvalidParams "Invalid Bitcoin address") Null
-                Just addr -> do
-                  -- Convert BTC to satoshis
-                  let satoshis = round (amountBtc * 100000000) :: Word64
-                      wallet   = wsWallet walletState
+                Nothing -> return $ rpcFail rpcInvalidAddressOrKey
+                  "Invalid Bitcoin address"
+                Just addr ->
+                  case parseBtcAmount amountBtc of
+                    Left msg -> return $ rpcFail rpcTypeError msg
+                    Right sats -> walletFundAndBroadcast server walletState
+                      [WalletTxOutput addr sats] (FeeRate 1000)
+            _ -> return $ rpcFail rpcInvalidParams
+              "Missing address or amount parameter"
 
-                  -- Maturity-aware coin selection: pin the spendable set to
-                  -- the current tip height so immature coinbase is excluded
-                  -- (Core's CWallet only spends mature coins).  The legacy
-                  -- 'sendToAddress' wrapper used 'selectCoins' (tip 0) which
-                  -- both ignored maturity AND produced an UNSIGNED tx; we go
-                  -- through select -> build -> sign here instead.
-                  tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
-                  -- Fee rate in sat/kvB (FeeRate's unit; calculateFeeRate /
-                  -- feeFromWeight both scale by /1000).  FeeRate 1000 = 1
-                  -- sat/vB — comfortably above the mempool relay floor
-                  -- (mpcMinFeeRate = FeeRate 1 = 0.001 sat/vB) and large
-                  -- enough that the per-tx fee is a clearly-positive amount
-                  -- (~110 sat for a 1-in/2-out P2WPKH tx) rather than
-                  -- rounding toward zero.
-                  selRes <- selectCoinsWithHeight wallet
-                              [WalletTxOutput addr satoshis] (FeeRate 1000) tipHeight
-                  case selRes of
-                    Left err -> return $ RpcResponse Null
-                      (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-                    Right cs -> do
-                      let unsigned = createTransaction cs
-                          -- Prevout map for the signer: every selected input
-                          -- with its (value, scriptPubKey) so the PSBT signer
-                          -- can compute the BIP-143 sighash and pick the key
-                          -- whose pubkey-hash matches (resolves the wallet's
-                          -- own coinbase prevout).
-                          prevs    = csInputs cs
-                      signedRes <- resignViaPsbt wallet unsigned prevs
-                      case signedRes of
-                        Left err -> return $ RpcResponse Null
-                          (toJSON $ RpcError rpcMiscError ("Signing failed: " <> T.pack err)) Null
-                        Right tx -> do
-                          let txid = computeTxId tx
-                          addRes <- addTransaction (rsMempool server) tx
-                          case addRes of
-                            Left mErr -> return $ RpcResponse Null
-                              (toJSON $ RpcError rpcMiscError
-                                ("Transaction rejected by mempool: " <> T.pack (show mErr))) Null
-                            Right _ -> do
-                              broadcastTxToPeers server tx 0
-                              return $ RpcResponse
-                                (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
-            _ -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcInvalidParams "Missing address or amount parameter") Null
+-- | send [{"address": amount}, ...] ( conf_target estimate_mode fee_rate options )
+-- Reference: bitcoin-core/src/wallet/rpc/spend.cpp send.
+-- Returns {complete, txid} after broadcasting. fee_rate is sat/vB.
+handleSend :: RpcServer -> Value -> IO RpcResponse
+handleSend server params = do
+  case rsWalletMgr server of
+    Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
+    Just walletMgr -> do
+      (mWallet, _) <- getDefaultWallet walletMgr
+      case mWallet of
+        Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
+        Just walletState ->
+          case extractParamArray params 0 of
+            Nothing -> return $ rpcFail rpcInvalidParameter
+              "Invalid parameter, output argument must be non-empty"
+            Just arr | V.null arr -> return $ rpcFail rpcInvalidParameter
+              "Invalid parameter, output argument must be non-empty"
+            Just arr -> case parseOutputs (V.toList arr) of
+              Left err -> return $ rpcFail (outputParseCode err) (T.pack err)
+              Right txOuts -> case traverse txOutToWalletOutput txOuts of
+                Nothing -> return $ rpcFail rpcInvalidParameter
+                  "Outputs include addressless / OP_RETURN entries"
+                Just [] -> return $ rpcFail rpcInvalidParameter
+                  "Invalid parameter, output argument must be non-empty"
+                Just wtos -> do
+                  let feeRate = case rawParamAt params 3 of
+                        Just (Number n) ->
+                          FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double)))
+                        _ -> FeeRate 1000
+                  resp <- walletFundAndBroadcast server walletState wtos feeRate
+                  case resp of
+                    RpcResponse (String txid) Null _
+                      | not (T.isPrefixOf rawResultMagic txid) ->
+                          return $ RpcResponse
+                            (object [ "complete" .= True
+                                    , "txid"     .= txid
+                                    ]) Null Null
+                    other -> return other
 
 --------------------------------------------------------------------------------
 -- Wallet: List Transactions RPC Handler
@@ -12185,21 +12417,31 @@ handleListTransactions server params = do
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
         Just walletState -> do
-          let count = fromMaybe 10 (extractParam params 1 :: Maybe Int)
-              skip  = fromMaybe 0  (extractParam params 2 :: Maybe Int)
-          tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
-          -- Oldest→newest entries; each entry expands to one or more
-          -- per-category rows.  Concat in entry order, then apply Core's
-          -- tail-slice (skip from the end, take `count`).
-          entries <- getWalletTxHistory (wsWallet walletState)
-          let allRows = concatMap (entryToListRows tipHeight) entries
-              n       = length allRows
-              -- Core: nFrom counts from the END.  rows[n-skip-count .. n-skip).
-              endIdx  = max 0 (n - max 0 skip)
-              startIdx = max 0 (endIdx - max 0 count)
-              chosen  = take (endIdx - startIdx) (drop startIdx allRows)
-              rawBs   = encodingToLazyByteString (AE.list listRowEnc chosen)
-          return $ RpcResponse (rawJsonResult rawBs) Null Null
+          -- Core listtransactions: negative count / skip are
+          -- RPC_INVALID_PARAMETER (-8), not silently clamped.
+          let mCount = extractParam params 1 :: Maybe Int
+              mSkip  = extractParam params 2 :: Maybe Int
+          case (mCount, mSkip) of
+            (Just c, _) | c < 0 ->
+              return $ rpcFail rpcInvalidParameter "Negative count"
+            (_, Just s) | s < 0 ->
+              return $ rpcFail rpcInvalidParameter "Negative from"
+            _ -> do
+              let count = fromMaybe 10 mCount
+                  skip  = fromMaybe 0 mSkip
+              tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+              -- Oldest→newest entries; each entry expands to one or more
+              -- per-category rows.  Concat in entry order, then apply Core's
+              -- tail-slice (skip from the end, take `count`).
+              entries <- getWalletTxHistory (wsWallet walletState)
+              let allRows = concatMap (entryToListRows tipHeight) entries
+                  n       = length allRows
+                  -- Core: nFrom counts from the END.  rows[n-skip-count .. n-skip).
+                  endIdx  = max 0 (n - max 0 skip)
+                  startIdx = max 0 (endIdx - max 0 count)
+                  chosen  = take (endIdx - startIdx) (drop startIdx allRows)
+                  rawBs   = encodingToLazyByteString (AE.list listRowEnc chosen)
+              return $ RpcResponse (rawJsonResult rawBs) Null Null
 
 -- | One listtransactions output row (a flattened send/receive detail with
 -- its parent tx's confirmation context).
@@ -12287,7 +12529,9 @@ listRowEnc r =
        pair "blockheight"   (AE.word32 (ltrBlockHeight r))                     <>
        pair "blocktime"     (AE.word32 (ltrBlockTime r))                       <>
        pair "txid"          (text (showHash (BlockHash (getTxIdHash (ltrTxId r))))) <>
-       pair "time"          (AE.word32 (ltrTime r))
+       pair "time"          (AE.word32 (ltrTime r))                        <>
+       pair "timereceived"  (AE.word32 (ltrTime r))                        <>
+       pair "abandoned"     (AE.bool False)
 
 --------------------------------------------------------------------------------
 -- Wallet: Get Transaction RPC Handler
@@ -12396,39 +12640,73 @@ handleListUnspent server params = do
         Just walletState -> do
           let minConf = fromMaybe 1 (extractParam params 0 :: Maybe Int)
               maxConf = fromMaybe 9999999 (extractParam params 1 :: Maybe Int)
-
-          -- Get current tip height for confirmation calculation
-          tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
-
-          -- Get wallet UTXOs
-          utxos <- getWalletUTXOs (wsWallet walletState)
-
-          -- Filter and format using the streaming path for amount precision.
-          let encodings = catMaybes $ map (utxoToEnc tipHeight minConf maxConf) utxos
-              rawBs     = encodingToLazyByteString (AE.list id encodings)
-          return $ RpcResponse (rawJsonResult rawBs) Null Null
+              net = rsNetwork server
+          -- addresses filter: invalid -> -5, duplicate -> -8 (coins.cpp).
+          -- Absent or [] means no filter.
+          case parseListUnspentAddrs params of
+            Left (code, msg) -> return $ rpcFail code msg
+            Right mAddrs -> do
+              tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
+              utxos <- getWalletUTXOs (wsWallet walletState)
+              labels <- readTVarIO (walletAddressLabels (wsWallet walletState))
+              let encodings = catMaybes $
+                    map (utxoToEnc net labels mAddrs tipHeight minConf maxConf) utxos
+                  rawBs = encodingToLazyByteString (AE.list id encodings)
+              return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    -- | Build a streaming Encoding for one UTXO entry.
-    -- amount uses btcAmountEnc for Core's fixed-decimal format.
+    parseListUnspentAddrs :: Value -> Either (Int, Text) (Maybe (Set.Set Address))
+    parseListUnspentAddrs p = case rawParamAt p 2 of
+      Nothing -> Right Nothing
+      Just (Array arr)
+        | V.null arr -> Right Nothing
+        | otherwise -> go Set.empty (V.toList arr)
+      Just _ -> Left (rpcInvalidParameter, "Invalid parameter, addresses")
+      where
+        go seen [] = Right (Just seen)
+        go seen (String t : rest) =
+          case textToAddress (T.strip t) of
+            Nothing -> Left (rpcInvalidAddressOrKey, "Invalid Bitcoin address: " <> t)
+            Just a
+              | Set.member a seen ->
+                  Left (rpcInvalidParameter, "Invalid parameter, duplicated address: " <> t)
+              | otherwise -> go (Set.insert a seen) rest
+        go _ (_ : _) = Left (rpcInvalidAddressOrKey, "Invalid Bitcoin address")
+
     -- NOTE: 'getWalletUTXOs' returns the UTXO's CREATION block height in
     -- the third slot (not confirmations); convert to real confirmations
-    -- here as @tipHeight - blockHeight + 1@ so the minconf/maxconf filter
-    -- behaves like Core's.
-    utxoToEnc :: Word32 -> Int -> Int -> (OutPoint, TxOut, Word32) -> Maybe AE.Encoding
-    utxoToEnc tipHeight minConf maxConf (op, txout, blockHeight) =
+    -- here as @tipHeight - blockHeight + 1@.
+    utxoToEnc :: Network -> Map.Map Address Text -> Maybe (Set.Set Address)
+              -> Word32 -> Int -> Int
+              -> (OutPoint, TxOut, Word32) -> Maybe AE.Encoding
+    utxoToEnc net labels mAddrs tipHeight minConf maxConf (op, txout, blockHeight) =
       let confirmations =
             if tipHeight >= blockHeight
               then fromIntegral (tipHeight - blockHeight + 1) :: Int
               else 0
-      in if confirmations >= minConf && confirmations <= maxConf
-           then Just $ pairs $
+          mAddr = scriptBytesToAddress (txOutScript txout)
+          addrOk = case (mAddrs, mAddr) of
+            (Nothing, _) -> True
+            (Just want, Just a) -> Set.member a want
+            (Just _, Nothing) -> False
+      in if confirmations >= minConf && confirmations <= maxConf && addrOk
+           then
+             let addrText = maybe "" (addressToTextNet net) mAddr
+                 label = case mAddr of
+                   Just a -> fromMaybe "" (Map.lookup a labels)
+                   Nothing -> ""
+                 desc = maybe "" (addressDescriptor net) mAddr
+             in Just $ pairs $
                   pair "txid"          (text (showHash (BlockHash (getTxIdHash (outPointHash op))))) <>
                   pair "vout"          (AE.word32 (outPointIndex op))                               <>
+                  pair "address"       (text addrText)                                              <>
+                  pair "label"         (text label)                                                 <>
                   pair "scriptPubKey"  (text (TE.decodeUtf8 (B16.encode (txOutScript txout))))      <>
                   pair "amount"        (btcAmountEnc (fromIntegral (txOutValue txout)))             <>
                   pair "confirmations" (AE.int confirmations)                                       <>
                   pair "spendable"     (AE.bool True)                                               <>
                   pair "solvable"      (AE.bool True)                                               <>
+                  pair "desc"          (text desc)                                                  <>
+                  pair "parent_descs"  (list text [desc])                                           <>
                   pair "safe"          (AE.bool True)
            else Nothing
 
@@ -13037,10 +13315,12 @@ allRpcCommands =
   , "signrawtransactionwithwallet \"hexstring\""
   , ""
   , "== Wallet =="
+  , "backupwallet \"destination\""
   , "createwallet \"wallet_name\" ( disable_private_keys blank )"
   , "encryptwallet \"passphrase\""
   , "getaddressinfo \"address\""
   , "getbalance"
+  , "getbalances"
   , "getnewaddress ( \"label\" \"address_type\" )"
   , "getwalletinfo"
   , "importdescriptors \"requests\""
@@ -13049,6 +13329,7 @@ allRpcCommands =
   , "listunspent ( minconf maxconf [\"address\",...] )"
   , "listwallets"
   , "loadwallet \"filename\""
+  , "send [{\"address\":amount},...]"
   , "sendtoaddress \"address\" amount"
   , "unloadwallet ( \"wallet_name\" )"
   , ""
@@ -13117,6 +13398,7 @@ allRpcCommands =
   , "setmocktime"
   , "verifytxoutproof \"proof\""
   , "walletcreatefundedpsbt"
+  , "walletprocesspsbt \"psbt\""
   ]
 
 -- | Get help text for a specific command
@@ -13534,24 +13816,33 @@ handleGetNetTotals _server = do
 --------------------------------------------------------------------------------
 
 -- | Initiate graceful shutdown
--- Reference: Bitcoin Core's stop RPC (server.cpp)
+-- Reference: Bitcoin Core's stop RPC (server.cpp). The hidden first
+-- argument is a number of milliseconds to wait; a non-number is
+-- RPC_TYPE_ERROR (-3). We accept the number (so the type check matches)
+-- and do not sleep — a caller-supplied wait must not pin an RPC thread.
 -- Returns:
 --   "Bitcoin server stopping"
-handleStop :: RpcServer -> IO RpcResponse
-handleStop server = do
-  -- Signal shutdown (stop the RPC server thread)
-  mTid <- readTVarIO (rsThread server)
-  case mTid of
-    Just tid -> do
-      -- Kill the server thread (will stop accepting new connections)
-      forkIO $ do
-        threadDelay 100000  -- 100ms delay to allow response to be sent
-        killThread tid
-      return ()
-    Nothing -> return ()
-
-  -- Return the standard message immediately
-  return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
+handleStop :: RpcServer -> Value -> IO RpcResponse
+handleStop server params =
+  case rawParamAt params 0 of
+    Just (Number _) -> doStop
+    Just _ -> return $ rpcFail rpcTypeError
+      "JSON value is not a number as expected"
+    Nothing -> doStop
+  where
+    doStop = do
+      -- Signal shutdown (stop the RPC server thread)
+      mTid <- readTVarIO (rsThread server)
+      case mTid of
+        Just tid -> do
+          -- Kill the server thread (will stop accepting new connections)
+          forkIO $ do
+            threadDelay 100000  -- 100ms delay to allow response to be sent
+            killThread tid
+          return ()
+        Nothing -> return ()
+      -- Return the standard message immediately
+      return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool persistence RPCs (Bitcoin Core compatible)

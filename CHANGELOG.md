@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: R5 regtest wallet lane T3 2/16 → 16/16. Core error codes on createwallet/getnewaddress/listunspent/listtransactions/walletcreatefundedpsbt/sendtoaddress/stop; getwalletinfo txcount + blank/flags/lastprocessedblock; getaddressinfo and listunspent descriptor fields; new getbalances, send, walletprocesspsbt, and backupwallet; restorewallet loads a backup file (Core), not a mnemonic.
 - feat: name the branch on every linear-download getdata window (`branch=progress|stall|receipt`) and count MBlock bodies that arrive without connecting (`Block arrived unconnected`, with reason + running count). Instrumentation only — e8a03a9 refill/cap behaviour is unchanged. The kicker line keeps the `Block-gap kicker: pipelining` prefix and appends `branch=`; UpdateTip is untouched.
 - feat: single `--connect` peer defaults the per-peer in-flight cap to 128 (`HASHHOG_BLOCKS_IN_FLIGHT_PER_PEER` overrides); MBlock refills the pipeline on receipt so a local feeder does not wait for the 0.4s kicker poll
 

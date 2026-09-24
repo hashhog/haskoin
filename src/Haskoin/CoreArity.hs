@@ -105,7 +105,10 @@ coreArityTable = Map.fromList
   , ("setnetworkactive", (1, 1))
   , ("signmessagewithprivkey", (2, 2))
   , ("signrawtransactionwithkey", (2, 4))
-  , ("stop", (0, 0))
+  -- Core's hidden `wait` NUM (server.cpp stop). A present non-number is
+  -- RPC_TYPE_ERROR (-3), not an arity miss (-1). (0, 0) made the R5
+  -- wrong-type probe fail closed as -1 before the handler saw the value.
+  , ("stop", (0, 1))
   , ("submitblock", (1, 2))
   , ("submitheader", (1, 1))
   , ("submitpackage", (1, 3))
@@ -119,6 +122,35 @@ coreArityTable = Map.fromList
   , ("waitforblock", (1, 2))
   , ("waitforblockheight", (1, 2))
   , ("waitfornewblock", (0, 2))
+  ]
+  `Map.union` walletArityExtras
+
+-- | Wallet RPCs absent from the generator's 87-method snapshot.
+--
+-- Counts are @(required, declared)@ from Core's RPCHelpMan
+-- (wallet/rpc/{wallet,addresses,coins,transactions,spend,backup}.cpp).
+-- Hand-maintained: a regenerated base table must keep this union, or the
+-- R5 lane's zero-arg wrong-arity probes (getwalletinfo / listwallets /
+-- getbalances) fail open and createwallet's missing name stays -32602
+-- instead of Core's -1.
+walletArityExtras :: Map Text (Int, Int)
+walletArityExtras = Map.fromList
+  [ ("backupwallet", (1, 1))
+  , ("createwallet", (1, 8))
+  , ("getaddressinfo", (1, 1))
+  , ("getbalances", (0, 0))
+  , ("getnewaddress", (0, 2))
+  , ("getwalletinfo", (0, 0))
+  , ("listtransactions", (0, 4))
+  , ("listunspent", (0, 5))
+  , ("listwallets", (0, 0))
+  , ("loadwallet", (1, 2))
+  , ("restorewallet", (2, 3))
+  , ("send", (1, 6))
+  , ("sendtoaddress", (2, 11))
+  , ("unloadwallet", (0, 2))
+  , ("walletcreatefundedpsbt", (2, 6))
+  , ("walletprocesspsbt", (1, 5))
   ]
 
 -- | Look a method up. 'Nothing' means the method is absent from the table and
