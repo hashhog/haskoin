@@ -61,9 +61,12 @@ module Haskoin.Storage
   , getUTXOCoin
   , getUTXOCoinHealingTip
   , healTipCreatedCoin
+  , readHealTipAttempts
   , deleteUTXO
   , buildSpentUtxoMapFromDB
   , buildSpentUtxoMapCached
+  , blockOwnTxIds
+  , isOwnCreated
   , isUnspendable
     -- * UTXO Cache (Legacy)
   , UTXOEntry(..)
@@ -249,10 +252,12 @@ import System.Mem (performGC)
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class (liftIO)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
+import System.IO.Unsafe (unsafePerformIO)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.Set as Set
 import qualified Data.List as L
 import Data.List (foldl')
 import Data.Maybe (isJust)
@@ -630,6 +635,7 @@ healTipCreatedCoin db op = do
   case existing of
     Just _  -> return False
     Nothing -> do
+      atomicModifyIORef' healTipAttemptsRef (\n -> (n + 1, ()))
       mBest <- getBestBlockHash db
       case mBest of
         Nothing -> return False
@@ -654,6 +660,15 @@ healTipCreatedCoin db op = do
                         "[heal] omitted tip output restored: " ++ show op
                         ++ " height=" ++ show h
                       return True
+
+-- | Process-wide count of tip-block repair scans (each one decodes the
+-- whole tip block and hashes its txids). Diagnostics and tests only.
+{-# NOINLINE healTipAttemptsRef #-}
+healTipAttemptsRef :: IORef Int
+healTipAttemptsRef = unsafePerformIO (newIORef 0)
+
+readHealTipAttempts :: IO Int
+readHealTipAttempts = readIORef healTipAttemptsRef
 
 -- | 'getUTXOCoin' that repairs a tip-created hole before returning
 -- Nothing.  Used by the connect spent-map builders and G19 so a
@@ -743,10 +758,38 @@ buildSpentUtxoMapFromDB db block = do
                   | tx <- nonCoinbaseTxs
                   , inp <- txInputs tx
                   ]
+      own = blockOwnTxIds block
   pairs <- mapM (\op -> do
-                   m <- getUTXOCoinHealingTip db op
+                   m <- if isOwnCreated own op
+                          then getUTXOCoin db op
+                          else getUTXOCoinHealingTip db op
                    return (op, m)) outpoints
   return $ Map.fromList [ (op, c) | (op, Just c) <- pairs ]
+
+-- | Txids of every transaction in @block@ (coinbase included).
+blockOwnTxIds :: Block -> Set.Set TxId
+blockOwnTxIds block = Set.fromList (map computeTxId (blockTxns block))
+
+-- | True when @op@ names an output of a transaction in the block being
+-- connected: an intra-block (chained) spend. Core resolves these from the
+-- in-memory CCoinsViewCache, which 'UpdateCoins' (validation.cpp:2600 ->
+-- coins.cpp AddCoins) fills tx-by-tx inside ConnectBlock, never from disk
+-- and never from the parent block. Here the fold in
+-- 'validateBlockTransactions' / 'connectBlockAt' resolves them from the
+-- block itself, so the spent-coin builders must not send them down the
+-- tip-hole repair path ('healTipCreatedCoin'): that path re-reads and
+-- re-decodes the whole TIP block and hashes every one of its txids, once
+-- PER such input, only to find nothing. Live mainnet 911,955: 4,372
+-- intra-block spends, connect=521,585 ms (~119 ms each); the per-block
+-- cost across 911,946-911,960 tracked the intra-spend count, not the
+-- input count.
+--
+-- The plain DB read is kept, so the returned map is unchanged. The heal
+-- could only ever succeed for such an op if the tip block contained a
+-- transaction with the same txid as one in THIS block (a duplicate txid
+-- in adjacent blocks), which BIP-30/BIP-34 exclude and mainnet never had.
+isOwnCreated :: Set.Set TxId -> OutPoint -> Bool
+isOwnCreated own op = Set.member (outPointHash op) own
 
 --------------------------------------------------------------------------------
 -- UTXO Entry with Metadata
@@ -938,7 +981,13 @@ flushCache cache = do
 -- into a post-reorg cache. Negatives are NOT cached (keeps the mirror a strict
 -- subset of the live disk UTXO set). Returns exactly what 'getUTXOCoin' returns.
 getUTXOCoinCached :: UTXOCache -> OutPoint -> IO (Maybe Coin)
-getUTXOCoinCached cache op = do
+getUTXOCoinCached = getUTXOCoinCachedWith True
+
+-- | 'getUTXOCoinCached' with the tip-hole repair made optional. @False@
+-- is for intra-block spends ('isOwnCreated'), where the repair can never
+-- find the coin and costs a full tip-block decode per call.
+getUTXOCoinCachedWith :: Bool -> UTXOCache -> OutPoint -> IO (Maybe Coin)
+getUTXOCoinCachedWith healTip cache op = do
   hit <- atomically $ Map.lookup op <$> readTVar (rcEntries cache)
   case hit of
     Just coin -> return (Just coin)          -- lossless; identical to getUTXOCoin
@@ -947,11 +996,13 @@ getUTXOCoinCached cache op = do
       mc0 <- getUTXOCoin (ucDB cache) op      -- lossless full Coin; never lookupUTXO
       mc <- case mc0 of
         Just c  -> return (Just c)
-        Nothing -> do
-          -- Tip-created hole (live 5bcc4f93:6): repair from the tip body
-          -- before treating the miss as a real missing prevout.
-          did <- healTipCreatedCoin (ucDB cache) op
-          if did then getUTXOCoin (ucDB cache) op else return Nothing
+        Nothing
+          | not healTip -> return Nothing
+          | otherwise -> do
+              -- Tip-created hole (live 5bcc4f93:6): repair from the tip body
+              -- before treating the miss as a real missing prevout.
+              did <- healTipCreatedCoin (ucDB cache) op
+              if did then getUTXOCoin (ucDB cache) op else return Nothing
       case mc of
         Nothing   -> return Nothing           -- do NOT cache negatives
         Just coin -> do
@@ -989,8 +1040,9 @@ buildSpentUtxoMapCached cache block = do
                   | tx <- nonCoinbaseTxs
                   , inp <- txInputs tx
                   ]
+      own = blockOwnTxIds block
   pairs <- mapM (\op -> do
-                   m <- getUTXOCoinCached cache op
+                   m <- getUTXOCoinCachedWith (not (isOwnCreated own op)) cache op
                    return (op, m)) outpoints
   return $ Map.fromList [ (op, c) | (op, Just c) <- pairs ]
 

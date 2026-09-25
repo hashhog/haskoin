@@ -81,6 +81,8 @@ import Haskoin.Storage
   , putBlock
   , newUTXOCache
   , buildSpentUtxoMapFromDB
+  , buildSpentUtxoMapCached
+  , readHealTipAttempts
   , Coin(..)
   )
 
@@ -391,3 +393,62 @@ spec = do
           getBestBlockHash db `shouldReturn` Just (ceHash w2Ce)
           forM_ positions $ \i ->
             getUTXOCoin db (pick i) `shouldReturn` Nothing
+
+  -- H5/H6: an intra-block spend (prevout created by an earlier tx of the
+  -- SAME block) must not take the tip-repair path. Core resolves it from
+  -- the in-memory view that UpdateCoins fills tx-by-tx
+  -- (validation.cpp:2600); the repair scan decodes the whole tip block per
+  -- call and can never find it. Live 911,955: 4,372 such inputs,
+  -- connect=521,585 ms. The spent map itself must be unchanged.
+  describe "intra-block spends skip the tip-repair scan" $ do
+
+    it "H5: both builders return the same map with zero repair scans" $ do
+      withTestDB "h5" $ \db -> do
+        (hc, forkHash, forkWork) <- connectChainToFork db
+        (_, parent, _) <- parentEight db hc forkHash forkWork
+        mTip <- getBestBlockHash db
+        tip <- maybe (expectationFailure "no tip" >> return (error "no tip"))
+                     return mTip
+        let parentId = computeTxId parent
+            opA      = OutPoint parentId 0          -- on disk
+            txA      = spendOut opA 600000000
+            opB      = OutPoint (computeTxId txA) 0 -- created in THIS block
+            txB      = spendOut opB 500000000
+            opC      = OutPoint (computeTxId txB) 0 -- chained twice
+            txC      = spendOut opC 400000000
+            child    = mkBlock tip (baseTime + forkHeight + 2)
+                         [coinbaseTxAt 103 0x0b, txA, txB, txC]
+        Just coinA <- getUTXOCoin db opA
+        cache <- newUTXOCache db 100000
+        n0 <- readHealTipAttempts
+        spentDB <- buildSpentUtxoMapFromDB db child
+        spentC  <- buildSpentUtxoMapCached cache child
+        n1 <- readHealTipAttempts
+        spentDB `shouldBe` Map.singleton opA coinA
+        spentC  `shouldBe` Map.singleton opA coinA
+        (n1 - n0) `shouldBe` 0
+        -- connect still resolves the chained spends from the block itself
+        r <- connectBlockAt db regtest child 103 spentC
+        r `shouldBe` Right ()
+        getUTXOCoin db opB `shouldReturn` Nothing
+        mC <- getUTXOCoin db (OutPoint (computeTxId txC) 0)
+        mC `shouldSatisfy` isJust
+
+    it "H6: control - a genuine miss still takes the repair scan" $ do
+      withTestDB "h6" $ \db -> do
+        (hc, forkHash, forkWork) <- connectChainToFork db
+        _ <- parentEight db hc forkHash forkWork
+        mTip <- getBestBlockHash db
+        tip <- maybe (expectationFailure "no tip" >> return (error "no tip"))
+                     return mTip
+        let ghost = OutPoint (TxId (Hash256 (BS.replicate 32 0x7e))) 3
+            child = mkBlock tip (baseTime + forkHeight + 2)
+                      [coinbaseTxAt 103 0x0b, spendOut ghost 1]
+        cache <- newUTXOCache db 100000
+        n0 <- readHealTipAttempts
+        spentDB <- buildSpentUtxoMapFromDB db child
+        spentC  <- buildSpentUtxoMapCached cache child
+        n1 <- readHealTipAttempts
+        spentDB `shouldBe` Map.empty
+        spentC  `shouldBe` Map.empty
+        (n1 - n0) `shouldBe` 2
