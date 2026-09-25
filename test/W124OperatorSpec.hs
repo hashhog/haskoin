@@ -281,16 +281,14 @@ spec = describe "W124 — Operator experience (haskoin)" $ do
       -- sighash-vectors, one for script-vectors.  At least 3.
       occ `shouldSatisfy` (>= 3)
 
-    it "G20 (PARTIAL): NO +RTS -I0 to disable idle-time GC during long IBD pauses" $ do
+    it "G20 (FIXED): production executable runs with +RTS -I0 (no idle-time GC)" $ do
       cab <- cabalFile
-      -- During the wave47 outage window, haskoin was idle (no
-      -- block-connect work) and could have triggered an idle GC
-      -- mid-RocksDB FFI.  -I0 disables idle GC; Core doesn't have
-      -- this knob (no Haskell RTS) so the cross-impl reference
-      -- doesn't help.  Soft-flag as PARTIAL — recommend
-      -- "-with-rtsopts=-N -I0" for the production executable.
-      ("-I0"       `isInfixOf` cab) `shouldBe` False
-      ("-with-rtsopts=-N -I0" `isInfixOf` cab) `shouldBe` False
+      -- Was PARTIAL (this pin asserted -I0 ABSENT). Measured 2026-09-25:
+      -- with the default -I0.3 an idle node ran a major GC of its
+      -- 2-4 GB heap about once a second (224 major GCs / 100 GB copied,
+      -- GC 447 s of 511 s CPU in a scratch idle run); -I0 -> 17 / 5.7 GB.
+      -- Core has no such knob (no Haskell RTS).
+      ("\"-with-rtsopts=-N4 -I0\"" `isInfixOf` cab) `shouldBe` True
 
     it "G21 (MISSING): bracketed forkIO for background threads — many `void $ forkIO` lack catch on the OUTER body" $ do
       src <- mainHs
