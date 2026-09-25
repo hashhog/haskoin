@@ -30,6 +30,7 @@ import Control.Exception
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
+import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.List as L
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -3382,7 +3383,7 @@ detectP2PFork db hc = do
           | ceChainWork headerTip <= ceChainWork connectedTip -> return Nothing
           | ceHash headerTip == ceHash connectedTip           -> return Nothing
           | otherwise -> do
-              mFork <- findForkPoint hc bestHash (ceHash headerTip)
+              mFork <- findForkPointMemo hc entries bestHash (ceHash headerTip)
               case mFork of
                 Nothing -> return Nothing
                 Just forkEntry
@@ -3488,6 +3489,36 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock =
 -- bodies are required by 'buildReorgConnectList' before the reorg can run.
 -- In that case the floor drops to FORK_POINT+1 so 'requestForkBlocks' fetches
 -- the whole heavier branch.
+-- | 'findForkPoint' memoised on the (connected tip, header tip) pair.
+-- The block-gap kicker calls 'detectP2PFork' every 0.4 s; during a
+-- catch-up with the header tip ~56k blocks ahead each call walked all
+-- ~56k cePrev links (a Map lookup each) to rediscover that the fork
+-- point is the connected tip. The pair changes once per connected block
+-- or header batch. A fork point is a function of the two hashes'
+-- ancestries, which never change once the headers exist, so a hit is
+-- exact; the entry is re-read from the CURRENT map (never a stale
+-- ChainEntry), and only found fork points are cached. Core keeps this
+-- O(1) via CChain / CBlockIndex::GetAncestor skip pointers
+-- (chain.cpp LastCommonAncestor).
+{-# NOINLINE forkPointMemoRef #-}
+forkPointMemoRef :: IORef (Maybe ((BlockHash, BlockHash), BlockHash))
+forkPointMemoRef = unsafePerformIO (newIORef Nothing)
+
+findForkPointMemo :: HeaderChain -> Map.Map BlockHash ChainEntry
+                  -> BlockHash -> BlockHash -> IO (Maybe ChainEntry)
+findForkPointMemo hc entries h1 h2 = do
+  memo <- readIORef forkPointMemoRef
+  case memo of
+    Just (k, forkHash) | k == (h1, h2)
+                       , Just ce <- Map.lookup forkHash entries ->
+      return (Just ce)
+    _ -> do
+      r <- findForkPoint hc h1 h2
+      case r of
+        Just ce -> writeIORef forkPointMemoRef (Just ((h1, h2), ceHash ce))
+        Nothing -> return ()
+      return r
+
 -- | Log text for a duplicate of an already-connected block
 -- ('isAlreadyConnected'). Core AcceptBlock: @if (fAlreadyHave) return
 -- true;@ (validation.cpp:4335) - no ConnectBlock, no store, no reorg try.
