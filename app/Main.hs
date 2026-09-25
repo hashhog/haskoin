@@ -4158,7 +4158,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                       elapsedMs
                       (length (blockTxns block))
                       (blockInputCount block)
-                when (shouldLogUpdateTip isIBD height utiHeaderTip) $ do
+                -- Phases also for any connect >= 1 s, even mid-IBD where
+                -- UpdateTip is sampled every 100 heights: a slow block is
+                -- exactly the one whose split is needed.
+                when (shouldLogUpdateTip isIBD height utiHeaderTip
+                      || elapsedMs >= 1000) $ do
                   (pL, pS, pV, pW) <- readIORef phaseRef
                   let msD a b = max 0 (round ((b - a) * 1000) :: Int)
                   putStrLn $
