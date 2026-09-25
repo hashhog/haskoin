@@ -486,3 +486,36 @@ spec = do
       isAlreadyConnected 100 100 (Just h1) h1 `shouldBe` False
     it "D4: no stored hash is not a duplicate" $
       isAlreadyConnected 100 50 Nothing h1 `shouldBe` False
+
+  -- P1: the cached builder's parallel prefetch must return exactly the
+  -- serial builder's map: DB coins, mirror hits, intra-block spends and
+  -- genuine misses mixed in one block.
+  describe "spent-coin prefetch" $ do
+    it "P1: cached (prefetch) == FromDB (serial) over 400 mixed inputs" $ do
+      withTestDB "p1" $ \db -> do
+        (hc, forkHash, forkWork) <- connectChainToFork db
+        _ <- parentEight db hc forkHash forkWork
+        mTip <- getBestBlockHash db
+        tip <- maybe (expectationFailure "no tip" >> return (error "no tip"))
+                     return mTip
+        let dbOp i = OutPoint (TxId (Hash256 (BS.pack (fromIntegral (i `div` 256) : fromIntegral (i `mod` 256) : replicate 30 0x33)))) (fromIntegral (i `mod` 3))
+            dbOps = [ dbOp i | i <- [0 .. 299 :: Int] ]
+            coinFor i = Coin { coinTxOut = TxOut (1000 + fromIntegral i) opTrue
+                             , coinHeight = 50 + fromIntegral (i `mod` 40)
+                             , coinIsCoinbase = even i }
+        forM_ (zip [0 :: Int ..] dbOps) $ \(i, op) -> S.putUTXOCoin db op (coinFor i)
+        let ghosts = [ OutPoint (TxId (Hash256 (BS.replicate 32 (0x80 + fromIntegral g)))) 1 | g <- [0 .. 49 :: Int] ]
+            spendA = [ spendOut op 1 | op <- dbOps ]
+            chainA = spendOut (dbOps !! 0) 2        -- duplicate prevout (invalid block, still one map entry)
+            txI    = spendOut (OutPoint (computeTxId (head spendA)) 0) 1  -- intra
+            spendG = [ spendOut op 1 | op <- ghosts ]
+            child  = mkBlock tip (baseTime + forkHeight + 2)
+                       (coinbaseTxAt 103 0x0b : spendA ++ [chainA, txI] ++ spendG)
+        cache <- newUTXOCache db 100000
+        -- warm the mirror with 40 of them so hits and prefetches mix
+        forM_ (take 40 dbOps) $ \op -> S.getUTXOCoinCached cache op
+        spentDB <- buildSpentUtxoMapFromDB db child
+        spentC  <- buildSpentUtxoMapCached cache child
+        let expected = Map.fromList [ (op, coinFor i) | (i, op) <- zip [0 ..] dbOps ]
+        spentDB `shouldBe` expected
+        spentC  `shouldBe` expected

@@ -258,6 +258,8 @@ import Control.DeepSeq (NFData(..))
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
+import Control.Concurrent (getNumCapabilities)
+import Control.Concurrent.Async (mapConcurrently)
 import qualified Data.List as L
 import Data.List (foldl')
 import Data.Maybe (isJust)
@@ -822,6 +824,25 @@ buildSpentUtxoMapFromDB db block = do
                    return (op, m)) outpoints
   return $ Map.fromList [ (op, c) | (op, Just c) <- pairs ]
 
+-- | Read @ops@ from PrefixUTXO concurrently: up to 16 workers (bounded by
+-- the RTS capability count), each doing plain 'getUTXOCoin' over its
+-- slice. Read-only; the result maps each op to exactly what an inline
+-- 'getUTXOCoin' would have returned.
+prefetchCoins :: HaskoinDB -> [OutPoint] -> IO (Map OutPoint (Maybe Coin))
+prefetchCoins _ [] = return Map.empty
+prefetchCoins db ops = do
+  caps <- getNumCapabilities
+  let n = length ops
+      workers = max 1 (min 16 (min caps ((n + 63) `div` 64)))
+      slices = [ [ op | (i, op) <- zip [0 :: Int ..] ops, i `mod` workers == w ]
+               | w <- [0 .. workers - 1] ]
+  results <- mapConcurrently
+               (mapM (\op -> do
+                        mc <- getUTXOCoin db op
+                        return (op, mc)))
+               slices
+  return $! Map.fromList (concat results)
+
 -- | Txids of every transaction in @block@ (coinbase included).
 blockOwnTxIds :: Block -> Set.Set TxId
 blockOwnTxIds block = Set.fromList (map computeTxId (blockTxns block))
@@ -1046,13 +1067,26 @@ getUTXOCoinCached cache op =
 -- tip is decoded at most once.
 getUTXOCoinCachedWith :: Maybe (OutPoint -> IO Bool) -> UTXOCache -> OutPoint
                       -> IO (Maybe Coin)
-getUTXOCoinCachedWith mHeal cache op = do
+getUTXOCoinCachedWith = getUTXOCoinCachedPre Nothing
+
+-- | 'getUTXOCoinCachedWith' that can take the disk read from a prefetch
+-- ('prefetchCoins'): @Just (g0, mc0)@ is a 'getUTXOCoin' result for @op@
+-- read AFTER generation @g0@ was sampled, so the populate guard below is
+-- exactly as strong as for an inline read (a clear after @g0@ discards it).
+getUTXOCoinCachedPre :: Maybe (Word64, Maybe Coin)
+                     -> Maybe (OutPoint -> IO Bool) -> UTXOCache -> OutPoint
+                     -> IO (Maybe Coin)
+getUTXOCoinCachedPre pre mHeal cache op = do
   hit <- atomically $ Map.lookup op <$> readTVar (rcEntries cache)
   case hit of
     Just coin -> return (Just coin)          -- lossless; identical to getUTXOCoin
     Nothing -> do
-      g0 <- readTVarIO (rcGen cache)          -- sample BEFORE the lock-free read
-      mc0 <- getUTXOCoin (ucDB cache) op      -- lossless full Coin; never lookupUTXO
+      (g0, mc0) <- case pre of
+        Just gm -> return gm
+        Nothing -> do
+          g <- readTVarIO (rcGen cache)       -- sample BEFORE the lock-free read
+          mc <- getUTXOCoin (ucDB cache) op   -- lossless full Coin; never lookupUTXO
+          return (g, mc)
       mc <- case mc0 of
         Just c  -> return (Just c)
         Nothing -> case mHeal of
@@ -1101,8 +1135,26 @@ buildSpentUtxoMapCached cache block = do
                   ]
       own = blockOwnTxIds block
   heal <- newTipHealer (ucDB cache)
+  -- Parallel prefetch, then the unchanged serial pass. Every prevout that
+  -- is not intra-block and not already in the read mirror is read from
+  -- RocksDB concurrently (rocksdb_get is a 'safe' FFI call: each runs on
+  -- its own OS thread). The serial pass below then consumes those reads in
+  -- block order instead of issuing them one by one; cache hits, the
+  -- tip-hole repair (it re-reads after writing) and the populate guard are
+  -- exactly as before. Scratch A/B at 910,001-910,030 after the repair-scan
+  -- fix: the spent-coin phase was 2-27 s of every 3-28 s connect, ~0.8 ms
+  -- per serial cold read. Nothing else writes PrefixUTXO while the caller
+  -- holds the connect lock, so a prefetched read equals the inline one.
+  g0 <- readTVarIO (rcGen cache)
+  mirror <- readTVarIO (rcEntries cache)
+  let toFetch = Set.toList $ Set.fromList
+        [ op | op <- outpoints
+             , not (isOwnCreated own op)
+             , Map.notMember op mirror ]
+  fetched <- prefetchCoins (ucDB cache) toFetch
   pairs <- mapM (\op -> do
-                   m <- getUTXOCoinCachedWith
+                   m <- getUTXOCoinCachedPre
+                          (fmap (\mc -> (g0, mc)) (Map.lookup op fetched))
                           (if isOwnCreated own op then Nothing else Just heal)
                           cache op
                    return (op, m)) outpoints
