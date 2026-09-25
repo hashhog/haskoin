@@ -119,6 +119,11 @@ module Haskoin.Network
   , blockStallingTimeout
   , stallingNextNeeded
   , neededLinearHashes
+  , dropPeerInflight
+  , StoredDrainStop(..)
+  , drainStoredBodies
+  , formatStoredDrain
+  , markPeerSendFailed
   , simulateStallingNextNeeded
   , LinearDownloadState(..)
   , simulateLinearDownloadRate
@@ -683,7 +688,7 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        AddrInfoFlag(..))
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, sendAll)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO, randomRIO)
 import qualified Crypto.Random as CryptoRandom
@@ -691,7 +696,7 @@ import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import System.Timeout (timeout)
 import Control.Concurrent.STM
-import Control.Exception (try, SomeException, catch, mask_, IOException, finally)
+import Control.Exception (try, SomeException, catch, mask, mask_, IOException, finally, throwIO)
 import Data.Hashable (Hashable(..))
 
 import Haskoin.Types
@@ -1312,6 +1317,101 @@ stallingNextNeeded now nextNeeded xs
           heights =
             [ pifHeight x | x <- xs, pifPeer x `Set.member` stallSet ]
        in (Set.toList stallSet, heights)
+
+-- | Drop every inflight body charged to planner id @pid@.
+--
+-- 'requestBlockRange' used to record a window's hashes as inflight even
+-- when the getdata send threw ("a failure still records inflight"), and
+-- kept the peer's earlier entries. Those hashes then waited on a socket
+-- that could never answer until a mute / stalling timeout noticed. Core
+-- @FinalizeNode@ (net_processing.cpp) removes a disconnected node's
+-- @vBlocksInFlight@ so the blocks are requested from another peer at the
+-- next @SendMessages@.
+dropPeerInflight
+  :: Int
+  -> Map BlockHash (Int, Word32, Int64)
+  -> Map BlockHash (Int, Word32, Int64)
+dropPeerInflight pid = Map.filter (\(p, _, _) -> p /= pid)
+
+-- | Why a 'drainStoredBodies' pass stopped.
+data StoredDrainStop
+  = StoredDrainBusy
+    -- ^ another thread is already draining; this call did nothing
+  | StoredDrainNoBody !Word32
+    -- ^ no stored body for this next-needed height
+  | StoredDrainNotAdvanced !Word32
+    -- ^ the stored body at this height was handed to the connector and
+    --   the connected tip did not move (rejected, or not connectable)
+  deriving (Eq, Show)
+
+-- | Connect already-stored bodies onto the tip, in height order, until
+-- the next-needed body is not on disk.
+--
+-- Core @ActivateBestChain@ (validation.cpp) is not owned by any peer:
+-- every @ProcessNewBlock@ call, from whichever peer, re-runs it, and it
+-- connects every block that already has data (@BLOCK_HAVE_DATA@) on the
+-- best chain. haskoin ran the equivalent drain as a RECURSIVE call at
+-- the end of the MBlock handler, on the recv thread of whichever peer
+-- delivered the last in-order block. Live mainnet 2026-09-24 (height
+-- 911,896, stuck 12 h): one peer's thread drained 911890..911896 at
+-- 1-4 min per connect, its socket went unread, the remote hung up, and
+-- the 20-minute inactivity check killThread'd that recv thread while it
+-- was validating 911897. Nothing ever re-ran the drain, and 911897 was
+-- in the kicker's have-body set, so it was never requested again:
+-- 3,589 consecutive @next-needed height=911897 fate=not-requested@.
+--
+-- This is the re-runnable, single-owner drain. @busyRef@ admits one
+-- drainer at a time and is released even when the drainer is killed
+-- (the flag is taken under 'mask'), so a killed drain never wedges
+-- later ones. The caller decides what to do with the stop reason (the
+-- node evicts the height from its have-body set so it is re-requested).
+drainStoredBodies
+  :: IORef Bool                -- ^ single-drainer flag
+  -> IO Word32                 -- ^ read next-needed height
+  -> (Word32 -> IO (Maybe b))  -- ^ stored body at a height, if any
+  -> (b -> IO ())              -- ^ connect one body (the MBlock path)
+  -> IO (Int, StoredDrainStop)
+drainStoredBodies busyRef readNext loadBody connectOne =
+  mask $ \restore -> do
+    acquired <- atomicModifyIORef' busyRef (\b -> (True, not b))
+    if not acquired
+      then return (0, StoredDrainBusy)
+      else restore (go 0) `finally` writeIORef busyRef False
+  where
+    go !n = do
+      nb <- readNext
+      mBody <- loadBody nb
+      case mBody of
+        Nothing -> return (n, StoredDrainNoBody nb)
+        Just body -> do
+          -- Another thread (the in-order MBlock path) may have connected
+          -- this height while the body was loading; do not hand the
+          -- connector a block that is now behind the tip.
+          nbNow <- readNext
+          if nbNow /= nb
+            then go n
+            else do
+              connectOne body
+              nb' <- readNext
+              if nb' > nb
+                then go (n + 1)
+                else return (n, StoredDrainNotAdvanced nb)
+
+-- | Operator line for a drain pass that connected something or evicted
+-- a have-body height. @evicted@ is (height, reason) when that height
+-- left the have-body set and will be requested from a peer again.
+formatStoredDrain :: Int -> StoredDrainStop -> Maybe (Word32, String) -> String
+formatStoredDrain n stop evicted =
+  "Stored-body drain: connected=" ++ show n
+    ++ " stop=" ++ stopTxt
+    ++ case evicted of
+         Nothing -> ""
+         Just (h, why) -> " evicted=" ++ show h ++ " reason=" ++ why
+  where
+    stopTxt = case stop of
+      StoredDrainBusy          -> "busy"
+      StoredDrainNoBody h      -> "no-body height=" ++ show h
+      StoredDrainNotAdvanced h -> "not-connected height=" ++ show h
 
 -- | Heights the linear planner still needs to getdata. Inflight and
 -- already-stored bodies (Core BLOCK_HAVE_DATA) are skipped so an
@@ -3307,7 +3407,7 @@ sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
           atomically $ modifyTVar' (pcInfo pc) (\i -> i { piState = PeerDisconnected })
           putStrLn $ "v2: sendMessage encrypt failed: " ++ err
         Right encrypted -> do
-          sendAll (pcSocket pc) encrypted
+          sendAllOrDisconnect pc encrypted
           atomically $ modifyTVar' (pcInfo pc) $ \i ->
             i { piBytesSent = piBytesSent i + fromIntegral (BS.length encrypted)
               , piMsgsSent = piMsgsSent i + 1
@@ -3315,11 +3415,51 @@ sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
     Nothing -> do
       let magic = netMagic (pcNetwork pc)
           encoded = encodeMessage magic msg
-      sendAll (pcSocket pc) encoded
+      sendAllOrDisconnect pc encoded
       atomically $ modifyTVar' (pcInfo pc) $ \i ->
         i { piBytesSent = piBytesSent i + fromIntegral (BS.length encoded)
           , piMsgsSent = piMsgsSent i + 1
           }
+
+-- | Write to the peer's socket; a failed write disconnects the peer.
+--
+-- Core @CConnman::SocketSendData@ (net.cpp): any send error other than
+-- WSAEWOULDBLOCK / EMSGSIZE / EINTR / EINPROGRESS logs "socket send
+-- error" and calls @CloseSocketDisconnect@, which sets @fDisconnect@
+-- and closes the socket. The next @SendMessages@ never selects that
+-- node again.
+--
+-- Live mainnet 2026-09-24: 68.1.224.37 logged 125 sends failing with
+-- "resource vanished (Broken pipe)" while still @state=PeerConnected@.
+-- Only the recv loop moved a peer out of 'PeerConnected', and that
+-- peer's recv thread was busy inside a 20-minute block-connect drain,
+-- so the dead socket stayed selectable for getdata the whole time.
+-- The exception is re-thrown so every caller's existing
+-- send-failure handling (and log line) is unchanged.
+sendAllOrDisconnect :: PeerConnection -> BS.ByteString -> IO ()
+sendAllOrDisconnect pc bytes =
+  sendAll (pcSocket pc) bytes
+    `catch` (\(e :: IOException) -> do
+               markPeerSendFailed pc
+               throwIO e)
+
+-- | Core @CloseSocketDisconnect@ for a failed send: leave the connected
+-- set ('getConnectedPeerList' filters on 'PeerConnected';
+-- 'peerManagerLoop' reaps 'PeerDisconnected' entries from 'pmPeers'
+-- and frees the outbound slot) and close the socket so the recv
+-- thread's next read fails and it exits.
+--
+-- Deliberately does NOT kill the recv thread: that thread may be in
+-- the middle of connecting a block (MBlock runs on the delivering
+-- peer's thread), and Core never aborts validation because a socket
+-- died. A 'PeerBanned' state is kept as is.
+markPeerSendFailed :: PeerConnection -> IO ()
+markPeerSendFailed pc = do
+  atomically $ modifyTVar' (pcInfo pc) $ \i ->
+    case piState i of
+      PeerBanned -> i
+      _          -> i { piState = PeerDisconnected }
+  close (pcSocket pc) `catch` (\(_ :: IOException) -> return ())
 
 -- | Receive exactly n bytes from the socket, buffering partial reads.
 --

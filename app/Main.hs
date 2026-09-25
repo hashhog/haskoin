@@ -20,13 +20,13 @@ import Text.Read (readMaybe)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
-import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM)
+import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM, join)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
 import Control.Exception
-  ( AsyncException, SomeException, bracket, catch, fromException, throwIO )
+  ( AsyncException, SomeException, bracket, catch, fromException, throwIO, uninterruptibleMask_ )
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
@@ -42,7 +42,7 @@ import qualified Network.Wai as Wai
 import qualified Network.Wai.Handler.Warp as Warp
 import qualified Network.HTTP.Types as HTTP
 
-import qualified Network.Socket as NS (getAddrInfo, addrAddress, AddrInfo)
+import qualified Network.Socket as NS (getAddrInfo, addrAddress, AddrInfo, SockAddr(..))
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeBlockHash, textToAddress, Address(..))
 import qualified Haskoin.Crypto as Crypto (computeWtxid)
@@ -1462,6 +1462,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Installed after PeerManager starts (needs linearLock). Ahead-store
     -- drops the hash from inflight so the slot can be next-needed.
     bodyStoredRef <- newIORef ((\_ _ -> return ()) :: BlockHash -> Word32 -> IO ())
+    -- Installed after PeerManager starts (needs pm'). Forks the
+    -- single-owner stored-body drain; see 'drainStoredBodies'.
+    storedDrainRef <- newIORef (return () :: IO ())
+    storedDrainBusyRef <- newIORef False
     -- Serialise kicker + MBlock receipt-refill against the same inflight
     -- map. Without this, a connect-side refill can overwrite a mute
     -- rotation the kicker just computed.
@@ -1784,7 +1788,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr msg
           `catchSync` (\e -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1803,6 +1807,40 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     writeIORef bodyStoredRef $ \bh ht -> withMVar linearLock $ \() -> do
       modifyIORef' linearInflightRef (Map.delete bh)
       modifyIORef' haveBodyRef (Set.insert ht)
+    -- Stored-body drain (Core ActivateBestChain). Forked, single-owner
+    -- ('drainStoredBodies' flag), never on a peer's recv thread, so a
+    -- peer disconnect cannot kill it half way. Re-run by every
+    -- successful connect AND by the kicker whenever next-needed is in
+    -- haveBody — the 12 h stall at 911,896 was a killed drain that
+    -- nothing re-ran. A height whose stored body is missing or does not
+    -- connect leaves haveBody so the kicker requests it from a peer.
+    let drainPseudoAddr = NS.SockAddrInet 0 0
+        loadStoredBody ht = do
+          hmap <- readTVarIO (hcByHeight hc)
+          case Map.lookup ht hmap of
+            Nothing -> return Nothing
+            Just bhS -> getBlock db bhS
+        evictHaveBody ht = withMVar linearLock $ \() -> do
+          had <- Set.member ht <$> readIORef haveBodyRef
+          when had $ modifyIORef' haveBodyRef (Set.delete ht)
+          return had
+        drainOnce = do
+          (nDrained, stop) <- drainStoredBodies storedDrainBusyRef
+            (readIORef nextBlockRef)
+            loadStoredBody
+            (\blkS ->
+               syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef drainPseudoAddr (MBlock blkS)
+                 `catchSync` (\e -> putStrLn $ "Stored-body drain: handler error: " ++ show e))
+          evicted <- case stop of
+            StoredDrainBusy          -> return Nothing
+            StoredDrainNoBody h      -> fmap (\had -> if had then Just (h, "no-body") else Nothing) (evictHaveBody h)
+            StoredDrainNotAdvanced h -> fmap (\had -> if had then Just (h, "not-connected") else Nothing) (evictHaveBody h)
+          when (nDrained > 0 || isJust evicted) $
+            putStrLn $ formatStoredDrain nDrained stop evicted
+    writeIORef storedDrainRef $
+      void $ forkIO $ drainOnce
+        `catch` (\(e :: SomeException) ->
+                   putStrLn $ "Stored-body drain error: " ++ show e)
 
     -- W117 DH-1: hidden-service / SAM-session announcement at startup.
     --
@@ -1975,6 +2013,16 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
              let headerSyncActiveKick = nowKick - lastFullKick < 45
              reqFrom <- forkDownloadFloor db hc nextBlock
              requestedUpTo <- readIORef requestedUpToRef
+             -- next-needed is on disk (haveBody) but not connected: re-run
+             -- the stored-body drain. The planner never re-requests a
+             -- haveBody height, so without this a drain that died (its
+             -- thread killed, or never started) wedges IBD forever — the
+             -- 911,896 stall: 3,589 x "next-needed height=911897
+             -- fate=not-requested". A running drain makes this a no-op.
+             haveBodyK <- readIORef haveBodyRef
+             when (reqFrom >= nextBlock && nextBlock <= headerTip
+                   && Set.member nextBlock haveBodyK) $
+               join (readIORef storedDrainRef)
              let connectedTip = if nextBlock == 0 then 0 else nextBlock - 1
                  -- A competing heavier fork drops the floor below the connected
                  -- tip (forkDownloadFloor); that path needs the fork-aware
@@ -3189,7 +3237,15 @@ requestBlockRange pm hc fromHeight toHeight rot failed inflight now cap branch n
                          [ (h, (idx, Map.findWithDefault 0 h heightByHash, now))
                          | h <- hashes ]
                        out = (idx, addrTxt, connectedAtSend, sendOk, hasNext, errS)
-                   return (out : outs, Map.union added acc))
+                       -- A failed send disconnects the peer
+                       -- (sendMessage -> markPeerSendFailed, Core
+                       -- CloseSocketDisconnect). Do not charge it this
+                       -- window, and release what it already held (Core
+                       -- FinalizeNode clears vBlocksInFlight) so the
+                       -- hashes are re-planned onto live peers.
+                       acc' | sendOk    = Map.union added acc
+                            | otherwise = dropPeerInflight idx acc
+                   return (out : outs, acc'))
                 ([], inflight)
                 plan
               let assigned =
@@ -3611,12 +3667,17 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- ^ Ahead-store: drop the hash from inflight and
                       -- remember the height as BLOCK_HAVE_DATA so it is
                       -- not re-getdata'd. Core AcceptBlock.
+                   -> IORef (IO ())
+                      -- ^ Stored-body drain (Core ActivateBestChain):
+                      -- forks the single-owner 'drainStoredBodies' pass.
+                      -- Run after a successful connect instead of a
+                      -- recursive drain on the delivering peer's thread.
                    -> IORef Word64
                       -- ^ Running count of MBlock bodies that arrived and
                       -- were not connected. e8a03a9's 8x RATE drop was
                       -- silent on out-of-order G1 (only next-needed logged).
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr msg = case msg of
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -3924,33 +3985,45 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                                    return (Left ("Core full-block validation: exception: " <> show e)))
                 r <- case vr of
                        Left verr -> return (Left ("Core full-block validation: " <> verr))
-                       Right () ->
-                         (connectBlock db net block height spent)
-                           `catch` (\(e :: SomeException) -> do
-                                      putStrLn $ "ERROR connecting block "
-                                              ++ show height ++ ": " ++ show e
-                                      return (Left ("exception: " <> show e)))
-                -- Advance the next-block pointer IF the connect succeeded.
-                -- Done inside the lock so the @BestBlock / nextBlockRef@
-                -- pair stays consistent end-to-end — a concurrent kicker
-                -- read of 'nextBlockRef' won't see a "tip without cursor"
-                -- or vice versa.
-                case r of
-                  Right () -> do
-                    -- Class-A dbcache coherence: mirror connectBlockAt's PrefixUTXO
-                    -- BatchDelete set (the spent prevouts, Consensus.hs:3667) into
-                    -- the dedicated read-through cache so a later read-through can
-                    -- never serve a just-spent coin as unspent. This generator is
-                    -- IDENTICAL to the BatchDelete generator, so the invalidation
-                    -- set == the on-disk delete set by construction. Under
-                    -- connectLock => atomic vs sibling connects; vs the lock-free
-                    -- kicker reorg the rcGen guard protects the populate path.
-                    mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
-                          [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
-                    nextBlock <- readIORef nextBlockRef
-                    when (height >= nextBlock) $
-                      writeIORef nextBlockRef (height + 1)
-                  Left _ -> return ()
+                       -- Commit + cursor advance are one unit against async
+                       -- exceptions. MBlock runs on the delivering peer's recv
+                       -- thread, and 'disconnectPeer' killThread's it (20-min
+                       -- inactivity check, HARD STALL, ban). A kill after the
+                       -- WriteBatch commit but before 'nextBlockRef' moves
+                       -- leaves BestBlock = H with next-needed = H: H is then
+                       -- re-validated against a UTXO set that already spent
+                       -- its inputs (Missing UTXO) forever. Validation above
+                       -- stays interruptible; only the write + advance is
+                       -- masked. Core holds cs_main across ConnectTip.
+                       Right () -> uninterruptibleMask_ $ do
+                         rC <- (connectBlock db net block height spent)
+                                 `catch` (\(e :: SomeException) -> do
+                                            putStrLn $ "ERROR connecting block "
+                                                    ++ show height ++ ": " ++ show e
+                                            return (Left ("exception: " <> show e)))
+                         -- Advance the next-block pointer IF the connect
+                         -- succeeded. Done inside the lock so the
+                         -- @BestBlock / nextBlockRef@ pair stays consistent
+                         -- end-to-end — a concurrent kicker read of
+                         -- 'nextBlockRef' won't see a "tip without cursor"
+                         -- or vice versa.
+                         case rC of
+                           Right () -> do
+                             -- Class-A dbcache coherence: mirror connectBlockAt's PrefixUTXO
+                             -- BatchDelete set (the spent prevouts, Consensus.hs:3667) into
+                             -- the dedicated read-through cache so a later read-through can
+                             -- never serve a just-spent coin as unspent. This generator is
+                             -- IDENTICAL to the BatchDelete generator, so the invalidation
+                             -- set == the on-disk delete set by construction. Under
+                             -- connectLock => atomic vs sibling connects; vs the lock-free
+                             -- kicker reorg the rcGen guard protects the populate path.
+                             mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
+                                   [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
+                             nextBlock <- readIORef nextBlockRef
+                             when (height >= nextBlock) $
+                               writeIORef nextBlockRef (height + 1)
+                           Left _ -> return ()
+                         return rC
                 return (Right r)
           t1 <- getPOSIXTime
           let elapsedMs = max 0 (round ((t1 - t0) * 1000) :: Int)
@@ -4149,22 +4222,16 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                         }
                   void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
                     `catch` (\(_ :: SomeException) -> return ())
-                -- Drain already-persisted next blocks. Multi-peer download
-                -- stores out-of-order bodies on the G1-fail putBlock path;
-                -- once the next-needed block connects, walk hcByHeight and
-                -- connect anything already on disk so RATE is not "wait
-                -- until we re-receive them".
-                do
-                  nbDrain <- readIORef nextBlockRef
-                  hmapDrain <- readTVarIO (hcByHeight hc)
-                  case Map.lookup nbDrain hmapDrain of
-                    Just bhDrain -> do
-                      mBlkDrain <- getBlock db bhDrain
-                      case mBlkDrain of
-                        Just blkDrain ->
-                          syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr (MBlock blkDrain)
-                        Nothing -> return ()
-                    Nothing -> return ()
+                -- Drain already-stored next blocks (Core ActivateBestChain
+                -- after ProcessNewBlock). NOT a recursive call on this
+                -- peer's recv thread any more: that thread then stayed
+                -- inside the handler for the whole drain (1-4 min per
+                -- block on mainnet), stopped reading its socket, and was
+                -- killThread'd by the 20-min inactivity check mid-drain —
+                -- which stranded 911897 on disk for 12 h. The installed
+                -- action forks a single-owner drainer that no peer
+                -- disconnect can kill ('drainStoredBodies').
+                join (readIORef storedDrainRef)
 
   MTx tx -> do
     let txid = computeTxId tx
@@ -4522,7 +4589,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -4629,7 +4696,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef unconnectedCountRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()

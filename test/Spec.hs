@@ -185,6 +185,7 @@ import qualified W197DownloadInstrumentSpec
 import qualified W198PeerIdleSpec
 import qualified W199StallDiscriminatorSpec
 import qualified W200OutOfOrderStallSpec
+import qualified W201DeadPeerStallSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23923,6 +23924,12 @@ main = hspec $ do
   -- UTXO (Missing UTXO) and next-needed stuck already-inflight on one
   -- peer that stamped first-byte by sending later heights.
   W200OutOfOrderStallSpec.spec
+
+  -- W201: dead peer + killed stored-body drain. Live 2026-09-24, 12 h at
+  -- 911,896: sends to a hung-up peer failed while it stayed
+  -- PeerConnected, and the drain running on its recv thread was killed
+  -- by the inactivity check with 911897 on disk and never re-run.
+  W201DeadPeerStallSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
