@@ -3917,7 +3917,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           -- clean, peer announce — those are independently thread-safe
           -- and don't compete with another peer's tip update.
           t0 <- getPOSIXTime
+          -- Per-phase connect timing (lock wait / spent-coin fetch /
+          -- validation / write), POSIX seconds; logged beside UpdateTip.
+          phaseRef <- newIORef (t0, t0, t0, t0)
           aheadOrConnect <- withMVar connectLock $ \() -> do
+            tLock <- getPOSIXTime
+            writeIORef phaseRef (tLock, tLock, tLock, tLock)
             -- Live 2026-09-24: height=911889 next-needed=911874
             -- reason=validation err=Missing UTXO. ConnectBlock against
             -- the current UTXO MUST fail for an ahead body. Core
@@ -3954,6 +3959,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 -- DB-only builder; invalidated per-spend in the Right () branch
                 -- below and wiped at every reorg/disconnect/flush boundary.
                 spent <- buildSpentUtxoMapCached cache block
+                tSpent <- Map.size spent `seq` getPOSIXTime
                 -- W164 hollow-live-path fix: run the SAME full consensus gate the
                 -- shim (VerifyScriptShim.hs:710) and submitblock (BlockTemplate.hs:544)
                 -- use, BEFORE connecting.  connectBlock alone (connectBlockAt)
@@ -3983,6 +3989,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                                    putStrLn $ "ERROR validating block "
                                            ++ show height ++ ": " ++ show e
                                    return (Left ("Core full-block validation: exception: " <> show e)))
+                -- WHNF of the Either runs the whole (pure) validation,
+                -- including the script-check pool dispatch.
+                tValid <- vr `seq` getPOSIXTime
+                writeIORef phaseRef (tLock, tSpent, tValid, tValid)
                 r <- case vr of
                        Left verr -> return (Left ("Core full-block validation: " <> verr))
                        -- Commit + cursor advance are one unit against async
@@ -4023,6 +4033,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                              when (height >= nextBlock) $
                                writeIORef nextBlockRef (height + 1)
                            Left _ -> return ()
+                         tWrite <- getPOSIXTime
+                         writeIORef phaseRef (tLock, tSpent, tValid, tWrite)
                          return rC
                 return (Right r)
           t1 <- getPOSIXTime
@@ -4098,6 +4110,13 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                       elapsedMs
                       (length (blockTxns block))
                       (blockInputCount block)
+                when (shouldLogUpdateTip isIBD height utiHeaderTip) $ do
+                  (pL, pS, pV, pW) <- readIORef phaseRef
+                  let msD a b = max 0 (round ((b - a) * 1000) :: Int)
+                  putStrLn $
+                    formatConnectPhases height
+                      (msD t0 pL) (msD pL pS) (msD pS pV) (msD pV pW)
+                      (blockIntraSpendCount block)
                 -- Receipt refill: keep the linear pipeline full without
                 -- waiting for the 0.4s kicker poll. Live 2026-09-20
                 -- bottom-chain: 16 pipelined, kicker every 14 UpdateTips,

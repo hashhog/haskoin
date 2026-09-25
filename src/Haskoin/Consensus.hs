@@ -142,6 +142,8 @@ module Haskoin.Consensus
   , formatUnconnectedArrivalDetail
   , formatOutOfOrderStored
   , blockInputCount
+  , blockIntraSpendCount
+  , formatConnectPhases
   , blockHashToHex
   , rewindChainstateToPrefix
   , DisconnectResult(..)
@@ -4386,6 +4388,36 @@ blockHashToHex (BlockHash (Hash256 bs)) =
 -- | Input count of a block (every vin, including the coinbase).
 blockInputCount :: Block -> Int
 blockInputCount Block {blockTxns = txs} = sum (map (length . txInputs) txs)
+
+-- | Non-coinbase inputs whose prevout txid is a transaction of the SAME
+-- block (chained / intra-block spends). Operator diagnostics only.
+blockIntraSpendCount :: Block -> Int
+blockIntraSpendCount block =
+  let own = Set.fromList (map computeTxId (blockTxns block))
+  in length [ ()
+            | tx <- drop 1 (blockTxns block)
+            , inp <- txInputs tx
+            , Set.member (outPointHash (txInPrevOutput inp)) own ]
+
+-- | Per-phase timing of one linear connect, logged beside UpdateTip.
+-- @lock@ is the wait for the connect lock; @spent@ the spent-coin fetch
+-- (Core: the CCoinsViewCache fetches inside ConnectBlock); @validate@ the
+-- full consensus gate incl. script checks; @write@ the chainstate commit.
+formatConnectPhases
+  :: Word32 -- ^ height
+  -> Int    -- ^ lock-wait ms
+  -> Int    -- ^ spent-coin fetch ms
+  -> Int    -- ^ validation ms
+  -> Int    -- ^ write ms
+  -> Int    -- ^ intra-block spends
+  -> String
+formatConnectPhases height lockMs spentMs validMs writeMs intra =
+  "ConnectBlock phases: height=" ++ show height
+    ++ " lock=" ++ show lockMs ++ "ms"
+    ++ " spent=" ++ show spentMs ++ "ms"
+    ++ " validate=" ++ show validMs ++ "ms"
+    ++ " write=" ++ show writeMs ++ "ms"
+    ++ " intra=" ++ show intra
 
 -- | Core-style UpdateTip INFO line. Prefix is @UpdateTip:@ so a grep
 -- for that token finds every connected-block event. Carries height,
