@@ -141,6 +141,7 @@ module Haskoin.Consensus
   , formatUnconnectedArrival
   , formatUnconnectedArrivalDetail
   , formatOutOfOrderStored
+  , isAlreadyConnected
   , blockInputCount
   , blockIntraSpendCount
   , formatConnectPhases
@@ -4513,6 +4514,7 @@ data UnconnectedReason
   | UnconnG19MissingPrevout
   | UnconnValidation
   | UnconnAwaitingParent
+  | UnconnAlreadyConnected
   | UnconnOther
   deriving (Eq, Show)
 
@@ -4523,6 +4525,7 @@ unconnectedReasonTag UnconnG1OutOfOrder      = "g1-out-of-order"
 unconnectedReasonTag UnconnG19MissingPrevout = "g19-missing-prevout"
 unconnectedReasonTag UnconnValidation        = "validation"
 unconnectedReasonTag UnconnAwaitingParent    = "awaiting-parent"
+unconnectedReasonTag UnconnAlreadyConnected  = "already-connected"
 unconnectedReasonTag UnconnOther             = "other"
 
 -- | Classify a connectBlock / validateFullBlock Left. G19 is checked
@@ -4534,6 +4537,22 @@ classifyConnectReject err
   | "Core G1" `isInfixOf` err = UnconnG1OutOfOrder
   | "Core full-block validation" `isInfixOf` err = UnconnValidation
   | otherwise = UnconnOther
+
+-- | A body at or below the connected tip whose hash IS the active
+-- chain's block at that height: already connected. Core AcceptBlock
+-- returns before any validation (@if (fAlreadyHave) return true;@,
+-- validation.cpp:4318/4335). Re-running ConnectBlock on it can only
+-- fail (every prevout is already spent) and, pre-fix, did so under the
+-- connect lock at full cost (live 2026-09-25: 15 such re-validations of
+-- 3-9k-input blocks in one run, reason=validation Missing UTXO).
+isAlreadyConnected
+  :: Word32          -- ^ next-needed height (connected tip + 1)
+  -> Word32          -- ^ arriving block's height
+  -> Maybe BlockHash -- ^ active-chain hash stored at that height
+  -> BlockHash       -- ^ arriving block's hash
+  -> Bool
+isAlreadyConnected nextNeeded height mActive bh =
+  height < nextNeeded && mActive == Just bh
 
 -- | Operator line for a body that arrived and was not connected.
 -- @count=@ is the process-lifetime running total so a flood is a

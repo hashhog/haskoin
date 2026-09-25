@@ -71,6 +71,7 @@ import Haskoin.Consensus
   , headerWork
   , computeMerkleRoot
   , encodeBip34Height
+  , isAlreadyConnected
   )
 import qualified Haskoin.Storage as S
 import Haskoin.Storage
@@ -452,3 +453,36 @@ spec = do
         spentDB `shouldBe` Map.empty
         spentC  `shouldBe` Map.empty
         (n1 - n0) `shouldBe` 2
+
+    it "H7: N genuine misses in one block decode the tip once per builder" $ do
+      withTestDB "h7" $ \db -> do
+        (hc, forkHash, forkWork) <- connectChainToFork db
+        _ <- parentEight db hc forkHash forkWork
+        mTip <- getBestBlockHash db
+        tip <- maybe (expectationFailure "no tip" >> return (error "no tip"))
+                     return mTip
+        let ghost i = OutPoint (TxId (Hash256 (BS.replicate 32 (0x60 + i)))) 0
+            spends  = [ spendOut (ghost i) 1 | i <- [0 .. 4] ]
+            child   = mkBlock tip (baseTime + forkHeight + 2)
+                        (coinbaseTxAt 103 0x0b : spends)
+        cache <- newUTXOCache db 100000
+        n0 <- readHealTipAttempts
+        spentDB <- buildSpentUtxoMapFromDB db child
+        spentC  <- buildSpentUtxoMapCached cache child
+        n1 <- readHealTipAttempts
+        spentDB `shouldBe` Map.empty
+        spentC  `shouldBe` Map.empty
+        (n1 - n0) `shouldBe` 2
+
+  -- Core AcceptBlock: if (fAlreadyHave) return true; (validation.cpp:4335)
+  describe "isAlreadyConnected (duplicate of a connected block)" $ do
+    let h1 = BlockHash (Hash256 (BS.replicate 32 0x11))
+        h2 = BlockHash (Hash256 (BS.replicate 32 0x22))
+    it "D1: same hash below next-needed is a duplicate" $
+      isAlreadyConnected 100 99 (Just h1) h1 `shouldBe` True
+    it "D2: a different hash at a connected height is NOT (fork block)" $
+      isAlreadyConnected 100 99 (Just h1) h2 `shouldBe` False
+    it "D3: next-needed itself is never a duplicate" $
+      isAlreadyConnected 100 100 (Just h1) h1 `shouldBe` False
+    it "D4: no stored hash is not a duplicate" $
+      isAlreadyConnected 100 50 Nothing h1 `shouldBe` False

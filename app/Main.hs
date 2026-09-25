@@ -3488,6 +3488,14 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock =
 -- bodies are required by 'buildReorgConnectList' before the reorg can run.
 -- In that case the floor drops to FORK_POINT+1 so 'requestForkBlocks' fetches
 -- the whole heavier branch.
+-- | Log text for a duplicate of an already-connected block
+-- ('isAlreadyConnected'). Core AcceptBlock: @if (fAlreadyHave) return
+-- true;@ (validation.cpp:4335) - no ConnectBlock, no store, no reorg try.
+alreadyConnectedMsg :: String
+alreadyConnectedMsg =
+  "already connected at this height on the active chain; dropped without \
+  \re-validation (Core AcceptBlock fAlreadyHave)"
+
 forkDownloadFloor :: HaskoinDB -> HeaderChain -> Word32 -> IO Word32
 forkDownloadFloor db hc nextBlock = do
   mFork <- detectP2PFork db hc
@@ -3931,7 +3939,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- is the tip. Discriminator: stored=yes invalid=no — do
             -- not insert hcInvalidated (that set is RPC invalidateblock).
             nextNeededNow <- readIORef nextBlockRef
-            if height > nextNeededNow
+            mActiveAt <- if height < nextNeededNow
+                           then getBlockHeight db height
+                           else return Nothing
+            if isAlreadyConnected nextNeededNow height mActiveAt bh
+              then return (Left (nextNeededNow, 0, Just alreadyConnectedMsg))
+            else if height > nextNeededNow
               then do
                 nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
                 blockEntries <- readTVarIO (hcEntries hc)
@@ -4044,6 +4057,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               storedAct <- readIORef bodyStoredRef
               storedAct bh height
               putStrLn $ formatOutOfOrderStored (Just height) nb nUnc
+            Left (nb, _, Just err) | err == alreadyConnectedMsg ->
+              putStrLn $
+                formatUnconnectedArrivalDetail
+                  (Just height) nb UnconnAlreadyConnected 0 err
             Left (nb, nUnc, Just err) ->
               putStrLn $
                 formatUnconnectedArrivalDetail
