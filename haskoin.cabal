@@ -131,7 +131,20 @@ executable haskoin
   -- burning ~4 cores at idle tip. Bounding to 4 dropped steady-state CPU from
   -- 4.23 to 0.86 cores (measured 2026-06-15) with ample parallelism for block
   -- validation. (Does NOT address the separate slow at-tip RSS growth.)
-  ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N4"
+  --
+  -- -I0: no idle GC. The script-check pool raises capabilities to NumCPU
+  -- (setNumCapabilities 32 here), and the default idle GC (-I0.3) ran a
+  -- MAJOR collection of the ~2-4 GB heap every time the node went idle for
+  -- 0.3 s - i.e. between blocks and all through a download wait. Scratch,
+  -- 2026-09-25, same binary and datadir, idle with a 47k-header gap
+  -- (+RTS -s): default 224 major GCs / 100 GB copied / GC 447 s of 511 s
+  -- CPU, 189-388 % CPU and 3.5-7k context switches/s at idle; -I0: 17 major
+  -- GCs / 5.7 GB copied, 0-10 % CPU, 106-294 ctxsw/s. Over 199 connected
+  -- blocks: node CPU 2,190 s -> 1,100 s at equal wall time; peak RSS
+  -- 6.06 -> 7.47 GB (well inside the unit's 12 G MemoryMax). Live
+  -- mainnet showed the same signature: ~144 % CPU, ~18k ctxsw/s, spread
+  -- over ~30 threads at 3-4 % each, with little I/O.
+  ghc-options:     -Wall -threaded -rtsopts "-with-rtsopts=-N4 -I0"
 
 test-suite haskoin-test
   type:          exitcode-stdio-1.0
