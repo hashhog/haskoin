@@ -246,6 +246,15 @@ data NodeOptions = NodeOptions
     --   count: 0 = auto (every core; extra workers = CPU-1, master joins),
     --   1 = serial (0 extra workers), N>1 = N-1 extra workers, <0 = leave
     --   that many cores free.  No 15-thread cap.  Default 0.
+  , noExternalIP :: ![String]
+    -- ^ @--externalip=IP[:PORT]@ (repeatable / comma-separated; Bitcoin
+    --   Core @-externalip@).  Our own public address, advertised to peers
+    --   with score LOCAL_MANUAL.  A bare IP uses the P2P listen port.
+  , noDiscover :: !(Maybe Bool)
+    -- ^ @--discover True|False@ (Bitcoin Core @-discover@).  Learn our
+    --   public address from outbound peers' VERSION addr_recv.  Unset =
+    --   on, except off when --externalip or --proxy is given (Core
+    --   init.cpp soft-sets -discover=0 in both cases).
   } deriving (Show)
 
 data WalletCommand
@@ -430,6 +439,15 @@ parseNodeOptions = NodeOptions
                 \0=auto (every core), 1=serial, N=N threads \
                 \(N-1 extra workers; connecting thread joins as master), \
                 \<0=leave that many cores free. No 15-thread cap.")
+  <*> many (strOption (long "externalip" <> metavar "IP[:PORT]"
+        <> help "Our own public address to advertise to peers (repeatable \
+                \or comma-separated). A bare IP uses the P2P listen port. \
+                \Implies --discover False unless --discover is given. \
+                \Bitcoin Core -externalip."))
+  <*> optional (option auto (long "discover" <> metavar "True|False"
+        <> help "Discover our public address from what outbound peers \
+                \report (default True unless --externalip or --proxy is \
+                \set). Bitcoin Core -discover."))
 
 parseWalletCommand :: Parser WalletCommand
 parseWalletCommand = hsubparser
@@ -712,6 +730,13 @@ applyConfigOverlay cm n = n
   , noPar = if noPar n == 0
               then Daemon.configLookupInt "par" 0 cm
               else noPar n
+  -- externalip= (comma-separated, Core naming) appends to the CLI list.
+  , noExternalIP = noExternalIP n ++ maybe [] splitCsv (Daemon.configLookup "externalip" cm)
+  , noDiscover = case noDiscover n of
+                   Just b  -> Just b
+                   Nothing -> case Daemon.configLookup "discover" cm of
+                     Just _  -> Just (Daemon.configLookupBool "discover" True cm)
+                     Nothing -> Nothing
   -- Pass-through (not in conf overlay).
   , noConfFile   = noConfFile n
   }
@@ -1751,12 +1776,23 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     when (noNoDnsSeed && not connectModeActive) $
       putStrLn "--nodnsseed: DNS seed resolution disabled"
 
+    -- Self-advertisement inputs.  The listen port is the one the
+    -- inbound listener below binds (Core GetListenPort); 0 when
+    -- --listen False (Core fListen), which disables advertisement.
+    -- Core init.cpp soft-sets -discover=0 when -externalip or -proxy is
+    -- given; an explicit --discover wins.
+    let p2pListenPort = if noListenPort == 8333
+          then netDefaultPort net
+          else noListenPort
+        discoverOn = fromMaybe (null noExternalIP && isNothing noProxy) noDiscover
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcMaxBlockRelayOnly = min 2 (max 0 (noMaxPeers - min 8 noMaxPeers))
           , pmcMaxInbound  = inboundSlotsFromMaxConnections noMaxPeers
           , pmcMaxTotal    = noMaxPeers
           , pmcBindHosts   = noBind
+          , pmcListenPort  = if noListen then p2pListenPort else 0
+          , pmcDiscover    = discoverOn
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
           , pmcPruneMode   = pruneOn
@@ -1798,6 +1834,38 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           `catchSync` (\e ->
             putStrLn $ "eraseOrphansForPeer error: " ++ show e))
     writeIORef pmRef pm
+
+    -- Self-address advertisement (Core MaybeSendAddr): hold it during IBD.
+    -- Core ChainstateManager::IsInitialBlockDownload: in IBD while the
+    -- active tip has less work than nMinimumChainWork or is older than
+    -- max tip age (24h); once it clears it latches false for the process.
+    -- ibdModeRef is haskoin's header-sync flag, not this.
+    selfAdvIbdDone <- newIORef False
+    setSelfAdvIBDCheck pm $ do
+      done <- readIORef selfAdvIbdDone
+      if done then return False else do
+        tipE <- getValidatedChainTip db hc
+        nowT <- (round <$> getPOSIXTime :: IO Int64)
+        let tipTime = fromIntegral (bhTimestamp (ceHeader tipE)) :: Int64
+            inIBD = ceChainWork tipE < netMinimumChainWork net
+                    || tipTime < nowT - 24 * 60 * 60
+        unless inIBD $ do
+          writeIORef selfAdvIbdDone True
+          putStrLn "self-advertise: out of IBD, local address announcements enabled"
+        return inIBD
+    forM_ (concatMap (splitOnComma) noExternalIP) $ \ext -> do
+      parsed <- parseExternalIP ext
+      case parsed of
+        Left err -> putStrLn $ "WARNING: --externalip=" ++ ext ++ ": " ++ err ++ "; ignored"
+        Right (ip, port) -> do
+          ok <- addExternalIP pm ip port
+          if ok
+            then putStrLn $ "externalip: advertising " ++ showIP16 ip ++ ":"
+                         ++ show (if port == 0 then p2pListenPort else fromIntegral port)
+            else putStrLn $ "WARNING: --externalip=" ++ ext
+                         ++ " is not publicly routable or we are not listening; ignored"
+    putStrLn $ "self-advertise: listen=" ++ show noListen ++ " port="
+            ++ show p2pListenPort ++ " discover=" ++ show discoverOn
     -- W115 FIX-50: inject asmap bytecode into PeerManager so that
     -- computeNetworkGroupWithASMap can use ASN-keyed bucketing.
     let pm' = pm { pmAsmapData = asmapData }
@@ -2425,9 +2493,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       putStrLn $ "Prometheus metrics server listening on port " ++ show noMetricsPort
 
     -- Start P2P listener for inbound connections
-    let listenPort = if noListenPort == 8333
-          then netDefaultPort net  -- Use network-appropriate default
-          else noListenPort
+    let listenPort = p2pListenPort  -- network-appropriate default (8333 sentinel)
     when noListen $ do
       startInboundListener pm listenPort
       let bindDesc = case noBind of
@@ -5339,3 +5405,10 @@ catchSync act h = act `catch` \e ->
   case fromException e of
     Just (_ :: AsyncException) -> throwIO e
     Nothing -> h e
+
+-- | Split an option value on commas (Core -externalip=a,b), trimming blanks.
+splitOnComma :: String -> [String]
+splitOnComma s0 = filter (not . null) (map (filter (/= ' ')) (go s0))
+  where go xs = case break (== ',') xs of
+          (a, [])     -> [a]
+          (a, _:rest) -> a : go rest

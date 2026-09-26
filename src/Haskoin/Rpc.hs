@@ -439,6 +439,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          getSnapshotBaseHash)
 import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          PeerState(..), Version(..),
+                         LocalAddress(..), getLocalAddresses, showIP16,
                          getPeerCount, getConnectedPeers, broadcastMessage,
                          sendMessage, requestFromPeer,
                          Message(..), Inv(..), GetData(..),
@@ -4906,6 +4907,15 @@ handleGetNetworkInfo server = do
   -- live CConnman::fNetworkActive flag, not a hardcoded True, so toggling it
   -- via setnetworkactive is observable here.
   networkActive <- getNetworkActive (rsPeerMgr server)
+  -- localaddresses: our own advertised addresses (--externalip + discovered
+  -- from outbound peers' addr_recv), Core rpc/net.cpp [{address, port, score}].
+  localAddrs <- getLocalAddresses (rsPeerMgr server)
+  let localAddrEncs =
+        [ pairs $
+            pair "address" (text (T.pack (showIP16 (laIP la)))) <>
+            pair "port"    (AE.int (fromIntegral (laPort la) :: Int)) <>
+            pair "score"   (AE.int (laScore la))
+        | la <- localAddrs ]
   let mpCfg = mpConfig (rsMempool server)
       relayFloorKvb  = fromIntegral (getFeeRate (mpcMinFeeRate mpCfg)) :: Int64
       incrementalKvb = fromIntegral incrementalRelayFeePerKvb :: Int64
@@ -4963,7 +4973,7 @@ handleGetNetworkInfo server = do
               -- fee (100 sat/kvB).  Coupled to the real floor, not hardcoded.
               pair "relayfee"           (btcAmountEnc relayFloorKvb)    <>
               pair "incrementalfee"     (btcAmountEnc incrementalKvb)   <>
-              pair "localaddresses"     (AE.list id [])                 <>
+              pair "localaddresses"     (AE.list id localAddrEncs)      <>
               pair "warnings"           (AE.list text [])
       rawBs = encodingToLazyByteString enc
   return $ RpcResponse (rawJsonResult rawBs) Null Null

@@ -596,6 +596,35 @@ module Haskoin.Network
   , shouldAdvertiseAddress
   , filterReachableAddresses
   , reachabilityFromConfig
+    -- * Self-address advertisement (Core MaybeSendAddr / -externalip / -discover)
+  , LocalAddrEntry(..)
+  , LocalAddrTable
+  , LocalAddress(..)
+  , SelfAdvPeer(..)
+  , localManual
+  , minDiscoveredLocalScore
+  , discoveredLocalAddrTTL
+  , maxDiscoveredLocalAddrs
+  , avgLocalAddressBroadcastInterval
+  , isRoutableIP16
+  , ip16ToSockAddr
+  , sockAddrIP16
+  , showIP16
+  , localAddrAddManual
+  , localAddrConfirm
+  , localAddrExpire
+  , localAddrBest
+  , localAddrList
+  , chooseLocalAddrForPeer
+  , selfAdvertMessage
+  , parseExternalIP
+  , addExternalIP
+  , getLocalAddresses
+  , setSelfAdvIBDCheck
+  , noteVersionAddrRecv
+  , selfAdvOnHandshake
+  , maybeSendLocalAddr
+  , selfAdvTick
     -- * ASMap Health Check (G23)
   , ASMapHealthStats(..)
   , asmapHealthCheckInterval
@@ -640,7 +669,7 @@ import Data.Serialize
 import Data.Word
 import Data.Int (Int32, Int64)
 import Data.Bits ((.&.), (.|.), shiftR, shiftL, xor, complement, rotateL)
-import Control.Monad (replicateM, forM_, forM, when, forever, unless, void, filterM)
+import Control.Monad (replicateM, forM_, forM, when, forever, unless, void, filterM, join)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
 import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr)
@@ -664,7 +693,7 @@ import Data.ByteArray (convert, ScrubbedBytes)
 import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
-import Data.Maybe (mapMaybe, listToMaybe, isNothing)
+import Data.Maybe (mapMaybe, listToMaybe, isNothing, fromMaybe)
 import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
 import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
@@ -4271,7 +4300,24 @@ data PeerManager = PeerManager
     -- ^ Live P2P listen sockets created by 'startInboundListenerOn'.
     --   Closed by 'stopPeerManager' so tests (and a clean shutdown) do
     --   not leak the bind.
+  , pmLocalAddrs         :: !(TVar LocalAddrTable)
+    -- ^ Our own addresses (Core mapLocalHost): --externalip entries plus
+    --   addresses discovered from outbound peers' VERSION addr_recv.
+    --   See the "Self-address advertisement" section.
+  , pmSelfAdvPeers       :: !(TVar (Map SockAddr SelfAdvPeer))
+    -- ^ Per-peer self-announcement state (Core Peer::m_next_local_addr_send)
+    --   for registered, handshaked peers.  Feelers never appear here.
+  , pmSelfAdvIsIBD       :: !(IORef (IO Bool))
+    -- ^ IBD predicate gating the self-announcement (Core MaybeSendAddr).
+    --   Installed by 'setSelfAdvIBDCheck'; the default reports IBD, so
+    --   nothing is advertised until the node wires a real check.
   }
+
+-- | Per-peer self-announcement state.
+data SelfAdvPeer = SelfAdvPeer
+  { sapServices :: !Word64         -- ^ services we sent in VERSION
+  , sapNextSend :: !(Maybe Int64)  -- ^ next announcement (unix secs); Nothing = not yet sent
+  } deriving (Show, Eq)
 
 -- | Configuration for the peer manager
 data PeerManagerConfig = PeerManagerConfig
@@ -4352,6 +4398,14 @@ data PeerManagerConfig = PeerManagerConfig
     -- ^ Operator @--bind@ hosts.  Empty (the default) means bind all
     --   interfaces ('defaultBindHosts' = 0.0.0.0 and ::).  A non-empty
     --   list restricts the listener to those addresses.
+  , pmcListenPort       :: !Int
+    -- ^ P2P port we accept inbound connections on; 0 = not listening
+    --   (Core fListen / GetListenPort).  Self-advertisement is off at 0
+    --   and advertised addresses carry this port.
+  , pmcDiscover         :: !Bool
+    -- ^ Core @-discover@: learn our public address from outbound peers'
+    --   VERSION addr_recv.  Default True; the node turns it off when
+    --   @--externalip@ is given unless @--discover@ is explicit.
   } deriving (Show)
 
 -- | Default peer manager configuration (matches Bitcoin Core defaults)
@@ -4380,6 +4434,8 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcDnsSeed          = True   -- -dnsseed (Core DEFAULT_DNSSEED = true)
   , pmcHandshakeTimeout = 60     -- inbound VERSION/VERACK timeout (seconds)
   , pmcBindHosts        = []     -- empty = defaultBindHosts (0.0.0.0 and ::)
+  , pmcListenPort       = 0      -- not listening until the node sets its port
+  , pmcDiscover         = True   -- Core DEFAULT -discover=1
   }
 
 -- | W117 DH-2 wiring: derive a 'NetworkReachability' record from the
@@ -4550,6 +4606,9 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTVarIO []    -- pmAddedNodes: empty addnode-managed persistent-peer list
     <*> newTVarIO True  -- pmNetworkActive: P2P enabled by default (Core fNetworkActive=true)
     <*> newTVarIO []    -- pmListenSocks: filled by startInboundListenerOn
+    <*> newTVarIO Map.empty  -- pmLocalAddrs
+    <*> newTVarIO Map.empty  -- pmSelfAdvPeers
+    <*> newIORef (return True)  -- pmSelfAdvIsIBD: IBD until wired
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -4816,6 +4875,12 @@ peerManagerLoop pm = forever $ do
   when (dumpTs `mod` 900 < 10) $
     saveAddrMan (pmcDataDir (pmConfig pm)) (pmAddrMan pm)
 
+  -- Self-address re-announcement (Core MaybeSendAddr timer; also sends the
+  -- first announcement that IBD held back at handshake time).
+  selfAdvTick pm
+    `catch` (\(e :: SomeException) ->
+      putStrLn $ "peerManagerLoop: selfAdvTick error: " ++ show e)
+
   -- Sleep before next iteration
   threadDelay (10 * 1000000)  -- 10 seconds
 
@@ -4894,7 +4959,11 @@ tryConnectFeeler pm connected = do
                   disconnectPeer pc `catch` (\(_ :: SomeException) -> return ())
                   nowFail <- (round <$> getPOSIXTime :: IO Int64)
                   markAttempt (pmAddrMan pm) addr nowFail
-                Right _ver -> do
+                Right ver -> do
+                  -- Learn our address from the feeler's addr_recv (discovery
+                  -- only; a feeler never gets an addr of ours).
+                  nowSeen <- (round <$> getPOSIXTime :: IO Int64)
+                  noteVersionAddrRecv pm addr False ver nowSeen
                   -- SUCCESS: promote NEW->TRIED, then disconnect immediately.
                   -- The feeler is never added to pmPeers nor the outbound
                   -- diversity set, so it consumes no relay slot.
@@ -5121,6 +5190,9 @@ attemptProxyOutbound pm config blockRelayOnly addr
               unless blockRelayOnly $
                 sendMessage pc' MGetAddr
                   `catch` (\(_ :: IOException) -> return ())
+              -- Self-announcement (Core MaybeSendAddr). No discovery: the
+              -- peer saw the proxy's exit address, not ours.
+              selfAdvOnHandshake pm addr pc' (pcfgServices config) ver False
 
 -- | W117 DH-1: outbound dial by hostname string (the .onion / .i2p path).
 --
@@ -5248,6 +5320,7 @@ finalizeHostConnect pm config host port blockRelayOnly res = case res of
         unless blockRelayOnly $
           sendMessage pc' MGetAddr
             `catch` (\(_ :: IOException) -> return ())
+        selfAdvOnHandshake pm synthAddr0 pc' (pcfgServices config) ver False
         putStrLn $ "tryConnectByHost: connected to " ++ host
 
 -- | Attempt a BIP-324 v2 outbound handshake on a fresh socket.  Returns
@@ -5320,6 +5393,8 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
                     -- Only request addresses from full-relay peers (not block-relay-only)
                     unless blockRelayOnly $
                       sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+                    -- Self-address discovery + announcement (Core MaybeSendAddr).
+                    selfAdvOnHandshake pm addr pc' (pcfgServices config) ver True
                     putStrLn $ "v2 outbound: connected (encrypted) to " ++ host
                     return (Just ())
   case mResult of
@@ -5391,6 +5466,9 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           -- Only request addresses from full-relay peers (not block-relay-only)
           unless blockRelayOnly $
             sendMessage pc' MGetAddr `catch` (\(_ :: IOException) -> return ())
+
+          -- Self-address discovery + announcement (Core MaybeSendAddr).
+          selfAdvOnHandshake pm addr pc' (pcfgServices config) ver True
 
 -- | Return True if the address is a loopback / local address.
 -- Mirrors Bitcoin Core's @CNetAddr::IsLocal()@:
@@ -5726,10 +5804,10 @@ startInboundListenerOn pm specs = do
                 hsResult <- performHandshake config pc
                 case hsResult of
                   Left err -> return (Left err)
-                  Right _  -> do
+                  Right ver -> do
                     pc' <- startPeerThreadsWithMisbehavior pc
                              (pmMessageHandler pm addr) onMisbehave
-                    return (Right pc')
+                    return (Right (pc', ver))
               Just TransportV2 -> do
                 hsResult <- v2InboundHandshake pc net
                 case hsResult of
@@ -5739,10 +5817,10 @@ startInboundListenerOn pm specs = do
                     appRes <- performHandshake config pc
                     case appRes of
                       Left err -> return (Left err)
-                      Right _  -> do
+                      Right ver -> do
                         pc' <- startPeerThreadsWithMisbehavior pc
                                  (pmMessageHandler pm addr) onMisbehave
-                        return (Right pc')
+                        return (Right (pc', ver))
       watchdog <- forkIO $ do
         threadDelay hsMicros
         st <- readTVarIO (pcInfo pc)
@@ -5755,9 +5833,12 @@ startInboundListenerOn pm specs = do
         Left err -> do
           putStrLn $ "Inbound handshake failed from " ++ show addr ++ ": " ++ err
           dropInbound addr pc
-        Right pc' -> do
+        Right (pc', ver) -> do
           atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc')
           putStrLn $ "Accepted inbound connection from " ++ show addr
+          -- Inbound: addr_recv only scores a known address (Core SeenLocal);
+          -- then the initial self-announcement (Core MaybeSendAddr).
+          selfAdvOnHandshake pm addr pc' (pcfgServices config) ver True
 
 -- | Connect to a peer by host:port string (for addnode RPC).
 -- Marks the resulting PeerInfo entry as a manual connection
@@ -12437,3 +12518,423 @@ filterReachableAddresses reach = filter (shouldAdvertise . av2NetId)
     shouldAdvertise NetTorV3 = nrOnion reach
     shouldAdvertise NetI2P   = nrI2P reach
     shouldAdvertise NetCJDNS = nrCJDNS reach
+
+--------------------------------------------------------------------------------
+-- Self-address advertisement (Bitcoin Core parity)
+--------------------------------------------------------------------------------
+--
+-- A listening node must tell the network where it can be reached, or nobody
+-- dials it: peers learn addresses only from addr/addrv2 gossip, and the only
+-- gossip source for OUR address is us.  Core does this in three parts,
+-- mirrored here:
+--
+--  1. A table of local addresses (Core net.cpp mapLocalHost / AddLocal /
+--     SeenLocal).  Entries come from @--externalip@ (score 'localManual') and
+--     from discovery: an outbound peer's VERSION carries addr_recv, the
+--     address it sees us at.  A discovered entry's score is the number of
+--     DISTINCT peer netgroups that confirmed it, so one peer (or one /16)
+--     cannot talk us into advertising an address; it needs
+--     'minDiscoveredLocalScore' groups before it is used, and it ages out
+--     after 'discoveredLocalAddrTTL' without a fresh confirmation, so a
+--     changed public IP replaces the old one.  Inbound peers only score an
+--     entry that already exists.
+--  2. The per-peer choice of which address to advertise (Core net.cpp
+--     GetLocalAddrForPeer, 240-268): the best table entry, but if the peer
+--     itself told us a routable address for us, use that instead when the
+--     table has nothing usable, and otherwise sometimes (1/2, or 1/8 when the
+--     best entry scores above LOCAL_MANUAL).
+--  3. The send (Core net_processing.cpp MaybeSendAddr, 5445-5479): only when
+--     listening and out of IBD, one addr/addrv2 carrying just our address
+--     right after the handshake, then again on a Poisson timer averaging 24h
+--     (AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL).  Never to block-relay-only or
+--     feeler connections.  An IBD-suppressed first send leaves the timer
+--     untouched, so it goes out on the first 'peerManagerLoop' tick (10 s)
+--     after IBD ends.
+--
+-- Addresses are kept in the 16-byte form of 'NetworkAddress' (IPv4 as
+-- ::ffff:a.b.c.d), keyed by IP only, like Core's map<CNetAddr, ...>.
+
+-- | Core net.h LOCAL_MANUAL: address given by -externalip.
+localManual :: Int
+localManual = 4
+
+-- | Core net_processing.cpp AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL (24h), secs.
+avgLocalAddressBroadcastInterval :: Double
+avgLocalAddressBroadcastInterval = 24 * 60 * 60
+
+-- | A discovered entry not confirmed for this long is dropped (seconds).
+discoveredLocalAddrTTL :: Int64
+discoveredLocalAddrTTL = 3 * 60 * 60
+
+-- | Distinct peer netgroups needed before a discovered address is advertised.
+minDiscoveredLocalScore :: Int
+minDiscoveredLocalScore = 2
+
+-- | Cap on discovered entries; the weakest is evicted to make room.
+maxDiscoveredLocalAddrs :: Int
+maxDiscoveredLocalAddrs = 8
+
+-- | Cap on the per-entry confirmer set (score ceiling).
+maxLocalAddrConfirmers :: Int
+maxLocalAddrConfirmers = 64
+
+-- | One entry of the local address table.
+data LocalAddrEntry = LocalAddrEntry
+  { laeIP         :: !ByteString            -- ^ 16-byte IP
+  , laePort       :: !Word16                -- ^ port to advertise
+  , laeManual     :: !Bool                  -- ^ from --externalip
+  , laeConfirmers :: !(Set.Set NetworkGroup) -- ^ distinct confirming netgroups
+  , laeLastSeen   :: !Int64                 -- ^ last confirmation (unix secs)
+  } deriving (Show, Eq)
+
+-- | The local address table (Core mapLocalHost), keyed by the 16-byte IP.
+type LocalAddrTable = Map ByteString LocalAddrEntry
+
+-- | One row of getnetworkinfo.localaddresses.
+data LocalAddress = LocalAddress
+  { laIP    :: !ByteString   -- ^ 16-byte IP
+  , laPort  :: !Word16
+  , laScore :: !Int
+  } deriving (Show, Eq)
+
+localAddrEntryScore :: LocalAddrEntry -> Int
+localAddrEntryScore e =
+  (if laeManual e then localManual else 0) + Set.size (laeConfirmers e)
+
+-- | May this entry be advertised to arbitrary peers?
+localAddrEntryUsable :: LocalAddrEntry -> Bool
+localAddrEntryUsable e =
+  laeManual e || Set.size (laeConfirmers e) >= minDiscoveredLocalScore
+
+ipv4MappedPrefix :: ByteString
+ipv4MappedPrefix = BS.pack [0,0,0,0,0,0,0,0,0,0,0xff,0xff]
+
+-- | Is a 16-byte IP an IPv4 (::ffff:a.b.c.d) address?
+ip16IsIPv4 :: ByteString -> Bool
+ip16IsIPv4 ip = BS.length ip == 16 && BS.take 12 ip == ipv4MappedPrefix
+
+-- | 16-byte IP -> 'SockAddr' with the given port.
+ip16ToSockAddr :: Word16 -> ByteString -> Maybe SockAddr
+ip16ToSockAddr port ip
+  | BS.length ip /= 16 = Nothing
+  | ip16IsIPv4 ip =
+      case BS.unpack (BS.drop 12 ip) of
+        [a, b, c, d] -> Just $ SockAddrInet (fromIntegral port)
+                                 (tupleToHostAddress (a, b, c, d))
+        _ -> Nothing
+  | otherwise =
+      let w i = foldl' (\acc x -> (acc `shiftL` 8) .|. fromIntegral x) (0 :: Word32)
+                       (BS.unpack (BS.take 4 (BS.drop (4 * i) ip)))
+      in Just $ SockAddrInet6 (fromIntegral port) 0 (w 0, w 1, w 2, w 3) 0
+
+-- | 'SockAddr' -> 16-byte IP (IPv4 in mapped form).  A v4-mapped IPv6
+-- socket address yields the same bytes as the plain IPv4 one.
+sockAddrIP16 :: SockAddr -> Maybe ByteString
+sockAddrIP16 = sockAddrToIpBytes
+
+-- | Core CNetAddr::IsRoutable for a 16-byte IP.  IPv4 reuses the node's
+-- existing 'isRoutable' (Core's IsRFC1918/2544/3927/6598/5737/IsLocal
+-- exclusions).  IPv6 excludes unspecified, ::1 (IsLocal), fc00::/7
+-- (RFC4193), fe80::/64 (RFC4862), 2001:db8::/32 (RFC3849), 2001:10::/28
+-- (RFC4843) and 2001:20::/28 (RFC7343).
+isRoutableIP16 :: ByteString -> Bool
+isRoutableIP16 ip
+  | BS.length ip /= 16 = False
+  | ip16IsIPv4 ip = maybe False isRoutable (ip16ToSockAddr 0 ip)
+  | otherwise =
+      let b i = BS.index ip i
+          unspecified = BS.all (== 0) ip
+          loopback    = BS.all (== 0) (BS.take 15 ip) && b 15 == 1
+          rfc4193     = b 0 .&. 0xfe == 0xfc
+          rfc4862     = b 0 == 0xfe && b 1 == 0x80 && BS.all (== 0) (BS.take 6 (BS.drop 2 ip))
+          rfc3849     = b 0 == 0x20 && b 1 == 0x01 && b 2 == 0x0d && b 3 == 0xb8
+          rfc4843     = b 0 == 0x20 && b 1 == 0x01 && b 2 == 0x00 && b 3 .&. 0xf0 == 0x10
+          rfc7343     = b 0 == 0x20 && b 1 == 0x01 && b 2 == 0x00 && b 3 .&. 0xf0 == 0x20
+      in not (unspecified || loopback || rfc4193 || rfc4862 || rfc3849
+              || rfc4843 || rfc7343)
+
+-- | Render a 16-byte IP the way Core's CNetAddr::ToStringAddr does
+-- (dotted quad for IPv4, RFC 5952 compressed hex for IPv6).
+showIP16 :: ByteString -> String
+showIP16 ip
+  | BS.length ip /= 16 = "invalid"
+  | ip16IsIPv4 ip =
+      let [a, b, c, d] = BS.unpack (BS.drop 12 ip)
+      in show a ++ "." ++ show b ++ "." ++ show c ++ "." ++ show d
+  | otherwise =
+      let groups = [ (fromIntegral (BS.index ip (2*i)) `shiftL` 8)
+                       .|. fromIntegral (BS.index ip (2*i+1)) :: Word16
+                   | i <- [0..7] ]
+          hex :: Word16 -> String
+          hex 0 = "0"
+          hex w = go w ""
+            where go 0 acc = acc
+                  go n acc = go (n `div` 16) ("0123456789abcdef" !! fromIntegral (n `mod` 16) : acc)
+          -- longest run (>= 2) of zero groups, first wins on ties
+          runs = [ (i, len) | i <- [0..7], i == 0 || groups !! (i-1) /= 0
+                            , let len = length (takeWhile (== 0) (drop i groups))
+                            , len >= 2 ]
+          best = foldl' (\acc r -> case acc of
+                           Nothing -> Just r
+                           Just (_, l) -> if snd r > l then Just r else acc) Nothing runs
+          join' = foldr1 (\x y -> x ++ ":" ++ y)
+      in case best of
+           Nothing -> join' (map hex groups)
+           Just (i, len) ->
+             let pre  = map hex (take i groups)
+                 post = map hex (drop (i + len) groups)
+             in (if null pre then "" else join' pre) ++ "::"
+                ++ (if null post then "" else join' post)
+
+-- | Drop discovered entries not confirmed within 'discoveredLocalAddrTTL'.
+localAddrExpire :: Int64 -> LocalAddrTable -> LocalAddrTable
+localAddrExpire now =
+  Map.filter (\e -> laeManual e || now - laeLastSeen e <= discoveredLocalAddrTTL)
+
+-- | Record an operator-specified address (Core AddLocal(.., LOCAL_MANUAL)).
+-- 'Nothing' for a non-routable address, which Core also refuses.
+localAddrAddManual :: ByteString -> Word16 -> LocalAddrTable -> Maybe LocalAddrTable
+localAddrAddManual ip port tbl
+  | not (isRoutableIP16 ip) = Nothing
+  | otherwise =
+      let e0 = Map.findWithDefault (LocalAddrEntry ip port True Set.empty 0) ip tbl
+      in Just $ Map.insert ip e0 { laeManual = True, laePort = port } tbl
+
+-- | A peer in netgroup @grp@ reports seeing us at @ip@.  With @create@
+-- (outbound discovery) a new entry is made with @port@; without it
+-- (inbound, Core SeenLocal) only an existing entry is scored.
+localAddrConfirm :: Int64 -> ByteString -> Word16 -> NetworkGroup -> Bool
+                 -> LocalAddrTable -> LocalAddrTable
+localAddrConfirm now ip port grp create tbl0
+  | not (isRoutableIP16 ip) = tbl0
+  | otherwise =
+      let tbl = localAddrExpire now tbl0
+          bump e = e { laeConfirmers =
+                         if Set.size (laeConfirmers e) < maxLocalAddrConfirmers
+                           then Set.insert grp (laeConfirmers e)
+                           else laeConfirmers e
+                     , laeLastSeen = now }
+      in case Map.lookup ip tbl of
+           Just e -> Map.insert ip (bump e) tbl
+           Nothing
+             | not create -> tbl
+             | otherwise ->
+                 Map.insert ip (bump (LocalAddrEntry ip port False Set.empty now))
+                            (localAddrMakeRoom tbl)
+
+-- | Evict the weakest (lowest score, then oldest) discovered entry when the
+-- discovered set is full.
+localAddrMakeRoom :: LocalAddrTable -> LocalAddrTable
+localAddrMakeRoom tbl =
+  let disc = filter (not . laeManual) (Map.elems tbl)
+  in if length disc < maxDiscoveredLocalAddrs || null disc
+       then tbl
+       else let worst = minimumBy (comparing (\e -> (localAddrEntryScore e, laeLastSeen e))) disc
+            in Map.delete (laeIP worst) tbl
+
+-- | Best usable address for a peer (Core GetLocal): same address family as
+-- the peer first, then the highest score, then the most recently confirmed.
+localAddrBest :: Int64 -> Maybe ByteString -> LocalAddrTable -> Maybe LocalAddress
+localAddrBest now mPeerIP tbl =
+  let usable = filter localAddrEntryUsable (Map.elems (localAddrExpire now tbl))
+      reach e = case mPeerIP of
+        Nothing -> 0 :: Int
+        Just pip -> if ip16IsIPv4 (laeIP e) == ip16IsIPv4 pip then 1 else 0
+      key e = (reach e, localAddrEntryScore e, laeLastSeen e)
+  in case usable of
+       [] -> Nothing
+       es -> let e = maximumBy (comparing key) es
+             in Just (LocalAddress (laeIP e) (laePort e) (localAddrEntryScore e))
+
+-- | Every entry, highest score first (getnetworkinfo.localaddresses).
+localAddrList :: Int64 -> LocalAddrTable -> [LocalAddress]
+localAddrList now tbl =
+  sortBy (comparing (\l -> (Down (laScore l), laIP l)))
+    [ LocalAddress (laeIP e) (laePort e) (localAddrEntryScore e)
+    | e <- Map.elems (localAddrExpire now tbl) ]
+
+-- | Core GetLocalAddrForPeer (net.cpp:240-268), pure.  @roll@ is a uniform
+-- random draw in [0, 8); the peer's own view of us replaces the table entry
+-- when the table has nothing usable, or when @roll@ hits the 1/2 (1/8 if
+-- the best entry scores above LOCAL_MANUAL) chance.  An inbound peer dialed
+-- our listening port, so its view carries the right port too; an outbound
+-- peer's view keeps our listen port.
+chooseLocalAddrForPeer
+  :: Bool                  -- ^ -discover
+  -> Word16                -- ^ our listen port
+  -> Maybe LocalAddress    -- ^ best table entry for this peer
+  -> Bool                  -- ^ peer is inbound
+  -> Maybe ByteString      -- ^ peer's IP
+  -> Maybe NetworkAddress  -- ^ peer's addr_recv (its view of us)
+  -> Int                   -- ^ roll in [0, 8)
+  -> Maybe (ByteString, Word16)
+chooseLocalAddrForPeer discover listenPort mBest inbound mPeerIP mSeen roll =
+  let (ip0, port0) = case mBest of
+        Just la -> (laIP la, laPort la)
+        Nothing -> (BS.empty, listenPort)
+      peerGood = case (mPeerIP, mSeen) of
+        (Just pip, Just seen) -> discover && isRoutableIP16 pip
+                                          && isRoutableIP16 (naAddress seen)
+        _ -> False
+      bits = case mBest of
+        Just la | laScore la > localManual -> 3
+        _ -> 1 :: Int
+      useSeen = peerGood && (isNothing mBest || roll `mod` (2 ^ bits) == 0)
+      (ip, port) = case mSeen of
+        Just seen | useSeen ->
+          (naAddress seen, if inbound then naPort seen else port0)
+        _ -> (ip0, port0)
+  in if isRoutableIP16 ip && port /= 0 then Just (ip, port) else Nothing
+
+-- | The single-entry addr / addrv2 carrying our own address
+-- (Core MaybeSendAddr: services = our local services, time = now).
+selfAdvertMessage :: Bool -> Word64 -> Word32 -> ByteString -> Word16 -> Message
+selfAdvertMessage wantsV2 services ts ip port =
+  let entry = AddrEntry ts (NetworkAddress services ip port)
+  in if wantsV2
+       then MAddrV2 (AddrV2Msg [addrEntryToAddrV2 entry])
+       else MAddr (Addr [entry])
+
+-- | Parse an @--externalip@ value: @ip@, @ip:port@, @[ipv6]@, @[ipv6]:port@
+-- or a bare IPv6.  Port 0 means "use the listen port".  Numeric hosts only.
+parseExternalIP :: String -> IO (Either String (ByteString, Word16))
+parseExternalIP s0 = do
+  let s = filter (/= ' ') s0
+      split = case s of
+        ('[':rest) -> case break (== ']') rest of
+          (h, "]")          -> Right (h, Nothing)
+          (h, ']':':':p)    -> Right (h, Just p)
+          _                 -> Left ("invalid address " ++ show s0)
+        _ -> case length (filter (== ':') s) of
+          0 -> Right (s, Nothing)
+          1 -> let (h, p) = break (== ':') s in Right (h, Just (drop 1 p))
+          _ -> Right (s, Nothing)   -- bare IPv6
+  case split of
+    Left e -> return (Left e)
+    Right (h, mp) -> do
+      let mPort = case mp of
+            Nothing -> Just 0
+            Just p  -> case readMaybe p :: Maybe Int of
+              Just n | n > 0 && n < 65536 -> Just (fromIntegral n)
+              _ -> Nothing
+      case mPort of
+        Nothing -> return (Left ("invalid port in " ++ show s0))
+        Just port -> do
+          r <- try @SomeException $
+                 getAddrInfo (Just defaultHints { NS.addrFlags = [AI_NUMERICHOST] })
+                             (Just h) Nothing
+          return $ case r of
+            Right (ai:_) | Just ip <- sockAddrIP16 (NS.addrAddress ai) -> Right (ip, port)
+            _ -> Left ("invalid IP " ++ show h)
+
+-- | Our listen port, 0 when not listening (Core GetListenPort / fListen).
+pmListenPort :: PeerManager -> Word16
+pmListenPort pm = fromIntegral (max 0 (min 65535 (pmcListenPort (pmConfig pm))))
+
+-- | Record an @--externalip@ address.  Port 0 = the listen port.  False when
+-- not routable or not listening (Core ignores -externalip with -listen=0
+-- in effect: nothing would ever be advertised).
+addExternalIP :: PeerManager -> ByteString -> Word16 -> IO Bool
+addExternalIP pm ip port0 = do
+  let lp = pmListenPort pm
+      port = if port0 == 0 then lp else port0
+  if lp == 0 || port == 0 then return False else
+    atomically $ do
+      tbl <- readTVar (pmLocalAddrs pm)
+      case localAddrAddManual ip port tbl of
+        Nothing -> return False
+        Just t' -> writeTVar (pmLocalAddrs pm) t' >> return True
+
+-- | getnetworkinfo.localaddresses.
+getLocalAddresses :: PeerManager -> IO [LocalAddress]
+getLocalAddresses pm = do
+  now <- round <$> getPOSIXTime
+  localAddrList now <$> readTVarIO (pmLocalAddrs pm)
+
+-- | Install the IBD predicate used to hold the advertisement (Core
+-- MaybeSendAddr: @!m_chainman.IsInitialBlockDownload()@).  Until one is
+-- installed the manager behaves as if in IBD and advertises nothing.
+setSelfAdvIBDCheck :: PeerManager -> IO Bool -> IO ()
+setSelfAdvIBDCheck pm = writeIORef (pmSelfAdvIsIBD pm)
+
+-- | Handle a peer's VERSION addr_recv: an outbound peer's view of us is a
+-- discovery (only with -discover, only when both ends are routable, Core
+-- IsPeerAddrLocalGood); an inbound peer's view only scores an address we
+-- already know (Core SeenLocal).
+noteVersionAddrRecv :: PeerManager -> SockAddr -> Bool -> Version -> Int64 -> IO ()
+noteVersionAddrRecv pm peerAddr inbound ver now = do
+  let lp = pmListenPort pm
+      recvIP = naAddress (vAddrRecv ver)
+  case sockAddrIP16 peerAddr of
+    Just pip
+      | pmcDiscover (pmConfig pm), lp /= 0
+      , isRoutableIP16 pip, isRoutableIP16 recvIP -> do
+          let canon = fromMaybe peerAddr (ip16ToSockAddr 0 pip)
+              grp = computeNetworkGroupWithASMap (pmAsmapData pm) canon
+          atomically $ modifyTVar' (pmLocalAddrs pm) $
+            localAddrConfirm now recvIP lp grp (not inbound)
+    _ -> return ()
+
+-- | Post-handshake hook for a registered peer: learn from its addr_recv,
+-- remember the services we sent it, and try the initial self-announcement.
+--
+-- @learn@ is False for hostname/proxy dials, whose map key is synthetic and
+-- whose addr_recv is the proxy's exit, not us.
+selfAdvOnHandshake :: PeerManager -> SockAddr -> PeerConnection -> Word64
+                   -> Version -> Bool -> IO ()
+selfAdvOnHandshake pm addr pc services ver learn = do
+  now <- round <$> getPOSIXTime
+  info <- readTVarIO (pcInfo pc)
+  when learn $ noteVersionAddrRecv pm addr (piInbound info) ver now
+  atomically $ modifyTVar' (pmSelfAdvPeers pm) $
+    Map.insert addr (SelfAdvPeer services Nothing)
+  void (maybeSendLocalAddr pm addr pc now)
+    `catch` (\(_ :: SomeException) -> return ())
+
+-- | Core MaybeSendAddr's self-announcement block.  Returns True when a
+-- message was sent.  IBD leaves the timer untouched so the first send
+-- happens once out of IBD.
+maybeSendLocalAddr :: PeerManager -> SockAddr -> PeerConnection -> Int64 -> IO Bool
+maybeSendLocalAddr pm addr pc now = do
+  info <- readTVarIO (pcInfo pc)
+  mState <- Map.lookup addr <$> readTVarIO (pmSelfAdvPeers pm)
+  let lp = pmListenPort pm
+  case mState of
+    Nothing -> return False              -- feeler / unregistered connection
+    Just st
+      | lp == 0 -> return False          -- not listening
+      | piBlockOnly info -> return False -- block-relay-only: no addr relay
+      | piState info /= PeerConnected -> return False
+      | maybe False (> now) (sapNextSend st) -> return False
+      | otherwise -> do
+          isIBD <- join (readIORef (pmSelfAdvIsIBD pm))
+          if isIBD then return False else do
+            u <- randomRIO (0, 1 :: Double)
+            let delay = round (negate (log (1 - u)) * avgLocalAddressBroadcastInterval)
+            atomically $ modifyTVar' (pmSelfAdvPeers pm) $
+              Map.adjust (\s -> s { sapNextSend = Just (now + max 1 delay) }) addr
+            tbl <- readTVarIO (pmLocalAddrs pm)
+            roll <- randomRIO (0, 7)
+            let mPeerIP = sockAddrIP16 addr
+                best = localAddrBest now mPeerIP tbl
+                seen = vAddrRecv <$> piVersion info
+            case chooseLocalAddrForPeer (pmcDiscover (pmConfig pm)) lp best
+                   (piInbound info) mPeerIP seen roll of
+              Nothing -> return False
+              Just (ip, port) -> do
+                sendMessage pc (selfAdvertMessage (piWantsAddrV2 info)
+                                  (sapServices st) (fromIntegral now) ip port)
+                return True
+
+-- | Timer pass (called from 'peerManagerLoop' every tick): re-announce to
+-- each peer whose Poisson deadline passed, send the IBD-deferred first
+-- announcement, and forget peers that are gone.
+selfAdvTick :: PeerManager -> IO ()
+selfAdvTick pm = do
+  now <- round <$> getPOSIXTime
+  peers <- readTVarIO (pmPeers pm)
+  atomically $ modifyTVar' (pmSelfAdvPeers pm) (`Map.intersection` peers)
+  when (pmListenPort pm /= 0) $
+    forM_ (Map.toList peers) $ \(addr, pc) ->
+      void (maybeSendLocalAddr pm addr pc now)
+        `catch` (\(_ :: SomeException) -> return ())

@@ -237,6 +237,7 @@ test-suite haskoin-test
                , W199StallDiscriminatorSpec
                , W200OutOfOrderStallSpec
                , W201DeadPeerStallSpec
+               , W202SelfAdvertiseSpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , Paths_haskoin

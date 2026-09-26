@@ -186,6 +186,7 @@ import qualified W198PeerIdleSpec
 import qualified W199StallDiscriminatorSpec
 import qualified W200OutOfOrderStallSpec
 import qualified W201DeadPeerStallSpec
+import qualified W202SelfAdvertiseSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23461,8 +23462,12 @@ main = hspec $ do
       -- Also: inbound path has NO service-flag check at all.
       contents <- readFile "src/Haskoin/Network.hs"
       ("hasService (vServices ver) nodeNetwork" `isInfixOf` contents) `shouldBe` True
-      -- inbound path skips the service check
-      ("Right _ver ->" `isInfixOf` contents) `shouldBe` True
+      -- inbound path skips the service check: its handshake branch goes
+      -- straight to thread start and returns (pc', ver) with no
+      -- hasService test.  (This pin used to match the text
+      -- "Right _ver ->", which was actually the FEELER branch; the feeler
+      -- now binds its version to learn our address from addr_recv.)
+      ("return (Right (pc', ver))" `isInfixOf` contents) `shouldBe` True
 
     it "G23 FIXED: MAX_PROTOCOL_MESSAGE_LENGTH=4MB (W99 DOS)" $ do
       -- Bitcoin Core uses MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 (4 MB).
@@ -23930,6 +23935,11 @@ main = hspec $ do
   -- PeerConnected, and the drain running on its recv thread was killed
   -- by the inactivity check with 911897 on disk and never re-run.
   W201DeadPeerStallSpec.spec
+
+  -- W202: self-address advertisement (Core MaybeSendAddr / -externalip /
+  -- -discover). localaddresses was a hardcoded [] and no addr carrying our
+  -- own address was ever sent, so a port-forwarded node got no inbound.
+  W202SelfAdvertiseSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
