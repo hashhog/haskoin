@@ -189,6 +189,7 @@ import qualified W201DeadPeerStallSpec
 import qualified W202SelfAdvertiseSpec
 import qualified W203HandshakeCoreParitySpec
 import qualified W204GetDataWtxSpec
+import qualified W205SendRawMaxFeeRateSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23968,6 +23969,9 @@ main = hspec $ do
   -- W204: getdata MSG_WTX by wtxid, MSG_TX/MSG_BLOCK without witness,
   -- tx fetch keeps MSG_WTX (Core ProcessGetData parity).
   W204GetDataWtxSpec.spec
+  -- W205: sendrawtransaction maxfeerate in BTC/kvB (Core ParseFeeRate),
+  -- checked on a dry run BEFORE mempool acceptance (BroadcastTransaction).
+  W205SendRawMaxFeeRateSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

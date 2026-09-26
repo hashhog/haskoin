@@ -84,6 +84,10 @@ module Haskoin.Rpc
   , softforksFromEntry
   , mempoolErrorToRpcResponse
   , mempoolRejectToken
+    -- * sendrawtransaction maxfeerate (Core ParseFeeRate / CFeeRate::GetFee)
+  , parseMaxFeeRateParam
+  , maxRawTxFee
+  , defaultMaxRawTxFeeRateKvb
     -- * gettxoutsetinfo (exported for testing — snapshot-consistent height/hash)
   , handleGetTxOutSetInfo
   , handleGetBlockCount
@@ -4118,62 +4122,105 @@ handleSendRawTransaction server params = do
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcDeserializationError
                 (T.pack $ "TX decode failed. Make sure the tx has at least one input.")) Null
-            Right tx -> do
-              -- Parse maxfeerate parameter (default: 0.10 BTC/kvB = 10,000 sat/vB)
-              let defaultMaxFeeRate = 10000 :: Word64  -- 0.10 BTC/kvB in sat/vB
-                  maxFeeRateSatPerVB = case extractParam params 1 :: Maybe Double of
-                    Nothing -> defaultMaxFeeRate
-                    Just btcPerKvB
-                      | btcPerKvB <= 0 -> 0  -- 0 means no limit
-                      | otherwise ->
-                          -- Convert BTC/kvB to sat/vB
-                          -- 1 BTC = 100,000,000 satoshis
-                          -- 1 kvB = 1000 vB
-                          -- So BTC/kvB -> sat/vB = value * 100,000,000 / 1000 = value * 100,000
-                          round (btcPerKvB * 100000)
-
-              -- Calculate fee rate of this transaction
-              let vsize = calculateVSize tx
-
-              -- Attempt to add to mempool
-              result <- addTransaction (rsMempool server) tx
-              case result of
-                Left err ->
-                  -- Emit the bare Core reject token (unified with
-                  -- testmempoolaccept), threading the node's configured static
-                  -- relay floor so the fee-floor sub-token is exact.
-                  let staticFloorKvb =
+            Right tx ->
+              -- Core rpc/mempool.cpp sendrawtransaction:
+              --   max_raw_tx_fee_rate = ParseFeeRate(maxfeerate)   (BTC/kvB)
+              --   max_raw_tx_fee      = max_raw_tx_fee_rate.GetFee(vsize)
+              -- then node/transaction.cpp BroadcastTransaction runs ATMP with
+              -- test_accept=true FIRST and returns MAX_FEE_EXCEEDED (-25) when
+              -- base fee > max_raw_tx_fee, so an over-cap tx never enters the
+              -- mempool.  A cap of 0 disables the check (and the dry run).
+              case parseMaxFeeRateParam (rawParamAt params 1) of
+                Left (code, msg) -> return $ RpcResponse Null
+                  (toJSON $ RpcError code msg) Null
+                Right maxRateKvb -> do
+                  let maxFee = maxRawTxFee maxRateKvb (calculateVSize tx)
+                      staticFloorKvb =
                         getFeeRate (mpcMinFeeRate (mpConfig (rsMempool server)))
-                  in return $ mempoolErrorToRpcResponseWith staticFloorKvb err
-                Right txid -> do
-                  -- Get the fee from the mempool entry (for maxfeerate check)
-                  mEntry <- getTransaction (rsMempool server) txid
-                  case mEntry of
-                    Nothing ->
-                      -- Shouldn't happen - we just added it
-                      return $ RpcResponse
-                        (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
-                    Just entry -> do
-                      let fee = meFee entry
-                          actualFeeRate = if vsize > 0
-                                          then (fee * 1000) `div` fromIntegral vsize
-                                          else 0
-
-                      -- Check maxfeerate (if set to non-zero)
-                      if maxFeeRateSatPerVB > 0 && actualFeeRate > maxFeeRateSatPerVB
-                        then do
-                          -- Remove from mempool since fee is too high
-                          -- Note: In real impl we'd do this atomically
-                          return $ RpcResponse Null
-                            (toJSON $ RpcError rpcVerifyError
-                              (T.pack $ "Fee exceeds maximum configured by user: "
-                                ++ show actualFeeRate ++ " > " ++ show maxFeeRateSatPerVB
-                                ++ " sat/vB")) Null
-                        else do
-                          -- Broadcast to peers via per-peer BIP-339 inv selection
-                          broadcastTxToPeers server tx (getFeeRate (meFeeRate entry))
+                      rejectResp = mempoolErrorToRpcResponseWith staticFloorKvb
+                  preCheck <-
+                    if maxFee > 0
+                      then do
+                        dry <- testAcceptTransaction (rsMempool server) tx
+                        return $ case dry of
+                          Left err -> Just (rejectResp err)
+                          Right entry
+                            | meFee entry > maxFee -> Just maxFeeExceededResponse
+                            | otherwise            -> Nothing
+                      else return Nothing
+                  case preCheck of
+                    Just resp -> return resp
+                    Nothing -> do
+                      result <- addTransaction (rsMempool server) tx
+                      case result of
+                        Left err ->
+                          -- Emit the bare Core reject token (unified with
+                          -- testmempoolaccept), threading the node's configured
+                          -- static relay floor so the fee-floor sub-token is exact.
+                          return $ rejectResp err
+                        Right txid -> do
+                          mEntry <- getTransaction (rsMempool server) txid
+                          case mEntry of
+                            Just entry ->
+                              -- Broadcast to peers via per-peer BIP-339 inv selection
+                              broadcastTxToPeers server tx (getFeeRate (meFeeRate entry))
+                            Nothing -> return ()
                           return $ RpcResponse
                             (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
+
+-- | Core @DEFAULT_MAX_RAW_TX_FEE_RATE@ (node/transaction.h): 0.10 BTC/kvB,
+-- expressed in sat/kvB.
+defaultMaxRawTxFeeRateKvb :: Word64
+defaultMaxRawTxFeeRateKvb = 10_000_000
+
+-- | Parse the @maxfeerate@ argument exactly like Core's
+-- @ParseFeeRate(AmountFromValue(v))@ (rpc/util.cpp), returning sat/kvB.
+--
+-- * absent / null            -> default 0.10 BTC/kvB
+-- * not a number or string   -> -3 "Amount is not a number or string"
+-- * unparseable / >8 decimals-> -3 "Invalid amount"
+-- * negative or > MAX_MONEY  -> -3 "Amount out of range"
+-- * >= 1 BTC/kvB             -> -8 "Fee rates larger than or equal to 1BTC/kvB are not accepted"
+-- * 0                        -> 0 (no limit)
+parseMaxFeeRateParam :: Maybe Value -> Either (Int, Text) Word64
+parseMaxFeeRateParam Nothing = Right defaultMaxRawTxFeeRateKvb
+parseMaxFeeRateParam (Just v) = case v of
+  Number n -> fromBtc n
+  String t -> case readMaybe (T.unpack (T.strip t)) :: Maybe Scientific of
+    Just n  -> fromBtc n
+    Nothing -> Left (rpcTypeError, "Invalid amount")
+  _ -> Left (rpcTypeError, "Amount is not a number or string")
+  where
+    fromBtc :: Scientific -> Either (Int, Text) Word64
+    fromBtc n =
+      -- toBoundedInteger is Nothing for a non-integral satoshi count (more
+      -- than 8 decimals) or a magnitude outside Int64 -- both are Core
+      -- ParseFixedPoint failures ("Invalid amount").  It is also safe on
+      -- pathological exponents (no huge Integer is materialised).
+      case toBoundedInteger (n * 100000000) :: Maybe Int64 of
+        Nothing -> Left (rpcTypeError, "Invalid amount")
+        Just sats
+          | sats < 0 || sats > 2100000000000000 ->
+              Left (rpcTypeError, "Amount out of range")
+          | sats >= 100000000 ->
+              Left (rpcInvalidParameter,
+                    "Fee rates larger than or equal to 1BTC/kvB are not accepted")
+          | otherwise -> Right (fromIntegral sats)
+
+-- | Core @CFeeRate::GetFee(vsize)@ for a sat/kvB rate: the fee at that rate
+-- for @vsize@ virtual bytes, rounded UP (FeeFrac::EvaluateFeeUp).  A zero
+-- rate yields 0, which disables the maxfeerate check.
+maxRawTxFee :: Word64 -> Int -> Word64
+maxRawTxFee rateKvb vsize
+  | rateKvb == 0 || vsize <= 0 = 0
+  | otherwise = (rateKvb * fromIntegral vsize + 999) `div` 1000
+
+-- | Core TransactionError::MAX_FEE_EXCEEDED via JSONRPCTransactionError:
+-- RPC_TRANSACTION_ERROR (-25) with the common/messages.cpp wording.
+maxFeeExceededResponse :: RpcResponse
+maxFeeExceededResponse = RpcResponse Null
+  (toJSON $ RpcError rpcVerifyError
+    "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)") Null
 
 -- | Try to decode a transaction, trying witness format first then legacy
 decodeTxWithFallback :: ByteString -> Either String Tx
