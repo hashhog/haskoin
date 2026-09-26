@@ -83,7 +83,7 @@ mkInfo a = PeerInfo
   { piAddress             = a
   , piVersion             = Nothing
   , piState               = PeerConnected
-  , piServices            = 0
+  , piServices            = 9  -- NODE_NETWORK|NODE_WITNESS (FetchBlock needs witness)
   , piStartHeight         = 0
   , piRelay               = True
   , piLastSeen            = 0
@@ -108,6 +108,8 @@ mkInfo a = PeerInfo
   , piIsManual            = False
   , piIsLocal             = True
   , piWtxidRelay          = False
+  , piProvidesCmpct       = False
+  , piCmpctHBFrom         = False
   , piGetaddrRecvd        = False
   , piAddrTokenBucket     = 1.0
   , piAddrTokenTimestamp  = 0
@@ -190,6 +192,11 @@ spec = describe "W168 getblockfrompeer" $ do
     it "(4) success -> resolves peer 1 to its addr (getpeerinfo id convention)" $
       decideGetBlockFromPeer True False 1 peers testHash
         `shouldBe` Right (addr1, expectedMsg testHash)
+
+    it "(2b) peer without NODE_WITNESS -> \"Pre-SegWit peer\" (Core FetchBlock:1969)" $
+      let old = (mkInfo addr1) { piServices = 1 }  -- NODE_NETWORK only
+      in decideGetBlockFromPeer True False 1 [(addr0, mkInfo addr0), (addr1, old)] testHash
+           `shouldBe` Left (rpcMiscError, "Pre-SegWit peer")
 
     it "(4) the getdata carries the requested hash, witness-flagged inv type" $
       case decideGetBlockFromPeer True False 0 peers testHash of

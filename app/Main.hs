@@ -3160,7 +3160,10 @@ announceTip pm header bh = do
 -- Batches requests in groups of 16 to avoid overwhelming peers
 requestBlocks :: PeerManager -> HeaderChain -> Word32 -> Word32 -> Int -> IO ()
 requestBlocks pm hc fromHeight toHeight rot = do
+  -- Only NODE_WITNESS peers are asked for blocks (Core CanServeWitnesses).
   peerList <- getConnectedPeerList pm
+                >>= filterM (fmap (peerCanServeWitnesses . piServices)
+                               . readTVarIO . pcInfo)
   case peerList of
     [] -> putStrLn "No connected peers to request blocks from"
     _ -> do
@@ -4683,6 +4686,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
   MSendCmpct sc -> do
     putStrLn $ "Peer supports compact blocks: version=" ++ show (scVersion sc)
                ++ ", announce=" ++ show (scAnnounce sc)
+    -- Record it (Core m_provides_cmpctblocks / m_bip152_highbandwidth_from);
+    -- 'recordSendCmpct' ignores anything but version 2, as Core does.
+    pmSC <- readIORef pmRef
+    peersSC <- readTVarIO (pmPeers pmSC)
+    forM_ (Map.lookup addr peersSC) $ \pc ->
+      atomically $ modifyTVar' (pcInfo pc) (recordSendCmpct sc)
 
   MCmpctBlock cb -> do
     -- BIP 152: Reconstruct block from compact block + mempool

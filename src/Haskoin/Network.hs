@@ -147,6 +147,21 @@ module Haskoin.Network
     -- * Protocol Constants
   , protocolVersion
   , minProtocolVersion
+  , p2pBip31Version
+  , p2pSendHeadersVersion
+  , p2pFeeFilterVersion
+  , p2pShortIdsBlocksVersion
+  , p2pWtxidRelayVersion
+  , commonVersionWith
+  , peerCommonVersion
+  , preVerackReplies
+  , postVerackFeatureMessages
+  , recordPreVerackMessage
+  , recordSendCmpct
+  , peerCanServeWitnesses
+  , outboundHasDesirableServices
+  , isBlockDataRequest
+  , blockRequestAllowed
   , userAgent
     -- * Inventory type helpers
   , invTypeToWord32
@@ -741,9 +756,49 @@ import qualified Haskoin.ASMap as ASMap
 protocolVersion :: Int32
 protocolVersion = 70016
 
--- | Minimum supported protocol version
+-- | Minimum peer protocol version (Core @MIN_PEER_PROTO_VERSION@,
+-- node/protocol_version.h:18). Core disconnects a peer only below this,
+-- for inbound AND outbound (net_processing.cpp:3619). Everything newer
+-- than 31800 is kept; features are gated per message on the common
+-- version instead (see the @p2p*Version@ constants below). This used to
+-- be 70015, which refused every inbound peer Core would have accepted
+-- with a 31800..70014 version.
 minProtocolVersion :: Int32
-minProtocolVersion = 70015
+minProtocolVersion = 31800
+
+-- | Core @BIP0031_VERSION@: ping carries a nonce and expects a pong only
+-- when the common version is strictly greater than this.
+p2pBip31Version :: Int32
+p2pBip31Version = 60000
+
+-- | Core @SENDHEADERS_VERSION@ (BIP-130).
+p2pSendHeadersVersion :: Int32
+p2pSendHeadersVersion = 70012
+
+-- | Core @FEEFILTER_VERSION@ (BIP-133).
+p2pFeeFilterVersion :: Int32
+p2pFeeFilterVersion = 70013
+
+-- | Core @SHORT_IDS_BLOCKS_VERSION@ (BIP-152 sendcmpct).
+p2pShortIdsBlocksVersion :: Int32
+p2pShortIdsBlocksVersion = 70014
+
+-- | Core @WTXID_RELAY_VERSION@ (BIP-339). Also the version Core uses as
+-- the courtesy gate for sending @sendaddrv2@ (net_processing.cpp:3714).
+p2pWtxidRelayVersion :: Int32
+p2pWtxidRelayVersion = 70016
+
+-- | Common version with a peer: Core @std::min(nVersion, PROTOCOL_VERSION)@
+-- (net_processing.cpp:3668).
+commonVersionWith :: Int32 -> Int32
+commonVersionWith theirs = min theirs protocolVersion
+
+-- | Common version recorded for a connected peer. Before the handshake
+-- has recorded a VERSION this answers 'protocolVersion' so callers that
+-- run on a not-yet-populated record keep their previous behaviour.
+peerCommonVersion :: PeerInfo -> Int32
+peerCommonVersion info =
+  maybe protocolVersion (commonVersionWith . vVersion) (piVersion info)
 
 -- | User agent string identifying this client
 userAgent :: ByteString
@@ -1107,6 +1162,41 @@ peerCanServeBlock services headerTipHeight blockHeight
         && (headerTipHeight - blockHeight)
              < (nodeNetworkLimitedMinBlocks - 2)
   | otherwise = False
+
+-- | Core @CanServeWitnesses@ (net_processing.cpp:1166): the peer set
+-- NODE_WITNESS. Blocks are only ever requested from such peers.
+peerCanServeWitnesses :: Word64 -> Bool
+peerCanServeWitnesses services = hasService services nodeWitness
+
+-- | Service requirement for an OUTBOUND connection we chose (Core
+-- @HasAllDesirableServiceFlags@ for full-relay / block-relay dials,
+-- net_processing.cpp:3602): NODE_WITNESS plus NODE_NETWORK. Inbound
+-- peers are never held to this — Core keeps a non-witness inbound peer
+-- (a pre-fix side effect of the 70015 floor was refusing them).
+outboundHasDesirableServices :: Word64 -> Bool
+outboundHasDesirableServices services =
+  hasService services nodeNetwork && peerCanServeWitnesses services
+
+-- | Does this message ask the peer for block data? (getdata for any
+-- block-type inventory, or getblocktxn.)
+isBlockDataRequest :: Message -> Bool
+isBlockDataRequest msg = case msg of
+  MGetData (GetData ivs) -> any (isBlockInv . ivType) ivs
+  MGetBlockTxn _         -> True
+  _                      -> False
+  where
+    isBlockInv t = t `elem` [ InvBlock, InvWitnessBlock
+                            , InvFilteredBlock, InvCompactBlock ]
+
+-- | Single chokepoint for every block request that goes through
+-- 'requestFromPeerChecked': refuse to ask a peer without NODE_WITNESS
+-- for block data (Core only downloads from CanServeWitnesses peers,
+-- FindNextBlocksToDownload / FetchBlock / compact-block paths). Now that
+-- non-witness inbound peers complete the handshake, an inv / headers /
+-- cmpctblock from one must not turn into a getdata to it.
+blockRequestAllowed :: Word64 -> Message -> Bool
+blockRequestAllowed services msg =
+  not (isBlockDataRequest msg) || peerCanServeWitnesses services
 
 -- | A connected peer as seen by the fork-aware getdata planner.
 data ForkGetDataPeer = ForkGetDataPeer
@@ -3252,6 +3342,15 @@ data PeerInfo = PeerInfo
     -- with the txid.  Mirrors Bitcoin Core's m_wtxid_relay field set in
     -- net_processing.cpp:2027 (ProcessMessage "wtxidrelay").
   , piWtxidRelay :: !Bool
+    -- | BIP-152: the peer sent @sendcmpct@ with version 2 (Core
+    -- @CNodeState::m_provides_cmpctblocks@, net_processing.cpp:3910).
+    -- Recorded pre- and post-VERACK, as Core does.
+  , piProvidesCmpct :: !Bool
+    -- | BIP-152: the high-bandwidth flag of the peer's last
+    -- @sendcmpct(version 2)@ (Core @m_bip152_highbandwidth_from@ /
+    -- @m_requested_hb_cmpctblocks@). Surfaced as getpeerinfo
+    -- @bip152_hb_from@.
+  , piCmpctHBFrom :: !Bool
     -- | GETADDR answer-once flag (Core @Peer::m_getaddr_recvd@,
     -- net_processing.cpp:4833).  Set True the first time we answer a getaddr
     -- from this peer; subsequent getaddr messages from the same peer are
@@ -3370,6 +3469,8 @@ connectPeer config host port = do
               , piIsManual = False
               , piIsLocal  = isLocalAddr peerAddr
               , piWtxidRelay = False
+              , piProvidesCmpct = False
+              , piCmpctHBFrom = False
               , piGetaddrRecvd = False
               , piAddrTokenBucket = 1.0
               , piAddrTokenTimestamp = 0
@@ -3706,11 +3807,12 @@ performHandshake config pc = do
             | vNonce theirVersion == nonce ->
                 return $ Left "Self-connection detected"
             | otherwise -> do
-                -- BIP155: Send sendaddrv2 BEFORE verack to signal addrv2
-                sendMessage pc MSendAddrV2
-                -- Send verack
-                sendMessage pc MVerAck
-                -- Handle pre-verack messages (sendaddrv2, etc.) until verack
+                -- Core net_processing.cpp:3700-3738: WTXIDRELAY and
+                -- SENDADDRV2 only when the common version is >= 70016,
+                -- then VERACK. A 70002 peer gets VERACK alone.
+                mapM_ (sendMessage pc)
+                      (preVerackReplies (commonVersionWith (vVersion theirVersion)))
+                -- Record pre-verack feature negotiation until verack
                 continueHandshake pc theirVersion
           -- Forward-compat: drop the frame, retry for the version.
           Right (MUnknown _) -> recvVersion (n - 1)
@@ -3732,10 +3834,80 @@ performHandshakeWithin secs config pc = do
     Nothing -> return (Left "Handshake timed out")
     Just r  -> return r
 
--- | Continue handshake after version exchange, handling pre-verack feature messages
--- BIP155 requires handling sendaddrv2 between version and verack
+-- | Messages we send after receiving the peer's VERSION, before VERACK
+-- is exchanged, for common version @cv@ (Core net_processing.cpp:3700-3738).
+--
+--   * @wtxidrelay@ iff cv >= WTXID_RELAY_VERSION (70016)
+--   * @sendaddrv2@ iff cv >= 70016 (Core's BIP-155 courtesy gate: "don't
+--     send it to nodes with a version before 70016")
+--   * @verack@ always
+preVerackReplies :: Int32 -> [Message]
+preVerackReplies cv =
+  [ MWtxidRelay | cv >= p2pWtxidRelayVersion ]
+  ++ [ MSendAddrV2 | cv >= p2pWtxidRelayVersion ]
+  ++ [ MVerAck ]
+
+-- | Messages we send once the peer's VERACK arrives, each gated on the
+-- common version exactly where Core gates it:
+--
+--   * @sendheaders@ iff cv >= SENDHEADERS_VERSION (70012; Core
+--     MaybeSendSendHeaders, net_processing.cpp:5525)
+--   * @sendcmpct(0, 2)@ iff cv >= SHORT_IDS_BLOCKS_VERSION (70014;
+--     net_processing.cpp:3864)
+--   * @feefilter@ iff cv >= FEEFILTER_VERSION (70013; MaybeSendFeefilter,
+--     net_processing.cpp:5543) and the peer asked for tx relay
+--
+-- A peer below all three (e.g. 70002) receives nothing here; it would
+-- not be able to parse any of them.
+postVerackFeatureMessages :: Int32 -> Bool -> [Message]
+postVerackFeatureMessages cv relay =
+  [ MSendHeaders | cv >= p2pSendHeadersVersion ]
+  ++ [ MSendCmpct (SendCmpct False 2) | cv >= p2pShortIdsBlocksVersion ]
+  -- BIP133: initial feefilter (100 sat/vbyte = 100000 sat/kvB)
+  ++ [ MFeeFilter (FeeFilter 100000) | cv >= p2pFeeFilterVersion, relay ]
+
+-- | Record a BIP-152 @sendcmpct@ (Core net_processing.cpp:3900-3915):
+-- only version 2 (segwit compact blocks) is recorded; any other version
+-- is ignored. Valid before and after VERACK.
+recordSendCmpct :: SendCmpct -> PeerInfo -> PeerInfo
+recordSendCmpct sc info
+  | scVersion sc /= 2 = info
+  | otherwise = info { piProvidesCmpct = True
+                     , piCmpctHBFrom   = scAnnounce sc }
+
+-- | Apply one message received between VERSION and VERACK to the peer
+-- record, for common version @cv@. Mirrors the messages Core PROCESSES
+-- before verack (net_processing.cpp:3894-3960):
+--
+--   * @sendheaders@ -> prefers headers announcements (m_prefers_headers)
+--   * @sendcmpct@   -> 'recordSendCmpct'
+--   * @wtxidrelay@  -> wtxid relay, only if cv >= 70016 (else ignored)
+--   * @sendaddrv2@  -> wants addrv2
+--
+-- Everything else (ping, inv, feefilter, getheaders, a duplicate version,
+-- sendtxrcncl — we do not run txreconciliation) is left untouched: Core
+-- logs "Unsupported message prior to verack" and ignores it, with no
+-- disconnect and no misbehaviour (net_processing.cpp:4009-4012).
+recordPreVerackMessage :: Int32 -> Message -> PeerInfo -> PeerInfo
+recordPreVerackMessage cv msg info = case msg of
+  MSendHeaders   -> info { piWantsHeaders = True }
+  MSendCmpct sc  -> recordSendCmpct sc info
+  MWtxidRelay
+    | cv >= p2pWtxidRelayVersion -> info { piWtxidRelay = True }
+    | otherwise                  -> info
+  MSendAddrV2    -> info { piWantsAddrV2 = True }
+  _              -> info
+
+-- | Continue handshake after version exchange: record pre-verack feature
+-- negotiation until the peer's VERACK arrives.
+--
+-- Pre-fix this kept only @sendaddrv2@ and DISCARDED @wtxidrelay@,
+-- @sendheaders@ and @sendcmpct@ sent before verack — which is exactly
+-- when Core sends wtxidrelay, so 'piWtxidRelay' was never set for a Core
+-- peer. Unsupported messages are ignored without limit, as in Core.
 continueHandshake :: PeerConnection -> Version -> IO (Either String Version)
 continueHandshake pc theirVersion = do
+  let cv = commonVersionWith (vVersion theirVersion)
   r <- receiveMessage pc
   case r of
     Right MVerAck -> do
@@ -3750,24 +3922,15 @@ continueHandshake pc theirVersion = do
           , piTimeOffset  = vTimestamp theirVersion - now
           }
 
-      -- Send post-handshake feature negotiation messages
-      sendMessage pc MSendHeaders
-      sendMessage pc (MSendCmpct (SendCmpct False 2))
-      -- BIP133: Send initial feefilter (100 sat/vbyte = 100000 sat/kvB)
-      when (vRelay theirVersion) $
-        sendMessage pc (MFeeFilter (FeeFilter 100000))
+      -- Post-handshake feature negotiation, version-gated as in Core.
+      mapM_ (sendMessage pc) (postVerackFeatureMessages cv (vRelay theirVersion))
 
       return $ Right theirVersion
 
-    Right MSendAddrV2 -> do
-      -- Peer signaled addrv2 support - record it and continue waiting for verack
-      atomically $ modifyTVar' (pcInfo pc) $ \i ->
-        i { piWantsAddrV2 = True }
-      continueHandshake pc theirVersion
-
-    Right other ->
-      -- Unexpected message before verack (some peers may send other feature messages)
-      -- For now, log and continue waiting for verack
+    Right other -> do
+      -- Core: feature messages are recorded; anything else is logged and
+      -- ignored ("Unsupported message prior to verack"), no disconnect.
+      atomically $ modifyTVar' (pcInfo pc) (recordPreVerackMessage cv other)
       continueHandshake pc theirVersion
 
     Left err -> return $ Left $ "Verack failed: " ++ err
@@ -4845,7 +5008,11 @@ peerManagerLoop pm = forever $ do
     info <- readTVarIO (pcInfo pc)
     when (piState info == PeerConnected) $ do
       -- Send ping if no recent activity
-      when (now - piLastSeen info > fromIntegral (pmcPingInterval (pmConfig pm))) $ do
+      -- Core SendPings: a nonce ping (and a pong to wait for) only when
+      -- the common version is > BIP0031_VERSION (net_processing.cpp:5431);
+      -- a peer that old cannot parse the 8-byte nonce, so skip it.
+      when (now - piLastSeen info > fromIntegral (pmcPingInterval (pmConfig pm))
+            && peerCommonVersion info > p2pBip31Version) $ do
         nonce <- randomIO
         atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
         sendMessage pc (MPing (Ping nonce)) `catch` (\(_ :: IOException) -> return ())
@@ -5171,7 +5338,7 @@ attemptProxyOutbound pm config blockRelayOnly addr
               nowFail <- (round <$> getPOSIXTime :: IO Int64)
               markAttempt (pmAddrMan pm) addr nowFail
             Right ver -> do
-              unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+              unless (outboundHasDesirableServices (vServices ver)) $ disconnectPeer pc
               when blockRelayOnly $
                 atomically $ modifyTVar' (pcInfo pc)
                   (\i -> i { piBlockOnly = True })
@@ -5305,7 +5472,7 @@ finalizeHostConnect pm config host port blockRelayOnly res = case res of
                 ++ host ++ ": " ++ err
         disconnectPeer pc
       Right ver -> do
-        unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+        unless (outboundHasDesirableServices (vServices ver)) $ disconnectPeer pc
         when blockRelayOnly $
           atomically $ modifyTVar' (pcInfo pc)
             (\i -> i { piBlockOnly = True })
@@ -5370,7 +5537,7 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
                 markAttempt (pmAddrMan pm) addr nowFail
                 return Nothing
               Right ver -> do
-                if not (hasService (vServices ver) nodeNetwork)
+                if not (outboundHasDesirableServices (vServices ver))
                   then do
                     disconnectPeer pc
                     return Nothing
@@ -5436,7 +5603,7 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           markAttempt (pmAddrMan pm) addr nowFail
         Right ver -> do
           -- Verify peer supports required services
-          unless (hasService (vServices ver) nodeNetwork) $ disconnectPeer pc
+          unless (outboundHasDesirableServices (vServices ver)) $ disconnectPeer pc
 
           -- Mark as block-relay-only if requested
           when blockRelayOnly $
@@ -5727,6 +5894,8 @@ startInboundListenerOn pm specs = do
             , piIsManual = False
             , piIsLocal  = isLocalAddr addr
             , piWtxidRelay = False
+            , piProvidesCmpct = False
+            , piCmpctHBFrom = False
             , piGetaddrRecvd = False
             , piAddrTokenBucket = 1.0
             , piAddrTokenTimestamp = 0
@@ -5959,10 +6128,17 @@ requestFromPeerChecked pm addr msg = do
       -- peer that is still in the map used to be attempted, and the
       -- log is how a vanished socket is told apart from a stale index.
       info <- readTVarIO (pcInfo pc)
-      (sendMessage pc msg >> return True)
-        `catch` (\(e :: IOException) -> do
-          putStrLn $ formatRequestSendFailure (show addr) (msgTypeName msg) (show (piState info)) (show e)
-          return False)
+      if not (blockRequestAllowed (piServices info) msg)
+        then do
+          putStrLn $ "requestFromPeer: not asking " ++ show addr
+                  ++ " for block data (" ++ msgTypeName msg
+                  ++ "): peer lacks NODE_WITNESS"
+          return False
+        else
+          (sendMessage pc msg >> return True)
+            `catch` (\(e :: IOException) -> do
+              putStrLn $ formatRequestSendFailure (show addr) (msgTypeName msg) (show (piState info)) (show e)
+              return False)
 
 -- | Get the number of connected peers
 getPeerCount :: PeerManager -> IO Int
@@ -7067,17 +7243,21 @@ feeChangedSignificantly current sent
 -- Returns the new PeerInfo with updated feefilter state
 sendFeeFilter :: PeerConnection -> Word64 -> IO ()
 sendFeeFilter pc feeFilter = do
-  now <- round . (* 1000000) <$> getPOSIXTime
-  -- Generate random delay for next send (Poisson distributed)
-  nextDelay <- poissonDelay avgFeeFilterBroadcastInterval
-  let nextSend = now + nextDelay
-  -- Update peer info
-  atomically $ modifyTVar' (pcInfo pc) $ \info ->
-    info { piFeeFilterSent = feeFilter
-         , piNextFeeFilterSend = nextSend
-         }
-  -- Send the feefilter message
-  sendMessage pc (MFeeFilter (FeeFilter feeFilter))
+  -- Core MaybeSendFeefilter: nothing below FEEFILTER_VERSION
+  -- (net_processing.cpp:5543) — an older peer cannot parse it.
+  info0 <- readTVarIO (pcInfo pc)
+  when (peerCommonVersion info0 >= p2pFeeFilterVersion) $ do
+    now <- round . (* 1000000) <$> getPOSIXTime
+    -- Generate random delay for next send (Poisson distributed)
+    nextDelay <- poissonDelay avgFeeFilterBroadcastInterval
+    let nextSend = now + nextDelay
+    -- Update peer info
+    atomically $ modifyTVar' (pcInfo pc) $ \info ->
+      info { piFeeFilterSent = feeFilter
+           , piNextFeeFilterSend = nextSend
+           }
+    -- Send the feefilter message
+    sendMessage pc (MFeeFilter (FeeFilter feeFilter))
 
 -- | Check if a transaction's fee rate passes the peer's fee filter
 -- txFeeRate is in sat/vB, peerFeeFilter is in sat/kvB
@@ -12427,6 +12607,8 @@ createPeerConnectionFromSocket config sock _host = do
           , piIsManual = False
           , piIsLocal  = False  -- proxy addresses are never local
           , piWtxidRelay = False
+          , piProvidesCmpct = False
+          , piCmpctHBFrom = False
           , piGetaddrRecvd = False
           , piAddrTokenBucket = 1.0
           , piAddrTokenTimestamp = 0

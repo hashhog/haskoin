@@ -444,7 +444,9 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          sendMessage, requestFromPeer,
                          Message(..), Inv(..), GetData(..),
                          InvVector(..), InvType(..),
-                         protocolVersion, nodeNetwork, nodeWitness, nodeBloom,
+                         protocolVersion, peerCommonVersion, p2pBip31Version,
+                         peerCanServeWitnesses,
+                         nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, nodeP2PV2, bip324V2OutboundEnabled,
                          hasService, ServiceFlag(..),
                          disconnectPeer, addNodeConnect,
@@ -5051,7 +5053,7 @@ peerInfoToEncoding asmapData idx (addr, info) =
            pair "subver"                  (text (maybe "" (TE.decodeUtf8 . getVarString . vUserAgent) (piVersion info))) <>
            pair "inbound"                 (AE.bool isInbound)                           <>
            pair "bip152_hb_to"            (AE.bool False)                               <>
-           pair "bip152_hb_from"          (AE.bool False)                               <>
+           pair "bip152_hb_from"          (AE.bool (piCmpctHBFrom info))                <>
            -- Core v31.99 removed `startingheight` from getpeerinfo: rpc/net.cpp
            -- pushes presynced_headers directly after bip152_hb_from (m_starting_
            -- height is no longer surfaced via RPC). Emitting it is an extra-field
@@ -5149,10 +5151,17 @@ decideGetBlockFromPeer headerKnown bodyStored peerId peers bh
   | otherwise = case lookupPeerByIndex peerId peers of
       -- (2) Core net_processing.cpp:1966 — peer not connected.
       Nothing   -> Left (rpcMiscError, "Peer does not exist")
+      -- Core net_processing.cpp:1969 — never ask a peer without
+      -- NODE_WITNESS for a block (CanServeWitnesses).
+      Just addr
+        | not (peerSegWitCapable addr) -> Left (rpcMiscError, "Pre-SegWit peer")
       -- (4) Core net_processing.cpp:1981 — CInv(MSG_BLOCK|MSG_WITNESS_FLAG).
       Just addr ->
         let inv = InvVector InvWitnessBlock (getBlockHashHash bh)
         in Right (addr, MGetData (GetData [inv]))
+  where
+    peerSegWitCapable a =
+      maybe False (peerCanServeWitnesses . piServices) (lookup a peers)
 
 -- | Resolve a getpeerinfo-style peer id (0-based index into the
 -- 'getConnectedPeers' list) to its 'SockAddr'. Returns 'Nothing' for a
@@ -11276,7 +11285,9 @@ handlePing server = do
   -- not fail the RPC (Core loops over the map and returns regardless).
   forM_ (Map.toList peers) $ \(_, pc) -> do
     info <- readTVarIO (pcInfo pc)
-    when (piState info == PeerConnected) $ do
+    -- Nonce pings only above BIP0031_VERSION (Core net_processing.cpp:5431).
+    when (piState info == PeerConnected
+          && peerCommonVersion info > p2pBip31Version) $ do
       nonce <- SysRandom.randomIO
       atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
       sendMessage pc (MPing (Ping nonce))

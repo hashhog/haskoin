@@ -187,6 +187,7 @@ import qualified W199StallDiscriminatorSpec
 import qualified W200OutOfOrderStallSpec
 import qualified W201DeadPeerStallSpec
 import qualified W202SelfAdvertiseSpec
+import qualified W203HandshakeCoreParitySpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -5113,8 +5114,8 @@ main = hspec $ do
     it "protocolVersion is 70016" $ do
       protocolVersion `shouldBe` 70016
 
-    it "minProtocolVersion is 70015" $ do
-      minProtocolVersion `shouldBe` 70015
+    it "minProtocolVersion is Core MIN_PEER_PROTO_VERSION (31800)" $ do
+      minProtocolVersion `shouldBe` 31800
 
     it "userAgent contains Haskoin" $ do
       userAgent `shouldBe` "/Haskoin:0.1.0/"
@@ -11020,6 +11021,8 @@ main = hspec $ do
             , piIsManual = False
             , piIsLocal  = False
             , piWtxidRelay = False
+            , piProvidesCmpct = False
+            , piCmpctHBFrom = False
             , piGetaddrRecvd = False
             , piAddrTokenBucket = 1.0
             , piAddrTokenTimestamp = 0
@@ -11444,6 +11447,8 @@ main = hspec $ do
               , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
               , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
               , piWtxidRelay = False
+              , piProvidesCmpct = False
+              , piCmpctHBFrom = False
               , piGetaddrRecvd = False
               , piAddrTokenBucket = 1.0
               , piAddrTokenTimestamp = 0
@@ -11529,6 +11534,8 @@ main = hspec $ do
               , piIsManual = False
               , piIsLocal  = False
               , piWtxidRelay = False
+              , piProvidesCmpct = False
+              , piCmpctHBFrom = False
               , piGetaddrRecvd = False
               , piAddrTokenBucket = 1.0
               , piAddrTokenTimestamp = 0
@@ -11565,6 +11572,8 @@ main = hspec $ do
               , piIsManual = False
               , piIsLocal  = False
               , piWtxidRelay = False
+              , piProvidesCmpct = False
+              , piCmpctHBFrom = False
               , piGetaddrRecvd = False
               , piAddrTokenBucket = 1.0
               , piAddrTokenTimestamp = 0
@@ -11596,6 +11605,8 @@ main = hspec $ do
             , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
             , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
             , piWtxidRelay = False
+            , piProvidesCmpct = False
+            , piCmpctHBFrom = False
             , piGetaddrRecvd = False
             , piAddrTokenBucket = 1.0
             , piAddrTokenTimestamp = 0
@@ -11872,6 +11883,8 @@ main = hspec $ do
               , piIsManual = False
               , piIsLocal  = False
               , piWtxidRelay = False
+              , piProvidesCmpct = False
+              , piCmpctHBFrom = False
               , piGetaddrRecvd = False
               , piAddrTokenBucket = 1.0
               , piAddrTokenTimestamp = 0
@@ -23144,6 +23157,8 @@ main = hspec $ do
             , piNextFeeFilterSend = 0, piBlockOnly = False, piUnconnectingHeaders = 0
             , piTimeOffset = 0, piNoBan = False, piIsManual = False, piIsLocal = False
             , piWtxidRelay = False
+            , piProvidesCmpct = False
+            , piCmpctHBFrom = False
             , piGetaddrRecvd = False
             , piAddrTokenBucket = 1.0
             , piAddrTokenTimestamp = 0
@@ -23191,6 +23206,8 @@ main = hspec $ do
             , piIsManual = False
             , piIsLocal  = False
             , piWtxidRelay = False
+            , piProvidesCmpct = False
+            , piCmpctHBFrom = False
             , piGetaddrRecvd = False
             , piAddrTokenBucket = 1.0
             , piAddrTokenTimestamp = 0
@@ -23461,7 +23478,9 @@ main = hspec $ do
       -- the check is not atomic — threads may already be running by then.
       -- Also: inbound path has NO service-flag check at all.
       contents <- readFile "src/Haskoin/Network.hs"
-      ("hasService (vServices ver) nodeNetwork" `isInfixOf` contents) `shouldBe` True
+      -- W203: the outbound check is now Core HasAllDesirableServiceFlags
+      -- (NODE_NETWORK + NODE_WITNESS) via 'outboundHasDesirableServices'.
+      ("outboundHasDesirableServices (vServices ver)" `isInfixOf` contents) `shouldBe` True
       -- inbound path skips the service check: its handshake branch goes
       -- straight to thread start and returns (pc', ver) with no
       -- hasService test.  (This pin used to match the text
@@ -23940,6 +23959,11 @@ main = hspec $ do
   -- -discover). localaddresses was a hardcoded [] and no addr carrying our
   -- own address was ever sent, so a port-forwarded node got no inbound.
   W202SelfAdvertiseSpec.spec
+
+  -- W203: VERSION/VERACK handshake Core parity — MIN_PEER_PROTO_VERSION
+  -- 31800 (was 70015), per-message version gates, pre-verack feature
+  -- messages recorded / others ignored, blocks only from NODE_WITNESS.
+  W203HandshakeCoreParitySpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
