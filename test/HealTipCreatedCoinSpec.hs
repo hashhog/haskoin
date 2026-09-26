@@ -84,6 +84,7 @@ import Haskoin.Storage
   , buildSpentUtxoMapFromDB
   , buildSpentUtxoMapCached
   , readHealTipAttempts
+  , readSerialCoinReads
   , Coin(..)
   )
 
@@ -517,5 +518,69 @@ spec = do
         spentDB <- buildSpentUtxoMapFromDB db child
         spentC  <- buildSpentUtxoMapCached cache child
         let expected = Map.fromList [ (op, coinFor i) | (i, op) <- zip [0 ..] dbOps ]
+        spentDB `shouldBe` expected
+        spentC  `shouldBe` expected
+
+    -- P2: intra-block spends are prefetched too. Pre-fix they were left
+    -- out of the prefetch, so each one became a serial (negative) RocksDB
+    -- get on the connecting thread: live 926,981 intra=5,382 ->
+    -- spent=13,055 ms. The cached builder must now issue ZERO inline reads
+    -- for a block of on-disk and chained intra-block spends, and still
+    -- return the serial builder's map. (Control: restoring the
+    -- `not (isOwnCreated own op)` filter makes the count 40.)
+    it "P2: intra-block spends issue no serial reads; map unchanged" $ do
+      withTestDB "p2" $ \db -> do
+        (hc, forkHash, forkWork) <- connectChainToFork db
+        _ <- parentEight db hc forkHash forkWork
+        mTip <- getBestBlockHash db
+        tip <- maybe (expectationFailure "no tip" >> return (error "no tip"))
+                     return mTip
+        let dbOp i = OutPoint (TxId (Hash256 (BS.pack (0x44 : fromIntegral i : replicate 30 0x55)))) 0
+            dbOps  = [ dbOp i | i <- [0 .. 39 :: Int] ]
+            coinFor i = Coin { coinTxOut = TxOut (5000 + fromIntegral i) opTrue
+                             , coinHeight = 60, coinIsCoinbase = False }
+        forM_ (zip [0 :: Int ..] dbOps) $ \(i, op) -> S.putUTXOCoin db op (coinFor i)
+        let firsts = [ spendOut op 4000 | op <- dbOps ]
+            -- each first spend is chained on by an intra-block spend
+            chained = [ spendOut (OutPoint (computeTxId t) 0) 3000 | t <- firsts ]
+            child  = mkBlock tip (baseTime + forkHeight + 2)
+                       (coinbaseTxAt 103 0x0b : firsts ++ chained)
+        cache <- newUTXOCache db 100000
+        spentDB <- buildSpentUtxoMapFromDB db child
+        r0 <- readSerialCoinReads
+        spentC  <- buildSpentUtxoMapCached cache child
+        r1 <- readSerialCoinReads
+        let expected = Map.fromList [ (op, coinFor i) | (i, op) <- zip [0 ..] dbOps ]
+        spentDB `shouldBe` expected
+        spentC  `shouldBe` expected
+        (r1 - r0) `shouldBe` 0
+
+    -- P3: the plain read is KEPT for an intra-block op (only moved into
+    -- the prefetch). If a txid created in this block also has a coin on
+    -- disk (a duplicate txid - BIP-30 territory), both builders return
+    -- that disk coin, as they did before. Pins that the speedup did not
+    -- become "skip the read for intra ops", which would change the map.
+    it "P3: duplicate-txid intra op still returns the on-disk coin" $ do
+      withTestDB "p3" $ \db -> do
+        (hc, forkHash, forkWork) <- connectChainToFork db
+        _ <- parentEight db hc forkHash forkWork
+        mTip <- getBestBlockHash db
+        tip <- maybe (expectationFailure "no tip" >> return (error "no tip"))
+                     return mTip
+        let opSeed = OutPoint (TxId (Hash256 (BS.replicate 32 0x66))) 0
+            seedCoin = Coin { coinTxOut = TxOut 7000 opTrue, coinHeight = 70
+                            , coinIsCoinbase = False }
+            txT    = spendOut opSeed 6000
+            opDup  = OutPoint (computeTxId txT) 5   -- txid of a tx in THIS block
+            dupCoin = Coin { coinTxOut = TxOut 1234 opTrue, coinHeight = 71
+                           , coinIsCoinbase = True }
+            child  = mkBlock tip (baseTime + forkHeight + 2)
+                       [coinbaseTxAt 103 0x0b, txT, spendOut opDup 1000]
+        S.putUTXOCoin db opSeed seedCoin
+        S.putUTXOCoin db opDup dupCoin
+        cache <- newUTXOCache db 100000
+        spentDB <- buildSpentUtxoMapFromDB db child
+        spentC  <- buildSpentUtxoMapCached cache child
+        let expected = Map.fromList [(opSeed, seedCoin), (opDup, dupCoin)]
         spentDB `shouldBe` expected
         spentC  `shouldBe` expected

@@ -62,6 +62,7 @@ module Haskoin.Storage
   , getUTXOCoinHealingTip
   , healTipCreatedCoin
   , readHealTipAttempts
+  , readSerialCoinReads
   , deleteUTXO
   , buildSpentUtxoMapFromDB
   , buildSpentUtxoMapCached
@@ -722,6 +723,17 @@ healTipAttemptsRef = unsafePerformIO (newIORef 0)
 readHealTipAttempts :: IO Int
 readHealTipAttempts = readIORef healTipAttemptsRef
 
+-- | Process-wide count of prevout reads 'getUTXOCoinCachedPre' issued
+-- INLINE (no prefetched result supplied): each is one serial RocksDB get
+-- on the connecting thread, inside the connect lock. Diagnostics and
+-- tests only; the spent-coin builder's prefetch should leave it at zero.
+{-# NOINLINE serialCoinReadsRef #-}
+serialCoinReadsRef :: IORef Int
+serialCoinReadsRef = unsafePerformIO (newIORef 0)
+
+readSerialCoinReads :: IO Int
+readSerialCoinReads = readIORef serialCoinReadsRef
+
 -- | 'getUTXOCoin' that repairs a tip-created hole before returning
 -- Nothing.  Used by the connect spent-map builders and G19 so a
 -- historical omitted output of the current tip is visible to the
@@ -1084,6 +1096,7 @@ getUTXOCoinCachedPre pre mHeal cache op = do
       (g0, mc0) <- case pre of
         Just gm -> return gm
         Nothing -> do
+          atomicModifyIORef' serialCoinReadsRef (\n -> (n + 1, ()))
           g <- readTVarIO (rcGen cache)       -- sample BEFORE the lock-free read
           mc <- getUTXOCoin (ucDB cache) op   -- lossless full Coin; never lookupUTXO
           return (g, mc)
@@ -1136,7 +1149,7 @@ buildSpentUtxoMapCached cache block = do
       own = blockOwnTxIds block
   heal <- newTipHealer (ucDB cache)
   -- Parallel prefetch, then the unchanged serial pass. Every prevout that
-  -- is not intra-block and not already in the read mirror is read from
+  -- is not already in the read mirror is read from
   -- RocksDB concurrently (rocksdb_get is a 'safe' FFI call: each runs on
   -- its own OS thread). The serial pass below then consumes those reads in
   -- block order instead of issuing them one by one; cache hits, the
@@ -1145,11 +1158,24 @@ buildSpentUtxoMapCached cache block = do
   -- fix: the spent-coin phase was 2-27 s of every 3-28 s connect, ~0.8 ms
   -- per serial cold read. Nothing else writes PrefixUTXO while the caller
   -- holds the connect lock, so a prefetched read equals the inline one.
+  --
+  -- Intra-block spends are prefetched too. They are not on disk (the coin
+  -- is created by this very block), but the serial pass still does the
+  -- plain read for them so the map stays byte-identical to
+  -- 'buildSpentUtxoMapFromDB' (a duplicate-txid coin on disk would be
+  -- returned). Leaving them out of the prefetch made each one a serial
+  -- NEGATIVE RocksDB get inside the connect lock - no bloom filter is
+  -- configured, so a miss walks every level. Live mainnet 926,977 vs
+  -- 926,981 (2026-09-26), ~8.1k vs ~8.3k inputs: intra=428 -> spent=1,272
+  -- ms, intra=5,382 -> spent=13,055 ms (~2.4 ms per intra input; 926,984:
+  -- intra=5,026 -> 38,936 ms). The spent phase tracked the intra count,
+  -- not the input count. Only where the read runs changes: an intra op
+  -- still gets no tip-hole repair (mHeal = Nothing below) and a negative
+  -- is still never cached.
   g0 <- readTVarIO (rcGen cache)
   mirror <- readTVarIO (rcEntries cache)
   let toFetch = Set.toList $ Set.fromList
         [ op | op <- outpoints
-             , not (isOwnCreated own op)
              , Map.notMember op mirror ]
   fetched <- prefetchCoins (ucDB cache) toFetch
   pairs <- mapM (\op -> do
