@@ -4437,37 +4437,16 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               void $ misbehaving pm addr InvalidTransaction
 
   MGetData (GetData ivs) -> do
+    -- Core ProcessGetData parity (see 'serveGetData'): MSG_WTX is looked up
+    -- by wtxid, MSG_TX / MSG_BLOCK are served without witness, and every
+    -- unserveable item goes into one batched notfound.
     pm <- readIORef pmRef
-    forM_ ivs $ \iv -> case ivType iv of
-      InvBlock -> do
-        let bh = BlockHash (ivHash iv)
-        mBlock <- getBlock db bh
-        case mBlock of
-          Just block -> requestFromPeer pm addr (MBlock block)
-          Nothing    -> requestFromPeer pm addr
-            (MNotFound (NotFound [iv]))
-      InvWitnessBlock -> do
-        let bh = BlockHash (ivHash iv)
-        mBlock <- getBlock db bh
-        case mBlock of
-          Just block -> requestFromPeer pm addr (MBlock block)
-          Nothing    -> requestFromPeer pm addr
-            (MNotFound (NotFound [iv]))
-      InvTx -> do
-        let txid = TxId (ivHash iv)
-        mEntry <- getTransaction mp txid
-        case mEntry of
-          Just entry -> requestFromPeer pm addr (MTx (meTransaction entry))
-          Nothing    -> requestFromPeer pm addr
-            (MNotFound (NotFound [iv]))
-      InvWitnessTx -> do
-        let txid = TxId (ivHash iv)
-        mEntry <- getTransaction mp txid
-        case mEntry of
-          Just entry -> requestFromPeer pm addr (MTx (meTransaction entry))
-          Nothing    -> requestFromPeer pm addr
-            (MNotFound (NotFound [iv]))
-      _ -> requestFromPeer pm addr (MNotFound (NotFound [iv]))
+    replies <- serveGetData
+      (fmap (fmap meTransaction) . getTransaction mp)
+      (fmap (fmap meTransaction) . getTransactionByWtxid mp)
+      (getBlock db)
+      ivs
+    forM_ replies $ requestFromPeer pm addr
 
   MInv (Inv ivs) -> do
     -- During IBD, skip block inv requests — we download blocks sequentially
@@ -4546,25 +4525,33 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     unless (null txIvs) $ do
       rejected <- readIORef recentlyRejectedRef
       -- Filter to unknown txs: not in mempool and not recently rejected
+      -- A MSG_WTX hash is a WTXID: resolve it through the mempool's wtxid
+      -- index, not as a txid (for a segwit tx the two differ).
       unknown <- filterM (\iv -> do
             let txid = TxId (ivHash iv)
             if Set.member txid rejected
               then return False
               else do
-                mEntry <- getTransaction mp txid
+                mEntry <- if ivType iv == InvWtx
+                  then getTransactionByWtxid mp (Wtxid (ivHash iv))
+                  else getTransaction mp txid
                 case mEntry of
                   Just _  -> return False
                   Nothing -> return True
             ) txIvs
       unless (null unknown) $ do
         pm <- readIORef pmRef
-        -- Request as witness txs for full witness data.
+        -- Request with witness data.  A wtxid announcement MUST be fetched
+        -- as MSG_WTX: rewriting it to MSG_WITNESS_TX sends the WTXID where
+        -- the peer expects a txid, so a segwit tx is always notfound
+        -- ('txFetchInv'; Core net_processing.cpp SendMessages:
+        -- gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(peer))).
         -- BUG-5 FIX: cap outgoing GETDATA at maxGetDataSz=1000 per message.
         -- Core net_processing.cpp:6207 batches at MAX_GETDATA_SZ=1000;
         -- without this cap a single MInv with 50_000 items would emit one
         -- giant GetData, violating Core's application-level protocol limit.
         -- Reference: bitcoin-core/src/protocol.h:482 MAX_GETDATA_SZ = 1000.
-        let witnessTxIvs = map (\iv -> iv { ivType = InvWitnessTx }) unknown
+        let witnessTxIvs = map txFetchInv unknown
             batches = chunksOf maxGetDataSz witnessTxIvs
         mapM_ (\batch ->
           requestFromPeer pm addr (MGetData (GetData batch))
@@ -4890,19 +4877,18 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                        `catch` (\(_ :: SomeException) -> return ())
           Nothing -> return ()
       else do
-        -- Determine inv type per peer: MSG_WTX (0x40000002) for nodeWitness
-        -- peers, otherwise MSG_TX (1). Bitcoin Core picks per peer state.
+        -- Inv type per peer, as Core's SendMessages mempool reply:
+        --   peer.m_wtxid_relay ? CInv{MSG_WTX, wtxid} : CInv{MSG_TX, txid}
+        -- (MSG_WITNESS_TX is a getdata-only flag, never an inv type.)
         peerMap <- readTVarIO (pmPeers pm)
-        peerWantsWitness <- case Map.lookup addr peerMap of
-          Just pc -> do
-            info <- readTVarIO (pcInfo pc)
-            return $ hasService (piServices info) nodeWitness
+        peerWtxid <- case Map.lookup addr peerMap of
+          Just pc -> piWtxidRelay <$> readTVarIO (pcInfo pc)
           Nothing -> return False
-        let invKind = if peerWantsWitness then InvWitnessTx else InvTx
-        txids <- getMempoolTxIds mp
-        let invs   = [ InvVector invKind (getTxIdHash t) | t <- txids ]
-            -- Bitcoin Core MAX_INV_SZ = 50000 entries per inv message.
-            chunks = chunksOf 50000 invs
+        invs <- if peerWtxid
+          then map (InvVector InvWtx . getWtxidHash) <$> getMempoolWtxids mp
+          else map (InvVector InvTx  . getTxIdHash)  <$> getMempoolTxIds mp
+        -- Bitcoin Core MAX_INV_SZ = 50000 entries per inv message.
+        let chunks = chunksOf 50000 invs
         forM_ chunks $ \chunk -> unless (null chunk) $
           requestFromPeer pm addr (MInv (Inv chunk))
             `catch` (\(_ :: SomeException) -> return ())

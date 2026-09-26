@@ -188,6 +188,7 @@ import qualified W200OutOfOrderStallSpec
 import qualified W201DeadPeerStallSpec
 import qualified W202SelfAdvertiseSpec
 import qualified W203HandshakeCoreParitySpec
+import qualified W204GetDataWtxSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23964,6 +23965,9 @@ main = hspec $ do
   -- 31800 (was 70015), per-message version gates, pre-verack feature
   -- messages recorded / others ignored, blocks only from NODE_WITNESS.
   W203HandshakeCoreParitySpec.spec
+  -- W204: getdata MSG_WTX by wtxid, MSG_TX/MSG_BLOCK without witness,
+  -- tx fetch keeps MSG_WTX (Core ProcessGetData parity).
+  W204GetDataWtxSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

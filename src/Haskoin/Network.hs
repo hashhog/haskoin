@@ -27,6 +27,10 @@ module Haskoin.Network
   , Inv(..)
   , InvVector(..)
   , InvType(..)
+  , serveGetData
+  , txFetchInv
+  , stripTxWitness
+  , stripBlockWitness
   , GetData(..)
   , NotFound(..)
   , GetBlocks(..)
@@ -2189,6 +2193,66 @@ instance Serialize InvVector where
   get = InvVector
     <$> (word32ToInvType <$> getWord32le)
     <*> get
+
+--------------------------------------------------------------------------------
+-- getdata serving (Core ProcessGetData / FindTxForGetData parity)
+--------------------------------------------------------------------------------
+
+-- | Drop a transaction's witness so 'Serialize Tx' emits the legacy
+-- serialization (Core @TX_NO_WITNESS@): no BIP-144 marker/flag, no stacks.
+stripTxWitness :: Tx -> Tx
+stripTxWitness tx = tx { txWitness = [] }
+
+-- | Drop every transaction's witness in a block (Core @TX_NO_WITNESS(*pblock)@).
+stripBlockWitness :: Block -> Block
+stripBlockWitness b = b { blockTxns = map stripTxWitness (blockTxns b) }
+
+-- | Answer a peer's @getdata@.  Returns the replies to send, in request
+-- order, followed by one batched @notfound@ for everything that could not be
+-- served (omitted when empty).
+--
+-- Reference: bitcoin-core/src/net_processing.cpp ProcessGetData.
+--
+--   * MSG_TX (1)                  lookup by txid,  serialized WITHOUT witness
+--   * MSG_WITNESS_TX (0x40000001) lookup by txid,  serialized WITH witness
+--   * MSG_WTX (5, BIP-339)        lookup by WTXID, serialized WITH witness
+--     (@maybe_with_witness = inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS@,
+--     and FindTxForGetData resolves a GenTxid::Wtxid against the mempool's
+--     wtxid index)
+--   * MSG_BLOCK (2)               serialized WITHOUT witness
+--   * MSG_WITNESS_BLOCK           serialized WITH witness
+--   * anything else               notfound
+--
+-- Every modern Core peer negotiates wtxidrelay and therefore fetches our tx
+-- announcements with MSG_WTX + wtxid; if that lookup misses, no segwit
+-- transaction we relay ever reaches Core.
+-- | The getdata item we send to fetch an announced transaction.
+-- Core (net_processing.cpp SendMessages):
+--   @vGetData.emplace_back(gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(peer)), ...)@
+-- A MSG_WTX announcement carries a wtxid and must be requested as MSG_WTX;
+-- a txid announcement is requested as MSG_WITNESS_TX to get witness data.
+txFetchInv :: InvVector -> InvVector
+txFetchInv iv
+  | ivType iv == InvWtx = iv
+  | otherwise           = iv { ivType = InvWitnessTx }
+
+serveGetData
+  :: (TxId -> IO (Maybe Tx))         -- ^ mempool lookup by txid
+  -> (Wtxid -> IO (Maybe Tx))        -- ^ mempool lookup by wtxid
+  -> (BlockHash -> IO (Maybe Block)) -- ^ block store lookup
+  -> [InvVector]
+  -> IO [Message]
+serveGetData byTxid byWtxid getBlk ivs = do
+  results <- forM ivs $ \iv -> case ivType iv of
+    InvTx           -> fmap (MTx . stripTxWitness) <$> byTxid (TxId (ivHash iv))
+    InvWitnessTx    -> fmap MTx <$> byTxid (TxId (ivHash iv))
+    InvWtx          -> fmap MTx <$> byWtxid (Wtxid (ivHash iv))
+    InvBlock        -> fmap (MBlock . stripBlockWitness) <$> getBlk (BlockHash (ivHash iv))
+    InvWitnessBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
+    _               -> return Nothing
+  let served   = [ m | Just m <- results ]
+      notFound = [ iv | (iv, Nothing) <- zip ivs results ]
+  return $ served ++ [ MNotFound (NotFound notFound) | not (null notFound) ]
 
 --------------------------------------------------------------------------------
 -- Inv, GetData, NotFound Messages
