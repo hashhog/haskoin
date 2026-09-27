@@ -4562,7 +4562,15 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     -- Find the fork point using the locator hashes, then send up to 2000 headers.
     entries <- readTVarIO (hcEntries hc)
     heightMap <- readTVarIO (hcByHeight hc)
-    tipHeight <- readTVarIO (hcHeight hc)
+    headerTipHeight <- readTVarIO (hcHeight hc)
+    -- Serve only up to the CONNECTED tip (nextBlockRef = tip + 1).  Core
+    -- answers getheaders from ActiveChain() only (net_processing.cpp
+    -- GETHEADERS handler).  The header chain runs ahead of the connected
+    -- chain during sync; serving it handed peers headers whose bodies we
+    -- did not have, their getdata got notfound, and they stalled on the gap
+    -- (regtest relay test 2026-09-26: Core B stuck at height 16 of 101).
+    nextH <- readIORef nextBlockRef
+    let tipHeight = connectedServeCeiling headerTipHeight nextH
     -- Find the starting point from locator hashes (first known hash)
     let findStart [] = 0  -- Genesis
         findStart (loc:rest) = case Map.lookup loc entries of
@@ -4584,10 +4592,17 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         headerHashes = collectHeaders (startHeight + 1) []
         headersList = [ ceHeader e | bh <- headerHashes
                                    , Just e <- [Map.lookup bh entries] ]
-    unless (null headersList) $ do
-      pm <- readIORef pmRef
-      requestFromPeer pm addr (MHeaders (Headers headersList))
-        `catch` (\(_ :: SomeException) -> return ())
+    -- Always answer, with an EMPTY headers message when the peer already
+    -- has our tip.  Core's GETHEADERS handler (net_processing.cpp) always
+    -- pushes HEADERS.  Staying silent is not neutral: the requester only
+    -- clears m_last_getheaders_timestamp on a HEADERS reply, so its
+    -- MaybeSendGetHeaders refuses another getheaders for
+    -- HEADERS_RESPONSE_TIME (2 min) and every inv we announce in that
+    -- window is ignored (regtest relay test 2026-09-26: Core B stayed at
+    -- genesis while haskoin inv'd all 101 blocks).
+    pm <- readIORef pmRef
+    requestFromPeer pm addr (MHeaders (Headers headersList))
+      `catch` (\(_ :: SomeException) -> return ())
 
   MGetBlocks (GetBlocks _ver locators hashStop) -> do
     -- Respond to getblocks from peers by sending inv messages.

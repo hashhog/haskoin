@@ -117,15 +117,34 @@ spec = describe "W204 getdata / tx-fetch Core parity" $ do
   it "unserveable items are batched into ONE notfound after the served replies" $ do
     let ivs = [ InvVector InvTx missH, InvVector InvWtx wtxidH
               , InvVector InvWtx missH, InvVector InvBlock missH
-              , InvVector InvCompactBlock blockH ]
+              , InvVector InvCompactBlock missH ]
     r <- serve ivs
     map commandName r `shouldBe` ["tx", "notfound"]
     last r `shouldBe` MNotFound (NotFound [ InvVector InvTx missH, InvVector InvWtx missH
-                                          , InvVector InvBlock missH, InvVector InvCompactBlock blockH ])
+                                          , InvVector InvBlock missH, InvVector InvCompactBlock missH ])
+
+  -- Regtest relay test 2026-09-26: Core fetched haskoin's announced tip with
+  -- getdata(MSG_CMPCT_BLOCK) and got notfound, so it never received the block.
+  it "MSG_CMPCT_BLOCK for a known block is served as the full witness block" $ do
+    r <- serve [InvVector InvCompactBlock blockH]
+    case r of
+      [MBlock b] -> encode b `shouldBe` encode theBlock
+      other -> expectationFailure ("expected [MBlock], got " ++ show (map commandName other))
 
   it "no notfound when everything is served" $ do
     r <- serve [InvVector InvWtx wtxidH, InvVector InvTx txidH]
     map commandName r `shouldBe` ["tx", "tx"]
+
+  -- Regtest relay test 2026-09-26: getheaders was served from the header
+  -- chain, ahead of the connected tip; the peer's getdata for those bodies got
+  -- notfound and it stalled at height 16 of 101.
+  describe "connectedServeCeiling (getheaders from the connected chain only)" $ do
+    it "caps at the connected tip while headers run ahead" $
+      connectedServeCeiling 101 17 `shouldBe` 16
+    it "is the header tip once blocks caught up" $
+      connectedServeCeiling 101 102 `shouldBe` 101
+    it "fresh chain (only genesis connected) serves nothing past genesis" $
+      connectedServeCeiling 5 1 `shouldBe` 0
 
   describe "txFetchInv (requesting an announced tx)" $ do
     it "a MSG_WTX announcement is fetched as MSG_WTX with the same hash" $

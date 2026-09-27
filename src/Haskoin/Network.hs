@@ -28,6 +28,7 @@ module Haskoin.Network
   , InvVector(..)
   , InvType(..)
   , serveGetData
+  , connectedServeCeiling
   , txFetchInv
   , stripTxWitness
   , stripBlockWitness
@@ -2221,6 +2222,8 @@ stripBlockWitness b = b { blockTxns = map stripTxWitness (blockTxns b) }
 --     wtxid index)
 --   * MSG_BLOCK (2)               serialized WITHOUT witness
 --   * MSG_WITNESS_BLOCK           serialized WITH witness
+--   * MSG_CMPCT_BLOCK (4)         the full block WITH witness (Core's
+--                                 fallback outside MAX_CMPCTBLOCK_DEPTH)
 --   * anything else               notfound
 --
 -- Every modern Core peer negotiates wtxidrelay and therefore fetches our tx
@@ -2236,6 +2239,17 @@ txFetchInv iv
   | ivType iv == InvWtx = iv
   | otherwise           = iv { ivType = InvWitnessTx }
 
+-- | Highest height a getheaders reply may reach: the connected (block) tip,
+-- never the header tip.  @nextBlockHeight@ is the next height to connect
+-- (connected tip + 1).  Core serves getheaders from ActiveChain() only;
+-- serving header-only entries makes the peer ask for bodies we lack.
+connectedServeCeiling :: Word32  -- ^ header-chain tip height
+                      -> Word32  -- ^ next block height to connect
+                      -> Word32
+connectedServeCeiling headerTip nextBlockHeight
+  | nextBlockHeight == 0 = 0
+  | otherwise            = min headerTip (nextBlockHeight - 1)
+
 serveGetData
   :: (TxId -> IO (Maybe Tx))         -- ^ mempool lookup by txid
   -> (Wtxid -> IO (Maybe Tx))        -- ^ mempool lookup by wtxid
@@ -2249,6 +2263,14 @@ serveGetData byTxid byWtxid getBlk ivs = do
     InvWtx          -> fmap MTx <$> byWtxid (Wtxid (ivHash iv))
     InvBlock        -> fmap (MBlock . stripBlockWitness) <$> getBlk (BlockHash (ivHash iv))
     InvWitnessBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
+    -- BIP-152: a Core peer that picked us as a high-bandwidth compact-block
+    -- peer fetches a freshly announced tip with getdata(MSG_CMPCT_BLOCK).
+    -- Answer with the full witness block -- what Core itself sends for
+    -- MSG_CMPCT_BLOCK outside MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData, the
+    -- IsMsgCmpctBlk arm); a full block satisfies the in-flight request.
+    -- This used to fall through to notfound, so Core never got the block
+    -- (regtest relay test 2026-09-26).
+    InvCompactBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
     _               -> return Nothing
   let served   = [ m | Just m <- results ]
       notFound = [ iv | (iv, Nothing) <- zip ivs results ]
