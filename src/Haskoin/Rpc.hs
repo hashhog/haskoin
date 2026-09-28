@@ -222,6 +222,9 @@ module Haskoin.Rpc
   -- and prove the ordering rather than assume it.
   , handleGetBlockHash
   , handleGetBlock
+    -- * R3 own-state answers for absent block data (exported for testing)
+  , blockDataUnavailableMsg
+  , nTxFromStoredBody
   , handleGetTxOut
   , handleGetRawTransaction
   , handleWaitForNewBlock
@@ -304,7 +307,7 @@ import Control.Monad (forM, forM_, void, when, unless, replicateM, foldM)
 import qualified System.Random as SysRandom
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust, isNothing)
-import Data.List (find, sort, sortBy, dropWhileEnd)
+import Data.List (find, findIndex, sort, sortBy, dropWhileEnd)
 import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
@@ -465,11 +468,7 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          AddrMan(..), AddrInfo(..), addAddress, isRoutable)
 import Haskoin.Daemon (DebugCategory(..), parseDebugCategory,
                        DebugSet, globalDebugSet, setGlobalDebugSet)
-import qualified Network.Socket as NS
-import Network.Socket (SockAddr(..), Socket, socket, Family(..), SocketType(..),
-                       connect, close, getAddrInfo, defaultHints,
-                       addrAddress, defaultProtocol)
-import qualified Network.Socket.ByteString as SockBS
+import Network.Socket (SockAddr(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
                          addTransaction, testAcceptTransaction,
@@ -2433,18 +2432,55 @@ checkBlockContextFree n block hdr ts = do
   -- Per-tx structural CheckTransaction.
   mapM_ validateTransaction ts
 
+-- | Core @CheckBlockDataAvailability@ (rpc/blockchain.cpp) message for a
+-- block whose index entry exists but whose data is not stored:
+--
+-- >  if (blockman.IsBlockPruned(blockindex))   -> "Block not available (pruned data)"
+-- >  else                                      -> "Block not available (not fully downloaded)"
+--
+-- @IsBlockPruned@ is @m_have_pruned && !(nStatus & BLOCK_HAVE_DATA) && nTx > 0@:
+-- the node prunes, and the block's data was once held (nTx > 0).  Both are
+-- RPC_MISC_ERROR (-1).  First arg: prune mode; second: the data was held
+-- here once (the block was connected on the active chain by this node).
+blockDataUnavailableMsg :: Bool -> Bool -> Text
+blockDataUnavailableMsg havePruned hadData
+  | havePruned && hadData = "Block not available (pruned data)"
+  | otherwise             = "Block not available (not fully downloaded)"
+
+-- | getblock answer when 'getBlock' found no stored body.  Mirrors Core's
+-- getblock: LookupBlockIndex miss -> -5 "Block not found"; index hit without
+-- data -> -1 'blockDataUnavailableMsg'.  Never consults anything but this
+-- node's own block index / header chain.
+getBlockBodyAbsentResponse :: RpcServer -> BlockHash -> IO RpcResponse
+getBlockBodyAbsentResponse server bh = do
+  mHeader <- getBlockHeader (rsDB server) bh
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+  case (mHeader, Map.lookup bh entries) of
+    (Nothing, Nothing) -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
+    (_, mEntry) -> do
+      byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+      vtip     <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      let hadData = case mEntry of
+            Just ce -> Map.lookup (ceHeight ce) byHeight == Just bh
+                       && ceHeight ce <= ceHeight vtip
+            Nothing -> False
+          msg = blockDataUnavailableMsg (rsPruneEnabled server) hadData
+      return $ RpcResponse Null (toJSON $ RpcError rpcMiscError msg) Null
+
 -- | Get block data by hash
 -- | Handle getblock RPC.
 -- Byte-identical to Bitcoin Core 31.99 for verbosity=0,1,2 — W59.
 --
--- haskoin stores UTXO state in RocksDB but does NOT store full block bodies
--- during assume-valid IBD (blocks are validated by full nodes on the network).
--- When a block body is not in local storage, we proxy the entire request to
--- the local Bitcoin Core node (port 8332) and return its result verbatim —
--- since Core IS the reference implementation.
+-- Answered ONLY from haskoin's own state (R3).  A block whose header is
+-- unknown is -5 "Block not found"; a block whose header is known but whose
+-- body is not stored here (below an assumeutxo snapshot base, a header not
+-- yet downloaded, a side branch) is -1 with Core's CheckBlockDataAvailability
+-- message -- see 'getBlockBodyAbsentResponse'.  (This handler used to proxy
+-- the whole request to a live Bitcoin Core on its local RPC port and return
+-- Core's answer as its own; removed.)
 --
--- When a block body IS locally stored (e.g. after submitblock or recent
--- blocks downloaded post-IBD), we build the response ourselves using the
+-- When a block body IS locally stored we build the response using the
 -- streaming Encoding path (W52–W57 pattern) with all Core-parity fixes:
 --   - difficulty: getDifficultyCore + difficultyStr (FFI %.16g)
 --   - chainwork: showHex64 (64-char zero-padded)
@@ -2476,13 +2512,7 @@ handleGetBlock server params = do
            Right verbosity -> do
             mBlock <- getBlock (rsDB server) bh
             case mBlock of
-              Nothing -> do
-                -- Block body not in local storage — proxy to Bitcoin Core.
-                mRaw <- fetchGetBlockFromCore hexHash verbosity
-                case mRaw of
-                  Nothing  -> return $ RpcResponse Null
-                    (toJSON $ RpcError rpcInvalidAddressOrKey "Block not found") Null
-                  Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
+              Nothing -> getBlockBodyAbsentResponse server bh
               Just block -> do
                 if verbosity == 0
                   then do
@@ -2879,155 +2909,6 @@ emptyBlockStats = BlockStatsAcc
   , bsUtxos = 0, bsUtxoSizeInc = 0, bsUtxoSizeIncA = 0
   , bsFees = [], bsTxSizes = [], bsFeeRates = [] }
 
--- | Fetch getblock result from local Bitcoin Core node via HTTP/1.0.
--- Used as fallback when block body is not in haskoin's local storage.
--- Reads cookie from the standard mainnet path; returns Nothing on any failure.
-fetchGetBlockFromCore :: Text -> Int -> IO (Maybe BS.ByteString)
-fetchGetBlockFromCore hashHex verbosity = do
-  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
-                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
-                    ]
-  mCookie <- tryReadCookies cookiePaths
-  case mCookie of
-    Nothing     -> return Nothing
-    Just cookie -> doFetchGetBlock hashHex verbosity cookie
-
-doFetchGetBlock :: Text -> Int -> BS.ByteString -> IO (Maybe BS.ByteString)
-doFetchGetBlock hashHex verbosity cookie =
-  doFetchGetBlock' hashHex verbosity cookie
-    `catch` \(_ :: SomeException) -> return Nothing
-
-doFetchGetBlock' :: Text -> Int -> BS.ByteString -> IO (Maybe BS.ByteString)
-doFetchGetBlock' hashHex verbosity cookie = do
-  let port    = 8332 :: Int
-      hashStr = TE.encodeUtf8 hashHex
-      credB64 = B64.encode cookie
-      body    = "{\"jsonrpc\":\"1.0\",\"method\":\"getblock\",\"params\":[\"" <>
-                hashStr <> "\"," <> C8.pack (show verbosity) <> "],\"id\":1}"
-      bodyLen = BS.length body
-      req     = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
-                "\r\nContent-Type: application/json\r\nContent-Length: " <>
-                C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
-                credB64 <> "\r\n\r\n" <> body
-  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
-                       (Just "127.0.0.1") (Just (show port))
-  case addrs of
-    [] -> return Nothing
-    (a:_) -> do
-      sock <- socket AF_INET Stream defaultProtocol
-      mResult <- (do
-        connect sock (addrAddress a)
-        SockBS.sendAll sock req
-        -- getblock verbose=2 on a large block can be several MB.
-        chunks <- recvAllLarge sock
-        close sock
-        let respBody = skipHttpHeaders (BS.concat chunks)
-        -- Extract the "result" field as raw bytes.
-        return $! extractResultRaw respBody)
-        `catch` \(_ :: SomeException) -> do
-          (close sock) `catch` \(_ :: SomeException) -> return ()
-          return Nothing
-      return mResult
-
--- | Receive all data from a socket with a large buffer (for big getblock responses).
-recvAllLarge :: Socket -> IO [BS.ByteString]
-recvAllLarge sock = go []
-  where
-    go acc = do
-      chunk <- SockBS.recv sock 65536
-      if BS.null chunk
-        then return (reverse acc)
-        else go (chunk : acc)
-
--- | Extract the raw bytes of the "result" field from a JSON-RPC response,
--- WITHOUT Aeson decode/re-encode (which would normalise 0.00000000 → 0.0).
--- Strategy: scan for @"result":@ in the raw bytes, then extract the value
--- span by balanced-bracket counting.  This preserves exact numeric formatting.
--- Returns Nothing if the result is null, on any parse error, or if the
--- "error" field is non-null.
-extractResultRaw :: BS.ByteString -> Maybe BS.ByteString
-extractResultRaw respBs =
-  -- First check that "error" is null using Aeson (error values are small).
-  let asnVal = decode (BL.fromStrict respBs) :: Maybe Value
-      hasError = case asnVal of
-        Just (Object km) ->
-          case KM.lookup (Key.fromText "error") km of
-            Just Null -> False
-            Just _    -> True
-            Nothing   -> False
-        _ -> True  -- malformed response
-  in if hasError
-       then Nothing
-       else extractRawValue "\"result\":" respBs
-
--- | Scan @haystack@ for @needle@, then extract the JSON value that follows
--- (skipping leading whitespace).  Uses balanced-bracket counting to find the
--- end of the value.  Returns Nothing for null values or parse errors.
-extractRawValue :: BS.ByteString -> BS.ByteString -> Maybe BS.ByteString
-extractRawValue needle haystack =
-  case BS.breakSubstring needle haystack of
-    (_, rest) | BS.null rest -> Nothing
-    (_, rest) ->
-      let afterKey = BS.drop (BS.length needle) rest
-          trimmed  = BS.dropWhile (\w -> w == 32 || w == 9 || w == 10 || w == 13) afterKey
-      in if BS.null trimmed then Nothing
-         else if BS.head trimmed == fromIntegral (fromEnum 'n')
-              then Nothing  -- "null" value
-              else
-                let span_ = jsonValueSpan trimmed
-                in if span_ <= 0 then Nothing
-                   else Just $! BS.take span_ trimmed
-
--- | Returns the byte length of the first JSON value in the input,
--- handling objects {}, arrays [], strings "", and atoms (numbers/true/false/null).
-jsonValueSpan :: BS.ByteString -> Int
-jsonValueSpan bs
-  | BS.null bs = 0
-  | otherwise  =
-      let b0 = BS.head bs
-      in case b0 of
-           123 -> balancedSpan bs 123 125  -- '{' ... '}'
-           91  -> balancedSpan bs 91  93   -- '[' ... ']'
-           34  -> stringSpan bs            -- '"' string
-           _   -> atomSpan bs             -- number / true / false / null
-
--- | Span a JSON object or array by counting balanced open/close bytes,
--- accounting for strings (which may contain the bracket characters).
-balancedSpan :: BS.ByteString -> Word8 -> Word8 -> Int
-balancedSpan bs open close = go 0 0
-  where
-    go !pos !depth
-      | pos >= BS.length bs = pos
-      | otherwise =
-          let c = BS.index bs pos
-          in if c == 34  -- '"'
-             then let strLen = stringSpan (BS.drop pos bs)
-                  in go (pos + strLen) depth
-             else if c == open  then go (pos + 1) (depth + 1)
-             else if c == close then
-               if depth == 1 then pos + 1
-               else go (pos + 1) (depth - 1)
-             else go (pos + 1) depth
-
--- | Span a JSON string starting at position 0 (must start with '"').
-stringSpan :: BS.ByteString -> Int
-stringSpan bs = go 1
-  where
-    go !i
-      | i >= BS.length bs = i
-      | otherwise =
-          let c = BS.index bs i
-          in if c == 92  then go (i + 2)  -- backslash: skip next char
-             else if c == 34 then i + 1   -- closing '"'
-             else go (i + 1)
-
--- | Span a JSON atom (number, true, false, null) — terminated by
--- whitespace, comma, ']', or '}'.
-atomSpan :: BS.ByteString -> Int
-atomSpan bs = BS.length (BS.takeWhile (\w -> w /= 44 && w /= 93 && w /= 125
-                                             && w /= 32 && w /= 9
-                                             && w /= 10 && w /= 13) bs)
-
 -- | Build the coinbase_tx Encoding: {coinbase, locktime, sequence, version, witness}.
 -- Shape matches Bitcoin Core 27+ getblock coinbase_tx field.
 buildCoinbaseTxEnc :: Block -> AE.Encoding
@@ -3278,7 +3159,7 @@ handleGetBlockHeader server params = do
                       -- nextblockhash: canonical chain entry at height+1, if present
                       mNextBh = if onActive then Map.lookup (height + 1) byHeight
                                             else Nothing
-                  -- nTx: count from stored block body, or Core RPC fallback
+                  -- nTx: stored body's tx count, 0 when no body (Core: index nTx)
                   nTx <- fetchNTxForBlock server bh
                   let enc = pairs $
                               pair "hash"              (text (showHash bh))                              <>
@@ -3958,46 +3839,43 @@ handleGetRawTransaction server params = do
 handleGetRawTransactionLookup
   :: RpcServer -> TxId -> Int -> Maybe Text -> Maybe BlockHash -> Bool
   -> IO RpcResponse
-handleGetRawTransactionLookup server txid verbosity mBlockHashText mBlockHashParam blockHashArgGiven = do
-          -- verbosity=2: proxy to Bitcoin Core to get prevout-enriched output
-          -- with byte-identical formatting (fee, in_active_chain, vin[].prevout).
-          -- haskoin does not store block bodies during assumevalid IBD, so the
-          -- local-block path cannot compute undo-based prevout data.
-          -- Reuse the extractResultRaw raw-byte scanner (W59 pattern) to bypass
-          -- Aeson re-encoding and preserve 0.00000000 eight-decimal formatting.
-          if verbosity >= 2
-            then do
-              -- Canonical display-order txid hex (equivalent to the user-supplied
-              -- string) for the Core proxy lookup.
-              let hexTxid = showHash (BlockHash (getTxIdHash txid))
-              mRaw <- fetchGetRawTxFromCore hexTxid verbosity mBlockHashText
-              case mRaw of
-                Just raw -> return $ RpcResponse (rawJsonResult (BL.fromStrict raw)) Null Null
-                Nothing  -> return $ RpcResponse Null
-                  (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash to a node with block access.") Null
-            else
-              -- Lookup precedence mirrors Core's node::GetTransaction
-              -- (node/transaction.cpp:143-174):
-              --   1. mempool — ONLY when no blockhash arg was supplied.
-              --   2. txindex — when present (and, if a blockhash arg is given,
-              --      only when the indexed block matches that hash).
-              --   3. the specific block named by the blockhash arg.
-              -- Critically, when a blockhash arg is given Core does NOT consult
-              -- the mempool, so a still-unconfirmed-locally tx is reported with
-              -- its confirmation context rather than the bare mempool form.
+handleGetRawTransactionLookup server txid verbosity _mBlockHashText mBlockHashParam blockHashArgGiven = do
+          -- Answered ONLY from haskoin's own state (R3) at every verbosity.
+          -- (verbosity >= 2 used to be proxied wholesale to a live Bitcoin
+          -- Core on its local RPC port; removed.)  verbosity 2 adds per-input
+          -- "prevout" + "fee" from this node's own undo data when it has it,
+          -- and omits them otherwise -- see 'returnTxResult'.
+          --
+          -- Lookup precedence mirrors Core's node::GetTransaction
+          -- (node/transaction.cpp):
+          --   1. mempool — ONLY when no blockhash arg was supplied.
+          --   2. txindex — when present.
+          --   3. the specific block named by the blockhash arg.
+          -- Critically, when a blockhash arg is given Core does NOT consult
+          -- the mempool, so a still-unconfirmed-locally tx is reported with
+          -- its confirmation context rather than the bare mempool form.
               case mBlockHashParam of
                 Just blockHash -> do
                   -- A blockhash arg was supplied: look up that block directly.
                   mBlock <- getBlock (rsDB server) blockHash
                   case mBlock of
-                    Nothing -> return $ RpcResponse Null
-                      (toJSON $ RpcError (-5) "Block hash not found") Null
+                    Nothing -> do
+                      -- Core: LookupBlockIndex miss -> -5 "Block hash not
+                      -- found"; index hit without BLOCK_HAVE_DATA -> -1
+                      -- "Block not available" (rpc/rawtransaction.cpp).
+                      mHdr <- getBlockHeader (rsDB server) blockHash
+                      entries <- readTVarIO (hcEntries (rsHeaderChain server))
+                      let known = isJust mHdr || Map.member blockHash entries
+                      return $ RpcResponse Null
+                        (toJSON $ if known
+                           then RpcError rpcMiscError "Block not available"
+                           else RpcError (-5) "Block hash not found") Null
                     Just block -> do
-                      let mTx = find (\t -> computeTxId t == txid) (blockTxns block)
-                      case mTx of
+                      case findIndex (\t -> computeTxId t == txid) (blockTxns block) of
                         Nothing -> return $ RpcResponse Null
                           (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
-                        Just tx -> returnTxResult server tx txid (Just blockHash) blockHashArgGiven verbosity
+                        Just ix -> returnTxResult server (blockTxns block !! ix) txid
+                                     (Just (blockHash, ix)) blockHashArgGiven verbosity
 
                 Nothing -> do
                   -- No blockhash arg: mempool first.
@@ -4024,75 +3902,43 @@ handleGetRawTransactionLookup server txid verbosity mBlockHashText mBlockHashPar
                               if txIdx < length txns
                                 then do
                                   let tx = txns !! txIdx
-                                  returnTxResult server tx txid (Just (txLocBlock txLoc)) blockHashArgGiven verbosity
+                                  returnTxResult server tx txid
+                                    (Just (txLocBlock txLoc, txIdx)) blockHashArgGiven verbosity
                                 else return $ RpcResponse Null
                                   (toJSON $ RpcError (-5) "Transaction index out of range") Null
 
 -- | Helper to return transaction result (raw hex or verbose JSON).
 -- @blockHashArgGiven@ tracks whether the caller supplied an explicit
 -- blockhash argument; Core only emits "in_active_chain" in that case.
-returnTxResult :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> Int -> IO RpcResponse
-returnTxResult server tx txid mBlockHash blockHashArgGiven verbosity =
-  if verbosity == 0
+-- @mCtx@ is (containing block hash, tx position in the block) for a
+-- confirmed tx; Nothing for a mempool tx.
+--
+-- verbosity >= 2 (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT): per-input
+-- "prevout" and a "fee" are added from THIS node's undo data for the
+-- containing block.  Core skips them for a coinbase or a mempool tx, and
+-- so do we; when no undo data is stored here for the block they are
+-- likewise omitted (the rest of the object is the verbosity-1 answer).
+returnTxResult :: RpcServer -> Tx -> TxId -> Maybe (BlockHash, Int) -> Bool -> Int -> IO RpcResponse
+returnTxResult server tx txid mCtx blockHashArgGiven verbosity =
+  if verbosity <= 0
     then return $ RpcResponse
       (toJSON $ TE.decodeUtf8 $ B16.encode $ S.encode tx) Null Null
     else do
-      verboseResult <- txToVerboseJSON server tx txid mBlockHash blockHashArgGiven
+      mTxUndo <- if verbosity >= 2
+        then case mCtx of
+          Just (bh, ix) | ix > 0 -> do
+            mUndo <- getUndoData (rsDB server) bh
+            return (mUndo >>= txUndoAt ix)
+          _ -> return Nothing
+        else return Nothing
+      verboseResult <- txToVerboseJSON server tx txid (fmap fst mCtx)
+                         blockHashArgGiven mTxUndo
       return $ RpcResponse verboseResult Null Null
-
--- | Proxy getrawtransaction to the local Bitcoin Core node (port 8332).
--- Used for verbosity=2 which requires prevout enrichment, fee computation,
--- and in_active_chain — data haskoin cannot provide without block bodies.
--- Returns raw bytes of the "result" field, bypassing Aeson re-encoding
--- to preserve numeric formatting (0.00000000 must not collapse to 0.0).
-fetchGetRawTxFromCore :: Text -> Int -> Maybe Text -> IO (Maybe BS.ByteString)
-fetchGetRawTxFromCore txidHex verbosity mBlockHashHex = do
-  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
-                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
-                    ]
-  mCookie <- tryReadCookies cookiePaths
-  case mCookie of
-    Nothing     -> return Nothing
-    Just cookie -> doFetchGetRawTx txidHex verbosity mBlockHashHex cookie
-
-doFetchGetRawTx :: Text -> Int -> Maybe Text -> BS.ByteString -> IO (Maybe BS.ByteString)
-doFetchGetRawTx txidHex verbosity mBlockHashHex cookie =
-  (doFetchGetRawTx' txidHex verbosity mBlockHashHex cookie)
-    `catch` \(_ :: SomeException) -> return Nothing
-
-doFetchGetRawTx' :: Text -> Int -> Maybe Text -> BS.ByteString -> IO (Maybe BS.ByteString)
-doFetchGetRawTx' txidHex verbosity mBlockHashHex cookie = do
-  let port    = 8332 :: Int
-      credB64 = B64.encode cookie
-      -- Build params array: [txid, verbosity] or [txid, verbosity, blockhash]
-      paramsJson = case mBlockHashHex of
-        Nothing -> "[\"" <> TE.encodeUtf8 txidHex <> "\"," <> C8.pack (show verbosity) <> "]"
-        Just bh -> "[\"" <> TE.encodeUtf8 txidHex <> "\"," <> C8.pack (show verbosity) <>
-                   ",\"" <> TE.encodeUtf8 bh <> "\"]"
-      body    = "{\"jsonrpc\":\"1.0\",\"method\":\"getrawtransaction\",\"params\":" <>
-                paramsJson <> ",\"id\":1}"
-      bodyLen = BS.length body
-      req     = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
-                "\r\nContent-Type: application/json\r\nContent-Length: " <>
-                C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
-                credB64 <> "\r\n\r\n" <> body
-  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
-                       (Just "127.0.0.1") (Just (show port))
-  case addrs of
-    [] -> return Nothing
-    (a:_) -> do
-      sock <- socket AF_INET Stream defaultProtocol
-      mResult <- (do
-        connect sock (addrAddress a)
-        SockBS.sendAll sock req
-        chunks <- recvAllLarge sock
-        close sock
-        let respBody = skipHttpHeaders (BS.concat chunks)
-        return $! extractResultRaw respBody)
-        `catch` \(_ :: SomeException) -> do
-          (close sock) `catch` \(_ :: SomeException) -> return ()
-          return Nothing
-      return mResult
+  where
+    -- Block undo has one entry per NON-coinbase tx: tx position ix -> ix-1.
+    txUndoAt ix ud = case drop (ix - 1) (buTxUndo (udBlockUndo ud)) of
+      (u:_) | length (tuPrevOutputs u) == length (txInputs tx) -> Just u
+      _                                                        -> Nothing
 
 -- | Submit a raw transaction to the network
 -- Parameters:
@@ -14781,109 +14627,19 @@ stripTrailingZeros s =
       let trimmed = dropWhileEnd (== '0') dec
       in if trimmed == "." then int else int ++ trimmed
 
--- | Fetch nTx for a block by counting transactions from the stored block body,
--- or (if the block body is absent — e.g. assume-valid IBD) by falling back to
--- a synchronous HTTP/1.0 call to the local Bitcoin Core node (port 8332).
--- Returns 0 on any error so callers always get a usable value.
+-- | nTx for getblockheader, from this node's OWN data only.  Core's
+-- blockheaderToJSON reports @blockindex.nTx@, which is set only once the
+-- block's transactions have been received (ReceivedBlockTransactions); a
+-- header-only index entry reports 0.  haskoin keeps no per-index tx count,
+-- so nTx is the stored body's tx count, or 0 when no body is stored here.
+-- (Formerly fell back to a live Bitcoin Core getblockheader over
+-- Core's local RPC port -- removed, R3.)
 fetchNTxForBlock :: RpcServer -> BlockHash -> IO Int
-fetchNTxForBlock server bh = do
-  -- First try: count from stored block body.
-  mBlock <- getBlock (rsDB server) bh
-  case mBlock of
-    Just blk -> return $! length (blockTxns blk)
-    Nothing  -> fetchNTxFromCore (showHash bh)
+fetchNTxForBlock server bh = nTxFromStoredBody <$> getBlock (rsDB server) bh
 
--- | Query local Bitcoin Core node for nTx via raw TCP HTTP/1.0.
--- Reads the cookie from the known mainnet path; returns 0 on any failure.
-fetchNTxFromCore :: Text -> IO Int
-fetchNTxFromCore hashHex = do
-  let cookiePaths = [ "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"
-                    , "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"
-                    ]
-  mCookie <- tryReadCookies cookiePaths
-  case mCookie of
-    Nothing     -> return 0
-    Just cookie -> doFetchNTx hashHex cookie
-
-tryReadCookies :: [FilePath] -> IO (Maybe BS.ByteString)
-tryReadCookies [] = return Nothing
-tryReadCookies (p:ps) = do
-  exists <- doesFileExist p
-  if not exists
-    then tryReadCookies ps
-    else do
-      mbs <- (Just . stripNewlines <$> C8.readFile p) `catch` \(_ :: SomeException) -> return Nothing
-      case mbs of
-        Nothing -> tryReadCookies ps
-        Just bs -> return (Just bs)
-
-doFetchNTx :: Text -> BS.ByteString -> IO Int
-doFetchNTx hashHex cookie = do
-  result <- (Just <$> doFetchNTx' hashHex cookie) `catch` \(_ :: SomeException) -> return Nothing
-  return $! fromMaybe 0 result
-
-doFetchNTx' :: Text -> BS.ByteString -> IO Int
-doFetchNTx' hashHex cookie = do
-  let port     = 8332 :: Int
-      hashStr  = TE.encodeUtf8 hashHex
-      credB64  = B64.encode cookie
-      body     = "{\"jsonrpc\":\"1.0\",\"method\":\"getblockheader\",\"params\":[\"" <>
-                 hashStr <> "\",true],\"id\":1}"
-      bodyLen  = BS.length body
-      req      = "POST / HTTP/1.0\r\nHost: 127.0.0.1:" <> C8.pack (show port) <>
-                 "\r\nContent-Type: application/json\r\nContent-Length: " <>
-                 C8.pack (show bodyLen) <> "\r\nAuthorization: Basic " <>
-                 credB64 <> "\r\n\r\n" <> body
-  addrs <- getAddrInfo (Just defaultHints { NS.addrSocketType = Stream })
-                       (Just "127.0.0.1") (Just (show port))
-  case addrs of
-    []     -> return 0
-    (a:_)  -> do
-      sock <- socket AF_INET Stream defaultProtocol
-      result <- (do
-        connect sock (addrAddress a)
-        SockBS.sendAll sock req
-        -- Read response in chunks; the header response is small (<8KB).
-        chunks <- recvAll sock
-        close sock
-        return $! extractNTx (BS.concat chunks))
-        `catch` \(_ :: SomeException) -> do
-          (close sock) `catch` \(_ :: SomeException) -> return ()
-          return 0
-      return result
-
-recvAll :: Socket -> IO [BS.ByteString]
-recvAll sock = go []
-  where
-    go acc = do
-      chunk <- SockBS.recv sock 4096
-      if BS.null chunk
-        then return (reverse acc)
-        else go (chunk : acc)
-
--- | Parse nTx from a Bitcoin Core getblockheader JSON response.
-extractNTx :: BS.ByteString -> Int
-extractNTx respBs =
-  let body = skipHttpHeaders respBs
-  in case (decode (BL.fromStrict body) :: Maybe Value) of
-       Just (Object km) ->
-         case KM.lookup (Key.fromText "result") km of
-           Just (Object rm) ->
-             case KM.lookup (Key.fromText "nTx") rm of
-               Just (Number n) -> fromMaybe 0 (toBoundedInteger n)
-               _               -> 0
-           _ -> 0
-       _ -> 0
-
-skipHttpHeaders :: BS.ByteString -> BS.ByteString
-skipHttpHeaders bs =
-  case BS.breakSubstring "\r\n\r\n" bs of
-    (_, rest) | BS.length rest >= 4 -> BS.drop 4 rest
-    _                               -> bs
-
--- | Strip trailing CR/LF characters from a ByteString (for cookie file parsing).
-stripNewlines :: BS.ByteString -> BS.ByteString
-stripNewlines = BS.reverse . BS.dropWhile (\w -> w == 13 || w == 10) . BS.reverse
+-- | Pure core of 'fetchNTxForBlock': the tx count of a stored body, 0 if absent.
+nTxFromStoredBody :: Maybe Block -> Int
+nTxFromStoredBody = maybe 0 (length . blockTxns)
 
 -- | Parse a hex hash string to BlockHash
 parseHash :: Text -> Maybe BlockHash
@@ -15012,8 +14768,8 @@ computeBlockRestConfirmations (Just (entryHash, entryHeight)) tipHeight byHeight
 -- confirmations, time, blocktime.  When a blockhash ARG was supplied
 -- (@blockHashArgGiven@), also emits "in_active_chain" (Core only adds it in
 -- that case; rpc/rawtransaction.cpp:337-340).
-txToVerboseJSON :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> IO Value
-txToVerboseJSON server tx txid mBlockHash blockHashArgGiven = do
+txToVerboseJSON :: RpcServer -> Tx -> TxId -> Maybe BlockHash -> Bool -> Maybe TxUndo -> IO Value
+txToVerboseJSON server tx txid mBlockHash blockHashArgGiven mTxUndo = do
   -- Calculate transaction metrics
   let baseSize = txBaseSize tx
       totalSize = txTotalSize tx
@@ -15068,6 +14824,10 @@ txToVerboseJSON server tx txid mBlockHash blockHashArgGiven = do
         pair "locktime" (AE.word32 (txLockTime tx))                     <>
         pair "vin"      (AE.list id (map (vinToEnc tx) [0 .. length (txInputs tx) - 1])) <>
         pair "vout"     (AE.list id (zipWith voutToEnc [0..] (txOutputs tx))) <>
+        -- Core TxToUniv: "fee" only with undo data, pushed before "hex".
+        (case mTxUndo >>= computeFee tx of
+           Just fee -> pair "fee" (btcAmountEnc (fromIntegral fee))
+           Nothing  -> mempty) <>
         pair "hex"      (text hexTx)
       -- Core pushes in_active_chain into the result object first, then the
       -- TxToUniv body, then the blockhash/confirmations/time/blocktime tail.
@@ -15093,9 +14853,16 @@ txToVerboseJSON server tx txid mBlockHash blockHashArgGiven = do
          else pairs $
                 pair "txid"      (text (showHash (BlockHash (getTxIdHash (outPointHash (txInPrevOutput inp)))))) <>
                 pair "vout"      (AE.word32 (outPointIndex (txInPrevOutput inp)))                               <>
-                pair "scriptSig" (pairs (pair "asm" (text (scriptToAsm (txInScript inp))) <>
+                -- Core TxToUniv: ScriptToAsmStr(scriptSig, fAttemptSighashDecode=true).
+                pair "scriptSig" (pairs (pair "asm" (text (scriptToAsmSighashDecodeTop (txInScript inp))) <>
                                          pair "hex" (text (TE.decodeUtf8 (B16.encode (txInScript inp)))))) <>
                 witnessEnc                                                                                    <>
+                -- verbosity 2 with undo: "prevout" after txinwitness, before
+                -- sequence (Core TxToUniv SHOW_DETAILS_AND_PREVOUT).
+                (case mTxUndo of
+                   Just u | idx < length (tuPrevOutputs u) ->
+                     pair "prevout" (buildPrevoutEnc (rsNetwork server) (tuPrevOutputs u !! idx))
+                   _ -> mempty)                                                                                <>
                 pair "sequence"  (AE.word32 (txInSequence inp))
 
     -- | Streaming Encoding for one vout entry.

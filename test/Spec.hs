@@ -191,6 +191,7 @@ import qualified W203HandshakeCoreParitySpec
 import qualified W204GetDataWtxSpec
 import qualified W205SendRawMaxFeeRateSpec
 import qualified W206DownloadRedundancySpec
+import qualified W207NoCoreProxySpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified Bip21Spec
@@ -23977,6 +23978,9 @@ main = hspec $ do
   -- ARRIVES (Core RemoveBlockRequest); a staller needs another idle peer
   -- and an exhausted window, and is disconnected, never re-asked.
   W206DownloadRedundancySpec.spec
+  -- W207: R3 — no live-Bitcoin-Core RPC proxy (getblock / getrawtransaction
+  -- v2 / getblockheader nTx answer from own state; source guard).
+  W207NoCoreProxySpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
