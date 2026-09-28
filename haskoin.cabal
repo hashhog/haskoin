@@ -241,6 +241,7 @@ test-suite haskoin-test
                , W203HandshakeCoreParitySpec
                , W204GetDataWtxSpec
                , W205SendRawMaxFeeRateSpec
+               , W206DownloadRedundancySpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , Paths_haskoin

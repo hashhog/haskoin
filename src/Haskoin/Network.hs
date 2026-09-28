@@ -122,7 +122,15 @@ module Haskoin.Network
   , v2PacketLooksLikeBlock
   , mutePipelineHeads
   , blockStallingTimeout
-  , stallingNextNeeded
+  , blockStallingTimeoutMax
+  , findBlockStaller
+  , StallClock(..)
+  , initialStallClock
+  , stallClockDelivered
+  , stallClockConnected
+  , stallClockStep
+  , muteClockView
+  , muteRotationAllowed
   , neededLinearHashes
   , dropPeerInflight
   , StoredDrainStop(..)
@@ -130,6 +138,7 @@ module Haskoin.Network
   , formatStoredDrain
   , markPeerSendFailed
   , simulateStallingNextNeeded
+  , simulateSingleFeeder
   , LinearDownloadState(..)
   , simulateLinearDownloadRate
   , simulateLinearDownloadRateChurn
@@ -1411,36 +1420,135 @@ mutePipelineHeads now xs
             [ pifHeight x | x <- xs, pifPeer x `Set.member` muteSet ]
        in (mutePids, heights)
 
--- | Core net_processing.cpp BLOCK_STALLING_TIMEOUT_DEFAULT. The
--- first-byte mute (16s) is "this peer is sending no block data". A
--- peer that streams later heights stamps first-byte and never looks
--- mute, while next-needed stays already-inflight (live 2026-09-24:
--- 71.191.251.202:8333, 6 of 8 fates). Stalling is "the window cannot
--- move": next-needed has been charged to that peer for this long.
+-- | Core net_processing.cpp BLOCK_STALLING_TIMEOUT_DEFAULT (2s) and
+-- BLOCK_STALLING_TIMEOUT_MAX (64s).
 blockStallingTimeout :: Int64
 blockStallingTimeout = 2
 
--- | Peers holding next-needed inflight past 'blockStallingTimeout'.
--- The whole pipeline on those peers is rotated (Core disconnects the
--- staller). First-byte does not excuse them.
-stallingNextNeeded
-  :: Int64
-  -> Word32
-  -> [PipelineInflight]
-  -> ([Int], [Word32])
-stallingNextNeeded now nextNeeded xs
-  | null xs = ([], [])
+blockStallingTimeoutMax :: Int64
+blockStallingTimeoutMax = 64
+
+-- | Core FindNextBlocksToDownload's @nodeStaller@: the peer that holds
+-- the FIRST in-flight block of the download window (@waitingfor@), when
+-- ANOTHER eligible peer has an empty in-flight queue and cannot be given
+-- anything because every block in the window is already in flight or
+-- already has data (@vBlocks.size() == 0 && waitingfor != peer.m_id@).
+--
+-- 1f73e73 and earlier ('stallingNextNeeded') charged a stall to whoever
+-- held next-needed for 2 s measured from the REQUEST, with no idle peer
+-- and no exhausted window required, and then re-requested that peer's
+-- whole pipeline while the peer was still alive. With one --connect
+-- feeder (cap 128) the staller was always the only peer, so every
+-- rotation re-sent the same 128 getdata to the same socket: replay
+-- harness 910001-910200 served 11,156 blocks to connect 199, 3,104
+-- "re-requesting 128 stalling-next-needed" lines. Under Core a lone
+-- peer can never be a staller (@waitingfor != peer.m_id@).
+--
+-- Blocks that have ARRIVED are not in flight (Core RemoveBlockRequest
+-- runs on receipt), so the caller passes the pipeline without them.
+findBlockStaller
+  :: [Int]              -- ^ eligible (connected, not failed/mute) peer ids
+  -> Bool               -- ^ window exhausted: nothing left to request
+  -> [PipelineInflight] -- ^ in flight (received bodies excluded)
+  -> Maybe Int
+findBlockStaller eligible windowExhausted xs
+  | not windowExhausted || null xs = Nothing
   | otherwise =
-      let stallSet =
-            Set.fromList
-              [ pifPeer x
-              | x <- xs
-              , pifHeight x == nextNeeded
-              , now - pifRequestedAt x >= blockStallingTimeout
-              ]
-          heights =
-            [ pifHeight x | x <- xs, pifPeer x `Set.member` stallSet ]
-       in (Set.toList stallSet, heights)
+      let waiting = pifPeer (minimumBy (comparing pifHeight <> comparing pifPeer) xs)
+          holding = Set.fromList (map pifPeer xs)
+          idle = [ p | p <- eligible, p /= waiting, p `Set.notMember` holding ]
+       in if null idle then Nothing else Just waiting
+
+-- | Core per-peer @m_stalling_since@ plus the shared adaptive
+-- @m_block_stalling_timeout@.
+data StallClock k = StallClock
+  { scSince   :: !(Map k Int64)
+  , scTimeout :: !Double
+  } deriving (Show, Eq)
+
+initialStallClock :: StallClock k
+initialStallClock = StallClock Map.empty (fromIntegral blockStallingTimeout)
+
+-- | Core RemoveBlockRequest: any block received from the peer clears its
+-- @m_stalling_since@.
+stallClockDelivered :: Ord k => k -> StallClock k -> StallClock k
+stallClockDelivered k sc = sc { scSince = Map.delete k (scSince sc) }
+
+-- | Core BlockConnected: a doubled timeout decays by 0.85 per connected
+-- block, never below the 2 s default.
+stallClockConnected :: Int -> StallClock k -> StallClock k
+stallClockConnected n sc
+  | n <= 0 = sc
+  | otherwise =
+      let floorT = fromIntegral blockStallingTimeout
+          t' = max floorT (scTimeout sc * (0.85 ^ n))
+       in sc { scTimeout = t' }
+
+-- | One Core SendMessages pass over the stall clocks.
+--
+-- * the current staller (if any, and not delivering right now) starts
+--   its clock the first time it is seen (@m_stalling_since == 0@);
+-- * a peer whose clock is older than the timeout is the one to
+--   disconnect (@m_stalling_since < now - timeout@); the timeout then
+--   doubles, capped at 64 s, so our own slowness does not disconnect
+--   peer after peer;
+-- * peers that left, or are delivering a block right now (haskoin reads
+--   a peer's socket on the same thread that validates its block, so
+--   its queue is blind while it works — not the peer's fault), have no
+--   clock.
+stallClockStep
+  :: Ord k
+  => Int64      -- ^ now (s)
+  -> Set.Set k  -- ^ connected peers
+  -> Set.Set k  -- ^ peers whose block is being processed right now
+  -> Maybe k    -- ^ current staller ('findBlockStaller')
+  -> StallClock k
+  -> (Maybe k, StallClock k)
+stallClockStep now live delivering mStaller sc =
+  let since0 = Map.filterWithKey
+                 (\k _ -> k `Set.member` live && k `Set.notMember` delivering)
+                 (scSince sc)
+      since1 = case mStaller of
+        Just k | k `Set.member` live
+               , k `Set.notMember` delivering
+               , not (Map.member k since0) -> Map.insert k now since0
+        _ -> since0
+      t = scTimeout sc
+      fired = [ k | (k, s0) <- Map.toList since1, fromIntegral (now - s0) > t ]
+   in case fired of
+        (k : _) ->
+          ( Just k
+          , sc { scSince = Map.delete k since1
+               , scTimeout = min (2 * t) (fromIntegral blockStallingTimeoutMax) } )
+        [] -> (Nothing, sc { scSince = since1 })
+
+-- | The pipeline as 'mutePipelineHeads' should see it. A peer whose
+-- block we are processing cannot be read (same thread), so its head is
+-- not mute; after that block is done the head's clock restarts from
+-- then, not from the original request.
+muteClockView
+  :: Set.Set Int        -- ^ peer ids with a block being processed
+  -> Map Int Int64      -- ^ peer id -> when its last block finished
+  -> Int64              -- ^ now
+  -> [PipelineInflight]
+  -> [PipelineInflight]
+muteClockView busy lastDone now = map adj
+  where
+    adj x
+      | pifPeer x `Set.member` busy = x { pifFirstByteAt = Just now }
+      | Just d <- Map.lookup (pifPeer x) lastDone
+      , d > pifRequestedAt x = x { pifRequestedAt = d }
+      | otherwise = x
+
+-- | Mute rotation re-requests a peer's blocks from OTHER peers. When no
+-- other connected peer is left to take them, rotating only re-sends the
+-- same getdata to the same live socket (the peer then serves every block
+-- twice), so do not rotate: the single-peer HARD STALL redial handles a
+-- lone peer that has really stopped serving.
+muteRotationAllowed :: Int -> Set.Set Int -> [Int] -> Bool
+muteRotationAllowed nPeers failed mutePids =
+  let out = failed `Set.union` Set.fromList mutePids
+   in any (`Set.notMember` out) [0 .. nPeers - 1]
 
 -- | Drop every inflight body charged to planner id @pid@.
 --
@@ -1653,17 +1761,97 @@ simulateLinearDownloadRate muteFlags nBlocks nTicks =
                         )
        in foldl' step ([], have) (Map.toList grouped)
 
--- | Two peers, 16 each. Peer 0 is assigned next-needed first and
--- delivers only heights ABOVE it (stamping first-byte on the rest).
--- mutePipelineHeads therefore never fires. stallingNextNeeded rotates
--- peer 0 at 2s so peer 1 can take the head.
-simulateStallingNextNeeded :: Int -> Word32 -> LinearDownloadState
-simulateStallingNextNeeded nTicks _nBlocks =
-  foldl' tick initState [1 .. nTicks]
+-- | Model of the replay harness: ONE --connect feeder (cap 128), a
+-- 128-block window, and a node that reads the feeder's socket on the
+-- same thread that validates a block ('procTicks' ticks per block, the
+-- socket unread meanwhile). The feeder answers getdata strictly FIFO.
+-- Each kicker tick runs the same pure pieces the node's kicker runs
+-- ('muteClockView', 'mutePipelineHeads', 'muteRotationAllowed',
+-- 'findBlockStaller', 'stallClockStep', 'neededLinearHashes',
+-- 'planLinearGetDataWithCap'); a fired staller is disconnected (its
+-- queued getdata are lost, its in-flight released), as the node does.
+--
+-- Returns the connected tip and how many times each height was
+-- requested. Core never re-requests a block that is in flight on a
+-- live peer, so every count must be 1.
+simulateSingleFeeder :: Int -> Int -> Word32 -> Int -> (Word32, Map Word32 Int)
+simulateSingleFeeder feedTicks procTicks nBlocks nTicks = go 1 (st0, 0)
   where
-    -- Live shape, miniaturised: peer 0 holds next-needed AND one later
-    -- hash. It only delivers the later hash (first-byte stamps). Peer 1
-    -- starts empty so a stall rotation has a free slot for the head.
+    cap = 128 :: Int
+    peers = [ ForkGetDataPeer 0 (combineServices [nodeNetwork, nodeWitness]) ]
+    heightMap = Map.fromList [ (h, linearSimHash h) | h <- [1 .. nBlocks] ]
+    heightOf = Map.fromList [ (linearSimHash h, h) | h <- [1 .. nBlocks] ]
+    st0 = ( 0 :: Word32              -- tip
+          , Map.empty :: Map BlockHash (Int, Word32, Int64) -- in flight
+          , [] :: [Word32]           -- feeder FIFO (requested, unread)
+          , Set.empty :: Set.Set Word32  -- have body (stored ahead)
+          , Nothing :: Maybe (Word32, Int) -- block being processed
+          , Nothing :: Maybe Int64   -- last processing finished
+          , initialStallClock :: StallClock Int
+          , Map.empty :: Map Word32 Int )  -- requests per height
+    drain tip have
+      | Set.member (tip + 1) have = drain (tip + 1) (Set.delete (tip + 1) have)
+      | otherwise = (tip, have)
+    go t (st@(tip, _, _, _, _, _, _, reqs), feedAt)
+      | t > nTicks || tip >= nBlocks = (tip, reqs)
+      | otherwise = go (t + 1) (tick t feedAt st)
+    tick t feedAt (tip, inf, queue, have, busy, lastDone, sc, reqs) =
+      let now = fromIntegral t :: Int64
+          -- 1. processing
+          (tip1, have1, busy1, lastDone1, nConnected) = case busy of
+            Just (h, k) | k > 1 -> (tip, have, Just (h, k - 1), lastDone, 0)
+            Just (h, _)
+              | h == tip + 1 ->
+                  let (tp, hv) = drain h have in (tp, hv, Nothing, Just now, fromIntegral (tp - tip))
+              | h > tip -> (tip, Set.insert h have, Nothing, Just now, 0)
+              | otherwise -> (tip, have, Nothing, Just now, 0)
+            Nothing -> (tip, have, Nothing, lastDone, 0)
+          sc1 = stallClockConnected nConnected sc
+          -- 2. read the next block off the socket (receipt removes it
+          --    from in flight: Core RemoveBlockRequest)
+          --    The feeder needs 'feedTicks' per block.
+          (inf2, queue2, busy2, sc2, feedAt2) = case (busy1, queue) of
+            (Nothing, h : rest) | now >= feedAt ->
+              ( Map.delete (linearSimHash h) inf, rest
+              , Just (h, if h > tip1 && Set.notMember h have1 then procTicks else 1)
+              , stallClockDelivered 0 sc1, now + fromIntegral feedTicks )
+            _ -> (inf, queue, busy1, sc1, feedAt)
+          receiving = maybe Set.empty (Set.singleton . fst) busy2
+          busyIds = maybe Set.empty (const (Set.singleton 0)) busy2
+          lastDoneIds = maybe Map.empty (Map.singleton 0) lastDone1
+          -- 3. kicker
+          infLive = Map.filter (\(_, ht, _) -> ht > tip1) inf2
+          pipeline = [ PipelineInflight pid ht rq Nothing | (_, (pid, ht, rq)) <- Map.toList infLive ]
+          (mute0, _) = mutePipelineHeads now (muteClockView busyIds lastDoneIds now pipeline)
+          mutePids = if muteRotationAllowed 1 Set.empty mute0 then mute0 else []
+          infAfterMute = Map.filter (\(pid, _, _) -> pid `notElem` mutePids) infLive
+          windowEnd = min nBlocks (tip1 + 128)
+          haveOrRecv = have1 `Set.union` receiving
+          needed0 = neededLinearHashes (tip1 + 1) windowEnd heightMap infAfterMute haveOrRecv
+          staller = findBlockStaller [ p | p <- [0], p `notElem` mutePids ] (null needed0)
+                      [ x | x <- pipeline, pifPeer x `notElem` mutePids ]
+          (fired, sc3) = stallClockStep now (Set.singleton 0) busyIds staller sc2
+          (infK, queueK) = case fired of
+            Just _ -> (Map.empty, [])
+            Nothing -> (infAfterMute, queue2)
+          needed = neededLinearHashes (tip1 + 1) windowEnd heightMap infK haveOrRecv
+          used = Map.fromListWith (+) [ (pid, 1) | (pid, _, _) <- Map.elems infK ]
+          plan = planLinearGetDataWithCap cap peers needed nBlocks 0 Set.empty used
+          newHs = [ ht | (_, hs) <- plan, bh <- hs, Just ht <- [Map.lookup bh heightOf] ]
+          infN = foldl' (\m ht -> Map.insert (linearSimHash ht) (0, ht, now) m) infK newHs
+          reqsN = foldl' (\m ht -> Map.insertWith (+) ht 1 m) reqs newHs
+       in ((tip1, infN, queueK ++ newHs, have1, busy2, lastDone1, sc3, reqsN), feedAt2)
+
+-- | Two peers. Peer 0 is assigned next-needed first and delivers only
+-- heights ABOVE it (stamping first-byte on the rest), so
+-- mutePipelineHeads never fires. Peer 1 is idle and the (two-block)
+-- window is exhausted, so peer 0 is Core's staller: its clock starts
+-- when that is first seen and it is dropped once the clock passes the
+-- 2 s timeout; peer 1 then takes the head.
+simulateStallingNextNeeded :: Int -> Word32 -> LinearDownloadState
+simulateStallingNextNeeded nTicks nBlocks =
+  fst (foldl' tick (initState, initialStallClock) [1 .. nTicks])
+  where
     initState =
       LinearDownloadState
         { ldsTip = 0
@@ -1674,17 +1862,29 @@ simulateStallingNextNeeded nTicks _nBlocks =
         , ldsHaveBody = Set.empty
         , ldsFailed = Set.empty
         }
-    tick st t =
+    countFor pid xs = length [ () | x <- xs, pifPeer x == pid ]
+    tick (st, sc) t =
       let now = fromIntegral t :: Int64
           nextNeeded = ldsTip st + 1
           (inf1, have1) =
             deliverSkipNextNeeded now nextNeeded (ldsInflight st) (ldsHaveBody st)
+          deliveredPids =
+            [ pid | pid <- [0, 1 :: Int]
+                  , countFor pid inf1 < countFor pid (ldsInflight st) ]
+          sc1 = foldr stallClockDelivered sc deliveredPids
           (mutePids, _) = mutePipelineHeads now inf1
-          (stallPids, _) = stallingNextNeeded now nextNeeded inf1
-          rotateSet = Set.fromList mutePids `Set.union` Set.fromList stallPids
+          tip0 = drainTipSim (ldsTip st) have1
+          windowEnd = min nBlocks (tip0 + 2)
+          assigned0 = Set.fromList (map pifHeight inf1) `Set.union` have1
+          exhausted = all (`Set.member` assigned0) [tip0 + 1 .. windowEnd]
+          live = [ pid | pid <- [0, 1], pid `Set.notMember` ldsFailed st ]
+          staller = findBlockStaller live exhausted
+                      [ x | x <- inf1, pifHeight x > tip0 ]
+          (fired, sc2) = stallClockStep now (Set.fromList live) Set.empty staller sc1
+          rotateSet = Set.fromList mutePids `Set.union` maybe Set.empty Set.singleton fired
           inf2 = [x | x <- inf1, pifPeer x `Set.notMember` rotateSet]
           failed' = ldsFailed st `Set.union` rotateSet
-          tip' = drainTipSim (ldsTip st) have1
+          tip' = tip0
           hasNext =
             any (\x -> pifHeight x == tip' + 1) inf2
               || Set.member (tip' + 1) have1
@@ -1701,14 +1901,16 @@ simulateStallingNextNeeded nTicks _nBlocks =
                 , pifFirstByteAt = Nothing
                 }
             | not hasNext
+            , tip' + 1 <= nBlocks
             , pid <- take 1 assignee
             ]
-       in LinearDownloadState
-            { ldsTip = tip'
-            , ldsInflight = inf2 ++ newInf
-            , ldsHaveBody = have1
-            , ldsFailed = failed'
-            }
+       in ( LinearDownloadState
+              { ldsTip = tip'
+              , ldsInflight = inf2 ++ newInf
+              , ldsHaveBody = have1
+              , ldsFailed = failed'
+              }
+          , sc2 )
 
     drainTipSim tip have
       | Set.member (tip + 1) have = drainTipSim (tip + 1) have

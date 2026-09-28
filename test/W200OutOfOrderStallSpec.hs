@@ -58,8 +58,8 @@ import Haskoin.Network
   , blockStallingTimeout
   , mutePipelineHeads
   , neededLinearHashes
+  , findBlockStaller
   , simulateStallingNextNeeded
-  , stallingNextNeeded
   )
 import Haskoin.Storage (Coin (..))
 import Haskoin.Types
@@ -199,33 +199,38 @@ spec = describe "out-of-order" $ do
     it "first-byte stamped does not excuse a next-needed that never arrives" $ do
       -- Live shape: peer sends 911889 (ahead) so first-byte is stamped;
       -- mutePipelineHeads sees a live head; next-needed 911874 stays
-      -- already-inflight forever.
+      -- already-inflight forever. Core FindNextBlocksToDownload names
+      -- peer 2 the staller once another peer (0) is idle and the window
+      -- is exhausted; first-byte does not excuse it. A lone peer is
+      -- never its own staller (waitingfor != peer.m_id): the 1f73e73
+      -- rule charged it anyway and re-sent its whole window to it.
       let inf =
             [ PipelineInflight 2 911874 0 (Just 1)
             , PipelineInflight 2 911889 0 (Just 1)
             ]
       mutePipelineHeads 3 inf `shouldBe` ([], [])
-      stallingNextNeeded 1 911874 inf `shouldBe` ([], [])
-      let (pids, heights) = stallingNextNeeded 3 911874 inf
-      pids `shouldBe` [2]
-      heights `shouldMatchList` [911874, 911889]
+      findBlockStaller [0, 2] True inf `shouldBe` Just 2
+      findBlockStaller [2] True inf `shouldBe` Nothing
+      findBlockStaller [0, 2] False inf `shouldBe` Nothing
 
     it "a peer that skips next-needed is rotated so another peer can take it" $ do
       -- Two peers, 16 each. Peer 0 is assigned 1..16 and delivers only
       -- heights > next-needed (stamping first-byte). Without
-      -- stallingNextNeeded the tip stays 0. With it, peer 0 is failed
+      -- a stall rule the tip stays 0. With it, peer 0 is failed
       -- at t=2 and peer 1 takes the head.
       let st = simulateStallingNextNeeded 40 128
       ldsTip st `shouldSatisfy` (>= 1)
       Set.member 0 (ldsFailed st) `shouldBe` True
 
-    it "kicker unions stallingNextNeeded with mute and requestBlockRange skips stored bodies" $ do
+    it "kicker disconnects a Core staller and requestBlockRange skips stored bodies" $ do
       src <- mainHs
       let fill = bindingBody src "fillLinearPipeline pm hc db" "P2P fork-aware"
           req = bindingBody src "requestBlockRange pm hc fromHeight" "fillLinearPipeline"
           srcFlat = flat src
-      srcFlat `shouldSatisfy` ("stallingNextNeeded" `isInfixOf`)
-      srcFlat `shouldSatisfy` ("stalling-next-needed" `isInfixOf`)
+      srcFlat `shouldSatisfy` ("findBlockStaller" `isInfixOf`)
+      srcFlat `shouldSatisfy` ("stallClockStep" `isInfixOf`)
+      srcFlat `shouldSatisfy` ("Peer is stalling block download" `isInfixOf`)
+      srcFlat `shouldSatisfy` (not . ("stallingNextNeeded" `isInfixOf`))
       flat req `shouldSatisfy` ("neededLinearHashes" `isInfixOf`)
       srcFlat `shouldSatisfy`
         ("requestBlockRange pm' hc refillFrom windowEnd rot failed2 infAfterMute nowKick perPeerCap branch nextBlock haveBody" `isInfixOf`)

@@ -26,7 +26,7 @@ import qualified Haskoin.Daemon as Daemon
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
 import Control.Exception
-  ( AsyncException, SomeException, bracket, catch, fromException, throwIO, uninterruptibleMask_ )
+  ( AsyncException, SomeException, bracket, catch, finally, fromException, throwIO, uninterruptibleMask_ )
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
@@ -1496,6 +1496,35 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- map. Without this, a connect-side refill can overwrite a mute
     -- rotation the kicker just computed.
     linearLock <- newMVar ()
+    -- Core RemoveBlockRequest (net_processing.cpp): a block stops being
+    -- "in flight" the moment it ARRIVES, before validation. haskoin
+    -- validates on the delivering peer's recv thread, so an arrived
+    -- in-order block used to stay charged to that peer for its whole
+    -- connect (seconds), where the stall rule counted it as undelivered
+    -- and re-requested it. These track arrivals instead:
+    --   receivingRef     heights whose body is being processed (not to
+    --                    be requested again meanwhile)
+    --   busyPeersRef     peers whose recv thread is processing a block
+    --                    (their socket is unread; not the peer's fault)
+    --   lastBlockDoneRef when each peer's last block finished processing
+    --   stallClockRef    Core m_stalling_since + m_block_stalling_timeout
+    receivingRef <- newIORef (Map.empty :: Map.Map Word32 Int)
+    busyPeersRef <- newIORef (Map.empty :: Map.Map SockAddr Int)
+    lastBlockDoneRef <- newIORef (Map.empty :: Map.Map SockAddr Int64)
+    stallClockRef <- newIORef (initialStallClock :: StallClock SockAddr)
+    let decRef k = Map.update (\n -> if n <= 1 then Nothing else Just (n - 1)) k
+        blockReceipt raddr rbh rht = withMVar linearLock $ \() -> do
+          modifyIORef' linearInflightRef (Map.delete rbh)
+          modifyIORef' receivingRef (Map.insertWith (+) rht 1)
+          modifyIORef' busyPeersRef (Map.insertWith (+) raddr 1)
+          modifyIORef' stallClockRef (stallClockDelivered raddr)
+          return $ do
+            tDone <- round <$> getPOSIXTime :: IO Int64
+            withMVar linearLock $ \() -> do
+              modifyIORef' receivingRef (decRef rht)
+              modifyIORef' busyPeersRef (decRef raddr)
+              modifyIORef' lastBlockDoneRef (Map.insert raddr tDone)
+              modifyIORef' stallClockRef (stallClockDelivered raddr)
     -- Installed after PeerManager starts (needs pm'). MBlock calls this
     -- after a successful connect so the pipeline refills without waiting
     -- for the 0.4s kicker poll.
@@ -1825,7 +1854,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     pmRef <- newIORef (undefined :: PeerManager)
     pm <- startPeerManagerWith net pmConfig
       (\addr msg ->
-        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr msg
+        syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr msg
           `catchSync` (\e -> putStrLn $ "Handler error: " ++ show e))
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
@@ -1873,6 +1902,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     writeIORef receiptRefillRef $
       fillLinearPipeline pm' hc db nextBlockRef requestedUpToRef
         linearInflightRef linearFailedRef 0 perPeerCap linearLock haveBodyRef
+        receivingRef
     writeIORef bodyStoredRef $ \bh ht -> withMVar linearLock $ \() -> do
       modifyIORef' linearInflightRef (Map.delete bh)
       modifyIORef' haveBodyRef (Set.insert ht)
@@ -1898,7 +1928,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
             (readIORef nextBlockRef)
             loadStoredBody
             (\blkS ->
-               syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef drainPseudoAddr (MBlock blkS)
+               syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt drainPseudoAddr (MBlock blkS)
                  `catchSync` (\e -> putStrLn $ "Stored-body drain: handler error: " ++ show e))
           evicted <- case stop of
             StoredDrainBusy          -> return Nothing
@@ -2139,6 +2169,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                      infStored <- readIORef linearInflightRef
                      failedKeys0 <- readIORef linearFailedRef
                      peerKeys <- mapM (\pc -> piAddress <$> readTVarIO (pcInfo pc)) peers
+                     peerSvcsK <- mapM (\pc -> piServices <$> readTVarIO (pcInfo pc)) peers
                      let keyToId = Map.fromList (zip peerKeys [0 :: Int ..])
                          idToKey = Map.fromList (zip [0 :: Int ..] peerKeys)
                          (inf0, orphanedHs) = projectStableInflight keyToId infStored
@@ -2174,6 +2205,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                        forM (zip [0 :: Int ..] peers) $ \(i, pc) -> do
                          fb <- readIORef (pcBlockFirstByteAt pc)
                          return (i, fb)
+                     busyAddrs <- readIORef busyPeersRef
+                     lastDoneAddrs <- readIORef lastBlockDoneRef
+                     receivingK <- Map.keysSet <$> readIORef receivingRef
+                     heightMapK <- readTVarIO (hcByHeight hc)
+                     haveBodyK0 <- readIORef haveBodyRef
                      let pipeline =
                            [ PipelineInflight
                                { pifPeer = pid
@@ -2186,12 +2222,68 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                }
                            | (_, (pid, ht, reqAt)) <- Map.toList infRestarted
                            ]
-                         (mutePids, muteHs) = mutePipelineHeads nowKick pipeline
-                         (stallPids, stallHs) = stallingNextNeeded nowKick nextBlock pipeline
+                         busyKeys = Map.keysSet busyAddrs
+                         busyIds = Set.fromList
+                           [ pid | k <- Set.toList busyKeys, Just pid <- [Map.lookup k keyToId] ]
+                         lastDoneIds = Map.fromList
+                           [ (pid, t) | (k, t) <- Map.toList lastDoneAddrs
+                                      , Just pid <- [Map.lookup k keyToId] ]
+                         -- Mute (no first byte in 16 s) must not count time
+                         -- our own recv thread spent validating that peer's
+                         -- previous block, and must not "rotate" to the same
+                         -- live peer when no other peer is left.
+                         (mutePids0, _) = mutePipelineHeads nowKick
+                           (muteClockView busyIds lastDoneIds nowKick pipeline)
+                         mutePids = if muteRotationAllowed (length peers) failed0 mutePids0
+                                      then mutePids0 else []
                          muteSet = Set.fromList mutePids
+                         muteHs = [ pifHeight x | x <- pipeline, pifPeer x `Set.member` muteSet ]
+                         -- Core staller: first in-flight block of the window
+                         -- is held by P, another eligible peer is idle, and
+                         -- nothing in the window is left to request.
+                         haveOrRecvK = Set.filter (>= nextBlock) haveBodyK0 `Set.union` receivingK
+                         infNoMute = Map.filter (\(pid, _, _) -> pid `Set.notMember` muteSet) infRestarted
+                         windowExhausted = null
+                           (neededLinearHashes nextBlock windowEnd heightMapK infNoMute haveOrRecvK)
+                         -- Only a peer that could download next-needed counts
+                         -- as idle (Core skips LIMITED peers during IBD).
+                         eligibleIds = [ pid | (pid, svc) <- zip [0 ..] peerSvcsK
+                                             , pid `Set.notMember` failed0
+                                             , pid `Set.notMember` muteSet
+                                             , peerCanServeBlock svc headerTip nextBlock ]
+                         mStallerId = findBlockStaller eligibleIds windowExhausted
+                           [ x | x <- pipeline, pifPeer x `Set.notMember` muteSet ]
+                         mStallerKey = mStallerId >>= \pid -> Map.lookup pid idToKey
+                     scPrev <- readIORef stallClockRef
+                     let nConnectedK = if progressed && lastConn /= maxBound && nextBlock > lastConn
+                                         then fromIntegral (nextBlock - lastConn) else 0
+                         scDecayed = stallClockConnected nConnectedK scPrev
+                         (firedKey, scNext) = stallClockStep nowKick (Set.fromList peerKeys) busyKeys mStallerKey
+                                                scDecayed
+                     writeIORef stallClockRef scNext
+                     let stallPids = [ pid | Just k <- [firedKey], Just pid <- [Map.lookup k keyToId] ]
                          stallSet = Set.fromList stallPids
+                         stallHs = [ pifHeight x | x <- pipeline, pifPeer x `Set.member` stallSet ]
                          rotateSet = muteSet `Set.union` stallSet
-                         infAfterMute =
+                     -- Core: "Peer is stalling block download" -> fDisconnect;
+                     -- FinalizeNode releases its vBlocksInFlight, which the
+                     -- refill below re-plans onto the idle peer. Never
+                     -- re-request its blocks while it stays connected.
+                     forM_ (zip [0 :: Int ..] peers) $ \(i, pc) ->
+                       when (i `Set.member` stallSet) $ do
+                         a <- piAddress <$> readTVarIO (pcInfo pc)
+                         putStrLn $ "Peer is stalling block download (Core BLOCK_STALLING_TIMEOUT): "
+                                 ++ show a ++ " held next window block "
+                                 ++ show (if null stallHs then nextBlock else minimum stallHs)
+                                 ++ " while another peer sat idle for > "
+                                 ++ show (round (scTimeout scDecayed) :: Int)
+                                 ++ "s; disconnecting (next timeout "
+                                 ++ show (round (scTimeout scNext) :: Int) ++ "s)"
+                         disconnectPeer pc
+                           `catch` (\(e :: SomeException) ->
+                                      putStrLn $ "stall disconnect error: " ++ show e)
+                         atomically $ modifyTVar' (pmPeers pm') (Map.delete a)
+                     let infAfterMute =
                            Map.filter (\(pid, _, _) ->
                              pid `Set.notMember` rotateSet)
                              infRestarted
@@ -2204,7 +2296,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                  | otherwise = failed1
                      when (not (null mutePids) || not (null stallPids)) $ do
                        let rotatedHs = muteHs ++ stallHs
-                           kind | not (null stallPids) = " stalling-next-needed hash(es) "
+                           kind | not (null stallPids) = " stalling-peer hash(es) "
                                 | otherwise = " mute-head hash(es) "
                        putStrLn $ "Block-gap kicker (stall recover): re-requesting "
                                ++ show (length rotatedHs) ++ kind
@@ -2213,7 +2305,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                         else maximum rotatedHs)
                                ++ " from other peers (mute peer idx "
                                ++ show mutePids
-                               ++ " stalling-next-needed idx "
+                               ++ " stalling-peer idx "
                                ++ show stallPids ++ ")"
                        -- Restart the first-byte stamp on rotated peers.
                        forM_ (zip [0 :: Int ..] peers) $ \(i, pc) ->
@@ -2226,9 +2318,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                          , Just k <- [Map.lookup pid idToKey]
                          ]
                      writeIORef linearInflightRef (storeStableInflight idToKey infAfterMute)
-                     haveBody0 <- readIORef haveBodyRef
-                     let haveBody = Set.filter (>= nextBlock) haveBody0
-                     writeIORef haveBodyRef haveBody
+                     let haveBodyStored = Set.filter (>= nextBlock) haveBodyK0
+                     writeIORef haveBodyRef haveBodyStored
+                     -- Arrived-and-processing heights are not requested
+                     -- again (Core: the block is no longer in flight, and
+                     -- it is not missing either).
+                     let haveBody = haveBodyStored `Set.union` receivingK
                      let refillFrom = min pipeFrom nextBlock
                          wantFill = needNew || not (null mutePids) || not (null stallPids)
                                      || Map.size infAfterMute < fromIntegral maxBlocksInFlight
@@ -3346,8 +3441,10 @@ fillLinearPipeline
   -> Int
   -> MVar ()
   -> IORef (Set.Set Word32)
+  -> IORef (Map.Map Word32 Int)
+     -- ^ heights whose body has arrived and is being processed
   -> IO ()
-fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock haveBodyRef =
+fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock haveBodyRef receivingRef =
   withMVar linearLock $ \() -> do
     peers <- getConnectedPeerList pm
     unless (null peers) $ do
@@ -3359,6 +3456,7 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
         infStored <- readIORef linearInflightRef
         failedKeys0 <- readIORef linearFailedRef
         haveBody0 <- readIORef haveBodyRef
+        receivingNow <- readIORef receivingRef
         peerKeys <- mapM (\pc -> piAddress <$> readTVarIO (pcInfo pc)) peers
         let keyToId = Map.fromList (zip peerKeys [0 :: Int ..])
             idToKey = Map.fromList (zip [0 :: Int ..] peerKeys)
@@ -3369,12 +3467,13 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
               , Just pid <- [Map.lookup k keyToId]
               ]
             infPruned = Map.filter (\(_, ht, _) -> ht >= nextBlock) inf0
-            haveBody = Set.filter (>= nextBlock) haveBody0
+            haveBodyStored = Set.filter (>= nextBlock) haveBody0
+            haveBody = haveBodyStored `Set.union` Map.keysSet receivingNow
             connectedTip = if nextBlock == 0 then 0 else nextBlock - 1
             windowEnd = min headerTip
                           (min (connectedTip + 1024)
                                (connectedTip + fromIntegral maxBlocksInFlightTotal))
-        writeIORef haveBodyRef haveBody
+        writeIORef haveBodyRef haveBodyStored
         inf' <- requestBlockRange pm hc nextBlock windowEnd
                   rot failed0 infPruned nowKick cap FillReceipt nextBlock haveBody
         writeIORef linearInflightRef (storeStableInflight idToKey inf')
@@ -3784,8 +3883,12 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- ^ Running count of MBlock bodies that arrived and
                       -- were not connected. e8a03a9's 8x RATE drop was
                       -- silent on out-of-order G1 (only next-needed logged).
+                   -> (SockAddr -> BlockHash -> Word32 -> IO (IO ()))
+                      -- ^ Block receipt (Core RemoveBlockRequest): take the
+                      -- arrived block out of in-flight before validation;
+                      -- the returned action marks processing finished.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr msg = case msg of
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -3980,6 +4083,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         pm <- readIORef pmRef
         void $ misbehaving pm addr InvalidBlock
       Right entry -> do
+       -- Arrived: no longer in flight (Core RemoveBlockRequest), and not
+       -- re-requested while this thread validates it. 'finally' so a
+       -- killed recv thread cannot leave the height marked forever.
+       receiptDone <- blockReceipt addr bh (ceHeight entry)
+       flip finally receiptDone $ do
         let height = ceHeight entry
         -- W97 G19c: fTooFarAhead gate.
         -- Core validation.cpp:4325 — for unrequested blocks, reject when
@@ -4737,7 +4845,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               then case fillPartialBlock pdb [] of
                 Right block -> do
                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr (MBlock block)
+                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -4844,7 +4952,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- IBD, header indexing, index manager mirroring, etc.).
             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef addr (MBlock block)
+            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()
