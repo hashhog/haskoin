@@ -245,6 +245,7 @@ test-suite haskoin-test
                , W207NoCoreProxySpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
+               , R5ErrCodeParitySpec
                , Paths_haskoin
                , Bip21Spec
                , Fix64TlsSpec

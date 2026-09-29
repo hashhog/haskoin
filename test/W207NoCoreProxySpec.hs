@@ -89,8 +89,11 @@ sourceViolations files =
     bad l =  "bitcoin-core/.cookie" `BS.isInfixOf` l
           || "Authorization: Basic" `BS.isInfixOf` l
           || hasPort "48343" l
-          || (hasPort "8332" l && not (ownRpcPortLine l))
+          || (hasPort "8332" l && not (ownRpcPortLine l) && not (helpExampleUrlDef l))
     ownRpcPortLine l = any (`BS.isInfixOf` l) ["rpcPort", "RpcPort", "rpcport"]
+    -- Core's HelpExampleRpc URL is part of byte-identical help text (e.g. the
+    -- addnode unknown-command error).  Only its one DEFINITION line is exempt.
+    helpExampleUrlDef l = "coreHelpExampleRpcUrl = \"http://127.0.0.1:8332/\"" == l
     -- The port as a whole number: not 18332 / 28332 / 83321.
     hasPort p l = any standalone (BS.breakSubstring p `iter` l)
       where
@@ -146,6 +149,11 @@ sourceGuardSpec = describe "source guard" $ do
     flagged "  <$> option auto (long \"rpcport\" <> value 8332" `shouldBe` False
     flagged "  zmq tcp://127.0.0.1:28332"                       `shouldBe` False
     flagged "  testnet 18332"                                   `shouldBe` False
+    -- Core's help-example URL: only its exact definition line is exempt;
+    -- the same URL anywhere else (e.g. inline, or dialed) still flags.
+    flagged "coreHelpExampleRpcUrl = \"http://127.0.0.1:8332/\"" `shouldBe` False
+    flagged "  httpPost \"http://127.0.0.1:8332/\" body"          `shouldBe` True
+    flagged "  coreHelpExampleRpcUrl = \"http://127.0.0.1:8332/\"" `shouldBe` True
 
 --------------------------------------------------------------------------------
 -- Pure helpers

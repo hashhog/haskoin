@@ -194,6 +194,7 @@ import qualified W206DownloadRedundancySpec
 import qualified W207NoCoreProxySpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
+import qualified R5ErrCodeParitySpec
 import qualified Bip21Spec
 import qualified Fix64TlsSpec
 import qualified Fix65PayjoinReceiverSpec
@@ -23989,6 +23990,7 @@ main = hspec $ do
   -- both kept, set-union max-version/min-locktime, AddInput sig-clearing.
   ConvertJoinPsbtSpec.spec
   T2R5Spec.spec
+  R5ErrCodeParitySpec.spec
 
   -- BIP-21 URI parser (FIX-62, prerequisite host for W119 PayJoin pj=/pjos=)
   Bip21Spec.spec

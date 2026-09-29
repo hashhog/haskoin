@@ -234,6 +234,17 @@ module Haskoin.Rpc
   , handleEstimateSmartFee
   , handleGetNodeAddresses
   , handleCreatePsbt
+    -- * T1 R5 error-code parity (exported for testing)
+  , handleGetMempoolEntry
+  , handleGetMempoolAncestors
+  , handleGetMempoolDescendants
+  , handleGetBlockStats
+  , handleAddNode
+  , addnodeHelpText
+  , handleGetNetTotals
+  , handleGetNetworkHashPS
+  , CoreArgType(..)
+  , coreArgTypeCheck
     -- * T2 R5 probe handlers (exported for testing)
   , handleDecodeRawTransaction
   , handleValidateAddress
@@ -2618,7 +2629,13 @@ handleGetBlock server params = do
 -- restricts the response to those keys (unknown name -> -8, like Core).  The
 -- bytediff exercises the no-filter (do_all) path with a height argument.
 handleGetBlockStats :: RpcServer -> Value -> IO RpcResponse
-handleGetBlockStats server params = do
+handleGetBlockStats server params
+  -- Core RPCHelpMan type check: hash_or_height has skip_type_check (it takes
+  -- a height OR a hash); stats is an ARR, so a non-array is -3 up front.
+  | Just typeErr <- coreArgTypeCheck
+      [Nothing, Just ("stats", CArgArr, False)] params
+  = return typeErr
+  | otherwise = do
   -- Resolve hash_or_height (param 0): an int height into the active chain, or a
   -- block-hash hex string.  Mirrors Core ParseHashOrHeight.
   tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
@@ -2651,13 +2668,27 @@ handleGetBlockStats server params = do
         Nothing -> return (Left (rpcInvalidAddressOrKey, "Block not found"))
         Just _  -> return (Right bh)
     Just _ -> return (Left (rpcInvalidParams, "hash_or_height must be a height or block hash"))
+  -- Core reads each selected stat with get_str() right after
+  -- ParseHashOrHeight and BEFORE the block is read: a non-string element is
+  -- -3 "JSON value of type <t> is not of expected type string".
+  let statTypeErr = case extractParam params 1 :: Maybe Value of
+        Just (Array sel) ->
+          listToMaybe [ jsonTypeName v | v <- V.toList sel, not (isStr v) ]
+        _ -> Nothing
+      isStr (String _) = True
+      isStr _          = False
   case mResolved of
     Left (code, msg) -> return $ RpcResponse Null (toJSON $ RpcError code msg) Null
+    Right _ | Just t <- statTypeErr -> return $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("JSON value of type " <> t <> " is not of expected type string")) Null
     Right bh -> do
       mBlock <- getBlock (rsDB server) bh
       case mBlock of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcMiscError "Block not found on disk") Null
+        -- Core GetBlockChecked -> CheckBlockDataAvailability: an indexed
+        -- block whose data is not stored is -1 "Block not available (not
+        -- fully downloaded)" / "(pruned data)", not "Block not found on disk".
+        Nothing -> getBlockBodyAbsentResponse server bh
         Just block -> do
           let mEntry = Map.lookup bh entries
               height = maybe 0 ceHeight mEntry
@@ -5075,7 +5106,12 @@ handleGetConnectionCount server = do
 
 -- | Add a node to connect to
 handleAddNode :: RpcServer -> Value -> IO RpcResponse
-handleAddNode server params = do
+handleAddNode server params
+  | Just typeErr <- coreArgTypeCheck
+      [ Just ("node", CArgStr, True), Just ("command", CArgStr, True)
+      , Just ("v2transport", CArgBool, False) ] params
+  = return typeErr
+  | otherwise = do
   case params of
     Array arr | V.length arr >= 2 ->
       case ((arr V.!) 0, (arr V.!) 1) of
@@ -5131,19 +5167,53 @@ handleAddNode server params = do
                       disconnectPeer pc
                   return $ RpcResponse Null Null Null
             _ ->
-              -- BUG-1 fix: return a proper {code, message} RpcError object, not
-              -- a bare JSON string (which conformant JSON-RPC clients reject).
+              -- Core rpc/net.cpp addnode: an unknown command is
+              -- @throw std::runtime_error(self.ToString())@ -- the method's
+              -- full help text as an RPC_MISC_ERROR (-1).  (Was -32602
+              -- "Invalid command, expected onetry/add/remove".)
               return $ RpcResponse Null
-                (toJSON $ RpcError rpcInvalidParams
-                  "Invalid command, expected onetry/add/remove") Null
+                (toJSON $ RpcError rpcMiscError addnodeHelpText) Null
         _ ->
-          -- BUG-1 fix: proper {code, message} RpcError object, not a string.
+          -- Unreachable: coreArgTypeCheck already rejected non-strings (-3).
           return $ RpcResponse Null
             (toJSON $ RpcError rpcInvalidParams "Invalid parameter types") Null
     _ ->
       -- BUG-1 fix: proper {code, message} RpcError object, not a string.
       return $ RpcResponse Null
         (toJSON $ RpcError rpcInvalidParams "Expected [node, command]") Null
+
+-- | Core's @addnode@ help text (@RPCHelpMan::ToString()@), byte-identical to
+-- @bitcoin-cli help addnode@ on Core v31.99.  Core returns it verbatim as the
+-- -1 error for an unknown command, and as the @help addnode@ answer.  The
+-- example URL is Core's fixed @HelpExampleRpc@ literal on every network.
+addnodeHelpText :: Text
+addnodeHelpText = T.concat
+  [ "addnode \"node\" \"command\" ( v2transport )\n"
+  , "\n"
+  , "Attempts to add or remove a node from the addnode list.\n"
+  , "Or try a connection to a node once.\n"
+  , "Nodes added using addnode (or -connect) are protected from DoS disconnection and are not required to be\n"
+  , "full nodes/support SegWit as other outbound peers are (though such peers will not be synced from).\n"
+  , "Addnode connections are limited to 8 at a time and are counted separately from the -maxconnections limit.\n"
+  , "\n"
+  , "Arguments:\n"
+  , "1. node           (string, required) The IP address/hostname optionally followed by :port of the peer to connect to\n"
+  , "2. command        (string, required) 'add' to add a node to the list, 'remove' to remove a node from the list, 'onetry' to try a connection to the node once\n"
+  , "3. v2transport    (boolean, optional, default=set by -v2transport) Attempt to connect using BIP324 v2 transport protocol (ignored for 'remove' command)\n"
+  , "\n"
+  , "Result:\n"
+  , "null    (json null)\n"
+  , "\n"
+  , "Examples:\n"
+  , "> bitcoin-cli addnode \"192.168.0.6:8333\" \"onetry\" true\n"
+  , "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"addnode\", \"params\": [\"192.168.0.6:8333\", \"onetry\" true]}' -H 'content-type: application/json' " <> coreHelpExampleRpcUrl <> "\n"
+  ]
+
+-- | The URL Core's @HelpExampleRpc@ (rpc/util.cpp) hardcodes into every
+-- method's help text, on every network.  A help-text STRING only -- never
+-- dialed; the W207 R3 source guard exempts exactly this definition line.
+coreHelpExampleRpcUrl :: Text
+coreHelpExampleRpcUrl = "http://127.0.0.1:8332/"
 
 --------------------------------------------------------------------------------
 -- Mining RPC Handlers
@@ -9664,7 +9734,10 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
 -- Returns:
 --   Object with vsize, weight, fee, time, height, descendant/ancestor info
 handleGetMempoolEntry :: RpcServer -> Value -> IO RpcResponse
-handleGetMempoolEntry server params = do
+handleGetMempoolEntry server params
+  | Just typeErr <- coreArgTypeCheck [Just ("txid", CArgStr, True)] params
+  = return typeErr
+  | otherwise = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
@@ -9679,8 +9752,11 @@ handleGetMempoolEntry server params = do
           let txid = TxId (getBlockHashHash bh)
           mEntry <- getTransaction (rsMempool server) txid
           case mEntry of
+            -- Core rpc/mempool.cpp getmempoolentry: a well-formed txid that
+            -- is not in the pool is RPC_INVALID_ADDRESS_OR_KEY (-5), the same
+            -- code getmempoolancestors/descendants use.  (Was -1.)
             Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcMiscError "Transaction not in mempool") Null
+              (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
             Just entry -> do
               -- Get ancestor/descendant info
               ancestors <- getAncestors (rsMempool server) (meTransaction entry)
@@ -9739,19 +9815,25 @@ handleGetMempoolEntry server params = do
 -- Returns:
 --   Array of ancestor txids, or object with detailed ancestor info
 handleGetMempoolAncestors :: RpcServer -> Value -> IO RpcResponse
-handleGetMempoolAncestors server params = do
+handleGetMempoolAncestors server params
+  -- Core RPCHelpMan type check first (-3), then ParseHashV (-8 for a
+  -- malformed txid; was -32602 "Invalid txid"), then the pool lookup (-5).
+  | Just typeErr <- coreArgTypeCheck
+      [Just ("txid", CArgStr, True), Just ("verbose", CArgBool, False)] params
+  = return typeErr
+  | otherwise = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
     Just txidHex -> do
       let verbose = fromMaybe False (extractParam params 1 :: Maybe Bool)
           mp = rsMempool server
-      entries <- readTVarIO (mpEntries mp)
-      case parseTxId txidHex of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
-        Just txid -> do
-          case Map.lookup txid entries of
+      case parseHashV "txid" txidHex of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right txidBh -> do
+         let txid = TxId (getBlockHashHash txidBh)
+         entries <- readTVarIO (mpEntries mp)
+         case Map.lookup txid entries of
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
             Just entry -> do
@@ -10959,6 +11041,66 @@ jsonTypeName (Number _) = "number"
 jsonTypeName (String _) = "string"
 jsonTypeName (Array _)  = "array"
 jsonTypeName (Object _) = "object"
+
+-- | The declared type of a positional argument in Core's RPCHelpMan
+-- (@RPCArg::Type@ reduced to the UniValue type @RPCArg::MatchesType@ checks).
+data CoreArgType = CArgStr | CArgNum | CArgBool | CArgArr | CArgObj
+  deriving (Eq, Show)
+
+coreArgTypeName :: CoreArgType -> Text
+coreArgTypeName CArgStr  = "string"
+coreArgTypeName CArgNum  = "number"
+coreArgTypeName CArgBool = "bool"
+coreArgTypeName CArgArr  = "array"
+coreArgTypeName CArgObj  = "object"
+
+coreArgTypeMatches :: CoreArgType -> Value -> Bool
+coreArgTypeMatches CArgStr  (String _) = True
+coreArgTypeMatches CArgNum  (Number _) = True
+coreArgTypeMatches CArgBool (Bool _)   = True
+coreArgTypeMatches CArgArr  (Array _)  = True
+coreArgTypeMatches CArgObj  (Object _) = True
+coreArgTypeMatches _        _          = False
+
+-- | Core's up-front argument type check, @RPCHelpMan::HandleRequest@
+-- (rpc/util.cpp): BEFORE the method body runs, every positional argument is
+-- matched against its declared type ('RPCArg::MatchesType').  An optional
+-- argument passed as JSON null is skipped; a REQUIRED one passed as null is a
+-- mismatch.  All mismatches are collected and reported together as
+-- RPC_TYPE_ERROR (-3):
+--
+-- > Wrong type passed:
+-- > {
+-- >     "Position 1 (nblocks)": "JSON value of type string is not of expected type number"
+-- > }
+--
+-- (the object is @UniValue::write(4)@: four-space indent, @": "@ separator,
+-- @",\n"@ between members).  Each spec entry is (name, type, required); an
+-- argument with @skip_type_check@ in Core must simply be left out of the
+-- positions it covers by passing 'Nothing'.
+coreArgTypeCheck :: [Maybe (Text, CoreArgType, Bool)] -> Value -> Maybe RpcResponse
+coreArgTypeCheck specs params =
+  case mismatches of
+    [] -> Nothing
+    ms -> Just $ RpcResponse Null
+      (toJSON $ RpcError rpcTypeError
+        ("Wrong type passed:\n{\n" <> T.intercalate ",\n" ms <> "\n}")) Null
+  where
+    args = case params of
+      Array arr -> V.toList arr
+      _         -> []
+    mismatches =
+      [ "    " <> jsonQuote (T.pack ("Position " ++ show i ++ " (") <> name <> ")")
+        <> ": " <> jsonQuote ("JSON value of type " <> jsonTypeName v
+                              <> " is not of expected type " <> coreArgTypeName ty)
+      | (i, Just (name, ty, required), v) <- zip3 [1 :: Int ..] specs args
+      , not (v == Null && not required)
+      , not (coreArgTypeMatches ty v)
+      ]
+    jsonQuote t = "\"" <> T.concatMap esc t <> "\""
+    esc '"'  = "\\\""
+    esc '\\' = "\\\\"
+    esc c    = T.singleton c
 
 -- | @setnetworkactive state@ — disable/enable all P2P network activity.
 --
@@ -13334,6 +13476,7 @@ getCommandHelp cmd = case T.toLower cmd of
     "submitpackage [\"rawtx\",...] ( maxfeerate )\n\nSubmit a package of raw transactions (hex-encoded) to local mempool. The package must be topologically sorted with the child as the last element. Up to MAX_PACKAGE_COUNT (25) transactions. Returns {package_msg, tx-results, replaced-transactions}."
   "getmempoolentry" ->
     "getmempoolentry \"txid\"\n\nReturns mempool data for given transaction."
+  "addnode" -> addnodeHelpText
   "prioritisetransaction" ->
     "prioritisetransaction \"txid\" ( dummy ) fee_delta\n\nAccepts the transaction into mined blocks at a higher (or lower) priority.\n\nArguments:\n1. txid       (string, required) The transaction id\n2. dummy      (numeric, optional) API-Compatibility for previous API. Must be zero or null.\n3. fee_delta  (numeric, required) The fee value (in satoshis) to add (or subtract, if negative).\n               Not a fee rate. The transaction selection algorithm considers the tx as it would\n               have paid a higher (or lower) fee.\n\nResult:\ntrue (boolean) Returns true"
   "getaddressinfo" ->
@@ -13651,18 +13794,25 @@ handleEstimateRawFee server params = do
 -- Reference: Bitcoin Core's @getmempooldescendants@ RPC (rpc/mempool.cpp).
 -- Mirrors 'handleGetMempoolAncestors' but walks the descendant index.
 handleGetMempoolDescendants :: RpcServer -> Value -> IO RpcResponse
-handleGetMempoolDescendants server params = do
+handleGetMempoolDescendants server params
+  -- Core RPCHelpMan type check first (-3), then ParseHashV (-8 for a
+  -- malformed txid; was -32602 "Invalid txid"), then the pool lookup (-5).
+  | Just typeErr <- coreArgTypeCheck
+      [Just ("txid", CArgStr, True), Just ("verbose", CArgBool, False)] params
+  = return typeErr
+  | otherwise = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing txid parameter") Null
     Just txidHex -> do
       let verbose = fromMaybe False (extractParam params 1 :: Maybe Bool)
           mp = rsMempool server
-      entries <- readTVarIO (mpEntries mp)
-      case parseTxId txidHex of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcInvalidParams "Invalid txid") Null
-        Just txid -> case Map.lookup txid entries of
+      case parseHashV "txid" txidHex of
+        Left err -> return $ RpcResponse Null (toJSON err) Null
+        Right txidBh -> do
+         let txid = TxId (getBlockHashHash txidBh)
+         entries <- readTVarIO (mpEntries mp)
+         case Map.lookup txid entries of
           Nothing -> return $ RpcResponse Null
             (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
           Just _ -> do
@@ -13713,17 +13863,36 @@ handleUptime server = do
   return $ RpcResponse (toJSON uptimeSeconds) Null Null
 
 -- | Return network traffic totals.
--- Returns stub with zero byte counts and current time in milliseconds.
+--
+-- Shape and key order are Core's rpc/net.cpp getnettotals:
+-- @{totalbytesrecv, totalbytessent, timemillis, uploadtarget}@, where
+-- @uploadtarget@ is @{timeframe, target, target_reached,
+-- serve_historical_blocks, bytes_left_in_cycle, time_left_in_cycle}@.
+--
+-- haskoin has no @-maxuploadtarget@, which is Core's default state
+-- (nMaxOutboundLimit = 0): timeframe = MAX_UPLOAD_TIMEFRAME (86400 s),
+-- target 0, OutboundTargetReached(false) = false, serve_historical_blocks =
+-- !OutboundTargetReached(true) = true, and GetOutboundTargetBytesLeft /
+-- GetMaxOutboundTimeLeftInCycle both 0 when no limit is set.
+--
+-- The byte counters remain zero (haskoin keeps no process-lifetime totals).
 handleGetNetTotals :: RpcServer -> IO RpcResponse
 handleGetNetTotals _server = do
   now <- getPOSIXTime
   let timeMillis = round (now * 1000) :: Int64
-      result = object
-        [ "totalbytesrecv" .= (0 :: Int64)
-        , "totalbytessent" .= (0 :: Int64)
-        , "timemillis"     .= timeMillis
-        ]
-  return $ RpcResponse result Null Null
+      uploadTarget = pairs $
+           pair "timeframe"               (AE.int64 86400)
+        <> pair "target"                  (AE.int64 0)
+        <> pair "target_reached"          (AE.bool False)
+        <> pair "serve_historical_blocks" (AE.bool True)
+        <> pair "bytes_left_in_cycle"     (AE.int64 0)
+        <> pair "time_left_in_cycle"      (AE.int64 0)
+      enc = pairs $
+           pair "totalbytesrecv" (AE.int64 0)
+        <> pair "totalbytessent" (AE.int64 0)
+        <> pair "timemillis"     (AE.int64 timeMillis)
+        <> pair "uploadtarget"   uploadTarget
+  return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
 -- Control: Stop RPC Handler
@@ -17435,20 +17604,46 @@ estimateNetworkHashPS server nblocks reqHeight =
             _ -> return 0.0
         _ -> return 0.0
 
--- | getnetworkhashps: estimate network hash rate over sliding window.
+-- | getnetworkhashps ( nblocks height ): estimate network hash rate.
+--
+-- Argument handling is Core's (rpc/mining.cpp getnetworkhashps +
+-- GetNetworkHashPS), in Core's order:
+--
+--   1. RPCHelpMan type check: both are NUM, so a string/bool/... is -3
+--      "Wrong type passed: ..." (was silently replaced by the default).
+--   2. self.Arg<int>: an out-of-int32 or fractional number is -1
+--      "JSON integer out of range".
+--   3. nblocks < -1 or == 0 -> -8 "Invalid nblocks. Must be a positive
+--      number or -1."  (was: 0 meant "since genesis", negatives -> 120)
+--   4. height < -1 or > active height -> -8 "Block does not exist at
+--      specified height"  (was: clamped to the tip)
+--   5. nblocks == -1 -> blocks since the last difficulty change
+--      (height % 2016 + 1); nblocks > height -> height.
 handleGetNetworkHashPS :: RpcServer -> Value -> IO RpcResponse
-handleGetNetworkHashPS server params = do
-  tip <- readTVarIO (hcTip (rsHeaderChain server))
-  let defaultNBlocks = 120 :: Int
-      nblocks = case extractParam params 0 :: Maybe Int of
-        Just n | n > 0 -> n
-        Just 0 -> fromIntegral (ceHeight tip)  -- nblocks=0 means "since genesis"
-        _      -> defaultNBlocks
-      reqHeight = case extractParam params 1 :: Maybe Int of
-        Just h | h >= 0 -> min h (fromIntegral (ceHeight tip))
-        _               -> fromIntegral (ceHeight tip)
-  hashps <- estimateNetworkHashPS server nblocks reqHeight
-  return $ RpcResponse (toJSON hashps) Null Null
+handleGetNetworkHashPS server params
+  | Just typeErr <- coreArgTypeCheck
+      [Just ("nblocks", CArgNum, False), Just ("height", CArgNum, False)] params
+  = return typeErr
+  | otherwise =
+  case (parseCoreInt32At params 0 120, parseCoreInt32At params 1 (-1)) of
+    (Left (c, m), _) -> return (rpcFail c m)
+    (_, Left (c, m)) -> return (rpcFail c m)
+    (Right lookup0, Right height)
+      | lookup0 < -1 || lookup0 == 0 -> return $ rpcFail rpcInvalidParameter
+          "Invalid nblocks. Must be a positive number or -1."
+      | otherwise -> do
+          tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+          let tipH = fromIntegral (ceHeight tip) :: Int
+          if height < -1 || height > tipH
+            then return $ rpcFail rpcInvalidParameter
+                   "Block does not exist at specified height"
+            else do
+              let pbH = if height >= 0 then height else tipH
+                  interval = fromIntegral (netRetargetInterval (rsNetwork server)) :: Int
+                  lookup1 = if lookup0 == -1 then pbH `mod` interval + 1 else lookup0
+                  nblocks = min lookup1 pbH
+              hashps <- estimateNetworkHashPS server nblocks pbH
+              return $ RpcResponse (toJSON hashps) Null Null
 
 -- | Core-style tree height: increment while CalcTreeWidth(h) > 1.
 -- Mirrors merkleblock.cpp CPartialMerkleTree ctor (lines 143-145) and
