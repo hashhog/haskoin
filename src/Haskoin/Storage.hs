@@ -148,6 +148,7 @@ module Haskoin.Storage
   , getUTXOCount
     -- * Chainstate reset (for -reindex-chainstate)
   , wipeChainstate
+  , purgeUndoRecords
     -- * Utilities
   , toBE32
   , fromBE32
@@ -2052,8 +2053,14 @@ iterateWithPrefix db = iterateWithPrefixOpts db (dbReadOpts db)
 -- rather than whatever 'connectBlockAt' writes while it runs.
 iterateWithPrefixOpts :: HaskoinDB -> R.ReadOptions -> KeyPrefix
                       -> (ByteString -> ByteString -> IO Bool) -> IO ()
-iterateWithPrefixOpts db opts prefix callback = runResourceT $ do
-  let prefixBS = BS.singleton (prefixByte prefix)
+iterateWithPrefixOpts db opts prefix =
+  iterateWithRawPrefixOpts db opts (BS.singleton (prefixByte prefix))
+
+-- | 'iterateWithPrefixOpts' over a raw key prefix — for keyspaces that are
+-- not a 'KeyPrefix' constructor (the 0x10 undo records).
+iterateWithRawPrefixOpts :: HaskoinDB -> R.ReadOptions -> ByteString
+                         -> (ByteString -> ByteString -> IO Bool) -> IO ()
+iterateWithRawPrefixOpts db opts prefixBS callback = runResourceT $ do
   R.withIterator (dbHandle db) opts $ \iter -> do
     R.iterSeek iter prefixBS
     let loop = do
@@ -2141,6 +2148,31 @@ deleteKeysWithPrefix db p = do
   flushBatch
   readIORef countRef
 
+-- | Delete every per-block undo record (raw key prefix 0x10).
+--
+-- Undo records describe how to rewind ONE PARTICULAR coin-set history.
+-- Once that coin set is replaced (-reindex-chainstate wipe, assumeutxo
+-- import) they are not merely useless but actively misleading: the boot
+-- reconciliation treats "undo record exists" as "block connected", so
+-- leftovers from the previous chain re-stamped mainnet's tip from 961631
+-- to 966500 over 4,869 un-applied blocks (2026-10-01).  Core keeps rev
+-- files across -reindex-chainstate because it never infers the tip from
+-- them; haskoin does, so it must drop them with the coin set.
+purgeUndoRecords :: HaskoinDB -> IO Int
+purgeUndoRecords db = do
+  pendingRef <- newIORef ([] :: [BatchOp])
+  countRef   <- newIORef (0 :: Int)
+  let flushBatch = do
+        ops <- atomicModifyIORef' pendingRef (\xs -> ([], xs))
+        unless (null ops) $ writeBatch db (WriteBatch ops)
+  iterateWithRawPrefixOpts db (dbReadOpts db) (BS.singleton 0x10) $ \key _ -> do
+    modifyIORef' pendingRef (BatchDelete key :)
+    n <- atomicModifyIORef' countRef (\x -> (x + 1, x + 1))
+    when (n `mod` 4096 == 0) flushBatch
+    return True
+  flushBatch
+  readIORef countRef
+
 wipeChainstate :: HaskoinDB -> IO Int
 wipeChainstate db = do
   totalRef <- newIORef (0 :: Int)
@@ -2185,6 +2217,9 @@ wipeChainstate db = do
     flushBatch
     n <- readIORef countRef
     modifyIORef' totalRef (+ n)
+  -- Undo records belong to the coin set just wiped (see 'purgeUndoRecords').
+  nUndo <- purgeUndoRecords db
+  modifyIORef' totalRef (+ nUndo)
   -- One synchronous flush so the wipe is durable before the caller
   -- starts replaying connectBlock against the empty UTXO set.
   syncFlush db
@@ -3221,6 +3256,13 @@ streamSnapshotIntoLegacyUTXO db path expectedMagic baseHeight expectedHash = do
       putSnapshotImportInProgress db
       syncFlush db
       dropped <- deleteKeysWithPrefix db PrefixUTXO
+      -- The undo records of the replaced coin set must go with it, or the
+      -- boot reconciliation resurrects the old chain's tip over blocks
+      -- this snapshot never applied (see 'purgeUndoRecords').
+      staleUndo <- purgeUndoRecords db
+      when (staleUndo > 0) $
+        putStrLn $ "[snapshot] purged " ++ show staleUndo
+                ++ " undo record(s) belonging to the replaced coin set"
       when (dropped > 0) $
         putStrLn $ "[snapshot] replacing " ++ show dropped
                 ++ " pre-existing live coin(s) with the verified snapshot set"

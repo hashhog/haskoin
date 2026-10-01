@@ -147,6 +147,8 @@ module Haskoin.Consensus
   , formatConnectPhases
   , blockHashToHex
   , rewindChainstateToPrefix
+  , coinbaseApplied
+  , capConnectedTipByUtxo
   , DisconnectResult(..)
   , bip30ExceptionHeight
   , applyTxInUndo
@@ -5349,6 +5351,117 @@ rewindChainstateToPrefix db inPrefix prefixHeight mSnapBase = go (0 :: Int)
                             [ BatchDelete
                                 (makeKey PrefixBlockHeight (toBE32 h)) ])
                           go (n + 1)
+
+-- | Does the UTXO set hold the spendable coinbase outputs of the block at
+-- height @h@ (hash @bh@), stamped with height @h@?
+--
+-- A coinbase output cannot be spent until COINBASE_MATURITY (100) blocks
+-- later, so for any block within 100 of the true UTXO tip "every spendable
+-- coinbase output is present at height h" holds IFF that block's UTXO
+-- effects were applied.  This is evidence read from the coin set itself,
+-- unlike the per-block undo record, which survives a wipe / snapshot
+-- re-bootstrap / disconnect and therefore proves nothing about the
+-- CURRENT coin set (mainnet 2026-10-01: undo records left by the
+-- pre-re-bootstrap chain made the boot reconciliation re-stamp the tip
+-- from 961631 forward to 966500 over an un-applied 4,869-block gap).
+--
+-- @Nothing@ = inconclusive (no body on disk, or no spendable coinbase
+-- output to probe); callers must fail closed on it.
+coinbaseApplied :: HaskoinDB -> Word32 -> BlockHash -> IO (Maybe Bool)
+coinbaseApplied db h bh = do
+  mBlk <- getBlock db bh
+  case mBlk of
+    Nothing -> return Nothing
+    Just blk -> case blockTxns blk of
+      [] -> return Nothing
+      (cb : _) -> do
+        let cbid = computeTxId cb
+            outs = [ OutPoint cbid (fromIntegral i)
+                   | (i, o) <- zip [(0 :: Int) ..] (txOutputs cb)
+                   , not (isUnspendable (txOutScript o)) ]
+        if null outs
+          then return Nothing
+          else do
+            found <- mapM (getUTXOCoin db) outs
+            return $ Just $ all (\mc -> case mc of
+                                         Just c  -> coinHeight c == h
+                                         Nothing -> False) found
+
+-- | Boot-reconciliation guard: never move the connected tip FORWARD past
+-- blocks whose UTXO effects are not in the coin set.
+--
+-- The boot reconciliation (app/Main.hs "Chainstate reconciliation")
+-- estimates the connected tip @t@ as the top of the contiguous run of
+-- per-block undo records along the active-chain height index.  That is a
+-- sound recovery for a best-block pointer that fell BEHIND the coin set
+-- (the W162 genesis-reset incident), but an undo record is not proof that
+-- the CURRENT coin set contains the block: 'wipeChainstate'
+-- (-reindex-chainstate), the assumeutxo import, and every disconnect leave
+-- undo records behind.  So a forward re-stamp must be proven:
+--
+--   * @t@ proven applied ('coinbaseApplied' = Just True) -> @Right (t, 0)@.
+--   * not proven, and the persisted pointer resolves on the active chain
+--     at height @b < t@ whose own coinbase IS proven (or @b@ is 0) -> the
+--     undo records for heights @b+1 .. t@ are stale: delete them (so this
+--     and every later boot sees the honest tip) and return @Right (b, n)@.
+--   * otherwise -> @Left@: the node must refuse to start rather than
+--     resume from a tip it cannot justify.
+--
+-- When @t <= b@ (estimate at or below the pointer) this guard does not
+-- apply and returns @Right (t, 0)@ unchanged; backward moves are the
+-- business of 'rewindChainstateToPrefix'.
+--
+-- Core analogue: the chainstate's own best-block (CCoinsViewDB::GetBestBlock)
+-- is authoritative; ReplayBlocks only rolls FORWARD across blocks named by
+-- the coins-view head markers (validation.cpp ReplayBlocks), never across
+-- blocks merely present in rev*.dat.
+capConnectedTipByUtxo
+  :: HaskoinDB
+  -> (Word32 -> IO (Maybe BlockHash))  -- ^ active-chain hash at height
+  -> Maybe Word32  -- ^ height of the persisted best-block pointer, when it
+                   --   resolves to a block on the active chain
+  -> Word32        -- ^ undo-record estimate of the connected tip
+  -> IO (Either String (Word32, Int))
+capConnectedTipByUtxo db hashAt mBestH t
+  | t == 0 = return (Right (0, 0))
+  | Just b <- mBestH, t <= b = return (Right (t, 0))
+  | otherwise = do
+      mT <- hashAt t
+      proofT <- maybe (return Nothing) (coinbaseApplied db t) mT
+      case proofT of
+        Just True -> return (Right (t, 0))
+        _ -> case mBestH of
+          Nothing -> return $ Left $
+            "undo records claim a connected tip at height " <> show t
+            <> " but its coinbase outputs are not in the UTXO set, and the "
+            <> "persisted best-block pointer does not resolve on the active "
+            <> "chain — cannot determine the UTXO-set height; repair offline "
+            <> "or reindex"
+          Just b -> do
+            proofB <- if b == 0
+                        then return (Just True)
+                        else do
+                          mB <- hashAt b
+                          maybe (return Nothing) (coinbaseApplied db b) mB
+            case proofB of
+              Just True -> do
+                purged <- foldM (\n h -> do
+                                    mh <- hashAt h
+                                    case mh of
+                                      Nothing -> return n
+                                      Just hh -> do
+                                        e <- getUndoData db hh
+                                        case e of
+                                          Nothing -> return n
+                                          Just _  -> deleteUndoData db hh
+                                                       >> return (n + 1))
+                                 (0 :: Int) [b + 1 .. t]
+                return (Right (b, purged))
+              _ -> return $ Left $
+                "undo records claim a connected tip at height " <> show t
+                <> " and the persisted best-block pointer says " <> show b
+                <> ", but the UTXO set proves NEITHER (coinbase outputs "
+                <> "absent) — refusing to guess; repair offline or reindex"
 
 --------------------------------------------------------------------------------
 -- Pure Batch Builders — Pattern D Multi-Block Atomicity

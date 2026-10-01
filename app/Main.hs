@@ -1368,7 +1368,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               Nothing -> do
                 mUnsafe <- lookupEnv "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
                 return (mUnsafe >>= (readMaybe :: String -> Maybe Word32))
-    connectedTipHeight <-
+    undoTipEstimate <-
       case mSnapshotBaseHeight of
         -- Snapshot-bootstrapped chainstate: undo records (if any) start
         -- at baseHeight+1.  The connected tip is at least baseHeight —
@@ -1426,6 +1426,43 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               if not oneConnected
                 then return 0
                 else findConnectedTip 1 headerTipHeight
+    -- FORWARD-MOVE GUARD (2026-10-01 mainnet 961631 -> 966500 incident).
+    -- An undo record proves a block was connected into SOME coin set, not
+    -- into THIS one: -reindex-chainstate / --load-snapshot (before the
+    -- 'purgeUndoRecords' fix) and every disconnect leave them behind.  So
+    -- the estimate may only move the tip FORWARD of the persisted pointer
+    -- when the coin set itself proves it ('capConnectedTipByUtxo':
+    -- the estimated tip's immature coinbase outputs are present).  An
+    -- unproven forward move keeps the pointer and purges the stale undo
+    -- records above it; an unprovable state refuses to start.
+    connectedTipHeight <- do
+      mBestNow <- getBestBlockHash db
+      entriesNow <- readTVarIO (hcEntries hc)
+      mBestH <- case mBestNow of
+        Nothing -> return Nothing
+        Just bh -> case Map.lookup bh entriesNow of
+          Nothing -> return Nothing
+          Just ce -> do
+            -- Only an ACTIVE-chain pointer is a usable floor.
+            mRow <- if ceHeight ce == 0
+                      then return (Just bh)
+                      else getBlockHeight db (ceHeight ce)
+            return $ if mRow == Just bh || ceHeight ce == 0
+                       then Just (ceHeight ce) else Nothing
+      capped <- capConnectedTipByUtxo db (getBlockHeight db) mBestH undoTipEstimate
+      case capped of
+        Left err -> do
+          putStrLn $ "FATAL: chainstate reconciliation: " ++ err
+          exitWith (ExitFailure 1)
+        Right (h, purged) -> do
+          when (h /= undoTipEstimate) $
+            putStrLn $ "Chainstate reconciliation: undo records claim a "
+                    ++ "connected tip at height " ++ show undoTipEstimate
+                    ++ " but the UTXO set does not contain it; keeping the "
+                    ++ "persisted best-block at height " ++ show h
+                    ++ " and purging " ++ show purged
+                    ++ " stale undo record(s) above it."
+          return h
     -- Repair the best-block pointer so it names the true connected tip.
     -- This is the recovery: a genesis-stuck (or otherwise stale)
     -- @PrefixBestBlock@ is re-pointed at the block whose UTXO mutations

@@ -430,9 +430,32 @@ test-suite reload-rewind-test
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- Boot reconciliation must never move the tip forward over blocks whose
+-- UTXO effects are not applied (mainnet 961631 -> 966500, 2026-10-01).
+test-suite reconcile-forward-test
+  type:          exitcode-stdio-1.0
+  main-is:       ReconcileForwardTest.hs
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , bytestring
+               , containers
+               , directory
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 executable db-breakdown
   main-is:         DbBreakdown.hs
   hs-source-dirs:  tools-measure
   build-depends:   base, bytestring, haskoin
+  default-language: Haskell2010
+  ghc-options:     -O2
+
+-- Offline repair: re-stamp a best-block pointer that was moved forward over
+-- un-applied blocks, and purge the stale undo records above it.
+executable reconcile-repair
+  main-is:         ReconcileRepair.hs
+  hs-source-dirs:  tools-measure
+  build-depends:   base, bytestring, cereal, haskoin
   default-language: Haskell2010
   ghc-options:     -O2
