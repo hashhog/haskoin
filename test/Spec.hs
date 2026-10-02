@@ -18802,6 +18802,78 @@ main = hspec $ do
             other -> expectationFailure
               ("expected ExitFailure 1 on blockhash collision, got " ++ show other)
 
+    -- campaign-910k: an entry IDENTICAL to a built-in row (the real
+    -- soak-910000 fixture == Core's hardcoded 910000 anchor) is a
+    -- confirmation; a DIFFERENT commitment at the same height still refuses.
+    let soak910Json hs ntx =
+          "[{\"height\":910000,\"blockhash\":\"0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821\""
+          ++ ",\"hash_serialized\":\"" ++ hs ++ "\""
+          ++ ",\"m_chain_tx_count\":" ++ show (ntx :: Integer)
+          ++ ",\"base_mtp\":1755159732"
+          ++ ",\"chainwork\":\"0000000000000000000000000000000000000000da15bcbf68ad7fed795c504f\"}]"
+        soak910Hash = "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
+        expectRefusal net json what =
+          withSystemTempDirectory "haskoin-campaign-910k" $ \dir ->
+            withCampaignEnv Nothing $ do
+              let path = dir </> "campaign.json"
+              writeFile path json
+              setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path
+              r <- try (loadCampaignAssumeutxoFromEnv net)
+                     :: IO (Either ExitCode Network)
+              case r of
+                Left (ExitFailure 1) -> pure ()
+                other -> expectationFailure
+                  ("expected ExitFailure 1 on " ++ what ++ ", got " ++ show other)
+
+    it "entry IDENTICAL to the built-in 910000 row (soak-910000): accepted, table unchanged" $
+      withSystemTempDirectory "haskoin-campaign-910k" $ \dir ->
+        withCampaignEnv Nothing $ do
+          let path = dir </> "campaign.json"
+          writeFile path (soak910Json soak910Hash 1226586151)
+          setEnv "HASHHOG_CAMPAIGN_ASSUMEUTXO" path
+          r <- try (loadCampaignAssumeutxoFromEnv mainnet)
+                 :: IO (Either ExitCode Network)
+          case r of
+            Right net' -> do
+              -- The built-in already covers it: nothing appended, no second
+              -- row at 910000, built-in commitment intact.
+              netAssumeUtxo net' `shouldBe` netAssumeUtxo mainnet
+              length (filter ((== 910000) . fst) (netAssumeUtxo net')) `shouldBe` 1
+            Left e -> expectationFailure
+              ("identical entry must be accepted as a confirmation, got " ++ show e)
+
+    it "the on-disk soak-910000 campaign-entry.json (when present) is accepted on mainnet" $ do
+      let real = "/home/work/hashhog/tools/boundary-blocks/soak-910000/campaign-entry.json"
+      present <- Dir.doesFileExist real
+      when present $ withCampaignEnv (Just real) $ do
+        r <- try (loadCampaignAssumeutxoFromEnv mainnet)
+               :: IO (Either ExitCode Network)
+        case r of
+          Right net' -> netAssumeUtxo net' `shouldBe` netAssumeUtxo mainnet
+          Left e -> expectationFailure ("real soak-910000 fixture refused: " ++ show e)
+
+    it "different hash_serialized at built-in height 910000: refuses to start" $
+      expectRefusal mainnet (soak910Json (replicate 63 '4' ++ "5") 1226586151)
+        "a differing hash_serialized at 910000"
+
+    it "different m_chain_tx_count at built-in height 910000: refuses to start" $
+      expectRefusal mainnet (soak910Json soak910Hash 1226586152)
+        "a differing m_chain_tx_count at 910000"
+
+    it "built-in 910000 blockhash at ANOTHER height: refuses to start" $
+      expectRefusal mainnet
+        ("[{\"height\":910001,\"blockhash\":\"0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821\""
+         ++ ",\"hash_serialized\":\"" ++ soak910Hash ++ "\",\"m_chain_tx_count\":1226586151}]")
+        "the built-in blockhash at another height"
+
+    it "duplicate height inside the campaign file: refuses to start" $
+      expectRefusal mainnet
+        ("[{\"height\":123456,\"blockhash\":\"" ++ replicate 64 'a'
+         ++ "\",\"hash_serialized\":\"" ++ replicate 64 'b' ++ "\",\"m_chain_tx_count\":1}"
+         ++ ",{\"height\":123456,\"blockhash\":\"" ++ replicate 64 'c'
+         ++ "\",\"hash_serialized\":\"" ++ replicate 64 'd' ++ "\",\"m_chain_tx_count\":2}]")
+        "an in-file duplicate height"
+
     it "invalid JSON: refuses to start" $
       withSystemTempDirectory "haskoin-campaign-badjson" $ \dir ->
         withCampaignEnv Nothing $ do

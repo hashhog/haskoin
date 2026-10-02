@@ -285,6 +285,7 @@ module Haskoin.Consensus
   , CampaignAssumeutxoEntry(..)
   , campaignEntryToParams
   , loadCampaignAssumeutxoFromEnv
+  , classifyCampaignEntries
     -- * Block Invalidation (invalidateblock/reconsiderblock RPCs)
   , InvalidateError(..)
   , invalidateBlock
@@ -667,12 +668,62 @@ campaignEntryToParams CampaignAssumeutxoEntry{..}
   where
     isHex64 s = length s == 64 && all isHexDigit s
 
+-- | Classify validated campaign entries against the network's existing
+-- assumeutxo table. Returns @(fresh, confirmed)@: @fresh@ entries are new
+-- heights to append; @confirmed@ entries are IDENTICAL to an existing row.
+--
+-- Refuses ('Left') on:
+--
+--   * a duplicate inside the campaign file itself (same height OR blockhash),
+--     checked before any comparison with the table;
+--   * an entry at an existing height whose blockhash, hash_serialized or
+--     m_chain_tx_count differs from that row -- campaign data may never
+--     override a production hash (Core: an m_assumeutxo_data row is keyed by
+--     height and the snapshot is gated on its hash_serialized);
+--   * an existing row's blockhash at a DIFFERENT height.
+--
+-- The one non-refusal: an entry whose whole commitment (height, blockhash,
+-- hash_serialized, m_chain_tx_count) equals an existing row is a second
+-- source agreeing with the first, not an override. R4's rung at 910,000 was
+-- minted by dumping a Core clone there and equals Core's own hardcoded
+-- anchor; refusing it blocked the slice 910000-920000. Such an entry is not
+-- appended (the built-in row already covers it). 'AssumeUtxoParams' carries
+-- only those four fields, so there is no supplemental ancestry to merge --
+-- the schema's base_mtp/base_header/chainwork keys are not read here.
+classifyCampaignEntries :: [(Word32, AssumeUtxoParams)]
+                        -> [AssumeUtxoParams]
+                        -> Either String ([AssumeUtxoParams], [AssumeUtxoParams])
+classifyCampaignEntries existing params = do
+  let dupInFile (i, p) = any
+        (\q -> aupHeight q == aupHeight p || aupBlockHash q == aupBlockHash p)
+        (take i params)
+  forM_ (zip [0 :: Int ..] params) $ \ip@(_, p) ->
+    when (dupInFile ip) $
+      Left ("campaign entry height=" ++ show (aupHeight p)
+            ++ " duplicates an earlier entry in the same campaign file"
+            ++ " -- refusing to start")
+  parts <- forM params $ \p ->
+    case [ q | (_, q) <- existing
+             , aupHeight q == aupHeight p || aupBlockHash q == aupBlockHash p ] of
+      [] -> Right (Left p)
+      qs | all (== p) qs -> Right (Right p)
+         | otherwise ->
+             Left ("campaign entry height=" ++ show (aupHeight p)
+                   ++ " collides with a built-in/already-loaded assumeutxo entry"
+                   ++ " for this network (blockhash/hash_serialized/m_chain_tx_count"
+                   ++ " differ from the existing row, or its blockhash sits at"
+                   ++ " another height) -- refusing to start (campaign data may"
+                   ++ " never override a production hash)")
+  return ([ p | Left p <- parts ], [ p | Right p <- parts ])
+
 -- | Read @HASHHOG_CAMPAIGN_ASSUMEUTXO@ exactly once and, if set to a
 -- non-empty path, parse + validate its JSON array and append every entry to
 -- @net@'s 'netAssumeUtxo' allowlist. Refuses to start (@exitWith
--- (ExitFailure 1)@) on any parse error or on a collision (same height OR
--- same block hash) with a built-in entry for this network — campaign data
--- may never override a production hash. Emits the greppable
+-- (ExitFailure 1)@) on any parse error, an in-file duplicate, or a collision
+-- (same height OR same block hash) with a built-in entry for this network
+-- whose commitment differs — campaign data may never override a production
+-- hash. An entry IDENTICAL to a built-in row is accepted as a confirmation
+-- and not appended (see 'classifyCampaignEntries'). Emits the greppable
 -- @[CAMPAIGN-ASSUMEUTXO] loaded N entries from \<path\> heights=[...]@ banner
 -- on stderr on success.
 --
@@ -706,21 +757,21 @@ loadCampaignAssumeutxoFromEnv net = do
             Right p  -> return p
 
           let existing = netAssumeUtxo net
-              collides p = any
-                (\(_, q) -> aupHeight q == aupHeight p || aupBlockHash q == aupBlockHash p)
-                existing
-          forM_ params $ \p ->
-            when (collides p) $
-              fail_ ("campaign entry height=" ++ show (aupHeight p)
-                     ++ " collides with a built-in/already-loaded assumeutxo entry"
-                     ++ " for this network — refusing to start (campaign data"
-                     ++ " may never override a production hash)")
+          (fresh, confirmed) <- either fail_ return
+                                  (classifyCampaignEntries existing params)
+          forM_ confirmed $ \p ->
+            hPutStrLn stderr
+              ("[CAMPAIGN-ASSUMEUTXO] entry height=" ++ show (aupHeight p)
+               ++ " is IDENTICAL to the existing assumeutxo commitment"
+               ++ " (blockhash, hash_serialized, m_chain_tx_count) -- accepted"
+               ++ " as a confirmation; built-in row kept, nothing appended")
 
-          let merged  = existing ++ [ (aupHeight p, p) | p <- params ]
+          let merged  = existing ++ [ (aupHeight p, p) | p <- fresh ]
               heights = map aupHeight params
           hPutStrLn stderr
             ("[CAMPAIGN-ASSUMEUTXO] loaded " ++ show (length params)
-             ++ " entries from " ++ path ++ " heights=" ++ show heights)
+             ++ " entries from " ++ path ++ " heights=" ++ show heights
+             ++ " (confirming existing: " ++ show (map aupHeight confirmed) ++ ")")
           return net { netAssumeUtxo = merged }
 
 --------------------------------------------------------------------------------
