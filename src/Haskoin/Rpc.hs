@@ -29,6 +29,7 @@ module Haskoin.Rpc
   , defaultRpcConfig
   , startRpcServer
   , stopRpcServer
+  , requestNodeShutdown
     -- * Regtest miner helpers (exported for testing)
   , generateSingleBlock
   , buildRegtestCoinbase
@@ -344,6 +345,7 @@ import qualified Crypto.Random as CryptoRandom
 import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, doesDirectoryExist, listDirectory, getFileSize, copyFile)
 import System.FilePath ((</>), isRelative, takeDirectory)
 import System.Posix.Files (setFileMode)
+import System.Posix.Signals (raiseSignal, sigTERM)
 import System.IO (hSetEncoding, hPutStr, hPutStrLn, stderr, utf8, withFile, IOMode(..))
 import System.IO.Unsafe (unsafePerformIO)
 import Foreign.C (CDouble(..), CInt(..), CChar)
@@ -13952,8 +13954,18 @@ handleGetNetTotals _server = do
 -- and do not sleep — a caller-supplied wait must not pin an RPC thread.
 -- Returns:
 --   "Bitcoin server stopping"
+-- | Ask the node to shut down through the SIGTERM path: after a short delay
+-- (so the caller's RPC reply is written first) raise SIGTERM in our own
+-- process. app/Main.hs installs the sigTERM handler that fills shutdownVar,
+-- so RPC @stop@ and an operator's @kill -TERM@ run one identical shutdown
+-- sequence (stopRpcServer, final flush, closeDB, 30 s watchdog).
+requestNodeShutdown :: IO ()
+requestNodeShutdown = void $ forkIO $ do
+  threadDelay 100000  -- 100ms: let the "stopping" reply reach the client
+  raiseSignal sigTERM
+
 handleStop :: RpcServer -> Value -> IO RpcResponse
-handleStop server params =
+handleStop _server params =
   case rawParamAt params 0 of
     Just (Number _) -> doStop
     Just _ -> return $ rpcFail rpcTypeError
@@ -13961,16 +13973,11 @@ handleStop server params =
     Nothing -> doStop
   where
     doStop = do
-      -- Signal shutdown (stop the RPC server thread)
-      mTid <- readTVarIO (rsThread server)
-      case mTid of
-        Just tid -> do
-          -- Kill the server thread (will stop accepting new connections)
-          forkIO $ do
-            threadDelay 100000  -- 100ms delay to allow response to be sent
-            killThread tid
-          return ()
-        Nothing -> return ()
+      -- Core rpc/server.cpp stop -> StartShutdown(): the process exits via
+      -- the same path as SIGTERM. Before gate 5 this only killThread'd the
+      -- RPC server thread, so main's shutdownVar was never filled and the
+      -- node kept running (no flush, no clean exit).
+      requestNodeShutdown
       -- Return the standard message immediately
       return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
 

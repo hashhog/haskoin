@@ -31,6 +31,11 @@ import Data.List (isInfixOf)
 import System.Directory (doesFileExist, removeFile, getTemporaryDirectory)
 import System.FilePath ((</>))
 import Control.Exception (try, SomeException)
+import Control.Concurrent.MVar (newEmptyMVar, tryPutMVar, takeMVar)
+import Control.Monad (void)
+import System.Posix.Signals (installHandler, sigTERM, Handler(..))
+import System.Timeout (timeout)
+import qualified Haskoin.Rpc as Rpc
 
 import qualified Haskoin.Daemon as Daemon
 
@@ -101,18 +106,25 @@ spec = describe "W124 — Operator experience (haskoin)" $ do
       -- tooling that scrapes "Aborted" / coredumpctl never fires.
       ("Shutdown watchdog: forcing exit after 30s" `isInfixOf` src) `shouldBe` True
 
-    it "G6 (PARTIAL): `stop` RPC kills the RPC thread but does not satisfy main shutdownVar" $ do
+    it "G6 (FIXED, gate 5): `stop` RPC goes through the SIGTERM shutdown path" $ do
       src <- rpcHs
-      -- Rpc.hs:7601-7615.  handleStop only killThread's the
-      -- internal RPC thread; it never raiseSignal sigTERM /
-      -- tryPutMVar shutdownVar.  Net effect: the JSON-RPC client
-      -- gets "Bitcoin server stopping" but the process keeps
-      -- running (no mempool/UTXO flush, no anchors.json save, no
-      -- pidfile removal).  Operator runs `bitcoin-cli stop`,
-      -- believes the node is down, then notices --rpcport is still
-      -- bound on the next restart.  BUG-2 P1.
-      ("killThread tid" `isInfixOf` src) `shouldBe` True
-      ("raiseSignal"    `isInfixOf` src) `shouldBe` False
+      -- handleStop used to only killThread the RPC server thread, so
+      -- main's shutdownVar was never filled and the node kept running
+      -- (crash-restart-harness: rpc-stop-ignored). It now calls
+      -- requestNodeShutdown, which raises SIGTERM in-process.
+      ("requestNodeShutdown" `isInfixOf` src) `shouldBe` True
+      ("raiseSignal sigTERM" `isInfixOf` src) `shouldBe` True
+
+    it "G6b: requestNodeShutdown delivers SIGTERM to the installed handler" $ do
+      -- Behavioural: install a sigTERM handler exactly like app/Main.hs
+      -- (tryPutMVar shutdownVar), call the helper handleStop uses, and the
+      -- handler must fire. Restore the previous handler afterwards.
+      fired <- newEmptyMVar
+      old <- installHandler sigTERM (Catch $ void $ tryPutMVar fired ()) Nothing
+      Rpc.requestNodeShutdown
+      got <- timeout 5000000 (takeMVar fired)
+      _ <- installHandler sigTERM old Nothing
+      got `shouldBe` Just ()
 
 
   ------------------------------------------------------------------
