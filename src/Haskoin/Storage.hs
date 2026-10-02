@@ -148,6 +148,8 @@ module Haskoin.Storage
   , getUTXOCount
     -- * Chainstate reset (for -reindex-chainstate)
   , wipeChainstate
+  , finishChainstateWipe
+  , getChainstateWipeInProgress
   , purgeUndoRecords
     -- * Utilities
   , toBE32
@@ -2173,8 +2175,23 @@ purgeUndoRecords db = do
   flushBatch
   readIORef countRef
 
+--
+-- CRASH SAFETY (2026-10-01, tools/crash-restart-repro/
+-- haskoin-reindex-wipe-window.py).  The wipe is many committed batches,
+-- one prefix at a time, and the coin set ('PrefixUTXO') goes BEFORE the
+-- best-block pointer.  A SIGKILL in between left the old tip pointer
+-- (150) over an empty coin set; the next plain boot trusted it and
+-- rejected the valid block 151 (bad-txns-inputs-missingorspent).  Core
+-- has no such window because -reindex-chainstate destroys the whole
+-- coins LevelDB at open.  Here the wipe is bracketed by a durable marker
+-- ('prefixChainstateWipeInProgress'), synced BEFORE the first delete and
+-- cleared only by 'finishChainstateWipe' once the genesis pointer is
+-- re-stamped.  app/Main.hs re-runs the wipe on any boot that finds it set,
+-- so an interrupted wipe always completes; it can never be resumed from.
 wipeChainstate :: HaskoinDB -> IO Int
 wipeChainstate db = do
+  putChainstateWipeInProgress db
+  syncFlush db
   totalRef <- newIORef (0 :: Int)
   -- A wipe supersedes any interrupted snapshot import (the rebuild that
   -- follows starts from genesis), so drop the in-progress flag too.  Made
@@ -4356,3 +4373,37 @@ getSnapshotImportInProgress db =
 clearSnapshotImportInProgress :: HaskoinDB -> IO ()
 clearSnapshotImportInProgress db =
   R.delete (dbHandle db) (dbWriteOpts db) (BS.singleton prefixSnapshotImportInProgress)
+
+-- | Single-byte key that exists ONLY while a -reindex-chainstate wipe is
+-- incomplete: set + synced by 'wipeChainstate' before it deletes anything,
+-- cleared by 'finishChainstateWipe' after the genesis pointer is stamped.
+-- If it is present at startup the coin set, tx-index and best-block
+-- pointer are in an arbitrary partially-deleted state, and app/Main.hs
+-- redoes the wipe + replay instead of booting from them.
+prefixChainstateWipeInProgress :: Word8
+prefixChainstateWipeInProgress = 0x0E
+
+putChainstateWipeInProgress :: HaskoinDB -> IO ()
+putChainstateWipeInProgress db =
+  R.put (dbHandle db) (dbWriteOpts db)
+        (BS.singleton prefixChainstateWipeInProgress) (BS.singleton 1)
+
+-- | Was a -reindex-chainstate wipe interrupted before it completed?
+getChainstateWipeInProgress :: HaskoinDB -> IO Bool
+getChainstateWipeInProgress db =
+  maybe False (const True)
+    <$> R.get (dbHandle db) (dbReadOpts db) (BS.singleton prefixChainstateWipeInProgress)
+
+-- | Complete a wipe: pin the best-block pointer and height index to
+-- genesis (the replay starts from there), clear the in-progress marker,
+-- and make all of it durable.  The pointer write and the marker delete go
+-- in ONE batch, so no crash can leave the marker cleared with a missing
+-- or stale pointer.
+finishChainstateWipe :: HaskoinDB -> BlockHash -> IO ()
+finishChainstateWipe db genesisHash = do
+  writeBatch db $ WriteBatch
+    [ BatchPut (makeKey PrefixBestBlock BS.empty) (encode genesisHash)
+    , BatchPut (makeKey PrefixBlockHeight (toBE32 0)) (encode genesisHash)
+    , BatchDelete (BS.singleton prefixChainstateWipeInProgress)
+    ]
+  syncFlush db

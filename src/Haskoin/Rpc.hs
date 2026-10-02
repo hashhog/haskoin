@@ -254,6 +254,13 @@ module Haskoin.Rpc
   , handleImportMempool
   , handleScanTxOutSet
   , handleDecodeScript
+    -- * Script classification (exported for P2AScriptClassifySpec)
+  , scriptTypeToString
+  , scriptToAddress
+  , psbtSpkEnc
+  , witnessV1PlusAddressToScript
+  , scriptToAsm
+  , scriptToAsmPartial
   , handleCombinePsbt
   , handleSubmitPackage
   , handleCreateMultisig
@@ -348,7 +355,7 @@ import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddress,
                         Address(..), PubKey(..), serializePubKeyCompressed,
                         base58Check, base58CheckDecode,
-                        bech32Encode, bech32mEncode, derivePubKey,
+                        bech32Encode, bech32mEncode, bech32Decode, derivePubKey,
                         SecKey(..), hash160, sha256, parsePubKey,
                         signMessage, recoverMessagePubKey,
                         addressToText)
@@ -417,7 +424,8 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            verifyDbUndoSuffix, VerifyDbResult(..),
                            readScriptChecksTotal)
 import Haskoin.Script (decodeScript, classifyOutput, ScriptType(..), Script(..),
-                        ScriptOp(..), encodeScriptOps)
+                        ScriptOp(..), encodeScriptOps, p2aWitnessProgram,
+                        decodeScriptNum)
 -- BIP-157/158 helpers for the REST blockfilter / blockfilterheaders
 -- handlers.  We compute filters on-demand from the stored block + undo
 -- payload (Phase-1 BIP-157 ships the helpers but no chain-connect
@@ -6244,6 +6252,28 @@ handleValidateAddress server params = do
       (toJSON $ RpcError rpcInvalidParams "Missing address") Null
     Just addr ->
       case textToAddress addr of
+        -- Pay-to-Anchor / WITNESS_UNKNOWN: valid destinations in Core
+        -- (key_io.cpp DecodeDestination) that the wallet 'Address' type does
+        -- not carry.  DescribeAddressVisitor (rpc/util.cpp): PayToAnchor ->
+        -- isscript+iswitness; WitnessUnknown -> iswitness, witness_version,
+        -- witness_program.
+        Nothing | Just spk <- witnessV1PlusAddressToScript (rsNetwork server) addr -> do
+          let ver    = fromIntegral (BS.index spk 0) - 0x50 :: Int
+              prog   = BS.drop 2 spk
+              detail
+                | ver == 1 && prog == p2aWitnessProgram =
+                    pair "isscript"  (AE.bool True) <>
+                    pair "iswitness" (AE.bool True)
+                | otherwise =
+                    pair "iswitness"       (AE.bool True) <>
+                    pair "witness_version" (AE.int ver)   <>
+                    pair "witness_program" (text (TE.decodeUtf8 (B16.encode prog)))
+              enc = pairs $
+                      pair "isvalid"      (AE.bool True) <>
+                      pair "address"      (text (T.toLower addr)) <>
+                      pair "scriptPubKey" (text (TE.decodeUtf8 (B16.encode spk))) <>
+                      detail
+          return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
         -- Invalid: Core pushKV order is isvalid, error_locations, error
         -- (rpc/output_script.cpp validateaddress, ret.pushKV after detail).
         Nothing -> do
@@ -7132,15 +7162,40 @@ psbtSpkEnc net script =
       asmStr   = scriptToAsm script
       hexStr   = TE.decodeUtf8 (B16.encode script)
       mAddress = scriptToAddress net script scriptType
-      -- Core suppresses "address" for pubkey / multisig / nulldata / nonstandard
-      suppressAddr = case scriptType of
-        P2PK _      -> True
-        P2MultiSig _ _ -> True
-        OpReturn _  -> True
-        NonStandard -> True
-        _           -> False
-      -- BIP-380 descriptor: rawtr(KEY)#csum for P2TR, addr(<address>)#<csum> or raw(<hex>)#<csum>
-      descStr = case scriptType of
+      suppressAddr = spkSuppressAddress scriptType
+      descStr  = inferSpkDescriptor net script
+  in pairs $
+       pair "asm"  (text asmStr) <>
+       pair "desc" (text descStr) <>
+       pair "hex"  (text hexStr) <>
+       ( case mAddress of
+           Just addr | not suppressAddr -> pair "address" (text addr)
+           _                            -> mempty
+       ) <>
+       pair "type" (text typeStr)
+
+-- | Core suppresses "address" for pubkey / multisig / nulldata / nonstandard.
+spkSuppressAddress :: ScriptType -> Bool
+spkSuppressAddress scriptType = case scriptType of
+  P2PK _         -> True
+  P2MultiSig _ _ -> True
+  OpReturn _     -> True
+  NonStandard    -> True
+  _              -> False
+
+-- | Core InferDescriptor(script, empty provider)->ToString() as far as
+-- haskoin models it: rawtr(KEY)#csum for P2TR, addr(<address>)#csum when
+-- the script has an address (incl. P2A / witness_unknown), raw(<hex>)#csum
+-- otherwise.  Shared by every scriptPubKey renderer and scantxoutset.
+inferSpkDescriptor :: Network -> ByteString -> Text
+inferSpkDescriptor net script =
+  let scriptType = case decodeScript script of
+        Right s -> classifyOutput s
+        Left _  -> NonStandard
+      hexStr   = TE.decodeUtf8 (B16.encode script)
+      mAddress = scriptToAddress net script scriptType
+      suppressAddr = spkSuppressAddress scriptType
+  in case scriptType of
         P2TR (Hash256 h) ->
           -- Core uses rawtr(X-ONLY-KEY)#CHECKSUM when spending data is unavailable.
           -- Reference: bitcoin-core/src/script/descriptor.cpp InferDescriptor line 2796.
@@ -7154,15 +7209,6 @@ psbtSpkEnc net script =
           _ ->
             fromMaybe ("raw(" <> hexStr <> ")") $
               addDescriptorChecksum ("raw(" <> hexStr <> ")")
-  in pairs $
-       pair "asm"  (text asmStr) <>
-       pair "desc" (text descStr) <>
-       pair "hex"  (text hexStr) <>
-       ( case mAddress of
-           Just addr | not suppressAddr -> pair "address" (text addr)
-           _                            -> mempty
-       ) <>
-       pair "type" (text typeStr)
 
 -- | Build a PSBT tx-level vin Encoding entry.
 -- Emits { "txid", "vout", "scriptSig": {"asm","hex"}, "txinwitness"?, "sequence" }.
@@ -9306,6 +9352,7 @@ handleDecodeScript server params = do
                 P2SH _   -> False
                 P2TR _   -> False
                 P2A      -> False
+                WitnessUnknown _ _ -> False   -- Core: WITNESS_UNKNOWN never wrapped
                 OpReturn _ -> False
                 _ -> not isUnspendable && not (hasChecksigAdd scriptBytes)
               -- can_wrap_P2WSH: pubkey/pubkeyhash/nonstandard/multisig only.
@@ -15047,6 +15094,17 @@ txToVerboseJSON server tx txid mBlockHash blockHashArgGiven mTxUndo = do
            pair "scriptPubKey" (psbtSpkEnc (rsNetwork server) scriptHex)
 
 
+-- | ASM token for pushed data, Core ScriptToAsmStr (core_io.cpp): a push of
+-- at most 4 bytes prints as its CScriptNum value (non-minimal accepted,
+-- getint()), anything longer as hex.  So P2A's program push is "29518",
+-- not "4e73" (decodescript 51024e73 -> "1 29518").
+asmPushToken :: ByteString -> Text
+asmPushToken bs
+  | BS.length bs <= 4 = case decodeScriptNum False bs of
+      Right n -> T.pack (show n)
+      Left _  -> TE.decodeUtf8 (B16.encode bs)   -- unreachable for <= 4 bytes
+  | otherwise = TE.decodeUtf8 (B16.encode bs)
+
 -- | Convert script bytes to assembly string representation
 scriptToAsm :: ByteString -> Text
 scriptToAsm scriptBytes =
@@ -15057,7 +15115,7 @@ scriptToAsm scriptBytes =
     opToAsm :: ScriptOp -> Text
     opToAsm op = case op of
       OP_0 -> "0"
-      OP_PUSHDATA bs _ -> TE.decodeUtf8 $ B16.encode bs
+      OP_PUSHDATA bs _ -> asmPushToken bs
       OP_1NEGATE -> "-1"
       OP_RESERVED -> "OP_RESERVED"
       OP_1 -> "1"
@@ -15165,6 +15223,11 @@ scriptToAsm scriptBytes =
       OP_NOP8 -> "OP_NOP8"
       OP_NOP9 -> "OP_NOP9"
       OP_NOP10 -> "OP_NOP10"
+      -- Core GetOpName(OP_CHECKSIGADD).  Was missing: the non-exhaustive
+      -- case threw lazily inside the response encoder (same class as the
+      -- P2A gettxout drop), so any script holding a 0xba byte as an opcode
+      -- dropped the connection of every RPC that renders its asm.
+      OP_CHECKSIGADD -> "OP_CHECKSIGADD"
       OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
 
 -- | ASM emitter that handles truncated push data by emitting literal "[error]".
@@ -15187,7 +15250,7 @@ scriptToAsmPartial scriptBytes =
     opToAsmPart :: ScriptOp -> Text
     opToAsmPart op = case op of
       OP_0 -> "0"
-      OP_PUSHDATA bs _ -> TE.decodeUtf8 $ B16.encode bs
+      OP_PUSHDATA bs _ -> asmPushToken bs
       OP_1NEGATE -> "-1"
       OP_RESERVED -> "OP_RESERVED"
       OP_1 -> "1" ; OP_2 -> "2" ; OP_3 -> "3" ; OP_4 -> "4"
@@ -15237,6 +15300,11 @@ scriptToAsmPartial scriptBytes =
       OP_NOP4 -> "OP_NOP4" ; OP_NOP5 -> "OP_NOP5" ; OP_NOP6 -> "OP_NOP6"
       OP_NOP7 -> "OP_NOP7" ; OP_NOP8 -> "OP_NOP8" ; OP_NOP9 -> "OP_NOP9"
       OP_NOP10 -> "OP_NOP10"
+      -- Core GetOpName(OP_CHECKSIGADD).  Was missing: the non-exhaustive
+      -- case threw lazily inside the response encoder (same class as the
+      -- P2A gettxout drop), so any script holding a 0xba byte as an opcode
+      -- dropped the connection of every RPC that renders its asm.
+      OP_CHECKSIGADD -> "OP_CHECKSIGADD"
       OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
 
     -- Walk raw bytes, accumulating ASM tokens.
@@ -15256,7 +15324,7 @@ scriptToAsmPartial scriptBytes =
                   in if BS.length rest < n
                      then ["[error]"]   -- truncated
                      else let dat = BS.take n rest
-                          in TE.decodeUtf8 (B16.encode dat) : walkBytes (BS.drop n rest)
+                          in asmPushToken dat : walkBytes (BS.drop n rest)
              else case op of
                0x4c -> -- OP_PUSHDATA1: 1-byte length
                  if BS.null rest
@@ -15265,7 +15333,7 @@ scriptToAsmPartial scriptBytes =
                           rest2 = BS.drop 1 rest
                       in if BS.length rest2 < n
                          then ["[error]"]
-                         else TE.decodeUtf8 (B16.encode (BS.take n rest2))
+                         else asmPushToken (BS.take n rest2)
                               : walkBytes (BS.drop n rest2)
                0x4d -> -- OP_PUSHDATA2: 2-byte LE length
                  if BS.length rest < 2
@@ -15275,7 +15343,7 @@ scriptToAsmPartial scriptBytes =
                           rest2 = BS.drop 2 rest
                       in if BS.length rest2 < n
                          then ["[error]"]
-                         else TE.decodeUtf8 (B16.encode (BS.take n rest2))
+                         else asmPushToken (BS.take n rest2)
                               : walkBytes (BS.drop n rest2)
                0x4e -> -- OP_PUSHDATA4: 4-byte LE length
                  if BS.length rest < 4
@@ -15287,7 +15355,7 @@ scriptToAsmPartial scriptBytes =
                           rest2 = BS.drop 4 rest
                       in if BS.length rest2 < n
                          then ["[error]"]
-                         else TE.decodeUtf8 (B16.encode (BS.take n rest2))
+                         else asmPushToken (BS.take n rest2)
                               : walkBytes (BS.drop n rest2)
                0x4f -> "-1" : walkBytes rest    -- OP_1NEGATE
                0x50 -> "OP_RESERVED" : walkBytes rest
@@ -15423,7 +15491,7 @@ scriptToAsmSighashDecodeTop scriptBytes =
                           then TE.decodeUtf8 (B16.encode bs)
                           else TE.decodeUtf8 (B16.encode payload)
           in hexPart <> suffix
-      | otherwise = TE.decodeUtf8 (B16.encode bs)
+      | otherwise = asmPushToken bs
     opToAsmSH op = scriptToAsm (encodeScriptOps [op])
 
 -- | Build a vin Encoding entry for decoderawtransaction.
@@ -15484,11 +15552,32 @@ scriptTypeToString st = case st of
   P2WPKH _    -> "witness_v0_keyhash"
   P2WSH _     -> "witness_v0_scripthash"
   P2TR _      -> "witness_v1_taproot"
+  -- Core TxoutType::ANCHOR -> "anchor" (script/solver.cpp GetTxnOutputType).
+  -- This case was missing: the non-exhaustive case threw lazily inside the
+  -- response encoder, so gettxout / getrawtransaction / getblock 2 / decode*
+  -- on any P2A output dropped the RPC connection instead of answering.
+  P2A         -> "anchor"
   P2PK _      -> "pubkey"
   P2MultiSig _ _ -> "multisig"
   OpReturn _  -> "nulldata"
   WitnessUnknown _ _ -> "witness_unknown"
   NonStandard -> "nonstandard"
+
+-- | Decode a bech32m witness-v1+ address that the wallet 'Address' type
+-- cannot carry (Pay-to-Anchor, WITNESS_UNKNOWN) into its scriptPubKey
+-- @OP_n <program>@.  Core's DecodeDestination accepts these (key_io.cpp:
+-- PayToAnchor / WitnessUnknown), so @scantxoutset ["addr(bc1pfeessrawgf)"]@
+-- must resolve.  The round-trip re-encode pins the BIP-350 bech32m variant
+-- and canonical (lower-case) form; the HRP must be this network's.
+witnessV1PlusAddressToScript :: Network -> Text -> Maybe ByteString
+witnessV1PlusAddressToScript net t = case bech32Decode t of
+  Just (hrp, ver, prog)
+    | hrp == netBech32Prefix net
+    , ver >= 1, ver <= 16
+    , BS.length prog >= 2, BS.length prog <= 40
+    , bech32mEncode hrp ver prog == T.toLower t ->
+        Just (BS.pack [0x50 + fromIntegral ver, fromIntegral (BS.length prog)] <> prog)
+  _ -> Nothing
 
 -- | Extract address from scriptPubKey based on network and script type
 scriptToAddress :: Network -> ByteString -> ScriptType -> Maybe Text
@@ -15498,6 +15587,12 @@ scriptToAddress net _ scriptType = case scriptType of
   P2WPKH (Hash160 h) -> Just $ bech32Encode (netBech32Prefix net) 0 h
   P2WSH (Hash256 h) -> Just $ bech32Encode (netBech32Prefix net) 0 h
   P2TR (Hash256 h)  -> Just $ bech32mEncode (netBech32Prefix net) 1 h
+  -- Core ExtractDestination: ANCHOR -> PayToAnchor, encoded as the bech32m
+  -- witness v1 program 0x4e73 (bc1pfeessrawgf / bcrt1pfeesnyr2tx).
+  P2A               -> Just $ bech32mEncode (netBech32Prefix net) 1 p2aWitnessProgram
+  -- Core ExtractDestination: WITNESS_UNKNOWN -> WitnessUnknown{version,
+  -- program}, encoded bech32m (addresstype.cpp / key_io.cpp, BIP-350).
+  WitnessUnknown v prog -> Just $ bech32mEncode (netBech32Prefix net) v prog
   _ -> Nothing
   where
     -- Base58Check encoding
@@ -17335,7 +17430,10 @@ handleScanTxOutSet server params = do
             let txout  = coinTxOut coin
                 script = txOutScript txout
             case Map.lookup script targets of
-              Just descTxt -> do
+              Just _queryDesc -> do
+                -- Core reports InferDescriptor(scriptPubKey)->ToString() per
+                -- unspent (rpc/blockchain.cpp scantxoutset), NOT the scan
+                -- object's text: raw(51024e73) -> addr(bcrt1pfeesnyr2tx)#swxgse0y.
                 modifyIORef' sumRef (+ txOutValue txout)
                 -- Resolve the block hash at the coin's height via the
                 -- on-disk height->hash index (same index handleGetBlockHash
@@ -17351,7 +17449,7 @@ handleScanTxOutSet server params = do
                             pair "txid"          (text txidHex)                         <>
                             pair "vout"          (AE.word32 (outPointIndex op))         <>
                             pair "scriptPubKey"  (text hex)                             <>
-                            pair "desc"          (text descTxt)                         <>
+                            pair "desc"          (text (inferSpkDescriptor (rsNetwork srv) script)) <>
                             pair "amount"        (btcAmountEnc sats)                    <>
                             pair "coinbase"      (AE.bool (coinIsCoinbase coin))        <>
                             pair "height"        (AE.word32 (coinHeight coin))          <>
@@ -17392,7 +17490,9 @@ handleScanTxOutSet server params = do
            then let inner = T.drop 5 (T.dropEnd 1 s)
                 in case textToAddress inner of
                      Just a  -> Right [(addressToScript a, "addr(" <> inner <> ")")]
-                     Nothing -> Left ("scantxoutset: invalid address in addr(): " ++ T.unpack inner)
+                     Nothing -> case witnessV1PlusAddressToScript net inner of
+                       Just spk -> Right [(spk, "addr(" <> inner <> ")")]
+                       Nothing  -> Left ("scantxoutset: invalid address in addr(): " ++ T.unpack inner)
          else if "raw(" `T.isPrefixOf` s && ")" `T.isSuffixOf` s
            then let inner = T.drop 4 (T.dropEnd 1 s)
                 in case B16.decode (TE.encodeUtf8 inner) of

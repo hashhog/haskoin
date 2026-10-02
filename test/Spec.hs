@@ -63,7 +63,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          -- UTXO single-key API (for wipeChainstate test)
                          putUTXO, getUTXO, putUTXOCoin, getUTXOCoin,
                          putTxIndex, getTxIndex,
-                         wipeChainstate,
+                         wipeChainstate, finishChainstateWipe, getChainstateWipeInProgress,
                          -- Undo data round-trip (for dumptxoutset rollback)
                          buildSpentUtxoMapFromDB, getUndoData, putUndoData,
                          deleteUndoData, TxInUndo(..), TxUndo(..),
@@ -99,6 +99,8 @@ import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
 import qualified RpcConversionBeforeLookupSpec
+import qualified P2AScriptClassifySpec
+import qualified SubmitBlockValidatedForkSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
 import qualified W102AssumeUTXOSpec
@@ -18449,6 +18451,26 @@ main = hspec $ do
           mPostHt1 <- getBlockHeight db 1
           mPostHt1 `shouldBe` Just childHash
 
+    it "is crash-safe: the in-progress marker brackets the wipe (gate-4, 2026-10-01)" $
+      withSystemTempDirectory "haskoin-wipe-marker" $ \tmpDir -> do
+        bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
+          let genesisHash = BlockHash (Hash256 (BS.replicate 32 1))
+              oldTip      = BlockHash (Hash256 (BS.replicate 32 2))
+              op0 = OutPoint (TxId (Hash256 (BS.replicate 32 0xAA))) 0
+          putBestBlockHash db oldTip
+          putUTXO db op0 (TxOut 1 "spk")
+          getChainstateWipeInProgress db `shouldReturn` False
+          -- wipeChainstate alone = a process killed right after the wipe,
+          -- before the genesis re-pin: the marker MUST still be set, so the
+          -- next boot redoes the wipe instead of trusting what is left.
+          _ <- wipeChainstate db
+          getChainstateWipeInProgress db `shouldReturn` True
+          finishChainstateWipe db genesisHash
+          getChainstateWipeInProgress db `shouldReturn` False
+          getBestBlockHash db `shouldReturn` Just genesisHash
+          getBlockHeight db 0 `shouldReturn` Just genesisHash
+          getUTXO db op0 `shouldReturn` Nothing
+
     it "is idempotent on an already-wiped database" $
       withSystemTempDirectory "haskoin-wipe-test2" $ \tmpDir -> do
         bracket (openDB (defaultDBConfig tmpDir)) closeDB $ \db -> do
@@ -23657,6 +23679,8 @@ main = hspec $ do
   CreateRawTxDropSpec.spec
   RpcIntArgBoundsSpec.spec
   RpcConversionBeforeLookupSpec.spec
+  P2AScriptClassifySpec.spec
+  SubmitBlockValidatedForkSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)
   W126BIP152CompactBlocksSpec.spec

@@ -930,23 +930,37 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- is passed we log that we are downgrading to chainstate-only
     -- and continue. This matches the "honest progress" Cat-F
     -- decision (nimrod c14311d shipped the same scope).
-    let doReindexChainstate = noReindex || noReindexChainstate
+    -- An interrupted wipe (marker set by 'wipeChainstate', cleared by
+    -- 'finishChainstateWipe') leaves the coin set, tx-index and best-block
+    -- pointer partially deleted -- e.g. the old tip pointer over an empty
+    -- coin set (crash-restart harness, 2026-10-01).  Nothing on disk can be
+    -- trusted, so finish the job: redo the wipe and the replay, exactly as
+    -- if -reindex-chainstate had been passed again.
+    wipeInterrupted <- getChainstateWipeInProgress db
+    when (wipeInterrupted && not (noReindex || noReindexChainstate)) $
+      putStrLn $ "[-reindex-chainstate] a previous chainstate wipe was "
+              ++ "interrupted before it completed; the on-disk coin set is "
+              ++ "partial. Redoing the wipe and replay now."
+    let doReindexChainstate = noReindex || noReindexChainstate || wipeInterrupted
     when noReindex $
       putStrLn $ "Note: -reindex ran as -reindex-chainstate "
               ++ "(block-index rebuild from blk*.dat is TODO)."
     when doReindexChainstate $ do
       putStrLn "[-reindex-chainstate] Wiping chainstate (UTXO + tx-index + best-block)..."
+      -- A failed wipe is FATAL: the marker stays set, so the next boot
+      -- retries it.  (It used to be logged and ignored, and the genesis
+      -- re-pin below then ran over whatever the wipe had left.)
       n <- wipeChainstate db
         `catch` (\(e :: SomeException) -> do
-                   putStrLn $ "[-reindex-chainstate] wipe error: " ++ show e
-                   return 0)
+                   putStrLn $ "FATAL: [-reindex-chainstate] wipe error: " ++ show e
+                   exitWith (ExitFailure 1))
       putStrLn $ "[-reindex-chainstate] wiped " ++ show n ++ " keys."
       -- Re-pin best-block to the genesis hash so the rebuild starts
-      -- from height 0 (any pre-existing tip pointer was just wiped).
+      -- from height 0 (any pre-existing tip pointer was just wiped), and
+      -- clear the wipe marker in the same durable batch.
       let genesis     = netGenesisBlock net
           genesisHash = computeBlockHash (blockHeader genesis)
-      putBestBlockHash db genesisHash
-      putBlockHeight db 0 genesisHash
+      finishChainstateWipe db genesisHash
 
     -- Initialize header chain
     hc <- initHeaderChainFromDB db net
@@ -963,7 +977,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               ++ "by replaying blocks 1.." ++ show tipH
       let logEvery = 10000 :: Word32
           replay h
-            | h > tipH = return h
+            | h > tipH = return (h - 1)  -- last height replayed, not the next one
             | otherwise = do
                 mHash <- getBlockHeight db h
                 case mHash of

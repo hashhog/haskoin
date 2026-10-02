@@ -52,7 +52,7 @@ import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
-import Control.Monad (forM, forM_, foldM, void, unless)
+import Control.Monad (forM, forM_, foldM, void, unless, when)
 import Data.List (stripPrefix)
 import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
 import qualified Data.Map.Strict as Map
@@ -73,7 +73,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            txBaseSize, txTotalSize, difficultyAdjustment,
                            checkProofOfWork,
                            medianTimePast, ChainEntry(..), HeaderChain(..),
-                           getValidatedChainTip,
+                           getValidatedChainTip, findForkPoint,
                            addHeader, contextualCheckBlockHeader,
                            addSideBranchHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
@@ -840,24 +840,28 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
   putBlock db bh block
   _sideEntry <- addSideBranchHeader hc header
 
-  -- Step 2: best-chain selection.
+  -- Step 2: best-chain selection against the ACTIVE chain.
   --
-  -- KNOWN REMAINING DIVERGENCE (deliberately out of scope, documented so
-  -- the next reader does not mistake it for the same bug): this reads the
-  -- HEADER tip, not the validated tip, so during headers-ahead-of-blocks a
-  -- genuine side branch that Core would reorg to (more work than
-  -- @m_chain.Tip()@, less than @m_best_header@) still answers
-  -- "inconclusive".  Flipping this alone would not fix that — the reorg it
-  -- would then attempt walks the disconnect list from 'hcTip' via
-  -- 'findSideBranchForkPoint', and the bodies above the validated tip do
-  -- not exist, so 'doSideBranchReorg' would fail and land on the same
-  -- "inconclusive" through the infrastructure-failure arm.  Both reads plus
-  -- the 'hcByHeight' fork-point walk have to move together; that is a
-  -- separate change with its own reorg test matrix.  Unreachable from the
-  -- snapshot-base case this commit fixes: base+1..base+n each extend the
-  -- validated tip and take the active-tip arm.
-  currentTip     <- readTVarIO (hcTip hc)
-  let activeWork = ceChainWork currentTip
+  -- Core ActivateBestChain / FindMostWorkChain compare a candidate with
+  -- @m_chain.Tip()@ -- the validated tip -- never with @m_best_header@.
+  -- This used to read 'hcTip' (haskoin's best HEADER), and the fork-point
+  -- walk below used 'hcByHeight' (the best-header chain) and disconnected
+  -- from 'hcTip'.  Whenever the validated chain and the header chain
+  -- disagree that is wrong in both directions.  The crash-restart harness
+  -- found it (2026-10-01, tools/crash-restart-repro/
+  -- haskoin-reorg-after-reindex-rewind.py): after a -reindex-chainstate
+  -- that was killed mid-replay, the coin set rewinds to ~100 while the
+  -- header chain still names branch B up to 224.  Re-fed A101..A200 extend
+  -- the validated tip (active-tip arm); re-fed B176..B224 were then
+  -- measured against the B224 HEADER, so none could ever win
+  -- ("inconclusive"), and B225 "won" with a fork point of B224 (found in
+  -- hcByHeight), an EMPTY disconnect list, and was connected straight onto
+  -- the A200 coin set -> bad-txns-inputs-missingorspent, valid chain
+  -- rejected.  Now: compare with the validated tip, find the fork as the
+  -- common ancestor of the validated tip and this block
+  -- ('findSideBranchForkPoint'), disconnect from the validated tip.
+  validatedTip <- getValidatedChainTip db hc
+  let activeWork = ceChainWork validatedTip
   if newWork <= activeWork
     then
       -- Side-branch with insufficient work.  BIP-22 / Core convention:
@@ -920,54 +924,48 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
 findSideBranchForkPoint :: HeaderChain -> HaskoinDB -> ChainEntry
                         -> Block -> IO (Either String (BlockHash, [Block], [Block]))
 findSideBranchForkPoint hc db parent newTipBlock = do
-  byHeight <- readTVarIO (hcByHeight hc)
-  entries  <- readTVarIO (hcEntries hc)
-
-  -- Walk back along the side-branch from the new tip's parent
-  -- collecting block bodies until we find a block hash that
-  -- @hcByHeight@ owns at that height — that's the fork point.
-  let go :: BlockHash -> [Block] -> IO (Either String (BlockHash, [Block]))
-      go walkHash acc =
-        case Map.lookup walkHash entries of
-          Nothing ->
-            return $ Left $ "Side-branch ancestor "
-              ++ show walkHash ++ " missing from header index"
-          Just walkEntry ->
-            case Map.lookup (ceHeight walkEntry) byHeight of
-              Just activeAtHeight | activeAtHeight == walkHash ->
-                -- Hit the fork point — walkHash is on the active chain.
-                return $ Right (walkHash, acc)
-              _ -> do
-                -- Not on the active chain at this height; keep walking.
-                mWalkBlk <- getBlock db walkHash
-                case mWalkBlk of
-                  Nothing -> return $ Left $
-                    "Side-branch ancestor body missing: " ++ show walkHash
-                  Just walkBlk ->
-                    case cePrev walkEntry of
-                      Nothing  -> return $ Left
-                        "Side-branch walked past genesis without finding fork"
-                      Just prv -> go prv (walkBlk : acc)
-
-  -- newTipBlock is the deepest side-branch block; its parent
-  -- (passed in as @parent@) is where we start the walk.
-  forkRes <- go (ceHash parent) []
-  case forkRes of
-    Left e -> return (Left e)
-    Right (forkHash, parentChain) ->
-      -- 'parentChain' walks from fork-child .. parent of newTipBlock.
-      -- Append newTipBlock to get the full connect list.
-      let connectList = parentChain ++ [newTipBlock]
-      in do
-        -- Build disconnect list: walk active chain from current tip
-        -- back to (but excluding) forkHash.  Read fresh tip in case
-        -- another thread shifted it (we hold no global lock here, but
-        -- submitblock is serialised at the RPC layer).
-        currentTip <- readTVarIO (hcTip hc)
-        disconnectRes <- buildDisconnectList db (ceHash currentTip) forkHash []
-        case disconnectRes of
-          Left e   -> return (Left e)
-          Right ds -> return $ Right (forkHash, ds, connectList)
+  entries <- readTVarIO (hcEntries hc)
+  -- The chain we are leaving is the VALIDATED chain (PrefixBestBlock),
+  -- not the best-header chain: see 'submitBlockSideBranch' step 2.  The
+  -- fork point is the last common ancestor of the validated tip and the
+  -- new block's parent, found over the hash-keyed index ('cePrev'), never
+  -- over 'hcByHeight', which names the best-HEADER chain and can disagree
+  -- with the coin set (Core: FindFork(m_chain, pindexMostWork)).
+  validatedTip <- getValidatedChainTip db hc
+  mFork <- findForkPoint hc (ceHash validatedTip) (ceHash parent)
+  case mFork of
+    Nothing -> return $ Left $
+      "No common ancestor between validated tip " ++ show (ceHash validatedTip)
+      ++ " and side-branch parent " ++ show (ceHash parent)
+    Just forkCe -> do
+      let forkHash = ceHash forkCe
+          -- Collect side-branch bodies from the new tip's parent back to
+          -- (excluding) the fork, returned fork-child first.
+          go :: BlockHash -> [Block] -> IO (Either String [Block])
+          go walkHash acc
+            | walkHash == forkHash = return (Right acc)
+            | otherwise =
+                case Map.lookup walkHash entries of
+                  Nothing -> return $ Left $ "Side-branch ancestor "
+                    ++ show walkHash ++ " missing from header index"
+                  Just walkEntry -> do
+                    mWalkBlk <- getBlock db walkHash
+                    case mWalkBlk of
+                      Nothing -> return $ Left $
+                        "Side-branch ancestor body missing: " ++ show walkHash
+                      Just walkBlk -> case cePrev walkEntry of
+                        Nothing  -> return $ Left
+                          "Side-branch walked past genesis without finding fork"
+                        Just prv -> go prv (walkBlk : acc)
+      parentChainRes <- go (ceHash parent) []
+      case parentChainRes of
+        Left e -> return (Left e)
+        Right parentChain -> do
+          let connectList = parentChain ++ [newTipBlock]
+          disconnectRes <- buildDisconnectList db (ceHash validatedTip) forkHash []
+          case disconnectRes of
+            Left e   -> return (Left e)
+            Right ds -> return $ Right (forkHash, ds, connectList)
   where
     buildDisconnectList :: HaskoinDB -> BlockHash -> BlockHash -> [Block]
                        -> IO (Either String [Block])
@@ -1038,7 +1036,7 @@ doSideBranchReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
                   -> Block       -- ^ new tip block
                   -> Integer     -- ^ new tip's cumulative work
                   -> IO (Either String ())
-doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
+doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock newWork = do
   forkRes <- findSideBranchForkPoint hc db parent newTipBlock
   case forkRes of
     Left err -> return (Left err)
@@ -1091,7 +1089,17 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
 
                     -- Header chain pointer flip — same shape as the
                     -- pre-Pattern-D dispatcher.
+                    --
+                    -- Only when the new tip is also the best HEADER: the
+                    -- validated chain can now reorg to a branch that is
+                    -- still lighter than a known header chain (headers
+                    -- ahead of bodies, or a -reindex-chainstate rewind),
+                    -- and 'hcTip' / 'hcByHeight' are haskoin's
+                    -- m_best_header chain -- a reorg of the coin set must
+                    -- not drag them backwards.
                     atomically $ do
+                     hdrTip <- readTVar (hcTip hc)
+                     when (newWork > ceChainWork hdrTip) $ do
                       entries <- readTVar (hcEntries hc)
                       forM_ disconnectList $ \blk ->
                         let h = computeBlockHash (blockHeader blk)
@@ -1105,11 +1113,15 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock _newWork = do
                              Just ce -> modifyTVar' (hcByHeight hc)
                                (Map.insert (ceHeight ce) h)
                              Nothing -> return ()
+                      -- The new tip is now the best header: any height
+                      -- above it names a lighter abandoned branch.
+                      modifyTVar' (hcByHeight hc)
+                        (Map.filterWithKey (\k _ -> k <= ceHeight newTipEntry))
                       writeTVar (hcTip hc) newTipEntry
                       writeTVar (hcHeight hc) (ceHeight newTipEntry)
-                      -- Notify wait-family RPC waiters of the tip change.
-                      -- In the same atomically block (lost-wakeup-safe).
-                      bumpTipGen hc
+                     -- Notify wait-family RPC waiters of the tip change.
+                     -- In the same atomically block (lost-wakeup-safe).
+                     bumpTipGen hc
 
                     -- Pattern B — re-admit disconnected non-coinbase
                     -- txs into the mempool against the new tip.  Same
