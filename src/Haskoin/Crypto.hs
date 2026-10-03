@@ -66,6 +66,7 @@ module Haskoin.Crypto
   , Address(..)
   , addressToText
   , textToAddress
+  , anchorWitnessProgram
   , pubKeyToP2PKH
   , pubKeyToP2WPKH
   , scriptToP2SH
@@ -1357,7 +1358,14 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | AnchorAddress                   -- ^ P2A: Bech32m witness v1 program 0x4e73
   deriving (Show, Eq, Ord, Generic)
+
+-- | Pay-to-Anchor witness program (Core ANCHOR_BYTES / addresstype.h).
+-- Singleton: OP_1 OP_PUSHBYTES_2 0x4e73. Kept here so the wallet Address
+-- type can round-trip P2A without importing Haskoin.Script.
+anchorWitnessProgram :: ByteString
+anchorWitnessProgram = BS.pack [0x4e, 0x73]
 
 instance NFData Address
 
@@ -1615,6 +1623,7 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText AnchorAddress = bech32mEncode "bc" 1 anchorWitnessProgram
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1627,10 +1636,11 @@ textToAddress txt
           | BS.length prog == 32 -> Just $ WitnessScriptAddress (Hash256 prog)
         _ -> Nothing
   | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt
-    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
+    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m v1
       case bech32Decode txt of
         Just (_, 1, prog)
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
+          | prog == anchorWitnessProgram -> Just AnchorAddress
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
       case base58CheckDecode txt of

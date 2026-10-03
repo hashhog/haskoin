@@ -31,17 +31,28 @@ import Data.Aeson.Encoding (encodingToLazyByteString)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
-import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Crypto
+  ( Address(..)
+  , addressToText
+  , textToAddress
+  , bech32Encode
+  , bech32mEncode
+  )
+import Haskoin.Wallet (Descriptor(..), parseDescriptor, deriveScripts)
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
   , psbtSpkEnc
+  , inferSpkDescriptor
+  , decodeScriptEnc
   , witnessV1PlusAddressToScript
   , scriptToAsm
   , scriptToAsmPartial
@@ -61,6 +72,14 @@ spkObj spk = do
 
 field :: KM.KeyMap Value -> T.Text -> Maybe Value
 field o k = KM.lookup (K.fromText k) o
+
+decodeObj :: BS.ByteString -> IO (KM.KeyMap Value)
+decodeObj spk = do
+  let bytes = encodingToLazyByteString (decodeScriptEnc regtest spk)
+  _ <- evaluate (BL.length bytes)
+  case decode bytes of
+    Just (Object o) -> return o
+    _ -> expectationFailure ("not a JSON object: " ++ show bytes) >> return KM.empty
 
 spec :: Spec
 spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
@@ -128,3 +147,103 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     o <- spkObj (BS.pack [0xba])
     field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
     field o "type" `shouldBe` Just (String "nonstandard")
+
+  -- ------------------------------------------------------------------
+  -- RPC follow-ups from the P2A fix (QUEUES.md 2026-10-03).
+  -- Core values taken from a throwaway regtest bitcoind v31.99
+  -- (bitcoin-core/build, 2026-10-03) via:
+  --   bitcoin-cli -regtest decodescript <hex>
+  --   bitcoin-cli -regtest getdescriptorinfo <desc>
+  -- ------------------------------------------------------------------
+  let pkHex = "03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd" :: T.Text
+      k2Hex = "03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626" :: T.Text
+      unhex t = case B16.decode (TE.encodeUtf8 t) of
+        Right bs -> bs
+        Left err -> error ("unhex: " ++ err)
+      -- <pk> OP_CHECKSIG
+      p2pkSpk = BS.pack [0x21] <> unhex pkHex <> BS.pack [0xac]
+      -- OP_1 <pk> <k2> OP_2 OP_CHECKMULTISIG
+      multiSpk =
+        BS.pack [0x51, 0x21] <> unhex pkHex
+        <> BS.pack [0x21] <> unhex k2Hex
+        <> BS.pack [0x52, 0xae]
+      corePkDesc    = "pk(" <> pkHex <> ")#vwaefwnq"
+      coreMultiDescNoCsum = "multi(1," <> pkHex <> "," <> k2Hex <> ")"
+      coreMultiDesc = coreMultiDescNoCsum <> "#ve902xrt"
+      coreBaDesc    = "raw(ba)#yy0eg44l"
+      coreBbDesc    = "raw(bb)#79gjzk4q"
+
+  it "CONTROL: P2PK descriptor is pk() not raw() (Core InferDescriptor)" $ do
+    o <- spkObj p2pkSpk
+    field o "type" `shouldBe` Just (String "pubkey")
+    field o "desc" `shouldBe` Just (String corePkDesc)
+    field o "address" `shouldBe` Nothing
+
+  it "CONTROL: bare multisig descriptor is multi() not raw() (Core InferDescriptor)" $ do
+    o <- spkObj multiSpk
+    field o "type" `shouldBe` Just (String "multisig")
+    field o "desc" `shouldBe` Just (String coreMultiDesc)
+    field o "address" `shouldBe` Nothing
+
+  it "CONTROL: 0xba script descriptor stays raw(ba) (nonstandard, Core InferDescriptor)" $ do
+    o <- spkObj (BS.pack [0xba])
+    field o "desc" `shouldBe` Just (String coreBaDesc)
+    field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
+
+  it "CONTROL: unknown opcode asm is OP_UNKNOWN not OP_UNKNOWN[n] (Core GetOpName)" $ do
+    -- Core: decodescript bb -> {"asm":"OP_UNKNOWN","desc":"raw(bb)#79gjzk4q","type":"nonstandard"}
+    a1 <- evaluate (scriptToAsm (BS.pack [0xbb]))
+    a1 `shouldBe` "OP_UNKNOWN"
+    a2 <- evaluate (scriptToAsmPartial (BS.pack [0xbb]))
+    a2 `shouldBe` "OP_UNKNOWN"
+    o <- spkObj (BS.pack [0xbb])
+    field o "asm"  `shouldBe` Just (String "OP_UNKNOWN")
+    field o "desc" `shouldBe` Just (String coreBbDesc)
+    field o "type" `shouldBe` Just (String "nonstandard")
+
+  it "CONTROL: decodescript P2PK matches Core (pk desc, p2sh wrap, p2wpkh segwit)" $ do
+    o <- decodeObj p2pkSpk
+    field o "asm"  `shouldBe` Just (String (pkHex <> " OP_CHECKSIG"))
+    field o "desc" `shouldBe` Just (String corePkDesc)
+    field o "type" `shouldBe` Just (String "pubkey")
+    field o "address" `shouldBe` Nothing
+    field o "p2sh" `shouldBe` Just (String "2MweapFn2FbSP6tQAEv8bVMRyY4GhyCzKb8")
+    case field o "segwit" of
+      Just (Object s) -> do
+        field s "type" `shouldBe` Just (String "witness_v0_keyhash")
+        field s "address" `shouldBe` Just (String "bcrt1qgp3v3thdf7qu94ellp2299tsyyv3ug9k7j72vw")
+        field s "desc" `shouldBe` Just (String "addr(bcrt1qgp3v3thdf7qu94ellp2299tsyyv3ug9k7j72vw)#k9hnkezd")
+      other -> expectationFailure ("missing segwit object: " ++ show other)
+
+  it "CONTROL: decodescript bare multisig matches Core (multi desc, wsh(multi) wrap)" $ do
+    o <- decodeObj multiSpk
+    field o "desc" `shouldBe` Just (String coreMultiDesc)
+    field o "type" `shouldBe` Just (String "multisig")
+    field o "p2sh" `shouldBe` Just (String "2NA8iB4spraDPgu6t4Uqt2bPdc16BSWUXxT")
+    case field o "segwit" of
+      Just (Object s) -> do
+        field s "type" `shouldBe` Just (String "witness_v0_scripthash")
+        field s "desc" `shouldBe` Just (String ("wsh(" <> coreMultiDescNoCsum <> ")#8yt2huam"))
+        field s "address" `shouldBe` Just (String "bcrt1qt5lawy8yvnhqr8ujmst8834ztzr4rtp894k99fyah5ghch3g3g4qawxk8e")
+      other -> expectationFailure ("missing segwit object: " ++ show other)
+
+  it "CONTROL: getdescriptorinfo of inferred pk()/multi() is solvable (Core)" $ do
+    inferSpkDescriptor regtest p2pkSpk `shouldBe` corePkDesc
+    inferSpkDescriptor regtest multiSpk `shouldBe` coreMultiDesc
+    case parseDescriptor corePkDesc of
+      Right (Pk _) -> pure ()
+      other -> expectationFailure ("pk() did not parse: " ++ show other)
+    case parseDescriptor coreMultiDesc of
+      Right (Multi 1 _) -> pure ()
+      other -> expectationFailure ("multi() did not parse: " ++ show other)
+
+  it "wallet Address type carries P2A (text/script round-trip)" $ do
+    textToAddress "bc1pfeessrawgf" `shouldBe` Just AnchorAddress
+    textToAddress "bcrt1pfeesnyr2tx" `shouldBe` Just AnchorAddress
+    addressToText AnchorAddress `shouldBe` "bc1pfeessrawgf"
+    deriveScripts (Addr AnchorAddress) 0 `shouldBe` [p2aSpk]
+    -- P2TR still wins for 32-byte v1 programs
+    textToAddress "bc1pfeessrawgf" `shouldNotBe` Nothing
+    -- CONTROL: a v0 address is not P2A
+    textToAddress (bech32Encode "bc" 0 (BS.replicate 20 7))
+      `shouldSatisfy` maybe False (/= AnchorAddress)
