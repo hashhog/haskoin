@@ -100,6 +100,7 @@ import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
 import qualified RpcConversionBeforeLookupSpec
 import qualified P2AScriptClassifySpec
+import qualified WitnessProgramCanonicalSpec
 import qualified SubmitBlockValidatedForkSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
@@ -23752,6 +23753,7 @@ main = hspec $ do
   RpcIntArgBoundsSpec.spec
   RpcConversionBeforeLookupSpec.spec
   P2AScriptClassifySpec.spec
+  WitnessProgramCanonicalSpec.spec
   SubmitBlockValidatedForkSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)

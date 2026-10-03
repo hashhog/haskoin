@@ -373,7 +373,7 @@ import Haskoin.Crypto (doubleSHA256, sha256, computeTxId, computeBlockHash,
 import Haskoin.Script (decodeScript, countScriptSigops, countSigopsBytes,
                        ScriptVerifyFlag(..), ScriptFlags, flagSet,
                        verifyScriptWithFlags, isPushOnly, classifyOutput,
-                       ScriptType(..), Script(..), ScriptOp(..))
+                       isWitnessProgram, ScriptType(..), Script(..), ScriptOp(..))
 import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         makeKey, KeyPrefix(..), prefixByte, toBE32, TxLocation(..),
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
@@ -3055,45 +3055,48 @@ getWitnessSigOpCost tx utxoMap flags
            Just prevOut -> countWitnessSigOps (txInScript inp) (txOutScript prevOut) witness
 
 -- | Count witness sigops for a single input.
--- Reference: Bitcoin Core CountWitnessSigOps() in interpreter.cpp
+-- Faithful port of Bitcoin Core CountWitnessSigOps / WitnessSigOps
+-- (script/interpreter.cpp:2139, :2122).  Witness-program detection MUST be
+-- Core's byte-exact CScript::IsWitnessProgram ('isWitnessProgram': version
+-- opcode + ONE DIRECT push of 2-40 bytes).  This used to go through
+-- 'classifyOutput', which accepted any push encoding, so a spend of
+-- `OP_0 OP_PUSHDATA1 <20>` (a plain legacy script to Core) cost 1 witness
+-- sigop here and 0 in Core: a block at exactly MAX_BLOCK_SIGOPS_COST under
+-- Core's count was rejected bad-blk-sigops (consensus split; diff-test corpus
+-- sigops-witness-noncanonical).
 countWitnessSigOps :: ByteString -> ByteString -> [ByteString] -> Int
 countWitnessSigOps scriptSigBytes scriptPubKeyBytes witness =
   case decodeScript scriptPubKeyBytes of
-    Right scriptPubKey ->
-      case classifyOutput scriptPubKey of
-        -- Direct witness output (P2WPKH or P2WSH)
-        P2WPKH _ -> 1  -- P2WPKH always counts as 1 sigop
-        P2WSH _ ->
-          -- For P2WSH, count sigops in the witness script (last witness item).
-          -- Use countSigopsBytes so that a malformed witness script contributes
-          -- its partial prefix count (not 0), matching Core CountWitnessSigOps.
-          if null witness
-          then 0
-          else countSigopsBytes (last witness) True
-        -- P2SH-wrapped witness (P2SH-P2WPKH or P2SH-P2WSH)
-        P2SH _ ->
-          -- Check if this is a P2SH-wrapped witness program
-          case getRedeemScript scriptSigBytes of
-            Just redeemScriptBytes ->
-              case decodeScript redeemScriptBytes of
-                Right redeemScript ->
-                  case classifyOutput redeemScript of
-                    P2WPKH _ -> 1  -- P2SH-P2WPKH counts as 1
-                    P2WSH _ ->
-                      -- Same partial-count fix for the witness script in
-                      -- P2SH-P2WSH: byte-walk, don't short-circuit on failure.
-                      if null witness
-                      then 0
-                      else countSigopsBytes (last witness) True
-                    _ -> 0  -- Not a witness program
-                Left _ -> 0
-            Nothing -> 0
-        -- Taproot (witness v1) - sigop counting is different (budget-based)
-        -- For now, return 0 as tapscript uses a different model
-        P2TR _ -> 0
-        -- Other script types have no witness sigops
-        _ -> 0
     Left _ -> 0
+    Right scriptPubKey ->
+      case isWitnessProgram scriptPubKey of
+        Just (ver, prog) -> witnessSigOps ver prog
+        Nothing ->
+          -- Core: scriptPubKey.IsPayToScriptHash() && scriptSig.IsPushOnly()
+          -- -> the last pushed item, re-tested with IsWitnessProgram.
+          case classifyOutput scriptPubKey of
+            P2SH _ ->
+              case getRedeemScript scriptSigBytes of
+                Just redeemScriptBytes ->
+                  case decodeScript redeemScriptBytes of
+                    Right redeemScript ->
+                      case isWitnessProgram redeemScript of
+                        Just (ver, prog) -> witnessSigOps ver prog
+                        Nothing -> 0
+                    Left _ -> 0
+                Nothing -> 0
+            _ -> 0
+  where
+    -- Core WitnessSigOps: v0 keyhash = 1; v0 scripthash = accurate count of
+    -- the witnessScript (last stack item, byte-walked so a malformed script
+    -- keeps its partial count); every other version/size = 0 (tapscript is
+    -- budget-based, not counted here).
+    witnessSigOps :: Int -> ByteString -> Int
+    witnessSigOps 0 prog
+      | BS.length prog == 20 = 1
+      | BS.length prog == 32 = if null witness then 0
+                               else countSigopsBytes (last witness) True
+    witnessSigOps _ _ = 0
 
 -- | Compute total sigop cost for a block.
 getBlockSigOpCost :: Block -> Map OutPoint TxOut -> ConsensusFlags -> SigOpCost

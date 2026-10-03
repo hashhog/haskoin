@@ -717,8 +717,16 @@ data ScriptType
 -- | Classify an output script
 classifyOutput :: Script -> ScriptType
 classifyOutput (Script ops) = case ops of
+  -- Every template below requires DIRECT pushes (OPCODE), as Core's Solver
+  -- does: MatchPayToPubkeyHash checks script[2] == 20, MatchPayToPubkey
+  -- script[0] == 33/65, and IsWitnessProgram (script.cpp:249) byte[1]+2 ==
+  -- size.  An OP_PUSHDATA1/2/4 encoding of the same bytes is NONSTANDARD in
+  -- Core.  This is not just policy: countWitnessSigOps used to consult this
+  -- function, so `OP_0 OP_PUSHDATA1 <20>` cost 1 witness sigop here and 0 in
+  -- Core -> false bad-blk-sigops (diff-test sigops-witness-noncanonical).
+
   -- P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
-  [OP_DUP, OP_HASH160, OP_PUSHDATA h _, OP_EQUALVERIFY, OP_CHECKSIG]
+  [OP_DUP, OP_HASH160, OP_PUSHDATA h OPCODE, OP_EQUALVERIFY, OP_CHECKSIG]
     | BS.length h == 20 -> P2PKH (Hash160 h)
 
   -- P2SH: OP_HASH160 <20> OP_EQUAL
@@ -728,24 +736,24 @@ classifyOutput (Script ops) = case ops of
     | BS.length h == 20 -> P2SH (Hash160 h)
 
   -- P2WPKH: OP_0 <20>
-  [OP_0, OP_PUSHDATA h _]
+  [OP_0, OP_PUSHDATA h OPCODE]
     | BS.length h == 20 -> P2WPKH (Hash160 h)
 
   -- P2WSH: OP_0 <32>
-  [OP_0, OP_PUSHDATA h _]
+  [OP_0, OP_PUSHDATA h OPCODE]
     | BS.length h == 32 -> P2WSH (Hash256 h)
 
   -- P2TR: OP_1 <32>
-  [OP_1, OP_PUSHDATA h _]
+  [OP_1, OP_PUSHDATA h OPCODE]
     | BS.length h == 32 -> P2TR (Hash256 h)
 
   -- P2A (Pay-to-Anchor): OP_1 <0x4e73> (witness v1, 2-byte program)
   -- Anyone-can-spend anchor output for Lightning Network commitment transactions
-  [OP_1, OP_PUSHDATA h _]
+  [OP_1, OP_PUSHDATA h OPCODE]
     | h == p2aWitnessProgram -> P2A
 
   -- P2PK: <pubkey> OP_CHECKSIG
-  [OP_PUSHDATA pk _, OP_CHECKSIG]
+  [OP_PUSHDATA pk OPCODE, OP_CHECKSIG]
     | BS.length pk `elem` [33, 65] -> P2PK pk
 
   -- OP_RETURN
