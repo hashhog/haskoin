@@ -1357,6 +1357,7 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | AnchorAddress                   -- ^ P2A:    Bech32m witness v1 program 0x4e73
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1608,6 +1609,11 @@ bech32Decode addr =
 -- Address Encoding/Decoding
 --------------------------------------------------------------------------------
 
+-- | Pay-to-Anchor witness program (BIP-352 / Bitcoin Core pay-to-anchor).
+-- Hardcoded here: Haskoin.Script imports Crypto, so Crypto cannot import it.
+p2aProgram :: ByteString
+p2aProgram = BS.pack [0x4e, 0x73]
+
 -- | Convert an Address to its text representation
 addressToText :: Address -> Text
 addressToText (PubKeyAddress h) = base58Check 0x00 (getHash160 h)
@@ -1615,6 +1621,7 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText AnchorAddress = bech32mEncode "bc" 1 p2aProgram
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1629,8 +1636,14 @@ textToAddress txt
   | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt
     || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
       case bech32Decode txt of
-        Just (_, 1, prog)
+        Just (hrp, 1, prog)
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
+          -- Pay-to-Anchor is witness v1 program 0x4e73 (BIP-350 bech32m only).
+          -- Re-encoding rejects a bech32 (not bech32m) checksum. P2TR above
+          -- is unchanged: a 32-byte v1 program is still accepted on either
+          -- checksum, matching the previous decoder.
+          | prog == p2aProgram
+          , bech32mEncode hrp 1 prog == txtLower -> Just AnchorAddress
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
       case base58CheckDecode txt of

@@ -37,7 +37,7 @@ import qualified Data.Text as T
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
-import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Crypto (bech32Encode, bech32mEncode, textToAddress, addressToText, Address(..))
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
@@ -128,3 +128,38 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     o <- spkObj (BS.pack [0xba])
     field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
     field o "type" `shouldBe` Just (String "nonstandard")
+
+  it "asm matches Core GetOpName: OP_UNKNOWN, OP_INVALIDOPCODE, truncated 0xba" $ do
+    -- decodescript babb / ff / ba4c against regtest Core.
+    scriptToAsmPartial (BS.pack [0xba, 0xbb]) `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+    scriptToAsmPartial (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+    scriptToAsmPartial (BS.pack [0xba, 0x4c]) `shouldBe` "OP_CHECKSIGADD [error]"
+    scriptToAsm (BS.pack [0xba, 0xbb]) `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+    scriptToAsm (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+
+  it "InferDescriptor emits pk() / multi(), not raw(), for P2PK and bare multisig" $ do
+    let pk1 = BS.pack
+          [ 0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0
+          , 0x62, 0x95, 0xce, 0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d
+          , 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b, 0x16, 0xf8, 0x17, 0x98 ]
+        pk2 = BS.pack
+          [ 0x02, 0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45
+          , 0x40, 0x6e, 0x95, 0xc0, 0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b, 0x8c
+          , 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c, 0x70, 0x9e, 0xe5 ]
+        p2pk = BS.cons 0x21 pk1 <> BS.pack [0xac]
+        multi = BS.pack [0x51, 0x21] <> pk1 <> BS.pack [0x21] <> pk2 <> BS.pack [0x52, 0xae]
+    opk <- spkObj p2pk
+    field opk "desc" `shouldBe` Just (String
+      "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7")
+    field opk "type" `shouldBe` Just (String "pubkey")
+    om <- spkObj multi
+    field om "desc" `shouldBe` Just (String
+      "multi(1,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#l5sy3u48")
+    field om "type" `shouldBe` Just (String "multisig")
+
+  it "textToAddress accepts the P2A address and rejects a bech32 checksum" $ do
+    textToAddress "bcrt1pfeesnyr2tx" `shouldBe` Just AnchorAddress
+    textToAddress "bc1pfeessrawgf" `shouldBe` Just AnchorAddress
+    addressToText AnchorAddress `shouldBe` "bc1pfeessrawgf"
+    textToAddress (bech32Encode "bcrt" 1 p2aWitnessProgram) `shouldBe` Nothing
+    textToAddress (bech32mEncode "bcrt" 1 p2aWitnessProgram) `shouldBe` Just AnchorAddress
