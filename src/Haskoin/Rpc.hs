@@ -244,6 +244,10 @@ module Haskoin.Rpc
   , addnodeHelpText
   , handleGetNetTotals
   , handleGetNetworkHashPS
+  , handleGetBlockTemplate
+  , handleTestMempoolAccept
+  , coreNetworkHashPS
+  , arithGetDouble
   , CoreArgType(..)
   , coreArgTypeCheck
     -- * T2 R5 probe handlers (exported for testing)
@@ -378,7 +382,7 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            -- Right on success/already-known and Left
                            -- "Unknown previous block: ..." / reject-reason on
                            -- failure. (Core: ProcessNewBlockHeaders.)
-                           addHeader,
+                           addHeader, headerWork,
                            invalidateBlock, reconsiderBlock, InvalidateError(..),
                            preciousBlock, PreciousError(..),
                            Deployment(..), taprootDeployment,
@@ -5271,12 +5275,59 @@ computeGbtDeploymentStatus namedDeps entries tip =
 -- Parameters:
 --   template_request (optional): object with mode, capabilities, rules
 handleGetBlockTemplate :: RpcServer -> Value -> IO RpcResponse
-handleGetBlockTemplate server params = do
-  -- Parse template request parameters
-  let modeParam = extractTemplateMode params
-  case modeParam of
-    Just "proposal" -> handleBlockProposal server params
-    _ -> handleTemplateRequest server
+handleGetBlockTemplate server params
+  -- Core RPCHelpMan: template_request is a required object.
+  | Just typeErr <- coreArgTypeCheck
+      [Just ("template_request", CArgObj, True)] params
+  = return typeErr
+  | otherwise =
+  case gbtRequestCheck params of
+    Left err         -> return err
+    Right "proposal" -> handleBlockProposal server params
+    Right _          -> handleTemplateRequest server
+
+-- | Core rpc/mining.cpp getblocktemplate request parsing (:715-760, :849-857),
+-- in Core's order, for everything that does not need chain state:
+--
+--   mode neither a string nor null          -> -8 "Invalid mode"
+--   mode == "proposal"                      -> proposal path (rules unread)
+--   a non-string entry in an array "rules"  -> -3 get_str type error
+--   mode not "template" (and not proposal)  -> -8 "Invalid mode"
+--   "segwit" not among the rules            -> -8 "getblocktemplate must be
+--                                              called with the segwit rule set
+--                                              (call with {"rules": ["segwit"]})"
+--
+-- Haskoin read only mode=="proposal" and served a template for anything
+-- else, so a client without segwit support was handed a segwit template.
+-- (Core's not-connected / initial-download refusals, which sit between the
+-- mode and the segwit checks on non-test chains, are not implemented here.)
+gbtRequestCheck :: Value -> Either RpcResponse Text
+gbtRequestCheck params = do
+  let fail' c m = Left (RpcResponse Null (toJSON $ RpcError c m) Null)
+      obj = case params of
+        Array arr | not (V.null arr), Object o <- V.head arr -> o
+        _ -> KM.empty
+  mode <- case KM.lookup "mode" obj of
+    Nothing         -> Right "template"
+    Just Null       -> Right "template"
+    Just (String m) -> Right m
+    Just _          -> fail' rpcInvalidParameter "Invalid mode"
+  if mode == "proposal"
+    then Right mode
+    else do
+      rules <- case KM.lookup "rules" obj of
+        Just (Array rs) -> mapM (\r -> case r of
+          String t -> Right t
+          v -> fail' rpcTypeError ("JSON value of type " <> jsonTypeName v
+                                   <> " is not of expected type string"))
+          (V.toList rs)
+        _ -> Right []
+      if mode /= "template"
+        then fail' rpcInvalidParameter "Invalid mode"
+        else if "segwit" `notElem` rules
+          then fail' rpcInvalidParameter
+            "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+          else Right mode
 
 -- | Handle standard "template" mode for getblocktemplate
 handleTemplateRequest :: RpcServer -> IO RpcResponse
@@ -9464,8 +9515,49 @@ handleDecodeScript server params = do
 --   maxfeerate (optional): Reject if fee rate exceeds this (default: 0.10 BTC/kvB)
 -- Returns:
 --   Array of {txid, wtxid, allowed, vsize, fees, reject-reason}
+-- | Core rpc/mempool.cpp testmempoolaccept (:319-336): the batch is
+-- checked and EVERY rawtx decoded before any mempool work, and a failure is
+-- an RPC error for the whole call, not an allowed:false row:
+--
+--   size < 1 or > MAX_PACKAGE_COUNT (25) -> -8  "Array must contain between 1
+--                                              and 25 transactions."
+--   a non-string element (get_str)       -> -3  "JSON value of type <t> is not
+--                                              of expected type string"
+--   !DecodeHexTx                         -> -22 "TX decode failed: <hex> Make
+--                                              sure the tx has at least one input."
+--
+-- Haskoin used to answer an undecodable hex with a success response carrying
+-- {"allowed":false,"reject-reason":"TX decode failed"}.
+testMempoolAcceptInputError :: V.Vector Value -> Maybe RpcResponse
+testMempoolAcceptInputError txArray
+  | V.length txArray < 1 || V.length txArray > 25 =
+      Just $ fail' rpcInvalidParameter
+        "Array must contain between 1 and 25 transactions."
+  | otherwise = listToMaybe (mapMaybe checkRaw (V.toList txArray))
+  where
+    fail' c m = RpcResponse Null (toJSON $ RpcError c m) Null
+    checkRaw (String hexTx) =
+      let decodes = case B16.decode (TE.encodeUtf8 hexTx) of
+            Right txBytes | not (BS.null txBytes) ->
+              either (const False) (const True) (decodeTxWithFallback txBytes)
+            _ -> False
+      in if decodes then Nothing
+         else Just $ fail' rpcDeserializationError
+                ("TX decode failed: " <> hexTx
+                  <> " Make sure the tx has at least one input.")
+    checkRaw v = Just $ fail' rpcTypeError
+      ("JSON value of type " <> jsonTypeName v
+        <> " is not of expected type string")
+
 handleTestMempoolAccept :: RpcServer -> Value -> IO RpcResponse
-handleTestMempoolAccept server params = do
+handleTestMempoolAccept server params
+  -- Core RPCHelpMan: rawtxs is a required array (-3 before the body runs).
+  | Just typeErr <- coreArgTypeCheck [Just ("rawtxs", CArgArr, True)] params
+  = return typeErr
+  | Just txArray <- extractParamArray params 0
+  , Just err <- testMempoolAcceptInputError txArray
+  = return err
+  | otherwise =
   case extractParamArray params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing rawtxs parameter") Null
@@ -17680,36 +17772,63 @@ parseScanBlocksObject net v = case v of
 -- getnetworkhashps().HandleRequest(request), not a hardcoded 0) share one
 -- implementation. `reqHeight` and `nblocks` are already-resolved heights.
 estimateNetworkHashPS :: RpcServer -> Int -> Int -> IO Double
-estimateNetworkHashPS server nblocks reqHeight =
-  if reqHeight < 1
-    then return 0.0
-    else do
-      let startH = fromIntegral $ max 0 (reqHeight - nblocks)
-          endH   = fromIntegral reqHeight
-      mTopHash <- getBlockHeight (rsDB server) endH
-      mBotHash <- getBlockHeight (rsDB server) startH
-      case (mTopHash, mBotHash) of
-        (Just topHash, Just botHash) -> do
-          mTopHdr <- getBlockHeader (rsDB server) topHash
-          mBotHdr <- getBlockHeader (rsDB server) botHash
-          case (mTopHdr, mBotHdr) of
-            (Just topHdr, Just botHdr) -> do
-              let timeDiff = fromIntegral (bhTimestamp topHdr) - fromIntegral (bhTimestamp botHdr) :: Integer
-              if timeDiff <= 0
-                then return 0.0
-                else do
-                  -- Get chainwork from in-memory header chain entries
-                  entries <- readTVarIO (hcEntries (rsHeaderChain server))
-                  let lookupWork bh = maybe 0 ceChainWork (Map.lookup bh entries)
-                      workTop  = lookupWork topHash
-                      workBot  = lookupWork botHash
-                      workDiff = workTop - workBot
-                  let hashps = if workDiff > 0
-                        then workDiff `div` timeDiff
-                        else fromIntegral (endH - fromIntegral startH) * 4294967296 `div` timeDiff
-                  return (fromIntegral hashps :: Double)
-            _ -> return 0.0
-        _ -> return 0.0
+estimateNetworkHashPS server nblocks reqHeight
+  -- Core: `if (pb == nullptr || !pb->nHeight) return 0`.
+  | reqHeight < 1 = return 0.0
+  | otherwise = do
+      -- Core walks pb0 back `lookup` (= nblocks, already clamped to the
+      -- height) steps from pb: heights [startH .. reqHeight], genesis
+      -- included when the window reaches it.
+      let startH = max 0 (reqHeight - nblocks)
+          fetch h = do
+            mh <- getBlockHeight (rsDB server) (fromIntegral h)
+            case mh of
+              Nothing -> return Nothing
+              Just bh -> fmap (\hdr -> (bh, hdr)) <$> getBlockHeader (rsDB server) bh
+      window <- mapM fetch [reqHeight, reqHeight - 1 .. startH]
+      case sequence window of
+        Nothing -> return 0.0
+        Just [] -> return 0.0
+        Just ws@((topHash, _) : _) -> do
+          let (botHash, _) = last ws
+              times = map (fromIntegral . bhTimestamp . snd) ws
+          entries <- readTVarIO (hcEntries (rsHeaderChain server))
+          let workDiff = case ( Map.lookup topHash entries
+                              , Map.lookup botHash entries ) of
+                (Just t, Just b) -> ceChainWork t - ceChainWork b
+                -- No chainwork entry for one end: the difference is by
+                -- definition the summed work of the blocks in (pb0, pb].
+                _ -> sum (map (headerWork . snd) (init ws))
+          return (coreNetworkHashPS times workDiff)
+
+-- | Core rpc/mining.cpp GetNetworkHashPS arithmetic (:89-104), given the
+-- block times of the window pb..pb0 and the chainwork difference: min/max
+-- time over the WHOLE window (block times are not monotonic), 0 when
+-- minTime == maxTime, else workDiff.getdouble() / (maxTime - minTime).
+--
+-- The previous body used only the two endpoint timestamps and Integer
+-- `div`, so any rate below 1 H/s -- a regtest/testnet window reaching the
+-- 2011 genesis timestamp, work ~2e2 over ~5e8 s -- came back as 0.
+coreNetworkHashPS :: [Integer] -> Integer -> Double
+coreNetworkHashPS [] _ = 0
+coreNetworkHashPS times workDiff
+  | minT == maxT = 0
+  | otherwise    = arithGetDouble workDiff / fromIntegral (maxT - minT)
+  where
+    minT = minimum times
+    maxT = maximum times
+
+-- | arith_uint256::getdouble (Core arith_uint256.cpp): the eight 32-bit
+-- limbs least-significant first, each scaled by 2^(32*i), with Core's
+-- per-step double rounding.
+arithGetDouble :: Integer -> Double
+arithGetDouble v = go 0 1 (0 :: Int)
+  where
+    go !acc !fact i
+      | i >= 8    = acc
+      | otherwise =
+          let limb = fromIntegral ((v `shiftR` (32 * i)) .&. 0xffffffff) :: Double
+          in go (acc + fact * limb) (fact * 4294967296) (i + 1)
 
 -- | getnetworkhashps ( nblocks height ): estimate network hash rate.
 --

@@ -22,7 +22,9 @@
 module R5ErrCodeParitySpec (spec) where
 
 import Test.Hspec
-import Control.Concurrent.STM (newTVarIO)
+import Control.Concurrent.STM (newTVarIO, atomically, modifyTVar', writeTVar)
+import Control.Monad (forM_, when)
+import Data.Scientific (toRealFloat)
 import Control.Exception (bracket)
 import Data.Aeson (Value(..), toJSON, decode)
 import qualified Data.Aeson.KeyMap as KM
@@ -32,14 +34,16 @@ import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Scientific (toBoundedInteger)
 import qualified Data.Text as T
+import qualified Data.Vector as V
 import qualified Data.Text.Encoding as TE
 import System.Directory (removeDirectoryRecursive, getTemporaryDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (createTempDirectory)
 
-import Haskoin.Consensus (regtest, initHeaderChain, Network(..))
+import Haskoin.Consensus (regtest, initHeaderChain, Network(..), HeaderChain(..)
+                         , ChainEntry(..), BlockStatus(..), headerWork)
 import Haskoin.Crypto (computeBlockHash)
-import Haskoin.Types (Block(..))
+import Haskoin.Types (Block(..), BlockHeader(..))
 import Haskoin.FeeEstimator (newFeeEstimator)
 import Haskoin.Mempool (newMempool, defaultMempoolConfig)
 import Haskoin.Network
@@ -48,13 +52,16 @@ import Haskoin.Network
   )
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Storage
-  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, putBlock )
+  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, putBlock
+  , putBlockHeader, putBlockHeight )
 import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Rpc
   ( RpcResponse(..), RpcServer(..), RpcConfig(..), defaultRpcConfig
   , handleGetMempoolEntry, handleGetMempoolAncestors, handleGetMempoolDescendants
   , handleGetBlockStats, handleAddNode, addnodeHelpText
   , handleGetNetTotals, handleGetNetworkHashPS
+  , handleGetBlockTemplate, handleTestMempoolAccept
+  , coreNetworkHashPS, arithGetDouble
   )
 
 noServer :: a
@@ -256,3 +263,140 @@ spec = describe "r5_errcode" $ do
           resError resp `shouldBe` Null
           resResult resp `shouldBe` Number 0)
           [[], [120 :: Int], [-1], [120, 0], [120, -1]]
+
+  -- getnetworkhashps VALUE parity (Core rpc/mining.cpp GetNetworkHashPS
+  -- :65-104).  A deterministic 110-block regtest chain: block h has
+  -- time = 1296688602 + 600*h + (h*7919 mod 300), every block (genesis too)
+  -- bits 0x207fffff so chainwork(h) = 2*(h+1).  The expected values were read
+  -- from a scratch regtest Core v31.99 that mined exactly this chain under
+  -- setmocktime (2026-10-04).  Before the fix every row answered 0: Integer
+  -- `div` of ~2e2 work by ~6e4 s, endpoint times only.
+  describe "r5_value getnetworkhashps == Core on a regtest chain" $ do
+    let modes = [ ("chainwork from the header chain", True)
+                , ("chainwork summed from the window's bits", False) ]
+    forM_ modes $ \(modeName, withEntries) ->
+      it (modeName ++ ": 12 Core vectors + height 0") $ withLiveServer $ \srv -> do
+        plantRegtestChain srv withEntries
+        forM_ coreHashPSVectors $ \(nb, ht, want) -> do
+          resp <- handleGetNetworkHashPS srv (toJSON [nb, ht :: Int])
+          resError resp `shouldBe` Null
+          case resResult resp of
+            Number n -> do
+              let got = toRealFloat n :: Double
+              when (abs (got - want) > 1e-15 * want) $
+                expectationFailure ("getnetworkhashps " ++ show nb ++ " " ++ show ht
+                  ++ ": got " ++ show got ++ ", Core " ++ show want)
+            v -> expectationFailure ("expected a number, got " ++ show v)
+        resp0 <- handleGetNetworkHashPS srv (toJSON [120, 0 :: Int])
+        resResult resp0 `shouldBe` Number 0
+    it "coreNetworkHashPS: min/max over the window, 0 when minTime == maxTime" $ do
+      coreNetworkHashPS [100, 50, 400, 200] 700 `shouldBe` 2.0
+      coreNetworkHashPS [7, 7, 7] 10 `shouldBe` 0
+    it "arithGetDouble is Core's limb-wise getdouble" $ do
+      arithGetDouble 222 `shouldBe` 222
+      arithGetDouble (2 ^ (200 :: Int) + 12345) `shouldBe` 2 ** 200
+
+  -- getblocktemplate request checks (Core rpc/mining.cpp :715-760, :855).
+  -- Every expected (code, message) captured from a regtest bitcoind v31.99.
+  describe "r5_errcode getblocktemplate" $ do
+    let segwitMsg = "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+        gbt v = handleGetBlockTemplate noServer (Array (V.fromList [v]))
+        obj kvs = Object (KM.fromList kvs)
+    it "no segwit rule is -8 (empty request)" $
+      gbt (obj []) >>= errorOf >>= (`shouldBe` (-8, segwitMsg))
+    it "no segwit rule is -8 (rules lacks segwit; rules not an array)" $ do
+      gbt (obj [("rules", toJSON ["csv" :: T.Text])]) >>= errorOf >>= (`shouldBe` (-8, segwitMsg))
+      gbt (obj [("rules", String "segwit")]) >>= errorOf >>= (`shouldBe` (-8, segwitMsg))
+    it "a non-string rule is -3 get_str" $
+      gbt (obj [("rules", toJSON [1 :: Int])]) >>= errorOf >>= (`shouldBe`
+        (-3, "JSON value of type number is not of expected type string"))
+    it "a non-string mode, or an unknown mode, is -8 Invalid mode" $ do
+      gbt (obj [("mode", Number 1)]) >>= errorOf >>= (`shouldBe` (-8, "Invalid mode"))
+      gbt (obj [("mode", String "foo"), ("rules", toJSON ["segwit" :: T.Text])])
+        >>= errorOf >>= (`shouldBe` (-8, "Invalid mode"))
+    it "a non-object request is RPCHelpMan -3" $
+      gbt (String "x") >>= errorOf >>= (`shouldBe`
+        (-3, wrongType 1 "template_request" "string" "object"))
+    it "CONTROL: with the segwit rule a template is served" $ withLiveServer $ \srv -> do
+      resp <- handleGetBlockTemplate srv
+        (Array (V.fromList [obj [("rules", toJSON ["segwit" :: T.Text])]]))
+      resError resp `shouldBe` Null
+      case resResult resp of
+        Object o -> KM.member "bits" o `shouldBe` True
+        v -> expectationFailure ("expected a template, got " ++ show v)
+
+  -- testmempoolaccept input checks (Core rpc/mempool.cpp :319-336).
+  describe "r5_errcode testmempoolaccept" $ do
+    let tma vs = handleTestMempoolAccept noServer (toJSON [vs])
+        decodeMsg h = "TX decode failed: " <> h <> " Make sure the tx has at least one input."
+    it "undecodable hex is -22, not an allowed:false row" $
+      forM_ ["deadbeef", "zz", ""] $ \h ->
+        tma [String h] >>= errorOf >>= (`shouldBe` (-22, decodeMsg h))
+    it "an empty batch is -8" $
+      tma ([] :: [Value]) >>= errorOf >>= (`shouldBe`
+        (-8, "Array must contain between 1 and 25 transactions."))
+    it "a non-string element is -3 get_str" $
+      tma [Number 1] >>= errorOf >>= (`shouldBe`
+        (-3, "JSON value of type number is not of expected type string"))
+    it "a non-array rawtxs is RPCHelpMan -3" $ do
+      resp <- handleTestMempoolAccept noServer (toJSON [String "x"])
+      errorOf resp >>= (`shouldBe` (-3, wrongType 1 "rawtxs" "string" "array"))
+    it "CONTROL: a decodable tx with missing inputs is still a result row" $
+      withLiveServer $ \srv -> do
+        resp <- handleTestMempoolAccept srv (toJSON [[String missingInputsTx]])
+        resError resp `shouldBe` Null
+        v <- resultValue resp
+        case v of
+          Array rows | [Object o] <- V.toList rows -> do
+            KM.lookup "allowed" o `shouldBe` Just (Bool False)
+            KM.lookup "reject-reason" o `shouldBe` Just (String "missing-inputs")
+          _ -> expectationFailure ("unexpected result " ++ show v)
+
+-- | The R5 probe's missing-inputs transaction (tools/r5-probes.d/mining-relay.jsonl).
+missingInputsTx :: T.Text
+missingInputsTx = "020000000101000000000000000000000000000000000000000000000000000000000000000000000000fdffffff01a086010000000000160014751e76e8199196d454941c45d1b3a323f1433bd600000000"
+
+coreHashPSVectors :: [(Int, Int, Double)]
+coreHashPSVectors =
+  [ (120, -1, 0.00332376491917208)    -- lookup clamps to 110: walks to genesis
+  , (120, 50, 0.003305785123966942)   -- the R5 probe shape: nblocks >= height
+  , (50, 50, 0.003305785123966942)
+  , (49, 50, 0.003318546612034811)
+  , (10, 50, 0.00333889816360601)
+  , (1, 1, 0.002781641168289291)
+  , (-1, -1, 0.00332376491917208)
+  , (-1, 30, 0.003284072249589491)
+  , (1000, 110, 0.00332376491917208)
+  , (110, 110, 0.00332376491917208)
+  , (109, 110, 0.003329718501321196)
+  , (3, 100, 0.003231017770597738)
+  ]
+
+-- | Write the 110-block chain's headers + height index to the DB and, when
+-- asked, its chainwork entries to the header chain; the tip becomes 110.
+plantRegtestChain :: RpcServer -> Bool -> IO ()
+plantRegtestChain srv withEntries = do
+  let db = rsDB srv
+      hc = rsHeaderChain srv
+      gen = blockHeader (netGenesisBlock regtest)
+      genHash = computeBlockHash gen
+  putBlockHeader db genHash gen
+  putBlockHeight db 0 genHash
+  let go _ _ h | h > (110 :: Int) = return ()
+      go prevHash prevHdr h = do
+        let hdr = prevHdr { bhPrevBlock = prevHash
+                          , bhTimestamp = fromIntegral (1296688602 + 600 * h + (h * 7919) `mod` 300) }
+            bh = computeBlockHash hdr
+            ce = ChainEntry { ceHeader = hdr, ceHash = bh, ceHeight = fromIntegral h
+                            , ceChainWork = fromIntegral (2 * (h + 1)), cePrev = Just prevHash
+                            , ceStatus = StatusValid, ceMedianTime = 0, ceSequenceId = 0 }
+        putBlockHeader db bh hdr
+        putBlockHeight db (fromIntegral h) bh
+        atomically $ do
+          when withEntries $ modifyTVar' (hcEntries hc) (Map.insert bh ce)
+          when (h == 110) $ writeTVar (hcTip hc) ce
+        go bh hdr (h + 1)
+  headerWork gen `shouldBe` 2
+  when (not withEntries) $
+    atomically $ modifyTVar' (hcEntries hc) (Map.delete genHash)
+  go genHash gen 1
