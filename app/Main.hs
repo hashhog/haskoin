@@ -2073,6 +2073,11 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     void $ forkIO $ getheadersSender pm' hc net
       `catch` (\(e :: SomeException) -> putStrLn $ "getheadersSender error: " ++ show e)
 
+    -- Stale-tip check (Core CheckForStaleTipAndEvictPeers, every
+    -- STALE_CHECK_INTERVAL): see 'staleTipWatcher'.
+    void $ forkIO $ staleTipWatcher pm' hc db net linearInflightRef
+      `catch` (\(e :: SomeException) -> putStrLn $ "staleTipWatcher error: " ++ show e)
+
     -- Block download is driven SOLELY by this gap-kicker.
     -- Sync.startIBD is never started (dead code). MHeaders only extends
     -- the header chain; MInv skips bodies while ibdModeRef is True.
@@ -3199,6 +3204,52 @@ initHeaderChainFromDB db net = do
 -- with dead send threads. sendMessage is simpler and works.
 safeSendMessage :: PeerConnection -> Message -> IO ()
 safeSendMessage = sendMessage
+
+-- | Core 'PeerManagerImpl::CheckForStaleTipAndEvictPeers'
+-- (net_processing.cpp:5372): every 'staleCheckIntervalSecs', if the
+-- validated tip has not moved for three target spacings and nothing is in
+-- flight ('tipMayBeStale'), ask the connection loop for one extra
+-- full-relay outbound ('requestExtraOutbound'), and — beyond Core, cheap —
+-- re-ask every connected peer for headers past our tip. The flag clears
+-- once the tip moves. The 2026-10-04 wedge sat 45+ min with 37 peers and
+-- nothing noticed; this is the alarm and the way out when the current
+-- peers have all gone quiet.
+staleTipWatcher :: PeerManager -> HeaderChain -> HaskoinDB -> Network
+                -> IORef (Map.Map BlockHash (SockAddr, Word32, Int64)) -> IO ()
+staleTipWatcher pm hc db net inflightRef = do
+  t0 <- (round <$> getPOSIXTime :: IO Int64)
+  tip0 <- ceHash <$> getValidatedChainTip db hc
+  let spacing = fromIntegral (netPowTargetSpacing net) :: Int64
+      loop lastTip lastUpdate nextCheck = do
+        threadDelay (30 * 1000000)
+        now <- (round <$> getPOSIXTime :: IO Int64)
+        tipH <- ceHash <$> getValidatedChainTip db hc
+        let (lastTip', lastUpdate')
+              | tipH /= lastTip = (tipH, now)
+              | otherwise       = (lastTip, lastUpdate)
+        if now < nextCheck
+          then loop lastTip' lastUpdate' nextCheck
+          else do
+            anyInFlight <- not . Map.null <$> readIORef inflightRef
+            if tipMayBeStale now lastUpdate' spacing anyInFlight
+              then do
+                putStrLn (formatStaleTipLog (now - lastUpdate'))
+                requestExtraOutbound pm True
+                peers <- getConnectedPeerList pm
+                locator <- buildBlockLocatorFromChain hc
+                let gh = GetHeaders
+                      { ghVersion  = fromIntegral protocolVersion
+                      , ghLocators = locator
+                      , ghHashStop = BlockHash (Hash256 (BS.replicate 32 0))
+                      }
+                forM_ peers $ \pc -> void $ forkIO $
+                  sendMessage pc (MGetHeaders gh)
+                    `catch` (\(_ :: SomeException) -> return ())
+              else do
+                was <- extraOutboundRequested pm
+                when was $ requestExtraOutbound pm False
+            loop lastTip' lastUpdate' (now + staleCheckIntervalSecs)
+  loop tip0 t0 (t0 + staleCheckIntervalSecs)
 
 -- | Periodically send getheaders to sync the chain
 getheadersSender :: PeerManager -> HeaderChain -> Network -> IO ()
@@ -4686,8 +4737,13 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   -- MHeaders, the rest get the legacy MInv.  Reference:
                   -- announceTip helper +
                   -- bitcoin-core/src/net_processing.cpp PeerManagerImpl::SendMessages.
+                  -- Queued, not sent here: this is the delivering peer's
+                  -- recv thread (or the drainer). Sent inline, one deaf
+                  -- peer parked it inside sendMessage, and the peer's next
+                  -- block announcement was never read (mainnet 969,866,
+                  -- 2026-10-04). Core UpdatedBlockTip only queues.
                   pm <- readIORef pmRef
-                  announceTip pm (blockHeader block) bh
+                  enqueueBackgroundSend pm (announceTip pm (blockHeader block) bh)
                   -- After connecting a block that reaches our best HEADER tip,
                   -- probe for further blocks we might be missing.  Gated on
                   -- 'height >= headerTipH': during bulk IBD the connected block is
@@ -4735,8 +4791,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         -- Reference: bitcoin-core/src/net_processing.cpp RelayTransaction.
         pm <- readIORef pmRef
         let wtxid = Crypto.computeWtxid tx
-        peers <- readTVarIO (pmPeers pm)
-        forM_ (Map.elems peers) $ \pc -> do
+        -- Fan-out off the recv thread (see 'enqueueBackgroundSend').
+        enqueueBackgroundSend pm $ do
+         peers <- readTVarIO (pmPeers pm)
+         forM_ (Map.elems peers) $ \pc -> do
           info <- readTVarIO (pcInfo pc)
           when (piState info == PeerConnected && not (piBlockOnly info)) $ do
             let (itype, ihash)
@@ -5594,13 +5652,19 @@ handleGetCFCheckpt pmRef hc mIdxMgr addr payload =
 relayAddrToRandomPeers :: PeerManager -> SockAddr -> Message -> IO ()
 relayAddrToRandomPeers pm sourceAddr msg = do
   peerMap <- atomically $ readTVar (pmPeers pm)
-  let candidates = Map.keys $ Map.filterWithKey (\a _ -> a /= sourceAddr) peerMap
+  infos <- forM (Map.toList peerMap) $ \(a, pc) -> do
+    i <- readTVarIO (pcInfo pc)
+    return (a, i)
+  -- Connected addr-relay peers only, chosen at random (Core RelayAddress).
+  -- The old 'take 2' of the map keys always hit the same two lowest keys,
+  -- dead or not.
+  let candidates = addrRelayCandidates sourceAddr infos
   unless (null candidates) $ do
-    -- Pick up to 2 random peers (simple approach: take first 2)
-    let targets = take 2 candidates
-    forM_ targets $ \targetAddr ->
-      requestFromPeer pm targetAddr msg
-        `catch` (\(_ :: SomeException) -> return ())
+    targets <- pickRandomN 2 candidates
+    enqueueBackgroundSend pm $
+      forM_ targets $ \targetAddr ->
+        requestFromPeer pm targetAddr msg
+          `catch` (\(_ :: SomeException) -> return ())
 
 -- | Apply the per-peer inbound-addr token bucket to a received addr/addrv2 list.
 -- Refills the bucket by elapsed*MAX_ADDR_RATE_PER_SECOND (capped at 1000),

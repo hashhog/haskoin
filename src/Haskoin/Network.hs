@@ -139,6 +139,17 @@ module Haskoin.Network
   , drainStoredBodies
   , formatStoredDrain
   , markPeerSendFailed
+  , sendAllWithStallTimeout
+  , sendStallTimeoutMicros
+  , setSendStallTimeoutMicros
+  , addrRelayCandidates
+  , enqueueBackgroundSend
+  , pickRandomN
+  , tipMayBeStale
+  , staleCheckIntervalSecs
+  , requestExtraOutbound
+  , extraOutboundRequested
+  , formatStaleTipLog
   , simulateStallingNextNeeded
   , simulateSingleFeeder
   , LinearDownloadState(..)
@@ -747,7 +758,10 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        tupleToHostAddress, getSocketName,
                        AddrInfoFlag(..))
 import qualified Network.Socket as NS (AddrInfo(..))
-import Network.Socket.ByteString (recv, sendAll)
+import Network.Socket.ByteString (recv, send, sendAll)
+import System.IO.Unsafe (unsafePerformIO)
+import System.IO.Error (mkIOError)
+import GHC.IO.Exception (IOErrorType (TimeExpired))
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO, randomRIO)
@@ -3892,12 +3906,129 @@ sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
 -- so the dead socket stayed selectable for getdata the whole time.
 -- The exception is re-thrown so every caller's existing
 -- send-failure handling (and log line) is unchanged.
+--
+-- Live mainnet 2026-10-04 (tip wedge at 969,866 for 45+ min): the write
+-- itself had no bound. A peer that stops READING (TCP zero window) leaves
+-- 'sendAll' parked forever with 'pcSendLock' held, and every thread that
+-- then sends to that peer parks behind it: the delivering peer's recv
+-- thread in 'announceTip' (so the next block announcement from that peer is
+-- never read), 'peerManagerLoop' (its ping: so no reaping, no inactivity
+-- check, no outbound refill), 'getheadersSender', addr relay. Core never
+-- blocks on a socket: 'SocketSendData' (net.cpp:1602) sends with
+-- MSG_DONTWAIT and 'InactivityCheck' (net.cpp:2013) drops a peer whose
+-- sends made no progress ("socket sending timeout"). Here the caller is
+-- the sender, so a write that makes NO progress for
+-- 'sendStallTimeoutMicros' disconnects the peer instead of waiting forever.
 sendAllOrDisconnect :: PeerConnection -> BS.ByteString -> IO ()
-sendAllOrDisconnect pc bytes =
-  sendAll (pcSocket pc) bytes
+sendAllOrDisconnect pc bytes = do
+  limit <- readIORef sendStallTimeoutRef
+  sendAllWithStallTimeout limit (send (pcSocket pc)) bytes
     `catch` (\(e :: IOException) -> do
                markPeerSendFailed pc
                throwIO e)
+
+-- | Write all of @bytes@ through @sendSome@ (a partial-write primitive such
+-- as 'Network.Socket.ByteString.send'), failing with a 'timeExpiredErrorType'
+-- 'IOException' when a single write makes no progress within @limit@
+-- microseconds. Progress resets the clock: a slow peer that keeps reading is
+-- never cut off; a peer that stopped reading is.
+sendAllWithStallTimeout :: Int -> (BS.ByteString -> IO Int) -> BS.ByteString -> IO ()
+sendAllWithStallTimeout limit sendSome = go
+  where
+    go b
+      | BS.null b = return ()
+      | otherwise = do
+          r <- timeout limit (sendSome b)
+          case r of
+            Nothing -> throwIO $ mkIOError TimeExpired
+                         ("send stalled: no progress for "
+                            ++ show (limit `div` 1000000)
+                            ++ "s (peer not reading)") Nothing Nothing
+            Just n  -> go (BS.drop n b)
+
+-- | No-progress budget for one socket write. Core's equivalent is the
+-- 20-minute 'TIMEOUT_INTERVAL' on 'm_last_send', but Core's sender never
+-- waits; ours does, so the budget is short. A healthy peer drains a
+-- kernel send buffer in well under a second; 60 s of zero progress means
+-- the peer is not reading.
+sendStallTimeoutMicros :: Int
+sendStallTimeoutMicros = 60 * 1000000
+
+sendStallTimeoutRef :: IORef Int
+sendStallTimeoutRef = unsafePerformIO (newIORef sendStallTimeoutMicros)
+{-# NOINLINE sendStallTimeoutRef #-}
+
+-- | Override the no-progress budget (tests only; production uses
+-- 'sendStallTimeoutMicros').
+setSendStallTimeoutMicros :: Int -> IO ()
+setSendStallTimeoutMicros = writeIORef sendStallTimeoutRef
+
+-- | Addr-relay targets (Core RelayAddress, net_processing.cpp: only
+-- fully-connected, non-disconnecting addr-relay peers). The old pick was
+-- the first two keys of 'pmPeers' with no state filter, so a dead inbound
+-- that sorted low (159.195.111.12, mainnet 2026-10-04) got EVERY relay
+-- (134 failed sends in 343 log lines) and a deaf one would have parked
+-- every relaying recv thread. Order is left to the caller (it shuffles).
+addrRelayCandidates :: SockAddr -> [(SockAddr, PeerInfo)] -> [SockAddr]
+addrRelayCandidates source peers =
+  [ a | (a, i) <- peers
+      , a /= source
+      , piState i == PeerConnected
+      , not (piBlockOnly i) ]
+
+-- | Run a fan-out send off the caller's thread (in FIFO order with the
+-- other background sends). The caller is typically a peer's receive
+-- thread; a send there that waits on ANOTHER peer's socket stops this peer
+-- from being read (mainnet 2026-10-04: the delivering peer's thread parked
+-- in 'announceTip', so its next block announcement was never processed).
+enqueueBackgroundSend :: PeerManager -> IO () -> IO ()
+enqueueBackgroundSend pm act = atomically $ writeTQueue (pmBackgroundSends pm) act
+
+backgroundSendWorker :: PeerManager -> IO ()
+backgroundSendWorker pm = forever $ do
+  act <- atomically $ readTQueue (pmBackgroundSends pm)
+  act `catch` (\(e :: SomeException) ->
+    putStrLn $ "backgroundSend: " ++ show e)
+
+-- | Up to @k@ distinct elements, uniformly at random.
+pickRandomN :: Int -> [a] -> IO [a]
+pickRandomN k xs
+  | k <= 0 || null xs = return []
+  | otherwise = do
+      j <- randomRIO (0, length xs - 1)
+      case splitAt j xs of
+        (pre, x : post) -> (x :) <$> pickRandomN (k - 1) (pre ++ post)
+        (_, [])         -> return []
+
+-- | Core 'STALE_CHECK_INTERVAL' (net_processing.cpp:108): how often the
+-- stale-tip check runs.
+staleCheckIntervalSecs :: Int64
+staleCheckIntervalSecs = 10 * 60
+
+-- | Core 'PeerManagerImpl::TipMayBeStale' (net_processing.cpp:1331): the
+-- tip has not moved for three target spacings and no block is in flight.
+tipMayBeStale :: Int64   -- ^ now (unix secs)
+              -> Int64   -- ^ last tip update (unix secs)
+              -> Int64   -- ^ consensus target spacing (secs)
+              -> Bool    -- ^ any block in flight
+              -> Bool
+tipMayBeStale now lastTipUpdate spacing anyInFlight =
+  lastTipUpdate < now - 3 * spacing && not anyInFlight
+
+-- | Core 'SetTryNewOutboundPeer' (net.h): the stale-tip check asks the
+-- connection loop for one extra full-relay outbound, and clears it once
+-- the tip moves again.
+requestExtraOutbound :: PeerManager -> Bool -> IO ()
+requestExtraOutbound pm on = atomically $ writeTVar (pmTryNewOutbound pm) on
+
+extraOutboundRequested :: PeerManager -> IO Bool
+extraOutboundRequested pm = readTVarIO (pmTryNewOutbound pm)
+
+-- | The Core log line (net_processing.cpp CheckForStaleTipAndEvictPeers).
+formatStaleTipLog :: Int64 -> String
+formatStaleTipLog ago =
+  "Potential stale tip detected, will try using extra outbound peer (last tip update: "
+    ++ show ago ++ " seconds ago)"
 
 -- | Core @CloseSocketDisconnect@ for a failed send: leave the connected
 -- set ('getConnectedPeerList' filters on 'PeerConnected';
@@ -4800,6 +4931,16 @@ data PeerManager = PeerManager
     -- ^ IBD predicate gating the self-announcement (Core MaybeSendAddr).
     --   Installed by 'setSelfAdvIBDCheck'; the default reports IBD, so
     --   nothing is advertised until the node wires a real check.
+  , pmTryNewOutbound     :: !(TVar Bool)
+    -- ^ Core @m_try_another_outbound_peer@ (net.h SetTryNewOutboundPeer):
+    --   set by the stale-tip check ('tipMayBeStale'), it lets
+    --   'peerManagerLoop' open ONE full-relay outbound beyond the target.
+  , pmBackgroundSends    :: !(TQueue (IO ()))
+    -- ^ Fan-out sends (tip announcements, tx/addr relay) run here, in
+    --   order, on one worker started by 'startPeerManagerWith' — never on
+    --   a peer's receive thread. Core's relay paths only queue
+    --   (PushMessage); the socket thread writes. See
+    --   'enqueueBackgroundSend'.
   }
 
 -- | Per-peer self-announcement state.
@@ -5098,6 +5239,8 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTVarIO Map.empty  -- pmLocalAddrs
     <*> newTVarIO Map.empty  -- pmSelfAdvPeers
     <*> newIORef (return True)  -- pmSelfAdvIsIBD: IBD until wired
+    <*> newTVarIO False         -- pmTryNewOutbound: no stale tip yet
+    <*> newTQueueIO             -- pmBackgroundSends
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -5108,6 +5251,7 @@ startPeerManagerWith net config handler onDisconnect = do
   forM_ anchors $ \ac ->
     void $ forkIO $ tryConnectBlockRelay pm (acAddress ac)
 
+  _ <- forkIO $ backgroundSendWorker pm
   tid <- forkIO $ peerManagerLoop pm
   atomically $ writeTVar (pmManagerThread pm) (Just tid)
   return pm
@@ -5185,7 +5329,11 @@ peerManagerLoop pm = forever $ do
                               , not (piInbound info), not (piBlockOnly info) ]
       blockRelayCount = length [ () | (_, info) <- peerInfos
                                , not (piInbound info), piBlockOnly info ]
-      fullRelayTarget = pmcMaxOutbound (pmConfig pm)
+  -- Stale tip (Core CheckForStaleTipAndEvictPeers -> SetTryNewOutboundPeer,
+  -- net.cpp ThreadOpenConnections): one full-relay slot beyond the target.
+  tryNewOutbound <- readTVarIO (pmTryNewOutbound pm)
+  let fullRelayTarget = pmcMaxOutbound (pmConfig pm)
+                        + (if tryNewOutbound then 1 else 0)
       blockRelayTarget = pmcMaxBlockRelayOnly (pmConfig pm)
       totalTarget = fullRelayTarget + blockRelayTarget
 
@@ -5341,7 +5489,13 @@ peerManagerLoop pm = forever $ do
             && peerCommonVersion info > p2pBip31Version) $ do
         nonce <- randomIO
         atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
-        sendMessage pc (MPing (Ping nonce)) `catch` (\(_ :: IOException) -> return ())
+        -- Off this loop's thread: the loop is the reaper, the inactivity
+        -- check and the outbound refill. A ping parked on one deaf peer's
+        -- socket froze all three on mainnet 2026-10-04 (no feeler, no
+        -- reaping of a dead inbound for 45+ min). Core's SendPings only
+        -- queues (PushMessage); it never waits on the socket.
+        void $ forkIO $
+          sendMessage pc (MPing (Ping nonce)) `catch` (\(_ :: IOException) -> return ())
 
       -- Core InactivityCheck: TIMEOUT_INTERVAL (pingTimeout, 20 min)
       -- since the last received message. The old 300 s cutoff fired

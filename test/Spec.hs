@@ -196,6 +196,7 @@ import qualified W204GetDataWtxSpec
 import qualified W205SendRawMaxFeeRateSpec
 import qualified W206DownloadRedundancySpec
 import qualified W207NoCoreProxySpec
+import qualified W208DeafPeerTipWedgeSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified R5ErrCodeParitySpec
@@ -24082,6 +24083,11 @@ main = hspec $ do
   -- W207: R3 — no live-Bitcoin-Core RPC proxy (getblock / getrawtransaction
   -- v2 / getblockheader nTx answer from own state; source guard).
   W207NoCoreProxySpec.spec
+  -- W208: tip wedge at mainnet 969,866 (2026-10-04). A peer that stopped
+  -- reading parked sendMessage forever; announceTip on the delivering
+  -- peer's recv thread, the peer-manager loop and the getheaders backstop
+  -- all parked behind it. Bounded writes, off-thread fan-out, stale tip.
+  W208DeafPeerTipWedgeSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx
