@@ -1074,7 +1074,7 @@ encodeP2TR (Hash256 h) = Script [OP_1, OP_PUSHDATA h OPCODE]
 -- This is a witness v1 program with a 2-byte program (shorter than normal
 -- Taproot's 32 bytes), designed to be anyone-can-spend for anchor outputs.
 p2aWitnessProgram :: ByteString
-p2aWitnessProgram = BS.pack [0x4e, 0x73]
+p2aWitnessProgram = Crypto.anchorWitnessProgram
 
 -- | Create P2A (Pay-to-Anchor) output script
 -- OP_1 <0x4e73> (witness v1, 2-byte program, anyone-can-spend)
