@@ -116,6 +116,8 @@ module Haskoin.Network
   , planForkGetData
   , planLinearGetData
   , planLinearGetDataWithCap
+  , planLinearGetDataWithCapEx
+  , planForkGetDataEx
   , PipelineInflight(..)
   , blockFirstByteTimeout
   , v2BlockFirstByteMinLen
@@ -722,7 +724,7 @@ import Data.ByteArray (convert, ScrubbedBytes)
 import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
-import Data.Maybe (mapMaybe, listToMaybe, isNothing, fromMaybe)
+import Data.Maybe (mapMaybe, listToMaybe, isNothing, fromMaybe, catMaybes)
 import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
 import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
@@ -750,7 +752,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef, atomicModifyIORef')
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Random (randomIO, randomRIO)
 import qualified Crypto.Random as CryptoRandom
-import Control.Concurrent (ThreadId, forkIO, killThread)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import System.Timeout (timeout)
 import Control.Concurrent.STM
@@ -1235,7 +1237,18 @@ planForkGetData :: [ForkGetDataPeer]
                 -> Word32                 -- ^ header-tip height
                 -> Int                    -- ^ rotation
                 -> [(Int, [BlockHash])]   -- ^ peer id → hashes
-planForkGetData peers needed headerTip rot
+planForkGetData peers needed headerTip rot =
+  planForkGetDataEx peers needed headerTip rot (\_ _ -> False)
+
+-- | 'planForkGetData' with a per-(hash, peer) exclusion (a peer that
+-- answered @notfound@ for that hash).
+planForkGetDataEx :: [ForkGetDataPeer]
+                  -> [(BlockHash, Word32)]
+                  -> Word32
+                  -> Int
+                  -> (BlockHash -> Int -> Bool)
+                  -> [(Int, [BlockHash])]
+planForkGetDataEx peers needed headerTip rot excluded
   | null peers || null needed = []
   | otherwise =
       let n = length peers
@@ -1255,6 +1268,7 @@ planForkGetData peers needed headerTip rot
                 used = length (Map.findWithDefault [] pid acc)
             in if used < maxBlocksInTransitPerPeer
                   && peerCanServeBlock (fgdpServices p) headerTip ht
+                  && not (excluded h pid)
                  then Just pid
                  else findPeer acc h ht (i + 1)
           raw = assign Map.empty needed
@@ -1302,7 +1316,24 @@ planLinearGetDataWithCap
   -> Set.Set Int
   -> Map Int Int
   -> [(Int, [BlockHash])]
-planLinearGetDataWithCap cap peers needed headerTip rot failed already
+planLinearGetDataWithCap cap peers needed headerTip rot failed already =
+  planLinearGetDataWithCapEx cap peers needed headerTip rot failed already
+    (\_ _ -> False)
+
+-- | 'planLinearGetDataWithCap' with a per-(hash, peer) exclusion: a peer
+-- that answered @notfound@ for a hash is not asked for it again (Core only
+-- asks a peer for blocks on its best-known chain).
+planLinearGetDataWithCapEx
+  :: Int
+  -> [ForkGetDataPeer]
+  -> [(BlockHash, Word32)]
+  -> Word32
+  -> Int
+  -> Set.Set Int
+  -> Map Int Int
+  -> (BlockHash -> Int -> Bool)   -- ^ excluded (hash, peer id)
+  -> [(Int, [BlockHash])]
+planLinearGetDataWithCapEx cap peers needed headerTip rot failed already excluded
   | null peers || null needed || cap <= 0 = []
   | otherwise =
       let n = length peers
@@ -1322,6 +1353,7 @@ planLinearGetDataWithCap cap peers needed headerTip rot failed already
             in if pid `Set.notMember` failed
                   && used < cap
                   && peerCanServeBlock (fgdpServices p) headerTip ht
+                  && not (excluded h pid)
                  then Just pid
                  else findPeer acc h ht (i + 1)
           raw = assign Map.empty needed
@@ -3789,9 +3821,15 @@ connectPeer config host port = do
 disconnectPeer :: PeerConnection -> IO ()
 disconnectPeer pc = do
   atomically $ modifyTVar' (pcInfo pc) (\i -> i { piState = PeerDisconnected })
-  -- Kill threads if they exist
-  mapM_ killThread (pcSendThread pc)
-  mapM_ killThread (pcRecvThread pc)
+  -- Kill threads if they exist — but never the CALLING thread.  A peer is
+  -- most often punished from its own receive thread (the MBlock / headers
+  -- handler runs there); 'killThread' on oneself throws ThreadKilled
+  -- synchronously, so the socket below was never closed and the caller's
+  -- remaining cleanup (pmPeers delete) never ran: the misbehaving peer
+  -- stayed connected.  The receive loop exits on its own once the socket
+  -- is closed.
+  me <- myThreadId
+  mapM_ killThread (filter (/= me) (catMaybes [pcSendThread pc, pcRecvThread pc]))
   -- Close socket
   close (pcSocket pc)
 

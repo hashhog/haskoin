@@ -155,6 +155,7 @@ import qualified ReorgSharedTxRecreatedCoinSpec
 import qualified ReorgSharedTxPreforkSpendSpec
 import qualified ReorgDeepIncrementalSpec
 import qualified ReorgConnectFinalitySpec
+import qualified InvalidBlockP2PSpec
 import qualified HealTipCreatedCoinSpec
 import qualified GetTxOutSetInfoSnapshotSpec
 import qualified W166WalletPersistSpec
@@ -23869,6 +23870,7 @@ main = hspec $ do
   -- was a shared tx re-created by 966500 and spent by 966501.  Peak RSS
   -- of a padded deep reorg is in ReorgDeepIncrementalSpec.
   ReorgConnectFinalitySpec.spec
+  InvalidBlockP2PSpec.spec
 
   -- Live 966499/966500 (2026-09-18, 042d357): P2PKH vout 6 of a tip-created
   -- 8-output tx was never in PrefixUTXO, so linear connect of Core's 966500

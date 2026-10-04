@@ -203,6 +203,7 @@ test-suite haskoin-test
                , ReorgSharedTxPreforkSpendSpec
                , ReorgDeepIncrementalSpec
                , ReorgConnectFinalitySpec
+               , InvalidBlockP2PSpec
                , HealTipCreatedCoinSpec
                , GetTxOutSetInfoSnapshotSpec
                , W166WalletPersistSpec

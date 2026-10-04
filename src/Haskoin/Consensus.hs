@@ -296,6 +296,12 @@ module Haskoin.Consensus
   , findDescendants
   , isBlockInvalidated
   , isFailedStatus
+    -- * InvalidBlockFound (consensus-invalid block delivered over P2P)
+  , BlockRejectKind(..)
+  , classifyBlockReject
+  , invalidBlockFound
+  , recalculateBestHeader
+  , performReorgActivating
   , activateBestChain
   , findBestCandidate
     -- * Global Signature Cache
@@ -337,7 +343,7 @@ import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
 import Data.List (sort, sortBy, foldl', isInfixOf)
 import Numeric (showHex)
-import Control.Monad (when, unless, forM, forM_, foldM, forever, void, replicateM)
+import Control.Monad (when, unless, forM, forM_, foldM, forever, void, replicateM, filterM)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Vector as V
@@ -356,7 +362,7 @@ import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Network.Socket (SockAddr)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (mapMaybe, isJust)
 import Data.Char (isSpace, isHexDigit)
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
@@ -7343,10 +7349,17 @@ reorgConnectIncremental net cache db hc mIdxMgr (ce : rest) = do
                           (getBlockScriptFlags net bh (ceHeight ce))
           getMtp = getMtpFromAncestry entriesRC (bhPrevBlock (blockHeader blk))
       case validateFullBlock net cs getMtp False False blk spentUtxos0 of
-        Left err -> return $ Left $
-          "reorg connect: block " ++ show bh
-          ++ " (height " ++ show (ceHeight ce)
-          ++ ") failed full validation: " ++ err
+        Left err -> do
+          -- Core ConnectTip failure -> InvalidBlockFound (validation.cpp):
+          -- disk is at this block's parent, so the reject was produced in
+          -- the block's own context.  Only a VERDICT marks it failed
+          -- ('classifyBlockReject'); a missing prevout etc. stays unmarked.
+          when (classifyBlockReject err == BlockRejectVerdict) $
+            void (invalidBlockFound db hc bh)
+          return $ Left $
+            "reorg connect: block " ++ show bh
+            ++ " (height " ++ show (ceHeight ce)
+            ++ ") failed full validation: " ++ err
         Right () -> do
           -- Body is already on disk (putBlock / fork download).
           -- Re-encoding PrefixBlockData into every connect WriteBatch
@@ -8757,6 +8770,203 @@ isFailedStatus StatusInvalid     = True
 isFailedStatus StatusFailedValid = True
 isFailedStatus StatusFailedChild = True
 isFailedStatus _                 = False
+
+--------------------------------------------------------------------------------
+-- InvalidBlockFound — a block that failed consensus validation in its own
+-- context (P2P delivery or a reorg connect step).
+--------------------------------------------------------------------------------
+-- Reference: bitcoin-core/src/validation.cpp
+--   Chainstate::InvalidBlockFound — unless the result is BLOCK_MUTATED, set
+--     BLOCK_FAILED_VALID, erase from setBlockIndexCandidates, then
+--     InvalidChainFound;
+--   Chainstate::SetBlockFailureFlags — descendants become BLOCK_FAILED_CHILD;
+--   ChainstateManager::RecalculateBestHeader — the best header is the
+--     most-work header that is not failed;
+--   Chainstate::ActivateBestChain — after a failed ActivateBestChainStep the
+--     loop picks the most-work VALID candidate again, so a valid tip that the
+--     failed step disconnected is reconnected.
+--
+-- Pre-fix haskoin did none of this for a P2P block: the reject was logged and
+-- the header stayed the best header, so the kicker re-requested the same
+-- invalid body for ever and the valid competitor at the same height was never
+-- fetched; a failed fork reorg left the chainstate at the fork point (the
+-- valid tip it had disconnected was never reconnected).
+
+-- | Is a block-validation reject a consensus VERDICT on the block itself?
+--
+-- Only verdicts may mark a block failed.  Everything else — a mutated block
+-- (Core BLOCK_MUTATED: merkle / duplicate-tx / witness malleation; the same
+-- header can still have a valid body), a missing prevout (in haskoin this has
+-- also been produced by local chainstate inconsistencies, see QUEUES haskoin
+-- 2026-10-01), an exception, a G1/G19 ordering gate, a missing body or undo
+-- record — is a non-verdict: no mark, no punishment, retry later.  This is a
+-- WHITELIST: an unrecognised reject string is a non-verdict, so a new error
+-- path can never poison a valid block by default.
+data BlockRejectKind = BlockRejectVerdict | BlockRejectNonVerdict
+  deriving (Eq, Show)
+
+classifyBlockReject :: String -> BlockRejectKind
+classifyBlockReject err
+  | any (`isInfixOf` err) nonVerdictMarkers = BlockRejectNonVerdict
+  | any (`isInfixOf` err) verdictMarkers    = BlockRejectVerdict
+  | otherwise                               = BlockRejectNonVerdict
+  where
+    nonVerdictMarkers =
+      [ "Merkle root mismatch", "bad-txnmrklroot", "bad-txns-duplicate"
+      , "bad-witness-merkle-match", "bad-witness-nonce-size"
+      , "unexpected-witness"
+      , "Missing UTXO", "bad-txns-inputs-missingorspent"
+      , "exception", "Exception"
+      , "Core G1"                -- also covers "Core G19"
+      , "Missing block data", "Undo data error", "header entry missing"
+      ]
+    verdictMarkers =
+      [ "Coinbase value exceeds allowed amount", "bad-cb-amount"
+      , "bad-txns-nonfinal"
+      , "bad-cb-height", "bad-cb-multiple", "bad-cb-missing"
+      , "First transaction is not coinbase", "bad-blk-length"
+      , "bad-version("
+      , "Block exceeds maximum weight", "bad-blk-weight"
+      , "Block exceeds sigop cost limit", "bad-blk-sigops"
+      , "Transaction has no inputs", "Transaction has no outputs"
+      , "bad-txns-oversize", "Transaction output has negative value"
+      , "Transaction output value exceeds MAX_MONEY"
+      , "bad-txns-txouttotal-toolarge", "bad-txns-inputs-duplicate"
+      , "Coinbase scriptSig size out of range"
+      , "Non-coinbase transaction references null prevout"
+      , "bad-txns-accumulated-fee-outofrange"
+      , "bad-txns-inputvalues-outofrange"
+      , "Outputs exceed inputs", "bad-txns-in-belowout"
+      , "bad-txns-premature-spend-of-coinbase", "Coinbase not yet mature"
+      , "bad-txns-BIP30"
+      , "script verify failed"
+      ]
+
+-- | Core InvalidBlockFound + SetBlockFailureFlags + RecalculateBestHeader for
+-- a block whose validation produced a VERDICT ('classifyBlockReject').  The
+-- caller guarantees the block was validated in its own context (parent ==
+-- the connected tip at the time).  Marks the block 'StatusFailedValid', every
+-- known descendant 'StatusFailedChild' (later headers on it inherit the mark
+-- in 'addHeaderAt'), drops them from 'hcCandidates', and moves the best
+-- header off the failed branch.  A block on the connected chain is never
+-- marked here (that would need a disconnect; invalidateblock does that).
+-- Returns True iff the block was marked.
+invalidBlockFound :: HaskoinDB -> HeaderChain -> BlockHash -> IO Bool
+invalidBlockFound db hc bh = do
+  entries <- readTVarIO (hcEntries hc)
+  mDisk <- getBestBlockHash db
+  let onConnected = case mDisk of
+        Just d  -> isAncestor entries bh d
+        Nothing -> False
+  case Map.lookup bh entries of
+    Nothing -> return False
+    Just ce
+      | ceHeight ce == 0 || onConnected -> return False
+      | otherwise -> do
+          descendants <- findDescendants hc bh
+          let st e = if ceHash e == bh then StatusFailedValid else StatusFailedChild
+          atomically $ do
+            modifyTVar' (hcEntries hc) $ \m ->
+              foldl' (\acc e -> Map.adjust (\x -> x { ceStatus = st e }) (ceHash e) acc)
+                     m descendants
+            modifyTVar' (hcCandidates hc) $ \s ->
+              foldl' (\acc e -> Set.delete (mkCandidateKey e) acc) s descendants
+          forM_ descendants $ \e -> putBlockStatus db (ceHash e) (st e)
+          recalculateBestHeader db hc
+          return True
+
+-- | Core RecalculateBestHeader: the best header is the most-work header that
+-- is not failed (ties: the current best header, else the first-seen).
+-- 'hcByHeight' above the CONNECTED tip is rewritten to follow it; heights at
+-- or below the connected tip belong to the connect / reorg code and are not
+-- touched.
+recalculateBestHeader :: HaskoinDB -> HeaderChain -> IO ()
+recalculateBestHeader db hc = do
+  entries <- readTVarIO (hcEntries hc)
+  cur <- readTVarIO (hcTip hc)
+  mDisk <- getBestBlockHash db
+  let ok e = not (isFailedStatus (ceStatus e))
+      valid = filter ok (Map.elems entries)
+      connectedH = maybe 0 ceHeight (mDisk >>= (`Map.lookup` entries))
+  unless (null valid) $ do
+    let maxWork = maximum (map ceChainWork valid)
+        curNow = Map.lookup (ceHash cur) entries
+        best = case curNow of
+          Just c | ok c && ceChainWork c == maxWork -> c
+          _ -> foldl1 (\a b -> if ceSequenceId b < ceSequenceId a then b else a)
+                      [ e | e <- valid, ceChainWork e == maxWork ]
+        walk e acc
+          | ceHeight e <= connectedH = acc
+          | otherwise = case cePrev e >>= (`Map.lookup` entries) of
+              Just p  -> walk p ((ceHeight e, ceHash e) : acc)
+              Nothing -> (ceHeight e, ceHash e) : acc
+        above = walk best []
+    atomically $ do
+      -- A header that arrived meanwhile and out-works our pick wins.
+      tipNow <- readTVar (hcTip hc)
+      entsNow <- readTVar (hcEntries hc)
+      let tipNowOk = maybe False ok (Map.lookup (ceHash tipNow) entsNow)
+      unless (tipNowOk && ceChainWork tipNow > ceChainWork best) $ do
+        modifyTVar' (hcByHeight hc) $ \m ->
+          let (keep, _) = Map.split (connectedH + 1) m
+          in foldl' (\acc (h, x) -> Map.insert h x acc) keep above
+        when (ceHash tipNow /= ceHash best) $ do
+          writeTVar (hcTip hc) best
+          writeTVar (hcHeight hc) (ceHeight best)
+          bumpTipGen hc
+
+-- | 'performReorg' with Core's ActivateBestChain recovery.  On a connect
+-- step that fails with a VERDICT, 'reorgConnectIncremental' has already
+-- marked the block ('invalidBlockFound'); the chainstate (left at the last
+-- committed step) is then moved to the most-work VALID header prefix whose
+-- bodies are on disk — which reconnects a valid tip the failed step had
+-- disconnected.  On a NON-verdict failure nothing is marked and the
+-- chainstate returns to @oldTip@ (the reorg is retried later by the caller's
+-- backoff).  The original error is still returned so callers log/back off.
+performReorgActivating :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                       -> Maybe IndexManager
+                       -> BlockHash -> BlockHash -> IO (Either String ())
+performReorgActivating net cache db hc mIdxMgr oldTip newTip = do
+  r <- performReorg net cache db hc mIdxMgr oldTip newTip
+  case r of
+    Right () -> return r
+    Left err -> do
+      entries <- readTVarIO (hcEntries hc)
+      let verdict = maybe False (isFailedStatus . ceStatus)
+                          (Map.lookup newTip entries)
+      mDisk <- getBestBlockHash db
+      case mDisk of
+        Nothing -> return ()
+        Just disk
+          | verdict -> activateBestValidPrefix disk
+          | disk /= oldTip ->
+              void (performReorg net cache db hc mIdxMgr disk oldTip)
+          | otherwise -> return ()
+      recalculateBestHeader db hc
+      return (Left err)
+  where
+    activateBestValidPrefix disk = do
+      recalculateBestHeader db hc
+      entries <- readTVarIO (hcEntries hc)
+      best <- readTVarIO (hcTip hc)
+      case Map.lookup disk entries of
+        Just diskCe | ceChainWork best > ceChainWork diskCe -> do
+          mFork <- findForkPoint hc disk (ceHash best)
+          case mFork of
+            Nothing -> return ()
+            Just fork -> case heavierBranchHashes entries (ceHash fork) (ceHash best) of
+              Nothing -> return ()
+              Just hs -> do
+                present <- filterM (\h -> isJust <$> getBlock db h) hs
+                let have = Set.fromList present
+                case connectableForkTip entries (ceHash fork) (ceHash best)
+                                        disk (`Set.member` have) of
+                  Nothing -> return ()
+                  Just t  ->
+                    -- Recursive: another verdict marks another block and
+                    -- tries the next-best valid prefix (Core's loop).
+                    void (performReorgActivating net cache db hc mIdxMgr disk t)
+        _ -> return ()
 
 -- | Activate the best valid chain.
 -- After invalidation, we may need to switch to a different fork.
