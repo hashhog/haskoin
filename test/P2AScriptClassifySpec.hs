@@ -34,10 +34,15 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 
+import Data.Maybe (isJust)
+import qualified Data.ByteString.Base16 as B16
+import qualified Data.Text.Encoding as TE
+
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
-import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Crypto (bech32Encode, bech32mEncode, textToAddress, addressToText)
+import qualified Haskoin.Wallet as W
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
@@ -46,6 +51,18 @@ import Haskoin.Rpc
   , scriptToAsm
   , scriptToAsmPartial
   )
+
+-- Core test-vector compressed keys (bitcoin-core src/test).
+pk1Hex, pk2Hex, p2pkHex, multiHex :: T.Text
+pk1Hex   = "03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd"
+pk2Hex   = "03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626"
+p2pkHex  = "21" <> pk1Hex <> "ac"
+multiHex = "5121" <> pk1Hex <> "21" <> pk2Hex <> "52ae"
+
+fromHex :: T.Text -> BS.ByteString
+fromHex t = case B16.decode (TE.encodeUtf8 t) of
+  Right bs -> bs
+  Left e   -> error e
 
 p2aSpk :: BS.ByteString
 p2aSpk = BS.pack [0x51, 0x02, 0x4e, 0x73]
@@ -128,3 +145,82 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     o <- spkObj (BS.pack [0xba])
     field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
     field o "type" `shouldBe` Just (String "nonstandard")
+
+  -- ----------------------------------------------------------------
+  -- RPC follow-ups from the P2A fix (QUEUES.md 2026-10-02):
+  --   * InferDescriptor emits pk()/multi() (Core), not raw()
+  --   * wallet Address type parses P2A
+  --   * GetOpName unassigned opcodes print OP_UNKNOWN, not OP_UNKNOWN[n]
+  -- Control values are Core v31.99 bitcoin-cli decodescript /
+  -- getdescriptorinfo on 2026-10-04 (mainnet datadir; pk/multi/raw
+  -- descriptors are network-independent).
+  -- ----------------------------------------------------------------
+
+  it "CONTROL: InferDescriptor of P2PK is pk(KEY)#csum, not raw()" $ do
+    o <- spkObj (fromHex p2pkHex)
+    field o "type" `shouldBe` Just (String "pubkey")
+    field o "desc" `shouldBe`
+      Just (String ("pk(" <> pk1Hex <> ")#vwaefwnq"))
+    field o "asm" `shouldBe`
+      Just (String (pk1Hex <> " OP_CHECKSIG"))
+    -- address is suppressed for pubkey (Core ScriptToUniv)
+    field o "address" `shouldBe` Nothing
+
+  it "CONTROL: InferDescriptor of bare 1-of-2 multisig is multi(...), not raw()" $ do
+    o <- spkObj (fromHex multiHex)
+    field o "type" `shouldBe` Just (String "multisig")
+    field o "desc" `shouldBe`
+      Just (String ("multi(1," <> pk1Hex <> "," <> pk2Hex <> ")#ve902xrt"))
+    field o "address" `shouldBe` Nothing
+
+  it "CONTROL: getdescriptorinfo round-trips Core's inferred pk()/multi()/raw(ba)" $ do
+    let pkDesc    = "pk(" <> pk1Hex <> ")#vwaefwnq"
+        multiDesc = "multi(1," <> pk1Hex <> "," <> pk2Hex <> ")#ve902xrt"
+        rawBa     = "raw(ba)#yy0eg44l"
+    case W.parseDescriptor pkDesc of
+      Left err -> expectationFailure ("pk() parse: " ++ show err)
+      Right d  -> W.addDescriptorChecksum (W.descriptorToText d)
+                    `shouldBe` Just pkDesc
+    case W.parseDescriptor multiDesc of
+      Left err -> expectationFailure ("multi() parse: " ++ show err)
+      Right d  -> W.addDescriptorChecksum (W.descriptorToText d)
+                    `shouldBe` Just multiDesc
+    case W.parseDescriptor rawBa of
+      Left err -> expectationFailure ("raw(ba) parse: " ++ show err)
+      Right d  -> W.addDescriptorChecksum (W.descriptorToText d)
+                    `shouldBe` Just rawBa
+
+  it "CONTROL: 0xba-containing script asm is OP_CHECKSIGADD and desc is raw(ba)#yy0eg44l" $ do
+    o <- spkObj (BS.pack [0xba])
+    field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
+    field o "desc" `shouldBe` Just (String "raw(ba)#yy0eg44l")
+    field o "type" `shouldBe` Just (String "nonstandard")
+
+  it "CONTROL: unassigned opcode 0xbb prints OP_UNKNOWN (not OP_UNKNOWN[n])" $ do
+    a1 <- evaluate (scriptToAsm (BS.pack [0xbb]))
+    a1 `shouldBe` "OP_UNKNOWN"
+    a2 <- evaluate (scriptToAsmPartial (BS.pack [0xbb]))
+    a2 `shouldBe` "OP_UNKNOWN"
+    o <- spkObj (BS.pack [0xbb])
+    field o "asm"  `shouldBe` Just (String "OP_UNKNOWN")
+    field o "desc" `shouldBe` Just (String "raw(bb)#79gjzk4q")
+    T.isInfixOf "[" a1 `shouldBe` False
+
+  it "CONTROL: 0xff prints OP_INVALIDOPCODE (Core GetOpName)" $ do
+    scriptToAsm (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+    o <- spkObj (BS.pack [0xff])
+    field o "asm" `shouldBe` Just (String "OP_INVALIDOPCODE")
+
+  it "CONTROL: wallet Address type parses P2A (bc1pfeessrawgf / bcrt1pfeesnyr2tx)" $ do
+    textToAddress "bc1pfeessrawgf" `shouldSatisfy` isJust
+    textToAddress "bcrt1pfeesnyr2tx" `shouldSatisfy` isJust
+    -- round-trip through the mainnet encoder (addressToText hardcodes bc)
+    fmap addressToText (textToAddress "bc1pfeessrawgf")
+      `shouldBe` Just "bc1pfeessrawgf"
+    -- addr() descriptor parse (uses the wallet Address type)
+    case W.parseDescriptor "addr(bc1pfeessrawgf)#d6x2lh3c" of
+      Left err -> expectationFailure ("addr(P2A) parse: " ++ show err)
+      Right (W.Addr _) -> return ()
+      Right other -> expectationFailure ("expected Addr, got " ++ show other)
+    -- BIP-350: bech32 (not bech32m) checksum of the same program is invalid
+    textToAddress (bech32Encode "bc" 1 p2aWitnessProgram) `shouldBe` Nothing
