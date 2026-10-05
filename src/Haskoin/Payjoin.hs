@@ -151,7 +151,7 @@ import qualified Network.HTTP.Client     as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTPStatus
 
-import Haskoin.Crypto (sha256, Address(..))
+import Haskoin.Crypto (sha256, Address(..), payToAnchorScript)
 import Haskoin.Types (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
                      Hash160(..), Hash256(..))
 import qualified Haskoin.Wallet as W
@@ -569,6 +569,7 @@ scriptPubKeyToAddress s
   -- P2TR
   | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
       Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+  | s == payToAnchorScript = Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | Pick the first wallet UTXO available.  Real receivers should

@@ -34,10 +34,15 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
 
+import qualified Data.ByteString.Base16 as B16
+import qualified Data.Text.Encoding as TE
+
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
-import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Crypto (bech32Encode, bech32mEncode, textToAddress, addressToText,
+                       Address(..), payToAnchorScript)
+import Haskoin.Wallet (addDescriptorChecksum)
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
@@ -128,3 +133,55 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     o <- spkObj (BS.pack [0xba])
     field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
     field o "type" `shouldBe` Just (String "nonstandard")
+
+  -- Core InferDescriptor (empty provider) on a regtest bitcoind, 2026-10-05.
+  -- Generator G and privkey-2, both on-curve compressed points.  Hybrid
+  -- 0x06 is Solver-PUBKEY but InferPubkey rejects it (IsValidNonHybrid).
+  it "psbtSpkEnc infers pk() for a non-hybrid P2PK (Core #gn28ywm7)" $ do
+    let g = hex "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        spk = BS.cons 0x21 g <> BS.pack [0xac]
+    o <- spkObj spk
+    field o "desc" `shouldBe` Just (String
+      "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7")
+    field o "type" `shouldBe` Just (String "pubkey")
+    field o "address" `shouldBe` Nothing
+
+  it "psbtSpkEnc infers multi() for a bare 1-of-2 (Core #l5sy3u48)" $ do
+    let g = hex "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        h = hex "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        spk = BS.concat [BS.pack [0x51, 0x21], g, BS.pack [0x21], h, BS.pack [0x52, 0xae]]
+    o <- spkObj spk
+    field o "desc" `shouldBe` Just (String
+      "multi(1,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#l5sy3u48")
+    field o "type" `shouldBe` Just (String "multisig")
+
+  it "psbtSpkEnc keeps raw() for a hybrid pubkey (not pk())" $ do
+    let pk = BS.cons 0x06 (BS.replicate 64 0x11)
+        spk = BS.cons 0x41 pk <> BS.pack [0xac]
+        hexStr = TE.decodeUtf8 (B16.encode spk)
+    expected <- case addDescriptorChecksum ("raw(" <> hexStr <> ")") of
+      Just e  -> return e
+      Nothing -> expectationFailure "checksum failed" >> return ""
+    o <- spkObj spk
+    field o "desc" `shouldBe` Just (String expected)
+    field o "type" `shouldBe` Just (String "pubkey")
+
+  it "asm prints OP_UNKNOWN / OP_INVALIDOPCODE the way Core GetOpName does" $ do
+    scriptToAsm (BS.pack [0xbb]) `shouldBe` "OP_UNKNOWN"
+    scriptToAsm (BS.pack [0xba, 0xbb]) `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+    scriptToAsm (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+    -- Truncated push: decode fails, the byte walker must still name 0xba.
+    scriptToAsmPartial (BS.pack [0xba, 0x4c]) `shouldBe` "OP_CHECKSIGADD [error]"
+    scriptToAsmPartial (BS.pack [0x7e, 0x4c]) `shouldBe` "OP_CAT [error]"
+
+  it "textToAddress accepts the pay-to-anchor address and nothing else at v1 len 2" $ do
+    textToAddress "bcrt1pfeesnyr2tx" `shouldBe` Just PayToAnchorAddress
+    textToAddress "bc1pfeessrawgf" `shouldBe` Just PayToAnchorAddress
+    addressToText PayToAnchorAddress `shouldBe` "bc1pfeessrawgf"
+    payToAnchorScript `shouldBe` BS.pack [0x51, 0x02, 0x4e, 0x73]
+    textToAddress (bech32mEncode "bcrt" 1 (BS.pack [0xab, 0xcd])) `shouldBe` Nothing
+
+hex :: T.Text -> BS.ByteString
+hex t = case B16.decode (TE.encodeUtf8 t) of
+  Right b -> b
+  Left e  -> error e

@@ -64,6 +64,7 @@ module Haskoin.Crypto
   , computeBlockHash
     -- * Addresses
   , Address(..)
+  , payToAnchorScript
   , addressToText
   , textToAddress
   , pubKeyToP2PKH
@@ -1357,6 +1358,7 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | PayToAnchorAddress              -- ^ P2A:    Bech32m witness v1 program 0x4e73
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1381,6 +1383,17 @@ scriptToP2SH script = ScriptAddress (hash160 script)
 -- P2WSH uses single SHA-256 (not double)
 scriptToP2WSH :: ByteString -> Address
 scriptToP2WSH script = WitnessScriptAddress (Hash256 (sha256 script))
+
+-- | scriptPubKey of every Pay-to-Anchor output: OP_1 PUSH2 0x4e73.
+-- The program is fixed (addresstype.h ANCHOR_BYTES), so the address type
+-- carries no payload. Same bytes as Script.encodeP2A; defined here so
+-- address encode/decode does not import Script.
+payToAnchorScript :: ByteString
+payToAnchorScript = BS.pack [0x51, 0x02, 0x4e, 0x73]
+
+-- | Witness program inside 'payToAnchorScript' (0x4e73).
+payToAnchorProgram :: ByteString
+payToAnchorProgram = BS.pack [0x4e, 0x73]
 
 --------------------------------------------------------------------------------
 -- Base58Check Encoding
@@ -1615,6 +1628,7 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText PayToAnchorAddress = bech32mEncode "bc" 1 payToAnchorProgram
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1631,6 +1645,7 @@ textToAddress txt
       case bech32Decode txt of
         Just (_, 1, prog)
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
+          | prog == payToAnchorProgram -> Just PayToAnchorAddress
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
       case base58CheckDecode txt of

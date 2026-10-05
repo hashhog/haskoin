@@ -367,7 +367,7 @@ import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash, textToAddres
                         bech32Encode, bech32mEncode, bech32Decode, derivePubKey,
                         SecKey(..), hash160, sha256, parsePubKey,
                         signMessage, recoverMessagePubKey,
-                        addressToText)
+                        addressToText, payToAnchorScript)
 import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockStatus(..),
                            bitsToTarget, blockReward, txBaseSize, txTotalSize,
                            -- getblockstats: subsidy (regtest-aware), coinbase
@@ -6275,6 +6275,9 @@ addressToScript addr = case addr of
   TaprootAddress (Hash256 h) ->
     -- P2TR: OP_1 <32 bytes>
     BS.pack [0x51, 0x20] <> h
+  PayToAnchorAddress ->
+    -- P2A: OP_1 <0x4e73> (witness v1 program, fixed)
+    payToAnchorScript
 
 --------------------------------------------------------------------------------
 -- Fee Estimation RPC Handlers
@@ -6327,11 +6330,12 @@ handleValidateAddress server params = do
       (toJSON $ RpcError rpcInvalidParams "Missing address") Null
     Just addr ->
       case textToAddress addr of
-        -- Pay-to-Anchor / WITNESS_UNKNOWN: valid destinations in Core
-        -- (key_io.cpp DecodeDestination) that the wallet 'Address' type does
-        -- not carry.  DescribeAddressVisitor (rpc/util.cpp): PayToAnchor ->
-        -- isscript+iswitness; WitnessUnknown -> iswitness, witness_version,
-        -- witness_program.
+        -- WITNESS_UNKNOWN (and any v1+ program textToAddress does not
+        -- accept): valid destinations in Core (key_io.cpp DecodeDestination).
+        -- DescribeAddressVisitor (rpc/util.cpp): WitnessUnknown -> iswitness,
+        -- witness_version, witness_program.  Pay-to-Anchor is a real Address
+        -- (the Just branch below): Core reports isscript+iswitness and does
+        -- NOT emit witness_version / witness_program.
         Nothing | Just spk <- witnessV1PlusAddressToScript (rsNetwork server) addr -> do
           let ver    = fromIntegral (BS.index spk 0) - 0x50 :: Int
               prog   = BS.drop 2 spk
@@ -6364,10 +6368,15 @@ handleValidateAddress server params = do
         Just address -> do
           let (scriptPubKey, isScript, isWitness, witnessVersion, witnessProgram) =
                 addressToScriptInfo (rsNetwork server) address
-              witEnc = if isWitness
-                         then pair "witness_version" (AE.int witnessVersion) <>
-                              pair "witness_program" (text witnessProgram)
-                         else mempty
+              -- PayToAnchor: isscript + iswitness, no witness_version /
+              -- witness_program (rpc/util.cpp DescribeAddress).  Every other
+              -- witness address still carries both fields.
+              witEnc = case address of
+                PayToAnchorAddress -> mempty
+                _ | isWitness ->
+                      pair "witness_version" (AE.int witnessVersion) <>
+                      pair "witness_program" (text witnessProgram)
+                  | otherwise -> mempty
               enc = pairs $
                       pair "isvalid"      (AE.bool True)        <>
                       pair "address"      (text addr)           <>
@@ -6424,6 +6433,10 @@ addressToScriptInfo _net addr = case addr of
     -- P2TR: OP_1 <32 bytes>; witness_program is 32 bytes > 20, so isscript=true
     let script = BS.pack [0x51, 0x20] <> h
     in (TE.decodeUtf8 $ B16.encode script, True, True, 1, TE.decodeUtf8 $ B16.encode h)
+  PayToAnchorAddress ->
+    -- P2A: OP_1 <0x4e73>.  isscript+iswitness; the caller omits witness fields.
+    let script = payToAnchorScript
+    in (TE.decodeUtf8 $ B16.encode script, True, True, -1, "")
 
 -- | Get general information (deprecated but still useful)
 -- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
@@ -7259,9 +7272,12 @@ spkSuppressAddress scriptType = case scriptType of
   _              -> False
 
 -- | Core InferDescriptor(script, empty provider)->ToString() as far as
--- haskoin models it: rawtr(KEY)#csum for P2TR, addr(<address>)#csum when
--- the script has an address (incl. P2A / witness_unknown), raw(<hex>)#csum
--- otherwise.  Shared by every scriptPubKey renderer and scantxoutset.
+-- haskoin models it: pk(PUB)#csum / multi(N,PUB,...)#csum when every key is
+-- a non-hybrid pubkey (InferPubkey / IsValidNonHybrid), rawtr(KEY)#csum for
+-- P2TR, addr(<address>)#csum when the script has an address (incl. P2A /
+-- witness_unknown), raw(<hex>)#csum otherwise.  No origin info, xonly=false.
+-- Shared by every scriptPubKey renderer and scantxoutset.
+-- Reference: bitcoin-core/src/script/descriptor.cpp InferScript ~2706.
 inferSpkDescriptor :: Network -> ByteString -> Text
 inferSpkDescriptor net script =
   let scriptType = case decodeScript script of
@@ -7277,6 +7293,8 @@ inferSpkDescriptor net script =
           let xonlyHex = TE.decodeUtf8 (B16.encode h)
               rawtrDesc = "rawtr(" <> xonlyHex <> ")"
           in fromMaybe rawtrDesc (addDescriptorChecksum rawtrDesc)
+        P2PK pk | inferablePubKey pk -> pkDescriptor pk
+        P2MultiSig m pks | all inferablePubKey pks -> multiDescriptor m pks
         _ -> case mAddress of
           Just addr | not suppressAddr ->
             fromMaybe ("addr(" <> addr <> ")") $
@@ -7284,6 +7302,41 @@ inferSpkDescriptor net script =
           _ ->
             fromMaybe ("raw(" <> hexStr <> ")") $
               addDescriptorChecksum ("raw(" <> hexStr <> ")")
+
+-- | CPubKey::IsValidNonHybrid (pubkey.h): size > 0 and header 0x02, 0x03 or
+-- 0x04 only.  Hybrid 0x06/0x07 is Solver-PUBKEY (ValidSize) but InferPubkey
+-- returns null, so the descriptor stays raw().  A 33-byte push with any other
+-- header is not a pubkey here either.
+inferablePubKey :: ByteString -> Bool
+inferablePubKey pk = case BS.uncons pk of
+  Just (0x02, rest) -> BS.length rest == 32
+  Just (0x03, rest) -> BS.length rest == 32
+  Just (0x04, rest) -> BS.length rest == 64
+  _                 -> False
+
+pkHex :: ByteString -> Text
+pkHex = TE.decodeUtf8 . B16.encode
+
+-- | multi(N,pk,...) with no checksum.  Threshold is the decoded small integer.
+multiBody :: Int -> [ByteString] -> Text
+multiBody m pks =
+  "multi(" <> T.intercalate "," (T.pack (show m) : map pkHex pks) <> ")"
+
+pkDescriptor :: ByteString -> Text
+pkDescriptor pk = fromMaybe body (addDescriptorChecksum body)
+  where body = "pk(" <> pkHex pk <> ")"
+
+multiDescriptor :: Int -> [ByteString] -> Text
+multiDescriptor m pks = fromMaybe body (addDescriptorChecksum body)
+  where body = multiBody m pks
+
+-- | wsh(multi(...))#csum.  The checksum covers the whole wsh() expression;
+-- the inner multi() is not checksummed first.  decodescript's segwit wrap
+-- of a bare multisig inserts the redeem script into the signing provider,
+-- so InferDescriptor emits this rather than addr(bcrt1q...).
+wshMultiDescriptor :: Int -> [ByteString] -> Text
+wshMultiDescriptor m pks = fromMaybe body (addDescriptorChecksum body)
+  where body = "wsh(" <> multiBody m pks <> ")"
 
 -- | Build a PSBT tx-level vin Encoding entry.
 -- Emits { "txid", "vout", "scriptSig": {"asm","hex"}, "txinwitness"?, "sequence" }.
@@ -8580,6 +8633,7 @@ handleWalletCreateFundedPsbtChecked server params = withWalletMgr server $ \wm -
       -- P2TR: OP_1 <32-byte x-only pubkey>
       | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
           Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+      | s == payToAnchorScript = Just PayToAnchorAddress
       | otherwise = Nothing
 
     -- | Build a synthetic 1-input/1-output transaction to satisfy the
@@ -9232,6 +9286,9 @@ handleGetAddressInfo server params = withWalletMgr server $ \wm -> do
                                                  Just (TE.decodeUtf8 (B16.encode (getHash256 h))))
                     TaprootAddress h         -> (False, True,  Just 1,
                                                  Just (TE.decodeUtf8 (B16.encode (getHash256 h))))
+                    -- Core DescribeAddress PayToAnchor: isscript+iswitness,
+                    -- no witness_version / witness_program.
+                    PayToAnchorAddress       -> (True, True, Nothing, Nothing)
                   labelList = case Map.lookup addr labels of
                     Just l  -> [l]
                     Nothing -> [] :: [Text]
@@ -9395,7 +9452,6 @@ handleDecodeScript server params = do
                              Left _  -> NonStandard
               typeStr    = scriptTypeToString scriptType
               asmStr     = scriptToAsmPartial scriptBytes
-              hexStr'    = TE.decodeUtf8 (B16.encode scriptBytes)
               mAddress   = scriptToAddress net scriptBytes scriptType
               -- Suppress address for pubkey/multisig/nulldata/nonstandard (Core rule).
               suppressAddr = case scriptType of
@@ -9404,32 +9460,22 @@ handleDecodeScript server params = do
                 OpReturn _     -> True
                 NonStandard    -> True
                 _              -> False
-              -- desc: rawtr(KEY)#csum for P2TR, addr(addr)#csum if addressable,
-              --        raw(hex)#csum otherwise. Mirrors psbtSpkEnc descStr.
-              descStr = case scriptType of
-                P2TR (Hash256 h) ->
-                  let xonly   = TE.decodeUtf8 (B16.encode h)
-                      rawtrD  = "rawtr(" <> xonly <> ")"
-                  in fromMaybe rawtrD (addDescriptorChecksum rawtrD)
-                _ -> case mAddress of
-                  Just addr | not suppressAddr ->
-                    fromMaybe ("addr(" <> addr <> ")") $
-                      addDescriptorChecksum ("addr(" <> addr <> ")")
-                  _ ->
-                    fromMaybe ("raw(" <> hexStr' <> ")") $
-                      addDescriptorChecksum ("raw(" <> hexStr' <> ")")
+              -- Same InferDescriptor as psbtSpkEnc: pk()/multi() for non-hybrid
+              -- keys, rawtr() for P2TR, addr() when addressable, else raw().
+              descStr = inferSpkDescriptor net scriptBytes
               -- IsUnspendable: starts with OP_RETURN (0x6a).
               isUnspendable = not (BS.null scriptBytes) && BS.index scriptBytes 0 == 0x6a
               -- can_wrap: Core includes pubkey/pubkeyhash/multisig/nonstandard/
-              --   witness_v0_keyhash/witness_v0_scripthash, but only if not
-              --   unspendable and no OP_CHECKSIGADD (0xba) in raw bytes.
+              --   witness_v0_keyhash/witness_v0_scripthash, but only if
+              --   HasValidOps, not unspendable, and no OP_CHECKSIGADD /
+              --   IsOpSuccess opcode (rawtransaction.cpp decodescript).
               canWrap = case scriptType of
                 P2SH _   -> False
                 P2TR _   -> False
                 P2A      -> False
                 WitnessUnknown _ _ -> False   -- Core: WITNESS_UNKNOWN never wrapped
                 OpReturn _ -> False
-                _ -> not isUnspendable && not (hasChecksigAdd scriptBytes)
+                _ -> not isUnspendable && not (scriptRejectsWrap scriptBytes)
               -- can_wrap_P2WSH: pubkey/pubkeyhash/nonstandard/multisig only.
               -- witness_v0_keyhash and witness_v0_scripthash are already segwit.
               canWrapP2WSH = canWrap && case scriptType of
@@ -9468,13 +9514,20 @@ handleDecodeScript server params = do
               segwitTypeStr  = scriptTypeToString segwitScriptType
               segwitAsmStr   = scriptToAsmPartial segwitScript
               segwitHexStr   = TE.decodeUtf8 (B16.encode segwitScript)
-              segwitDescStr  = case segwitMAddr of
-                Just addr ->
-                  fromMaybe ("addr(" <> addr <> ")") $
-                    addDescriptorChecksum ("addr(" <> addr <> ")")
-                Nothing ->
-                  fromMaybe ("raw(" <> segwitHexStr <> ")") $
-                    addDescriptorChecksum ("raw(" <> segwitHexStr <> ")")
+              -- P2WSH wrap of a bare multisig: Core inserts the redeem script
+              -- into the signing provider, so InferDescriptor yields
+              -- wsh(multi(...)) rather than addr(P2WSH).  P2PK stays
+              -- addr(P2WPKH); anything else keeps addr()/raw().
+              segwitDescStr  = case scriptType of
+                P2MultiSig m pks
+                  | all inferablePubKey pks -> wshMultiDescriptor m pks
+                _ -> case segwitMAddr of
+                  Just addr ->
+                    fromMaybe ("addr(" <> addr <> ")") $
+                      addDescriptorChecksum ("addr(" <> addr <> ")")
+                  Nothing ->
+                    fromMaybe ("raw(" <> segwitHexStr <> ")") $
+                      addDescriptorChecksum ("raw(" <> segwitHexStr <> ")")
               segwitEnc = pairs $
                 pair "asm"  (text segwitAsmStr) <>
                 pair "desc" (text segwitDescStr) <>
@@ -9504,10 +9557,66 @@ handleDecodeScript server params = do
           let rawBs = encodingToLazyByteString topEnc
           return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    -- | Check if script bytes contain OP_CHECKSIGADD (0xba).
-    -- Reference: Bitcoin Core decodescript can_wrap loop.
-    hasChecksigAdd :: ByteString -> Bool
-    hasChecksigAdd bs = 0xba `BS.elem` bs
+    -- | Core decodescript refuses the p2sh/segwit wrap when HasValidOps is
+    -- false or the opcode walk hits OP_CHECKSIGADD / IsOpSuccess
+    -- (script.cpp HasValidOps / IsOpSuccess, rawtransaction.cpp).
+    -- HasValidOps: GetOp fails, opcode > MAX_OPCODE (OP_NOP10 = 0xb9), or a
+    -- push longer than MAX_SCRIPT_ELEMENT_SIZE (520).  OP_CHECKSIGADD (0xba)
+    -- is already above MAX_OPCODE; IsOpSuccess still rejects the disabled
+    -- opcodes at or below 0xb9 (OP_CAT, OP_VER, ...).  This walks opcodes,
+    -- so a push that merely contains the byte 0xba does not trip it.
+    scriptRejectsWrap :: ByteString -> Bool
+    scriptRejectsWrap = go
+      where
+        go bs
+          | BS.null bs = False
+          | otherwise =
+              let op = BS.index bs 0
+                  rest = BS.drop 1 bs
+              in case operand op rest of
+                   Nothing -> True
+                   Just (nPush, rest')
+                     | nPush > 520 -> True
+                     | op > 0xb9   -> True
+                     | isOpSuccess op -> True
+                     | otherwise -> go rest'
+        operand :: Word8 -> ByteString -> Maybe (Int, ByteString)
+        operand op rest
+          | op <= 0x4b =
+              let n = fromIntegral op
+              in if BS.length rest < n then Nothing else Just (n, BS.drop n rest)
+          | op == 0x4c =
+              if BS.null rest then Nothing
+              else let n = fromIntegral (BS.index rest 0) :: Int
+                       rest2 = BS.drop 1 rest
+                   in if BS.length rest2 < n then Nothing
+                      else Just (n, BS.drop n rest2)
+          | op == 0x4d =
+              if BS.length rest < 2 then Nothing
+              else let n = fromIntegral (BS.index rest 0)
+                         + fromIntegral (BS.index rest 1) * 256
+                       rest2 = BS.drop 2 rest
+                   in if BS.length rest2 < n then Nothing
+                      else Just (n, BS.drop n rest2)
+          | op == 0x4e =
+              if BS.length rest < 4 then Nothing
+              else let n = fromIntegral (BS.index rest 0)
+                         + fromIntegral (BS.index rest 1) * 256
+                         + fromIntegral (BS.index rest 2) * 65536
+                         + fromIntegral (BS.index rest 3) * 16777216
+                       rest2 = BS.drop 4 rest
+                   in if BS.length rest2 < n then Nothing
+                      else Just (n, BS.drop n rest2)
+          | otherwise = Just (0, rest)
+        -- script.cpp IsOpSuccess.  187-254 is also > MAX_OPCODE.
+        isOpSuccess op =
+          op == 80 || op == 98
+          || (op >= 126 && op <= 129)
+          || (op >= 131 && op <= 134)
+          || (op >= 137 && op <= 138)
+          || (op >= 141 && op <= 142)
+          || (op >= 149 && op <= 153)
+          || (op >= 187 && op <= 254)
 
     -- | Hash160 = RIPEMD160(SHA256(bs)).
     doHash160 :: ByteString -> ByteString
@@ -10652,6 +10761,7 @@ fundRawTx wallet tipHeight FundOptions{..} baseTx =
           Just $ ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s)))
       | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
           Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+      | s == payToAnchorScript = Just PayToAnchorAddress
       | otherwise = Nothing
 
     -- | Deduct 'fee' evenly across the SFFO-named outputs (Core's
@@ -12478,6 +12588,7 @@ scriptBytesToAddress s
       Just $ ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s)))
   | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
       Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+  | s == payToAnchorScript = Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | addr() descriptor (checksummed when the charset accepts it). Descriptor
@@ -14874,6 +14985,7 @@ addressToTextNet net addr =
        WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
        WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
        TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
+       PayToAnchorAddress     -> bech32mEncode hrp 1 p2aWitnessProgram
 
 -- | Display a BlockHash as hex (reversed byte order for display)
 showHash :: BlockHash -> Text
@@ -15226,6 +15338,41 @@ asmPushToken bs
       Left _  -> TE.decodeUtf8 (B16.encode bs)   -- unreachable for <= 4 bytes
   | otherwise = TE.decodeUtf8 (B16.encode bs)
 
+-- | Core GetOpName (script.cpp) for the opcodes the truncated-script walker
+-- does not special-case, and for OP_INVALIDOPCODE.  0xff is
+-- "OP_INVALIDOPCODE"; every other unnamed opcode is "OP_UNKNOWN" with no
+-- bracketed byte.  Named opcodes the walker already prints stay in its
+-- explicit arms; the gaps (disabled splice/bit/numeric ops, OP_NOP1,
+-- OP_NOP4..OP_NOP10, OP_CHECKSIGADD) fall through to here.
+opcodeByteName :: Word8 -> Text
+opcodeByteName 0x7e = "OP_CAT"
+opcodeByteName 0x7f = "OP_SUBSTR"
+opcodeByteName 0x80 = "OP_LEFT"
+opcodeByteName 0x81 = "OP_RIGHT"
+opcodeByteName 0x82 = "OP_SIZE"
+opcodeByteName 0x83 = "OP_INVERT"
+opcodeByteName 0x84 = "OP_AND"
+opcodeByteName 0x85 = "OP_OR"
+opcodeByteName 0x86 = "OP_XOR"
+opcodeByteName 0x8d = "OP_2MUL"
+opcodeByteName 0x8e = "OP_2DIV"
+opcodeByteName 0x95 = "OP_MUL"
+opcodeByteName 0x96 = "OP_DIV"
+opcodeByteName 0x97 = "OP_MOD"
+opcodeByteName 0x98 = "OP_LSHIFT"
+opcodeByteName 0x99 = "OP_RSHIFT"
+opcodeByteName 0xb0 = "OP_NOP1"
+opcodeByteName 0xb3 = "OP_NOP4"
+opcodeByteName 0xb4 = "OP_NOP5"
+opcodeByteName 0xb5 = "OP_NOP6"
+opcodeByteName 0xb6 = "OP_NOP7"
+opcodeByteName 0xb7 = "OP_NOP8"
+opcodeByteName 0xb8 = "OP_NOP9"
+opcodeByteName 0xb9 = "OP_NOP10"
+opcodeByteName 0xba = "OP_CHECKSIGADD"
+opcodeByteName 0xff = "OP_INVALIDOPCODE"
+opcodeByteName _    = "OP_UNKNOWN"
+
 -- | Convert script bytes to assembly string representation
 scriptToAsm :: ByteString -> Text
 scriptToAsm scriptBytes =
@@ -15349,7 +15496,9 @@ scriptToAsm scriptBytes =
       -- P2A gettxout drop), so any script holding a 0xba byte as an opcode
       -- dropped the connection of every RPC that renders its asm.
       OP_CHECKSIGADD -> "OP_CHECKSIGADD"
-      OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
+      -- Core GetOpName: 0xff is OP_INVALIDOPCODE, anything else unnamed
+      -- is OP_UNKNOWN (no "[n]").
+      OP_INVALIDOPCODE w -> opcodeByteName w
 
 -- | ASM emitter that handles truncated push data by emitting literal "[error]".
 -- Reference: Bitcoin Core ScriptToAsmStr (core_io.cpp) — walks raw bytes and
@@ -15426,7 +15575,7 @@ scriptToAsmPartial scriptBytes =
       -- P2A gettxout drop), so any script holding a 0xba byte as an opcode
       -- dropped the connection of every RPC that renders its asm.
       OP_CHECKSIGADD -> "OP_CHECKSIGADD"
-      OP_INVALIDOPCODE w -> T.pack $ "OP_UNKNOWN[" ++ show w ++ "]"
+      OP_INVALIDOPCODE w -> opcodeByteName w
 
     -- Walk raw bytes, accumulating ASM tokens.
     -- Mirrors Core's ScriptToAsmStr byte-level loop.
@@ -15553,7 +15702,7 @@ scriptToAsmPartial scriptBytes =
                0xaf -> "OP_CHECKMULTISIGVERIFY" : walkBytes rest
                0xb1 -> "OP_CHECKLOCKTIMEVERIFY" : walkBytes rest
                0xb2 -> "OP_CHECKSEQUENCEVERIFY" : walkBytes rest
-               _    -> T.pack (printf "OP_UNKNOWN[%d]" (fromIntegral op :: Int)) : walkBytes rest
+               _    -> opcodeByteName op : walkBytes rest
 
 -- | Map a sighash byte to its text label.
 -- Reference: bitcoin-core/src/core_io.cpp SighashToStr.
