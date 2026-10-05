@@ -274,13 +274,15 @@ spec = describe "W203 handshake Core parity (MIN_PEER_PROTO_VERSION, pre-verack)
       map commandName (preVerackReplies 70016)
         `shouldBe` ["wtxidrelay", "sendaddrv2", "verack"]
 
-    it "postVerackFeatureMessages gates at 70012 / 70014 / 70013(+relay)" $ do
+    -- feefilter is no longer a handshake message: it is sent by the
+    -- MaybeSendFeefilter ticker (FeeFilterRelaySpec), as in Core.
+    it "postVerackFeatureMessages gates at 70012 / 70014" $ do
       map commandName (postVerackFeatureMessages 70011 True) `shouldBe` []
       map commandName (postVerackFeatureMessages 70012 True) `shouldBe` ["sendheaders"]
       map commandName (postVerackFeatureMessages 70013 True)
-        `shouldBe` ["sendheaders", "feefilter"]
+        `shouldBe` ["sendheaders"]
       map commandName (postVerackFeatureMessages 70016 True)
-        `shouldBe` ["sendheaders", "sendcmpct", "feefilter"]
+        `shouldBe` ["sendheaders", "sendcmpct"]
       map commandName (postVerackFeatureMessages 70016 False)
         `shouldBe` ["sendheaders", "sendcmpct"]
 

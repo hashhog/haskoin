@@ -1915,19 +1915,39 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- active tip has less work than nMinimumChainWork or is older than
     -- max tip age (24h); once it clears it latches false for the process.
     -- ibdModeRef is haskoin's header-sync flag, not this.
+    -- The same latching check also drives the BIP133 feefilter ticker below.
     selfAdvIbdDone <- newIORef False
-    setSelfAdvIBDCheck pm $ do
-      done <- readIORef selfAdvIbdDone
-      if done then return False else do
-        tipE <- getValidatedChainTip db hc
-        nowT <- (round <$> getPOSIXTime :: IO Int64)
-        let tipTime = fromIntegral (bhTimestamp (ceHeader tipE)) :: Int64
-            inIBD = ceChainWork tipE < netMinimumChainWork net
-                    || tipTime < nowT - 24 * 60 * 60
-        unless inIBD $ do
-          writeIORef selfAdvIbdDone True
-          putStrLn "self-advertise: out of IBD, local address announcements enabled"
-        return inIBD
+    let coreIsIBD = do
+          done <- readIORef selfAdvIbdDone
+          if done then return False else do
+            tipE <- getValidatedChainTip db hc
+            nowT <- (round <$> getPOSIXTime :: IO Int64)
+            let tipTime = fromIntegral (bhTimestamp (ceHeader tipE)) :: Int64
+                inIBD = ceChainWork tipE < netMinimumChainWork net
+                        || tipTime < nowT - 24 * 60 * 60
+            unless inIBD $ do
+              writeIORef selfAdvIbdDone True
+              putStrLn "self-advertise: out of IBD, local address announcements enabled"
+            return inIBD
+    setSelfAdvIBDCheck pm coreIsIBD
+    -- BIP133 feefilter (Core SendMessages -> MaybeSendFeefilter, run for
+    -- every peer on each SendMessages pass): the first feefilter goes out
+    -- right after verack (piNextFeeFilterSend starts at 0), then on a
+    -- Poisson(10 min) schedule, expedited on a >25% mempool-min-fee move;
+    -- MAX_MONEY while in IBD.  Before this ticker existed the only
+    -- feefilter haskoin ever sent was a hardcoded 100 sat/vB at verack, so
+    -- peers announced ~no transactions and the mainnet mempool stayed empty.
+    void $ forkIO $ forever $ do
+      threadDelay 1_000_000
+      (do isIBD <- coreIsIBD
+          mpMin <- getMempoolMinFeeRate mp
+          let FeeRate minRelay = mpcMinFeeRate (mpConfig mp)
+          peersFF <- readTVarIO (pmPeers pm)
+          forM_ (Map.elems peersFF) $ \pc ->
+            maybeSendFeefilter isIBD mpMin (fromIntegral minRelay) pc
+              `catch` (\(_ :: SomeException) -> return ()))
+        `catch` (\(e :: SomeException) ->
+                   putStrLn ("feefilter ticker error: " ++ show e))
     forM_ (concatMap (splitOnComma) noExternalIP) $ \ext -> do
       parsed <- parseExternalIP ext
       case parsed of

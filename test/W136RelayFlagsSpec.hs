@@ -79,6 +79,7 @@ import Data.Serialize (encode, decode)
 import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
 
+import FeeFilterRelaySpec (feeFilterTestPeer)
 import Haskoin.Network
   ( Message(..)
   , SendHeaders(..)
@@ -91,6 +92,8 @@ import Haskoin.Network
   , feeAtRate
   , filterTxByFeeRate
   , poissonDelay
+  , feefilterStep
+  , feeFilterMaxMoney
   )
 
 --------------------------------------------------------------------------------
@@ -329,20 +332,11 @@ spec = describe "W136 sendheaders + feefilter + wtxidrelay" $ do
   ------------------------------------------------------------------------------
 
   describe "G18 Initial outbound feefilter uses mempool min fee, not constant" $ do
-    it "G18 PINS current behavior: continueHandshake sends FeeFilter 100000 sat/kvB hardcoded" $
-      -- Source-level pin: Network.hs:2431
-      --   sendMessage pc (MFeeFilter (FeeFilter 100000))
-      -- This is 100 sat/vbyte — way above the typical mempool minfee
-      -- of 1 sat/vbyte.  Any peer receiving our initial filter will
-      -- stop relaying ~all txs to us until our scheduled feefilter
-      -- broadcast cycle (10min Poisson) updates them.
-      True `shouldBe` True
-
-    xit "G18 GATE: initial feefilter = m_mempool.GetMinFee().GetFeePerK() rounded" $
-      -- Core net_processing.cpp:5550 + 5565:
-      --   CAmount currentFilter = m_mempool.GetMinFee().GetFeePerK();
-      --   CAmount filterToSend  = m_fee_filter_rounder.round(currentFilter);
-      pendingWith "BUG-6: initial feefilter hardcoded to 100000; not mempool-derived"
+    it "G18 FIXED: no hardcoded handshake feefilter; first send = max(mempool min, min relay)" $
+      -- Was: postVerackFeatureMessages sent FeeFilter 100000 (100 sat/vB)
+      -- and nothing ever corrected it.  Now: the MaybeSendFeefilter ticker
+      -- (FeeFilterRelaySpec) sends max(GetMinFee, min_relay_feerate).
+      fst (feefilterStep False 0 100 1 1 1 feeFilterTestPeer) `shouldBe` Just 100
 
   describe "G19 FeeFilter sent every ~AVG_FEEFILTER_BROADCAST_INTERVAL (10min)" $ do
     it "G19 PASS: avgFeeFilterBroadcastInterval = 10 * 60 * 1_000_000 micros (matches Core)" $
@@ -402,18 +396,8 @@ spec = describe "W136 sendheaders + feefilter + wtxidrelay" $ do
       pendingWith "BUG-13: no ForceRelay / Whitelist permission gate"
 
   describe "G25 FeeFilter set to MAX_MONEY during IBD" $ do
-    xit "G25 MISSING: shouldSendFeeFilter has no IBD branch (Core: currentFilter = MAX_MONEY)" $
-      -- Core net_processing.cpp:5552-5555:
-      --   if (m_chainman.IsInitialBlockDownload()) {
-      --     // tx-inv messages are discarded when chainstate is in IBD,
-      --     // so tell the peer to not send them.
-      --     currentFilter = MAX_MONEY;
-      --   }
-      -- haskoin's shouldSendFeeFilter (Network.hs:4890-4908) has no IBD
-      -- check at all — during IBD we will still tell peers to relay
-      -- mempool minfee txs to us, even though we discard them anyway.
-      -- This is bandwidth waste during multi-day IBD.
-      pendingWith "BUG-7 P0-CDIV: no IBD branch; should send MAX_MONEY during IBD"
+    it "G25 FIXED: feefilterStep advertises MAX_MONEY while in IBD" $
+      fst (feefilterStep True 0 100 1 1 1 feeFilterTestPeer) `shouldBe` Just feeFilterMaxMoney
 
   describe "G26 FeeFilter quantized via FeeFilterRounder (log-spaced ~120 buckets)" $ do
     xit "G26 MISSING: sendFeeFilter sends raw value (no quantization, privacy regression)" $

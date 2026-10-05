@@ -321,6 +321,9 @@ module Haskoin.Network
   , handleFeeFilter
   , shouldSendFeeFilter
   , sendFeeFilter
+  , feeFilterMaxMoney
+  , feefilterStep
+  , maybeSendFeefilter
   , filterTxByFeeRate
     -- * Re-exports from Network.Socket
   , SockAddr(..)
@@ -4364,17 +4367,24 @@ preVerackReplies cv =
 --     MaybeSendSendHeaders, net_processing.cpp:5525)
 --   * @sendcmpct(0, 2)@ iff cv >= SHORT_IDS_BLOCKS_VERSION (70014;
 --     net_processing.cpp:3864)
---   * @feefilter@ iff cv >= FEEFILTER_VERSION (70013; MaybeSendFeefilter,
---     net_processing.cpp:5543) and the peer asked for tx relay
 --
--- A peer below all three (e.g. 70002) receives nothing here; it would
--- not be able to parse any of them.
+-- @feefilter@ is NOT sent here.  It used to be, as a hardcoded
+-- @FeeFilter 100000@ — 100000 sat/kvB = 100 sat/vB, 1000x Core's
+-- DEFAULT_MIN_RELAY_TX_FEE (100 sat/kvB) — and the periodic re-send that
+-- was meant to correct it ('sendFeeFilter') had no caller, so every peer
+-- was told for the whole connection to announce only txs paying >= 100
+-- sat/vB.  On mainnet that is ~no tx at all: the mempool stayed EMPTY.
+-- Core sends feefilter from SendMessages -> MaybeSendFeefilter
+-- (net_processing.cpp), the first time right after verack and then on a
+-- Poisson schedule; haskoin now does the same from a per-peer ticker
+-- ('maybeSendFeefilter'), with the value derived from the mempool.
+--
+-- A peer below both (e.g. 70002) receives nothing here; it would
+-- not be able to parse either.  The relay argument is kept for callers.
 postVerackFeatureMessages :: Int32 -> Bool -> [Message]
-postVerackFeatureMessages cv relay =
+postVerackFeatureMessages cv _relay =
   [ MSendHeaders | cv >= p2pSendHeadersVersion ]
   ++ [ MSendCmpct (SendCmpct False 2) | cv >= p2pShortIdsBlocksVersion ]
-  -- BIP133: initial feefilter (100 sat/vbyte = 100000 sat/kvB)
-  ++ [ MFeeFilter (FeeFilter 100000) | cv >= p2pFeeFilterVersion, relay ]
 
 -- | Record a BIP-152 @sendcmpct@ (Core net_processing.cpp:3900-3915):
 -- only version 2 (segwit compact blocks) is recorded; any other version
@@ -7791,6 +7801,68 @@ sendFeeFilter pc feeFilter = do
            }
     -- Send the feefilter message
     sendMessage pc (MFeeFilter (FeeFilter feeFilter))
+
+-- | MAX_MONEY in satoshis: the feefilter Core advertises while in IBD.
+feeFilterMaxMoney :: Word64
+feeFilterMaxMoney = 2100000000000000
+
+-- | One MaybeSendFeefilter decision for one peer (Core net_processing.cpp
+-- PeerManagerImpl::MaybeSendFeefilter), pure so it can be pinned.
+--
+-- Arguments: whether we are in IBD (Core IsInitialBlockDownload), the
+-- mempool minimum fee (sat/kvB, Core m_mempool.GetMinFee()), the static
+-- min relay fee (sat/kvB, Core min_relay_feerate), now (us), a freshly
+-- drawn Poisson delay for the regular schedule
+-- (rand_exp_duration(AVG_FEEFILTER_BROADCAST_INTERVAL)), a freshly drawn
+-- uniform delay in [0, MAX_FEEFILTER_CHANGE_DELAY) for the expedite arm,
+-- and the peer.  Returns the value to send (if any) and the new
+-- piNextFeeFilterSend.
+--
+-- Not ported: FeeFilterRounder quantisation (privacy; W136 G26 / W139 G5
+-- stay pending) and the ForceRelay permission (haskoin has none).
+feefilterStep :: Bool -> Word64 -> Word64 -> Int64 -> Int64 -> Int64
+              -> PeerInfo -> (Maybe Word64, Int64)
+feefilterStep isIBD mempoolMinKvb minRelayKvb now poissonUs expediteUs info
+  -- if (pto.GetCommonVersion() < FEEFILTER_VERSION) return;
+  | peerCommonVersion info < p2pFeeFilterVersion = (Nothing, next0)
+  -- if (pto.IsBlockOnlyConn()) return;
+  | piBlockOnly info = (Nothing, next0)
+  | now > next1 =
+      let filterToSend = max currentFilter minRelayKvb
+          toSend | filterToSend /= piFeeFilterSent info = Just filterToSend
+                 | otherwise = Nothing
+      in (toSend, now + poissonUs)
+  | now + maxFeeFilterChangeDelay < next1
+    && ( currentFilter < 3 * sent `div` 4
+      || currentFilter > 4 * sent `div` 3 ) =
+      (Nothing, now + expediteUs)
+  | otherwise = (Nothing, next1)
+  where
+    next0 = piNextFeeFilterSend info
+    sent  = piFeeFilterSent info
+    -- Received tx-inv messages are useless during IBD: tell the peer
+    -- not to send them.
+    currentFilter | isIBD     = feeFilterMaxMoney
+                  | otherwise = mempoolMinKvb
+    -- Send the current filter at once if we sent MAX previously and made
+    -- it out of IBD.
+    next1 | not isIBD && sent == feeFilterMaxMoney = 0
+          | otherwise = next0
+
+-- | Run 'feefilterStep' for one connected peer and send the result.
+maybeSendFeefilter :: Bool -> Word64 -> Word64 -> PeerConnection -> IO ()
+maybeSendFeefilter isIBD mempoolMinKvb minRelayKvb pc = do
+  info <- readTVarIO (pcInfo pc)
+  when (piState info == PeerConnected) $ do
+    now <- round . (* 1000000) <$> getPOSIXTime
+    poissonUs  <- poissonDelay avgFeeFilterBroadcastInterval
+    expediteUs <- randomRIO (0, maxFeeFilterChangeDelay - 1)
+    let (toSend, nextSend) =
+          feefilterStep isIBD mempoolMinKvb minRelayKvb now poissonUs expediteUs info
+    atomically $ modifyTVar' (pcInfo pc) $ \i ->
+      i { piNextFeeFilterSend = nextSend
+        , piFeeFilterSent = maybe (piFeeFilterSent i) id toSend }
+    forM_ toSend $ \f -> sendMessage pc (MFeeFilter (FeeFilter f))
 
 -- | Check if a transaction's fee rate passes the peer's fee filter
 -- txFeeRate is in sat/vB, peerFeeFilter is in sat/kvB

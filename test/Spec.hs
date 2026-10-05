@@ -98,6 +98,7 @@ import qualified PrioritiseTransactionSpec
 import qualified RbfMempoolParentSpec
 import qualified RelayTxNoPunishSpec
 import qualified MempoolActiveTipSpec
+import qualified FeeFilterRelaySpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
@@ -23666,9 +23667,12 @@ main = hspec $ do
       -- Also: feefilter value is not lower-bounded (Core enforces
       -- feeFilter >= 0, which is trivially true for Word64, but the
       -- \"reasonable range\" check is present only in handleFeeFilter).
-      -- Verify the after-verack send path exists:
+      -- Verify the after-verack send path exists (the MaybeSendFeefilter
+      -- ticker; the hardcoded 100 sat/vB handshake feefilter is gone):
       contents <- readFile "src/Haskoin/Network.hs"
-      ("MFeeFilter (FeeFilter 100000)" `isInfixOf` contents) `shouldBe` True
+      ("MFeeFilter (FeeFilter 100000)" `isInfixOf` contents) `shouldBe` False
+      mainSrc <- readFile "app/Main.hs"
+      ("maybeSendFeefilter isIBD" `isInfixOf` mainSrc) `shouldBe` True
 
   -- W100 CCoinsViewCache + FlushStateToDisk gate audit
   W100UTXOCacheSpec.spec
@@ -23703,6 +23707,7 @@ main = hspec $ do
 
   -- mempool reads the ACTIVE tip (height, MTP, coin MTP, maturity, BIP-68)
   MempoolActiveTipSpec.spec
+  FeeFilterRelaySpec.spec
 
   -- W107 CompactSize + VarInt 30-gate audit
   W107CompactSizeSpec.spec
