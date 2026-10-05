@@ -32,10 +32,11 @@
 module CoinCacheResurrectionSpec (spec) where
 
 import Test.Hspec
-import Control.Exception (bracket)
+import Control.Exception (bracket, finally)
 import Control.Monad (replicateM_)
 import Control.Concurrent.STM (newTVarIO, readTVarIO)
-import Data.IORef (newIORef)
+import Control.Monad (when)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Either (isLeft, isRight)
 import Data.Maybe (isJust)
 import Data.Word (Word64)
@@ -56,7 +57,8 @@ import Haskoin.Consensus
   , consensusFlagsAtHeight, getMtpFromAncestry, computeWtxId )
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, getUTXO
-  , getBlock, lookupUTXO, flushCache, buildSpentUtxoMapCached, rcInvalidate )
+  , getBlock, lookupUTXO, flushCache, buildSpentUtxoMapCached
+  , noteBlockConnectedOnDisk, lookupUTXOReadHookRef, UTXOCache(..), UTXOEntry(..) )
 import Haskoin.Mempool
   ( Mempool, newMempool, initNodeMempool, defaultMempoolConfig, addTransaction
   , blockConnected )
@@ -176,13 +178,15 @@ p2pConnect server mp block = do
       case vr of
         Left e -> return (Left e)
         Right () -> do
+          -- Main.hs: pre-commit cache notification (F0).
+          noteBlockConnectedOnDisk cache block
           rC <- connectBlock db regtest block height spent
           case rC of
             Left e -> return (Left e)
             Right () -> do
-              -- Main.hs: the post-commit cache notification.
-              mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
-                    [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
+              -- Main.hs: the post-commit cache notification (F0; it also
+              -- does the rcEntries invalidation Main did before).
+              noteBlockConnectedOnDisk cache block
               blockConnected mp block
               return (Right ())
 
@@ -289,3 +293,33 @@ spec = describe "F0 coin-cache resurrection: a P2P-connected spend reaches every
       submit server blkB >>= (`shouldSatisfy` isRight)
       getUTXO db x >>= (`shouldBe` Nothing)
       lookupUTXO cache x >>= (`shouldBe` Nothing)
+
+  it "(4) race: a lookupUTXO disk read straddling a P2P spend+commit is not installed (ucGen guard)" $
+    withLiveServer $ \server -> do
+      let db = rsDB server
+          cache = rsUTXOCache server
+      x <- setupMatureCoin server
+      flushCache cache
+      mp <- nodeMempool server
+      tip0 <- getValidatedChainTip db (rsHeaderChain server)
+      blkB <- mkBlock server (ceHash tip0) [spendTx x 4_999_990_000]
+      fired <- newIORef False
+      -- Deterministic interleaving: the reader has read X from disk (still
+      -- unspent there); before it installs, block B spending X is connected
+      -- and committed by the P2P arm.
+      writeIORef lookupUTXOReadHookRef $ \op -> when (op == x) $ do
+        done <- readIORef fired
+        when (not done) $ do
+          writeIORef fired True
+          p2pConnect server mp blkB >>= (`shouldBe` Right ())
+      r <- lookupUTXO cache x
+             `finally` writeIORef lookupUTXOReadHookRef (\_ -> return ())
+      readIORef fired `shouldReturn` True
+      getUTXO db x >>= (`shouldBe` Nothing)            -- control: B committed
+      cached <- Map.lookup x <$> readTVarIO (ucEntries cache)
+      putStrLn ("    [F0] racing lookupUTXO returned " ++ show (fmap ueSpent r)
+                ++ "; cached entry: " ++ show (fmap ueSpent cached))
+      r `shouldBe` Nothing
+      cached `shouldSatisfy` maybe True ueSpent
+      blkC <- mkBlock server (hashOf blkB) [spendTx x 4_999_980_000]
+      submit server blkC >>= (`shouldSatisfy` isLeft)

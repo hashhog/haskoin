@@ -396,7 +396,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         makeKey, KeyPrefix(..), prefixByte, toBE32, TxLocation(..),
                         BlockStatus(..), UTXOCache(..), UTXOEntry(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
-                        mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear,
+                        mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear, invalidateCoinCaches,
                         putUndoData, getUndoData, getUndoDataVerified, deleteUndoData,
                         getBlock, getUTXO, getUTXOCoin, getUTXOCoinChecked, getUTXOCoinHealingTip,
                         getBlockHeight,
@@ -7526,7 +7526,7 @@ reorgDisconnectIncremental cache db hc mIdxMgr (ce : rest) = do
             Right ops -> do
               noteReorgBatch ops
               writeBatch db (WriteBatch ops)
-              rcClear cache
+              invalidateCoinCaches cache  -- F0: rcEntries + ucEntries/ucDirty
               atomically $ do
                 modifyTVar' (hcByHeight hc) (Map.delete (ceHeight ce))
                 case cePrev ce of
@@ -7605,7 +7605,7 @@ reorgConnectIncremental net cache db hc mIdxMgr (ce : rest) = do
               blockOps  = filter (not . isReorgBlockDataPut) blockOps0
           noteReorgBatch blockOps
           writeBatch db (WriteBatch blockOps)
-          rcClear cache
+          invalidateCoinCaches cache  -- F0: rcEntries + ucEntries/ucDirty
           atomically $ do
             modifyTVar' (hcByHeight hc)
               (Map.insert (ceHeight ce) (ceHash ce))

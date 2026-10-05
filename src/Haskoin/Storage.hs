@@ -83,6 +83,10 @@ module Haskoin.Storage
   , getUTXOCoinCached
   , rcInvalidate
   , rcClear
+  , ucInvalidate
+  , noteBlockConnectedOnDisk
+  , invalidateCoinCaches
+  , lookupUTXOReadHookRef
     -- * CoinsView Type Class Hierarchy
   , Coin(..)
   , CoinEntry(..)
@@ -956,6 +960,13 @@ data UTXOCache = UTXOCache
   -- TOCTOU vs the lock-free kicker reorg: a reader samples it before its
   -- lock-free DB read and only populates if it is unchanged at insert time.
   , rcGen      :: !(TVar Word64)                   -- ^ Read-through generation
+  -- | F0 generation for 'ucEntries', bumped every time the on-disk UTXO set
+  -- changes BEHIND this cache ('ucInvalidate', 'invalidateCoinCaches',
+  -- 'flushCache'). A 'lookupUTXO' miss samples it before its lock-free disk
+  -- read and installs the result only if it is unchanged (and the key is
+  -- still uncached), so a pre-spend disk read can never be installed as an
+  -- unspent coin after the spend committed.
+  , ucGen      :: !(TVar Word64)                   -- ^ ucEntries generation
   }
 
 -- | Create a new UTXO cache with the given maximum size.
@@ -969,6 +980,7 @@ newUTXOCache db maxSize = UTXOCache
   <*> newTVarIO 0           -- ucSize
   <*> newTVarIO Map.empty   -- rcEntries (dedicated read-through mirror)
   <*> newTVarIO 0           -- rcGen     (read-through generation counter)
+  <*> newTVarIO 0           -- ucGen     (ucEntries generation counter)
 
 -- | Look up a UTXO, checking cache first then database.
 -- Returns Nothing if the UTXO doesn't exist or is marked as spent.
@@ -1009,7 +1021,18 @@ lookupUTXO cache op = do
       -- 'putUTXO' still writes height=0/coinbase=False, but it has no
       -- production callers (tests only); production writes go through
       -- 'putUTXOCoin'.
+      --
+      -- F0 (coin-cache resurrection): the disk read below is lock-free, so a
+      -- block can spend @op@ and commit (and invalidate this cache) while it
+      -- is in flight. Core never has this window -- FetchCoin runs under
+      -- cs_main and a spent coin stays a DIRTY spent entry (coins.cpp
+      -- :69-82, SpendCoin :142-171). Here: sample 'ucGen' first; install
+      -- only if no disk change was announced since and the key is still
+      -- uncached (never overwrite a spent/dirty entry); otherwise re-resolve.
+      -- Absent is never cached.
+      g0 <- readTVarIO (ucGen cache)
       mCoin <- getUTXOCoin (ucDB cache) op
+      readIORef lookupUTXOReadHookRef >>= \hook -> hook op
       case mCoin of
         Nothing -> return Nothing
         Just coin -> do
@@ -1017,9 +1040,65 @@ lookupUTXO cache op = do
                                 (coinHeight coin)
                                 (coinIsCoinbase coin)
                                 False
-          -- Add to cache for future lookups
-          atomically $ modifyTVar' (ucEntries cache) (Map.insert op entry)
-          return (Just entry)
+          r <- atomically $ do
+            g1  <- readTVar (ucGen cache)
+            cur <- Map.lookup op <$> readTVar (ucEntries cache)
+            case cur of
+              Just e  -> return (Just (if ueSpent e then Nothing else Just e))
+              Nothing
+                | g1 == g0 -> do
+                    modifyTVar' (ucEntries cache) (Map.insert op entry)
+                    return (Just (Just entry))
+                | otherwise -> return Nothing      -- disk changed mid-read
+          maybe (lookupUTXO cache op) return r
+
+-- | F0 TEST HOOK: runs in 'lookupUTXO' between its disk read and the cache
+-- install (the race window). Default no-op.
+{-# NOINLINE lookupUTXOReadHookRef #-}
+lookupUTXOReadHookRef :: IORef (OutPoint -> IO ())
+lookupUTXOReadHookRef = unsafePerformIO (newIORef (\_ -> return ()))
+
+-- | F0: the on-disk UTXO rows for @ops@ were just rewritten BEHIND the cache
+-- (a direct 'connectBlock' / disconnect commit). Drop them from 'ucEntries'
+-- and 'ucDirty' and bump 'ucGen' so an in-flight 'lookupUTXO' read of the old
+-- row is discarded. Dropping 'ucDirty' is required, not just safe: every
+-- cache writer ('applyBlockToCache', 'applyBlock', the reorg Phase-D mirror)
+-- also commits the same change to disk, so a dirty entry for a key the disk
+-- has since moved past is OLDER than disk -- 'flushCache' would write the
+-- spent coin back (resurrect it on disk).
+ucInvalidate :: UTXOCache -> [OutPoint] -> IO ()
+ucInvalidate cache ops = atomically $ do
+  modifyTVar' (ucGen cache) (+ 1)
+  modifyTVar' (ucEntries cache) (\m -> foldl' (flip Map.delete) m ops)
+  modifyTVar' (ucDirty cache)   (\m -> foldl' (flip Map.delete) m ops)
+
+-- | F0: a block was connected straight to disk (the P2P connect arm). Every
+-- key it touched -- spent prevouts and created outputs -- now has its truth
+-- on disk only, so invalidate both read caches for them. Call it after the
+-- commit (an in-flight read is then discarded by the generation bump); the
+-- P2P arm also calls it just before the commit so no reader is served the
+-- cached pre-block value while the batch is being written.
+noteBlockConnectedOnDisk :: UTXOCache -> Block -> IO ()
+noteBlockConnectedOnDisk cache block = do
+  let txs     = blockTxns block
+      spent   = [ txInPrevOutput i | tx <- drop 1 txs, i <- txInputs tx ]
+      created = [ OutPoint (computeTxId tx) (fromIntegral n)
+                | tx <- txs, n <- [0 .. length (txOutputs tx) - 1] ]
+  mapM_ (rcInvalidate cache) spent
+  ucInvalidate cache (spent ++ created)
+
+-- | F0: the on-disk UTXO set changed in bulk or non-monotonically (reorg
+-- step, disconnect, rollback, snapshot load). Wipe the read mirror
+-- ('rcClear') AND the lookupUTXO cache (entries + the disk-redundant dirty
+-- set, see 'ucInvalidate'), bumping both generations.
+invalidateCoinCaches :: UTXOCache -> IO ()
+invalidateCoinCaches cache = do
+  rcClear cache
+  atomically $ do
+    modifyTVar' (ucGen cache) (+ 1)
+    writeTVar (ucEntries cache) Map.empty
+    writeTVar (ucDirty cache) Map.empty
+    writeTVar (ucSize cache) 0
 
 -- | Add a new UTXO to the cache.
 -- Marks the entry as dirty so it will be written on next flush.
@@ -1098,6 +1177,8 @@ flushCache cache = do
     -- + bumping rcGen here guarantees rcEntries can never out-live disk truth.
     modifyTVar' (rcGen cache) (+ 1)
     writeTVar (rcEntries cache) Map.empty
+    -- F0: an in-flight lookupUTXO read straddling the wipe is discarded.
+    modifyTVar' (ucGen cache) (+ 1)
 
   -- Force GC to reclaim the old Map's tree nodes
   performGC

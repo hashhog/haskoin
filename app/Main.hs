@@ -1194,7 +1194,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                               -- write. rcEntries is empty here (peer/RPC threads
                               -- have not started), but this keeps it a strict
                               -- subset of disk by construction.
-                              rcClear cache
+                              invalidateCoinCaches cache  -- F0
                               -- Durably record the snapshot base hash
                               -- (analogue of Core's
                               -- chainstate_snapshot/base_blockhash file,
@@ -4571,6 +4571,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                          -- stays interruptible; only the write + advance is
                          -- masked. Core holds cs_main across ConnectTip.
                          Right () -> uninterruptibleMask_ $ do
+                           -- F0: drop the cached pre-block values before the
+                           -- commit too (see 'noteBlockConnectedOnDisk').
+                           noteBlockConnectedOnDisk cache block
                            rC <- (connectBlock db net block height spent)
                                    `catch` (\(e :: SomeException) -> do
                                               putStrLn $ "ERROR connecting block "
@@ -4592,8 +4595,19 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                                -- set == the on-disk delete set by construction. Under
                                -- connectLock => atomic vs sibling connects; vs the lock-free
                                -- kicker reorg the rcGen guard protects the populate path.
-                               mapM_ (\inp -> rcInvalidate cache (txInPrevOutput inp))
-                                     [ inp | tx <- drop 1 (blockTxns block), inp <- txInputs tx ]
+                               --
+                               -- F0 (coin-cache resurrection): the same commit also
+                               -- moved past every key the lookupUTXO cache may hold
+                               -- (mempool / gettxout / submitblock coin map readers).
+                               -- 'noteBlockConnectedOnDisk' invalidates rcEntries for
+                               -- the spent prevouts (as before) AND drops spent +
+                               -- created keys from ucEntries/ucDirty under a
+                               -- generation bump. Without it a reader-cached coin
+                               -- stayed unspent after this block spent it (mempool
+                               -- and submitblock accepted a second spend) and a
+                               -- dirty cache-created coin was written back to disk
+                               -- by the next flushCache.
+                               noteBlockConnectedOnDisk cache block
                                nextBlock <- readIORef nextBlockRef
                                when (height >= nextBlock) $
                                  writeIORef nextBlockRef (height + 1)

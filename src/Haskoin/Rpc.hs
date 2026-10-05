@@ -454,7 +454,7 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        txoSpenderIndexFind, txoSpenderIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          isUnspendable,
-                         lookupUTXO, rcClear, UTXOEntry(..), TxLocation(..), getTxIndex,
+                         lookupUTXO, rcClear, invalidateCoinCaches, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
                          PruneConfig(..), defaultPruneConfig,
@@ -14723,7 +14723,7 @@ handleDumpTxOutSet server params = do
                   -- (NOT reorgAtomic), so wipe the read-through mirror once it
                   -- completes. Block submission is paused throughout this
                   -- handler, so there are no concurrent connect-arm reads.
-                  rcClear (rsUTXOCache server)
+                  invalidateCoinCaches (rsUTXOCache server)  -- F0
                   case (dumpRes, rRes) of
                     (Left dErr, _) -> return $ RpcResponse Null
                       (toJSON $ RpcError rpcInternalError
