@@ -1357,6 +1357,7 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | PayToAnchorAddress              -- ^ P2A: Bech32m witness v1 program 0x4e73
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1615,6 +1616,13 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText PayToAnchorAddress = bech32mEncode "bc" 1 p2aAddrProgram
+
+-- | P2A witness program (BIP-350 bech32m v1). Same bytes as
+-- 'Haskoin.Script.p2aWitnessProgram'; kept here so Crypto does not
+-- import Script.
+p2aAddrProgram :: ByteString
+p2aAddrProgram = BS.pack [0x4e, 0x73]
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1627,10 +1635,11 @@ textToAddress txt
           | BS.length prog == 32 -> Just $ WitnessScriptAddress (Hash256 prog)
         _ -> Nothing
   | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt
-    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
+    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR / P2A
       case bech32Decode txt of
         Just (_, 1, prog)
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
+          | prog == p2aAddrProgram -> Just PayToAnchorAddress
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
       case base58CheckDecode txt of
