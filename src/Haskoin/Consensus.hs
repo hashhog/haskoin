@@ -3127,9 +3127,12 @@ getBlockSigOpCost block utxoMap flags =
       let cost = getTransactionSigOpCost tx utxos flags
           -- Update UTXO map: add new outputs, remove spent inputs
           txid = computeTxId tx
+          -- Core AddCoin (coins.cpp:84-91): unspendable outputs never
+          -- enter the view, not even for a later tx of the same block.
           newUtxos = Map.fromList
             [ (OutPoint txid (fromIntegral i), txout)
             | (i, txout) <- zip [0..] (txOutputs tx)
+            , not (isUnspendable (txOutScript txout))
             ]
           spentOutpoints = map txInPrevOutput (txInputs tx)
           utxos' = foldr Map.delete (Map.union newUtxos utxos) spentOutpoints
@@ -3480,7 +3483,8 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
                 let txid = computeTxId tx
                     newOuts = Map.fromList
                       [ (OutPoint txid (fromIntegral i), height)
-                      | i <- [0 .. length (txOutputs tx) - 1]
+                      | (i, o) <- zip [(0 :: Int) ..] (txOutputs tx)
+                      , not (isUnspendable (txOutScript o))  -- Core AddCoin
                       ]
                 go (Map.union newOuts intrablockHeights) rest
             | otherwise = do
@@ -3516,7 +3520,8 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
                 let txid = computeTxId tx
                     newOuts = Map.fromList
                       [ (OutPoint txid (fromIntegral i), height)
-                      | i <- [0 .. length (txOutputs tx) - 1]
+                      | (i, o) <- zip [(0 :: Int) ..] (txOutputs tx)
+                      , not (isUnspendable (txOutScript o))  -- Core AddCoin
                       ]
                 go (Map.union newOuts intrablockHeights) rest
       go Map.empty txns
@@ -4362,11 +4367,19 @@ validateBlockTransactions flags skipScripts txns initialUtxoMap = do
         let accFees' = accFees + fee
         when (accFees' > maxMoney) $
           Left "bad-txns-accumulated-fee-outofrange"
-        -- Add outputs from this tx to UTXO map for subsequent txs in block
+        -- Add outputs from this tx to UTXO map for subsequent txs in block.
+        -- UNSPENDABLE outputs (OP_RETURN prefix / > MAX_SCRIPT_SIZE) are
+        -- never added: Core's AddCoin returns early on IsUnspendable
+        -- (coins.cpp:84-91), so a same-block spend of one fails
+        -- CheckTxInputs -> bad-txns-inputs-missingorspent, with or without
+        -- assumevalid.  Adding them let such a spend through under
+        -- assumevalid (no script runs) and mis-reasoned it as a script
+        -- failure otherwise.
         let txid = computeTxId tx
             newUtxos = Map.fromList
               [ (OutPoint txid (fromIntegral i), txout)
               | (i, txout) <- zip [0..] (txOutputs tx)
+              , not (isUnspendable (txOutScript txout))
               ]
             -- Remove spent outputs
             spentOutpoints = map txInPrevOutput (txInputs tx)
@@ -5091,7 +5104,8 @@ connectBlockAt db net block height spentUtxos = do
               blockCreated = Map.fromList
                 [ (OutPoint txid (fromIntegral i), ())
                 | (txid, tx) <- zip (map computeTxId txns) txns
-                , (i, _) <- zip [(0 :: Int) ..] (txOutputs tx)
+                , (i, o) <- zip [(0 :: Int) ..] (txOutputs tx)
+                , not (isUnspendable (txOutScript o))  -- Core AddCoin: never a coin
                 ]
           missingInputs <- foldM (\acc inp ->
               case acc of
