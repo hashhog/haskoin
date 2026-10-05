@@ -155,6 +155,7 @@ import qualified W162ChainstateWedgeSpec
 import qualified W163SnapshotRecoverySpec
 import qualified W165ReorgAtomicSpec
 import qualified ReorgIntraBlockChainSpec
+import qualified UnspendableIntraBlockSpendSpec
 import qualified ReorgSharedTxRecreatedCoinSpec
 import qualified ReorgSharedTxPreforkSpendSpec
 import qualified ReorgDeepIncrementalSpec
@@ -23861,6 +23862,10 @@ main = hspec $ do
   -- overlay/cache/disk by construction; reorgConBuild used to hard-fail on
   -- it ("Reorg connect: missing prevout"), wedging every reorg attempt.
   ReorgIntraBlockChainSpec.spec
+
+  -- Unspendable outputs (OP_RETURN / >10000 bytes) never enter the
+  -- intra-block view: a same-block spend is missing-inputs (Core AddCoin).
+  UnspendableIntraBlockSpendSpec.spec
 
   -- Reorg connect must REVIVE a coin the disconnect tombstoned (P0, mainnet
   -- 963853/963854, 2026-08-24): competing blocks share transactions, so the
