@@ -230,6 +230,9 @@ getList g = do
 
 -- Address: 1-byte tag + raw hash bytes (network-independent; the bech32
 -- HRP is reapplied from the stored network on display).
+-- Tag 5 is PayToAnchorAddress and carries no payload (the program is the
+-- fixed 0x4e73). Tags 0-4 are unchanged, so older snapshots still read.
+-- This is a wallet-snapshot extension, not a chainstate format bump.
 putAddress :: Address -> Put
 putAddress = \case
   PubKeyAddress h        -> putWord8 0 >> putVarBytes' (getHash160 h)
@@ -237,6 +240,7 @@ putAddress = \case
   WitnessPubKeyAddress h -> putWord8 2 >> putVarBytes' (getHash160 h)
   WitnessScriptAddress h -> putWord8 3 >> putVarBytes' (getHash256 h)
   TaprootAddress h       -> putWord8 4 >> putVarBytes' (getHash256 h)
+  PayToAnchorAddress     -> putWord8 5
 
 getAddress :: Get Address
 getAddress = getWord8 >>= \case
@@ -245,6 +249,7 @@ getAddress = getWord8 >>= \case
   2 -> WitnessPubKeyAddress . Hash160 <$> getVarBytes'
   3 -> WitnessScriptAddress . Hash256 <$> getVarBytes'
   4 -> TaprootAddress . Hash256 <$> getVarBytes'
+  5 -> pure PayToAnchorAddress
   t -> fail ("wallet snapshot: bad address tag " ++ show t)
 
 putAddrMap :: Map Address (Word32, Bool) -> Put
