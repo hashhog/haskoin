@@ -1357,6 +1357,7 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | PayToAnchorAddress              -- ^ P2A:    Bech32m v1, fixed program 0x4e73
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1615,6 +1616,9 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+-- Pay-to-anchor program is fixed (OP_1 PUSH 0x4e73). Mainnet encoding is
+-- bc1pfeessrawgf; regtest/testnet go through addressToTextW.
+addressToText PayToAnchorAddress = bech32mEncode "bc" 1 (BS.pack [0x4e, 0x73])
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1630,6 +1634,8 @@ textToAddress txt
     || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
       case bech32Decode txt of
         Just (_, 1, prog)
+          -- Exactly the anchor program, not an arbitrary 2-byte witness v1.
+          | prog == BS.pack [0x4e, 0x73] -> Just PayToAnchorAddress
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)

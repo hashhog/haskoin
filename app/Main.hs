@@ -5885,6 +5885,7 @@ addressTypeName (ScriptAddress _) = "P2SH (script hash)"
 addressTypeName (WitnessPubKeyAddress _) = "P2WPKH (native SegWit)"
 addressTypeName (WitnessScriptAddress _) = "P2WSH (native SegWit script)"
 addressTypeName (TaprootAddress _) = "P2TR (Taproot)"
+addressTypeName PayToAnchorAddress = "P2A (pay-to-anchor)"
 
 -- | 'catch' that rethrows async exceptions (ThreadKilled, UserInterrupt).
 --
