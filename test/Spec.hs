@@ -95,6 +95,7 @@ import Haskoin.Index
 import qualified Haskoin.Index as Index
 import qualified Haskoin.MuHash as MuHash
 import qualified PrioritiseTransactionSpec
+import qualified RbfMempoolParentSpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
@@ -23691,6 +23692,9 @@ main = hspec $ do
   -- prioritisetransaction (mining/eviction effect) + fee-estimator untrack
   -- (bundle 2026-06-09)
   PrioritiseTransactionSpec.spec
+
+  -- RBF replacement inputs via the mempool view (CCoinsViewMemPool)
+  RbfMempoolParentSpec.spec
 
   -- W107 CompactSize + VarInt 30-gate audit
   W107CompactSizeSpec.spec

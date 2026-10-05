@@ -256,6 +256,7 @@ test-suite haskoin-test
                , Fix66PayjoinSenderSpec
                , Fix67RpcAllowIpSpec
                , PrioritiseTransactionSpec
+               , RbfMempoolParentSpec
                , ParseHashVSpec
                , CreateRawTxDropSpec
                , RpcIntArgBoundsSpec

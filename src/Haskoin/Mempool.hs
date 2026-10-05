@@ -914,8 +914,29 @@ addTransactionWithReplacementInner mp tx txid conflictTxIds = do
                     Right inputPairs' ->
                       finalizeTransaction mp tx txid inputPairs'
 
--- | Resolve inputs for a replacement transaction
--- For inputs that conflict with mempool txs, resolve from UTXO set only
+-- | Resolve inputs for a replacement transaction.
+--
+-- An input whose outpoint is currently spent by one of the conflicts being
+-- replaced is resolved through a mempool-backed coins view: the chain UTXO
+-- set first, then the outputs of a transaction still in the mempool (an
+-- unconfirmed parent).  Mirrors Bitcoin Core's CCoinsViewMemPool::GetCoin
+-- (txmempool.cpp:742-763), which MemPoolAccept::PreChecks uses as its coins
+-- view (validation.cpp m_viewmempool): a mempool tx's outputs are visible
+-- regardless of whether another mempool tx spends them — that spend is
+-- exactly the conflict being replaced.
+--
+-- Pre-fix this branch read the chain UTXO set ONLY, so a fee-bump of a
+-- child of an unconfirmed parent (parent P in the mempool, child C spends
+-- P:0, replacement C' spends P:0) came back ErrMissingInput: the relay path
+-- parked it as an orphan that could never be promoted (its "missing" parent
+-- is already in the pool), and sendrawtransaction / testmempoolaccept
+-- reported missing inputs.
+--
+-- A parent that is itself one of the conflicts is never a coin source (the
+-- EntriesAndTxidsDisjoint gate rejects that case before we get here; this
+-- is belt-and-braces).  Mempool-parent coins are never coinbase, so no
+-- maturity check applies; BIP-68 already treats them as MEMPOOL_HEIGHT
+-- (tip+1) in 'checkSeqLocksAtTip'.
 resolveInputsForReplacement :: Mempool -> Tx -> [TxId] -> IO (Either MempoolError [(OutPoint, TxOut)])
 resolveInputsForReplacement mp tx conflictTxIds = do
   let conflictSet = Set.fromList conflictTxIds
@@ -925,7 +946,8 @@ resolveInputsForReplacement mp tx conflictTxIds = do
     mSpender <- atomically $ Map.lookup op <$> readTVar (mpByOutpoint mp)
     case mSpender of
       Just spenderTxId | Set.member spenderTxId conflictSet -> do
-        -- This input is spent by a conflict - resolve from UTXO only
+        -- This input is spent by a conflict: resolve it through the
+        -- mempool-backed view (chain UTXO, then unconfirmed parent).
         mUtxo <- lookupUTXO (mpUTXOCache mp) op
         case mUtxo of
           Just entry -> do
@@ -933,7 +955,17 @@ resolveInputsForReplacement mp tx conflictTxIds = do
             if ueCoinbase entry && height - ueHeight entry < fromIntegral coinbaseMaturity
               then return $ Left (ErrCoinbaseNotMature (ueHeight entry) height)
               else return $ Right (op, ueOutput entry)
-          Nothing -> return $ Left (ErrMissingInput op)
+          Nothing -> do
+            entries <- readTVarIO (mpEntries mp)
+            let parentId = outPointHash op
+                idx      = fromIntegral (outPointIndex op) :: Int
+            case Map.lookup parentId entries of
+              Just parent
+                | not (Set.member parentId conflictSet)
+                , outs <- txOutputs (meTransaction parent)
+                , idx < length outs
+                -> return $ Right (op, outs !! idx)
+              _ -> return $ Left (ErrMissingInput op)
       _ -> resolveInput mp op
   return $ sequence results
 
