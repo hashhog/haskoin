@@ -13,6 +13,7 @@ data-files:    resources/bip39-english.txt
 
 library
   exposed-modules: Haskoin.Types
+                 , Haskoin.Fatal
                  , Haskoin.Crypto
                  , Haskoin.Script
                  , Haskoin.Consensus
@@ -330,6 +331,30 @@ test-suite parallel-script
                , hspec
                , bytestring
                , time
+  default-language: Haskell2010
+  ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+
+-- gate-6 fault tests (receipts/haskoin-gate6-design-2026-10-04.md).
+-- Gate6Spec is shared verbatim with the "5668c1b + hooks" pre tree;
+-- Gate6PostSpec uses fix-only API (compile-red on the pre tree).
+test-suite gate6
+  type:          exitcode-stdio-1.0
+  main-is:       Gate6Main.hs
+  other-modules: Gate6Spec
+               , Gate6Adapter
+               , Gate6PostSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , containers
+               , stm
+               , temporary
+               , filepath
+               , cereal
+               , text
+               , aeson
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
 

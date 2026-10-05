@@ -17,7 +17,7 @@ import Control.Concurrent (threadDelay, forkIO, killThread)
 import System.Mem (performMajorGC)
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar, isEmptyMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM, join)
@@ -26,7 +26,7 @@ import qualified Haskoin.Daemon as Daemon
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
 import Control.Exception
-  ( AsyncException, SomeException, bracket, catch, finally, fromException, throwIO, uninterruptibleMask_ )
+  ( SomeException, bracket, catch, finally, uninterruptibleMask_ )
 import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.IORef
@@ -49,6 +49,7 @@ import Haskoin.Crypto (computeTxId, computeBlockHash, textToAddress, Address(..)
 import qualified Haskoin.Crypto as Crypto (computeWtxid)
 import Haskoin.Script (decodeScript)
 import Haskoin.Network
+import Haskoin.Fatal (catchSync, isFatalLatched, readFatalLatch, installFatalShutdownHook)
 import qualified Haskoin.ASMap as ASMap (loadAsmap)
 import Haskoin.Consensus
 import Haskoin.Storage
@@ -2143,12 +2144,12 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
            kickerPollUsec  = 400 * 1000 :: Int    -- 0.4 s progress poll
            kickerStallSecs = 12 :: Int64          -- stall re-request cadence
            -- Single-peer HARD-STALL threshold (W-TRACKB): seconds the
-           -- CONNECTED tip may stay frozen, while in active linear catch-up
-           -- against a SINGLE peer, before we force-drop that peer to trigger
-           -- a fresh '-connect' redial.  Chosen well above any legitimate
-           -- per-block validation / periodic-flush pause (blocks connect in
-           -- << 1 s even under --noassumevalid full script verify), so it only
-           -- fires on a genuine download wedge, not on a slow block.
+           -- next-needed block may stay owed by the SINGLE peer (requested,
+           -- no byte of it arrived, the peer idle) before we force-drop that
+           -- peer to trigger a fresh '-connect' redial. gate-6: the old
+           -- premise "blocks connect in << 1 s" is false on mainnet (validate
+           -- p99 11 s, max 241.6 s), so the rule no longer looks at tip age
+           -- alone; see 'hardStallFires'.
            hardStallSecs   = 120 :: Int64
            -- 'lastConn' = value of 'nextBlock' (connected tip + 1) recorded at
            -- the previous request; used to detect whether the connected tip
@@ -2206,7 +2207,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                        -- (BIP-159).
                        requestForkBlocks pm' db hc rot
                        tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock pmRef
-                         `catch` (\(e :: SomeException) ->
+                         `catchSync` (\e ->
                                     putStrLn $ "P2P reorg kicker error: " ++ show e)
                      return $ if progressed || stalled
                                 then (rot + 1, nextBlock, nowKick)
@@ -2401,7 +2402,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                          unless (null assignedH) $
                            modifyIORef' requestedUpToRef (max (maximum assignedH))
                          tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock pmRef
-                           `catch` (\(e :: SomeException) ->
+                           `catchSync` (\e ->
                                       putStrLn $ "P2P reorg kicker error: " ++ show e)
                          let rot' = if null mutePids && null stallPids then rot else rot + 1
                          return (rot', nextBlock, nowKick)
@@ -2427,9 +2428,31 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
              -- fresh session that also stalls is dropped again, instead of a
              -- permanent wedge only a full process restart could clear.
              let numPeersK   = length peers
-                 hardStalled = not progressed && activeK && not isFork
-                               && numPeersK == 1
-                               && (nowKick - lastProgAt) >= hardStallSecs
+             -- gate-6: owed-and-not-arriving, never a validating peer.
+             hsView <- case peers of
+               [solePc] | activeK && not isFork && not progressed -> do
+                 soleAddr <- piAddress <$> readTVarIO (pcInfo solePc)
+                 infNow <- readIORef linearInflightRef
+                 fbSole <- readIORef (pcBlockFirstByteAt solePc)
+                 doneSole <- Map.lookup soleAddr <$> readIORef lastBlockDoneRef
+                 busySole <- Map.member soleAddr <$> readIORef busyPeersRef
+                 recvNow <- readIORef receivingRef
+                 haveNow <- readIORef haveBodyRef
+                 lockHeld <- isEmptyMVar connectLock
+                 let reqs = [ t | (k, ht, t) <- Map.elems infNow
+                                , k == soleAddr, ht == nextBlock ]
+                 return $ Just HardStallView
+                   { hsvNow = nowKick, hsvPeers = numPeersK, hsvActive = activeK
+                   , hsvIsFork = isFork, hsvProgressed = progressed
+                   , hsvLastProgAt = lastProgAt
+                   , hsvNextInflight = if null reqs then Nothing
+                                       else Just (maximum reqs, fbSole)
+                   , hsvPeerLastDoneAt = doneSole
+                   , hsvNextArrived = Map.member nextBlock recvNow
+                                      || Set.member nextBlock haveNow
+                   , hsvPeerBusy = busySole, hsvConnectLockHeld = lockHeld }
+               _ -> return Nothing
+             let hardStalled = maybe False (hardStallFires hardStallSecs) hsView
              lastProgAtFinal <-
                if progressed
                  then return nowKick
@@ -2445,10 +2468,17 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                      forM_ peers $ \pc -> do
                        a <- piAddress <$> readTVarIO (pcInfo pc)
                        disconnectPeer pc
-                         `catch` (\(e :: SomeException) ->
+                         `catchSync` (\e ->
                                     putStrLn $ "HARD STALL force-drop error: "
                                             ++ show e)
                        atomically $ modifyTVar' (pmPeers pm') (Map.delete a)
+                       -- Core FinalizeNode: a dropped peer's blocks are no
+                       -- longer in flight. A '-connect' redial comes back
+                       -- under the SAME address, so its stale entries would
+                       -- otherwise read as owed by the fresh session.
+                       withMVar linearLock $ \() ->
+                         modifyIORef' linearInflightRef
+                           (Map.filter (\(k, _, _) -> k /= a))
                      -- Reset the timer to now: give the fresh session up to
                      -- another 'hardStallSecs' to reconnect and start serving
                      -- before we would drop again.
@@ -2724,6 +2754,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- if a second signal arrived during shutdown.
     void $ installHandler sigINT  (Catch $ void $ tryPutMVar shutdownVar ()) Nothing
     void $ installHandler sigTERM (Catch $ void $ tryPutMVar shutdownVar ()) Nothing
+    -- gate-6 fatal latch (AbortNode) -> the same shutdown, ending in exit 1.
+    installFatalShutdownHook (void $ tryPutMVar shutdownVar ())
     takeMVar shutdownVar
     putStrLn "Shutting down..."
     -- Tell systemd we are intentionally exiting so it extends
@@ -2759,9 +2791,17 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Without this, any blocks connected since the last periodic flush
     -- live only in the RocksDB memtable and are lost if the process is
     -- SIGKILL'd or otherwise killed before closeDB returns.
-    putStrLn "Flushing chainstate to disk..."
-    (flushCache cache
-       `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e))
+    fatalAtShutdown <- readFatalLatch
+    case fatalAtShutdown of
+      Just why ->
+        -- AbortNode: do not write the in-memory cache over a chainstate we
+        -- no longer trust. Every connect commits its own atomic WriteBatch,
+        -- so the on-disk state is the last block that fully connected.
+        putStrLn $ "Fatal latch set (" ++ why ++ "): SKIPPING the cache flush"
+      Nothing -> do
+        putStrLn "Flushing chainstate to disk..."
+        (flushCache cache
+           `catch` (\(e :: SomeException) -> putStrLn $ "flushCache error: " ++ show e))
     (syncFlush db
        `catch` (\(e :: SomeException) -> putStrLn $ "syncFlush error: " ++ show e))
     putStrLn "Chainstate flushed."
@@ -2787,6 +2827,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                  putStrLn $ "removePidFile error: " ++ show e)
 
     putStrLn "Shutdown complete."
+    fatalAtExit <- isFatalLatched
+    when fatalAtExit $ do
+      putStrLn "Exiting with status 1 (fatal internal error; see FATAL above)"
+      exitWith (ExitFailure 1)
     -- Explicit exit. Without this, any forked thread mid-FFI call
     -- (accept on the inbound listener, RocksDB I/O, Warp thread in
     -- the middle of a response) keeps the RTS alive after main
@@ -3739,7 +3783,7 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock pmRefR
                   -- the step disconnected); see 'performReorgActivating'.
                   res <- performReorgActivating net cache db hc mIdxMgr
                                       oldH newTipHash
-                           `catch` (\(e :: SomeException) ->
+                           `catchSync` (\e ->
                                       return (Left ("exception: " <> show e)))
                   case res of
                     Left err -> do
@@ -4472,14 +4516,20 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                       cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
                                       (consensusFlagsAtHeight net height)
                       getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
-                  vr <- (validateFullBlockIO db net cs getMtpBg skipScripts block spent)
-                          `catch` (\(e :: SomeException) -> do
-                                     putStrLn $ "ERROR validating block "
-                                             ++ show height ++ ": " ++ show e
-                                     return (Left ("Core full-block validation: exception: " <> show e)))
-                  -- WHNF of the Either runs the whole (pure) validation,
-                  -- including the script-check pool dispatch.
-                  tValid <- vr `seq` getPOSIXTime
+                  -- gate-6: the validation (a lazy Either: forcing it runs
+                  -- the whole pure validation incl. the script pool) is
+                  -- forced INSIDE a sync-only handler. It used to be forced
+                  -- by a bare `seq` outside any handler, and the per-item
+                  -- catch-SomeException in the pool swallowed a ThreadKilled
+                  -- aimed at this recv thread (shutdown, HARD STALL, reaper)
+                  -- as "script verify failed (input i): thread killed" -> a
+                  -- VERDICT -> invalidBlockFound on disk + punish. Now: an
+                  -- async kill propagates (this thread dies, nothing is
+                  -- marked); a sync fault is Internal -> one serial retry ->
+                  -- fatal latch; never a verdict.
+                  vr <- validateBlockGuarded ("block " ++ show height ++ " " ++ hexHashS bh)
+                          (validateFullBlockIO db net cs getMtpBg skipScripts block spent)
+                  tValid <- getPOSIXTime
                   writeIORef phaseRef (tLock, tSpent, tValid, tValid)
                   r <- case vr of
                          Left verr -> do
@@ -4768,7 +4818,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                           , ghHashStop = zeroHash
                           }
                     void $ (safeSendMessage (head connPeers) (MGetHeaders getHdrs))
-                      `catch` (\(_ :: SomeException) -> return ())
+                      `catchSync` (\_ -> return ())
                   -- Drain already-stored next blocks (Core ActivateBestChain
                   -- after ProcessNewBlock). NOT a recursive call on this
                   -- peer's recv thread any more: that thread then stayed
@@ -5831,11 +5881,10 @@ addressTypeName (TaprootAddress _) = "P2TR (Taproot)"
 -- killed", and the loop then read the closed socket. On v2 that read is
 -- "connection closed reading length", which was scored as misbehavior and
 -- banned the peer for 24 h.
-catchSync :: IO a -> (SomeException -> IO a) -> IO a
-catchSync act h = act `catch` \e ->
-  case fromException e of
-    Just (_ :: AsyncException) -> throwIO e
-    Nothing -> h e
+-- (gate-6: now 'Haskoin.Fatal.catchSync', which rethrows EVERY async
+-- exception type -- 'SomeAsyncException': Warp's TimeoutThread, async's
+-- AsyncCancelled and System.Timeout's Timeout were swallowed by the old
+-- 'AsyncException'-only test.)
 
 -- | Split an option value on commas (Core -externalip=a,b), trimming blanks.
 splitOnComma :: String -> [String]

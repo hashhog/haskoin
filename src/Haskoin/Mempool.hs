@@ -187,6 +187,7 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            consensusFlagsToScriptFlags,
                            SigOpCost(..), isCoinbase)
 import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
+import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
 import qualified Haskoin.Policy.Standard as Std
@@ -742,6 +743,15 @@ fireRemoveNotify mp txid = do
 -- Returns the TxId on success, or an error on failure
 addTransaction :: Mempool -> Tx -> IO (Either MempoolError TxId)
 addTransaction mp tx = do
+  -- gate-6: after a fatal internal error (AbortNode) the node accepts
+  -- nothing new; it is shutting down.
+  latched <- readFatalLatch
+  case latched of
+    Just why -> return (Left (ErrValidationFailed (fatalLatchedReject why)))
+    Nothing -> addTransactionUnlatched mp tx
+
+addTransactionUnlatched :: Mempool -> Tx -> IO (Either MempoolError TxId)
+addTransactionUnlatched mp tx = do
   let txid = computeTxId tx
       wtxid = computeWtxid tx
 

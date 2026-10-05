@@ -25,6 +25,8 @@
 module Haskoin.Rpc
   ( -- * Server
     RpcServer(..)
+  , submitBlockLeftResponse
+  , generateErrorCode
   , RpcConfig(..)
   , defaultRpcConfig
   , startRpcServer
@@ -342,6 +344,7 @@ import Text.Printf (printf)
 -- formatDoubleG16 (FFI snprintf) or btcAmountEnc (fixed-decimal).
 import qualified Data.Vector as V
 import Haskoin.CoreArity (lookupCoreArity)
+import Haskoin.Fatal (isInternalReject)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
@@ -5682,6 +5685,21 @@ bip22ResultString err
   where
     s = map toLower err
 
+-- | gate-6: how a submitblock 'Left' is answered. A local fault or the
+-- fatal latch (an 'isInternalReject' string) is an error object with
+-- RPC_VERIFY_ERROR (-25) — never a BIP-22 rejection reason, which would
+-- claim the block is invalid. Everything else is the BIP-22 result string.
+submitBlockLeftResponse :: String -> Either (Int, String) String
+submitBlockLeftResponse err
+  | isInternalReject err = Left (rpcVerifyError, err)
+  | otherwise = Right (bip22ResultString err)
+
+-- | gate-6: error code for a generate* failure (-25 for a local fault).
+generateErrorCode :: String -> Int
+generateErrorCode err
+  | isInternalReject err = rpcVerifyError
+  | otherwise = rpcMiscError
+
 -- | Submit a mined block
 handleSubmitBlock :: RpcServer -> Value -> IO RpcResponse
 handleSubmitBlock server params = do
@@ -5741,8 +5759,12 @@ handleSubmitBlockUnpaused server params = do
                   -- Map internal error strings to canonical BIP-22 result strings.
                   -- BIP-22: rejection reason goes in the result field as a plain
                   -- string, not as a JSON-RPC error object.
-                  let bip22 = T.pack $ bip22ResultString err
-                  in return $ RpcResponse (toJSON bip22) Null Null
+                  -- gate-6: a local fault / the fatal latch is NOT a rejection
+                  -- of the block: RPC_VERIFY_ERROR (-25), as rustoshi/blockbrew.
+                  case submitBlockLeftResponse err of
+                    Left (code, msg) -> return $ RpcResponse Null
+                      (toJSON $ RpcError code (T.pack msg)) Null
+                    Right bip22 -> return $ RpcResponse (toJSON (T.pack bip22)) Null Null
                 Right () -> do
                   -- Mirror CTxMemPool::removeForBlock: drop the txs this block
                   -- confirmed (and now-conflicting txs) from the mempool so
@@ -5904,7 +5926,7 @@ handleGenerateToAddress server params = do
             result <- generateBlocks server nblocks addr
             case result of
               Left err -> return $ RpcResponse Null
-                (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                (toJSON $ RpcError (generateErrorCode err) (T.pack err)) Null
               Right hashes -> return $ RpcResponse (toJSON $ map showHash hashes) Null Null
 
 -- | Generate a block with specific transactions (regtest only)
@@ -5936,7 +5958,7 @@ handleGenerateBlock server params = do
                 result <- generateBlockWithTxs server addr parsedTxs
                 case result of
                   Left err -> return $ RpcResponse Null
-                    (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                    (toJSON $ RpcError (generateErrorCode err) (T.pack err)) Null
                   Right bh -> return $ RpcResponse (toJSON $ object
                     [ "hash" .= showHash bh
                     ]) Null Null
@@ -5959,7 +5981,7 @@ handleGenerate server params = do
         result <- generateBlocksWithScript server nblocks dummyScript
         case result of
           Left err -> return $ RpcResponse Null
-            (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+            (toJSON $ RpcError (generateErrorCode err) (T.pack err)) Null
           Right hashes -> return $ RpcResponse (toJSON $ map showHash hashes) Null Null
 
 -- | Parse an array of raw transaction hex strings

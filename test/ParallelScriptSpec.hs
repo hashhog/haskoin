@@ -115,6 +115,8 @@ ppRes :: ScriptCheckResult -> String
 ppRes ScriptCheckOK = "OK"
 ppRes (ScriptCheckFail i reason) =
   "FAIL idx=" ++ show i ++ " reason=" ++ show reason
+ppRes (ScriptCheckInternal i reason) =
+  "INTERNAL idx=" ++ show i ++ " reason=" ++ show reason
 
 rssKb :: IO Int
 rssKb = do

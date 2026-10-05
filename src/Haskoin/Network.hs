@@ -161,6 +161,8 @@ module Haskoin.Network
   , simulateLinearReceipt
   , projectStableInflight
   , storeStableInflight
+  , HardStallView(..)
+  , hardStallFires
   , LinearFillBranch(..)
   , linearFillBranchTag
   , selectLinearFillBranch
@@ -1585,6 +1587,57 @@ muteClockView busy lastDone now = map adj
       | Just d <- Map.lookup (pifPeer x) lastDone
       , d > pifRequestedAt x = x { pifRequestedAt = d }
       | otherwise = x
+
+-- | Everything the single-peer HARD STALL decision may look at (gate-6
+-- extraction so the rule can be unit-tested).
+data HardStallView = HardStallView
+  { hsvNow             :: !Int64
+  , hsvPeers           :: !Int
+  , hsvActive          :: !Bool
+  , hsvIsFork          :: !Bool
+  , hsvProgressed      :: !Bool
+  , hsvLastProgAt      :: !Int64
+    -- ^ when the connected tip last moved (or the last HARD STALL fired)
+  , hsvNextInflight    :: !(Maybe (Int64, Maybe Int64))
+    -- ^ next-needed in flight to the sole peer: (requested at, first byte at)
+  , hsvPeerLastDoneAt  :: !(Maybe Int64)
+    -- ^ when the sole peer's recv thread last finished processing a block
+  , hsvNextArrived     :: !Bool
+    -- ^ next-needed body is being received / processed, or is on disk
+  , hsvPeerBusy        :: !Bool
+    -- ^ the sole peer's recv thread is processing a block right now
+  , hsvConnectLockHeld :: !Bool
+  } deriving (Show, Eq)
+
+-- | Single-peer HARD STALL: drop the sole peer only when the next-needed
+-- block is OWED by it and not arriving (Core BLOCK_DOWNLOAD_TIMEOUT /
+-- stalling shape, net_processing.cpp): it is in flight to that peer, was
+-- requested @thr@ s ago (counted from when the peer's recv thread last
+-- finished a block, since it cannot read its socket while validating), no
+-- byte of it has arrived, and it is not being received, processed or
+-- stored. Never while the peer's thread is processing a block or the
+-- connect lock is held: Core never disconnects for a block it already has.
+--
+-- gate-6: the 5668c1b rule was "the connected tip has not moved for 120 s"
+-- alone. At tip that fired within one 0.4 s poll of every new header whose
+-- predecessor connected >= 120 s earlier (~82 % of blocks), and on every
+-- block that took >= 120 s to validate it killed the very thread that was
+-- validating it (7 mainnet blocks >= 120 s, max 241.6 s).
+hardStallFires :: Int64 -> HardStallView -> Bool
+hardStallFires thr v =
+  hsvPeers v == 1 && hsvActive v && not (hsvIsFork v) && not (hsvProgressed v)
+    && (hsvNow v - hsvLastProgAt v) >= thr
+    && not (hsvPeerBusy v) && not (hsvConnectLockHeld v) && not (hsvNextArrived v)
+    && case hsvNextInflight v of
+         Just (reqAt, mFirstByte) ->
+           let clockFrom = maybe reqAt (max reqAt) (hsvPeerLastDoneAt v)
+           in case mFirstByte of
+                -- nothing of it has arrived
+                Nothing -> hsvNow v - clockFrom >= thr
+                -- it started arriving and never finished: Core's whole-
+                -- block download timeout (10 min base), not the 2 min one
+                Just fb -> hsvNow v - max fb clockFrom >= 5 * thr
+         Nothing -> False
 
 -- | Mute rotation re-requests a peer's blocks from OTHER peers. When no
 -- other connected peer is left to take them, rotating only re-sends the

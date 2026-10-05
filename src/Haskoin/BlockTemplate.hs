@@ -68,6 +68,7 @@ import qualified Data.Serialize as S
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
 import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, blockReward,
+                           validateBlockGuarded, validateFullBlockFresh,
                            maxBlockWeight, maxBlockSigops, maxBlockSigOpsCost,
                            witnessScaleFactor,
                            txBaseSize, txTotalSize, difficultyAdjustment,
@@ -92,6 +93,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            taprootDeployment,
                            bumpTipGen,
                            getMtpAtHeightFromEntries, getMtpFromAncestry)
+import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -488,6 +490,15 @@ submitBlock :: Network         -- ^ Network configuration
             -> Block           -- ^ The mined block
             -> IO (Either String ())
 submitBlock net db hc cache pm mp mIdxMgr block = do
+  -- gate-6: after a fatal internal error (AbortNode) nothing is connected.
+  latched <- readFatalLatch
+  case latched of
+    Just why -> return (Left (fatalLatchedReject why))
+    Nothing -> submitBlockUnlatched net db hc cache pm mp mIdxMgr block
+
+submitBlockUnlatched :: Network -> HaskoinDB -> HeaderChain -> UTXOCache -> PeerManager
+                     -> Mempool -> Maybe IndexManager -> Block -> IO (Either String ())
+submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
   let bh = computeBlockHash (blockHeader block)
       header = blockHeader block
       prevHash = bhPrevBlock header
@@ -674,7 +685,10 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
           -- enforcement with the IBD path.
           -- Reference: Bitcoin Core ConnectBlock() / IsBIP30Repeat(), validation.cpp.
           -- Wave-29 audit (0d56486): checkBIP30 was previously only wired in Sync.hs.
-          validationResult <- validateFullBlockIO db net cs getMtpSB False block utxoMap
+          -- gate-6: forced under a sync-only handler; a fault is retried
+          -- once serially, then latches (never a verdict).
+          validationResult <- validateBlockGuarded ("submitblock " ++ show bh)
+                                (validateFullBlockIO db net cs getMtpSB False block utxoMap)
           case validationResult of
             Left err -> return $ Left $ "Block validation failed: " ++ err
             Right () -> do
@@ -1374,7 +1388,9 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                   -- tx_verify.cpp:74 uses block.GetAncestor(coinHeight-1); a
                   -- reorg's hcByHeight can still point at the losing branch.
                   getMtpCC  = getMtpFromAncestry entries (bhPrevBlock (blockHeader blk))
-              case validateFullBlock n csReorg getMtpCC False False blk spentUtxos of
+              vrR <- validateBlockGuarded ("reorg connect " ++ show bh ++ " height " ++ show (ceHeight ce))
+                       (validateFullBlockFresh n csReorg getMtpCC False False blk spentUtxos)
+              case vrR of
                 Left err -> return $ Left $
                   "invalid-connect: reorg connect: block " ++ show bh
                   ++ " (height " ++ show (ceHeight ce)

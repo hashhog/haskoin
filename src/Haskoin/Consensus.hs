@@ -333,6 +333,16 @@ module Haskoin.Consensus
   , startGlobalScriptCheckQueue
   , stopGlobalScriptCheckQueue
   , scriptCheckResultToEither
+    -- gate-6
+  , evalChecksSerialIO
+  , withSerialScriptChecks
+  , forceValidation
+  , validateBlockGuarded
+  , validateFullBlockFresh
+    -- gate-6 test hooks (test-only; default no-op)
+  , scriptItemHookRef
+  , masterWaitHookRef
+  , masterStartHookRef
   ) where
 
 import Data.ByteString (ByteString)
@@ -343,7 +353,7 @@ import Data.Int (Int32, Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.), testBit)
 import Data.List (sort, sortBy, foldl', isInfixOf)
 import Numeric (showHex)
-import Control.Monad (when, unless, forM, forM_, foldM, forever, void, replicateM, filterM)
+import Control.Monad (when, unless, forM, forM_, foldM, forever, void, replicateM, filterM, join)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Vector as V
@@ -352,10 +362,12 @@ import qualified Data.Set as Set
 import Data.Serialize (encode, runPut, putWord32le, putWord64le, putByteString)
 import GHC.Generics (Generic)
 import Control.Concurrent.STM
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, threadDelay, myThreadId, ThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, takeMVar, putMVar)
 import Control.Concurrent.Async (Async, async, cancel, waitCatch)
-import Control.Exception (try, catch, SomeException, bracket_, evaluate)
+import Control.Exception (try, catch, SomeException, bracket_, evaluate, mask, onException)
+import Haskoin.Fatal (internalErrorMarker, trySync, catchSync, internalReject, isInternalReject,
+                     readFatalLatch, setFatalLatch, fatalLatchedReject)
 import GHC.Conc (getNumProcessors, getNumCapabilities, setNumCapabilities)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
 import System.Mem.StableName (makeStableName, hashStableName)
@@ -386,7 +398,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear,
                         putUndoData, getUndoData, getUndoDataVerified, deleteUndoData,
-                        getBlock, getUTXO, getUTXOCoin, getUTXOCoinHealingTip,
+                        getBlock, getUTXO, getUTXOCoin, getUTXOCoinChecked, getUTXOCoinHealingTip,
                         getBlockHeight,
                         getBestBlockHash,
                         isUnspendable, Coin(..),
@@ -3615,7 +3627,10 @@ checkBIP30 db net height block = do
     checkTxOutputs _ [] = return (Right ())
     checkTxOutputs txid (vout:vouts) = do
       let op = OutPoint txid vout
-      mUtxo <- getUTXO db op
+      -- gate-6: checked read. A present-but-undecodable row used to read as
+      -- "absent" here = "no conflict" (fail-open on testnet4/regtest, where
+      -- BIP30 is enforced); now it throws -> internal fault -> latch.
+      mUtxo <- getUTXOCoinChecked db op
       case mUtxo of
         Just _ ->
           return $ Left $
@@ -3845,26 +3860,60 @@ setConfiguredPar n = writeIORef configuredParRef n
 getConfiguredPar :: IO Int
 getConfiguredPar = readIORef configuredParRef
 
--- | Result of one queue drain. 'scfIndex' is the job index (block-order
--- concatenation of per-input checks), not sciInputIdx. The reason string
--- is byte-identical to the serial loop's 'verifyScriptCheckItem' error.
+-- | Result of one queue drain. Index fields are job indices (block-order
+-- concatenation of per-input checks), not sciInputIdx. A 'ScriptCheckFail'
+-- reason is byte-identical to the serial loop's 'verifyScriptCheckItem'
+-- error.
+--
+-- gate-6: THREE outcomes, as in Core (a script error is a consensus
+-- verdict; anything else that stops a check is a local fault):
+--
+-- * 'ScriptCheckFail'     — the interpreter said no. A VERDICT.
+-- * 'ScriptCheckInternal' — a check THREW a synchronous exception (the
+--   interpreter signals every consensus failure as a value, so a throw is a
+--   bug or a fault: an FFI fault, a partial function), or its worker died
+--   before finishing it. NEVER a verdict: the caller retries once on the
+--   serial path and then latches ('Haskoin.Fatal').
+-- * 'ScriptCheckOK'.
+--
+-- Asynchronous exceptions are not outcomes at all: they propagate out of the
+-- checking thread (a killed recv thread used to be swallowed here and
+-- reported as "script verify failed (input i): thread killed").
+--
+-- Combining: any Fail -> Fail (lowest index; scripts are pure, so a real
+-- failure is sound even if another item faulted); else any Internal ->
+-- Internal (lowest index); else OK.
 data ScriptCheckResult
   = ScriptCheckOK
   | ScriptCheckFail { scfIndex :: !Int, scfReason :: !String }
+  | ScriptCheckInternal { sciFaultIndex :: !Int, sciFaultReason :: !String }
   deriving (Eq, Show)
 
 scriptCheckResultToEither :: ScriptCheckResult -> Either String ()
 scriptCheckResultToEither ScriptCheckOK = Right ()
 scriptCheckResultToEither (ScriptCheckFail _ reason) = Left reason
+scriptCheckResultToEither (ScriptCheckInternal i reason) =
+  Left (internalReject ("script check fault (job index " ++ show i ++ ", "
+                        ++ reason ++ ")"))
 
--- | One in-flight batch. IORefs are the mutable claim/result state;
--- the vector is shared read-only across workers.
+-- | One in-flight job (Core CCheckQueue's per-Complete state). Everything a
+-- worker touches lives HERE, never on the queue: a stale worker of a dead
+-- job can only write into that job's object, which nobody reads any more.
 data ActiveJob = ActiveJob
-  { ajFlags    :: !ScriptFlags
-  , ajItems    :: !(Vector ScriptCheckItem)
-  , ajNext     :: !(IORef Int)
-  , ajInFlight :: !(IORef Int)
-  , ajFails    :: !(IORef (Map Int String))
+  { ajSeq       :: !Int
+  , ajFlags     :: !ScriptFlags
+  , ajItems     :: !(Vector ScriptCheckItem)
+  , ajNext      :: !(IORef Int)
+    -- ^ next unclaimed index
+  , ajInFlight  :: !(IORef Int)
+  , ajFails     :: !(IORef (Map Int String))
+    -- ^ verdicts
+  , ajInternal  :: !(IORef (Map Int String))
+    -- ^ faults (never verdicts)
+  , ajRemaining :: !(TVar Int)
+    -- ^ items not yet FINISHED (Core nTodo). The master waits for 0.
+  , ajCancelled :: !(IORef Bool)
+    -- ^ the master died: stop claiming from this job
   }
 
 data QCtl = QCtl
@@ -3876,11 +3925,17 @@ data QCtl = QCtl
 -- | Persistent CCheckQueue analog. extraWorkers extra threads plus the
 -- connecting thread as master. In-flight is bounded by
 -- 'scriptCheckBatchSize' * (extra + 1), not by the job count.
+--
+-- gate-6 F6: there is no queue-wide "workers done" counter any more. That
+-- counter was reset per job, so a worker still finishing a dead job's
+-- items incremented the NEXT job's count, and the next master returned
+-- while one of its own claimed items was unchecked (fail-open). Completion
+-- is now per job ('ajRemaining').
 data ScriptCheckQueue = ScriptCheckQueue
   { scqExtra       :: !Int
   , scqControl     :: !(MVar ())
   , scqCtl         :: !(TVar QCtl)
-  , scqWorkersDone :: !(TVar Int)
+  , scqJobSeq      :: !(IORef Int)
   , scqMaxInFlight :: !(IORef Int)
   , scqWorkers     :: ![Async ()]
   }
@@ -3898,47 +3953,84 @@ bumpMaxInFlight :: ScriptCheckQueue -> Int -> IO ()
 bumpMaxInFlight q n =
   atomicModifyIORef' (scqMaxInFlight q) $ \m -> (max m n, ())
 
+-- | Run one check under a SYNCHRONOUS-only handler. The hook is test-only.
+checkOneItem :: Int -> Bool -> Int -> ScriptFlags -> ScriptCheckItem
+             -> IO (Either SomeException (Maybe String))
+checkOneItem jobSeq isMaster i flags item = trySync $ do
+  hook <- readIORef scriptItemHookRef
+  hook jobSeq isMaster i
+  r <- evaluate (verifyScriptCheckItem flags item)
+  case r of
+    Just s  -> evaluate (length s) >> return r
+    Nothing -> return r
+
+describeFault :: ScriptCheckItem -> SomeException -> String
+describeFault item ex = "input " ++ show (sciInputIdx item) ++ ": " ++ show ex
+
 -- | Claim up to nBatchSize items (Core checkqueue.h:121) and run them.
 -- In-flight is the number of currently-claimed items across all workers.
-claimAndRun :: ScriptCheckQueue -> ActiveJob -> IO ()
-claimAndRun q job = loop
+--
+-- Runs MASKED except for the check itself, so a claimed batch is always
+-- accounted for: if the thread dies inside the batch (an async exception),
+-- every unfinished item of the batch is recorded Internal and counted
+-- finished before the exception continues. The master therefore never waits
+-- for ever, and a dying worker's items read as a fault, never as OK and
+-- never as a verdict.
+claimAndRun :: ScriptCheckQueue -> Bool -> ActiveJob -> IO ()
+claimAndRun q isMaster job = mask $ \restore -> loop restore
   where
     n = V.length (ajItems job)
     extra = scqExtra q
-    loop = do
-      claimed <- atomicModifyIORef' (ajNext job) $ \i ->
-        if i >= n
-          then (i, Nothing)
-          else
-            let remaining = n - i
-                denom = extra + 2
-                raw = remaining `div` denom
-                nNow = min remaining (max 1 (min scriptCheckBatchSize raw))
-            in (i + nNow, Just (i, nNow))
-      case claimed of
-        Nothing -> return ()
-        Just (start, nNow) -> do
-          old <- atomicModifyIORef' (ajInFlight job) $ \x -> (x + nNow, x)
-          bumpMaxInFlight q (old + nNow)
-          forM_ [start .. start + nNow - 1] $ \i -> do
-            let item = ajItems job V.! i
-            er <- try (evaluate (verifyScriptCheckItem (ajFlags job) item))
-                    :: IO (Either SomeException (Maybe String))
-            case er of
-              Left ex ->
-                atomicModifyIORef' (ajFails job) $ \m ->
-                  ( Map.insert i
-                      ("script verify failed (input "
-                       ++ show (sciInputIdx item) ++ "): " ++ show ex)
-                      m
-                  , ()
-                  )
-              Right Nothing -> return ()
-              Right (Just err) ->
-                atomicModifyIORef' (ajFails job) $ \m ->
-                  (Map.insert i err m, ())
-          atomicModifyIORef' (ajInFlight job) $ \x -> (x - nNow, ())
-          loop
+    recordFail i err =
+      atomicModifyIORef' (ajFails job) $ \m -> (Map.insert i err m, ())
+    recordInternal i why =
+      atomicModifyIORef' (ajInternal job) $ \m -> (Map.insert i why m, ())
+    finished k = atomically $ modifyTVar' (ajRemaining job) (subtract k)
+    loop restore = do
+      cancelled <- readIORef (ajCancelled job)
+      unless cancelled $ do
+        claimed <- atomicModifyIORef' (ajNext job) $ \i ->
+          if i >= n
+            then (i, Nothing)
+            else
+              let remaining = n - i
+                  denom = extra + 2
+                  raw = remaining `div` denom
+                  nNow = min remaining (max 1 (min scriptCheckBatchSize raw))
+              in (i + nNow, Just (i, nNow))
+        case claimed of
+          Nothing -> return ()
+          Just (start, nNow) -> do
+            let end = start + nNow
+            old <- atomicModifyIORef' (ajInFlight job) $ \x -> (x + nNow, x)
+            bumpMaxInFlight q (old + nNow)
+            nextRef <- newIORef start
+            let runBatch i
+                  | i >= end = return ()
+                  | otherwise = do
+                      let item = ajItems job V.! i
+                      er <- restore (checkOneItem (ajSeq job) isMaster i (ajFlags job) item)
+                      case er of
+                        Left ex          -> recordInternal i (describeFault item ex)
+                        Right Nothing    -> return ()
+                        Right (Just err) -> recordFail i err
+                      writeIORef nextRef (i + 1)
+                      runBatch (i + 1)
+                -- Runs (masked) only if the batch died part way: the rest of
+                -- the batch is a fault, and the whole batch is accounted for.
+                abandon = do
+                  f <- readIORef nextRef
+                  forM_ [f .. end - 1] $ \i ->
+                    recordInternal i
+                      ("input " ++ show (sciInputIdx (ajItems job V.! i))
+                       ++ ": check abandoned, its thread died")
+                  atomicModifyIORef' (ajInFlight job) $ \x -> (x - nNow, ())
+                  finished nNow
+            runBatch start `onException` abandon
+            atomicModifyIORef' (ajInFlight job) $ \x -> (x - nNow, ())
+            -- one STM commit per batch, not per item (31 workers share it)
+            finished nNow
+            loop restore
 
 scriptCheckWorkerLoop :: ScriptCheckQueue -> Int -> IO ()
 scriptCheckWorkerLoop q lastGen = do
@@ -3949,12 +4041,15 @@ scriptCheckWorkerLoop q lastGen = do
   if qcStop ctl
     then return ()
     else do
+      -- A synchronous fault outside a check is logged and the worker goes
+      -- on (its batch is already accounted for). An asynchronous exception
+      -- ends the worker: the master claims whatever is left, so a smaller
+      -- pool is slower, never wrong.
       case qcJob ctl of
         Nothing -> return ()
         Just job ->
-          claimAndRun q job
-            `catch` \(_ :: SomeException) -> return ()
-      atomically $ modifyTVar' (scqWorkersDone q) (+1)
+          claimAndRun q False job
+            `catchSync` \e -> hPutStrLn stderr ("script-check worker fault: " ++ show e)
       scriptCheckWorkerLoop q (qcGen ctl)
 
 newScriptCheckQueue :: Int -> IO ScriptCheckQueue
@@ -3962,14 +4057,14 @@ newScriptCheckQueue extraWorkersNum = do
   let extra = max 0 extraWorkersNum
   control <- newMVar ()
   ctl <- newTVarIO (QCtl 0 False Nothing)
-  done <- newTVarIO 0
+  jobSeq <- newIORef 0
   maxIF <- newIORef 0
   let q0 =
         ScriptCheckQueue
           { scqExtra = extra
           , scqControl = control
           , scqCtl = ctl
-          , scqWorkersDone = done
+          , scqJobSeq = jobSeq
           , scqMaxInFlight = maxIF
           , scqWorkers = []
           }
@@ -3988,8 +4083,11 @@ shutdownScriptCheckQueue q = do
   putMVar (scqControl q) ()
 
 -- | Drain 'items' on the persistent pool. The connecting thread joins as
--- master (Core CCheckQueue::Complete). After every claimed job finishes,
--- the LOWEST-INDEX failure is the result — worker count cannot change it.
+-- master (Core CCheckQueue::Complete) and waits until every item of ITS job
+-- has finished; the LOWEST-INDEX failure is the result — worker count cannot
+-- change it. If the master dies (it is a P2P recv thread and can be killed),
+-- the job is cancelled: workers stop claiming from it, and their in-flight
+-- items finish into the dead job object, which no later job reads.
 runScriptCheckQueue :: ScriptCheckQueue -> ScriptFlags -> [ScriptCheckItem]
                     -> IO ScriptCheckResult
 runScriptCheckQueue q flags items =
@@ -4000,25 +4098,63 @@ runScriptCheckQueue q flags items =
     if n == 0
       then return ScriptCheckOK
       else do
+        seqN <- atomicModifyIORef' (scqJobSeq q) $ \s -> (s + 1, s + 1)
         job <-
-          ActiveJob flags vec
+          ActiveJob seqN flags vec
             <$> newIORef 0
             <*> newIORef 0
             <*> newIORef Map.empty
-        atomically $ writeTVar (scqWorkersDone q) 0
-        atomically $ modifyTVar' (scqCtl q) $ \c ->
-          c { qcGen = qcGen c + 1, qcJob = Just job }
-        -- Master joins as the Nth worker.
-        claimAndRun q job
-        when (scqExtra q > 0) $
-          atomically $ do
-            d <- readTVar (scqWorkersDone q)
-            when (d < scqExtra q) retry
-        atomically $ modifyTVar' (scqCtl q) $ \c -> c { qcJob = Nothing }
+            <*> newIORef Map.empty
+            <*> newTVarIO n
+            <*> newIORef False
+        let unpublish = atomically $ modifyTVar' (scqCtl q) $ \c ->
+              case qcJob c of
+                Just j | ajSeq j == seqN -> c { qcJob = Nothing }
+                _ -> c
+            cancelJob = do
+              writeIORef (ajCancelled job) True
+              unpublish
+        mask $ \restore -> do
+          atomically $ modifyTVar' (scqCtl q) $ \c ->
+            c { qcGen = qcGen c + 1, qcJob = Just job }
+          restore (do
+            startHook <- readIORef masterStartHookRef
+            startHook seqN
+            -- Master joins as the Nth worker.
+            claimAndRun q True job
+            join (readIORef masterWaitHookRef)
+            -- Core nTodo == 0: every item of THIS job finished.
+            atomically $ do
+              r <- readTVar (ajRemaining job)
+              when (r > 0) retry)
+            `onException` cancelJob
+          unpublish
         fails <- readIORef (ajFails job)
-        case Map.lookupMin fails of
-          Nothing -> return ScriptCheckOK
-          Just (i, err) -> return (ScriptCheckFail i err)
+        faults <- readIORef (ajInternal job)
+        return $ case Map.lookupMin fails of
+          Just (i, err) -> ScriptCheckFail i err
+          Nothing -> case Map.lookupMin faults of
+            Just (i, why) -> ScriptCheckInternal i why
+            Nothing -> ScriptCheckOK
+
+-- | gate-6 TEST HOOK: called inside the per-item handler just before the
+-- item is evaluated, with (job sequence, is-master, job index); the serial
+-- path passes job sequence -1. Default no-op.
+{-# NOINLINE scriptItemHookRef #-}
+scriptItemHookRef :: IORef (Int -> Bool -> Int -> IO ())
+scriptItemHookRef = unsafePerformIO (newIORef (\_ _ _ -> return ()))
+
+-- | gate-6 TEST HOOK: called by the master after its claim loop returns and
+-- before it waits for the job to finish. Default no-op.
+{-# NOINLINE masterWaitHookRef #-}
+masterWaitHookRef :: IORef (IO ())
+masterWaitHookRef = unsafePerformIO (newIORef (return ()))
+
+-- | gate-6 TEST HOOK: called by the master (with the job sequence) after the
+-- job is published and before the master claims its first batch. No-op.
+{-# NOINLINE masterStartHookRef #-}
+masterStartHookRef :: IORef (Int -> IO ())
+masterStartHookRef = unsafePerformIO (newIORef (\_ -> return ()))
 
 {-# NOINLINE globalScriptCheckQueueRef #-}
 globalScriptCheckQueueRef :: IORef (Maybe ScriptCheckQueue)
@@ -4051,23 +4187,56 @@ stopGlobalScriptCheckQueue = do
       shutdownScriptCheckQueue q
       writeIORef globalScriptCheckQueueRef Nothing
 
-evalChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
-evalChecksSerial scriptFlags = go
+-- | Serial drain with the same three outcomes as the pool: the first Fail
+-- wins at once; a fault is remembered and the scan goes on (a later real
+-- Fail still wins, exactly as the pool combines); async exceptions
+-- propagate.
+evalChecksSerialIO :: ScriptFlags -> [ScriptCheckItem] -> IO ScriptCheckResult
+evalChecksSerialIO scriptFlags = go 0 Nothing
   where
-    go [] = Right ()
-    go (c:cs) = case verifyScriptCheckItem scriptFlags c of
-      Just err -> Left err
-      Nothing  -> go cs
+    go _ mFault [] =
+      return (maybe ScriptCheckOK (uncurry ScriptCheckInternal) mFault)
+    go !i mFault (c:cs) = do
+      er <- checkOneItem (-1) True i scriptFlags c
+      case er of
+        Right Nothing    -> go (i + 1) mFault cs
+        Right (Just err) -> return (ScriptCheckFail i err)
+        Left ex ->
+          go (i + 1) (maybe (Just (i, describeFault c ex)) Just mFault) cs
+
+-- | Pure face of 'evalChecksSerialIO' (mempool / 'validateSingleTx' /
+-- no-pool callers). A fault is an 'internalReject' string, never a script
+-- verdict.
+{-# NOINLINE evalChecksSerial #-}
+evalChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
+evalChecksSerial scriptFlags checks =
+  scriptCheckResultToEither (unsafePerformIO (evalChecksSerialIO scriptFlags checks))
+
+-- | Threads that must verify scripts serially (the gate-6 retry). Keyed by
+-- the forcing thread: the pure dispatch runs on whichever thread forces it.
+{-# NOINLINE serialScriptThreadsRef #-}
+serialScriptThreadsRef :: IORef (Set.Set ThreadId)
+serialScriptThreadsRef = unsafePerformIO (newIORef Set.empty)
+
+-- | Run @act@ with script checks forced onto the serial path on this thread.
+withSerialScriptChecks :: IO a -> IO a
+withSerialScriptChecks act = do
+  tid <- myThreadId
+  bracket_
+    (atomicModifyIORef' serialScriptThreadsRef $ \s -> (Set.insert tid s, ()))
+    (atomicModifyIORef' serialScriptThreadsRef $ \s -> (Set.delete tid s, ()))
+    act
 
 {-# NOINLINE dispatchScriptChecks #-}
 dispatchScriptChecks :: ScriptFlags -> [ScriptCheckItem] -> IO (Either String ())
 dispatchScriptChecks scriptFlags checks = do
+  tid <- myThreadId
+  forceSerial <- Set.member tid <$> readIORef serialScriptThreadsRef
   mq <- readIORef globalScriptCheckQueueRef
-  case mq of
-    Just q -> do
-      r <- runScriptCheckQueue q scriptFlags checks
-      return (scriptCheckResultToEither r)
-    Nothing -> return (evalChecksSerial scriptFlags checks)
+  r <- case mq of
+    Just q | not forceSerial -> runScriptCheckQueue q scriptFlags checks
+    _ -> evalChecksSerialIO scriptFlags checks
+  return (scriptCheckResultToEither r)
 
 -- | Run a batch of pre-resolved script checks IN PARALLEL, returning the FIRST
 -- failure (if any) — exactly as the equivalent serial loop would have rejected.
@@ -4092,6 +4261,70 @@ runScriptChecksSerial :: ScriptFlags -> [ScriptCheckItem] -> Either String ()
 runScriptChecksSerial scriptFlags checks =
   let !_ = recordScriptChecks (length checks)
   in evalChecksSerial scriptFlags checks
+
+--------------------------------------------------------------------------------
+-- gate-6: validation forced under a handler; Internal -> retry once -> latch
+--------------------------------------------------------------------------------
+
+-- | Run a validation action and force its result (WHNF + the reject
+-- string) INSIDE a synchronous-only handler. The pure validators return a
+-- lazy 'Either'; forcing it is what runs the whole validation, including the
+-- script pool, so the force must be here and not at a later @seq@ outside
+-- any handler. A synchronous throw becomes an 'internalReject' (never a
+-- verdict); an asynchronous one propagates.
+forceValidation :: IO (Either String a) -> IO (Either String a)
+forceValidation act = do
+  r <- trySync $ do
+    v <- act >>= evaluate
+    case v of
+      Left s  -> evaluate (length s) >> return v
+      Right _ -> return v
+  return $ case r of
+    Left e  -> Left (internalReject ("validation threw: " ++ show e))
+    Right v -> v
+
+-- | Core ConnectBlock's error handling for a local fault: never a verdict.
+--
+-- * the fatal latch is checked first (every connect entry goes through
+--   here): once set, nothing is validated or connected;
+-- * the validation is forced under a sync-only handler ('forceValidation');
+-- * an Internal result is retried ONCE with the script checks on the serial
+--   path (a pool fault is not reproduced there); OK or a real verdict from
+--   the retry stands;
+-- * a second Internal sets the fatal latch (AbortNode) and returns the
+--   Internal reject, which 'classifyBlockReject' never treats as a verdict.
+--
+-- @act@ must build its validation afresh each time it runs (the IO wrappers
+-- 'validateFullBlockIO' / 'validateFullBlockFresh' do).
+validateBlockGuarded :: String -> IO (Either String ()) -> IO (Either String ())
+validateBlockGuarded ctx act = do
+  latched <- readFatalLatch
+  case latched of
+    Just why -> return (Left (fatalLatchedReject why))
+    Nothing -> do
+      r1 <- forceValidation act
+      case r1 of
+        Left e1 | isInternalReject e1 -> do
+          putStrLn $ "gate-6: internal fault validating " ++ ctx ++ ": " ++ e1
+                  ++ " -- not a verdict; retrying once with serial script checks"
+          r2 <- withSerialScriptChecks (forceValidation act)
+          case r2 of
+            Left e2 | isInternalReject e2 -> do
+              setFatalLatch ("validating " ++ ctx ++ ": fault persisted after a serial retry: " ++ e2)
+              return (Left e2)
+            _ -> do
+              putStrLn $ "gate-6: serial retry of " ++ ctx ++ " gave "
+                      ++ either ("reject: " ++) (const "OK") r2
+              return r2
+        _ -> return r1
+
+-- | 'validateFullBlock' as an IO action whose result is built when the
+-- action RUNS (so a retry re-validates instead of re-reading a cached
+-- result). For 'validateBlockGuarded'.
+validateFullBlockFresh :: Network -> ChainState -> (Word32 -> Word32) -> Bool -> Bool
+                       -> Block -> Map OutPoint Coin -> IO (Either String ())
+validateFullBlockFresh net cs getMtp skipScripts skipConnectChecks block utxo =
+  evaluate (validateFullBlock net cs getMtp skipScripts skipConnectChecks block utxo)
 
 -- | Validate all non-coinbase transactions in a block.
 -- Returns the total fees collected.
@@ -7348,7 +7581,9 @@ reorgConnectIncremental net cache db hc mIdxMgr (ce : rest) = do
                           0 parentMTP
                           (getBlockScriptFlags net bh (ceHeight ce))
           getMtp = getMtpFromAncestry entriesRC (bhPrevBlock (blockHeader blk))
-      case validateFullBlock net cs getMtp False False blk spentUtxos0 of
+      vrR <- validateBlockGuarded ("reorg connect " ++ show bh ++ " height " ++ show (ceHeight ce))
+               (validateFullBlockFresh net cs getMtp False False blk spentUtxos0)
+      case vrR of
         Left err -> do
           -- Core ConnectTip failure -> InvalidBlockFound (validation.cpp):
           -- disk is at this block's parent, so the reject was produced in
@@ -7624,7 +7859,9 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
           -- block.GetAncestor(coinHeight-1); during a reorg hcByHeight can still
           -- point at the losing branch, giving the wrong-branch MTP.
           getMtp = getMtpFromAncestry entriesRC (bhPrevBlock (blockHeader blk))
-      case validateFullBlock net cs getMtp False False blk spentUtxos of
+      vrR <- validateBlockGuarded ("reorg connect " ++ show bh ++ " height " ++ show (ceHeight ce))
+               (validateFullBlockFresh net cs getMtp False False blk spentUtxos)
+      case vrR of
         Left err -> return $ Left $
           "reorg connect: block " ++ show bh
           ++ " (height " ++ show (ceHeight ce)
@@ -7942,7 +8179,9 @@ connectChain net cache db hc fromHash toHash = do
             let cs = ChainState (ceHeight ce - 1) (bhPrevBlock (blockHeader block))
                                 0 prevBlockMTP
                                 (getBlockScriptFlags net (ceHash ce) (ceHeight ce))
-            case validateFullBlock net cs getMtpCC False False block spentCoins of
+            vrR <- validateBlockGuarded ("reorg connect " ++ show (ceHash ce) ++ " height " ++ show (ceHeight ce))
+                     (validateFullBlockFresh net cs getMtpCC False False block spentCoins)
+            case vrR of
               Left err -> return $ Left $
                 "reorg connect: block " ++ show (ceHash ce)
                 ++ " (height " ++ show (ceHeight ce)
@@ -8812,7 +9051,8 @@ classifyBlockReject err
   | otherwise                               = BlockRejectNonVerdict
   where
     nonVerdictMarkers =
-      [ "Merkle root mismatch", "bad-txnmrklroot", "bad-txns-duplicate"
+      [ internalErrorMarker      -- gate-6: a local fault, never a verdict
+      , "Merkle root mismatch", "bad-txnmrklroot", "bad-txns-duplicate"
       , "bad-witness-merkle-match", "bad-witness-nonce-size"
       , "unexpected-witness"
       , "Missing UTXO", "bad-txns-inputs-missingorspent"

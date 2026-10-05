@@ -59,6 +59,8 @@ module Haskoin.Storage
   , getUTXO
   , putUTXOCoin
   , getUTXOCoin
+  , getUTXOCoinChecked
+  , flushWriteHookRef
   , getUTXOCoinHealingTip
   , healTipCreatedCoin
   , readHealTipAttempts
@@ -251,7 +253,7 @@ import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Control.Exception (bracket, try, IOException, catch)
-import Control.Monad (when, void, unless, forM_)
+import Control.Monad (when, void, unless, forM_, join)
 import System.Mem (performGC)
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class (liftIO)
@@ -281,6 +283,7 @@ import qualified Crypto.Hash as Hash
 import qualified Data.ByteArray as BA
 
 import Haskoin.Types
+import Haskoin.Fatal (trySync, setFatalLatch)
 import qualified Haskoin.MuHash as MuHash
 import Haskoin.MuHash (MuHash3072)
 import Haskoin.Crypto (decompressPubKey, computeTxId)
@@ -615,6 +618,24 @@ putUTXOCoin db outpoint coin =
 -- metadata that 'getUTXOCoin' returns.
 getUTXO :: HaskoinDB -> OutPoint -> IO (Maybe TxOut)
 getUTXO db outpoint = fmap coinTxOut <$> getUTXOCoin db outpoint
+
+-- | 'getUTXOCoin' that does NOT turn an undecodable row into "absent".
+-- gate-6: a coin row that is present but cannot be decoded is a corrupt
+-- chainstate, not a missing coin (Core: CCoinsViewDB::GetCoin throws ->
+-- CCoinsViewErrorCatcher -> AbortNode). Throws an 'IOError'; callers on a
+-- validation path run under 'validateBlockGuarded', which turns it into an
+-- internal fault (retry, then the fatal latch) — never a verdict and never
+-- the BIP30 "no conflict" that the lenient read used to give (fail-open).
+getUTXOCoinChecked :: HaskoinDB -> OutPoint -> IO (Maybe Coin)
+getUTXOCoinChecked db outpoint = do
+  let key = makeKey PrefixUTXO (encode outpoint)
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  case mval of
+    Nothing -> return Nothing
+    Just v -> case decode v of
+      Right c -> return (Just c)
+      Left err -> ioError (userError ("corrupt UTXO row for " ++ show outpoint
+                                      ++ ": " ++ err))
 
 -- | Retrieve a UTXO with full Core-format @Coin@ metadata.
 getUTXOCoin :: HaskoinDB -> OutPoint -> IO (Maybe Coin)
@@ -1030,14 +1051,40 @@ spendUTXO cache op = do
 -- Entries are written in Core-format @Coin@ (varint code + TxOut), the
 -- same on-disk shape 'connectBlock' uses, so a flush is invisible to
 -- 'getUTXO' / 'dumpTxOutSetFromDB'.
+-- | gate-6 TEST HOOK: runs just before 'flushCache' writes its batch (a
+-- throw simulates a failed write). Default no-op.
+{-# NOINLINE flushWriteHookRef #-}
+flushWriteHookRef :: IORef (IO ())
+flushWriteHookRef = unsafePerformIO (newIORef (return ()))
+
 flushCache :: UTXOCache -> IO ()
 flushCache cache = do
-  dirty <- atomically $ do
-    d <- readTVar (ucDirty cache)
-    writeTVar (ucDirty cache) Map.empty
-    return d
+  -- gate-6: WRITE BEFORE FORGET. The dirty set used to be emptied BEFORE the
+  -- write (rustoshi F2 / blockbrew P0 shape): a failed write lost every
+  -- pending change from the flush set while memory still served it, and a
+  -- restart then read a chainstate missing them. Now the batch is written
+  -- first and only what was written is forgotten; a failed write is retried
+  -- once, then the node latches (AbortNode) and the exception propagates.
+  dirty <- readTVarIO (ucDirty cache)
   let ops = map toOp (Map.toList dirty)
-  writeBatch (ucDB cache) (WriteBatch ops)
+      write = do
+        join (readIORef flushWriteHookRef)
+        writeBatch (ucDB cache) (WriteBatch ops)
+  r1 <- trySync write
+  case r1 of
+    Right () -> return ()
+    Left e1 -> do
+      putStrLn $ "flushCache: UTXO batch write failed (" ++ show e1 ++ "); retrying once"
+      r2 <- trySync write
+      case r2 of
+        Right () -> return ()
+        Left e2 -> do
+          setFatalLatch ("flushCache: UTXO batch write failed twice: " ++ show e2)
+          Exc.throwIO e2
+  -- Forget exactly what was written; an entry re-dirtied meanwhile (a
+  -- different value) stays pending.
+  atomically $ modifyTVar' (ucDirty cache) $ \d ->
+    Map.differenceWith (\cur wrote -> if cur == wrote then Nothing else Just cur) d dirty
 
   -- Clear the entire cache — entries will be re-fetched from DB on
   -- demand. This is the only reliable way to bound Haskell Map memory
