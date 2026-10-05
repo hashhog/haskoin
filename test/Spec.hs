@@ -97,6 +97,7 @@ import qualified Haskoin.MuHash as MuHash
 import qualified PrioritiseTransactionSpec
 import qualified RbfMempoolParentSpec
 import qualified RelayTxNoPunishSpec
+import qualified MempoolActiveTipSpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
@@ -23699,6 +23700,9 @@ main = hspec $ do
 
   -- relayed tx rejections never punish (Core ProcessInvalidTx)
   RelayTxNoPunishSpec.spec
+
+  -- mempool reads the ACTIVE tip (height, MTP, coin MTP, maturity, BIP-68)
+  MempoolActiveTipSpec.spec
 
   -- W107 CompactSize + VarInt 30-gate audit
   W107CompactSizeSpec.spec

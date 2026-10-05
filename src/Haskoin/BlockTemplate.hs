@@ -102,7 +102,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
 import Haskoin.Index (IndexManager, indexManagerConnectBlock,
                        indexManagerDisconnectBlock)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions,
-                         blockDisconnected)
+                         blockDisconnected, blockConnected, checkSeqLocksAtTip)
 import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
                          Inv(..), InvVector(..), InvType(..))
 
@@ -242,9 +242,21 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
   -- transactions can only use (MAX_BLOCK_WEIGHT - 8000) = 3,992,000 weight.
   allEntries <- selectTransactions mp (maxBlockWeight - blockReservedWeight)
 
-  -- Filter out transactions that are not final at this height/time
-  -- For block template, use MTP (median time past) as the time threshold
-  let mtpFinalEntries = filter (isFinalEntry height mtp) allEntries
+  -- Re-check every selected tx against the block being built: IsFinalTx
+  -- (BIP-113, MTP cutoff; Core miner.cpp:255) AND its BIP-68 sequence locks
+  -- (CheckSequenceLocksAtTip semantics: coin height / coin MTP per input,
+  -- in-template parents at height+1 with the tip MTP).  Core can skip the
+  -- BIP-68 re-check because removeForReorg evicts txs whose locks stop
+  -- holding (validation.cpp:334-385); haskoin has no removeForReorg, and its
+  -- admission check ran against a "blocks since boot" counter until this
+  -- fix — an entry admitted then could make the template an INVALID block.
+  -- A dropped tx takes its in-template descendants with it (a child without
+  -- its parent is bad-txns-inputs-missingorspent).
+  lockChecks <- forM allEntries $ \e -> do
+    r <- checkSeqLocksAtTip mp (meTransaction e) (ceHeight tip) mtp
+    return (meTxId e, isFinalEntry height mtp e && either (const False) (const True) r)
+  let mtpFinalEntries = dropWithDescendants
+        (Set.fromList [t | (t, False) <- lockChecks]) allEntries
 
   -- Enforce the per-block sigop cost budget (BIP-141 / MAX_BLOCK_SIGOPS_COST = 80,000).
   -- Without UTXO-resolved prevouts at template time we use the legacy sigop count
@@ -303,6 +315,25 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
     }
 
 -- | Check if a mempool entry is final at the given height and time
+-- | All but the last element ([] for []).
+dropLast :: [a] -> [a]
+dropLast [] = []
+dropLast xs = init xs
+
+-- | Remove the entries in @bad@ and, transitively, every entry spending an
+-- output of a removed entry.
+dropWithDescendants :: Set TxId -> [MempoolEntry] -> [MempoolEntry]
+dropWithDescendants bad es
+  | Set.size bad' == Set.size bad = filter (not . (`Set.member` bad) . meTxId) es
+  | otherwise = dropWithDescendants bad' es
+  where
+    bad' = foldl step bad es
+    step acc e
+      | Set.member (meTxId e) acc = acc
+      | any (\i -> Set.member (outPointHash (txInPrevOutput i)) acc)
+            (txInputs (meTransaction e)) = Set.insert (meTxId e) acc
+      | otherwise = acc
+
 isFinalEntry :: Word32 -> Word32 -> MempoolEntry -> Bool
 isFinalEntry height mtp entry = isFinalTx (meTransaction entry) height mtp
 
@@ -1144,6 +1175,19 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock newWork = do
                     -- AFTER the atomic disk commit so the mempool
                     -- never sees a tx whose corresponding chainstate
                     -- has not yet been persisted.
+                    --
+                    -- Core order (ActivateBestChainStep): every CONNECTED
+                    -- block runs removeForBlock (confirmed txs + conflicts
+                    -- leave the pool), then MaybeUpdateMempoolForReorg
+                    -- re-admits the disconnected txs.  Pre-fix only the
+                    -- disconnect half ran here, so txs confirmed by the
+                    -- intermediate connected blocks stayed in the pool
+                    -- (and the old height counter drifted).  The new TIP's
+                    -- blockConnected is run by submitBlock's caller (the
+                    -- submitblock / generate RPC arms), so it is skipped
+                    -- here to keep it single.
+                    forM_ (dropLast connectList) $ \blk ->
+                      blockConnected mp blk
                     forM_ disconnectList $ \blk ->
                       blockDisconnected mp blk
 

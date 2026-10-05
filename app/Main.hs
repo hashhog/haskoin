@@ -1216,19 +1216,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                                       ++ "base marker (height " ++ show baseHeight
                                       ++ ") for restart-safe reconciliation."
 
-    -- Initialize mempool.
-    -- Provide a per-input coin-MTP lookup function (BIP-68 time-based locks):
-    -- given a coin-height H, return MTP(max(H-1, 0)).
-    -- Reference: Bitcoin Core tx_verify.cpp:74 — nCoinTime =
-    --   GetAncestor(max(H-1,0))->GetMedianTimePast().
-    let getCoinMtpFromChain coinH = do
-          entries  <- readTVarIO (hcEntries hc)
-          byHeight <- readTVarIO (hcByHeight hc)
-          let targetH = if coinH == 0 then 0 else coinH - 1
-          case Map.lookup targetH byHeight of
-            Just blockHash -> return (medianTimePast entries blockHash)
-            Nothing        -> return 0  -- height not in chain (shouldn't happen)
-    mp <- newMempool net cache defaultMempoolConfig 0 0 getCoinMtpFromChain
+    -- Initialize mempool.  'initNodeMempool' reads the ACTIVE tip (height +
+    -- 11-block MTP) live for every admission check and resolves per-coin
+    -- BIP-68 MTP from the header chain ('chainBlockMtp').  It used to seed
+    -- height/MTP with 0/0 here and count connected blocks from there, and
+    -- this closure subtracted 1 from a height the caller had already
+    -- decremented (MTP(H-2)).  Installed before mempool.dat is loaded.
+    mp <- initNodeMempool net db hc cache defaultMempoolConfig
 
     -- Load mempool.dat (Core-format), if present. We use a 14-day
     -- expiry (matches Bitcoin Core's DEFAULT_MEMPOOL_EXPIRY_HOURS = 336).

@@ -258,6 +258,7 @@ test-suite haskoin-test
                , PrioritiseTransactionSpec
                , RbfMempoolParentSpec
                , RelayTxNoPunishSpec
+               , MempoolActiveTipSpec
                , ParseHashVSpec
                , CreateRawTxDropSpec
                , RpcIntArgBoundsSpec

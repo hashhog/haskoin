@@ -34,6 +34,12 @@ module Haskoin.Mempool
     -- * Mempool Creation
   , newMempool
   , setOnRemoveTx
+  , initNodeMempool
+  , setMempoolTipSource
+  , refreshMempoolTip
+  , activeTipSource
+  , chainBlockMtp
+  , coinbaseImmatureAt
   , noopCoinMtp
     -- * Transaction Operations
   , addTransaction
@@ -171,7 +177,7 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
-import Control.Monad (forM, forM_, when, unless, foldM)
+import Control.Monad (forM, forM_, when, unless, foldM, void)
 import Control.Concurrent.STM
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Generics (Generic)
@@ -180,14 +186,16 @@ import Data.Serialize (encode)
 
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeWtxid)
+import Haskoin.Consensus (HeaderChain(..), ChainEntry(..), getValidatedChainTip,
+                           medianTimePast)
 import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            txBaseSize, txTotalSize, coinbaseMaturity,
                            isFinalTxCheck, calculateSequenceLocks,
-                           checkSequenceLocks, bip68Active,
+                           checkSequenceLocks,
                            getTransactionSigOpCost, consensusFlagsAtHeight,
                            consensusFlagsToScriptFlags,
                            SigOpCost(..), isCoinbase)
-import Haskoin.Storage (UTXOCache(..), UTXOEntry(..), lookupUTXO)
+import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
@@ -636,9 +644,12 @@ data Mempool = Mempool
     -- ^ Transactions originated locally that have not yet been confirmed
     -- relayed to a peer. Persisted in mempool.dat.
   , mpGetCoinMtp :: !(Word32 -> IO Word32)
-    -- ^ BIP-68: Given a coin's confirmation height H, returns the Median Time
-    -- Past of block max(H-1, 0).  This is the per-input nCoinTime used by
-    -- Bitcoin Core's CalculateSequenceLocks (tx_verify.cpp:74).
+    -- ^ BIP-68: given a BLOCK height B, returns the Median Time Past of the
+    -- block at B.  'checkSeqLocksAtTip' calls it with B = max(H-1, 0) for a
+    -- coin confirmed at H, giving Bitcoin Core's per-input nCoinTime
+    -- (CalculateSequenceLocks, tx_verify.cpp:74).  The function itself must
+    -- NOT subtract again (the live node's closure did: MTP(H-2); fixed by
+    -- 'chainBlockMtp').
     -- Callers with a live header chain should supply a function that looks up
     -- the height->hash index and calls medianTimePast.  In tests or when chain
     -- history is unavailable, pass 'noopCoinMtp' (returns 0), which makes all
@@ -673,6 +684,17 @@ data Mempool = Mempool
     -- their @feePending@/@fbInMempool@ entries forever.  Defaults to a no-op so
     -- the mempool stays decoupled from the estimator (no module dependency) and
     -- behaviour is unchanged until a subscriber is installed.
+  , mpTipSource :: !(TVar (Maybe (IO (Word32, Word32))))
+    -- ^ Authoritative (height, MTP) of the ACTIVE chain tip.  When installed
+    -- ('setMempoolTipSource', done by 'initNodeMempool' on a live node) every
+    -- admission reads the tip through it ('refreshMempoolTip'), so
+    -- 'mpHeight' / 'mpMTP' are a cache of the chain, never a counter.  Core
+    -- reads m_active_chainstate.m_chain.Tip() for every check
+    -- (CheckFinalTxAtTip / CalculateLockPointsAtTip / CheckTxInputs at
+    -- Height()+1).  Pre-fix the node seeded 0/0 at boot and only
+    -- blockConnected (+1) / blockDisconnected (-1) moved it, so mpHeight was
+    -- "blocks since boot".  Nothing installed (unit tests) = the legacy
+    -- TVar arithmetic.
   }
 
 -- | A no-op coin-MTP lookup that returns 0 for every height.
@@ -716,6 +738,7 @@ newMempool net cache config height mtp getCoinMtp = do
     <*> newTVarIO False      -- mpBlockSinceLastFeeBump: no block yet
     <*> newTVarIO now        -- mpLastRollingFeeUpdate: now
     <*> newTVarIO (\_ -> return ())  -- mpOnRemoveTx: no subscriber by default
+    <*> newTVarIO Nothing    -- mpTipSource: none (legacy arithmetic) until installed
 
 -- | Install the non-block removal subscriber.  The wiring layer (the RPC
 -- server, which owns both the 'Mempool' and the 'FeeEstimator') calls this
@@ -725,6 +748,80 @@ newMempool net cache config height mtp getCoinMtp = do
 -- receives @TransactionRemovedFromMempool@ (init.cpp / validationinterface).
 setOnRemoveTx :: Mempool -> (TxId -> IO ()) -> IO ()
 setOnRemoveTx mp cb = atomically $ writeTVar (mpOnRemoveTx mp) cb
+
+-- | Install the authoritative active-tip source and refresh from it now.
+setMempoolTipSource :: Mempool -> IO (Word32, Word32) -> IO ()
+setMempoolTipSource mp src = do
+  atomically $ writeTVar (mpTipSource mp) (Just src)
+  _ <- refreshMempoolTip mp
+  return ()
+
+-- | The tip (height, MTP) the next admission check must use: read through
+-- the installed source (and cached into 'mpHeight' / 'mpMTP'), or the
+-- cached TVars when no source is installed.
+refreshMempoolTip :: Mempool -> IO (Word32, Word32)
+refreshMempoolTip mp = do
+  msrc <- readTVarIO (mpTipSource mp)
+  case msrc of
+    Just src -> do
+      (h, m) <- src
+      atomically $ do
+        writeTVar (mpHeight mp) h
+        writeTVar (mpMTP mp) m
+      return (h, m)
+    Nothing -> (,) <$> readTVarIO (mpHeight mp) <*> readTVarIO (mpMTP mp)
+
+-- | Is a coinbase output confirmed at @coinH@ still immature for a mempool
+-- transaction, given the active tip height @tipH@?  Core PreChecks calls
+-- Consensus::CheckTxInputs with nSpendHeight = Height()+1 (validation.cpp
+-- :892) and rejects when nSpendHeight - coin.nHeight < COINBASE_MATURITY
+-- (consensus/tx_verify.cpp:179).  Pre-fix haskoin computed
+-- @tip - coinH < 100@ in Word32: one block too strict, and a coin height
+-- above the (blocks-since-boot) mempool height WRAPPED to a huge value —
+-- an immature coinbase spend passed as mature.  Written without
+-- subtraction so it cannot underflow.
+coinbaseImmatureAt :: Word32 -> Word32 -> Bool
+coinbaseImmatureAt tipH coinH =
+  toInteger tipH + 1 < toInteger coinH + toInteger coinbaseMaturity
+
+isJustM :: TVar (Maybe a) -> IO Bool
+isJustM v = maybe False (const True) <$> readTVarIO v
+
+-- | Tip height for an admission check (see 'refreshMempoolTip').
+mempoolTipHeight :: Mempool -> IO Word32
+mempoolTipHeight mp = fst <$> refreshMempoolTip mp
+
+-- | (height, MTP) of the ACTIVE (validated) chain tip -- the same tip
+-- getblockcount / getbestblockhash report ('getValidatedChainTip'), with the
+-- full 11-block median ('medianTimePast'; Core CBlockIndex::GetMedianTimePast).
+activeTipSource :: HaskoinDB -> HeaderChain -> IO (Word32, Word32)
+activeTipSource db hc = do
+  tip <- getValidatedChainTip db hc
+  entries <- readTVarIO (hcEntries hc)
+  return (ceHeight tip, medianTimePast entries (ceHash tip))
+
+-- | MTP of the block AT height @b@ on the height index ('hcByHeight').
+-- 'checkSeqLocksAtTip' passes @max(H-1,0)@ for a coin confirmed at H, so this
+-- yields Core's nCoinTime = GetAncestor(max(H-1,0))->GetMedianTimePast()
+-- (consensus/tx_verify.cpp CalculateSequenceLocks).  Pre-fix the node's
+-- closure (app/Main.hs) subtracted 1 AGAIN, giving MTP(H-2).
+chainBlockMtp :: HeaderChain -> Word32 -> IO Word32
+chainBlockMtp hc b = do
+  entries  <- readTVarIO (hcEntries hc)
+  byHeight <- readTVarIO (hcByHeight hc)
+  case Map.lookup b byHeight of
+    Just bh -> return (medianTimePast entries bh)
+    Nothing -> return 0
+
+-- | The live node's mempool: per-coin MTP from the header chain and the
+-- active tip read live (installed before any tx -- mempool.dat included --
+-- is admitted).  app/Main.hs calls exactly this.
+initNodeMempool :: Network -> HaskoinDB -> HeaderChain -> UTXOCache -> MempoolConfig
+                -> IO Mempool
+initNodeMempool net db hc cache cfg = do
+  mp <- newMempool net cache cfg 0 0 (chainBlockMtp hc)
+  setMempoolTipSource mp (activeTipSource db hc)
+  return mp
 
 -- | Fire the non-block removal notification for a txid.  Run after the STM
 -- removal commits (the subscriber does its own IO/STM), so it must not be
@@ -803,8 +900,7 @@ addTransactionInner mp tx txid = do
           -- tipHeight+1 and the MTP of the current tip per BIP-113.
           -- Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
           -- (validation.cpp:819).
-          height <- readTVarIO (mpHeight mp)
-          mtp    <- readTVarIO (mpMTP mp)
+          (height, mtp) <- refreshMempoolTip mp
           let nextHeight = height + 1
           if not (isFinalTxCheck tx nextHeight mtp)
             then return $ Left (ErrNonFinal "non-final")
@@ -972,8 +1068,8 @@ resolveInputsForReplacement mp tx conflictTxIds = do
         mUtxo <- lookupUTXO (mpUTXOCache mp) op
         case mUtxo of
           Just entry -> do
-            height <- readTVarIO (mpHeight mp)
-            if ueCoinbase entry && height - ueHeight entry < fromIntegral coinbaseMaturity
+            height <- mempoolTipHeight mp
+            if ueCoinbase entry && coinbaseImmatureAt height (ueHeight entry)
               then return $ Left (ErrCoinbaseNotMature (ueHeight entry) height)
               else return $ Right (op, ueOutput entry)
           Nothing -> do
@@ -1092,7 +1188,7 @@ finalizeTransaction mp tx txid inputPairs = do
                             Right () -> do
                               -- MAX_STANDARD_TX_SIGOPS_COST check
                               -- (Bitcoin Core validation.cpp:908,941-943).
-                              tipHeight <- readTVarIO (mpHeight mp)
+                              tipHeight <- mempoolTipHeight mp
                               let sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipHeight + 1)
                                   SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
                               if txSigOpCost > maxStandardTxSigOpsCost
@@ -1152,7 +1248,7 @@ buildMempoolEntry mp tx txid fee vsize txSigOpCost ancestors = do
       adjWeight = calculateAdjustedWeight tx txSigOpCost
       feeRate  = calculateFeeRate modFee adjVsize
   now    <- round <$> getPOSIXTime
-  height <- readTVarIO (mpHeight mp)
+  height <- mempoolTipHeight mp
   let rbfOptIn      = signalsOptInRBF tx
       ancestorCount = length ancestors + 1
       ancestorSize  = sum (map meSize ancestors) + adjVsize
@@ -1288,7 +1384,7 @@ finalizeTransactionDry mp tx txid inputPairs = do
                           Left ephErr ->
                             return $ Left (ErrEphemeralViolation ephErr)
                           Right () -> do
-                            tipHeight <- readTVarIO (mpHeight mp)
+                            tipHeight <- mempoolTipHeight mp
                             let sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipHeight + 1)
                                 SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
                             if txSigOpCost > maxStandardTxSigOpsCost
@@ -1343,8 +1439,7 @@ testAcceptTransactionInner mp tx txid = do
       case Std.checkStandardTx tx of
         Left stdErr -> return $ Left (ErrNonStandard (renderStdReason stdErr))
         Right () -> do
-          height <- readTVarIO (mpHeight mp)
-          mtp    <- readTVarIO (mpMTP mp)
+          (height, mtp) <- refreshMempoolTip mp
           let nextHeight = height + 1
           if not (isFinalTxCheck tx nextHeight mtp)
             then return $ Left (ErrNonFinal "non-final")
@@ -1493,8 +1588,8 @@ resolveInput mp op = do
   case mUtxo of
     Just entry -> do
       -- Check coinbase maturity
-      height <- readTVarIO (mpHeight mp)
-      if ueCoinbase entry && height - ueHeight entry < fromIntegral coinbaseMaturity
+      height <- mempoolTipHeight mp
+      if ueCoinbase entry && coinbaseImmatureAt height (ueHeight entry)
         then return $ Left (ErrCoinbaseNotMature (ueHeight entry) height)
         else return $ Right (op, ueOutput entry)
     Nothing -> do
@@ -1537,7 +1632,7 @@ verifyAllScripts mp tx inputMap = do
     Left err -> return $ Left err
     Right prevs -> do
       -- Use consensus flags for the next block height (mempool admission standard).
-      height <- readTVarIO (mpHeight mp)
+      height <- mempoolTipHeight mp
       let cflags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
           scriptFlags = consensusFlagsToScriptFlags cflags
           spentAmounts = map txOutValue prevs
@@ -2318,12 +2413,17 @@ blockConnected mp block = do
   -- Prepend the new block's timestamp to the rolling window (capped at 11),
   -- then recompute the median so that IsFinalTx at mempool admit uses the
   -- correct MTP of the new tip, matching Bitcoin Core's CheckFinalTxAtTip.
+  -- With a tip source installed (the live node) the tip is re-read from the
+  -- chain instead: a counter seeded at 0 drifts from the chain (boot, and
+  -- any connect/disconnect path that does not call these hooks).
   let ts = bhTimestamp (blockHeader block)
-  atomically $ do
+  hasSource <- isJustM (mpTipSource mp)
+  if hasSource then void (refreshMempoolTip mp) else atomically $ do
     modifyTVar' (mpHeight mp) (+ 1)
     modifyTVar' (mpRecentTimestamps mp) (\old -> take 11 (ts : old))
     timestamps <- readTVar (mpRecentTimestamps mp)
     writeTVar (mpMTP mp) (computeMTPFromList timestamps)
+  atomically $ do
     -- Signal that a block has connected.  GetMinFee uses this flag to decide
     -- whether to apply exponential decay to the rolling minimum fee rate.
     -- Bitcoin Core: blockSinceLastRollingFeeBump = true (txmempool.cpp set in
@@ -2352,7 +2452,8 @@ blockDisconnected :: Mempool -> Block -> IO ()
 blockDisconnected mp block = do
   -- Decrease chain height and drop the disconnected block's timestamp from
   -- the MTP window. We drop the head (most-recent) and recompute.
-  atomically $ do
+  hasSource <- isJustM (mpTipSource mp)
+  if hasSource then void (refreshMempoolTip mp) else atomically $ do
     modifyTVar' (mpHeight mp) (subtract 1)
     modifyTVar' (mpRecentTimestamps mp) safeDropHead
     timestamps <- readTVar (mpRecentTimestamps mp)
@@ -2362,8 +2463,6 @@ blockDisconnected mp block = do
   -- (they may fail validation if inputs are now missing)
   forM_ (tail $ blockTxns block) $ \tx ->
     void $ addTransaction mp tx
-  where
-    void = fmap (const ())
 
 -- | Check BIP-68 sequence locks for mempool admission.
 -- For each input, fetch the coin height from the UTXO set (unconfirmed mempool
@@ -2378,33 +2477,35 @@ blockDisconnected mp block = do
 -- Reference: tx_verify.cpp:74 — nCoinTime = GetAncestor(max(H-1,0))->GetMedianTimePast()
 checkSeqLocksAtTip :: Mempool -> Tx -> Word32 -> Word32 -> IO (Either MempoolError ())
 checkSeqLocksAtTip mp tx tipHeight mtp = do
-  let enforce = bip68Active (mpNetwork mp) (tipHeight + 1)
-  if not enforce
+  -- Core's mempool evaluates lock points with STANDARD_LOCKTIME_VERIFY_FLAGS
+  -- (= SCRIPT_VERIFY_CHECKSEQUENCEVERIFY, policy/policy.h), i.e. BIP-68 is
+  -- ALWAYS enforced for version>=2 txs, independent of the CSV deployment
+  -- height (CalculateLockPointsAtTip, validation.cpp:201).  Pre-fix this was
+  -- gated on bip68Active(mempool height + 1), and the mempool height counted
+  -- blocks since boot, so on mainnet (CSV 419,328) BIP-68 was never enforced.
+  -- Collect per-input coin heights and per-input coin MTPs.
+  -- UTXOs in the confirmed set: use confirmed height and MTP(max(H-1,0)).
+  -- UTXOs from unconfirmed mempool parents or unknown: use tipHeight+1 and
+  -- tip MTP, exactly as Bitcoin Core uses MEMPOOL_HEIGHT inputs.
+  heightMTPs <- forM (txInputs tx) $ \inp -> do
+    let op = txInPrevOutput inp
+    mUtxo <- lookupUTXO (mpUTXOCache mp) op
+    case mUtxo of
+      Just entry -> do
+        -- Confirmed UTXO: get MTP of block max(coinHeight-1, 0) as Core does.
+        -- tx_verify.cpp:74: nCoinTime = GetAncestor(max(H-1,0))->GetMedianTimePast()
+        let h = ueHeight entry
+        coinMtp <- mpGetCoinMtp mp (if h == 0 then 0 else h - 1)
+        return (h, coinMtp)
+      Nothing ->
+        -- Mempool parent or unknown — use tipHeight+1 + tip MTP as Core does
+        -- for MEMPOOL_HEIGHT coins (validation.cpp:189-191).
+        return (tipHeight + 1, mtp)
+  let (prevHeights, prevMTPs) = unzip heightMTPs
+      lock = calculateSequenceLocks tx prevHeights prevMTPs True
+  if checkSequenceLocks (tipHeight + 1) mtp lock
     then return (Right ())
-    else do
-      -- Collect per-input coin heights and per-input coin MTPs.
-      -- UTXOs in the confirmed set: use confirmed height and MTP(max(H-1,0)).
-      -- UTXOs from unconfirmed mempool parents or unknown: use tipHeight+1 and
-      -- tip MTP, exactly as Bitcoin Core uses MEMPOOL_HEIGHT inputs.
-      heightMTPs <- forM (txInputs tx) $ \inp -> do
-        let op = txInPrevOutput inp
-        mUtxo <- lookupUTXO (mpUTXOCache mp) op
-        case mUtxo of
-          Just entry -> do
-            -- Confirmed UTXO: get MTP of block max(coinHeight-1, 0) as Core does.
-            -- tx_verify.cpp:74: nCoinTime = GetAncestor(max(H-1,0))->GetMedianTimePast()
-            let h = ueHeight entry
-            coinMtp <- mpGetCoinMtp mp (if h == 0 then 0 else h - 1)
-            return (h, coinMtp)
-          Nothing ->
-            -- Mempool parent or unknown — use tipHeight+1 + tip MTP as Core does
-            -- for MEMPOOL_HEIGHT coins (validation.cpp:189-191).
-            return (tipHeight + 1, mtp)
-      let (prevHeights, prevMTPs) = unzip heightMTPs
-          lock = calculateSequenceLocks tx prevHeights prevMTPs True
-      if checkSequenceLocks (tipHeight + 1) mtp lock
-        then return (Right ())
-        else return (Left ErrSeqLockNotSatisfied)
+    else return (Left ErrSeqLockNotSatisfied)
 
 -- | Compute Median Time Past from a list of block timestamps (newest first).
 -- Takes the median of the first ≤11 entries — matches Bitcoin Core's
@@ -2881,8 +2982,8 @@ resolvePackageInputs mp txns = do
       mUtxo <- lookupUTXO (mpUTXOCache mp) op
       case mUtxo of
         Just entry -> do
-          height <- readTVarIO (mpHeight mp)
-          if ueCoinbase entry && height - ueHeight entry < fromIntegral coinbaseMaturity
+          height <- mempoolTipHeight mp
+          if ueCoinbase entry && coinbaseImmatureAt height (ueHeight entry)
             then return $ Left (txid, ErrCoinbaseNotMature (ueHeight entry) height)
             else return $ Right (op, ueOutput entry)
         Nothing ->
@@ -2946,8 +3047,7 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
                                        (ErrNonStandard (renderStdReason stdErr))
             Right () -> do
               -- IsFinalTx (BIP-113).
-              height <- readTVarIO (mpHeight mp)
-              mtp    <- readTVarIO (mpMTP mp)
+              (height, mtp) <- refreshMempoolTip mp
               let nextHeight = height + 1
               if not (isFinalTxCheck tx nextHeight mtp)
                 then return $ Left $ PkgTxError txid (ErrNonFinal "non-final")
@@ -2996,7 +3096,7 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
                           (ErrNonStandard (renderWitnessStdReason wsErr))
                         Right () -> do
                           -- MAX_STANDARD_TX_SIGOPS_COST.
-                          tipH <- readTVarIO (mpHeight mp)
+                          tipH <- mempoolTipHeight mp
                           let inputMap = Map.fromList inputs
                               sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipH + 1)
                               SigOpCost txSigOpCost = getTransactionSigOpCost tx inputMap sigopFlags
@@ -3059,7 +3159,7 @@ verifyAllScripts' mp tx inputMap = do
     Left err -> return $ Left err
     Right prevs -> do
       -- Use consensus flags for the next block height (mempool admission standard).
-      height <- readTVarIO (mpHeight mp)
+      height <- mempoolTipHeight mp
       let cflags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
           scriptFlags = consensusFlagsToScriptFlags cflags
           spentAmounts = map txOutValue prevs
@@ -3077,7 +3177,7 @@ verifyAllScripts' mp tx inputMap = do
 -- | Add a single transaction to the mempool (internal helper)
 addTransactionToMempool :: Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> Word64 -> Int -> IO (Either MempoolError ())
 addTransactionToMempool mp tx txid inputPairs fee _vsize = do
-  height <- readTVarIO (mpHeight mp)
+  height <- mempoolTipHeight mp
   -- Sigop cost must be known BEFORE the cluster gate: the gate is denominated
   -- in sigop-adjusted weight, so the candidate has to be measured in the same
   -- unit as the pool members it is summed with.
