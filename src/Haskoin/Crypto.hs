@@ -1357,6 +1357,7 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | PayToAnchorAddress              -- ^ P2A:    Bech32m v1 program {0x4e, 0x73}
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1615,6 +1616,14 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText PayToAnchorAddress = bech32mEncode "bc" 1 p2aProgramBytes
+
+-- | Pay-to-Anchor witness program (OP_1 push of {0x4e, 0x73}).
+-- Duplicated from Haskoin.Script.p2aWitnessProgram: Crypto cannot import
+-- Script (import cycle). Core CTxDestination::PayToAnchor is this fixed
+-- 2-byte v1 program and nothing else.
+p2aProgramBytes :: ByteString
+p2aProgramBytes = BS.pack [0x4e, 0x73]
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1627,9 +1636,14 @@ textToAddress txt
           | BS.length prog == 32 -> Just $ WitnessScriptAddress (Hash256 prog)
         _ -> Nothing
   | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt
-    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
+    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR / P2A
       case bech32Decode txt of
-        Just (_, 1, prog)
+        -- P2A before the 32-byte Taproot case. Re-encode with bech32m so a
+        -- v1 program checksummed as plain bech32 is rejected (BIP-350),
+        -- matching witnessV1PlusAddressToScript.
+        Just (hrp, 1, prog)
+          | prog == p2aProgramBytes
+          , bech32mEncode hrp 1 prog == txtLower -> Just PayToAnchorAddress
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)

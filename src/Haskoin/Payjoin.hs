@@ -569,6 +569,10 @@ scriptPubKeyToAddress s
   -- P2TR
   | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
       Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+  -- P2A: OP_1 OP_PUSHBYTES_2 0x4e73
+  | BS.length s == 4 && BS.index s 0 == 0x51 && BS.index s 1 == 0x02 &&
+    BS.index s 2 == 0x4e && BS.index s 3 == 0x73 =
+      Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | Pick the first wallet UTXO available.  Real receivers should
