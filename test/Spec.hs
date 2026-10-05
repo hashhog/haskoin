@@ -96,6 +96,7 @@ import qualified Haskoin.Index as Index
 import qualified Haskoin.MuHash as MuHash
 import qualified PrioritiseTransactionSpec
 import qualified RbfMempoolParentSpec
+import qualified RelayTxNoPunishSpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
 import qualified RpcIntArgBoundsSpec
@@ -23695,6 +23696,9 @@ main = hspec $ do
 
   -- RBF replacement inputs via the mempool view (CCoinsViewMemPool)
   RbfMempoolParentSpec.spec
+
+  -- relayed tx rejections never punish (Core ProcessInvalidTx)
+  RelayTxNoPunishSpec.spec
 
   -- W107 CompactSize + VarInt 30-gate audit
   W107CompactSizeSpec.spec

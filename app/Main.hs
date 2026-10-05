@@ -4883,15 +4883,14 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             rejected <- readIORef recentlyRejectedRef
             when (Set.size rejected < 50000) $
               writeIORef recentlyRejectedRef (Set.insert txid rejected)
-            -- Attribute misbehavior on consensus-invalid txs.  We deliberately
-            -- skip soft / policy-only rejections (mempool full, fee too low,
-            -- duplicate) — those are honest peer behavior.  Reference:
-            -- bitcoin-core/src/net_processing.cpp:3045 — only state.IsInvalid
-            -- (consensus failure) increments the score, not policy rejects.
-            let errStr = show err
-            when ("consensus" `infixOfStr` errStr
-                 || "invalid"       `infixOfStr` errStr
-                 || "bad-"          `infixOfStr` errStr) $ do
+            -- No misbehavior for a rejected relayed tx: current Bitcoin Core
+            -- ProcessInvalidTx (net_processing.cpp:3119) punishes none.  The
+            -- old substring test ("consensus"/"invalid"/"bad-" in the
+            -- rendered error) punished policy-only rejects such as
+            -- bad-witness-nonstandard and bad-txns-too-many-sigops.  The
+            -- decision lives in 'punishRelayedTxReject' (always False) so it
+            -- is pinned by RelayTxNoPunishSpec.
+            when (punishRelayedTxReject err) $ do
               pm <- readIORef pmRef
               void $ misbehaving pm addr InvalidTransaction
 

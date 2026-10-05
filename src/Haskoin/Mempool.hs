@@ -38,6 +38,7 @@ module Haskoin.Mempool
     -- * Transaction Operations
   , addTransaction
   , testAcceptTransaction
+  , punishRelayedTxReject
   , removeTransaction
   , removeTransactionForBlock
   , prioritiseTransaction
@@ -913,6 +914,26 @@ addTransactionWithReplacementInner mp tx txid conflictTxIds = do
                     Left err -> return $ Left err
                     Right inputPairs' ->
                       finalizeTransaction mp tx txid inputPairs'
+
+-- | Does a mempool rejection of a transaction RELAYED by a peer charge that
+-- peer a misbehavior score?  Never.
+--
+-- Current Bitcoin Core punishes no relayed transaction:
+-- PeerManagerImpl::ProcessInvalidTx (net_processing.cpp:3119) logs the
+-- rejection, hands it to the tx-download manager (reject filters, orphan
+-- handling) and returns — there is no Misbehaving call for any
+-- TxValidationResult.  (Core <= v27's MaybePunishNodeForTx scored
+-- TX_CONSENSUS only.)
+--
+-- haskoin used to give +10 whenever @show err@ contained "consensus",
+-- "invalid" or "bad-" (case-insensitive), which caught POLICY-only rejects
+-- such as "bad-witness-nonstandard" and "bad-txns-too-many-sigops"
+-- (ErrNonStandard) — an honest peer relaying a tx that is valid by
+-- consensus but non-standard for us was walked towards a ban.  The P2P tx
+-- handler (app/Main.hs) routes its only punishment decision through this
+-- function, so the tests pin the handler's behaviour here.
+punishRelayedTxReject :: MempoolError -> Bool
+punishRelayedTxReject _ = False
 
 -- | Resolve inputs for a replacement transaction.
 --
