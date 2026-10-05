@@ -1981,6 +1981,8 @@ addressToTextW net addr =
        WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
        WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
        TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
+       AnchorAddress          -> bech32mEncode hrp 1 (BS.pack [0x4e, 0x73])
+       WitnessUnknownAddress v prog -> bech32mEncode hrp v prog
 
 -- | Import a raw private key into the wallet keychain (importprivkey).
 --
@@ -2669,15 +2671,7 @@ createTransaction CoinSelection{..} =
     }
   where
     encodeOutputScript :: Address -> ByteString
-    encodeOutputScript (WitnessPubKeyAddress (Hash160 h)) =
-      encodeScript $ encodeP2WPKH (Hash160 h)
-    encodeOutputScript (PubKeyAddress (Hash160 h)) =
-      encodeScript $ encodeP2PKH (Hash160 h)
-    encodeOutputScript (ScriptAddress (Hash160 h)) =
-      encodeScript $ encodeP2SH (Hash160 h)
-    encodeOutputScript (TaprootAddress (Hash256 h)) =
-      encodeScript $ encodeP2TR (Hash256 h)
-    encodeOutputScript (WitnessScriptAddress _) = BS.empty -- Would need full script
+    encodeOutputScript = addressToScriptPubKey
 
 -- | Fund a transaction by selecting coins and creating inputs.
 -- This is a convenience wrapper around selectCoins and createTransaction.
@@ -2965,18 +2959,7 @@ autoDetectChangeIndex wallet tx = do
 -- produces P2WPKH change, but we accept all 4 standard types so a
 -- restored or imported wallet still works).
 decodeOurAddress :: ByteString -> Maybe Address
-decodeOurAddress s
-  | BS.length s == 22 && BS.head s == 0x00 && BS.index s 1 == 0x14 =
-      Just (WitnessPubKeyAddress (Hash160 (BS.take 20 (BS.drop 2 s))))
-  | BS.length s == 25 && BS.head s == 0x76 && BS.index s 1 == 0xa9 &&
-    BS.index s 2 == 0x14 && BS.index s 23 == 0x88 && BS.index s 24 == 0xac =
-      Just (PubKeyAddress (Hash160 (BS.take 20 (BS.drop 3 s))))
-  | BS.length s == 23 && BS.head s == 0xa9 && BS.index s 1 == 0x14 &&
-    BS.index s 22 == 0x87 =
-      Just (ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s))))
-  | BS.length s == 34 && BS.head s == 0x51 && BS.index s 1 == 0x20 =
-      Just (TaprootAddress (Hash256 (BS.drop 2 s)))
-  | otherwise = Nothing
+decodeOurAddress = scriptPubKeyToAddress
 
 -- | Compute the replacement fee given the original fee, the bumped-tx
 -- vsize, the wallet incremental relay fee, and an optional user-supplied
@@ -6549,32 +6532,11 @@ scriptToAddresses = mapMaybe scriptToAddress
 
 -- | Convert a script to an address (if applicable).
 scriptToAddress :: ByteString -> Maybe Address
-scriptToAddress script
-  -- P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
-  | BS.length script == 25 && BS.index script 0 == 0x76 =
-      Just $ PubKeyAddress (Hash160 $ BS.take 20 $ BS.drop 3 script)
-  -- P2SH: OP_HASH160 <20> OP_EQUAL
-  | BS.length script == 23 && BS.index script 0 == 0xa9 =
-      Just $ ScriptAddress (Hash160 $ BS.take 20 $ BS.drop 2 script)
-  -- P2WPKH: OP_0 <20>
-  | BS.length script == 22 && BS.index script 0 == 0x00 =
-      Just $ WitnessPubKeyAddress (Hash160 $ BS.take 20 $ BS.drop 2 script)
-  -- P2WSH: OP_0 <32>
-  | BS.length script == 34 && BS.index script 0 == 0x00 && BS.index script 1 == 0x20 =
-      Just $ WitnessScriptAddress (Hash256 $ BS.take 32 $ BS.drop 2 script)
-  -- P2TR: OP_1 <32>
-  | BS.length script == 34 && BS.index script 0 == 0x51 && BS.index script 1 == 0x20 =
-      Just $ TaprootAddress (Hash256 $ BS.take 32 $ BS.drop 2 script)
-  | otherwise = Nothing
+scriptToAddress = scriptPubKeyToAddress
 
 -- | Convert an address to its scriptPubKey.
 addressToScript :: Address -> ByteString
-addressToScript addr = case addr of
-  PubKeyAddress h -> encodeScript (encodeP2PKH h)
-  ScriptAddress h -> encodeScript (encodeP2SH h)
-  WitnessPubKeyAddress h -> encodeScript (encodeP2WPKH h)
-  WitnessScriptAddress h -> encodeP2WSH (getHash256 h)
-  TaprootAddress h -> encodeScript (encodeP2TR h)
+addressToScript = addressToScriptPubKey
 
 -- | Expand a combo descriptor into its constituent descriptors.
 -- For compressed keys: P2PK, P2PKH, P2WPKH, P2SH-P2WPKH (4 outputs)

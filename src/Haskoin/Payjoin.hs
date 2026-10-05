@@ -151,9 +151,8 @@ import qualified Network.HTTP.Client     as HTTP
 import qualified Network.HTTP.Client.TLS as HTTPS
 import qualified Network.HTTP.Types.Status as HTTPStatus
 
-import Haskoin.Crypto (sha256, Address(..))
-import Haskoin.Types (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
-                     Hash160(..), Hash256(..))
+import Haskoin.Crypto (sha256, Address(..), scriptPubKeyToAddress)
+import Haskoin.Types (Tx(..), TxIn(..), TxOut(..), OutPoint(..))
 import qualified Haskoin.Wallet as W
 import Haskoin.Wallet
   ( Wallet(..), Psbt(..), PsbtGlobal(..), PsbtInput(..)
@@ -550,26 +549,8 @@ locateReceiverOutput wallet psbt = do
         Just a  -> Map.member a addrMap
         Nothing -> False
 
--- | Best-effort scriptPubKey → Address parse, mirroring the
--- 'scriptToAddress' helper in @Rpc.hs:4832@.  Pulled local here so
--- 'Payjoin.hs' has no dependency on the giant Rpc module.
-scriptPubKeyToAddress :: ByteString -> Maybe Address
-scriptPubKeyToAddress s
-  -- P2WPKH: OP_0 <20-byte pubkey hash>
-  | BS.length s == 22 && BS.index s 0 == 0x00 && BS.index s 1 == 0x14 =
-      Just $ WitnessPubKeyAddress (Hash160 (BS.drop 2 s))
-  -- P2PKH
-  | BS.length s == 25 && BS.index s 0 == 0x76 && BS.index s 1 == 0xa9 &&
-    BS.index s 2 == 0x14 && BS.index s 23 == 0x88 && BS.index s 24 == 0xac =
-      Just $ PubKeyAddress (Hash160 (BS.take 20 (BS.drop 3 s)))
-  -- P2SH
-  | BS.length s == 23 && BS.index s 0 == 0xa9 && BS.index s 1 == 0x14 &&
-    BS.index s 22 == 0x87 =
-      Just $ ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s)))
-  -- P2TR
-  | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
-      Just $ TaprootAddress (Hash256 (BS.drop 2 s))
-  | otherwise = Nothing
+-- scriptPubKeyToAddress is defined in Haskoin.Crypto (P2A / witness-unknown
+-- inclusive).  Payjoin previously inlined a four-type copy.
 
 -- | Pick the first wallet UTXO available.  Real receivers should
 -- layer anti-fingerprinting selection (G20) on top — leaving that to

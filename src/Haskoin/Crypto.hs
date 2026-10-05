@@ -66,6 +66,8 @@ module Haskoin.Crypto
   , Address(..)
   , addressToText
   , textToAddress
+  , scriptPubKeyToAddress
+  , addressToScriptPubKey
   , pubKeyToP2PKH
   , pubKeyToP2WPKH
   , scriptToP2SH
@@ -102,7 +104,7 @@ module Haskoin.Crypto
 import qualified Crypto.Hash as H
 import qualified Crypto.MAC.HMAC as HMAC
 import qualified Crypto.Random as CryptoRandom
-import Control.Monad (when)
+import Control.Monad (when, guard)
 import Data.ByteArray (convert)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -1350,13 +1352,18 @@ putOutPoint OutPoint{..} = do
 -- Address Types
 --------------------------------------------------------------------------------
 
--- | Bitcoin address types
+-- | Bitcoin address types.  Mirrors Core's CTxDestination
+-- (addresstype.h): PKHash, ScriptHash, WitnessV0KeyHash,
+-- WitnessV0ScriptHash, WitnessV1Taproot, PayToAnchor, WitnessUnknown.
 data Address
   = PubKeyAddress !Hash160          -- ^ P2PKH: Base58Check with version 0x00
   | ScriptAddress !Hash160          -- ^ P2SH:  Base58Check with version 0x05
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | AnchorAddress                   -- ^ P2A: Bech32m v1 program 0x4e73
+  | WitnessUnknownAddress !Int !ByteString
+      -- ^ Bech32m v1-16, 2-40 byte program, not P2TR / P2A
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1608,31 +1615,27 @@ bech32Decode addr =
 -- Address Encoding/Decoding
 --------------------------------------------------------------------------------
 
--- | Convert an Address to its text representation
+-- | Pay-to-Anchor witness program (Core ANCHOR_BYTES / IsPayToAnchor).
+p2aProgramBytes :: ByteString
+p2aProgramBytes = BS.pack [0x4e, 0x73]
+
+-- | Convert an Address to its text representation (mainnet HRP / version).
 addressToText :: Address -> Text
 addressToText (PubKeyAddress h) = base58Check 0x00 (getHash160 h)
 addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText AnchorAddress = bech32mEncode "bc" 1 p2aProgramBytes
+addressToText (WitnessUnknownAddress v prog) = bech32mEncode "bc" v prog
 
--- | Parse an address from text
+-- | Parse an address from text.  Witness v1+ requires Bech32m (BIP-350);
+-- v0 requires Bech32.  P2A and WITNESS_UNKNOWN are first-class destinations
+-- (Core DecodeDestination, key_io.cpp).
 textToAddress :: Text -> Maybe Address
 textToAddress txt
-  | T.isPrefixOf "bc1q" txtLower || T.isPrefixOf "BC1Q" txt
-    || T.isPrefixOf "bcrt1q" txtLower || T.isPrefixOf "tb1q" txtLower = -- Bech32 P2WPKH/P2WSH
-      case bech32Decode txt of
-        Just (_, 0, prog)
-          | BS.length prog == 20 -> Just $ WitnessPubKeyAddress (Hash160 prog)
-          | BS.length prog == 32 -> Just $ WitnessScriptAddress (Hash256 prog)
-        _ -> Nothing
-  | T.isPrefixOf "bc1p" txtLower || T.isPrefixOf "BC1P" txt
-    || T.isPrefixOf "bcrt1p" txtLower || T.isPrefixOf "tb1p" txtLower = -- Bech32m P2TR
-      case bech32Decode txt of
-        Just (_, 1, prog)
-          | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
-        _ -> Nothing
-  | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
+  | looksBech32 = decodeWitnessAddress txt
+  | otherwise =
       case base58CheckDecode txt of
         Just (0x00, h) | BS.length h == 20 -> Just $ PubKeyAddress (Hash160 h)
         Just (0x6f, h) | BS.length h == 20 -> Just $ PubKeyAddress (Hash160 h)
@@ -1640,4 +1643,77 @@ textToAddress txt
         Just (0xc4, h) | BS.length h == 20 -> Just $ ScriptAddress (Hash160 h)
         _ -> Nothing
   where
-    txtLower = T.toLower txt
+    lower = T.toLower txt
+    looksBech32 =
+      T.isPrefixOf "bc1" lower || T.isPrefixOf "tb1" lower
+        || T.isPrefixOf "bcrt1" lower
+
+-- | Decode a Bech32/Bech32m address into an Address.  Round-trips the
+-- encoding (bech32 for v0, bech32m for v1+) so a v1 program checksummed
+-- with the wrong variant is rejected, matching Core.
+decodeWitnessAddress :: Text -> Maybe Address
+decodeWitnessAddress txt = do
+  (hrp, ver, prog) <- bech32Decode txt
+  guard (hrp `elem` ["bc", "tb", "bcrt"])
+  let lower = T.toLower txt
+      n = BS.length prog
+  case ver of
+    0 | n == 20, bech32Encode hrp 0 prog == lower ->
+        Just $ WitnessPubKeyAddress (Hash160 prog)
+    0 | n == 32, bech32Encode hrp 0 prog == lower ->
+        Just $ WitnessScriptAddress (Hash256 prog)
+    1 | n == 32, bech32mEncode hrp 1 prog == lower ->
+        Just $ TaprootAddress (Hash256 prog)
+    1 | prog == p2aProgramBytes, bech32mEncode hrp 1 prog == lower ->
+        Just AnchorAddress
+    v | v >= 1, v <= 16, n >= 2, n <= 40
+      , bech32mEncode hrp v prog == lower ->
+        Just $ WitnessUnknownAddress v prog
+    _ -> Nothing
+
+-- | Best-effort scriptPubKey → Address, including P2A / witness-unknown.
+-- Used by the wallet descriptor decoder and the RPC script→address copies.
+scriptPubKeyToAddress :: ByteString -> Maybe Address
+scriptPubKeyToAddress s
+  | BS.length s == 25 && BS.index s 0 == 0x76 && BS.index s 1 == 0xa9
+    && BS.index s 2 == 0x14 && BS.index s 23 == 0x88 && BS.index s 24 == 0xac =
+      Just $ PubKeyAddress (Hash160 (BS.take 20 (BS.drop 3 s)))
+  | BS.length s == 23 && BS.index s 0 == 0xa9 && BS.index s 1 == 0x14
+    && BS.index s 22 == 0x87 =
+      Just $ ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s)))
+  | BS.length s == 22 && BS.index s 0 == 0x00 && BS.index s 1 == 0x14 =
+      Just $ WitnessPubKeyAddress (Hash160 (BS.drop 2 s))
+  | BS.length s == 34 && BS.index s 0 == 0x00 && BS.index s 1 == 0x20 =
+      Just $ WitnessScriptAddress (Hash256 (BS.drop 2 s))
+  | BS.length s == 34 && BS.index s 0 == 0x51 && BS.index s 1 == 0x20 =
+      Just $ TaprootAddress (Hash256 (BS.drop 2 s))
+  | BS.length s == 4 && BS.index s 0 == 0x51 && BS.index s 1 == 0x02
+    && BS.drop 2 s == p2aProgramBytes =
+      Just AnchorAddress
+  | BS.length s >= 4
+    , let op = BS.index s 0
+          plen = fromIntegral (BS.index s 1) :: Int
+    , op >= 0x51, op <= 0x60
+    , plen >= 2, plen <= 40
+    , BS.length s == 2 + plen =
+      Just $ WitnessUnknownAddress (fromIntegral op - 0x50) (BS.drop 2 s)
+  | otherwise = Nothing
+
+-- | Address → scriptPubKey.  Inverse of 'scriptPubKeyToAddress' for the
+-- types that have a unique script.
+addressToScriptPubKey :: Address -> ByteString
+addressToScriptPubKey addr = case addr of
+  PubKeyAddress (Hash160 h) ->
+    BS.pack [0x76, 0xa9, 0x14] <> h <> BS.pack [0x88, 0xac]
+  ScriptAddress (Hash160 h) ->
+    BS.pack [0xa9, 0x14] <> h <> BS.pack [0x87]
+  WitnessPubKeyAddress (Hash160 h) ->
+    BS.pack [0x00, 0x14] <> h
+  WitnessScriptAddress (Hash256 h) ->
+    BS.pack [0x00, 0x20] <> h
+  TaprootAddress (Hash256 h) ->
+    BS.pack [0x51, 0x20] <> h
+  AnchorAddress ->
+    BS.pack [0x51, 0x02] <> p2aProgramBytes
+  WitnessUnknownAddress v prog ->
+    BS.pack [0x50 + fromIntegral v, fromIntegral (BS.length prog)] <> prog
