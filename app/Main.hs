@@ -4517,9 +4517,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   -- at :2271 already inserted bh into hcEntries).  assumevalid skip is
                   -- fail-closed: best-header lag => shouldSkipScripts=False => scripts
                   -- verified.  validateFullBlock is pure; checkBIP30's only IO is
-                  -- read-only DB lookups on the same db.  NOTE: coinbase-maturity is
-                  -- still NOT enforced on this arm (TxOut-only view), a residual
-                  -- false-ACCEPT gap, not a spurious reject.
+                  -- read-only DB lookups on the same db.  Coinbase maturity IS
+                  -- enforced here: 'spent' is a Map OutPoint Coin (height +
+                  -- is_coinbase) and validateFullBlock's step 0a checks it
+                  -- (f9afd6c; skipConnectChecks=False on this arm).  P2P-fed
+                  -- age-99 spend -> bad-txns-premature-spend-of-coinbase.
                   blockEntries <- readTVarIO (hcEntries hc)
                   byHeightBg   <- readTVarIO (hcByHeight hc)
                   bestHdr      <- readTVarIO (hcTip hc)
