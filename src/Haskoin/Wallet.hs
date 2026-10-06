@@ -324,7 +324,7 @@ import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoin
                        putVarInt, getVarInt', putVarBytes, getVarBytes)
 import Haskoin.Crypto
 import qualified Haskoin.TaprootSighash as TS
-import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encodeScript)
+import Haskoin.Script (encodeP2WPKH, encodeP2PKH, encodeP2SH, encodeP2TR, encodeP2A, encodeScript)
 import Haskoin.Mempool (FeeRate(..), signalsOptInRBF)
 import Haskoin.Consensus (Network(..), coinbaseMaturity)
 import qualified Haskoin.Consensus
@@ -1981,6 +1981,7 @@ addressToTextW net addr =
        WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
        WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
        TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
+       PayToAnchorAddress     -> bech32mEncode hrp 1 (BS.pack [0x4e, 0x73])
 
 -- | Import a raw private key into the wallet keychain (importprivkey).
 --
@@ -2677,6 +2678,8 @@ createTransaction CoinSelection{..} =
       encodeScript $ encodeP2SH (Hash160 h)
     encodeOutputScript (TaprootAddress (Hash256 h)) =
       encodeScript $ encodeP2TR (Hash256 h)
+    encodeOutputScript PayToAnchorAddress =
+      encodeScript encodeP2A
     encodeOutputScript (WitnessScriptAddress _) = BS.empty -- Would need full script
 
 -- | Fund a transaction by selecting coins and creating inputs.
@@ -2976,6 +2979,9 @@ decodeOurAddress s
       Just (ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s))))
   | BS.length s == 34 && BS.head s == 0x51 && BS.index s 1 == 0x20 =
       Just (TaprootAddress (Hash256 (BS.drop 2 s)))
+  | BS.length s == 4 && BS.head s == 0x51 && BS.index s 1 == 0x02
+    && BS.index s 2 == 0x4e && BS.index s 3 == 0x73 =
+      Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | Compute the replacement fee given the original fee, the bumped-tx
@@ -6345,7 +6351,10 @@ descriptorToTextNet net desc = case desc of
 -- | Convert a key expression to text.
 keyExprToText :: KeyExpr -> Text
 keyExprToText key = case key of
-  KeyLiteral pk -> hexEncode' (serializePubKeyCompressed pk)
+  -- Keep the parsed pubkey bytes. Core's ConstPubkeyProvider::ToString
+  -- hex-encodes the original key; compressing an uncompressed literal
+  -- would make getdescriptorinfo disagree with the input.
+  KeyLiteral pk -> hexEncode' (storedPubKeyBytes pk)
   KeyXPub xpub path range ->
     encodeXPub xpub <> pathToText path <> rangeToText range
   KeyXPriv xprv path range ->
@@ -6353,6 +6362,9 @@ keyExprToText key = case key of
   KeyWIF sk -> wifEncode sk
   KeyOrigin fp path inner ->
     "[" <> hexEncode' fp <> pathToText path <> "]" <> keyExprToText inner
+  where
+    storedPubKeyBytes (PubKeyCompressed bs) = bs
+    storedPubKeyBytes (PubKeyUncompressed bs) = bs
 
 -- | Convert a key expression to x-only (32-byte) hex text, for use in rawtr().
 -- BIP-386: rawtr() emits the x-only pubkey without the leading parity byte.
@@ -6565,6 +6577,10 @@ scriptToAddress script
   -- P2TR: OP_1 <32>
   | BS.length script == 34 && BS.index script 0 == 0x51 && BS.index script 1 == 0x20 =
       Just $ TaprootAddress (Hash256 $ BS.take 32 $ BS.drop 2 script)
+  -- P2A: OP_1 <0x4e73>
+  | BS.length script == 4 && BS.index script 0 == 0x51 && BS.index script 1 == 0x02
+    && BS.index script 2 == 0x4e && BS.index script 3 == 0x73 =
+      Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | Convert an address to its scriptPubKey.
@@ -6575,6 +6591,7 @@ addressToScript addr = case addr of
   WitnessPubKeyAddress h -> encodeScript (encodeP2WPKH h)
   WitnessScriptAddress h -> encodeP2WSH (getHash256 h)
   TaprootAddress h -> encodeScript (encodeP2TR h)
+  PayToAnchorAddress -> encodeScript encodeP2A
 
 -- | Expand a combo descriptor into its constituent descriptors.
 -- For compressed keys: P2PK, P2PKH, P2WPKH, P2SH-P2WPKH (4 outputs)

@@ -31,13 +31,19 @@ import Data.Aeson.Encoding (encodingToLazyByteString)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
-import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Crypto
+  ( bech32Encode, bech32mEncode
+  , textToAddress, addressToText
+  , Address (PayToAnchorAddress)
+  )
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
@@ -49,6 +55,11 @@ import Haskoin.Rpc
 
 p2aSpk :: BS.ByteString
 p2aSpk = BS.pack [0x51, 0x02, 0x4e, 0x73]
+
+mustHex :: T.Text -> BS.ByteString
+mustHex t = case B16.decode (TE.encodeUtf8 t) of
+  Right bs -> bs
+  Left err -> error ("bad hex fixture: " ++ err)
 
 -- | Run the encoder to completion and parse the result back.
 spkObj :: BS.ByteString -> IO (KM.KeyMap Value)
@@ -128,3 +139,33 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     o <- spkObj (BS.pack [0xba])
     field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
     field o "type" `shouldBe` Just (String "nonstandard")
+
+  it "asm prints Core's OP_UNKNOWN / OP_INVALIDOPCODE (not OP_UNKNOWN[n])" $ do
+    -- decodescript babb -> "OP_CHECKSIGADD OP_UNKNOWN"; 0xff is OP_INVALIDOPCODE.
+    a <- evaluate (scriptToAsmPartial (BS.pack [0xba, 0xbb]))
+    a `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+    a2 <- evaluate (scriptToAsm (BS.pack [0xba, 0xbb]))
+    a2 `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+    inv <- evaluate (scriptToAsm (BS.pack [0xff]))
+    inv `shouldBe` "OP_INVALIDOPCODE"
+
+  it "psbtSpkEnc infers pk() and multi() (Core InferDescriptor, empty provider)" $ do
+    let pk1 = mustHex "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        pk2 = mustHex "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        p2pk = BS.singleton 0x21 <> pk1 <> BS.singleton 0xac
+        multi = BS.pack [0x51, 0x21] <> pk1 <> BS.singleton 0x21 <> pk2 <> BS.pack [0x52, 0xae]
+    o1 <- spkObj p2pk
+    field o1 "desc" `shouldBe` Just (String
+      "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)#gn28ywm7")
+    field o1 "type" `shouldBe` Just (String "pubkey")
+    field o1 "address" `shouldBe` Nothing
+    o2 <- spkObj multi
+    field o2 "desc" `shouldBe` Just (String
+      "multi(1,0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798,02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)#l5sy3u48")
+    field o2 "type" `shouldBe` Just (String "multisig")
+    field o2 "address" `shouldBe` Nothing
+
+  it "textToAddress round-trips the pay-to-anchor address" $ do
+    textToAddress "bc1pfeessrawgf" `shouldBe` Just PayToAnchorAddress
+    textToAddress "bcrt1pfeesnyr2tx" `shouldBe` Just PayToAnchorAddress
+    addressToText PayToAnchorAddress `shouldBe` "bc1pfeessrawgf"
