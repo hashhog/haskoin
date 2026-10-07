@@ -332,7 +332,8 @@ import Control.Monad (forM, forM_, void, when, unless, replicateM, foldM)
 import qualified System.Random as SysRandom
 import Control.Concurrent (threadDelay)
 import Data.Maybe (fromMaybe, catMaybes, listToMaybe, mapMaybe, isJust, isNothing)
-import Data.List (find, findIndex, sort, sortBy, dropWhileEnd)
+import Data.List (find, findIndex, sort, sortBy, sortOn, dropWhileEnd)
+import Data.Ord (Down(..))
 import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
@@ -14734,17 +14735,33 @@ handleDumpTxOutSet server params = do
           (toJSON $ RpcError rpcInternalError
             (T.pack ("dumptxoutset rollback: " <> err))) Null
         Right rewindPath -> do
-          -- rewindPath = [target+1 .. tip], so the disconnect order
-          -- (tip first) is the reverse and the reconnect order is the
-          -- list itself. We fetch each block + verify undo data exists
-          -- BEFORE we start mutating — fail fast on a stale datadir.
+          -- We fetch each block + verify undo data exists BEFORE we start
+          -- mutating — fail fast on a stale datadir.
+          --
+          -- ORDER (fixed 2026-10-07): 'buildRewindPath' returns the path
+          -- TIP FIRST (its own doc says so), but this caller assumed
+          -- [target+1 .. tip] and reversed it: for any rollback deeper
+          -- than one block it disconnected target+1 first, while the tip
+          -- was still connected (disconnectBlock does not check), leaving
+          -- BestBlock at target+1 over a coin set with target+1's effects
+          -- undone; the "replay" then reconnected the tip onto that,
+          -- failed G1 at target+1 and left the LIVE chainstate at the
+          -- original tip with target+1's spends un-applied and its outputs
+          -- missing (UTXO != Core; reproduced: tools/chain-lock-haskoin-
+          -- proof.py RB2).  Core's TemporaryRollback disconnects tip-first
+          -- (InvalidateBlock walks down from the tip) and ReconsiderBlock
+          -- reconnects upward.  The order is now taken from the heights,
+          -- not from the list's construction.
           checkResult <- checkRewindFeasible db rewindPath
           case checkResult of
             Left err -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-            Right blocksToReplay -> do
+            Right blocksToReplay0 -> do
+              let tipFirst = sortOn (Down . ceHeight . fst) blocksToReplay0
+                  -- reconnect order: target+1 first, tip last
+                  blocksToReplay = reverse tipFirst
               -- Disconnect from tip down to target.
-              dRes <- disconnectChainTo db (reverse blocksToReplay)
+              dRes <- disconnectChainTo db tipFirst
               case dRes of
                 Left err -> return $ RpcResponse Null
                   (toJSON $ RpcError rpcInternalError (T.pack err)) Null
