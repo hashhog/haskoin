@@ -245,6 +245,7 @@ module Haskoin.Storage
   , clearSnapshotImportInProgress
   ) where
 
+import Haskoin.ChainLock (ChainLock, newChainLock, withChainLock)
 import qualified Database.RocksDB as R
 import Data.ByteString (ByteString, hPut, hGet, hGetSome)
 import qualified Data.ByteString as BS
@@ -967,6 +968,12 @@ data UTXOCache = UTXOCache
   -- still uncached), so a pre-spend disk read can never be installed as an
   -- unspent coin after the spend committed.
   , ucGen      :: !(TVar Word64)                   -- ^ ucEntries generation
+  -- | haskoin's cs_main (see "Haskoin.ChainLock"): every chainstate writer --
+  -- the P2P connect arm and reorg kicker, submitblock / generate*,
+  -- invalidate / reconsider / precious, the dumptxoutset rollback and every
+  -- 'flushCache' -- runs under it. It lives here because this record is the
+  -- one object all of those already share.
+  , ucChainLock :: !ChainLock
   }
 
 -- | Create a new UTXO cache with the given maximum size.
@@ -981,6 +988,7 @@ newUTXOCache db maxSize = UTXOCache
   <*> newTVarIO Map.empty   -- rcEntries (dedicated read-through mirror)
   <*> newTVarIO 0           -- rcGen     (read-through generation counter)
   <*> newTVarIO 0           -- ucGen     (ucEntries generation counter)
+  <*> newChainLock          -- ucChainLock (cs_main)
 
 -- | Look up a UTXO, checking cache first then database.
 -- Returns Nothing if the UTXO doesn't exist or is marked as spent.
@@ -1137,7 +1145,11 @@ flushWriteHookRef :: IORef (IO ())
 flushWriteHookRef = unsafePerformIO (newIORef (return ()))
 
 flushCache :: UTXOCache -> IO ()
-flushCache cache = do
+flushCache cache = withChainLock (ucChainLock cache) $ do
+  -- HK-7: under the chain lock (Core FlushStateToDisk runs under cs_main).
+  -- Without it the dirty snapshot below and the write raced a concurrent
+  -- connect, which could commit a spend in between and have this batch
+  -- write the pre-spend coin back.
   -- gate-6: WRITE BEFORE FORGET. The dirty set used to be emptied BEFORE the
   -- write (rustoshi F2 / blockbrew P0 shape): a failed write lost every
   -- pending change from the flush set while memory still served it, and a

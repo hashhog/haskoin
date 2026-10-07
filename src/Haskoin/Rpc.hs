@@ -346,6 +346,7 @@ import qualified Data.Vector as V
 import Haskoin.CoreArity (lookupCoreArity)
 import Haskoin.Fatal (isInternalReject)
 import Haskoin.TestHooks (hookPoint)
+import Haskoin.ChainLock (withChainLock)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
@@ -5751,10 +5752,19 @@ handleSubmitBlockUnpaused server params = do
               return $ RpcResponse Null
                 (toJSON $ RpcError rpcDeserializationError "Block decode failed") Null
             Right block -> do
-              result <- submitBlock (rsNetwork server) (rsDB server)
-                          (rsHeaderChain server) (rsUTXOCache server)
-                          (rsPeerMgr server) (rsMempool server)
-                          (rsIndexMgr server) block
+              -- HK-3: connect AND the mempool's removeForBlock in one
+              -- critical section (Core ConnectTip runs removeForBlock under
+              -- cs_main), so no reader sees the block connected with its
+              -- transactions still in the pool.
+              result <- withChainLock (ucChainLock (rsUTXOCache server)) $ do
+                r <- submitBlock (rsNetwork server) (rsDB server)
+                       (rsHeaderChain server) (rsUTXOCache server)
+                       (rsPeerMgr server) (rsMempool server)
+                       (rsIndexMgr server) block
+                case r of
+                  Right () -> blockConnected (rsMempool server) block
+                  Left _   -> return ()
+                return r
               case result of
                 Left err ->
                   -- Map internal error strings to canonical BIP-22 result strings.
@@ -5766,15 +5776,14 @@ handleSubmitBlockUnpaused server params = do
                     Left (code, msg) -> return $ RpcResponse Null
                       (toJSON $ RpcError code (T.pack msg)) Null
                     Right bip22 -> return $ RpcResponse (toJSON (T.pack bip22)) Null Null
-                Right () -> do
+                Right () ->
                   -- Mirror CTxMemPool::removeForBlock: drop the txs this block
                   -- confirmed (and now-conflicting txs) from the mempool so
                   -- getrawmempool / getmempoolinfo reflect the connected block.
                   -- The consensus-only 'submitBlock' does not do this; the P2P
                   -- connect path (Main.hs) and the regtest miner both call it,
                   -- so the submitblock RPC must too — otherwise a confirmed spend
-                  -- lingers in the pool.
-                  blockConnected (rsMempool server) block
+                  -- lingers in the pool.  (Done above, inside the chain lock.)
                   return $ RpcResponse Null Null Null
 
 -- | submitheader "hexdata"
@@ -6052,6 +6061,26 @@ generateBlockWithTxs server addr txs = do
 -- | Generate a single block, optionally with specific transactions
 generateSingleBlock :: RpcServer -> ByteString -> [Tx] -> IO (Either String BlockHash)
 generateSingleBlock server scriptPubKey specificTxs = do
+  -- HK-3: template -> submit -> removeForBlock under the chain lock (Core
+  -- generateBlock: CreateNewBlock + ProcessNewBlock, both under cs_main);
+  -- the wallet scan runs after it is released (lock order: the chain lock
+  -- is never held while waiting on a wallet).
+  r <- withChainLock (ucChainLock (rsUTXOCache server)) $
+         generateSingleBlockLocked server scriptPubKey specificTxs
+  case r of
+    Left err -> return (Left err)
+    Right (bh, block, height) -> do
+      case rsWalletMgr server of
+        Nothing -> return ()
+        Just wm -> do
+          wallets <- Map.elems <$> readTVarIO (wmWallets wm)
+          forM_ wallets $ \ws ->
+            scanBlockForWallet (wsWallet ws) block height
+      return (Right bh)
+
+generateSingleBlockLocked :: RpcServer -> ByteString -> [Tx]
+                          -> IO (Either String (BlockHash, Block, Word32))
+generateSingleBlockLocked server scriptPubKey specificTxs = do
   let net = rsNetwork server
       hc = rsHeaderChain server
       cache = rsUTXOCache server
@@ -6149,13 +6178,8 @@ generateSingleBlock server scriptPubKey specificTxs = do
           -- The block's height (computed from its own parent in
           -- submitBlock) is the active-tip arm's @height@ here; reuse it.
           blockConnected (rsMempool server) block
-          case rsWalletMgr server of
-            Nothing -> return ()
-            Just wm -> do
-              wallets <- Map.elems <$> readTVarIO (wmWallets wm)
-              forM_ wallets $ \ws ->
-                scanBlockForWallet (wsWallet ws) block height
-          return $ Right bh
+          -- (the wallet scan follows in 'generateSingleBlock', unlocked)
+          return $ Right (bh, block, height)
 
 -- | Build a coinbase transaction for regtest.
 --
@@ -14687,10 +14711,22 @@ handleDumpTxOutSet server params = do
       -- in rpc/blockchain.cpp::dumptxoutset. Pause inbound block
       -- acceptance for the duration of the rewind→dump→replay dance
       -- and restore on every exit path (success, error, exception).
+      --
+      -- HK-6: the flag alone gated only RPC submitblock.  The P2P connect
+      -- arm, the reorg kicker, invalidate/reconsider and the flush timer
+      -- kept running against the REWOUND chainstate: a P2P block extending
+      -- the rewound tip passed connectBlockAt's G1 and committed, after
+      -- which the replay failed and the node was left on that block.  The
+      -- whole rewind -> dump -> replay now holds the chain lock (cs_main),
+      -- so every chainstate writer waits until the original tip is back.
+      -- (Core: NetworkDisable + TemporaryRollback; here the lock is the
+      -- stronger, simpler guarantee.)  The flag is kept so submitblock still
+      -- answers at once instead of queueing behind the dump.
       bracket_
         (atomically $ writeTVar (rsBlockSubmissionPaused server) True)
         (atomically $ writeTVar (rsBlockSubmissionPaused server) False)
-        (doRollbackDumpInner db net path magic baseHeight baseHash tip entries)
+        (withChainLock (ucChainLock (rsUTXOCache server)) $
+           doRollbackDumpInner db net path magic baseHeight baseHash tip entries)
 
     doRollbackDumpInner db net path magic baseHeight baseHash tip entries = do
       case buildRewindPath entries tip baseHash of

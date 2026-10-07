@@ -17,7 +17,7 @@ import Control.Concurrent (threadDelay, forkIO, killThread)
 import System.Mem (performMajorGC)
 import System.Environment (lookupEnv)
 import Text.Read (readMaybe)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar, isEmptyMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM, join)
@@ -52,6 +52,7 @@ import Haskoin.Network
 import Haskoin.Fatal (catchSync, isFatalLatched, readFatalLatch, installFatalShutdownHook)
 import qualified Haskoin.ASMap as ASMap (loadAsmap)
 import Haskoin.Consensus
+import Haskoin.ChainLock (ChainLock, withChainLock, chainLockHeld)
 import Haskoin.Storage
 import Haskoin.Rpc
 import Haskoin.Mempool
@@ -1650,7 +1651,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- Cross-ref: '_chainstate-atomicity-family-2026-05-26.md' (this is
     -- the new dispatch-layer sibling) and
     -- '_haskoin-unfreeze-plan-2026-05-27.md' (Phase 1, P1-2).
-    connectLock <- newMVar () :: IO (MVar ())
+    --
+    -- 2026-10-07 (audit HK-3..HK-7): this used to be a private
+    -- @newMVar ()@ that ONLY the P2P arm and the P2P reorg kicker took; it
+    -- never reached the RPC server, so submitblock / generate* /
+    -- invalidate / reconsider / precious / the dumptxoutset rollback and
+    -- every flushCache ran without it.  It is now THE chain lock
+    -- ('Haskoin.ChainLock', re-entrant + FIFO), owned by the shared
+    -- 'UTXOCache' that every one of those writers already receives.
+    let connectLock = ucChainLock cache
 
     -- DURABILITY (sweep wa0fq5wtk): forward-declared handle to the
     -- WalletManager so the live P2P/IBD connect loop in
@@ -2453,7 +2462,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                  busySole <- Map.member soleAddr <$> readIORef busyPeersRef
                  recvNow <- readIORef receivingRef
                  haveNow <- readIORef haveBodyRef
-                 lockHeld <- isEmptyMVar connectLock
+                 lockHeld <- chainLockHeld connectLock
                  let reqs = [ t | (k, ht, t) <- Map.elems infNow
                                 , k == soleAddr, ht == nextBlock ]
                  return $ Just HardStallView
@@ -3769,7 +3778,7 @@ resyncNextBlock db hc ref = do
 tryP2PReorg :: Network -> HaskoinDB -> HeaderChain -> UTXOCache
             -> Maybe IndexManager -> IORef Word32
             -> IORef (Maybe (BlockHash, BlockHash, Int, POSIXTime))
-            -> MVar ()
+            -> ChainLock
             -> IORef PeerManager
             -> IO ()
 tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock pmRefR =
@@ -3778,7 +3787,7 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock pmRefR
   -- prefix loaded every body twice (24 G) and interleaved UTXO
   -- writeBatches (Missing UTXO / bad-txns-nonfinal on f317c18).
   -- Core holds cs_main across ActivateBestChainStep.
-  withMVar connectLock $ \() -> do
+  withChainLock connectLock $ do
   mFork <- detectP2PFork db hc
   case mFork of
     Nothing -> return ()
@@ -4175,8 +4184,8 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- BlockHash, persisted across MCmpctBlock→MBlockTxn.
                       -- Reference: bitcoin-core/src/net_processing.cpp
                       -- mapBlocksInFlight / PartiallyDownloadedBlock lifetime.
-                   -> MVar ()
-                      -- ^ P1-2 connect-lock — serialises the read-BestBlock /
+                   -> ChainLock
+                      -- ^ P1-2 connect-lock (now the shared chain lock) — serialises the read-BestBlock /
                       -- check-G1 / write critical section in the MBlock arm
                       -- across all per-peer recv threads (Network.hs:2797)
                       -- + the two compact-block re-dispatch sites. Closes
@@ -4485,7 +4494,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             -- validation / write), POSIX seconds; logged beside UpdateTip.
             phaseRef <- newIORef (t0, t0, t0, t0)
             markedInvalidRef <- newIORef False
-            aheadOrConnect <- withMVar connectLock $ \() -> do
+            aheadOrConnect <- withChainLock connectLock $ do
               tLock <- getPOSIXTime
               writeIORef phaseRef (tLock, tLock, tLock, tLock)
               -- Live 2026-09-24: height=911889 next-needed=911874

@@ -95,6 +95,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            getMtpAtHeightFromEntries, getMtpFromAncestry)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.TestHooks (hookPoint)
+import Haskoin.ChainLock (withChainLock)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -104,7 +105,7 @@ import Haskoin.Index (IndexManager, indexManagerConnectBlock,
                        indexManagerDisconnectBlock)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions,
                          blockDisconnected, blockConnected, checkSeqLocksAtTip)
-import Haskoin.Network (PeerManager, broadcastMessage, Message(..),
+import Haskoin.Network (PeerManager, broadcastMessage, enqueueBackgroundSend, Message(..),
                          Inv(..), InvVector(..), InvType(..))
 
 --------------------------------------------------------------------------------
@@ -526,7 +527,16 @@ submitBlock net db hc cache pm mp mIdxMgr block = do
   latched <- readFatalLatch
   case latched of
     Just why -> return (Left (fatalLatchedReject why))
-    Nothing -> submitBlockUnlatched net db hc cache pm mp mIdxMgr block
+    -- HK-3: the whole validate-then-connect is ONE critical section under
+    -- the chain lock (Core: ProcessNewBlock -> AcceptBlock ->
+    -- ActivateBestChain under cs_main, validation.cpp:4398/3323/3005).
+    -- Before, submitblock read the tip, validated and committed with no lock
+    -- while the P2P arm connected under its private connectLock: both could
+    -- pass connectBlockAt's G1 read and commit two blocks at one height, or
+    -- the loser of the race left its coins dirty in the cache for the next
+    -- flushCache to write onto the winner's chainstate.
+    Nothing -> withChainLock (ucChainLock cache) $
+                 submitBlockUnlatched net db hc cache pm mp mIdxMgr block
 
 submitBlockUnlatched :: Network -> HaskoinDB -> HeaderChain -> UTXOCache -> PeerManager
                      -> Mempool -> Maybe IndexManager -> Block -> IO (Either String ())
@@ -833,9 +843,12 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
                           -- this block, the in-memory tip and the on-disk
                           -- best-block are consistent once connectBlock returns.
 
-                          -- Broadcast to peers
+                          -- Broadcast to peers -- QUEUED: this runs under the
+                          -- chain lock, which is never held across network
+                          -- I/O (one slow peer would stall every connect).
                           let invVec = InvVector InvBlock (getBlockHashHash bh)
-                          broadcastMessage pm $ MInv $ Inv [invVec]
+                          enqueueBackgroundSend pm $
+                            broadcastMessage pm $ MInv $ Inv [invVec]
 
                           return $ Right ()
 
@@ -956,7 +969,9 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
           -- best-effort.  Broadcast the new tip so peers see the
           -- reorg-induced INV.
           let invVec = InvVector InvBlock (getBlockHashHash bh)
-          broadcastMessage pm $ MInv $ Inv [invVec]
+          -- Queued: under the chain lock (see the active-tip arm).
+          enqueueBackgroundSend pm $
+            broadcastMessage pm $ MInv $ Inv [invVec]
           return $ Right ()
 
 -- | Walk back from the new side-branch tip until we hit a block hash

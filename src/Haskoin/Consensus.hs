@@ -347,6 +347,7 @@ module Haskoin.Consensus
 
 import Data.ByteString (ByteString)
 import Haskoin.TestHooks (hookPoint)
+import Haskoin.ChainLock (withChainLock)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import Data.Word (Word8, Word32, Word64)
@@ -7388,7 +7389,10 @@ cacheFindSibling cache txid = atomically $ do
 performReorg :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
              -> Maybe IndexManager
              -> BlockHash -> BlockHash -> IO (Either String ())
-performReorg net cache db hc mIdxMgr oldTip newTip = do
+performReorg net cache db hc mIdxMgr oldTip newTip =
+  -- HK-3: chain writer, so under the chain lock (Core: ActivateBestChainStep
+  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
+  withChainLock (ucChainLock cache) $ do
   -- Find the fork point
   mFork <- findForkPoint hc oldTip newTip
   case mFork of
@@ -7453,6 +7457,7 @@ reorgAtomic :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
             -> [ChainEntry]            -- ^ connect list (fork-child first)
             -> IO (Either String ())
 reorgAtomic net cache db hc mIdxMgr disList conList =
+  withChainLock (ucChainLock cache) $
   -- Core-parity: NO reorg-depth cap.  Core's ActivateBestChainStep
   -- disconnects to the fork point in an UNBOUNDED loop
   -- (validation.cpp:3202) and follows the most-work valid chain to any
@@ -8905,7 +8910,10 @@ findDescendants hc blockHash = do
 invalidateBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                 -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
-invalidateBlock net cache db hc mIdxMgr blockHash = do
+invalidateBlock net cache db hc mIdxMgr blockHash =
+  -- HK-3: chain writer, so under the chain lock (Core: InvalidateBlock :3521
+  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
+  withChainLock (ucChainLock cache) $ do
   entries <- readTVarIO (hcEntries hc)
   tip <- readTVarIO (hcTip hc)
 
@@ -9184,7 +9192,10 @@ recalculateBestHeader db hc = do
 performReorgActivating :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                        -> Maybe IndexManager
                        -> BlockHash -> BlockHash -> IO (Either String ())
-performReorgActivating net cache db hc mIdxMgr oldTip newTip = do
+performReorgActivating net cache db hc mIdxMgr oldTip newTip =
+  -- HK-3: chain writer, so under the chain lock (Core: ActivateBestChain :3323
+  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
+  withChainLock (ucChainLock cache) $ do
   r <- performReorg net cache db hc mIdxMgr oldTip newTip
   case r of
     Right () -> return r
@@ -9250,7 +9261,10 @@ performReorgActivating net cache db hc mIdxMgr oldTip newTip = do
 -- 'addHeader' parks a new header at 'StatusHeaderValid').
 activateBestChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                   -> Maybe IndexManager -> IO ()
-activateBestChain net cache db hc mIdxMgr = do
+activateBestChain net cache db hc mIdxMgr =
+  -- HK-3: chain writer, so under the chain lock (Core: ActivateBestChain :3323
+  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
+  withChainLock (ucChainLock cache) $ do
   currentTip <- readTVarIO (hcTip hc)
   best       <- findBestCandidate hc
   case best of
@@ -9358,7 +9372,10 @@ findBestCandidate hc = do
 reconsiderBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                 -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
-reconsiderBlock net cache db hc mIdxMgr blockHash = do
+reconsiderBlock net cache db hc mIdxMgr blockHash =
+  -- HK-3: chain writer, so under the chain lock (Core: ReconsiderBlock / ActivateBestChain
+  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
+  withChainLock (ucChainLock cache) $ do
   entries <- readTVarIO (hcEntries hc)
   invalidated <- readTVarIO (hcInvalidated hc)
 
@@ -9432,7 +9449,10 @@ data PreciousError
 preciousBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
               -> Maybe IndexManager
               -> BlockHash -> IO (Either PreciousError ())
-preciousBlock net cache db hc mIdxMgr blockHash = do
+preciousBlock net cache db hc mIdxMgr blockHash =
+  -- HK-3: chain writer, so under the chain lock (Core: PreciousBlock :3490
+  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
+  withChainLock (ucChainLock cache) $ do
   entries <- readTVarIO (hcEntries hc)
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (PreciousBlockNotFound blockHash)
