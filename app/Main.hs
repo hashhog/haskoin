@@ -1991,7 +1991,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           return had
         drainOnce = do
           (nDrained, stop) <- drainStoredBodies storedDrainBusyRef
-            (readIORef nextBlockRef)
+            (resyncNextBlock db hc nextBlockRef)   -- HK-2
             loadStoredBody
             (\blkS ->
                syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt drainPseudoAddr (MBlock blkS)
@@ -2174,7 +2174,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
              threadDelay kickerPollUsec
              peers <- getConnectedPeerList pm'
              headerTip <- readTVarIO (hcHeight hc)
-             nextBlock <- readIORef nextBlockRef
+             -- HK-2: re-derive the cursor from the active tip every pass.
+             nextBlock <- resyncNextBlock db hc nextBlockRef
              -- Headers-first: stay quiet while bulk header sync is live
              -- (a full 2000-header batch within the last 45 s) so block
              -- download does not throttle header sync.
@@ -3609,7 +3610,7 @@ fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef line
   withMVar linearLock $ \() -> do
     peers <- getConnectedPeerList pm
     unless (null peers) $ do
-      nextBlock <- readIORef nextBlockRef
+      nextBlock <- resyncNextBlock db hc nextBlockRef   -- HK-2
       headerTip <- readTVarIO (hcHeight hc)
       reqFrom <- forkDownloadFloor db hc nextBlock
       unless (nextBlock > headerTip || reqFrom < nextBlock) $ do
@@ -3722,6 +3723,36 @@ detectP2PFork db hc = do
                   | ceHash forkEntry == ceHash connectedTip -> return Nothing
                   -- Genuine competing fork rooted below the connected tip.
                   | otherwise -> return (Just (connectedTip, headerTip, forkEntry))
+
+-- | HK-2 (audit 2026-10-07): the next block the download/connect machinery
+-- needs is ALWAYS active-tip height + 1, re-derived from the chainstate's
+-- best-block pointer each time it is used (Core FindNextBlocksToDownload
+-- walks from the active chain and pindexBestKnownBlock every pass; nothing
+-- is a private cursor).  'nextBlockRef' is kept only as a cache of that
+-- value: this resyncs it and returns the derived height.
+--
+-- Pre-fix the cursor was written only by the P2P arm and tryP2PReorg.  After
+-- submitblock / generate* / reconsider / precious connected N+1 (or
+-- invalidate / a rollback lowered the tip) it stayed put: N+2 arrived and was
+-- parked as "ahead", N+1 was re-requested every 12 s and re-validated
+-- against a coin set that had already spent it -- a permanent wedge only a
+-- restart cleared, with the stale-tip watcher silenced by the in-flight
+-- entry.  A best block missing from the header index (an assumeUTXO base
+-- whose header has not been re-synced yet) leaves the cursor as it is.
+resyncNextBlock :: HaskoinDB -> HeaderChain -> IORef Word32 -> IO Word32
+resyncNextBlock db hc ref = do
+  cur <- readIORef ref
+  mBest <- getBestBlockHash db
+  ents <- readTVarIO (hcEntries hc)
+  case mBest >>= (`Map.lookup` ents) of
+    Just ce | ceHeight ce + 1 /= cur -> do
+      let want = ceHeight ce + 1
+      writeIORef ref want
+      putStrLn $ "next-needed resync: cursor " ++ show cur ++ " -> " ++ show want
+              ++ " (active tip " ++ show (ceHeight ce) ++ " " ++ hexHashS (ceHash ce)
+              ++ " moved outside the P2P connect arm)"
+      return want
+    _ -> return cur
 
 -- | GAP3 route-through.  If the connected chain is wedged behind a heavier
 -- COMPETING header chain (per 'detectP2PFork') and every bridging body of
@@ -4464,7 +4495,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               -- ConnectBlock only from ActivateBestChain when the parent
               -- is the tip. Discriminator: stored=yes invalid=no — do
               -- not insert hcInvalidated (that set is RPC invalidateblock).
-              nextNeededNow <- readIORef nextBlockRef
+              -- HK-2: next-needed is DERIVED from the active tip under the
+              -- lock (Core FindNextBlocksToDownload / ActivateBestChain
+              -- recompute from the chain every pass), never trusted from
+              -- the private cursor: an RPC connect / invalidate / rollback
+              -- moves the tip without touching it.
+              nextNeededNow <- resyncNextBlock db hc nextBlockRef
               mActiveAt <- if height < nextNeededNow
                              then getBlockHeight db height
                              else return Nothing
