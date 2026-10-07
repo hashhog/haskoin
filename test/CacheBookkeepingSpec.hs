@@ -59,7 +59,11 @@ import Haskoin.Network
   , defaultPeerManagerConfig, PeerManagerConfig(..) )
 import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Payjoin (defaultPayjoinConfig)
-import Haskoin.BlockTemplate (submitBlock)
+import Haskoin.BlockTemplate (submitBlock, sideBranchCommittedHookRef)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryTakeMVar)
+import Control.Exception (finally)
+import Data.IORef (writeIORef)
 import Haskoin.Rpc
   ( RpcServer(..), defaultRpcConfig, RpcConfig(..)
   , generateSingleBlock, buildRegtestCoinbase, findRegtestNonce )
@@ -192,10 +196,28 @@ setupTwoCoins server = do
 coin :: Word64
 coin = 5_000_000_000
 
+-- | Wait up to @us@ for an action run on ANOTHER thread (a concurrent
+-- writer such as the flush timer); True if it finished in time.
+concurrently' :: Int -> IO () -> IO Bool
+concurrently' us act = do
+  done <- newEmptyMVar
+  _ <- forkIO (act >> putMVar done ())
+  let go 0 = return False
+      go k = tryTakeMVar done >>= maybe (threadDelay 10000 >> go (k - 1 :: Int))
+                                         (const (return True))
+  go (us `div` 10000)
+
 -- | HK-4 scenario.  @useTPrime@: the heavier branch spends C together with
 -- the uncached D (the hazard); otherwise it re-confirms T itself (control).
+-- @raceFlush@: a concurrent 'flushCache' (the flush timer / block-count
+-- flush / shutdown flush on another thread) lands between the reorg's disk
+-- commit and the cache update -- the window in which Phase D's lookups miss
+-- and its Left was ignored.
 sideBranchReorg :: Bool -> RpcServer -> IO ()
-sideBranchReorg useTPrime server = do
+sideBranchReorg = sideBranchReorgWith False
+
+sideBranchReorgWith :: Bool -> Bool -> RpcServer -> IO ()
+sideBranchReorgWith raceFlush useTPrime server = do
   let db = rsDB server
       cache = rsUTXOCache server
   (c, d) <- setupTwoCoins server
@@ -207,7 +229,14 @@ sideBranchReorg useTPrime server = do
   blkB1 <- mkBlock server (ceHash tip0) 1 []
   submit server blkB1 >>= (`shouldSatisfy` isLeft)       -- "inconclusive"
   blkB2 <- mkBlock server (hashOf blkB1) 0 [if useTPrime then t' else t]
-  rB2 <- submit server blkB2
+  rB2 <- if raceFlush
+    then do
+      writeIORef sideBranchCommittedHookRef $ do
+        inTime <- concurrently' 500000 (flushCache cache)
+        putStrLn ("    [HK-4] concurrent flushCache inside the commit window: "
+                  ++ if inTime then "RAN (unserialised)" else "waited for the chain lock")
+      submit server blkB2 `finally` writeIORef sideBranchCommittedHookRef (return ())
+    else submit server blkB2
   rB2 `shouldBe` Right ()
   vt <- getValidatedChainTip db (rsHeaderChain server)
   ceHash vt `shouldBe` hashOf blkB2                       -- control: reorged
@@ -237,6 +266,12 @@ spec = describe "HK-4/HK-5: submitblock keeps the coin caches equal to the commi
 
   it "HK-4 control: the new branch re-confirming the same spend leaves the coin spent" $
     withServer (sideBranchReorg False)
+
+  it "HK-4 race: a flush landing between the reorg commit and the cache update does not resurrect the restored coin" $
+    withServer (sideBranchReorgWith True True)
+
+  it "HK-4 race control: the same flush with the new branch re-confirming the spend" $
+    withServer (sideBranchReorgWith True False)
 
   it "HK-5: a coin in the read-through mirror spent by submitblock is not served to a later P2P connect (double spend rejected)" $
     withServer $ \server -> do

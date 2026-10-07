@@ -27,6 +27,7 @@ module Haskoin.BlockTemplate
     -- * Block Submission
   , submitBlock
   , applyBlockToCache
+  , sideBranchCommittedHookRef
     -- * Coinbase Construction
   , buildCoinbase
   , encodeHeight
@@ -54,7 +55,9 @@ import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
 import Control.Monad (forM, forM_, foldM, void, unless, when)
 import Data.List (stripPrefix)
-import Data.IORef (newIORef, readIORef, writeIORef, modifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
+import System.IO.Unsafe (unsafePerformIO)
+import Control.Monad (join)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
@@ -996,6 +999,12 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
             broadcastMessage pm $ MInv $ Inv [invVec]
           return $ Right ()
 
+-- | TEST HOOK: runs in 'doSideBranchReorg' right after the reorg's
+-- 'writeBatch' commit, before the coin caches are touched. Default no-op.
+{-# NOINLINE sideBranchCommittedHookRef #-}
+sideBranchCommittedHookRef :: IORef (IO ())
+sideBranchCommittedHookRef = unsafePerformIO (newIORef (return ()))
+
 -- | Walk back from the new side-branch tip until we hit a block hash
 -- that the active chain owns at that height — that's the fork point.
 -- Returns the (forkHash, [blocks-to-disconnect-tip-to-fork],
@@ -1151,6 +1160,10 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock newWork = do
                     -- pre-reorg state.  Once this returns, the
                     -- reorg is durable.
                     writeBatch db (WriteBatch allOps)
+                    -- Test seams (inert unless armed / set): the reorg is
+                    -- committed to disk, the coin caches not yet updated.
+                    hookPoint "sidebranch.committed"
+                    join (readIORef sideBranchCommittedHookRef)
 
                     -- Phase D — the coin caches.  HK-4: this used to
                     -- MIRROR the reorg into the lookupUTXO cache after the
