@@ -101,7 +101,7 @@ spec = describe "ChainLock (cs_main)" $ do
       threadDelay 20000                        -- arrive in order
     putMVar gate ()
     mapM_ takeMVar dones
-    reverse <$> readIORef order `shouldReturn'` [1, 2, 3, 4, 5]
+    (reverse <$> readIORef order) >>= (`shouldBe` [1, 2, 3, 4, 5])
 
   it "HK-7: flushCache takes the chain lock (waits while another writer holds it)" $
     withCache $ \cache -> do
@@ -118,8 +118,6 @@ spec = describe "ChainLock (cs_main)" $ do
       (ok, _) <- finishesWithin 2000000 $
         withChainLock (ucChainLock cache) (flushCache cache)
       ok `shouldBe` True
-  where
-    shouldReturn' act want = act >>= (`shouldBe` want)
 
 -- silence unused-import warnings on older GHCs
 _unused :: IO ()
