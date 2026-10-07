@@ -66,6 +66,7 @@ module Haskoin.Crypto
   , Address(..)
   , addressToText
   , textToAddress
+  , payToAnchorProgram
   , pubKeyToP2PKH
   , pubKeyToP2WPKH
   , scriptToP2SH
@@ -1357,6 +1358,7 @@ data Address
   | WitnessPubKeyAddress !Hash160   -- ^ P2WPKH: Bech32 with witness version 0
   | WitnessScriptAddress !Hash256   -- ^ P2WSH:  Bech32 with witness version 0
   | TaprootAddress !Hash256         -- ^ P2TR:   Bech32m with witness version 1
+  | PayToAnchorAddress              -- ^ P2A:    Bech32m witness v1 program 0x4e73
   deriving (Show, Eq, Ord, Generic)
 
 instance NFData Address
@@ -1615,6 +1617,12 @@ addressToText (ScriptAddress h) = base58Check 0x05 (getHash160 h)
 addressToText (WitnessPubKeyAddress h) = bech32Encode "bc" 0 (getHash160 h)
 addressToText (WitnessScriptAddress h) = bech32Encode "bc" 0 (getHash256 h)
 addressToText (TaprootAddress h) = bech32mEncode "bc" 1 (getHash256 h)
+addressToText PayToAnchorAddress = bech32mEncode "bc" 1 payToAnchorProgram
+
+-- | BIP-347 anchor witness program (Core ANCHOR_BYTES, addresstype.h).
+-- Kept here so 'Address' does not depend on Haskoin.Script.
+payToAnchorProgram :: ByteString
+payToAnchorProgram = BS.pack [0x4e, 0x73]
 
 -- | Parse an address from text
 textToAddress :: Text -> Maybe Address
@@ -1631,6 +1639,10 @@ textToAddress txt
       case bech32Decode txt of
         Just (_, 1, prog)
           | BS.length prog == 32 -> Just $ TaprootAddress (Hash256 prog)
+          -- Pay-to-Anchor (BIP-347 / Core PayToAnchor): witness v1, program
+          -- exactly 0x4e73.  Any other v1 length stays out of 'Address'
+          -- (WITNESS_UNKNOWN is still decoded by witnessV1PlusAddressToScript).
+          | prog == payToAnchorProgram -> Just PayToAnchorAddress
         _ -> Nothing
   | otherwise = -- Base58Check (mainnet 0x00/0x05, testnet/regtest 0x6f/0xc4)
       case base58CheckDecode txt of

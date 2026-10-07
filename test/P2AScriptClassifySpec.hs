@@ -31,13 +31,22 @@ import Data.Aeson.Encoding (encodingToLazyByteString)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
 import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Wallet
+  ( Descriptor(..)
+  , parseDescriptor
+  , descriptorToTextNet
+  , addDescriptorChecksum
+  , isRangeDescriptor
+  )
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
@@ -45,6 +54,7 @@ import Haskoin.Rpc
   , witnessV1PlusAddressToScript
   , scriptToAsm
   , scriptToAsmPartial
+  , inferSpkDescriptorWith
   )
 
 p2aSpk :: BS.ByteString
@@ -61,6 +71,19 @@ spkObj spk = do
 
 field :: KM.KeyMap Value -> T.Text -> Maybe Value
 field o k = KM.lookup (K.fromText k) o
+
+-- | Core getdescriptorinfo `descriptor` field on regtest: network-aware
+-- canonical text plus its own checksum. A parse failure is returned as
+-- text so the hspec diff shows the rejection instead of throwing.
+canonical :: T.Text -> T.Text
+canonical input =
+  case parseDescriptor input of
+    Left e  -> T.pack ("PARSE FAIL " ++ show e)
+    Right d ->
+      let body = descriptorToTextNet regtest d
+      in case addDescriptorChecksum body of
+           Just c  -> c
+           Nothing -> body
 
 spec :: Spec
 spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
@@ -117,6 +140,81 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     -- sanity for the line above: the bech32m form of the same data IS accepted
     witnessV1PlusAddressToScript regtest (bech32mEncode "bcrt" 1 p2aWitnessProgram)
       `shouldBe` Just p2aSpk
+
+  -- Golden strings are Bitcoin Core v31.99 (bitcoin-core/build) regtest,
+  -- captured 2026-10-07 via decodescript / getdescriptorinfo:
+  --   P2PK  210279be667e…1798ac
+  --   multi 52210279be66…2102c6047f…52ae   (2-of-2, both compressed)
+  --   babb  OP_CHECKSIGADD ++ an unnamed opcode
+  --   addr(bcrt1pfeesnyr2tx)
+  describe "RPC follow-ups from the P2A fix" $ do
+    let pkHex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        pk2   = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        p2pk  = BS.pack [0x21] <> hex pkHex <> BS.pack [0xac]
+        multi = BS.pack [0x52, 0x21] <> hex pkHex
+             <> BS.pack [0x21] <> hex pk2
+             <> BS.pack [0x52, 0xae]
+        corePk = "pk(" <> pkHex <> ")#gn28ywm7"
+        coreMulti =
+          "multi(2," <> pkHex <> "," <> pk2 <> ")#52kq63aa"
+        hex s = case B16.decode (TE.encodeUtf8 s) of
+                  Right b -> b
+                  Left e  -> error e
+
+    it "decodescript P2PK infers pk() (Core regtest), not raw()" $ do
+      o <- spkObj p2pk
+      field o "desc" `shouldBe` Just (String corePk)
+      field o "type" `shouldBe` Just (String "pubkey")
+      field o "asm"  `shouldBe` Just (String (pkHex <> " OP_CHECKSIG"))
+
+    it "decodescript bare multisig infers multi() (Core regtest), not raw()" $ do
+      o <- spkObj multi
+      field o "desc" `shouldBe` Just (String coreMulti)
+      field o "type" `shouldBe` Just (String "multisig")
+
+    it "decodescript segwit wrap of a bare multisig is wsh(multi())" $ do
+      -- Core decodescript of the 2-of-2 above: segwit.desc.
+      -- The redeem is the bare multisig; the outer script is the P2WSH
+      -- Core builds for the wrap (witness program = SHA256(redeem)).
+      -- This assertion was added after the red control run: the helper
+      -- did not exist yet, so the red examples could not name it.
+      let prog = hex "9b984c7bae3efddc3a3f0a20ff81bfe89ed1fe07ff13e562149ee654bed845db"
+          segwit = BS.pack [0x00, 0x20] <> prog
+      inferSpkDescriptorWith regtest segwit (Just multi)
+        `shouldBe` ("wsh(multi(2," <> pkHex <> "," <> pk2 <> "))#e7d75zev")
+
+    it "asm of a 0xba-containing script is OP_UNKNOWN, not OP_UNKNOWN[n]" $ do
+      -- Core decodescript babb -> "OP_CHECKSIGADD OP_UNKNOWN"
+      -- Core decodescript bb   -> "OP_UNKNOWN"
+      -- Core decodescript ff   -> "OP_INVALIDOPCODE" (the one named unknown)
+      scriptToAsm (BS.pack [0xba, 0xbb]) `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+      scriptToAsmPartial (BS.pack [0xba, 0xbb]) `shouldBe` "OP_CHECKSIGADD OP_UNKNOWN"
+      scriptToAsm (BS.pack [0xbb]) `shouldBe` "OP_UNKNOWN"
+      scriptToAsm (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+
+    it "getdescriptorinfo pk()/multi() canonical form matches regtest Core" $ do
+      canonical corePk `shouldBe` corePk
+      canonical coreMulti `shouldBe` coreMulti
+      case parseDescriptor corePk of
+        Right d -> isRangeDescriptor d `shouldBe` False
+        Left e  -> expectationFailure (show e)
+      case parseDescriptor coreMulti of
+        Right d -> isRangeDescriptor d `shouldBe` False
+        Left e  -> expectationFailure (show e)
+
+    it "getdescriptorinfo addr(P2A) round-trips (wallet Address has PayToAnchor)" $ do
+      -- Core: getdescriptorinfo "addr(bcrt1pfeesnyr2tx)"
+      --   descriptor = addr(bcrt1pfeesnyr2tx)#swxgse0y
+      --   checksum = swxgse0y, isrange false, issolvable false
+      case parseDescriptor "addr(bcrt1pfeesnyr2tx)" of
+        Left e -> expectationFailure ("addr(P2A) rejected: " ++ show e)
+        Right d -> do
+          canonical "addr(bcrt1pfeesnyr2tx)" `shouldBe` "addr(bcrt1pfeesnyr2tx)#swxgse0y"
+          descriptorToTextNet regtest d `shouldBe` "addr(bcrt1pfeesnyr2tx)"
+          isRangeDescriptor d `shouldBe` False
+          case d of
+            Addr _ -> pure ()
+            _      -> expectationFailure ("expected Addr, got " ++ show d)
 
   it "asm renders OP_CHECKSIGADD (0xba) instead of throwing (same lazy-throw class)" $ do
     -- Core: decodescript ba -> {"asm":"OP_CHECKSIGADD", ...,"type":"nonstandard"}
