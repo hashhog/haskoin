@@ -52,7 +52,7 @@ import Haskoin.Network
 import Haskoin.Fatal (catchSync, isFatalLatched, readFatalLatch, installFatalShutdownHook)
 import qualified Haskoin.ASMap as ASMap (loadAsmap)
 import Haskoin.Consensus
-import Haskoin.ChainLock (ChainLock, withChainLock, chainLockHeld)
+import Haskoin.ChainLock (ChainLock, withChainLock, tryWithChainLock, chainLockHeld)
 import Haskoin.Storage
 import Haskoin.Rpc
 import Haskoin.Mempool
@@ -1975,7 +1975,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     let pm' = pm { pmAsmapData = asmapData }
     writeIORef pmRef pm'
     writeIORef receiptRefillRef $
-      fillLinearPipeline pm' hc db nextBlockRef requestedUpToRef
+      fillLinearPipeline pm' hc db connectLock nextBlockRef requestedUpToRef
         linearInflightRef linearFailedRef 0 perPeerCap linearLock haveBodyRef
         receivingRef
     writeIORef bodyStoredRef $ \bh ht -> withMVar linearLock $ \() -> do
@@ -2000,7 +2000,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           return had
         drainOnce = do
           (nDrained, stop) <- drainStoredBodies storedDrainBusyRef
-            (resyncNextBlock db hc nextBlockRef)   -- HK-2
+            (resyncNextBlock connectLock db hc nextBlockRef)   -- HK-2
             loadStoredBody
             (\blkS ->
                syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt drainPseudoAddr (MBlock blkS)
@@ -2184,7 +2184,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
              peers <- getConnectedPeerList pm'
              headerTip <- readTVarIO (hcHeight hc)
              -- HK-2: re-derive the cursor from the active tip every pass.
-             nextBlock <- resyncNextBlock db hc nextBlockRef
+             nextBlock <- resyncNextBlock connectLock db hc nextBlockRef
              -- Headers-first: stay quiet while bulk header sync is live
              -- (a full 2000-header batch within the last 45 s) so block
              -- download does not throttle header sync.
@@ -3604,6 +3604,7 @@ fillLinearPipeline
   :: PeerManager
   -> HeaderChain
   -> HaskoinDB
+  -> ChainLock
   -> IORef Word32
   -> IORef Word32
   -> IORef (Map.Map BlockHash (SockAddr, Word32, Int64))
@@ -3615,11 +3616,11 @@ fillLinearPipeline
   -> IORef (Map.Map Word32 Int)
      -- ^ heights whose body has arrived and is being processed
   -> IO ()
-fillLinearPipeline pm hc db nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock haveBodyRef receivingRef =
+fillLinearPipeline pm hc db connectLock nextBlockRef requestedUpToRef linearInflightRef linearFailedRef rot cap linearLock haveBodyRef receivingRef =
   withMVar linearLock $ \() -> do
     peers <- getConnectedPeerList pm
     unless (null peers) $ do
-      nextBlock <- resyncNextBlock db hc nextBlockRef   -- HK-2
+      nextBlock <- resyncNextBlock connectLock db hc nextBlockRef   -- HK-2
       headerTip <- readTVarIO (hcHeight hc)
       reqFrom <- forkDownloadFloor db hc nextBlock
       unless (nextBlock > headerTip || reqFrom < nextBlock) $ do
@@ -3748,8 +3749,21 @@ detectP2PFork db hc = do
 -- restart cleared, with the stale-tip watcher silenced by the in-flight
 -- entry.  A best block missing from the header index (an assumeUTXO base
 -- whose header has not been re-synced yet) leaves the cursor as it is.
-resyncNextBlock :: HaskoinDB -> HeaderChain -> IORef Word32 -> IO Word32
-resyncNextBlock db hc ref = do
+--
+-- The resync runs only under the chain lock (re-entrant for the MBlock arm,
+-- a non-blocking try for the kicker / pipeline / drain): the cursor then
+-- always equals the committed tip + 1 at the moment it is written.  A caller
+-- that finds the lock taken uses the cached value -- the holder is a connect
+-- or an RPC writer that is moving the tip right now, and the next pass
+-- resyncs.  (Unlocked, the 0.4 s kicker read BestBlock between the arm's
+-- commit and its cursor write and logged a phantom "resync".)
+resyncNextBlock :: ChainLock -> HaskoinDB -> HeaderChain -> IORef Word32 -> IO Word32
+resyncNextBlock cl db hc ref =
+  tryWithChainLock cl (resyncNextBlockLocked db hc ref)
+    >>= maybe (readIORef ref) return
+
+resyncNextBlockLocked :: HaskoinDB -> HeaderChain -> IORef Word32 -> IO Word32
+resyncNextBlockLocked db hc ref = do
   cur <- readIORef ref
   mBest <- getBestBlockHash db
   ents <- readTVarIO (hcEntries hc)
@@ -4509,7 +4523,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
               -- recompute from the chain every pass), never trusted from
               -- the private cursor: an RPC connect / invalidate / rollback
               -- moves the tip without touching it.
-              nextNeededNow <- resyncNextBlock db hc nextBlockRef
+              nextNeededNow <- resyncNextBlock connectLock db hc nextBlockRef
               mActiveAt <- if height < nextNeededNow
                              then getBlockHeight db height
                              else return Nothing

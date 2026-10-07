@@ -40,6 +40,7 @@ module Haskoin.ChainLock
   ( ChainLock
   , newChainLock
   , withChainLock
+  , tryWithChainLock
   , chainLockHeld
   , chainLockHeldByMe
   ) where
@@ -70,6 +71,28 @@ withChainLock cl act = do
       r <- restore act `onException` release
       release
       return r
+  where
+    release = do
+      writeIORef (clOwner cl) Nothing
+      putMVar (clMVar cl) ()
+
+-- | Run the action only if the lock is free (or already ours); never waits.
+-- 'Nothing' = another thread holds it.
+tryWithChainLock :: ChainLock -> IO a -> IO (Maybe a)
+tryWithChainLock cl act = do
+  me <- myThreadId
+  owner <- readIORef (clOwner cl)
+  if owner == Just me
+    then Just <$> act
+    else mask $ \restore -> do
+      got <- tryTakeMVar (clMVar cl)
+      case got of
+        Nothing -> return Nothing
+        Just () -> do
+          writeIORef (clOwner cl) (Just me)
+          r <- restore act `onException` release
+          release
+          return (Just r)
   where
     release = do
       writeIORef (clOwner cl) Nothing
