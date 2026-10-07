@@ -107,6 +107,7 @@ import qualified P2AScriptClassifySpec
 import qualified WitnessProgramCanonicalSpec
 import qualified SubmitBlockValidatedForkSpec
 import qualified CoinCacheResurrectionSpec
+import qualified CacheBookkeepingSpec
 import qualified ChainLockSpec
 import qualified W100UTXOCacheSpec
 import qualified W101ActivateBestChainSpec
@@ -23778,6 +23779,7 @@ main = hspec $ do
   WitnessProgramCanonicalSpec.spec
   SubmitBlockValidatedForkSpec.spec
   CoinCacheResurrectionSpec.spec
+  CacheBookkeepingSpec.spec
   ChainLockSpec.spec
 
   -- W126 BIP-152 Compact Blocks (30-gate audit, discovery)

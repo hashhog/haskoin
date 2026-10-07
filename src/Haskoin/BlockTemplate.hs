@@ -78,7 +78,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            addHeader, contextualCheckBlockHeader,
                            addSideBranchHeader, computeMerkleRoot, ChainState(..),
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
-                           cumulativeWork, unapplyBlock,
+                           cumulativeWork,
                            getLegacySigOpCount,
                            getTransactionSigOpCost, SigOpCost(..),
                            maxMoney, isCoinbase,
@@ -96,7 +96,10 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.TestHooks (hookPoint)
 import Haskoin.ChainLock (withChainLock)
+import Control.Exception (uninterruptibleMask_)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
+                         newUTXOCache, noteBlockConnectedOnDisk,
+                         invalidateCoinCaches,
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
                          putBlock, getBlock, getUndoData, getUndoDataVerified, Coin(..),
@@ -772,11 +775,24 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
                   -- Test seam (inert unless armed): a validated submitblock
                   -- parked before it touches the cache / disk.
                   hookPoint "submit.preconnect"
-                  -- Apply block to in-memory UTXO cache (drives maturity check + builds
-                  -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
-                  -- spend an output created earlier in the same session without round-
-                  -- tripping through disk.
-                  undoResult <- applyBlockToCache cache net block height
+                  -- HK-5 / F0: the shared lookupUTXO cache is NOT the place to
+                  -- stage this block.  'applyBlockToCache' used to run on it
+                  -- here: it marked the block's spends/creates DIRTY in
+                  -- ucDirty BEFORE the commit (so a connectBlock that then
+                  -- failed -- the HK-3 race -- left them for the next
+                  -- flushCache to write onto someone else's chainstate), and
+                  -- it never told the read-through mirror (rcEntries), so a
+                  -- prevout this block spent stayed servable there and a
+                  -- later P2P block double-spending it was ACCEPTED.
+                  --
+                  -- Its extra ConnectBlock-side gates (G3..G12) are kept, as
+                  -- validation only, on a throwaway cache over the same DB
+                  -- (under the chain lock the DB is exactly the parent's
+                  -- coin set).  The shared caches get the SAME bookkeeping as
+                  -- the P2P connect arm: 'noteBlockConnectedOnDisk' around
+                  -- the commit (Main.hs MBlock arm).
+                  scratch <- newUTXOCache db 0
+                  undoResult <- applyBlockToCache scratch net block height
                   case undoResult of
                     Left err -> return $ Left err
                     Right _undo -> do
@@ -806,7 +822,13 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
                       -- when parent /= tip), so the G1 gate is structurally
                       -- guaranteed to pass; if it ever fires we surface as
                       -- Left rather than silently corrupting the tip.
-                      cbR <- connectBlock db net block height utxoMap
+                      -- Commit + cache bookkeeping as one unit against async
+                      -- exceptions, exactly as the P2P arm does.
+                      cbR <- uninterruptibleMask_ $ do
+                        noteBlockConnectedOnDisk cache block
+                        r <- connectBlock db net block height utxoMap
+                        noteBlockConnectedOnDisk cache block
+                        return r
                       case cbR of
                         Left cbErr -> return $ Left $
                           "submitBlock connectBlock failed (should be unreachable "
@@ -1130,26 +1152,23 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock newWork = do
                     -- reorg is durable.
                     writeBatch db (WriteBatch allOps)
 
-                    -- Phase D — mirror the disk state into the
-                    -- in-memory cache + header chain + mempool.
-                    -- These mutations are local to this process;
-                    -- if the process dies between writeBatch and
-                    -- here, the next incarnation re-derives cache
-                    -- from disk and the header chain from
-                    -- PrefixBlockHeight.  No "split-brain" between
-                    -- disk and the next live process.
-                    forM_ (zip disconnectList disconnectUndo) $ \(blk, undo) ->
-                      unapplyBlock cache blk undo
-                    forM_ connectList $ \blk -> do
-                      let bh = computeBlockHash (blockHeader blk)
-                      entries <- readTVarIO (hcEntries hc)
-                      case Map.lookup bh entries of
-                        Just ce -> do
-                          appRes <- applyBlockToCache cache net blk (ceHeight ce)
-                          case appRes of
-                            Right _ -> return ()
-                            Left _  -> return ()  -- already validated; cache may have stale spend
-                        Nothing -> return ()
+                    -- Phase D — the coin caches.  HK-4: this used to
+                    -- MIRROR the reorg into the lookupUTXO cache after the
+                    -- commit (unapplyBlock re-added every restored coin
+                    -- DIRTY-unspent, then applyBlockToCache re-spent per
+                    -- connected block with its Left ignored).  Its lookups
+                    -- ran against the post-reorg disk, so a connected tx
+                    -- with any uncached input already spent by the reorg
+                    -- returned Left before mutating, and every restored coin
+                    -- that tx spends stayed unspent in ucDirty: gettxout and
+                    -- the mempool saw it unspent and the next flushCache
+                    -- wrote it back to disk (a spent coin resurrected).  Core
+                    -- has one coins view that the reorg itself updates; the
+                    -- equivalent here is: disk is the truth, so DROP every
+                    -- cached coin (both mirrors, both generations bumped) the
+                    -- moment the batch is committed.  Nothing is lost -- every
+                    -- dirty entry is disk-redundant (see 'ucInvalidate').
+                    invalidateCoinCaches cache
 
                     -- Header chain pointer flip — same shape as the
                     -- pre-Pattern-D dispatcher.
