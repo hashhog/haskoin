@@ -346,6 +346,7 @@ module Haskoin.Consensus
   ) where
 
 import Data.ByteString (ByteString)
+import Haskoin.TestHooks (hookPoint)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base16 as B16
 import Data.Word (Word8, Word32, Word64)
@@ -5085,6 +5086,9 @@ connectBlockAt db net block height spentUtxos = do
           <> " does not equal current BestBlock " <> show mBest
           <> " (Core G1 — validation.cpp:2333)"
         else do
+          -- Test seam (inert unless armed): between the G1 read and the
+          -- commit -- the HK-3 window.
+          hookPoint "connect.g1"
           -- W93 Gate G19: every non-coinbase input must have a resolvable
           -- prevout — in the passed-in spentUtxos map, on disk, or
           -- created by an earlier transaction in THIS block.

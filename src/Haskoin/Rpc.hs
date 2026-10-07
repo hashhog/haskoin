@@ -345,6 +345,7 @@ import Text.Printf (printf)
 import qualified Data.Vector as V
 import Haskoin.CoreArity (lookupCoreArity)
 import Haskoin.Fatal (isInternalReject)
+import Haskoin.TestHooks (hookPoint)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
@@ -14712,6 +14713,9 @@ handleDumpTxOutSet server params = do
                 Left err -> return $ RpcResponse Null
                   (toJSON $ RpcError rpcInternalError (T.pack err)) Null
                 Right () -> do
+                  -- Test seam (inert unless armed): the chainstate is
+                  -- rewound to the dump base here.
+                  hookPoint "dump.rewound"
                   -- Dump at the rewound state.
                   dumpRes <- dumpTxOutSetFromDB db path magic baseHash
                   -- Replay blocks back to the original tip regardless

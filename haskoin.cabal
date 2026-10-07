@@ -14,6 +14,7 @@ data-files:    resources/bip39-english.txt
 library
   exposed-modules: Haskoin.Types
                  , Haskoin.Fatal
+                 , Haskoin.TestHooks
                  , Haskoin.Crypto
                  , Haskoin.Script
                  , Haskoin.Consensus

@@ -94,6 +94,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            bumpTipGen,
                            getMtpAtHeightFromEntries, getMtpFromAncestry)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
+import Haskoin.TestHooks (hookPoint)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
@@ -758,6 +759,9 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
               case hdrResult of
                 Left hdrErr -> return $ Left $ "Block validation failed: " ++ hdrErr
                 Right _ -> do
+                  -- Test seam (inert unless armed): a validated submitblock
+                  -- parked before it touches the cache / disk.
+                  hookPoint "submit.preconnect"
                   -- Apply block to in-memory UTXO cache (drives maturity check + builds
                   -- the BlockUndo record). Cache mutation lets a follow-on submitBlock
                   -- spend an output created earlier in the same session without round-
