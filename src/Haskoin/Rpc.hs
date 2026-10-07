@@ -3423,7 +3423,9 @@ handleInvalidateBlock server params = do
       case parseHashV "blockhash" hexHash of
         Left err -> return $ RpcResponse Null (toJSON err) Null
         Right bh -> do
-          result <- invalidateBlock (rsNetwork server) (rsUTXOCache server)
+          -- HK-3: chain writer -> under the chain lock (Core cs_main).
+          result <- withChainLock (ucChainLock (rsUTXOCache server)) $
+                    invalidateBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left InvalidateGenesis -> return $ RpcResponse Null
@@ -3459,7 +3461,9 @@ handleReconsiderBlock server params = do
       case parseHashV "blockhash" hexHash of
         Left err -> return $ RpcResponse Null (toJSON err) Null
         Right bh -> do
-          result <- reconsiderBlock (rsNetwork server) (rsUTXOCache server)
+          -- HK-3: chain writer -> under the chain lock (Core cs_main).
+          result <- withChainLock (ucChainLock (rsUTXOCache server)) $
+                    reconsiderBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left (ReconsiderBlockNotFound _) -> return $ RpcResponse Null
@@ -3496,7 +3500,9 @@ handlePreciousBlock server params = do
       case parseHashV "blockhash" hexHash of
         Left err -> return $ RpcResponse Null (toJSON err) Null
         Right bh -> do
-          result <- preciousBlock (rsNetwork server) (rsUTXOCache server)
+          -- HK-3: chain writer -> under the chain lock (Core cs_main).
+          result <- withChainLock (ucChainLock (rsUTXOCache server)) $
+                    preciousBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left (PreciousBlockNotFound _) -> return $ RpcResponse Null

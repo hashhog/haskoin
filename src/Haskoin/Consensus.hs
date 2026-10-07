@@ -8910,10 +8910,10 @@ findDescendants hc blockHash = do
 invalidateBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                 -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
-invalidateBlock net cache db hc mIdxMgr blockHash =
-  -- HK-3: chain writer, so under the chain lock (Core: InvalidateBlock :3521
-  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
-  withChainLock (ucChainLock cache) $ do
+invalidateBlock net cache db hc mIdxMgr blockHash = do
+  -- HK-3: the caller holds the chain lock (the RPC handlers take it; Core:
+  -- InvalidateBlock :3521 under cs_main).  Taken there, not here, so the header-only
+  -- early exits stay usable without a coins cache.
   entries <- readTVarIO (hcEntries hc)
   tip <- readTVarIO (hcTip hc)
 
@@ -9261,10 +9261,10 @@ performReorgActivating net cache db hc mIdxMgr oldTip newTip =
 -- 'addHeader' parks a new header at 'StatusHeaderValid').
 activateBestChain :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                   -> Maybe IndexManager -> IO ()
-activateBestChain net cache db hc mIdxMgr =
-  -- HK-3: chain writer, so under the chain lock (Core: ActivateBestChain :3323
-  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
-  withChainLock (ucChainLock cache) $ do
+activateBestChain net cache db hc mIdxMgr = do
+  -- HK-3: the caller holds the chain lock (the RPC handlers take it; Core:
+  -- ActivateBestChain :3323 under cs_main).  Taken there, not here, so the header-only
+  -- early exits stay usable without a coins cache.
   currentTip <- readTVarIO (hcTip hc)
   best       <- findBestCandidate hc
   case best of
@@ -9372,10 +9372,10 @@ findBestCandidate hc = do
 reconsiderBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                 -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
-reconsiderBlock net cache db hc mIdxMgr blockHash =
-  -- HK-3: chain writer, so under the chain lock (Core: ReconsiderBlock / ActivateBestChain
-  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
-  withChainLock (ucChainLock cache) $ do
+reconsiderBlock net cache db hc mIdxMgr blockHash = do
+  -- HK-3: the caller holds the chain lock (the RPC handlers take it; Core:
+  -- ReconsiderBlock / ActivateBestChain under cs_main).  Taken there, not here, so the header-only
+  -- early exits stay usable without a coins cache.
   entries <- readTVarIO (hcEntries hc)
   invalidated <- readTVarIO (hcInvalidated hc)
 
@@ -9449,10 +9449,10 @@ data PreciousError
 preciousBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
               -> Maybe IndexManager
               -> BlockHash -> IO (Either PreciousError ())
-preciousBlock net cache db hc mIdxMgr blockHash =
-  -- HK-3: chain writer, so under the chain lock (Core: PreciousBlock :3490
-  -- under cs_main).  Re-entrant: the P2P kicker already holds it.
-  withChainLock (ucChainLock cache) $ do
+preciousBlock net cache db hc mIdxMgr blockHash = do
+  -- HK-3: the caller holds the chain lock (the RPC handlers take it; Core:
+  -- PreciousBlock :3490 under cs_main).  Taken there, not here, so the header-only
+  -- early exits stay usable without a coins cache.
   entries <- readTVarIO (hcEntries hc)
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (PreciousBlockNotFound blockHash)
