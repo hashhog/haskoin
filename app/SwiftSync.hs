@@ -666,15 +666,16 @@ processWithUndo cx wk h ph block bh txids undo0 nin0 p0 = do
         Right () -> return ()
       -- P-ORD, same-block half: created by an EARLIER tx with identical data
       let txidPos = Map.fromList (zip txids [0 :: Int ..])
+          txv = V.fromList txns
       sb <- if cNoPord ctl then return 0 else do
         forM_ sameBlock $ \(i, j, op, c) ->
           case Map.lookup (txidBytes (outPointHash op)) txidPos of
             Just k | k < i -> do
-              let outs = txOutputs (txns !! k)
+              let outs = V.fromList (txOutputs (txv V.! k))
                   v = fromIntegral (outPointIndex op)
-                  ok = v < length outs
-                       && txOutValue (outs !! v) == ucValue c
-                       && txOutScript (outs !! v) == ucScript c
+                  ok = v < V.length outs
+                       && txOutValue (outs V.! v) == ucValue c
+                       && txOutScript (outs V.! v) == ucScript c
                        && ucCoinbase c == (k == 0)
               unless ok $ err "P-ORD" ("tx " ++ show i ++ " in " ++ show j ++ ": same-block coin data != created output")
             _ -> err "P-ORD" ("tx " ++ show i ++ " in " ++ show j ++ ": coin height == h but prevout not created earlier in block")
@@ -921,10 +922,16 @@ runInner a = do
   hdrErrs <- newIORef ([] :: [String])
   let hdrErr s = modifyIORef' hdrErrs (s :)
   br0 <- newBlkReader blocksDir (pkXor pack)
-  headers <- V.generateM (fromIntegral to + 1) $ \i -> do
+  -- all headers into ONE contiguous buffer, decoded as slices of it: a
+  -- separate 80-byte pinned buffer per retained header pins a whole pinned
+  -- block each (~4 KiB x 958k headers of fragmentation)
+  raws <- forM [0 .. fromIntegral to :: Int] $ \i -> do
     let e = pkEnts pack V.! fromIntegral (Map.findWithDefault (fromIntegral i) (fromIntegral i) relabel)
-    raw <- blkRead br0 (beFile e) (bePos e) 80
-    case runGetState (get :: Get BlockHeader) raw 0 of
+    blkRead br0 (beFile e) (bePos e) 80
+  let bigHdr = BS.concat raws
+  _ <- evaluate (BS.length bigHdr)
+  headers <- V.generateM (fromIntegral to + 1) $ \i ->
+    case runGetState (get :: Get BlockHeader) (BS.take 80 (BS.drop (80 * i) bigHdr)) 0 of
       Left err -> fatal ("header " ++ show i ++ ": " ++ err)
       Right (hd, _) -> return $! hd
   closeBlkReader br0
