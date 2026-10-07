@@ -31,13 +31,25 @@ import Data.Aeson.Encoding (encodingToLazyByteString)
 import qualified Data.Aeson.Key as K
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as TE
 
 import Haskoin.Consensus (mainnet, regtest)
 import Haskoin.Script (ScriptType(..), p2aWitnessProgram)
 import Haskoin.Types (Hash256(..))
-import Haskoin.Crypto (bech32Encode, bech32mEncode)
+import Haskoin.Crypto
+  ( addressToText
+  , bech32Encode
+  , bech32mEncode
+  , textToAddress
+  )
+import Haskoin.Wallet
+  ( addDescriptorChecksum
+  , descriptorToText
+  , parseDescriptor
+  )
 import Haskoin.Rpc
   ( scriptTypeToString
   , scriptToAddress
@@ -128,3 +140,82 @@ spec = describe "P2A script classification (gettxout drop, 2026-10-02)" $ do
     o <- spkObj (BS.pack [0xba])
     field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
     field o "type" `shouldBe` Just (String "nonstandard")
+
+  -- -----------------------------------------------------------------------
+  -- RPC follow-ups from the P2A fix (QUEUES.md).  Expected strings are
+  -- Core v31.99 `decodescript` / `getdescriptorinfo` on 2026-10-07
+  -- (live bitcoind :8332), for:
+  --   * P2PK of secp256k1 G
+  --   * bare 1-of-2 multisig of G and 2G
+  --   * a 0xba-containing script, plus unnamed 0xbb / named 0xff
+  -- Control: cabal run haskoin-test --enable-tests --
+  --          -m 'RPC follow-ups from the P2A fix'
+  -- -----------------------------------------------------------------------
+  describe "RPC follow-ups from the P2A fix" $ do
+    -- secp256k1 G compressed; 2G compressed.  Core InferPubkey accepts
+    -- these (IsValidNonHybrid) and InferDescriptor emits pk()/multi().
+    let pkG  = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+        pk2G = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+        p2pkHex   = "21" <> pkG <> "ac"
+        multiHex  = "5121" <> pkG <> "21" <> pk2G <> "52ae"
+        p2pkSpk   = hexBS p2pkHex
+        multiSpk  = hexBS multiHex
+        pkDesc    = "pk(" <> pkG <> ")#gn28ywm7"
+        multiDesc = "multi(1," <> pkG <> "," <> pk2G <> ")#l5sy3u48"
+
+    it "decodescript P2PK infers pk() (not raw())" $ do
+      o <- spkObj p2pkSpk
+      field o "type" `shouldBe` Just (String "pubkey")
+      field o "desc" `shouldBe` Just (String pkDesc)
+      field o "asm"  `shouldBe` Just (String (pkG <> " OP_CHECKSIG"))
+
+    it "decodescript bare multisig infers multi() (not raw())" $ do
+      o <- spkObj multiSpk
+      field o "type" `shouldBe` Just (String "multisig")
+      field o "desc" `shouldBe` Just (String multiDesc)
+
+    it "decodescript 0xba-containing script: asm OP_CHECKSIGADD, desc raw(ba)" $ do
+      o <- spkObj (BS.pack [0xba])
+      field o "asm"  `shouldBe` Just (String "OP_CHECKSIGADD")
+      field o "desc" `shouldBe` Just (String "raw(ba)#yy0eg44l")
+      field o "type" `shouldBe` Just (String "nonstandard")
+
+    it "asm prints OP_UNKNOWN (not OP_UNKNOWN[n]); 0xff stays OP_INVALIDOPCODE" $ do
+      scriptToAsm (BS.pack [0xbb]) `shouldBe` "OP_UNKNOWN"
+      scriptToAsmPartial (BS.pack [0xbb]) `shouldBe` "OP_UNKNOWN"
+      scriptToAsm (BS.pack [0xc0]) `shouldBe` "OP_UNKNOWN"
+      scriptToAsm (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+      scriptToAsmPartial (BS.pack [0xff]) `shouldBe` "OP_INVALIDOPCODE"
+      o <- spkObj (BS.pack [0xbb])
+      field o "asm" `shouldBe` Just (String "OP_UNKNOWN")
+
+    it "wallet Address type carries P2A (textToAddress / addressToText)" $ do
+      -- Core DecodeDestination accepts bc1pfeessrawgf as PayToAnchor.
+      -- Before the Address constructor existed this was Nothing.
+      case textToAddress "bc1pfeessrawgf" of
+        Nothing -> expectationFailure
+          "textToAddress rejected Core's P2A address (Address type lacks P2A)"
+        Just a -> do
+          addressToText a `shouldBe` "bc1pfeessrawgf"
+          show a `shouldBe` "PayToAnchorAddress"
+      case textToAddress "bcrt1pfeesnyr2tx" of
+        Nothing -> expectationFailure
+          "textToAddress rejected regtest P2A address (Address type lacks P2A)"
+        Just a -> show a `shouldBe` "PayToAnchorAddress"
+
+    it "getdescriptorinfo of inferred pk()/multi() round-trips Core's fields" $ do
+      case parseDescriptor pkDesc of
+        Left err -> expectationFailure ("pk parse: " ++ show err)
+        Right d  -> do
+          descriptorToText d `shouldBe` ("pk(" <> pkG <> ")")
+          addDescriptorChecksum (descriptorToText d) `shouldBe` Just pkDesc
+      case parseDescriptor multiDesc of
+        Left err -> expectationFailure ("multi parse: " ++ show err)
+        Right d  -> do
+          descriptorToText d `shouldBe` ("multi(1," <> pkG <> "," <> pk2G <> ")")
+          addDescriptorChecksum (descriptorToText d) `shouldBe` Just multiDesc
+
+hexBS :: T.Text -> BS.ByteString
+hexBS t = case B16.decode (TE.encodeUtf8 t) of
+  Right bs -> bs
+  Left err -> error ("hexBS: " ++ err)
