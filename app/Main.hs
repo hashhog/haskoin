@@ -15,7 +15,8 @@ import System.Directory (createDirectoryIfMissing, getHomeDirectory, doesFileExi
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO, killThread)
 import System.Mem (performMajorGC)
-import System.Environment (lookupEnv)
+import System.Environment (lookupEnv, getArgs)
+import qualified SwiftSync
 import Text.Read (readMaybe)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar, withMVar, isEmptyMVar)
 import System.Exit (exitWith, ExitCode(..), exitSuccess)
@@ -488,6 +489,16 @@ parseUtilCommand = hsubparser
 
 main :: IO ()
 main = do
+  argv <- getArgs
+  case argv of
+    -- SwiftSync batch pass (app/SwiftSync.hs): validates a height range
+    -- through this binary's own connect arm with supplied coins. No datadir,
+    -- no network; exits before any node startup.
+    ("swiftsync-pass" : rest) -> SwiftSync.runSwiftSyncPass rest >>= exitWith
+    _ -> mainNode
+
+mainNode :: IO ()
+mainNode = do
   hSetBuffering stdout LineBuffering
   opts <- execParser $ info (parseOptions <**> helper)
     ( fullDesc

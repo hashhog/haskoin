@@ -108,8 +108,15 @@ library
 
 executable haskoin
   main-is:       Main.hs
+  -- SwiftSync batch pass (`haskoin swiftsync-pass`, hashhog design
+  -- receipts/swiftsync-design-2026-10-05.md); dispatched from main before
+  -- any node startup.
+  other-modules: SwiftSync
   hs-source-dirs: app
   build-depends: base >= 4.14 && < 5
+               , aeson
+               , vector
+               , vector-algorithms
                , haskoin
                , optparse-applicative
                , text
