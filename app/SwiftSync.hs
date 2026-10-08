@@ -80,7 +80,7 @@ import Data.List (sort, sortOn, nub, isPrefixOf)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
-import Data.Serialize (Get, runGetState, runGetLazyState, get)
+import Data.Serialize (Get, runGetState, get)
 import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
@@ -766,8 +766,11 @@ processStartSet cx path from spillDir = do
     Intro.sort mv
     keys <- VU.unsafeFreeze mv
     matched <- VUM.replicate nKeys False
-    lbs <- BL.readFile path
-    case runGetLazyState (get :: Get SnapshotMetadata) lbs of
+    -- strict read + runGetState: the remainder is an O(1) slice. cereal's
+    -- runGetLazyState re-walks the whole remaining chunk list per call, which
+    -- made this loop quadratic (~600 coins/s on a 2.2 GB snapshot).
+    sbs <- BS.readFile path
+    case runGetState (get :: Get SnapshotMetadata) sbs 0 of
       Left e -> return (Left ("start snapshot metadata: " ++ e))
       Right (meta, body)
         | smNetworkMagic meta /= netMagic (cxNet cx) -> return (Left "start snapshot: network magic")
@@ -784,8 +787,8 @@ processStartSet cx path from spillDir = do
                                                in if x == k then Just m else if x < k then bs (m + 1) hi else bs lo m
                 goGroups !remaining !coins !surv !spent !agg rest
                   | remaining == 0 = return (Right (coins, surv, spent, agg, rest))
-                  | BL.null rest = return (Left ("start snapshot: short, " ++ show remaining ++ " coins missing"))
-                  | otherwise = case runGetLazyState groupGet rest of
+                  | BS.null rest = return (Left ("start snapshot: short, " ++ show remaining ++ " coins missing"))
+                  | otherwise = case runGetState groupGet rest 0 of
                       Left e -> return (Left ("start snapshot coin: " ++ e))
                       Right ((t, cs), rest') -> do
                         (s1, sp1, a1, dup) <- foldM (\(!s, !sp, !a, !d) (v, c) -> do
@@ -807,7 +810,7 @@ processStartSet cx path from spillDir = do
             case r of
               Left e -> return (Left e)
               Right (coins, surv, spent, agg, rest)
-                | not (BL.null rest) -> return (Left "start snapshot: trailing bytes")
+                | not (BS.null rest) -> return (Left "start snapshot: trailing bytes")
                 | otherwise -> do
                     unmatched <- VU.length . VU.filter not <$> VU.freeze matched
                     if unmatched /= 0
