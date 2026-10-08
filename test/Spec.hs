@@ -3397,6 +3397,38 @@ main = hspec $ do
     it "bip22ResultString: unexpected-witness is already canonical" $ do
       bip22ResultString "unexpected-witness" `shouldBe` "unexpected-witness"
 
+  -- fleet-conformance MAL (2026-10-08): Core IsBlockMutated, used on receipt
+  -- of every P2P block (net_processing.cpp ProcessMessage "block").
+  describe "blockMutation (Core IsBlockMutated)" $ do
+    let nonce = BS.replicate 32 0x00
+        Hash256 commitH = doubleSHA256 (BS.replicate 32 0x00 <> nonce)
+        commitOut = TxOut 0 (BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed] <> commitH)
+        cbIn = TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff) (BS.pack [0x51]) 0xffffffff
+        cbTx w = Tx 2 [cbIn] [TxOut 5000000000 (BS.pack [0x51]), commitOut] w 0
+        rootOf txs = fst (computeMerkleRootMutated (map computeTxId txs))
+        hdr txs = BlockHeader 4 (BlockHash (Hash256 (BS.replicate 32 7))) (rootOf txs) 0 0x207fffff 0
+        honestTxs = [cbTx [[nonce]]]
+        honest = Block (hdr honestTxs) honestTxs
+        strippedB = Block (hdr honestTxs) [cbTx [[]]]
+        spend b = Tx 2 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 9))) 0) BS.empty 0]
+                       [TxOut 1 (BS.replicate b 0x51)] [[]] 0
+    it "honest segwit block is not mutated" $
+      blockMutation True honest `shouldBe` Nothing
+    it "witness-stripped body (same header): bad-witness-nonce-size" $
+      blockMutation True strippedB `shouldBe` Just "bad-witness-nonce-size"
+    it "witness before segwit: unexpected-witness" $
+      blockMutation False honest `shouldBe` Just "unexpected-witness"
+    it "transactions not matching the header: bad-txnmrklroot" $
+      blockMutation True (Block (hdr honestTxs) [cbTx [[nonce]], spend 1]) `shouldBe` Just "bad-txnmrklroot"
+    it "CVE-2012-2459 duplicate: bad-txns-duplicate" $ do
+      let txs = [cbTx [[nonce]], spend 1, spend 2, spend 2]
+      blockMutation True (Block (hdr txs) txs) `shouldBe` Just "bad-txns-duplicate"
+    it "no coinbase: mutated only with a 64-byte transaction" $ do
+      -- spend 4: 4+1+41+1+(8+1+4)+4 = 64 bytes without witness
+      txBaseSize (spend 4) `shouldBe` 64
+      isBlockMutated True (Block (hdr [spend 4]) [spend 4]) `shouldBe` True
+      blockMutation True (Block (hdr [spend 5]) [spend 5]) `shouldBe` Nothing
+
   describe "Consensus flags" $ do
     it "all flags disabled at height 0 on mainnet" $ do
       let flags = consensusFlagsAtHeight mainnet 0
