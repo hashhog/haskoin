@@ -44,6 +44,7 @@ module Haskoin.Storage
   , getBlockHeader
   , putBlock
   , getBlock
+  , deleteBlockData
   , putBestBlockHash
   , getBestBlockHash
   , putBlockHeight
@@ -473,6 +474,16 @@ putBlock db bh block =
   let key = makeKey PrefixBlockData (encode bh)
       val = encode block
   in R.put (dbHandle db) (dbWriteOpts db) key val
+
+-- | Drop a stored block body.  Only for a body found MUTATED (it does not
+-- match the header's commitments — Core IsBlockMutated): the honest body has
+-- the same hash and must be fetched again, and a stored bad body would be
+-- replayed by the stored-body drain / reorg engine.  Never for a block on the
+-- active chain (a mutated body cannot have connected).
+deleteBlockData :: HaskoinDB -> BlockHash -> IO ()
+deleteBlockData db bh =
+  let key = makeKey PrefixBlockData (encode bh)
+  in R.delete (dbHandle db) (dbWriteOpts db) key
 
 -- | Retrieve a full block by its hash
 getBlock :: HaskoinDB -> BlockHash -> IO (Maybe Block)

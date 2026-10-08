@@ -4175,6 +4175,60 @@ infixOfStr needle haystack =
       | c >= 'A' && c <= 'Z' = toEnum (fromEnum c + 32)
       | otherwise            = c
 
+-- | Core @IsBlockMutated@ for a block that arrived over the wire, when its
+-- parent header is known (Core checks only then: the segwit rule set is
+-- DeploymentActiveAfter(prev, SEGWIT)).  @Just (reason, height)@ = mutated.
+-- Cost: one txid pass (+ one wtxid pass under segwit) over the block.
+mutationOnReceipt :: Network -> HeaderChain -> Block -> IO (Maybe (String, Word32))
+mutationOnReceipt net hc block = do
+  entries <- readTVarIO (hcEntries hc)
+  return $ case Map.lookup (bhPrevBlock (blockHeader block)) entries of
+    Nothing    -> Nothing
+    Just prevE ->
+      let ht = ceHeight prevE + 1
+      in fmap (\w -> (w, ht)) (blockMutation (ht >= netSegwitHeight net) block)
+
+-- | A mutated block body (Core IsBlockMutated): the body says nothing about
+-- the block.  Core (net_processing.cpp): @Misbehaving(peer, "mutated
+-- block")@, @RemoveBlockRequest(hash, peer)@, return — the block is NOT
+-- marked failed (validation.cpp InvalidBlockFound skips BLOCK_MUTATED), the
+-- body is NOT stored, and the block is fetched again from another peer.
+--
+-- Before 2026-10-08 haskoin validated the body, classified the mutation as a
+-- non-verdict, stored it as a "side-branch" body (putBlock) and never
+-- punished the sender, which kept being asked for the block: one peer
+-- serving a witness-stripped block wedged the node at height-1
+-- (fleet-conformance MAL).
+--
+-- The stored-body drain re-feeds bodies under the pseudo-peer 0.0.0.0:0; a
+-- mutated body found there (stored by a pre-fix build) is deleted so the
+-- block is downloaded again.
+rejectMutatedOnReceipt :: HaskoinDB -> IORef PeerManager -> IORef (IO ())
+                       -> (SockAddr -> BlockHash -> Word32 -> IO (IO ()))
+                       -> SockAddr -> BlockHash -> Word32 -> String -> IO ()
+rejectMutatedOnReceipt db pmRefM refillRef blockReceiptM addr bh ht why
+  | addr == NS.SockAddrInet 0 0 = do
+      putStrLn $ "Stored body of block " ++ hexHashS bh ++ " height=" ++ show ht
+              ++ " is mutated (" ++ why ++ "): deleted, block NOT marked, re-requesting"
+      deleteBlockData db bh
+        `catchSync` (\e -> putStrLn $ "deleteBlockData (mutated) error: " ++ show e)
+  | otherwise = do
+      putStrLn $ "Mutated block " ++ hexHashS bh ++ " height=" ++ show ht
+              ++ " from " ++ show addr ++ ": " ++ why
+              ++ " — punishing the sender, block NOT marked, re-requesting from another peer"
+      -- Out of in-flight (Core RemoveBlockRequest): the receipt action
+      -- removes the hash from the linear in-flight map; its completion
+      -- action is run at once (nothing is being processed).
+      done <- blockReceiptM addr bh ht
+      done
+      pm <- readIORef pmRefM
+      -- Disconnects (and, for a non-local peer, discourages) the sender and
+      -- removes it from pmPeers synchronously, so the refill below cannot
+      -- hand the block straight back to it.
+      void (misbehaving pm addr InvalidBlock)
+      join (readIORef refillRef)
+        `catchSync` (\e -> putStrLn $ "refill after mutated block: " ++ show e)
+
 -- | Sync-aware message handler
 syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                    -> Mempool -> FeeEstimator -> Network
@@ -4236,7 +4290,18 @@ syncMessageHandler :: HaskoinDB -> HeaderChain -> HeaderSync -> UTXOCache
                       -- arrived block out of in-flight before validation;
                       -- the returned action marks processing finished.
                    -> SockAddr -> Message -> IO ()
-syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr msg = case msg of
+syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr msg = do
+ -- Core net_processing.cpp ProcessMessage "block": IsBlockMutated runs on
+ -- receipt, before ANY download state, header, storage or validation step,
+ -- whenever the parent is known.  Computed here so the MBlock arm below can
+ -- branch on it with a guard.
+ receiptMutation <- case msg of
+   MBlock blk -> mutationOnReceipt net hc blk
+   _          -> return Nothing
+ case msg of
+  MBlock block | Just (why, mutHeight) <- receiptMutation ->
+    rejectMutatedOnReceipt db pmRef receiptRefillRef blockReceipt addr
+      (computeBlockHash (blockHeader block)) mutHeight why
   MPing ping -> do
     -- BIP-0031 keep-alive: answer every inbound ping with a pong that echoes
     -- the nonce, sent to the peer that pinged us (keyed by its SockAddr in the
@@ -5289,8 +5354,22 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             if null missing
               then case fillPartialBlock pdb [] of
                 Right block -> do
-                  putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
-                  syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
+                 -- Core blockencodings.cpp FillBlock: IsBlockMutated on the
+                 -- reconstructed block -> READ_STATUS_FAILED -> fall back to
+                 -- a full getdata from the same peer, no punishment (a
+                 -- short-ID collision is not the peer's fault).
+                 cmpMut <- mutationOnReceipt net hc block
+                 case cmpMut of
+                  Just (why, _) -> do
+                    putStrLn $ "Compact block " ++ show bh ++ " reconstructed MUTATED (" ++ why
+                            ++ "), requesting the full block"
+                    pm <- readIORef pmRef
+                    let iv = InvVector InvWitnessBlock (getBlockHashHash bh)
+                    requestFromPeer pm addr (MGetData (GetData [iv]))
+                      `catch` (\(_ :: SomeException) -> return ())
+                  Nothing -> do
+                   putStrLn $ "Compact block " ++ show bh ++ " reconstructed (mempool_hits=" ++ show (pdbMempoolCount pdb) ++ ")"
+                   syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
                 Left err -> do
                   putStrLn $ "Compact block " ++ show bh ++ " fill error: " ++ err
                   pm <- readIORef pmRef
@@ -5392,12 +5471,25 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             requestFromPeer pm addr (MGetData (GetData [iv]))
               `catch` (\(_ :: SomeException) -> return ())
           Right block -> do
+           cmpMut <- mutationOnReceipt net hc block
+           case cmpMut of
+            Just (why, _) -> do
+              -- Core BLOCKTXN: FillBlock READ_STATUS_FAILED (IsBlockMutated)
+              -- -> "might have collided, fall back to getdata", no
+              -- punishment.
+              putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed MUTATED ("
+                      ++ why ++ "), requesting the full block"
+              pm <- readIORef pmRef
+              let iv = InvVector InvWitnessBlock (getBlockHashHash blockHash)
+              requestFromPeer pm addr (MGetData (GetData [iv]))
+                `catch` (\(_ :: SomeException) -> return ())
+            Nothing -> do
             -- Reconstruction succeeded — submit to the validation pipeline.
             -- Reuse the MBlock path exactly (handles connectBlock, reorg,
             -- IBD, header indexing, index manager mirroring, etc.).
-            -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
-            putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
-            syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
+             -- Reference: bitcoin-core/src/net_processing.cpp:4350-4360
+             putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
+             syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
 
   MPong _ -> return ()
   MVerAck -> return ()

@@ -117,6 +117,8 @@ module Haskoin.Consensus
   , getLegacySigOpCount
     -- * Witness Commitment
   , checkWitnessMalleation
+  , blockMutation
+  , isBlockMutated
   , validateWitnessCommitment
   , txHasWitness
   , computeWtxId
@@ -4635,6 +4637,40 @@ checkWitnessMalleation expectCommitment block
             && BS.isPrefixOf commitPrefix (txOutScript txo)
             ) (txOutputs coinbase)
       in if null matches then Nothing else Just (last matches)
+
+-- | Bitcoin Core @IsBlockMutated(block, check_witness_root)@
+-- (validation.cpp 4027-4056), with the reject reason: 'Nothing' = the body
+-- matches what the header commits to.  A mutated body says NOTHING about the
+-- block (the hash commits only to the header): the receiver must drop the
+-- body, punish the peer that sent it and fetch the block again elsewhere —
+-- never mark the block failed and never store the body (Core
+-- net_processing.cpp ProcessMessage "block" runs this before anything else
+-- when the parent is known; InvalidBlockFound skips BLOCK_MUTATED).
+--
+-- Order exactly as Core:
+--   1. CheckMerkleRoot: root mismatch "bad-txnmrklroot", CVE-2012-2459
+--      duplicate "bad-txns-duplicate".
+--   2. First tx not a coinbase: mutated iff some tx is 64 bytes without
+--      witness; otherwise NOT mutated (CheckBlock gives the verdict) and the
+--      witness check is skipped.
+--   3. CheckWitnessMalleation(check_witness_root).
+blockMutation :: Bool -> Block -> Maybe String
+blockMutation checkWitnessRoot block =
+  case blockTxns block of
+    [] -> Just "bad-txnmrklroot"
+    txs@(tx0:_) ->
+      let (root, dup) = computeMerkleRootMutated (map computeTxId txs)
+      in if root /= bhMerkleRoot (blockHeader block) then Just "bad-txnmrklroot"
+         else if dup then Just "bad-txns-duplicate"
+         else if not (isCoinbase tx0)
+           then if any ((== 64) . txBaseSize) txs
+                  then Just "mutated: 64-byte transaction in a block without a coinbase"
+                  else Nothing
+         else either Just (const Nothing) (checkWitnessMalleation checkWitnessRoot block)
+
+-- | 'blockMutation' as Core's bool.
+isBlockMutated :: Bool -> Block -> Bool
+isBlockMutated w b = isJust (blockMutation w b)
 
 -- | True if a transaction has any non-empty witness stack item.
 -- Mirrors Core CTransaction::HasWitness() — any input with a non-empty
