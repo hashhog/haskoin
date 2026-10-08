@@ -75,6 +75,8 @@ module Haskoin.Storage
     -- * UTXO Cache (Legacy)
   , UTXOEntry(..)
   , UTXOCache(..)
+  , ChainMempoolSink(..)
+  , noMempoolSink
   , newUTXOCache
   , lookupUTXO
   , addUTXO
@@ -987,7 +989,34 @@ data UTXOCache = UTXOCache
   -- 'flushCache' -- runs under it. It lives here because this record is the
   -- one object all of those already share.
   , ucChainLock :: !ChainLock
+  -- | The mempool's chain-event sink (Core: the @m_mempool@ / disconnectpool
+  -- calls inside DisconnectTip, ConnectTip and ActivateBestChainStep).  The
+  -- library's reorg engine ('Haskoin.Consensus.reorgAtomic') fires it under
+  -- the chain lock; the live mempool installs itself here
+  -- ('Haskoin.Mempool.initNodeMempool').  A no-op until installed, so a
+  -- cache without a mempool (tests, the snapshot chainstate) is unaffected.
+  , ucMempoolSink :: !(IORef ChainMempoolSink)
   }
+
+-- | What the chainstate tells the mempool while the chain moves.  Mirrors
+-- the three mempool touch points of Core's validation.cpp:
+--
+--   * 'cmsDisconnected' — DisconnectTip: the block's non-coinbase txs go to
+--     the DisconnectedBlockTransactions pool (not straight into the mempool).
+--   * 'cmsConnected'    — ConnectTip: @m_mempool->removeForBlock(block.vtx)@
+--     (confirmed txs + conflicts, recursively) and
+--     @disconnectpool->removeForBlock@.
+--   * 'cmsReorgDone'    — MaybeUpdateMempoolForReorg after the disconnects /
+--     connects: re-accept the pooled txs earliest first, then removeForReorg.
+data ChainMempoolSink = ChainMempoolSink
+  { cmsDisconnected :: Block -> IO ()
+  , cmsConnected    :: Block -> IO ()
+  , cmsReorgDone    :: IO ()
+  }
+
+-- | The sink of a cache with no mempool attached.
+noMempoolSink :: ChainMempoolSink
+noMempoolSink = ChainMempoolSink (\_ -> return ()) (\_ -> return ()) (return ())
 
 -- | Create a new UTXO cache with the given maximum size.
 -- The cache starts empty; entries are loaded on demand from the database.
@@ -1002,6 +1031,7 @@ newUTXOCache db maxSize = UTXOCache
   <*> newTVarIO 0           -- rcGen     (read-through generation counter)
   <*> newTVarIO 0           -- ucGen     (ucEntries generation counter)
   <*> newChainLock          -- ucChainLock (cs_main)
+  <*> newIORef noMempoolSink -- ucMempoolSink (installed by the live mempool)
 
 -- | Look up a UTXO, checking cache first then database.
 -- Returns Nothing if the UTXO doesn't exist or is marked as spent.

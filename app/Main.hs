@@ -4734,6 +4734,16 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                                -- dirty cache-created coin was written back to disk
                                -- by the next flushCache.
                                noteBlockConnectedOnDisk cache block
+                               -- ConnectTip: m_mempool->removeForBlock under
+                               -- cs_main, in the same critical section as the
+                               -- commit, so no RPC reader (getrawmempool /
+                               -- getblocktemplate) sees this block connected
+                               -- with its txs or their conflicts still pooled.
+                               -- Pre-fix it ran after the lock was released.
+                               blockConnected mp block
+                                 `catch` (\(e :: SomeException) ->
+                                   putStrLn $ "mempool removeForBlock error at height "
+                                           ++ show height ++ ": " ++ show e)
                                nextBlock <- readIORef nextBlockRef
                                when (height >= nextBlock) $
                                  writeIORef nextBlockRef (height + 1)
@@ -4920,8 +4930,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                           putStrLn $ "auto-prune: pruned " ++ show n
                                   ++ " block file(s) at height=" ++ show height
                       Nothing -> return ()
-                  -- Remove confirmed txs from mempool and clear rejection filter
-                  blockConnected mp block
+                  -- Confirmed txs left the mempool under the chain lock
+                  -- above (removeForBlock); clear the rejection filter.
                   writeIORef recentlyRejectedRef Set.empty
                   -- BUG-13 FIX: EraseForBlock — remove confirmed txs from the
                   -- orphan pool.  Core calls TxOrphanage::EraseForBlock after
