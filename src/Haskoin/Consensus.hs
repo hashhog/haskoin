@@ -398,7 +398,7 @@ import Haskoin.Script (decodeScript, countScriptSigops, countSigopsBytes,
                        isWitnessProgram, ScriptType(..), Script(..), ScriptOp(..))
 import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         makeKey, KeyPrefix(..), prefixByte, toBE32, TxLocation(..),
-                        BlockStatus(..), UTXOCache(..), UTXOEntry(..),
+                        BlockStatus(..), UTXOCache(..), UTXOEntry(..), ChainMempoolSink(..),
                         TxInUndo(..), TxUndo(..), BlockUndo(..), UndoData(..),
                         mkUndoData, lookupUTXO, addUTXO, spendUTXO, rcClear, invalidateCoinCaches,
                         putUndoData, getUndoData, getUndoDataVerified, deleteUndoData,
@@ -7521,10 +7521,24 @@ reorgAtomic net cache db hc mIdxMgr disList conList =
           -- the whole reorg.
           flushCache cache
           disR <- reorgDisconnectIncremental cache db hc mIdxMgr disList
-          case disR of
+          res <- case disR of
             Left err -> return (Left err)
             Right () ->
               reorgConnectIncremental net cache db hc mIdxMgr conList
+          -- MaybeUpdateMempoolForReorg (validation.cpp ActivateBestChainStep
+          -- "if (fBlocksDisconnected) ... MaybeUpdateMempoolForReorg"): once
+          -- the disconnects and connects are committed -- whether the
+          -- connect side finished or stopped at an invalid block -- the
+          -- disconnected txs are re-accepted against the tip we ended on and
+          -- removeForReorg runs.  Still under the chain lock, so no RPC
+          -- reader sees the tip moved with the pool not yet updated.
+          -- InvalidateBlock (a pure disconnect) runs it once here rather than
+          -- after every block; the re-accept is earliest-first against the
+          -- final tip, which yields the same pool.
+          unless (null disList) $ do
+            sink <- readIORef (ucMempoolSink cache)
+            cmsReorgDone sink
+          return res
 
 -- | Load one reorg body.  Callers drop the Block after the step so
 -- peak RSS is O(block), not O(depth).
@@ -7598,6 +7612,9 @@ reorgDisconnectIncremental cache db hc mIdxMgr (ce : rest) = do
                         writeTVar (hcTip hc) parent
                         writeTVar (hcHeight hc) (ceHeight parent)
                         bumpTipGen hc
+              -- DisconnectTip: disconnectpool->AddTransactionsFromBlock.
+              sink <- readIORef (ucMempoolSink cache)
+              cmsDisconnected sink blk
               case mIdxMgr of
                 Just im ->
                   indexManagerDisconnectBlock im blk (ceHash ce) (ceHeight ce)
@@ -7671,6 +7688,11 @@ reorgConnectIncremental net cache db hc mIdxMgr (ce : rest) = do
             writeTVar (hcTip hc) ce
             writeTVar (hcHeight hc) (ceHeight ce)
             bumpTipGen hc
+          -- ConnectTip: m_mempool->removeForBlock(block.vtx) for EVERY
+          -- connected block (confirmed txs + conflicts with descendants) and
+          -- disconnectpool->removeForBlock.
+          sink <- readIORef (ucMempoolSink cache)
+          cmsConnected sink blk
           case mIdxMgr of
             Just im -> do
               mUndo <- getUndoData db bh
@@ -9425,16 +9447,39 @@ reconsiderBlock net cache db hc mIdxMgr blockHash = do
           -- Find all descendants (including this block)
           descendants <- findDescendants hc blockHash
 
-          -- Remove invalid marks from all descendants
+          -- Remove from manually-invalidated set first, so the candidate
+          -- gate below sees the block as no longer invalidated.
+          atomically $ modifyTVar' (hcInvalidated hc) (Set.delete blockHash)
+
+          -- Remove invalid marks from all descendants.  Core
+          -- ResetBlockFailureFlags (validation.cpp) clears BLOCK_FAILED_* and
+          -- puts every reset block that has its data (IsValid(
+          -- BLOCK_VALID_TRANSACTIONS) && HaveNumChainTxs) back into
+          -- setBlockIndexCandidates, so the ActivateBestChain below can
+          -- re-activate it.  haskoin's "have data" state is 'StatusValid'
+          -- (the candidate gate in 'findBestCandidate'); a body on disk is
+          -- that state.  Pre-fix every reset block went to StatusHeaderValid
+          -- and none re-entered 'hcCandidates', so reconsiderblock never
+          -- re-activated the chain it un-invalidated (the node stayed on the
+          -- fork point until a peer re-sent the blocks).  Re-activation
+          -- still fully re-validates each block ('reorgConnectIncremental').
           forM_ descendants $ \ce -> do
-            -- Restore status to StatusHeaderValid (will need re-validation)
+            -- Clear the failure first (header-valid), then upgrade a block
+            -- whose body is on disk to the have-data state + candidate.
             atomically $ modifyTVar' (hcEntries hc) $
               Map.adjust (\e -> e { ceStatus = StatusHeaderValid }) (ceHash ce)
+            haveData <- isJust <$> getBlock db (ceHash ce)
+            let st = if haveData then StatusValid else StatusHeaderValid
+            when haveData $ atomically $ do
+              modifyTVar' (hcEntries hc) $
+                Map.adjust (\e -> e { ceStatus = StatusValid }) (ceHash ce)
+              ents <- readTVar (hcEntries hc)
+              case Map.lookup (ceHash ce) ents of
+                Just ce' -> modifyTVar' (hcCandidates hc)
+                              (Set.insert (mkCandidateKey ce'))
+                Nothing  -> return ()
             -- Persist status
-            putBlockStatus db (ceHash ce) StatusHeaderValid
-
-          -- Remove from manually-invalidated set
-          atomically $ modifyTVar' (hcInvalidated hc) (Set.delete blockHash)
+            putBlockStatus db (ceHash ce) st
 
           -- Try to activate the best chain (may include reconsidered blocks);
           -- index-aware so any reorg keeps the secondary indexes in sync.

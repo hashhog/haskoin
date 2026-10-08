@@ -63,6 +63,11 @@ module Haskoin.Mempool
     -- * Block Handlers
   , blockConnected
   , blockDisconnected
+  , addDisconnectedBlock
+  , updateMempoolForReorg
+  , removeForReorg
+  , mempoolChainSink
+  , getDisconnectPool
     -- * Ancestry
   , getAncestors
   , getDescendants
@@ -179,6 +184,9 @@ import qualified Data.Set as Set
 import Data.Set (Set)
 import Control.Monad (forM, forM_, when, unless, foldM, void)
 import Control.Concurrent.STM
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Exception (finally)
+import Data.IORef (writeIORef)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData)
@@ -195,7 +203,8 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            getTransactionSigOpCost, consensusFlagsAtHeight,
                            consensusFlagsToScriptFlags,
                            SigOpCost(..), isCoinbase)
-import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..), lookupUTXO)
+import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..), lookupUTXO,
+                        ChainMempoolSink(..))
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
@@ -695,6 +704,18 @@ data Mempool = Mempool
     -- blockConnected (+1) / blockDisconnected (-1) moved it, so mpHeight was
     -- "blocks since boot".  Nothing installed (unit tests) = the legacy
     -- TVar arithmetic.
+  , mpDisconnectPool :: !(TVar [Tx])
+    -- ^ Core's DisconnectedBlockTransactions: the non-coinbase txs of the
+    -- blocks disconnected by the reorg in progress, EARLIEST-CONFIRMED FIRST
+    -- (the order 'updateMempoolForReorg' re-accepts them in).  Filled by
+    -- 'addDisconnectedBlock' (DisconnectTip), pruned by 'blockConnected'
+    -- (ConnectTip's disconnectpool->removeForBlock), drained by
+    -- 'updateMempoolForReorg' (MaybeUpdateMempoolForReorg).
+  , mpBypassLimitsFor :: !(TVar (Maybe ThreadId))
+    -- ^ The thread re-accepting disconnected txs in 'updateMempoolForReorg'
+    -- (Core ATMP with @bypass_limits = true@: no mempool-min-fee / min-relay
+    -- floor and no per-tx size-limit eviction; LimitMempoolSize runs once at
+    -- the end).  Keyed by thread so a concurrent admission is not exempted.
   }
 
 -- | A no-op coin-MTP lookup that returns 0 for every height.
@@ -739,6 +760,8 @@ newMempool net cache config height mtp getCoinMtp = do
     <*> newTVarIO now        -- mpLastRollingFeeUpdate: now
     <*> newTVarIO (\_ -> return ())  -- mpOnRemoveTx: no subscriber by default
     <*> newTVarIO Nothing    -- mpTipSource: none (legacy arithmetic) until installed
+    <*> newTVarIO []         -- mpDisconnectPool: no reorg in progress
+    <*> newTVarIO Nothing    -- mpBypassLimitsFor: nobody
 
 -- | Install the non-block removal subscriber.  The wiring layer (the RPC
 -- server, which owns both the 'Mempool' and the 'FeeEstimator') calls this
@@ -821,6 +844,10 @@ initNodeMempool :: Network -> HaskoinDB -> HeaderChain -> UTXOCache -> MempoolCo
 initNodeMempool net db hc cache cfg = do
   mp <- newMempool net cache cfg 0 0 (chainBlockMtp hc)
   setMempoolTipSource mp (activeTipSource db hc)
+  -- The chainstate's reorg engine (Consensus.reorgAtomic: invalidateblock,
+  -- reconsiderblock, preciousblock, the P2P reorg) tells this mempool about
+  -- every block it disconnects / connects, under the chain lock.
+  writeIORef (ucMempoolSink cache) (mempoolChainSink mp)
   return mp
 
 -- | Fire the non-block removal notification for a txid.  Run after the STM
@@ -1125,7 +1152,8 @@ finalizeTransaction mp tx txid inputPairs = do
       -- eviction-driven rolling minimum (GetMinFee) never gated admission and
       -- its decay never advanced on the live path.
       minFee <- effectiveMinFeeRate mp
-      if feeRate < minFee
+      bypass <- bypassingLimits mp
+      if not bypass && feeRate < minFee
         then return $ Left (ErrFeeBelowMinimum feeRate minFee)
         else
           -- W96 Gate (client-maxfeerate): mirrors Bitcoin Core
@@ -1313,10 +1341,17 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
   -- delegates to trimToSize, which loops until back under the limit and bumps the
   -- rolling minimum fee.
   totalSize <- readTVarIO (mpSize mp)
-  when (totalSize > mpcMaxSize (mpConfig mp)) $
+  bypass <- bypassingLimits mp
+  when (not bypass && totalSize > mpcMaxSize (mpConfig mp)) $
     evictLowestFee mp
 
   return $ Right txid
+
+-- | Is this admission a reorg re-accept (Core @bypass_limits@)?
+bypassingLimits :: Mempool -> IO Bool
+bypassingLimits mp = do
+  me <- myThreadId
+  (== Just me) <$> readTVarIO (mpBypassLimitsFor mp)
 
 -- | Dry-run variant of 'continueAddTransaction': runs TRUC check and
 -- builds the entry but does NOT insert into any TVar.
@@ -1794,7 +1829,10 @@ getDescendantsOfEntry mp txid = do
 -- | Remove a transaction and all its descendants
 removeWithDescendants :: Mempool -> TxId -> IO ()
 removeWithDescendants mp txid = do
-  descendants <- getDescendants mp txid
+  -- ALL descendants (Core removeRecursive -> CalculateDescendants), not just
+  -- the direct children: pre-fix a grandchild of a removed conflict stayed
+  -- in the pool spending an output that no longer existed anywhere.
+  descendants <- filter ((/= txid) . meTxId) <$> getDescendantsRecursive mp txid
   -- Remove descendants first (in reverse order - children before parents)
   forM_ (reverse descendants) $ removeTransaction mp . meTxId
   removeTransaction mp txid
@@ -2382,6 +2420,11 @@ blockConnected mp block = do
   -- (FeeEstimator.recordConfirmation / Core processBlockTx).
   forM_ (Set.toList confirmedTxIds) $ removeTransactionForBlock mp
 
+  -- disconnectpool->removeForBlock (validation.cpp ConnectTip): a tx this
+  -- block re-confirms is not re-accepted when the reorg finishes.
+  atomically $ modifyTVar' (mpDisconnectPool mp) $
+    filter (\t -> not (Set.member (computeTxId t) confirmedTxIds))
+
   -- Delta lifecycle: a prioritisetransaction fee delta is ERASED for every
   -- tx confirmed by this block (Core removeForBlock → ClearPrioritisation,
   -- txmempool.cpp:405-421, cleared for every block tx whether or not it was
@@ -2400,14 +2443,23 @@ blockConnected mp block = do
         , inp <- txInputs tx
         ]
 
-  entries <- readTVarIO (mpEntries mp)
-  forM_ (Map.toList entries) $ \(txid, entry) -> do
-    let txSpends = Set.fromList $ map txInPrevOutput (txInputs (meTransaction entry))
-    unless (Set.null $ Set.intersection txSpends spentByBlock) $ do
-      removeWithDescendants mp txid
-      -- Core removeConflicts → ClearPrioritisation for the directly
-      -- conflicting tx (txmempool.cpp:388-402; descendants keep theirs).
-      atomically $ modifyTVar' (mpFeeDeltas mp) (Map.delete txid)
+  -- Core removeConflicts walks mapNextTx for each block input
+  -- (txmempool.cpp:388-402): O(block inputs), not O(pool).  The confirmed
+  -- txs are already gone, so any remaining spender of a block-spent
+  -- outpoint is a conflict.  This runs under the chain lock on every
+  -- connect, so it must not scan the whole pool.
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  let conflicting = Set.toList $ Set.fromList $
+        mapMaybe (`Map.lookup` byOutpoint) (Set.toList spentByBlock)
+  forM_ conflicting $ \txid -> do
+    still <- getTransaction mp txid
+    case still of
+      Nothing -> return ()   -- already gone as a descendant of another conflict
+      Just _ -> do
+        removeWithDescendants mp txid
+        -- Core removeConflicts → ClearPrioritisation for the directly
+        -- conflicting tx (txmempool.cpp:388-402; descendants keep theirs).
+        atomically $ modifyTVar' (mpFeeDeltas mp) (Map.delete txid)
 
   -- Update chain height and MTP (BIP-113).
   -- Prepend the new block's timestamp to the rolling window (capped at 11),
@@ -2446,10 +2498,26 @@ blockConnected mp block = do
   _ <- expireOldTransactions mp
   trimToSize mp
 
--- | Handle a disconnected block (during reorg)
--- Re-adds transactions from the disconnected block back to mempool
+-- | Handle one disconnected block on its own: DisconnectTip followed by
+-- MaybeUpdateMempoolForReorg, exactly what Core's InvalidateBlock does for
+-- each block it disconnects (validation.cpp InvalidateBlock).  A multi-block
+-- reorg queues every block with 'addDisconnectedBlock', runs 'blockConnected'
+-- for each connected block and calls 'updateMempoolForReorg' once at the end
+-- (ActivateBestChainStep) -- the chainstate's reorg engine does that through
+-- 'mempoolChainSink'.
 blockDisconnected :: Mempool -> Block -> IO ()
 blockDisconnected mp block = do
+  addDisconnectedBlock mp block
+  updateMempoolForReorg mp
+
+-- | DisconnectTip's half: queue the block's non-coinbase txs in the
+-- disconnect pool (Core disconnectpool->AddTransactionsFromBlock).  Blocks
+-- are disconnected tip first, so each block's txs go IN FRONT of what is
+-- already queued; the pool stays earliest-confirmed first.  The txs are NOT
+-- admitted here: a tx is only re-accepted once the chain has stopped moving
+-- ('updateMempoolForReorg'), so an intermediate tip never judges it.
+addDisconnectedBlock :: Mempool -> Block -> IO ()
+addDisconnectedBlock mp block = do
   -- Decrease chain height and drop the disconnected block's timestamp from
   -- the MTP window. We drop the head (most-recent) and recompute.
   hasSource <- isJustM (mpTipSource mp)
@@ -2458,11 +2526,157 @@ blockDisconnected mp block = do
     modifyTVar' (mpRecentTimestamps mp) safeDropHead
     timestamps <- readTVar (mpRecentTimestamps mp)
     writeTVar (mpMTP mp) (computeMTPFromList timestamps)
+  atomically $ modifyTVar' (mpDisconnectPool mp) (drop 1 (blockTxns block) ++)
 
-  -- Re-add non-coinbase transactions
-  -- (they may fail validation if inputs are now missing)
-  forM_ (tail $ blockTxns block) $ \tx ->
-    void $ addTransaction mp tx
+-- | The disconnect pool, earliest-confirmed first (tests / diagnostics).
+getDisconnectPool :: Mempool -> IO [Tx]
+getDisconnectPool mp = readTVarIO (mpDisconnectPool mp)
+
+-- | Core MaybeUpdateMempoolForReorg (validation.cpp:294-386), run once the
+-- disconnects and connects of a reorg are committed:
+--
+--   1. Re-accept every queued tx EARLIEST FIRST (so a parent is back before
+--      its child) with @bypass_limits@ -- no fee floor, no size eviction,
+--      every other check.  A tx that fails is removeRecursive'd: its
+--      in-mempool descendants (e.g. a child spending an output of a tx the
+--      new chain double-spent) leave too.
+--   2. UpdateTransactionsFromBlock: a re-accepted tx whose children were
+--      already in the pool gets its descendant aggregates back, and those
+--      children their ancestor aggregates.
+--   3. removeForReorg: drop every entry (with descendants) that is no
+--      longer final, sequence-locked, or spending an immature coinbase at
+--      the new tip + 1.
+--   4. LimitMempoolSize.
+--
+-- Callers hold the chain lock (the reorg engine does), so the tip cannot
+-- move under it.
+updateMempoolForReorg :: Mempool -> IO ()
+updateMempoolForReorg mp = do
+  queued <- atomically $ do
+    q <- readTVar (mpDisconnectPool mp)
+    writeTVar (mpDisconnectPool mp) []
+    return q
+  _ <- refreshMempoolTip mp
+  me <- myThreadId
+  readded <- (do
+      atomically $ writeTVar (mpBypassLimitsFor mp) (Just me)
+      fmap catMaybes $ forM queued $ \tx -> do
+        let txid = computeTxId tx
+        present <- isJust' <$> getTransaction mp txid
+        if present
+          then return Nothing
+          else do
+            r <- addTransaction mp tx
+            case r of
+              Right _ -> return (Just txid)
+              Left _  -> do
+                removeRecursiveTx mp tx
+                return Nothing)
+    `finally` atomically (writeTVar (mpBypassLimitsFor mp) Nothing)
+  unless (null readded) $ recomputeAggregates mp readded
+  removeForReorg mp
+  trimToSize mp
+  where
+    isJust' = maybe False (const True)
+
+-- | Core CTxMemPool::removeRecursive for a tx that may itself be absent from
+-- the pool: drop every in-mempool spender of its outputs (with descendants),
+-- then the tx itself if present.
+removeRecursiveTx :: Mempool -> Tx -> IO ()
+removeRecursiveTx mp tx = do
+  let txid = computeTxId tx
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  let children = Set.toList $ Set.fromList $ mapMaybe (`Map.lookup` byOutpoint)
+        [ OutPoint txid (fromIntegral i) | i <- [0 .. length (txOutputs tx) - 1] ]
+  forM_ children $ \c -> do
+    still <- getTransaction mp c
+    case still of
+      Just _  -> removeWithDescendants mp c
+      Nothing -> return ()
+  present <- getTransaction mp txid
+  case present of
+    Just _  -> removeWithDescendants mp txid
+    Nothing -> return ()
+
+-- | Recompute the ancestor / descendant aggregates of every entry related
+-- to the given (re-accepted) txids: the txs, their in-mempool descendants
+-- and those descendants' ancestors.  Core UpdateTransactionsFromBlock: a
+-- tx re-added under children that stayed in the pool must count them, and
+-- they must count it, or ancestor-feerate selection and the package
+-- limits see a parentless child.
+recomputeAggregates :: Mempool -> [TxId] -> IO ()
+recomputeAggregates mp txids = do
+  descs <- concat <$> mapM (getDescendantsRecursive mp) txids
+  let seeds = Set.fromList (txids ++ map meTxId descs)
+  ancs <- concat <$> mapM (\t -> do
+             me' <- getTransaction mp t
+             case me' of
+               Just e  -> getAncestorsRecursive mp (meTransaction e)
+               Nothing -> return []) (Set.toList seeds)
+  let targets = Set.toList (Set.union seeds (Set.fromList (map meTxId ancs)))
+  deltas <- readTVarIO (mpFeeDeltas mp)
+  let modFee e = applyFeeDelta (meFee e) (Map.findWithDefault 0 (meTxId e) deltas)
+  forM_ targets $ \t -> do
+    mE <- getTransaction mp t
+    case mE of
+      Nothing -> return ()
+      Just e -> do
+        as <- getAncestorsRecursive mp (meTransaction e)
+        ds <- getDescendantsOfEntry mp t
+        atomically $ modifyTVar' (mpEntries mp) $ Map.adjust
+          (\x -> x { meAncestorCount   = length as + 1
+                   , meAncestorSize    = sum (map meSize as) + meSize x
+                   , meAncestorFees    = sum (map modFee as) + modFee x
+                   , meDescendantCount = length ds + 1
+                   , meDescendantSize  = sum (map meSize ds) + meSize x
+                   , meDescendantFees  = sum (map modFee ds) + modFee x
+                   }) t
+
+-- | Core CTxMemPool::removeForReorg (txmempool.cpp:360) with the
+-- filter_final_and_mature predicate of MaybeUpdateMempoolForReorg
+-- (validation.cpp:334-385): after the tip moved, remove (with descendants)
+-- every entry that at tip + 1 is non-final (CheckFinalTxAtTip, BIP-113),
+-- sequence-locked (CheckSequenceLocksAtTip, BIP-68) or spends a coinbase
+-- that is immature.  An input that is neither a coin nor an in-mempool
+-- output cannot occur in Core (removeRecursive already took it); here it is
+-- dropped too rather than left to poison a block template.
+removeForReorg :: Mempool -> IO ()
+removeForReorg mp = do
+  (height, mtp) <- refreshMempoolTip mp
+  entries <- readTVarIO (mpEntries mp)
+  bad <- fmap catMaybes $ forM (Map.elems entries) $ \e -> do
+    let tx = meTransaction e
+    if not (isFinalTxCheck tx (height + 1) mtp)
+      then return (Just (meTxId e))
+      else do
+        sl <- checkSeqLocksAtTip mp tx height mtp
+        case sl of
+          Left _ -> return (Just (meTxId e))
+          Right () -> do
+            okInputs <- forM (txInputs tx) $ \inp -> do
+              let op = txInPrevOutput inp
+              if Map.member (outPointHash op) entries
+                then return True
+                else do
+                  mc <- lookupUTXO (mpUTXOCache mp) op
+                  return $ case mc of
+                    Nothing -> False
+                    Just c  -> not (ueCoinbase c && coinbaseImmatureAt height (ueHeight c))
+            return $ if and okInputs then Nothing else Just (meTxId e)
+  forM_ bad $ \t -> do
+    still <- getTransaction mp t
+    case still of
+      Just _  -> removeWithDescendants mp t
+      Nothing -> return ()
+
+-- | The chainstate-facing sink this mempool installs in its 'UTXOCache'
+-- (see 'ChainMempoolSink').
+mempoolChainSink :: Mempool -> ChainMempoolSink
+mempoolChainSink mp = ChainMempoolSink
+  { cmsDisconnected = addDisconnectedBlock mp
+  , cmsConnected    = blockConnected mp
+  , cmsReorgDone    = updateMempoolForReorg mp
+  }
 
 -- | Check BIP-68 sequence locks for mempool admission.
 -- For each input, fetch the coin height from the UTXO set (unconfirmed mempool

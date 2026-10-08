@@ -99,6 +99,7 @@ import qualified PrioritiseTransactionSpec
 import qualified RbfMempoolParentSpec
 import qualified RelayTxNoPunishSpec
 import qualified MempoolActiveTipSpec
+import qualified MempoolReorgSpec
 import qualified FeeFilterRelaySpec
 import qualified ParseHashVSpec
 import qualified CreateRawTxDropSpec
@@ -23772,6 +23773,7 @@ main = hspec $ do
 
   -- mempool reads the ACTIVE tip (height, MTP, coin MTP, maturity, BIP-68)
   MempoolActiveTipSpec.spec
+  MempoolReorgSpec.spec
   FeeFilterRelaySpec.spec
 
   -- W107 CompactSize + VarInt 30-gate audit
