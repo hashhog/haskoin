@@ -75,6 +75,7 @@ import Haskoin.Storage (KeyPrefix(..), prefixByte, makeKey, toBE32, fromBE32,
                          UtxoSnapshot(..), snapshotMagicBytes,
                          snapshotVersion, loadSnapshot, parseSnapshotCoin,
                          dumpTxOutSetFromDB, streamUTXOSnapshotGroups,
+                         dumpTxOutSetFromDBWithHash, computeUtxoHashFromDB,
                          loadSnapshotIntoLegacyUTXO,
                          compressAmount, decompressAmount,
                          putCompressedScript, getCompressedScript,
@@ -19339,6 +19340,34 @@ main = hspec $ do
                        | (OutPoint txid vout, TxOut val scr) <- entries
                        ]
                 got `shouldBe` expected
+
+      it "dumpTxOutSetFromDBWithHash: txoutset_hash == hash_serialized_3 \
+         \of the dumped set (Core WriteUTXOSnapshot)" $
+        withSystemTempDirectory "haskoin-snap-hash" $ \tmp -> do
+          let dbDir = tmp </> "db"
+              snapPath = tmp </> "h.utxo.dat"
+          Dir.createDirectoryIfMissing True dbDir
+          let cfg = (defaultDBConfig dbDir)
+                { dbCreateIfMissing = True, dbCompression = False }
+          bracket (openDB cfg) closeDB $ \db -> do
+            -- vout 256 sorts before vout 1 as LE32 key bytes; Core hashes
+            -- numeric vout order -- both paths must agree.
+            let entries =
+                  [ (OutPoint (mkTxId 0x01) 0,   TxOut 100_000 sampleP2PKH)
+                  , (OutPoint (mkTxId 0x01) 256, TxOut 200_000 sampleP2SH)
+                  , (OutPoint (mkTxId 0x01) 1,   TxOut 250_000 sampleP2SH)
+                  , (OutPoint (mkTxId 0x02) 0,   TxOut 300_000 sampleP2PKCompressed)
+                  , (OutPoint (mkTxId 0x03) 7,   TxOut 999_999 sampleP2PKH)
+                  ]
+            forM_ entries $ \(op, tx) -> putUTXO db op tx
+            want <- computeUtxoHashFromDB db
+            r <- dumpTxOutSetFromDBWithHash db snapPath mainnetMagic
+                   (BlockHash (Hash256 (BS.replicate 32 0x55)))
+            case r of
+              Left e -> expectationFailure $ "dumpTxOutSetFromDBWithHash: " ++ e
+              Right (cnt, h) -> do
+                cnt `shouldBe` 5
+                h `shouldBe` want
 
       it "dumpTxOutSetFromDB streams; does not materialise the coin set" $ do
         -- Revert control for QUEUES.md haskoin item 1. The pre-fix body

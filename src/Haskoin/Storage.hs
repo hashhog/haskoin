@@ -212,6 +212,8 @@ module Haskoin.Storage
   , newSnapshotChainstate
   , writeSnapshot
   , dumpTxOutSetFromDB
+  , dumpTxOutSetFromDBWithHash
+  , getBlockTxCount
   , streamUTXOSnapshotGroups
   , computeUtxoHash
   , computeUtxoMuHash
@@ -3896,7 +3898,24 @@ dumpTxOutSetFromDB :: HaskoinDB
                    -> Word32                 -- ^ network magic (little-endian)
                    -> BlockHash              -- ^ current chain tip
                    -> IO (Either String Word64)
-dumpTxOutSetFromDB db path networkMagic tipHash = do
+dumpTxOutSetFromDB db path networkMagic tipHash =
+  fmap fst <$> dumpTxOutSetFromDBWithHash db path networkMagic tipHash
+
+-- | 'dumpTxOutSetFromDB' that also returns Core's HASH_SERIALIZED digest of
+-- the coins it wrote (the dumptxoutset @txoutset_hash@, == gettxoutsetinfo
+-- @hash_serialized_3@ at the base), computed in the SAME streaming pass so
+-- the label can only describe the bytes in the file (Core
+-- WriteUTXOSnapshot: one cursor feeds both the stats and the file).  Per
+-- coin it hashes 'putTxOutSer' in txid-group / ascending-vout order, the
+-- order 'computeUtxoHashFromDBPrefixWithOpts' uses (kernel/coinstats.cpp
+-- ApplyHash), then SHA256d.
+dumpTxOutSetFromDBWithHash :: HaskoinDB
+                           -> FilePath
+                           -> Word32
+                           -> BlockHash
+                           -> IO (Either String (Word64, Hash256))
+dumpTxOutSetFromDBWithHash db path networkMagic tipHash = do
+  ctxRef <- newIORef (Hash.hashInit :: Hash.Context Hash.SHA256)
   let tmpPath = path <> ".incomplete"
       cleanupTemp = Exc.handle
         (\(_ :: IOException) -> pure ())
@@ -3926,6 +3945,9 @@ dumpTxOutSetFromDB db path networkMagic tipHash = do
                    put (VarInt (fromIntegral vout))
                    putCoreCoin coin
            BS.hPut h body
+           forM_ (Map.toAscList outs) $ \(vout, coin) ->
+             modifyIORef' ctxRef
+               (\c -> Hash.hashUpdate c (runPut (putTxOutSer (OutPoint tid vout) coin)))
          -- Patch coins_count (trailing Word64le of the 51-byte header).
          hSeek h AbsoluteSeek (fromIntegral (BS.length header - 8))
          BS.hPut h (runPut (putWord64le n))
@@ -3949,7 +3971,23 @@ dumpTxOutSetFromDB db path networkMagic tipHash = do
     Left (e :: IOException) -> do
       cleanupTemp
       return $ Left $ "Failed to write snapshot: " ++ show e
-    Right n -> return $ Right n
+    Right n -> do
+      innerCtx <- readIORef ctxRef
+      let innerBS = BS.pack (BA.unpack (Hash.hashFinalize innerCtx))
+          outer   = Hash.hashFinalize
+                      (Hash.hashUpdate (Hash.hashInit :: Hash.Context Hash.SHA256) innerBS)
+      return $ Right (n, Hash256 (BS.pack (BA.unpack outer)))
+
+-- | Transaction count of a stored block body, read from the header and the
+-- tx-count compact size without decoding the transactions (Core: the block
+-- index's nTx).  'Nothing' when no body is stored.
+getBlockTxCount :: HaskoinDB -> BlockHash -> IO (Maybe Word64)
+getBlockTxCount db bh = do
+  let key = makeKey PrefixBlockData (encode bh)
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= \raw ->
+    either (const Nothing) Just
+      (runGet (getBytes 80 >> (getVarInt <$> get)) raw)
 
 -- | Serialize coins grouped by txid using Bitcoin Core's snapshot format.
 --

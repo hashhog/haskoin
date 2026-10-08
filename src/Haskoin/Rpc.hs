@@ -465,7 +465,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          pruneConfigAutoTarget, pruneTargetManual,
                          calculateCurrentUsage,
                          loadSnapshot, SnapshotMetadata(..), UtxoSnapshot(..),
-                         dumpTxOutSetFromDB,
+                         dumpTxOutSetFromDB, dumpTxOutSetFromDBWithHash, getBlockTxCount,
                          AssumeUtxoData(..), verifySnapshot,
                          buildSpentUtxoMapFromDB,
                          getUndoData, UndoData(..), TxUndo(..), TxInUndo(..), BlockUndo(..),
@@ -14674,19 +14674,30 @@ handleDumpTxOutSet server params = do
                              tip entries
   where
     doDump path magic baseHeight baseHash status = do
-      result <- dumpTxOutSetFromDB (rsDB server) path magic baseHash
+      result <- dumpTxOutSetFromDBWithHash (rsDB server) path magic baseHash
       case result of
         Left err -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInternalError (T.pack err)) Null
-        Right cnt ->
+        Right (cnt, hashSer) -> do
+          ents <- readTVarIO (hcEntries (rsHeaderChain server))
+          nChainTx <- chainTxCountAt (rsDB server) (rsNetwork server) ents baseHash
           return $ RpcResponse
-            (object [ "coins_written"   .= cnt
-                    , "base_hash"       .= showHash baseHash
-                    , "base_height"     .= baseHeight
-                    , "path"            .= T.pack path
-                    , "rollback_status" .= (status :: Text)
-                    ])
+            (dumpResultObject cnt baseHash baseHeight path hashSer nChainTx status)
             Null Null
+
+    -- Core WriteUTXOSnapshot result (rpc/blockchain.cpp): coins_written,
+    -- base_hash, base_height, path, txoutset_hash (= hashSerialized of the
+    -- base, == gettxoutsetinfo hash_serialized_3), nchaintx
+    -- (= base->m_chain_tx_count).  rollback_status is haskoin-only.
+    dumpResultObject cnt baseHash baseHeight path hashSer nChainTx status =
+      object [ "coins_written"   .= cnt
+             , "base_hash"       .= showHash baseHash
+             , "base_height"     .= baseHeight
+             , "path"            .= T.pack path
+             , "txoutset_hash"   .= showHash256 hashSer
+             , "nchaintx"        .= nChainTx
+             , "rollback_status" .= (status :: Text)
+             ]
 
     -- Build the path of blocks from tip back to target (exclusive of
     -- target, inclusive of tip), walking 'cePrev'. Returns the list
@@ -14776,7 +14787,7 @@ handleDumpTxOutSet server params = do
                   -- rewound to the dump base here.
                   hookPoint "dump.rewound"
                   -- Dump at the rewound state.
-                  dumpRes <- dumpTxOutSetFromDB db path magic baseHash
+                  dumpRes <- dumpTxOutSetFromDBWithHash db path magic baseHash
                   -- Replay blocks back to the original tip regardless
                   -- of whether the dump itself errored — leaving the
                   -- chainstate in a half-rewound state would be worse.
@@ -14797,15 +14808,11 @@ handleDumpTxOutSet server params = do
                         (T.pack ("dumptxoutset rollback replay failed: "
                                  <> rErr <> " — chainstate may be "
                                  <> "inconsistent, restart to recover"))) Null
-                    (Right cnt, Right ()) ->
+                    (Right (cnt, hashSer), Right ()) -> do
+                      nChainTx <- chainTxCountAt db net entries baseHash
                       return $ RpcResponse
-                        (object
-                          [ "coins_written"   .= cnt
-                          , "base_hash"       .= showHash baseHash
-                          , "base_height"     .= baseHeight
-                          , "path"            .= T.pack path
-                          , "rollback_status" .= ("rollback" :: Text)
-                          ])
+                        (dumpResultObject cnt baseHash baseHeight path hashSer
+                           nChainTx "rollback")
                         Null Null
 
     -- Pre-flight check: every block in the rewind path must have its
@@ -15036,6 +15043,30 @@ stripTrailingZeros s =
 -- Core's local RPC port -- removed, R3.)
 fetchNTxForBlock :: RpcServer -> BlockHash -> IO Int
 fetchNTxForBlock server bh = nTxFromStoredBody <$> getBlock (rsDB server) bh
+
+-- | Core @CBlockIndex::m_chain_tx_count@ of an active-chain block: the
+-- cumulative tx count genesis..=block, 0 when unknown (Core's sentinel).
+-- Walks down via 'cePrev' summing each stored body's tx count until an
+-- anchor -- genesis (1 tx) or a static assumeUTXO base carrying a
+-- chainparams count (node/blockstorage.cpp seeds
+-- @base->m_chain_tx_count = au_data.m_chain_tx_count@).  A missing entry or
+-- body (below an un-backfilled snapshot base) means unknown -> 0.
+chainTxCountAt :: HaskoinDB -> Network -> Map BlockHash ChainEntry -> BlockHash
+               -> IO Word64
+chainTxCountAt db net ents = go 0
+  where
+    go !acc bh = case Map.lookup bh ents of
+      Nothing -> return 0
+      Just ce
+        | ceHeight ce == 0 -> return (acc + 1)
+        | Just au <- assumeUtxoForBlockHash net bh
+        , aupHeight au == ceHeight ce
+        , aupChainTxCount au /= 0 -> return (acc + aupChainTxCount au)
+        | otherwise -> do
+            mN <- getBlockTxCount db bh
+            case (mN, cePrev ce) of
+              (Just n, Just prevH) | n > 0 -> go (acc + n) prevH
+              _ -> return 0
 
 -- | Pure core of 'fetchNTxForBlock': the tx count of a stored body, 0 if absent.
 nTxFromStoredBody :: Maybe Block -> Int
