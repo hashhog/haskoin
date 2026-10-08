@@ -96,7 +96,8 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            computeBlockVersionFromChain,
                            taprootDeployment,
                            bumpTipGen,
-                           getMtpAtHeightFromEntries, getMtpFromAncestry)
+                           getMtpAtHeightFromEntries, getMtpFromAncestry,
+                           isFailedStatus)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.TestHooks (hookPoint)
 import Haskoin.ChainLock (withChainLock)
@@ -637,7 +638,34 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
   -- (there 'hcTip' == PrefixBestBlock, since the active-tip arm below
   -- advances both), and restores Core's semantics everywhere else.
   tip <- getValidatedChainTip db hc
-  case Map.lookup prevHash entries of
+  invalidated <- readTVarIO (hcInvalidated hc)
+  -- INV-SUBMIT (fleet conformance 2026-10-08): Core's answers for a block it
+  -- already knows, checked BEFORE any validation or connect.
+  --   * index entry BLOCK_FAILED_MASK (invalidateblock'd, a descendant of one,
+  --     or a block that failed validation) -> AcceptBlockHeader returns
+  --     state.Invalid(BLOCK_CACHED_INVALID, "duplicate-invalid")
+  --     (validation.cpp AcceptBlockHeader; submitblock's StateCatcher hands
+  --     the reason back, rpc/mining.cpp submitblock -> BIP22ValidationResult).
+  --     Pre-fix the active-tip arm below re-validated the invalidated block
+  --     against the rewound tip and CONNECTED it (tip 294 -> 295, answer null).
+  --   * a block already on the active chain -> AcceptBlock's fAlreadyHave,
+  --     ProcessNewBlock new_block=false, submitblock "duplicate"
+  --     (rpc/mining.cpp:1097).  Pre-fix it fell into the side-branch arm.
+  --   * a NEW block whose parent is failed -> AcceptBlockHeader
+  --     "bad-prevblk" (BLOCK_INVALID_PREV); never connected.
+  let failedOrInvalidated ce =
+        isFailedStatus (ceStatus ce) || Set.member (ceHash ce) invalidated
+      -- bounded walk: tip back to the known block's height (not to genesis)
+      onActive known = go tip
+        where go ce | ceHeight ce < ceHeight known = False
+                    | ceHeight ce == ceHeight known = ceHash ce == ceHash known
+                    | otherwise = maybe False go (cePrev ce >>= (`Map.lookup` entries))
+  case Map.lookup bh entries of
+   Just known
+    | failedOrInvalidated known -> return (Left "duplicate-invalid")
+    | onActive known -> return (Left "duplicate")
+   _ -> case Map.lookup prevHash entries of
+    Just parentCe | failedOrInvalidated parentCe -> return (Left "bad-prevblk")
     Nothing -> return $ Left $
       "Block validation failed: parent " ++ show prevHash ++
       " not in block index"

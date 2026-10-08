@@ -295,8 +295,8 @@ spec = do
     ---------------------------------------------------------------------------
     -- BUG-5b: reconsiderBlock doesn't clear ancestors
     ---------------------------------------------------------------------------
-    describe "BUG-5b: reconsiderBlock does not clear ancestor FAILED_CHILD marks" $ do
-      it "reconsidering h2 leaves parent h1 as StatusInvalid" $ do
+    describe "BUG-5b (FIXED 2026-10-08): reconsiderBlock clears failed ANCESTORS too" $ do
+      it "reconsidering h2 clears parent h1 (Core ResetBlockFailureFlags)" $ do
         hc <- freshChain
         let h1 = mkBlockHash 30
             h2 = mkBlockHash 31
@@ -315,9 +315,9 @@ spec = do
                   (error "no db")
                   hc Nothing h2
         entries <- readTVarIO (hcEntries hc)
-        -- BUG: h1 should be cleared by Core's ancestor walk, but haskoin
-        -- only calls findDescendants(h2) which does NOT include h1
-        fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusInvalid
+        -- Core's ancestor walk clears h1 as well (in memory before any DB
+        -- access, so the "no db" sentinel does not hide it).
+        fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusHeaderValid
 
     ---------------------------------------------------------------------------
     -- BUG-6: reconsidered entries become StatusHeaderValid tip candidates

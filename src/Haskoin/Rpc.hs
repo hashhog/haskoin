@@ -5502,7 +5502,7 @@ bip22ResultString err
   -- (:3955), bad-cb-length (consensus/tx_check.cpp), bad-txns-duplicate —
   -- Consensus.hs now emits several of these verbatim and they previously fell
   -- through to the generic "rejected" (bwmc A2/A5/A6 divergences).
-  | err `elem` ["duplicate", "inconclusive", "duplicate-invalid",
+  | err `elem` ["duplicate", "inconclusive", "duplicate-invalid", "bad-prevblk",
                 "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
                 "bad-witness-nonce-size", "unexpected-witness",
                 "bad-blk-length", "bad-cb-missing", "bad-cb-multiple",
