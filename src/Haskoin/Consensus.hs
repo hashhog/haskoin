@@ -9464,17 +9464,20 @@ reconsiderBlock net cache db hc mIdxMgr blockHash = do
           -- fork point until a peer re-sent the blocks).  Re-activation
           -- still fully re-validates each block ('reorgConnectIncremental').
           forM_ descendants $ \ce -> do
+            -- Clear the failure first (header-valid), then upgrade a block
+            -- whose body is on disk to the have-data state + candidate.
+            atomically $ modifyTVar' (hcEntries hc) $
+              Map.adjust (\e -> e { ceStatus = StatusHeaderValid }) (ceHash ce)
             haveData <- isJust <$> getBlock db (ceHash ce)
             let st = if haveData then StatusValid else StatusHeaderValid
-            atomically $ do
+            when haveData $ atomically $ do
               modifyTVar' (hcEntries hc) $
-                Map.adjust (\e -> e { ceStatus = st }) (ceHash ce)
-              when haveData $ do
-                ents <- readTVar (hcEntries hc)
-                case Map.lookup (ceHash ce) ents of
-                  Just ce' -> modifyTVar' (hcCandidates hc)
-                                (Set.insert (mkCandidateKey ce'))
-                  Nothing  -> return ()
+                Map.adjust (\e -> e { ceStatus = StatusValid }) (ceHash ce)
+              ents <- readTVar (hcEntries hc)
+              case Map.lookup (ceHash ce) ents of
+                Just ce' -> modifyTVar' (hcCandidates hc)
+                              (Set.insert (mkCandidateKey ce'))
+                Nothing  -> return ()
             -- Persist status
             putBlockStatus db (ceHash ce) st
 
