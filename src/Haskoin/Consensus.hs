@@ -8973,20 +8973,20 @@ invalidateBlock net cache db hc mIdxMgr blockHash = do
   -- InvalidateBlock :3521 under cs_main).  Taken there, not here, so the header-only
   -- early exits stay usable without a coins cache.
   entries <- readTVarIO (hcEntries hc)
-  -- HK-12: "on the active chain" is judged against the CONNECTED tip
-  -- (PrefixBestBlock; Core m_chain.Tip(), InvalidateBlock walks
-  -- m_chain.Contains), not the best header 'hcTip'.  With headers ahead on
-  -- another branch the old test called a connected block "off-chain" and
-  -- only marked it, leaving a failed block inside the active chain.
-  -- 'getValidatedChainTip' falls back to hcTip when there is no best block.
-  tip <- getValidatedChainTip db hc
-
+  -- Core order (validation.cpp InvalidateBlock, rpc/blockchain.cpp):
+  -- LookupBlockIndex misses and nHeight == 0 return BEFORE any chain walk.
+  -- Only a block that exists and is not genesis needs the connected tip.
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (InvalidateBlockNotFound blockHash)
     Just entry
-      -- Cannot invalidate genesis block
       | ceHeight entry == 0 -> return $ Left InvalidateGenesis
       | otherwise -> do
+          -- HK-12: "on the active chain" is Core m_chain.Contains, judged
+          -- against the CONNECTED tip (PrefixBestBlock), not the best header
+          -- 'hcTip'.  Headers ahead on another branch used to call a connected
+          -- block "off-chain" and only mark it.  'getValidatedChainTip' falls
+          -- back to hcTip when PrefixBestBlock is unset.
+          tip <- getValidatedChainTip db hc
           -- Find all descendants (including this block)
           descendants <- findDescendants hc blockHash
 
