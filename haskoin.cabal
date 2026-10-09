@@ -271,6 +271,7 @@ test-suite haskoin-test
                , P2AScriptClassifySpec
                , WitnessProgramCanonicalSpec
                , SubmitBlockValidatedForkSpec
+               , InvalidatedSubmitSpec
                , CoinCacheResurrectionSpec
                , CacheBookkeepingSpec
                , ChainLockSpec

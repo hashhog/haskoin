@@ -8973,14 +8973,20 @@ invalidateBlock net cache db hc mIdxMgr blockHash = do
   -- InvalidateBlock :3521 under cs_main).  Taken there, not here, so the header-only
   -- early exits stay usable without a coins cache.
   entries <- readTVarIO (hcEntries hc)
-  tip <- readTVarIO (hcTip hc)
-
+  -- Core order (validation.cpp InvalidateBlock, rpc/blockchain.cpp):
+  -- LookupBlockIndex misses and nHeight == 0 return BEFORE any chain walk.
+  -- Only a block that exists and is not genesis needs the connected tip.
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (InvalidateBlockNotFound blockHash)
     Just entry
-      -- Cannot invalidate genesis block
       | ceHeight entry == 0 -> return $ Left InvalidateGenesis
       | otherwise -> do
+          -- HK-12: "on the active chain" is Core m_chain.Contains, judged
+          -- against the CONNECTED tip (PrefixBestBlock), not the best header
+          -- 'hcTip'.  Headers ahead on another branch used to call a connected
+          -- block "off-chain" and only mark it.  'getValidatedChainTip' falls
+          -- back to hcTip when PrefixBestBlock is unset.
+          tip <- getValidatedChainTip db hc
           -- Find all descendants (including this block)
           descendants <- findDescendants hc blockHash
 
@@ -9070,7 +9076,12 @@ invalidateBlock net cache db hc mIdxMgr blockHash = do
 
           -- Add to manually-invalidated set only on success
           case result of
-            Right () -> atomically $ modifyTVar' (hcInvalidated hc) (Set.insert blockHash)
+            Right () -> do
+              atomically $ modifyTVar' (hcInvalidated hc) (Set.insert blockHash)
+              -- Core InvalidChainFound -> RecalculateBestHeader: the best
+              -- header leaves the failed branch (the disconnect above left
+              -- hcTip at the fork, dropping any valid header-only branch).
+              recalculateBestHeader db hc
             Left _   -> return ()
 
           return result
@@ -9418,73 +9429,120 @@ findBestCandidate hc = do
             Just par -> descendsFrom ents par target
 
 -- | Reconsider a previously invalidated block.
--- Reference: bitcoin/src/validation.cpp Chainstate::ResetBlockFailureFlags
+-- Reference: bitcoin-core/src/rpc/blockchain.cpp ReconsiderBlock ->
+--   Chainstate::ResetBlockFailureFlags (validation.cpp) +
+--   ChainstateManager::RecalculateBestHeader, then ActivateBestChain.
 --
--- This function:
---   1. Removes the invalid mark from the block and all its descendants
---   2. Removes the block from the manually-invalidated set
---   3. Re-validates blocks if needed
---   4. May activate the reconsidered chain if it has more work
+-- Core, under cs_main (the caller holds 'withChainLock'):
+--   1. clear BLOCK_FAILED_* on the block, every DESCENDANT and every
+--      ANCESTOR (reconsidering a child of an invalidated block clears the
+--      invalidated ancestor too); each one with data re-enters
+--      setBlockIndexCandidates;
+--   2. RecalculateBestHeader — the best header moves back onto the branch;
+--   3. ActivateBestChain — the stored bodies are connected NOW, so the tip
+--      returns to the branch's downloaded prefix before the RPC returns.
+--   A block that is not failed is a successful no-op (Core never errors).
 --
--- Returns Left on error, Right on success.
+-- Pre-fix (fleet conformance INV-RECONSIDER, 2026-10-08): only the block and
+-- its descendants were reset, to StatusHeaderValid, with no candidate
+-- re-insert, no best-header recompute (hcByHeight above the connected tip
+-- kept naming nothing at the reconsidered heights, so the block kicker had
+-- ONE hash for heights 295..302 and never fetched 301) and an
+-- 'activateBestChain' that only follows StatusValid candidates — the node
+-- stayed at the invalidation point (294) even after a peer announced 302.
 reconsiderBlock :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
                 -> Maybe IndexManager
                 -> BlockHash -> IO (Either InvalidateError ())
 reconsiderBlock net cache db hc mIdxMgr blockHash = do
   -- HK-3: the caller holds the chain lock (the RPC handlers take it; Core:
-  -- ReconsiderBlock / ActivateBestChain under cs_main).  Taken there, not here, so the header-only
-  -- early exits stay usable without a coins cache.
+  -- ReconsiderBlock / ActivateBestChain under cs_main).
   entries <- readTVarIO (hcEntries hc)
   invalidated <- readTVarIO (hcInvalidated hc)
-
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (ReconsiderBlockNotFound blockHash)
-    Just entry
-      | not (isFailedStatus (ceStatus entry)) && not (Set.member blockHash invalidated) ->
-          -- Block isn't actually invalid
-          return $ Left (ReconsiderNotInvalidated blockHash)
-      | otherwise -> do
-          -- Find all descendants (including this block)
-          descendants <- findDescendants hc blockHash
+    Just entry -> do
+      descendants <- findDescendants hc blockHash   -- includes the block
+      let failed ce = isFailedStatus (ceStatus ce) || Set.member (ceHash ce) invalidated
+          -- A failed block's descendants are all failed, so the failed
+          -- ancestors form one contiguous run directly above the block.
+          ancestors = go (cePrev entry)
+            where go mh = case mh >>= (`Map.lookup` entries) of
+                    Just p | failed p -> p : go (cePrev p)
+                    _ -> []
+          affected = filter failed (ancestors ++ descendants)
+      -- Clear in memory first (one STM transaction), as invalidateBlock marks.
+      atomically $ do
+        modifyTVar' (hcEntries hc) $ \m ->
+          foldl' (\acc ce -> Map.adjust (\e -> e { ceStatus = StatusHeaderValid }) (ceHash ce) acc)
+                 m affected
+        modifyTVar' (hcInvalidated hc) $ \s0 ->
+          foldl' (\acc ce -> Set.delete (ceHash ce) acc) s0 (ancestors ++ descendants)
+      -- BLOCK_HAVE_DATA: a body on disk makes the entry a full candidate again
+      -- (haskoin: StatusValid, the status 'findBestCandidate' and the reload
+      -- path use; Core re-inserts it into setBlockIndexCandidates); a
+      -- header-only entry stays StatusHeaderValid.
+      restored <- forM affected $ \ce -> do
+        hasBody <- isJust <$> getBlock db (ceHash ce)
+        return (ce, if hasBody then StatusValid else StatusHeaderValid)
+      atomically $ do
+        modifyTVar' (hcEntries hc) $ \m ->
+          foldl' (\acc (ce, st) -> Map.adjust (\e -> e { ceStatus = st }) (ceHash ce) acc)
+                 m restored
+        modifyTVar' (hcCandidates hc) $ \cs ->
+          foldl' (\acc (ce, st) -> if st == StatusValid
+                                     then Set.insert (mkCandidateKey ce) acc
+                                     else acc)
+                 cs restored
+      forM_ restored $ \(ce, st) -> putBlockStatus db (ceHash ce) st
+      -- Core RecalculateBestHeader.
+      recalculateBestHeader db hc
+      -- Core ActivateBestChain: connect the downloaded prefix of the best
+      -- header chain (one step per block, script-verifying; a verdict marks
+      -- that block failed and stops there — Core's loop).
+      activateDownloadedPrefix net cache db hc mIdxMgr
+      return (Right ())
 
-          -- Remove from manually-invalidated set first, so the candidate
-          -- gate below sees the block as no longer invalidated.
-          atomically $ modifyTVar' (hcInvalidated hc) (Set.delete blockHash)
-
-          -- Remove invalid marks from all descendants.  Core
-          -- ResetBlockFailureFlags (validation.cpp) clears BLOCK_FAILED_* and
-          -- puts every reset block that has its data (IsValid(
-          -- BLOCK_VALID_TRANSACTIONS) && HaveNumChainTxs) back into
-          -- setBlockIndexCandidates, so the ActivateBestChain below can
-          -- re-activate it.  haskoin's "have data" state is 'StatusValid'
-          -- (the candidate gate in 'findBestCandidate'); a body on disk is
-          -- that state.  Pre-fix every reset block went to StatusHeaderValid
-          -- and none re-entered 'hcCandidates', so reconsiderblock never
-          -- re-activated the chain it un-invalidated (the node stayed on the
-          -- fork point until a peer re-sent the blocks).  Re-activation
-          -- still fully re-validates each block ('reorgConnectIncremental').
-          forM_ descendants $ \ce -> do
-            -- Clear the failure first (header-valid), then upgrade a block
-            -- whose body is on disk to the have-data state + candidate.
-            atomically $ modifyTVar' (hcEntries hc) $
-              Map.adjust (\e -> e { ceStatus = StatusHeaderValid }) (ceHash ce)
-            haveData <- isJust <$> getBlock db (ceHash ce)
-            let st = if haveData then StatusValid else StatusHeaderValid
-            when haveData $ atomically $ do
-              modifyTVar' (hcEntries hc) $
-                Map.adjust (\e -> e { ceStatus = StatusValid }) (ceHash ce)
-              ents <- readTVar (hcEntries hc)
-              case Map.lookup (ceHash ce) ents of
-                Just ce' -> modifyTVar' (hcCandidates hc)
-                              (Set.insert (mkCandidateKey ce'))
-                Nothing  -> return ()
-            -- Persist status
-            putBlockStatus db (ceHash ce) st
-
-          -- Try to activate the best chain (may include reconsidered blocks);
-          -- index-aware so any reorg keeps the secondary indexes in sync.
-          activateBestChain net cache db hc mIdxMgr
-          return (Right ())
+-- | Core ActivateBestChain from the CONNECTED tip (PrefixBestBlock) toward the
+-- best header: connect every contiguous stored body that adds work.  Bodies
+-- that are not on disk end the prefix (the block kicker fetches them; Core's
+-- FindMostWorkChain skips a candidate with missing data the same way).
+-- The reorg itself is 'performReorgActivating' -> 'reorgAtomic', so a
+-- reconnect updates the mempool (DisconnectTip / ConnectTip /
+-- MaybeUpdateMempoolForReorg) the same way an invalidate or a side-branch
+-- reorg does.  Caller holds the chain lock.
+activateDownloadedPrefix :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                         -> Maybe IndexManager -> IO ()
+activateDownloadedPrefix net cache db hc mIdxMgr = do
+  mDisk <- getBestBlockHash db
+  entries <- readTVarIO (hcEntries hc)
+  best <- readTVarIO (hcTip hc)
+  case mDisk >>= (`Map.lookup` entries) of
+    Just diskCe | ceChainWork best > ceChainWork diskCe
+                , not (isFailedStatus (ceStatus best)) -> do
+      mFork <- findForkPoint hc (ceHash diskCe) (ceHash best)
+      case mFork of
+        Nothing -> return ()
+        Just fork -> case heavierBranchHashes entries (ceHash fork) (ceHash best) of
+          Nothing -> return ()
+          Just hs -> do
+            let takeStored [] = return []
+                takeStored (h:rest) = do
+                  have <- isJust <$> getBlock db h
+                  if have then (h :) <$> takeStored rest else return []
+            present <- takeStored hs
+            let haveSet = Set.fromList present
+            case connectableForkTip entries (ceHash fork) (ceHash best)
+                                    (ceHash diskCe) (`Set.member` haveSet) of
+              Nothing -> return ()
+              Just t -> do
+                r <- performReorgActivating net cache db hc mIdxMgr (ceHash diskCe) t
+                case r of
+                  Left err -> hPutStrLn stderr $
+                    "reconsiderblock: ActivateBestChain stopped: " ++ err
+                  Right () -> return ()
+                -- the reorg moved hcTip to t; the best header may be above it
+                recalculateBestHeader db hc
+    _ -> return ()
 
 --------------------------------------------------------------------------------
 -- preciousblock — mark a block as preferred in equal-work chain selection

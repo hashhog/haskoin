@@ -3445,10 +3445,10 @@ handleInvalidateBlock server params = do
 -- Parameters:
 --   blockhash (required): The hash of the block to reconsider
 -- Returns:
---   null on success
+--   null on success, including a block that is not failed (Core's
+--   ResetBlockFailureFlags + ActivateBestChain is a successful no-op)
 -- Errors:
 --   -5: Block not found
---   -8: Block was not previously invalidated
 handleReconsiderBlock :: RpcServer -> Value -> IO RpcResponse
 handleReconsiderBlock server params = do
   case extractParamText params 0 of
@@ -5502,7 +5502,7 @@ bip22ResultString err
   -- (:3955), bad-cb-length (consensus/tx_check.cpp), bad-txns-duplicate —
   -- Consensus.hs now emits several of these verbatim and they previously fell
   -- through to the generic "rejected" (bwmc A2/A5/A6 divergences).
-  | err `elem` ["duplicate", "inconclusive", "duplicate-invalid",
+  | err `elem` ["duplicate", "inconclusive", "duplicate-invalid", "bad-prevblk",
                 "high-hash", "bad-txnmrklroot", "bad-witness-merkle-match",
                 "bad-witness-nonce-size", "unexpected-witness",
                 "bad-blk-length", "bad-cb-missing", "bad-cb-multiple",
