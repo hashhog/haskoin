@@ -3445,10 +3445,10 @@ handleInvalidateBlock server params = do
 -- Parameters:
 --   blockhash (required): The hash of the block to reconsider
 -- Returns:
---   null on success
+--   null on success, including a block that is not failed (Core's
+--   ResetBlockFailureFlags + ActivateBestChain is a successful no-op)
 -- Errors:
 --   -5: Block not found
---   -8: Block was not previously invalidated
 handleReconsiderBlock :: RpcServer -> Value -> IO RpcResponse
 handleReconsiderBlock server params = do
   case extractParamText params 0 of
