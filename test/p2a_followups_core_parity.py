@@ -361,30 +361,40 @@ def compare_scantxoutset(core, hask):
 def compare_wallet_p2a(core, hask):
     addr = "bcrt1pfeesnyr2tx"
     desc = DESCS["p2a"]
+    # addr() has no private key. Core refuses that import into a wallet
+    # that still has private keys enabled, so both wallets are watch-only.
     for node, rpc in (("core", core), ("haskoin", hask)):
         try:
-            rpc.call("createwallet", ["p2a-parity"])
-        except RpcError as exc:
+            rpc.call("createwallet", ["p2a-parity", True])
+        except (RpcError, RuntimeError) as exc:
             record("notrun", "wallet %s createwallet" % node, str(exc))
             return
+    # timestamp 0 rescans the anchor coinbase already mined above.
+    # "now" would skip it.
     try:
         c_imp = core.call(
             "importdescriptors",
-            [[{"desc": desc, "timestamp": "now"}]],
+            [[{"desc": desc, "timestamp": 0}]],
         )
-    except RpcError as exc:
+    except (RpcError, RuntimeError) as exc:
         record("notrun", "wallet core importdescriptors", str(exc))
         c_imp = None
     try:
         h_imp = hask.call(
             "importdescriptors",
-            [[{"desc": desc, "timestamp": "now"}]],
+            [[{"desc": desc, "timestamp": 0}]],
         )
-    except RpcError as exc:
+    except (RpcError, RuntimeError) as exc:
         record("notrun", "wallet haskoin importdescriptors", str(exc))
         h_imp = None
     if c_imp is not None and h_imp is not None:
         compare_value("importdescriptors success", _import_ok(c_imp), _import_ok(h_imp))
+        if not (_import_ok(c_imp) is True and _import_ok(h_imp) is True):
+            compare_value(
+                "importdescriptors error",
+                _import_err(c_imp),
+                _import_err(h_imp),
+            )
     for method, params in (
         ("getaddressinfo", [addr]),
         ("validateaddress", [addr]),
@@ -409,11 +419,19 @@ def compare_wallet_p2a(core, hask):
             )
         else:
             record("match", "wallet %s omits witness_version" % method, "absent")
+    # Coinbase maturity is 100. One more hundred blocks makes the
+    # anchor coinbase from scantxoutset spendable, so listunspent can
+    # show its address. Later coinbases to the same address stay immature.
+    try:
+        core.call("generatetoaddress", [100, addr])
+        hask.call("generatetoaddress", [100, addr])
+    except (RpcError, RuntimeError) as exc:
+        record("notrun", "wallet mature anchor", str(exc))
     # listunspent address, if either wallet saw the mined anchor.
     try:
-        c_u = core.call("listunspent", [0, 9999999, [addr]])
-        h_u = hask.call("listunspent", [0, 9999999, [addr]])
-    except RpcError as exc:
+        c_u = core.call("listunspent", [1, 9999999, [addr]])
+        h_u = hask.call("listunspent", [1, 9999999, [addr]])
+    except (RpcError, RuntimeError) as exc:
         record("notrun", "wallet listunspent", str(exc))
         return
     c_addrs = sorted({u.get("address") for u in c_u}) if isinstance(c_u, list) else None
@@ -428,6 +446,14 @@ def _import_ok(result):
     if isinstance(result, list) and result:
         return bool(result[0].get("success"))
     return result
+
+
+def _import_err(result):
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        err = result[0].get("error") or {}
+        if isinstance(err, dict):
+            return err.get("message")
+    return None
 
 
 def main():
