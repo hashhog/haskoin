@@ -54,7 +54,8 @@ import Data.Word (Word32, Word64)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
 import Control.Monad (forM, forM_, foldM, void, unless, when)
-import Data.List (stripPrefix)
+import Data.List (stripPrefix, foldl')
+import Data.Maybe (mapMaybe)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef')
 import System.IO.Unsafe (unsafePerformIO)
 import Control.Monad (join)
@@ -110,7 +111,8 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
 import Haskoin.Index (IndexManager, indexManagerConnectBlock,
                        indexManagerDisconnectBlock)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), selectTransactions,
-                         blockDisconnected, blockConnected, checkSeqLocksAtTip)
+                         blockConnected, checkSeqLocksAtTip,
+                         addDisconnectedBlock, updateMempoolForReorg)
 import Haskoin.Network (PeerManager, broadcastMessage, enqueueBackgroundSend, Message(..),
                          Inv(..), InvVector(..), InvType(..))
 
@@ -275,7 +277,8 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
   -- cost alone would exceed the limit is always invalid, so we drop those txs
   -- here and skip any tx that would push the running total over 80k. See
   -- node/miner.cpp:239-247 (TestChunkBlockLimits) for Core's analogous gate.
-  let finalEntries = selectWithinSigopBudget mtpFinalEntries
+  poolIds <- Map.keysSet <$> readTVarIO (mpEntries mp)
+  let finalEntries = orderForBlock poolIds (selectWithinSigopBudget mtpFinalEntries)
 
   -- Build template transactions with dependency tracking
   let txIdSet = Set.fromList $ map meTxId finalEntries
@@ -323,10 +326,32 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
     }
 
 -- | Check if a mempool entry is final at the given height and time
--- | All but the last element ([] for []).
-dropLast :: [a] -> [a]
-dropLast [] = []
-dropLast xs = init xs
+
+-- | Make the selected entries a valid block body: drop every entry with an
+-- in-mempool parent that is not in the template (the weight / sigop passes
+-- can skip a parent and keep its child: bad-txns-inputs-missingorspent),
+-- with its descendants, then order parents before children.  Selection
+-- sorts by ancestor feerate, which does not order a high-fee child (CPFP,
+-- or a parent re-added after a reorg with the same feerate as its child)
+-- after its parent; Core's BlockAssembler adds a package's ancestors first
+-- (node/miner.cpp addPackageTxs / SortForBlock).
+orderForBlock :: Set TxId -> [MempoolEntry] -> [MempoolEntry]
+orderForBlock poolIds es0 =
+  let selIds = Set.fromList (map meTxId es0)
+      parents e = [ outPointHash (txInPrevOutput i) | i <- txInputs (meTransaction e) ]
+      orphaned = Set.fromList
+        [ meTxId e | e <- es0
+        , any (\p -> Set.member p poolIds && not (Set.member p selIds)) (parents e) ]
+      es = dropWithDescendants orphaned es0
+      byId = Map.fromList [ (meTxId e, e) | e <- es ]
+      visit (seen, acc) e
+        | Set.member (meTxId e) seen = (seen, acc)
+        | otherwise =
+            let seen1 = Set.insert (meTxId e) seen
+                ps = mapMaybe (`Map.lookup` byId) (parents e)
+                (seen2, acc2) = foldl' visit (seen1, acc) ps
+            in (seen2, e : acc2)
+  in reverse (snd (foldl' visit (Set.empty, []) es))
 
 -- | Remove the entries in @bad@ and, transitively, every entry spending an
 -- output of a removed entry.
@@ -1237,10 +1262,23 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock newWork = do
                     -- blockConnected is run by submitBlock's caller (the
                     -- submitblock / generate RPC arms), so it is skipped
                     -- here to keep it single.
-                    forM_ (dropLast connectList) $ \blk ->
-                      blockConnected mp blk
+                    --
+                    -- The disconnected txs go to the disconnect pool FIRST
+                    -- (DisconnectTip), every connected block -- the new tip
+                    -- included, so the re-accept below runs against the
+                    -- final pool -- does removeForBlock (ConnectTip), then
+                    -- MaybeUpdateMempoolForReorg re-accepts the pool
+                    -- earliest first.  Pre-fix each disconnected block was
+                    -- re-admitted on its own, tip block first, so a child
+                    -- confirmed above its parent was re-offered before the
+                    -- parent and lost, and nothing ran removeForReorg.
+                    -- The caller's blockConnected for the tip is then a
+                    -- no-op removal.
                     forM_ disconnectList $ \blk ->
-                      blockDisconnected mp blk
+                      addDisconnectedBlock mp blk
+                    forM_ connectList $ \blk ->
+                      blockConnected mp blk
+                    updateMempoolForReorg mp
 
                     -- Mirror the reorg into any opted-in secondary
                     -- indexes.  Disconnect-side first (delete entries
