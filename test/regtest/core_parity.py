@@ -316,7 +316,7 @@ def mempool_parent_child(core: Rpc, hk: Rpc) -> None:
             mismatch("core parent-before-child", c_order, "child before parent")
     if c_order != h_order and parent_txid in h_order and child_txid in h_order:
         if h_order.index(parent_txid) > h_order.index(child_txid):
-            mismatch("haskoin parent-before-child", h_order, c_order)
+            mismatch("haskoin parent-before-child", c_order, h_order)
 
     for field in ("fee", "weight", "sigops"):
         c_f = [(t["txid"], t[field]) for t in c_gbt]
