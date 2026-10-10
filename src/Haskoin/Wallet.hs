@@ -1981,6 +1981,7 @@ addressToTextW net addr =
        WitnessPubKeyAddress h -> bech32Encode hrp 0 (getHash160 h)
        WitnessScriptAddress h -> bech32Encode hrp 0 (getHash256 h)
        TaprootAddress h       -> bech32mEncode hrp 1 (getHash256 h)
+       PayToAnchorAddress     -> bech32mEncode hrp 1 (BS.pack [0x4e, 0x73])
 
 -- | Import a raw private key into the wallet keychain (importprivkey).
 --
@@ -2678,6 +2679,8 @@ createTransaction CoinSelection{..} =
     encodeOutputScript (TaprootAddress (Hash256 h)) =
       encodeScript $ encodeP2TR (Hash256 h)
     encodeOutputScript (WitnessScriptAddress _) = BS.empty -- Would need full script
+    encodeOutputScript PayToAnchorAddress =
+      BS.pack [0x51, 0x02, 0x4e, 0x73]
 
 -- | Fund a transaction by selecting coins and creating inputs.
 -- This is a convenience wrapper around selectCoins and createTransaction.
@@ -2976,6 +2979,9 @@ decodeOurAddress s
       Just (ScriptAddress (Hash160 (BS.take 20 (BS.drop 2 s))))
   | BS.length s == 34 && BS.head s == 0x51 && BS.index s 1 == 0x20 =
       Just (TaprootAddress (Hash256 (BS.drop 2 s)))
+  | BS.length s == 4 && BS.head s == 0x51 && BS.index s 1 == 0x02
+    && BS.index s 2 == 0x4e && BS.index s 3 == 0x73 =
+      Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | Compute the replacement fee given the original fee, the bumped-tx
@@ -6565,6 +6571,10 @@ scriptToAddress script
   -- P2TR: OP_1 <32>
   | BS.length script == 34 && BS.index script 0 == 0x51 && BS.index script 1 == 0x20 =
       Just $ TaprootAddress (Hash256 $ BS.take 32 $ BS.drop 2 script)
+  -- P2A: OP_1 <0x4e73>
+  | BS.length script == 4 && BS.index script 0 == 0x51 && BS.index script 1 == 0x02
+    && BS.index script 2 == 0x4e && BS.index script 3 == 0x73 =
+      Just PayToAnchorAddress
   | otherwise = Nothing
 
 -- | Convert an address to its scriptPubKey.
@@ -6575,6 +6585,7 @@ addressToScript addr = case addr of
   WitnessPubKeyAddress h -> encodeScript (encodeP2WPKH h)
   WitnessScriptAddress h -> encodeP2WSH (getHash256 h)
   TaprootAddress h -> encodeScript (encodeP2TR h)
+  PayToAnchorAddress -> BS.pack [0x51, 0x02, 0x4e, 0x73]
 
 -- | Expand a combo descriptor into its constituent descriptors.
 -- For compressed keys: P2PK, P2PKH, P2WPKH, P2SH-P2WPKH (4 outputs)
