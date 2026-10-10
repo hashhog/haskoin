@@ -299,6 +299,10 @@ def mempool_parent_child(core: Rpc, hk: Rpc) -> None:
         mismatch("getblocktemplate tx order", c_order, h_order)
     else:
         note(f"match getblocktemplate tx order: {c_order}")
+    # Expected depends are Core's actual list. BIP 22 indexes the template
+    # from 1 (the coinbase is vtx index 0 and is omitted from `transactions`).
+    # A node that numbers the same list from 0 differs from Core and is a
+    # mismatch, even when it names the same parent.
     c_dep = [(t["txid"], t["depends"]) for t in c_gbt]
     h_dep = [(t["txid"], t["depends"]) for t in h_gbt]
     if c_dep != h_dep:
@@ -306,25 +310,13 @@ def mempool_parent_child(core: Rpc, hk: Rpc) -> None:
     else:
         note(f"match getblocktemplate depends: {c_dep}")
     # Parent must precede the child even though the child pays more.
+    # Core's order is the expectation; haskoin is compared to that order above.
     if parent_txid in c_order and child_txid in c_order:
         if c_order.index(parent_txid) > c_order.index(child_txid):
             mismatch("core parent-before-child", c_order, "child before parent")
-    if parent_txid in h_order and child_txid in h_order:
+    if c_order != h_order and parent_txid in h_order and child_txid in h_order:
         if h_order.index(parent_txid) > h_order.index(child_txid):
-            mismatch("haskoin parent-before-child", h_order, "child before parent")
-    # BIP 22 / Core mining.cpp: depends is a 1-based index into the
-    # transactions list (the coinbase occupies vtx index 0 and is omitted
-    # from the list, so the first template tx is 1). haskoin numbers the
-    # same list from 0. Each side must still name the parent.
-    for label, rows, base in (("core", c_gbt, 1), ("haskoin", h_gbt, 0)):
-        ids = [t["txid"] for t in rows]
-        if parent_txid in ids and child_txid in ids:
-            expect = [ids.index(parent_txid) + base]
-            deps = {t["txid"]: t["depends"] for t in rows}[child_txid]
-            if deps != expect:
-                mismatch(f"{label} child depends (base {base})", expect, deps)
-            else:
-                note(f"match {label} child depends on parent: {deps}")
+            mismatch("haskoin parent-before-child", h_order, c_order)
 
     for field in ("fee", "weight", "sigops"):
         c_f = [(t["txid"], t[field]) for t in c_gbt]
