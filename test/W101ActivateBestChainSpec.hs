@@ -71,7 +71,9 @@ module W101ActivateBestChainSpec (spec) where
 
 import Test.Hspec
 import Control.Concurrent.STM (STM, TVar, atomically, readTVarIO, readTVar, writeTVar, newTVarIO)
-import Control.Exception (try, SomeException)
+import Control.Exception (bracket)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Word (Word32)
@@ -81,7 +83,8 @@ import qualified Data.ByteString as BS
 import Haskoin.Types
 import Haskoin.Crypto (computeBlockHash)
 import Haskoin.Consensus
-import Haskoin.Storage (BlockStatus(..))
+import Haskoin.Storage
+  ( BlockStatus(..), HaskoinDB, defaultDBConfig, openDB, closeDB, putBlock )
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -122,6 +125,15 @@ genesisEntry = ChainEntry
 -- | Build a fresh in-memory HeaderChain with only the genesis entry.
 freshChain :: IO HeaderChain
 freshChain = initHeaderChain regtest
+
+-- | Empty chainstate.  PrefixBestBlock is unset, so 'getValidatedChainTip'
+-- falls back to the in-memory tip — the same answer Core's in-memory
+-- m_chain gives before any block is connected.  'error "no db"' is not
+-- that fallback: the first read throws and the mark never happens.
+withChainDB :: (HaskoinDB -> IO a) -> IO a
+withChainDB act =
+  withSystemTempDirectory "w101-chain" $ \dir ->
+    bracket (openDB (defaultDBConfig (dir </> "db"))) closeDB act
 
 -- | STM helper: modify a TVar.
 modifyTVar_ :: TVar a -> (a -> a) -> STM ()
@@ -249,21 +261,20 @@ spec = do
         -- structural invariant verified by code inspection; this test checks
         -- the observable effect on an off-chain target.
         --
-        -- Implementation note: invalidateBlock updates in-memory state first
-        -- (via STM), then writes to DB.  We pass (error "no db") so the DB
-        -- write throws, but by that point the STM commit has already fired.
-        -- We use 'try' to absorb the DB exception and inspect in-memory state.
+        -- The connected tip is PrefixBestBlock (Core's m_chain).  An empty
+        -- chainstate leaves it unset, so the tip is the in-memory genesis
+        -- and h1 is off-chain: mark, no disconnect.
         hc <- freshChain
         let h1 = mkBlockHash 10
             e1 = mkEntry h1 genesisHash 1 200 StatusValid
         -- h1 is NOT set as tip → off-chain path (no disconnect needed)
         atomically $ modifyTVar_ (hcEntries hc) (Map.insert h1 e1)
-        -- absorb the "no db" exception; in-memory STM already committed
-        _ <- (try :: IO (Either InvalidateError ()) -> IO (Either SomeException (Either InvalidateError ()))) $
-               invalidateBlock regtest (error "no cache") (error "no db") hc Nothing h1
-        entries <- readTVarIO (hcEntries hc)
-        -- FIXED: off-chain target is StatusFailedValid (direct invalidation flag)
-        fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusFailedValid
+        withChainDB $ \db -> do
+          r <- invalidateBlock regtest (error "no cache") db hc Nothing h1
+          r `shouldBe` Right ()
+          entries <- readTVarIO (hcEntries hc)
+          -- FIXED: off-chain target is StatusFailedValid (direct invalidation flag)
+          fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusFailedValid
 
     ---------------------------------------------------------------------------
     -- BUG-5 FIXED: FAILED_VALID vs FAILED_CHILD distinction
@@ -274,8 +285,6 @@ spec = do
         -- 3704-3705 (FAILED_CHILD).  The distinction is required for correct
         -- ResetBlockFailureFlags / reconsiderblock semantics.
         --
-        -- We use 'try' to absorb the "no db" exception; in-memory STM state
-        -- (which is committed before any DB write) holds the fixed values.
         hc <- freshChain
         let h1 = mkBlockHash 20
             h2 = mkBlockHash 21
@@ -283,20 +292,20 @@ spec = do
             e2 = mkEntry h2 h1          2 300 StatusValid
         -- h1/h2 are NOT set as the tip → off-chain path (no disconnect needed)
         atomically $ modifyTVar_ (hcEntries hc) (Map.insert h1 e1 . Map.insert h2 e2)
-        -- absorb the "no db" exception; STM already committed before DB write
-        _ <- (try :: IO (Either InvalidateError ()) -> IO (Either SomeException (Either InvalidateError ()))) $
-               invalidateBlock regtest (error "no cache") (error "no db") hc Nothing h1
-        entries <- readTVarIO (hcEntries hc)
-        -- FIXED: h1 is directly invalidated → StatusFailedValid
-        fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusFailedValid
-        -- FIXED: h2 is a descendant        → StatusFailedChild
-        fmap ceStatus (Map.lookup h2 entries) `shouldBe` Just StatusFailedChild
+        withChainDB $ \db -> do
+          r <- invalidateBlock regtest (error "no cache") db hc Nothing h1
+          r `shouldBe` Right ()
+          entries <- readTVarIO (hcEntries hc)
+          -- FIXED: h1 is directly invalidated → StatusFailedValid
+          fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusFailedValid
+          -- FIXED: h2 is a descendant        → StatusFailedChild
+          fmap ceStatus (Map.lookup h2 entries) `shouldBe` Just StatusFailedChild
 
     ---------------------------------------------------------------------------
     -- BUG-5b: reconsiderBlock doesn't clear ancestors
     ---------------------------------------------------------------------------
-    describe "BUG-5b: reconsiderBlock does not clear ancestor FAILED_CHILD marks" $ do
-      it "reconsidering h2 leaves parent h1 as StatusInvalid" $ do
+    describe "BUG-5b (FIXED 2026-10-08): reconsiderBlock clears failed ANCESTORS too" $ do
+      it "reconsidering h2 clears parent h1 (Core ResetBlockFailureFlags)" $ do
         hc <- freshChain
         let h1 = mkBlockHash 30
             h2 = mkBlockHash 31
@@ -305,44 +314,55 @@ spec = do
         atomically $ do
           modifyTVar_ (hcEntries hc) (Map.insert h1 e1 . Map.insert h2 e2)
           modifyTVar_ (hcInvalidated hc) (Set.insert h2)
-        -- Absorb the "no db" exception (reconsiderBlock calls
-        -- 'putBlockStatus db ...' which forces the test sentinel);
-        -- the in-memory STM state is committed before the DB write.
-        _ <- (try :: IO (Either InvalidateError ())
-                   -> IO (Either SomeException (Either InvalidateError ()))) $
-                reconsiderBlock regtest
-                  (error "no cache")
-                  (error "no db")
-                  hc Nothing h2
-        entries <- readTVarIO (hcEntries hc)
-        -- BUG: h1 should be cleared by Core's ancestor walk, but haskoin
-        -- only calls findDescendants(h2) which does NOT include h1
-        fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusInvalid
+        -- No bodies on disk: Core clears BLOCK_FAILED_MASK and leaves a
+        -- header that is not BLOCK_HAVE_DATA (haskoin: StatusHeaderValid).
+        withChainDB $ \db -> do
+          r <- reconsiderBlock regtest (error "no cache") db hc Nothing h2
+          r `shouldBe` Right ()
+          entries <- readTVarIO (hcEntries hc)
+          fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusHeaderValid
+          fmap ceStatus (Map.lookup h2 entries) `shouldBe` Just StatusHeaderValid
 
     ---------------------------------------------------------------------------
     -- BUG-6: reconsidered entries become StatusHeaderValid tip candidates
     ---------------------------------------------------------------------------
-    describe "BUG-6: reconsiderBlock restores StatusHeaderValid not StatusValid" $ do
-      it "after reconsider, entry status is StatusHeaderValid" $ do
+    -- Core ResetBlockFailureFlags clears BLOCK_FAILED_MASK only.  A block
+    -- that already has data (BLOCK_HAVE_DATA / BLOCK_VALID_TRANSACTIONS)
+    -- stays that way and re-enters setBlockIndexCandidates.  A header-only
+    -- block stays header-valid and is NOT a candidate (HaveNumChainTxs).
+    -- The old pin asserted StatusHeaderValid and passed only because
+    -- getBlock on 'error "no db"' threw after the first status write.
+    describe "BUG-6 (FIXED): reconsider keeps Core's have-data status" $ do
+      it "body on disk -> StatusValid and a candidate" $ do
         hc <- freshChain
         let h1 = mkBlockHash 40
             e1 = mkEntry h1 genesisHash 1 200 StatusInvalid
         atomically $ do
           modifyTVar_ (hcEntries hc) (Map.insert h1 e1)
           modifyTVar_ (hcInvalidated hc) (Set.insert h1)
-        -- Absorb the "no db" exception (see BUG-5b for rationale).
-        _ <- (try :: IO (Either InvalidateError ())
-                   -> IO (Either SomeException (Either InvalidateError ()))) $
-                reconsiderBlock regtest
-                  (error "no cache")
-                  (error "no db")
-                  hc Nothing h1
-        entries <- readTVarIO (hcEntries hc)
-        -- After reconsider, the status is StatusHeaderValid.
-        -- activateBestChain will then pick this as a tip candidate (BUG-3).
-        case Map.lookup h1 entries of
-          Nothing -> expectationFailure "entry missing after reconsider"
-          Just ce -> ceStatus ce `shouldBe` StatusHeaderValid
+        withChainDB $ \db -> do
+          putBlock db h1 (netGenesisBlock regtest)
+          r <- reconsiderBlock regtest (error "no cache") db hc Nothing h1
+          r `shouldBe` Right ()
+          entries <- readTVarIO (hcEntries hc)
+          fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusValid
+          cs <- readTVarIO (hcCandidates hc)
+          Set.member (mkCandidateKey e1) cs `shouldBe` True
+
+      it "header-only block stays StatusHeaderValid and is not a candidate" $ do
+        hc <- freshChain
+        let h1 = mkBlockHash 41
+            e1 = mkEntry h1 genesisHash 1 200 StatusInvalid
+        atomically $ do
+          modifyTVar_ (hcEntries hc) (Map.insert h1 e1)
+          modifyTVar_ (hcInvalidated hc) (Set.insert h1)
+        withChainDB $ \db -> do
+          r <- reconsiderBlock regtest (error "no cache") db hc Nothing h1
+          r `shouldBe` Right ()
+          entries <- readTVarIO (hcEntries hc)
+          fmap ceStatus (Map.lookup h1 entries) `shouldBe` Just StatusHeaderValid
+          cs <- readTVarIO (hcCandidates hc)
+          Set.member (mkCandidateKey e1) cs `shouldBe` False
 
     ---------------------------------------------------------------------------
     -- BUG-7: initHeaderChainFromDB uses raw timestamp instead of MTP
@@ -603,15 +623,15 @@ spec = do
         let h1 = mkBlockHash 82
             e1 = mkEntry h1 genesisHash 1 200 StatusValid
         -- h1 is OFF-CHAIN (not the tip) → invalidate goes through the
-        -- mark-only path with no DB writes for the disconnect.
+        -- mark-only path with no disconnect.
         insertEntry hc e1
         csBefore <- readTVarIO (hcCandidates hc)
         Set.member (mkCandidateKey e1) csBefore `shouldBe` True
-        _ <- (try :: IO (Either InvalidateError ())
-                   -> IO (Either SomeException (Either InvalidateError ()))) $
-                invalidateBlock regtest (error "no cache") (error "no db") hc Nothing h1
-        csAfter <- readTVarIO (hcCandidates hc)
-        Set.member (mkCandidateKey e1) csAfter `shouldBe` False
+        withChainDB $ \db -> do
+          r <- invalidateBlock regtest (error "no cache") db hc Nothing h1
+          r `shouldBe` Right ()
+          csAfter <- readTVarIO (hcCandidates hc)
+          Set.member (mkCandidateKey e1) csAfter `shouldBe` False
 
       it "ceSequenceId for genesis is seqIdBestChainFromDisk" $ do
         hc <- freshChain
@@ -809,10 +829,16 @@ spec = do
         result <- reconsiderBlock regtest (error "no cache") (error "no db") hc Nothing unknownHash
         result `shouldBe` Left (ReconsiderBlockNotFound unknownHash)
 
-      it "valid (non-invalidated) block returns Left ReconsiderNotInvalidated" $ do
+      it "valid (non-invalidated) block is a successful no-op (Core ReconsiderBlock)" $ do
+        -- Core ResetBlockFailureFlags changes nothing and ActivateBestChain
+        -- still succeeds.  haskoin used to return ReconsiderNotInvalidated.
         hc <- freshChain
-        result <- reconsiderBlock regtest (error "no cache") (error "no db") hc Nothing genesisHash
-        result `shouldBe` Left (ReconsiderNotInvalidated genesisHash)
+        withChainDB $ \db -> do
+          result <- reconsiderBlock regtest (error "no cache") db hc Nothing genesisHash
+          result `shouldBe` Right ()
+          tip <- readTVarIO (hcTip hc)
+          ceHash tip `shouldBe` genesisHash
+          ceStatus tip `shouldBe` StatusValid
 
     ---------------------------------------------------------------------------
     -- isBlockInvalidated helper
