@@ -358,3 +358,20 @@ spec = describe "t2_r5" $ do
             KM.lookup "window_block_count" o `shouldNotBe` Nothing
             KM.lookup "window_final_block_hash" o `shouldNotBe` Nothing
           _ -> expectationFailure ("expected object, got " ++ show v)
+    it "txcount is the cumulative tx count (genesis chain = 1)" $
+      withLiveServer $ \server -> do
+        resp <- handleGetChainTxStats server (toJSON ([] :: [Value]))
+        v <- decodeRaw <$> resultOf resp
+        case v of
+          Object o -> KM.lookup "txcount" o `shouldBe` Just (toJSON (1 :: Int))
+          _ -> expectationFailure ("expected object, got " ++ show v)
+    it "nblocks=0 keeps txcount but drops the window extras" $
+      withLiveServer $ \server -> do
+        resp <- handleGetChainTxStats server (toJSON [0 :: Int])
+        v <- decodeRaw <$> resultOf resp
+        case v of
+          Object o -> do
+            KM.lookup "txcount" o `shouldBe` Just (toJSON (1 :: Int))
+            KM.lookup "window_tx_count" o `shouldBe` Nothing
+            KM.lookup "txrate" o `shouldBe` Nothing
+          _ -> expectationFailure ("expected object, got " ++ show v)

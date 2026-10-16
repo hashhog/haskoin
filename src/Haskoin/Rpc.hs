@@ -3594,10 +3594,10 @@ handleGetChainTxStats server params = do
                (toJSON $ RpcError rpcInvalidParameter
                   "Invalid block count: should be between 0 and the block's height - 1") Null
         Right nReq -> do
-          -- Do NOT walk genesis..height for txcount.  Core omits txcount
-          -- (and window_tx_count / txrate) when nChainTx is unknown
-          -- (assumeutxo); walking every stored body timed the R5 probe
-          -- out on a 900k+ snapshot node.
+          -- txcount is Core's pindex->m_chain_tx_count: omitted (0 = unknown)
+          -- when the count cannot be anchored (assumeutxo below an
+          -- un-backfilled base), exactly as Core omits it.
+          nChainTx <- chainTxCountAt (rsDB server) (rsNetwork server) entries (ceHash pindex)
           let finalTime = bhTimestamp (ceHeader pindex)
               finalHashTxt = showHash (ceHash pindex)
               -- window_block_count: clamp request into [0, height].
@@ -3613,9 +3613,23 @@ handleGetChainTxStats server params = do
                     mtpFinal = ceMedianTime pindex
                     mtpAnc = maybe mtpFinal ceMedianTime mAnc
                     interval = fromIntegral mtpFinal - fromIntegral mtpAnc :: Int
-                return $ pair "window_interval" (AE.int interval)
+                nPast <- case mAnc of
+                  Nothing -> return 0
+                  Just anc -> chainTxCountAt (rsDB server) (rsNetwork server) entries (ceHash anc)
+                -- Core: window_tx_count only when both counts are known;
+                -- txrate only when additionally window_interval > 0.
+                let txExtras
+                      | nChainTx /= 0 && nPast /= 0 =
+                          let wtx = nChainTx - nPast
+                          in pair "window_tx_count" (AE.word64 wtx)
+                             <> (if interval > 0
+                                   then pair "txrate" (AE.double (fromIntegral wtx / fromIntegral interval))
+                                   else mempty)
+                      | otherwise = mempty
+                return $ pair "window_interval" (AE.int interval) <> txExtras
           let enc = pairs $
                       pair "time"                      (AE.word32 finalTime)            <>
+                      (if nChainTx /= 0 then pair "txcount" (AE.word64 nChainTx) else mempty) <>
                       pair "window_final_block_hash"   (text finalHashTxt)              <>
                       pair "window_final_block_height" (AE.word32 height)               <>
                       pair "window_block_count"        (AE.int window)                  <>
