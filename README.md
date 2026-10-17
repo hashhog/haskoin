@@ -1,326 +1,125 @@
 # haskoin
 
-A Bitcoin full node written from scratch in Haskell. Part of the Hashhog project.
+A Bitcoin full node written from scratch in Haskell. One of the ten [hashhog](https://github.com/hashhog) nodes.
 
-## Status — v1.0.2
+> **Experimental.** hashhog nodes are independent re-implementations of Bitcoin Core for research and testing. Do not use them with real funds.
 
-> **Every `receipts/…`, `tools/…`, `docs/…` and `CORE-PARITY-AUDIT/…` path cited in
-> this section is in the hashhog meta-repo, which is permanently private.** Those
-> citations are maintainer provenance, not evidence you can check. The full note on
-> what that does and does not leave verifiable is further down this section.
+## Status
 
-**Label: "Pending — genesis rig running; label not assignable from a committed
-artifact"** (`receipts/RELEASE-v1.0-SCORECARD.md`). haskoin is the one node the
-release scorecard declines to grade: a from-genesis rig is running, but its height
-is not recorded in any committed artifact — the only source is an uncommitted live
-log. The git tag `v0.1.0-beta1` (`receipts/RELEASE-v1.0-FREEZE.md`) says the same
-from the other side: `rc` is reserved for an independent from-genesis
-`--assumevalid=0` reproduction of Core's UTXO-set commitment, and `beta` means that
-receipt does not exist (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither
-label certifies wallet or fund-custody readiness — see `SECURITY.md`.
+| Area | State |
+|---|---|
+| Mainnet validation | Validated mainnet from genesis to height 958,794 with assumevalid off and matched Core's `gettxoutsetinfo` `hash_serialized_3` there (`29692050…6e7af0`, 166,180,925 coins). How to reproduce: [docs/status.md](docs/status.md). |
+| Consensus | Block, transaction and script validation through Taproot. Runs all of Core's `script_tests.json` and `sighash.json` vectors as test suites. |
+| RPC | 135 JSON-RPC methods modelled on Core's, plus optional REST. Known differences in [docs/rpc.md](docs/rpc.md). |
+| P2P | Headers-first sync, inbound and outbound peers, BIP-324 v2 transport, addrv2, compact blocks, SOCKS5/Tor/I2P outbound. |
+| Wallet | Descriptor wallets, multi-wallet, PSBT, BIP-32/39 keys. No custody audit. |
+| Known limitations | `getblocktemplate` can order a child before its parent (do not mine with it). No signet. RPC responses carry `"id": null`. See [docs/status.md](docs/status.md#known-limitations). |
 
-**haskoin has not been shown to validate the chain from genesis.** There is no
-haskoin row in the reproduction ledger (`receipts/TRUST-ANCHOR.md:140-145`) and
-no haskoin replay ledger in `CORE-PARITY-AUDIT/replay-ledgers/`.
-`receipts/SYNCS.md:30` records the live mainnet chainstate as having been created
-by `--load-snapshot` (base height 956407, 166,119,542 coins, 2026-07-02
-recovery), with "from-genesis full script validation **UNKNOWN** — no banked
-AV=0/genesis replay found". The node honours assumevalid (`skipScripts`), so
-being at Core's tip with a matching best-block hash is not by itself evidence
-that it verified the scripts below the assumevalid height. A from-genesis rig is
-in flight, but the release scorecard records its height as NOT PROVEN — the only
-source is an uncommitted live log, and a download pointer is not a validated
-height. A reader of this repository alone should assume haskoin's from-genesis
-validation is untested.
+Last updated: 2026-10-17.
 
-**Operator RPC parity: 57 of Bitcoin Core's 85.** From the 103-method R5
-operator probe run 2026-09-01
-(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): haskoin 57 PASS /
-28 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
-(`SKIP-REGTEST`) for every node including Core. Failures are largely error-code
-mismatches (`decoderawtransaction` on non-hex returns `-1` where Core returns
-`-22`; `getmempoolentry` on an absent transaction returns `-1` where Core returns
-`-5`). Until `ccfa0f2`, 31 methods were dispatched but absent from
-`allRpcCommands`, so `help` never listed them — the RPC surface under-reported
-itself.
+## Quick start
 
-**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
-suite (5052 examples, 466 pending) went 34 failing → 0 with no skips and no gaps
-carried; one of those was a real bug, mutation-verified — `26f71d7`, so that
-`loadtxoutset` answers `-8 "Couldn't open file … for reading."` before any
-snapshot parsing, matching Core's `bitcoin-core/src/rpc/blockchain.cpp:3411-3416`. The assumeUTXO
-snapshot-boot gate was red for haskoin from 2026-08-11; the genesis-body defect
-behind it was fixed in `b1d1d43`
-(`receipts/boot-smoke-4-red-triaged-2026-08-16.md:76-90`).
-
-**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the hashhog
-meta-repo, which is **not public** — see the note below.
-
-> **The cited paths are NOT publicly readable — do not treat them as evidence.**
-> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
-> the hashhog meta-repo, which is a **permanently private** repository, not to
-> this one. They are provenance for the maintainers. From outside, any claim
-> resting only on such a path is **unverified**, and you should read it as such.
->
-> Two of those paths are unreadable even with the meta-repo in hand: the R5 probe
-> JSON is gitignored (`.gitignore:60  tools/diff-test-artifacts/`) and so are the
-> nightly `diffguard-*.log` files (`.gitignore:43  *.log`). Regenerate the probe
-> JSON with `python3 tools/r5_probe.py` against a running fleet.
->
-> **What you can check from this repository alone:** build it, run its own test
-> suite, and reproduce its behaviour against Bitcoin Core yourself. That is the
-> evidence this repo actually ships.
-
-## Quick Start
-
-### Docker
+Needs GHC 9.6 and cabal-install 3.14 ([GHCup](https://www.haskell.org/ghcup/) installs both),
+RocksDB 9, libsecp256k1, libzmq 4, and two libraries Debian does not package:
+[minisketch](https://github.com/sipa/minisketch) and a small RocksDB shim built by
+`scripts/build-rocksdb-compat.sh`. On Debian 13:
 
 ```bash
-docker-compose up -d
-```
-
-This starts haskoin on mainnet with data persisted to a Docker volume. Ports 8333 (P2P) and 8332 (RPC) are exposed.
-
-### Build from Source
-
-```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt-get install -y librocksdb-dev pkg-config libsecp256k1-dev zlib1g-dev
-# Also required (not packaged on Debian): libminisketch, built from
-# https://github.com/sipa/minisketch, and the rocksdb_compat shim for RocksDB 9.x:
-#   bash scripts/build-rocksdb-compat.sh     (see haskoin.cabal extra-libraries)
-# Toolchain: haskoin.cabal pins no GHC (base >= 4.14 && < 5); the Dockerfile
-# builds with GHC 9.8 (haskell:9.8-slim) and the fleet builds with GHC 9.6.7 /
-# cabal-install 3.14.2.0 (cabal-version 3.0).
-
-# Build
+sudo apt-get install -y build-essential autoconf automake libtool pkg-config git curl \
+  librocksdb-dev libsecp256k1-dev libzmq5 zlib1g-dev libgmp-dev
+git clone --depth 1 https://github.com/sipa/minisketch.git && (cd minisketch && ./autogen.sh && ./configure && make -j"$(nproc)" && sudo make install && sudo ldconfig)
+git clone https://github.com/hashhog/haskoin.git && cd haskoin
+sudo bash scripts/build-rocksdb-compat.sh
 cabal update
-cabal build all
-
-# Run on testnet4
-cabal run haskoin -- -n Testnet4 node
-
-# Run on mainnet with RTS tuning for IBD
-cabal run haskoin -- +RTS -N -A64m -H2G -I0 -RTS -n Mainnet node
+cabal build exe:haskoin
+cp "$(cabal list-bin haskoin)" ./haskoin && ./haskoin --help | head -3
 ```
 
-## Features
+More detail is in [docs/building.md](docs/building.md). Start a regtest node in a throwaway
+data directory and make an RPC call:
 
-- Full block and transaction validation with all consensus BIP rules
-- Script interpreter supporting P2PKH, P2SH, P2WPKH, P2WSH, and P2TR
-- SegWit transaction serialization via cereal
-- Headers-first sync with parallel IBD pipeline
-- RocksDB storage layer with UTXO cache and LRU eviction
-- Memory-mapped I/O for block files
-- Transaction mempool with RBF and cluster mempool
-- Fee estimation with confirmation tracking
-- Block template construction for mining
-- HD wallet (BIP-32/39/44/84) with mnemonic generation and restore
-- PSBT support (BIP-174/BIP-370: create, decode, combine, finalize, sign)
-- Output descriptors (BIP-380-386: parse, checksum, derive addresses, import)
-- Miniscript (BIP-379: type system, compilation, satisfaction)
-- Block indexes (txindex, BIP-157/158 blockfilterindex, coinstatsindex)
-- Hardware-accelerated crypto (SHA-NI/AVX2 auto-detect, batch Schnorr, parallel ECDSA)
-- Peer manager with misbehavior scoring, connection eviction, and ban lists
-- Stale peer eviction (ping timeout, block stall, chain sync timeout)
-- Tor/I2P connectivity (SOCKS5 proxy, Tor hidden services, I2P SAM)
-- Regtest mode with generatetoaddress, generateblock, and generate RPCs
-- CLI with node, wallet, and utility subcommands
-
-## Configuration
-
-### CLI Flags (Global)
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-d, --datadir DIR` | Data directory | `~/.haskoin` |
-| `-n, --network NETWORK` | Network: Mainnet, Testnet, Testnet4, Regtest | `Mainnet` |
-
-### Node Subcommand Flags
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--rpcport ARG` | RPC port | network default |
-| `--rpcuser ARG` | RPC username | |
-| `--rpcpassword ARG` | RPC password | |
-| `--maxpeers ARG` | Maximum peer connections | |
-| `--connect ARG` | Peer to connect to | |
-| `--prune` | Enable pruning | disabled |
-| `--dbcache ARG` | DB cache size in MB | |
-| `--listen ARG` | Accept incoming connections | `True` |
-| `--port ARG` | P2P listen port | network default |
-| `--bind ADDR[:PORT]` | P2P listen address (repeatable; default all interfaces) | `0.0.0.0` and `[::]` |
-
-### Wallet Subcommands
-
-| Command | Description |
-|---------|-------------|
-| `wallet create` | Create a new wallet |
-| `wallet restore` | Restore wallet from mnemonic |
-| `wallet balance` | Show wallet balance |
-| `wallet address` | Generate a new receive address |
-| `wallet send` | Send bitcoin |
-| `wallet history` | Show transaction history |
-| `wallet dump` | Dump wallet info |
-
-### Utility Subcommands
-
-| Command | Description |
-|---------|-------------|
-| `util decodetx` | Decode a raw transaction |
-| `util decodescript` | Decode a script |
-| `util validateaddress` | Validate a Bitcoin address |
-| `util hashblock` | Hash a block header |
-
-## RPC API
-
-### Blockchain
-
-| Method | Description |
-|--------|-------------|
-| `getblockchaininfo` | Returns blockchain processing state info |
-| `getblockcount` | Returns height of the most-work fully-validated chain |
-| `getbestblockhash` | Returns hash of the best (tip) block |
-| `getblockhash` | Returns hash of block at given height |
-| `getblock` | Returns block data for a given hash |
-| `getblockheader` | Returns block header data |
-| `getdifficulty` | Returns proof-of-work difficulty |
-| `getchaintips` | Returns information about all known tips in the block tree |
-| `gettxout` | Returns details about an unspent transaction output |
-
-### Transactions
-
-| Method | Description |
-|--------|-------------|
-| `getrawtransaction` | Returns raw transaction data |
-| `sendrawtransaction` | Submits a raw transaction to the network |
-| `decoderawtransaction` | Decodes a hex-encoded raw transaction |
-| `createrawtransaction` | Creates an unsigned raw transaction |
-| `signrawtransactionwithwallet` | Signs a raw transaction with wallet keys |
-| `decodescript` | Decodes a hex-encoded script |
-| `testmempoolaccept` | Tests whether a raw transaction would be accepted by the mempool |
-
-### Mempool
-
-| Method | Description |
-|--------|-------------|
-| `getmempoolinfo` | Returns mempool state details |
-| `getrawmempool` | Returns all transaction IDs in the mempool |
-| `getmempoolentry` | Returns mempool data for a given transaction |
-| `getmempoolancestors` | Returns all in-mempool ancestors for a transaction |
-
-### Network
-
-| Method | Description |
-|--------|-------------|
-| `getnetworkinfo` | Returns P2P networking state info |
-| `getpeerinfo` | Returns data about each connected peer |
-| `getconnectioncount` | Returns the number of connections |
-| `getnettotals` | Returns network traffic statistics |
-| `addnode` | Adds or removes a peer |
-| `disconnectnode` | Disconnects a peer |
-
-### Mining
-
-| Method | Description |
-|--------|-------------|
-| `getblocktemplate` | Returns a block template for mining |
-| `submitblock` | Submits a new block to the network |
-| `getmininginfo` | Returns mining-related information |
-| `estimatesmartfee` | Estimates fee rate for confirmation within N blocks |
-| `generatetoaddress` | Mines blocks to an address (regtest only) |
-| `generateblock` | Mines a block with specific transactions (regtest only) |
-| `generate` | Mines blocks (regtest only) |
-| `setmocktime` | Sets mock time for testing (regtest only) |
-
-### Wallet
-
-| Method | Description |
-|--------|-------------|
-| `createwallet` | Creates a new wallet |
-| `listwallets` | Lists loaded wallets |
-| `getwalletinfo` | Returns wallet state info |
-| `getnewaddress` | Generates a new receiving address |
-| `getbalance` | Returns wallet balance |
-| `listunspent` | Lists unspent outputs |
-| `sendtoaddress` | Sends bitcoin to an address |
-| `listtransactions` | Lists wallet transactions |
-| `walletpassphrase` | Unlocks an encrypted wallet |
-| `walletlock` | Locks the wallet |
-| `setlabel` | Sets an address label |
-| `importdescriptors` | Imports output descriptors into the wallet |
-| `listdescriptors` | Lists imported descriptors |
-
-### Descriptors and PSBT
-
-| Method | Description |
-|--------|-------------|
-| `createpsbt` | Creates a PSBT |
-| `decodepsbt` | Decodes a base64 PSBT |
-| `combinepsbt` | Combines multiple PSBTs |
-| `finalizepsbt` | Finalizes a PSBT |
-
-### Utility
-
-| Method | Description |
-|--------|-------------|
-| `validateaddress` | Validates a Bitcoin address |
-| `verifymessage` | Verifies a signed message |
-| `getinfo` | Returns general node info |
-| `stop` | Stops the node |
-| `help` | Lists available RPC commands |
-
-## Architecture
-
-haskoin uses Haskell's type system to make invalid blockchain states unrepresentable. Core data types (Hash256, TxId, BlockHash, Transaction, Block) are defined with strict binary serialization via the cereal library. Cryptographic operations -- SHA256d, RIPEMD160, HASH160, and secp256k1 ECDSA/Schnorr -- use hardware-accelerated implementations that auto-detect SHA-NI and AVX2 CPU features at startup. Batch Schnorr verification and parallel ECDSA validation are used during IBD for throughput.
-
-The consensus module implements the script interpreter as a pure function, covering all standard script types (P2PKH, P2SH, P2WPKH, P2WSH, P2TR) with full BIP rule enforcement. Block and transaction validation, header sync, and reorg handling are cleanly separated. The storage layer uses RocksDB for persistent state with a UTXO cache backed by an LRU eviction policy. Block files are memory-mapped for efficient random access during validation and reindexing.
-
-P2P networking is managed through an async peer manager that handles DNS seed discovery, version/verack handshakes, misbehavior scoring, and connection eviction. Stale peer eviction covers ping timeouts, block download stalls, and chain sync timeouts. The sync pipeline implements headers-first IBD with parallel block downloads. Tor and I2P connectivity is supported via SOCKS5 proxies with optional hidden service and SAM session management.
-
-The mempool supports Replace-By-Fee (RBF) and a cluster mempool design for more accurate mining score computation. Fee estimation tracks confirmation times across fee-rate buckets. Block template construction selects transactions by ancestor feerate for optimal miner revenue. The wallet module provides BIP-32/39/44/84 HD key derivation with mnemonic generation, PSBT workflows (BIP-174/370), and output descriptor support (BIP-380-386).
-
-The RPC server exposes a JSON-RPC interface with HTTP Basic Auth, modelled on Bitcoin Core's. It is not yet behaviourally compatible: on the 2026-09-01 operator probe haskoin answers 57 of the 103 probed methods correctly against Core's 85, with 28 failures, largely error-code mismatches. Until `ccfa0f2`, 31 methods were dispatched but missing from `allRpcCommands`, so `help` did not list them. It supports blockchain queries, raw transaction operations, mempool inspection, mining (block templates and regtest generation), wallet operations, and PSBT handling. The CLI provides three subcommands: `node` for running the full node, `wallet` for offline wallet operations, and `util` for transaction/script/address utilities.
-
-## Project Structure
-
-```
-haskoin/
-  src/Haskoin/
-    Types.hs         -- core data types and serialization
-    Crypto.hs        -- hashing, keys, signatures, addresses
-    Script.hs        -- script parsing and interpreter
-    Consensus.hs     -- validation, header sync, reorgs
-    Storage.hs       -- rocksdb persistence, UTXO cache
-    Network.hs       -- p2p messages, peer connection, ban scoring, eviction
-    Sync.hs          -- block download, IBD pipeline
-    Mempool.hs       -- transaction pool, RBF, cluster mempool
-    FeeEstimator.hs  -- fee rate estimation
-    BlockTemplate.hs -- block template for mining
-    Rpc.hs           -- json-rpc server
-    Wallet.hs        -- hd wallet, psbt, output descriptors
-    Performance.hs   -- hardware crypto, parallel validation, mmap
-    Index.hs         -- txindex, blockfilterindex, coinstatsindex
-  bench/
-    Bench.hs         -- criterion benchmarks
-  app/
-    Main.hs          -- CLI entry point
-  test/
-    Spec.hs          -- test suite
+```bash
+export DATADIR=$(mktemp -d)
+./haskoin -d "$DATADIR" -n Regtest node --rpcport 18443 --metricsport 0 > "$DATADIR/node.log" 2>&1 &
+sleep 10
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" -d '{"method":"getblockchaininfo","params":[]}' http://127.0.0.1:18443/
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" -d '{"method":"stop","params":[]}' http://127.0.0.1:18443/
 ```
 
-## Running Tests
+## Running
+
+Global options (`-d`, `-n`) go before the `node` subcommand, node options after it:
+
+```bash
+./haskoin -n Mainnet  node
+./haskoin -n Testnet4 node --rpcport 48332
+./haskoin -n Regtest  node --rpcport 18443
+```
+
+`-n Testnet` selects testnet3. The data directory defaults to `~/.haskoin`, and each network
+uses a subdirectory of it: `main`, `testnet3`, `testnet4` or `regtest`.
+
+| Network | P2P port | RPC port |
+|---|---|---|
+| Mainnet | 8333 | 8332 |
+| Testnet4 | 48333 | 8332 unless `--rpcport` |
+| Testnet (testnet3) | 18333 | 8332 unless `--rpcport` |
+| Regtest | 18444 | 8332 unless `--rpcport` |
+
+The RPC port does not follow the network: it is 8332 unless you pass `--rpcport`. RPC listens
+on `127.0.0.1` only. A Prometheus metrics endpoint listens on port 9332 unless you pass
+`--metricsport 0`.
+
+A full mainnet node keeps every block unless you pass `--prune N` (N ≥ 550 MiB): plan for at
+least 1 TB of fast disk. The UTXO cache is set by `--dbcache` (default 450 MiB). With
+default settings a node following the mainnet tip uses about 8 GB of resident memory and
+initial sync can use more; give the machine at least 16 GB. `--noassumevalid` checks every
+script from genesis.
+
+Every flag, the config file, the data directory layout and logging are in
+[docs/running.md](docs/running.md).
+
+## RPC
+
+haskoin aims to match Bitcoin Core's JSON-RPC interface: same method names, parameters and
+result shapes. It accepts HTTP Basic auth with the `.cookie` file written to the network
+data directory at startup, or with `--rpcuser`/`--rpcpassword` (default `haskoin`/`haskoin`;
+change it if anything else can reach the port):
+
+```bash
+curl -s --user "$(cat "$DATADIR/regtest/.cookie")" \
+  -d '{"jsonrpc":"1.0","id":1,"method":"getblockcount","params":[]}' http://127.0.0.1:18443/
+```
+
+The method list and known differences from Core are in [docs/rpc.md](docs/rpc.md).
+
+## Development
 
 ```bash
 cabal test --test-show-details=direct
 ```
 
-## Running Benchmarks
+builds and runs the eight test suites (see [docs/status.md](docs/status.md) for what they cover).
 
-```bash
-cabal bench --benchmark-options='-o report.html'
 ```
+app/Main.hs              CLI, startup, sync driver
+src/Haskoin/Consensus.hs validation, chain parameters, reorgs, snapshots
+src/Haskoin/Script.hs    script interpreter
+src/Haskoin/Storage.hs   RocksDB, UTXO cache, block files
+src/Haskoin/Network.hs   peers, addrman, P2P messages, BIP-324
+src/Haskoin/Mempool.hs   mempool policy, RBF, packages
+src/Haskoin/Rpc.hs       JSON-RPC and REST server
+src/Haskoin/Wallet.hs    wallet, PSBT, descriptors
+test/                    hspec suites and Core's vector runners
+```
+
+The full map is in [docs/architecture.md](docs/architecture.md). See
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+
+## Security
+
+Report vulnerabilities privately; see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
