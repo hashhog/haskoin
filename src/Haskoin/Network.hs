@@ -147,6 +147,7 @@ module Haskoin.Network
   , backgroundSendQueueCap
   , backgroundSendsDropped
   , OutboundEvictEnv (..)
+  , OutboundTrack (..)
   , noteBlockAnnouncement
   , noteBlockAnnouncementAt
   , noteBlockReceived
@@ -749,7 +750,7 @@ import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe, isNothing, fromMaybe, catMaybes)
-import Data.List (sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
+import Data.List (sortOn, sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
 import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
@@ -4047,41 +4048,161 @@ addrRelayCandidates source peers =
 -- from being read (mainnet 2026-10-04: the delivering peer's thread parked
 -- in 'announceTip', so its next block announcement was never processed).
 enqueueBackgroundSend :: PeerManager -> IO () -> IO ()
-enqueueBackgroundSend pm act = atomically $ writeTQueue (pmBackgroundSends pm) act
+enqueueBackgroundSend pm act = do
+  dropped <- atomically $ do
+    full <- isFullTBQueue (pmBackgroundSends pm)
+    if full
+      then do modifyTVar' (pmBackgroundDropped pm) (+ 1)
+              Just <$> readTVar (pmBackgroundDropped pm)
+      else writeTBQueue (pmBackgroundSends pm) act >> return Nothing
+  case dropped of
+    Just n | n == 1 || n `mod` 1000 == 0 ->
+      putStrLn $ "backgroundSend: queue full (" ++ show backgroundSendQueueCap
+              ++ "), dropped " ++ show n ++ " fan-out send(s) so far"
+    _ -> return ()
 
--- | Cap on queued fan-out sends (see 'enqueueBackgroundSend').
+-- | Cap on queued fan-out sends. A parked worker (one deaf peer holds it
+-- for up to 'sendStallTimeoutMicros') used to let the queue, and the
+-- closures and peer sockets they capture, grow without limit; a full queue
+-- now drops the new send. Safe: these are announcements (tip, tx, addr)
+-- that the next getheaders/inv exchange repeats. Core bounds the same thing
+-- per peer (m_max_send_buffer) by disconnecting; the worker here is shared,
+-- so the cheapest correct response is to shed.
 backgroundSendQueueCap :: Int
 backgroundSendQueueCap = 1024
 
 -- | Fan-out sends dropped because the queue was full.
 backgroundSendsDropped :: PeerManager -> IO Int
-backgroundSendsDropped _ = return 0
+backgroundSendsDropped = readTVarIO . pmBackgroundDropped
 
 -- | Facts the eviction pass needs from the node.
 data OutboundEvictEnv = OutboundEvictEnv
   { oeeTipWork  :: IO Integer
+    -- ^ chain work of our validated tip
   , oeeInFlight :: SockAddr -> IO Int
+    -- ^ blocks currently requested from that peer
   , oeeLocator  :: IO [BlockHash]
+    -- ^ locator for the chain-sync probe. Core sends
+    --   GetLocator(work_header->pprev): it must start BELOW our tip so a
+    --   peer on our chain answers with at least the tip header.
   }
 
+-- | What 'runOutboundEviction' remembers per peer.
+data OutboundTrack = OutboundTrack
+  { otLastAnnounce :: !Int64            -- ^ Core m_last_block_announcement
+  , otLastBlock    :: !Int64            -- ^ Core m_last_block_time
+  , otBestWork     :: !(Maybe Integer)  -- ^ Core pindexBestKnownBlock->nChainWork
+  , otTimer        :: !ChainSyncTimer   -- ^ Core m_chain_sync
+  , otProtected    :: !Bool             -- ^ Core m_chain_sync.m_protect
+  } deriving (Show)
+
+emptyTrack :: OutboundTrack
+emptyTrack = OutboundTrack 0 0 Nothing noChainSyncTimer False
+
+adjustTrack :: PeerManager -> SockAddr -> (OutboundTrack -> OutboundTrack) -> IO ()
+adjustTrack pm addr f = atomically $ modifyTVar' (pmOutboundTrack pm) $
+  Map.alter (Just . f . fromMaybe emptyTrack) addr
+
+maxWork :: Maybe Integer -> Maybe Integer -> Maybe Integer
+maxWork a Nothing = a
+maxWork Nothing b = b
+maxWork (Just a) (Just b) = Just (max a b)
+
+-- | A peer announced a header that is new to us and beats our tip's work
+-- (Core: received_new_header && nChainWork > tip, net_processing.cpp:2919).
 noteBlockAnnouncement :: PeerManager -> SockAddr -> Maybe Integer -> IO ()
-noteBlockAnnouncement _ _ _ = return ()
+noteBlockAnnouncement pm addr w = do
+  t <- round <$> getPOSIXTime
+  noteBlockAnnouncementAt pm addr t w
 
 noteBlockAnnouncementAt :: PeerManager -> SockAddr -> Int64 -> Maybe Integer -> IO ()
-noteBlockAnnouncementAt _ _ _ _ = return ()
+noteBlockAnnouncementAt pm addr t w = adjustTrack pm addr $ \o ->
+  o { otLastAnnounce = t, otBestWork = maxWork (otBestWork o) w }
 
+-- | We stored a new block that this peer delivered (Core m_last_block_time).
 noteBlockReceived :: PeerManager -> SockAddr -> IO ()
-noteBlockReceived _ _ = return ()
+noteBlockReceived pm addr = do
+  t <- round <$> getPOSIXTime
+  adjustTrack pm addr $ \o -> o { otLastBlock = t }
 
+-- | Core UpdateBlockAvailability: the peer is known to have a chain with
+-- this much work.
 noteBestKnownWork :: PeerManager -> SockAddr -> Integer -> IO ()
-noteBestKnownWork _ _ _ = return ()
+noteBestKnownWork pm addr w = adjustTrack pm addr $ \o ->
+  o { otBestWork = maxWork (otBestWork o) (Just w) }
 
+-- | One pass of Core's EvictExtraOutboundPeers followed by ConsiderEviction
+-- over every outbound peer. Returns the peers disconnected. Call every
+-- 'extraPeerCheckIntervalSecs'. Only chooses connections to drop; touches
+-- no block validation state.
 runOutboundEviction :: PeerManager -> OutboundEvictEnv -> Int64 -> IO [SockAddr]
-runOutboundEviction _ _ _ = return []
+runOutboundEviction pm env now = do
+  peers <- readTVarIO (pmPeers pm)
+  infos <- forM (Map.toList peers) $ \(a, pc) -> do
+    i <- readTVarIO (pcInfo pc)
+    return (a, pc, i)
+  let live = [ x | x@(_, _, i) <- infos, piState i == PeerConnected, not (piInbound i) ]
+      kindOf i | piIsManual i = KindManual
+               | piBlockOnly i = KindBlockRelay
+               | otherwise     = KindFullRelay
+  tipWork <- oeeTipWork env
+  atomically $ modifyTVar' (pmOutboundTrack pm) (`Map.restrictKeys` Map.keysSet peers)
+  -- Protect up to maxProtectedOutbound outbound peers that have shown a
+  -- chain at least as good as ours (Core UpdatePeerStateForReceivedHeaders).
+  tr0 <- readTVarIO (pmOutboundTrack pm)
+  let trackOf a = Map.findWithDefault emptyTrack a tr0
+      nProtected = length [ () | (a, _, i) <- live, kindOf i /= KindManual, otProtected (trackOf a) ]
+      promotable = [ a | (a, _, i) <- sortOn (\(_, _, i) -> piConnectedAt i) live
+                       , kindOf i /= KindManual
+                       , not (otProtected (trackOf a))
+                       , maybe False (>= tipWork) (otBestWork (trackOf a)) ]
+  forM_ (take (maxProtectedOutbound - nProtected) promotable) $ \a ->
+    adjustTrack pm a (\o -> o { otProtected = True })
+  tr <- readTVarIO (pmOutboundTrack pm)
+  let tOf a = Map.findWithDefault emptyTrack a tr
+  cands <- forM live $ \(a, _, i) -> do
+    n <- oeeInFlight env a
+    return OutboundEvictCand
+      { oecAddr = a, oecKind = kindOf i, oecConnectedAt = piConnectedAt i
+      , oecLastAnnounce = otLastAnnounce (tOf a), oecLastBlock = otLastBlock (tOf a)
+      , oecBlocksInFlight = n, oecProtected = otProtected (tOf a)
+      , oecNetwork = case a of { SockAddrInet6 {} -> 1; _ -> 0 } }
+  let cfg = pmConfig pm
+      (victims, clearTry) =
+        selectExtraOutboundEvictions (pmcMaxOutbound cfg) (pmcMaxBlockRelayOnly cfg) now cands
+      pcOf a = [ pc | (a', pc, _) <- live, a' == a ]
+  forM_ victims $ \a -> do
+    putStrLn $ "disconnecting extra outbound peer " ++ show a
+            ++ " (last block announcement at " ++ show (otLastAnnounce (tOf a)) ++ ")"
+    mapM_ disconnectPeer (pcOf a)
+  when clearTry $ requestExtraOutbound pm False
+  -- ConsiderEviction: outbound and block-relay-only peers, not manual,
+  -- not protected, not already dropped above.
+  locator <- oeeLocator env
+  chain <- forM [ x | x@(a, _, i) <- live, kindOf i /= KindManual
+                    , a `notElem` victims, not (otProtected (tOf a)) ] $
+    \(a, pc, _) -> do
+      let (act, t') = considerEvictionStep now tipWork (otBestWork (tOf a)) (otTimer (tOf a))
+      adjustTrack pm a (\o -> o { otTimer = t' })
+      case act of
+        ConsiderNothing -> return Nothing
+        ConsiderSendGetHeaders -> do
+          let gh = GetHeaders { ghVersion = fromIntegral protocolVersion
+                              , ghLocators = locator
+                              , ghHashStop = BlockHash (Hash256 (BS.replicate 32 0)) }
+          _ <- forkIO $ sendMessage pc (MGetHeaders gh)
+                 `catch` (\(_ :: SomeException) -> return ())
+          return Nothing
+        ConsiderDisconnect -> do
+          putStrLn $ "Outbound peer has old chain, best known work = "
+                  ++ show (otBestWork (tOf a)) ++ ", disconnecting " ++ show a
+          disconnectPeer pc
+          return (Just a)
+  return (victims ++ catMaybes chain)
 
 backgroundSendWorker :: PeerManager -> IO ()
 backgroundSendWorker pm = forever $ do
-  act <- atomically $ readTQueue (pmBackgroundSends pm)
+  act <- atomically $ readTBQueue (pmBackgroundSends pm)
   act `catch` (\(e :: SomeException) ->
     putStrLn $ "backgroundSend: " ++ show e)
 
@@ -5037,12 +5158,17 @@ data PeerManager = PeerManager
     -- ^ Core @m_try_another_outbound_peer@ (net.h SetTryNewOutboundPeer):
     --   set by the stale-tip check ('tipMayBeStale'), it lets
     --   'peerManagerLoop' open ONE full-relay outbound beyond the target.
-  , pmBackgroundSends    :: !(TQueue (IO ()))
+  , pmBackgroundSends    :: !(TBQueue (IO ()))
     -- ^ Fan-out sends (tip announcements, tx/addr relay) run here, in
     --   order, on one worker started by 'startPeerManagerWith' — never on
     --   a peer's receive thread. Core's relay paths only queue
-    --   (PushMessage); the socket thread writes. See
-    --   'enqueueBackgroundSend'.
+    --   (PushMessage); the socket thread writes. Bounded at
+    --   'backgroundSendQueueCap'; see 'enqueueBackgroundSend'.
+  , pmBackgroundDropped  :: !(TVar Int)
+    -- ^ Fan-out sends refused because 'pmBackgroundSends' was full.
+  , pmOutboundTrack      :: !(TVar (Map SockAddr OutboundTrack))
+    -- ^ Per-peer facts for 'runOutboundEviction' (Core CNodeState:
+    --   m_last_block_announcement, pindexBestKnownBlock, m_chain_sync).
   }
 
 -- | Per-peer self-announcement state.
@@ -5342,7 +5468,9 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTVarIO Map.empty  -- pmSelfAdvPeers
     <*> newIORef (return True)  -- pmSelfAdvIsIBD: IBD until wired
     <*> newTVarIO False         -- pmTryNewOutbound: no stale tip yet
-    <*> newTQueueIO             -- pmBackgroundSends
+    <*> newTBQueueIO (fromIntegral backgroundSendQueueCap)  -- pmBackgroundSends
+    <*> newTVarIO 0             -- pmBackgroundDropped
+    <*> newTVarIO Map.empty     -- pmOutboundTrack
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"

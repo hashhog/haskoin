@@ -21,6 +21,8 @@ module Haskoin.PeerEviction
   ) where
 
 import Data.Int (Int64)
+import Data.List (sortBy)
+import Data.Ord (comparing)
 import Network.Socket (SockAddr)
 
 -- | Core @MINIMUM_CONNECT_TIME@ (net_processing.cpp:112).
@@ -63,7 +65,39 @@ data OutboundEvictCand = OutboundEvictCand
 -- whether to clear @m_try_another_outbound_peer@.
 selectExtraOutboundEvictions :: Int -> Int -> Int64 -> [OutboundEvictCand]
                              -> ([SockAddr], Bool)
-selectExtraOutboundEvictions _ _ _ _ = ([], False)
+selectExtraOutboundEvictions maxFull maxBlockRelay now cands =
+  (blockRelayVerdict ++ fullVerdict, clearTry)
+  where
+    -- Core orders by node id; connect time then address is the stand-in.
+    byAge = sortBy (comparing (\c -> (oecConnectedAt c, oecAddr c)))
+    blockRelay = byAge [c | c <- cands, oecKind c == KindBlockRelay]
+    fullRelay  = [c | c <- cands, oecKind c == KindFullRelay]
+
+    -- Youngest extra block-relay-only peer, unless it gave us a block more
+    -- recently than the second youngest, in which case the second youngest.
+    blockRelayVerdict
+      | length blockRelay <= maxBlockRelay = []
+      | otherwise = case reverse blockRelay of
+          (y : n : _) ->
+            let victim = if oecLastBlock y > oecLastBlock n then n else y
+            in [oecAddr victim | oecBlocksInFlight victim == 0
+                               , now - oecConnectedAt victim >= evictMinConnectSecs]
+          _ -> []
+
+    -- Full-relay: the peer that least recently announced a block; ties go
+    -- to the more recent connection. Protected peers, and the only
+    -- full-relay/manual connection on a network, are never chosen.
+    fullEligible = [ c | c <- fullRelay, not (oecProtected c), multipleOn (oecNetwork c) ]
+    multipleOn net = length [ () | c <- cands, oecKind c /= KindBlockRelay
+                                 , oecNetwork c == net ] > 1
+    worst = case sortBy (comparing (\c -> (oecLastAnnounce c, negate (oecConnectedAt c)))) fullEligible of
+      (c : _) -> Just c
+      []      -> Nothing
+    (fullVerdict, clearTry) = case worst of
+      Just w | length fullRelay > maxFull
+             , now - oecConnectedAt w > evictMinConnectSecs
+             , oecBlocksInFlight w == 0 -> ([oecAddr w], True)
+      _ -> ([], False)
 
 -- | Core's @ChainSyncTimeoutState@.
 data ChainSyncTimer = ChainSyncTimer
@@ -82,4 +116,18 @@ data ConsiderAction = ConsiderNothing | ConsiderSendGetHeaders | ConsiderDisconn
 -- now, our tip's chain work, the peer's best known chain work.
 considerEvictionStep :: Int64 -> Integer -> Maybe Integer -> ChainSyncTimer
                      -> (ConsiderAction, ChainSyncTimer)
-considerEvictionStep _ _ _ t = (ConsiderNothing, t)
+considerEvictionStep now tipWork peerWork t
+  | maybe False (>= tipWork) peerWork =
+      (ConsiderNothing, if cstTimeout t /= 0 then noChainSyncTimer else t)
+  | cstTimeout t == 0 || caughtUpToArmed =
+      (ConsiderNothing, ChainSyncTimer (now + chainSyncTimeoutSecs) (Just tipWork) False)
+  | now > cstTimeout t =
+      if cstSentGetHeaders t
+        then (ConsiderDisconnect, t)
+        else ( ConsiderSendGetHeaders
+             , t { cstTimeout = now + headersResponseTimeSecs, cstSentGetHeaders = True } )
+  | otherwise = (ConsiderNothing, t)
+  where
+    caughtUpToArmed = case (cstWorkTip t, peerWork) of
+      (Just w, Just p) -> p >= w
+      _                -> False

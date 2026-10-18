@@ -48,6 +48,7 @@ import Haskoin.Types
 import Haskoin.Crypto (computeTxId, computeBlockHash, textToAddress, Address(..))
 import qualified Haskoin.Crypto as Crypto (computeWtxid)
 import Haskoin.Script (decodeScript)
+import Haskoin.PeerEviction (extraPeerCheckIntervalSecs)
 import Haskoin.Network
 import Haskoin.Fatal (catchSync, isFatalLatched, readFatalLatch, installFatalShutdownHook)
 import qualified Haskoin.ASMap as ASMap (loadAsmap)
@@ -2101,6 +2102,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- STALE_CHECK_INTERVAL): see 'staleTipWatcher'.
     void $ forkIO $ staleTipWatcher pm' hc db net linearInflightRef
       `catch` (\(e :: SomeException) -> putStrLn $ "staleTipWatcher error: " ++ show e)
+    -- Extra-outbound eviction + chain-sync timeouts (Core EvictExtraOutboundPeers
+    -- / ConsiderEviction, every EXTRA_PEER_CHECK_INTERVAL): see 'outboundEvictionWatcher'.
+    void $ forkIO $ outboundEvictionWatcher pm' hc db linearInflightRef
+      `catch` (\(e :: SomeException) -> putStrLn $ "outboundEvictionWatcher error: " ++ show e)
 
     -- Block download is driven SOLELY by this gap-kicker.
     -- Sync.startIBD is never started (dead code). MHeaders only extends
@@ -3319,6 +3324,26 @@ staleTipWatcher pm hc db net inflightRef = do
             loop lastTip' lastUpdate' (now + staleCheckIntervalSecs)
   loop tip0 t0 (t0 + staleCheckIntervalSecs)
 
+-- | Core's 'EXTRA_PEER_CHECK_INTERVAL' loop: drop the extra outbound peer
+-- opened by the stale-tip check (or any outbound surplus) and time out
+-- outbound peers that never reach our tip's work. A deaf peer holding
+-- block requests is released by the in-flight stall handling; this makes
+-- sure it is also replaced rather than kept as an outbound slot forever.
+outboundEvictionWatcher :: PeerManager -> HeaderChain -> HaskoinDB
+                        -> IORef (Map.Map BlockHash (SockAddr, Word32, Int64)) -> IO ()
+outboundEvictionWatcher pm hc db inflightRef = forever $ do
+  threadDelay (extraPeerCheckIntervalSecs * 1000000)
+  now <- (round <$> getPOSIXTime :: IO Int64)
+  let env = OutboundEvictEnv
+        { oeeTipWork = ceChainWork <$> getValidatedChainTip db hc
+        , oeeInFlight = \a -> do
+            m <- readIORef inflightRef
+            return (length [ () | (k, _, _) <- Map.elems m, k == a ])
+        , oeeLocator = drop 1 <$> buildBlockLocatorFromChain hc
+        }
+  void (runOutboundEviction pm env now)
+    `catch` (\(e :: SomeException) -> putStrLn $ "outboundEvictionWatcher: " ++ show e)
+
 -- | Periodically send getheaders to sync the chain
 getheadersSender :: PeerManager -> HeaderChain -> Network -> IO ()
 getheadersSender pm hc _net = do
@@ -4337,10 +4362,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     -- 'received_new_header' (net_processing.cpp).  We approximate it by the
     -- header tip advancing.
     tipBefore <- readTVarIO (hcHeight hc)
+    batchWorkRef <- newIORef (Nothing :: Maybe Integer)
     (added, badPow, badConn) <- foldM (\(count, pow, conn) hdr -> do
         result <- addHeader net hc hdr False
         case result of
             Right entry -> do
+              modifyIORef' batchWorkRef (Just . maybe (ceChainWork entry) (max (ceChainWork entry)))
               -- Persist header and height index so the chain survives restarts.
               -- putBlockHeader/putBlockHeight are idempotent for duplicates.
               let bh = ceHash entry
@@ -4373,6 +4400,14 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     tipAfter <- readTVarIO (hcHeight hc)
     -- Did this batch extend our best header chain (Core's received_new_header)?
     let progressed = tipAfter > tipBefore
+    -- Per-peer eviction bookkeeping (Core UpdatePeerStateForReceivedHeaders):
+    -- the peer has a chain with at least this much work, and a NEW header
+    -- announced in a small batch is a block announcement.
+    batchWork <- readIORef batchWorkRef
+    forM_ batchWork $ \w -> do
+      noteBestKnownWork pmRefVal addr w
+      when (progressed && length hdrs <= 16) $
+        noteBlockAnnouncement pmRefVal addr (Just w)
     -- Attribute misbehavior for any rejected headers.  Reference:
     -- bitcoin-core/src/net_processing.cpp ProcessHeadersMessage —
     -- non-continuous batches are scored 100 (immediate ban); each
@@ -4947,6 +4982,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   -- block announcement was never read (mainnet 969,866,
                   -- 2026-10-04). Core UpdatedBlockTip only queues.
                   pm <- readIORef pmRef
+                  noteBlockReceived pm addr
                   enqueueBackgroundSend pm (announceTip pm (blockHeader block) bh)
                   -- After connecting a block that reaches our best HEADER tip,
                   -- probe for further blocks we might be missing.  Gated on
