@@ -137,8 +137,11 @@ output to `<netdir>/debug.log` (or `--logfile`), and prints where the log and PI
 SIGINT and SIGTERM shut the node down cleanly, as does the `stop` RPC.
 
 With `--metricsport` (on by default at 9332) Prometheus metrics are served at
-`http://<host>:<port>/metrics`. When the node is started by systemd with `Type=notify` it
-reports readiness through `NOTIFY_SOCKET`.
+`http://<host>:<port>/metrics`. If the port is already in use, the node still logs
+`Prometheus metrics server listening on port N`, then
+`Network.Socket.bind: resource busy (Address already in use)`, and runs on without metrics.
+When the node is started by systemd with `Type=notify` it reports readiness through
+`NOTIFY_SOCKET`.
 
 ## Stopping
 

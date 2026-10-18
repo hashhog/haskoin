@@ -31,8 +31,14 @@ run code:
 - `W124 — Operator experience ... G22 (PARTIAL): acceptLoop in Network.hs:3749 has NO catch around forever`
 
 Most pending examples name a known gap against Core (for example `CoinGrinder absent`); a
-few skip an integration leg whose tool is missing. Run one part of
-the suite with `--match`, as in [CONTRIBUTING.md](../CONTRIBUTING.md).
+few skip an integration leg whose tool is missing. One, `PUB->SUB round-trip via libzmq
+inproc handshake`, marks itself pending when it loses a timing race, so the pending count
+can be 462 or 463 (both seen on 2026-10-18). Run one part of the suite with `--match`, as
+in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+Keep `TMPDIR` short when running the suite. The two `sd_notify` examples create a Unix
+socket under it, and they fail with `pokeSockAddr: path is too long` if the socket path is
+longer than 108 bytes.
 
 ## UTXO set against Core, on regtest
 
@@ -110,9 +116,10 @@ python3 test/p2a_followups_core_parity.py --bitcoind "$(command -v bitcoind)" --
 ```
 
 The first covers `invalidateblock`/`reconsiderblock`, `submitblock` result strings, and
-mempool and `getblocktemplate` ordering for a parent and child. On 2026-10-17 it matched on
-every chain and mempool check and reported 6 mismatches, all in `getblocktemplate` (see
-below). The second covers `decodescript`, descriptors, `decoderawtransaction` and
+mempool and `getblocktemplate` ordering for a parent and child. It matches on every chain
+check. It reports 6 mismatches, all in `getblocktemplate` (see below), and in some runs a
+seventh, `getrawmempool order`: haskoin does not list the parent and child in a fixed
+order. On 2026-10-18 that seventh mismatch appeared in 2 of 4 runs. The second covers `decodescript`, descriptors, `decoderawtransaction` and
 pay-to-anchor outputs: 133 matched, 11 mismatched, 1 justified (the two chains differ). The
 mismatches are listed in [rpc.md](rpc.md).
 
@@ -120,7 +127,13 @@ mismatches are listed in [rpc.md](rpc.md).
 
 - `getblocktemplate` can list a child transaction before its in-mempool parent, and reports
   `sigops` as 0. Do not mine with it.
+- `getrawmempool` lists transactions in an order that can change from run to run, so a
+  parent can come after its child.
 - JSON-RPC responses always have `"id": null`.
+- On 2026-10-18 a testnet4 node that had been syncing from public peers for 10 seconds
+  printed `Shutdown complete.` after `stop` and then aborted with a RocksDB assertion
+  (``Assertion `get_impl_options.column_family' failed``). This was seen once. The
+  regtest, testnet3 and mainnet runs in the same session exited cleanly.
 - No signet.
 - `--reindex` is the same as `--reindex-chainstate`; there is no rebuild of the block index.
 - The RPC port defaults to 8332 on every network.

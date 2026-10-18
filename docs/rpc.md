@@ -74,7 +74,7 @@ field-by-field against Core.
 | `getmempoolentry` |  |
 | `getmempoolinfo` |  |
 | `getorphantxs` |  |
-| `getrawmempool` |  |
+| `getrawmempool` | The order of the list can change from run to run, so a parent can come after its child; see [status.md](status.md#rpc-behaviour-against-core). |
 | `testmempoolaccept` |  |
 | `submitpackage` |  |
 

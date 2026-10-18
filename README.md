@@ -68,7 +68,10 @@ uses a subdirectory of it: `main`, `testnet3`, `testnet4` or `regtest`.
 
 The RPC port does not follow the network: it is 8332 unless you pass `--rpcport`. RPC listens
 on `127.0.0.1` only. A Prometheus metrics endpoint listens on port 9332 unless you pass
-`--metricsport 0`.
+`--metricsport 0`. If something else already holds that port (another node, or a Bitcoin Core
+exporting metrics there), haskoin keeps running without metrics and logs
+`Network.Socket.bind: resource busy (Address already in use)`, so give each node its own
+`--metricsport`.
 
 A full mainnet node keeps every block unless you pass `--prune N` (N ≥ 550 MiB): plan for at
 least 1 TB of fast disk. The UTXO cache is set by `--dbcache` (default 450 MiB). With
