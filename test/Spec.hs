@@ -207,6 +207,7 @@ import qualified W205SendRawMaxFeeRateSpec
 import qualified W206DownloadRedundancySpec
 import qualified W207NoCoreProxySpec
 import qualified W208DeafPeerTipWedgeSpec
+import qualified W209OutboundEvictionSpec
 import qualified ConvertJoinPsbtSpec
 import qualified T2R5Spec
 import qualified R5ErrCodeParitySpec
@@ -24179,6 +24180,9 @@ main = hspec $ do
   -- peer's recv thread, the peer-manager loop and the getheaders backstop
   -- all parked behind it. Bounded writes, off-thread fan-out, stale tip.
   W208DeafPeerTipWedgeSpec.spec
+  -- W209: extra-outbound eviction (Core EvictExtraOutboundPeers /
+  -- ConsiderEviction) and a bounded background send queue.
+  W209OutboundEvictionSpec.spec
 
   -- converttopsbt + joinpsbts — Core v31.99 (rpc/rawtransaction.cpp
   -- converttopsbt / joinpsbts).  Offline pure-core tests: DecodeTx

@@ -21,6 +21,7 @@ library
                  , Haskoin.Consensus
                  , Haskoin.Storage
                  , Haskoin.Network
+                 , Haskoin.PeerEviction
                  , Haskoin.Sync
                  , Haskoin.Mempool
                  , Haskoin.Mempool.Persist
@@ -249,6 +250,7 @@ test-suite haskoin-test
                , W206DownloadRedundancySpec
                , W207NoCoreProxySpec
                , W208DeafPeerTipWedgeSpec
+               , W209OutboundEvictionSpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , R5ErrCodeParitySpec

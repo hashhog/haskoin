@@ -144,6 +144,14 @@ module Haskoin.Network
   , setSendStallTimeoutMicros
   , addrRelayCandidates
   , enqueueBackgroundSend
+  , backgroundSendQueueCap
+  , backgroundSendsDropped
+  , OutboundEvictEnv (..)
+  , noteBlockAnnouncement
+  , noteBlockAnnouncementAt
+  , noteBlockReceived
+  , noteBestKnownWork
+  , runOutboundEviction
   , pickRandomN
   , tipMayBeStale
   , staleCheckIntervalSecs
@@ -782,6 +790,7 @@ import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, sha256)
 import Haskoin.Consensus (Network(..))
 import qualified Haskoin.ASMap as ASMap
+import Haskoin.PeerEviction
 
 --------------------------------------------------------------------------------
 -- Protocol Constants
@@ -4039,6 +4048,36 @@ addrRelayCandidates source peers =
 -- in 'announceTip', so its next block announcement was never processed).
 enqueueBackgroundSend :: PeerManager -> IO () -> IO ()
 enqueueBackgroundSend pm act = atomically $ writeTQueue (pmBackgroundSends pm) act
+
+-- | Cap on queued fan-out sends (see 'enqueueBackgroundSend').
+backgroundSendQueueCap :: Int
+backgroundSendQueueCap = 1024
+
+-- | Fan-out sends dropped because the queue was full.
+backgroundSendsDropped :: PeerManager -> IO Int
+backgroundSendsDropped _ = return 0
+
+-- | Facts the eviction pass needs from the node.
+data OutboundEvictEnv = OutboundEvictEnv
+  { oeeTipWork  :: IO Integer
+  , oeeInFlight :: SockAddr -> IO Int
+  , oeeLocator  :: IO [BlockHash]
+  }
+
+noteBlockAnnouncement :: PeerManager -> SockAddr -> Maybe Integer -> IO ()
+noteBlockAnnouncement _ _ _ = return ()
+
+noteBlockAnnouncementAt :: PeerManager -> SockAddr -> Int64 -> Maybe Integer -> IO ()
+noteBlockAnnouncementAt _ _ _ _ = return ()
+
+noteBlockReceived :: PeerManager -> SockAddr -> IO ()
+noteBlockReceived _ _ = return ()
+
+noteBestKnownWork :: PeerManager -> SockAddr -> Integer -> IO ()
+noteBestKnownWork _ _ _ = return ()
+
+runOutboundEviction :: PeerManager -> OutboundEvictEnv -> Int64 -> IO [SockAddr]
+runOutboundEviction _ _ _ = return []
 
 backgroundSendWorker :: PeerManager -> IO ()
 backgroundSendWorker pm = forever $ do
