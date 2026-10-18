@@ -10,23 +10,32 @@
 module T2R5Spec (spec) where
 
 import Test.Hspec
-import Control.Concurrent.STM (newTVarIO)
+import Control.Concurrent.STM (newTVarIO, readTVarIO)
 import Control.Exception (bracket)
-import Data.Aeson (Value(..), toJSON, decode, object)
+import Control.Monad (foldM)
+import Data.Aeson (Value(..), Key, toJSON, decode, object)
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Base16 as B16
 import qualified Data.ByteString.Lazy as BL
 import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
-import Data.Scientific (toBoundedInteger)
+import Data.Scientific (toBoundedInteger, toRealFloat)
+import Data.Serialize (encode)
+import Data.Word (Word64)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import System.Directory (removeDirectoryRecursive, getTemporaryDirectory)
 import System.FilePath ((</>))
 import System.IO.Temp (createTempDirectory)
 
+import Haskoin.Types
+import Haskoin.Crypto (computeTxId, computeBlockHash, sha256, doubleSHA256)
 import Haskoin.Consensus
-  ( regtest, initHeaderChain )
+  ( regtest, initHeaderChain, medianTimePast, blockReward, computeMerkleRoot
+  , netPowLimit, ChainEntry(..), HeaderChain(..), getValidatedChainTip
+  , computeWtxId )
+import Haskoin.BlockTemplate (submitBlock)
 import Haskoin.FeeEstimator (newFeeEstimator)
 import Haskoin.Mempool (newMempool, defaultMempoolConfig)
 import Haskoin.Network
@@ -35,7 +44,8 @@ import Haskoin.Network
   )
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Storage
-  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig )
+  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig
+  , writeBatch, WriteBatch(..), BatchOp(..) )
 import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Rpc
   ( RpcResponse(..), RpcServer(..), RpcConfig(..), defaultRpcConfig
@@ -63,6 +73,7 @@ import Haskoin.Rpc
   , handlePruneBlockchain
   , handleUtxoUpdatePsbt
   , handleDescriptorProcessPsbt
+  , buildRegtestCoinbase, findRegtestNonce
   )
 
 noServer :: a
@@ -148,6 +159,91 @@ withLiveServer action = do
               , rsOrphanPool = orphanRef, rsAssumeUtxo = assumeUtxoVar
               }
         action server
+
+-- | P2WSH(OP_TRUE): spendable with witness [OP_TRUE].
+opTrueSpk :: BS.ByteString
+opTrueSpk = BS.pack [0x00, 0x20] <> sha256 (BS.singleton 0x51)
+
+spendOpTrue :: OutPoint -> Word64 -> Tx
+spendOpTrue op outV = Tx
+  { txVersion  = 2
+  , txInputs   = [TxIn op BS.empty 0xfffffffd]
+  , txOutputs  = [TxOut outV opTrueSpk]
+  , txWitness  = [[BS.singleton 0x51]]
+  , txLockTime = 0
+  }
+
+-- | Mine a regtest block on @parentHash@ carrying @txs@ and hand it to
+-- submitblock (side-branch blocks included).  Timestamp = parent MTP + 1, so MTP advances slowly and a
+-- window can have window_interval 0 (Core then omits txrate).
+mineOn :: RpcServer -> BlockHash -> [Tx] -> IO Block
+mineOn server parentHash txs = do
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+  parent <- maybe (fail "parent not in index") return (Map.lookup parentHash entries)
+  let height    = ceHeight parent + 1
+      blockTime = medianTimePast entries parentHash + 1
+      wtxids    = TxId (Hash256 (BS.replicate 32 0)) : map computeWtxId txs
+      commit    = getHash256 $ doubleSHA256
+                    (getHash256 (computeMerkleRoot wtxids) <> BS.replicate 32 0)
+      coinbase  = buildRegtestCoinbase height (blockReward height) opTrueSpk blockTime
+                    (if null txs then Nothing else Just commit)
+      allTxs    = coinbase : txs
+      hdr = BlockHeader
+        { bhVersion    = 0x20000000
+        , bhPrevBlock  = parentHash
+        , bhMerkleRoot = computeMerkleRoot (map computeTxId allTxs)
+        , bhTimestamp  = blockTime
+        , bhBits       = 0x207fffff
+        , bhNonce      = 0
+        }
+  mSolved <- findRegtestNonce hdr (netPowLimit regtest)
+  h <- maybe (fail "could not solve regtest nonce") return mSolved
+  let blk = Block h allTxs
+  r <- submitBlock regtest (rsDB server) (rsHeaderChain server) (rsUTXOCache server)
+                   (rsPeerMgr server) (rsMempool server) (rsIndexMgr server) blk
+  case r of
+    Right () -> return blk
+    -- Core's answer for a valid side-branch block that is not (yet) the tip.
+    Left "inconclusive" -> return blk
+    Left e -> fail ("submitblock: " ++ e)
+
+blockHashOf :: Block -> BlockHash
+blockHashOf = computeBlockHash . blockHeader
+
+-- | Genesis + 101 one-tx blocks (txcount 102 at h101), then h102 with one
+-- spend (2 txs, 104) and h103 with a spend plus an in-block child (3 txs,
+-- 107).  Returns the blocks h1..h103.
+buildTxChain :: RpcServer -> IO [Block]
+buildTxChain server = do
+  g <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  b1 <- mineOn server (ceHash g) []
+  rest <- foldM (\acc _ -> (: acc) <$> mineOn server (blockHashOf (head acc)) [])
+                [b1] [2 .. 101 :: Int]
+  let bs101 = reverse rest
+      cbOut b = OutPoint (computeTxId (head (blockTxns b))) 0
+      t1 = spendOpTrue (cbOut (bs101 !! 0)) 4999990000
+      t2 = spendOpTrue (cbOut (bs101 !! 1)) 4999990000
+      t3 = spendOpTrue (OutPoint (computeTxId t2) 0) 4999980000
+  b102 <- mineOn server (blockHashOf (last bs101)) [t1]
+  b103 <- mineOn server (blockHashOf b102) [t2, t3]
+  return (bs101 ++ [b102, b103])
+
+hexHash :: Block -> T.Text
+hexHash b = let BlockHash (Hash256 bs) = blockHashOf b
+            in TE.decodeUtf8 (B16.encode (BS.reverse bs))
+
+chainTxStats :: RpcServer -> [Value] -> IO (KM.KeyMap Value)
+chainTxStats server args = do
+  resp <- handleGetChainTxStats server (toJSON args)
+  v <- decodeRaw <$> resultOf resp
+  case v of
+    Object o -> return o
+    _ -> expectationFailure ("expected object, got " ++ show v) >> return KM.empty
+
+numField :: KM.KeyMap Value -> Key -> Maybe Double
+numField o k = case KM.lookup k o of
+  Just (Number n) -> Just (toRealFloat n)
+  _ -> Nothing
 
 spec :: Spec
 spec = describe "t2_r5" $ do
@@ -375,3 +471,63 @@ spec = describe "t2_r5" $ do
             KM.lookup "window_tx_count" o `shouldBe` Nothing
             KM.lookup "txrate" o `shouldBe` Nothing
           _ -> expectationFailure ("expected object, got " ++ show v)
+    it "connected chain: txcount, window_tx_count and txrate match Core's arithmetic" $
+      withLiveServer $ \server -> do
+        blocks <- buildTxChain server
+        entries <- readTVarIO (hcEntries (rsHeaderChain server))
+        let mtpOf b = maybe 0 ceMedianTime (Map.lookup (blockHashOf b) entries)
+            b101 = blocks !! 100
+            b103 = blocks !! 102
+            interval = fromIntegral (mtpOf b103) - fromIntegral (mtpOf b101) :: Int
+        -- window = h101..h103: Core m_chain_tx_count(h103) - (h101) = 107 - 102.
+        o <- chainTxStats server [toJSON (2 :: Int)]
+        KM.lookup "txcount" o `shouldBe` Just (toJSON (107 :: Int))
+        KM.lookup "window_block_count" o `shouldBe` Just (toJSON (2 :: Int))
+        KM.lookup "window_interval" o `shouldBe` Just (toJSON interval)
+        interval `shouldSatisfy` (> 0)   -- control: the txrate arm is reached
+        KM.lookup "window_tx_count" o `shouldBe` Just (toJSON (5 :: Int))
+        numField o "txrate" `shouldBe` Just (5 / fromIntegral interval)
+        -- A block below the tip, by hash: h102 over the 1-block window h101..h102.
+        o102 <- chainTxStats server [toJSON (1 :: Int), String (hexHash (blocks !! 101))]
+        KM.lookup "txcount" o102 `shouldBe` Just (toJSON (104 :: Int))
+        KM.lookup "window_tx_count" o102 `shouldBe` Just (toJSON (2 :: Int))
+    it "window_interval 0: window_tx_count stays, txrate is omitted" $
+      withLiveServer $ \server -> do
+        blocks <- buildTxChain server
+        entries <- readTVarIO (hcEntries (rsHeaderChain server))
+        let mtpOf b = maybe 0 ceMedianTime (Map.lookup (blockHashOf b) entries)
+        -- h1 and h2 share an MTP (timestamps g+1, g+2 over genesis g).
+        mtpOf (blocks !! 1) `shouldBe` mtpOf (blocks !! 0)   -- control
+        o <- chainTxStats server [toJSON (1 :: Int), String (hexHash (blocks !! 1))]
+        KM.lookup "txcount" o `shouldBe` Just (toJSON (3 :: Int))
+        KM.lookup "window_interval" o `shouldBe` Just (toJSON (0 :: Int))
+        KM.lookup "window_tx_count" o `shouldBe` Just (toJSON (1 :: Int))
+        KM.lookup "txrate" o `shouldBe` Nothing
+    it "reorg: txcount follows the new active branch" $
+      withLiveServer $ \server -> do
+        blocks <- buildTxChain server
+        -- Fork at h102 (txcount 104) with two empty blocks: 105, 106,
+        -- replacing h103 (3 txs, 107).
+        c103 <- mineOn server (blockHashOf (blocks !! 101)) []
+        c104 <- mineOn server (blockHashOf c103) []
+        tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+        ceHash tip `shouldBe` blockHashOf c104   -- control: the reorg happened
+        o <- chainTxStats server [toJSON (2 :: Int)]
+        KM.lookup "txcount" o `shouldBe` Just (toJSON (106 :: Int))
+        KM.lookup "window_tx_count" o `shouldBe` Just (toJSON (2 :: Int))
+    it "reads the count recorded at connect, without walking stored bodies" $
+      withLiveServer $ \server -> do
+        blocks <- buildTxChain server
+        let del k b = BatchDelete (BS.cons k (encode (blockHashOf b)))
+        -- A body walk from the tip would stop at h50 and report unknown.
+        writeBatch (rsDB server) (WriteBatch [del 0x02 (blocks !! 49)])  -- PrefixBlockData
+        o <- chainTxStats server [toJSON (2 :: Int)]
+        KM.lookup "txcount" o `shouldBe` Just (toJSON (107 :: Int))
+        KM.lookup "window_tx_count" o `shouldBe` Just (toJSON (5 :: Int))
+        -- No record (a block connected before records existed) is unknown:
+        -- Core omits txcount and the window extras, never a short sum.
+        writeBatch (rsDB server) (WriteBatch [del 0x0F (blocks !! 102)])  -- PrefixChainTxCount
+        o' <- chainTxStats server [toJSON (2 :: Int)]
+        KM.lookup "txcount" o' `shouldBe` Nothing
+        KM.lookup "window_tx_count" o' `shouldBe` Nothing
+        KM.lookup "txrate" o' `shouldBe` Nothing
