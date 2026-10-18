@@ -10,7 +10,7 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 import qualified Data.Text.Encoding as TE
-import System.IO (hSetBuffering, stdout, BufferMode(..))
+import System.IO (hSetBuffering, hPutStrLn, stderr, stdout, BufferMode(..))
 import System.Directory (createDirectoryIfMissing, getHomeDirectory, doesFileExist)
 import System.FilePath ((</>))
 import Control.Concurrent (threadDelay, forkIO, killThread)
@@ -112,6 +112,8 @@ data NodeOptions = NodeOptions
     --   * 2..549: rejected at startup (below 550 MiB minimum)
     -- Parsed via 'parsePruneArg' into a 'PruneConfig'.
   , noDbCache    :: !Int
+  , noFallbackFee :: !String
+    -- ^ @-fallbackfee=\<amt\>@ (BTC/kvB); \"0\" disables (Core default).
   , noListen     :: !Bool
   , noListenPort :: !Int
   , noMetricsPort :: !Int
@@ -309,6 +311,9 @@ parseNodeOptions = NodeOptions
                 \>=550=auto-prune at N MiB. Mirrors Bitcoin Core's \
                 \-prune=N (init.cpp).")
   <*> option auto (long "dbcache" <> value 450 <> help "DB cache in MB")
+  <*> strOption (long "fallbackfee" <> value "0" <> metavar "AMT"
+        <> help "Wallet fee rate (BTC/kvB) used when fee estimation has \
+                \insufficient data; 0 disables (default: 0, matches Core)")
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
@@ -638,6 +643,9 @@ applyConfigOverlay cm n = n
   , noDbCache    = if noDbCache n == 450
                      then Daemon.configLookupInt "dbcache" 450 cm
                      else noDbCache n
+  , noFallbackFee = if noFallbackFee n == "0"
+                     then fromMaybe "0" (Daemon.configLookup "fallbackfee" cm)
+                     else noFallbackFee n
   , noListen     = if noListen n
                      then Daemon.configLookupBool "listen" True cm
                      else noListen n
@@ -2514,6 +2522,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
                    putStrLn $ "block-gap kicker error: " ++ show e)
 
     -- Start RPC server
+    -- Wallet -fallbackfee (Core wallet.cpp: invalid amount is a startup error).
+    fallbackFeeKvb <- case parseFallbackFee noFallbackFee of
+      Right v -> return v
+      Left e  -> hPutStrLn stderr e >> exitWith (ExitFailure 1)
     let rpcConfig = defaultRpcConfig
           { rpcPort     = noRpcPort
           , rpcUser     = noRpcUser
@@ -2532,6 +2544,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           --   Both set => listener runs WarpTLS.runTLS; both unset =>
           --   plain HTTP (backward-compat).  Half-configured TLS
           --   aborts at startup inside startRpcServer.
+          , rpcFallbackFee = fallbackFeeKvb
           , rpcDbCacheMb   = noDbCache
           -- ^ The same parsed @-dbcache=N@ (MiB) used at line 752 to
           --   size @dbBlockCacheSize = noDbCache*1024*1024@ (the

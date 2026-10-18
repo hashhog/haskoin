@@ -29,6 +29,9 @@ module Haskoin.Rpc
   , generateErrorCode
   , RpcConfig(..)
   , defaultRpcConfig
+    -- * Wallet -fallbackfee
+  , parseFallbackFee
+  , resolveWalletFeeRate
   , startRpcServer
   , stopRpcServer
   , requestNodeShutdown
@@ -338,7 +341,7 @@ import qualified Data.Set as Set
 import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
 import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
-import Data.Char (chr, toLower, isHexDigit)
+import Data.Char (chr, toLower, isHexDigit, isDigit)
 import Data.List (foldl', isInfixOf, isPrefixOf, tails)
 import Text.Printf (printf)
 -- showFFloat was removed: all difficulty/fee formatting now uses
@@ -522,7 +525,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
 import qualified Haskoin.Mempool.Persist as MPP
 import qualified Haskoin.Policy.Standard as PolicyStd
 import Haskoin.TxOrphanage (OrphanPool(..))
-import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, FeeEstimateMode(..),
+import Haskoin.FeeEstimator (FeeEstimator(..), estimateSmartFee, estimateSmartFeeData, FeeEstimateMode(..),
                               estimateRawFee, RawFeeEstimate(..), RawBucketRange(..),
                               untrackTransaction)
 import Haskoin.BlockTemplate (BlockTemplate(..), TemplateTransaction(..),
@@ -657,6 +660,11 @@ data RpcConfig = RpcConfig
     -- (@cs.m_coinsdb_cache_size_bytes@ /
     -- @cs.m_coinstip_cache_size_bytes@ in Core's
     -- @rpc/blockchain.cpp@ make_chain_data).
+  , rpcFallbackFee :: !Word64
+    -- ^ @-fallbackfee=\<amt\>@ in sat/kvB (Core @wallet.m_fallback_fee@,
+    -- @DEFAULT_FALLBACK_FEE = 0@): the wallet fee rate used when fee
+    -- estimation has no data.  0 disables it, in which case wallet sends
+    -- without an explicit fee rate fail on a chain with no estimates.
   } deriving (Show, Generic)
 
 instance NFData RpcConfig
@@ -678,6 +686,7 @@ defaultRpcConfig = RpcConfig
   , rpcTlsCertFile = Nothing
   , rpcTlsKeyFile  = Nothing
   , rpcDbCacheMb   = 450   -- Core DEFAULT_DB_CACHE (init.cpp)
+  , rpcFallbackFee = 0     -- Core DEFAULT_FALLBACK_FEE (wallet/wallet.h)
   }
 
 --------------------------------------------------------------------------------
@@ -12610,6 +12619,51 @@ walletFundAndBroadcast server walletState outputs feeRate = do
                   return $ RpcResponse
                     (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
 
+-- | Parse a @-fallbackfee=\<amt\>@ value (BTC/kvB, Core @ParseMoney@) into
+-- sat/kvB.  At most 8 decimals, non-negative, no exponent.
+parseFallbackFee :: String -> Either String Word64
+parseFallbackFee str =
+  case break (== '.') str of
+    (whole, frac)
+      | not (null whole) || length frac > 1
+      , all isDigit whole
+      , let fracDigits = drop 1 frac
+      , all isDigit fracDigits
+      , length fracDigits <= 8
+      , not (null whole && null fracDigits) ->
+          Right (read ('0' : whole) * 100000000
+                 + read ('0' : take 8 (fracDigits ++ replicate 8 '0')))
+    _ -> Left ("Invalid amount for -fallbackfee=<amount>: '" ++ str ++ "'")
+
+-- | Wallet fee-rate selection for sends without an explicit fee rate
+-- (Core @GetMinimumFeeRate@, wallet/fees.cpp + the @m_allow_fallback_fee@
+-- check in wallet/spend.cpp CreateTransaction).  Result is sat/kvB.
+--
+-- No estimator data and @-fallbackfee@ = 0 is Core's
+-- RPC_WALLET_ERROR "Fee estimation failed. Fallbackfee is disabled. Wait a
+-- few blocks or enable -fallbackfee.".  Otherwise the rate is raised to the
+-- mempool minimum fee.
+resolveWalletFeeRate
+  :: FeeEstimator -> Word64 -> Word64 -> Maybe FeeRate -> IO (Either Text FeeRate)
+resolveWalletFeeRate _ _ _ (Just explicit) = return (Right explicit)
+resolveWalletFeeRate fe fallbackKvb mempoolMinKvb Nothing = do
+  est <- estimateSmartFeeData fe 6 FeeConservative
+  return $ case est of
+    -- estimateSmartFee reports sat/vB; wallet FeeRate is sat/kvB.
+    Just (satPerVb, _) -> Right (FeeRate (max mempoolMinKvb (satPerVb * 1000)))
+    Nothing
+      | fallbackKvb == 0 -> Left
+          "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee."
+      | otherwise -> Right (FeeRate (max mempoolMinKvb fallbackKvb))
+
+-- | Resolve the fee rate for a wallet RPC from an optional explicit rate.
+walletFeeRateFor :: RpcServer -> Maybe FeeRate -> IO (Either RpcResponse FeeRate)
+walletFeeRateFor server mExplicit = do
+  minKvb <- fromIntegral <$> getMempoolMinFeeRate (rsMempool server)
+  r <- resolveWalletFeeRate (rsFeeEst server) (rpcFallbackFee (rsConfig server))
+         minKvb mExplicit
+  return $ either (Left . rpcFail rpcWalletError) Right r
+
 -- | Send an amount to an address
 -- Reference: Bitcoin Core's sendtoaddress RPC (wallet/rpc/spend.cpp)
 -- Parameters:
@@ -12634,8 +12688,17 @@ handleSendToAddress server params = do
                 Just addr ->
                   case parseBtcAmount amountBtc of
                     Left msg -> return $ rpcFail rpcTypeError msg
-                    Right sats -> walletFundAndBroadcast server walletState
-                      [WalletTxOutput addr sats] (FeeRate 1000)
+                    Right sats -> do
+                      -- fee_rate (param 8) is sat/vB, like Core.
+                      let explicit = case rawParamAt params 8 of
+                            Just (Number n) ->
+                              Just (FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double))))
+                            _ -> Nothing
+                      rate <- walletFeeRateFor server explicit
+                      case rate of
+                        Left failure -> return failure
+                        Right fr -> walletFundAndBroadcast server walletState
+                          [WalletTxOutput addr sats] fr
             _ -> return $ rpcFail rpcInvalidParams
               "Missing address or amount parameter"
 
@@ -12664,11 +12727,13 @@ handleSend server params = do
                 Just [] -> return $ rpcFail rpcInvalidParameter
                   "Invalid parameter, output argument must be non-empty"
                 Just wtos -> do
-                  let feeRate = case rawParamAt params 3 of
+                  let explicit = case rawParamAt params 3 of
                         Just (Number n) ->
-                          FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double)))
-                        _ -> FeeRate 1000
-                  resp <- walletFundAndBroadcast server walletState wtos feeRate
+                          Just (FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double))))
+                        _ -> Nothing
+                  rate <- walletFeeRateFor server explicit
+                  resp <- either return
+                    (walletFundAndBroadcast server walletState wtos) rate
                   case resp of
                     RpcResponse (String txid) Null _
                       | not (T.isPrefixOf rawResultMagic txid) ->
