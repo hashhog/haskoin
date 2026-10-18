@@ -88,7 +88,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            bip68Active,
                            calculateSequenceLocks, checkSequenceLocks,
                            SequenceLock(..),
-                           buildConnectBlockOps, buildDisconnectBlockOps,
+                           buildConnectBlockOps, buildDisconnectBlockOps, recordChainTxCount,
                            blockCreatedOutpoints, disconnectRestoredPrevouts,
                            encodeBip34Height,
                            Deployment, DeploymentCache,
@@ -1519,6 +1519,9 @@ buildReorgBatch net db cache hc disList disUndos conList = do
                   ++ " (height " ++ show (ceHeight ce)
                   ++ ") failed full validation: " ++ err
                 Right () -> do
+                  -- Hash-keyed, so safe ahead of the accumulated batch: the
+                  -- next block in this reorg reads it as its parent's count.
+                  recordChainTxCount db n (ceHeight ce) blk
                   let blockOps = buildConnectBlockOps n blk (ceHeight ce) spentUtxos
                       -- Newly created (non-unspendable) UTXOs go into
                       -- overlay so a follow-on connect block in the

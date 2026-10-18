@@ -403,7 +403,7 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            AssumeUtxoState(..), activateSnapshotSync,
                            SnapshotVerdict(..),
                            AssumeUtxoParams(..), assumeUtxoForBlockHash,
-                           connectBlock, disconnectBlock,
+                           connectBlock, disconnectBlock, knownChainTxCount,
                            -- Recovery: regtest coinbase must use the SAME
                            -- BIP-34 height encoder that the consensus gate
                            -- ('validateCoinbaseHeightConsensus') prefix-matches
@@ -3595,9 +3595,13 @@ handleGetChainTxStats server params = do
                   "Invalid block count: should be between 0 and the block's height - 1") Null
         Right nReq -> do
           -- txcount is Core's pindex->m_chain_tx_count: omitted (0 = unknown)
-          -- when the count cannot be anchored (assumeutxo below an
-          -- un-backfilled base), exactly as Core omits it.
-          nChainTx <- chainTxCountAt (rsDB server) (rsNetwork server) entries (ceHash pindex)
+          -- when not known, exactly as Core omits it.  Read the count
+          -- recorded at connect time ('knownChainTxCount', O(1)).  Do NOT
+          -- walk genesis..height summing stored bodies ('chainTxCountAt'):
+          -- that is a full-body read per block and timed the R5 probe out
+          -- on a 900k+ snapshot node.
+          nChainTx <- knownChainTxCount (rsDB server) (rsNetwork server)
+                        (ceHeight pindex) (ceHash pindex)
           let finalTime = bhTimestamp (ceHeader pindex)
               finalHashTxt = showHash (ceHash pindex)
               -- window_block_count: clamp request into [0, height].
@@ -3615,7 +3619,8 @@ handleGetChainTxStats server params = do
                     interval = fromIntegral mtpFinal - fromIntegral mtpAnc :: Int
                 nPast <- case mAnc of
                   Nothing -> return 0
-                  Just anc -> chainTxCountAt (rsDB server) (rsNetwork server) entries (ceHash anc)
+                  Just anc -> knownChainTxCount (rsDB server) (rsNetwork server)
+                                (ceHeight anc) (ceHash anc)
                 -- Core: window_tx_count only when both counts are known;
                 -- txrate only when additionally window_interval > 0.
                 let txExtras

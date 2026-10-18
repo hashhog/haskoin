@@ -133,6 +133,8 @@ module Haskoin.Storage
     -- * Chain Work
   , putChainWork
   , getChainWork
+  , putChainTxCount
+  , getChainTxCount
     -- * Block Status
   , BlockStatus(..)
   , putBlockStatus
@@ -375,6 +377,12 @@ data KeyPrefix
     -- under this prefix, are hashed here, and are promoted into
     -- 'PrefixUTXO' only after the hash gate passes.  Validation never reads
     -- it.  Purged at the start of every import and by 'wipeChainstate'.
+  | PrefixChainTxCount
+    -- ^ 0x0F: BlockHash -> Word64 LE, Core's @CBlockIndex::m_chain_tx_count@
+    -- (cumulative tx count genesis..=block).  Written when a block is
+    -- connected, from its parent's count; absent = unknown.  A pure
+    -- function of the block's ancestry, so it is not chainstate and
+    -- survives 'wipeChainstate' with the bodies it is derived from.
   deriving (Show, Eq, Enum, Generic)
 
 -- | Get the byte value for a key prefix
@@ -391,6 +399,7 @@ prefixByte PrefixAddrHistory = 0x09
 prefixByte PrefixAddrBalance = 0x0A
 prefixByte PrefixAddrUTXO    = 0x0B
 prefixByte PrefixSnapshotStaging = 0x0C
+prefixByte PrefixChainTxCount = 0x0F
 
 -- | Create a database key with prefix.
 -- Keys are formatted as: [1-byte prefix][payload]
@@ -2073,6 +2082,20 @@ getChainWork db bh = do
   let key = makeKey PrefixChainWork (encode bh)
   mval <- R.get (dbHandle db) (dbReadOpts db) key
   return $ bsToInteger <$> mval
+
+-- | Store Core's @m_chain_tx_count@ for a block (see 'PrefixChainTxCount').
+putChainTxCount :: HaskoinDB -> BlockHash -> Word64 -> IO ()
+putChainTxCount db bh n =
+  let key = makeKey PrefixChainTxCount (encode bh)
+  in R.put (dbHandle db) (dbWriteOpts db) key (runPut (putWord64le n))
+
+-- | Stored @m_chain_tx_count@ of a block; 'Nothing' when never recorded.
+-- One point read, unlike summing stored bodies down the chain.
+getChainTxCount :: HaskoinDB -> BlockHash -> IO (Maybe Word64)
+getChainTxCount db bh = do
+  let key = makeKey PrefixChainTxCount (encode bh)
+  mval <- R.get (dbHandle db) (dbReadOpts db) key
+  return $ mval >>= either (const Nothing) Just . runGet getWord64le
 
 -- | Convert Integer to ByteString (big-endian, no leading zeros)
 integerToBS :: Integer -> ByteString
