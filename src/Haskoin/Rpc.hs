@@ -422,6 +422,7 @@ import Haskoin.Consensus (Network(..), HeaderChain(..), ChainEntry(..), BlockSta
                            -- on disk), not the in-memory header tip.
                            getValidatedChainTip,
                            getValidatedChainTipFromBest,
+                           isFailedStatus,
                            -- COINBASE_MATURITY (100) for the generate vs.
                            -- immature category split in listtransactions.
                            coinbaseMaturity,
@@ -9369,55 +9370,77 @@ handleGetAddressInfo server params = withWalletMgr server $ \wm -> do
 --------------------------------------------------------------------------------
 
 -- | Get information about all known chain tips
--- Reference: Bitcoin Core's getchaintips RPC (blockchain.cpp)
+-- Reference: Bitcoin Core's getchaintips RPC (rpc/blockchain.cpp)
 -- Returns array of: {height, hash, branchlen, status}
 -- Status values: "active", "valid-fork", "valid-headers", "headers-only", "invalid"
+--
+-- The ACTIVE chain is the connected chain ('getValidatedChainTip',
+-- PrefixBestBlock), Core's @ActiveChain()@.  'hcTip' is haskoin's
+-- @m_best_header@: it runs ahead of the connected tip during header sync and
+-- stays on a block whose body was rejected without a verdict (a non-verdict
+-- reject leaves no failure mark, see 'classifyBlockReject').  Pre-fix this
+-- handler took 'hcTip' as the active tip, so such a header was reported
+-- "active" while getbestblockhash named its parent, and the connected tip
+-- (which has a child) was not listed at all.
+--
+-- Core's tip set: every block that is not on the active chain and has no
+-- child, plus the active tip.  A childless entry is either the connected tip
+-- or off the active chain, so that is the childless entries plus the
+-- connected tip.
+--
+-- Status of a tip off the active chain, in Core's order:
+--   * failed (BLOCK_FAILED_*, or invalidateblock'd)          -> "invalid"
+--   * no body (Core !HaveNumChainTxs; haskoin checks the
+--     tip's own body, not every ancestor's)                   -> "headers-only"
+--   * connected at some point (Core BLOCK_VALID_SCRIPTS;
+--     haskoin: an undo record exists, written only by
+--     connectBlock and kept across a reorg disconnect)        -> "valid-fork"
+--   * body stored but never connected (Core VALID_TREE/
+--     VALID_TRANSACTIONS: a lesser-work side block)           -> "valid-headers"
+-- This handler only reads; it changes no chain state.
 handleGetChainTips :: RpcServer -> IO RpcResponse
 handleGetChainTips server = do
   entries <- readTVarIO (hcEntries (rsHeaderChain server))
-  tip <- readTVarIO (hcTip (rsHeaderChain server))
+  activeTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   invalidated <- readTVarIO (hcInvalidated (rsHeaderChain server))
 
-  -- Algorithm: find all chain tips (blocks with no children)
-  -- A tip is a block where no other block has it as cePrev
   let allEntries = Map.elems entries
       -- Build set of all blocks that are parents of some block
       parentSet = Set.fromList $ catMaybes $ map cePrev allEntries
-      -- Tips are entries not in the parent set (except genesis might not have children)
-      tips = filter (\e -> not (Set.member (ceHash e) parentSet) || ceHash e == ceHash tip) allEntries
-      -- Always include the active tip
-      allTips = if ceHash tip `elem` map ceHash tips
-                then tips
-                else tip : tips
+      offActive = filter (\e -> not (Set.member (ceHash e) parentSet)
+                                && ceHash e /= ceHash activeTip) allEntries
+      allTips = activeTip : offActive
+
+  statuses <- mapM (tipStatus activeTip invalidated) allTips
 
   -- Build result array (ordered streaming encoding — Core pushKV order is
   -- height, hash, branchlen, status; aeson `object` would sort alphabetically).
-  let tipResultsEnc = map (tipToJSONEnc entries tip invalidated) allTips
+  let tipResultsEnc = zipWith (tipToJSONEnc entries activeTip) allTips statuses
       rawBs = encodingToLazyByteString (AE.list id tipResultsEnc)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
-    tipToJSONEnc :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
-              -> ChainEntry -> AE.Encoding
-    tipToJSONEnc entries activeTip invalidatedSet entry =
-      let status = getChainTipStatus entries activeTip invalidatedSet entry
-          branchLen = computeBranchLen entries activeTip entry
+    tipStatus :: ChainEntry -> Set.Set BlockHash -> ChainEntry -> IO Text
+    tipStatus activeTip invalidatedSet entry
+      | ceHash entry == ceHash activeTip = return "active"
+      | Set.member (ceHash entry) invalidatedSet = return "invalid"
+      | isFailedStatus (ceStatus entry) = return "invalid"
+      | otherwise = do
+          hasBody <- isJust <$> getBlock (rsDB server) (ceHash entry)
+          if not hasBody
+            then return "headers-only"
+            else do
+              wasConnected <- isJust <$> getUndoData (rsDB server) (ceHash entry)
+              return (if wasConnected then "valid-fork" else "valid-headers")
+
+    tipToJSONEnc :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Text
+              -> AE.Encoding
+    tipToJSONEnc entries activeTip entry status =
+      let branchLen = computeBranchLen entries activeTip entry
       in pairs $
            pair "height"    (AE.word32 (ceHeight entry))          <>
            pair "hash"      (text (showHash (ceHash entry)))       <>
            pair "branchlen" (AE.int branchLen)                     <>
            pair "status"    (text status)
-
-    getChainTipStatus :: Map BlockHash ChainEntry -> ChainEntry -> Set.Set BlockHash
-                      -> ChainEntry -> Text
-    getChainTipStatus entries activeTip invalidatedSet entry
-      | ceHash entry == ceHash activeTip = "active"
-      | Set.member (ceHash entry) invalidatedSet = "invalid"
-      | ceStatus entry == StatusInvalid = "invalid"
-      | ceStatus entry == StatusFailedValid = "invalid"
-      | ceStatus entry == StatusFailedChild = "invalid"
-      | ceStatus entry == StatusValid = "valid-fork"
-      | ceStatus entry == StatusHeaderValid = "valid-headers"
-      | otherwise = "headers-only"
 
     computeBranchLen :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Int
     computeBranchLen entries activeTip entry

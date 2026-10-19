@@ -96,7 +96,9 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            taprootDeployment,
                            bumpTipGen,
                            getMtpAtHeightFromEntries, getMtpFromAncestry,
-                           isFailedStatus)
+                           isFailedStatus,
+                           classifyBlockReject, BlockRejectKind(..),
+                           invalidBlockFound)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
 import Haskoin.TestHooks (hookPoint)
 import Haskoin.ChainLock (withChainLock)
@@ -766,7 +768,27 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
           validationResult <- validateBlockGuarded ("submitblock " ++ show bh)
                                 (validateFullBlockIO db net cs getMtpSB False block utxoMap)
           case validationResult of
-            Left err -> return $ Left $ "Block validation failed: " ++ err
+            Left err -> do
+              -- A body that fails with a VERDICT is recorded as a failed
+              -- index entry, as Core does: AcceptBlockHeader stores the
+              -- header, then the failed CheckBlock / ConnectBlock marks it
+              -- BLOCK_FAILED_VALID (validation.cpp AcceptBlock,
+              -- InvalidBlockFound), so getchaintips lists it "invalid" and a
+              -- resubmission answers "duplicate-invalid".  Pre-fix the arm
+              -- returned without touching the index and the block was
+              -- unknown afterwards.  Same two steps as the P2P arm
+              -- (Main.hs MBlock): 'addHeader' runs the header gates (a bad
+              -- header stores nothing), 'invalidBlockFound' marks the entry
+              -- and moves the best header back off it.  The connected tip
+              -- and the coin set are not touched.  A non-verdict (mutated
+              -- body, missing prevout, internal fault) stores nothing, so
+              -- the same header with a good body can still connect.
+              when (classifyBlockReject err == BlockRejectVerdict) $ do
+                hdrResult <- addHeader net hc (blockHeader block) False
+                case hdrResult of
+                  Right _ -> void (invalidBlockFound db hc bh)
+                  Left _  -> return ()
+              return $ Left $ "Block validation failed: " ++ err
             Right () -> do
               -- HEADER VALIDATION MUST PRECEDE PERSISTENCE (submitblock/P2P
               -- unification fix).  'validateFullBlockIO' above runs CheckBlock +
@@ -825,7 +847,13 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
                   scratch <- newUTXOCache db 0
                   undoResult <- applyBlockToCache scratch net block height
                   case undoResult of
-                    Left err -> return $ Left err
+                    Left err -> do
+                      -- 'addHeader' above already made this the best
+                      -- header; a verdict marks it failed and moves the best
+                      -- header back (same as the validation reject above).
+                      when (classifyBlockReject err == BlockRejectVerdict) $
+                        void (invalidBlockFound db hc bh)
+                      return $ Left err
                     Right _undo -> do
                       -- Persist UTXOs + undo data + header + height + best-block in a
                       -- single atomic write batch via 'connectBlock' (the same path

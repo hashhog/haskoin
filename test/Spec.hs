@@ -108,6 +108,7 @@ import qualified P2AScriptClassifySpec
 import qualified WitnessProgramCanonicalSpec
 import qualified SubmitBlockValidatedForkSpec
 import qualified InvalidatedSubmitSpec
+import qualified GetChainTipsSpec
 import qualified CoinCacheResurrectionSpec
 import qualified CacheBookkeepingSpec
 import qualified ChainLockSpec
@@ -23843,6 +23844,7 @@ main = hspec $ do
   WitnessProgramCanonicalSpec.spec
   SubmitBlockValidatedForkSpec.spec
   InvalidatedSubmitSpec.spec
+  GetChainTipsSpec.spec
   CoinCacheResurrectionSpec.spec
   CacheBookkeepingSpec.spec
   ChainLockSpec.spec
