@@ -7,9 +7,11 @@
 module W209FallbackFeeSpec (spec) where
 
 import Test.Hspec
+import Data.Aeson (Value(..), toJSON)
 import Haskoin.FeeEstimator (newFeeEstimator)
 import Haskoin.Mempool (FeeRate(..))
-import Haskoin.Rpc (parseFallbackFee, resolveWalletFeeRate, defaultRpcConfig, RpcConfig(..))
+import Haskoin.Rpc (parseFallbackFee, resolveWalletFeeRate, sendToAddressFeeRate,
+                    defaultRpcConfig, RpcConfig(..))
 
 spec :: Spec
 spec = describe "W209 -fallbackfee" $ do
@@ -47,3 +49,19 @@ spec = describe "W209 -fallbackfee" $ do
     parseFallbackFee "-1" `shouldSatisfy` either (const True) (const False)
     parseFallbackFee "0.123456789" `shouldSatisfy` either (const True) (const False)
     parseFallbackFee "" `shouldSatisfy` either (const True) (const False)
+
+  -- Core v31.1 sendtoaddress: params[8] is avoid_reuse, params[9] is
+  -- fee_rate (wallet/rpc/spend.cpp SetFeeEstimateMode(..., request.params[9]),
+  -- rpc/client.cpp {"sendtoaddress", 9, "fee_rate"}).
+  it "sendtoaddress reads fee_rate from params[9] (Core's help example)" $
+    -- sendtoaddress "addr" 0.1 "" "" false true null "unset" null 1.1
+    sendToAddressFeeRate (toJSON
+      [ String "addr", Number 0.1, String "", String "", Bool False
+      , Bool True, Null, String "unset", Null, Number 1.1 ])
+      `shouldBe` Just (FeeRate 1100)
+
+  it "sendtoaddress does not read avoid_reuse (params[8]) as a fee rate" $
+    sendToAddressFeeRate (toJSON
+      [ String "addr", Number 0.1, String "", String "", Bool False
+      , Bool True, Null, String "unset", Number 5 ])
+      `shouldBe` Nothing

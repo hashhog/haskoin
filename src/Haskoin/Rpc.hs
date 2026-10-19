@@ -12685,9 +12685,12 @@ walletFeeRateFor server mExplicit = do
   return $ either (Left . rpcFail rpcWalletError) Right r
 
 -- | The explicit @fee_rate@ (sat/vB, like Core) of a positional
--- @sendtoaddress@ call, as a wallet FeeRate in sat/kvB.
+-- @sendtoaddress@ call, as a wallet FeeRate in sat/kvB.  Core v31.1 puts
+-- @avoid_reuse@ at params[8] and @fee_rate@ at params[9]
+-- (wallet/rpc/spend.cpp SetFeeEstimateMode(..., request.params[9], ...);
+-- rpc/client.cpp @{"sendtoaddress", 9, "fee_rate"}@).
 sendToAddressFeeRate :: Value -> Maybe FeeRate
-sendToAddressFeeRate params = case rawParamAt params 8 of
+sendToAddressFeeRate params = case rawParamAt params 9 of
   Just (Number n) ->
     Just (FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double))))
   _ -> Nothing
