@@ -32,6 +32,7 @@ module Haskoin.Rpc
     -- * Wallet -fallbackfee
   , parseFallbackFee
   , resolveWalletFeeRate
+  , sendToAddressFeeRate
   , startRpcServer
   , stopRpcServer
   , requestNodeShutdown
@@ -12683,6 +12684,14 @@ walletFeeRateFor server mExplicit = do
          minKvb mExplicit
   return $ either (Left . rpcFail rpcWalletError) Right r
 
+-- | The explicit @fee_rate@ (sat/vB, like Core) of a positional
+-- @sendtoaddress@ call, as a wallet FeeRate in sat/kvB.
+sendToAddressFeeRate :: Value -> Maybe FeeRate
+sendToAddressFeeRate params = case rawParamAt params 8 of
+  Just (Number n) ->
+    Just (FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double))))
+  _ -> Nothing
+
 -- | Send an amount to an address
 -- Reference: Bitcoin Core's sendtoaddress RPC (wallet/rpc/spend.cpp)
 -- Parameters:
@@ -12708,12 +12717,8 @@ handleSendToAddress server params = do
                   case parseBtcAmount amountBtc of
                     Left msg -> return $ rpcFail rpcTypeError msg
                     Right sats -> do
-                      -- fee_rate (param 8) is sat/vB, like Core.
-                      let explicit = case rawParamAt params 8 of
-                            Just (Number n) ->
-                              Just (FeeRate (max 1 (floor (toRealFloat n * 1000 :: Double))))
-                            _ -> Nothing
-                      rate <- walletFeeRateFor server explicit
+                      rate <- walletFeeRateFor server
+                                (sendToAddressFeeRate params)
                       case rate of
                         Left failure -> return failure
                         Right fr -> walletFundAndBroadcast server walletState
