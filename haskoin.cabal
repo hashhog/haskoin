@@ -272,6 +272,7 @@ test-suite haskoin-test
                , WitnessProgramCanonicalSpec
                , SubmitBlockValidatedForkSpec
                , InvalidatedSubmitSpec
+               , GetChainTipsSpec
                , CoinCacheResurrectionSpec
                , CacheBookkeepingSpec
                , ChainLockSpec
