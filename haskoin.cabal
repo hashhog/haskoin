@@ -250,6 +250,7 @@ test-suite haskoin-test
                , W207NoCoreProxySpec
                , W208DeafPeerTipWedgeSpec
                , W209OutboundEvictionSpec
+               , W209FallbackFeeSpec
                , ConvertJoinPsbtSpec
                , T2R5Spec
                , R5ErrCodeParitySpec

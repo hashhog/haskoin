@@ -32,6 +32,7 @@ module Haskoin.FeeEstimator
     -- * Fee Estimation
   , estimateFee
   , estimateSmartFee
+  , estimateSmartFeeData
   , estimateRawFee
   , RawFeeEstimate(..)
   , RawBucketRange(..)
@@ -329,10 +330,18 @@ estimateFee fe targetBlocks = do
 -- Returns (fee rate, actual target blocks)
 estimateSmartFee :: FeeEstimator -> Int -> FeeEstimateMode -> IO (Word64, Int)
 estimateSmartFee fe targetBlocks mode = do
+  r <- estimateSmartFeeData fe targetBlocks mode
+  return $ fromMaybe (adjustForMode fallbackFeeRate mode, maxConfirmBlocks) r
+
+-- | Like 'estimateSmartFee' but returns 'Nothing' when the estimator has no
+-- data for any target (Core: @estimateSmartFee@ returning @CFeeRate(0)@).
+-- Wallet sends use this to decide whether @-fallbackfee@ applies.
+estimateSmartFeeData :: FeeEstimator -> Int -> FeeEstimateMode -> IO (Maybe (Word64, Int))
+estimateSmartFeeData fe targetBlocks mode = do
   -- Try exact target first
   result <- estimateFee fe targetBlocks
   case result of
-    Just rate -> return (adjustForMode rate mode, targetBlocks)
+    Just rate -> return (Just (adjustForMode rate mode, targetBlocks))
     Nothing -> do
       -- Try progressively larger targets
       let targets = case mode of
@@ -342,13 +351,13 @@ estimateSmartFee fe targetBlocks mode = do
         r <- estimateFee fe t
         return (t, r)
       case [(t, r) | (t, Just r) <- results] of
-        [] -> return (adjustForMode fallbackFeeRate mode, maxConfirmBlocks)  -- Fallback with mode adjustment
-        ((t, r):_) -> return (adjustForMode r mode, t)
-  where
-    -- Conservative mode adds 10% buffer to the fee rate
-    adjustForMode :: Word64 -> FeeEstimateMode -> Word64
-    adjustForMode rate FeeConservative = rate + (rate `div` 10)
-    adjustForMode rate FeeEconomical   = rate
+        [] -> return Nothing
+        ((t, r):_) -> return (Just (adjustForMode r mode, t))
+
+-- Conservative mode adds 10% buffer to the fee rate
+adjustForMode :: Word64 -> FeeEstimateMode -> Word64
+adjustForMode rate FeeConservative = rate + (rate `div` 10)
+adjustForMode rate FeeEconomical   = rate
 
 --------------------------------------------------------------------------------
 -- Raw fee estimation (per-bucket data, like Bitcoin Core's estimaterawfee)
