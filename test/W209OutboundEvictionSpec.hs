@@ -4,11 +4,10 @@
 
 -- | Extra-outbound eviction and a bounded send queue.
 --
--- receipts/haskoin-tip-wedge-2026-10-04.md (Residual): a deaf peer could
--- still hold the background sender and block requests, the send queue was
--- unbounded, and the extra outbound peer opened by the stale-tip check was
--- never evicted (Core EvictExtraOutboundPeers / ConsiderEviction were not
--- ported). Fixtures: a stalled peer (no new blocks announced, blocks in
+-- What was left after the tip-wedge fix: a deaf peer could still hold the
+-- background sender and block requests, the send queue was unbounded, and
+-- the extra outbound peer opened by the stale-tip check was never evicted
+-- (Core EvictExtraOutboundPeers / ConsiderEviction were not ported). Fixtures: a stalled peer (no new blocks announced, blocks in
 -- flight, or never catching up) among healthy ones.
 module W209OutboundEvictionSpec (spec) where
 
@@ -205,7 +204,7 @@ spec = describe "outbound-eviction" $ do
         [n | (n, st) <- sts, st /= PeerConnected] `shouldBe` [3]
         flag `shouldBe` False
 
-    it "a peer that delivers our new block counts as having announced it (Core ProcessBlock)" $
+    it "a peer that delivers our new block counts as having announced it (no inv-path announcement is recorded)" $
       withPm "blockrecv" $ \pm -> do
         conns <- addAll pm 9
         -- peer 3 announced longest ago, but just delivered a block to us
@@ -238,3 +237,31 @@ spec = describe "outbound-eviction" $ do
         cg >> cs
         (r0, r1, r2) `shouldBe` ([], [], [addrN 2])
         (st1, st2, stGood) `shouldBe` (PeerConnected, PeerDisconnected, PeerConnected)
+
+    it "never protects a block-relay-only peer, so it cannot take a slot from a full-relay peer" $
+      withPm "blockrelayprotect" $ \pm -> do
+        -- The block-relay-only peer is the oldest connection, so it would be
+        -- the first to be protected if block-relay peers were eligible.
+        (br, cb) <- mkConn (addrN 10) (now0 - 5000)
+        atomically $ modifyTVar' (pcInfo br) (\i -> i { piBlockOnly = True })
+        fulls <- mapM (\n -> do
+                         (pc, c) <- mkConn (addrN n) (now0 - 1000 + fromIntegral n)
+                         return (n, pc, c)) [1 .. 4]
+        atomically $ modifyTVar' (pmPeers pm) $ \m ->
+          foldr (\(n, pc, _) -> Map.insert (addrN n) pc) (Map.insert (addrN 10) br m) fulls
+        -- All five have shown a chain with our tip's work.
+        mapM_ (\a -> noteBestKnownWork pm a 1000) (addrN 10 : [addrN n | n <- [1 .. 4]])
+        let envAt w = OutboundEvictEnv
+              { oeeTipWork = return w, oeeInFlight = \_ -> return 0
+              , oeeLocator = return [BlockHash (Hash256 (BS.replicate 32 0))] }
+        r0 <- runOutboundEviction pm (envAt 1000) now0
+        tr <- readTVarIO (pmOutboundTrack pm)
+        let prot a = maybe False otProtected (Map.lookup a tr)
+        -- Our tip moves ahead and nobody follows: only unprotected peers
+        -- go through the chain-sync timeout.
+        r1 <- runOutboundEviction pm (envAt 2000) (now0 + 1)
+        r2 <- runOutboundEviction pm (envAt 2000) (now0 + chainSyncTimeoutSecs + 2)
+        r3 <- runOutboundEviction pm (envAt 2000) (now0 + chainSyncTimeoutSecs + 3 + headersResponseTimeSecs)
+        cb >> mapM_ (\(_, _, c) -> c) fulls
+        (prot (addrN 10), [prot (addrN n) | n <- [1 .. 4 :: Int]]) `shouldBe` (False, replicate 4 True)
+        (r0, r1, r2, r3) `shouldBe` ([], [], [], [addrN 10])
