@@ -125,6 +125,8 @@ module Haskoin.Consensus
     -- * Block Connection (Legacy)
   , connectBlock
   , connectBlockAt
+  , knownChainTxCount
+  , recordChainTxCount
   , disconnectBlock
   , disconnectBlockAt
     -- * UpdateTip log (operator progress; not consensus)
@@ -412,7 +414,8 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         loadSnapshot, verifySnapshot,
                         CoinsViewDB(..), newCoinsViewDB,
                         CoinsViewCache(..), newCoinsViewCache, cacheFlush, defaultCacheSize,
-                        putBlockStatus, newUTXOCache, flushCache)
+                        putBlockStatus, newUTXOCache, flushCache,
+                        getChainTxCount, putChainTxCount)
 -- Secondary-index fan-out on the disconnect/reorg path (txindex /
 -- blockfilterindex / coinstatsindex).  Index.hs depends only on
 -- Types/Crypto/Storage/MuHash (never on Consensus), so importing it here
@@ -5105,6 +5108,7 @@ connectBlockAt db net block height spentUtxos = do
         , BatchPut (makeKey PrefixBlockData (encode bh))
                    (encode block)
         ])
+      recordChainTxCount db net height block
       return (Right ())
     else do
       -- W93 Gate G1: hashPrevBlock == GetBestBlock().
@@ -5234,7 +5238,44 @@ connectBlockAt db net block height spentUtxos = do
                       ]
                     ]
               writeBatch db (WriteBatch ops)
+              recordChainTxCount db net height block
               return (Right ())
+
+-- | Core @CBlockIndex::m_chain_tx_count@ of a block, 0 when unknown (Core's
+-- sentinel).  O(1): the count recorded by 'recordChainTxCount' when the
+-- block was connected, else one of the two anchors Core seeds without a
+-- parent -- genesis (its own tx count, 1) or a static assumeUTXO base
+-- (node/blockstorage.cpp: @base->m_chain_tx_count = au_data.m_chain_tx_count@).
+knownChainTxCount :: HaskoinDB -> Network -> Word32 -> BlockHash -> IO Word64
+knownChainTxCount db net height bh = do
+  mStored <- getChainTxCount db bh
+  return $ case mStored of
+    Just n -> n
+    Nothing
+      | height == 0 -> 1
+      | Just au <- assumeUtxoForBlockHash net bh
+      , aupHeight au == height -> aupChainTxCount au
+      | otherwise -> 0
+
+-- | Record @m_chain_tx_count@ for a block being connected: its parent's
+-- count plus its own tx count, as Core's ReceivedBlockTransactions does.
+-- Nothing is written when the parent's count is unknown (below an
+-- un-backfilled snapshot base, or a datadir connected before this record
+-- existed), so the RPC keeps reporting "unknown" rather than a short sum.
+--
+-- Keyed by hash and a pure function of the block's ancestry, so it needs
+-- no atomicity with the connect batch: a crash between the two leaves it
+-- absent (unknown), never wrong, and a disconnect has nothing to undo.
+recordChainTxCount :: HaskoinDB -> Network -> Word32 -> Block -> IO ()
+recordChainTxCount db net height block = do
+  let bh  = computeBlockHash (blockHeader block)
+      nTx = fromIntegral (length (blockTxns block)) :: Word64
+  parentCount <-
+    if height == 0
+      then return 0
+      else knownChainTxCount db net (height - 1) (bhPrevBlock (blockHeader block))
+  when (height == 0 || parentCount /= 0) $
+    putChainTxCount db bh (parentCount + nTx)
 
 -- | Result of a 'disconnectBlock' / 'disconnectBlockAt' call, mirroring
 -- Bitcoin Core's 'DisconnectResult' enum
@@ -7664,6 +7705,7 @@ reorgConnectIncremental net cache db hc mIdxMgr (ce : rest) = do
               blockOps  = filter (not . isReorgBlockDataPut) blockOps0
           noteReorgBatch blockOps
           writeBatch db (WriteBatch blockOps)
+          recordChainTxCount db net (ceHeight ce) blk
           invalidateCoinCaches cache  -- F0: rcEntries + ucEntries/ucDirty
           atomically $ do
             modifyTVar' (hcByHeight hc)
@@ -7926,6 +7968,9 @@ reorgConBuild net cache db hc ov ((ce, blk) : rest) ops = do
           ++ " (height " ++ show (ceHeight ce)
           ++ ") failed full validation: " ++ err
         Right () -> do
+          -- Hash-keyed, so safe ahead of the accumulated batch: the next
+          -- block in this reorg reads it as its parent's count.
+          recordChainTxCount db net (ceHeight ce) blk
           let blockOps = buildConnectBlockOps net blk (ceHeight ce) spentUtxos
               txids = map computeTxId txns
               coinbaseFlag txIdx = txIdx == (0 :: Int)
@@ -8252,6 +8297,7 @@ connectChain net cache db hc fromHash toHash = do
                   Right undoData -> do
                     -- Store undo data for this block
                     putUndoData db (ceHash ce) undoData
+                    recordChainTxCount db net (ceHeight ce) block
                     return (Right ())
   return $ sequence_ results
   where
