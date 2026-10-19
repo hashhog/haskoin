@@ -4134,7 +4134,11 @@ noteBlockAnnouncementAt pm addr t w = adjustTrack pm addr $ \o ->
 noteBlockReceived :: PeerManager -> SockAddr -> IO ()
 noteBlockReceived pm addr = do
   t <- round <$> getPOSIXTime
-  -- Core ProcessBlock sets m_last_block_announcement alongside m_last_block_time.
+  -- Core ProcessBlock sets only m_last_block_time; m_last_block_announcement
+  -- is set in UpdatePeerStateForReceivedHeaders and the cmpctblock handler
+  -- when a new header beats our tip's work. Here only the headers handler
+  -- records one; a block announced by inv records nothing, so a delivered
+  -- block stands in for the announcement.
   adjustTrack pm addr $ \o -> o { otLastBlock = t, otLastAnnounce = t }
 
 -- | Core UpdateBlockAvailability: the peer is known to have a chain with
@@ -4159,13 +4163,16 @@ runOutboundEviction pm env now = do
                | otherwise     = KindFullRelay
   tipWork <- oeeTipWork env
   atomically $ modifyTVar' (pmOutboundTrack pm) (`Map.restrictKeys` Map.keysSet peers)
-  -- Protect up to maxProtectedOutbound outbound peers that have shown a
-  -- chain at least as good as ours (Core UpdatePeerStateForReceivedHeaders).
+  -- Protect up to maxProtectedOutbound full-relay outbound peers that have
+  -- shown a chain at least as good as ours (Core
+  -- UpdatePeerStateForReceivedHeaders: pfrom.IsFullOutboundConn()).
+  -- Block-relay-only peers are never protected, so they stay subject to
+  -- the chain-sync timeout below.
   tr0 <- readTVarIO (pmOutboundTrack pm)
   let trackOf a = Map.findWithDefault emptyTrack a tr0
-      nProtected = length [ () | (a, _, i) <- live, kindOf i /= KindManual, otProtected (trackOf a) ]
+      nProtected = length [ () | (a, _, i) <- live, kindOf i == KindFullRelay, otProtected (trackOf a) ]
       promotable = [ a | (a, _, i) <- sortOn (\(_, _, i) -> piConnectedAt i) live
-                       , kindOf i /= KindManual
+                       , kindOf i == KindFullRelay
                        , not (otProtected (trackOf a))
                        , maybe False (>= tipWork) (otBestWork (trackOf a)) ]
   forM_ (take (maxProtectedOutbound - nProtected) promotable) $ \a ->
