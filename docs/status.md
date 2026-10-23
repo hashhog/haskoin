@@ -92,6 +92,35 @@ At mainnet height 958,794 (block
 166,180,925 coins; Core reports both with `gettxoutsetinfo` at that height, or with
 `dumptxoutset` and `rollback=958794`.
 
+### What has been recorded, and what has not
+
+A from-genesis rig (`--noassumevalid`, fed by a block server capped at 958,794 so it
+stopped on the anchor) was hashed on 2026-09-09 and matched the value above. The record
+is the hashhog meta-repo's `receipts/TRUST-ANCHOR.md:224`,
+`receipts/T2-capture-haskoin-20260909T120645Z.md` and
+`staged-patches/haskoin-lineage-2026-10-22/` (the rig log and a read-out of it). That
+repository is private, so a reader of this one cannot check them.
+
+What the evidence supports:
+
+- the rig held a UTXO set at 958,794 whose `hash_serialized_3` equals Core's;
+- the rig log shows `--noassumevalid` on every start and the node past height 200,089.
+
+What it does not support, and the README therefore does not claim:
+
+- Heights 0 to 200,089. The log begins with a resume at 200,089 (`Chainstate reconciliation:
+  connected-block tip is height 200089`), so that stretch is not in it.
+- One binary throughout. The log has five start banners and prints no binary identity.
+  Per the receipts, binary `57026489ec71` (sha256
+  `57026489ec71d7d5456c9393bc5a2ef07f337d7e7425707985d39cf6cff3a38b`) built the
+  chainstate; the hash was taken by `965764b10786` after the rig was killed by the
+  out-of-memory killer during the first attempt. Its full sha256 was never recorded and
+  the binary was not kept. The last two restarts resumed at the anchor itself, so nothing
+  below 958,794 was re-validated by the second binary.
+- Ratification. The capture receipt says it is evidence, not a ledger entry; no signed tag
+  rests on it.
+- The 994 `thread killed` reorg/side-branch error lines in the log are unexplained.
+
 To check haskoin against it, sync a mainnet node from genesis with every script verified:
 
 ```bash
