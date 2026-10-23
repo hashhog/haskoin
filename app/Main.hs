@@ -1889,6 +1889,16 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           then netDefaultPort net
           else noListenPort
         discoverOn = fromMaybe (null noExternalIP && isNothing noProxy) noDiscover
+    -- A snapshot-bootstrapped chainstate (the persisted --load-snapshot base
+    -- marker) has no block bodies at or below the base, and haskoin never
+    -- downloads that history, so it must not advertise NODE_NETWORK — Core
+    -- drops the bit on loadtxoutset and keeps it off across restarts while
+    -- the historical chainstate is unfinished (init.cpp:1947).
+    historyIncomplete <- isJust <$> getSnapshotBaseHash db
+    when historyIncomplete $
+      putStrLn "Snapshot-based chainstate: blocks at and below the snapshot \
+               \base are not stored; advertising NODE_NETWORK_LIMITED \
+               \without NODE_NETWORK."
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcMaxBlockRelayOnly = min 2 (max 0 (noMaxPeers - min 8 noMaxPeers))
@@ -1900,6 +1910,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
           , pmcPruneMode   = pruneOn
+          , pmcHistoryIncomplete = historyIncomplete
           -- -connect peer pinning + -dnsseed gate (see resolution above).
           , pmcConnectAddrs = resolvedConnectAddrs
           , pmcDnsSeed      = dnsSeedEnabled

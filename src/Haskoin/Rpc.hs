@@ -231,6 +231,7 @@ module Haskoin.Rpc
   , handleGetBlock
     -- * R3 own-state answers for absent block data (exported for testing)
   , blockDataUnavailableMsg
+  , blockBodyWasHeld
   , nTxFromStoredBody
   , handleGetTxOut
   , handleGetRawTransaction
@@ -491,7 +492,9 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          peerCanServeWitnesses,
                          nodeNetwork, nodeWitness, nodeBloom,
                          nodeNetworkLimited, nodeP2PV2, bip324V2OutboundEnabled,
-                         hasService, ServiceFlag(..),
+                         hasService, ServiceFlag(..), localServicesFor,
+                         PeerManagerConfig(..),
+                         nodeCompactFilters,
                          disconnectPeer, addNodeConnect,
                          addAddedNode, removeAddedNode, getAddedNodes,
                          getNetworkActive, setNetworkActive,
@@ -2489,6 +2492,19 @@ blockDataUnavailableMsg havePruned hadData
   | havePruned && hadData = "Block not available (pruned data)"
   | otherwise             = "Block not available (not fully downloaded)"
 
+-- | Whether this node ever held the body of an indexed block (Core: @nTx > 0@
+-- in 'IsBlockPruned').  A block on the active chain at or below the validated
+-- tip was connected here — EXCEPT at or below a UTXO-snapshot base: a
+-- snapshot-started node imported the coins, never the bodies, so those
+-- blocks were never downloaded (Core leaves their nTx at 0; even the base
+-- block only gets m_chain_tx_count).  Such a block is "not fully downloaded"
+-- even in prune mode.  Args: snapshot base height (if the chainstate came
+-- from a snapshot), on-active-chain-at-or-below-tip, block height.
+-- Exported for testing.
+blockBodyWasHeld :: Maybe Word32 -> Bool -> Word32 -> Bool
+blockBodyWasHeld mSnapBaseHeight connectedHere height =
+  connectedHere && maybe True (height >) mSnapBaseHeight
+
 -- | getblock answer when 'getBlock' found no stored body.  Mirrors Core's
 -- getblock: LookupBlockIndex miss -> -5 "Block not found"; index hit without
 -- data -> -1 'blockDataUnavailableMsg'.  Never consults anything but this
@@ -2503,9 +2519,16 @@ getBlockBodyAbsentResponse server bh = do
     (_, mEntry) -> do
       byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
       vtip     <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-      let hadData = case mEntry of
-            Just ce -> Map.lookup (ceHeight ce) byHeight == Just bh
-                       && ceHeight ce <= ceHeight vtip
+      mSnapBase <- getSnapshotBaseHash (rsDB server)
+      let mSnapBaseHeight = mSnapBase >>= \b ->
+            case Map.lookup b entries of
+              Just ce -> Just (ceHeight ce)
+              Nothing -> aupHeight <$> assumeUtxoForBlockHash (rsNetwork server) b
+          hadData = case mEntry of
+            Just ce -> blockBodyWasHeld mSnapBaseHeight
+                         (Map.lookup (ceHeight ce) byHeight == Just bh
+                          && ceHeight ce <= ceHeight vtip)
+                         (ceHeight ce)
             Nothing -> False
           msg = blockDataUnavailableMsg (rsPruneEnabled server) hadData
       return $ RpcResponse Null (toJSON $ RpcError rpcMiscError msg) Null
@@ -4877,14 +4900,18 @@ handleGetNetworkInfo server = do
               in if odd n
                  then xs !! m
                  else (xs !! (m - 1) + xs !! m) `div` 2
-  -- Our local services: NODE_NETWORK (1) | NODE_WITNESS (8) |
-  -- NODE_NETWORK_LIMITED (0x400) = 0x409, plus NODE_P2P_V2 (0x800) iff
-  -- BIP-324 v2 outbound is enabled -> 0xc09.  Gated on the SAME predicate that
-  -- gates the wire advertisement (Network.hs three sites) so localservices can
-  -- never claim a capability the node will not actually offer (Core binds the
-  -- flag to the action).  Matches Core g_local_services (init.cpp:863) +
-  -- NODE_P2P_V2 when v2 is on.
+  -- Our local services: exactly the bitset the handshake puts in our
+  -- version message ('localServicesFor' over the PeerManager's config):
+  -- NODE_NETWORK (1) unless a snapshot-started node lacks the history below
+  -- its base | NODE_WITNESS (8) | NODE_NETWORK_LIMITED (0x400), plus
+  -- NODE_P2P_V2 (0x800) iff BIP-324 v2 outbound is enabled -> 0xc09 for a
+  -- full-history node, 0xc08 for a snapshot-started one (Core
+  -- g_local_services, init.cpp:863/1947; loadtxoutset drops NODE_NETWORK).
   v2adv <- bip324V2OutboundEnabled
+  -- The snapshot-base marker is what the node reads at startup to set
+  -- 'pmcHistoryIncomplete' (app/Main.hs); read it here too so localservices
+  -- states the node's history from the same on-disk fact.
+  historyIncomplete <- isJust <$> getSnapshotBaseHash (rsDB server)
   -- setnetworkactive mirror (Core getnetworkinfo, net.cpp:709): report the
   -- live CConnman::fNetworkActive flag, not a hardcoded True, so toggling it
   -- via setnetworkactive is observable here.
@@ -4901,17 +4928,20 @@ handleGetNetworkInfo server = do
   let mpCfg = mpConfig (rsMempool server)
       relayFloorKvb  = fromIntegral (getFeeRate (mpcMinFeeRate mpCfg)) :: Int64
       incrementalKvb = fromIntegral incrementalRelayFeePerKvb :: Int64
-      localServices = getServiceFlag nodeNetwork
-                  .|. getServiceFlag nodeWitness
-                  .|. getServiceFlag nodeNetworkLimited
-                  .|. (if v2adv then getServiceFlag nodeP2PV2 else 0) :: Word64
+      pmCfg = pmConfig (rsPeerMgr server)
+      localServices = localServicesFor
+                        pmCfg { pmcHistoryIncomplete =
+                                  pmcHistoryIncomplete pmCfg || historyIncomplete }
+                        v2adv
       localServicesHex = T.pack $ printf "%016x" localServices
       -- Build human-readable service names
       serviceNames :: [Text]
       serviceNames = catMaybes
+        -- Bit order, as Core GetServicesNames emits them.
         [ if hasService localServices nodeNetwork then Just "NETWORK" else Nothing
-        , if hasService localServices nodeWitness then Just "WITNESS" else Nothing
         , if hasService localServices nodeBloom then Just "BLOOM" else Nothing
+        , if hasService localServices nodeWitness then Just "WITNESS" else Nothing
+        , if hasService localServices nodeCompactFilters then Just "COMPACT_FILTERS" else Nothing
         , if hasService localServices nodeNetworkLimited then Just "NETWORK_LIMITED" else Nothing
         , if hasService localServices nodeP2PV2 then Just "P2P_V2" else Nothing
         ]

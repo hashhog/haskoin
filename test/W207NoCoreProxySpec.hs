@@ -56,7 +56,7 @@ import Haskoin.Network (Message, PeerManagerConfig(..),
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Rpc (RpcConfig(..), RpcResponse(..), RpcServer(..),
                     defaultRpcConfig, handleBatchRequest,
-                    blockDataUnavailableMsg, nTxFromStoredBody)
+                    blockDataUnavailableMsg, blockBodyWasHeld, nTxFromStoredBody)
 import Haskoin.Storage (BlockUndo(..), PruneConfig(..), TxInUndo(..),
                         TxUndo(..), UndoData(..), defaultDBConfig,
                         defaultPruneConfig, getBlock, newUTXOCache, putBlock,
@@ -167,6 +167,12 @@ pureSpec = describe "pure helpers" $ do
     blockDataUnavailableMsg True  False `shouldBe` "Block not available (not fully downloaded)"
     blockDataUnavailableMsg False True  `shouldBe` "Block not available (not fully downloaded)"
     blockDataUnavailableMsg False False `shouldBe` "Block not available (not fully downloaded)"
+  it "blockBodyWasHeld: never held at or below a snapshot base" $ do
+    blockBodyWasHeld Nothing    True  1   `shouldBe` True
+    blockBodyWasHeld Nothing    False 1   `shouldBe` False
+    blockBodyWasHeld (Just 299) True  1   `shouldBe` False
+    blockBodyWasHeld (Just 299) True  299 `shouldBe` False
+    blockBodyWasHeld (Just 299) True  300 `shouldBe` True
   it "nTxFromStoredBody: 0 without a body, tx count with one" $ do
     nTxFromStoredBody Nothing `shouldBe` 0
     nTxFromStoredBody (Just fixtureBlock) `shouldBe` 2
