@@ -8,14 +8,14 @@ A Bitcoin full node written from scratch in Haskell. One of the ten [hashhog](ht
 
 | Area | State |
 |---|---|
-| Mainnet validation | One recorded reproduction: a `--noassumevalid` rig's UTXO set at height 958,794 hashed to `hash_serialized_3` `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` (166,180,925 coins), equal to Core's and to the other recorded reproductions (ledger row `receipts/TRUST-ANCHOR.md:224` in the hashhog meta-repo, 2026-09-09). **Not ratified, and weaker than "validated from genesis"**: the rig log we have begins with a resume at height 200,089 (heights 0 to 200,089 are not in it) and has five restarts; the set was built by binary `57026489ec71` and hashed by a different one, `965764b10786`, after an out-of-memory restart, and that binary's full sha256 was not recorded. Details and what is unproven: [docs/status.md](docs/status.md#mainnet-validation-to-height-958794). |
+| Mainnet validation | At height 958,794 a `--noassumevalid` rig's UTXO set hashed to `hash_serialized_3` `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` (166,180,925 coins), equal to Core's (recorded 2026-09-09, not ratified). Limits: the rig log begins with a resume at height 200,089 (heights 0 to 200,089 are not in it) and has five start banners, each with `--noassumevalid`; the set was built by binary `57026489ec71` and hashed by a different one, `965764b10786`, after an out-of-memory restart, and that binary's full sha256 was not recorded. Details: [docs/status.md](docs/status.md#mainnet-validation-to-height-958794). |
 | Consensus | Block, transaction and script validation through Taproot. Runs all of Core's `script_tests.json` and `sighash.json` vectors as test suites. |
 | RPC | 135 JSON-RPC methods modelled on Core's, plus optional REST. Known differences in [docs/rpc.md](docs/rpc.md). |
 | P2P | Headers-first sync, inbound and outbound peers, BIP-324 v2 transport, addrv2, compact blocks, SOCKS5/Tor/I2P outbound. |
 | Wallet | Descriptor wallets, multi-wallet, PSBT, BIP-32/39 keys. No custody audit. |
 | Known limitations | `getblocktemplate` can order a child before its parent (do not mine with it). No signet. RPC responses carry `"id": null`. See [docs/status.md](docs/status.md#known-limitations). |
 
-Last updated: 2026-10-17.
+Last updated: 2026-10-23.
 
 ## Quick start
 

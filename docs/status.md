@@ -94,32 +94,34 @@ At mainnet height 958,794 (block
 
 ### What has been recorded, and what has not
 
-A from-genesis rig (`--noassumevalid`, fed by a block server capped at 958,794 so it
-stopped on the anchor) was hashed on 2026-09-09 and matched the value above. The record
-is the hashhog meta-repo's `receipts/TRUST-ANCHOR.md:224`,
-`receipts/T2-capture-haskoin-20260909T120645Z.md` and
-`staged-patches/haskoin-lineage-2026-10-22/` (the rig log and a read-out of it). That
-repository is private, so a reader of this one cannot check them.
+On 2026-09-09 a rig run with `--noassumevalid`, fed by a block server capped at 958,794
+so it stopped on the anchor, held a UTXO set at height 958,794 whose `hash_serialized_3`
+was `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over 166,180,925
+coins, equal to Core's value above. The match was recorded; it is not ratified (no signed
+tag rests on it).
 
-What the evidence supports:
+What the rig log supports:
 
-- the rig held a UTXO set at 958,794 whose `hash_serialized_3` equals Core's;
-- the rig log shows `--noassumevalid` on every start and the node past height 200,089.
+- the UTXO set at 958,794 matched Core's;
+- the log has five start banners, each with `--noassumevalid`, and shows the node
+  validating from height 200,089 onward.
 
 What it does not support, and the README therefore does not claim:
 
 - Heights 0 to 200,089. The log begins with a resume at 200,089 (`Chainstate reconciliation:
   connected-block tip is height 200089`), so that stretch is not in it.
-- One binary throughout. The log has five start banners and prints no binary identity.
-  Per the receipts, binary `57026489ec71` (sha256
+- One binary throughout. The log prints no binary identity. Per the capture record, binary
+  `57026489ec71` (sha256
   `57026489ec71d7d5456c9393bc5a2ef07f337d7e7425707985d39cf6cff3a38b`) built the
   chainstate; the hash was taken by `965764b10786` after the rig was killed by the
-  out-of-memory killer during the first attempt. Its full sha256 was never recorded and
-  the binary was not kept. The last two restarts resumed at the anchor itself, so nothing
+  out-of-memory killer during the first attempt. Its full sha256 was not recorded and
+  the binary was not kept. The last two starts resumed at the anchor itself, so nothing
   below 958,794 was re-validated by the second binary.
-- Ratification. The capture receipt says it is evidence, not a ledger entry; no signed tag
-  rests on it.
-- The 994 `thread killed` reorg/side-branch error lines in the log are unexplained.
+- An explanation for the 994 log lines containing `thread killed`. They split into 674
+  `P2P reorg (MBlock) error`, 90 `putBlock (side-branch) error`, 221 `Handler error`,
+  1 `ERROR validating block 481828`, 4 `ERROR connecting block` (heights 621,958,
+  621,960, 712,924 and 924,478), and 4 diagnostic lines `rejected by connectBlock:
+  exception: thread killed` at those same four heights.
 
 To check haskoin against it, sync a mainnet node from genesis with every script verified:
 
