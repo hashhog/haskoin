@@ -1459,7 +1459,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       mBestH <- case mBestNow of
         Nothing -> return Nothing
         Just bh -> case Map.lookup bh entriesNow of
-          Nothing -> return Nothing
+          -- The pointer still names the snapshot base and the header chain
+          -- has not been rebuilt up to it yet (a fresh --load-snapshot boot:
+          -- the import pins best-block to the base and records the marker
+          -- in the same commit, and imports no block bodies or height-index
+          -- rows).  The coin set IS the snapshot set at the base height by
+          -- construction, so the pointer resolves to that height.  Without
+          -- this, the forward-move guard below finds no active-chain row and
+          -- no base-block body to prove the coinbase with, and refuses to
+          -- start every fresh snapshot boot.
+          Nothing
+            | Just bh == mSnapshotBase, Just h <- mSnapshotBaseHeight ->
+                return (Just h)
+            | otherwise -> return Nothing
           Just ce -> do
             -- Only an ACTIVE-chain pointer is a usable floor.
             mRow <- if ceHeight ce == 0
