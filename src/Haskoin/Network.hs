@@ -106,6 +106,7 @@ module Haskoin.Network
   , nodeNetworkLimited
   , combineServices
   , hasService
+  , localServicesFor
   , nodeNetworkLimitedMinBlocks
   , maxBlocksInTransitPerPeer
   , maxBlocksInFlightTotal
@@ -961,6 +962,32 @@ combineServices = foldl (\acc (ServiceFlag s) -> acc .|. s) 0
 -- | Check if a service flag is set in a bitmask
 hasService :: Word64 -> ServiceFlag -> Bool
 hasService flags (ServiceFlag s) = flags .&. s == s
+
+-- | The services this node offers: the bitset it puts in the @version@
+-- message it sends (all three handshake paths) and reports as
+-- @getnetworkinfo.localservices@.  One function so the two cannot disagree.
+--
+-- Core: @g_local_services = NODE_NETWORK_LIMITED | NODE_WITNESS@
+-- (init.cpp:863); NODE_NETWORK is added only when the node can serve every
+-- block — not in prune mode and with no historical chainstate still to
+-- download (init.cpp:1947), and is removed by loadtxoutset
+-- (rpc/blockchain.cpp:3432).  A node started from a UTXO snapshot never
+-- fetched the bodies at or below the snapshot base, so it must not claim
+-- NODE_NETWORK ('pmcHistoryIncomplete').  NODE_BLOOM / NODE_COMPACT_FILTERS
+-- follow the operator's options; NODE_P2P_V2 is bound to the v2 transport
+-- being enabled (first argument).
+localServicesFor :: PeerManagerConfig -> Bool -> Word64
+localServicesFor cfg v2adv = combineServices flags
+  where
+    networkFlags = if pmcHistoryIncomplete cfg then [] else [nodeNetwork]
+    baseFlags = networkFlags ++ [nodeWitness]
+    bloomFlags = if pmcPeerBloomFilters cfg then nodeBloom : baseFlags else baseFlags
+    -- BIP-159: NODE_NETWORK_LIMITED unconditionally — every node serves at
+    -- least the recent-288 window (Core init.cpp:863).
+    limitedFlags = nodeNetworkLimited : bloomFlags
+    filterFlags = if pmcCompactFilters cfg then nodeCompactFilters : limitedFlags
+                                           else limitedFlags
+    flags = (if v2adv then (nodeP2PV2 :) else id) filterFlags
 
 -- | BIP-159 / Core @NODE_NETWORK_LIMITED_MIN_BLOCKS@ (net_processing.cpp).
 -- A NETWORK_LIMITED peer only serves this many most-recent blocks.
@@ -5209,6 +5236,12 @@ data PeerManagerConfig = PeerManagerConfig
   , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
   , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default False, matches Core's DEFAULT_PEERBLOOMFILTERS)
   , pmcPruneMode        :: !Bool       -- ^ BIP-159: advertise NODE_NETWORK_LIMITED (1<<10) when prune mode is on (default False, mirrors Core's `IsPruneMode()` gate in init.cpp)
+  , pmcHistoryIncomplete :: !Bool
+    -- ^ The node lacks the block bodies at and below a UTXO-snapshot base
+    --   (it was bootstrapped with @--load-snapshot@ and never downloads
+    --   that history).  Clears NODE_NETWORK from the advertised services
+    --   ('localServicesFor'), as Core does while a historical chainstate
+    --   is unfinished (init.cpp:1947, rpc/blockchain.cpp:3432).
   -- W117 DH-1: BIP-155 privacy-network proxy + reachability wiring.
   , pmcProxy            :: !(Maybe (String, Int))
     -- ^ Generic SOCKS5 proxy host:port used for clearnet outbound
@@ -5299,6 +5332,7 @@ defaultPeerManagerConfig = PeerManagerConfig
   , pmcDataDir          = "."
   , pmcPeerBloomFilters = False    -- Bitcoin Core default (DEFAULT_PEERBLOOMFILTERS=false, net_processing.h:44)
   , pmcPruneMode        = False    -- BIP-159 NODE_NETWORK_LIMITED off by default; flipped on when --prune is set
+  , pmcHistoryIncomplete = False   -- full history: advertise NODE_NETWORK
   -- W117 DH-1: privacy-network proxy + reachability defaults.
   -- All four fields default to "no proxy / unreachable" to match Core's
   -- default operator posture (clearnet-only).  Flipped on via CLI.
@@ -5955,25 +5989,12 @@ tryConnectWithType pm addr blockRelayOnly = do
     -- GetLocalServices()&NODE_P2P_V2).
     v2adv <- bip324V2OutboundEnabled
     let net = pmNetwork pm
-        baseFlags = [nodeNetwork, nodeWitness]
-        bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
-                      then nodeBloom : baseFlags
-                      else baseFlags
-        -- BIP-159: advertise NODE_NETWORK_LIMITED UNCONDITIONALLY for this
-        -- full node. Core sets g_local_services = NODE_NETWORK_LIMITED |
-        -- NODE_WITNESS unconditionally (init.cpp:863) — a full node always
-        -- serves at least the recent-288 window, so the bit is honest
-        -- regardless of prune mode.
-        prunedFlags = nodeNetworkLimited : bloomFlags
-        -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — advertise when the
-        -- operator enabled @-blockfilterindex@ AND the index is usable.
-        filterFlags = if pmcCompactFilters (pmConfig pm)
-                        then nodeCompactFilters : prunedFlags
-                        else prunedFlags
-        flags = (if v2adv then (nodeP2PV2 :) else id) filterFlags
+        -- NETWORK (unless history below a snapshot base is missing),
+        -- WITNESS, NETWORK_LIMITED, optional BLOOM / COMPACT_FILTERS, and
+        -- P2P_V2 iff v2 is on — see 'localServicesFor'.
         config = PeerConfig
           { pcfgNetwork     = net
-          , pcfgServices    = combineServices flags
+          , pcfgServices    = localServicesFor (pmConfig pm) v2adv
           , pcfgBestHeight  = 0
           , pcfgUserAgent   = userAgent
           , pcfgRelay       = not blockRelayOnly  -- block-relay-only: no tx relay
@@ -6108,23 +6129,10 @@ tryConnectByHost pm host port blockRelayOnly = do
   -- (flag bound to the action), matching 'tryConnectWithType'.
   v2adv <- bip324V2OutboundEnabled
   let net = pmNetwork pm
-      baseFlags = [nodeNetwork, nodeWitness]
-      bloomFlags = if pmcPeerBloomFilters (pmConfig pm)
-                    then nodeBloom : baseFlags
-                    else baseFlags
-      -- BIP-159: advertise NODE_NETWORK_LIMITED UNCONDITIONALLY for this
-      -- full node (Core init.cpp:863), matching 'tryConnectWithType'.
-      prunedFlags = nodeNetworkLimited : bloomFlags
-      -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
-      -- decision as 'tryConnectWithType' so the hostname dial path
-      -- doesn't accidentally bypass the index gate.
-      filterFlags = if pmcCompactFilters (pmConfig pm)
-                      then nodeCompactFilters : prunedFlags
-                      else prunedFlags
-      flags = (if v2adv then (nodeP2PV2 :) else id) filterFlags
+      -- Same advertisement as 'tryConnectWithType' ('localServicesFor').
       config = PeerConfig
         { pcfgNetwork     = net
-        , pcfgServices    = combineServices flags
+        , pcfgServices    = localServicesFor (pmConfig pm) v2adv
         , pcfgBestHeight  = 0
         , pcfgUserAgent   = userAgent
         , pcfgRelay       = not blockRelayOnly
@@ -6653,23 +6661,11 @@ startInboundListenerOn pm specs = do
             }
       -- Perform inbound handshake (receive version first, then send ours)
       let net = pmNetwork pm
-          baseFlagsIn = [nodeNetwork, nodeWitness]
-          bloomFlagsIn = if pmcPeerBloomFilters (pmConfig pm)
-                           then nodeBloom : baseFlagsIn
-                           else baseFlagsIn
-          -- BIP-159: same as outbound; advertise NODE_NETWORK_LIMITED
-          -- UNCONDITIONALLY for this full node (Core init.cpp:863).
-          prunedFlagsIn = nodeNetworkLimited : bloomFlagsIn
-          -- FIX-86: BIP-157 NODE_COMPACT_FILTERS — same advertisement
-          -- decision as outbound paths.  Inbound peers must see the
-          -- same service-bit picture as outbound dials.
-          filterFlagsIn = if pmcCompactFilters (pmConfig pm)
-                            then nodeCompactFilters : prunedFlagsIn
-                            else prunedFlagsIn
-          flagsIn = (if v2adv then (nodeP2PV2 :) else id) filterFlagsIn
+          -- Inbound peers see the same services as outbound dials
+          -- ('localServicesFor').
           config = PeerConfig
             { pcfgNetwork     = net
-            , pcfgServices    = combineServices flagsIn
+            , pcfgServices    = localServicesFor (pmConfig pm) v2adv
             , pcfgBestHeight  = 0
             , pcfgUserAgent   = userAgent
             , pcfgRelay       = True

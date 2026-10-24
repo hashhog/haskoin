@@ -16,10 +16,13 @@
 -- NODE_NETWORK_LIMITED(0x400), and the NODE_P2P_V2 bit (0x800, BIP-324,
 -- default-off for haskoin) is NOT set.
 --
--- The flag-list expression below mirrors EXACTLY the assembly the three
--- handshake sites build (baseFlags -> bloom -> network-limited -> compact),
--- parameterised on the same PeerManagerConfig fields, so the assertion tracks
--- the real code path rather than a hard-coded constant.
+-- The assertions call 'localServicesFor', the function all three handshake
+-- sites and getnetworkinfo.localservices use, so they track the real code
+-- path rather than a mirror of it.
+--
+-- 2026-10-23: a node started from a UTXO snapshot has no block bodies at or
+-- below the base and must not advertise NODE_NETWORK (Core loadtxoutset
+-- RemoveLocalServices(NODE_NETWORK), rpc/blockchain.cpp:3432; init.cpp:1947).
 module ServiceFlagsAdvertiseSpec (spec) where
 
 import Test.Hspec
@@ -29,31 +32,20 @@ import Data.Word (Word64)
 import Haskoin.Network
   ( PeerManagerConfig(..)
   , defaultPeerManagerConfig
-  , nodeNetwork
-  , nodeWitness
-  , nodeBloom
-  , nodeNetworkLimited
-  , nodeCompactFilters
-  , combineServices
+  , localServicesFor
   )
 
--- | Reconstruct the advertised service-flag bitset for a given config,
--- mirroring the (now prune-independent) assembly in Haskoin.Network's three
--- connect paths.
+-- | Advertised bitset with BIP-324 v2 off (the pre-v2 baseline these
+-- assertions were written against).
 advertisedServices :: PeerManagerConfig -> Word64
-advertisedServices cfg = combineServices flags
-  where
-    baseFlags  = [nodeNetwork, nodeWitness]
-    bloomFlags = if pmcPeerBloomFilters cfg then nodeBloom : baseFlags else baseFlags
-    -- FIX 2026-06-11: NODE_NETWORK_LIMITED advertised UNCONDITIONALLY (Core
-    -- init.cpp:863), no longer gated on pmcPruneMode.
-    prunedFlags = nodeNetworkLimited : bloomFlags
-    flags = if pmcCompactFilters cfg then nodeCompactFilters : prunedFlags else prunedFlags
+advertisedServices cfg = localServicesFor cfg False
 
--- BIP-324 NODE_P2P_V2 = 1 << 11 = 0x800. Not exported (unused on the wire by
--- default for haskoin); define the bit locally for the negative assertion.
+-- BIP-324 NODE_P2P_V2 = 1 << 11 = 0x800.
 nodeP2PV2Bit :: Word64
 nodeP2PV2Bit = 0x800
+
+snapshotCfg :: PeerManagerConfig
+snapshotCfg = defaultPeerManagerConfig { pmcHistoryIncomplete = True }
 
 spec :: Spec
 spec = describe "Advertised service flags (Core init.cpp:863 parity)" $ do
@@ -70,3 +62,17 @@ spec = describe "Advertised service flags (Core init.cpp:863 parity)" $ do
   it "stays 0x409 even when prune mode is on (un-gated from prune)" $
     advertisedServices defaultPeerManagerConfig { pmcPruneMode = True }
       `shouldBe` 0x409
+
+  describe "snapshot-started node (history below the base missing)" $ do
+    it "full-history node with v2 advertises 0xc09 (NETWORK kept)" $
+      localServicesFor defaultPeerManagerConfig True `shouldBe` 0xc09
+
+    it "snapshot node with v2 advertises 0xc08, as Core after loadtxoutset" $
+      localServicesFor snapshotCfg True `shouldBe` 0xc08
+
+    it "snapshot node drops NODE_NETWORK and keeps NODE_NETWORK_LIMITED" $ do
+      (advertisedServices snapshotCfg .&. 0x1) `shouldBe` 0
+      (advertisedServices snapshotCfg .&. 0x400) `shouldBe` 0x400
+
+    it "snapshot node in prune mode also omits NODE_NETWORK" $
+      advertisedServices snapshotCfg { pmcPruneMode = True } `shouldBe` 0x408

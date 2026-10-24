@@ -1459,7 +1459,19 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       mBestH <- case mBestNow of
         Nothing -> return Nothing
         Just bh -> case Map.lookup bh entriesNow of
-          Nothing -> return Nothing
+          -- The pointer still names the snapshot base and the header chain
+          -- has not been rebuilt up to it yet (a fresh --load-snapshot boot:
+          -- the import pins best-block to the base and records the marker
+          -- in the same commit, and imports no block bodies or height-index
+          -- rows).  The coin set IS the snapshot set at the base height by
+          -- construction, so the pointer resolves to that height.  Without
+          -- this, the forward-move guard below finds no active-chain row and
+          -- no base-block body to prove the coinbase with, and refuses to
+          -- start every fresh snapshot boot.
+          Nothing
+            | Just bh == mSnapshotBase, Just h <- mSnapshotBaseHeight ->
+                return (Just h)
+            | otherwise -> return Nothing
           Just ce -> do
             -- Only an ACTIVE-chain pointer is a usable floor.
             mRow <- if ceHeight ce == 0
@@ -1877,6 +1889,16 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           then netDefaultPort net
           else noListenPort
         discoverOn = fromMaybe (null noExternalIP && isNothing noProxy) noDiscover
+    -- A snapshot-bootstrapped chainstate (the persisted --load-snapshot base
+    -- marker) has no block bodies at or below the base, and haskoin never
+    -- downloads that history, so it must not advertise NODE_NETWORK — Core
+    -- drops the bit on loadtxoutset and keeps it off across restarts while
+    -- the historical chainstate is unfinished (init.cpp:1947).
+    historyIncomplete <- isJust <$> getSnapshotBaseHash db
+    when historyIncomplete $
+      putStrLn "Snapshot-based chainstate: blocks at and below the snapshot \
+               \base are not stored; advertising NODE_NETWORK_LIMITED \
+               \without NODE_NETWORK."
     let pmConfig = defaultPeerManagerConfig
           { pmcMaxOutbound = min 8 noMaxPeers
           , pmcMaxBlockRelayOnly = min 2 (max 0 (noMaxPeers - min 8 noMaxPeers))
@@ -1888,6 +1910,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
           , pmcDataDir     = dataDir
           , pmcPeerBloomFilters = noPeerBloomFilters
           , pmcPruneMode   = pruneOn
+          , pmcHistoryIncomplete = historyIncomplete
           -- -connect peer pinning + -dnsseed gate (see resolution above).
           , pmcConnectAddrs = resolvedConnectAddrs
           , pmcDnsSeed      = dnsSeedEnabled

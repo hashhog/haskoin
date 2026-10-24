@@ -56,11 +56,12 @@ import Haskoin.Network (Message, PeerManagerConfig(..),
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Rpc (RpcConfig(..), RpcResponse(..), RpcServer(..),
                     defaultRpcConfig, handleBatchRequest,
-                    blockDataUnavailableMsg, nTxFromStoredBody)
+                    blockDataUnavailableMsg, blockBodyWasHeld, nTxFromStoredBody)
 import Haskoin.Storage (BlockUndo(..), PruneConfig(..), TxInUndo(..),
                         TxUndo(..), UndoData(..), defaultDBConfig,
                         defaultPruneConfig, getBlock, newUTXOCache, putBlock,
-                        putBlockHeader, putUndoData, withDB)
+                        putBlockHeader, putUndoData, withDB,
+                        putSnapshotBaseHash)
 import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Types
 
@@ -166,6 +167,12 @@ pureSpec = describe "pure helpers" $ do
     blockDataUnavailableMsg True  False `shouldBe` "Block not available (not fully downloaded)"
     blockDataUnavailableMsg False True  `shouldBe` "Block not available (not fully downloaded)"
     blockDataUnavailableMsg False False `shouldBe` "Block not available (not fully downloaded)"
+  it "blockBodyWasHeld: never held at or below a snapshot base" $ do
+    blockBodyWasHeld Nothing    True  1   `shouldBe` True
+    blockBodyWasHeld Nothing    False 1   `shouldBe` False
+    blockBodyWasHeld (Just 299) True  1   `shouldBe` False
+    blockBodyWasHeld (Just 299) True  299 `shouldBe` False
+    blockBodyWasHeld (Just 299) True  300 `shouldBe` True
   it "nTxFromStoredBody: 0 without a body, tx count with one" $ do
     nTxFromStoredBody Nothing `shouldBe` 0
     nTxFromStoredBody (Just fixtureBlock) `shouldBe` 2
@@ -195,6 +202,42 @@ liveSpec = describe "RPC behaviour with block data absent" $ do
       (isJust <$> getBlock (rsDB server) g) >>= (`shouldBe` False)
       call server "getblock" [hashV g, Number 1]
         >>= (`shouldBe` Left (-1, "Block not available (pruned data)"))
+
+  -- A snapshot-started node imported the coins at the base, never the
+  -- bodies at or below it.  Core leaves those blocks at nTx == 0, so
+  -- IsBlockPruned is false and CheckBlockDataAvailability says "not fully
+  -- downloaded" even with -prune (rpc/blockchain.cpp; node/blockstorage.cpp
+  -- IsBlockPruned).  Here the snapshot base is genesis (height 0).
+  it "getblock: snapshot base and below in prune mode -> -1 not fully downloaded" $
+    withServer pruning $ \server -> do
+      let g = computeBlockHash (blockHeader (netGenesisBlock regtest))
+      putSnapshotBaseHash (rsDB server) g
+      (isJust <$> getBlock (rsDB server) g) >>= (`shouldBe` False)
+      mapM_ (\v -> call server "getblock" [hashV g, Number v]
+                     >>= (`shouldBe` Left (-1, "Block not available (not fully downloaded)")))
+            [0, 1, 2]
+
+  -- localservices is the bitset the handshake advertises: a node whose
+  -- history below a snapshot base is missing must not claim NODE_NETWORK
+  -- (Core loadtxoutset RemoveLocalServices(NODE_NETWORK)); a full-history
+  -- node keeps it.
+  it "getnetworkinfo: snapshot-started node drops NETWORK, keeps NETWORK_LIMITED" $
+    withServer defaultPruneConfig $ \server -> do
+      putSnapshotBaseHash (rsDB server)
+        (computeBlockHash (blockHeader (netGenesisBlock regtest)))
+      r <- call server "getnetworkinfo" []
+      let names = field "localservicesnames" r
+          bits  = localServicesBits r
+      (bits >>= \b -> Just (b `mod` 2)) `shouldBe` Just 0
+      (bits >>= \b -> Just ((b `div` 0x400) `mod` 2)) `shouldBe` Just 1
+      (names >>= hasName "NETWORK") `shouldBe` Just False
+      (names >>= hasName "NETWORK_LIMITED") `shouldBe` Just True
+
+  it "getnetworkinfo: full-history node advertises NETWORK" $
+    withServer defaultPruneConfig $ \server -> do
+      r <- call server "getnetworkinfo" []
+      (localServicesBits r >>= \b -> Just (b `mod` 2)) `shouldBe` Just 1
+      (field "localservicesnames" r >>= hasName "NETWORK") `shouldBe` Just True
 
   it "getblockheader: nTx is 0 for a header without a stored body" $
     withServer defaultPruneConfig $ \server -> do
@@ -328,6 +371,17 @@ field _ (Left _)  = Nothing
 fieldOf :: T.Text -> Value -> Maybe Value
 fieldOf k (Object o) = KM.lookup (K.fromText k) o
 fieldOf _ _          = Nothing
+
+localServicesBits :: Either (Int, T.Text) Value -> Maybe Integer
+localServicesBits r = case field "localservices" r of
+  Just (String t) -> case B16.decode (TE.encodeUtf8 t) of
+    Right bs -> Just (BS.foldl' (\acc w -> acc * 256 + fromIntegral w) 0 bs)
+    Left _   -> Nothing
+  _ -> Nothing
+
+hasName :: T.Text -> Value -> Maybe Bool
+hasName n (Array a) = Just (String n `elem` V.toList a)
+hasName _ _         = Nothing
 
 firstElem :: Value -> Maybe Value
 firstElem (Array a) | not (V.null a) = Just (V.head a)
