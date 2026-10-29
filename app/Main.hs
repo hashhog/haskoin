@@ -5124,7 +5124,13 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     -- by wtxid, MSG_TX / MSG_BLOCK are served without witness, and every
     -- unserveable item goes into one batched notfound.
     pm <- readIORef pmRef
-    replies <- serveGetData
+    tipH <- readTVarIO (hcHeight hc)
+    ents <- readTVarIO (hcEntries hc)
+    let depthOf bh = return $ case Map.lookup bh ents of
+          Just e  -> Just (fromIntegral tipH - fromIntegral (ceHeight e))
+          Nothing -> Nothing
+    replies <- serveGetDataCompact
+      depthOf
       (fmap (fmap meTransaction) . getTransaction mp)
       (fmap (fmap meTransaction) . getTransactionByWtxid mp)
       (getBlock db)
@@ -5252,7 +5258,14 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     -- chain during sync; serving it handed peers headers whose bodies we
     -- did not have, their getdata got notfound, and they stalled on the gap
     -- (regtest relay test 2026-09-26: Core B stuck at height 16 of 101).
-    nextH <- readIORef nextBlockRef
+    --
+    -- The cursor is a cache that only the P2P connect arm advances: a block
+    -- mined over RPC (generatetoaddress) moves the committed tip without
+    -- touching it, so the getheaders that follows the block's own inv was
+    -- answered with an empty headers message and the peer then waited for
+    -- the NEXT announcement (conformance SERVE, 2026-10-28).  Resync it from
+    -- the committed best block first, as the other readers do.
+    nextH <- resyncNextBlock connectLock db hc nextBlockRef
     let tipHeight = connectedServeCeiling headerTipHeight nextH
     -- Find the starting point from locator hashes (first known hash)
     let findStart [] = 0  -- Genesis
@@ -5478,31 +5491,22 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     -- instead of serving individual transactions.
     -- Reference: bitcoin-core/src/net_processing.cpp:4276-4285
     let blockHash = gbtBlockHash gbt
-        indices = gbtIndexes gbt
     currentTip <- readTVarIO (hcHeight hc)
     chainEnts <- readTVarIO (hcEntries hc)
     let mBlkHeight = fmap ceHeight (Map.lookup blockHash chainEnts)
         blkDepth = case mBlkHeight of
           Just blockH -> fromIntegral currentTip - fromIntegral blockH :: Int
           Nothing     -> 0  -- Unknown: let normal block lookup handle it
-    if blkDepth > maxBlocktxnDepth
-      then do
-        putStrLn $ "GetBlockTxn for " ++ show blockHash ++ " too old (depth=" ++ show blkDepth
-                ++ " > MAX_BLOCKTXN_DEPTH=" ++ show maxBlocktxnDepth
-                ++ "), sending full block"
+    mBlock <- getBlock db blockHash
+    case serveGetBlockTxn (fmap (const blkDepth) mBlkHeight) gbt mBlock of
+      Left err -> do
+        putStrLn $ "GetBlockTxn for " ++ show blockHash ++ ": " ++ err
         pm <- readIORef pmRef
-        let iv = InvVector InvWitnessBlock (getBlockHashHash blockHash)
-        requestFromPeer pm addr (MGetData (GetData [iv]))
+        void $ misbehaving pm addr InvalidCompactBlock
+      Right replies -> do
+        pm <- readIORef pmRef
+        forM_ replies $ \m -> requestFromPeer pm addr m
           `catch` (\(_ :: SomeException) -> return ())
-      else do
-        mBlock <- getBlock db blockHash
-        case mBlock of
-          Just block -> do
-            let txns = mapMaybe (\i -> let idx = fromIntegral i in if idx < length (blockTxns block) then Just (blockTxns block !! idx) else Nothing) indices
-            pm <- readIORef pmRef
-            requestFromPeer pm addr (MBlockTxn (BlockTxn { btBlockHash = blockHash, btTxns = txns }))
-              `catch` (\(_ :: SomeException) -> return ())
-          Nothing -> return ()
 
   MBlockTxn bt -> do
     -- BIP-152 BUG-1 FIX (W112): Complete compact block reconstruction.

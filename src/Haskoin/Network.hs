@@ -28,6 +28,8 @@ module Haskoin.Network
   , InvVector(..)
   , InvType(..)
   , serveGetData
+  , serveGetDataCompact
+  , serveGetBlockTxn
   , connectedServeCeiling
   , txFetchInv
   , stripTxWitness
@@ -2608,25 +2610,65 @@ serveGetData
   -> (BlockHash -> IO (Maybe Block)) -- ^ block store lookup
   -> [InvVector]
   -> IO [Message]
-serveGetData byTxid byWtxid getBlk ivs = do
+serveGetData = serveGetDataCompact (const (return Nothing))
+
+-- | 'serveGetData' with BIP-152 serving.  The first argument gives a block's
+-- depth below the active tip (0 = tip), or 'Nothing' when the block is not on
+-- the active chain.  Core (ProcessGetBlockData, the IsMsgCmpctBlk arm) builds
+-- a @cmpctblock@ when the block is within 'maxCmpctBlockDepth' of the tip and
+-- otherwise sends the full witness block; an unknown depth takes the same
+-- full-block fallback.
+serveGetDataCompact
+  :: (BlockHash -> IO (Maybe Int))   -- ^ depth below the active tip
+  -> (TxId -> IO (Maybe Tx))         -- ^ mempool lookup by txid
+  -> (Wtxid -> IO (Maybe Tx))        -- ^ mempool lookup by wtxid
+  -> (BlockHash -> IO (Maybe Block)) -- ^ block store lookup
+  -> [InvVector]
+  -> IO [Message]
+serveGetDataCompact depthOf byTxid byWtxid getBlk ivs = do
   results <- forM ivs $ \iv -> case ivType iv of
     InvTx           -> fmap (MTx . stripTxWitness) <$> byTxid (TxId (ivHash iv))
     InvWitnessTx    -> fmap MTx <$> byTxid (TxId (ivHash iv))
     InvWtx          -> fmap MTx <$> byWtxid (Wtxid (ivHash iv))
     InvBlock        -> fmap (MBlock . stripBlockWitness) <$> getBlk (BlockHash (ivHash iv))
     InvWitnessBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
-    -- BIP-152: a Core peer that picked us as a high-bandwidth compact-block
-    -- peer fetches a freshly announced tip with getdata(MSG_CMPCT_BLOCK).
-    -- Answer with the full witness block -- what Core itself sends for
-    -- MSG_CMPCT_BLOCK outside MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData, the
-    -- IsMsgCmpctBlk arm); a full block satisfies the in-flight request.
-    -- This used to fall through to notfound, so Core never got the block
-    -- (regtest relay test 2026-09-26).
-    InvCompactBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
+    InvCompactBlock -> do
+      let bh = BlockHash (ivHash iv)
+      mBlk <- getBlk bh
+      case mBlk of
+        Nothing  -> return Nothing
+        Just blk -> do
+          depth <- depthOf bh
+          case depth of
+            Just d | d <= maxCmpctBlockDepth -> Just . MCmpctBlock <$> createCompactBlock blk
+            _                                -> return (Just (MBlock blk))
     _               -> return Nothing
   let served   = [ m | Just m <- results ]
       notFound = [ iv | (iv, Nothing) <- zip ivs results ]
   return $ served ++ [ MNotFound (NotFound notFound) | not (null notFound) ]
+
+-- | Answer a @getblocktxn@ (Core net_processing.cpp, NetMsgType::GETBLOCKTXN
+-- and SendBlockTransactions).  Within 'maxBlocktxnDepth' of the tip the
+-- requested transactions go out as @blocktxn@; deeper, Core replies with the
+-- full witness block instead.  An index past the end of the block is
+-- 'Left' (Core: Misbehaving "getblocktxn with out-of-bound tx indices").
+-- @Right []@ means nothing to send (block not available).
+serveGetBlockTxn
+  :: Maybe Int                       -- ^ depth below the active tip
+  -> GetBlockTxn
+  -> Maybe Block                     -- ^ the block, if we have it
+  -> Either String [Message]
+serveGetBlockTxn depth gbt mBlk = case mBlk of
+  Nothing  -> Right []
+  Just blk
+    | maybe False (> maxBlocktxnDepth) depth -> Right [MBlock blk]
+    | any (>= n) idxs -> Left "getblocktxn with out-of-bound tx indices"
+    | otherwise ->
+        Right [MBlockTxn (BlockTxn (gbtBlockHash gbt) [ txs !! i | i <- idxs ])]
+    where
+      txs  = blockTxns blk
+      n    = length txs
+      idxs = map fromIntegral (gbtIndexes gbt) :: [Int]
 
 --------------------------------------------------------------------------------
 -- Inv, GetData, NotFound Messages

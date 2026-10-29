@@ -457,7 +457,8 @@ spec = describe "W112 BIP-152 Compact Blocks" $ do
       ("MGetBlockTxn gbt" `isInfixOf` src) `shouldBe` True
 
     it "MGetBlockTxn handler constructs and sends MBlockTxn" $ do
-      src <- readFile "app/Main.hs"
+      -- the reply is built by serveGetBlockTxn (Network.hs); Main.hs sends it
+      src <- readFile "src/Haskoin/Network.hs"
       ("MBlockTxn (BlockTxn" `isInfixOf` src) `shouldBe` True
 
     it "FIX: MGetBlockTxn handler has MAX_BLOCKTXN_DEPTH=10 guard (BUG-5 FIX-42)" $ do

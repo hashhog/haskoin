@@ -204,6 +204,7 @@ import qualified W201DeadPeerStallSpec
 import qualified W202SelfAdvertiseSpec
 import qualified W203HandshakeCoreParitySpec
 import qualified W204GetDataWtxSpec
+import qualified CmpctServeSpec
 import qualified W205SendRawMaxFeeRateSpec
 import qualified W206DownloadRedundancySpec
 import qualified W207NoCoreProxySpec
@@ -24168,6 +24169,7 @@ main = hspec $ do
   -- W204: getdata MSG_WTX by wtxid, MSG_TX/MSG_BLOCK without witness,
   -- tx fetch keeps MSG_WTX (Core ProcessGetData parity).
   W204GetDataWtxSpec.spec
+  CmpctServeSpec.spec
   -- W205: sendrawtransaction maxfeerate in BTC/kvB (Core ParseFeeRate),
   -- checked on a dry run BEFORE mempool acceptance (BroadcastTransaction).
   W205SendRawMaxFeeRateSpec.spec
