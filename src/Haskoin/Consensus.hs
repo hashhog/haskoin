@@ -414,7 +414,7 @@ import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         loadSnapshot, verifySnapshot,
                         CoinsViewDB(..), newCoinsViewDB,
                         CoinsViewCache(..), newCoinsViewCache, cacheFlush, defaultCacheSize,
-                        putBlockStatus, newUTXOCache, flushCache,
+                        putBlockStatus, putBlockHeader, newUTXOCache, flushCache,
                         getChainTxCount, putChainTxCount)
 -- Secondary-index fan-out on the disconnect/reorg path (txindex /
 -- blockfilterindex / coinstatsindex).  Index.hs depends only on
@@ -9230,7 +9230,14 @@ invalidBlockFound db hc bh = do
                      m descendants
             modifyTVar' (hcCandidates hc) $ \s ->
               foldl' (\acc e -> Set.delete (mkCandidateKey e) acc) s descendants
-          forM_ descendants $ \e -> putBlockStatus db (ceHash e) (st e)
+          -- The header row goes with the mark: Core's AcceptBlockHeader
+          -- writes the index entry, so a failed block survives a restart
+          -- (LoadBlockIndexGuts).  The submitblock verdict arm added this
+          -- entry with 'addHeader', which stores nothing on disk, and the
+          -- restart reload reads PrefixBlockHeader.  Idempotent.
+          forM_ descendants $ \e -> do
+            putBlockHeader db (ceHash e) (ceHeader e)
+            putBlockStatus db (ceHash e) (st e)
           recalculateBestHeader db hc
           return True
 

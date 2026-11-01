@@ -108,7 +108,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          invalidateCoinCaches,
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlock, getBlock, getUndoData, getUndoDataVerified, Coin(..),
+                         putBlock, putBlockHeader, getBlock, getUndoData, getUndoDataVerified, Coin(..),
                          WriteBatch(..), BatchOp, writeBatch, isUnspendable)
 import Haskoin.Index (IndexManager, indexManagerConnectBlock,
                        indexManagerDisconnectBlock)
@@ -981,6 +981,10 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
   -- be rejected as orphan even though B1 is "accepted" by the prior
   -- submitblock call.
   putBlock db bh block
+  -- The header row too (Core AcceptBlockHeader writes the index entry):
+  -- the restart reload rebuilds off-chain entries from PrefixBlockHeader,
+  -- so without it a stored side block was gone after a restart.
+  putBlockHeader db bh header
   _sideEntry <- addSideBranchHeader hc header
 
   -- Step 2: best-chain selection against the ACTIVE chain.

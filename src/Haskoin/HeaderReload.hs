@@ -13,6 +13,10 @@ import Control.Concurrent.STM
 import Control.Monad (forM_, unless, when)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
+import Data.IORef
+import Data.List (sortOn)
+import Data.Serialize (decode)
+import qualified Data.ByteString as BS
 import Data.Word (Word32)
 
 import Haskoin.Types
@@ -357,7 +361,15 @@ initHeaderChainFromDB db net = do
               Nothing -> do
                 loadedH <- readTVarIO heightVar
                 tipNow  <- readTVarIO tipVar
-                above   <- collectPersistedHeadersAbove db loadedH (ceHash tipNow)
+                above0  <- collectPersistedHeadersAbove db loadedH (ceHash tipNow)
+                -- Stop at the first header with a persisted failure mark
+                -- (invalidateblock leaves its height-index row behind).
+                -- Admitting it here made it StatusValid, the best header
+                -- and a candidate again after a restart; Core reloads the
+                -- mark (LoadBlockIndexGuts nStatus) and never extends the
+                -- best header through a failed entry.  It and everything
+                -- above it load as failed off-chain entries below.
+                above   <- takeWhileNotFailed db above0
                 if null above
                   then return (mTrunc0, heals0)
                   else do
@@ -381,7 +393,12 @@ initHeaderChainFromDB db net = do
       finalHeight <- readTVarIO heightVar
       putStrLn $ "Loaded " ++ show finalHeight ++ " headers from database"
       case mTruncated of
-        Nothing -> return ()
+        Nothing -> do
+          n <- loadOffActiveEntries net db entriesVar candidatesVar
+          when (n > 0) $
+            putStrLn $ "Loaded " ++ show n
+                    ++ " header(s) off the active chain (side, failed, "
+                    ++ "invalidated or reorged-away branches)"
         Just prefixTip -> do
           -- Truncated reload: bring the chainstate back onto the
           -- validated prefix before the reconciliation below runs (see
@@ -424,3 +441,108 @@ initHeaderChainFromDB db net = do
     , hcPreciousReverseSeq = preciousReverseSeqVar
     , hcLastPreciousWork = lastPreciousWorkVar
     }
+
+-- | Load every persisted header that is not on the reloaded active chain:
+-- side branches, blocks that failed validation, invalidateblock'd blocks
+-- and branches a reorg moved away from.
+--
+-- Core loads the WHOLE block index at startup, not only the active chain
+-- (node/blockstorage.cpp BlockTreeDB::LoadBlockIndexGuts walks every
+-- DB_BLOCK_INDEX row and re-checks its proof of work), then re-links
+-- pprev in height order and marks every descendant of a
+-- BLOCK_FAILED_VALID entry failed too (BlockManager::LoadBlockIndex).
+-- Each loaded entry gets SEQ_ID_INIT_FROM_DISK, so an equal-work rival
+-- never displaces the active chain (SEQ_ID_BEST_CHAIN_FROM_DISK) at
+-- boot.  Pre-fix haskoin rebuilt only the active chain, so after a
+-- restart getchaintips lost every off-chain tip, reconsiderblock
+-- answered "Block not found" for an invalidated block, and a child of a
+-- failed block was no longer known to be failed.
+--
+-- A header is admitted only through its parent (attach in parent-first
+-- order from the loaded chain), and only if it passes the same header
+-- gates as the active-chain reload: stored hash == header hash, proof
+-- of work, nBits == the required difficulty.  A header that fails is
+-- skipped, and so is everything above it (fail-closed: nothing
+-- unvalidated is laundered into the index).
+--
+-- Status, in Core's order:
+--   * a persisted failed status (StatusFailedValid / StatusFailedChild /
+--     StatusInvalid), or a failed parent              -> failed
+--   * a stored body                                   -> StatusValid, a
+--     chain-selection candidate (Core: BLOCK_VALID_TRANSACTIONS with
+--     data goes back into setBlockIndexCandidates; connecting it still
+--     runs full validation)
+--   * header only                                     -> StatusHeaderValid
+-- The active chain, the best header ('hcTip') and the height index are
+-- not touched.  Returns how many entries were added.
+loadOffActiveEntries :: Network -> HaskoinDB
+                     -> TVar (Map.Map BlockHash ChainEntry)
+                     -> TVar (Set.Set CandidateKey)
+                     -> IO Int
+loadOffActiveEntries net db entriesVar candidatesVar = do
+  loaded <- readTVarIO entriesVar
+  pendingRef <- newIORef (Map.empty :: Map.Map BlockHash [(BlockHash, BlockHeader)])
+  iterateWithPrefix db PrefixBlockHeader $ \key val -> do
+    case (decode (BS.drop 1 key), decode val) of
+      (Right bh, Right header)
+        | not (Map.member bh loaded) ->
+            modifyIORef' pendingRef
+              (Map.insertWith (++) (bhPrevBlock header) [(bh, header)])
+      _ -> return ()
+    return True
+  pending <- readIORef pendingRef
+  let childrenOf h = sortOn fst (Map.findWithDefault [] h pending)
+      roots = concat [ childrenOf p | p <- Map.keys pending, Map.member p loaded ]
+      go [] n = return n
+      go ((bh, header) : rest) n = do
+        entries <- readTVarIO entriesVar
+        case Map.lookup (bhPrevBlock header) entries of
+          Nothing -> go rest n
+          Just parent
+            | Map.member bh entries -> go rest n
+            | computeBlockHash header /= bh
+              || not (checkProofOfWork header (netPowLimit net))
+              || bhBits header /= difficultyAdjustment net entries parent header -> do
+                putStrLn $ "WARNING: header reload skipped off-chain header "
+                        ++ show bh ++ " (fails the header gates); "
+                        ++ "it and its descendants are not loaded"
+                go rest n
+            | otherwise -> do
+                stored <- getBlockStatus db bh
+                hasBody <- isJust' <$> getBlock db bh
+                let status = case stored of
+                      Just st | isFailedStatus st -> st
+                      _ | isFailedStatus (ceStatus parent) -> StatusFailedChild
+                        | hasBody   -> StatusValid
+                        | otherwise -> StatusHeaderValid
+                    entry = ChainEntry
+                      { ceHeader = header
+                      , ceHash = bh
+                      , ceHeight = ceHeight parent + 1
+                      , ceChainWork = ceChainWork parent + headerWork header
+                      , cePrev = Just (ceHash parent)
+                      , ceStatus = status
+                      , ceMedianTime = computeEntryMtp entries (ceHash parent)
+                                                       (bhTimestamp header)
+                      , ceSequenceId = seqIdInitFromDisk
+                      }
+                atomically $ do
+                  modifyTVar' entriesVar (Map.insert bh entry)
+                  when (status == StatusValid) $
+                    modifyTVar' candidatesVar (Set.insert (mkCandidateKey entry))
+                go (childrenOf bh ++ rest) (n + 1)
+      isJust' = maybe False (const True)
+  go roots (0 :: Int)
+
+-- | The prefix of @hs@ before the first header whose persisted status is a
+-- failure ('isFailedStatus').
+takeWhileNotFailed :: HaskoinDB -> [(BlockHash, BlockHeader)]
+                   -> IO [(BlockHash, BlockHeader)]
+takeWhileNotFailed db = go []
+  where
+    go acc [] = return (reverse acc)
+    go acc ((bh, header) : rest) = do
+      st <- getBlockStatus db bh
+      if maybe False isFailedStatus st
+        then return (reverse acc)
+        else go ((bh, header) : acc) rest
