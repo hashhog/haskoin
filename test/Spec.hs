@@ -109,6 +109,7 @@ import qualified WitnessProgramCanonicalSpec
 import qualified SubmitBlockValidatedForkSpec
 import qualified InvalidatedSubmitSpec
 import qualified GetChainTipsSpec
+import qualified RestartChainTipsSpec
 import qualified CoinCacheResurrectionSpec
 import qualified CacheBookkeepingSpec
 import qualified ChainLockSpec
@@ -23846,6 +23847,7 @@ main = hspec $ do
   SubmitBlockValidatedForkSpec.spec
   InvalidatedSubmitSpec.spec
   GetChainTipsSpec.spec
+  RestartChainTipsSpec.spec
   CoinCacheResurrectionSpec.spec
   CacheBookkeepingSpec.spec
   ChainLockSpec.spec
