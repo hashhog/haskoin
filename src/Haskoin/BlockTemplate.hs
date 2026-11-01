@@ -1546,10 +1546,21 @@ buildReorgBatch net db cache hc disList disUndos conList = do
               vrR <- validateBlockGuarded ("reorg connect " ++ show bh ++ " height " ++ show (ceHeight ce))
                        (validateFullBlockFresh n csReorg getMtpCC False False blk spentUtxos)
               case vrR of
-                Left err -> return $ Left $
-                  "invalid-connect: reorg connect: block " ++ show bh
-                  ++ " (height " ++ show (ceHeight ce)
-                  ++ ") failed full validation: " ++ err
+                Left err -> do
+                  -- Core ConnectTip failure -> InvalidBlockFound: a VERDICT
+                  -- marks the block BLOCK_FAILED_VALID (and its
+                  -- descendants), so getchaintips lists it "invalid" and
+                  -- the mark (with its header row) survives a restart.
+                  -- The overlay is this block's own parent state, so the
+                  -- verdict is in context.  Pre-fix nothing was marked and
+                  -- the block stayed a "valid-headers" tip and a candidate.
+                  -- A non-verdict (fault) stays unmarked.
+                  when (classifyBlockReject err == BlockRejectVerdict) $
+                    void (invalidBlockFound dbh hc' bh)
+                  return $ Left $
+                    "invalid-connect: reorg connect: block " ++ show bh
+                    ++ " (height " ++ show (ceHeight ce)
+                    ++ ") failed full validation: " ++ err
                 Right () -> do
                   -- Hash-keyed, so safe ahead of the accumulated batch: the
                   -- next block in this reorg reads it as its parent's count.
