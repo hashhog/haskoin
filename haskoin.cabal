@@ -20,6 +20,7 @@ library
                  , Haskoin.Script
                  , Haskoin.Consensus
                  , Haskoin.Storage
+                 , Haskoin.HeaderReload
                  , Haskoin.Network
                  , Haskoin.Sync
                  , Haskoin.Mempool
