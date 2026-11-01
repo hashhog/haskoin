@@ -462,6 +462,7 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        TxoSpender(..), TxoSpenderIndexDB,
                        txoSpenderIndexFind, txoSpenderIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
+                         putBlockHeader,
                          isUnspendable,
                          lookupUTXO, rcClear, invalidateCoinCaches, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
@@ -5926,8 +5927,14 @@ handleSubmitHeader server params =
                                           (rsHeaderChain server)
                                           header True
                       case result of
-                        -- Success / already-known → JSON null.
-                        Right _ -> return $ RpcResponse Null Null Null
+                        -- Success / already-known → JSON null.  The header
+                        -- row is written too (Core AcceptBlockHeader adds the
+                        -- index entry, which survives a restart); 'addHeader'
+                        -- only updates memory, so a submitheader branch was
+                        -- gone after a restart.  Idempotent.
+                        Right entry -> do
+                          putBlockHeader (rsDB server) (ceHash entry) (ceHeader entry)
+                          return $ RpcResponse Null Null Null
                         -- Validation failure → -25 with the reject reason.
                         Left reason -> return $ RpcResponse Null
                           (toJSON $ RpcError rpcVerifyError (T.pack reason)) Null
