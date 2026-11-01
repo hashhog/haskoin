@@ -5357,9 +5357,12 @@ main = hspec $ do
     -- #53(b) (2026-08-27): the header tip must never move onto an
     -- INVALIDATED branch. Pre-fix, addHeaderAt built every entry as
     -- StatusHeaderValid and the tip-move compared only work, so a child
-    -- of a failed block became the header tip. Core poisons descendants
-    -- (BLOCK_FAILED_CHILD / m_failed_blocks). FAILS AT PARENT: the tip
+    -- of a failed block became the header tip. FAILS AT PARENT: the tip
     -- walked onto the failed lineage and h2's status was HeaderValid.
+    -- Core AcceptBlockHeader goes further: a header on a failed parent is
+    -- rejected "bad-prevblk" and never stored (validation.cpp), so it can
+    -- neither move the tip nor be listed.  (#53b stored it as
+    -- StatusFailedChild; that assertion is flipped to Core's rule.)
     it "header tip never moves onto an invalidated branch (#53b)" $ do
       hc <- initHeaderChain regtest
       genesisTip <- getChainTip hc
@@ -5382,11 +5385,10 @@ main = hspec $ do
       let h2 = mineRegtestHeader (BlockHeader 1 (ceHash e1)
                  (Hash256 (BS.replicate 32 0xa2)) (gts + 1200) 0x207fffff 0)
       r2 <- addHeaderAt regtest hc h2 True Nothing
-      e2 <- case r2 of
-        Right e  -> pure e
-        Left err -> error ("addHeaderAt h2 failed: " ++ err)
-      -- The child inherits the poison and the tip stays on genesis.
-      ceStatus e2 `shouldBe` StatusFailedChild
+      -- Rejected bad-prevblk, not stored, and the tip stays on genesis.
+      either id (const "accepted") r2 `shouldBe` "bad-prevblk"
+      entries <- readTVarIO (hcEntries hc)
+      Map.member (computeBlockHash h2) entries `shouldBe` False
       tip' <- getChainTip hc
       ceHash tip' `shouldBe` genesisHash
 
@@ -22724,15 +22726,14 @@ main = hspec $ do
         Left err -> err `shouldContain` "Unknown previous block"
         Right _  -> expectationFailure "missing parent must be rejected"
 
-    it "G6 BUG: parent BLOCK_FAILED_VALID is NOT checked (W97 CONSENSUS-DIVERGENT)" $ do
+    it "G6 FIXED: parent BLOCK_FAILED_VALID is checked (bad-prevblk, W97)" $ do
       -- Core: lines 4220-4223 — if pindexPrev->nStatus has BLOCK_FAILED_VALID,
       -- state.Invalid(BLOCK_INVALID_PREV, "bad-prevblk").
-      -- haskoin's 'addHeader' Consensus.hs:3870-3974 reads the parent
-      -- entry but never inspects 'ceStatus' for StatusInvalid.  A peer
-      -- can chain a fresh header off a known-invalid parent and
-      -- haskoin will run all the per-header checks AS IF the parent
-      -- were valid — wasting CPU and admitting a doomed branch into
-      -- hcEntries.
+      -- haskoin's 'addHeader' used to read the parent entry without
+      -- inspecting 'ceStatus', so a header on a known-invalid parent ran
+      -- every per-header check as if the parent were valid and entered
+      -- hcEntries.  This spec pinned that gap ("BUG: haskoin admits the
+      -- child"); it now asserts Core's answer.
       hc <- initHeaderChain regtest
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
@@ -22746,10 +22747,8 @@ main = hspec $ do
                        0x207fffff 0
       r <- addHeader regtest hc childHdr True
       case r of
-        Right _ -> return ()  -- BUG: haskoin admits the child.
-        Left err ->
-          expectationFailure $
-            "Once G6 is fixed this should reject with bad-prevblk. Got: " ++ err
+        Left err -> err `shouldBe` "bad-prevblk"
+        Right _  -> expectationFailure "a header on a failed parent must be rejected bad-prevblk"
 
     it "G7 ContextualCheckBlockHeader: bad-diffbits enforced (W97)" $ do
       -- Core: 4224-4227 — calls ContextualCheckBlockHeader.  haskoin

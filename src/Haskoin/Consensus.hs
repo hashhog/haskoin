@@ -6535,6 +6535,16 @@ addHeaderAt net hc header minPowChecked mNow = do
         -- Validate proof of work
         if not (checkProofOfWork header (netPowLimit net))
           then return $ Left "Proof of work check failed"
+        -- Core AcceptBlockHeader: a header whose parent failed validation
+        -- is invalid ("bad-prevblk", BLOCK_INVALID_PREV) and is NOT added
+        -- to the block index (validation.cpp, after the prev lookup).
+        -- haskoin used to store it with an inherited failed mark, so a
+        -- header on a failed block was answered by getblockheader, listed
+        -- by getchaintips and accepted by submitheader where Core answers
+        -- -25 bad-prevblk (core-regtest */header/failed-parent,
+        -- warden_invalidated_submit/p2p-header/failed-child).
+        else if isFailedStatus (ceStatus parent)
+          then return $ Left "bad-prevblk"
           else do
             -- Gate 1: Timestamp > MTP of previous 11 blocks (time-too-old).
             -- Reference: bitcoin-core/src/validation.cpp:4092-4093

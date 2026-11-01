@@ -180,14 +180,17 @@ spec = describe "invalidated blocks: submitblock answers + reconsiderblock (Core
           hc = rsHeaderChain server
       invalidate server h4
       validatedHash server `shouldReturn` h3
-      -- the network extends the invalidated branch while it is failed (header only)
+      -- the network extends the invalidated branch while it is failed: Core
+      -- AcceptBlockHeader refuses the header bad-prevblk and stores nothing
       b7 <- mkChild server h6 (BS.pack [0x55])
-      Right ce7 <- addHeader regtest hc (blockHeader b7) False
-      ceStatus ce7 `shouldSatisfy` isFailedStatus
+      r7h <- addHeader regtest hc (blockHeader b7) False
+      either id (const "accepted") r7h `shouldBe` "bad-prevblk"
       reconsider server h4
       -- Core: ActivateBestChain before the RPC returns -> the stored 4..6
       validatedHash server `shouldReturn` h6
       statusOf server h4 >>= (`shouldSatisfy` maybe False (not . isFailedStatus))
+      -- with the parent reconsidered the same header is accepted again
+      Right _ <- addHeader regtest hc (blockHeader b7) False
       statusOf server (hashOf b7) >>= (`shouldSatisfy` maybe False (not . isFailedStatus))
       -- best header = 7 and the height index names it, so 7 gets requested
       ceHash <$> readTVarIO (hcTip hc) `shouldReturn` hashOf b7
