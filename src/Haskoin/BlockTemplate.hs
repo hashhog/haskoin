@@ -108,7 +108,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..),
                          invalidateCoinCaches,
                          lookupUTXO, UndoData(..), addUTXO, spendUTXO,
                          TxInUndo(..), TxUndo(..), BlockUndo(..), mkUndoData,
-                         putBlock, getBlock, getUndoData, getUndoDataVerified, Coin(..),
+                         putBlock, putBlockHeader, getBlock, getUndoData, getUndoDataVerified, Coin(..),
                          WriteBatch(..), BatchOp, writeBatch, isUnspendable)
 import Haskoin.Index (IndexManager, indexManagerConnectBlock,
                        indexManagerDisconnectBlock)
@@ -981,6 +981,10 @@ submitBlockSideBranch net db hc cache pm mp mIdxMgr block parent = do
   -- be rejected as orphan even though B1 is "accepted" by the prior
   -- submitblock call.
   putBlock db bh block
+  -- The header row too (Core AcceptBlockHeader writes the index entry):
+  -- the restart reload rebuilds off-chain entries from PrefixBlockHeader,
+  -- so without it a stored side block was gone after a restart.
+  putBlockHeader db bh header
   _sideEntry <- addSideBranchHeader hc header
 
   -- Step 2: best-chain selection against the ACTIVE chain.
@@ -1542,10 +1546,21 @@ buildReorgBatch net db cache hc disList disUndos conList = do
               vrR <- validateBlockGuarded ("reorg connect " ++ show bh ++ " height " ++ show (ceHeight ce))
                        (validateFullBlockFresh n csReorg getMtpCC False False blk spentUtxos)
               case vrR of
-                Left err -> return $ Left $
-                  "invalid-connect: reorg connect: block " ++ show bh
-                  ++ " (height " ++ show (ceHeight ce)
-                  ++ ") failed full validation: " ++ err
+                Left err -> do
+                  -- Core ConnectTip failure -> InvalidBlockFound: a VERDICT
+                  -- marks the block BLOCK_FAILED_VALID (and its
+                  -- descendants), so getchaintips lists it "invalid" and
+                  -- the mark (with its header row) survives a restart.
+                  -- The overlay is this block's own parent state, so the
+                  -- verdict is in context.  Pre-fix nothing was marked and
+                  -- the block stayed a "valid-headers" tip and a candidate.
+                  -- A non-verdict (fault) stays unmarked.
+                  when (classifyBlockReject err == BlockRejectVerdict) $
+                    void (invalidBlockFound dbh hc' bh)
+                  return $ Left $
+                    "invalid-connect: reorg connect: block " ++ show bh
+                    ++ " (height " ++ show (ceHeight ce)
+                    ++ ") failed full validation: " ++ err
                 Right () -> do
                   -- Hash-keyed, so safe ahead of the accumulated batch: the
                   -- next block in this reorg reads it as its parent's count.
