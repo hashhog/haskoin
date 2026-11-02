@@ -1856,6 +1856,7 @@ scanBlockForWallet wallet block height = do
       bHash     = computeBlockHash header
       bTime     = bhTimestamp header
   ourAddrs <- readTVarIO (walletAddresses wallet)
+  sentTxs  <- readTVarIO (walletSentTxs wallet)
   let net = walletNetwork wallet
       decodeAddr s = decodeOurAddress s
       isOurScript s = case decodeAddr s of
@@ -1876,7 +1877,19 @@ scanBlockForWallet wallet block height = do
                            else map txInPrevOutput (txInputs tx)
               spentHits  = [ (op, e) | op <- spentOps
                            , Just e <- [Map.lookup op utxos] ]
+              -- A tx this wallet built (sendtoaddress & co.) had its inputs
+              -- dropped from the ledger at send time (commitWalletSpend), so
+              -- the live-map lookup misses them: take those prevouts from the
+              -- sent-tx record, or the confirmed send would read as debit 0
+              -- (no "send" row, change listed as a receive, no fee).
+              recordedPrevs = case Map.lookup txid sentTxs of
+                Nothing  -> []
+                Just rec -> [ txOutValue txo
+                            | (op, txo) <- strPrevOutputs rec
+                            , op `elem` spentOps
+                            , Map.notMember op utxos ]
               debit      = sum [ txOutValue (wueTxOut e) | (_, e) <- spentHits ]
+                         + sum recordedPrevs
               utxosDebit = foldr (Map.delete . fst) utxos spentHits
               -- Credit: outputs paying a wallet address.
               ourOuts    = [ (oi, txout)
@@ -1896,18 +1909,25 @@ scanBlockForWallet wallet block height = do
               -- address = the payee.  Then emit one "receive" row per
               -- wallet output (category resolved generate/immature/receive
               -- at query time from wthIsCoinbase + confirmations).
-              ourOutIdxs = map fst ourOuts
+              -- Core CachedTxGetAmounts: on a tx we funded (debit > 0) a
+              -- CHANGE output is not reported at all, and every other output
+              -- gets a "send" row -- including one paying another address of
+              -- this wallet, which ALSO gets its "receive" row.
+              isChangeScript s = case decodeAddr s of
+                Just a  -> maybe False snd (Map.lookup a ourAddrs)
+                Nothing -> False
+              reportable txout = not (debit > 0 && isChangeScript (txOutScript txout))
               sendDetails = if debit > 0
                               then [ WalletTxDetail (addrText (txOutScript txout))
                                        "send"
                                        (negate (fromIntegral (txOutValue txout))) oi
                                    | (oi, txout) <- zip [0 :: Int ..] (txOutputs tx)
-                                   , oi `notElem` ourOutIdxs ]
+                                   , reportable txout ]
                               else []
               recvDetails = [ WalletTxDetail (addrText (txOutScript txout))
                                (if isCb then "coinbase" else "receive")
                                (fromIntegral (txOutValue txout)) oi
-                           | (oi, txout) <- ourOuts ]
+                           | (oi, txout) <- ourOuts, reportable txout ]
               relevant   = credit > 0 || debit > 0
               entry      = WalletTxHistoryEntry
                              { wthTxId        = txid

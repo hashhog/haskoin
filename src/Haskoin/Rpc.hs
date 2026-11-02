@@ -39,6 +39,8 @@ module Haskoin.Rpc
     -- * Regtest miner helpers (exported for testing)
   , generateSingleBlock
   , handleSubmitBlock
+  , handleListUnspent
+  , handleGetBalances
   , buildRegtestCoinbase
   , findRegtestNonce
     -- * TLS (HTTPS) configuration — W119 + FIX-64
@@ -561,7 +563,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- Wallet address/transaction functions
                         AddressType(..), getNewAddress, sendToAddress,
                         getWalletUTXOs, getWalletUTXOsFull, Utxo(..),
-                        addWalletUTXO, removeWalletUTXO,
+                        addWalletUTXO, removeWalletUTXO, recordSentTx,
                         -- Coin selection (walletcreatefundedpsbt)
                         WalletTxOutput(..), CoinSelection(..),
                         selectCoinsWithHeight, createTransaction,
@@ -9149,7 +9151,7 @@ handleGetBalances server _params = withWalletMgr server $ \wm -> do
             let v = fromIntegral (txOutValue (wueTxOut e)) :: Int64
                 h = wueBlockHeight e
                 c = if tipH >= h then fromIntegral (tipH - h) + 1 else 0 :: Int
-            in if wueIsCoinbase e && c < fromIntegral coinbaseMaturity
+            in if wueIsCoinbase e && c <= fromIntegral coinbaseMaturity
                  then (t, p, i + v)
                  else if c == 0 then (t, p + v, i) else (t + v, p, i)
           (trusted, pending, immature) =
@@ -12677,6 +12679,12 @@ txOutToWalletOutput txout = do
 commitWalletSpend :: Wallet -> CoinSelection -> Tx -> Word32 -> IO ()
 commitWalletSpend wallet cs tx tipH = do
   mapM_ (removeWalletUTXO wallet) (map fst (csInputs cs))
+  -- Core CommitTransaction puts the tx in mapWallet.  The record also keeps
+  -- the prevouts removed above, so the block scan that later confirms this
+  -- tx can still book the debit (send row, fee, change not reported).
+  recordSentTx wallet tx (csInputs cs)
+    (fmap (const (fromIntegral (length (csOutputs cs)))) (csChange cs))
+    (fmap fst (csChange cs)) (csFee cs)
   case csChange cs of
     Nothing -> pure ()
     Just _ ->
@@ -13108,9 +13116,16 @@ handleListUnspent server params = do
             Left (code, msg) -> return $ rpcFail code msg
             Right mAddrs -> do
               tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
-              utxos <- getWalletUTXOs (wsWallet walletState)
+              utxosFull <- getWalletUTXOsFull (wsWallet walletState)
               labels <- readTVarIO (walletAddressLabels (wsWallet walletState))
-              let encodings = catMaybes $
+              -- Core AvailableCoins skips immature coinbase outputs
+              -- (CWalletTx::IsImmatureCoinBase: depth <= COINBASE_MATURITY).
+              let depth e = if tipHeight >= wueBlockHeight e
+                              then fromIntegral (tipHeight - wueBlockHeight e) + 1 else 0 :: Int
+                  utxos = [ (op, wueTxOut e, wueBlockHeight e)
+                          | (op, e) <- utxosFull
+                          , not (wueIsCoinbase e) || depth e > fromIntegral coinbaseMaturity ]
+                  encodings = catMaybes $
                     map (utxoToEnc net labels mAddrs tipHeight minConf maxConf) utxos
                   rawBs = encodingToLazyByteString (AE.list id encodings)
               return $ RpcResponse (rawJsonResult rawBs) Null Null

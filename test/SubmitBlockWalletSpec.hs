@@ -16,7 +16,10 @@ module SubmitBlockWalletSpec (spec) where
 import Test.Hspec
 import Control.Exception (bracket)
 import Control.Concurrent.STM (newTVarIO, readTVarIO)
-import Data.Aeson (toJSON, Value(Null))
+import Data.Aeson (toJSON, Value(Null, String), Value, encode, decode)
+import qualified Data.ByteString.Lazy as BL
+import Data.Aeson.Key (fromText)
+import qualified Data.Aeson.KeyMap as KM
 import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as T
@@ -30,6 +33,7 @@ import System.IO.Temp (createTempDirectory)
 import System.FilePath ((</>))
 
 import Haskoin.Types
+import Data.List (sort)
 import Haskoin.Crypto (computeTxId, computeBlockHash, Address(..))
 import Haskoin.Consensus
   ( regtest, initHeaderChain, medianTimePast, blockReward, computeMerkleRoot
@@ -44,10 +48,12 @@ import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Wallet
   ( WalletManager, WalletState(..), newWalletManager, createManagedWallet
-  , getNewAddress, AddressType(..), getWalletTxHistory )
+  , getNewAddress, AddressType(..), getWalletTxHistory, getChangeAddress
+  , scanBlockForWallet, WalletTxHistoryEntry(..), WalletTxDetail(..)
+  , removeWalletUTXO, recordSentTx )
 import Haskoin.Rpc
   ( RpcServer(..), RpcResponse(..), defaultRpcConfig, RpcConfig(..)
-  , handleSubmitBlock, buildRegtestCoinbase, findRegtestNonce )
+  , handleSubmitBlock, handleListUnspent, handleGetBalances, buildRegtestCoinbase, findRegtestNonce )
 
 liveNoopHandler :: a -> Message -> IO ()
 liveNoopHandler _ _ = return ()
@@ -139,3 +145,70 @@ spec = describe "submitblock credits loaded wallets (Core CWallet::blockConnecte
       _ <- submitHex server blk
       hist <- getWalletTxHistory (wsWallet ws)
       length hist `shouldBe` 0
+
+  -- Core: an immature coinbase (depth <= COINBASE_MATURITY) is not listed by
+  -- listunspent (AvailableCoins) and is counted as immature, not trusted, by
+  -- getbalances (GetBlocksToMaturity = COINBASE_MATURITY + 1 - depth).
+  it "listunspent and getbalances treat a coinbase as mature only at depth 101" $
+    withWalletServer $ \server wm -> do
+      Right ws <- createManagedWallet wm "w" False False
+      addr <- getNewAddress AddrP2WPKH (wsWallet ws)
+      let spk = p2wpkhScript addr
+          extend n = mapM_ (\_ -> do
+            t <- readTVarIO (hcTip (rsHeaderChain server))
+            b <- mkChild server (ceHash t) spk
+            _ <- submitHex server b
+            return ()) [1 .. n :: Int]
+      extend 100   -- tip 100: block 1 has depth 100, still immature
+      lu100 <- handleListUnspent server (toJSON ([] :: [Int]))
+      listLen (resResult lu100) `shouldBe` 0
+      extend 1     -- tip 101: block 1 has depth 101, mature
+      lu101 <- handleListUnspent server (toJSON ([] :: [Int]))
+      listLen (resResult lu101) `shouldBe` 1
+      bals <- handleGetBalances server (toJSON ([] :: [Int]))
+      mineField "trusted" (resResult bals) `shouldBe` Just 50
+      mineField "immature" (resResult bals) `shouldBe` Just 5000
+  -- Core CachedTxGetAmounts: on a tx the wallet funded, change is not
+  -- reported; every other output gets a "send" row, and one paying the wallet
+  -- itself also gets its "receive" row (gettransaction details of a
+  -- send-to-self = [receive 1, send -1], not [receive 1, receive 49]).
+  it "a send-to-self reports send+receive for the payee and nothing for change" $
+    withWalletServer $ \_ wm -> do
+      Right ws <- createManagedWallet wm "w" False False
+      let w = wsWallet ws
+      a <- getNewAddress AddrP2WPKH w
+      b <- getNewAddress AddrP2WPKH w
+      c <- getChangeAddress w
+      let funding = Tx 2 [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 7))) 0) BS.empty 0xffffffff]
+                       [TxOut 5000000000 (p2wpkhScript a)] [] 0
+          spend = Tx 2 [TxIn (OutPoint (computeTxId funding) 0) BS.empty 0xfffffffd]
+                      [TxOut 100000000 (p2wpkhScript b), TxOut 4899999000 (p2wpkhScript c)] [] 0
+          hdr = BlockHeader 0x20000000 (BlockHash (Hash256 (BS.replicate 32 0))) (Hash256 (BS.replicate 32 0)) 0 0x207fffff 0
+      scanBlockForWallet w (Block hdr [funding]) 1
+      -- what sendtoaddress does before the tx confirms (commitWalletSpend):
+      -- drop the spent coin from the ledger, keep it in the sent-tx record
+      let prevOp = OutPoint (computeTxId funding) 0
+      removeWalletUTXO w prevOp
+      recordSentTx w spend [(prevOp, head (txOutputs funding))] (Just 1) (Just c) 1000
+      scanBlockForWallet w (Block hdr [funding, spend]) 2
+      hist <- getWalletTxHistory w
+      let [e] = [ x | x <- hist, wthTxId x == computeTxId spend ]
+      sort [ (wtdCategory d, wtdAmount d) | d <- wthDetails e ]
+        `shouldBe` [("receive", 100000000), ("send", -100000000)]
+      -- the debit was booked, so the tx reads as funded by us (fee, from-me)
+      wthDebit e `shouldBe` 5000000000
+  where
+    -- results of the streaming handlers arrive as "__RAWJSON__:<json>"
+    unraw :: Value -> Value
+    unraw (String t) | Just j <- T.stripPrefix "__RAWJSON__:" t
+                     , Just v <- decode (BL.fromStrict (TE.encodeUtf8 j)) = v
+    unraw v = v
+    listLen v = case decode (encode (unraw v)) :: Maybe [Value] of
+      Just xs -> length xs
+      Nothing -> -1
+    mineField k v = do
+      o <- decode (encode (unraw v)) :: Maybe (KM.KeyMap Value)
+      m <- KM.lookup (fromText "mine") o
+      mo <- decode (encode m) :: Maybe (KM.KeyMap Value)
+      x <- KM.lookup (fromText k) mo
+      decode (encode x) :: Maybe Double
