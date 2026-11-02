@@ -38,6 +38,9 @@ module Haskoin.Rpc
   , requestNodeShutdown
     -- * Regtest miner helpers (exported for testing)
   , generateSingleBlock
+  , handleSubmitBlock
+  , handleListUnspent
+  , handleGetBalances
   , buildRegtestCoinbase
   , findRegtestNonce
     -- * TLS (HTTPS) configuration — W119 + FIX-64
@@ -561,7 +564,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- Wallet address/transaction functions
                         AddressType(..), getNewAddress, sendToAddress,
                         getWalletUTXOs, getWalletUTXOsFull, Utxo(..),
-                        addWalletUTXO, removeWalletUTXO,
+                        addWalletUTXO, removeWalletUTXO, recordSentTx,
                         -- Coin selection (walletcreatefundedpsbt)
                         WalletTxOutput(..), CoinSelection(..),
                         selectCoinsWithHeight, createTransaction,
@@ -5844,7 +5847,13 @@ handleSubmitBlockUnpaused server params = do
                     Left (code, msg) -> return $ RpcResponse Null
                       (toJSON $ RpcError code (T.pack msg)) Null
                     Right bip22 -> return $ RpcResponse (toJSON (T.pack bip22)) Null Null
-                Right () ->
+                Right () -> do
+                  -- Core CWallet::blockConnected runs for every block that
+                  -- ConnectTip connects, whatever submitted it; without this
+                  -- a wallet only ever saw generatetoaddress blocks, so a
+                  -- node fed blocks by submitblock reported balance 0 and
+                  -- sendtoaddress failed "Insufficient funds".
+                  scanWalletsForSubmittedBlock server block
                   -- Mirror CTxMemPool::removeForBlock: drop the txs this block
                   -- confirmed (and now-conflicting txs) from the mempool so
                   -- getrawmempool / getmempoolinfo reflect the connected block.
@@ -5853,6 +5862,27 @@ handleSubmitBlockUnpaused server params = do
                   -- so the submitblock RPC must too — otherwise a confirmed spend
                   -- lingers in the pool.  (Done above, inside the chain lock.)
                   return $ RpcResponse Null Null Null
+
+-- | Credit every loaded wallet with a block 'submitBlock' accepted, when it
+-- is now on the active chain (a side-branch block that did not become the
+-- tip has no height-index entry and is skipped, as Core's blockConnected
+-- fires only from ConnectTip).  Runs after the chain lock is released
+-- (lock order: the chain lock is never held while waiting on a wallet).
+scanWalletsForSubmittedBlock :: RpcServer -> Block -> IO ()
+scanWalletsForSubmittedBlock server block =
+  case rsWalletMgr server of
+    Nothing -> return ()
+    Just wm -> do
+      let bh = computeBlockHash (blockHeader block)
+          hc = rsHeaderChain server
+      entries <- readTVarIO (hcEntries hc)
+      byHeight <- readTVarIO (hcByHeight hc)
+      case Map.lookup bh entries of
+        Just ce | Map.lookup (ceHeight ce) byHeight == Just bh -> do
+          wallets <- Map.elems <$> readTVarIO (wmWallets wm)
+          forM_ wallets $ \ws ->
+            scanBlockForWallet (wsWallet ws) block (ceHeight ce)
+        _ -> return ()
 
 -- | submitheader "hexdata"
 --
@@ -9128,7 +9158,7 @@ handleGetBalances server _params = withWalletMgr server $ \wm -> do
             let v = fromIntegral (txOutValue (wueTxOut e)) :: Int64
                 h = wueBlockHeight e
                 c = if tipH >= h then fromIntegral (tipH - h) + 1 else 0 :: Int
-            in if wueIsCoinbase e && c < fromIntegral coinbaseMaturity
+            in if wueIsCoinbase e && c <= fromIntegral coinbaseMaturity
                  then (t, p, i + v)
                  else if c == 0 then (t, p + v, i) else (t + v, p, i)
           (trusted, pending, immature) =
@@ -12656,6 +12686,12 @@ txOutToWalletOutput txout = do
 commitWalletSpend :: Wallet -> CoinSelection -> Tx -> Word32 -> IO ()
 commitWalletSpend wallet cs tx tipH = do
   mapM_ (removeWalletUTXO wallet) (map fst (csInputs cs))
+  -- Core CommitTransaction puts the tx in mapWallet.  The record also keeps
+  -- the prevouts removed above, so the block scan that later confirms this
+  -- tx can still book the debit (send row, fee, change not reported).
+  recordSentTx wallet tx (csInputs cs)
+    (fmap (const (fromIntegral (length (csOutputs cs)))) (csChange cs))
+    (fmap fst (csChange cs)) (csFee cs)
   case csChange cs of
     Nothing -> pure ()
     Just _ ->
@@ -13087,9 +13123,16 @@ handleListUnspent server params = do
             Left (code, msg) -> return $ rpcFail code msg
             Right mAddrs -> do
               tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
-              utxos <- getWalletUTXOs (wsWallet walletState)
+              utxosFull <- getWalletUTXOsFull (wsWallet walletState)
               labels <- readTVarIO (walletAddressLabels (wsWallet walletState))
-              let encodings = catMaybes $
+              -- Core AvailableCoins skips immature coinbase outputs
+              -- (CWalletTx::IsImmatureCoinBase: depth <= COINBASE_MATURITY).
+              let depth e = if tipHeight >= wueBlockHeight e
+                              then fromIntegral (tipHeight - wueBlockHeight e) + 1 else 0 :: Int
+                  utxos = [ (op, wueTxOut e, wueBlockHeight e)
+                          | (op, e) <- utxosFull
+                          , not (wueIsCoinbase e) || depth e > fromIntegral coinbaseMaturity ]
+                  encodings = catMaybes $
                     map (utxoToEnc net labels mAddrs tipHeight minConf maxConf) utxos
                   rawBs = encodingToLazyByteString (AE.list id encodings)
               return $ RpcResponse (rawJsonResult rawBs) Null Null
