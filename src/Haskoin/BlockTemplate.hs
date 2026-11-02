@@ -22,6 +22,7 @@ module Haskoin.BlockTemplate
   , TemplateTransaction(..)
     -- * Template Creation
   , createBlockTemplate
+  , buildTemplateTx
     -- * Block Assembly
   , assembleBlock
     -- * Block Submission

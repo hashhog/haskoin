@@ -255,6 +255,7 @@ module Haskoin.Rpc
   , handleGetNetTotals
   , handleGetNetworkHashPS
   , handleGetBlockTemplate
+  , buildWitnessCommitmentScript
   , handleTestMempoolAccept
   , coreNetworkHashPS
   , arithGetDouble
