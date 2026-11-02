@@ -255,6 +255,7 @@ module Haskoin.Rpc
   , handleGetNetTotals
   , handleGetNetworkHashPS
   , handleGetBlockTemplate
+  , buildWitnessCommitmentScript
   , handleTestMempoolAccept
   , coreNetworkHashPS
   , arithGetDouble
@@ -5527,17 +5528,14 @@ extractProposalData (Array arr) = case V.toList arr of
 extractProposalData _ = Nothing
 
 -- | Build the OP_RETURN witness commitment script for SegWit blocks
--- Format: OP_RETURN <0xaa21a9ed><32-byte commitment hash>
--- The commitment is: SHA256d(witness_merkle_root || witness_nonce)
--- For now we return empty since the actual commitment is computed by miner
+-- Format: OP_RETURN <push 36> <0xaa21a9ed><32-byte commitment hash>
+-- The commitment is SHA256d(witness_merkle_root || witness_nonce) over the
+-- template's transactions, with the coinbase wtxid zeroed (BIP-141).  Core
+-- (rpc/mining.cpp) reports it as default_witness_commitment on every
+-- template, including an empty one.
 buildWitnessCommitmentScript :: BlockTemplate -> ByteString
-buildWitnessCommitmentScript bt
-  | null (btTransactions bt) = BS.empty
-  | otherwise =
-      -- OP_RETURN <aa21a9ed><placeholder 32 bytes>
-      -- In a real implementation, we'd compute the witness merkle root
-      -- For now, return empty and let miner compute it
-      BS.empty
+buildWitnessCommitmentScript bt =
+  BS.concat [BS.pack [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed], btWitnessCommitment bt]
 
 -- | Map an internal block-validation error string to a canonical BIP-22
 -- submitblock result string.

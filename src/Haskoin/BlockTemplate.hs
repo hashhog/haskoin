@@ -22,6 +22,7 @@ module Haskoin.BlockTemplate
   , TemplateTransaction(..)
     -- * Template Creation
   , createBlockTemplate
+  , buildTemplateTx
     -- * Block Assembly
   , assembleBlock
     -- * Block Submission
@@ -386,7 +387,9 @@ buildTemplateTx txIdSet allEntries idx entry =
   let tx = meTransaction entry
       -- Find which template transactions this depends on
       parentTxIds = map (outPointHash . txInPrevOutput) (txInputs tx)
-      depends = [ i | (i, e) <- zip [0..] allEntries
+      -- Core (rpc/mining.cpp) numbers transactions from 1: depends are
+      -- 1-based positions in the template's transactions array.
+      depends = [ i + 1 | (i, e) <- zip [0..] allEntries
                 , meTxId e `elem` parentTxIds
                 , Set.member (meTxId e) txIdSet
                 , i < idx  -- Can only depend on earlier transactions

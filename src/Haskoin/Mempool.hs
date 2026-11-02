@@ -2674,8 +2674,13 @@ selectTransactions mp maxWeight = do
   -- Sort by ancestor fee rate (descending)
   let sorted = sortBy (comparing (Down . ancestorFeeRate)) (Map.elems entries)
 
-  -- Select transactions up to weight limit
-  return $ selectWithinWeight sorted 0 maxWeight []
+  -- Select transactions up to weight limit, then put every parent before
+  -- its children.  An ancestor-fee-rate sort alone ranks a high-fee child
+  -- ahead of its low-fee parent, and a block with the child first is
+  -- invalid (bad-txns-inputs-missingorspent); Core's chunk linearization
+  -- is topological (node/miner.cpp addChunks, txgraph linearization).
+  return $ topoOrderSelected entries
+             (selectWithinWeight sorted 0 maxWeight [])
   where
     selectWithinWeight :: [MempoolEntry] -> Int -> Int -> [MempoolEntry]
                        -> [MempoolEntry]
@@ -2685,6 +2690,33 @@ selectTransactions mp maxWeight = do
       | otherwise = selectWithinWeight rest (currentWeight + weight) limit (e : acc)
       where
         weight = meSize e * witnessScaleFactor
+
+-- | Reorder a rate-sorted selection so each in-mempool parent precedes its
+-- children; the first-seen order is otherwise kept.  A child whose
+-- in-mempool parent was not selected (did not fit) is dropped together with
+-- its own descendants, since a block holding it would spend a missing output.
+topoOrderSelected :: Map TxId MempoolEntry -> [MempoolEntry] -> [MempoolEntry]
+topoOrderSelected pool sel = reverse accFinal
+  where
+    selMap = Map.fromList [(meTxId e, e) | e <- sel]
+    (accFinal, _, _) =
+      foldl' (\st e -> snd (visit st e)) ([], Set.empty, Set.empty) sel
+    -- state: (emitted in reverse, emitted ids, dropped ids)
+    visit st@(_, done, bad) e
+      | Set.member tid done = (True, st)
+      | Set.member tid bad  = (False, st)
+      | otherwise =
+          let parents = [ ph | i <- txInputs (meTransaction e)
+                             , let ph = outPointHash (txInPrevOutput i)
+                             , Map.member ph pool ]
+              step (ok, s) ph = case Map.lookup ph selMap of
+                Nothing -> (False, s)  -- parent is in the pool but not selected
+                Just pe -> let (ok', s') = visit s pe in (ok && ok', s')
+              (allOk, (acc1, done1, bad1)) = foldl' step (True, st) parents
+          in if allOk
+               then (True, (e : acc1, Set.insert tid done1, bad1))
+               else (False, (acc1, done1, Set.insert tid bad1))
+      where tid = meTxId e
 
 --------------------------------------------------------------------------------
 -- Package Relay (BIP-331)
