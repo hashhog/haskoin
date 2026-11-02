@@ -323,6 +323,29 @@ test-suite haskoin-test
   default-language: Haskell2010
   ghc-options:     -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
 
+-- batch5-haskoin-node_error: own target so the spec needs no edit to the
+-- shared Spec.hs / haskoin-test other-modules list.
+test-suite submitblock-wallet
+  type:          exitcode-stdio-1.0
+  main-is:       SubmitBlockWalletMain.hs
+  other-modules: SubmitBlockWalletSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite service-flags
   type:          exitcode-stdio-1.0
   main-is:       ServiceFlagsMain.hs

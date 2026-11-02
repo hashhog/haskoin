@@ -38,6 +38,7 @@ module Haskoin.Rpc
   , requestNodeShutdown
     -- * Regtest miner helpers (exported for testing)
   , generateSingleBlock
+  , handleSubmitBlock
   , buildRegtestCoinbase
   , findRegtestNonce
     -- * TLS (HTTPS) configuration — W119 + FIX-64
