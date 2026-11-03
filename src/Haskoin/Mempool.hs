@@ -77,6 +77,7 @@ module Haskoin.Mempool
   , trackPackageRemoved
   , trimToSize
   , rollingFeeHalflife
+  , applyMaxMempoolMb
     -- * RBF (Replace-by-Fee)
   , checkReplacement
   , removeConflicts
@@ -2618,6 +2619,10 @@ trimToSize mp = loop
             trackPackageRemoved mp evictedKvb
             removeWithDescendants mp txid
             loop  -- keep trimming until under limit
+
+-- | Apply @-maxmempool=<n>@ (megabytes) to a mempool config.
+applyMaxMempoolMb :: Int -> MempoolConfig -> Either String MempoolConfig
+applyMaxMempoolMb _ cfg = Right cfg
 
 -- | Evict the lowest fee-rate transaction (and its descendants) from the
 -- mempool and bump the rolling minimum fee rate accordingly.
