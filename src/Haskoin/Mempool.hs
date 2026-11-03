@@ -2621,8 +2621,22 @@ trimToSize mp = loop
             loop  -- keep trimming until under limit
 
 -- | Apply @-maxmempool=<n>@ (megabytes) to a mempool config.
+--
+-- Bitcoin Core node/mempool_args.cpp ApplyArgsManOptions:
+-- @max_size_bytes = n * 1'000'000@ (megabytes are 10^6).  txmempool.cpp
+-- Flatten then refuses a negative limit, or a positive one below 40 x the
+-- cluster size limit (policy.h DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB),
+-- with "-maxmempool must be at least %d MB" (ceil of 4.04 MB = 5); Core
+-- stops at startup on that error.  A limit of 0 passes the check.
 applyMaxMempoolMb :: Int -> MempoolConfig -> Either String MempoolConfig
-applyMaxMempoolMb _ cfg = Right cfg
+applyMaxMempoolMb mb cfg
+  | mb < 0 || (bytes > 0 && bytes < clusterLimitBytes) =
+      Left ("-maxmempool must be at least "
+            ++ show ((clusterLimitBytes + 999999) `div` 1000000) ++ " MB")
+  | otherwise = Right cfg { mpcMaxSize = bytes }
+  where
+    bytes = mb * 1000000
+    clusterLimitBytes = 101 * 1000 * 40
 
 -- | Evict the lowest fee-rate transaction (and its descendants) from the
 -- mempool and bump the rolling minimum fee rate accordingly.
