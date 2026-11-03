@@ -115,6 +115,9 @@ data NodeOptions = NodeOptions
   , noDbCache    :: !Int
   , noFallbackFee :: !String
     -- ^ @-fallbackfee=\<amt\>@ (BTC/kvB); \"0\" disables (Core default).
+  , noMaxMempool :: !Int
+    -- ^ @-maxmempool=\<n\>@ megabytes (Core default 300); see
+    -- 'applyMaxMempoolMb'.
   , noListen     :: !Bool
   , noListenPort :: !Int
   , noMetricsPort :: !Int
@@ -315,6 +318,9 @@ parseNodeOptions = NodeOptions
   <*> strOption (long "fallbackfee" <> value "0" <> metavar "AMT"
         <> help "Wallet fee rate (BTC/kvB) used when fee estimation has \
                 \insufficient data; 0 disables (default: 0, matches Core)")
+  <*> option auto (long "maxmempool" <> value 300 <> metavar "N"
+        <> help "Keep the transaction memory pool below N megabytes \
+                \(default: 300, matches Core)")
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
@@ -647,6 +653,9 @@ applyConfigOverlay cm n = n
   , noFallbackFee = if noFallbackFee n == "0"
                      then fromMaybe "0" (Daemon.configLookup "fallbackfee" cm)
                      else noFallbackFee n
+  , noMaxMempool = if noMaxMempool n == 300
+                     then Daemon.configLookupInt "maxmempool" 300 cm
+                     else noMaxMempool n
   , noListen     = if noListen n
                      then Daemon.configLookupBool "listen" True cm
                      else noListen n
@@ -854,6 +863,15 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
   --     node/blockmanager_args.cpp semantics).  Reject negative and
   --     2..549 values up front so misconfiguration fails fast before
   --     we touch the DB.
+  -- 2a'. -maxmempool (Core node/mempool_args.cpp).  A value below the
+  --      5 MB floor is a startup error, as Core's CTxMemPool constructor
+  --      makes it; checked here so it fails before we touch the DB.
+  mempoolCfg <- case applyMaxMempoolMb noMaxMempool defaultMempoolConfig of
+    Right cfg -> return cfg
+    Left err -> do
+      putStrLn $ "FATAL: " ++ err
+      exitWith (ExitFailure 1)
+
   pruneCfg <- case parsePruneArg noPrune of
     Left err -> do
       putStrLn $ "FATAL: " ++ err
@@ -1232,7 +1250,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- height/MTP with 0/0 here and count connected blocks from there, and
     -- this closure subtracted 1 from a height the caller had already
     -- decremented (MTP(H-2)).  Installed before mempool.dat is loaded.
-    mp <- initNodeMempool net db hc cache defaultMempoolConfig
+    mp <- initNodeMempool net db hc cache mempoolCfg
 
     -- Load mempool.dat (Core-format), if present. We use a 14-day
     -- expiry (matches Bitcoin Core's DEFAULT_MEMPOOL_EXPIRY_HOURS = 336).
