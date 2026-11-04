@@ -128,6 +128,7 @@ module Haskoin.Mempool
   , maxClusterSizeVbytes
   , maxClusterSizeWeight
   , findCluster
+  , findClusterFrom
   , findAllClusters
   , linearize
   , linearizeCluster
@@ -2058,14 +2059,14 @@ effectiveMinFeeRate mp = FeeRate <$> getMempoolMinFeeRate mp
 -- Ancestor/Descendant Tracking
 --------------------------------------------------------------------------------
 
--- | Get direct unconfirmed ancestors of a transaction
+-- | Get direct unconfirmed ancestors of a transaction, in txid order.
+-- One map lookup per distinct parent txid; this used to filter the whole
+-- pool on every call.
 getAncestors :: Mempool -> Tx -> IO [MempoolEntry]
 getAncestors mp tx = do
   entries <- readTVarIO (mpEntries mp)
   let parentTxIds = Set.fromList $ map (outPointHash . txInPrevOutput) (txInputs tx)
-      directParents = Map.elems $ Map.filterWithKey
-        (\k _ -> Set.member k parentTxIds) entries
-  return directParents
+  return $ mapMaybe (`Map.lookup` entries) (Set.toAscList parentTxIds)
 
 -- | Get all unconfirmed ancestors recursively
 getAncestorsRecursive :: Mempool -> Tx -> IO [MempoolEntry]
@@ -3933,24 +3934,23 @@ checkClusterLimit tx entries byOutpoint txAdjWeight =
                   , let parentId = outPointHash (txInPrevOutput inp)
                   , Map.member parentId entries
                   ]
-      -- Build union-find for cluster membership (count check)
-      uf = buildUnionFind entries byOutpoint
   in if null parentIds
      then Right ()  -- No connections, will be singleton cluster — always fine
      else
-       let -- Count check: sum distinct cluster sizes + 1 for this tx
-           clusterTxCounts = getDistinctClusterSizes parentIds uf
-           totalTxCount    = sum clusterTxCounts + 1
+       let -- The union of the clusters this tx would merge, found by a search
+           -- from its in-pool parents.  Clusters are disjoint, so its size is
+           -- the sum of the distinct cluster sizes.  The cost is the size of
+           -- those clusters, not of the pool: this used to build a union-find
+           -- over every pool entry ('buildUnionFind') on each admission.
+           members      = findClusterFrom parentIds entries byOutpoint
+           totalTxCount = Set.size members + 1
            -- Size check: sum the sigop-adjusted weight of every member of every
            -- distinct cluster this tx would merge, plus the candidate's own.
-           distinctRoots   = Set.fromList
-                               [fst (ufFind parentId uf) | parentId <- parentIds]
-           totalWeight = Map.foldlWithKey'
-                           (\acc txid' e ->
-                              if fst (ufFind txid' uf) `Set.member` distinctRoots
-                                then acc + meAdjWeight e
-                                else acc)
-                           0 entries
+           totalWeight = foldl'
+                           (\acc txid' -> case Map.lookup txid' entries of
+                              Just e  -> acc + meAdjWeight e
+                              Nothing -> acc)
+                           0 (Set.toList members)
                          + txAdjWeight
        in if totalTxCount > maxClusterSize
           then Left $ ClusterLimitExceeded totalTxCount maxClusterSize
@@ -3969,8 +3969,18 @@ findCluster :: TxId                       -- ^ Starting transaction
             -> Map TxId MempoolEntry      -- ^ All mempool entries
             -> Map OutPoint TxId          -- ^ Spent outpoint index
             -> Set TxId
-findCluster startTxId entries byOutpoint =
-  bfs (Set.singleton startTxId) Set.empty
+findCluster startTxId = findClusterFrom [startTxId]
+
+-- | The union of the clusters containing any of the start transactions:
+-- a breadth-first search over spend edges (in-pool parents through
+-- 'mpEntries', children through the outpoint index).  Touches only the
+-- members of those clusters and their direct edges.
+findClusterFrom :: [TxId]                   -- ^ Start transactions
+                -> Map TxId MempoolEntry    -- ^ All mempool entries
+                -> Map OutPoint TxId        -- ^ Spent outpoint index
+                -> Set TxId
+findClusterFrom starts entries byOutpoint =
+  bfs (Set.fromList starts) Set.empty
   where
     bfs :: Set TxId -> Set TxId -> Set TxId
     bfs frontier visited
