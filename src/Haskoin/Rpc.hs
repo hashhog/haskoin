@@ -101,6 +101,7 @@ module Haskoin.Rpc
     -- * gettxoutsetinfo (exported for testing — snapshot-consistent height/hash)
   , handleGetTxOutSetInfo
   , handleGetBlockCount
+  , handleInvalidateBlock
   , handleGetBlockchainInfo
   , computeTxOutSetAtTip
     -- * getchainstates (Bitcoin Core v23) — handler + pure core (exported for testing)
