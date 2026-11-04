@@ -524,7 +524,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
                          setOnRemoveTx, prioritiseTransaction,
-                         isRbfReplaceable, blockConnected,
+                         isRbfReplaceable, blockConnected, blockDisconnected,
                          -- BIP-125 opt-in predicate (Core util/rbf.cpp
                          -- SignalsOptInRBF); reused by createrawtransaction's
                          -- "sequence contradicts replaceable" check.
@@ -3464,9 +3464,18 @@ handleInvalidateBlock server params = do
         Left err -> return $ RpcResponse Null (toJSON err) Null
         Right bh -> do
           -- HK-3: chain writer -> under the chain lock (Core cs_main).
-          result <- withChainLock (ucChainLock (rsUTXOCache server)) $
-                    invalidateBlock (rsNetwork server) (rsUTXOCache server)
-                      (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
+          result <- withChainLock (ucChainLock (rsUTXOCache server)) $ do
+                    oldTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                    r <- invalidateBlock (rsNetwork server) (rsUTXOCache server)
+                           (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
+                    -- Core DisconnectTip/ConnectTip -> MaybeUpdateMempoolForReorg:
+                    -- the pool follows the tip, same critical section.
+                    case r of
+                      Right () -> do
+                        newTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+                        mempoolFollowTip server (ceHash oldTip) (ceHash newTip)
+                      Left _ -> return ()
+                    return r
           case result of
             Left InvalidateGenesis -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "Cannot invalidate genesis block") Null
@@ -3479,6 +3488,31 @@ handleInvalidateBlock server params = do
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcMiscError "Block invalidation failed") Null
             Right () -> return $ RpcResponse Null Null Null
+
+-- | Bring the mempool along after the active tip moved from @oldTip@ to
+-- @newTip@ outside the block-connect path (invalidateblock).
+--
+-- Core (validation.cpp ActivateBestChainStep / DisconnectTip): each connected
+-- block runs removeForBlock, then MaybeUpdateMempoolForReorg re-admits the
+-- disconnected blocks' transactions against the new tip.  Disconnected blocks
+-- are re-added lowest first so a parent is in the pool before its child.
+-- Must run under the chain lock.
+mempoolFollowTip :: RpcServer -> BlockHash -> BlockHash -> IO ()
+mempoolFollowTip server oldTip newTip = when (oldTip /= newTip) $ do
+  entries <- readTVarIO (hcEntries (rsHeaderChain server))
+  let pathOf h = case Map.lookup h entries of
+        Nothing -> []
+        Just ce -> h : maybe [] pathOf (cePrev ce)
+      newPath = pathOf newTip
+      oldPath = pathOf oldTip
+      newSet  = Set.fromList newPath
+      oldSet  = Set.fromList oldPath
+      disconnected = takeWhile (`Set.notMember` newSet) oldPath          -- tip first
+      connected    = reverse (takeWhile (`Set.notMember` oldSet) newPath) -- fork child first
+  conBlocks <- mapM (getBlock (rsDB server)) connected
+  disBlocks <- mapM (getBlock (rsDB server)) disconnected
+  forM_ conBlocks $ mapM_ (blockConnected (rsMempool server))
+  forM_ (reverse disBlocks) $ mapM_ (blockDisconnected (rsMempool server))
 
 -- | Reconsider a previously invalidated block
 -- Reference: bitcoin/src/rpc/blockchain.cpp reconsiderblock
