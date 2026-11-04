@@ -198,6 +198,7 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            SigOpCost(..), isCoinbase)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
+import Haskoin.ChainLock (withChainLock)
 import Haskoin.Script (verifyScript, isPayToAnchor, decodeScript)
 import qualified Haskoin.Script as Script
 import qualified Haskoin.Policy.Standard as Std
@@ -838,10 +839,31 @@ fireRemoveNotify mp txid = do
 -- Transaction Addition
 --------------------------------------------------------------------------------
 
+-- | Run a mempool admission or removal holding the chain lock (haskoin's
+-- @cs_main@, 'ucChainLock' on the mempool's UTXO cache).
+--
+-- Core holds cs_main and pool.cs from the conflict check in PreChecks to the
+-- insert in Finalize (validation.cpp AcceptToMemoryPool / ProcessNewPackage),
+-- and around every removal (removeForBlock, removeForReorg, TrimToSize,
+-- Expire).  haskoin's conflict check ('getConflicts') and its insert are
+-- separate STM transactions, and 'addTransaction' is called from every
+-- peer's receive thread and from RPC handlers, so without one lock around
+-- the whole admission two spends of the same outpoint arriving together
+-- could both be admitted.  Taking the chain lock (rather than a lock of the
+-- mempool's own) also keeps admission from reading the UTXO cache halfway
+-- through a block connect or a reorg, and adds no lock-order edge: the
+-- chain lock is the outermost lock (Haskoin.ChainLock) and is re-entrant,
+-- so a caller that already holds it (block connect calling
+-- 'blockConnected', an RPC handler under 'withChainLock', RBF calling
+-- 'removeConflicts' from inside 'addTransaction') just proceeds.
+withAdmissionLock :: Mempool -> IO a -> IO a
+withAdmissionLock mp = withChainLock (ucChainLock (mpUTXOCache mp))
+
+
 -- | Add a transaction to the mempool after validation
 -- Returns the TxId on success, or an error on failure
 addTransaction :: Mempool -> Tx -> IO (Either MempoolError TxId)
-addTransaction mp tx = do
+addTransaction mp tx = withAdmissionLock mp $ do
   -- gate-6: after a fatal internal error (AbortNode) the node accepts
   -- nothing new; it is shutting down.
   latched <- readFatalLatch
@@ -1291,15 +1313,36 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
       wtxid    = meWtxid entry
       commitFee = meFee entry
 
-  -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync)
-  atomically $ do
-    modifyTVar' (mpEntries mp) (Map.insert txid entry)
-    modifyTVar' (mpByWtxid mp) (Map.insert wtxid txid)
-    forM_ (txInputs tx) $ \inp ->
-      modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
-    modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
-    modifyTVar' (mpSize mp) (+ adjVsize)
+  -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync).
+  -- The conflict and duplicate checks are repeated inside the insert's own
+  -- STM transaction, so the pool can never hold two spends of one outpoint
+  -- even if an admission ever ran outside 'withAdmissionLock'.
+  inserted <- atomically $ do
+    present <- Map.member txid <$> readTVar (mpEntries mp)
+    byOp <- readTVar (mpByOutpoint mp)
+    let clash = [ s | inp <- txInputs tx
+                    , Just s <- [Map.lookup (txInPrevOutput inp) byOp]
+                    , s /= txid ]
+    case clash of
+      _ | present -> return (Left ErrAlreadyInMempool)
+      (s : _)     -> return (Left (ErrInputSpentInMempool s))
+      []          -> do
+        modifyTVar' (mpEntries mp) (Map.insert txid entry)
+        modifyTVar' (mpByWtxid mp) (Map.insert wtxid txid)
+        forM_ (txInputs tx) $ \inp ->
+          modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
+        modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
+        modifyTVar' (mpSize mp) (+ adjVsize)
+        return (Right ())
+  case inserted of
+    Left err -> return (Left err)
+    Right () -> continueAfterInsert mp txid adjVsize commitFee ancestors
 
+-- | The rest of 'continueAddTransaction' once the entry is in the pool:
+-- ancestor bookkeeping and the size-limit trim.
+continueAfterInsert :: Mempool -> TxId -> Int -> Word64 -> [MempoolEntry]
+                    -> IO (Either MempoolError TxId)
+continueAfterInsert mp txid adjVsize commitFee ancestors = do
   -- Update ancestor entries with new descendant
   let ancUpdates = map meTxId ancestors
   atomically $ forM_ ancUpdates $ \ancId ->
@@ -1417,7 +1460,7 @@ finalizeTransactionDry mp tx txid inputPairs = do
 -- it would be accepted.  The caller can read 'meFee' and 'meSize' from
 -- the returned entry to populate the RPC response.
 testAcceptTransaction :: Mempool -> Tx -> IO (Either MempoolError MempoolEntry)
-testAcceptTransaction mp tx = do
+testAcceptTransaction mp tx = withAdmissionLock mp $ do
   let txid  = computeTxId tx
       wtxid = computeWtxid tx
   -- Duplicate checks (same as addTransaction)
@@ -1693,7 +1736,7 @@ checkAncestorLimits mp tx txAdjWeight = do
 -- 'removeTransactionForBlock', which omits the notification (Core: the
 -- estimator instead consumes confirmations via @processBlockTx@).
 removeTransaction :: Mempool -> TxId -> IO ()
-removeTransaction mp txid = do
+removeTransaction mp txid = withAdmissionLock mp $ do
   removed <- removeTransactionStructural mp txid
   when removed $ fireRemoveNotify mp txid
 
@@ -1704,7 +1747,8 @@ removeTransaction mp txid = do
 -- removal reason suppresses the @TransactionRemovedFromMempool@ signal —
 -- txmempool.cpp:269).
 removeTransactionForBlock :: Mempool -> TxId -> IO ()
-removeTransactionForBlock mp txid = () <$ removeTransactionStructural mp txid
+removeTransactionForBlock mp txid =
+  withAdmissionLock mp $ () <$ removeTransactionStructural mp txid
 
 -- | Shared structural removal used by both 'removeTransaction' (non-block) and
 -- 'removeTransactionForBlock' (block).  Returns 'True' iff an entry was
@@ -1794,7 +1838,7 @@ getDescendantsOfEntry mp txid = do
 
 -- | Remove a transaction and all its descendants
 removeWithDescendants :: Mempool -> TxId -> IO ()
-removeWithDescendants mp txid = do
+removeWithDescendants mp txid = withAdmissionLock mp $ do
   descendants <- getDescendants mp txid
   -- Remove descendants first (in reverse order - children before parents)
   forM_ (reverse descendants) $ removeTransaction mp . meTxId
@@ -2279,7 +2323,7 @@ checkNoNewUnconfirmedInputs tx mempoolTxIds oldUnconfirmedSpends =
 -- | Remove all conflicting transactions and their descendants
 -- This is called after successful replacement validation
 removeConflicts :: Set TxId -> Mempool -> IO ()
-removeConflicts conflictTxIds mp = do
+removeConflicts conflictTxIds mp = withAdmissionLock mp $ do
   -- Get all entries to remove (conflicts + descendants)
   allEvictions <- getConflictSet mp (Set.toList conflictTxIds)
 
@@ -2371,7 +2415,7 @@ attemptReplacement mp tx _txid conflictTxIds newFee newVsize newFeeRate = do
 -- | Handle a newly connected block
 -- Removes confirmed transactions and any transactions that conflict
 blockConnected :: Mempool -> Block -> IO ()
-blockConnected mp block = do
+blockConnected mp block = withAdmissionLock mp $ do
   -- Get all confirmed transaction IDs
   let confirmedTxIds = Set.fromList $ map computeTxId (blockTxns block)
 
@@ -2450,7 +2494,7 @@ blockConnected mp block = do
 -- | Handle a disconnected block (during reorg)
 -- Re-adds transactions from the disconnected block back to mempool
 blockDisconnected :: Mempool -> Block -> IO ()
-blockDisconnected mp block = do
+blockDisconnected mp block = withAdmissionLock mp $ do
   -- Decrease chain height and drop the disconnected block's timestamp from
   -- the MTP window. We drop the head (most-recent) and recompute.
   hasSource <- isJustM (mpTipSource mp)
@@ -2597,7 +2641,7 @@ getMempoolMinFeeRateDecayed mp = do
 -- Updates the rolling minimum fee rate via 'trackPackageRemoved' each
 -- iteration.  Mirrors CTxMemPool::TrimToSize (txmempool.cpp:861-911).
 trimToSize :: Mempool -> IO ()
-trimToSize mp = loop
+trimToSize mp = withAdmissionLock mp loop
   where
     -- Both 'totalSize' (mpSize) and 'sizelimit' (mpcMaxSize) are in vsize-bytes
     -- (W153 BUG-2 — units are now consistent on both sides of the comparison;
@@ -2652,7 +2696,7 @@ evictLowestFee = trimToSize
 --
 -- Returns the number of transactions removed (including descendants).
 expireOldTransactions :: Mempool -> IO Int
-expireOldTransactions mp = do
+expireOldTransactions mp = withAdmissionLock mp $ do
   now     <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
   let expirySeconds = fromIntegral (mpcExpiryHours (mpConfig mp)) * 3600 :: Int64
       cutoff        = now - expirySeconds
@@ -2921,7 +2965,7 @@ calculatePackageFeeRate txns utxoMap = do
 -- acceptPackageInner.  If every tx is already in the mempool the call
 -- succeeds and returns the empty list (nothing newly admitted).
 acceptPackage :: TxPackage -> Mempool -> IO (Either PackageError [TxId])
-acceptPackage pkg mp = do
+acceptPackage pkg mp = withAdmissionLock mp $ do
   let allTxns = pkgParents pkg ++ [pkgChild pkg]
 
   -- 1. Context-free validation (applied to the full declared package).
@@ -4220,7 +4264,7 @@ selectTransactionsFromClusters state entries maxWeight =
 -- | Evict the lowest fee-rate chunk from the lowest fee-rate cluster.
 -- This is used when the mempool is full.
 evictLowestFeeRateCluster :: Mempool -> IO ()
-evictLowestFeeRateCluster mp = do
+evictLowestFeeRateCluster mp = withAdmissionLock mp $ do
   entries <- readTVarIO (mpEntries mp)
   byOutpoint <- readTVarIO (mpByOutpoint mp)
 
