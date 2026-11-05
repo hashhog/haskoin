@@ -533,7 +533,8 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          -- Package relay (BIP-331) — submitpackage RPC
                          TxPackage(..), maxPackageCount, acceptPackage,
                          isWellFormedPackage, isChildWithParents,
-                         isChildWithParentsTree)
+                         isChildWithParentsTree,
+                         mempoolChunkInfo, mempoolParents, mempoolChildren)
 import qualified Haskoin.Mempool.Persist as MPP
 import qualified Haskoin.Policy.Standard as PolicyStd
 import Haskoin.TxOrphanage (OrphanPool(..))
@@ -4565,12 +4566,18 @@ handleGetRawMempool server params = do
         case mEntry of
           Nothing -> return Nothing
           Just entry -> return $ Just (txid, entry)
-      let validEntries = catMaybes entries
+      -- Core's entryToJSON reports each entry's chunk (fee, weight) and its
+      -- in-pool parents / children; snapshot the pool once for all of them.
+      (poolEntries, poolByOutpoint) <- atomically $
+        (,) <$> readTVar (mpEntries (rsMempool server))
+            <*> readTVar (mpByOutpoint (rsMempool server))
+      let chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
+          validEntries = catMaybes entries
           -- Build the object on the streaming path so fee amounts use
           -- Core's fixed-decimal format (btcAmountEnc) rather than Double.
           pairsEnc = foldl' (<>) mempty
             [ pair (Key.fromText (showHash (BlockHash (getTxIdHash txid))))
-                   (mempoolEntryEnc tipHeight entry)
+                   (mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry)
             | (txid, entry) <- validEntries
             ]
           rawBs = encodingToLazyByteString (pairs pairsEnc)
@@ -4578,8 +4585,9 @@ handleGetRawMempool server params = do
   where
     -- | Encode one mempool entry as a streaming Encoding so fee amounts
     -- use Core's fixed-decimal format (8 fractional digits, no sci notation).
-    mempoolEntryEnc :: Word32 -> MempoolEntry -> AE.Encoding
-    mempoolEntryEnc tipHeight entry =
+    mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
+                    -> Map TxId (Word64, Int) -> MempoolEntry -> AE.Encoding
+    mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry =
       let wtxid = computeWtxId (meTransaction entry)
           entryHeight = meHeight entry
           feeSat = fromIntegral (meFee entry) :: Int64
@@ -4589,7 +4597,17 @@ handleGetRawMempool server params = do
             pair "base"       (btcAmountEnc feeSat)  <>
             pair "modified"   (btcAmountEnc feeSat)  <>
             pair "ancestor"   (btcAmountEnc ancFee)  <>
-            pair "descendant" (btcAmountEnc descFee)
+            pair "descendant" (btcAmountEnc descFee) <>
+            pair "chunk"      (btcAmountEnc chunkFee)
+          -- A pool entry always belongs to a chunk; fall back to the entry
+          -- alone only if the snapshot raced a removal.
+          (chunkFeeW, chunkWeight) =
+            Map.findWithDefault (meFee entry, meAdjWeight entry) (meTxId entry) chunkInfo
+          chunkFee = fromIntegral chunkFeeW :: Int64
+          -- Core sorts depends by hex (std::set<std::string>).
+          hexIds = sort . map (showHash . BlockHash . getTxIdHash)
+          dependsHex = hexIds (mempoolParents poolEntries entry)
+          spentbyHex = hexIds (mempoolChildren poolByOutpoint entry)
           _confirmations = if tipHeight >= entryHeight
                            then tipHeight - entryHeight
                            else 0
@@ -4603,9 +4621,10 @@ handleGetRawMempool server params = do
            pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
            pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
            pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
+           pair "chunkweight"        (AE.int chunkWeight)                             <>
            pair "fees"               feesEnc                                          <>
-           pair "depends"            (AE.list text [])                                <>
-           pair "spentby"            (AE.list text [])                                <>
+           pair "depends"            (AE.list text dependsHex)                        <>
+           pair "spentby"            (AE.list text spentbyHex)                        <>
            pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
            pair "unbroadcast"        (AE.bool False)
 
