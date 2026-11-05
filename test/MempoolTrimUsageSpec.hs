@@ -31,7 +31,7 @@ import System.FilePath ((</>))
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId, sha256)
 import Haskoin.Mempool
-import Haskoin.Consensus (regtest)
+import Haskoin.Consensus (regtest, Network(..))
 import Haskoin.Storage (newUTXOCache, defaultDBConfig, withDB, addUTXO,
                         UTXOEntry(..))
 
@@ -126,3 +126,11 @@ spec = describe "-maxmempool trims by Core's DynamicMemoryUsage (txmempool.cpp T
         writeTVar (mpLastRollingFeeUpdate mp) (now - elapsed)
       let expected = floor (rolling / (2 ** (fromIntegral elapsed / 43_200))) :: Word64
       getMempoolMinFeeRate mp `shouldReturn` expected
+
+  it "maxmempool-pressure-decay: a connected block restarts the rolling-fee clock (Core removeForBlock: lastRollingFeeUpdate = GetTime())" $
+    withPressurePool $ \mp -> do
+      atomically $ writeTVar (mpLastRollingFeeUpdate mp) 0
+      blockConnected mp (netGenesisBlock regtest)
+      now <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+      t <- readTVarIO (mpLastRollingFeeUpdate mp)
+      t `shouldSatisfy` (\x -> x <= now && x >= now - 60)
