@@ -2713,9 +2713,10 @@ scriptUsage s
 --     shared_ptr<CTransaction> and the tx's TxGraph entry and chunk.
 --
 -- The constants were measured against Core v31.1 regtest (getmempoolinfo
--- usage after each send, staged in the meta-repo under
--- staged-patches/refill-1105-hs/calib): an 800-input spend with two 80-byte
--- items and a 3-byte script per witness is 397,512 bytes in Core and here.
+-- usage before and after each send of independent spends): a 1-input
+-- spend adds 1,208 bytes, each further input of the same shape 496, an
+-- extra 48-byte output 48; an 800-input spend with two 80-byte items and
+-- a 3-byte script per witness adds 397,512 bytes in Core and here.
 -- TxGraph's per-cluster bookkeeping for multi-tx clusters (a few hundred
 -- bytes per dependency) is not modelled.
 txMemUsage :: Tx -> Int
