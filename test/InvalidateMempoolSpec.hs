@@ -28,7 +28,7 @@ import System.FilePath ((</>))
 
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId)
-import Haskoin.Consensus (blockHashToHex, regtest, initHeaderChain, getValidatedChainTip, ChainEntry(..))
+import Haskoin.Consensus (blockHashToHex, regtest, initHeaderChain, getValidatedChainTip, ChainEntry(..), HeaderChain(..))
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, getBlock )
 import Haskoin.Mempool (newMempool, defaultMempoolConfig, addTransaction, getTransaction)
@@ -175,8 +175,49 @@ spec = describe "invalidateblock re-admits the disconnected blocks' transactions
       present parent `shouldReturn` Just ()
       present (head children) `shouldReturn` Nothing
       mapM present (tail children) >>= (`shouldBe` replicate 63 (Just ()))
+  -- Core regtest failed_reorg scenario C.  Core's CBlockIndexWorkComparator
+  -- (node/blockstorage.cpp:174-192) orders candidates by chain work, then by
+  -- the LOWER nSequenceId ("earliest activatable"), and ActivateBestChain
+  -- moves to the best candidate even when it only ties the tip.  So after
+  -- reconsiderblock, a reconsidered branch that was received first wins an
+  -- equal-work tie against the branch the node moved to meanwhile.
+  it "failed-reorg-c-reconsider: an equal-work branch received first is re-activated by reconsiderblock" $
+    withLiveServer $ \server -> do
+      let mineTo spk = either (fail . show) return =<< generateSingleBlock server spk []
+          tipHash = tipHashOf server
+      mapM_ (const (mineTo p2wshTrue)) [1 .. 2 :: Int]
+      b3a <- mineTo p2wshTrue
+      b4a <- mineTo p2wshTrue
+      invalidateRpc server b3a
+      -- the rival branch 3'-4' is mined after 3a-4a: higher sequence ids
+      _ <- mineTo otherSpk
+      b4' <- mineTo otherSpk
+      tipHash `shouldReturn` b4'
+      _ <- handleReconsiderBlock server (toJSON [blockHashToHex b3a])
+      tipHash `shouldReturn` b4a
+      -- getchaintips agrees: the header chain's best header is 4a too
+      (ceHash <$> readTVarIO (hcTip (rsHeaderChain server))) `shouldReturn` b4a
+
+  -- Scenario D's shape: a heavier rival keeps the tip after reconsiderblock.
+  it "failed-reorg-d-reconsider: a heavier branch keeps the tip after reconsiderblock" $
+    withLiveServer $ \server -> do
+      let mineTo spk = either (fail . show) return =<< generateSingleBlock server spk []
+          tipHash = tipHashOf server
+      mapM_ (const (mineTo p2wshTrue)) [1 .. 2 :: Int]
+      b3a <- mineTo p2wshTrue
+      _ <- mineTo p2wshTrue
+      invalidateRpc server b3a
+      _ <- mineTo otherSpk
+      _ <- mineTo otherSpk
+      b5' <- mineTo otherSpk
+      _ <- handleReconsiderBlock server (toJSON [blockHashToHex b3a])
+      tipHash `shouldReturn` b5'
   where
     isRight' (Right _) = True
     isRight' _ = False
     isNothing' Nothing = True
     isNothing' _ = False
+    tipHashOf server = ceHash <$> getValidatedChainTip (rsDB server) (rsHeaderChain server)
+    -- a coinbase script other than p2wshTrue, so the rival branch's blocks
+    -- differ from the original branch's at the same heights
+    otherSpk = BS.pack [0x51]
