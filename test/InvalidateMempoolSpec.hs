@@ -40,7 +40,7 @@ import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Rpc
   ( RpcServer(..), defaultRpcConfig, RpcConfig(..),
-  handleInvalidateBlock, generateSingleBlock )
+  handleInvalidateBlock, handleReconsiderBlock, generateSingleBlock )
 
 liveNoopHandler :: a -> Message -> IO ()
 liveNoopHandler _ _ = return ()
@@ -107,7 +107,7 @@ invalidateRpc server h = do
   return ()
 
 spec :: Spec
-spec = describe "invalidateblock re-admits the disconnected blocks' transactions (Core)" $
+spec = describe "invalidateblock re-admits the disconnected blocks' transactions (Core)" $ do
   it "a chain of spends confirmed one per block is back in the mempool, parents first" $
     withLiveServer $ \server -> do
       let mine = either (fail . show) return =<< generateSingleBlock server p2wshTrue []
@@ -130,6 +130,22 @@ spec = describe "invalidateblock re-admits the disconnected blocks' transactions
                 m <- getTransaction (rsMempool server) (computeTxId t)
                 (n, fmap (const ()) m) `shouldBe` (n :: String, Just ()))
             [("tx0", tx0), ("tx1", tx1), ("tx2", tx2)]
+
+  it "reconsiderblock reconnects them and removes them from the mempool again" $
+    withLiveServer $ \server -> do
+      let mine = either (fail . show) return =<< generateSingleBlock server p2wshTrue []
+      b1 <- mine
+      mapM_ (const mine) [2 .. 101 :: Int]
+      Just cb <- fmap (head . blockTxns) <$> getBlock (rsDB server) b1
+      let tx0 = spendOf (OutPoint (computeTxId cb) 0) 1
+      _ <- addTransaction (rsMempool server) tx0
+      blk102 <- either (fail . show) return =<< generateSingleBlock server p2wshTrue [tx0]
+      invalidateRpc server blk102
+      (fmap (const ()) <$> getTransaction (rsMempool server) (computeTxId tx0)) `shouldReturn` Just ()
+      _ <- handleReconsiderBlock server (toJSON [blockHashToHex blk102])
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      ceHeight tip `shouldBe` 102
+      (fmap (const ()) <$> getTransaction (rsMempool server) (computeTxId tx0)) `shouldReturn` Nothing
   where
     isRight' (Right _) = True
     isRight' _ = False

@@ -102,6 +102,7 @@ module Haskoin.Rpc
   , handleGetTxOutSetInfo
   , handleGetBlockCount
   , handleInvalidateBlock
+  , handleReconsiderBlock
   , handleGetBlockchainInfo
   , computeTxOutSetAtTip
     -- * getchainstates (Bitcoin Core v23) — handler + pure core (exported for testing)
@@ -3464,18 +3465,10 @@ handleInvalidateBlock server params = do
         Left err -> return $ RpcResponse Null (toJSON err) Null
         Right bh -> do
           -- HK-3: chain writer -> under the chain lock (Core cs_main).
-          result <- withChainLock (ucChainLock (rsUTXOCache server)) $ do
-                    oldTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-                    r <- invalidateBlock (rsNetwork server) (rsUTXOCache server)
-                           (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
-                    -- Core DisconnectTip/ConnectTip -> MaybeUpdateMempoolForReorg:
-                    -- the pool follows the tip, same critical section.
-                    case r of
-                      Right () -> do
-                        newTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-                        mempoolFollowTip server (ceHash oldTip) (ceHash newTip)
-                      Left _ -> return ()
-                    return r
+          result <- withChainLock (ucChainLock (rsUTXOCache server)) $
+                    mempoolFollowsTip server $
+                    invalidateBlock (rsNetwork server) (rsUTXOCache server)
+                      (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
             Left InvalidateGenesis -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "Cannot invalidate genesis block") Null
@@ -3489,8 +3482,21 @@ handleInvalidateBlock server params = do
               (toJSON $ RpcError rpcMiscError "Block invalidation failed") Null
             Right () -> return $ RpcResponse Null Null Null
 
+-- | Run a tip-moving RPC action (invalidateblock / reconsiderblock /
+-- preciousblock) and, if it succeeded, bring the mempool along.  Chain lock held.
+mempoolFollowsTip :: RpcServer -> IO (Either e ()) -> IO (Either e ())
+mempoolFollowsTip server act = do
+  oldTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+  r <- act
+  case r of
+    Right () -> do
+      newTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      mempoolFollowTip server (ceHash oldTip) (ceHash newTip)
+    Left _ -> return ()
+  return r
+
 -- | Bring the mempool along after the active tip moved from @oldTip@ to
--- @newTip@ outside the block-connect path (invalidateblock).
+-- @newTip@ outside the block-connect path.
 --
 -- Core (validation.cpp ActivateBestChainStep / DisconnectTip): each connected
 -- block runs removeForBlock, then MaybeUpdateMempoolForReorg re-admits the
@@ -3537,6 +3543,7 @@ handleReconsiderBlock server params = do
         Right bh -> do
           -- HK-3: chain writer -> under the chain lock (Core cs_main).
           result <- withChainLock (ucChainLock (rsUTXOCache server)) $
+                    mempoolFollowsTip server $
                     reconsiderBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
@@ -3576,6 +3583,7 @@ handlePreciousBlock server params = do
         Right bh -> do
           -- HK-3: chain writer -> under the chain lock (Core cs_main).
           result <- withChainLock (ucChainLock (rsUTXOCache server)) $
+                    mempoolFollowsTip server $
                     preciousBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
