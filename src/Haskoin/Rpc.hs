@@ -524,7 +524,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
                          getAncestors, getDescendants, removeTransaction,
-                         setOnRemoveTx, prioritiseTransaction,
+                         setOnRemoveTx, setMempoolMockTime, prioritiseTransaction,
                          isRbfReplaceable, blockConnected, blockDisconnected,
                          -- BIP-125 opt-in predicate (Core util/rbf.cpp
                          -- SignalsOptInRBF); reused by createrawtransaction's
@@ -6192,6 +6192,10 @@ handleSetMockTime server params = do
       Just (timestamp :: Word32) -> do
         atomically $ writeTVar (rsMockTime server) $
           if timestamp == 0 then Nothing else Just timestamp
+        -- The mempool's rolling-fee clock follows the same mock time
+        -- (Core: GetTime() in GetMinFee / removeForBlock is mockable).
+        setMempoolMockTime (rsMempool server) $
+          if timestamp == 0 then Nothing else Just (fromIntegral timestamp)
         return $ RpcResponse Null Null Null
 
 --------------------------------------------------------------------------------

@@ -77,6 +77,9 @@ module Haskoin.Mempool
   , trackPackageRemoved
   , trimToSize
   , rollingFeeHalflife
+  , txMemUsage
+  , getMempoolDynamicUsage
+  , setMempoolMockTime
   , applyMaxMempoolMb
     -- * RBF (Replace-by-Fee)
   , checkReplacement
@@ -701,6 +704,17 @@ data Mempool = Mempool
     -- blockConnected (+1) / blockDisconnected (-1) moved it, so mpHeight was
     -- "blocks since boot".  Nothing installed (unit tests) = the legacy
     -- TVar arithmetic.
+  , mpUsage :: !(TVar Int)
+    -- ^ Sum of 'txMemUsage' over the pool's entries: Core's per-entry share
+    -- of @CTxMemPool::DynamicMemoryUsage()@ (txmempool.cpp:781).  This, not
+    -- the vsize total in 'mpSize', is what @-maxmempool@ limits.
+  , mpRandCap :: !(TVar Int)
+    -- ^ Capacity of Core's @txns_randomized@ vector (txmempool.h:266): it
+    -- grows by doubling on push_back and never shrinks on removal, so it is
+    -- the pool's high-water count rounded up to a power of two.
+  , mpMockTime :: !(TVar (Maybe Int64))
+    -- ^ @setmocktime@ value, read by the rolling-fee clock ('mempoolNow').
+    -- Core's GetTime() in GetMinFee / removeForBlock is the mockable clock.
   }
 
 -- | A no-op coin-MTP lookup that returns 0 for every height.
@@ -745,6 +759,9 @@ newMempool net cache config height mtp getCoinMtp = do
     <*> newTVarIO now        -- mpLastRollingFeeUpdate: now
     <*> newTVarIO (\_ -> return ())  -- mpOnRemoveTx: no subscriber by default
     <*> newTVarIO Nothing    -- mpTipSource: none (legacy arithmetic) until installed
+    <*> newTVarIO 0          -- mpUsage: empty pool
+    <*> newTVarIO 0          -- mpRandCap: txns_randomized never allocated
+    <*> newTVarIO Nothing    -- mpMockTime: real clock
 
 -- | Install the non-block removal subscriber.  The wiring layer (the RPC
 -- server, which owns both the 'Mempool' and the 'FeeEstimator') calls this
@@ -1337,6 +1354,7 @@ continueAddTransaction mp tx txid fee vsize txSigOpCost ancestors = do
           modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
         modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
         modifyTVar' (mpSize mp) (+ adjVsize)
+        accountEntryAdded mp tx
         return (Right ())
   case inserted of
     Left err -> return (Left err)
@@ -1360,8 +1378,8 @@ continueAfterInsert mp txid adjVsize commitFee ancestors = do
   -- in vsize-bytes (W153 BUG-2 — unit-consistent; see field docs).  evictLowestFee
   -- delegates to trimToSize, which loops until back under the limit and bumps the
   -- rolling minimum fee.
-  totalSize <- readTVarIO (mpSize mp)
-  when (totalSize > mpcMaxSize (mpConfig mp)) $
+  usage <- atomically (getMempoolDynamicUsage mp)
+  when (usage > mpcMaxSize (mpConfig mp)) $
     evictLowestFee mp
 
   return $ Right txid
@@ -1785,6 +1803,7 @@ removeTransactionStructural mp txid = do
         modifyTVar' (mpByFeeRate mp) (Map.delete (meFeeRate entry, txid))
         -- Update size
         modifyTVar' (mpSize mp) (subtract vsize)
+        modifyTVar' (mpUsage mp) (subtract (txMemUsage (meTransaction entry)))
 
         -- Update descendant counts for all ancestors
         forM_ ancestors $ \anc ->
@@ -2478,6 +2497,10 @@ blockConnected mp block = withAdmissionLock mp $ do
     -- Bitcoin Core: blockSinceLastRollingFeeBump = true (txmempool.cpp set in
     -- CTxMemPool::AddTransactionsUpdated, called from ConnectBlock).
     writeTVar (mpBlockSinceLastFeeBump mp) True
+  -- Core removeForBlock (txmempool.cpp:426): lastRollingFeeUpdate = GetTime(),
+  -- so the decay after a block runs from the block, not from boot.
+  blockNow <- mempoolNow mp
+  atomically $ writeTVar (mpLastRollingFeeUpdate mp) blockNow
 
   -- Post-connect mempool maintenance — mirrors Bitcoin Core's
   -- LimitMempoolSize(pool, coins) (validation.cpp:264-277), invoked after each
@@ -2632,12 +2655,13 @@ getMempoolMinFeeRateDecayed mp = do
   if not blockSince || rolling == 0
     then return (floor rolling)
     else do
-      now        <- (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+      now        <- mempoolNow mp
       lastUpdate <- readTVarIO (mpLastRollingFeeUpdate mp)
       if now > lastUpdate + 10
         then do
-          -- Compute adaptive halflife based on pool fullness
-          poolSize  <- readTVarIO (mpSize mp)
+          -- Compute adaptive halflife based on pool fullness, measured as
+          -- Core does: DynamicMemoryUsage() against the size limit.
+          poolSize  <- atomically (getMempoolDynamicUsage mp)
           let maxSize  = fromIntegral (mpcMaxSize (mpConfig mp)) :: Double
               poolFrac = fromIntegral poolSize / maxSize
               halflife
@@ -2663,6 +2687,90 @@ getMempoolMinFeeRateDecayed mp = do
           -- Less than 10s since last update: return current without decaying
           return (max (floor rolling) incrementalRelayFeePerKvb)
 
+-- | Core's @memusage::MallocUsage@ on a 64-bit build (memusage.h:52-58).
+mallocUsage :: Int -> Int
+mallocUsage n
+  | n <= 0    = 0
+  | otherwise = ((n + 31) `div` 16) * 16
+
+-- | Heap bytes of a CScript: @prevector<36, unsigned char>@ (script.h,
+-- CScriptBase) keeps up to 36 bytes inline and allocates the exact size
+-- beyond that (memusage.h DynamicUsage(prevector)).
+scriptUsage :: ByteString -> Int
+scriptUsage s
+  | BS.length s > 36 = mallocUsage (BS.length s)
+  | otherwise        = 0
+
+-- | One entry's share of Core's @CTxMemPool::DynamicMemoryUsage()@
+-- (txmempool.cpp:781), in bytes:
+--
+--   * @RecursiveDynamicUsage(tx)@ (core_memusage.h): the vin vector
+--     (sizeof(CTxIn) = 112), the vout vector (sizeof(CTxOut) = 48), every
+--     script past the 36-byte prevector, every witness stack (a vector of
+--     24-byte vectors) and its items;
+--   * one @mapNextTx@ node per input (an indirectmap node, 64 bytes);
+--   * a fixed 632 bytes for the CTxMemPoolEntry allocation, the
+--     shared_ptr<CTransaction> and the tx's TxGraph entry and chunk.
+--
+-- The constants were measured against Core v31.1 regtest (getmempoolinfo
+-- usage after each send, staged in the meta-repo under
+-- staged-patches/refill-1105-hs/calib): an 800-input spend with two 80-byte
+-- items and a 3-byte script per witness is 397,512 bytes in Core and here.
+-- TxGraph's per-cluster bookkeeping for multi-tx clusters (a few hundred
+-- bytes per dependency) is not modelled.
+txMemUsage :: Tx -> Int
+txMemUsage tx =
+    entryOverhead
+  + mallocUsage (length ins * 112)
+  + mallocUsage (length outs * 48)
+  + sum (map (scriptUsage . txOutScript) outs)
+  + sum (zipWith inputUsage ins stacks)
+  where
+    ins    = txInputs tx
+    outs   = txOutputs tx
+    stacks = txWitness tx ++ repeat []
+    entryOverhead = 632
+    inputUsage i st =
+        64                                   -- mapNextTx node
+      + scriptUsage (txInScript i)
+      + mallocUsage (length st * 24)
+      + sum (map (mallocUsage . BS.length) st)
+
+-- | Book a newly inserted entry: its 'txMemUsage' and the growth of Core's
+-- @txns_randomized@ vector (push_back doubles capacity from 1).
+accountEntryAdded :: Mempool -> Tx -> STM ()
+accountEntryAdded mp tx = do
+  modifyTVar' (mpUsage mp) (+ txMemUsage tx)
+  n <- Map.size <$> readTVar (mpEntries mp)
+  modifyTVar' (mpRandCap mp) (grow n)
+  where
+    grow n c | c >= n    = c
+             | c == 0    = grow n 1
+             | otherwise = grow n (c * 2)
+
+-- | Core's @CTxMemPool::DynamicMemoryUsage()@ (txmempool.cpp:781) as
+-- modelled by 'txMemUsage', plus the @txns_randomized@ vector of
+-- (Wtxid, iterator) pairs (40 bytes each).  This is what @-maxmempool@
+-- limits ('trimToSize') and what sets the rolling-fee halflife.
+getMempoolDynamicUsage :: Mempool -> STM Int
+getMempoolDynamicUsage mp = do
+  used <- readTVar (mpUsage mp)
+  cap  <- readTVar (mpRandCap mp)
+  return (used + mallocUsage (cap * 40))
+
+-- | Set or clear (Nothing) the mempool's mock clock; @setmocktime@ calls it.
+setMempoolMockTime :: Mempool -> Maybe Int64 -> IO ()
+setMempoolMockTime mp t = atomically $ writeTVar (mpMockTime mp) t
+
+-- | The rolling-fee clock: mock time when set, else wall time.  Core's
+-- GetTime() is the mockable clock (util/time.cpp).
+mempoolNow :: Mempool -> IO Int64
+mempoolNow mp = do
+  mock <- readTVarIO (mpMockTime mp)
+  case mock of
+    Just t  -> return t
+    Nothing -> (round :: Double -> Int64) . realToFrac <$> getPOSIXTime
+
 -- | Trim the mempool to the configured size limit by removing the
 -- lowest-feerate transactions, looping until under the limit.
 -- Updates the rolling minimum fee rate via 'trackPackageRemoved' each
@@ -2670,14 +2778,13 @@ getMempoolMinFeeRateDecayed mp = do
 trimToSize :: Mempool -> IO ()
 trimToSize mp = withAdmissionLock mp loop
   where
-    -- Both 'totalSize' (mpSize) and 'sizelimit' (mpcMaxSize) are in vsize-bytes
-    -- (W153 BUG-2 — units are now consistent on both sides of the comparison;
-    -- see the mpSize / mpcMaxSize field docs).  Bitcoin Core compares
-    -- DynamicMemoryUsage() (RAM bytes) > max_size_bytes; haskoin uses
-    -- vsize-bytes as a documented proxy (txmempool.cpp:868).
+    -- Core: while (DynamicMemoryUsage() > sizelimit) (txmempool.cpp:868).
+    -- 'getMempoolDynamicUsage' models DynamicMemoryUsage(); the vsize total
+    -- ('mpSize') is 2-5x smaller for witness-heavy transactions, so comparing
+    -- it kept a pool Core would already have trimmed.
     sizelimit = mpcMaxSize (mpConfig mp)
     loop = do
-      totalSize <- readTVarIO (mpSize mp)
+      totalSize <- atomically (getMempoolDynamicUsage mp)
       when (totalSize > sizelimit) $ do
         feeRateMap <- readTVarIO (mpByFeeRate mp)
         case Map.lookupMin feeRateMap of
@@ -3358,6 +3465,7 @@ addTransactionToMempool mp tx txid inputPairs fee _vsize = do
           modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
         modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
         modifyTVar' (mpSize mp) (+ adjVsize)
+        accountEntryAdded mp tx
 
       -- Update ancestor entries with new descendant
       atomically $ forM_ ancestors $ \anc ->
