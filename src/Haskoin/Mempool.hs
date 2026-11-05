@@ -139,6 +139,9 @@ module Haskoin.Mempool
   , buildClusterState
   , getClusterForTx
   , getClusterFeeRate
+  , mempoolChunkInfo
+  , mempoolParents
+  , mempoolChildren
     -- * Union-Find
   , UnionFind(..)
   , emptyUnionFind
@@ -4226,6 +4229,40 @@ getClusterFeeRate :: Cluster -> FeeRate
 getClusterFeeRate cluster
   | clTotalSize cluster <= 0 = FeeRate 0
   | otherwise = calculateFeeRate (clTotalFee cluster) (clTotalSize cluster)
+
+-- | Per-transaction chunk data for @getrawmempool@ / @getmempoolentry@:
+-- txid -> (chunk fee in satoshis, chunk sigop-adjusted weight).
+--
+-- Core's @entryToJSON@ (rpc/mempool.cpp) reports @fees.chunk@ and
+-- @chunkweight@ from @GetMainChunkFeerate@: the fee and the sigop-adjusted
+-- weight of the chunk the entry sits in, where chunks come from the
+-- cluster's linearization.  Each cluster is linearized and chunked here with
+-- 'meAdjWeight' as the size so the weight is the sigop-adjusted one.
+mempoolChunkInfo :: Map TxId MempoolEntry -> Map OutPoint TxId -> Map TxId (Word64, Int)
+mempoolChunkInfo entries byOutpoint = Map.fromList
+  [ (t, (chFee ch, chSize ch))
+  | txids <- findAllClusters entries byOutpoint
+  , ch <- computeChunks
+            [ (t0, meFee e, meAdjWeight e)
+            | t0 <- linearize txids entries
+            , Just e <- [Map.lookup t0 entries] ]
+  , t <- Set.toList (chTxIds ch)
+  ]
+
+-- | In-pool parents of an entry (Core @depends@): the txids its inputs spend
+-- that are themselves in the pool, de-duplicated.
+mempoolParents :: Map TxId MempoolEntry -> MempoolEntry -> [TxId]
+mempoolParents entries e = Set.toList $ Set.fromList
+  [ p | inp <- txInputs (meTransaction e)
+      , let p = outPointHash (txInPrevOutput inp)
+      , Map.member p entries ]
+
+-- | In-pool children of an entry (Core @spentby@): the pool transactions
+-- spending any of its outputs, de-duplicated.
+mempoolChildren :: Map OutPoint TxId -> MempoolEntry -> [TxId]
+mempoolChildren byOutpoint e = Set.toList $ Set.fromList
+  [ c | i <- [0 .. length (txOutputs (meTransaction e)) - 1]
+      , Just c <- [Map.lookup (OutPoint (meTxId e) (fromIntegral i)) byOutpoint] ]
 
 --------------------------------------------------------------------------------
 -- Mining Selection from Clusters
