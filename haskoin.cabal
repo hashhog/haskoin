@@ -620,3 +620,21 @@ executable reconcile-repair
   build-depends:   base, bytestring, cereal, haskoin
   default-language: Haskell2010
   ghc-options:     -O2
+
+test-suite invalidate-mempool
+  type:          exitcode-stdio-1.0
+  main-is:       InvalidateMempoolMain.hs
+  other-modules: InvalidateMempoolSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , containers
+               , filepath
+               , directory
+               , stm
+               , temporary
+               , text
+               , aeson
+  default-language: Haskell2010

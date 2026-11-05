@@ -2512,6 +2512,29 @@ blockDisconnected mp block = withAdmissionLock mp $ do
   -- (they may fail validation if inputs are now missing)
   forM_ (tail $ blockTxns block) $ \tx ->
     void $ addTransaction mp tx
+  -- A re-added transaction can join clusters that are already in the pool
+  -- (its children were never mined away), which the admission gate does not
+  -- see.  Core re-adds with bypass_limits and then TrimToSize()s; do the same.
+  trimOversizedClusters mp
+
+-- | Evict the worst chunk (with its descendants) of every cluster that is over
+-- the cluster count or weight limit, until none is.  Mirrors Core's
+-- TrimToSize() on an oversized TxGraph after a reorg re-add
+-- (validation.cpp MaybeUpdateMempoolForReorg -> LimitMempoolSize).
+-- Caller holds the admission lock.
+trimOversizedClusters :: Mempool -> IO ()
+trimOversizedClusters mp = do
+  entries <- readTVarIO (mpEntries mp)
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  let over cl = Set.size (clTxIds cl) > maxClusterSize
+                || sum [ meAdjWeight e | t <- Set.toList (clTxIds cl)
+                                       , Just e <- [Map.lookup t entries] ]
+                   > maxClusterSizeWeight
+  case filter over (csClusters (buildClusterState entries byOutpoint)) of
+    (cl : _) | not (null (clChunks cl)) -> do
+      forM_ (Set.toList (chTxIds (last (clChunks cl)))) $ removeWithDescendants mp
+      trimOversizedClusters mp
+    _ -> return ()
 
 -- | Check BIP-68 sequence locks for mempool admission.
 -- For each input, fetch the coin height from the UTXO set (unconfirmed mempool
