@@ -146,6 +146,35 @@ spec = describe "invalidateblock re-admits the disconnected blocks' transactions
       tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
       ceHeight tip `shouldBe` 102
       (fmap (const ()) <$> getTransaction (rsMempool server) (computeTxId tx0)) `shouldReturn` Nothing
+  -- Core warden_e: a parent with 64 children whose own block is invalidated.
+  -- The children are still in the pool, so re-adding the parent makes one
+  -- cluster of 65.  Core re-adds with bypass_limits, then TrimToSize() drops
+  -- the cheapest child; the cluster ends at 64 with the parent kept.
+  it "an over-limit cluster formed by the re-add is trimmed to 64, cheapest child first" $
+    withLiveServer $ \server -> do
+      let mine = either (fail . show) return =<< generateSingleBlock server p2wshTrue []
+      b1 <- mine
+      mapM_ (const mine) [2 .. 101 :: Int]
+      Just cb <- fmap (head . blockTxns) <$> getBlock (rsDB server) b1
+      let each = (5_000_000_000 - 10_000) `div` 64
+          parent = Tx { txVersion = 2
+                      , txInputs = [TxIn (OutPoint (computeTxId cb) 0) BS.empty 0xfffffffd]
+                      , txOutputs = replicate 64 (TxOut each p2wshTrue)
+                      , txWitness = [[BS.pack [0x51]]], txLockTime = 0 }
+          pid = computeTxId parent
+          child i = Tx { txVersion = 2
+                       , txInputs = [TxIn (OutPoint pid i) BS.empty 0xfffffffd]
+                       , txOutputs = [ TxOut (each - (fromIntegral i + 1) * 1000) p2wshTrue
+                                     , TxOut 0 (BS.pack (0x6a : 0x28 : replicate 40 0xab)) ]
+                       , txWitness = [[BS.pack [0x51]]], txLockTime = 0 }
+          children = map child [0 .. 63]
+      blk102 <- either (fail . show) return =<< generateSingleBlock server p2wshTrue [parent]
+      mapM_ (\t -> addTransaction (rsMempool server) t >>= (`shouldSatisfy` isRight')) children
+      invalidateRpc server blk102
+      let present t = fmap (const ()) <$> getTransaction (rsMempool server) (computeTxId t)
+      present parent `shouldReturn` Just ()
+      present (head children) `shouldReturn` Nothing
+      mapM present (tail children) >>= (`shouldBe` replicate 63 (Just ()))
   where
     isRight' (Right _) = True
     isRight' _ = False
