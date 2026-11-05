@@ -9541,6 +9541,9 @@ reconsiderBlock net cache db hc mIdxMgr blockHash = do
       -- header chain (one step per block, script-verifying; a verdict marks
       -- that block failed and stops there — Core's loop).
       activateDownloadedPrefix net cache db hc mIdxMgr
+      -- ... and Core's comparator's second key: an equal-work candidate
+      -- received earlier than the tip beats it.
+      activateEarlierEqualWork net cache db hc mIdxMgr
       return (Right ())
 
 -- | Core ActivateBestChain from the CONNECTED tip (PrefixBestBlock) toward the
@@ -9584,6 +9587,64 @@ activateDownloadedPrefix net cache db hc mIdxMgr = do
                 -- the reorg moved hcTip to t; the best header may be above it
                 recalculateBestHeader db hc
     _ -> return ()
+
+-- | Core ActivateBestChain's equal-work arm after reconsiderblock.
+--
+-- Core keeps setBlockIndexCandidates sorted by CBlockIndexWorkComparator
+-- (node/blockstorage.cpp:174-192): most chain work first, then the LOWER
+-- nSequenceId ("earliest activatable time").  ResetBlockFailureFlags
+-- (validation.cpp:3711) re-inserts every reconsidered block that compares
+-- better than the tip, and ActivateBestChain then moves to the best
+-- candidate (FindMostWorkChain) whenever it is not the tip, including a
+-- candidate that only TIES the tip's work but was received first.
+--
+-- 'activateDownloadedPrefix' only moves on strictly more work, so after
+-- invalidateblock 3a (tip moves to an equal-work rival 4' received later)
+-- and reconsiderblock 3a, haskoin stayed on 4' where Core goes back to 4a
+-- (Core regtest failed_reorg scenario C).  This step reorgs onto the
+-- valid, fully downloaded candidate with the tip's work and the lowest
+-- sequence id below the tip's.  It never moves to less work, never to a
+-- failed or header-only entry, and the reorg itself re-validates every
+-- block it connects ('performReorgActivating').  After a restart the tip
+-- carries 'seqIdBestChainFromDisk' (0), so it wins every tie, as in Core.
+-- Caller holds the chain lock.
+activateEarlierEqualWork :: Network -> UTXOCache -> HaskoinDB -> HeaderChain
+                         -> Maybe IndexManager -> IO ()
+activateEarlierEqualWork net cache db hc mIdxMgr = do
+  mDisk <- getBestBlockHash db
+  entries <- readTVarIO (hcEntries hc)
+  invalidated <- readTVarIO (hcInvalidated hc)
+  cands <- readTVarIO (hcCandidates hc)
+  case mDisk >>= (`Map.lookup` entries) of
+    Nothing -> return ()
+    Just diskCe -> do
+      -- Set.toDescList: at equal work the highest ckSeqInv, i.e. the lowest
+      -- sequence id, comes first, as Core's std::set::rbegin().
+      let rivals = [ ce | k <- Set.toDescList cands
+                        , ckWork k == ceChainWork diskCe
+                        , Just ce <- [Map.lookup (ckHash k) entries]
+                        , ceHash ce /= ceHash diskCe
+                        , ceChainWork ce == ceChainWork diskCe
+                        , ceStatus ce == StatusValid
+                        , not (Set.member (ceHash ce) invalidated)
+                        , ceSequenceId ce < ceSequenceId diskCe ]
+      case rivals of
+        [] -> return ()
+        (t : _) -> do
+          mFork <- findForkPoint hc (ceHash diskCe) (ceHash t)
+          case mFork >>= \fork -> heavierBranchHashes entries (ceHash fork) (ceHash t) of
+            Nothing -> return ()
+            Just hs -> do
+              -- Core's candidates have every ancestor's data (HaveNumChainTxs)
+              stored <- mapM (\h -> isJust <$> getBlock db h) hs
+              when (and stored) $ do
+                r <- performReorgActivating net cache db hc mIdxMgr (ceHash diskCe) (ceHash t)
+                case r of
+                  Left err -> hPutStrLn stderr $
+                    "reconsiderblock: equal-work ActivateBestChain stopped: " ++ err
+                  Right () -> return ()
+                -- the reorg moved hcTip to t; the best header may be above it
+                recalculateBestHeader db hc
 
 --------------------------------------------------------------------------------
 -- preciousblock — mark a block as preferred in equal-work chain selection
