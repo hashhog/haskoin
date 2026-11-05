@@ -279,20 +279,13 @@ calculateAdjustedWeight tx sigopCost =
 
 -- | Mempool configuration parameters
 data MempoolConfig = MempoolConfig
-  { mpcMaxSize           :: !Int      -- ^ Max pool size, in vsize-bytes
-                                      --   (default 300M, i.e. "300MB").
-                                      --   W153 BUG-2: this limit is compared
-                                      --   against 'mpSize', which accumulates
-                                      --   transaction *vsize* (vbytes), so both
-                                      --   sides use the same vsize-bytes unit.
-                                      --   This is haskoin's documented proxy for
-                                      --   Bitcoin Core's @DynamicMemoryUsage()@
-                                      --   (RAM bytes) vs @-maxmempool@ comparison
-                                      --   in CTxMemPool::TrimToSize
-                                      --   (txmempool.cpp:868). Core's RAM usage
-                                      --   is larger than raw vsize, so the same
-                                      --   numeric default is conservative
-                                      --   (trims no earlier than Core would).
+  { mpcMaxSize           :: !Int      -- ^ Max pool size in bytes of
+                                      --   Core's @DynamicMemoryUsage()@
+                                      --   (default 300M, i.e. "300MB"),
+                                      --   compared with
+                                      --   'getMempoolDynamicUsage' as
+                                      --   CTxMemPool::TrimToSize does
+                                      --   (txmempool.cpp:868).
   , mpcMinFeeRate        :: !FeeRate  -- ^ Min fee rate to accept (sat/vB)
   , mpcMaxOrphans        :: !Int      -- ^ Max orphan transactions
   , mpcRBFEnabled        :: !Bool     -- ^ Allow BIP-125 RBF
@@ -630,11 +623,9 @@ data Mempool = Mempool
     -- ^ UTXO cache for input validation
   , mpSize       :: !(TVar Int)
     -- ^ Total mempool size, in *vsize-bytes* (sum of each entry's 'meSize',
-    --   i.e. sigop-adjusted vsize).  NOT raw serialized bytes.  Compared
-    --   against 'mpcMaxSize' (same unit) in 'trimToSize' / 'evictLowestFee'.
-    --   W153 BUG-2: 'mpcMaxSize' is documented in the same vsize-bytes unit so
-    --   the limit comparison is unit-consistent.  This is the documented proxy
-    --   for Bitcoin Core's @DynamicMemoryUsage()@ (RAM bytes).
+    --   i.e. sigop-adjusted vsize).  NOT raw serialized bytes.  Reported as
+    --   getmempoolinfo bytes; the -maxmempool limit is checked against
+    --   'mpUsage' (Core's DynamicMemoryUsage), not this.
   , mpNetwork    :: !Network
     -- ^ Network configuration
   , mpHeight     :: !(TVar Word32)
@@ -710,8 +701,9 @@ data Mempool = Mempool
     -- the vsize total in 'mpSize', is what @-maxmempool@ limits.
   , mpRandCap :: !(TVar Int)
     -- ^ Capacity of Core's @txns_randomized@ vector (txmempool.h:266): it
-    -- grows by doubling on push_back and never shrinks on removal, so it is
-    -- the pool's high-water count rounded up to a power of two.
+    -- grows by doubling on push_back; removeUnchecked (txmempool.cpp:289-299)
+    -- shrinks it to its size once that falls below half the capacity, and
+    -- keeps the capacity when the last entry goes (clear()).
   , mpMockTime :: !(TVar (Maybe Int64))
     -- ^ @setmocktime@ value, read by the rolling-fee clock ('mempoolNow').
     -- Core's GetTime() in GetMinFee / removeForBlock is the mockable clock.
@@ -1374,10 +1366,10 @@ continueAfterInsert mp txid adjVsize commitFee ancestors = do
                , meDescendantFees  = meDescendantFees  e + commitFee
                }) ancId
 
-  -- Evict if mempool is too large.  totalSize (mpSize) and mpcMaxSize are both
-  -- in vsize-bytes (W153 BUG-2 — unit-consistent; see field docs).  evictLowestFee
-  -- delegates to trimToSize, which loops until back under the limit and bumps the
-  -- rolling minimum fee.
+  -- Evict if mempool is too large: Core compares DynamicMemoryUsage()
+  -- ('getMempoolDynamicUsage') with the limit.  evictLowestFee delegates to
+  -- trimToSize, which loops until back under the limit and bumps the rolling
+  -- minimum fee.
   usage <- atomically (getMempoolDynamicUsage mp)
   when (usage > mpcMaxSize (mpConfig mp)) $
     evictLowestFee mp
@@ -1804,6 +1796,7 @@ removeTransactionStructural mp txid = do
         -- Update size
         modifyTVar' (mpSize mp) (subtract vsize)
         modifyTVar' (mpUsage mp) (subtract (txMemUsage (meTransaction entry)))
+        accountEntryRemoved mp
 
         -- Update descendant counts for all ancestors
         forM_ ancestors $ \anc ->
@@ -2717,8 +2710,9 @@ scriptUsage s
 -- spend adds 1,208 bytes, each further input of the same shape 496, an
 -- extra 48-byte output 48; an 800-input spend with two 80-byte items and
 -- a 3-byte script per witness adds 397,512 bytes in Core and here.
--- TxGraph's per-cluster bookkeeping for multi-tx clusters (a few hundred
--- bytes per dependency) is not modelled.
+-- Not modelled: TxGraph's per-cluster bookkeeping for multi-tx clusters (a
+-- few hundred bytes per dependency) and the mapDeltas map that
+-- prioritisetransaction fills.
 txMemUsage :: Tx -> Int
 txMemUsage tx =
     entryOverhead
@@ -2748,6 +2742,15 @@ accountEntryAdded mp tx = do
     grow n c | c >= n    = c
              | c == 0    = grow n 1
              | otherwise = grow n (c * 2)
+
+-- | After an entry left 'mpEntries': Core's removeUnchecked pops the
+-- entry from @txns_randomized@ and calls shrink_to_fit() once
+-- @size * 2 < capacity@; removing the last entry is clear(), which keeps
+-- the capacity (txmempool.cpp:289-299).
+accountEntryRemoved :: Mempool -> STM ()
+accountEntryRemoved mp = do
+  n <- Map.size <$> readTVar (mpEntries mp)
+  modifyTVar' (mpRandCap mp) $ \c -> if n >= 1 && n * 2 < c then n else c
 
 -- | Core's @CTxMemPool::DynamicMemoryUsage()@ (txmempool.cpp:781) as
 -- modelled by 'txMemUsage', plus the @txns_randomized@ vector of
