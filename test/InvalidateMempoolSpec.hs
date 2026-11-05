@@ -28,7 +28,10 @@ import System.FilePath ((</>))
 
 import Haskoin.Types
 import Haskoin.Crypto (computeTxId)
-import Haskoin.Consensus (blockHashToHex, regtest, initHeaderChain, getValidatedChainTip, ChainEntry(..), HeaderChain(..))
+import Haskoin.Consensus (blockHashToHex, regtest, initHeaderChain, getValidatedChainTip, ChainEntry(..), HeaderChain(..)
+                         , medianTimePast, blockReward, computeMerkleRoot, netPowLimit, BlockStatus(..))
+import Haskoin.Crypto (computeBlockHash)
+import Haskoin.BlockTemplate (submitBlock)
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, getBlock )
 import Haskoin.Mempool (newMempool, defaultMempoolConfig, addTransaction, getTransaction)
@@ -40,7 +43,8 @@ import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Payjoin (defaultPayjoinConfig)
 import Haskoin.Rpc
   ( RpcServer(..), defaultRpcConfig, RpcConfig(..),
-  handleInvalidateBlock, handleReconsiderBlock, generateSingleBlock )
+  handleInvalidateBlock, handleReconsiderBlock, generateSingleBlock
+  , buildRegtestCoinbase, findRegtestNonce )
 
 liveNoopHandler :: a -> Message -> IO ()
 liveNoopHandler _ _ = return ()
@@ -212,6 +216,41 @@ spec = describe "invalidateblock re-admits the disconnected blocks' transactions
       b5' <- mineTo otherSpk
       _ <- handleReconsiderBlock server (toJSON [blockHashToHex b3a])
       tipHash `shouldReturn` b5'
+  -- The equal-work step must not let a block that genuinely fails
+  -- ConnectBlock become the tip.  Core's ResetBlockFailureFlags clears a
+  -- real ConnectBlock failure too; ActivateBestChain then tries it again,
+  -- it fails again, and the chain stays on the valid rival.  Here the tip
+  -- must stay on the valid rival 4'.
+  it "failed-reorg-c-reconsider-invalid: an earlier equal-work branch that fails ConnectBlock again leaves the tip on the valid rival" $
+    withLiveServer $ \server -> do
+      let mineTo spk = either (fail . show) return =<< generateSingleBlock server spk []
+          tipHash = tipHashOf server
+      _ <- mineTo p2wshTrue
+      bT <- mineTo p2wshTrue
+      b3a <- mineTo p2wshTrue
+      -- 4a pays one satoshi too much: bad-cb-amount at ConnectBlock
+      bad4a <- childBlock server b3a p2wshTrue 1
+      _ <- submitBlock regtest (rsDB server) (rsHeaderChain server) (rsUTXOCache server)
+                       (rsPeerMgr server) (rsMempool server) (rsIndexMgr server) bad4a
+      let h4a = computeBlockHash (blockHeader bad4a)
+      tipHash `shouldReturn` b3a
+      -- the rival 3'-4' on T: more work than 3a, received after 4a
+      c3 <- childBlock server bT otherSpk 0
+      _ <- submitBlock regtest (rsDB server) (rsHeaderChain server) (rsUTXOCache server)
+                       (rsPeerMgr server) (rsMempool server) (rsIndexMgr server) c3
+      c4 <- childBlock server (computeBlockHash (blockHeader c3)) otherSpk 0
+      _ <- submitBlock regtest (rsDB server) (rsHeaderChain server) (rsUTXOCache server)
+                       (rsPeerMgr server) (rsMempool server) (rsIndexMgr server) c4
+      let h4' = computeBlockHash (blockHeader c4)
+      tipHash `shouldReturn` h4'
+      _ <- handleReconsiderBlock server (toJSON [blockHashToHex h4a])
+      tipHash `shouldReturn` h4'
+      -- haskoin keeps no body for a block that failed at submit, so the
+      -- reconsidered 4a is header-only: never a full-data candidate, and
+      -- the equal-work step cannot select it.
+      st <- fmap ceStatus . Map.lookup h4a <$> readTVarIO (hcEntries (rsHeaderChain server))
+      fmap (== StatusValid) st `shouldBe` Just False
+      (fmap (const ()) <$> getBlock (rsDB server) h4a) `shouldReturn` Nothing
   where
     isRight' (Right _) = True
     isRight' _ = False
@@ -221,3 +260,21 @@ spec = describe "invalidateblock re-admits the disconnected blocks' transactions
     -- a coinbase script other than p2wshTrue, so the rival branch's blocks
     -- differ from the original branch's at the same heights
     otherSpk = BS.pack [0x51]
+    -- a coinbase-only regtest block on @parentHash@ paying the subsidy plus
+    -- @extra@ satoshis (extra > 0: bad-cb-amount)
+    childBlock server parentHash spk extra = do
+      entries <- readTVarIO (hcEntries (rsHeaderChain server))
+      parent <- maybe (fail "parent not in index") return (Map.lookup parentHash entries)
+      let height    = ceHeight parent + 1
+          blockTime = medianTimePast entries parentHash + 1
+          cb  = buildRegtestCoinbase height (blockReward height + extra) spk blockTime Nothing
+          hdr = BlockHeader
+            { bhVersion    = 0x20000000
+            , bhPrevBlock  = parentHash
+            , bhMerkleRoot = computeMerkleRoot [computeTxId cb]
+            , bhTimestamp  = blockTime
+            , bhBits       = 0x207fffff
+            , bhNonce      = 0
+            }
+      mSolved <- findRegtestNonce hdr (netPowLimit regtest)
+      maybe (fail "could not solve regtest nonce") (\h -> return (Block h [cb])) mSolved
