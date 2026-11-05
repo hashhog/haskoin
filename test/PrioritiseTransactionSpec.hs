@@ -125,6 +125,7 @@ insertEntry mp e = atomically $ do
     modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) (meTxId e))
   modifyTVar' (mpByFeeRate mp)  (Map.insert (meFeeRate e, meTxId e) ())
   modifyTVar' (mpSize mp)       (+ meSize e)
+  modifyTVar' (mpUsage mp)      (+ txMemUsage (meTransaction e))
 
 --------------------------------------------------------------------------------
 -- Spec
@@ -156,14 +157,15 @@ spec = do
         pri <- getPrioritisedTransactions mp
         pri `shouldBe` [(meTxId entB, 100_000, True, Just 101_000)]
 
-    it "a negative delta makes the tx the trimToSize eviction victim" $
-      -- Cap fits ONE 200-vB entry: inserting two puts the pool over the
-      -- limit and trimToSize must evict exactly the lowest MODIFIED-feerate
-      -- entry (Core TrimToSize, txmempool.cpp:861-897).
-      withMempoolCap 300 $ \mp -> do
-        let txA = makeTx [coinOutPoint 3] [9_000]
-            txB = makeTx [coinOutPoint 4] [9_000]
-            entA = mkEntry txA 5_000 200   -- high base feerate
+    it "a negative delta makes the tx the trimToSize eviction victim" $ do
+      -- Cap fits ONE entry (in Core DynamicMemoryUsage bytes, which
+      -- -maxmempool limits): inserting two puts the pool over the limit and
+      -- trimToSize must evict exactly the lowest MODIFIED-feerate entry
+      -- (Core TrimToSize, txmempool.cpp:861-897).
+      let txA = makeTx [coinOutPoint 3] [9_000]
+          txB = makeTx [coinOutPoint 4] [9_000]
+      withMempoolCap (txMemUsage txA + txMemUsage txB `div` 2) $ \mp -> do
+        let entA = mkEntry txA 5_000 200   -- high base feerate
             entB = mkEntry txB 1_000 200   -- low base feerate
         insertEntry mp entA
         insertEntry mp entB
