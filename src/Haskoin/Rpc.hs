@@ -2580,7 +2580,12 @@ handleGetBlock server params = do
         Right bh -> do
           -- getInt<int> before the block lookup: an out-of-int32 verbosity
           -- answered -5 "Block not found" where Core answers -1.
-          case parseCoreInt32At params 1 1 of
+          -- Core ParseVerbosity(..., allow_bool=true) (rpc/util.cpp): a JSON
+          -- bool is accepted, true = 1, false = 0.
+          let verbosityE = case rawParamAt params 1 of
+                Just (Bool b) -> Right (if b then 1 else 0)
+                _             -> parseCoreInt32At params 1 1
+          case verbosityE of
            Left (vcode, vmsg) -> return $ RpcResponse Null (toJSON $ RpcError vcode vmsg) Null
            Right verbosity -> do
             mBlock <- getBlock (rsDB server) bh
