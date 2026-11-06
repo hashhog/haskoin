@@ -44,6 +44,7 @@ module Haskoin.Mempool
     -- * Transaction Operations
   , addTransaction
   , testAcceptTransaction
+  , testAcceptPackage
   , punishRelayedTxReject
   , removeTransaction
   , removeTransactionForBlock
@@ -1477,7 +1478,35 @@ finalizeTransactionDry mp tx txid inputPairs = do
 -- it would be accepted.  The caller can read 'meFee' and 'meSize' from
 -- the returned entry to populate the RPC response.
 testAcceptTransaction :: Mempool -> Tx -> IO (Either MempoolError MempoolEntry)
-testAcceptTransaction mp tx = withAdmissionLock mp $ do
+testAcceptTransaction mp tx = withAdmissionLock mp $
+  testAcceptTransactionWith Map.empty mp tx
+
+-- | Dry-run a package (child last, parents first) the way Core's
+-- ProcessNewPackage(test_accept=true) does (validation.cpp
+-- AcceptMultipleTransactionsInternal with ATMPArgs::PackageTestAccept): every
+-- tx is judged with the outputs of the package txs before it, against the
+-- normal per-tx rules (no package-feerate rescue: PackageTestAccept has
+-- m_package_feerates=false, so a below-floor parent is rejected on its own).
+-- The first failing tx stops the run: its result is returned and the txs after
+-- it get no result.  Nothing is written to the mempool.
+testAcceptPackage :: Mempool -> [Tx] -> IO [Either MempoolError MempoolEntry]
+testAcceptPackage mp txns = withAdmissionLock mp (go Map.empty txns)
+  where
+    go _ [] = return []
+    go overlay (tx:rest) = do
+      r <- testAcceptTransactionWith overlay mp tx
+      case r of
+        Left _  -> return [r]
+        Right _ -> do
+          let overlay' = Map.union overlay (Map.fromList
+                [ (OutPoint (computeTxId tx) (fromIntegral i), o)
+                | (i, o) <- zip [0 :: Int ..] (txOutputs tx) ])
+          (r :) <$> go overlay' rest
+
+-- | 'testAcceptTransaction' without the admission lock, with extra
+-- not-yet-mempool outputs (earlier package txs) visible to input resolution.
+testAcceptTransactionWith :: Map OutPoint TxOut -> Mempool -> Tx -> IO (Either MempoolError MempoolEntry)
+testAcceptTransactionWith overlay mp tx = do
   let txid  = computeTxId tx
       wtxid = computeWtxid tx
   -- Duplicate checks (same as addTransaction)
@@ -1488,11 +1517,11 @@ testAcceptTransaction mp tx = withAdmissionLock mp $ do
       byTxid <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
       case byTxid of
         Just _ -> return $ Left ErrSameNonwitnessInMempool
-        Nothing -> testAcceptTransactionInner mp tx txid
+        Nothing -> testAcceptTransactionInner overlay mp tx txid
 
 -- | Inner dry-run validation (mirrors addTransactionInner without commits).
-testAcceptTransactionInner :: Mempool -> Tx -> TxId -> IO (Either MempoolError MempoolEntry)
-testAcceptTransactionInner mp tx txid = do
+testAcceptTransactionInner :: Map OutPoint TxOut -> Mempool -> Tx -> TxId -> IO (Either MempoolError MempoolEntry)
+testAcceptTransactionInner overlay mp tx txid = do
   case validateTransaction tx of
     Left err -> return $ Left (ErrValidationFailed err)
     Right () | isCoinbase tx -> return $ Left ErrCoinbaseNotAllowed
@@ -1522,8 +1551,11 @@ testAcceptTransactionInner mp tx txid = do
                   conflicts <- getConflicts mp tx
                   if null conflicts
                     then do
-                      inputResults <- resolveInputs mp tx
-                      case inputResults of
+                      inputResults <- forM (txInputs tx) $ \inp ->
+                        case Map.lookup (txInPrevOutput inp) overlay of
+                          Just o  -> return $ Right (txInPrevOutput inp, o)
+                          Nothing -> resolveInput mp (txInPrevOutput inp)
+                      case sequence inputResults of
                         Left err     -> return $ Left err
                         Right inputPairs -> finalizeTransactionDry mp tx txid inputPairs
                     else if mpcRBFEnabled (mpConfig mp)
