@@ -460,6 +460,28 @@ test-suite getblock-bool
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- policy-cause-17: own suite so the shared test list is not touched.
+test-suite regtest-ibd
+  type:          exitcode-stdio-1.0
+  main-is:       RegtestIbdMain.hs
+  other-modules: RegtestIbdSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , stm
+               , containers
+               , bytestring
+               , base16-bytestring
+               , text
+               , aeson
+               , vector
+               , directory
+               , filepath
+               , temporary
+  default-language: Haskell2010
+  ghc-options:     -Wall -O2
+
 test-suite service-flags
   type:          exitcode-stdio-1.0
   main-is:       ServiceFlagsMain.hs
