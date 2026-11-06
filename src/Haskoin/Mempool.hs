@@ -87,6 +87,9 @@ module Haskoin.Mempool
   , applyMaxMempoolMb
     -- * RBF (Replace-by-Fee)
   , checkReplacement
+  , checkReplacementWith
+  , evaluateReplacementRules
+
   , removeConflicts
   , isRbfReplaceable
   , checkAllConflictsRbfReplaceable
@@ -1624,6 +1627,18 @@ testAcceptWithReplacement mp tx txid conflictTxIds = do
                       -- gives the same answer the commit path would.
                       finalizeTransactionDry mp tx txid inputPairs
 
+-- | Number of distinct mempool clusters touched by the direct conflicts.
+countConflictClusters :: Mempool -> [MempoolEntry] -> IO Int
+countConflictClusters mp directConflicts = do
+  entries <- readTVarIO (mpEntries mp)
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  let go _ n [] = n
+      go seen n (e:es) =
+        let t = meTxId e
+        in if Set.member t seen then go seen n es
+           else go (Set.union seen (findCluster t entries byOutpoint)) (n + 1) es
+  return (go Set.empty (0 :: Int) directConflicts)
+
 -- | Read-only evaluation of the BIP-125 replacement rules (2, 3, 3a, 4, 5)
 -- plus the no-conflict-spending gate.  Identical decision logic to
 -- 'attemptReplacement' but performs no eviction.  Returns @Right ()@ when the
@@ -1650,8 +1665,8 @@ evaluateReplacementRules mp tx conflictTxIds newFee newVsize newFeeRate = do
           return $ Left (ErrRBFNewUnconfirmedInput parent)
         Left _ ->
           return $ Left (ErrRBFNewUnconfirmedInput (head conflictTxIds))
-        Right () ->
-          case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
+        Right () -> countConflictClusters mp directConflicts >>= \nClusters ->
+          case checkReplacementWith nClusters tx directConflicts allEvictions newFee newVsize newFeeRate of
             Left (RbfInsufficientAbsoluteFee f r) -> return $ Left (ErrRBFInsufficientAbsoluteFee f r)
             Left (RbfInsufficientFeeRate r m)     -> return $ Left (ErrRBFInsufficientFeeRate r m)
             Left (RbfTooManyEvictions c m)        -> return $ Left (ErrRBFTooManyReplacements c m)
@@ -2293,10 +2308,17 @@ checkReplacement :: Tx                -- ^ New replacement transaction
                  -> Int               -- ^ New transaction vsize
                  -> FeeRate           -- ^ New transaction feerate
                  -> Either RbfError ()
-checkReplacement _tx directConflicts allEvictions newFee newVsize newFeeRate = do
-  -- Rule 5: Check eviction count limit
-  -- bitcoin-core/src/policy/rbf.cpp:70 — GetEntriesForConflicts checks cluster count <= 100
-  let evictionCount = length allEvictions
+checkReplacement tx directConflicts allEvictions =
+  checkReplacementWith (length allEvictions) tx directConflicts allEvictions
+
+-- | 'checkReplacement' with Rule 5's count supplied by the caller.  Core v31
+-- counts the distinct clusters the replacement conflicts with directly, not
+-- the evicted transactions (policy/rbf.cpp GetEntriesForConflicts:
+-- @GetUniqueClusterCount(iters_conflicting) > MAX_REPLACEMENT_CANDIDATES@).
+checkReplacementWith :: Int -> Tx -> [MempoolEntry] -> [MempoolEntry]
+                     -> Word64 -> Int -> FeeRate -> Either RbfError ()
+checkReplacementWith evictionCount _tx directConflicts allEvictions newFee newVsize newFeeRate = do
+  -- Rule 5: Check cluster count limit
   when (evictionCount > maxReplacementEvictions) $
     Left $ RbfTooManyEvictions evictionCount maxReplacementEvictions
 
@@ -2449,7 +2471,8 @@ attemptReplacement mp tx _txid conflictTxIds newFee newVsize newFeeRate = do
           return $ Left $ ErrRBFNewUnconfirmedInput (head conflictTxIds)
         Right () ->
           -- Apply RBF rules 3, 3a, 4, 5
-          case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
+          countConflictClusters mp directConflicts >>= \nClusters ->
+          case checkReplacementWith nClusters tx directConflicts allEvictions newFee newVsize newFeeRate of
             Left (RbfInsufficientAbsoluteFee newF reqF) ->
               return $ Left $ ErrRBFInsufficientAbsoluteFee newF reqF
             Left (RbfInsufficientFeeRate newR minR) ->

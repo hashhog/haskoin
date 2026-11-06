@@ -134,6 +134,7 @@ import qualified W117BIP155NetworksSpec
 import qualified W118WalletSpec
 import qualified W119PayjoinSpec
 import qualified W120MempoolRbfSpec
+import qualified RbfClusterCountSpec
 import qualified W121CompactFiltersSpec
 import qualified W123MiningGBTSpec
 import qualified W124OperatorSpec
@@ -23820,6 +23821,7 @@ main = hspec $ do
 
   -- W120 Mempool strict BIP-125 RBF rules 1-5 (30-gate audit)
   W120MempoolRbfSpec.spec
+  RbfClusterCountSpec.spec
 
   -- W121 BIP-157/158 Compact Block Filters (30-gate audit)
   W121CompactFiltersSpec.spec
