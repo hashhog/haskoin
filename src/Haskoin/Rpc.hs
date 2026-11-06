@@ -10202,7 +10202,7 @@ handleGetMempoolEntry server params
                                         chunkInfo live
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
----
+--------------------------------------------------------------------------------
 -- Mempool: Get Mempool Ancestors RPC Handler
 --------------------------------------------------------------------------------
 
