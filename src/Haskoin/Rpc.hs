@@ -10184,9 +10184,22 @@ handleGetMempoolEntry server params
               (poolEntries, poolByOutpoint) <- atomically $
                 (,) <$> readTVar (mpEntries (rsMempool server))
                     <*> readTVar (mpByOutpoint (rsMempool server))
-              let chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
+              -- The stored ancestor/descendant aggregates can lag a reorg or
+              -- invalidateblock, so (as before) recompute them from the live
+              -- graph; the shared encoder then only adds depends/spentby/chunk.
+              ancestors <- getAncestors (rsMempool server) (meTransaction entry)
+              descendants <- getDescendants (rsMempool server) txid
+              let live = entry
+                    { meAncestorCount    = length ancestors + 1
+                    , meAncestorSize     = sum (map meSize ancestors) + meSize entry
+                    , meAncestorFees     = sum (map meFee ancestors) + meFee entry
+                    , meDescendantCount  = length descendants + 1
+                    , meDescendantSize   = sum (map meSize descendants) + meSize entry
+                    , meDescendantFees   = sum (map meFee descendants) + meFee entry
+                    }
+                  chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
                   enc = mempoolEntryEnc (ceHeight tip) poolEntries poolByOutpoint
-                                        chunkInfo entry
+                                        chunkInfo live
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 ---
