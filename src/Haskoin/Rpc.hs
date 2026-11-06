@@ -3196,7 +3196,14 @@ buildPrevoutEnc net u =
 -- References: bitcoin-core/src/rpc/blockchain.cpp getblockheader,
 --             bitcoin-core/src/rpc/blockchain.cpp GetDifficulty.
 handleGetBlockHeader :: RpcServer -> Value -> IO RpcResponse
-handleGetBlockHeader server params = do
+handleGetBlockHeader server params
+  -- Core's RPC framework type-checks the declared arguments (hash: string,
+  -- verbose: bool) before the handler body runs, so a non-bool verbose is
+  -- -3 "Wrong type passed" rather than being read as the default.
+  | Just typeErr <- coreArgTypeCheck
+      [Just ("hash", CArgStr, True), Just ("verbose", CArgBool, False)] params
+  = return typeErr
+  | otherwise = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
@@ -4037,7 +4044,7 @@ handleGetRawTransactionLookup server txid verbosity _mBlockHashText mBlockHashPa
                     Just block -> do
                       case findIndex (\t -> computeTxId t == txid) (blockTxns block) of
                         Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
+                          (toJSON $ RpcError (-5) "No such transaction found in the provided block. Use gettransaction for wallet transactions.") Null
                         Just ix -> returnTxResult server (blockTxns block !! ix) txid
                                      (Just (blockHash, ix)) blockHashArgGiven verbosity
 

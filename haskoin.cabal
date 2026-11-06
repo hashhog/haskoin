@@ -327,6 +327,28 @@ test-suite haskoin-test
 
 -- batch5-haskoin-node_error: own target so the spec needs no edit to the
 -- shared Spec.hs / haskoin-test other-modules list.
+test-suite rawtx-messages
+  type:          exitcode-stdio-1.0
+  main-is:       RawTxMessagesMain.hs
+  other-modules: RawTxMessagesSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite gbt-order
   type:          exitcode-stdio-1.0
   main-is:       GbtOrderMain.hs
