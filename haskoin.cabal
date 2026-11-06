@@ -327,10 +327,50 @@ test-suite haskoin-test
 
 -- batch5-haskoin-node_error: own target so the spec needs no edit to the
 -- shared Spec.hs / haskoin-test other-modules list.
+test-suite rawtx-messages
+  type:          exitcode-stdio-1.0
+  main-is:       RawTxMessagesMain.hs
+  other-modules: RawTxMessagesSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite gbt-order
   type:          exitcode-stdio-1.0
   main-is:       GbtOrderMain.hs
   other-modules: GbtOrderSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , containers
+               , filepath
+               , stm
+               , temporary
+               , text
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- policy-cause-09: own target so the spec needs no edit to shared lists.
+test-suite gbt-sigops
+  type:          exitcode-stdio-1.0
+  main-is:       GbtSigopsMain.hs
+  other-modules: GbtSigopsSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
@@ -481,6 +521,28 @@ test-suite decode-strict
                , vector
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
+
+-- policy-cause-17: own suite so the shared test list is not touched.
+test-suite regtest-ibd
+  type:          exitcode-stdio-1.0
+  main-is:       RegtestIbdMain.hs
+  other-modules: RegtestIbdSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , stm
+               , containers
+               , bytestring
+               , base16-bytestring
+               , text
+               , aeson
+               , vector
+               , directory
+               , filepath
+               , temporary
+  default-language: Haskell2010
+  ghc-options:     -Wall -O2
 
 test-suite service-flags
   type:          exitcode-stdio-1.0
@@ -709,6 +771,30 @@ test-suite unbroadcast-set
   type:          exitcode-stdio-1.0
   main-is:       UnbroadcastSetMain.hs
   other-modules: UnbroadcastSetSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- policy-cause-20: own target so the spec needs no edit to the shared
+-- Spec.hs / haskoin-test other-modules list.
+test-suite package-accept-child
+  type:          exitcode-stdio-1.0
+  main-is:       PackageAcceptChildMain.hs
+  other-modules: PackageAcceptChildSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
