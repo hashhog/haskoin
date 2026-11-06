@@ -4148,13 +4148,20 @@ handleSendRawTransaction server params = do
                   let maxFee = maxRawTxFee maxRateKvb (calculateVSize tx)
                       staticFloorKvb =
                         getFeeRate (mpcMinFeeRate (mpConfig (rsMempool server)))
-                      rejectResp = mempoolErrorToRpcResponseWith staticFloorKvb
-                  preCheck <-
+                  -- Core node/transaction.cpp BroadcastTransaction, in order:
+                  --   1. any output (txid, n) already in the UTXO set
+                  --      -> ALREADY_IN_UTXO_SET (-27)
+                  --   2. txid already in the mempool -> re-announce, return txid
+                  --   3. otherwise the max-fee dry run, then admission.
+                  early <- sendRawEarlyOutcome server tx
+                  preCheck <- case early of
+                   Just resp -> return (Just resp)
+                   Nothing ->
                     if maxFee > 0
                       then do
                         dry <- testAcceptTransaction (rsMempool server) tx
                         return $ case dry of
-                          Left err -> Just (rejectResp err)
+                          Left err -> Just (sendRawRejectResp staticFloorKvb err)
                           Right entry
                             | meFee entry > maxFee -> Just maxFeeExceededResponse
                             | otherwise            -> Nothing
@@ -4168,7 +4175,7 @@ handleSendRawTransaction server params = do
                           -- Emit the bare Core reject token (unified with
                           -- testmempoolaccept), threading the node's configured
                           -- static relay floor so the fee-floor sub-token is exact.
-                          return $ rejectResp err
+                          return $ sendRawRejectResp staticFloorKvb err
                         Right txid -> do
                           addUnbroadcast (rsMempool server) txid
                           mEntry <- getTransaction (rsMempool server) txid
@@ -4179,6 +4186,45 @@ handleSendRawTransaction server params = do
                             Nothing -> return ()
                           return $ RpcResponse
                             (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
+
+-- | Core's sendrawtransaction error text for a mempool rejection.  It is the
+-- validation state's own string (HandleATMPError -> state.ToString()), which
+-- for TX_MISSING_INPUTS is "bad-txns-inputs-missingorspent"; testmempoolaccept
+-- alone remaps that one reason to "missing-inputs" (rpc/mempool.cpp), so
+-- 'mempoolRejectToken' keeps the remap and only this caller undoes it.  The
+-- error code (-25) is unchanged.
+sendRawRejectResp :: Word64 -> MempoolError -> RpcResponse
+sendRawRejectResp staticFloorKvb err = case err of
+  ErrMissingInput _ ->
+    RpcResponse Null (toJSON (RpcError (mempoolErrorCode err)
+                                "bad-txns-inputs-missingorspent")) Null
+  _ -> mempoolErrorToRpcResponseWith staticFloorKvb err
+
+-- | The two checks Core's BroadcastTransaction runs before any admission
+-- work: a tx whose outputs are already unspent in the chain is
+-- TransactionError::ALREADY_IN_UTXO_SET (-27 "Transaction outputs already in
+-- utxo set"); a tx whose txid is already in the mempool is NOT resubmitted
+-- (it would be a conflict) -- it is re-announced and its txid returned, so
+-- resending a known tx is idempotent rather than an error.
+sendRawEarlyOutcome :: RpcServer -> Tx -> IO (Maybe RpcResponse)
+sendRawEarlyOutcome server tx = do
+  let txid  = computeTxId tx
+      nOuts = length (txOutputs tx)
+  inUtxo <- or <$> mapM
+    (\i -> isJust <$> lookupUTXO (rsUTXOCache server) (OutPoint txid (fromIntegral i)))
+    [0 .. nOuts - 1]
+  if inUtxo
+    then return $ Just $ RpcResponse Null
+           (toJSON $ RpcError rpcVerifyAlreadyInChain
+              "Transaction outputs already in utxo set") Null
+    else do
+      mEntry <- getTransaction (rsMempool server) txid
+      case mEntry of
+        Nothing -> return Nothing
+        Just entry -> do
+          broadcastTxToPeers server tx (getFeeRate (meFeeRate entry))
+          return $ Just $ RpcResponse
+            (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
 
 -- | Core @DEFAULT_MAX_RAW_TX_FEE_RATE@ (node/transaction.h): 0.10 BTC/kvB,
 -- expressed in sat/kvB.
