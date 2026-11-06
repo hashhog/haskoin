@@ -389,8 +389,8 @@ selectWithinSigopBudget = go 0
 -- resolved prevouts.
 templateReportedSigops :: ConsensusFlags -> Map OutPoint TxOut -> Tx -> Int
 templateReportedSigops flags prevouts tx =
-  let _ = (flags, prevouts)
-  in templateLegacySigOpCost tx  -- pre-fix behaviour (legacy only)
+  let SigOpCost c = getTransactionSigOpCost tx prevouts flags
+  in if flagSegWit flags then c else c `div` witnessScaleFactor
 
 -- | Overwrite each template tx's 'ttSigops' with the Core-reported value.
 -- Prevouts come from the UTXO cache, else from an in-mempool parent.
@@ -411,8 +411,10 @@ applyTemplateSigops net mp cache height tts = do
                       , i < length (txOutputs (meTransaction pe)) ->
                           return (Just (op, txOutputs (meTransaction pe) !! i))
               _ -> return Nothing
-  let _ = (flags, resolve, pool)
-  return tts
+  forM tts $ \tt -> do
+    ps <- forM (txInputs (ttTx tt)) (resolve . txInPrevOutput)
+    return tt { ttSigops = templateReportedSigops flags
+                             (Map.fromList (catMaybes ps)) (ttTx tt) }
 
 -- | Build a TemplateTransaction from a MempoolEntry
 -- Tracks which other transactions in the template this one depends on
