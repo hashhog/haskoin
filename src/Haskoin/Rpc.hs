@@ -1774,16 +1774,15 @@ handleGetBlockchainInfo server = do
   -- Compute verification progress estimate (blocks validated / estimated total)
   -- For a fully synced node this approaches 1.0
   let progress = computeVerificationProgress (ceHeight tip) (bhTimestamp (ceHeader tip))
-      -- Initial block download heuristic: we're in IBD if the tip is older than 24 hours
-      -- or if we're significantly behind the estimated chain height.
-      -- Regtest is never in IBD once past genesis (Core's IsInitialBlockDownload
-      -- clears as soon as the chain advances on regtest's trivial-PoW network);
-      -- the mainnet-timed heuristic would otherwise mis-report IBD=True under a
-      -- pinned-mocktime regtest chain.
-      currentTime = bhTimestamp (ceHeader tip)
-      isIBD = if netName (rsNetwork server) == "regtest"
-                then ceHeight tip == 0
-                else estimateIsInitialBlockDownload (ceHeight tip) currentTime
+      -- Core ChainstateManager::IsInitialBlockDownload (validation.cpp): in
+      -- IBD while the tip's work is below nMinimumChainWork or the tip is
+      -- older than DEFAULT_MAX_TIP_AGE (24h) at the node clock (setmocktime
+      -- honoured).  Regtest has nMinimumChainWork = 0, so only tip age
+      -- decides: a regtest chain of old-dated blocks stays in IBD, as Core.
+      -- Core also latches the answer false for the process; not modelled.
+  nowTime <- getCurrentTime server
+  let isIBD = coreIsInitialBlockDownload (netMinimumChainWork (rsNetwork server))
+                (ceChainWork tip) (bhTimestamp (ceHeader tip)) nowTime
   -- Pruning fields (Bitcoin Core parity).  Reference:
   -- bitcoin-core/src/rpc/blockchain.cpp getblockchaininfo emits
   --   "pruned"            : whether prune mode is enabled
@@ -16237,6 +16236,15 @@ computeVerificationProgress height blockTime =
       actualHeight = fromIntegral height :: Double
   in if expectedHeight <= 0 then 1.0
      else min 1.0 (actualHeight / expectedHeight)
+
+-- | Core's IsInitialBlockDownload predicate without the latch
+-- (validation.cpp): chain work below the minimum, or tip older than
+-- DEFAULT_MAX_TIP_AGE = 24h.  Args: nMinimumChainWork, tip chain work,
+-- tip timestamp, current time.
+coreIsInitialBlockDownload :: Integer -> Integer -> Word32 -> Word32 -> Bool
+coreIsInitialBlockDownload minWork tipWork tipTime now =
+  tipWork < minWork
+    || (fromIntegral tipTime :: Integer) < fromIntegral now - 24 * 60 * 60
 
 -- | Estimate if we're in Initial Block Download mode.
 -- IBD is true if the tip is more than 24 hours old (heuristic).
