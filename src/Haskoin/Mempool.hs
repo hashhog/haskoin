@@ -89,7 +89,6 @@ module Haskoin.Mempool
   , checkReplacement
   , checkReplacementWith
   , evaluateReplacementRules
-
   , removeConflicts
   , isRbfReplaceable
   , checkAllConflictsRbfReplaceable
