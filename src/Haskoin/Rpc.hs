@@ -520,6 +520,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          addTransaction, testAcceptTransaction,
                          getTransaction, getMempoolTxIds,
                          getMempoolSize, getPrioritisedTransactions,
+                         addUnbroadcast, getUnbroadcastSet,
                          getMempoolMinFeeRate, incrementalRelayFeePerKvb,
                          FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
@@ -4169,6 +4170,7 @@ handleSendRawTransaction server params = do
                           -- static relay floor so the fee-floor sub-token is exact.
                           return $ rejectResp err
                         Right txid -> do
+                          addUnbroadcast (rsMempool server) txid
                           mEntry <- getTransaction (rsMempool server) txid
                           case mEntry of
                             Just entry ->
@@ -4422,6 +4424,7 @@ handleGetMempoolInfo server = do
   -- effective floor (rolling minimum bumped by evictions, never below the
   -- static relay floor).  Reads the REAL floor via getMempoolMinFeeRate.
   effFloorKvb <- fromIntegral <$> getMempoolMinFeeRate (rsMempool server) :: IO Int64
+  unbroadcastN <- Set.size <$> getUnbroadcastSet (rsMempool server)
   let enc = pairs $
               pair "loaded"              (AE.bool True)                             <>
               pair "size"                (AE.int count)                             <>
@@ -4432,7 +4435,7 @@ handleGetMempoolInfo server = do
               pair "mempoolminfee"       (btcAmountEnc effFloorKvb)                 <>
               pair "minrelaytxfee"       (btcAmountEnc staticFloorKvb)              <>
               pair "incrementalrelayfee" (btcAmountEnc incrementalKvb)              <>
-              pair "unbroadcastcount"    (AE.int 0)                                 <>
+              pair "unbroadcastcount"    (AE.int unbroadcastN)                               <>
               pair "fullrbf"             (AE.bool True)                             <>
               -- The 5 policy fields Core v31.99 added after fullrbf, in Core
               -- pushKV order (src/rpc/mempool.cpp MempoolInfoToJSON).
@@ -4576,13 +4579,14 @@ handleGetRawMempool server params = do
       (poolEntries, poolByOutpoint) <- atomically $
         (,) <$> readTVar (mpEntries (rsMempool server))
             <*> readTVar (mpByOutpoint (rsMempool server))
+      unbroadcastSet <- getUnbroadcastSet (rsMempool server)
       let chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
           validEntries = catMaybes entries
           -- Build the object on the streaming path so fee amounts use
           -- Core's fixed-decimal format (btcAmountEnc) rather than Double.
           pairsEnc = foldl' (<>) mempty
             [ pair (Key.fromText (showHash (BlockHash (getTxIdHash txid))))
-                   (mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry)
+                   (mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry)
             | (txid, entry) <- validEntries
             ]
           rawBs = encodingToLazyByteString (pairs pairsEnc)
@@ -4591,8 +4595,8 @@ handleGetRawMempool server params = do
     -- | Encode one mempool entry as a streaming Encoding so fee amounts
     -- use Core's fixed-decimal format (8 fractional digits, no sci notation).
     mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
-                    -> Map TxId (Word64, Int) -> MempoolEntry -> AE.Encoding
-    mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry =
+                    -> Map TxId (Word64, Int) -> Set.Set TxId -> MempoolEntry -> AE.Encoding
+    mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry =
       let wtxid = computeWtxId (meTransaction entry)
           entryHeight = meHeight entry
           feeSat = fromIntegral (meFee entry) :: Int64
@@ -4631,7 +4635,7 @@ handleGetRawMempool server params = do
            pair "depends"            (AE.list text dependsHex)                        <>
            pair "spentby"            (AE.list text spentbyHex)                        <>
            pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
-           pair "unbroadcast"        (AE.bool False)
+           pair "unbroadcast"        (AE.bool (Set.member (meTxId entry) unbroadcastSet))
 
 -- | getorphantxs — show transactions in the tx orphanage.
 --
@@ -10172,6 +10176,7 @@ handleGetMempoolEntry server params
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
             Just entry -> do
+              isUnbroadcast <- Set.member txid <$> getUnbroadcastSet (rsMempool server)
               -- Get ancestor/descendant info
               ancestors <- getAncestors (rsMempool server) (meTransaction entry)
               descendants <- getDescendants (rsMempool server) txid
@@ -10214,7 +10219,7 @@ handleGetMempoolEntry server params
                           pair "depends"            (AE.list text depends)                            <>
                           pair "spentby"            (AE.list text [])                                 <>
                           pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                      <>
-                          pair "unbroadcast"        (AE.bool False)
+                          pair "unbroadcast"        (AE.bool isUnbroadcast)
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------

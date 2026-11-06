@@ -4745,8 +4745,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           Nothing -> Nothing
     replies <- serveGetDataCompact
       depthOf
-      (fmap (fmap meTransaction) . getTransaction mp)
-      (fmap (fmap meTransaction) . getTransactionByWtxid mp)
+      (\t -> do r <- getTransaction mp t
+                forM_ r $ \_ -> removeUnbroadcast mp t
+                return (fmap meTransaction r))
+      (\w -> do r <- getTransactionByWtxid mp w
+                forM_ r $ \e -> removeUnbroadcast mp (meTxId e)
+                return (fmap meTransaction r))
       (getBlock db)
       ivs
     forM_ replies $ requestFromPeer pm addr

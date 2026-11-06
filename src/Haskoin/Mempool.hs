@@ -56,6 +56,9 @@ module Haskoin.Mempool
   , getMempoolTxIds
   , getMempoolWtxids
   , getMempoolSize
+  , addUnbroadcast
+  , removeUnbroadcast
+  , getUnbroadcastSet
   , getMempoolInfo
   , getPrioritisedTransactions
   , getMempoolMinFeeRate
@@ -1796,6 +1799,8 @@ removeTransactionStructural mp txid = do
         -- Update size
         modifyTVar' (mpSize mp) (subtract vsize)
         modifyTVar' (mpUsage mp) (subtract (txMemUsage (meTransaction entry)))
+        -- Core CTxMemPool::removeUnchecked: m_unbroadcast_txids.erase(hash)
+        modifyTVar' (mpUnbroadcast mp) (Set.delete txid)
         accountEntryRemoved mp
 
         -- Update descendant counts for all ancestors
@@ -1901,6 +1906,23 @@ getMempoolSize mp = atomically $ do
   entries <- readTVar (mpEntries mp)
   size <- readTVar (mpSize mp)
   return (Map.size entries, size)
+
+-- | Mark a locally submitted transaction as not yet requested by any peer
+-- (Core CTxMemPool::AddUnbroadcastTx, called from BroadcastTransaction).
+-- A no-op unless the tx is currently in the pool.
+addUnbroadcast :: Mempool -> TxId -> IO ()
+addUnbroadcast mp txid = atomically $ do
+  es <- readTVar (mpEntries mp)
+  when (Map.member txid es) $ modifyTVar' (mpUnbroadcast mp) (Set.insert txid)
+
+-- | A peer asked for the tx (getdata): it is no longer unbroadcast
+-- (Core net_processing ProcessGetData -> RemoveUnbroadcastTx).
+removeUnbroadcast :: Mempool -> TxId -> IO ()
+removeUnbroadcast mp txid = atomically $ modifyTVar' (mpUnbroadcast mp) (Set.delete txid)
+
+-- | Snapshot of the unbroadcast set.
+getUnbroadcastSet :: Mempool -> IO (Set TxId)
+getUnbroadcastSet mp = readTVarIO (mpUnbroadcast mp)
 
 -- | Get mempool info (count, size, bytes, fee stats)
 getMempoolInfo :: Mempool -> IO (Int, Int, Word64, Word64)
