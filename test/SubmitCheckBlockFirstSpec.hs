@@ -38,7 +38,7 @@ import Haskoin.Crypto (computeTxId, computeBlockHash)
 import Haskoin.Consensus
   ( regtest, initHeaderChain, medianTimePast, blockReward, computeMerkleRoot
   , netPowLimit, ChainEntry(..), HeaderChain(..), BlockStatus(..)
-  , getValidatedChainTip, invalidateBlock, reconsiderBlock, isFailedStatus )
+  , getValidatedChainTip, invalidateBlock, isFailedStatus, checkProofOfWork, addHeader )
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, getBlock )
 import Haskoin.Mempool (newMempool, defaultMempoolConfig)
@@ -117,9 +117,6 @@ submit server =
   submitBlock regtest (rsDB server) (rsHeaderChain server) (rsUTXOCache server)
               (rsPeerMgr server) (rsMempool server) (rsIndexMgr server)
 
-coinbaseOut :: Block -> OutPoint
-coinbaseOut blk = OutPoint (computeTxId (head (blockTxns blk))) 0
-
 hashOf :: Block -> BlockHash
 hashOf = computeBlockHash . blockHeader
 
@@ -129,12 +126,9 @@ validatedHash server = ceHash <$> getValidatedChainTip (rsDB server) (rsHeaderCh
 statusOf :: RpcServer -> BlockHash -> IO (Maybe BlockStatus)
 statusOf server h = fmap ceStatus . Map.lookup h <$> readTVarIO (hcEntries (rsHeaderChain server))
 
-invalidate, reconsider :: RpcServer -> BlockHash -> IO ()
+invalidate :: RpcServer -> BlockHash -> IO ()
 invalidate server h = do
   r <- invalidateBlock regtest (rsUTXOCache server) (rsDB server) (rsHeaderChain server) Nothing h
-  r `shouldBe` Right ()
-reconsider server h = do
-  r <- reconsiderBlock regtest (rsUTXOCache server) (rsDB server) (rsHeaderChain server) Nothing h
   r `shouldBe` Right ()
 
 -- | Blocks 1..6 connected; returns their hashes (index 0 = height 1).
@@ -224,3 +218,53 @@ spec = describe "submitblock: CheckBlock before the index lookups; stored block 
       validatedHash server `shouldReturn` hashOf s7
       -- s6 is now active: resubmit is "duplicate" via the active arm
       submit server s6 `shouldReturn` Left "duplicate"
+
+  it "submitblock-stored-side-block-heavier-than-tip: resubmitting it retries the reorg, not duplicate" $
+    withLiveServer $ \server -> do
+      hs <- chain6 server
+      let h4 = hs !! 3
+          hc = rsHeaderChain server
+      -- branch s5 <- s6 <- s7 off h4; s7 out-works h6
+      s5 <- mkChild server h4 (BS.pack [0x66])
+      Right _ <- addHeader regtest hc (blockHeader s5) False
+      s6 <- mkChild server (hashOf s5) (BS.pack [0x66])
+      Right _ <- addHeader regtest hc (blockHeader s6) False
+      s7 <- mkChild server (hashOf s6) (BS.pack [0x66])
+      -- s7's body arrives first: it is stored, but the reorg cannot run
+      -- (s5 / s6 bodies missing), so the tip stays at h6
+      r7a <- submit server s7
+      r7a `shouldSatisfy` (/= Right ())
+      validatedHash server `shouldReturn` last hs
+      getBlock (rsDB server) (hashOf s7) >>= (`shouldSatisfy` maybe False (const True))
+      -- NOTE (known divergence, not this test's subject): Core's
+      -- ActivateBestChain would already reorg onto s7 once s6's body arrives;
+      -- haskoin's side-branch arm only weighs the submitted block itself.  If
+      -- that is fixed, the s6 submission below reorgs and this setup changes.
+      submit server s5 `shouldReturn` Left "inconclusive"
+      submit server s6 `shouldReturn` Left "inconclusive"
+      -- s7 is stored, not failed, and heavier than the tip: Core's
+      -- ActivateBestChain moves to it, so it must not be answered "duplicate"
+      r7 <- submit server s7
+      r7 `shouldBe` Right ()
+      validatedHash server `shouldReturn` hashOf s7
+
+  it "submitblock-bad-pow answers high-hash before the parent lookup" $
+    withLiveServer $ \server -> do
+      hs <- chain6 server
+      good <- mkChild server (last hs) (BS.pack [0x67])
+      let base = (blockHeader good) { bhPrevBlock = BlockHash (Hash256 (BS.replicate 32 0x12)) }
+          bad  = head [ h | n <- [0 ..], let h = base { bhNonce = n }
+                          , not (checkProofOfWork h (netPowLimit regtest)) ]
+      submit server (Block bad (blockTxns good)) `shouldReturn` Left "high-hash"
+
+  it "submitblock-duplicate-txids (CVE-2012-2459) answers bad-txns-duplicate before the parent lookup" $
+    withLiveServer $ \server -> do
+      hs <- chain6 server
+      good <- mkChild server (last hs) (BS.pack [0x68])
+      let cb  = head (blockTxns good)
+          hdr = (blockHeader good)
+                  { bhPrevBlock  = BlockHash (Hash256 (BS.replicate 32 0x13))
+                  , bhMerkleRoot = computeMerkleRoot [computeTxId cb, computeTxId cb]
+                  , bhNonce = 0 }
+      Just solved <- findRegtestNonce hdr (netPowLimit regtest)
+      submit server (Block solved [cb, cb]) `shouldReturn` Left "bad-txns-duplicate"
