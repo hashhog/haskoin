@@ -4124,9 +4124,11 @@ handleSendRawTransaction server params = do
     Just hexTx -> do
       -- Decode hex string
       case B16.decode (TE.encodeUtf8 hexTx) of
-        Left err -> return $ RpcResponse Null
+        -- Core DecodeHexTx fails on non-hex input too, and sendrawtransaction
+        -- (rpc/mempool.cpp) words every decode failure the same way.
+        Left _ -> return $ RpcResponse Null
           (toJSON $ RpcError rpcDeserializationError
-            (T.pack $ "TX decode failed. " ++ err)) Null
+            "TX decode failed. Make sure the tx has at least one input.") Null
         Right txBytes -> do
           -- Try to decode transaction (witness format first, then legacy)
           case decodeTxWithFallback txBytes of
@@ -4238,7 +4240,12 @@ maxFeeExceededResponse = RpcResponse Null
 decodeTxWithFallback :: ByteString -> Either String Tx
 decodeTxWithFallback txBytes =
   -- The standard decode tries witness format first (looks for marker/flag bytes)
-  case S.decode txBytes of
+  --
+  -- Core's DecodeHexTx accepts a candidate decode only when it consumes the
+  -- WHOLE byte stream (core_io.cpp: @if (ssData.empty()) ok = true@), so a
+  -- hex string with trailing bytes is "TX decode failed", never a silent
+  -- truncation.  'S.decode' alone ignores the leftover bytes.
+  case decodeTxFullConsume True True txBytes of
     Right tx -> Right tx
     Left _ -> Left "TX decode failed"
 
@@ -4392,7 +4399,14 @@ handleDecodeRawTransaction server params = do
         Left _ -> return $ RpcResponse Null
           (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
         Right txBytes -> do
-          case S.decode txBytes of
+          -- Core decoderawtransaction: iswitness (arg 2) absent tries both
+          -- encodings, true = witness only, false = legacy only; a candidate
+          -- must consume every byte (rpc/rawtransaction.cpp, core_io.cpp
+          -- DecodeHexTx).
+          let iswitness = extractParam params 1 :: Maybe Bool
+              tryWit    = maybe True id iswitness
+              tryLegacy = maybe True not iswitness
+          case decodeTxFullConsume tryWit tryLegacy txBytes of
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
             Right tx -> do
