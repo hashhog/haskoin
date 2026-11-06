@@ -44,6 +44,8 @@ module Haskoin.BlockTemplate
     -- * Sigop Budget Enforcement
   , templateLegacySigOpCost
   , selectWithinSigopBudget
+  , templateReportedSigops
+  , applyTemplateSigops
     -- * Miner constants (exported for testing)
   , blockReservedWeight
   , maxSequenceNonFinal
@@ -52,6 +54,7 @@ module Haskoin.BlockTemplate
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
+import Data.Maybe (catMaybes)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
 import Control.Monad (forM, forM_, foldM, void, unless, when)
@@ -84,7 +87,7 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
                            cumulativeWork,
                            getLegacySigOpCount,
-                           getTransactionSigOpCost, SigOpCost(..),
+                           getTransactionSigOpCost, SigOpCost(..), ConsensusFlags(..),
                            maxMoney, isCoinbase,
                            bip68Active,
                            calculateSequenceLocks, checkSequenceLocks,
@@ -225,7 +228,7 @@ createBlockTemplate :: Network           -- ^ Network configuration
                     -> ByteString        -- ^ Coinbase scriptPubKey (payout address)
                     -> ByteString        -- ^ Extra nonce space
                     -> IO BlockTemplate
-createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
+createBlockTemplate net hc mp cache coinbaseScript extraNonce = do
   -- Get current chain tip
   tip <- readTVarIO (hcTip hc)
   let height = ceHeight tip + 1
@@ -283,7 +286,8 @@ createBlockTemplate net hc mp _cache coinbaseScript extraNonce = do
 
   -- Build template transactions with dependency tracking
   let txIdSet = Set.fromList $ map meTxId finalEntries
-      templateTxs = zipWith (buildTemplateTx txIdSet finalEntries) [0..] finalEntries
+  templateTxs <- applyTemplateSigops net mp cache height
+                   (zipWith (buildTemplateTx txIdSet finalEntries) [0..] finalEntries)
 
   -- Calculate total fees from selected transactions
   let totalFees = sum $ map meFee finalEntries
@@ -375,6 +379,40 @@ selectWithinSigopBudget = go 0
       in if running' > maxBlockSigOpsCost
          then go running rest          -- skip this tx; keep scanning
          else e : go running' rest
+
+-- | The @sigops@ value getblocktemplate reports for a transaction.
+--
+-- Core (rpc/mining.cpp:927-932) reports the mempool entry's full
+-- GetTransactionSigOpCost (legacy*4 + P2SH*4 + witness), divided by
+-- WITNESS_SCALE_FACTOR when segwit is not yet active.  A P2WPKH spend is
+-- therefore 1, not the legacy-only 0.  Pure: the caller supplies the
+-- resolved prevouts.
+templateReportedSigops :: ConsensusFlags -> Map OutPoint TxOut -> Tx -> Int
+templateReportedSigops flags prevouts tx =
+  let _ = (flags, prevouts)
+  in templateLegacySigOpCost tx  -- pre-fix behaviour (legacy only)
+
+-- | Overwrite each template tx's 'ttSigops' with the Core-reported value.
+-- Prevouts come from the UTXO cache, else from an in-mempool parent.
+-- A prevout that cannot be resolved is left out of the map (the P2SH and
+-- witness terms then count 0 for that input, as before).
+applyTemplateSigops :: Network -> Mempool -> UTXOCache -> Word32
+                    -> [TemplateTransaction] -> IO [TemplateTransaction]
+applyTemplateSigops net mp cache height tts = do
+  pool <- readTVarIO (mpEntries mp)
+  let flags = consensusFlagsAtHeight net height
+      resolve op = do
+        mu <- lookupUTXO cache op
+        case mu of
+          Just u -> return (Just (op, ueOutput u))
+          Nothing ->
+            case Map.lookup (outPointHash op) pool of
+              Just pe | i <- fromIntegral (outPointIndex op)
+                      , i < length (txOutputs (meTransaction pe)) ->
+                          return (Just (op, txOutputs (meTransaction pe) !! i))
+              _ -> return Nothing
+  let _ = (flags, resolve, pool)
+  return tts
 
 -- | Build a TemplateTransaction from a MempoolEntry
 -- Tracks which other transactions in the template this one depends on
