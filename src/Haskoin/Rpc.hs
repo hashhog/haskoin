@@ -4474,6 +4474,16 @@ handleDecodeRawTransaction server params = do
 -- | Get information about the mempool
 handleGetMempoolInfo :: RpcServer -> IO RpcResponse
 handleGetMempoolInfo server = do
+  rawBs <- mempoolInfoJson server
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | The getmempoolinfo object, shared by the RPC and by REST
+-- @/rest/mempool/info.json@: Core builds both from one function,
+-- MempoolInfoToJSON (rpc/mempool.cpp:1043; rest.cpp:825 rest_mempool), so
+-- the REST body carries the same fields, in the same order and in the same
+-- BTC/kvB units, as the RPC result.
+mempoolInfoJson :: RpcServer -> IO BL.ByteString
+mempoolInfoJson server = do
   (count, size) <- getMempoolSize (rsMempool server)
   -- Calculate total fees from all mempool entries
   txids <- getMempoolTxIds (rsMempool server)
@@ -4510,8 +4520,7 @@ handleGetMempoolInfo server = do
               pair "limitclustercount"   (AE.int 64)                                <>
               pair "limitclustersize"    (AE.int 101000)                            <>
               pair "optimal"             (AE.bool True)
-      rawBs = encodingToLazyByteString enc
-  return $ RpcResponse (rawJsonResult rawBs) Null Null
+  return (encodingToLazyByteString enc)
 
 -- | prioritisetransaction "txid" ( dummy ) fee_delta
 --
@@ -16880,21 +16889,15 @@ handleRestMempoolInfo server pathPart = do
 
   case format of
     RestJson -> do
-      (count, size) <- getMempoolSize (rsMempool server)
-      let mpCfg = mpConfig (rsMempool server)
-          jsonResult = object
-            [ "loaded" .= True
-            , "size" .= count
-            , "bytes" .= size
-            , "usage" .= size
-            , "maxmempool" .= mpcMaxSize mpCfg
-            -- Coupled to the real (sat/kvB-native) relay floor (100 sat/kvB).
-            , "mempoolminfee" .= getFeeRate (mpcMinFeeRate mpCfg)
-            , "minrelaytxfee" .= getFeeRate (mpcMinFeeRate mpCfg)
-            ]
+      -- Core rest.cpp:825: MempoolInfoToJSON(*mempool).write() + "\n" — the
+      -- very object getmempoolinfo returns.  This handler used to build its
+      -- own 7-field subset, missing total_fee / incrementalrelayfee / fullrbf
+      -- and the five v31 policy fields, and reported mempoolminfee and
+      -- minrelaytxfee as raw sat/kvB (100) instead of BTC/kvB (0.000001).
+      body <- mempoolInfoJson server
       return $ responseLBS status200
         [(hContentType, "application/json")]
-        (encode jsonResult)
+        (body <> "\n")
 
     _ ->
       return $ restError 404 "output format not found (available: json)"
