@@ -188,3 +188,15 @@ spec = describe "getmempoolentry (chunk fields, depends, spentby, weight)" $ do
       p <- entryRpc server pid
       key p "weight" >>= (`shouldBe` A.Number 276)
       key p "vsize" >>= (`shouldBe` A.Number 100)
+
+  -- Core's entryToJSON "depends" lists the direct in-pool parents only
+  -- (CTxMemPool::GetParents), not every ancestor.
+  it "depends is direct parents only: a grandchild does not list the grandparent" $
+    withServer $ \server -> do
+      let gchild = mkTx 4 [OutPoint (computeTxId child) 0]
+          gid = computeTxId gchild
+      load server [mkEntry parent 400 100, mkEntry child 400 1_000, mkEntry gchild 400 10_000]
+      g <- entryRpc server gid
+      key g "depends" >>= (`shouldBe` A.toJSON [hex cid])
+      c <- entryRpc server cid
+      key c "spentby" >>= (`shouldBe` A.toJSON [hex gid])
