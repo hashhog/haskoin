@@ -6127,12 +6127,13 @@ handleSubmitHeader server params =
 --
 -- Only a header that is now the best header is written, and only rows
 -- ABOVE the connected tip: rows at or below it belong to connect / reorg,
--- exactly as in the P2P handler.  Ancestors are written too, walking back
--- until a row already holds the right hash, because a side-branch header
--- can become the best header only when a later child arrives; its
--- ancestors' rows then still name the old branch.  getblockhash and the
--- other height-index readers stop at the connected tip, so these rows are
--- never read as connected blocks.
+-- exactly as in the P2P handler.  Ancestors are written too, all the way
+-- down to the connected tip, because a side-branch header can become the
+-- best header only when a later child arrives; its ancestors' rows then
+-- still name the old branch.  The walk does not stop at the first row that
+-- already matches: rows are rewritten one height at a time (here and in
+-- the P2P handler), so a matching row says nothing about the rows below
+-- it.  Only rows that differ are written.
 persistBestHeaderRows :: HaskoinDB -> HeaderChain -> ChainEntry -> IO ()
 persistBestHeaderRows db hc entry = do
   best <- readTVarIO (hcTip hc)
@@ -6143,9 +6144,9 @@ persistBestHeaderRows db hc entry = do
           | ceHeight e <= ceHeight connected = return ()
           | otherwise = do
               row <- getBlockHeight db (ceHeight e)
-              unless (row == Just (ceHash e)) $ do
+              unless (row == Just (ceHash e)) $
                 putBlockHeight db (ceHeight e) (ceHash e)
-                mapM_ go (cePrev e >>= (`Map.lookup` entries))
+              mapM_ go (cePrev e >>= (`Map.lookup` entries))
     go entry
 
 -- | Get mining-related information
