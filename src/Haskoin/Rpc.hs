@@ -517,9 +517,10 @@ import Haskoin.Daemon (DebugCategory(..), parseDebugCategory,
 import Network.Socket (SockAddr(..))
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
-                         addTransaction, testAcceptTransaction,
+                         addTransaction, testAcceptTransaction, testAcceptPackage,
                          getTransaction, getMempoolTxIds,
                          getMempoolSize, getPrioritisedTransactions,
+                         addUnbroadcast, getUnbroadcastSet,
                          getMempoolMinFeeRate, incrementalRelayFeePerKvb,
                          FeeRate(..), calculateVSize,
                          calculateFeeRate, selectTransactions,
@@ -1773,16 +1774,15 @@ handleGetBlockchainInfo server = do
   -- Compute verification progress estimate (blocks validated / estimated total)
   -- For a fully synced node this approaches 1.0
   let progress = computeVerificationProgress (ceHeight tip) (bhTimestamp (ceHeader tip))
-      -- Initial block download heuristic: we're in IBD if the tip is older than 24 hours
-      -- or if we're significantly behind the estimated chain height.
-      -- Regtest is never in IBD once past genesis (Core's IsInitialBlockDownload
-      -- clears as soon as the chain advances on regtest's trivial-PoW network);
-      -- the mainnet-timed heuristic would otherwise mis-report IBD=True under a
-      -- pinned-mocktime regtest chain.
-      currentTime = bhTimestamp (ceHeader tip)
-      isIBD = if netName (rsNetwork server) == "regtest"
-                then ceHeight tip == 0
-                else estimateIsInitialBlockDownload (ceHeight tip) currentTime
+      -- Core ChainstateManager::IsInitialBlockDownload (validation.cpp): in
+      -- IBD while the tip's work is below nMinimumChainWork or the tip is
+      -- older than DEFAULT_MAX_TIP_AGE (24h) at the node clock (setmocktime
+      -- honoured).  Regtest has nMinimumChainWork = 0, so only tip age
+      -- decides: a regtest chain of old-dated blocks stays in IBD, as Core.
+      -- Core also latches the answer false for the process; not modelled.
+  nowTime <- getCurrentTime server
+  let isIBD = coreIsInitialBlockDownload (netMinimumChainWork (rsNetwork server))
+                (ceChainWork tip) (bhTimestamp (ceHeader tip)) nowTime
   -- Pruning fields (Bitcoin Core parity).  Reference:
   -- bitcoin-core/src/rpc/blockchain.cpp getblockchaininfo emits
   --   "pruned"            : whether prune mode is enabled
@@ -3196,7 +3196,14 @@ buildPrevoutEnc net u =
 -- References: bitcoin-core/src/rpc/blockchain.cpp getblockheader,
 --             bitcoin-core/src/rpc/blockchain.cpp GetDifficulty.
 handleGetBlockHeader :: RpcServer -> Value -> IO RpcResponse
-handleGetBlockHeader server params = do
+handleGetBlockHeader server params
+  -- Core's RPC framework type-checks the declared arguments (hash: string,
+  -- verbose: bool) before the handler body runs, so a non-bool verbose is
+  -- -3 "Wrong type passed" rather than being read as the default.
+  | Just typeErr <- coreArgTypeCheck
+      [Just ("hash", CArgStr, True), Just ("verbose", CArgBool, False)] params
+  = return typeErr
+  | otherwise = do
   case extractParamText params 0 of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing blockhash parameter") Null
@@ -4037,7 +4044,7 @@ handleGetRawTransactionLookup server txid verbosity _mBlockHashText mBlockHashPa
                     Just block -> do
                       case findIndex (\t -> computeTxId t == txid) (blockTxns block) of
                         Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "No such transaction found in the provided block") Null
+                          (toJSON $ RpcError (-5) "No such transaction found in the provided block. Use gettransaction for wallet transactions.") Null
                         Just ix -> returnTxResult server (blockTxns block !! ix) txid
                                      (Just (blockHash, ix)) blockHashArgGiven verbosity
 
@@ -4123,9 +4130,11 @@ handleSendRawTransaction server params = do
     Just hexTx -> do
       -- Decode hex string
       case B16.decode (TE.encodeUtf8 hexTx) of
-        Left err -> return $ RpcResponse Null
+        -- Core DecodeHexTx fails on non-hex input too, and sendrawtransaction
+        -- (rpc/mempool.cpp) words every decode failure the same way.
+        Left _ -> return $ RpcResponse Null
           (toJSON $ RpcError rpcDeserializationError
-            (T.pack $ "TX decode failed. " ++ err)) Null
+            "TX decode failed. Make sure the tx has at least one input.") Null
         Right txBytes -> do
           -- Try to decode transaction (witness format first, then legacy)
           case decodeTxWithFallback txBytes of
@@ -4147,13 +4156,20 @@ handleSendRawTransaction server params = do
                   let maxFee = maxRawTxFee maxRateKvb (calculateVSize tx)
                       staticFloorKvb =
                         getFeeRate (mpcMinFeeRate (mpConfig (rsMempool server)))
-                      rejectResp = mempoolErrorToRpcResponseWith staticFloorKvb
-                  preCheck <-
+                  -- Core node/transaction.cpp BroadcastTransaction, in order:
+                  --   1. any output (txid, n) already in the UTXO set
+                  --      -> ALREADY_IN_UTXO_SET (-27)
+                  --   2. txid already in the mempool -> re-announce, return txid
+                  --   3. otherwise the max-fee dry run, then admission.
+                  early <- sendRawEarlyOutcome server tx
+                  preCheck <- case early of
+                   Just resp -> return (Just resp)
+                   Nothing ->
                     if maxFee > 0
                       then do
                         dry <- testAcceptTransaction (rsMempool server) tx
                         return $ case dry of
-                          Left err -> Just (rejectResp err)
+                          Left err -> Just (sendRawRejectResp staticFloorKvb err)
                           Right entry
                             | meFee entry > maxFee -> Just maxFeeExceededResponse
                             | otherwise            -> Nothing
@@ -4167,8 +4183,9 @@ handleSendRawTransaction server params = do
                           -- Emit the bare Core reject token (unified with
                           -- testmempoolaccept), threading the node's configured
                           -- static relay floor so the fee-floor sub-token is exact.
-                          return $ rejectResp err
+                          return $ sendRawRejectResp staticFloorKvb err
                         Right txid -> do
+                          addUnbroadcast (rsMempool server) txid
                           mEntry <- getTransaction (rsMempool server) txid
                           case mEntry of
                             Just entry ->
@@ -4177,6 +4194,45 @@ handleSendRawTransaction server params = do
                             Nothing -> return ()
                           return $ RpcResponse
                             (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
+
+-- | Core's sendrawtransaction error text for a mempool rejection.  It is the
+-- validation state's own string (HandleATMPError -> state.ToString()), which
+-- for TX_MISSING_INPUTS is "bad-txns-inputs-missingorspent"; testmempoolaccept
+-- alone remaps that one reason to "missing-inputs" (rpc/mempool.cpp), so
+-- 'mempoolRejectToken' keeps the remap and only this caller undoes it.  The
+-- error code (-25) is unchanged.
+sendRawRejectResp :: Word64 -> MempoolError -> RpcResponse
+sendRawRejectResp staticFloorKvb err = case err of
+  ErrMissingInput _ ->
+    RpcResponse Null (toJSON (RpcError (mempoolErrorCode err)
+                                "bad-txns-inputs-missingorspent")) Null
+  _ -> mempoolErrorToRpcResponseWith staticFloorKvb err
+
+-- | The two checks Core's BroadcastTransaction runs before any admission
+-- work: a tx whose outputs are already unspent in the chain is
+-- TransactionError::ALREADY_IN_UTXO_SET (-27 "Transaction outputs already in
+-- utxo set"); a tx whose txid is already in the mempool is NOT resubmitted
+-- (it would be a conflict) -- it is re-announced and its txid returned, so
+-- resending a known tx is idempotent rather than an error.
+sendRawEarlyOutcome :: RpcServer -> Tx -> IO (Maybe RpcResponse)
+sendRawEarlyOutcome server tx = do
+  let txid  = computeTxId tx
+      nOuts = length (txOutputs tx)
+  inUtxo <- or <$> mapM
+    (\i -> isJust <$> lookupUTXO (rsUTXOCache server) (OutPoint txid (fromIntegral i)))
+    [0 .. nOuts - 1]
+  if inUtxo
+    then return $ Just $ RpcResponse Null
+           (toJSON $ RpcError rpcVerifyAlreadyInChain
+              "Transaction outputs already in utxo set") Null
+    else do
+      mEntry <- getTransaction (rsMempool server) txid
+      case mEntry of
+        Nothing -> return Nothing
+        Just entry -> do
+          broadcastTxToPeers server tx (getFeeRate (meFeeRate entry))
+          return $ Just $ RpcResponse
+            (toJSON $ showHash (BlockHash (getTxIdHash txid))) Null Null
 
 -- | Core @DEFAULT_MAX_RAW_TX_FEE_RATE@ (node/transaction.h): 0.10 BTC/kvB,
 -- expressed in sat/kvB.
@@ -4236,7 +4292,12 @@ maxFeeExceededResponse = RpcResponse Null
 decodeTxWithFallback :: ByteString -> Either String Tx
 decodeTxWithFallback txBytes =
   -- The standard decode tries witness format first (looks for marker/flag bytes)
-  case S.decode txBytes of
+  --
+  -- Core's DecodeHexTx accepts a candidate decode only when it consumes the
+  -- WHOLE byte stream (core_io.cpp: @if (ssData.empty()) ok = true@), so a
+  -- hex string with trailing bytes is "TX decode failed", never a silent
+  -- truncation.  'S.decode' alone ignores the leftover bytes.
+  case decodeTxFullConsume True True txBytes of
     Right tx -> Right tx
     Left _ -> Left "TX decode failed"
 
@@ -4390,7 +4451,14 @@ handleDecodeRawTransaction server params = do
         Left _ -> return $ RpcResponse Null
           (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
         Right txBytes -> do
-          case S.decode txBytes of
+          -- Core decoderawtransaction: iswitness (arg 2) absent tries both
+          -- encodings, true = witness only, false = legacy only; a candidate
+          -- must consume every byte (rpc/rawtransaction.cpp, core_io.cpp
+          -- DecodeHexTx).
+          let iswitness = extractParam params 1 :: Maybe Bool
+              tryWit    = maybe True id iswitness
+              tryLegacy = maybe True not iswitness
+          case decodeTxFullConsume tryWit tryLegacy txBytes of
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
             Right tx -> do
@@ -4422,6 +4490,7 @@ handleGetMempoolInfo server = do
   -- effective floor (rolling minimum bumped by evictions, never below the
   -- static relay floor).  Reads the REAL floor via getMempoolMinFeeRate.
   effFloorKvb <- fromIntegral <$> getMempoolMinFeeRate (rsMempool server) :: IO Int64
+  unbroadcastN <- Set.size <$> getUnbroadcastSet (rsMempool server)
   let enc = pairs $
               pair "loaded"              (AE.bool True)                             <>
               pair "size"                (AE.int count)                             <>
@@ -4432,7 +4501,7 @@ handleGetMempoolInfo server = do
               pair "mempoolminfee"       (btcAmountEnc effFloorKvb)                 <>
               pair "minrelaytxfee"       (btcAmountEnc staticFloorKvb)              <>
               pair "incrementalrelayfee" (btcAmountEnc incrementalKvb)              <>
-              pair "unbroadcastcount"    (AE.int 0)                                 <>
+              pair "unbroadcastcount"    (AE.int unbroadcastN)                               <>
               pair "fullrbf"             (AE.bool True)                             <>
               -- The 5 policy fields Core v31.99 added after fullrbf, in Core
               -- pushKV order (src/rpc/mempool.cpp MempoolInfoToJSON).
@@ -4576,13 +4645,14 @@ handleGetRawMempool server params = do
       (poolEntries, poolByOutpoint) <- atomically $
         (,) <$> readTVar (mpEntries (rsMempool server))
             <*> readTVar (mpByOutpoint (rsMempool server))
+      unbroadcastSet <- getUnbroadcastSet (rsMempool server)
       let chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
           validEntries = catMaybes entries
           -- Build the object on the streaming path so fee amounts use
           -- Core's fixed-decimal format (btcAmountEnc) rather than Double.
           pairsEnc = foldl' (<>) mempty
             [ pair (Key.fromText (showHash (BlockHash (getTxIdHash txid))))
-                   (mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry)
+                   (mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry)
             | (txid, entry) <- validEntries
             ]
           rawBs = encodingToLazyByteString (pairs pairsEnc)
@@ -4593,8 +4663,8 @@ handleGetRawMempool server params = do
 -- Encoding so fee amounts use Core's fixed-decimal format (8 fractional
 -- digits, no sci notation).
 mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
-                -> Map TxId (Word64, Int) -> MempoolEntry -> AE.Encoding
-mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry =
+                -> Map TxId (Word64, Int) -> Set.Set TxId -> MempoolEntry -> AE.Encoding
+mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry =
   let wtxid = computeWtxId (meTransaction entry)
       entryHeight = meHeight entry
       feeSat = fromIntegral (meFee entry) :: Int64
@@ -4637,7 +4707,7 @@ mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo entry =
        pair "depends"            (AE.list text dependsHex)                        <>
        pair "spentby"            (AE.list text spentbyHex)                        <>
        pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
-       pair "unbroadcast"        (AE.bool False)
+       pair "unbroadcast"        (AE.bool (Set.member (meTxId entry) unbroadcastSet))
 
 -- | getorphantxs — show transactions in the tx orphanage.
 --
@@ -9846,18 +9916,88 @@ handleTestMempoolAccept server params
             Just rate -> rate * 100000  -- BTC/kvB to sat/vB
             Nothing -> 10000.0  -- Default 0.10 BTC/kvB
 
-      -- Parse and test each transaction; build results on the streaming path
-      -- so fee fields use Core's fixed-decimal format (btcAmountEnc).
-      resultEncs <- forM (V.toList txArray) $ \txVal -> do
-        case txVal of
-          String hexTx -> testSingleTx hexTx maxFeeRateSatPerVB
-          _ -> return $ pairs $
-                 pair "allowed"       (AE.bool False) <>
-                 pair "reject-reason" (text "invalid-type")
-
-      let rawBs = encodingToLazyByteString (AE.list id resultEncs)
-      return $ RpcResponse (rawJsonResult rawBs) Null Null
+      -- Core rpc/mempool.cpp testmempoolaccept: one raw tx goes through
+      -- ProcessNewTransaction(test_accept); several go through
+      -- ProcessNewPackage(test_accept=true), which judges a child WITH its
+      -- in-package parent.  The package path needs every entry to decode and
+      -- the set to be child-with-parents; anything else keeps the per-tx path.
+      let decodeOne (String h) = case B16.decode (TE.encodeUtf8 h) of
+            Right bs -> either (const Nothing) Just (decodeTxWithFallback bs)
+            Left _   -> Nothing
+          decodeOne _ = Nothing
+          mDecoded = mapM decodeOne (V.toList txArray)
+      case mDecoded of
+        Just txs
+          | length txs > 1
+          , Right () <- isWellFormedPackage txs
+          , isChildWithParentsTree txs -> do
+              results <- testAcceptPackage (rsMempool server) txs
+              let encs = effectiveFields maxFeeRateSatPerVB txs results
+              return $ RpcResponse
+                (rawJsonResult (encodingToLazyByteString (AE.list id encs))) Null Null
+        _ -> do
+          -- Parse and test each transaction; build results on the streaming path
+          -- so fee fields use Core's fixed-decimal format (btcAmountEnc).
+          resultEncs <- forM (V.toList txArray) $ \txVal -> do
+            case txVal of
+              String hexTx -> testSingleTx hexTx maxFeeRateSatPerVB
+              _ -> return $ pairs $
+                     pair "allowed"       (AE.bool False) <>
+                     pair "reject-reason" (text "invalid-type")
+          let rawBs = encodingToLazyByteString (AE.list id resultEncs)
+          return $ RpcResponse (rawJsonResult rawBs) Null Null
   where
+    -- Package results: Core stops at the first failing tx (its result is
+    -- returned) and the txs after it carry only txid and wtxid; a tx over
+    -- maxfeerate also leaves the rest blank (rpc/mempool.cpp exit_early).
+    -- Allowed txs report their OWN effective feerate and wtxid:
+    -- PackageTestAccept runs with m_package_feerates=false.
+    effectiveFields :: Double -> [Tx] -> [Either MempoolError MempoolEntry] -> [AE.Encoding]
+    effectiveFields maxFeeRate = go False
+      where
+        go _ [] _ = []
+        go _ (tx:rest) [] = bare tx : go True rest []
+        go early (tx:rest) (r:rs)
+          | early     = bare tx : go True rest (r:rs)
+          | otherwise =
+              let enc = renderOne maxFeeRate tx r
+                  stop = case r of
+                    Left _  -> True
+                    Right e -> fromIntegral (meFee e) / fromIntegral (meSize e) > maxFeeRate
+              in enc : go stop rest rs
+        bare tx = pairs $
+          pair "txid"  (text (showHash (BlockHash (getTxIdHash (computeTxId tx))))) <>
+          pair "wtxid" (text (showHash (BlockHash (getTxIdHash (computeWtxId tx)))))
+
+    renderOne :: Double -> Tx -> Either MempoolError MempoolEntry -> AE.Encoding
+    renderOne maxFeeRate tx result =
+      let txidTxt  = showHash (BlockHash (getTxIdHash (computeTxId tx)))
+          wtxidTxt = showHash (BlockHash (getTxIdHash (computeWtxId tx)))
+      in case result of
+        Left err -> pairs $
+          pair "txid"          (text txidTxt)  <>
+          pair "wtxid"         (text wtxidTxt) <>
+          pair "allowed"       (AE.bool False) <>
+          pair "reject-reason" (text (mempoolErrorToText err))
+        Right entry
+          | fromIntegral (meFee entry) / fromIntegral (meSize entry) > maxFeeRate ->
+              pairs $ pair "txid" (text txidTxt) <> pair "wtxid" (text wtxidTxt) <>
+                      pair "allowed" (AE.bool False) <>
+                      pair "reject-reason" (text "max-fee-exceeded")
+          | otherwise ->
+              pairs $ pair "txid" (text txidTxt) <> pair "wtxid" (text wtxidTxt) <>
+                      pair "allowed" (AE.bool True) <>
+                      pair "vsize" (AE.int (meSize entry)) <>
+                      pair "fees" (feesEncoding entry (computeWtxId tx))
+
+    feesEncoding :: MempoolEntry -> TxId -> AE.Encoding
+    feesEncoding entry wtxid = pairs $
+      pair "base" (btcAmountEnc (fromIntegral (meFee entry))) <>
+      pair "effective-feerate"
+        (btcAmountEnc (fromIntegral ((meFee entry * 1000) `div` fromIntegral (max 1 (meSize entry))))) <>
+      pair "effective-includes"
+        (AE.list (text . showHash . BlockHash . getTxIdHash) [wtxid])
+
     testSingleTx :: Text -> Double -> IO AE.Encoding
     testSingleTx hexTx maxFeeRate = do
       case B16.decode (TE.encodeUtf8 hexTx) of
@@ -9870,47 +10010,10 @@ handleTestMempoolAccept server params
               pair "allowed"       (AE.bool False) <>
               pair "reject-reason" (text ("TX decode failed: " <> T.pack err))
             Right tx -> do
-              let txid  = computeTxId tx
-                  wtxid = computeWtxId tx
-
-              -- W116 BUG-G6 FIX: use testAcceptTransaction (dry-run, no TVar
-              -- writes) instead of addTransaction + removeTransaction.
-              -- Bitcoin Core validation.cpp:1388 returns early before
-              -- AddUnchecked when test_accept=true — we mirror that here.
-              -- The old add+remove pattern created a race window where another
-              -- thread could observe the transaction as "in mempool" between
-              -- the insert and the subsequent remove.
-              -- BIP-339 duplicate checks (wtxid → "txn-already-in-mempool",
-              -- txid → "txn-same-nonwitness-data-in-mempool") are handled
-              -- inside testAcceptTransaction the same way addTransaction did.
+              -- W116 BUG-G6 FIX: dry-run, no TVar writes (Core validation.cpp:1388
+              -- returns before AddUnchecked when test_accept=true).
               result <- testAcceptTransaction (rsMempool server) tx
-              case result of
-                Left err -> return $ pairs $
-                  pair "txid"          (text (showHash (BlockHash (getTxIdHash txid))))  <>
-                  pair "wtxid"         (text (showHash (BlockHash (getTxIdHash wtxid)))) <>
-                  pair "allowed"       (AE.bool False)                                   <>
-                  pair "reject-reason" (text (mempoolErrorToText err))
-                Right entry -> do
-                  let vsize = meSize entry
-                      fee   = meFee entry
-                      feeRateSatPerVB = fromIntegral fee / fromIntegral vsize :: Double
-                      txidTxt  = showHash (BlockHash (getTxIdHash txid))
-                      wtxidTxt = showHash (BlockHash (getTxIdHash wtxid))
-
-                  if feeRateSatPerVB > maxFeeRate
-                    then return $ pairs $
-                           pair "txid"          (text txidTxt)             <>
-                           pair "wtxid"         (text wtxidTxt)            <>
-                           pair "allowed"       (AE.bool False)            <>
-                           pair "reject-reason" (text "max-fee-exceeded")
-                    else do
-                      let feesEnc = pairs $ pair "base" (btcAmountEnc (fromIntegral fee))
-                      return $ pairs $
-                                 pair "txid"    (text txidTxt)  <>
-                                 pair "wtxid"   (text wtxidTxt) <>
-                                 pair "allowed" (AE.bool True)  <>
-                                 pair "vsize"   (AE.int vsize)  <>
-                                 pair "fees"    feesEnc
+              return $ renderOne maxFeeRate tx result
 
     -- Emit the bare Core reject token via the shared 'mempoolRejectToken'
     -- (single source of truth, also used by sendrawtransaction), threading the
@@ -10181,6 +10284,7 @@ handleGetMempoolEntry server params
               -- Same entryToJSON as getrawmempool verbose: in-pool depends /
               -- spentby and the entry's chunk come from one pool snapshot.
               tip <- readTVarIO (hcTip (rsHeaderChain server))
+              unbroadcastSet <- getUnbroadcastSet (rsMempool server)
               (poolEntries, poolByOutpoint) <- atomically $
                 (,) <$> readTVar (mpEntries (rsMempool server))
                     <*> readTVar (mpByOutpoint (rsMempool server))
@@ -10199,7 +10303,7 @@ handleGetMempoolEntry server params
                     }
                   chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
                   enc = mempoolEntryEnc (ceHeight tip) poolEntries poolByOutpoint
-                                        chunkInfo live
+                                        chunkInfo unbroadcastSet live
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
@@ -16217,6 +16321,15 @@ computeVerificationProgress height blockTime =
       actualHeight = fromIntegral height :: Double
   in if expectedHeight <= 0 then 1.0
      else min 1.0 (actualHeight / expectedHeight)
+
+-- | Core's IsInitialBlockDownload predicate without the latch
+-- (validation.cpp): chain work below the minimum, or tip older than
+-- DEFAULT_MAX_TIP_AGE = 24h.  Args: nMinimumChainWork, tip chain work,
+-- tip timestamp, current time.
+coreIsInitialBlockDownload :: Integer -> Integer -> Word32 -> Word32 -> Bool
+coreIsInitialBlockDownload minWork tipWork tipTime now =
+  tipWork < minWork
+    || (fromIntegral tipTime :: Integer) < fromIntegral now - 24 * 60 * 60
 
 -- | Estimate if we're in Initial Block Download mode.
 -- IBD is true if the tip is more than 24 hours old (heuristic).

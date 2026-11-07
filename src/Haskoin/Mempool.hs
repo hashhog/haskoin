@@ -44,6 +44,7 @@ module Haskoin.Mempool
     -- * Transaction Operations
   , addTransaction
   , testAcceptTransaction
+  , testAcceptPackage
   , punishRelayedTxReject
   , removeTransaction
   , removeTransactionForBlock
@@ -56,6 +57,9 @@ module Haskoin.Mempool
   , getMempoolTxIds
   , getMempoolWtxids
   , getMempoolSize
+  , addUnbroadcast
+  , removeUnbroadcast
+  , getUnbroadcastSet
   , getMempoolInfo
   , getPrioritisedTransactions
   , getMempoolMinFeeRate
@@ -83,6 +87,8 @@ module Haskoin.Mempool
   , applyMaxMempoolMb
     -- * RBF (Replace-by-Fee)
   , checkReplacement
+  , checkReplacementWith
+  , evaluateReplacementRules
   , removeConflicts
   , isRbfReplaceable
   , checkAllConflictsRbfReplaceable
@@ -1474,7 +1480,35 @@ finalizeTransactionDry mp tx txid inputPairs = do
 -- it would be accepted.  The caller can read 'meFee' and 'meSize' from
 -- the returned entry to populate the RPC response.
 testAcceptTransaction :: Mempool -> Tx -> IO (Either MempoolError MempoolEntry)
-testAcceptTransaction mp tx = withAdmissionLock mp $ do
+testAcceptTransaction mp tx = withAdmissionLock mp $
+  testAcceptTransactionWith Map.empty mp tx
+
+-- | Dry-run a package (child last, parents first) the way Core's
+-- ProcessNewPackage(test_accept=true) does (validation.cpp
+-- AcceptMultipleTransactionsInternal with ATMPArgs::PackageTestAccept): every
+-- tx is judged with the outputs of the package txs before it, against the
+-- normal per-tx rules (no package-feerate rescue: PackageTestAccept has
+-- m_package_feerates=false, so a below-floor parent is rejected on its own).
+-- The first failing tx stops the run: its result is returned and the txs after
+-- it get no result.  Nothing is written to the mempool.
+testAcceptPackage :: Mempool -> [Tx] -> IO [Either MempoolError MempoolEntry]
+testAcceptPackage mp txns = withAdmissionLock mp (go Map.empty txns)
+  where
+    go _ [] = return []
+    go overlay (tx:rest) = do
+      r <- testAcceptTransactionWith overlay mp tx
+      case r of
+        Left _  -> return [r]
+        Right _ -> do
+          let overlay' = Map.union overlay (Map.fromList
+                [ (OutPoint (computeTxId tx) (fromIntegral i), o)
+                | (i, o) <- zip [0 :: Int ..] (txOutputs tx) ])
+          (r :) <$> go overlay' rest
+
+-- | 'testAcceptTransaction' without the admission lock, with extra
+-- not-yet-mempool outputs (earlier package txs) visible to input resolution.
+testAcceptTransactionWith :: Map OutPoint TxOut -> Mempool -> Tx -> IO (Either MempoolError MempoolEntry)
+testAcceptTransactionWith overlay mp tx = do
   let txid  = computeTxId tx
       wtxid = computeWtxid tx
   -- Duplicate checks (same as addTransaction)
@@ -1485,11 +1519,11 @@ testAcceptTransaction mp tx = withAdmissionLock mp $ do
       byTxid <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
       case byTxid of
         Just _ -> return $ Left ErrSameNonwitnessInMempool
-        Nothing -> testAcceptTransactionInner mp tx txid
+        Nothing -> testAcceptTransactionInner overlay mp tx txid
 
 -- | Inner dry-run validation (mirrors addTransactionInner without commits).
-testAcceptTransactionInner :: Mempool -> Tx -> TxId -> IO (Either MempoolError MempoolEntry)
-testAcceptTransactionInner mp tx txid = do
+testAcceptTransactionInner :: Map OutPoint TxOut -> Mempool -> Tx -> TxId -> IO (Either MempoolError MempoolEntry)
+testAcceptTransactionInner overlay mp tx txid = do
   case validateTransaction tx of
     Left err -> return $ Left (ErrValidationFailed err)
     Right () | isCoinbase tx -> return $ Left ErrCoinbaseNotAllowed
@@ -1519,8 +1553,11 @@ testAcceptTransactionInner mp tx txid = do
                   conflicts <- getConflicts mp tx
                   if null conflicts
                     then do
-                      inputResults <- resolveInputs mp tx
-                      case inputResults of
+                      inputResults <- forM (txInputs tx) $ \inp ->
+                        case Map.lookup (txInPrevOutput inp) overlay of
+                          Just o  -> return $ Right (txInPrevOutput inp, o)
+                          Nothing -> resolveInput mp (txInPrevOutput inp)
+                      case sequence inputResults of
                         Left err     -> return $ Left err
                         Right inputPairs -> finalizeTransactionDry mp tx txid inputPairs
                     else if mpcRBFEnabled (mpConfig mp)
@@ -1589,6 +1626,18 @@ testAcceptWithReplacement mp tx txid conflictTxIds = do
                       -- gives the same answer the commit path would.
                       finalizeTransactionDry mp tx txid inputPairs
 
+-- | Number of distinct mempool clusters touched by the direct conflicts.
+countConflictClusters :: Mempool -> [MempoolEntry] -> IO Int
+countConflictClusters mp directConflicts = do
+  entries <- readTVarIO (mpEntries mp)
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  let go _ n [] = n
+      go seen n (e:es) =
+        let t = meTxId e
+        in if Set.member t seen then go seen n es
+           else go (Set.union seen (findCluster t entries byOutpoint)) (n + 1) es
+  return (go Set.empty (0 :: Int) directConflicts)
+
 -- | Read-only evaluation of the BIP-125 replacement rules (2, 3, 3a, 4, 5)
 -- plus the no-conflict-spending gate.  Identical decision logic to
 -- 'attemptReplacement' but performs no eviction.  Returns @Right ()@ when the
@@ -1615,8 +1664,8 @@ evaluateReplacementRules mp tx conflictTxIds newFee newVsize newFeeRate = do
           return $ Left (ErrRBFNewUnconfirmedInput parent)
         Left _ ->
           return $ Left (ErrRBFNewUnconfirmedInput (head conflictTxIds))
-        Right () ->
-          case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
+        Right () -> countConflictClusters mp directConflicts >>= \nClusters ->
+          case checkReplacementWith nClusters tx directConflicts allEvictions newFee newVsize newFeeRate of
             Left (RbfInsufficientAbsoluteFee f r) -> return $ Left (ErrRBFInsufficientAbsoluteFee f r)
             Left (RbfInsufficientFeeRate r m)     -> return $ Left (ErrRBFInsufficientFeeRate r m)
             Left (RbfTooManyEvictions c m)        -> return $ Left (ErrRBFTooManyReplacements c m)
@@ -1796,6 +1845,8 @@ removeTransactionStructural mp txid = do
         -- Update size
         modifyTVar' (mpSize mp) (subtract vsize)
         modifyTVar' (mpUsage mp) (subtract (txMemUsage (meTransaction entry)))
+        -- Core CTxMemPool::removeUnchecked: m_unbroadcast_txids.erase(hash)
+        modifyTVar' (mpUnbroadcast mp) (Set.delete txid)
         accountEntryRemoved mp
 
         -- Update descendant counts for all ancestors
@@ -1901,6 +1952,23 @@ getMempoolSize mp = atomically $ do
   entries <- readTVar (mpEntries mp)
   size <- readTVar (mpSize mp)
   return (Map.size entries, size)
+
+-- | Mark a locally submitted transaction as not yet requested by any peer
+-- (Core CTxMemPool::AddUnbroadcastTx, called from BroadcastTransaction).
+-- A no-op unless the tx is currently in the pool.
+addUnbroadcast :: Mempool -> TxId -> IO ()
+addUnbroadcast mp txid = atomically $ do
+  es <- readTVar (mpEntries mp)
+  when (Map.member txid es) $ modifyTVar' (mpUnbroadcast mp) (Set.insert txid)
+
+-- | A peer asked for the tx (getdata): it is no longer unbroadcast
+-- (Core net_processing ProcessGetData -> RemoveUnbroadcastTx).
+removeUnbroadcast :: Mempool -> TxId -> IO ()
+removeUnbroadcast mp txid = atomically $ modifyTVar' (mpUnbroadcast mp) (Set.delete txid)
+
+-- | Snapshot of the unbroadcast set.
+getUnbroadcastSet :: Mempool -> IO (Set TxId)
+getUnbroadcastSet mp = readTVarIO (mpUnbroadcast mp)
 
 -- | Get mempool info (count, size, bytes, fee stats)
 getMempoolInfo :: Mempool -> IO (Int, Int, Word64, Word64)
@@ -2239,10 +2307,17 @@ checkReplacement :: Tx                -- ^ New replacement transaction
                  -> Int               -- ^ New transaction vsize
                  -> FeeRate           -- ^ New transaction feerate
                  -> Either RbfError ()
-checkReplacement _tx directConflicts allEvictions newFee newVsize newFeeRate = do
-  -- Rule 5: Check eviction count limit
-  -- bitcoin-core/src/policy/rbf.cpp:70 — GetEntriesForConflicts checks cluster count <= 100
-  let evictionCount = length allEvictions
+checkReplacement tx directConflicts allEvictions =
+  checkReplacementWith (length allEvictions) tx directConflicts allEvictions
+
+-- | 'checkReplacement' with Rule 5's count supplied by the caller.  Core v31
+-- counts the distinct clusters the replacement conflicts with directly, not
+-- the evicted transactions (policy/rbf.cpp GetEntriesForConflicts:
+-- @GetUniqueClusterCount(iters_conflicting) > MAX_REPLACEMENT_CANDIDATES@).
+checkReplacementWith :: Int -> Tx -> [MempoolEntry] -> [MempoolEntry]
+                     -> Word64 -> Int -> FeeRate -> Either RbfError ()
+checkReplacementWith evictionCount _tx directConflicts allEvictions newFee newVsize newFeeRate = do
+  -- Rule 5: Check cluster count limit
   when (evictionCount > maxReplacementEvictions) $
     Left $ RbfTooManyEvictions evictionCount maxReplacementEvictions
 
@@ -2395,7 +2470,8 @@ attemptReplacement mp tx _txid conflictTxIds newFee newVsize newFeeRate = do
           return $ Left $ ErrRBFNewUnconfirmedInput (head conflictTxIds)
         Right () ->
           -- Apply RBF rules 3, 3a, 4, 5
-          case checkReplacement tx directConflicts allEvictions newFee newVsize newFeeRate of
+          countConflictClusters mp directConflicts >>= \nClusters ->
+          case checkReplacementWith nClusters tx directConflicts allEvictions newFee newVsize newFeeRate of
             Left (RbfInsufficientAbsoluteFee newF reqF) ->
               return $ Left $ ErrRBFInsufficientAbsoluteFee newF reqF
             Left (RbfInsufficientFeeRate newR minR) ->
