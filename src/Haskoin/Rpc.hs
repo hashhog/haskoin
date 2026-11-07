@@ -468,7 +468,7 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        TxoSpender(..), TxoSpenderIndexDB,
                        txoSpenderIndexFind, txoSpenderIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
-                         putBlockHeader,
+                         putBlockHeader, putBlockHeight,
                          isUnspendable,
                          lookupUTXO, rcClear, invalidateCoinCaches, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
@@ -6099,6 +6099,7 @@ handleSubmitHeader server params =
                         -- gone after a restart.  Idempotent.
                         Right entry -> do
                           putBlockHeader (rsDB server) (ceHash entry) (ceHeader entry)
+                          persistBestHeaderRows (rsDB server) (rsHeaderChain server) entry
                           return $ RpcResponse Null Null Null
                         -- Validation failure → -25 with the reject reason.
                         Left reason -> return $ RpcResponse Null
@@ -6106,6 +6107,46 @@ handleSubmitHeader server params =
   where
     decodeFailed = RpcResponse Null
       (toJSON $ RpcError rpcDeserializationError "Block header decode failed") Null
+
+-- | Persist the height-index rows of a best header above the connected tip,
+-- so the best header survives a restart.
+--
+-- Core: AcceptBlockHeader adds the block index entry and moves
+-- m_best_header (validation.cpp ChainstateManager::AcceptBlockHeader); at
+-- startup BlockManager::LoadBlockIndex sets m_best_header back to the
+-- most-work valid entry (node/blockstorage.cpp), and getblockchaininfo
+-- reports its height as "headers" (rpc/blockchain.cpp).
+--
+-- haskoin rebuilds the best header above the connected tip from these rows
+-- ('Storage.collectPersistedHeadersAbove' in 'initHeaderChainFromDB').  The
+-- P2P headers handler writes them (app/Main.hs, "Persist header and height
+-- index"); submitheader wrote only the header row, so after a restart a
+-- submitheader best header was reloaded as an off-chain entry and
+-- "headers" fell back to the connected tip (core-regtest
+-- warden_invalidated_submit/restart/info:headers, Core 210, haskoin 208).
+--
+-- Only a header that is now the best header is written, and only rows
+-- ABOVE the connected tip: rows at or below it belong to connect / reorg,
+-- exactly as in the P2P handler.  Ancestors are written too, walking back
+-- until a row already holds the right hash, because a side-branch header
+-- can become the best header only when a later child arrives; its
+-- ancestors' rows then still name the old branch.  getblockhash and the
+-- other height-index readers stop at the connected tip, so these rows are
+-- never read as connected blocks.
+persistBestHeaderRows :: HaskoinDB -> HeaderChain -> ChainEntry -> IO ()
+persistBestHeaderRows db hc entry = do
+  best <- readTVarIO (hcTip hc)
+  when (ceHash best == ceHash entry) $ do
+    connected <- getValidatedChainTip db hc
+    entries <- readTVarIO (hcEntries hc)
+    let go e
+          | ceHeight e <= ceHeight connected = return ()
+          | otherwise = do
+              row <- getBlockHeight db (ceHeight e)
+              unless (row == Just (ceHash e)) $ do
+                putBlockHeight db (ceHeight e) (ceHash e)
+                mapM_ go (cePrev e >>= (`Map.lookup` entries))
+    go entry
 
 -- | Get mining-related information
 -- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
