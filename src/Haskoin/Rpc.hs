@@ -4657,51 +4657,57 @@ handleGetRawMempool server params = do
             ]
           rawBs = encodingToLazyByteString (pairs pairsEnc)
       return $ RpcResponse (rawJsonResult rawBs) Null Null
-  where
-    -- | Encode one mempool entry as a streaming Encoding so fee amounts
-    -- use Core's fixed-decimal format (8 fractional digits, no sci notation).
-    mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
-                    -> Map TxId (Word64, Int) -> Set.Set TxId -> MempoolEntry -> AE.Encoding
-    mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry =
-      let wtxid = computeWtxId (meTransaction entry)
-          entryHeight = meHeight entry
-          feeSat = fromIntegral (meFee entry) :: Int64
-          ancFee = fromIntegral (meAncestorFees entry) :: Int64
-          descFee = fromIntegral (meDescendantFees entry) :: Int64
-          feesEnc = pairs $
-            pair "base"       (btcAmountEnc feeSat)  <>
-            pair "modified"   (btcAmountEnc feeSat)  <>
-            pair "ancestor"   (btcAmountEnc ancFee)  <>
-            pair "descendant" (btcAmountEnc descFee) <>
-            pair "chunk"      (btcAmountEnc chunkFee)
-          -- A pool entry always belongs to a chunk; fall back to the entry
-          -- alone only if the snapshot raced a removal.
-          (chunkFeeW, chunkWeight) =
-            Map.findWithDefault (meFee entry, meAdjWeight entry) (meTxId entry) chunkInfo
-          chunkFee = fromIntegral chunkFeeW :: Int64
-          -- Core sorts depends by hex (std::set<std::string>).
-          hexIds = sort . map (showHash . BlockHash . getTxIdHash)
-          dependsHex = hexIds (mempoolParents poolEntries entry)
-          spentbyHex = hexIds (mempoolChildren poolByOutpoint entry)
-          _confirmations = if tipHeight >= entryHeight
-                           then tipHeight - entryHeight
-                           else 0
-      in pairs $
-           pair "vsize"              (AE.int (meSize entry))                          <>
-           pair "weight"             (AE.int (meSize entry * witnessScaleFactor))     <>
-           pair "time"               (AE.int64 (meTime entry))                        <>
-           pair "height"             (AE.word32 (meHeight entry))                     <>
-           pair "descendantcount"    (AE.int (meDescendantCount entry))               <>
-           pair "descendantsize"     (AE.int (meDescendantSize entry))                <>
-           pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
-           pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
-           pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
-           pair "chunkweight"        (AE.int chunkWeight)                             <>
-           pair "fees"               feesEnc                                          <>
-           pair "depends"            (AE.list text dependsHex)                        <>
-           pair "spentby"            (AE.list text spentbyHex)                        <>
-           pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
-           pair "unbroadcast"        (AE.bool (Set.member (meTxId entry) unbroadcastSet))
+
+-- | Encode one mempool entry as Core's entryToJSON (rpc/mempool.cpp) does,
+-- shared by getrawmempool verbose=true and getmempoolentry.  Streaming
+-- Encoding so fee amounts use Core's fixed-decimal format (8 fractional
+-- digits, no sci notation).
+mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
+                -> Map TxId (Word64, Int) -> Set.Set TxId -> MempoolEntry -> AE.Encoding
+mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry =
+  let wtxid = computeWtxId (meTransaction entry)
+      entryHeight = meHeight entry
+      feeSat = fromIntegral (meFee entry) :: Int64
+      ancFee = fromIntegral (meAncestorFees entry) :: Int64
+      descFee = fromIntegral (meDescendantFees entry) :: Int64
+      feesEnc = pairs $
+        pair "base"       (btcAmountEnc feeSat)  <>
+        pair "modified"   (btcAmountEnc feeSat)  <>
+        pair "ancestor"   (btcAmountEnc ancFee)  <>
+        pair "descendant" (btcAmountEnc descFee) <>
+        pair "chunk"      (btcAmountEnc chunkFee)
+      -- A pool entry always belongs to a chunk; fall back to the entry
+      -- alone only if the snapshot raced a removal.
+      (chunkFeeW, chunkWeight) =
+        Map.findWithDefault (meFee entry, meAdjWeight entry) (meTxId entry) chunkInfo
+      chunkFee = fromIntegral chunkFeeW :: Int64
+      -- Core reports GetTxWeight(tx), the real serialized weight, not
+      -- vsize * 4 (which rounds up and ignores the sigop adjustment).
+      entryWeight = txBaseSize (meTransaction entry) * (witnessScaleFactor - 1)
+                    + txTotalSize (meTransaction entry)
+      -- Core sorts depends by hex (std::set<std::string>).
+      hexIds = sort . map (showHash . BlockHash . getTxIdHash)
+      dependsHex = hexIds (mempoolParents poolEntries entry)
+      spentbyHex = hexIds (mempoolChildren poolByOutpoint entry)
+      _confirmations = if tipHeight >= entryHeight
+                       then tipHeight - entryHeight
+                       else 0
+  in pairs $
+       pair "vsize"              (AE.int (meSize entry))                          <>
+       pair "weight"             (AE.int entryWeight)                             <>
+       pair "time"               (AE.int64 (meTime entry))                        <>
+       pair "height"             (AE.word32 (meHeight entry))                     <>
+       pair "descendantcount"    (AE.int (meDescendantCount entry))               <>
+       pair "descendantsize"     (AE.int (meDescendantSize entry))                <>
+       pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
+       pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
+       pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
+       pair "chunkweight"        (AE.int chunkWeight)                             <>
+       pair "fees"               feesEnc                                          <>
+       pair "depends"            (AE.list text dependsHex)                        <>
+       pair "spentby"            (AE.list text spentbyHex)                        <>
+       pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
+       pair "unbroadcast"        (AE.bool (Set.member (meTxId entry) unbroadcastSet))
 
 -- | getorphantxs — show transactions in the tx orphanage.
 --
@@ -10275,50 +10281,29 @@ handleGetMempoolEntry server params
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
             Just entry -> do
-              isUnbroadcast <- Set.member txid <$> getUnbroadcastSet (rsMempool server)
-              -- Get ancestor/descendant info
+              -- Same entryToJSON as getrawmempool verbose: in-pool depends /
+              -- spentby and the entry's chunk come from one pool snapshot.
+              tip <- readTVarIO (hcTip (rsHeaderChain server))
+              unbroadcastSet <- getUnbroadcastSet (rsMempool server)
+              (poolEntries, poolByOutpoint) <- atomically $
+                (,) <$> readTVar (mpEntries (rsMempool server))
+                    <*> readTVar (mpByOutpoint (rsMempool server))
+              -- The stored ancestor/descendant aggregates can lag a reorg or
+              -- invalidateblock, so (as before) recompute them from the live
+              -- graph; the shared encoder then only adds depends/spentby/chunk.
               ancestors <- getAncestors (rsMempool server) (meTransaction entry)
               descendants <- getDescendants (rsMempool server) txid
-
-              let ancestorCount = length ancestors + 1  -- Include self
-                  ancestorSize = sum (map meSize ancestors) + meSize entry
-                  ancestorFees = sum (map meFee ancestors) + meFee entry
-
-                  descendantCount = length descendants + 1
-                  descendantSize = sum (map meSize descendants) + meSize entry
-                  descendantFees = sum (map meFee descendants) + meFee entry
-
-                  -- Calculate weight
-                  baseSize = txBaseSize (meTransaction entry)
-                  totalSize = txTotalSize (meTransaction entry)
-                  weight = baseSize * (witnessScaleFactor - 1) + totalSize
-
-                  -- Get parent txids (depends)
-                  depends = map (\e -> showHash (BlockHash (getTxIdHash (meTxId e)))) ancestors
-
-              let feeSat    = fromIntegral (meFee entry) :: Int64
-                  ancFeeSat = fromIntegral ancestorFees :: Int64
-                  descFeeSat = fromIntegral descendantFees :: Int64
-                  feesEnc   = pairs $
-                                pair "base"       (btcAmountEnc feeSat)     <>
-                                pair "modified"   (btcAmountEnc feeSat)     <>
-                                pair "ancestor"   (btcAmountEnc ancFeeSat)  <>
-                                pair "descendant" (btcAmountEnc descFeeSat)
-                  enc = pairs $
-                          pair "vsize"              (AE.int (meSize entry))                           <>
-                          pair "weight"             (AE.int weight)                                   <>
-                          pair "time"               (AE.int64 (meTime entry))                         <>
-                          pair "height"             (AE.word32 (meHeight entry))                      <>
-                          pair "descendantcount"    (AE.int descendantCount)                          <>
-                          pair "descendantsize"     (AE.int descendantSize)                           <>
-                          pair "ancestorcount"      (AE.int ancestorCount)                            <>
-                          pair "ancestorsize"       (AE.int ancestorSize)                             <>
-                          pair "wtxid"              (text (showHash (BlockHash (getTxIdHash (computeWtxId (meTransaction entry)))))) <>
-                          pair "fees"               feesEnc                                           <>
-                          pair "depends"            (AE.list text depends)                            <>
-                          pair "spentby"            (AE.list text [])                                 <>
-                          pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                      <>
-                          pair "unbroadcast"        (AE.bool isUnbroadcast)
+              let live = entry
+                    { meAncestorCount    = length ancestors + 1
+                    , meAncestorSize     = sum (map meSize ancestors) + meSize entry
+                    , meAncestorFees     = sum (map meFee ancestors) + meFee entry
+                    , meDescendantCount  = length descendants + 1
+                    , meDescendantSize   = sum (map meSize descendants) + meSize entry
+                    , meDescendantFees   = sum (map meFee descendants) + meFee entry
+                    }
+                  chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
+                  enc = mempoolEntryEnc (ceHeight tip) poolEntries poolByOutpoint
+                                        chunkInfo unbroadcastSet live
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
