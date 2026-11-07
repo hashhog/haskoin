@@ -4062,7 +4062,7 @@ handleGetRawTransactionLookup server txid verbosity _mBlockHashText mBlockHashPa
                       mTxLoc <- getTxIndex (rsDB server) txid
                       case mTxLoc of
                         Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash.") Null
+                          (toJSON $ RpcError (-5) "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.") Null
                         Just txLoc -> do
                           mBlock <- getBlock (rsDB server) (txLocBlock txLoc)
                           case mBlock of
