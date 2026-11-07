@@ -350,6 +350,28 @@ test-suite rawtx-messages
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+test-suite rawtx-notfound
+  type:          exitcode-stdio-1.0
+  main-is:       RawTxNotFoundMain.hs
+  other-modules: RawTxNotFoundSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite gbt-order
   type:          exitcode-stdio-1.0
   main-is:       GbtOrderMain.hs
@@ -367,7 +389,48 @@ test-suite gbt-order
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- refill-20261106-haskoin-consensus: own target (no shared Spec.hs edit).
+test-suite submit-checkblock-first
+  type:          exitcode-stdio-1.0
+  main-is:       SubmitCheckBlockFirstMain.hs
+  other-modules: SubmitCheckBlockFirstSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- policy-cause-09: own target so the spec needs no edit to shared lists.
+test-suite tma-details
+  type:          exitcode-stdio-1.0
+  main-is:       TmaDetailsMain.hs
+  other-modules: TmaDetailsSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite gbt-sigops
   type:          exitcode-stdio-1.0
   main-is:       GbtSigopsMain.hs
@@ -456,12 +519,55 @@ test-suite mempool-bounded-cluster
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- refill-20261106-haskoin-consensus: own target (no shared Spec.hs edit).
+test-suite rest-mempool-info
+  type:          exitcode-stdio-1.0
+  main-is:       RestMempoolInfoMain.hs
+  other-modules: RestMempoolInfoSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+               , wai
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- refill-20261104-haskoin-rpc: own target so the spec needs no edit to the
 -- shared Spec.hs / haskoin-test other-modules list.
 test-suite getrawmempool-verbose
   type:          exitcode-stdio-1.0
   main-is:       GetRawMempoolVerboseMain.hs
   other-modules: GetRawMempoolVerboseSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- policy-cause-07: own target (no shared Spec.hs edit).
+test-suite getmempoolentry
+  type:          exitcode-stdio-1.0
+  main-is:       GetMempoolEntryMain.hs
+  other-modules: GetMempoolEntrySpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin
@@ -524,6 +630,28 @@ test-suite decode-strict
   ghc-options:     -Wall -O1 -threaded
 
 -- policy-cause-17: own suite so the shared test list is not touched.
+test-suite operator-shape
+  type:          exitcode-stdio-1.0
+  main-is:       OperatorShapeMain.hs
+  other-modules: OperatorShapeSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , network
+               , stm
+               , temporary
+               , text
+               , unix
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite regtest-ibd
   type:          exitcode-stdio-1.0
   main-is:       RegtestIbdMain.hs
@@ -544,6 +672,30 @@ test-suite regtest-ibd
                , temporary
   default-language: Haskell2010
   ghc-options:     -Wall -O2
+
+-- getblockchaininfo.headers keeps a submitheader best header across a
+-- restart (core-regtest warden_invalidated_submit/*/info:headers).
+test-suite restart-best-header
+  type:          exitcode-stdio-1.0
+  main-is:       RestartBestHeaderMain.hs
+  other-modules: RestartBestHeaderSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
 
 test-suite service-flags
   type:          exitcode-stdio-1.0

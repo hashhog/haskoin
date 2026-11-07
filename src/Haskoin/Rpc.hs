@@ -113,6 +113,7 @@ module Haskoin.Rpc
   , chainstateSnapshotReport
     -- * getpeerinfo per-peer encoder (exported for testing — Core v31.99 wire shape)
   , peerInfoToEncoding
+  , peerInfoToEncodingWith
     -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
   , handleGetBlockFromPeer
   , decideGetBlockFromPeer
@@ -468,7 +469,7 @@ import Haskoin.Index (BlockFilter(..), BlockFilterType(..), computeBlockFilter,
                        TxoSpender(..), TxoSpenderIndexDB,
                        txoSpenderIndexFind, txoSpenderIndexTipHeight)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
-                         putBlockHeader,
+                         putBlockHeader, putBlockHeight,
                          isUnspendable,
                          lookupUTXO, rcClear, invalidateCoinCaches, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
@@ -509,12 +510,12 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          sockAddrToHostPort, sockAddrToString,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList,
-                         getMappedASFromSockAddr,
+                         getMappedASFromSockAddr, sockAddrToNetworkAddress,
                          -- AddrMan dump / inject for getnodeaddresses + addpeeraddress
                          AddrMan(..), AddrInfo(..), addAddress, isRoutable)
 import Haskoin.Daemon (DebugCategory(..), parseDebugCategory,
                        DebugSet, globalDebugSet, setGlobalDebugSet)
-import Network.Socket (SockAddr(..))
+import Network.Socket (SockAddr(..), getSocketName)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
                          addTransaction, testAcceptTransaction, testAcceptPackage,
@@ -4078,7 +4079,7 @@ handleGetRawTransactionLookup server txid verbosity _mBlockHashText mBlockHashPa
                       mTxLoc <- getTxIndex (rsDB server) txid
                       case mTxLoc of
                         Nothing -> return $ RpcResponse Null
-                          (toJSON $ RpcError (-5) "No such mempool or blockchain transaction. Use -txindex or provide a block hash.") Null
+                          (toJSON $ RpcError (-5) "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.") Null
                         Just txLoc -> do
                           mBlock <- getBlock (rsDB server) (txLocBlock txLoc)
                           case mBlock of
@@ -4491,6 +4492,16 @@ handleDecodeRawTransaction server params = do
 -- | Get information about the mempool
 handleGetMempoolInfo :: RpcServer -> IO RpcResponse
 handleGetMempoolInfo server = do
+  rawBs <- mempoolInfoJson server
+  return $ RpcResponse (rawJsonResult rawBs) Null Null
+
+-- | The getmempoolinfo object, shared by the RPC and by REST
+-- @/rest/mempool/info.json@: Core builds both from one function,
+-- MempoolInfoToJSON (rpc/mempool.cpp:1043; rest.cpp:825 rest_mempool), so
+-- the REST body carries the same fields, in the same order and in the same
+-- BTC/kvB units, as the RPC result.
+mempoolInfoJson :: RpcServer -> IO BL.ByteString
+mempoolInfoJson server = do
   (count, size) <- getMempoolSize (rsMempool server)
   -- Calculate total fees from all mempool entries
   txids <- getMempoolTxIds (rsMempool server)
@@ -4527,8 +4538,7 @@ handleGetMempoolInfo server = do
               pair "limitclustercount"   (AE.int 64)                                <>
               pair "limitclustersize"    (AE.int 101000)                            <>
               pair "optimal"             (AE.bool True)
-      rawBs = encodingToLazyByteString enc
-  return $ RpcResponse (rawJsonResult rawBs) Null Null
+  return (encodingToLazyByteString enc)
 
 -- | prioritisetransaction "txid" ( dummy ) fee_delta
 --
@@ -4674,51 +4684,57 @@ handleGetRawMempool server params = do
             ]
           rawBs = encodingToLazyByteString (pairs pairsEnc)
       return $ RpcResponse (rawJsonResult rawBs) Null Null
-  where
-    -- | Encode one mempool entry as a streaming Encoding so fee amounts
-    -- use Core's fixed-decimal format (8 fractional digits, no sci notation).
-    mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
-                    -> Map TxId (Word64, Int) -> Set.Set TxId -> MempoolEntry -> AE.Encoding
-    mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry =
-      let wtxid = computeWtxId (meTransaction entry)
-          entryHeight = meHeight entry
-          feeSat = fromIntegral (meFee entry) :: Int64
-          ancFee = fromIntegral (meAncestorFees entry) :: Int64
-          descFee = fromIntegral (meDescendantFees entry) :: Int64
-          feesEnc = pairs $
-            pair "base"       (btcAmountEnc feeSat)  <>
-            pair "modified"   (btcAmountEnc feeSat)  <>
-            pair "ancestor"   (btcAmountEnc ancFee)  <>
-            pair "descendant" (btcAmountEnc descFee) <>
-            pair "chunk"      (btcAmountEnc chunkFee)
-          -- A pool entry always belongs to a chunk; fall back to the entry
-          -- alone only if the snapshot raced a removal.
-          (chunkFeeW, chunkWeight) =
-            Map.findWithDefault (meFee entry, meAdjWeight entry) (meTxId entry) chunkInfo
-          chunkFee = fromIntegral chunkFeeW :: Int64
-          -- Core sorts depends by hex (std::set<std::string>).
-          hexIds = sort . map (showHash . BlockHash . getTxIdHash)
-          dependsHex = hexIds (mempoolParents poolEntries entry)
-          spentbyHex = hexIds (mempoolChildren poolByOutpoint entry)
-          _confirmations = if tipHeight >= entryHeight
-                           then tipHeight - entryHeight
-                           else 0
-      in pairs $
-           pair "vsize"              (AE.int (meSize entry))                          <>
-           pair "weight"             (AE.int (meSize entry * witnessScaleFactor))     <>
-           pair "time"               (AE.int64 (meTime entry))                        <>
-           pair "height"             (AE.word32 (meHeight entry))                     <>
-           pair "descendantcount"    (AE.int (meDescendantCount entry))               <>
-           pair "descendantsize"     (AE.int (meDescendantSize entry))                <>
-           pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
-           pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
-           pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
-           pair "chunkweight"        (AE.int chunkWeight)                             <>
-           pair "fees"               feesEnc                                          <>
-           pair "depends"            (AE.list text dependsHex)                        <>
-           pair "spentby"            (AE.list text spentbyHex)                        <>
-           pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
-           pair "unbroadcast"        (AE.bool (Set.member (meTxId entry) unbroadcastSet))
+
+-- | Encode one mempool entry as Core's entryToJSON (rpc/mempool.cpp) does,
+-- shared by getrawmempool verbose=true and getmempoolentry.  Streaming
+-- Encoding so fee amounts use Core's fixed-decimal format (8 fractional
+-- digits, no sci notation).
+mempoolEntryEnc :: Word32 -> Map TxId MempoolEntry -> Map OutPoint TxId
+                -> Map TxId (Word64, Int) -> Set.Set TxId -> MempoolEntry -> AE.Encoding
+mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet entry =
+  let wtxid = computeWtxId (meTransaction entry)
+      entryHeight = meHeight entry
+      feeSat = fromIntegral (meFee entry) :: Int64
+      ancFee = fromIntegral (meAncestorFees entry) :: Int64
+      descFee = fromIntegral (meDescendantFees entry) :: Int64
+      feesEnc = pairs $
+        pair "base"       (btcAmountEnc feeSat)  <>
+        pair "modified"   (btcAmountEnc feeSat)  <>
+        pair "ancestor"   (btcAmountEnc ancFee)  <>
+        pair "descendant" (btcAmountEnc descFee) <>
+        pair "chunk"      (btcAmountEnc chunkFee)
+      -- A pool entry always belongs to a chunk; fall back to the entry
+      -- alone only if the snapshot raced a removal.
+      (chunkFeeW, chunkWeight) =
+        Map.findWithDefault (meFee entry, meAdjWeight entry) (meTxId entry) chunkInfo
+      chunkFee = fromIntegral chunkFeeW :: Int64
+      -- Core reports GetTxWeight(tx), the real serialized weight, not
+      -- vsize * 4 (which rounds up and ignores the sigop adjustment).
+      entryWeight = txBaseSize (meTransaction entry) * (witnessScaleFactor - 1)
+                    + txTotalSize (meTransaction entry)
+      -- Core sorts depends by hex (std::set<std::string>).
+      hexIds = sort . map (showHash . BlockHash . getTxIdHash)
+      dependsHex = hexIds (mempoolParents poolEntries entry)
+      spentbyHex = hexIds (mempoolChildren poolByOutpoint entry)
+      _confirmations = if tipHeight >= entryHeight
+                       then tipHeight - entryHeight
+                       else 0
+  in pairs $
+       pair "vsize"              (AE.int (meSize entry))                          <>
+       pair "weight"             (AE.int entryWeight)                             <>
+       pair "time"               (AE.int64 (meTime entry))                        <>
+       pair "height"             (AE.word32 (meHeight entry))                     <>
+       pair "descendantcount"    (AE.int (meDescendantCount entry))               <>
+       pair "descendantsize"     (AE.int (meDescendantSize entry))                <>
+       pair "ancestorcount"      (AE.int (meAncestorCount entry))                 <>
+       pair "ancestorsize"       (AE.int (meAncestorSize entry))                  <>
+       pair "wtxid"              (text (showHash (BlockHash (getTxIdHash wtxid))))<>
+       pair "chunkweight"        (AE.int chunkWeight)                             <>
+       pair "fees"               feesEnc                                          <>
+       pair "depends"            (AE.list text dependsHex)                        <>
+       pair "spentby"            (AE.list text spentbyHex)                        <>
+       pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                     <>
+       pair "unbroadcast"        (AE.bool (Set.member (meTxId entry) unbroadcastSet))
 
 -- | getorphantxs — show transactions in the tx orphanage.
 --
@@ -5157,8 +5173,17 @@ handleGetNetworkInfo server = do
 handleGetPeerInfo :: RpcServer -> IO RpcResponse
 handleGetPeerInfo server = do
   peers <- getConnectedPeers (rsPeerMgr server)
+  -- Core rpc/net.cpp "addrbind": the local (bind) address of the peer's
+  -- socket, present when valid.  Read from the live socket, in the same
+  -- Map order 'getConnectedPeers' used so the ids line up.
+  pcs <- readTVarIO (pmPeers (rsPeerMgr server))
+  binds <- forM peers $ \(a, _) -> case Map.lookup a pcs of
+    Nothing -> return Nothing
+    Just pc -> (Just <$> getSocketName (pcSocket pc))
+                 `catch` (\(_ :: SomeException) -> return Nothing)
   let asmapData = rsAsmapData server
-      peerEncs  = zipWith (peerInfoToEncoding asmapData) [0..] peers
+      peerEncs  = zipWith3 (\i b p -> peerInfoToEncodingWith (b >>= sockAddrText) asmapData i p)
+                    [0..] binds peers
       rawBs     = encodingToLazyByteString (AE.list id peerEncs)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
@@ -5168,7 +5193,30 @@ handleGetPeerInfo server = do
 -- set + ordering (rpc/net.cpp). Field order matters: aeson's 'pairs'
 -- preserves declaration order, mirroring Core's pushKV sequence.
 peerInfoToEncoding :: ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
-peerInfoToEncoding asmapData idx (addr, info) =
+peerInfoToEncoding = peerInfoToEncodingWith Nothing
+
+-- | @ip:port@ of a P2P 'NetworkAddress', or 'Nothing' when the address is
+-- not valid (the all-zero address), as Core's @CService::IsValid@.  Only
+-- IPv4-mapped addresses are rendered; others yield 'Nothing'.
+networkAddressText :: NetworkAddress -> Maybe Text
+networkAddressText na
+  | BS.length a /= 16 = Nothing
+  | BS.take 12 a /= BS.pack [0,0,0,0,0,0,0,0,0,0,0xff,0xff] = Nothing
+  | BS.drop 12 a == BS.pack [0,0,0,0] = Nothing
+  | otherwise = Just $ T.intercalate "." (map (T.pack . show) (BS.unpack (BS.drop 12 a)))
+                         <> ":" <> T.pack (show (naPort na))
+  where a = naAddress na
+
+sockAddrText :: SockAddr -> Maybe Text
+sockAddrText sa = sockAddrToNetworkAddress 0 sa >>= networkAddressText
+
+-- | 'peerInfoToEncoding' with the connection's local bind address
+-- (Core's @addrbind@, rpc/net.cpp) supplied by the caller, which owns the
+-- socket.  @addrlocal@ is the address the peer reported for us in its
+-- version message (Core @CNode::SetAddrLocal@, net_processing.cpp), emitted
+-- when valid.  Both sit directly after @addr@, as in Core.
+peerInfoToEncodingWith :: Maybe Text -> ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
+peerInfoToEncodingWith mBind asmapData idx (addr, info) =
       let services = piServices info
           serviceNames :: [Text]
           serviceNames = catMaybes
@@ -5199,6 +5247,9 @@ peerInfoToEncoding asmapData idx (addr, info) =
       in pairs $
            pair "id"                      (AE.int idx)                                  <>
            pair "addr"                    (text (T.pack (show addr)))                   <>
+           maybe mempty (pair "addrbind" . text) mBind                                  <>
+           maybe mempty (pair "addrlocal" . text)
+             (piVersion info >>= networkAddressText . vAddrRecv)                        <>
            pair "network"                 (text networkLabel)                            <>
            pair "services"                (text (T.pack (printf "%016x" services)))     <>
            pair "servicesnames"           (AE.list text serviceNames)                   <>
@@ -6116,6 +6167,7 @@ handleSubmitHeader server params =
                         -- gone after a restart.  Idempotent.
                         Right entry -> do
                           putBlockHeader (rsDB server) (ceHash entry) (ceHeader entry)
+                          persistBestHeaderRows (rsDB server) (rsHeaderChain server) entry
                           return $ RpcResponse Null Null Null
                         -- Validation failure → -25 with the reject reason.
                         Left reason -> return $ RpcResponse Null
@@ -6123,6 +6175,47 @@ handleSubmitHeader server params =
   where
     decodeFailed = RpcResponse Null
       (toJSON $ RpcError rpcDeserializationError "Block header decode failed") Null
+
+-- | Persist the height-index rows of a best header above the connected tip,
+-- so the best header survives a restart.
+--
+-- Core: AcceptBlockHeader adds the block index entry and moves
+-- m_best_header (validation.cpp ChainstateManager::AcceptBlockHeader); at
+-- startup BlockManager::LoadBlockIndex sets m_best_header back to the
+-- most-work valid entry (node/blockstorage.cpp), and getblockchaininfo
+-- reports its height as "headers" (rpc/blockchain.cpp).
+--
+-- haskoin rebuilds the best header above the connected tip from these rows
+-- ('Storage.collectPersistedHeadersAbove' in 'initHeaderChainFromDB').  The
+-- P2P headers handler writes them (app/Main.hs, "Persist header and height
+-- index"); submitheader wrote only the header row, so after a restart a
+-- submitheader best header was reloaded as an off-chain entry and
+-- "headers" fell back to the connected tip (core-regtest
+-- warden_invalidated_submit/restart/info:headers, Core 210, haskoin 208).
+--
+-- Only a header that is now the best header is written, and only rows
+-- ABOVE the connected tip: rows at or below it belong to connect / reorg,
+-- exactly as in the P2P handler.  Ancestors are written too, all the way
+-- down to the connected tip, because a side-branch header can become the
+-- best header only when a later child arrives; its ancestors' rows then
+-- still name the old branch.  The walk does not stop at the first row that
+-- already matches: rows are rewritten one height at a time (here and in
+-- the P2P handler), so a matching row says nothing about the rows below
+-- it.  Only rows that differ are written.
+persistBestHeaderRows :: HaskoinDB -> HeaderChain -> ChainEntry -> IO ()
+persistBestHeaderRows db hc entry = do
+  best <- readTVarIO (hcTip hc)
+  when (ceHash best == ceHash entry) $ do
+    connected <- getValidatedChainTip db hc
+    entries <- readTVarIO (hcEntries hc)
+    let go e
+          | ceHeight e <= ceHeight connected = return ()
+          | otherwise = do
+              row <- getBlockHeight db (ceHeight e)
+              unless (row == Just (ceHash e)) $
+                putBlockHeight db (ceHeight e) (ceHash e)
+              mapM_ go (cePrev e >>= (`Map.lookup` entries))
+    go entry
 
 -- | Get mining-related information
 -- difficulty uses Core-parity %.16g formatting (difficultyStr / FFI snprintf).
@@ -9923,7 +10016,10 @@ handleTestMempoolAccept server params
       (toJSON $ RpcError rpcInvalidParams "Missing rawtxs parameter") Null
     Just txArray -> do
       -- Parse maxfeerate (sat/vB, default 0.10 BTC/kvB = 10000 sat/vB)
+      -- maxfeerate 0 lifts the cap (Core rpc/mempool.cpp: the cap applies only
+      -- when the computed max fee is non-zero).
       let maxFeeRateSatPerVB = case extractParam params 1 :: Maybe Double of
+            Just 0 -> 1 / 0  -- no cap
             Just rate -> rate * 100000  -- BTC/kvB to sat/vB
             Nothing -> 10000.0  -- Default 0.10 BTC/kvB
 
@@ -9985,11 +10081,7 @@ handleTestMempoolAccept server params
       let txidTxt  = showHash (BlockHash (getTxIdHash (computeTxId tx)))
           wtxidTxt = showHash (BlockHash (getTxIdHash (computeWtxId tx)))
       in case result of
-        Left err -> pairs $
-          pair "txid"          (text txidTxt)  <>
-          pair "wtxid"         (text wtxidTxt) <>
-          pair "allowed"       (AE.bool False) <>
-          pair "reject-reason" (text (mempoolErrorToText err))
+        Left err -> rejectEnc txidTxt wtxidTxt (mempoolErrorToText err)
         Right entry
           | fromIntegral (meFee entry) / fromIntegral (meSize entry) > maxFeeRate ->
               pairs $ pair "txid" (text txidTxt) <> pair "wtxid" (text wtxidTxt) <>
@@ -10000,6 +10092,25 @@ handleTestMempoolAccept server params
                       pair "allowed" (AE.bool True) <>
                       pair "vsize" (AE.int (meSize entry)) <>
                       pair "fees" (feesEncoding entry (computeWtxId tx))
+
+    -- Core rpc/mempool.cpp: a rejected tx carries reject-reason plus
+    -- reject-details (TxValidationState::ToString); only TX_MISSING_INPUTS is
+    -- reduced to the bare "missing-inputs" reason.  haskoin keeps no separate
+    -- debug string, so details are emitted only for the states Core builds
+    -- WITHOUT a debug message (validation.cpp PreChecks: txn-already-in-mempool,
+    -- txn-same-nonwitness-data-in-mempool, txn-already-known), where
+    -- ToString() is the bare token; elsewhere Core appends ", <debug>" that we
+    -- cannot reproduce, so the key stays absent rather than carry a wrong value.
+    rejectEnc :: Text -> Text -> Text -> AE.Encoding
+    rejectEnc txidTxt wtxidTxt reason = pairs $
+      pair "txid"          (text txidTxt)  <>
+      pair "wtxid"         (text wtxidTxt) <>
+      pair "allowed"       (AE.bool False) <>
+      pair "reject-reason" (text reason)   <>
+      (if reason `elem` [ "txn-already-in-mempool"
+                        , "txn-same-nonwitness-data-in-mempool"
+                        , "txn-already-known" ]
+         then pair "reject-details" (text reason) else mempty)
 
     feesEncoding :: MempoolEntry -> TxId -> AE.Encoding
     feesEncoding entry wtxid = pairs $
@@ -10024,7 +10135,20 @@ handleTestMempoolAccept server params
               -- W116 BUG-G6 FIX: dry-run, no TVar writes (Core validation.cpp:1388
               -- returns before AddUnchecked when test_accept=true).
               result <- testAcceptTransaction (rsMempool server) tx
-              return $ renderOne maxFeeRate tx result
+              -- Core validation.cpp PreChecks: when an input is missing but an
+              -- output of this very tx is already in the coins cache, the tx is
+              -- confirmed -> "txn-already-known" (TX_CONFLICT), not missing-inputs.
+              let txid = computeTxId tx
+              known <- case result of
+                Left (ErrMissingInput _) -> or <$> mapM
+                  (\i -> isJust <$> lookupUTXO (rsUTXOCache server) (OutPoint txid (fromIntegral i)))
+                  [0 .. length (txOutputs tx) - 1]
+                _ -> return False
+              return $ if known
+                then rejectEnc (showHash (BlockHash (getTxIdHash txid)))
+                               (showHash (BlockHash (getTxIdHash (computeWtxId tx))))
+                               "txn-already-known"
+                else renderOne maxFeeRate tx result
 
     -- Emit the bare Core reject token via the shared 'mempoolRejectToken'
     -- (single source of truth, also used by sendrawtransaction), threading the
@@ -10292,56 +10416,33 @@ handleGetMempoolEntry server params
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidAddressOrKey "Transaction not in mempool") Null
             Just entry -> do
-              isUnbroadcast <- Set.member txid <$> getUnbroadcastSet (rsMempool server)
-              -- Get ancestor/descendant info: Core's ancestorcount /
-              -- descendantcount cover ALL in-pool ancestors / descendants
-              -- (CTxMemPool::CalculateMemPoolAncestors), not just parents and
-              -- children; a three-spend chain gives the leaf ancestorcount 3.
+              -- Same entryToJSON as getrawmempool verbose: in-pool depends /
+              -- spentby and the entry's chunk come from one pool snapshot.
+              tip <- readTVarIO (hcTip (rsHeaderChain server))
+              unbroadcastSet <- getUnbroadcastSet (rsMempool server)
+              (poolEntries, poolByOutpoint) <- atomically $
+                (,) <$> readTVar (mpEntries (rsMempool server))
+                    <*> readTVar (mpByOutpoint (rsMempool server))
+              -- The stored ancestor/descendant aggregates can lag a reorg or
+              -- invalidateblock, so recompute them from the live graph.  Core's
+              -- ancestorcount / descendantcount cover ALL in-pool ancestors /
+              -- descendants (CTxMemPool::CalculateMemPoolAncestors), not just
+              -- parents and children: a three-spend chain gives the leaf
+              -- ancestorcount 3.  depends stays the direct in-pool parents
+              -- (the shared encoder's mempoolParents, Core's GetMemPoolParents).
               ancestors <- getAncestorsRecursive (rsMempool server) (meTransaction entry)
               descendants <- getDescendantsOfEntry (rsMempool server) txid
-              -- depends stays the DIRECT in-pool parents (Core entryToJSON
-              -- GetMemPoolParents).
-              parents <- getAncestors (rsMempool server) (meTransaction entry)
-
-              let ancestorCount = length ancestors + 1  -- Include self
-                  ancestorSize = sum (map meSize ancestors) + meSize entry
-                  ancestorFees = sum (map meFee ancestors) + meFee entry
-
-                  descendantCount = length descendants + 1
-                  descendantSize = sum (map meSize descendants) + meSize entry
-                  descendantFees = sum (map meFee descendants) + meFee entry
-
-                  -- Calculate weight
-                  baseSize = txBaseSize (meTransaction entry)
-                  totalSize = txTotalSize (meTransaction entry)
-                  weight = baseSize * (witnessScaleFactor - 1) + totalSize
-
-                  -- Get parent txids (depends)
-                  depends = map (\e -> showHash (BlockHash (getTxIdHash (meTxId e)))) parents
-
-              let feeSat    = fromIntegral (meFee entry) :: Int64
-                  ancFeeSat = fromIntegral ancestorFees :: Int64
-                  descFeeSat = fromIntegral descendantFees :: Int64
-                  feesEnc   = pairs $
-                                pair "base"       (btcAmountEnc feeSat)     <>
-                                pair "modified"   (btcAmountEnc feeSat)     <>
-                                pair "ancestor"   (btcAmountEnc ancFeeSat)  <>
-                                pair "descendant" (btcAmountEnc descFeeSat)
-                  enc = pairs $
-                          pair "vsize"              (AE.int (meSize entry))                           <>
-                          pair "weight"             (AE.int weight)                                   <>
-                          pair "time"               (AE.int64 (meTime entry))                         <>
-                          pair "height"             (AE.word32 (meHeight entry))                      <>
-                          pair "descendantcount"    (AE.int descendantCount)                          <>
-                          pair "descendantsize"     (AE.int descendantSize)                           <>
-                          pair "ancestorcount"      (AE.int ancestorCount)                            <>
-                          pair "ancestorsize"       (AE.int ancestorSize)                             <>
-                          pair "wtxid"              (text (showHash (BlockHash (getTxIdHash (computeWtxId (meTransaction entry)))))) <>
-                          pair "fees"               feesEnc                                           <>
-                          pair "depends"            (AE.list text depends)                            <>
-                          pair "spentby"            (AE.list text [])                                 <>
-                          pair "bip125-replaceable" (AE.bool (meRBFOptIn entry))                      <>
-                          pair "unbroadcast"        (AE.bool isUnbroadcast)
+              let live = entry
+                    { meAncestorCount    = length ancestors + 1
+                    , meAncestorSize     = sum (map meSize ancestors) + meSize entry
+                    , meAncestorFees     = sum (map meFee ancestors) + meFee entry
+                    , meDescendantCount  = length descendants + 1
+                    , meDescendantSize   = sum (map meSize descendants) + meSize entry
+                    , meDescendantFees   = sum (map meFee descendants) + meFee entry
+                    }
+                  chunkInfo = mempoolChunkInfo poolEntries poolByOutpoint
+                  enc = mempoolEntryEnc (ceHeight tip) poolEntries poolByOutpoint
+                                        chunkInfo unbroadcastSet live
               return $ RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
@@ -14527,7 +14628,7 @@ handleGetNetTotals _server = do
 -- RPC_TYPE_ERROR (-3). We accept the number (so the type check matches)
 -- and do not sleep — a caller-supplied wait must not pin an RPC thread.
 -- Returns:
---   "Bitcoin server stopping"
+--   "Bitcoin Core stopping"
 -- | Ask the node to shut down through the SIGTERM path: after a short delay
 -- (so the caller's RPC reply is written first) raise SIGTERM in our own
 -- process. app/Main.hs installs the sigTERM handler that fills shutdownVar,
@@ -14553,7 +14654,7 @@ handleStop _server params =
       -- node kept running (no flush, no clean exit).
       requestNodeShutdown
       -- Return the standard message immediately
-      return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
+      return $ RpcResponse (toJSON ("Bitcoin Core stopping" :: Text)) Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool persistence RPCs (Bitcoin Core compatible)
@@ -16903,21 +17004,15 @@ handleRestMempoolInfo server pathPart = do
 
   case format of
     RestJson -> do
-      (count, size) <- getMempoolSize (rsMempool server)
-      let mpCfg = mpConfig (rsMempool server)
-          jsonResult = object
-            [ "loaded" .= True
-            , "size" .= count
-            , "bytes" .= size
-            , "usage" .= size
-            , "maxmempool" .= mpcMaxSize mpCfg
-            -- Coupled to the real (sat/kvB-native) relay floor (100 sat/kvB).
-            , "mempoolminfee" .= getFeeRate (mpcMinFeeRate mpCfg)
-            , "minrelaytxfee" .= getFeeRate (mpcMinFeeRate mpCfg)
-            ]
+      -- Core rest.cpp:825: MempoolInfoToJSON(*mempool).write() + "\n" — the
+      -- very object getmempoolinfo returns.  This handler used to build its
+      -- own 7-field subset, missing total_fee / incrementalrelayfee / fullrbf
+      -- and the five v31 policy fields, and reported mempoolminfee and
+      -- minrelaytxfee as raw sat/kvB (100) instead of BTC/kvB (0.000001).
+      body <- mempoolInfoJson server
       return $ responseLBS status200
         [(hContentType, "application/json")]
-        (encode jsonResult)
+        (body <> "\n")
 
     _ ->
       return $ restError 404 "output format not found (available: json)"

@@ -54,7 +54,7 @@ module Haskoin.BlockTemplate
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import Data.Word (Word32, Word64)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Data.Int (Int32, Int64)
 import Data.Bits (shiftR, (.&.))
 import Control.Monad (forM, forM_, foldM, void, unless, when)
@@ -83,7 +83,8 @@ import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, b
                            medianTimePast, ChainEntry(..), HeaderChain(..),
                            getValidatedChainTip, findForkPoint,
                            addHeader, contextualCheckBlockHeader,
-                           addSideBranchHeader, computeMerkleRoot, ChainState(..),
+                           addSideBranchHeader, computeMerkleRoot, computeMerkleRootMutated,
+                           ChainState(..),
                            consensusFlagsAtHeight, getBlockScriptFlags, connectBlock, disconnectBlock,
                            cumulativeWork,
                            getLegacySigOpCount,
@@ -680,10 +681,45 @@ submitBlockUnlatched net db hc cache pm mp mIdxMgr block = do
         where go ce | ceHeight ce < ceHeight known = False
                     | ceHeight ce == ceHeight known = ceHash ce == ceHash known
                     | otherwise = maybe False go (cePrev ce >>= (`Map.lookup` entries))
-  case Map.lookup bh entries of
-   Just known
+  -- Core ProcessNewBlock runs CheckBlock BEFORE AcceptBlock
+  -- (validation.cpp ProcessNewBlock: "ret = CheckBlock(*block, state, ...)",
+  -- then AcceptBlock -> AcceptBlockHeader), and CheckBlock opens with
+  -- CheckBlockHeader (proof of work, "high-hash") and CheckMerkleRoot
+  -- ("bad-txnmrklroot", CVE-2012-2459 "bad-txns-duplicate";
+  -- validation.cpp CheckBlock / CheckMerkleRoot).  So a block with a bad
+  -- merkle root is answered "bad-txnmrklroot" even when its parent is
+  -- failed (not "bad-prevblk") or unknown (not "prev-blk-not-found").
+  -- Nothing is stored or marked for such a body: the hash commits only to
+  -- the header, so a mutated body says nothing about the block.
+  let cbReject
+        | not (checkProofOfWork header (netPowLimit net)) = Just "high-hash"
+        | otherwise =
+            let (root, mutated) = computeMerkleRootMutated (map computeTxId (blockTxns block))
+            -- (an empty vtx has Core's all-zero root, as BlockMerkleRoot)
+            in if root /= bhMerkleRoot header
+                 then Just "bad-txnmrklroot"
+                 else if mutated then Just "bad-txns-duplicate" else Nothing
+  -- Core AcceptBlock: a block whose data is already stored (fAlreadyHave =
+  -- nStatus & BLOCK_HAVE_DATA) is accepted with new_block=false, and
+  -- submitblock answers "duplicate" (rpc/mining.cpp submitblock: "if
+  -- (!new_block && accepted) return "duplicate"").  That covers a stored
+  -- side block that lost on work as well as an active one; before, a
+  -- resubmitted lighter side block was re-run through the side-branch arm
+  -- and answered "inconclusive" again.  Only when its work does not exceed
+  -- the active tip: a heavier stored block still goes down the arm below so
+  -- the reorg is retried (Core runs ActivateBestChain after AcceptBlock).
+  storedSide <- case Map.lookup bh entries of
+    Just known
+      | not (failedOrInvalidated known)
+      , not (onActive known)
+      , ceChainWork known <= ceChainWork tip -> isJust <$> getBlock db bh
+    _ -> return False
+  case (cbReject, Map.lookup bh entries) of
+   (Just reason, _) -> return (Left reason)
+   (_, Just known)
     | failedOrInvalidated known -> return (Left "duplicate-invalid")
     | onActive known -> return (Left "duplicate")
+    | storedSide -> return (Left "duplicate")
    _ -> case Map.lookup prevHash entries of
     Just parentCe | failedOrInvalidated parentCe -> return (Left "bad-prevblk")
     Nothing -> return $ Left $
