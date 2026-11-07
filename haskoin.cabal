@@ -563,6 +563,27 @@ test-suite getrawmempool-verbose
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- policy-cause-07: own target (no shared Spec.hs edit).
+test-suite getmempoolentry
+  type:          exitcode-stdio-1.0
+  main-is:       GetMempoolEntryMain.hs
+  other-modules: GetMempoolEntrySpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- refill-20261105-haskoin-node_error: own target (no shared Spec.hs edit).
 test-suite getblock-bool
   type:          exitcode-stdio-1.0
