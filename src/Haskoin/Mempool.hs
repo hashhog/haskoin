@@ -67,7 +67,10 @@ module Haskoin.Mempool
     -- * Block Handlers
   , blockConnected
   , blockDisconnected
+  , blockDisconnectedAt
     -- * Ancestry
+  , getAncestorsRecursive
+  , getDescendantsOfEntry
   , getAncestors
   , getDescendants
     -- * Mining
@@ -2590,7 +2593,21 @@ blockConnected mp block = withAdmissionLock mp $ do
 -- | Handle a disconnected block (during reorg)
 -- Re-adds transactions from the disconnected block back to mempool
 blockDisconnected :: Mempool -> Block -> IO ()
-blockDisconnected mp block = withAdmissionLock mp $ do
+blockDisconnected mp = blockDisconnectedAt mp Nothing
+
+-- | 'blockDisconnected', recording @entryHeight@ (when given) as the height of
+-- every re-added entry instead of the tip height at the time of the call.
+--
+-- Core's InvalidateBlock (validation.cpp) runs MaybeUpdateMempoolForReorg
+-- after EACH DisconnectTip, so a transaction from the block at height H is
+-- re-accepted while the tip is H-1 and CTxMemPoolEntry records
+-- m_chain.Height() = H-1.  haskoin rewinds the whole chain first and then
+-- re-adds parents before children (the only order whose inputs resolve
+-- against the rewound UTXO set), so the invalidateblock caller passes H-1
+-- per block here.  ActivateBestChain reorgs re-add once at the new tip
+-- (validation.cpp ActivateBestChainStep), which is the Nothing case.
+blockDisconnectedAt :: Mempool -> Maybe Word32 -> Block -> IO ()
+blockDisconnectedAt mp mEntryHeight block = withAdmissionLock mp $ do
   -- Decrease chain height and drop the disconnected block's timestamp from
   -- the MTP window. We drop the head (most-recent) and recompute.
   hasSource <- isJustM (mpTipSource mp)
@@ -2602,12 +2619,69 @@ blockDisconnected mp block = withAdmissionLock mp $ do
 
   -- Re-add non-coinbase transactions
   -- (they may fail validation if inputs are now missing)
-  forM_ (tail $ blockTxns block) $ \tx ->
-    void $ addTransaction mp tx
+  readded <- fmap concat $ forM (tail $ blockTxns block) $ \tx -> do
+    r <- addTransaction mp tx
+    return [ t | Right t <- [r] ]
+  forM_ mEntryHeight $ \h -> atomically $ forM_ readded $ \t ->
+    modifyTVar' (mpEntries mp) (Map.adjust (\e -> e { meHeight = h }) t)
+  -- Core CTxMemPool::UpdateTransactionsFromBlock: a re-added transaction can
+  -- have in-pool descendants (children never mined away, or entries re-added
+  -- from a higher disconnected block), which admission does not see.
+  relinkReadded mp readded
   -- A re-added transaction can join clusters that are already in the pool
   -- (its children were never mined away), which the admission gate does not
   -- see.  Core re-adds with bypass_limits and then TrimToSize()s; do the same.
   trimOversizedClusters mp
+
+-- | Recompute the stored ancestor and descendant aggregates of every entry
+-- connected to the re-added @txids@ (their in-pool ancestors, descendants and
+-- themselves) from the current pool graph.  Mirrors the effect of Core's
+-- CTxMemPool::UpdateTransactionsFromBlock (txmempool.cpp) after a reorg
+-- re-add: admission counts only the ancestors present at the time, so a
+-- parent re-added under in-pool children left the children's ancestor
+-- aggregates and its own descendant aggregates short.
+--
+-- Fee aggregates use the same convention as admission ('buildMempoolEntry',
+-- 'continueAfterInsert'): the entry's own fee with its prioritisetransaction
+-- delta, the related entries' base fees.  meAncestorSigOps is left as is.
+-- Caller holds the admission lock.
+relinkReadded :: Mempool -> [TxId] -> IO ()
+relinkReadded _ [] = return ()
+relinkReadded mp txids = do
+  entries <- readTVarIO (mpEntries mp)
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  feeDeltas <- readTVarIO (mpFeeDeltas mp)
+  let parentsOf e = [ p | inp <- txInputs (meTransaction e)
+                        , let p = outPointHash (txInPrevOutput inp)
+                        , Map.member p entries ]
+      childrenOf e = [ c | i <- [0 .. length (txOutputs (meTransaction e)) - 1]
+                         , Just c <- [Map.lookup (OutPoint (meTxId e) (fromIntegral i)) byOutpoint]
+                         , Map.member c entries ]
+      closure step start = go Set.empty start
+        where
+          go seen [] = seen
+          go seen (t:rest)
+            | Set.member t seen = go seen rest
+            | otherwise = case Map.lookup t entries of
+                Nothing -> go seen rest
+                Just e  -> go (Set.insert t seen) (step e ++ rest)
+      strictly step e = Set.delete (meTxId e) (closure step (step e))
+      touched = Set.unions [ Set.insert t (closure parentsOf [t] `Set.union` closure childrenOf [t])
+                           | t <- txids, Map.member t entries ]
+      look = mapMaybe (`Map.lookup` entries) . Set.toList
+      selfFee e = applyFeeDelta (meFee e) (Map.findWithDefault 0 (meTxId e) feeDeltas)
+      relinked e =
+        let ancs = look (strictly parentsOf e)
+            descs = look (strictly childrenOf e)
+        in e { meAncestorCount   = length ancs + 1
+             , meAncestorSize    = sum (map meSize ancs) + meSize e
+             , meAncestorFees    = sum (map meFee ancs) + selfFee e
+             , meDescendantCount = length descs + 1
+             , meDescendantSize  = sum (map meSize descs) + meSize e
+             , meDescendantFees  = sum (map meFee descs) + selfFee e
+             }
+  atomically $ forM_ (Set.toList touched) $ \t ->
+    modifyTVar' (mpEntries mp) (Map.adjust relinked t)
 
 -- | Evict the worst chunk (with its descendants) of every cluster that is over
 -- the cluster count or weight limit, until none is.  Mirrors Core's
