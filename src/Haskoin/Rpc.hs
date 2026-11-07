@@ -9957,7 +9957,10 @@ handleTestMempoolAccept server params
       (toJSON $ RpcError rpcInvalidParams "Missing rawtxs parameter") Null
     Just txArray -> do
       -- Parse maxfeerate (sat/vB, default 0.10 BTC/kvB = 10000 sat/vB)
+      -- maxfeerate 0 lifts the cap (Core rpc/mempool.cpp: the cap applies only
+      -- when the computed max fee is non-zero).
       let maxFeeRateSatPerVB = case extractParam params 1 :: Maybe Double of
+            Just 0 -> 1 / 0  -- no cap
             Just rate -> rate * 100000  -- BTC/kvB to sat/vB
             Nothing -> 10000.0  -- Default 0.10 BTC/kvB
 
@@ -10019,11 +10022,7 @@ handleTestMempoolAccept server params
       let txidTxt  = showHash (BlockHash (getTxIdHash (computeTxId tx)))
           wtxidTxt = showHash (BlockHash (getTxIdHash (computeWtxId tx)))
       in case result of
-        Left err -> pairs $
-          pair "txid"          (text txidTxt)  <>
-          pair "wtxid"         (text wtxidTxt) <>
-          pair "allowed"       (AE.bool False) <>
-          pair "reject-reason" (text (mempoolErrorToText err))
+        Left err -> rejectEnc txidTxt wtxidTxt (mempoolErrorToText err)
         Right entry
           | fromIntegral (meFee entry) / fromIntegral (meSize entry) > maxFeeRate ->
               pairs $ pair "txid" (text txidTxt) <> pair "wtxid" (text wtxidTxt) <>
@@ -10034,6 +10033,25 @@ handleTestMempoolAccept server params
                       pair "allowed" (AE.bool True) <>
                       pair "vsize" (AE.int (meSize entry)) <>
                       pair "fees" (feesEncoding entry (computeWtxId tx))
+
+    -- Core rpc/mempool.cpp: a rejected tx carries reject-reason plus
+    -- reject-details (TxValidationState::ToString); only TX_MISSING_INPUTS is
+    -- reduced to the bare "missing-inputs" reason.  haskoin keeps no separate
+    -- debug string, so details are emitted only for the states Core builds
+    -- WITHOUT a debug message (validation.cpp PreChecks: txn-already-in-mempool,
+    -- txn-same-nonwitness-data-in-mempool, txn-already-known), where
+    -- ToString() is the bare token; elsewhere Core appends ", <debug>" that we
+    -- cannot reproduce, so the key stays absent rather than carry a wrong value.
+    rejectEnc :: Text -> Text -> Text -> AE.Encoding
+    rejectEnc txidTxt wtxidTxt reason = pairs $
+      pair "txid"          (text txidTxt)  <>
+      pair "wtxid"         (text wtxidTxt) <>
+      pair "allowed"       (AE.bool False) <>
+      pair "reject-reason" (text reason)   <>
+      (if reason `elem` [ "txn-already-in-mempool"
+                        , "txn-same-nonwitness-data-in-mempool"
+                        , "txn-already-known" ]
+         then pair "reject-details" (text reason) else mempty)
 
     feesEncoding :: MempoolEntry -> TxId -> AE.Encoding
     feesEncoding entry wtxid = pairs $
@@ -10058,7 +10076,20 @@ handleTestMempoolAccept server params
               -- W116 BUG-G6 FIX: dry-run, no TVar writes (Core validation.cpp:1388
               -- returns before AddUnchecked when test_accept=true).
               result <- testAcceptTransaction (rsMempool server) tx
-              return $ renderOne maxFeeRate tx result
+              -- Core validation.cpp PreChecks: when an input is missing but an
+              -- output of this very tx is already in the coins cache, the tx is
+              -- confirmed -> "txn-already-known" (TX_CONFLICT), not missing-inputs.
+              let txid = computeTxId tx
+              known <- case result of
+                Left (ErrMissingInput _) -> or <$> mapM
+                  (\i -> isJust <$> lookupUTXO (rsUTXOCache server) (OutPoint txid (fromIntegral i)))
+                  [0 .. length (txOutputs tx) - 1]
+                _ -> return False
+              return $ if known
+                then rejectEnc (showHash (BlockHash (getTxIdHash txid)))
+                               (showHash (BlockHash (getTxIdHash (computeWtxId tx))))
+                               "txn-already-known"
+                else renderOne maxFeeRate tx result
 
     -- Emit the bare Core reject token via the shared 'mempoolRejectToken'
     -- (single source of truth, also used by sendrawtransaction), threading the

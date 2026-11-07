@@ -387,6 +387,28 @@ test-suite submit-checkblock-first
   ghc-options:     -Wall -O1 -threaded
 
 -- policy-cause-09: own target so the spec needs no edit to shared lists.
+test-suite tma-details
+  type:          exitcode-stdio-1.0
+  main-is:       TmaDetailsMain.hs
+  other-modules: TmaDetailsSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite gbt-sigops
   type:          exitcode-stdio-1.0
   main-is:       GbtSigopsMain.hs
