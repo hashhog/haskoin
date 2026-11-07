@@ -50,7 +50,7 @@ import Haskoin.Consensus
   , getValidatedChainTip )
 import Haskoin.HeaderReload (initHeaderChainFromDB)
 import Haskoin.Storage
-  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig )
+  ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, putBlockHeight )
 import Haskoin.Mempool (newMempool, defaultMempoolConfig)
 import Haskoin.FeeEstimator (newFeeEstimator)
 import Haskoin.Network
@@ -284,3 +284,27 @@ spec = describe "best header across a restart (Core LoadBlockIndex sets m_best_h
           submit s b4 `shouldReturn` Right ()
           validatedHash s `shouldReturn` hashOf b4
           blocksHeaders s `shouldReturn` (4, 4))
+
+  it "restart-submitheader-best-header rewrites a stale ancestor row below a row that already matches" $
+    withRestart
+      (\s -> do
+          [_h1, _h2, h3] <- chainN s 3
+          b4 <- mkChild s h3 (BS.pack [0x60])
+          submitHeader s b4
+          b5 <- mkChild s (hashOf b4) (BS.pack [0x61])
+          submitHeader s b5
+          -- a stored equal-work sibling of b4 ...
+          a4 <- mkChild s h3 (BS.pack [0x65])
+          submitHeader s a4
+          bestHeader s `shouldReturn` hashOf b5
+          -- ... whose row replaced b4's (the P2P handler writes one row
+          -- per header, so a lower row can name another branch while the
+          -- row above it is already right)
+          putBlockHeight (rsDB s) 4 (hashOf a4)
+          b6 <- mkChild s (hashOf b5) (BS.pack [0x66])
+          submitHeader s b6
+          return (h3, hashOf b6))
+      (\(h3, b6) s -> do
+          validatedHash s `shouldReturn` h3
+          bestHeader s `shouldReturn` b6
+          blocksHeaders s `shouldReturn` (3, 6))
