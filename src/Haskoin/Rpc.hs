@@ -113,6 +113,7 @@ module Haskoin.Rpc
   , chainstateSnapshotReport
     -- * getpeerinfo per-peer encoder (exported for testing — Core v31.99 wire shape)
   , peerInfoToEncoding
+  , peerInfoToEncodingWith
     -- * getblockfrompeer (Bitcoin Core v24) — handler + pure core (exported for testing)
   , handleGetBlockFromPeer
   , decideGetBlockFromPeer
@@ -509,12 +510,12 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          sockAddrToHostPort, sockAddrToString,
                          banPeer, getBanList, clearExpiredBans,
                          saveBanList, loadBanList,
-                         getMappedASFromSockAddr,
+                         getMappedASFromSockAddr, sockAddrToNetworkAddress,
                          -- AddrMan dump / inject for getnodeaddresses + addpeeraddress
                          AddrMan(..), AddrInfo(..), addAddress, isRoutable)
 import Haskoin.Daemon (DebugCategory(..), parseDebugCategory,
                        DebugSet, globalDebugSet, setGlobalDebugSet)
-import Network.Socket (SockAddr(..))
+import Network.Socket (SockAddr(..), getSocketName)
 import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          MempoolError(..),
                          addTransaction, testAcceptTransaction, testAcceptPackage,
@@ -5149,8 +5150,17 @@ handleGetNetworkInfo server = do
 handleGetPeerInfo :: RpcServer -> IO RpcResponse
 handleGetPeerInfo server = do
   peers <- getConnectedPeers (rsPeerMgr server)
+  -- Core rpc/net.cpp "addrbind": the local (bind) address of the peer's
+  -- socket, present when valid.  Read from the live socket, in the same
+  -- Map order 'getConnectedPeers' used so the ids line up.
+  pcs <- readTVarIO (pmPeers (rsPeerMgr server))
+  binds <- forM peers $ \(a, _) -> case Map.lookup a pcs of
+    Nothing -> return Nothing
+    Just pc -> (Just <$> getSocketName (pcSocket pc))
+                 `catch` (\(_ :: SomeException) -> return Nothing)
   let asmapData = rsAsmapData server
-      peerEncs  = zipWith (peerInfoToEncoding asmapData) [0..] peers
+      peerEncs  = zipWith3 (\i b p -> peerInfoToEncodingWith (b >>= sockAddrText) asmapData i p)
+                    [0..] binds peers
       rawBs     = encodingToLazyByteString (AE.list id peerEncs)
   return $ RpcResponse (rawJsonResult rawBs) Null Null
 
@@ -5160,7 +5170,30 @@ handleGetPeerInfo server = do
 -- set + ordering (rpc/net.cpp). Field order matters: aeson's 'pairs'
 -- preserves declaration order, mirroring Core's pushKV sequence.
 peerInfoToEncoding :: ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
-peerInfoToEncoding asmapData idx (addr, info) =
+peerInfoToEncoding = peerInfoToEncodingWith Nothing
+
+-- | @ip:port@ of a P2P 'NetworkAddress', or 'Nothing' when the address is
+-- not valid (the all-zero address), as Core's @CService::IsValid@.  Only
+-- IPv4-mapped addresses are rendered; others yield 'Nothing'.
+networkAddressText :: NetworkAddress -> Maybe Text
+networkAddressText na
+  | BS.length a /= 16 = Nothing
+  | BS.take 12 a /= BS.pack [0,0,0,0,0,0,0,0,0,0,0xff,0xff] = Nothing
+  | BS.drop 12 a == BS.pack [0,0,0,0] = Nothing
+  | otherwise = Just $ T.intercalate "." (map (T.pack . show) (BS.unpack (BS.drop 12 a)))
+                         <> ":" <> T.pack (show (naPort na))
+  where a = naAddress na
+
+sockAddrText :: SockAddr -> Maybe Text
+sockAddrText sa = sockAddrToNetworkAddress 0 sa >>= networkAddressText
+
+-- | 'peerInfoToEncoding' with the connection's local bind address
+-- (Core's @addrbind@, rpc/net.cpp) supplied by the caller, which owns the
+-- socket.  @addrlocal@ is the address the peer reported for us in its
+-- version message (Core @CNode::SetAddrLocal@, net_processing.cpp), emitted
+-- when valid.  Both sit directly after @addr@, as in Core.
+peerInfoToEncodingWith :: Maybe Text -> ByteString -> Int -> (SockAddr, PeerInfo) -> AE.Encoding
+peerInfoToEncodingWith mBind asmapData idx (addr, info) =
       let services = piServices info
           serviceNames :: [Text]
           serviceNames = catMaybes
@@ -5191,6 +5224,9 @@ peerInfoToEncoding asmapData idx (addr, info) =
       in pairs $
            pair "id"                      (AE.int idx)                                  <>
            pair "addr"                    (text (T.pack (show addr)))                   <>
+           maybe mempty (pair "addrbind" . text) mBind                                  <>
+           maybe mempty (pair "addrlocal" . text)
+             (piVersion info >>= networkAddressText . vAddrRecv)                        <>
            pair "network"                 (text networkLabel)                            <>
            pair "services"                (text (T.pack (printf "%016x" services)))     <>
            pair "servicesnames"           (AE.list text serviceNames)                   <>
@@ -14586,7 +14622,7 @@ handleGetNetTotals _server = do
 -- RPC_TYPE_ERROR (-3). We accept the number (so the type check matches)
 -- and do not sleep — a caller-supplied wait must not pin an RPC thread.
 -- Returns:
---   "Bitcoin server stopping"
+--   "Bitcoin Core stopping"
 -- | Ask the node to shut down through the SIGTERM path: after a short delay
 -- (so the caller's RPC reply is written first) raise SIGTERM in our own
 -- process. app/Main.hs installs the sigTERM handler that fills shutdownVar,
@@ -14612,7 +14648,7 @@ handleStop _server params =
       -- node kept running (no flush, no clean exit).
       requestNodeShutdown
       -- Return the standard message immediately
-      return $ RpcResponse (toJSON ("Bitcoin server stopping" :: Text)) Null Null
+      return $ RpcResponse (toJSON ("Bitcoin Core stopping" :: Text)) Null Null
 
 --------------------------------------------------------------------------------
 -- Mempool persistence RPCs (Bitcoin Core compatible)
