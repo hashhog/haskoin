@@ -528,6 +528,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          getAncestors, getDescendants, removeTransaction,
                          setOnRemoveTx, setMempoolMockTime, prioritiseTransaction,
                          isRbfReplaceable, blockConnected, blockDisconnected,
+                         blockDisconnectedAt, getAncestorsRecursive, getDescendantsOfEntry,
                          -- BIP-125 opt-in predicate (Core util/rbf.cpp
                          -- SignalsOptInRBF); reused by createrawtransaction's
                          -- "sequence contradicts replaceable" check.
@@ -3480,7 +3481,7 @@ handleInvalidateBlock server params = do
         Right bh -> do
           -- HK-3: chain writer -> under the chain lock (Core cs_main).
           result <- withChainLock (ucChainLock (rsUTXOCache server)) $
-                    mempoolFollowsTip server $
+                    mempoolFollowsTipAt True server $
                     invalidateBlock (rsNetwork server) (rsUTXOCache server)
                       (rsDB server) (rsHeaderChain server) (rsIndexMgr server) bh
           case result of
@@ -3499,13 +3500,19 @@ handleInvalidateBlock server params = do
 -- | Run a tip-moving RPC action (invalidateblock / reconsiderblock /
 -- preciousblock) and, if it succeeded, bring the mempool along.  Chain lock held.
 mempoolFollowsTip :: RpcServer -> IO (Either e ()) -> IO (Either e ())
-mempoolFollowsTip server act = do
+mempoolFollowsTip = mempoolFollowsTipAt False
+
+-- | 'mempoolFollowsTip'; @perBlock@ re-adds each disconnected block's
+-- transactions with the height Core records for invalidateblock (see
+-- 'mempoolFollowTipAt').
+mempoolFollowsTipAt :: Bool -> RpcServer -> IO (Either e ()) -> IO (Either e ())
+mempoolFollowsTipAt perBlock server act = do
   oldTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
   r <- act
   case r of
     Right () -> do
       newTip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
-      mempoolFollowTip server (ceHash oldTip) (ceHash newTip)
+      mempoolFollowTipAt perBlock server (ceHash oldTip) (ceHash newTip)
     Left _ -> return ()
   return r
 
@@ -3517,8 +3524,14 @@ mempoolFollowsTip server act = do
 -- disconnected blocks' transactions against the new tip.  Disconnected blocks
 -- are re-added lowest first so a parent is in the pool before its child.
 -- Must run under the chain lock.
-mempoolFollowTip :: RpcServer -> BlockHash -> BlockHash -> IO ()
-mempoolFollowTip server oldTip newTip = when (oldTip /= newTip) $ do
+--
+-- With @perBlock@ (invalidateblock) every re-added entry records the height
+-- of its disconnected block's parent: Core's InvalidateBlock runs
+-- MaybeUpdateMempoolForReorg after each DisconnectTip, so the spend confirmed
+-- at H is re-accepted at tip H-1.  Otherwise (ActivateBestChain reorgs:
+-- reconsiderblock, preciousblock) Core re-adds once at the new tip.
+mempoolFollowTipAt :: Bool -> RpcServer -> BlockHash -> BlockHash -> IO ()
+mempoolFollowTipAt perBlock server oldTip newTip = when (oldTip /= newTip) $ do
   entries <- readTVarIO (hcEntries (rsHeaderChain server))
   let pathOf h = case Map.lookup h entries of
         Nothing -> []
@@ -3531,8 +3544,12 @@ mempoolFollowTip server oldTip newTip = when (oldTip /= newTip) $ do
       connected    = reverse (takeWhile (`Set.notMember` oldSet) newPath) -- fork child first
   conBlocks <- mapM (getBlock (rsDB server)) connected
   disBlocks <- mapM (getBlock (rsDB server)) disconnected
+  let entryHeight h
+        | perBlock, Just ce <- Map.lookup h entries, ceHeight ce > 0 = Just (ceHeight ce - 1)
+        | otherwise = Nothing
   forM_ conBlocks $ mapM_ (blockConnected (rsMempool server))
-  forM_ (reverse disBlocks) $ mapM_ (blockDisconnected (rsMempool server))
+  forM_ (reverse (zip disconnected disBlocks)) $ \(h, mBlk) ->
+    mapM_ (blockDisconnectedAt (rsMempool server) (entryHeight h)) mBlk
 
 -- | Reconsider a previously invalidated block
 -- Reference: bitcoin/src/rpc/blockchain.cpp reconsiderblock
@@ -10407,10 +10424,14 @@ handleGetMempoolEntry server params
                 (,) <$> readTVar (mpEntries (rsMempool server))
                     <*> readTVar (mpByOutpoint (rsMempool server))
               -- The stored ancestor/descendant aggregates can lag a reorg or
-              -- invalidateblock, so (as before) recompute them from the live
-              -- graph; the shared encoder then only adds depends/spentby/chunk.
-              ancestors <- getAncestors (rsMempool server) (meTransaction entry)
-              descendants <- getDescendants (rsMempool server) txid
+              -- invalidateblock, so recompute them from the live graph.  Core's
+              -- ancestorcount / descendantcount cover ALL in-pool ancestors /
+              -- descendants (CTxMemPool::CalculateMemPoolAncestors), not just
+              -- parents and children: a three-spend chain gives the leaf
+              -- ancestorcount 3.  depends stays the direct in-pool parents
+              -- (the shared encoder's mempoolParents, Core's GetMemPoolParents).
+              ancestors <- getAncestorsRecursive (rsMempool server) (meTransaction entry)
+              descendants <- getDescendantsOfEntry (rsMempool server) txid
               let live = entry
                     { meAncestorCount    = length ancestors + 1
                     , meAncestorSize     = sum (map meSize ancestors) + meSize entry
