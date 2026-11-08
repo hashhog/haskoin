@@ -4712,10 +4712,15 @@ mempoolEntryEnc tipHeight poolEntries poolByOutpoint chunkInfo unbroadcastSet en
       -- vsize * 4 (which rounds up and ignores the sigop adjustment).
       entryWeight = txBaseSize (meTransaction entry) * (witnessScaleFactor - 1)
                     + txTotalSize (meTransaction entry)
+      txidHex = showHash . BlockHash . getTxIdHash
       -- Core sorts depends by hex (std::set<std::string>).
-      hexIds = sort . map (showHash . BlockHash . getTxIdHash)
-      dependsHex = hexIds (mempoolParents poolEntries entry)
-      spentbyHex = hexIds (mempoolChildren poolByOutpoint entry)
+      dependsHex = sort (map txidHex (mempoolParents poolEntries entry))
+      -- Core's spentby is CTxMemPool::GetChildren, sorted by
+      -- CompareIteratorByHash: uint256 operator<, a memcmp of the txid's
+      -- internal bytes, which is the reverse of the display hex.
+      -- mempoolChildren comes back in TxId order, the same memcmp order,
+      -- so it must not be re-sorted by its hex text.
+      spentbyHex = map txidHex (sortOn getTxIdHash (mempoolChildren poolByOutpoint entry))
       _confirmations = if tipHeight >= entryHeight
                        then tipHeight - entryHeight
                        else 0
