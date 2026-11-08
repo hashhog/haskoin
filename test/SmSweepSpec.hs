@@ -19,13 +19,13 @@
 --                    removeForReorg(filter_final_and_mature))
 --   validation.cpp   MemPoolAccept::PreChecks (CheckFeeRate skipped when
 --                    bypass_limits)
---   node/blockstorage.cpp BlockManager::LoadBlockIndex (m_best_header =
---                    most-work BLOCK_VALID_TREE entry; nStatus persisted)
---   validation.cpp   ChainstateManager::LoadBlockIndex /
---                    TryAddBlockIndexCandidate (only HaveNumChainTxs entries
---                    become setBlockIndexCandidates)
---   net.cpp          CConnman::DisconnectNodes -> FinalizeNode (every
---                    disconnect releases the peer's outbound slot / netgroup)
+--   validation.cpp   ChainstateManager::LoadBlockIndex (m_best_header =
+--                    most-work IsValid(BLOCK_VALID_TREE) entry, ~4919; only
+--                    entries with data/HaveNumChainTxs become
+--                    setBlockIndexCandidates; nStatus is persisted)
+--   net.cpp          CConnman::ThreadOpenConnections (~2656-2690) rebuilds
+--                    outbound_ipv46_peer_netgroups from m_nodes on every pass,
+--                    so a disconnected peer's netgroup stops counting at once
 module SmSweepSpec (spec) where
 
 import Test.Hspec
@@ -34,7 +34,7 @@ import Control.Exception (bracket)
 import Control.Concurrent.STM (newTVarIO, readTVarIO)
 import Data.IORef (newIORef)
 import Data.Word (Word32, Word64)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import qualified Data.Text as T
@@ -59,7 +59,7 @@ import Haskoin.Consensus
 import Haskoin.HeaderReload (initHeaderChainFromDB)
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, getBlock )
-import Haskoin.Mempool (newMempool, defaultMempoolConfig, addTransaction, getTransaction)
+import Haskoin.Mempool (newMempool, defaultMempoolConfig, addTransaction, getTransaction, MempoolError(..))
 import Haskoin.FeeEstimator (newFeeEstimator)
 import Haskoin.Network
   ( startPeerManager, stopPeerManager, Message
@@ -75,7 +75,6 @@ import Haskoin.Rpc
   , buildRegtestCoinbase, findRegtestNonce )
 import qualified Data.Aeson.KeyMap as KM
 import qualified Data.Vector as V
-import Data.Maybe (fromMaybe)
 
 -- ============================================================
 -- Harness (copied from InvalidateMempoolSpec / RestartBestHeaderSpec)
@@ -171,6 +170,16 @@ tipHeight s = ceHeight <$> getValidatedChainTip (rsDB s) (rsHeaderChain s)
 
 storedOrConnected :: Either String () -> Bool
 storedOrConnected r = r == Right () || r == Left "inconclusive"
+
+belowMinFee :: Either MempoolError a -> Bool
+belowMinFee (Left (ErrFeeBelowMinimum _ _)) = True
+belowMinFee _ = False
+
+-- | Poll @act@ every 0.5 s until it returns True or 30 s pass; the result.
+eventually :: IO Bool -> IO Bool
+eventually act = go (60 :: Int)
+  where go 0 = act
+        go n = act >>= \ok -> if ok then return True else threadDelay 500_000 >> go (n - 1)
 
 isRight' :: Either a b -> Bool
 isRight' = either (const False) (const True)
@@ -312,7 +321,7 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
       -- 0-fee parent: below the min relay fee, so normal admission refuses it
       let parent = spendWith (OutPoint (computeTxId cb) 0) 5_000_000_000 0
           child  = spendWith (OutPoint (computeTxId parent) 0) 4_999_000_000 0
-      addTransaction (rsMempool s) parent >>= (`shouldSatisfy` (not . isRight'))
+      addTransaction (rsMempool s) parent >>= (`shouldSatisfy` belowMinFee)
       -- but a miner may include it (explicit txs go straight into the block)
       blk102 <- mine s [parent]
       addTransaction (rsMempool s) child >>= (`shouldSatisfy` isRight')
@@ -360,6 +369,8 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
           b4 <- childBlock s h3 (BS.pack [0x60])
           submitHeader s b4
           st <- statusOf s (hashOf b4)
+          -- control: live, a header-only block is header-valid, no candidate
+          st `shouldBe` (Just StatusHeaderValid, False)
           mc <- findBestCandidate (rsHeaderChain s)
           return (hashOf b4, st, fmap ceHash mc))
       (\(h4, stBefore, candBefore) s -> do
@@ -386,10 +397,14 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
           r `shouldSatisfy` isRight'
           -- control: in memory the best header moves to the valid sibling
           bestHeader s `shouldReturn` hashOf c4
-          return (hashOf c4))
-      (\c4 s ->
-          -- Core LoadBlockIndex: m_best_header = most-work valid entry = c4.
-          bestHeader s `shouldReturn` c4)
+          let names = [ (h3, "h3 (fork point)"), (hashOf a4, "a4 (invalidated)")
+                      , (hashOf a5, "a5 (failed child)"), (hashOf c4, "c4") ]
+          return names)
+      (\names s -> do
+          -- Core ChainstateManager::LoadBlockIndex: m_best_header = the
+          -- most-work IsValid(BLOCK_VALID_TREE) entry = c4.
+          h <- bestHeader s
+          fromMaybe "unknown" (lookup h names) `shouldBe` ("c4" :: String))
 
   -- ---------------------------------------------------------------
   -- Path d (peer states): every disconnect releases the netgroup slot
@@ -409,11 +424,11 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
           `shouldReturn` False
         (_, disconnected) <- misbehaving pm addr InvalidBlock
         disconnected `shouldBe` True
-        -- give peerManagerLoop (10 s tick) a full pass to clean up
-        threadDelay 12_000_000
-        -- Core FinalizeNode releases the netgroup on every disconnect;
-        -- haskoin deleted the peer from pmPeers first, so it never does.
-        checkOutboundDiversity (pmOutboundDiversity pm) (pmAsmapData pm) other
+        -- peerManagerLoop (10 s tick) is the only cleanup; allow it 30 s.
+        -- Core: ThreadOpenConnections rebuilds the netgroup set from the
+        -- live m_nodes, so a disconnected peer stops counting at once.
+        -- haskoin deleted the peer from pmPeers first, so it never cleans up.
+        eventually (checkOutboundDiversity (pmOutboundDiversity pm) (pmAsmapData pm) other)
           `shouldReturn` True
 
   -- Control (always runs): the instrument can see a release.  A peer left
@@ -431,6 +446,5 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
         addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
         checkOutboundDiversity (pmOutboundDiversity pm) (pmAsmapData pm) other
           `shouldReturn` False
-        threadDelay 12_000_000
-        checkOutboundDiversity (pmOutboundDiversity pm) (pmAsmapData pm) other
+        eventually (checkOutboundDiversity (pmOutboundDiversity pm) (pmAsmapData pm) other)
           `shouldReturn` True
