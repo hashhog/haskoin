@@ -351,7 +351,7 @@ import qualified Crypto.Hash as Crypto
 import qualified Data.ByteArray as BA
 import Data.Bits (shiftL, shiftR, (.|.), (.&.), xor, testBit)
 import Data.Char (chr, toLower, isHexDigit, isDigit)
-import Data.List (foldl', isInfixOf, isPrefixOf, tails)
+import Data.List (foldl', isInfixOf, isPrefixOf, isSuffixOf, tails)
 import Text.Printf (printf)
 -- showFFloat was removed: all difficulty/fee formatting now uses
 -- formatDoubleG16 (FFI snprintf) or btcAmountEnc (fixed-decimal).
@@ -5786,7 +5786,22 @@ bip22ResultString err
                 "bad-txns-accumulated-fee-outofrange",
                 "bad-txns-fee-outofrange",
                 -- Header contextual errors (Core validation.cpp:4089,4093,4102,4109)
-                "bad-diffbits", "time-too-old", "time-too-new", "time-timewarp-attack"] = err
+                "bad-diffbits", "time-too-old", "time-too-new", "time-timewarp-attack",
+                -- Unknown parent (Core validation.cpp AcceptBlockHeader,
+                -- BLOCK_MISSING_PREV)
+                "prev-blk-not-found"] = err
+
+  -- Unknown parent. Core ChainstateManager::AcceptBlockHeader looks the
+  -- parent up in m_block_index and, on a miss, returns
+  -- state.Invalid(BLOCK_MISSING_PREV, "prev-blk-not-found"); submitblock's
+  -- BIP22ValidationResult hands that reason back verbatim
+  -- (rpc/mining.cpp).  BlockTemplate.submitBlock reports the miss as
+  -- "Block validation failed: parent <hash> not in block index"; the wrapper
+  -- arm below strips the prefix and re-enters here.  Before this rule the
+  -- remainder matched nothing and was answered "rejected" (core-regtest row
+  -- chain/submit/prev-not-found).  Placed first so no looser prose rule can
+  -- match the hash text.
+  | "parent " `isPrefixOf` s && "not in block index" `isSuffixOf` s = "prev-blk-not-found"
 
   -- BIP34/66/65 outdated block nVersion (Core validation.cpp:4116
   -- ContextualCheckBlockHeader strprintf("bad-version(0x%08x)", nVersion)).
