@@ -29,6 +29,7 @@ module Haskoin.Network
   , InvType(..)
   , serveGetData
   , serveGetDataCompact
+  , serveGetDataStream
   , serveGetBlockTxn
   , connectedServeCeiling
   , txFetchInv
@@ -2564,7 +2565,9 @@ stripBlockWitness b = b { blockTxns = map stripTxWitness (blockTxns b) }
 
 -- | Answer a peer's @getdata@.  Returns the replies to send, in request
 -- order, followed by one batched @notfound@ for everything that could not be
--- served (omitted when empty).
+-- served (omitted when empty).  An item repeated in the request is answered
+-- once.  The node serves through 'serveGetDataStream', which sends each
+-- reply before loading the next; this list form is for tests.
 --
 -- Reference: bitcoin-core/src/net_processing.cpp ProcessGetData.
 --
@@ -2626,26 +2629,83 @@ serveGetDataCompact
   -> [InvVector]
   -> IO [Message]
 serveGetDataCompact depthOf byTxid byWtxid getBlk ivs = do
-  results <- forM ivs $ \iv -> case ivType iv of
-    InvTx           -> fmap (MTx . stripTxWitness) <$> byTxid (TxId (ivHash iv))
-    InvWitnessTx    -> fmap MTx <$> byTxid (TxId (ivHash iv))
-    InvWtx          -> fmap MTx <$> byWtxid (Wtxid (ivHash iv))
-    InvBlock        -> fmap (MBlock . stripBlockWitness) <$> getBlk (BlockHash (ivHash iv))
-    InvWitnessBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
-    InvCompactBlock -> do
-      let bh = BlockHash (ivHash iv)
-      mBlk <- getBlk bh
-      case mBlk of
-        Nothing  -> return Nothing
-        Just blk -> do
-          depth <- depthOf bh
-          case depth of
-            Just d | d <= maxCmpctBlockDepth -> Just . MCmpctBlock <$> createCompactBlock blk
-            _                                -> return (Just (MBlock blk))
-    _               -> return Nothing
-  let served   = [ m | Just m <- results ]
-      notFound = [ iv | (iv, Nothing) <- zip ivs results ]
-  return $ served ++ [ MNotFound (NotFound notFound) | not (null notFound) ]
+  out <- newIORef []
+  serveGetDataStream depthOf byTxid byWtxid getBlk
+    (\m -> atomicModifyIORef' out (\ms -> (m : ms, ())) >> return True) ivs
+  reverse <$> readIORef out
+
+-- | Serve a peer's @getdata@ one item at a time, as Core's ProcessGetData
+-- (net_processing.cpp) does.
+--
+-- Each reply is looked up and handed to @sendOne@ before the next item is
+-- looked up, so at most one reply is held at a time. The old
+-- 'serveGetDataCompact' ran a @forM@ over the whole request first: a 1.8 MB
+-- getdata naming one witness block 50,000 times (MAX_INV_SZ) loaded and kept
+-- all 50,000 copies before any went out (9.6 GB RSS).
+--
+-- @sendOne@ blocks until the reply is written to the socket, which plays the
+-- part of Core's @fPauseSend@ check: the next item is not loaded while the
+-- peer has not taken the previous one. It returns 'False' when the reply did
+-- not go out (peer gone, or no send progress within the send-stall timeout);
+-- serving then stops, as Core stops at @fDisconnect@, with no notfound.
+--
+-- An item that repeats an earlier one in the same request (the same type and
+-- hash) is skipped: it costs a set lookup, not a block read and a reply.
+-- MSG_BLOCK and MSG_WITNESS_BLOCK of one hash are different items.
+--
+-- Unserveable items go into one trailing @notfound@, in request order and
+-- each listed once.
+serveGetDataStream
+  :: (BlockHash -> IO (Maybe Int))   -- ^ depth below the active tip
+  -> (TxId -> IO (Maybe Tx))         -- ^ mempool lookup by txid
+  -> (Wtxid -> IO (Maybe Tx))        -- ^ mempool lookup by wtxid
+  -> (BlockHash -> IO (Maybe Block)) -- ^ block store lookup
+  -> (Message -> IO Bool)            -- ^ send one reply; 'False' = stop
+  -> [InvVector]
+  -> IO ()
+serveGetDataStream depthOf byTxid byWtxid getBlk sendOne = go Set.empty []
+  where
+    go _ notFound [] =
+      unless (null notFound) $
+        void $ sendOne (MNotFound (NotFound (reverse notFound)))
+    go seen notFound (iv : rest)
+      | key `Set.member` seen = go seen notFound rest
+      | otherwise = do
+          r <- serveOneGetData depthOf byTxid byWtxid getBlk iv
+          case r of
+            Nothing -> go seen' (iv : notFound) rest
+            Just m  -> do
+              ok <- sendOne m
+              when ok $ go seen' notFound rest
+      where
+        key   = (invTypeToWord32 (ivType iv), ivHash iv)
+        seen' = Set.insert key seen
+
+-- | Look up the reply to one getdata item ('Nothing' = notfound).
+serveOneGetData
+  :: (BlockHash -> IO (Maybe Int))
+  -> (TxId -> IO (Maybe Tx))
+  -> (Wtxid -> IO (Maybe Tx))
+  -> (BlockHash -> IO (Maybe Block))
+  -> InvVector
+  -> IO (Maybe Message)
+serveOneGetData depthOf byTxid byWtxid getBlk iv = case ivType iv of
+  InvTx           -> fmap (MTx . stripTxWitness) <$> byTxid (TxId (ivHash iv))
+  InvWitnessTx    -> fmap MTx <$> byTxid (TxId (ivHash iv))
+  InvWtx          -> fmap MTx <$> byWtxid (Wtxid (ivHash iv))
+  InvBlock        -> fmap (MBlock . stripBlockWitness) <$> getBlk (BlockHash (ivHash iv))
+  InvWitnessBlock -> fmap MBlock <$> getBlk (BlockHash (ivHash iv))
+  InvCompactBlock -> do
+    let bh = BlockHash (ivHash iv)
+    mBlk <- getBlk bh
+    case mBlk of
+      Nothing  -> return Nothing
+      Just blk -> do
+        depth <- depthOf bh
+        case depth of
+          Just d | d <= maxCmpctBlockDepth -> Just . MCmpctBlock <$> createCompactBlock blk
+          _                                -> return (Just (MBlock blk))
+  _               -> return Nothing
 
 -- | Answer a @getblocktxn@ (Core net_processing.cpp, NetMsgType::GETBLOCKTXN
 -- and SendBlockTransactions).  Within 'maxBlocktxnDepth' of the tip the

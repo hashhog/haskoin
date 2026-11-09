@@ -379,6 +379,8 @@ test-suite getdata-amplification
   main-is:       GetDataAmplificationMain.hs
   other-modules: GetDataAmplificationSpec
   hs-source-dirs: test
+  -- serveGetDataStream exists from this commit on (see the spec header).
+  cpp-options:   -DHASKOIN_GETDATA_STREAM
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
