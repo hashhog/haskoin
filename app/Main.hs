@@ -306,8 +306,13 @@ parseOptions = Options
 parseNodeOptions :: Parser NodeOptions
 parseNodeOptions = NodeOptions
   <$> option auto (long "rpcport" <> value 8332 <> help "RPC port")
-  <*> strOption (long "rpcuser" <> value "haskoin" <> help "RPC username")
-  <*> strOption (long "rpcpassword" <> value "haskoin" <> help "RPC password")
+  -- No built-in login: both default to empty (Core parity), and the
+  -- user:password pair is only accepted when both are set.  With neither,
+  -- the generated .cookie is the only credential.
+  <*> strOption (long "rpcuser" <> value (rpcUser defaultRpcConfig)
+        <> help "RPC username (default: none; use the .cookie file)")
+  <*> strOption (long "rpcpassword" <> value (rpcPassword defaultRpcConfig)
+        <> help "RPC password (default: none; use the .cookie file)")
   <*> option auto (long "maxpeers" <> value 125 <> help "Max peer connections")
   <*> many (strOption (long "connect" <> help "Peer to connect to"))
   <*> option auto (long "prune" <> value 0 <> metavar "N"
@@ -635,11 +640,11 @@ applyConfigOverlay cm n = n
   { noRpcPort    = if noRpcPort n == 8332
                      then Daemon.configLookupInt "rpcport" 8332 cm
                      else noRpcPort n
-  , noRpcUser    = if noRpcUser n == "haskoin"
-                     then T.pack (fromMaybe "haskoin" (Daemon.configLookup "rpcuser" cm))
+  , noRpcUser    = if T.null (noRpcUser n)
+                     then T.pack (fromMaybe "" (Daemon.configLookup "rpcuser" cm))
                      else noRpcUser n
-  , noRpcPass    = if noRpcPass n == "haskoin"
-                     then T.pack (fromMaybe "haskoin" (Daemon.configLookup "rpcpassword" cm))
+  , noRpcPass    = if T.null (noRpcPass n)
+                     then T.pack (fromMaybe "" (Daemon.configLookup "rpcpassword" cm))
                      else noRpcPass n
   , noMaxPeers   = if noMaxPeers n == 125
                      then Daemon.configLookupInt "maxpeers" 125 cm

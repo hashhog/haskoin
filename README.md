@@ -86,8 +86,10 @@ Every flag, the config file, the data directory layout and logging are in
 
 haskoin aims to match Bitcoin Core's JSON-RPC interface: same method names, parameters and
 result shapes. It accepts HTTP Basic auth with the `.cookie` file written to the network
-data directory at startup, or with `--rpcuser`/`--rpcpassword` (default `haskoin`/`haskoin`;
-change it if anything else can reach the port):
+data directory at startup, or with `--rpcuser`/`--rpcpassword`. There is no built-in login: a user/password pair is only
+accepted when both are set, as in Bitcoin Core. While RPC is bound to loopback, a request whose
+`Host` header names anything other than `localhost`, `127.x.x.x` or `[::1]` is refused (403),
+which blocks DNS-rebinding pages:
 
 ```bash
 curl -s --user "$(cat "$DATADIR/regtest/.cookie")" \

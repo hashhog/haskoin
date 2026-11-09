@@ -152,21 +152,15 @@ spec = describe "W140 HTTP server + rpcauth + cookie auth + JSON-RPC dispatch" $
   ------------------------------------------------------------------------------
 
   describe "G1 Default rpcuser/rpcpassword are NOT well-known constants" $ do
-    it "G1 PINS current shipping defaults: rpcuser=haskoin, rpcpassword=haskoin" $ do
-      -- Source-level pin: src/Haskoin/Rpc.hs:402-411 defines
-      -- 'defaultRpcConfig' with rpcUser = "haskoin", rpcPassword =
-      -- "haskoin".  app/Main.hs:230-231 also defaults the CLI parser
-      -- to "haskoin" / "haskoin".  This is the BUG-1 P0-SEC surface.
-      rpcUser defaultRpcConfig     `shouldBe` "haskoin"
-      rpcPassword defaultRpcConfig `shouldBe` "haskoin"
-
-    xit "G1 MISSING: Core ships rpcuser=\"\" + rpcpassword=\"\" defaults" $
+    it "G1 Core ships rpcuser=\"\" + rpcpassword=\"\" defaults (BUG-1 fixed)" $ do
       -- Core's gArgs.GetArg("-rpcuser","") and
       -- gArgs.GetArg("-rpcpassword","") return empty strings as the
-      -- default.  InitRPCAuthentication (httprpc.cpp:245-273) then
-      -- chooses cookie-only auth.  haskoin's "haskoin:haskoin" default
-      -- is the single most attackable surface in the daemon.
-      pendingWith "BUG-1 P0-SEC: defaultRpcConfig ships haskoin:haskoin instead of empty defaults"
+      -- default.  InitRPCAuthentication (httprpc.cpp) then chooses
+      -- cookie-only auth.  haskoin used to ship "haskoin:haskoin" here
+      -- (and app/Main.hs took its CLI default from it); the request-level
+      -- tests are in test/RpcAuthSpec.hs (default_credentials_rejected).
+      rpcUser defaultRpcConfig     `shouldBe` ""
+      rpcPassword defaultRpcConfig `shouldBe` ""
 
   describe "G2 Cookie auth gated on rpcpassword == \"\" (Core parity)" $ do
     xit "G2 MISSING: cookie generated unconditionally regardless of rpcpassword" $
