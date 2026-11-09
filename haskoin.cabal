@@ -649,6 +649,21 @@ test-suite decode-strict
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- secfix-haskoin-getblocktxn-index-wrap: own target so the spec needs no edit
+-- to the shared Spec.hs / haskoin-test other-modules list.
+test-suite getblocktxn-index-wrap
+  type:          exitcode-stdio-1.0
+  main-is:       GetBlockTxnIndexWrapMain.hs
+  other-modules: GetBlockTxnIndexWrapSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , cereal
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- policy-cause-17: own suite so the shared test list is not touched.
 test-suite operator-shape
   type:          exitcode-stdio-1.0
