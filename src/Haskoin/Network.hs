@@ -752,6 +752,7 @@ import Foreign.Storable (peek, poke)
 import qualified Data.ByteString.Unsafe as BSU
 import Control.Exception (bracket)
 import qualified Data.Map.Strict as Map
+import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Unboxed.Mutable as VUM
 import qualified Crypto.Cipher.ChaCha as ChaCha
@@ -2662,13 +2663,19 @@ serveGetBlockTxn depth gbt mBlk = case mBlk of
   Nothing  -> Right []
   Just blk
     | maybe False (> maxBlocktxnDepth) depth -> Right [MBlock blk]
+    -- The wire decoder only yields strictly increasing indexes (Core's
+    -- DifferenceFormatter; net_processing asserts it).  Refuse anything else
+    -- rather than build a reply holding repeated copies of one transaction.
+    | not (strictlyIncreasing idxs) -> Left "getblocktxn with non-increasing tx indices"
     | any (>= n) idxs -> Left "getblocktxn with out-of-bound tx indices"
     | otherwise ->
-        Right [MBlockTxn (BlockTxn (gbtBlockHash gbt) [ txs !! i | i <- idxs ])]
+        Right [MBlockTxn (BlockTxn (gbtBlockHash gbt) [ txs V.! i | i <- idxs ])]
     where
-      txs  = blockTxns blk
-      n    = length txs
+      -- Strictly increasing and all < n caps the reply at n transactions.
+      txs  = V.fromList (blockTxns blk)
+      n    = V.length txs
       idxs = map fromIntegral (gbtIndexes gbt) :: [Int]
+      strictlyIncreasing xs = and (zipWith (<) xs (drop 1 xs))
 
 --------------------------------------------------------------------------------
 -- Inv, GetData, NotFound Messages
@@ -10024,12 +10031,35 @@ instance Serialize GetBlockTxn where
     let diffs = differentialEncode gbtIndexes
     mapM_ (putVarInt . fromIntegral) diffs
 
+  -- Core: VectorFormatter<DifferenceFormatter> (bitcoin-core/src/
+  -- blockencodings.h).  Each gap is added to a 64-bit running shift, and the
+  -- decode fails ("differential value overflow") as soon as the index leaves
+  -- uint16.  Decoded indexes are therefore strictly increasing and < 65536.
+  -- Truncating each gap to Word16 first (the old decoder) let a gap of 0xffff
+  -- wrap back to the previous index, so one index repeated once per gap.
   get = do
     blockHash <- get
     count <- getVarInt'
-    diffs <- replicateM (fromIntegral count) (fromIntegral <$> getVarInt')
-    let indexes = differentialDecode diffs
+    -- More than 65536 strictly increasing uint16 indexes cannot exist; fail
+    -- before reading them (Core fails on the 65537th at the latest).
+    when (count > 0x10000) $ fail "getblocktxn: indexes overflowed 16 bits"
+    indexes <- getDifferentialIndexes count
     return $ GetBlockTxn blockHash indexes
+
+-- | Read @count@ differentially encoded getblocktxn indexes, as Core's
+-- DifferenceFormatter::Unser does: a uint64 running shift, failing the
+-- whole decode the first time an index would exceed 0xffff.
+getDifferentialIndexes :: Word64 -> Get [Word16]
+getDifferentialIndexes = go 0 []
+  where
+    go :: Word64 -> [Word16] -> Word64 -> Get [Word16]
+    go _ acc 0 = return (reverse acc)
+    go shift acc k = do
+      n <- getVarInt'
+      let cur = shift + n
+      when (cur < n || cur > 0xffff) $
+        fail "getblocktxn: differential value overflow"
+      go (cur + 1) (fromIntegral cur : acc) (k - 1)
 
 -- | Differential encode a sorted list of indices
 -- Each value is stored as the difference from (previous + 1)

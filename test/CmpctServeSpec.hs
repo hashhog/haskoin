@@ -94,9 +94,11 @@ spec = describe "BIP-152 serving (cmpctblock / blocktxn)" $ do
   describe "getblocktxn" $ do
     let bh  = BlockHash hashA
         req = GetBlockTxn bh
-    it "serves the requested transactions in request order" $
-      serveGetBlockTxn (Just 0) (req [2, 1]) (Just theBlock)
-        `shouldBe` Right [MBlockTxn (BlockTxn bh [mkTx 3, mkTx 2])]
+    -- Indexes off the wire are strictly increasing (Core's
+    -- DifferenceFormatter); a non-increasing list is refused (C3).
+    it "serves the requested transactions in index order" $
+      serveGetBlockTxn (Just 0) (req [0, 2]) (Just theBlock)
+        `shouldBe` Right [MBlockTxn (BlockTxn bh [mkTx 1, mkTx 3])]
     it "serves blocktxn exactly MAX_BLOCKTXN_DEPTH deep" $
       serveGetBlockTxn (Just maxBlocktxnDepth) (req [1]) (Just theBlock)
         `shouldBe` Right [MBlockTxn (BlockTxn bh [mkTx 2])]
