@@ -50,7 +50,7 @@ Every option of `haskoin node`, from `parseNodeOptions` in `app/Main.hs`:
 | Option | Default | Meaning |
 |---|---|---|
 | `--rpcport N` | 8332 | JSON-RPC port. RPC binds to `127.0.0.1` only. |
-| `--rpcuser U`, `--rpcpassword P` | `haskoin` / `haskoin` | Basic-auth credentials, accepted in addition to the cookie. |
+| `--rpcuser U`, `--rpcpassword P` | none | Basic-auth credentials, accepted in addition to the cookie only when both are set. With neither, only the cookie authenticates (Core parity). |
 | `--rpc-tls-cert PATH`, `--rpc-tls-key PATH` | off | Serve RPC over HTTPS. Both or neither. |
 | `--rest` | off | Serve Core's read-only REST endpoints (`/rest/...`) on the RPC port. |
 | `--port N` | network default | P2P listen port. |

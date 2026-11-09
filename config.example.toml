@@ -20,9 +20,11 @@ prune = false
 [rpc]
 # RPC port
 rpcport = 8332
-# RPC authentication
-rpcuser = "haskoin"
-rpcpassword = "haskoin"
+# RPC authentication. No built-in login: with neither set, only the
+# .cookie file in the data directory authenticates. Set BOTH to enable
+# user/password auth, and choose your own strong password.
+# rpcuser = "alice"
+# rpcpassword = "<a long random secret>"
 
 [p2p]
 # P2P listen port

@@ -325,7 +325,7 @@ import Network.Wai.Handler.Warp (run, runSettings, Settings, defaultSettings, se
 import qualified Network.Wai.Handler.WarpTLS as WarpTLS
 import Data.String (fromString)
 import Network.HTTP.Types (status200, status400, status401, status403, status404, status405,
-                           status500, status503, hContentType, hAuthorization)
+                           status500, status503, hContentType, hAuthorization, hHost)
 import Control.Concurrent (ThreadId, forkIO, killThread)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException, catch, bracket, bracket_, mask_, handle, evaluate)
@@ -694,8 +694,12 @@ defaultRpcConfig :: RpcConfig
 defaultRpcConfig = RpcConfig
   { rpcHost     = "127.0.0.1"
   , rpcPort     = 8332
-  , rpcUser     = "haskoin"
-  , rpcPassword = "haskoin"
+  -- No built-in login (Core: -rpcuser / -rpcpassword default to "", and
+  -- InitRPCAuthentication then authenticates with the generated cookie
+  -- only).  A user:password pair is honoured only when both are set; see
+  -- 'checkAuth'.
+  , rpcUser     = ""
+  , rpcPassword = ""
   , rpcAllowIp  = ["127.0.0.1"]
   , rpcDataDir  = "."
   , rpcRestEnabled = False
@@ -1253,7 +1257,9 @@ parseSingleRequest val =
 
 -- | Check HTTP Basic authentication.
 -- Accepts either:
---   (a) configured rpcUser:rpcPassword, or
+--   (a) configured rpcUser:rpcPassword, only when BOTH are non-empty (there
+--       is no built-in login; an unset pair must not match an empty
+--       "Basic Og==" / "user:" header), or
 --   (b) __cookie__:<cookie-password> (cookie-based auth for local clients)
 -- | Constant-time Text equality for credentials: compares the UTF-8 byte
 -- images via cryptonite's 'BA.constEq', so the compare time does not depend on
@@ -1282,8 +1288,57 @@ checkAuth server req =
                  -- Cookie auth: username must be exactly "__cookie__" (public
                  -- sentinel). Secrets (cookie/password) use constant-time compare.
              in (user == "__cookie__" && ctEqText pass (rsCookiePassword server))
-                -- Configured user/password auth
-                || (ctEqText user (rpcUser config) && ctEqText pass (rpcPassword config))
+                -- Configured user/password auth, only when the operator set
+                -- both (Core httprpc.cpp: no -rpcpassword => cookie only).
+                || (userPassConfigured config
+                    && ctEqText user (rpcUser config) && ctEqText pass (rpcPassword config))
+
+-- | True when the operator configured both an rpcuser and an rpcpassword.
+userPassConfigured :: RpcConfig -> Bool
+userPassConfigured config =
+  not (T.null (rpcUser config)) && not (T.null (rpcPassword config))
+
+--------------------------------------------------------------------------------
+-- DNS-rebinding guard (secfix C1)
+--
+-- A browser page on attacker.example can re-point its own hostname at
+-- 127.0.0.1 and then talk to the loopback RPC listener as same-origin.  The
+-- browser still sends "Host: attacker.example[:port]", so while the listener
+-- is bound to loopback, any Host that is not a loopback name is refused
+-- before routing (RPC, REST and /payjoin alike).  The header is read from
+-- 'requestHeaders' (what the client sent) rather than WAI's derived
+-- 'requestHeaderHost' field.  A request with no Host
+-- header (HTTP/1.0 clients) is allowed: a browser always sends one.  When an
+-- operator binds a non-loopback address the check is skipped, since clients
+-- may then legitimately use any name for the box; -rpcallowip and auth gate
+-- that case.
+--------------------------------------------------------------------------------
+
+-- | Is this request's Host header acceptable for the configured bind host?
+hostHeaderAllowed :: RpcConfig -> Request -> Bool
+hostHeaderAllowed config req
+  | not (isLoopbackHostName (C8.pack (rpcHost config))) = True
+  | otherwise = case lookup hHost (requestHeaders req) of
+      Nothing -> True
+      Just h  -> isLoopbackHostName (hostWithoutPort h)
+
+-- | Strip an optional ":port" from a Host header value.  A bracketed IPv6
+-- literal ("[::1]:18443") yields the address inside the brackets.
+hostWithoutPort :: ByteString -> ByteString
+hostWithoutPort h
+  | "[" `BS.isPrefixOf` h = C8.takeWhile (/= ']') (BS.drop 1 h)
+  | otherwise             = C8.takeWhile (/= ':') h
+
+-- | "localhost", "::1" or a dotted-quad in 127.0.0.0/8 (case-insensitive).
+isLoopbackHostName :: ByteString -> Bool
+isLoopbackHostName raw =
+  h == "localhost" || h == "::1" || isLoopbackV4 (C8.split '.' h)
+  where
+    h = C8.map toLower raw
+    isLoopbackV4 [a, b, c, d] = a == "127" && all octet [b, c, d]
+    isLoopbackV4 _            = False
+    octet o = not (BS.null o) && BS.length o <= 3 && C8.all isDigit o
+              && (read (C8.unpack o) :: Int) <= 255
 
 --------------------------------------------------------------------------------
 -- BUG-6 FIX: -rpcallowip IP allowlist enforcement (G6)
@@ -17687,6 +17742,10 @@ combinedApp server req respond = do
     then respond $ responseLBS status403
            [(hContentType, "application/json")]
            "{\"error\": \"Forbidden\"}"
+    else if not (hostHeaderAllowed (rsConfig server) req)
+    then respond $ responseLBS status403
+           [(hContentType, "application/json")]
+           "{\"error\": \"Forbidden: unexpected Host header\"}"
     else do
       let path = rawPathInfo req
       if BS.isPrefixOf "/rest/" path
