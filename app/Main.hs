@@ -4748,7 +4748,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     let depthOf bh = return $ case Map.lookup bh ents of
           Just e  -> Just (fromIntegral tipH - fromIntegral (ceHeight e))
           Nothing -> Nothing
-    replies <- serveGetDataCompact
+    -- One item at a time, each reply written before the next is loaded,
+    -- duplicates skipped; a failed send stops serving (C2: a getdata naming
+    -- one block 50,000 times used to build every reply first).
+    serveGetDataStream
       depthOf
       (\t -> do r <- getTransaction mp t
                 forM_ r $ \_ -> removeUnbroadcast mp t
@@ -4757,8 +4760,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 forM_ r $ \e -> removeUnbroadcast mp (meTxId e)
                 return (fmap meTransaction r))
       (getBlock db)
+      (requestFromPeerChecked pm addr)
       ivs
-    forM_ replies $ requestFromPeer pm addr
 
   MInv (Inv ivs) -> do
     -- During IBD, skip block inv requests — we download blocks sequentially
