@@ -230,6 +230,7 @@ module Haskoin.Consensus
   , bip68Active
   , getMtpAtHeightFromEntries
   , getMtpFromAncestry
+  , p2pBlockArmMtpResolver
     -- * BIP9 Version Bits (Soft Fork Deployment)
   , ThresholdState(..)
   , Deployment(..)
@@ -2434,6 +2435,19 @@ getMtpFromAncestry entries startHash h =
           | ceHeight ce > h -> maybe [] (\p -> collect p n) (cePrev ce)
           | otherwise       -> bhTimestamp (ceHeader ce)
                              : maybe [] (\p -> collect p (n - 1)) (cePrev ce)
+
+-- | The per-coin BIP-68 MTP resolver that both P2P @MBlock@ arms in
+-- app/Main.hs (the ahead-store arm and the linear-connect arm) hand to
+-- 'validateFullBlock' / 'validateFullBlockIO' for the block whose parent is
+-- @parentHash@.  Named here so the choice of resolver is testable without
+-- driving a peer (test/Bip68MtpP2PArmSpec.hs).
+--
+-- Resolves through the active-tip height index 'hcByHeight'.
+p2pBlockArmMtpResolver :: HeaderChain -> BlockHash -> IO (Word32 -> Word32)
+p2pBlockArmMtpResolver hc _parentHash = atomically $ do
+  entries  <- readTVar (hcEntries hc)
+  byHeight <- readTVar (hcByHeight hc)
+  return (getMtpAtHeightFromEntries entries byHeight)
 
 --------------------------------------------------------------------------------
 -- BIP9 Version Bits (Soft Fork Deployment)
