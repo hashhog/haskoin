@@ -229,3 +229,14 @@ spec = describe "cffix-haskoin-bip68-mtp-p2p-arm: P2P MBlock BIP-68 coin MTP fro
     fx <- buildFixture (baseTime + 1800) (baseTime + 1000) fxA5
     getMtp <- p2pBlockArmMtpResolver (fxHc fx) (fxC6 fx)
     getMtp 5 `shouldBe` baseTime + 1000
+
+  -- Straight-line controls: on D7's own branch the resolver must agree with
+  -- the height index wherever the index already names that branch, so the
+  -- ordinary tip-extension path is unchanged.  Height 6 is D7's parent (a
+  -- coin created inside D7 itself queries coinHeight-1 = 6); heights 1..4
+  -- are the shared prefix.
+  it "control: on the block's own branch the resolver equals the height index (parent and shared prefix)" $ do
+    fx <- buildFixture (baseTime + 1800) (baseTime + 1000) fxA5
+    getMtp <- p2pBlockArmMtpResolver (fxHc fx) (fxC6 fx)
+    getMtp 6 `shouldBe` mtpC6
+    map getMtp [1 .. 4] `shouldBe` map (baseTime +) [1 .. 4]
