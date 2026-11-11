@@ -2442,12 +2442,23 @@ getMtpFromAncestry entries startHash h =
 -- @parentHash@.  Named here so the choice of resolver is testable without
 -- driving a peer (test/Bip68MtpP2PArmSpec.hs).
 --
--- Resolves through the active-tip height index 'hcByHeight'.
+-- Resolves through the connecting block's OWN ancestry ('getMtpFromAncestry'
+-- from @parentHash@), as Core's CalculateSequenceLocks does
+-- (consensus/tx_verify.cpp:74, @block.GetAncestor(nCoinHeight-1)@).  It used
+-- to read 'hcByHeight', which is the best-HEADER index, not the active chain:
+-- 'addHeaderAt' rewrites a slot only for a strictly heavier header and only at
+-- that header's height, 'connectBlockAt' never writes it, and
+-- 'recalculateBestHeader' rewrites only heights above the connected tip.  With
+-- equal-work siblings A and B at height N where A's header came first,
+-- @hcByHeight[N]@ kept naming A after B's body connected, so a later spend of a
+-- coin created at N+1 with a time-based nSequence was judged against MTP(A):
+-- a false bad-txns-nonfinal (marked BLOCK_FAILED_VALID by the arm) or a false
+-- accept.  Every other 'validateFullBlock' caller already used the ancestry
+-- resolver (haskoin#3); a restart healed the index, the live arm did not.
 p2pBlockArmMtpResolver :: HeaderChain -> BlockHash -> IO (Word32 -> Word32)
-p2pBlockArmMtpResolver hc _parentHash = atomically $ do
-  entries  <- readTVar (hcEntries hc)
-  byHeight <- readTVar (hcByHeight hc)
-  return (getMtpAtHeightFromEntries entries byHeight)
+p2pBlockArmMtpResolver hc parentHash = do
+  entries <- readTVarIO (hcEntries hc)
+  return (getMtpFromAncestry entries parentHash)
 
 --------------------------------------------------------------------------------
 -- BIP9 Version Bits (Soft Fork Deployment)
