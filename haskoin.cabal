@@ -512,6 +512,33 @@ test-suite maxmempool-arg
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- secfix-haskoin-wallet-passphrase-unenforced: own suite so the shared
+-- Spec.hs / haskoin-test other-modules list is not touched.
+test-suite rpc-wallet-unlock
+  type:          exitcode-stdio-1.0
+  main-is:       RpcWalletMain.hs
+  other-modules: RpcWalletSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , http-types
+               , network
+               , stm
+               , temporary
+               , text
+               , vector
+               , wai
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- haskoin-design-fixes: own target so the spec needs no edit to the shared
 -- Spec.hs / haskoin-test other-modules list.  -N8: the admission race needs
 -- real parallelism to show.
