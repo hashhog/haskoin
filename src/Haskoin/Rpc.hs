@@ -1002,6 +1002,33 @@ rpcWalletError = -4
 rpcWalletInsufficientFunds :: Int
 rpcWalletInsufficientFunds = -6
 
+-- | @RPC_WALLET_UNLOCK_NEEDED@ (-13) from @bitcoin-core/src/rpc/protocol.h@:
+--   "Enter the wallet passphrase with walletpassphrase first".
+rpcWalletUnlockNeeded :: Int
+rpcWalletUnlockNeeded = -13
+
+-- | True iff the wallet is encrypted and not currently unlocked.  An
+--   unencrypted wallet is never "locked" ('isWalletLocked' alone reports
+--   True for it, because it has no decrypted key in memory).
+walletNeedsUnlock :: WalletState -> IO Bool
+walletNeedsUnlock ws = do
+  mEnc <- readTVarIO (wsEncrypted ws)
+  case mEnc of
+    Nothing -> return False
+    Just _  -> isWalletLocked ws
+
+-- | Core's @EnsureWalletIsUnlocked@ (wallet/rpc/util.cpp): every RPC that
+--   exports or signs with a wallet private key refuses with -13 while an
+--   encrypted wallet is locked; otherwise run the continuation.
+ensureWalletIsUnlocked :: WalletState -> IO RpcResponse -> IO RpcResponse
+ensureWalletIsUnlocked ws k = do
+  locked <- walletNeedsUnlock ws
+  if locked
+    then return $ RpcResponse Null
+      (toJSON $ RpcError rpcWalletUnlockNeeded
+        "Error: Please enter the wallet passphrase with walletpassphrase first.") Null
+    else k
+
 -- | Maximum @walletpassphrase@ unlock duration in seconds (~3.17 years).
 --   Matches Bitcoin Core's @MAX_SLEEP_TIME@ in wallet/rpc/encrypt.cpp.
 walletPassphraseMaxSleepTime :: Int
@@ -1793,7 +1820,7 @@ handleRpcRequest server req = do
     "walletlock"           -> handleWalletLock server
     "setlabel"             -> handleSetLabel server params
     "verifymessage"        -> handleVerifyMessage server params
-    "signmessage"          -> handleSignMessage server params
+    "signmessage"          -> handleSignMessageWallet server params
     "signmessagewithprivkey" -> handleSignMessage server params
     "uptime"               -> handleUptime server
     "getnettotals"         -> handleGetNetTotals server
@@ -7293,7 +7320,7 @@ handleImportDescriptors server params =
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcWalletNotFound
                 "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-            Just ws -> do
+            Just ws -> ensureWalletIsUnlocked ws $ do
               pkEnabled <- readTVarIO (wsPrivateKeysEnabled ws)
               now <- (round :: POSIXTime -> Word64) <$> getPOSIXTime
               results <- mapM (importOneDescriptor ws pkEnabled now)
@@ -9107,9 +9134,13 @@ handleWalletProcessPsbt server params = withWalletMgr server $ \wm -> do
             Right bytes -> case decodePsbt bytes of
               Left err -> return $ rpcFail rpcDeserializationError
                 ("TX decode failed " <> T.pack err)
-              Right psbt0 -> do
-                let doSign = fromMaybe True (extractParam params 1 :: Maybe Bool)
-                    doFinalize = fromMaybe True (extractParam params 4 :: Maybe Bool)
+              Right psbt0 ->
+               -- Core spend.cpp walletprocesspsbt: @if (sign)
+               -- EnsureWalletIsUnlocked@ — an unsigned fill is allowed locked.
+               let doSign = fromMaybe True (extractParam params 1 :: Maybe Bool)
+                   gate = if doSign then ensureWalletIsUnlocked ws else id
+               in gate $ do
+                let doFinalize = fromMaybe True (extractParam params 4 :: Maybe Bool)
                     nIns = length (txInputs (pgTx (psbtGlobal psbt0)))
                     padded = psbt0
                       { psbtInputs = take nIns
@@ -9588,7 +9619,7 @@ handleImportPrivKey server params = withWalletMgr server $ \wm -> do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound
         "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws ->
+    Just ws -> ensureWalletIsUnlocked ws $
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Missing private key parameter") Null
@@ -9631,7 +9662,7 @@ handleDumpPrivKey server params = withWalletMgr server $ \wm -> do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound
         "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws ->
+    Just ws -> ensureWalletIsUnlocked ws $
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Missing address parameter") Null
@@ -11271,7 +11302,7 @@ handleSignRawTransactionWithWallet server params = withWalletMgr server $ \walle
                 Nothing -> return $ RpcResponse Null
                   (toJSON $ RpcError rpcWalletNotFound
                     "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-                Just walletState -> do
+                Just walletState -> ensureWalletIsUnlocked walletState $ do
                   -- Per-input prev-output map from the wallet's UTXO store.
                   walletUtxos <- getWalletUTXOs (wsWallet walletState)
                   -- The set of HD child keys the wallet actually owns.  An
@@ -13077,7 +13108,10 @@ commitWalletSpend wallet cs tx tipH = do
 -- FeeRate is sat/kvB (FeeRate 1000 = 1 sat/vB).
 walletFundAndBroadcast
   :: RpcServer -> WalletState -> [WalletTxOutput] -> FeeRate -> IO RpcResponse
-walletFundAndBroadcast server walletState outputs feeRate = do
+walletFundAndBroadcast server walletState outputs feeRate =
+ -- Core SendMoney / sendtoaddress: EnsureWalletIsUnlocked before any
+ -- coin selection or signing.
+ ensureWalletIsUnlocked walletState $ do
   pkEnabled <- readTVarIO (wsPrivateKeysEnabled walletState)
   if not pkEnabled
     then return $ rpcFail rpcWalletError
@@ -13670,7 +13704,10 @@ bumpFeeShared server params wantPsbt = withWalletMgr server $ \walletMgr -> do
           Nothing -> return $ RpcResponse Null
             (toJSON $ RpcError rpcInvalidAddressOrKey
               "Invalid txid (must be 32-byte hex)") Null
-          Just txid -> do
+          -- Core bumpfee_helper (wallet/rpc/spend.cpp) serves bumpfee AND
+          -- psbtbumpfee and calls EnsureWalletIsUnlocked for both, after
+          -- parsing the txid and before building the replacement.
+          Just txid -> ensureWalletIsUnlocked walletState $ do
             let opts = parseBumpFeeOptions (extractParamObject params 1)
             if wantPsbt
               then do
@@ -13841,7 +13878,7 @@ handleSendPayjoinRequest server params = withWalletMgr server $ \walletMgr -> do
   case mWallet of
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-    Just walletState ->
+    Just walletState -> ensureWalletIsUnlocked walletState $
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams
@@ -14481,6 +14518,18 @@ handleVerifyMessage _server params = do
     _ -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams
         "Usage: verifymessage \"address\" \"signature\" \"message\"") Null
+
+-- | @signmessage@ (the wallet RPC) runs Core's EnsureWalletIsUnlocked
+-- before anything else (wallet/rpc/signmessage.cpp); the wallet-free
+-- @signmessagewithprivkey@ goes straight to 'handleSignMessage'.
+handleSignMessageWallet :: RpcServer -> Value -> IO RpcResponse
+handleSignMessageWallet server params = case rsWalletMgr server of
+  Nothing -> handleSignMessage server params
+  Just wm -> do
+    (mWallet, _) <- getDefaultWallet wm
+    case mWallet of
+      Nothing -> handleSignMessage server params
+      Just ws -> ensureWalletIsUnlocked ws (handleSignMessage server params)
 
 -- | Sign a UTF-8 message with the private key referenced by an address
 -- (haskoin's wallet stores keys directly, so we accept either a WIF private
@@ -17792,6 +17841,15 @@ routePayjoin server req respond = do
                       [(hContentType, "text/plain")]
                       "unavailable\r\n"
         Just ws -> do
+         -- The receiver signs its contributed input with wallet keys; a
+         -- locked encrypted wallet must not, so answer BIP-78
+         -- "unavailable" exactly as when no wallet can serve.
+         locked <- walletNeedsUnlock ws
+         if locked
+          then respond $ responseLBS status400
+                      [(hContentType, "text/plain")]
+                      "unavailable\r\n"
+          else do
           let wallet = wsWallet ws
               cache  = rsPayjoinOffers server
               cfg    = rsPayjoinConfig server
