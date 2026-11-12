@@ -41,6 +41,7 @@ module Haskoin.Rpc
   , handleSubmitBlock
   , handleListUnspent
   , handleGetBalances
+  , handleGetWalletInfo
   , buildRegtestCoinbase
   , findRegtestNonce
     -- * TLS (HTTPS) configuration — W119 + FIX-64
