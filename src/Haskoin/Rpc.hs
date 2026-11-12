@@ -9404,8 +9404,9 @@ handleGetWalletInfo server _params = withWalletMgr server $ \wm -> do
         Null Null
 
 -- | Convert a 'WalletInfo' record to the Core-shape getwalletinfo JSON.
--- Balance fields use btcAmountEnc on the streaming Encoding path so they
--- emit Core's fixed-decimal format (8 fractional digits, no sci notation).
+-- Core v31 getwalletinfo has no balance/unconfirmed_balance/immature_balance
+-- (wallet/rpc/wallet.cpp); those are getbalances' job. paytxfee uses
+-- btcAmountEnc so it emits Core's fixed-decimal format.
 walletInfoToJSON :: WalletInfo -> Text -> Word32 -> BL.ByteString
 walletInfoToJSON wi tipHash tipHeight =
   let unlockedEnc = case wiUnlockedUntil wi of
@@ -9415,9 +9416,6 @@ walletInfoToJSON wi tipHash tipHeight =
               pair "walletname"              (text (wiWalletName wi))               <>
               pair "walletversion"           (AE.int (wiWalletVersion wi))          <>
               pair "format"                  (text "bdb")                           <>
-              pair "balance"                 (btcAmountEnc (fromIntegral (wiBalance wi)))            <>
-              pair "unconfirmed_balance"     (btcAmountEnc (fromIntegral (wiUnconfirmedBalance wi))) <>
-              pair "immature_balance"        (btcAmountEnc (fromIntegral (wiImmatureBalance wi)))    <>
               pair "txcount"                 (AE.int (wiTxCount wi))                <>
               pair "keypoolsize"             (AE.int (wiKeypoolSize wi))            <>
               pair "keypoolsize_hd_internal" (AE.int (wiKeypoolSize wi))            <>
