@@ -13317,7 +13317,7 @@ data ListTxRow = ListTxRow
 -- Label only: spendability uses its own comparison (listunspent / getbalances).
 coinbaseCategory :: Int -> Text
 coinbaseCategory confs
-  | confs < coinbaseMaturity = "immature"
+  | confs <= coinbaseMaturity = "immature"
   | otherwise                = "generate"
 
 -- | Expand one wallet tx entry into its listtransactions rows: a "send"
