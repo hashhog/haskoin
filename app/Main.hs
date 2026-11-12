@@ -4287,12 +4287,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 then do
                   nUnc <- atomicModifyIORef' unconnectedCountRef (\c -> (c + 1, c + 1))
                   blockEntries <- readTVarIO (hcEntries hc)
-                  byHeightBg   <- readTVarIO (hcByHeight hc)
+                  getMtpBg     <- p2pBlockArmMtpResolver hc (bhPrevBlock hdr)
                   let parentHash  = bhPrevBlock hdr
                       prevMTP     = medianTimePast blockEntries parentHash
                       cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
                                       (consensusFlagsAtHeight net height)
-                      getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
                       acceptR     = validateFullBlock net cs getMtpBg False True block Map.empty
                   case acceptR of
                     Left err -> do
@@ -4336,7 +4335,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   -- (f9afd6c; skipConnectChecks=False on this arm).  P2P-fed
                   -- age-99 spend -> bad-txns-premature-spend-of-coinbase.
                   blockEntries <- readTVarIO (hcEntries hc)
-                  byHeightBg   <- readTVarIO (hcByHeight hc)
+                  getMtpBg     <- p2pBlockArmMtpResolver hc (bhPrevBlock hdr)
                   bestHdr      <- readTVarIO (hcTip hc)
                   let blockTs     = bhTimestamp hdr
                       parentHash  = bhPrevBlock hdr
@@ -4344,7 +4343,6 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                       skipScripts = shouldSkipScripts bh height blockTs net blockEntries bestHdr
                       cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
                                       (consensusFlagsAtHeight net height)
-                      getMtpBg    = getMtpAtHeightFromEntries blockEntries byHeightBg
                   -- gate-6: the validation (a lazy Either: forcing it runs
                   -- the whole pure validation incl. the script pool) is
                   -- forced INSIDE a sync-only handler. It used to be forced
