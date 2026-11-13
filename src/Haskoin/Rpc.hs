@@ -29,6 +29,7 @@ module Haskoin.Rpc
   , generateErrorCode
   , RpcConfig(..)
   , defaultRpcConfig
+  , coinbaseCategory
     -- * Wallet -fallbackfee
   , parseFallbackFee
   , resolveWalletFeeRate
@@ -13309,11 +13310,14 @@ data ListTxRow = ListTxRow
   }
 
 -- | Resolve a coinbase credit's category from its confirmation count:
--- < COINBASE_MATURITY -> "immature", else "generate" (Core
--- ListTransactions: IsTxImmatureCoinBase ? "immature" : "generate").
+-- <= COINBASE_MATURITY -> "immature", else "generate" (Core
+-- ListTransactions: IsTxImmatureCoinBase ? "immature" : "generate";
+-- GetBlocksToMaturity = max(0, COINBASE_MATURITY + 1 - depth), so a
+-- coinbase with exactly 100 confirmations is still immature).
+-- Label only: spendability uses its own comparison (listunspent / getbalances).
 coinbaseCategory :: Int -> Text
 coinbaseCategory confs
-  | confs < coinbaseMaturity = "immature"
+  | confs <= coinbaseMaturity = "immature"
   | otherwise                = "generate"
 
 -- | Expand one wallet tx entry into its listtransactions rows: a "send"
