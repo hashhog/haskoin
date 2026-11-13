@@ -891,10 +891,26 @@ addTransaction mp tx = withAdmissionLock mp $ do
   latched <- readFatalLatch
   case latched of
     Just why -> return (Left (ErrValidationFailed (fatalLatchedReject why)))
-    Nothing -> addTransactionUnlatched mp tx
+    Nothing -> addTransactionUnlatched False mp tx
 
-addTransactionUnlatched :: Mempool -> Tx -> IO (Either MempoolError TxId)
-addTransactionUnlatched mp tx = do
+-- | Re-add a transaction from a disconnected block: Core's
+-- AcceptToMemoryPool(..., bypass_limits=true) as called from
+-- Chainstate::MaybeUpdateMempoolForReorg (validation.cpp).  The only
+-- difference from 'addTransaction' is that the fee-rate floor (min relay fee
+-- and rolling minimum, Core CheckFeeRate in MemPoolAccept::PreChecks) is not
+-- applied: a transaction a miner already confirmed below our floor must come
+-- back, or its in-pool children are left spending a coin nobody has.
+addTransactionBypassLimits :: Mempool -> Tx -> IO (Either MempoolError TxId)
+addTransactionBypassLimits mp tx = withAdmissionLock mp $ do
+  latched <- readFatalLatch
+  case latched of
+    Just why -> return (Left (ErrValidationFailed (fatalLatchedReject why)))
+    Nothing -> addTransactionUnlatched True mp tx
+
+-- | The first argument is Core's bypass_limits: when True the fee-rate floor
+-- is skipped (see 'addTransactionBypassLimits').
+addTransactionUnlatched :: Bool -> Mempool -> Tx -> IO (Either MempoolError TxId)
+addTransactionUnlatched bypass mp tx = do
   let txid = computeTxId tx
       wtxid = computeWtxid tx
 
@@ -912,11 +928,11 @@ addTransactionUnlatched mp tx = do
       byTxid <- atomically $ Map.lookup txid <$> readTVar (mpEntries mp)
       case byTxid of
         Just _ -> return $ Left ErrSameNonwitnessInMempool
-        Nothing -> addTransactionInner mp tx txid
+        Nothing -> addTransactionInner bypass mp tx txid
 
 -- | Inner implementation of addTransaction after duplicate check
-addTransactionInner :: Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
-addTransactionInner mp tx txid = do
+addTransactionInner :: Bool -> Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
+addTransactionInner bypass mp tx txid = do
   -- 2a. Context-free CheckTransaction (consensus/tx_check.cpp).
   case validateTransaction tx of
     Left err -> return $ Left (ErrValidationFailed err)
@@ -965,13 +981,13 @@ addTransactionInner mp tx txid = do
 
                   if null conflicts
                     -- No conflicts: proceed with normal addition
-                    then addTransactionNoConflicts mp tx txid
+                    then addTransactionNoConflicts bypass mp tx txid
                     -- Has conflicts: attempt RBF replacement
                     else if mpcRBFEnabled (mpConfig mp)
                       -- Full RBF (mempoolfullrbf=1): all mempool txs are replaceable.
                       -- bitcoin-core/src/policy/rbf.cpp:IsRBFOptIn — in full-RBF mode
                       -- every in-mempool tx is treated as REPLACEABLE_BIP125.
-                      then addTransactionWithReplacement mp tx txid conflicts
+                      then addTransactionWithReplacement bypass mp tx txid conflicts
                       else do
                         -- Legacy BIP-125 mode: attempt replacement only if every
                         -- conflicting tx (or one of its mempool ancestors) signals
@@ -980,21 +996,21 @@ addTransactionInner mp tx txid = do
                         -- transaction itself, then walks in-mempool ancestors.
                         rbfOk <- checkAllConflictsRbfReplaceable mp conflicts
                         if rbfOk
-                          then addTransactionWithReplacement mp tx txid conflicts
+                          then addTransactionWithReplacement bypass mp tx txid conflicts
                           else return $ Left (ErrInputSpentInMempool (head conflicts))
 
 -- | Add a transaction with no conflicts (normal case)
-addTransactionNoConflicts :: Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
-addTransactionNoConflicts mp tx txid = do
+addTransactionNoConflicts :: Bool -> Mempool -> Tx -> TxId -> IO (Either MempoolError TxId)
+addTransactionNoConflicts bypass mp tx txid = do
   -- Resolve inputs
   inputResults <- resolveInputs mp tx
   case inputResults of
     Left err -> return $ Left err
-    Right inputPairs -> finalizeTransaction mp tx txid inputPairs
+    Right inputPairs -> finalizeTransaction bypass mp tx txid inputPairs
 
 -- | Add a transaction that replaces conflicting transactions (RBF)
-addTransactionWithReplacement :: Mempool -> Tx -> TxId -> [TxId] -> IO (Either MempoolError TxId)
-addTransactionWithReplacement mp tx txid conflictTxIds = do
+addTransactionWithReplacement :: Bool -> Mempool -> Tx -> TxId -> [TxId] -> IO (Either MempoolError TxId)
+addTransactionWithReplacement bypass mp tx txid conflictTxIds = do
   -- W96 Gate: EntriesAndTxidsDisjoint (Bitcoin Core
   -- validation.cpp:1356).  After we have the set of all ancestors of
   -- @tx@ + the set of conflicts to be replaced, verify the two sets
@@ -1009,12 +1025,12 @@ addTransactionWithReplacement mp tx txid conflictTxIds = do
       overlap = Set.intersection ancestorTxids conflictSet
   case Set.lookupMin overlap of
     Just badId -> return $ Left (ErrSpendsConflictingTx badId)
-    Nothing -> addTransactionWithReplacementInner mp tx txid conflictTxIds
+    Nothing -> addTransactionWithReplacementInner bypass mp tx txid conflictTxIds
 
 -- | Inner body of 'addTransactionWithReplacement' after the disjoint-set
 -- check.  Kept separate so the disjoint gate is visually obvious.
-addTransactionWithReplacementInner :: Mempool -> Tx -> TxId -> [TxId] -> IO (Either MempoolError TxId)
-addTransactionWithReplacementInner mp tx txid conflictTxIds = do
+addTransactionWithReplacementInner :: Bool -> Mempool -> Tx -> TxId -> [TxId] -> IO (Either MempoolError TxId)
+addTransactionWithReplacementInner bypass mp tx txid conflictTxIds = do
   -- For RBF, we need to resolve inputs differently:
   -- - Conflicting inputs will fail resolveInput, so we need to resolve from UTXO
   -- - Non-conflicting inputs should resolve normally
@@ -1040,7 +1056,7 @@ addTransactionWithReplacementInner mp tx txid conflictTxIds = do
           -- the static relay minimum and the (decayed) rolling minimum bumped by
           -- size-limit evictions (W153 BUG-5 — was: static mpcMinFeeRate only).
           minFee <- effectiveMinFeeRate mp
-          if feeRate < minFee
+          if not bypass && feeRate < minFee
             then return $ Left (ErrFeeBelowMinimum feeRate minFee)
             else do
               -- Attempt replacement with RBF rules
@@ -1054,7 +1070,7 @@ addTransactionWithReplacementInner mp tx txid conflictTxIds = do
                   case inputResults' of
                     Left err -> return $ Left err
                     Right inputPairs' ->
-                      finalizeTransaction mp tx txid inputPairs'
+                      finalizeTransaction bypass mp tx txid inputPairs'
 
 -- | Does a mempool rejection of a transaction RELAYED by a peer charge that
 -- peer a misbehavior score?  Never.
@@ -1132,8 +1148,8 @@ resolveInputsForReplacement mp tx conflictTxIds = do
   return $ sequence results
 
 -- | Finalize adding a transaction (common code for both normal and RBF)
-finalizeTransaction :: Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> IO (Either MempoolError TxId)
-finalizeTransaction mp tx txid inputPairs = do
+finalizeTransaction :: Bool -> Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> IO (Either MempoolError TxId)
+finalizeTransaction bypass mp tx txid inputPairs = do
   let inputMap = Map.fromList inputPairs
       totalIn = sum $ map (txOutValue . snd) inputPairs
       totalOut = sum $ map txOutValue (txOutputs tx)
@@ -1169,8 +1185,11 @@ finalizeTransaction mp tx txid inputPairs = do
       -- BUG-5: previously only the static mpcMinFeeRate was consulted, so the
       -- eviction-driven rolling minimum (GetMinFee) never gated admission and
       -- its decay never advanced on the live path.
+      -- Core: `if (!bypass_limits && ... && !CheckFeeRate(...))`
+      -- (validation.cpp MemPoolAccept::PreChecks): a re-add from a
+      -- disconnected block skips the floor.
       minFee <- effectiveMinFeeRate mp
-      if feeRate < minFee
+      if not bypass && feeRate < minFee
         then return $ Left (ErrFeeBelowMinimum feeRate minFee)
         else
           -- W96 Gate (client-maxfeerate): mirrors Bitcoin Core
@@ -2617,11 +2636,19 @@ blockDisconnectedAt mp mEntryHeight block = withAdmissionLock mp $ do
     timestamps <- readTVar (mpRecentTimestamps mp)
     writeTVar (mpMTP mp) (computeMTPFromList timestamps)
 
-  -- Re-add non-coinbase transactions
-  -- (they may fail validation if inputs are now missing)
+  -- Re-add non-coinbase transactions with bypass_limits, as Core's
+  -- MaybeUpdateMempoolForReorg does: a transaction confirmed below our fee
+  -- floor comes back.  A re-add that still fails (missing input, script,
+  -- standardness, ...) is followed by Core's removeRecursive(tx, REORG): any
+  -- in-pool spender of its outputs leaves with its descendants, so no entry
+  -- is left spending a coin that is neither in the UTXO set nor in the pool.
   readded <- fmap concat $ forM (tail $ blockTxns block) $ \tx -> do
-    r <- addTransaction mp tx
-    return [ t | Right t <- [r] ]
+    r <- addTransactionBypassLimits mp tx
+    case r of
+      Right t -> return [t]
+      Left _  -> do
+        removeSpendersOfFailedReadd mp tx
+        return []
   forM_ mEntryHeight $ \h -> atomically $ forM_ readded $ \t ->
     modifyTVar' (mpEntries mp) (Map.adjust (\e -> e { meHeight = h }) t)
   -- Core CTxMemPool::UpdateTransactionsFromBlock: a re-added transaction can
@@ -2632,6 +2659,22 @@ blockDisconnectedAt mp mEntryHeight block = withAdmissionLock mp $ do
   -- (its children were never mined away), which the admission gate does not
   -- see.  Core re-adds with bypass_limits and then TrimToSize()s; do the same.
   trimOversizedClusters mp
+
+-- | Remove every in-pool spender of @tx@'s outputs, with its descendants:
+-- the effect of Core's CTxMemPool::removeRecursive(tx, REORG) for a @tx@
+-- that is not itself in the pool (a failed reorg re-add).  Caller holds the
+-- admission lock.
+removeSpendersOfFailedReadd :: Mempool -> Tx -> IO ()
+removeSpendersOfFailedReadd mp tx = do
+  let txid = computeTxId tx
+  byOutpoint <- readTVarIO (mpByOutpoint mp)
+  let spenders = Set.toList $ Set.fromList
+        [ t | i <- [0 .. length (txOutputs tx) - 1]
+            , Just t <- [Map.lookup (OutPoint txid (fromIntegral i)) byOutpoint] ]
+  forM_ spenders $ \t -> do
+    -- an earlier removal may already have taken it as a descendant
+    present <- Map.member t <$> readTVarIO (mpEntries mp)
+    when present $ removeWithDescendants mp t
 
 -- | Recompute the stored ancestor and descendant aggregates of every entry
 -- connected to the re-added @txids@ (their in-pool ancestors, descendants and
