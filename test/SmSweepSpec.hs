@@ -382,7 +382,7 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
           candAfter <- fmap ceHash <$> findBestCandidate (rsHeaderChain s)
           candAfter `shouldBe` candBefore)
 
-  gap "sm-restart-best-header-after-invalidate: the best header after a restart is the most-work valid header, not the invalidated branch's ancestor" $
+  it "sm-restart-best-header-after-invalidate: the best header after a restart is the most-work valid header, not the invalidated branch's ancestor" $
     withRestart
       (\s -> do
           [_, _, h3] <- chainN s 3
