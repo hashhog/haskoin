@@ -76,6 +76,13 @@ module Haskoin.Network
   , BlockTxn(..)
   , PartiallyDownloadedBlock(..)
   , CompactBlockState(..)
+  , CmpctPendingMap
+  , CmpctPendingAdmit(..)
+  , admitPendingCompact
+  , takePendingCompact
+  , maxCmpctPendingPerPeer
+  , maxCmpctPendingPerBlock
+  , maxCmpctPendingGlobal
   , CompactBlockConfig(..)
   , defaultCompactBlockConfig
   , maxCmpctBlockDepth
@@ -10270,17 +10277,85 @@ data PartiallyDownloadedBlock = PartiallyDownloadedBlock
   , pdbTotalTxns     :: !Int                   -- ^ Total transaction count
   } deriving (Show, Generic)
 
+-- | Partially downloaded blocks waiting for missing txns, keyed by the peer
+-- that was sent the getblocktxn and the block hash (Core keeps the
+-- PartiallyDownloadedBlock inside that peer's mapBlocksInFlight entry), each
+-- with its POSIX-second insertion time for the 600 s sweep in app/Main.hs.
+type CmpctPendingMap = Map (SockAddr, BlockHash) (Int64, PartiallyDownloadedBlock)
+
 -- | Compact block reconstruction state
 data CompactBlockState = CompactBlockState
-  { cbsPending :: !(TVar (Map BlockHash (Int64, PartiallyDownloadedBlock)))
+  { cbsPending :: !(TVar CmpctPendingMap)
       -- ^ Partially downloaded blocks waiting for missing txns, paired with the
       --   POSIX-second insertion time so a periodic sweep can reap orphaned
       --   entries whose BLOCKTXN reply never arrives. Without the timestamp +
       --   sweep (see the cbsPending sweep in app/Main.hs) a never-completing
       --   reconstruction strands a near-full block of Txs in this live TVar
       --   forever — reachable data the forced major GC cannot reclaim.
+      --   Entries are only admitted through 'admitPendingCompact', which caps
+      --   the map per peer, per block and in total.
   , cbsConfig  :: !CompactBlockConfig
   }
+
+-- | Core MAX_BLOCKS_IN_TRANSIT_PER_PEER (net_processing.cpp): a peer never has
+-- more than this many blocks (and so partial blocks) in flight.
+maxCmpctPendingPerPeer :: Int
+maxCmpctPendingPerPeer = 16
+
+-- | Core MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK (net_processing.cpp): at most this
+-- many peers reconstruct the same block at once.
+maxCmpctPendingPerBlock :: Int
+maxCmpctPendingPerBlock = 3
+
+-- | Total partial blocks across all peers.  Core's bound is implicit (per-peer
+-- cap times peers, and only blocks at most tip+2 with a header that passed
+-- ProcessNewBlockHeaders); this is the explicit backstop so a set of peers on
+-- fresh addresses cannot grow the map with the peer count.
+maxCmpctPendingGlobal :: Int
+maxCmpctPendingGlobal = 64
+
+-- | Outcome of 'admitPendingCompact'.
+data CmpctPendingAdmit
+  = CmpctPendingStored      -- ^ Stored; send getblocktxn.
+  | CmpctPendingDuplicate   -- ^ This peer already has this block pending
+                            --   (Core: "Peer sent us compact block we were
+                            --   already syncing!"); the existing entry is kept.
+  | CmpctPendingPeerFull    -- ^ Peer at 'maxCmpctPendingPerPeer'.
+  | CmpctPendingBlockFull   -- ^ Block at 'maxCmpctPendingPerBlock' peers.
+  | CmpctPendingGlobalFull  -- ^ Map at 'maxCmpctPendingGlobal'.
+  deriving (Show, Eq)
+
+-- | Admit one partial block for @(addr, hash)@ if every cap allows it.
+admitPendingCompact :: TVar CmpctPendingMap -> SockAddr -> BlockHash -> Int64
+                    -> PartiallyDownloadedBlock -> STM CmpctPendingAdmit
+admitPendingCompact var addr bh ts pdb = do
+  m <- readTVar var
+  let keys     = Map.keys m
+      perPeer  = length (filter ((== addr) . fst) keys)
+      perBlock = length (filter ((== bh) . snd) keys)
+      verdict
+        | Map.member (addr, bh) m           = CmpctPendingDuplicate
+        | perPeer  >= maxCmpctPendingPerPeer  = CmpctPendingPeerFull
+        | perBlock >= maxCmpctPendingPerBlock = CmpctPendingBlockFull
+        | Map.size m >= maxCmpctPendingGlobal = CmpctPendingGlobalFull
+        | otherwise                           = CmpctPendingStored
+  when (verdict == CmpctPendingStored) $
+    writeTVar var (Map.insert (addr, bh) (ts, pdb) m)
+  pure verdict
+
+-- | Remove and return the partial block @addr@ was asked to complete for
+-- @hash@.  A blocktxn from any other peer finds nothing (Core
+-- ProcessCompactBlockTxns: "block transactions for block we weren't
+-- expecting"), so one peer cannot complete or discard another's.
+takePendingCompact :: TVar CmpctPendingMap -> SockAddr -> BlockHash
+                   -> STM (Maybe PartiallyDownloadedBlock)
+takePendingCompact var addr bh = do
+  m <- readTVar var
+  case Map.lookup (addr, bh) m of
+    Nothing       -> pure Nothing
+    Just (_, pdb) -> do
+      writeTVar var (Map.delete (addr, bh) m)
+      pure (Just pdb)
 
 -- | Initialize a partially downloaded block from a compact block message
 -- Returns the partially downloaded block and list of missing indices (if any)
