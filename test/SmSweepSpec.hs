@@ -362,7 +362,7 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
   -- ---------------------------------------------------------------
   -- Path b (block-index status across a restart)
   -- ---------------------------------------------------------------
-  gap "sm-restart-headeronly-not-candidate: a header-only block above the tip reloads header-only, not as a full-data candidate" $
+  it "sm-restart-headeronly-not-candidate: a header-only block above the tip reloads header-only, not as a full-data candidate" $
     withRestart
       (\s -> do
           [_, _, h3] <- chainN s 3
@@ -371,16 +371,23 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
           st <- statusOf s (hashOf b4)
           -- control: live, a header-only block is header-valid, no candidate
           st `shouldBe` (Just StatusHeaderValid, False)
+          -- control: live, chain selection is never handed b4
           mc <- findBestCandidate (rsHeaderChain s)
-          return (hashOf b4, st, fmap ceHash mc))
-      (\(h4, stBefore, candBefore) s -> do
+          fmap ceHash mc `shouldNotBe` Just (hashOf b4)
+          return (h3, hashOf b4, st))
+      (\(h3, h4, stBefore) s -> do
           -- Core: nStatus is persisted, so a BLOCK_VALID_TREE entry without
           -- BLOCK_HAVE_DATA reloads as such and never enters
           -- setBlockIndexCandidates.  The restart must not change it.
           stAfter <- statusOf s h4
           stAfter `shouldBe` stBefore
+          -- Core: the best candidate after the reload is the connected tip
+          -- h3 (the only entry with data at the most work), never the
+          -- body-less b4.  Not compared with the live value: haskoin's live
+          -- generate path does not keep the connected tip in hcCandidates
+          -- (live it answers genesis), a separate gap from this one.
           candAfter <- fmap ceHash <$> findBestCandidate (rsHeaderChain s)
-          candAfter `shouldBe` candBefore)
+          candAfter `shouldBe` Just h3)
 
   gap "sm-restart-best-header-after-invalidate: the best header after a restart is the most-work valid header, not the invalidated branch's ancestor" $
     withRestart
