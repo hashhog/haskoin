@@ -66,6 +66,9 @@ initHeaderChainFromDB db net = do
   -- restarts") — re-seeded on every boot.
   preciousReverseSeqVar <- newTVarIO preciousReverseSeqInit
   lastPreciousWorkVar <- newTVarIO 0
+  -- Set once the whole block index is loaded (no truncation): the best
+  -- header is then recomputed over every loaded entry (see the end).
+  recomputeBestRef <- newIORef False
 
   -- Load persisted headers to rebuild the in-memory chain.  Since 2026-08-12
   -- the ACTIVE chain is discovered by walking bhPrevBlock hash pointers DOWN
@@ -399,6 +402,7 @@ initHeaderChainFromDB db net = do
             putStrLn $ "Loaded " ++ show n
                     ++ " header(s) off the active chain (side, failed, "
                     ++ "invalidated or reorged-away branches)"
+          writeIORef recomputeBestRef True
         Just prefixTip -> do
           -- Truncated reload: bring the chainstate back onto the
           -- validated prefix before the reconciliation below runs (see
@@ -429,7 +433,7 @@ initHeaderChainFromDB db net = do
               ioError (userError
                 ("header reload: chainstate rewind failed: " ++ err))
 
-  return HeaderChain
+  hc <- pure HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
     , hcHeight = heightVar
@@ -441,6 +445,35 @@ initHeaderChainFromDB db net = do
     , hcPreciousReverseSeq = preciousReverseSeqVar
     , hcLastPreciousWork = lastPreciousWorkVar
     }
+
+  -- Recompute the best header over the whole loaded index.  The walk above
+  -- takes it from the persisted height rows only (active chain + rows above
+  -- the connected tip, stopping at the first failed row), and those rows
+  -- can name a branch that is no longer the best one: after invalidateblock
+  -- of a header branch that had a valid equal-work sibling, after a P2P
+  -- overtake (the headers handler writes one row per header) or after a
+  -- kill mid-reorg.  The reload then left the best header at the fork point
+  -- or on the losing branch while the in-memory node had moved on.
+  --
+  -- Core ChainstateManager::LoadBlockIndex (validation.cpp) sets
+  -- m_best_header to the most-work IsValid(BLOCK_VALID_TREE) entry of the
+  -- whole block index.  'recalculateBestHeader' is the same rule the live
+  -- invalidate / reconsider / reorg paths use: most work, not failed; on a
+  -- tie the current pick (the row-derived best header) stays.  It rewrites
+  -- hcByHeight above the connected tip only, so the active chain, the
+  -- best-block pointer and the persisted rows are left alone.  Skipped on a
+  -- truncated reload, where the off-active entries were never loaded.
+  recomputeBest <- readIORef recomputeBestRef
+  when recomputeBest $ do
+    before <- readTVarIO tipVar
+    recalculateBestHeader db hc
+    after <- readTVarIO tipVar
+    when (ceHash after /= ceHash before) $
+      putStrLn $ "Best header recomputed over the loaded block index: "
+              ++ show (ceHash before) ++ " (height "
+              ++ show (ceHeight before) ++ ") -> " ++ show (ceHash after)
+              ++ " (height " ++ show (ceHeight after) ++ ")"
+  return hc
 
 -- | Load every persisted header that is not on the reloaded active chain:
 -- side branches, blocks that failed validation, invalidateblock'd blocks
