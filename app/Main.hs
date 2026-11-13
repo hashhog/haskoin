@@ -55,6 +55,7 @@ import Haskoin.Consensus
 import Haskoin.ChainLock (ChainLock, withChainLock, tryWithChainLock, chainLockHeld)
 import Haskoin.Storage
 import Haskoin.HeaderReload (initHeaderChainFromDB)
+import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment)
 import Haskoin.Rpc
 import Haskoin.Mempool
 import qualified Haskoin.Mempool.Persist as MPP
@@ -1656,7 +1657,7 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- must call fillPartialBlock to complete the two-round-trip path).
     -- Reference: bitcoin-core/src/net_processing.cpp mapBlocksInFlight /
     -- PartiallyDownloadedBlock kept alive across the two messages.
-    cbsPendingVar <- newTVarIO (Map.empty :: Map.Map BlockHash (Int64, PartiallyDownloadedBlock))
+    cbsPendingVar <- newTVarIO (Map.empty :: CmpctPendingMap)
     let compactBlockState = CompactBlockState
           { cbsPending = cbsPendingVar
           , cbsConfig  = defaultCompactBlockConfig
@@ -2822,8 +2823,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- at-tip RSS climb the GC ticker alone could not bound. Bitcoin Core reaps
     -- the equivalent (mapBlocksInFlight) via the block-download timeout + peer
     -- teardown; haskoin has neither, so sweep entries older than
-    -- cbPendingTimeoutSecs once a minute. (cbsPending is keyed by block hash,
-    -- not peer, so an insertion-age sweep is the natural reaper.) Always on,
+    -- cbPendingTimeoutSecs once a minute. (cbsPending has no per-peer
+    -- teardown hook, so an insertion-age sweep is the natural reaper.) Always on,
     -- independent of the GC ticker's enable flag.
     let cbPendingTimeoutSecs = 600 :: Int64  -- ~Core's block-download timeout
     void $ forkIO $ forever $ do
@@ -5024,6 +5025,37 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
   MCmpctBlock cb -> do
     -- BIP 152: Reconstruct block from compact block + mempool
     let bh = computeBlockHash (cbHeader cb)
+    -- Header gate first (Core NetMsgType::CMPCTBLOCK): an unknown parent
+    -- gets a getheaders (outside IBD) and nothing else; a header that fails
+    -- ProcessNewBlockHeaders (addHeader) is punished.  Only an accepted header
+    -- may build a PartiallyDownloadedBlock.  Pre-fix a random header (bad PoW,
+    -- unknown parent) was parked in cbsPending for 600 s, unpunished.
+    cmpctGate <- cmpctHeaderGate net hc (cbHeader cb)
+    cmpctGateOk <- case cmpctGate of
+      CmpctHeaderAccepted _ -> pure True
+      CmpctHeaderUnknownParent -> do
+        putStrLn $ "Compact block " ++ show bh ++ " does not connect, requesting headers"
+        ibdCmpct <- readIORef ibdModeRef
+        unless ibdCmpct $ do
+          pm <- readIORef pmRef
+          locator <- buildBlockLocatorFromChain hc
+          tip <- getChainTip hc
+          let getHdrs = GetHeaders
+                { ghVersion  = fromIntegral protocolVersion
+                , ghLocators = if null locator then [ceHash tip] else locator
+                , ghHashStop = BlockHash (Hash256 (BS.replicate 32 0))
+                }
+          requestFromPeer pm addr (MGetHeaders getHdrs)
+            `catch` (\(_ :: SomeException) -> return ())
+        pure False
+      CmpctHeaderIgnored why -> do
+        putStrLn $ "Compact block " ++ show bh ++ " ignored: " ++ why
+        pure False
+      CmpctHeaderInvalid why -> do
+        putStrLn $ "Compact block " ++ show bh ++ " invalid header: " ++ why
+        pm <- readIORef pmRef
+        forM_ (cmpctHeaderPunishment cmpctGate) $ \r -> void $ misbehaving pm addr r
+        pure False
     -- MAX_CMPCTBLOCK_DEPTH=5 guard (BUG-4 FIX, W112).
     -- Core (net_processing.cpp:2466): only process compact blocks within 5 of
     -- the tip. Blocks deeper than that waste mempool lookup time and enable
@@ -5035,7 +5067,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         depth = case mBlockHeight of
           Just blockH -> fromIntegral currentTipHeight - fromIntegral blockH :: Int
           Nothing     -> 0  -- Unknown block: depth=0 (let normal validation handle it)
-    if depth > maxCmpctBlockDepth
+    if not cmpctGateOk
+      then return ()
+    else if depth > maxCmpctBlockDepth
       then do
         putStrLn $ "Compact block " ++ show bh ++ " too old (depth=" ++ show depth
                 ++ " > MAX_CMPCTBLOCK_DEPTH=" ++ show maxCmpctBlockDepth
@@ -5099,13 +5133,19 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                     -- can complete reconstruction.  Core keeps PartiallyDownloadedBlock
                     -- alive in mapBlocksInFlight keyed by block hash until BLOCKTXN arrives.
                     -- Reference: bitcoin-core/src/net_processing.cpp:3964-3967
+                    -- Keyed by (peer, hash) and capped per peer, per block and in
+                    -- total ('admitPendingCompact'); over a cap nothing is kept and
+                    -- no getblocktxn is sent (Core: give up for this peer).
                     cbs <- readIORef compactBlockStateRef
                     pdbTs <- (round <$> getPOSIXTime :: IO Int64)
-                    atomically $ modifyTVar' (cbsPending cbs) (Map.insert bh (pdbTs, pdb))
-                    pm <- readIORef pmRef
-                    let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
-                    requestFromPeer pm addr (MGetBlockTxn gbt)
-                      `catch` (\(_ :: SomeException) -> return ())
+                    adm <- atomically $ admitPendingCompact (cbsPending cbs) addr bh pdbTs pdb
+                    if adm /= CmpctPendingStored
+                      then putStrLn $ "Compact block " ++ show bh ++ " not kept: " ++ show adm
+                      else do
+                        pm <- readIORef pmRef
+                        let gbt = GetBlockTxn { gbtBlockHash = bh, gbtIndexes = map fromIntegral missing }
+                        requestFromPeer pm addr (MGetBlockTxn gbt)
+                          `catch` (\(_ :: SomeException) -> return ())
 
   MGetBlockTxn gbt -> do
     -- Serve missing transactions for compact block reconstruction
@@ -5142,15 +5182,11 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     let blockHash = btBlockHash bt
         missingTxns = btTxns bt
     cbs <- readIORef compactBlockStateRef
-    mPdb <- atomically $ do
-      pending <- readTVar (cbsPending cbs)
-      case Map.lookup blockHash pending of
-        Nothing       -> return Nothing
-        Just (_, pdb) -> do
-          -- Remove from pending regardless of outcome (either we reconstruct
-          -- successfully and submit, or we fall back to full block getdata).
-          writeTVar (cbsPending cbs) (Map.delete blockHash pending)
-          return (Just pdb)
+    -- Only the partial block this peer was asked to complete (Core
+    -- ProcessCompactBlockTxns requested_block_from_this_peer).  Removed
+    -- regardless of outcome (either we reconstruct successfully and submit,
+    -- or we fall back to full block getdata).
+    mPdb <- atomically $ takePendingCompact (cbsPending cbs) addr blockHash
     case mPdb of
       Nothing -> do
         -- No pending partial block for this hash — stale or unsolicited.
