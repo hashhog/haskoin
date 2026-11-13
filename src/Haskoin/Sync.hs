@@ -27,6 +27,10 @@ module Haskoin.Sync
   , getIBDState
     -- * Block Handling
   , handleBlockMessage
+    -- * Compact block header gate (BIP-152)
+  , CmpctHeaderVerdict(..)
+  , cmpctHeaderGate
+  , cmpctHeaderPunishment
     -- * Header Sync Anti-DoS (PRESYNC/REDOWNLOAD)
   , HeaderSyncState(..)
   , PresyncData(..)
@@ -929,3 +933,51 @@ popHeadersReadyForAcceptance rd = go [] rd
 -- | Convert Seq to list
 toList :: Seq a -> [a]
 toList = foldr (:) []
+
+--------------------------------------------------------------------------------
+-- Compact block header gate (BIP-152)
+--------------------------------------------------------------------------------
+
+-- | What a cmpctblock's header earns before any partial block is built.
+data CmpctHeaderVerdict
+  = CmpctHeaderAccepted ChainEntry
+    -- ^ Header is in the index (new or already known); go on.
+  | CmpctHeaderUnknownParent
+    -- ^ Parent not in the index.  Core: MaybeSendGetHeaders, return; not
+    --   punished, nothing stored.
+  | CmpctHeaderIgnored String
+    -- ^ Rejected for a reason Core does not punish (too-little-chainwork,
+    --   time-too-new); dropped.
+  | CmpctHeaderInvalid String
+    -- ^ Header fails validation; Core MaybePunishNodeForBlock.
+  deriving (Show, Eq)
+
+-- | Core NetMsgType::CMPCTBLOCK order (net_processing.cpp): look the parent
+-- up first and stop if it is unknown, then ProcessNewBlockHeaders.  haskoin's
+-- 'addHeader' is that header check (PoW, bad-prevblk, MTP, timewarp, future
+-- time, difficulty bits, checkpoint, chainwork).  Only an accepted header may
+-- go on to 'initPartialBlock' and the pending map.
+cmpctHeaderGate :: Network -> HeaderChain -> BlockHeader -> IO CmpctHeaderVerdict
+cmpctHeaderGate net hc hdr = do
+  entries <- readTVarIO (hcEntries hc)
+  if not (Map.member (bhPrevBlock hdr) entries)
+    then pure CmpctHeaderUnknownParent
+    else do
+      r <- addHeader net hc hdr False
+      pure $ case r of
+        Right ce -> CmpctHeaderAccepted ce
+        Left err
+          | err == "too-little-chainwork" || err == "time-too-new"
+              -> CmpctHeaderIgnored err
+          | "Unknown previous block" `isPrefixOf` err
+              -> CmpctHeaderUnknownParent
+          | otherwise -> CmpctHeaderInvalid err
+  where
+    isPrefixOf a b = take (length a) b == a
+
+-- | Misbehaviour for a gate verdict: Core MaybePunishNodeForBlock punishes an
+-- invalid header (BLOCK_INVALID_HEADER / _PREV / CHECKPOINT) but not a
+-- BLOCK_TIME_FUTURE or a low-work / non-connecting header.
+cmpctHeaderPunishment :: CmpctHeaderVerdict -> Maybe MisbehaviorReason
+cmpctHeaderPunishment (CmpctHeaderInvalid _) = Just InvalidBlockHeader
+cmpctHeaderPunishment _                      = Nothing
