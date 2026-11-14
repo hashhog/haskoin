@@ -2651,21 +2651,74 @@ blockDisconnectedAt mp mEntryHeight block = withAdmissionLock mp $ do
         return []
   forM_ mEntryHeight $ \h -> atomically $ forM_ readded $ \t ->
     modifyTVar' (mpEntries mp) (Map.adjust (\e -> e { meHeight = h }) t)
+  -- The disconnected block's coinbase is never re-added, so Core's
+  -- MaybeUpdateMempoolForReorg calls removeRecursive(coinbase, REORG): every
+  -- in-pool spend of its outputs (with descendants) leaves.  Without this a
+  -- spend of a coinbase whose own block was disconnected stayed in the pool,
+  -- immature (in fact unspendable) at the new tip, and the maturity pass
+  -- below cannot see it because the coin is no longer in the UTXO set.
+  forM_ (take 1 (blockTxns block)) (removeSpendersOf mp)
   -- Core CTxMemPool::UpdateTransactionsFromBlock: a re-added transaction can
   -- have in-pool descendants (children never mined away, or entries re-added
   -- from a higher disconnected block), which admission does not see.
   relinkReadded mp readded
+  -- Core MaybeUpdateMempoolForReorg → removeForReorg(filter_final_and_mature):
+  -- the tip moved down, so entries admitted at the old tip are re-checked
+  -- against the new one before the size limit runs.
+  removeImmatureForReorg mp
   -- A re-added transaction can join clusters that are already in the pool
   -- (its children were never mined away), which the admission gate does not
   -- see.  Core re-adds with bypass_limits and then TrimToSize()s; do the same.
   trimOversizedClusters mp
 
--- | Remove every in-pool spender of @tx@'s outputs, with its descendants:
--- the effect of Core's CTxMemPool::removeRecursive(tx, REORG) for a @tx@
--- that is not itself in the pool (a failed reorg re-add).  Caller holds the
--- admission lock.
-removeSpendersOfFailedReadd :: Mempool -> Tx -> IO ()
-removeSpendersOfFailedReadd mp tx = do
+-- | Evict (with their descendants) the entries that spend a coinbase output
+-- which is immature for the next block on the CURRENT tip.  The coinbase
+-- maturity arm of Core's removeForReorg(filter_final_and_mature)
+-- (validation.cpp Chainstate::MaybeUpdateMempoolForReorg; txmempool.cpp
+-- CTxMemPool::removeForReorg): for every input whose parent is not in the
+-- pool, a coinbase coin with (tip+1) - coin.nHeight < COINBASE_MATURITY makes
+-- the entry invalid, and the entry and all its descendants leave the pool
+-- (REORG reason: the removal is notified, prioritisation deltas are kept).
+--
+-- Admission already checks maturity ('coinbaseImmatureAt'), but only at the
+-- tip it was admitted at.  When the tip moves down (invalidateblock, or a
+-- reorg onto a shorter, heavier chain) a spend that was mature at the old
+-- tip can be immature at the new one; without this pass it stayed in the
+-- pool, was relayed and went into block templates.
+--
+-- A confirmed input that is no longer in the UTXO set is left alone here,
+-- as Core asserts it is unspent.  Spends of a disconnected block's coinbase
+-- were already removed by 'removeSpendersOf' in 'blockDisconnectedAt' (Core
+-- removeRecursive of the coinbase).  Caller holds the admission lock.
+removeImmatureForReorg :: Mempool -> IO ()
+removeImmatureForReorg mp = do
+  tipH <- mempoolTipHeight mp
+  entries <- readTVarIO (mpEntries mp)
+  let confirmedInputs e =
+        [ op | inp <- txInputs (meTransaction e)
+             , let op = txInPrevOutput inp
+             , not (Map.member (outPointHash op) entries) ]
+      immatureCoin op = do
+        mCoin <- lookupUTXO (mpUTXOCache mp) op
+        return $ case mCoin of
+          Just c  -> ueCoinbase c && coinbaseImmatureAt tipH (ueHeight c)
+          Nothing -> False
+      anyIO _ [] = return False
+      anyIO f (x:xs) = f x >>= \b -> if b then return True else anyIO f xs
+  stale <- fmap catMaybes $ forM (Map.elems entries) $ \e -> do
+    imm <- anyIO immatureCoin (confirmedInputs e)
+    return (if imm then Just (meTxId e) else Nothing)
+  -- An earlier removal may already have taken a later stale entry as its
+  -- descendant; removing an absent txid is a no-op.
+  forM_ stale $ \t -> do
+    present <- Map.member t <$> readTVarIO (mpEntries mp)
+    when present $ removeWithDescendants mp t
+
+-- | Remove every in-pool spender of @tx@'s outputs with its descendants
+-- (Core CTxMemPool::removeRecursive, REORG reason; @tx@ itself is not in the
+-- pool).  Caller holds the admission lock.
+removeSpendersOf :: Mempool -> Tx -> IO ()
+removeSpendersOf mp tx = do
   let txid = computeTxId tx
   byOutpoint <- readTVarIO (mpByOutpoint mp)
   let spenders = Set.toList $ Set.fromList
@@ -2675,6 +2728,13 @@ removeSpendersOfFailedReadd mp tx = do
     -- an earlier removal may already have taken it as a descendant
     present <- Map.member t <$> readTVarIO (mpEntries mp)
     when present $ removeWithDescendants mp t
+
+-- | Remove every in-pool spender of @tx@'s outputs, with its descendants:
+-- the effect of Core's CTxMemPool::removeRecursive(tx, REORG) for a @tx@
+-- that is not itself in the pool (a failed reorg re-add).  Shares the
+-- spender loop with 'removeSpendersOf'.  Caller holds the admission lock.
+removeSpendersOfFailedReadd :: Mempool -> Tx -> IO ()
+removeSpendersOfFailedReadd = removeSpendersOf
 
 -- | Recompute the stored ancestor and descendant aggregates of every entry
 -- connected to the re-added @txids@ (their in-pool ancestors, descendants and
