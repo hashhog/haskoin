@@ -752,7 +752,7 @@ import Data.Bits ((.&.), (.|.), shiftR, shiftL, xor, complement, rotateL)
 import Control.Monad (replicateM, forM_, forM, when, forever, unless, void, filterM, join)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
-import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr)
+import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr, plusPtr)
 import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.C.Types (CUInt(..), CSize(..), CInt(..), CChar, CUChar)
 import Foreign.Marshal.Alloc (mallocBytes, free, alloca, allocaBytes)
@@ -795,7 +795,7 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        bind, listen, accept, setSocketOption,
                        SocketOption(..), socketPair, defaultProtocol,
                        tupleToHostAddress, getSocketName,
-                       AddrInfoFlag(..))
+                       AddrInfoFlag(..), recvBuf)
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, send, sendAll)
 import System.IO.Unsafe (unsafePerformIO)
@@ -4436,6 +4436,24 @@ markPeerSendFailed pc = do
 -- ("connection closed reading length") was then banned for 24 h.
 -- Handshake paths that must fail faster wrap 'performHandshake' in
 -- 'performHandshakeWithin' (inbound uses the 60 s watchdog).
+--
+-- Cost is linear in n however the peer slices its writes. Reads go
+-- into one scratch buffer (at most 'recvScratchMax' bytes, allocated
+-- once per call) at the next free offset; the scratch is copied out as
+-- one chunk only when it is full or n bytes are in, and the chunks are
+-- joined once at the end. A peer sending one byte per segment therefore
+-- leaves at most n / 64 KiB chunks live, not one per byte. Core appends
+-- arriving bytes into the message's vRecv the same way
+-- (V1Transport::ReceivedBytes, net.cpp). Asking 'recv' for the whole
+-- remaining length on every read (recv allocates that many bytes) and
+-- appending every chunk to the buffered prefix made a 4,000,000-byte
+-- payload trickled 100 bytes at a time allocate ~160 GB, before the
+-- handshake.
+--
+-- On timeout, close or a socket error the bytes received so far are put
+-- back in 'pcReadBuffer', as before. An asynchronous exception (the
+-- handshake watchdog, 'killThread') drops them; every caller disconnects
+-- on those paths.
 recvExact :: PeerConnection -> Int -> IO (Maybe ByteString)
 recvExact pc n = do
   buf <- readIORef (pcReadBuffer pc)
@@ -4445,19 +4463,43 @@ recvExact pc n = do
       writeIORef (pcReadBuffer pc) rest
       return (Just result)
     else do
-      -- Need more data. Timeout matches Core's inactivity window so a
-      -- quiet-but-alive peer is not declared dead between pings.
-      mResult <- timeout recvIdleTimeoutMicros $
-        (Just <$> recv (pcSocket pc) (max 4096 (n - BS.length buf)))
-          `catch` (\(_ :: IOException) -> return Nothing)
-      case mResult of
-        Nothing -> return Nothing  -- Timeout: peer unresponsive
-        Just Nothing -> return Nothing  -- Connection closed or error
-        Just (Just chunk)
-          | BS.null chunk -> return Nothing  -- Connection closed
-          | otherwise -> do
-              writeIORef (pcReadBuffer pc) (BS.append buf chunk)
-              recvExact pc n
+      let scratchLen = min recvScratchMax (max 4096 (n - BS.length buf))
+      allocaBytes scratchLen $ \scratch ->
+        go scratch scratchLen [buf] (BS.length buf) 0
+  where
+    -- acc: chunks already copied out of the scratch, newest first;
+    -- flushed: their total length; off: bytes waiting in the scratch.
+    go scratch scratchLen acc flushed off
+      | flushed >= n = do
+          let (result, rest) = BS.splitAt n (BS.concat (reverse acc))
+          -- Copy the (at most one scratch) over-read so it does not keep
+          -- the whole joined message alive until the next read.
+          writeIORef (pcReadBuffer pc) (BS.copy rest)
+          return (Just result)
+      | otherwise = do
+          -- Timeout matches Core's inactivity window so a quiet-but-alive
+          -- peer is not declared dead between pings.
+          mResult <- timeout recvIdleTimeoutMicros $
+            (Just <$> recvBuf (pcSocket pc) (scratch `plusPtr` off) (scratchLen - off))
+              `catch` (\(_ :: IOException) -> return Nothing)
+          case mResult of
+            Just (Just k) | k > 0 -> do
+              let off' = off + k
+              if off' == scratchLen || flushed + off' >= n
+                then do
+                  chunk <- BS.packCStringLen (castPtr scratch, off')
+                  go scratch scratchLen (chunk : acc) (flushed + off') 0
+                else go scratch scratchLen acc flushed off'
+            _ -> do
+              -- Timeout, error or close: keep what arrived buffered, as
+              -- before.
+              pending <- BS.packCStringLen (castPtr scratch, off)
+              writeIORef (pcReadBuffer pc) (BS.concat (reverse (pending : acc)))
+              return Nothing
+
+-- | Largest single read 'recvExact' issues (64 KiB).
+recvScratchMax :: Int
+recvScratchMax = 65536
 
 -- | Receive a complete message from a peer.
 --
