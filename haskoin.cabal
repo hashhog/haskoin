@@ -830,6 +830,30 @@ test-suite restart-best-header
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- sm-restart-headeronly-status: the restart loader derives the status of
+-- the persisted headers above the connected tip from the stored body
+-- (header-only -> StatusHeaderValid, no candidate; body -> candidate).
+test-suite sm-restart-headeronly-status
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/sm-restart-headeronly-status
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 test-suite service-flags
   type:          exitcode-stdio-1.0
   main-is:       ServiceFlagsMain.hs

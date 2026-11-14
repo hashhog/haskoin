@@ -295,8 +295,27 @@ initHeaderChainFromDB db net = do
           -- old walk (returns Just prefixTip -> rewind).  Also accumulates
           -- the height-index rows that disagree with the validated active
           -- chain, for the self-heal batch after the load.
-          loadAscending [] _ _ heals = return (Nothing, heals)
-          loadAscending ((bh, header) : rest) height prevEntry heals = do
+          --
+          -- @aboveTip@ is False for the connected active chain (every
+          -- entry has its body and was connected: StatusValid, a
+          -- candidate) and True for the persisted headers above the
+          -- connected tip.  Those are headers-first rows, so each one's
+          -- status comes from its body like 'loadOffActiveEntries': a
+          -- stored body -> StatusValid, header only -> StatusHeaderValid.
+          -- Core persists nStatus; an entry re-enters
+          -- setBlockIndexCandidates only if it and every ancestor have
+          -- data (HaveNumChainTxs: node/blockstorage.cpp
+          -- BlockManager::LoadBlockIndex, validation.cpp
+          -- ChainstateManager::LoadBlockIndex).  @dataSoFar@ is True while
+          -- every row from the connected tip up to here had a body, so a
+          -- body stored above a header-only row is StatusValid but not a
+          -- candidate.  'findBestCandidate' cannot catch that case itself:
+          -- these rows are in hcByHeight, which its ancestry walk treats
+          -- as the active chain.  Admitting every row as a StatusValid
+          -- candidate let findBestCandidate return a block with no body
+          -- after a restart.
+          loadAscending _ _ [] _ _ heals = return (Nothing, heals)
+          loadAscending aboveTip dataSoFar ((bh, header) : rest) height prevEntry heals = do
             entriesSoFar <- readTVarIO entriesVar
             if computeBlockHash header /= bh
               then do r <- refuse height prevEntry
@@ -310,7 +329,13 @@ initHeaderChainFromDB db net = do
               then do r <- refuse height prevEntry "bad-diffbits"
                       return (r, heals)
             else do
-              let work = ceChainWork prevEntry + headerWork header
+              hasBody <- if aboveTip
+                           then maybe False (const True) <$> getBlock db bh
+                           else return True
+              let status | hasBody   = StatusValid
+                         | otherwise = StatusHeaderValid
+                  dataSoFar' = dataSoFar && hasBody
+                  work = ceChainWork prevEntry + headerWork header
                   newMtp = computeEntryMtp entriesSoFar
                                            (ceHash prevEntry)
                                            (bhTimestamp header)
@@ -320,7 +345,7 @@ initHeaderChainFromDB db net = do
                     , ceHeight = height
                     , ceChainWork = work
                     , cePrev = Just (ceHash prevEntry)
-                    , ceStatus = StatusValid
+                    , ceStatus = status
                     , ceMedianTime = newMtp
                     , ceSequenceId = seqIdBestChainFromDisk
                     }
@@ -329,15 +354,16 @@ initHeaderChainFromDB db net = do
                 modifyTVar' byHeightVar (Map.insert height bh)
                 writeTVar tipVar entry
                 writeTVar heightVar height
-                modifyTVar' candidatesVar
-                  (Set.insert (mkCandidateKey entry))
+                when dataSoFar' $
+                  modifyTVar' candidatesVar
+                    (Set.insert (mkCandidateKey entry))
               when (height `mod` 100000 == 0) $
                 putStrLn $ "  loaded headers up to height " ++ show height
               mIdx <- getBlockHeight db height
               let heals' = case mIdx of
                              Just idxHash | idxHash == bh -> heals
                              _ -> (height, bh) : heals
-              loadAscending rest (height + 1) entry heals'
+              loadAscending aboveTip dataSoFar' rest (height + 1) entry heals'
 
       walked <- collectActive bestHash (0 :: Int) []
       mTruncated <- case walked of
@@ -348,7 +374,7 @@ initHeaderChainFromDB db net = do
                   ++ "(maximal validated prefix + truncate + rewind)."
           goFallback 1 genesisEntry
         Right chainAsc -> do
-          (mTrunc0, heals0) <- loadAscending chainAsc (1 :: Word32) genesisEntry []
+          (mTrunc0, heals0) <- loadAscending False True chainAsc (1 :: Word32) genesisEntry []
           -- Headers-first: PrefixBlockHeight holds headers ABOVE the
           -- connected (best-block) tip. collectActive only walks from
           -- PrefixBestBlock, so a restart used to reload the UTXO prefix
@@ -376,7 +402,7 @@ initHeaderChainFromDB db net = do
                     putStrLn $ "Loading " ++ show (length above)
                             ++ " persisted header(s) above connected tip "
                             ++ show loadedH
-                    loadAscending above (loadedH + 1) tipNow heals0
+                    loadAscending True True above (loadedH + 1) tipNow heals0
           -- Self-heal the height index from the VALIDATED active chain.
           -- Rows below a truncation point are still-valid repairs; rows at
           -- or above it were never admitted, so they are never written.
