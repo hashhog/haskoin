@@ -197,6 +197,18 @@ notMarked hc entry (r, marked) = do
   marked `shouldBe` False
   statusOf hc (ceHash entry) `shouldReturn` Just False
 
+-- | A non-coinbase tx whose base serialization is exactly 64 bytes
+-- (4 + 1 + 41 + 1 + 13 + 4): IsBlockMutated's 64-byte rule applies to a
+-- block without a coinbase on the P2P path only.
+tx64 :: Tx
+tx64 = Tx
+  { txVersion  = 2
+  , txInputs   = [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x64))) 0) BS.empty 0xffffffff ]
+  , txOutputs  = [ TxOut 1000 (BS.replicate 4 0x51) ]
+  , txWitness  = [[]]
+  , txLockTime = 0
+  }
+
 junkNoCoinbase, junkEmpty, junkWitnessStuffed :: [Tx]
 junkNoCoinbase     = [spendTx 0x33 []]
 junkEmpty          = []
@@ -253,6 +265,21 @@ main = hspec $ describe "IsBlockMutated survives the parent-header race (H1)" $ 
       withTestDB "badstruct" $ \db -> do
         hc <- setup db
         let bad = mkBlock (computeBlockHash (blockHeader blockP)) (baseTime + 601) junkNoCoinbase
+        entry <- raceToEntry db hc False bad
+        (r, marked) <- p2pAhead db hc entry bad
+        r `shouldBe` Left "First transaction is not coinbase"
+        marked `shouldBe` True
+        statusOf hc (ceHash entry) `shouldReturn` Just True
+
+    it "correct merkle root, no coinbase, a 64-byte tx: still bad-cb-missing's verdict, still marked" $
+      withTestDB "tx64" $ \db -> do
+        hc <- setup db
+        let bad = mkBlock (computeBlockHash (blockHeader blockP)) (baseTime + 603) [tx64]
+        -- The P2P-only rule does fire on this body (the arm's receipt check
+        -- would drop it as mutated) ...
+        blockMutation True bad `shouldBe`
+          Just "mutated: 64-byte transaction in a block without a coinbase"
+        -- ... but validation is CheckBlock: the structural verdict.
         entry <- raceToEntry db hc False bad
         (r, marked) <- p2pAhead db hc entry bad
         r `shouldBe` Left "First transaction is not coinbase"

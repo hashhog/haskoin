@@ -3259,6 +3259,20 @@ isFinalTxCheck tx blockHeight blockTime
 validateFullBlock :: Network -> ChainState -> (Word32 -> Word32) -> Bool -> Bool -> Block -> Map OutPoint Coin
                  -> Either String ()
 validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxoCoinMap = do
+  -- 00. Core CheckMerkleRoot / CheckWitnessMalleation FIRST: see
+  -- 'mutationFirst'.  Steps 3 (merkle) and 10 (witness) used to run AFTER
+  -- the structural verdicts in 'validateFullBlockBody', so a junk body for
+  -- an honest header (first tx not a coinbase, an empty tx list, a 4 MB
+  -- witness) came back as a VERDICT and the caller marked the honest block
+  -- failed.
+  mutationFirst (consensusFlagsAtHeight net (csHeight cs + 1)) block
+  validateFullBlockBody net cs getMtpAtHeight skipScripts skipConnectChecks block utxoCoinMap
+
+-- | 'validateFullBlock' without step 00, for a caller that already ran
+-- 'mutationFirst' ('validateFullBlockIO', which must run it before BIP30).
+validateFullBlockBody :: Network -> ChainState -> (Word32 -> Word32) -> Bool -> Bool -> Block -> Map OutPoint Coin
+                      -> Either String ()
+validateFullBlockBody net cs getMtpAtHeight skipScripts skipConnectChecks block utxoCoinMap = do
   let height = csHeight cs + 1
       header = blockHeader block
       txns = blockTxns block
@@ -3285,13 +3299,8 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
       -- TxOut-only view for validateBlockTransactions (script checking).
       utxoMap = fmap coinTxOut utxoCoinMap
 
-  -- 00. Core IsBlockMutated FIRST: merkle root, CVE-2012-2459 duplicate,
-  -- witness malleation.  See 'mutationFirst'.  Steps 3 (merkle) and 10
-  -- (witness) used to run AFTER the structural verdicts below, so a junk
-  -- body for an honest header (first tx not a coinbase, an immature spend,
-  -- a 4 MB witness) came back as a VERDICT and the caller marked the honest
-  -- block failed.
-  mutationFirst dflags block
+  -- (Step 00, 'mutationFirst', ran in 'validateFullBlock' /
+  -- 'validateFullBlockIO' before this.)
 
   -- 0a. COINBASE_MATURITY (W164 follow-up). A tx may not spend a coinbase
   -- output until it is netCoinbaseMaturity (100) blocks deep. validateFullBlock
@@ -3587,11 +3596,12 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
 
   Right ()
 
--- | Core @IsBlockMutated@ (validation.cpp:4027-4056) as a validation step:
--- @Left reason@ iff the body does not match what the header commits to.
--- Every reason is a NON-verdict ('classifyBlockReject'): a mutated body
--- says nothing about the block, because the block hash commits only to
--- the header (Core InvalidBlockFound skips BLOCK_MUTATED).
+-- | The body-commitment checks of Core's CheckBlock / ContextualCheckBlock,
+-- run as the FIRST validation step: @Left reason@ iff the body does not
+-- match what the header commits to.  Every reason is a NON-verdict
+-- ('classifyBlockReject'): a mutated body says nothing about the block,
+-- because the block hash commits only to the header (Core InvalidBlockFound
+-- skips BLOCK_MUTATED).
 --
 -- It must run before every check that can return a verdict.  The P2P arm
 -- runs IsBlockMutated on receipt only when the parent header is already
@@ -3600,26 +3610,35 @@ validateFullBlock net cs getMtpAtHeight skipScripts skipConnectChecks block utxo
 -- third and the witness check last, a junk body then failed a structural
 -- check first and the honest block was marked BLOCK_FAILED_VALID.
 --
--- Segwit predicate: @flagSegWit dflags@ (height-based), Core's
--- DeploymentActiveAfter(pindexPrev, SEGWIT).
+-- What runs, in Core's order:
+--   1. CheckMerkleRoot (validation.cpp:3837, first in CheckBlock): root
+--      mismatch, CVE-2012-2459 duplicate.  An empty tx list has the null
+--      root (BlockMerkleRoot of no leaves): a non-null header root is a
+--      mismatch; a null one passes and step 1 gives bad-blk-length.
+--   2. CheckWitnessMalleation, only when the first tx is a coinbase (as in
+--      IsBlockMutated, validation.cpp:4041-4052); otherwise step 2 gives
+--      the bad-cb-missing verdict.  Segwit predicate: @flagSegWit dflags@
+--      (height-based), Core's DeploymentActiveAfter(pindexPrev, SEGWIT).
+-- NOT here: IsBlockMutated's 64-byte-transaction rule for a block without a
+-- coinbase.  Core applies it only on the P2P path (the receipt check and the
+-- post-addHeader recheck in app/Main.hs); CheckBlock gives bad-cb-missing.
 --
--- Empty tx list: Core's CheckMerkleRoot compares the header root with the
--- null hash (BlockMerkleRoot of no leaves).  A non-null root is mutated;
--- a null root is not, and step 1 gives the bad-blk-length verdict.
--- ('blockMutation' calls every empty body mutated; its callers check the
--- parent first, so the two only differ on a null-root header.)
--- "bad-txnmrklroot" is reported as "Merkle root mismatch", the string the
--- old step 3 returned (bip22ResultString maps it to bad-txnmrklroot).
+-- Witness malleation running before the CheckBlock structural checks is a
+-- deliberate departure from Core's submitblock order (ContextualCheckBlock
+-- runs after CheckBlock): a correct-root body that fails both is reported as
+-- the witness non-verdict, as on Core's P2P path, so a body whose witness
+-- does not match its commitment can never mark the block.
 mutationFirst :: ConsensusFlags -> Block -> Either String ()
-mutationFirst dflags block
-  | null (blockTxns block) =
-      when (bhMerkleRoot (blockHeader block) /= Hash256 (BS.replicate 32 0)) $
-        Left "Merkle root mismatch"
-  | otherwise =
-      case blockMutation (flagSegWit dflags) block of
-        Nothing                -> Right ()
-        Just "bad-txnmrklroot" -> Left "Merkle root mismatch"
-        Just why               -> Left why
+mutationFirst dflags block = do
+  let txns            = blockTxns block
+      (root, dup)     = computeMerkleRootMutated (map computeTxId txns)
+      headerRoot      = bhMerkleRoot (blockHeader block)
+  -- computeMerkleRootMutated [] is the null hash, as Core's BlockMerkleRoot.
+  unless (root == headerRoot) $ Left "Merkle root mismatch"
+  when dup $ Left "bad-txns-duplicate"
+  case txns of
+    (tx0:_) | isCoinbase tx0 -> checkWitnessMalleation (flagSegWit dflags) block
+    _                        -> Right ()
 
 -- | BIP-30: Reject a block if any of its transactions would overwrite an existing
 -- unspent transaction output in the UTXO set.
@@ -3732,7 +3751,7 @@ validateFullBlockIO' db net cs getMtpAtHeight skipScripts block utxoCoinMap = do
   bip30Result <- checkBIP30 db net (csHeight cs + 1) block
   case bip30Result of
     Left err -> return (Left err)
-    Right () -> return $ validateFullBlock net cs getMtpAtHeight skipScripts False block utxoCoinMap
+    Right () -> return $ validateFullBlockBody net cs getMtpAtHeight skipScripts False block utxoCoinMap
 
 -- | Convert ConsensusFlags to a Word32 for use as a cache key.
 consensusFlagsToWord32 :: ConsensusFlags -> Word32
