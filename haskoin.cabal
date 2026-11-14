@@ -21,6 +21,7 @@ library
                  , Haskoin.Consensus
                  , Haskoin.Storage
                  , Haskoin.HeaderReload
+                 , Haskoin.BlockNotFound
                  , Haskoin.Network
                  , Haskoin.Sync
                  , Haskoin.Mempool
@@ -769,6 +770,8 @@ test-suite notfound-unsolicited
   main-is:       NotFoundUnsolicitedMain.hs
   other-modules: NotFoundUnsolicitedSpec
   hs-source-dirs: test
+  -- Haskoin.BlockNotFound exists from this commit on (see the spec header).
+  cpp-options:   -DHASKOIN_NOTFOUND_SOLICITED
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
