@@ -2590,6 +2590,37 @@ blockConnected mp block = withAdmissionLock mp $ do
   _ <- expireOldTransactions mp
   trimToSize mp
 
+-- | Evict (with their descendants) the entries that are no longer final for
+-- the next block on the CURRENT tip.  The finality arm of Core's
+-- removeForReorg(filter_final_and_mature) (validation.cpp
+-- Chainstate::MaybeUpdateMempoolForReorg): CheckFinalTxAtTip(tip, tx), i.e.
+-- IsFinalTx(tx, tip->nHeight + 1, tip->GetMedianTimePast()), and a non-final
+-- entry leaves the pool with all its descendants (txmempool.cpp
+-- CTxMemPool::removeForReorg).
+--
+-- Admission already checks finality (step 2c of 'addTransactionUnlatched'),
+-- but only at the tip it was admitted at.  When the tip moves down
+-- (invalidateblock, or a reorg onto a shorter, heavier chain) a transaction
+-- whose nLockTime equals the old tip height -- the anti-fee-sniping shape
+-- wallets use -- is final in the old tip's next block and not in the new
+-- one's; without this pass it stayed in the pool, was relayed and went into
+-- block templates that the node itself would then reject (bad-txns-nonfinal).
+--
+-- Uses the same 'isFinalTxCheck' and tip (height, MTP) source as admission,
+-- so an entry admission would accept at the new tip is never evicted here.
+-- Caller holds the admission lock.
+removeNonFinalForReorg :: Mempool -> IO ()
+removeNonFinalForReorg mp = do
+  (tipH, mtp) <- refreshMempoolTip mp
+  entries <- readTVarIO (mpEntries mp)
+  let stale = [ meTxId e | e <- Map.elems entries
+                         , not (isFinalTxCheck (meTransaction e) (tipH + 1) mtp) ]
+  -- An earlier removal may already have taken a later stale entry as its
+  -- descendant; skip txids that are already gone.
+  forM_ stale $ \t -> do
+    present <- Map.member t <$> readTVarIO (mpEntries mp)
+    when present $ removeWithDescendants mp t
+
 -- | Handle a disconnected block (during reorg)
 -- Re-adds transactions from the disconnected block back to mempool
 blockDisconnected :: Mempool -> Block -> IO ()
@@ -2628,6 +2659,10 @@ blockDisconnectedAt mp mEntryHeight block = withAdmissionLock mp $ do
   -- have in-pool descendants (children never mined away, or entries re-added
   -- from a higher disconnected block), which admission does not see.
   relinkReadded mp readded
+  -- Core MaybeUpdateMempoolForReorg -> removeForReorg(filter_final_and_mature),
+  -- finality arm: entries admitted at the old tip are re-checked against the
+  -- new one.
+  removeNonFinalForReorg mp
   -- A re-added transaction can join clusters that are already in the pool
   -- (its children were never mined away), which the admission gate does not
   -- see.  Core re-adds with bypass_limits and then TrimToSize()s; do the same.
