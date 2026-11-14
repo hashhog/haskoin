@@ -1376,9 +1376,19 @@ doSideBranchReorg net db hc cache mp mIdxMgr parent newTipBlock newWork = do
                     -- blockConnected is run by submitBlock's caller (the
                     -- submitblock / generate RPC arms), so it is skipped
                     -- here to keep it single.
+                    --
+                    -- @disconnectList@ is tip-first (the disconnect
+                    -- order).  The re-add runs in BLOCK order, lowest
+                    -- disconnected block first, as Core's
+                    -- DisconnectedBlockTransactions hands
+                    -- MaybeUpdateMempoolForReorg its txs oldest block
+                    -- first: a child confirmed one block above its parent
+                    -- otherwise meets the pool before the parent, fails
+                    -- missing-inputs and is lost.  The RPC reorg path
+                    -- (mempoolFollowTipAt) re-adds in the same order.
                     forM_ (dropLast connectList) $ \blk ->
                       blockConnected mp blk
-                    forM_ disconnectList $ \blk ->
+                    forM_ (reverse disconnectList) $ \blk ->
                       blockDisconnected mp blk
 
                     -- Mirror the reorg into any opted-in secondary
