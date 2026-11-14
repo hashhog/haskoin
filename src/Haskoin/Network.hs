@@ -306,6 +306,12 @@ module Haskoin.Network
   , getUnconnectingHeadersCount
   , isDiscouraged
   , isBanned
+  , banKey
+  , lookupBan
+  , maxDiscouragedEntries
+  , addManualBan
+  , removeManualBan
+  , clearAllBans
   , getBanList
   , clearExpiredBans
   , loadBanList
@@ -783,7 +789,7 @@ import Control.Concurrent (threadDelay)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Aeson as Aeson
-import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
+import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:), (.:?), (.!=))
 import System.FilePath ((</>))
 import System.Directory (doesFileExist, renameFile, getFileSize)
 import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
@@ -5242,6 +5248,8 @@ data PeerManager = PeerManager
     --   backward-compat with callers that read this field directly.  The
     --   production connection loop now selects via 'pmAddrMan'.
   , pmBannedAddrs        :: !(TVar (Map SockAddr Int64))
+    -- ^ Ban / discouragement expiry by peer IP.  Keys are 'banKey'
+    --   addresses (port zeroed), so one entry covers every source port.
   , pmConfig             :: !PeerManagerConfig
   , pmNetwork            :: !Network
   , pmBestHeight         :: !(TVar Int32)
@@ -5332,6 +5340,11 @@ data PeerManager = PeerManager
   , pmOutboundTrack      :: !(TVar (Map SockAddr OutboundTrack))
     -- ^ Per-peer facts for 'runOutboundEviction' (Core CNodeState:
     --   m_last_block_announcement, pindexBestKnownBlock, m_chain_sync).
+  , pmManualBans         :: !(TVar (Set.Set SockAddr))
+    -- ^ Keys of 'pmBannedAddrs' that an operator added with @setban@ (or
+    --   that banlist.json marks manual).  Core keeps these in @m_banned@,
+    --   apart from the bounded @m_discouraged@ filter, so the discouragement
+    --   cap in 'banPeer' never evicts them.
   }
 
 -- | Per-peer self-announcement state.
@@ -5643,6 +5656,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTBQueueIO (fromIntegral backgroundSendQueueCap)  -- pmBackgroundSends
     <*> newTVarIO 0             -- pmBackgroundDropped
     <*> newTVarIO Map.empty     -- pmOutboundTrack
+    <*> newTVarIO Set.empty     -- pmManualBans
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -5713,6 +5727,9 @@ peerManagerLoop pm = forever $ do
   -- path (misbehaviour, timeouts, eviction).  Those already stopped counting
   -- (the groups are derived from the live map); this only bounds the registry.
   pruneOutboundDiversity (pmOutboundDiversity pm)
+  -- Drop expired bans every tick so the ban map holds live entries only
+  -- (Core's BanMan::SweepBanned runs on every IsBanned / dump).
+  void (clearExpiredBans pm)
 
   -- setnetworkactive gate (Core CConnman::fNetworkActive, net.cpp:2351/3022/
   -- 3219): when the operator has disabled networking, suppress ALL new
@@ -5764,7 +5781,7 @@ peerManagerLoop pm = forever $ do
         -- Pinned peers not already connected and not actively banned.
         toDial = [ a | a <- connectAddrs
                      , Set.notMember a connected
-                     , Map.notMember a activeBans ]
+                     , isNothing (lookupBan a activeBans) ]
     unless (null toDial) $
       putStrLn $ "peerManagerLoop: -connect mode — (re)dialing "
               ++ show (length toDial) ++ " pinned peer(s); "
@@ -5840,7 +5857,7 @@ peerManagerLoop pm = forever $ do
     let asmapD = pmAsmapData pm
     let filtered = filter (\a ->
           Set.notMember a connected &&
-          Map.notMember a activeBans &&
+          isNothing (lookupBan a activeBans) &&
           Set.notMember a failed) allCandidates
     -- Remove duplicates while preserving order.
     let unique = nub filtered
@@ -7004,12 +7021,110 @@ getConnectedPeers pm = do
     info <- readTVarIO (pcInfo pc)
     return (addr, info)
 
--- | Ban a peer for the configured duration
+-- | The ban-map key for an address: the IP with the port (and IPv6 flow
+-- info / scope id) zeroed, and an IPv4-mapped IPv6 address folded to IPv4.
+-- Core's BanMan keys both stores by 'CNetAddr', which has no port
+-- (banman.cpp Ban / Discourage / IsBanned / IsDiscouraged), so a ban covers
+-- every source port the peer can reconnect from.
+banKey :: SockAddr -> SockAddr
+banKey (SockAddrInet _ h) = SockAddrInet 0 h
+banKey (SockAddrInet6 _ _ (0, 0, 0xffff, w) _) =
+  -- ::ffff:a.b.c.d (HostAddress6 words are host order, a in the top byte).
+  let b1 = (w `shiftR` 24) .&. 0xff
+      b2 = (w `shiftR` 16) .&. 0xff
+      b3 = (w `shiftR` 8) .&. 0xff
+      b4 = w .&. 0xff
+  in SockAddrInet 0 (tupleToHostAddress ( fromIntegral b1, fromIntegral b2
+                                        , fromIntegral b3, fromIntegral b4 ))
+banKey (SockAddrInet6 _ _ h _) = SockAddrInet6 0 0 h 0
+banKey a = a
+
+-- | Look an address up in a ban map by its 'banKey'.  The exact address is
+-- tried as well so an entry inserted directly with a port still matches.
+lookupBan :: SockAddr -> Map SockAddr Int64 -> Maybe Int64
+lookupBan addr m = case Map.lookup (banKey addr) m of
+  Just e  -> Just e
+  Nothing -> Map.lookup addr m
+
+-- | Upper bound on the automatic (non-manual) entries of the ban map.
+-- Core holds discouraged addresses in @CRollingBloomFilter m_discouraged
+-- {50000, 0.000001}@ (banman.h), which forgets the oldest entries once
+-- 50000 have been added.  Manual bans ('pmManualBans', Core's @m_banned@)
+-- are not counted and never evicted.
+maxDiscouragedEntries :: Int
+maxDiscouragedEntries = 50000
+
+-- | Ban (discourage) a peer's IP for the configured duration.
+-- When the automatic entries are at 'maxDiscouragedEntries', expired entries
+-- are swept first and, if still full, the automatic entry nearest expiry is
+-- dropped, so the newest discouragement always lands and the map never holds
+-- more than the cap plus the operator's manual bans.  An IP that is already
+-- manually banned keeps its manual expiry.
 banPeer :: PeerManager -> SockAddr -> IO ()
 banPeer pm addr = do
   now <- round <$> getPOSIXTime
   let expiry = now + pmcBanDuration (pmConfig pm)
-  atomically $ modifyTVar' (pmBannedAddrs pm) (Map.insert addr expiry)
+      key    = banKey addr
+  atomically $ do
+    manual <- readTVar (pmManualBans pm)
+    unless (Set.member key manual) $ do
+      m0 <- readTVar (pmBannedAddrs pm)
+      let autoCount m = Map.size m - Set.size (Set.filter (`Map.member` m) manual)
+          full m = Map.notMember key m && autoCount m >= maxDiscouragedEntries
+          m1 = if full m0 then Map.filter (> now) m0 else m0
+          m2 = if full m1 then evictSoonest manual m1 else m1
+      writeTVar (pmBannedAddrs pm) (Map.insert key expiry m2)
+      when (Map.size m1 /= Map.size m0) $
+        writeTVar (pmManualBans pm) (Set.filter (`Map.member` m1) manual)
+  where
+    evictSoonest manual m =
+      case Map.foldrWithKey (pick manual) Nothing m of
+        Just (k, _) -> Map.delete k m
+        Nothing     -> m
+    pick manual k e acc
+      | Set.member k manual = acc
+      | otherwise = case acc of
+          Just (_, e') | e' <= e -> acc
+          _                      -> Just (k, e)
+
+-- | Operator ban (@setban add@): store @expiry@ under the IP's 'banKey' and
+-- mark it manual.  Returns 'False' without changing anything when the IP
+-- already holds a live manual ban (Core: "IP/Subnet already banned").  An
+-- automatic discouragement of the same IP is replaced by the manual entry.
+addManualBan :: PeerManager -> SockAddr -> Int64 -> IO Bool
+addManualBan pm addr expiry = do
+  now <- round <$> getPOSIXTime
+  let key = banKey addr
+  atomically $ do
+    manual <- readTVar (pmManualBans pm)
+    banned <- readTVar (pmBannedAddrs pm)
+    let live = Set.member key manual && maybe False (> now) (Map.lookup key banned)
+    if live
+      then return False
+      else do
+        writeTVar (pmBannedAddrs pm) (Map.insert key expiry banned)
+        writeTVar (pmManualBans pm) (Set.insert key manual)
+        return True
+
+-- | Operator unban (@setban remove@).  Only a manual ban can be removed, as
+-- Core's @BanMan::Unban@ only touches @m_banned@; returns 'False' otherwise.
+removeManualBan :: PeerManager -> SockAddr -> IO Bool
+removeManualBan pm addr = do
+  let key = banKey addr
+  atomically $ do
+    manual <- readTVar (pmManualBans pm)
+    if Set.member key manual
+      then do
+        modifyTVar' (pmBannedAddrs pm) (Map.delete key)
+        writeTVar (pmManualBans pm) (Set.delete key manual)
+        return True
+      else return False
+
+-- | Drop every ban, manual and automatic (@clearbanned@).
+clearAllBans :: PeerManager -> IO ()
+clearAllBans pm = atomically $ do
+  writeTVar (pmBannedAddrs pm) Map.empty
+  writeTVar (pmManualBans pm) Set.empty
 
 -- | Add to a peer's ban score for misbehavior
 -- Invalid messages typically add 10-100 points
@@ -7141,7 +7256,7 @@ isDiscouraged :: PeerManager -> SockAddr -> IO Bool
 isDiscouraged pm addr = do
   now <- round <$> getPOSIXTime
   banned <- readTVarIO (pmBannedAddrs pm)
-  case Map.lookup addr banned of
+  case lookupBan addr banned of
     Nothing -> return False
     Just expiry -> return (now < expiry)
 
@@ -7161,6 +7276,8 @@ clearExpiredBans pm = do
     banned <- readTVar (pmBannedAddrs pm)
     let (expired, active) = Map.partition (<= now) banned
     writeTVar (pmBannedAddrs pm) active
+    unless (Map.null expired) $
+      modifyTVar' (pmManualBans pm) (Set.filter (`Map.member` active))
     return (Map.size expired)
 
 -- | Insert a minimal peer entry directly into the peer map for testing.
@@ -7262,12 +7379,38 @@ banEntryToSockAddr be =
       | otherwise = let (h:t) = splitOn c xs in (x:h) : t
 
 -- | Save the ban list to a JSON file
+-- Each entry also records @"manual"@, so an operator ban stays out of the
+-- discouragement cap after a restart (see 'pmManualBans').
 saveBanList :: PeerManager -> FilePath -> IO ()
 saveBanList pm path = do
-  banned <- readTVarIO (pmBannedAddrs pm)
-  let entries = mapMaybe (uncurry sockAddrToBanEntry) (Map.toList banned)
+  (banned, manual) <- atomically $
+    (,) <$> readTVar (pmBannedAddrs pm) <*> readTVar (pmManualBans pm)
+  let entries =
+        [ SavedBan be (Set.member a manual)
+        | (a, e) <- Map.toList banned
+        , Just be <- [sockAddrToBanEntry a e]
+        ]
   withFile path WriteMode $ \h ->
     hPutStr h (C8.unpack $ LBS.toStrict $ Aeson.encode entries)
+
+-- | A banlist.json entry: the 'BanEntry' fields plus whether it is manual.
+-- A file without @"manual"@ (written before the flag existed) loads as
+-- automatic, so it stays inside the discouragement cap.
+data SavedBan = SavedBan !BanEntry !Bool
+
+instance ToJSON SavedBan where
+  toJSON (SavedBan be manual) = Aeson.object
+    [ "address" .= beAddress be
+    , "port"    .= bePort be
+    , "expiry"  .= beExpiry be
+    , "manual"  .= manual
+    ]
+
+instance FromJSON SavedBan where
+  parseJSON v = do
+    be <- parseJSON v
+    manual <- Aeson.withObject "SavedBan" (\o -> o .:? "manual" .!= False) v
+    return (SavedBan be manual)
 
 -- | Load the ban list from a JSON file
 loadBanList :: PeerManager -> FilePath -> IO (Either String Int)
@@ -7278,17 +7421,23 @@ loadBanList pm path = do
     Right contents ->
       case Aeson.decodeStrict (C8.pack contents) of
         Nothing -> return $ Left "Invalid JSON in ban list"
-        Just (entries :: [BanEntry]) -> do
+        Just (entries :: [SavedBan]) -> do
           now <- round <$> getPOSIXTime
-          let validEntries = filter (\e -> beExpiry e > now) entries
-              banMap = Map.fromList $ mapMaybe toBanPair validEntries
-          atomically $ modifyTVar' (pmBannedAddrs pm) (Map.union banMap)
+          let validEntries = [ e | e@(SavedBan be _) <- entries, beExpiry be > now ]
+              pairs  = mapMaybe toBanPair validEntries
+              banMap = Map.fromListWith max [ (k, x) | (k, x, _) <- pairs ]
+              manual = Set.fromList [ k | (k, _, True) <- pairs ]
+          atomically $ do
+            modifyTVar' (pmBannedAddrs pm) (Map.union banMap)
+            modifyTVar' (pmManualBans pm) (Set.union manual)
           return $ Right (Map.size banMap)
   where
-    toBanPair :: BanEntry -> Maybe (SockAddr, Int64)
-    toBanPair be = do
+    toBanPair :: SavedBan -> Maybe (SockAddr, Int64, Bool)
+    -- Entries saved before bans were keyed by IP carry the peer's port;
+    -- fold them to the IP key so they cover every port again.
+    toBanPair (SavedBan be manual) = do
       addr <- banEntryToSockAddr be
-      return (addr, beExpiry be)
+      return (banKey addr, beExpiry be, manual)
 
 --------------------------------------------------------------------------------
 -- Addr Message Handling
@@ -7418,7 +7567,7 @@ checkPreHandshake pm addr = do
   inboundCount <- countInboundPeers pm
 
   -- Check 1: Is the peer banned?
-  case Map.lookup addr banned of
+  case lookupBan addr banned of
     Just expiry | expiry > now -> return RejectBanned
     _ -> do
       -- Check 2: Is the peer discouraged and slots nearly full?
