@@ -24,7 +24,7 @@ module RestartBestHeaderSpec (spec) where
 
 import Test.Hspec
 import Control.Exception (bracket)
-import Control.Concurrent.STM (newTVarIO, readTVarIO)
+import Control.Concurrent.STM (newTVarIO, readTVarIO, atomically, modifyTVar')
 import Data.IORef (newIORef)
 import Data.Word (Word32, Word64)
 import Data.Maybe (fromMaybe)
@@ -47,8 +47,8 @@ import Haskoin.Crypto (computeTxId, computeBlockHash)
 import Haskoin.Consensus
   ( regtest, medianTimePast, blockReward, computeMerkleRoot
   , netPowLimit, Network(..), ChainEntry(..), HeaderChain(..)
-  , getValidatedChainTip )
-import Haskoin.HeaderReload (initHeaderChainFromDB)
+  , getValidatedChainTip, BlockStatus(..), recalculateBestHeader )
+import Haskoin.HeaderReload (initHeaderChainFromDB, estimateUndoConnectedTip)
 import Haskoin.Storage
   ( defaultDBConfig, withDB, newUTXOCache, defaultPruneConfig, putBlockHeight )
 import Haskoin.Mempool (newMempool, defaultMempoolConfig)
@@ -379,3 +379,62 @@ spec = describe "best header across a restart (Core LoadBlockIndex sets m_best_h
           bestHeader s `shouldReturn` h3
           blocksHeaders s `shouldReturn` (3, 3)
           validatedHash s `shouldReturn` h3)
+
+  -- Boot reconciliation (app/Main.hs) estimates the connected tip by a
+  -- binary search over undo records ('estimateUndoConnectedTip') and then
+  -- re-stamps the best-block pointer to that height without a UTXO rewind.
+  -- The reload's 'recalculateBestHeader' picks the most-WORK header, and
+  -- headerWork follows nBits, so on mainnet a valid header can out-work
+  -- the connected tip at a LOWER height.  If that lower header height
+  -- capped the search, the pointer would move back below the coin set and
+  -- the next blocks would fail on already-spent inputs (the wedge
+  -- documented in HeaderReload).  Regtest's header gates (bhBits must
+  -- equal the parent's) refuse such a header, so the test inserts the
+  -- index entry directly and runs the same recompute the reload runs.
+  it "restart-undo-search-cap: a most-work header below the connected tip does not lower the undo-record connected-tip estimate" $
+    withRestart
+      (\s -> chainN s 5)
+      (\hs s -> do
+          let hc = rsHeaderChain s
+              h3 = hs !! 2
+              h5 = hs !! 4
+          validatedHash s `shouldReturn` h5
+          estimateUndoConnectedTip (rsDB s) hc Nothing `shouldReturn` 5
+          entries <- readTVarIO (hcEntries hc)
+          parent <- maybe (fail "h3 not in index") return (Map.lookup h3 entries)
+          (hdr, _) <- mkHeader s h3 (BS.pack [0x67]) blockReward
+          let heavy = ChainEntry
+                { ceHeader = hdr
+                , ceHash = computeBlockHash hdr
+                , ceHeight = ceHeight parent + 1
+                , ceChainWork = ceChainWork parent * 1000
+                , cePrev = Just h3
+                , ceStatus = StatusHeaderValid
+                , ceMedianTime = bhTimestamp hdr
+                , ceSequenceId = 1000
+                }
+          atomically $ modifyTVar' (hcEntries hc) (Map.insert (ceHash heavy) heavy)
+          recalculateBestHeader (rsDB s) hc
+          -- control: the recompute did move the best header below the
+          -- connected tip (height 4 < 5) ...
+          bestHeader s `shouldReturn` ceHash heavy
+          readTVarIO (hcHeight hc) `shouldReturn` 4
+          -- ... and the connected chain did not move
+          validatedHash s `shouldReturn` h5
+          -- the undo records still prove blocks 1..5 connected
+          estimateUndoConnectedTip (rsDB s) hc Nothing `shouldReturn` 5)
+
+  -- Control (passes before and after): a best header ABOVE the connected
+  -- tip does not lift the estimate past the last block with an undo record.
+  it "restart-undo-search-cap: a header-only best header above the connected tip leaves the estimate at the connected tip" $
+    withRestart
+      (\s -> do
+          [_h1, _h2, h3] <- chainN s 3
+          b4 <- mkChild s h3 (BS.pack [0x60])
+          submitHeader s b4
+          b5 <- mkChild s (hashOf b4) (BS.pack [0x61])
+          submitHeader s b5
+          return ())
+      (\() s -> do
+          readTVarIO (hcHeight (rsHeaderChain s)) `shouldReturn` 5
+          estimateUndoConnectedTip (rsDB s) (rsHeaderChain s) Nothing `shouldReturn` 3)
