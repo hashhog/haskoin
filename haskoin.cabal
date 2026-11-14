@@ -1060,6 +1060,22 @@ test-suite reconcile-forward-test
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- A payload trickled a few bytes per read must cost memory linear in its
+-- size, not payload^2 / chunk (secfix-haskoin-recvexact-quadratic).
+test-suite recvexact-linear-cost
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/recvexact-linear-cost
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , cereal
+               , network
+               , stm
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 executable db-breakdown
   main-is:         DbBreakdown.hs
   hs-source-dirs:  tools-measure
