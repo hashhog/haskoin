@@ -3787,13 +3787,21 @@ infixOfStr needle haystack =
 -- DeploymentActiveAfter(prev, SEGWIT)).  @Just (reason, height)@ = mutated.
 -- Cost: one txid pass (+ one wtxid pass under segwit) over the block.
 mutationOnReceipt :: Network -> HeaderChain -> Block -> IO (Maybe (String, Word32))
-mutationOnReceipt net hc block = do
+mutationOnReceipt net hc block = snd <$> mutationOnReceiptChecked net hc block
+
+-- | 'mutationOnReceipt' plus whether the check RAN (the parent was known),
+-- from the same 'hcEntries' snapshot.  @False@ = not checked: the MBlock
+-- arm re-runs the check once 'addHeader' has placed the block, because the
+-- parent may have arrived on another peer thread in between.
+mutationOnReceiptChecked :: Network -> HeaderChain -> Block
+                         -> IO (Bool, Maybe (String, Word32))
+mutationOnReceiptChecked net hc block = do
   entries <- readTVarIO (hcEntries hc)
   return $ case Map.lookup (bhPrevBlock (blockHeader block)) entries of
-    Nothing    -> Nothing
+    Nothing    -> (False, Nothing)
     Just prevE ->
       let ht = ceHeight prevE + 1
-      in fmap (\w -> (w, ht)) (blockMutation (ht >= netSegwitHeight net) block)
+      in (True, fmap (\w -> (w, ht)) (blockMutation (ht >= netSegwitHeight net) block))
 
 -- | A mutated block body (Core IsBlockMutated): the body says nothing about
 -- the block.  Core (net_processing.cpp): @Misbehaving(peer, "mutated
@@ -3902,9 +3910,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
  -- receipt, before ANY download state, header, storage or validation step,
  -- whenever the parent is known.  Computed here so the MBlock arm below can
  -- branch on it with a guard.
- receiptMutation <- case msg of
-   MBlock blk -> mutationOnReceipt net hc blk
-   _          -> return Nothing
+ (receiptChecked, receiptMutation) <- case msg of
+   MBlock blk -> mutationOnReceiptChecked net hc blk
+   _          -> return (True, Nothing)
  case msg of
   MBlock block | Just (why, mutHeight) <- receiptMutation ->
     rejectMutatedOnReceipt db pmRef receiptRefillRef blockReceipt addr
@@ -4125,6 +4133,17 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         -- BlockChecked — invalid blocks score 100.
         pm <- readIORef pmRef
         void $ misbehaving pm addr InvalidBlock
+      -- The receipt check above did not run (parent unknown then), but
+      -- addHeader accepted the header, so the parent is known now: it
+      -- arrived on another peer thread in between.  Run IsBlockMutated now,
+      -- before any download state, storage or validation step, exactly as
+      -- the receipt check would have.  Without this a junk body skipped the
+      -- check and a structural verdict marked the honest block failed.
+      Right entry
+        | not receiptChecked
+        , Just why <- blockMutation (ceHeight entry >= netSegwitHeight net) block ->
+            rejectMutatedOnReceipt db pmRef receiptRefillRef blockReceipt addr
+              bh (ceHeight entry) why
       Right entry -> do
        -- Arrived: no longer in flight (Core RemoveBlockRequest), and not
        -- re-requested while this thread validates it. 'finally' so a

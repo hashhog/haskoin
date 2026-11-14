@@ -3724,7 +3724,9 @@ main = hspec $ do
 
     it "rejects block when first transaction is not coinbase" $ do
       let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
-          merkle = Hash256 (BS.replicate 32 0)
+          -- The real root: Core's CheckMerkleRoot runs first, so a wrong
+          -- root would (rightly) be the mutated reject, not this verdict.
+          merkle = computeMerkleRoot (map computeTxId [regularTx])
           header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           txid = TxId (Hash256 (BS.replicate 32 0xaa))
           txin = TxIn (OutPoint txid 0) "scriptsig" 0xffffffff
@@ -3737,7 +3739,9 @@ main = hspec $ do
 
     it "rejects block with multiple coinbase transactions" $ do
       let prevHash = BlockHash (Hash256 (BS.replicate 32 0))
-          merkle = Hash256 (BS.replicate 32 0)
+          -- The real root: Core's CheckMerkleRoot runs first, so a wrong
+          -- root would (rightly) be the mutated reject, not this verdict.
+          merkle = computeMerkleRoot (map computeTxId [coinbase1, coinbase2])
           header = BlockHeader 1 prevHash merkle 0 0x207fffff 0
           nullOutpoint = OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xffffffff
           coinbaseIn = TxIn nullOutpoint (BS.pack [0x01, 0x01]) 0xffffffff
