@@ -5007,8 +5007,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           `catch` (\(_ :: SomeException) -> return ())
       else do
         entries <- readTVarIO (mpEntries mp)
-        let mempoolTxMap = Map.map meTransaction entries
-        case initPartialBlock cb mempoolTxMap of
+        -- Cached wtxids (meWtxid): matching a short id must not
+        -- re-serialize and SHA256d every mempool tx per cmpctblock.
+        let mempoolWtxids = [ (meWtxid e, meTransaction e) | e <- Map.elems entries ]
+        case initPartialBlockCached cb mempoolWtxids of
           Left err -> do
             putStrLn $ "Compact block " ++ show bh ++ " init failed: " ++ err
             pm <- readIORef pmRef
