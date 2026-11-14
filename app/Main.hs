@@ -54,7 +54,7 @@ import qualified Haskoin.ASMap as ASMap (loadAsmap)
 import Haskoin.Consensus
 import Haskoin.ChainLock (ChainLock, withChainLock, tryWithChainLock, chainLockHeld)
 import Haskoin.Storage
-import Haskoin.HeaderReload (initHeaderChainFromDB)
+import Haskoin.HeaderReload (initHeaderChainFromDB, estimateUndoConnectedTip)
 import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment)
 import Haskoin.Rpc
 import Haskoin.Mempool
@@ -1335,25 +1335,6 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- fixing.  On a healthy node U already equals the pointer height
     -- and both steps are no-ops.
     headerTipHeight <- readTVarIO (hcHeight hc)
-    let -- Does the block at height @h@ have a persisted undo record?
-        -- Height 0 (genesis) has no undo record but is always
-        -- "connected"; callers handle 0 separately.
-        blockIsConnected h = do
-          mHash <- getBlockHeight db h
-          case mHash of
-            Nothing -> return False
-            Just bh -> isJust <$> getUndoData db bh
-        -- Binary search for the highest contiguous connected height in
-        -- the inclusive range [lo .. hi].  Invariant on entry: every
-        -- height <= lo is connected, every height > hi is not.
-        findConnectedTip lo hi
-          | lo >= hi  = return lo
-          | otherwise = do
-              let mid = lo + (hi - lo + 1) `div` 2
-              connected <- blockIsConnected mid
-              if connected
-                then findConnectedTip mid hi
-                else findConnectedTip lo (mid - 1)
     -- Snapshot-aware lower bound for the connected-tip search.
     --
     -- An assumeUTXO snapshot load ('--load-snapshot',
@@ -1411,64 +1392,10 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
               Nothing -> do
                 mUnsafe <- lookupEnv "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
                 return (mUnsafe >>= (readMaybe :: String -> Maybe Word32))
-    undoTipEstimate <-
-      case mSnapshotBaseHeight of
-        -- Snapshot-bootstrapped chainstate: undo records (if any) start
-        -- at baseHeight+1.  The connected tip is at least baseHeight —
-        -- the imported UTXO set legitimately begins at the snapshot base.
-        --
-        -- W164 forward-sync-wedge fix: this case MUST take priority over
-        -- the @headerTipHeight == 0@ short-circuit below.  On a freshly
-        -- wiped datadir bootstrapped from a snapshot, 'initHeaderChainFromDB'
-        -- loads only genesis ("Loaded 0 headers"), so 'headerTipHeight' is 0
-        -- at this point — the genesis->base->tip header chain is backfilled
-        -- by the headers-first P2P sync that runs AFTER node startup, not
-        -- before this reconciliation.  The old @if headerTipHeight == 0
-        -- then return 0@ guard ran first and seeded connectedTipHeight=0
-        -- (=> nextBlockRef=1), so the block-gap kicker forever requested
-        -- block 1 on top of BestBlock=base and every getdata failed the
-        -- ConnectBlock G1 gate (validation.cpp:2333) — the node wedged at
-        -- the base with blocks=base / headers=tip / ibd=false.  The snapshot
-        -- base marker is the authoritative UTXO-set floor regardless of how
-        -- far the header chain has rebuilt, so honour it unconditionally.
-        Just baseHeight -> do
-          -- No usable header tip yet (genesis-only chain, headers still
-          -- backfilling): the connected tip is exactly the snapshot base.
-          if headerTipHeight <= baseHeight
-            then do
-              putStrLn $ "Chainstate reconciliation: assumeUTXO snapshot "
-                      ++ "base at height " ++ show baseHeight
-                      ++ "; header chain not yet rebuilt past the base "
-                      ++ "(header tip " ++ show headerTipHeight
-                      ++ ") — treating the base as the connected tip. The "
-                      ++ "headers-first P2P sync will backfill "
-                      ++ "genesis->base->tip; the block-gap kicker then "
-                      ++ "downloads bodies " ++ show (baseHeight + 1)
-                      ++ "..header-tip."
-              return baseHeight
-            else do
-              aboveConnected <- blockIsConnected (baseHeight + 1)
-              if not aboveConnected
-                then do
-                  putStrLn $ "Chainstate reconciliation: assumeUTXO "
-                          ++ "snapshot base at height " ++ show baseHeight
-                          ++ "; no post-snapshot blocks connected yet "
-                          ++ "(snapshot UTXO set has no undo records by "
-                          ++ "design) — treating the base as the "
-                          ++ "connected tip."
-                  return baseHeight
-                else findConnectedTip (baseHeight + 1) headerTipHeight
-        -- Normal (genesis-up) chainstate, no snapshot marker.
-        Nothing ->
-          if headerTipHeight == 0
-            then return 0
-            else do
-              -- If even block 1 has no undo record the UTXO set never
-              -- advanced past genesis; otherwise binary-search [1..tip].
-              oneConnected <- blockIsConnected 1
-              if not oneConnected
-                then return 0
-                else findConnectedTip 1 headerTipHeight
+    -- The undo-record binary search itself lives in Haskoin.HeaderReload
+    -- ('estimateUndoConnectedTip') so the test suite can run it on a
+    -- reloaded header chain.
+    undoTipEstimate <- estimateUndoConnectedTip db hc mSnapshotBaseHeight
     -- FORWARD-MOVE GUARD (2026-10-01 mainnet 961631 -> 966500 incident).
     -- An undo record proves a block was connected into SOME coin set, not
     -- into THIS one: -reindex-chainstate / --load-snapshot (before the
