@@ -413,6 +413,7 @@ module Haskoin.Network
     -- ** Outbound Connection Diversity
   , OutboundDiversity(..)
   , newOutboundDiversity
+  , newOutboundDiversityFor
   , checkOutboundDiversity
   , addOutboundConnection
   , removeOutboundConnection
@@ -5605,7 +5606,9 @@ startPeerManagerWith :: Network -> PeerManagerConfig
                      -> (SockAddr -> IO ())          -- ^ on-peer-disconnect hook
                      -> IO PeerManager
 startPeerManagerWith net config handler onDisconnect = do
-  od  <- newOutboundDiversity
+  peersV <- newTVarIO Map.empty
+  -- The diversity tracker derives its netgroups from this live peer map.
+  od  <- newOutboundDiversityFor peersV
   -- Restore the persisted bucketed addrman (peers.json) so the address book
   -- survives restart instead of cold-starting empty.  A missing/corrupt/oversized
   -- file falls back to a fresh empty addrman + DNS seeds (loadAddrMan never
@@ -5614,7 +5617,7 @@ startPeerManagerWith net config handler onDisconnect = do
   mLoaded <- loadAddrMan (pmcDataDir config) BS.empty
   am  <- maybe newAddrMan return mLoaded
   pm  <- PeerManager
-    <$> newTVarIO Map.empty
+    <$> pure peersV
     <*> newTVarIO Set.empty
     <*> newTVarIO Map.empty
     <*> pure config
@@ -5706,6 +5709,10 @@ peerManagerLoop pm = forever $ do
         `catch` (\(e :: SomeException) ->
           putStrLn $ "peerManagerLoop: onDisconnect error for "
                   ++ show addr ++ ": " ++ show e)
+  -- Forget diversity registrations of peers that left the map by another
+  -- path (misbehaviour, timeouts, eviction).  Those already stopped counting
+  -- (the groups are derived from the live map); this only bounds the registry.
+  pruneOutboundDiversity (pmOutboundDiversity pm)
 
   -- setnetworkactive gate (Core CConnman::fNetworkActive, net.cpp:2351/3022/
   -- 3219): when the operator has disabled networking, suppress ALL new
@@ -6208,9 +6215,11 @@ attemptProxyOutbound pm config blockRelayOnly addr
               when blockRelayOnly $
                 atomically $ modifyTVar' (pcInfo pc)
                   (\i -> i { piBlockOnly = True })
+              -- Into the peer map first: the diversity registry is pruned
+              -- against it, so a registration must never precede the entry.
+              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
               addOutboundConnection (pmOutboundDiversity pm)
                                     (pmAsmapData pm) addr
-              atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
               nowOk <- (round <$> getPOSIXTime :: IO Int64)
               markGood (pmAddrMan pm) (pmAsmapData pm) addr nowOk
               pc' <- startPeerThreadsWithMisbehavior pc
@@ -6398,8 +6407,9 @@ attemptV2Outbound pm config blockRelayOnly addr host port = do
                     -- Mark as block-relay-only if requested
                     when blockRelayOnly $
                       atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
-                    addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
+                    -- Peer map first (see the registry prune in peerManagerLoop).
                     atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+                    addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
                     -- BUG-6 FIX: successful v2 connection → markGood so the
                     -- address moves from new table to tried table in AddrMan.
                     nowOk <- (round <$> getPOSIXTime :: IO Int64)
@@ -6462,11 +6472,12 @@ attemptV1Outbound pm config blockRelayOnly addr host port = do
           when blockRelayOnly $
             atomically $ modifyTVar' (pcInfo pc) (\i -> i { piBlockOnly = True })
 
-          -- Track netgroup diversity for outbound connections
-          addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
-
           -- Add to peer map
           atomically $ modifyTVar' (pmPeers pm) (Map.insert addr pc)
+
+          -- Track netgroup diversity for outbound connections.  After the
+          -- peer-map insert: the registry is pruned against the peer map.
+          addOutboundConnection (pmOutboundDiversity pm) (pmAsmapData pm) addr
 
           -- BUG-6 FIX: successful connection → mark address as good in AddrMan
           -- so it moves from the new table to the tried table.
@@ -9243,17 +9254,66 @@ loadAddrMan dataDir asmapData = do
 -- Reference: Bitcoin Core net.cpp ThreadOpenConnections
 --------------------------------------------------------------------------------
 
--- | Tracks connected network groups for outbound diversity
+-- | Tracks which outbound connections count towards netgroup diversity.
+--
+-- Core keeps no counter here: CConnman::ThreadOpenConnections rebuilds
+-- @outbound_ipv46_peer_netgroups@ from the live @m_nodes@ on every pass
+-- (bitcoin-core/src/net.cpp ~2656-2690), so a peer's netgroup stops counting
+-- the moment the peer is gone, whichever path disconnected it.
+--
+-- haskoin used to keep a per-group counter that only 'peerManagerLoop'
+-- decremented, and only for a peer still in 'pmPeers' as 'PeerDisconnected'.
+-- Every path that deletes a peer from 'pmPeers' itself (misbehaviour,
+-- silence/ping timeouts, the eviction loop, the stall disconnects in
+-- app/Main.hs) therefore left its netgroup taken for the rest of the process,
+-- and 'checkOutboundDiversity' refused every address in it.
+--
+-- Now the tracker holds only the set of addresses registered as
+-- diversity-counting outbound connections ('addOutboundConnection'; the
+-- Tor/I2P host path never registers, as Core skips privacy networks), and the
+-- groups in use are derived on every check.  For the 'PeerManager' tracker
+-- ('newOutboundDiversityFor') an address counts only while it is in the live
+-- peer map as an outbound peer, so no disconnect site needs a release step.
+-- Like Core's m_nodes, which still holds an fDisconnect node until
+-- DisconnectNodes removes it, a peer left in the map as 'PeerDisconnected'
+-- counts until 'peerManagerLoop' deletes it.  A tracker made with
+-- 'newOutboundDiversity' has no peer map and counts every registered address.
 data OutboundDiversity = OutboundDiversity
-  { odConnectedGroups :: !(TVar (Set.Set NetworkGroup))  -- ^ Groups with outbound connections
-  , odGroupCounts     :: !(TVar (Map NetworkGroup Int))  -- ^ Count per group
+  { odOutbound  :: !(TVar (Set.Set SockAddr))
+    -- ^ Addresses registered by 'addOutboundConnection'
+  , odLivePeers :: !(Maybe (TVar (Map SockAddr PeerConnection)))
+    -- ^ The live peer map the registered addresses are checked against
   }
 
--- | Create a new outbound diversity tracker
+-- | Create a standalone outbound diversity tracker (no live peer map).
 newOutboundDiversity :: IO OutboundDiversity
-newOutboundDiversity = OutboundDiversity
-  <$> newTVarIO Set.empty
-  <*> newTVarIO Map.empty
+newOutboundDiversity = OutboundDiversity <$> newTVarIO Set.empty <*> pure Nothing
+
+-- | Create an outbound diversity tracker whose groups are derived from the
+-- given live peer map (the 'PeerManager' tracker).
+newOutboundDiversityFor :: TVar (Map SockAddr PeerConnection) -> IO OutboundDiversity
+newOutboundDiversityFor peersV =
+  OutboundDiversity <$> newTVarIO Set.empty <*> pure (Just peersV)
+
+-- | The netgroups currently held by outbound connections, derived from the
+-- registered addresses and (when present) the live peer map.
+outboundGroupsInUse :: OutboundDiversity -> ByteString -> IO (Set.Set NetworkGroup)
+outboundGroupsInUse od asmapData = do
+  live <- atomically $ do
+    tracked <- readTVar (odOutbound od)
+    case odLivePeers od of
+      Nothing     -> return (Set.toList tracked)
+      Just peersV -> do
+        peers <- readTVar peersV
+        fmap catMaybes $ forM (Set.toList tracked) $ \a ->
+          case Map.lookup a peers of
+            Nothing -> return Nothing
+            Just pc -> do
+              i <- readTVar (pcInfo pc)
+              -- Core skips INBOUND connections (an attacker could make them
+              -- to keep us out of a netgroup).
+              return $ if piInbound i then Nothing else Just a
+  return $ Set.fromList (map (computeNetworkGroupWithASMap asmapData) live)
 
 -- | Check if connecting to an address would maintain ASN/IP diversity.
 -- @asmapData@ is the raw ASMap bytecode (empty = disabled).
@@ -9263,34 +9323,33 @@ newOutboundDiversity = OutboundDiversity
 checkOutboundDiversity :: OutboundDiversity -> ByteString -> SockAddr -> IO Bool
 checkOutboundDiversity od asmapData addr = do
   let group = computeNetworkGroupWithASMap asmapData addr
-  connected <- readTVarIO (odConnectedGroups od)
+  connected <- outboundGroupsInUse od asmapData
   -- Accept if this group (ASN-keyed or raw /16) is not already connected
   return $ not $ Set.member group connected
 
--- | Add an outbound connection to the diversity tracker.
--- @asmapData@ is the raw ASMap bytecode (empty = disabled).
+-- | Register an outbound connection with the diversity tracker.  The group is
+-- computed at check time, so @asmapData@ is not needed here; the parameter is
+-- kept so callers pass the same arguments to all three functions.
 addOutboundConnection :: OutboundDiversity -> ByteString -> SockAddr -> IO ()
-addOutboundConnection od asmapData addr = do
-  let group = computeNetworkGroupWithASMap asmapData addr
-  atomically $ do
-    modifyTVar' (odConnectedGroups od) (Set.insert group)
-    modifyTVar' (odGroupCounts od) $ \m ->
-      Map.insertWith (+) group 1 m
+addOutboundConnection od _asmapData addr =
+  atomically $ modifyTVar' (odOutbound od) (Set.insert addr)
 
--- | Remove an outbound connection from the diversity tracker.
--- @asmapData@ is the raw ASMap bytecode (empty = disabled).
+-- | Unregister an outbound connection from the diversity tracker.
 removeOutboundConnection :: OutboundDiversity -> ByteString -> SockAddr -> IO ()
-removeOutboundConnection od asmapData addr = do
-  let group = computeNetworkGroupWithASMap asmapData addr
-  atomically $ do
-    counts <- readTVar (odGroupCounts od)
-    let newCount = Map.findWithDefault 1 group counts - 1
-    if newCount <= 0
-      then do
-        modifyTVar' (odConnectedGroups od) (Set.delete group)
-        writeTVar (odGroupCounts od) (Map.delete group counts)
-      else
-        writeTVar (odGroupCounts od) (Map.insert group newCount counts)
+removeOutboundConnection od _asmapData addr =
+  atomically $ modifyTVar' (odOutbound od) (Set.delete addr)
+
+-- | Drop registrations whose address is no longer in the live peer map, so
+-- the registry does not grow with every peer that was deleted from
+-- 'pmPeers' without passing through 'peerManagerLoop'.  It only bounds
+-- memory: an address absent from the map already does not count.  No-op for
+-- a standalone tracker.
+pruneOutboundDiversity :: OutboundDiversity -> IO ()
+pruneOutboundDiversity od = case odLivePeers od of
+  Nothing     -> return ()
+  Just peersV -> atomically $ do
+    peers <- readTVar peersV
+    modifyTVar' (odOutbound od) (Set.filter (`Map.member` peers))
 
 --------------------------------------------------------------------------------
 -- Anchor Connections
