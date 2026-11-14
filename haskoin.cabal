@@ -507,6 +507,7 @@ test-suite headers-presync
   main-is:       HeaderSyncMain.hs
   other-modules: HeaderSyncSpec
   hs-source-dirs: test
+  cpp-options:   -DHASKOIN_HEADERS_PRESYNC
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec

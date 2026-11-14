@@ -182,6 +182,7 @@ spec = describe "outbound-eviction" $ do
     let env inflight = OutboundEvictEnv
           { oeeTipWork = return 1000
           , oeeInFlight = inflight
+          , oeeMaySendGetHeaders = \_ -> return True
           , oeeLocator = return [BlockHash (Hash256 (BS.replicate 32 0))] }
         addAll pm n0 = do
           conns <- mapM (\n -> do
@@ -253,6 +254,7 @@ spec = describe "outbound-eviction" $ do
         mapM_ (\a -> noteBestKnownWork pm a 1000) (addrN 10 : [addrN n | n <- [1 .. 4]])
         let envAt w = OutboundEvictEnv
               { oeeTipWork = return w, oeeInFlight = \_ -> return 0
+              , oeeMaySendGetHeaders = \_ -> return True
               , oeeLocator = return [BlockHash (Hash256 (BS.replicate 32 0))] }
         r0 <- runOutboundEviction pm (envAt 1000) now0
         tr <- readTVarIO (pmOutboundTrack pm)

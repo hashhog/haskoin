@@ -53,6 +53,13 @@ module Haskoin.Sync
   , popHeadersReadyForAcceptance
   , runPresync
   , runRedownload
+  , initHeaderSyncPeerWithThreshold
+    -- * P2P headers anti-DoS gate (Core ProcessHeadersMessage)
+  , HeadersSyncPeers
+  , PeerHeadersVerdict(..)
+  , antiDoSWorkThreshold
+  , peerHeadersGate
+  , headersSyncActive
   ) where
 
 import Data.ByteString (ByteString)
@@ -602,6 +609,7 @@ data PresyncData = PresyncData
   , pdStartHeight      :: !Int64         -- ^ Height of chain_start (m_chain_start.nHeight)
   , pdMaxCommitments   :: !Word64        -- ^ Upper bound on commitments (m_max_commitments)
   , pdMinimumWork      :: !Integer       -- ^ Target work threshold to proceed
+  , pdStartWork        :: !Integer       -- ^ chain_start.nChainWork (seeds m_redownload_chain_work)
   , pdParams           :: !HeaderSyncParams
   } deriving (Show, Eq, Generic)
 
@@ -627,6 +635,8 @@ data HeaderSyncPeer = HeaderSyncPeer
   { hspState      :: !(TVar HeaderSyncState)
   , hspNetwork    :: !Network
   , hspSalt       :: !Word64            -- ^ Random salt for commitment hashing
+  , hspStartHash  :: !BlockHash         -- ^ chain_start (m_chain_start), for the request locator
+  , hspLastRequest :: !(TVar Int64)     -- ^ when the sync last sent getheaders (m_last_getheaders_timestamp)
   } deriving (Generic)
 
 -- | Compute a salted commitment hash (SipHash-like) for anti-DoS
@@ -653,7 +663,16 @@ commitmentHash salt (BlockHash (Hash256 bs)) =
 --
 -- Reference: bitcoin-core/src/headerssync.cpp HeadersSyncState constructor (lines 17-46).
 initHeaderSyncPeer :: Network -> BlockHash -> Int64 -> Word32 -> Integer -> Word32 -> Int64 -> IO HeaderSyncPeer
-initHeaderSyncPeer net startHash startHeight startNBits startWork startMTP currentTime = do
+initHeaderSyncPeer net startHash startHeight startNBits startWork startMTP currentTime =
+  initHeaderSyncPeerWithThreshold net startHash startHeight startNBits startWork startMTP currentTime
+    (max (netMinimumChainWork net) startWork)
+
+-- | 'initHeaderSyncPeer' with the caller's minimum_required_work.  Core
+-- constructs HeadersSyncState with GetAntiDoSWorkThreshold()
+-- (net_processing.cpp TryLowWorkHeadersSync), which is at least
+-- nMinimumChainWork and also tracks the active tip.
+initHeaderSyncPeerWithThreshold :: Network -> BlockHash -> Int64 -> Word32 -> Integer -> Word32 -> Int64 -> Integer -> IO HeaderSyncPeer
+initHeaderSyncPeerWithThreshold net startHash startHeight startNBits startWork startMTP currentTime threshold = do
   salt <- randomRIO (0, maxBound :: Word64)
   let params = netHeaderSyncParams net
   commitOffset <- randomRIO (0, hspCommitmentPeriod params - 1)
@@ -664,8 +683,7 @@ initHeaderSyncPeer net startHash startHeight startNBits startWork startMTP curre
       secsSinceStart = currentTime - fromIntegral startMTP + maxFutSecs
       maxCommits   = fromIntegral (max 0 (6 * secsSinceStart `div` fromIntegral (hspCommitmentPeriod params))) :: Word64
 
-  let threshold = max (netMinimumChainWork net) startWork
-      presyncData = PresyncData
+  let presyncData = PresyncData
         { pdCumulativeWork  = startWork      -- BUG5 fix: init from chain_start.nChainWork
         , pdLastHeaderHash  = startHash      -- chain_start hash
         , pdLastHeaderBits  = startNBits     -- chain_start nBits for PermittedDifficultyTransition
@@ -677,14 +695,18 @@ initHeaderSyncPeer net startHash startHeight startNBits startWork startMTP curre
         , pdStartHeight     = startHeight
         , pdMaxCommitments  = maxCommits     -- BUG1 fix: memory DoS bound
         , pdMinimumWork     = threshold
+        , pdStartWork       = startWork
         , pdParams          = params
         }
 
   stateVar <- newTVarIO (Presync presyncData)
+  lastReq <- newTVarIO 0
   return HeaderSyncPeer
     { hspState = stateVar
     , hspNetwork = net
     , hspSalt = salt
+    , hspStartHash = startHash
+    , hspLastRequest = lastReq
     }
 
 -- | Get the current header sync state
@@ -791,7 +813,12 @@ runPresync salt net pd (h:hs) = do
                           -- Core: previous_nBits = m_chain_start.nBits when buffer empty
                           -- (headerssync.cpp lines 231-235)
                           , rdLastHeaderBits  = pdChainStartNBits newPd
-                          , rdCumulativeWork  = 0   -- m_redownload_chain_work = m_chain_start.nChainWork
+                          -- m_redownload_chain_work = m_chain_start.nChainWork
+                          -- (headerssync.cpp REDOWNLOAD transition).  This was
+                          -- 0, so a sync whose chain_start is not genesis
+                          -- compared work-above-start with the absolute
+                          -- threshold and never set m_process_all_remaining_headers.
+                          , rdCumulativeWork  = pdStartWork newPd
                           , rdCount           = 0
                           , rdCommitments     = pdCommitments newPd
                           , rdCommitOffset    = pdCommitOffset newPd
@@ -933,6 +960,231 @@ popHeadersReadyForAcceptance rd = go [] rd
 -- | Convert Seq to list
 toList :: Seq a -> [a]
 toList = foldr (:) []
+
+--------------------------------------------------------------------------------
+-- P2P headers anti-DoS gate (Core ProcessHeadersMessage)
+--------------------------------------------------------------------------------
+
+-- | Per-peer low-work headers sync (Core @Peer::m_headers_sync@).  At most one
+-- per peer; the entry goes when the sync finishes, aborts, or the peer
+-- disconnects.
+type HeadersSyncPeers = TVar (Map SockAddr HeaderSyncPeer)
+
+-- | What the MHeaders handler may do with one headers message.
+data PeerHeadersVerdict = PeerHeadersVerdict
+  { phvAccept     :: ![BlockHeader]
+    -- ^ Headers to hand to 'addHeader' (and to storage) with
+    --   min_pow_checked = True.  Empty while a low-work chain is being
+    --   pre-synced or was ignored: nothing of it is indexed or stored.
+  , phvGetHeaders :: !(Maybe [BlockHash])
+    -- ^ Send getheaders with this locator (the headers sync wants more).
+  , phvSyncActive :: !Bool
+    -- ^ A headers sync with this peer is still running; the handler must not
+    --   send its own continuation getheaders (Core: @!have_headers_sync@).
+  , phvPunish     :: !(Maybe MisbehaviorReason)
+    -- ^ Core CheckHeadersPoW: a header with invalid PoW, or a batch that is
+    --   not continuous, is punished and nothing in it is processed.
+  , phvLog        :: !(Maybe String)
+  } deriving (Show, Eq)
+
+verdict :: [BlockHeader] -> PeerHeadersVerdict
+verdict hs = PeerHeadersVerdict hs Nothing False Nothing Nothing
+
+-- | Core @PeerManagerImpl::GetAntiDoSWorkThreshold@ (net_processing.cpp):
+-- the larger of nMinimumChainWork and the active tip's work less 144 blocks'
+-- worth of the tip's own proof.
+antiDoSWorkThreshold :: Network -> ChainEntry -> Integer
+antiDoSWorkThreshold net activeTip =
+  let tipWork = ceChainWork activeTip
+      nearTip = tipWork - min (144 * headerWork (ceHeader activeTip)) tipWork
+  in max nearTip (netMinimumChainWork net)
+
+-- | Decide what a headers message from @addr@ may store.  Mirrors Core's
+-- ProcessHeadersMessage:
+--
+--   0. An empty message ends any running sync with the peer.
+--   1. CheckHeadersPoW: any invalid PoW or a non-continuous batch is
+--      punished and nothing is processed.
+--   2. IsContinuationOfLowWorkHeadersSync: a running PRESYNC / REDOWNLOAD
+--      sync with this peer consumes the message; only headers REDOWNLOAD
+--      releases (commitments checked, chain known to reach the threshold)
+--      are processed.  A failed sync lets the message fall through to 3.
+--   3. Unknown parent: returned as-is so the handler's unconnecting-headers
+--      logic runs (Core HandleUnconnectingHeaders; 'addHeader' indexes none).
+--   4. IsAncestorOfBestHeaderOrTip on the last header: already known, no
+--      anti-DoS check needed.
+--   5. TryLowWorkHeadersSync: chain_start work + the batch's claimed work
+--      below 'antiDoSWorkThreshold' is never stored.  A full (2000) batch
+--      starts a PRESYNC sync; a shorter one is ignored.
+--
+-- @activeTip@ is the connected tip (Core ActiveChain().Tip()), @now@ Unix
+-- seconds.
+peerHeadersGate :: Network -> HeaderChain -> ChainEntry -> HeadersSyncPeers
+                -> SockAddr -> Int64 -> [BlockHeader] -> IO PeerHeadersVerdict
+peerHeadersGate _ _ _ syncs addr _ [] = do
+  -- Core (nCount == 0): the peer suddenly has nothing to give us, perhaps
+  -- it reorged to our chain; clear its headers sync so the other getheaders
+  -- senders stop skipping it.
+  atomically $ modifyTVar' syncs (Map.delete addr)
+  pure (verdict [])
+peerHeadersGate net hc activeTip syncs addr now hdrs
+  | not (all (\h -> checkProofOfWork h (netPowLimit net)) hdrs) =
+      pure (verdict []) { phvPunish = Just InvalidBlockHeader
+                        , phvLog = Just "header with invalid proof of work" }
+  | not continuous =
+      pure (verdict []) { phvPunish = Just NonContinuousHeaders
+                        , phvLog = Just "non-continuous headers sequence" }
+  | otherwise = do
+      mSync <- Map.lookup addr <$> readTVarIO syncs
+      cont <- case mSync of
+        Nothing -> pure Nothing
+        Just sp -> do
+          r <- feedSync sp
+          case r of
+            Left _ -> do
+              -- Core: success=false finalizes the sync; the headers then
+              -- take the ordinary path below.
+              atomically $ modifyTVar' syncs (Map.delete addr)
+              pure Nothing
+            Right v -> pure (Just v)
+      case cont of
+        Just v  -> pure v
+        Nothing -> freshPath
+  where
+    full = length hdrs == maxHeadersPerMessage
+    hashes = map computeBlockHash hdrs
+    continuous = and (zipWith (\prevH h -> bhPrevBlock h == prevH) hashes (drop 1 hdrs))
+
+    -- Run the message through this peer's sync.  Left = the sync failed.
+    feedSync :: HeaderSyncPeer -> IO (Either String PeerHeadersVerdict)
+    feedSync sp = do
+      before <- readTVarIO (hspState sp)
+      r <- atomically $ case before of
+        Presync _    -> processPresyncHeaders sp hdrs
+        Redownload _ -> processRedownloadHeaders sp hdrs
+        Synced       -> pure (Left "headers sync already finished")
+      case r of
+        Left err -> pure (Left err)
+        Right (after, ready) -> do
+          let wasPresync = case before of Presync _ -> True; _ -> False
+              -- Core ProcessNextHeaders: PRESYNC asks for more on a full
+              -- message or after switching to REDOWNLOAD; REDOWNLOAD asks
+              -- for more on a full message unless everything was released.
+              more = case after of
+                Presync _    -> full
+                Redownload _ -> full || wasPresync
+                Synced       -> False
+              lastHash = case after of
+                Presync pd    -> Just (pdLastHeaderHash pd)
+                Redownload rd -> Just (rdLastHeaderHash rd)
+                Synced        -> Nothing
+          if more
+            then do
+              startLoc <- locatorFrom (hspStartHash sp)
+              atomically $ writeTVar (hspLastRequest sp) now
+              pure (Right (verdict ready)
+                { phvGetHeaders = fmap (: startLoc) lastHash
+                , phvSyncActive = True
+                , phvLog = Just (phaseLog after) })
+            else do
+              atomically $ modifyTVar' syncs (Map.delete addr)
+              pure (Right (verdict ready)
+                { phvLog = Just (case after of
+                    Synced -> "headers sync complete: releasing all"
+                    _      -> "headers sync aborted: incomplete headers message ("
+                              ++ phaseName after ++ " phase)") })
+
+    phaseName (Presync _)    = "presync"
+    phaseName (Redownload _) = "redownload"
+    phaseName Synced         = "synced"
+    phaseLog st = "headers sync " ++ phaseName st ++ " with peer " ++ show addr
+
+    freshPath :: IO PeerHeadersVerdict
+    freshPath = do
+      entries <- readTVarIO (hcEntries hc)
+      case Map.lookup (bhPrevBlock (head hdrs)) entries of
+        Nothing -> pure (verdict hdrs)
+        Just start -> do
+          byH <- readTVarIO (hcByHeight hc)
+          let lastHash = last hashes
+              onBest e h = Map.lookup (ceHeight e) byH == Just h
+              alreadyValidated = case Map.lookup lastHash entries of
+                Just e  -> onBest e lastHash
+                Nothing -> False
+              threshold = antiDoSWorkThreshold net activeTip
+              totalWork = ceChainWork start + sum (map headerWork hdrs)
+              endHeight = fromIntegral (ceHeight start) + length hdrs
+          if alreadyValidated || totalWork >= threshold
+            then pure (verdict hdrs)
+            else if full
+              then do
+                sp <- initHeaderSyncPeerWithThreshold net (ceHash start)
+                        (fromIntegral (ceHeight start)) (bhBits (ceHeader start))
+                        (ceChainWork start) (ceMedianTime start) now threshold
+                atomically $ modifyTVar' syncs (Map.insert addr sp)
+                r <- feedSync sp
+                case r of
+                  -- Core TryLowWorkHeadersSync: headers are cleared either
+                  -- way; a failure here only ends the sync it just made.
+                  Left err -> do
+                    atomically $ modifyTVar' syncs (Map.delete addr)
+                    pure (verdict []) { phvLog = Just ("low-work headers sync aborted: " ++ err) }
+                  Right v -> pure v { phvAccept = [] }
+              else pure (verdict [])
+                     { phvLog = Just ("Ignoring low-work chain (height="
+                                      ++ show endHeight ++ ")") }
+
+    -- Core HeadersSyncState::NextHeadersRequestLocator: LocatorEntries(chain_start).
+    locatorFrom :: BlockHash -> IO [BlockHash]
+    locatorFrom startHash = do
+      entries <- readTVarIO (hcEntries hc)
+      byH <- readTVarIO (hcByHeight hc)
+      case Map.lookup startHash entries of
+        Nothing -> pure [startHash]
+        Just e  -> pure (walkLocator entries byH e)
+
+-- | Is a low-work headers sync with this peer running?  While it is, the
+-- sync's own getheaders is always the one in flight (Core
+-- MaybeSendGetHeaders sends no second one), so the periodic backstop and
+-- stale-tip getheaders must skip the peer: their header-tip locator answers
+-- with headers that do not continue the sync, which aborts it, and a PRESYNC
+-- longer than one backstop period would then restart from scratch forever.
+--
+-- Like Core's m_last_getheaders_timestamp, the sync's request counts as in
+-- flight for HEADERS_RESPONSE_TIME (120 s) only: a peer that stops
+-- answering is probed again after that.
+headersSyncActive :: HeadersSyncPeers -> SockAddr -> Int64 -> IO Bool
+headersSyncActive syncs addr now = do
+  m <- readTVarIO syncs
+  case Map.lookup addr m of
+    Nothing -> pure False
+    Just sp -> do
+      t <- readTVarIO (hspLastRequest sp)
+      pure (now - t < headersResponseTime)
+  where
+    headersResponseTime = 120
+
+-- | Exponential locator from an index entry: the first ten steps are one
+-- block apart, then the step doubles, always ending at genesis.  Heights on
+-- the best header chain come from 'hcByHeight'; below a side branch the walk
+-- follows 'cePrev' only until it rejoins that chain.
+walkLocator :: Map BlockHash ChainEntry -> Map Word32 BlockHash -> ChainEntry -> [BlockHash]
+walkLocator entries byH start = go start (1 :: Word32) (0 :: Int)
+  where
+    onBest e = Map.lookup (ceHeight e) byH == Just (ceHash e)
+    ancestorAt e h
+      | ceHeight e == h = Just (ceHash e)
+      | ceHeight e < h  = Nothing
+      | onBest e        = Map.lookup h byH
+      | otherwise       = cePrev e >>= (`Map.lookup` entries) >>= (`ancestorAt` h)
+    go e step n
+      | ceHeight e == 0 = [ceHash e]
+      | otherwise =
+          let step' = if n >= 10 then step * 2 else step
+              nextH = if ceHeight e > step' then ceHeight e - step' else 0
+          in case ancestorAt e nextH >>= (`Map.lookup` entries) of
+               Just next -> ceHash e : go next step' (n + 1)
+               Nothing   -> [ceHash e]
 
 --------------------------------------------------------------------------------
 -- Compact block header gate (BIP-152)
