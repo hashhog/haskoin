@@ -410,7 +410,7 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
   -- ---------------------------------------------------------------
   -- Path d (peer states): every disconnect releases the netgroup slot
   -- ---------------------------------------------------------------
-  gap "sm-peer-misbehave-netgroup-leak: a peer disconnected for misbehaviour releases its outbound netgroup" $
+  it "sm-peer-misbehave-netgroup-leak: a peer disconnected for misbehaviour releases its outbound netgroup" $
     withSystemTempDirectory "haskoin-sm-sweep-peer" $ \dir -> do
       let cfg = defaultPeerManagerConfig
             { pmcDataDir = dir, pmcDnsSeed = False
@@ -428,7 +428,8 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
         -- peerManagerLoop (10 s tick) is the only cleanup; allow it 30 s.
         -- Core: ThreadOpenConnections rebuilds the netgroup set from the
         -- live m_nodes, so a disconnected peer stops counting at once.
-        -- haskoin deleted the peer from pmPeers first, so it never cleans up.
+        -- haskoin master deleted the peer from pmPeers first, so it never
+        -- cleaned up; the netgroups are now derived from the live peer map.
         eventually (checkOutboundDiversity (pmOutboundDiversity pm) (pmAsmapData pm) other)
           `shouldReturn` True
 
