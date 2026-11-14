@@ -1029,6 +1029,28 @@ test-suite sm-reorg-immature-coinbase
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- A disconnected block's txs are re-added with Core's bypass_limits (no
+-- fee-rate floor), and a failed re-add removes its in-pool spenders
+-- (Core MaybeUpdateMempoolForReorg: AcceptToMemoryPool bypass_limits=true,
+-- removeRecursive(tx, REORG)).
+test-suite sm-reorg-readd-bypass-limits
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/sm-reorg-readd-bypass-limits
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- An outbound peer's netgroup stops counting towards outbound diversity the
 -- moment the peer leaves pmPeers, by any path (Core rebuilds the set from
 -- m_nodes on every ThreadOpenConnections pass).
@@ -1254,28 +1276,6 @@ test-suite getwalletinfo-no-balance
                , bytestring
                , base16-bytestring
                , cereal
-               , containers
-               , directory
-               , filepath
-               , stm
-               , temporary
-               , text
-  default-language: Haskell2010
-  ghc-options:     -Wall -O1 -threaded
-
--- A disconnected block's txs are re-added with Core's bypass_limits (no
--- fee-rate floor), and a failed re-add removes its in-pool spenders
--- (Core MaybeUpdateMempoolForReorg: AcceptToMemoryPool bypass_limits=true,
--- removeRecursive(tx, REORG)).
-test-suite sm-reorg-readd-bypass-limits
-  type:          exitcode-stdio-1.0
-  main-is:       Main.hs
-  hs-source-dirs: test/sm-reorg-readd-bypass-limits
-  build-depends: base >= 4.14 && < 5
-               , haskoin
-               , hspec
-               , aeson
-               , bytestring
                , containers
                , directory
                , filepath
