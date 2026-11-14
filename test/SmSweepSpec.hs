@@ -314,7 +314,7 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
   -- Path c: Core re-adds with bypass_limits=true and removeRecursive on a
   -- failed re-add, so no in-pool child is left with a missing input.
   -- ---------------------------------------------------------------
-  gap "sm-reorg-readd-bypass-limits: a below-min-fee tx from a disconnected block is re-added and its child keeps its parent" $
+  it "sm-reorg-readd-bypass-limits: a below-min-fee tx from a disconnected block is re-added and its child keeps its parent" $
     withLive $ \s -> do
       b1 <- mine s []
       mapM_ (const (mine s [])) [2 .. 101 :: Int]
