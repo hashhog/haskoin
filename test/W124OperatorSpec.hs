@@ -353,14 +353,16 @@ spec = describe "W124 — Operator experience (haskoin)" $ do
       ("sdNotifyStatus"  `isInfixOf` src) `shouldBe` True
       ("sdNotifyWatchdog" `isInfixOf` src) `shouldBe` True
 
-    it "G27 (PARTIAL): Prometheus metrics server is forked without exception protection" $ do
+    it "G27 (FIXED): Prometheus metrics server failure is caught and logged" $ do
       src <- mainHs
-      -- Main.hs:1257.  Warp.run swallows synchronous WAI errors,
-      -- but if the listen port is already bound (operator restarts
-      -- haskoin without stopping fleet-monitor first) Warp throws
-      -- and the metrics endpoint silently disappears with no log
-      -- line.  BUG-11 P2.
-      ("void $ forkIO $ Warp.run noMetricsPort" `isInfixOf` src) `shouldBe` True
+      -- Was PARTIAL: "void $ forkIO $ Warp.run noMetricsPort" with no
+      -- handler, so a bind failure (port already in use) made the
+      -- endpoint disappear with no log line.  BUG-11 P2.  Since
+      -- secfix-haskoin-metrics-bind-all (audit H8) the listener runs
+      -- with Warp.runSettings under a catch that logs the failure; a
+      -- bad --metricsbind address is the other way it fails.
+      ("void $ forkIO $ Warp.run noMetricsPort" `isInfixOf` src) `shouldBe` False
+      ("void $ forkIO $ flip catch metricsStopped" `isInfixOf` src) `shouldBe` True
 
     it "G28 (MISSING): no canonical haskoin.service systemd unit file shipped" $ do
       -- The other fleet impls (blockbrew, ouroboros, beamchain) have
