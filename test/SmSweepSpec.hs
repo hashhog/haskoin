@@ -331,10 +331,11 @@ spec run = describe "sm-sweep-haskoin (gaps that fail on master)" $ do
       (,) <$> inPool s parent <*> inPool s child `shouldReturn` (True, True)
 
   -- ---------------------------------------------------------------
-  -- Path c: submitblock side-branch reorg re-adds tip block first.
-  -- Core re-adds disconnected txs in block order (parents first).
+  -- Path c: submitblock side-branch reorg re-adds disconnected txs.
+  -- Core re-adds them in block order (parents first).  Always runs: fixed
+  -- by sm-fix-haskoin-submitblock-reorg-readd-order.
   -- ---------------------------------------------------------------
-  gap "sm-submitblock-reorg-readd-order: a parent/child pair confirmed in two disconnected blocks are both back in the mempool" $
+  it "sm-submitblock-reorg-readd-order: a parent/child pair confirmed in two disconnected blocks are both back in the mempool" $
     withLive $ \s -> do
       b1 <- mine s []
       mapM_ (const (mine s [])) [2 .. 101 :: Int]
