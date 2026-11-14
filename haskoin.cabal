@@ -25,6 +25,7 @@ library
                  , Haskoin.Sync
                  , Haskoin.Mempool
                  , Haskoin.Mempool.Persist
+                 , Haskoin.Metrics
                  , Haskoin.Policy.Standard
                  , Haskoin.FeeEstimator
                  , Haskoin.BlockTemplate

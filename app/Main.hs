@@ -23,6 +23,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM, join)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
+import qualified Haskoin.Metrics as Metrics
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
 import Control.Exception
@@ -122,6 +123,9 @@ data NodeOptions = NodeOptions
   , noListen     :: !Bool
   , noListenPort :: !Int
   , noMetricsPort :: !Int
+  , noMetricsBind :: !(Maybe String)
+    -- ^ @--metricsbind=\<addr\>@; Nothing = conf file, else 127.0.0.1
+    -- (see "Haskoin.Metrics").
   , noPeerBloomFilters :: !Bool
     -- Operational / supervisor flags (Bitcoin Core parity).
   , noDaemon     :: !Bool       -- ^ -daemon: detach to background
@@ -330,6 +334,9 @@ parseNodeOptions = NodeOptions
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
+  <*> optional (strOption (long "metricsbind" <> metavar "ADDR"
+        <> help "Address the Prometheus metrics server binds \
+                \(default: 127.0.0.1; the endpoint is unauthenticated)"))
   <*> option auto (long "peerbloomfilters" <> value False
         <> help "Advertise NODE_BLOOM and serve BIP-37/BIP-35 (default: False, matches Core)")
   -- Operational flags
@@ -671,6 +678,9 @@ applyConfigOverlay cm n = n
   , noMetricsPort = if noMetricsPort n == 9332
                      then Daemon.configLookupInt "metricsport" 9332 cm
                      else noMetricsPort n
+  , noMetricsBind = case noMetricsBind n of
+                     Just _  -> noMetricsBind n
+                     Nothing -> Daemon.configLookup "metricsbind" cm
   , noPeerBloomFilters = if not (noPeerBloomFilters n)
                      then Daemon.configLookupBool "peerbloomfilters" False cm
                      else noPeerBloomFilters n
@@ -2664,7 +2674,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
 
     -- Start Prometheus metrics server
     when (noMetricsPort > 0) $ do
-      void $ forkIO $ Warp.run noMetricsPort $ \_ respond -> do
+      let metricsBind = fromMaybe Metrics.defaultMetricsBind noMetricsBind
+      metricsCfg <- Metrics.metricsSettings metricsBind noMetricsPort
+      let metricsStopped (e :: SomeException) =
+            hPutStrLn stderr $ "Prometheus metrics server on " ++ metricsBind
+              ++ ":" ++ show noMetricsPort ++ " stopped: " ++ show e
+      void $ forkIO $ flip catch metricsStopped $
+       Warp.runSettings metricsCfg $ \_ respond -> do
         nextB <- readIORef nextBlockRef
         let height = connectedHeight nextB
         peers <- Map.size <$> readTVarIO (pmPeers pm)
@@ -2687,7 +2703,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         respond $ Wai.responseLBS HTTP.status200
           [(HTTP.hContentType, "text/plain; version=0.0.4; charset=utf-8")]
           body
-      putStrLn $ "Prometheus metrics server listening on port " ++ show noMetricsPort
+      putStrLn $ "Prometheus metrics server listening on " ++ metricsBind
+              ++ ":" ++ show noMetricsPort
 
     -- Start P2P listener for inbound connections
     let listenPort = p2pListenPort  -- network-appropriate default (8333 sentinel)
