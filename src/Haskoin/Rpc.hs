@@ -1199,7 +1199,8 @@ stopRpcServer rs = do
 -- | WAI application for the RPC server
 -- Supports both single JSON-RPC requests (object) and batch requests (array)
 rpcApp :: RpcServer -> Application
-rpcApp server req respond = do
+rpcApp server0 req respond = do
+  let server = withRequestWalletUri req server0
   -- (G6 / BUG-6 FIX) Enforce -rpcallowip BEFORE auth — mirrors Core's
   -- ClientAllowed check (httpserver.cpp:137-145) which fires before any
   -- handler dispatch.  Non-allowlisted clients get 403 Forbidden immediately.
@@ -1497,7 +1498,9 @@ walletEndpointBase = "/wallet/"
 -- Reference: Bitcoin Core wallet/rpc/util.cpp GetWalletNameFromJSONRPCRequest
 extractWalletName :: Request -> Maybe Text
 extractWalletName req =
-  let path = TE.decodeUtf8 (rawPathInfo req)
+  -- Lenient: a path that is not valid UTF-8 names no loaded wallet and
+  -- gets -18, instead of throwing out of the wallet handler.
+  let path = TE.decodeUtf8Lenient (rawPathInfo req)
   in if walletEndpointBase `T.isPrefixOf` path
      then Just $ urlDecode $ T.drop (T.length walletEndpointBase) path
      else Nothing
@@ -1519,34 +1522,51 @@ urlDecode = T.pack . decode' . T.unpack
       | c >= 'A' && c <= 'F' = Just (fromEnum c - fromEnum 'A' + 10)
       | otherwise = Nothing
 
--- | Get wallet for the request, handling wallet selection.
--- Uses /wallet/<name> URI if present, otherwise uses the default wallet.
--- Returns error response if no wallet is available or multiple wallets without selection.
-getWalletForRequest :: RpcServer -> Request -> IO (Either RpcResponse WalletState)
-getWalletForRequest server req = do
-  case rsWalletMgr server of
-    Nothing -> return $ Left $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound "No wallet manager available") Null
-    Just wm -> do
-      case extractWalletName req of
-        Just walletName -> do
-          mWallet <- getManagedWallet wm walletName
-          case mWallet of
-            Nothing -> return $ Left $ RpcResponse Null
-              (toJSON $ RpcError rpcWalletNotFound
-                ("Requested wallet does not exist or is not loaded: " <> walletName)) Null
-            Just ws -> return $ Right ws
-        Nothing -> do
-          (mDefault, count) <- getDefaultWallet wm
-          case mDefault of
-            Nothing -> return $ Left $ RpcResponse Null
-              (toJSON $ RpcError rpcWalletNotFound
-                "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-            Just ws
-              | count == 1 -> return $ Right ws
-              | otherwise -> return $ Left $ RpcResponse Null
-                  (toJSON $ RpcError rpcWalletNotSpecified
-                    "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path.") Null
+-- | Attach the request's @/wallet/<name>@ selection (if any) to the
+-- server's wallet manager.  The result is a per-request copy: only the
+-- 'wmRequestWallet' field differs, every TVar stays shared.  Applied once
+-- in 'rpcApp', so a single request and every member of a batch resolve
+-- against the URI they arrived on (Core: JSONRPCRequest::URI, set per
+-- HTTP request in httprpc.cpp and shared by a batch).
+withRequestWalletUri :: Request -> RpcServer -> RpcServer
+withRequestWalletUri req server =
+  server { rsWalletMgr = fmap (\wm -> wm { wmRequestWallet = extractWalletName req })
+                              (rsWalletMgr server) }
+
+-- | Resolve the wallet a wallet RPC acts on.
+-- Reference: Bitcoin Core wallet/rpc/util.cpp GetWalletForJSONRPCRequest:
+--
+--   * @/wallet/<name>@ was used: that wallet, or RPC_WALLET_NOT_FOUND
+--     (-18) "Requested wallet does not exist or is not loaded".
+--   * no URI, exactly one wallet loaded: that wallet (GetDefaultWallet
+--     returns a wallet only when count == 1).
+--   * no URI, none loaded: -18 "No wallet is loaded. ...".
+--   * no URI, several loaded: RPC_WALLET_NOT_SPECIFIED (-19).  Picking one
+--     (the first loaded) would send a spend, a key export or a signature
+--     to a wallet the caller did not name.
+--
+-- Returns the wallet's name with its state (getwalletinfo reports it).
+getNamedWalletForRequest :: WalletManager -> IO (Either RpcResponse (Text, WalletState))
+getNamedWalletForRequest wm = case wmRequestWallet wm of
+  Just walletName -> do
+    mWallet <- getManagedWallet wm walletName
+    return $ case mWallet of
+      Nothing -> Left $ rpcFail rpcWalletNotFound
+        "Requested wallet does not exist or is not loaded"
+      Just ws -> Right (walletName, ws)
+  Nothing -> do
+    wallets <- readTVarIO (wmWallets wm)
+    return $ case Map.toList wallets of
+      [one] -> Right one
+      []    -> Left $ rpcFail rpcWalletNotFound
+        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet. (Note: A default wallet is no longer automatically created)"
+      _     -> Left $ rpcFail rpcWalletNotSpecified
+        "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path."
+
+-- | 'getNamedWalletForRequest' without the name.  Every handler that acts
+-- on one wallet goes through this.
+getWalletForRequest :: WalletManager -> IO (Either RpcResponse WalletState)
+getWalletForRequest wm = fmap snd <$> getNamedWalletForRequest wm
 
 --------------------------------------------------------------------------------
 -- Request Dispatcher
@@ -7317,12 +7337,10 @@ handleImportDescriptors server params =
           (toJSON $ RpcError rpcInvalidParams
             ("Expected array of descriptor import requests" :: Text)) Null
         Just reqs -> withWalletMgr server $ \wm -> do
-          (mWallet, _) <- getDefaultWallet wm
-          case mWallet of
-            Nothing -> return $ RpcResponse Null
-              (toJSON $ RpcError rpcWalletNotFound
-                "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-            Just ws -> ensureWalletIsUnlocked ws $ do
+          eWallet <- getWalletForRequest wm
+          case eWallet of
+            Left walletErr -> return walletErr
+            Right ws -> ensureWalletIsUnlocked ws $ do
               pkEnabled <- readTVarIO (wsPrivateKeysEnabled ws)
               now <- (round :: POSIXTime -> Word64) <$> getPOSIXTime
               results <- mapM (importOneDescriptor ws pkEnabled now)
@@ -7539,14 +7557,10 @@ importElemErr code msg = object
 handleListDescriptors :: RpcServer -> Value -> IO RpcResponse
 handleListDescriptors server params = withWalletMgr server $ \wm -> do
   let _showPrivate = fromMaybe False (extractParam params 0 :: Maybe Bool)
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws -> do
-      names <- listManagedWallets wm
-      let walletName = fromMaybe "" (listToMaybe names)
+  eWallet <- getNamedWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right (walletName, ws) -> do
       descs <- readTVarIO (wsDescriptors ws)
       let descToJson d = object $
             [ "desc"      .= idDescText d
@@ -8982,12 +8996,10 @@ handleWalletCreateFundedPsbtChecked server params = withWalletMgr server $ \wm -
     (_, Nothing) -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing outputs parameter") Null
     (Just inputsArr, Just outputsArr) -> do
-      (mWallet, _) <- getDefaultWallet wm
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound
-            "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-        Just walletState -> do
+      eWallet <- getWalletForRequest wm
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState -> do
           -- Validated by the guard in handleWalletCreateFundedPsbt.
           let locktime = either (const 0) id (parseLocktimeArg params)
               -- Parse optional fee rate from options (sat/vB).  Default to
@@ -9123,11 +9135,10 @@ rpcFail code msg = RpcResponse Null (toJSON (RpcError code msg)) Null
 -- A string that is not a PSBT is RPC_DESERIALIZATION_ERROR (-22).
 handleWalletProcessPsbt :: RpcServer -> Value -> IO RpcResponse
 handleWalletProcessPsbt server params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ rpcFail rpcWalletNotFound
-      "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet."
-    Just ws ->
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws ->
       case extractParamText params 0 of
         Nothing -> return $ rpcFail rpcDeserializationError "TX decode failed"
         Just psbtText ->
@@ -9185,20 +9196,15 @@ handleBackupWallet server params = withWalletMgr server $ \wm ->
       | T.null destText ->
           return $ rpcFail rpcWalletError "Error: Wallet backup failed!"
       | otherwise -> do
-          (mWallet, _) <- getDefaultWallet wm
-          case mWallet of
-            Nothing -> return $ rpcFail rpcWalletNotFound
-              "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet."
-            Just ws -> do
+          eWallet <- getNamedWalletForRequest wm
+          case eWallet of
+            Left walletErr -> return walletErr
+            Right (walletName, ws) -> do
               -- Flush so the copy contains the live keychain, not the
-              -- create-time snapshot.
+              -- create-time snapshot.  The file copied is the resolved
+              -- wallet's own, never the default wallet's.
               void (persistWallet (wsWallet ws))
-              mDef <- readTVarIO (wmDefaultName wm)
-              names <- listManagedWallets wm
-              let walletName = case mDef of
-                    Just n | n `elem` names -> n
-                    _ -> fromMaybe "" (listToMaybe names)
-                  src = wmWalletDir wm </> T.unpack walletName </> "wallet.dat"
+              let src = wmWalletDir wm </> T.unpack walletName </> "wallet.dat"
                   dest = T.unpack destText
               srcOk <- doesFileExist src
               destIsDir <- doesDirectoryExist dest
@@ -9365,19 +9371,25 @@ handleLoadWallet server params = withWalletMgr server $ \wm ->
 -- Reference: bitcoin-core/src/wallet/rpc/wallet.cpp unloadwallet
 -- Parameters:
 --   wallet_name (optional)  — Core defaults to the wallet specified by
---     the /wallet/<name> URI; if neither, the call is rejected.  We
---     defer URI-name resolution to the params side because the dispatcher
---     does not pass the WAI 'Request' to handlers.
+--     the /wallet/<name> URI; if neither, the call is rejected.  The URI
+--     arrives as 'wmRequestWallet' (set per request in 'rpcApp').
 --   load_on_startup (optional, bool, ignored)
 -- Returns:
 --   {"warning": <text-or-empty>}
 handleUnloadWallet :: RpcServer -> Value -> IO RpcResponse
 handleUnloadWallet server params = withWalletMgr server $ \wm -> do
-  -- Resolve target wallet name: explicit param first, then default if
-  -- exactly one is loaded.
-  mTargetName <- case extractParamText params 0 of
-    Just walletName | not (T.null walletName) -> return (Just walletName)
-    _ -> do
+  -- Resolve target wallet name.  Core EnsureUniqueWalletName: the
+  -- /wallet/<name> URI names it, and a wallet_name param that names a
+  -- different wallet is RPC_INVALID_PARAMETER.  Without a URI: the param,
+  -- then (haskoin's existing fallback) the only loaded wallet.
+  let mParamName = case extractParamText params 0 of
+        Just walletName | not (T.null walletName) -> Just walletName
+        _ -> Nothing
+  mTargetName <- case (wmRequestWallet wm, mParamName) of
+    (Just uriName, Just paramName) | uriName /= paramName -> return (Left ())
+    (Just uriName, _) -> return (Right (Just uriName))
+    (Nothing, Just paramName) -> return (Right (Just paramName))
+    (Nothing, Nothing) -> fmap Right $ do
       (mDefault, count) <- getDefaultWallet wm
       case (mDefault, count) of
         (Just _, 1) -> do
@@ -9386,10 +9398,12 @@ handleUnloadWallet server params = withWalletMgr server $ \wm -> do
           return $ listToMaybe names
         _ -> return Nothing
   case mTargetName of
-    Nothing -> return $ RpcResponse Null
+    Left () -> return $ rpcFail rpcInvalidParameter
+      "The RPC endpoint wallet and the wallet name parameter specify different wallets"
+    Right Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams
         "wallet_name required (no unique default wallet to infer)") Null
-    Just walletName -> do
+    Right (Just walletName) -> do
       result <- unloadManagedWallet wm walletName
       case result of
         Left err -> return $ RpcResponse Null
@@ -9408,23 +9422,15 @@ handleListWallets server = withWalletMgr server $ \wm -> do
 
 -- | Return wallet metadata.
 -- Reference: bitcoin-core/src/wallet/rpc/wallet.cpp getwalletinfo
--- Resolves the target wallet via 'getDefaultWallet' (the dispatcher
--- doesn't propagate /wallet/<name>; that's a follow-up).
+-- Resolves the target wallet via 'getNamedWalletForRequest' (the
+-- request's /wallet/<name> URI, else the only loaded wallet).
 -- Returns the Core-shape getwalletinfo object.
 handleGetWalletInfo :: RpcServer -> Value -> IO RpcResponse
 handleGetWalletInfo server _params = withWalletMgr server $ \wm -> do
-  (mWallet, _count) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws -> do
-      -- Recover the wallet name (manager keeps name → state map).
-      names <- listManagedWallets wm
-      mDef <- readTVarIO (wmDefaultName wm)
-      let walletName = case mDef of
-            Just n | n `elem` names -> n
-            _ -> fromMaybe "" (listToMaybe names)
+  eWallet <- getNamedWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right (walletName, ws) -> do
       info0 <- getWalletInfo walletName ws
       -- txcount is mapWallet size (wallet.cpp), not a constant. The R5
       -- counts-funding probe expects the three confirmed receives.
@@ -9476,12 +9482,10 @@ walletInfoToJSON wi tipHash tipHeight =
 --   Balance in BTC as a JSON Number.
 handleGetBalance :: RpcServer -> Value -> IO RpcResponse
 handleGetBalance server _params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws -> do
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws -> do
       -- getbalance reports the SPENDABLE balance: immature coinbase is
       -- excluded (Core's CWallet::GetBalance "trusted" balance skips
       -- IsImmatureCoinBase).  Anchor maturity on the current tip height
@@ -9501,11 +9505,10 @@ handleGetBalance server _params = withWalletMgr server $ \wm -> do
 -- lane funds 8.5 BTC in three confirmed payments to our address.
 handleGetBalances :: RpcServer -> Value -> IO RpcResponse
 handleGetBalances server _params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ rpcFail rpcWalletNotFound
-      "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet."
-    Just ws -> do
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws -> do
       tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
       let tipH = ceHeight tip
       utxos <- getWalletUTXOsFull (wsWallet ws)
@@ -9574,12 +9577,10 @@ rescanWalletRange server wallet start stop =
 -- CWallet::ScanForWalletTransactions.
 handleRescanBlockchain :: RpcServer -> Value -> IO RpcResponse
 handleRescanBlockchain server params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws -> do
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws -> do
       tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
       let tipH  = ceHeight tip
           start = case extractParam params 0 :: Maybe Int of
@@ -9614,12 +9615,10 @@ handleRescanBlockchain server params = withWalletMgr server $ \wm -> do
 -- CWallet::ImportPrivKeys + RescanWallet.
 handleImportPrivKey :: RpcServer -> Value -> IO RpcResponse
 handleImportPrivKey server params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws -> ensureWalletIsUnlocked ws $
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws -> ensureWalletIsUnlocked ws $
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Missing private key parameter") Null
@@ -9657,12 +9656,10 @@ handleImportPrivKey server params = withWalletMgr server $ \wm -> do
 -- Reference: bitcoin-core/src/wallet/rpc/backup.cpp dumpprivkey.
 handleDumpPrivKey :: RpcServer -> Value -> IO RpcResponse
 handleDumpPrivKey server params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws -> ensureWalletIsUnlocked ws $
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws -> ensureWalletIsUnlocked ws $
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Missing address parameter") Null
@@ -9703,12 +9700,10 @@ handleDumpPrivKey server params = withWalletMgr server $ \wm -> do
 --     (addresses.cpp:465-476, 485-487).
 handleGetAddressInfo :: RpcServer -> Value -> IO RpcResponse
 handleGetAddressInfo server params = withWalletMgr server $ \wm -> do
-  (mWallet, _) <- getDefaultWallet wm
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound
-        "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-    Just ws ->
+  eWallet <- getWalletForRequest wm
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right ws ->
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Missing address parameter") Null
@@ -11055,12 +11050,10 @@ handleFundRawTransaction server params = withWalletMgr server $ \wm ->
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
             Right baseTx -> do
-              (mWallet, _) <- getDefaultWallet wm
-              case mWallet of
-                Nothing -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcWalletNotFound
-                    "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-                Just walletState -> do
+              eWallet <- getWalletForRequest wm
+              case eWallet of
+                Left walletErr -> return walletErr
+                Right walletState -> do
                   let opts = parseFundOptions params
                   tipHeight <- readTVarIO (hcHeight (rsHeaderChain server))
                   result <- fundRawTx (wsWallet walletState) tipHeight opts baseTx
@@ -11297,12 +11290,10 @@ handleSignRawTransactionWithWallet server params = withWalletMgr server $ \walle
             Left _ -> return $ RpcResponse Null
               (toJSON $ RpcError rpcDeserializationError "TX decode failed") Null
             Right (tx :: Tx) -> do
-              (mWallet, _) <- getDefaultWallet walletMgr
-              case mWallet of
-                Nothing -> return $ RpcResponse Null
-                  (toJSON $ RpcError rpcWalletNotFound
-                    "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet.") Null
-                Just walletState -> ensureWalletIsUnlocked walletState $ do
+              eWallet <- getWalletForRequest walletMgr
+              case eWallet of
+                Left walletErr -> return walletErr
+                Right walletState -> ensureWalletIsUnlocked walletState $ do
                   -- Per-input prev-output map from the wallet's UTXO store.
                   walletUtxos <- getWalletUTXOs (wsWallet walletState)
                   -- The set of HD child keys the wallet actually owns.  An
@@ -12995,11 +12986,10 @@ handleGetNewAddress server params = do
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
       -- Get default wallet
-      (mWallet, _walletCount) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState -> do
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState -> do
           -- Parse address type (default to bech32)
           let addrTypeStr = fromMaybe "bech32" (extractParamText params 1)
               addrType = parseAddressType addrTypeStr
@@ -13209,10 +13199,10 @@ handleSendToAddress server params = do
   case rsWalletMgr server of
     Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
-        Just walletState ->
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState ->
           case (extractParamText params 0, extractParam params 1 :: Maybe Double) of
             (Just addrText, Just amountBtc) ->
               case textToAddress addrText of
@@ -13239,10 +13229,10 @@ handleSend server params = do
   case rsWalletMgr server of
     Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ rpcFail rpcWalletNotFound "No wallet loaded"
-        Just walletState ->
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState ->
           case extractParamArray params 0 of
             Nothing -> return $ rpcFail rpcInvalidParameter
               "Invalid parameter, output argument must be non-empty"
@@ -13294,11 +13284,10 @@ handleListTransactions server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState -> do
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState -> do
           -- Core listtransactions: negative count / skip are
           -- RPC_INVALID_PARAMETER (-8), not silently clamped.
           let mCount = extractParam params 1 :: Maybe Int
@@ -13436,11 +13425,10 @@ handleGetTransaction server params =
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState ->
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState ->
           case extractParamText params 0 >>= parseTxIdHex of
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams "txid must be a 64-char hex string") Null
@@ -13518,11 +13506,10 @@ handleListUnspent server params = do
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState -> do
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState -> do
           let minConf = fromMaybe 1 (extractParam params 0 :: Maybe Int)
               maxConf = fromMaybe 9999999 (extractParam params 1 :: Maybe Int)
               net = rsNetwork server
@@ -13693,11 +13680,10 @@ bumpFeeShared
   -> Bool       -- ^ True for psbtbumpfee, False for bumpfee
   -> IO RpcResponse
 bumpFeeShared server params wantPsbt = withWalletMgr server $ \walletMgr -> do
-  (mWallet, _) <- getDefaultWallet walletMgr
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-    Just walletState -> do
+  eWallet <- getWalletForRequest walletMgr
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right walletState -> do
       let wallet = wsWallet walletState
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
@@ -13812,11 +13798,10 @@ handlePsbtBumpFee server params = bumpFeeShared server params True
 -- This is the audit-flip closure for W119 G26 (was MISSING / BUG-1).
 handleGetPayjoinRequest :: RpcServer -> Value -> IO RpcResponse
 handleGetPayjoinRequest server params = withWalletMgr server $ \walletMgr -> do
-  (mWallet, _) <- getDefaultWallet walletMgr
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-    Just walletState ->
+  eWallet <- getWalletForRequest walletMgr
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right walletState ->
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams
@@ -13877,11 +13862,10 @@ handleGetPayjoinRequest server params = withWalletMgr server $ \walletMgr -> do
 -- This is the audit-flip closure for W119 G27 (was MISSING / BUG-1+3).
 handleSendPayjoinRequest :: RpcServer -> Value -> IO RpcResponse
 handleSendPayjoinRequest server params = withWalletMgr server $ \walletMgr -> do
-  (mWallet, _) <- getDefaultWallet walletMgr
-  case mWallet of
-    Nothing -> return $ RpcResponse Null
-      (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-    Just walletState -> ensureWalletIsUnlocked walletState $
+  eWallet <- getWalletForRequest walletMgr
+  case eWallet of
+    Left walletErr -> return walletErr
+    Right walletState -> ensureWalletIsUnlocked walletState $
       case extractParamText params 0 of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams
@@ -14359,11 +14343,10 @@ handleEncryptWallet server params =
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState ->
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState ->
           case extractParamText params 0 of
             Nothing -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams
@@ -14404,11 +14387,10 @@ handleWalletPassphrase server params =
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState ->
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState ->
           case (extractParamText params 0, extractParam params 1 :: Maybe Int) of
             (Just _, Nothing) -> return $ RpcResponse Null
               (toJSON $ RpcError rpcInvalidParams
@@ -14465,11 +14447,10 @@ handleWalletLock server =
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
     Just walletMgr -> do
-      (mWallet, _) <- getDefaultWallet walletMgr
-      case mWallet of
-        Nothing -> return $ RpcResponse Null
-          (toJSON $ RpcError rpcWalletNotFound "No wallet loaded") Null
-        Just walletState -> do
+      eWallet <- getWalletForRequest walletMgr
+      case eWallet of
+        Left walletErr -> return walletErr
+        Right walletState -> do
           mEncrypted <- readTVarIO (wsEncrypted walletState)
           case mEncrypted of
             Nothing -> return $ RpcResponse Null
@@ -14529,10 +14510,18 @@ handleSignMessageWallet :: RpcServer -> Value -> IO RpcResponse
 handleSignMessageWallet server params = case rsWalletMgr server of
   Nothing -> handleSignMessage server params
   Just wm -> do
-    (mWallet, _) <- getDefaultWallet wm
-    case mWallet of
-      Nothing -> handleSignMessage server params
-      Just ws -> ensureWalletIsUnlocked ws (handleSignMessage server params)
+    -- The wallet whose lock is checked is the one the request names
+    -- ('getWalletForRequest'); an unknown /wallet/<name> or an ambiguous
+    -- no-URI call is refused as Core refuses it.  With no wallet loaded
+    -- and no URI, the existing wallet-free path is kept.
+    loaded <- readTVarIO (wmWallets wm)
+    if Map.null loaded && isNothing (wmRequestWallet wm)
+      then handleSignMessage server params
+      else do
+        eWallet <- getWalletForRequest wm
+        case eWallet of
+          Left walletErr -> return walletErr
+          Right ws -> ensureWalletIsUnlocked ws (handleSignMessage server params)
 
 -- | Sign a UTF-8 message with the private key referenced by an address
 -- (haskoin's wallet stores keys directly, so we accept either a WIF private
