@@ -595,7 +595,21 @@ takeWhileNotFailed db = go []
 -- height, not 1.
 estimateUndoConnectedTip :: HaskoinDB -> HeaderChain -> Maybe Word32 -> IO Word32
 estimateUndoConnectedTip db hc mSnapshotBaseHeight = do
-  headerTipHeight <- readTVarIO (hcHeight hc)
+  bestHeaderHeight <- readTVarIO (hcHeight hc)
+  -- The search ceiling is max(best-header height, persisted best-block
+  -- height).  'recalculateBestHeader' (run by the full reload above) picks
+  -- the most-WORK valid header, and headerWork follows nBits, so a valid
+  -- header can out-work the connected tip at a LOWER height.  The caller
+  -- re-stamps the best-block pointer to this estimate without rewinding the
+  -- UTXO set, so a ceiling below the persisted best block would move the
+  -- pointer under the coin set: the next blocks then fail on inputs that
+  -- are already spent and the connected tip freezes (the wedge described in
+  -- 'initHeaderChainFromDB').  The best header still steers header sync; it
+  -- just cannot move the connected tip backward without a real rewind.
+  mBest <- getBestBlockHash db
+  entries <- readTVarIO (hcEntries hc)
+  let bestBlockHeight = maybe 0 ceHeight (mBest >>= (`Map.lookup` entries))
+      headerTipHeight = max bestHeaderHeight bestBlockHeight
   let -- Does the block at height @h@ have a persisted undo record?
       -- Height 0 (genesis) has no undo record but is always
       -- "connected"; callers handle 0 separately.
