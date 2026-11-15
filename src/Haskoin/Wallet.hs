@@ -48,6 +48,8 @@ module Haskoin.Wallet
   , newWalletManager
   , createManagedWallet
   , loadManagedWallet
+  , backupManagedWallet
+  , restoreManagedWallet
   , unloadManagedWallet
   , getManagedWallet
   , getDefaultWallet
@@ -314,9 +316,10 @@ import Control.DeepSeq (NFData)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Char (isSpace, isDigit, isHexDigit, digitToInt, ord)
 import Data.Maybe (listToMaybe, mapMaybe, fromMaybe, isJust)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory)
+import System.Directory (createDirectory, createDirectoryIfMissing, doesDirectoryExist,
+                         listDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>), takeDirectory)
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, try)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
                        TxIn(..), TxOut(..), Tx(..), decodeLegacyTx,
@@ -329,7 +332,7 @@ import Haskoin.Mempool (FeeRate(..), signalsOptInRBF)
 import Haskoin.Consensus (Network(..), coinbaseMaturity)
 import qualified Haskoin.Consensus
 import qualified Haskoin.Wallet.Persist as WP
-import Haskoin.Wallet.Persist (WalletSnapshot(..), SnapUtxo(..))
+import Haskoin.Wallet.Persist (WalletSnapshot(..), SnapUtxo(..), SnapEncryption(..))
 
 -- For wallet encryption
 import Crypto.Cipher.AES (AES256)
@@ -1290,6 +1293,13 @@ data Wallet = Wallet
       -- ^ Highest chain height whose block has been fed to
       --   'scanBlockForWallet'.  Persisted so startup rescan knows the gap
       --   [lastSynced+1 .. tip] to replay (RESCAN/RECONCILE anchor).
+  , walletEncryption   :: !(TVar (Maybe EncryptedWallet))
+      -- ^ Passphrase-encrypted master key (encryptwallet), or 'Nothing' for
+      --   an unencrypted wallet.  Lives on the 'Wallet' (not only on
+      --   'WalletState', which shares this TVar as 'wsEncrypted') so that
+      --   'snapshotWallet' persists it and a reload restores the wallet
+      --   encrypted and locked.  Reference: wallet/wallet.cpp
+      --   CWallet::EncryptWallet writes the CMasterKey record to the DB.
   }
 
 -- | A record of an outgoing transaction the wallet has produced.
@@ -1427,8 +1437,10 @@ loadWallet WalletConfig{..} mnemonic = do
   persistPath <- newTVarIO Nothing
   dirty <- newTVarIO False
   lastSynced <- newTVarIO 0
+  encryption <- newTVarIO Nothing
   return $ Wallet master account recvIdx changeIdx addrs utxos wcNetwork wcGapLimit
                   addrLabels txLabels sentTxs txHistory persistPath dirty lastSynced
+                  encryption
 
 -- | Save wallet state to a file.  Atomic + durable (temp + fsync +
 -- rename) with the spendable key material AES-sealed at rest.  This is
@@ -1487,6 +1499,7 @@ snapshotWallet wallet = atomically $ do
   aLabels <- readTVar (walletAddressLabels wallet)
   tLabels <- readTVar (walletTxLabels wallet)
   synced  <- readTVar (walletLastSynced wallet)
+  enc     <- readTVar (walletEncryption wallet)
   let mk = walletMasterKey wallet
       snapUtxos =
         [ SnapUtxo { suOutPoint    = op
@@ -1506,7 +1519,25 @@ snapshotWallet wallet = atomically $ do
     , wsnAddrLabels   = aLabels
     , wsnTxLabels     = tLabels
     , wsnLastSynced   = synced
+    , wsnEncryption   = encryptedToSnap <$> enc
     }
+
+-- | The on-disk form of the encryption record and back.
+encryptedToSnap :: EncryptedWallet -> SnapEncryption
+encryptedToSnap EncryptedWallet{..} = SnapEncryption
+  { seSalt       = epSalt ewParams
+  , seIterations = fromIntegral (epIterations ewParams)
+  , seIV         = ewIV
+  , seCiphertext = ewCiphertext
+  }
+
+snapToEncrypted :: SnapEncryption -> EncryptedWallet
+snapToEncrypted SnapEncryption{..} = EncryptedWallet
+  { ewParams     = EncryptionParams { epSalt       = seSalt
+                                    , epIterations = fromIntegral seIterations }
+  , ewIV         = seIV
+  , ewCiphertext = seCiphertext
+  }
 
 -- | Persist the wallet to its attached path, if any.  Atomic + durable.
 -- Clears the dirty flag on success.  Returns the path written, or
@@ -1556,9 +1587,13 @@ restoreWalletFromSnapshot net path atRestKey WalletSnapshot{..} = do
   persistPath <- newTVarIO (Just (path, atRestKey))
   dirty       <- newTVarIO False
   lastSynced  <- newTVarIO wsnLastSynced
+  -- An encrypted wallet comes back encrypted; 'createWalletState' starts it
+  -- LOCKED (no decrypted key), as Core loads an encrypted wallet.
+  encryption  <- newTVarIO (snapToEncrypted <$> wsnEncryption)
   pure $ Wallet master account recvIdx changeIdx addrs utxos net
                 (fromIntegral wsnGapLimit)
                 addrLabels txLabels sentTxs txHistory persistPath dirty lastSynced
+                encryption
 
 -- | Flush all dirty wallets in a manager to disk.  Intended for the
 -- periodic flusher thread and clean-shutdown hook.  Best-effort: a
@@ -3411,9 +3446,37 @@ encryptWallet passphrase ws = do
                   ciphertext = cbcEncrypt cipher iv paddedKey
                   encWallet = EncryptedWallet params ivBytes ciphertext
 
-              -- Store encrypted state
-              atomically $ writeTVar (wsEncrypted ws) (Just encWallet)
-              return $ Right ws
+              -- Store the encrypted state and write it to disk before
+              -- answering, as Core's EncryptWallet commits the master key
+              -- record in one DB transaction (wallet/wallet.cpp).  If the
+              -- write fails the wallet stays unencrypted: reporting
+              -- success would leave a passphrase that a restart drops.
+              -- An unattached (in-memory) wallet has nothing to write.
+              -- The already-encrypted check is repeated in the same STM
+              -- transaction as the write, so two concurrent encryptwallet
+              -- calls cannot both succeed (the second passphrase winning).
+              let wallet = wsWallet ws
+              claimed <- atomically $ do
+                cur <- readTVar (wsEncrypted ws)
+                case cur of
+                  Just _  -> return False
+                  Nothing -> do
+                    writeTVar (wsEncrypted ws) (Just encWallet)
+                    writeTVar (walletDirty wallet) True
+                    return True
+              if not claimed
+                then return $ Left "Wallet is already encrypted"
+                else do
+                  saved <- persistWallet wallet
+                  case saved of
+                    Right _ -> return $ Right ws
+                    Left err -> do
+                      -- Dirty again, so the flusher rewrites the file
+                      -- unencrypted even if it saved the record meanwhile.
+                      atomically $ do
+                        writeTVar (wsEncrypted ws) Nothing
+                        writeTVar (walletDirty wallet) True
+                      return $ Left $ "Failed to write the encrypted wallet: " ++ err
 
 -- | Decrypt a wallet with a passphrase.
 -- Returns the decrypted master key or an error.
@@ -3489,7 +3552,8 @@ isWalletLocked ws = do
 -- | Create a new WalletState from a Wallet.
 createWalletState :: Wallet -> IO WalletState
 createWalletState w = do
-  encrypted <- newTVarIO Nothing
+  -- Shared with the wallet so the encryption state is persisted with it.
+  let encrypted = walletEncryption w
   unlockExpiry <- newTVarIO Nothing
   decryptedKey <- newTVarIO Nothing
   descriptors <- newTVarIO []
@@ -6897,30 +6961,103 @@ loadManagedWallet wm name = do
         then return $ Left $ "Wallet not found: " <> name
         else do
           -- DURABILITY: load the persisted snapshot from disk and restore
-          -- the live wallet from it (sweep wa0fq5wtk).  A missing file =>
-          -- fresh wallet (newly-created dir before first save, or seed-only
-          -- recovery); a CORRUPT file is moved aside by 'loadWalletSnapshot'
-          -- and we recover to a fresh wallet rather than crashing.
+          -- the live wallet from it (sweep wa0fq5wtk).  Core wallet.cpp
+          -- LoadWallet: a wallet whose database is missing or cannot be
+          -- read FAILS to load.  It is never replaced by a fresh wallet
+          -- under the same name, and the file is left where it is (H11:
+          -- this used to move it to wallet.dat.bad and load a new keychain,
+          -- reporting success).
+          --
+          -- Messages follow Core: a directory with no wallet file, or a
+          -- file that is not a wallet, is MakeDatabase's FAILED_BAD_FORMAT
+          -- (RPC -18); a wallet file that is damaged is LoadExisting's
+          -- DBErrors::CORRUPT -> FAILED_LOAD (RPC -4).
           atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
           loaded    <- WP.loadWalletSnapshot atRestKey datPath
-          wallet <- case loaded of
-            Right (Just snap) ->
-              restoreWalletFromSnapshot (wmNetwork wm) datPath atRestKey snap
-            _ -> do
-              -- No snapshot (or corrupt -> moved aside): start fresh and
-              -- attach persistence so the next mutation lands on disk.
-              let config = WalletConfig (wmNetwork wm) 20 ""
-              (_mnemonic, w) <- createWallet config
-              attachWalletPersistence w datPath atRestKey
-              void (persistWallet w)
-              return w
-          walletState <- createWalletState wallet
-          atomically $ do
-            modifyTVar' (wmWallets wm) (Map.insert name walletState)
-            -- Set as default if first wallet
-            mDefault <- readTVar (wmDefaultName wm)
-            when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
-          return $ Right walletState
+          case loaded of
+            Right Nothing -> return $ Left (walletBadFormatMsg walletPath)
+            Left _ -> do
+              recognized <- WP.isRecognizedWalletFile datPath
+              return $ Left $ if recognized
+                then walletCorruptedMsg
+                else walletBadFormatMsg walletPath
+            Right (Just snap) -> do
+              wallet <- restoreWalletFromSnapshot (wmNetwork wm) datPath atRestKey snap
+              walletState <- createWalletState wallet
+              atomically $ do
+                modifyTVar' (wmWallets wm) (Map.insert name walletState)
+                -- Set as default if first wallet
+                mDefault <- readTVar (wmDefaultName wm)
+                when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
+              return $ Right walletState
+
+-- | Core walletdb.cpp MakeDatabase, FAILED_BAD_FORMAT (RPC -18).
+walletBadFormatMsg :: FilePath -> Text
+walletBadFormatMsg walletPath =
+  "Wallet file verification failed. Failed to load database path '"
+  <> T.pack walletPath <> "'. Data is not in recognized format."
+
+-- | Core wallet.cpp LoadWalletInternal + DBErrors::CORRUPT, FAILED_LOAD (RPC -4).
+walletCorruptedMsg :: Text
+walletCorruptedMsg = "Wallet loading failed. Error loading wallet.dat: Wallet corrupted"
+
+-- | Write a self-contained backup of a live wallet to @dest@ (backupwallet).
+-- Core wallet/walletdb.cpp BackupWallet: the backup opens on its own.  The
+-- secrets are re-sealed under a key carried in the file
+-- ('WP.encodeWalletBackup'); a bare copy of wallet.dat would need this
+-- datadir's wallet.key, which is not in the backup.
+backupManagedWallet :: Wallet -> FilePath -> IO (Either String ())
+backupManagedWallet wallet dest = do
+  snap <- snapshotWallet wallet
+  enc  <- WP.encodeWalletBackup snap
+  case enc of
+    Left e -> pure (Left e)
+    Right blob ->
+      -- Mode 0600: the backup carries its own key, so it is enough to spend.
+      (Right <$> WP.atomicWritePrivateFileSync dest blob)
+        `catch` (\(e :: SomeException) -> pure (Left (show e)))
+
+-- | Restore a backup file into a new wallet @name@ and load it
+-- (restorewallet).  The caller has checked that the name is free and the
+-- file exists.  Core wallet.cpp RestoreWallet: if the backup does not
+-- load, the error is returned and the wallet directory it created is
+-- removed.  A backup is re-sealed under this datadir's wallet.key.
+--
+-- The wallet directory is created with a non-recursive mkdir, which
+-- fails if it already exists, so a concurrent create of the same name is
+-- never overwritten, and the cleanup only ever removes a directory this
+-- call made.
+restoreManagedWallet :: WalletManager -> Text -> FilePath -> IO (Either Text WalletState)
+restoreManagedWallet wm name backupPath = do
+  let walletPath = wmWalletDir wm </> T.unpack name
+      datPath    = walletPath </> "wallet.dat"
+  atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
+  decoded   <- WP.readWalletBackupFile atRestKey backupPath
+  case decoded of
+    Left _ -> do
+      recognized <- WP.isRecognizedWalletFile backupPath
+      return $ Left $ if recognized
+        then walletCorruptedMsg
+        else walletBadFormatMsg walletPath
+    Right snap -> do
+      made <- try (createDirectory walletPath) :: IO (Either SomeException ())
+      case made of
+        Left _ -> return $ Left $
+          "Failed to restore database path '" <> T.pack walletPath <> "'."
+        Right () -> do
+          result <- (do
+              saved <- WP.saveWalletSnapshot atRestKey datPath snap
+              case saved of
+                Left e  -> return (Left ("Wallet restore failed: " <> T.pack e))
+                Right () -> loadManagedWallet wm name)
+            `catch` (\(e :: SomeException) ->
+                       return (Left ("Wallet restore failed: " <> T.pack (show e))))
+          case result of
+            Right ws -> return (Right ws)
+            Left err -> do
+              removeDirectoryRecursive walletPath
+                `catch` (\(_ :: SomeException) -> pure ())
+              return (Left err)
 
 -- | Unload a wallet.
 -- Removes the wallet from the manager but does not delete wallet files.

@@ -366,7 +366,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
-import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, doesDirectoryExist, listDirectory, getFileSize, copyFile)
+import System.Directory (doesFileExist, removeFile, doesDirectoryExist, listDirectory, getFileSize)
 import System.FilePath ((</>), isRelative, takeDirectory)
 import System.Posix.Files (setFileMode)
 import System.Posix.Signals (raiseSignal, sigTERM)
@@ -511,6 +511,7 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          Ping(..),
                          sockAddrToHostPort, sockAddrToString,
                          banPeer, getBanList, clearExpiredBans,
+                         banKey, addManualBan, removeManualBan, clearAllBans,
                          saveBanList, loadBanList,
                          getMappedASFromSockAddr, sockAddrToNetworkAddress,
                          -- AddrMan dump / inject for getnodeaddresses + addpeeraddress
@@ -561,6 +562,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- SAME PSBT Signer engine the wallet path uses.
                         ExtendedKey(..), derivePubKeyFromPrivate,
                         newWalletManager, createManagedWallet, loadManagedWallet,
+                        backupManagedWallet, restoreManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
                         getSpendableBalance, scanBlockForWallet, resignViaPsbt,
@@ -9186,8 +9188,10 @@ handleWalletProcessPsbt server params = withWalletMgr server $ \wm -> do
 
 -- | backupwallet "destination"
 -- Reference: bitcoin-core/src/wallet/rpc/backup.cpp backupwallet.
--- Copies wallet.dat to a file or into a directory. A destination whose
--- parent does not exist is RPC_WALLET_ERROR (-4). Success is JSON null.
+-- Writes a self-contained backup (secrets re-sealed under a key carried in
+-- the file, not this datadir's wallet.key) to a file or into a directory.
+-- A destination whose parent does not exist is RPC_WALLET_ERROR (-4).
+-- Success is JSON null.
 handleBackupWallet :: RpcServer -> Value -> IO RpcResponse
 handleBackupWallet server params = withWalletMgr server $ \wm ->
   case extractParamText params 0 of
@@ -9214,8 +9218,8 @@ handleBackupWallet server params = withWalletMgr server $ \wm ->
                 else do
                   let target | destIsDir = dest </> "wallet.dat"
                              | otherwise = dest
-                  copied <- try (copyFile src target) :: IO (Either SomeException ())
-                  case copied of
+                  written <- backupManagedWallet (wsWallet ws) target
+                  case written of
                     Left _ -> return $ rpcFail rpcWalletError "Error: Wallet backup failed!"
                     Right () -> return $ RpcResponse Null Null Null
 
@@ -9292,7 +9296,10 @@ handleCreateWallet server params = withWalletMgr server $ \wm ->
 -- | restorewallet "wallet_name" "backup_file" ( load_on_startup )
 --
 -- Reference: bitcoin-core/src/wallet/rpc/backup.cpp restorewallet.
--- Copies a backupwallet file into a new wallet directory and loads it.
+-- Re-seals a backupwallet file under this datadir's wallet.key into a new
+-- wallet directory and loads it. A file that is not a wallet is
+-- RPC_WALLET_NOT_FOUND (-18), a damaged one RPC_WALLET_ERROR (-4); either
+-- leaves no wallet directory behind.
 -- A missing backup is RPC_INVALID_PARAMETER (-8), checked BEFORE the
 -- name-exists test, which is RPC_WALLET_ALREADY_EXISTS (-36) — the only
 -- create path that still returns -36 (CreateWallet maps that status to -4).
@@ -9323,19 +9330,20 @@ handleRestoreWallet server params = withWalletMgr server $ \wm ->
               if not srcOk
                 then return $ rpcFail rpcInvalidParameter "Backup file does not exist"
                 else do
-                  createDirectoryIfMissing True walletPath
-                  let datPath = walletPath </> "wallet.dat"
-                  copied <- try (copyFile src datPath) :: IO (Either SomeException ())
-                  case copied of
-                    Left _ -> return $ rpcFail rpcWalletError "Wallet restore failed"
-                    Right () -> do
-                      result <- loadManagedWallet wm walletName
-                      case result of
-                        Left err -> return $ rpcFail rpcWalletError err
-                        Right _ -> return $ RpcResponse
-                          (object [ "name"    .= walletName
-                                  , "warning" .= ("" :: Text)
-                                  ]) Null Null
+                  result <- restoreManagedWallet wm walletName src
+                  -- Core HandleWalletError: FAILED_BAD_FORMAT -> -18,
+                  -- FAILED_ALREADY_EXISTS -> -36, FAILED_LOAD and the
+                  -- rest -> -4.
+                  let code err
+                        | "not in recognized format" `T.isInfixOf` err = rpcWalletNotFound
+                        | "Failed to restore database path" `T.isInfixOf` err = rpcWalletAlreadyExists
+                        | otherwise = rpcWalletError
+                  case result of
+                    Left err -> return $ rpcFail (code err) err
+                    Right _ -> return $ RpcResponse
+                      (object [ "name"    .= walletName
+                              , "warning" .= ("" :: Text)
+                              ]) Null Null
 
 -- | Load an existing wallet by name.
 -- Reference: bitcoin-core/src/wallet/rpc/wallet.cpp loadwallet
@@ -9358,7 +9366,11 @@ handleLoadWallet server params = withWalletMgr server $ \wm ->
         Left err ->
           -- Disambiguate "already loaded" vs "not found" by string match;
           -- 'loadManagedWallet' returns these two cases as 'Left _'.
+          -- A damaged wallet file is Core's DatabaseStatus::FAILED_LOAD,
+          -- which HandleWalletError maps to its default RPC_WALLET_ERROR
+          -- (-4). A file that is not a wallet (FAILED_BAD_FORMAT) is -18.
           let code | "already loaded" `T.isInfixOf` err = rpcWalletAlreadyLoaded
+                   | "Wallet corrupted" `T.isInfixOf` err = rpcWalletError
                    | otherwise                          = rpcWalletNotFound
           in return $ RpcResponse Null (toJSON $ RpcError code err) Null
         Right _ws ->
@@ -12834,10 +12846,8 @@ handleSetBan server params = do
     (Just subnet, Just command) | not (T.null subnet) -> do
       let subnetStr = T.unpack subnet
           cmdStr    = T.toLower command
-          -- Default to mainnet P2P port 8333; ban-list keys are SockAddr,
-          -- so the port matters.  We try the configured P2P port if
-          -- known, but fall back to 0 (haskoin matches by address+port,
-          -- but operators can also pass "host:port" inline).
+          -- An inline "host:port" still parses, but the port is dropped
+          -- below: ban-list keys are the IP alone (see 'banKey').
           (host, port) = case break (== ':') subnetStr of
                            (h, ':':p) -> case reads p :: [(Int, String)] of
                                            [(pn, "")] -> (h, pn)
@@ -12857,7 +12867,10 @@ handleSetBan server params = do
           return $ RpcResponse Null
             (toJSON $ RpcError rpcClientInvalidIpOrSubnet
               "Error: Invalid IP/Subnet") Null
-        Just sockAddr ->
+        Just parsedAddr ->
+          -- Bans are keyed by IP ('banKey' zeroes the port), as Core's
+          -- BanMan keys by CNetAddr: a ban covers every port of the host.
+          let sockAddr = banKey parsedAddr in
           case cmdStr of
             "add" -> do
               now <- round <$> getPOSIXTime :: IO Int64
@@ -12872,11 +12885,16 @@ handleSetBan server params = do
               -- Refuse duplicate bans.  Core answers RPC_CLIENT_NODE_ALREADY_ADDED
               -- (-23) "Error: IP/Subnet already banned" (rpc/net.cpp), not the
               -- generic -1 with a message missing its "Error: " prefix.
+              -- Only a live MANUAL ban counts (Core checks m_banned only); an
+              -- automatic discouragement of the IP is replaced by this ban.
+              let alreadyBannedErr = RpcResponse Null
+                    (toJSON $ RpcError rpcClientNodeAlreadyAdded
+                      "Error: IP/Subnet already banned") Null
+              manual <- readTVarIO (pmManualBans (rsPeerMgr server))
               banned <- getBanList (rsPeerMgr server)
-              if Map.member sockAddr banned
-                then return $ RpcResponse Null
-                  (toJSON $ RpcError rpcClientNodeAlreadyAdded
-                    "Error: IP/Subnet already banned") Null
+              if Set.member sockAddr manual
+                   && maybe False (> now) (Map.lookup sockAddr banned)
+                then return alreadyBannedErr
                 else if isAbs && durationFinal < now
                 -- Core refuses an ABSOLUTE bantime already in the past
                 -- (strictly banTime < GetTime()) instead of recording an
@@ -12885,17 +12903,15 @@ handleSetBan server params = do
                   (toJSON $ RpcError rpcInvalidParameter
                     "Error: Absolute timestamp is in the past") Null
                 else do
-                  -- Insert into ban map directly so we control the expiry.
-                  atomically $ modifyTVar' (pmBannedAddrs (rsPeerMgr server))
-                    (Map.insert sockAddr expiry)
-                  -- Also disconnect any currently-connected peer at this address.
+                 added <- addManualBan (rsPeerMgr server) sockAddr expiry
+                 if not added then return alreadyBannedErr else do
+                  -- Also disconnect every connected peer at this IP, on any port.
                   peers <- readTVarIO (pmPeers (rsPeerMgr server))
-                  case Map.lookup sockAddr peers of
-                    Just pc -> do
+                  forM_ (Map.toList peers) $ \(peerAddr, pc) ->
+                    when (banKey peerAddr == sockAddr) $ do
                       disconnectPeer pc
                       atomically $ modifyTVar' (pmPeers (rsPeerMgr server))
-                        (Map.delete sockAddr)
-                    Nothing -> return ()
+                        (Map.delete peerAddr)
                   -- Persist (best effort).  Failure to write is logged
                   -- but does not fail the RPC: the in-memory ban is
                   -- still effective for the running daemon.
@@ -12904,11 +12920,11 @@ handleSetBan server params = do
                       putStrLn $ "setban: persist failed: " ++ show e)
                   return $ RpcResponse Null Null Null
             "remove" -> do
-              banned <- getBanList (rsPeerMgr server)
-              if Map.member sockAddr banned
+              -- Core's Unban touches m_banned only: an automatic
+              -- discouragement of the IP is left in place.
+              removed <- removeManualBan (rsPeerMgr server) sockAddr
+              if removed
                 then do
-                  atomically $ modifyTVar' (pmBannedAddrs (rsPeerMgr server))
-                    (Map.delete sockAddr)
                   saveBanList (rsPeerMgr server) (banlistPath server)
                     `catch` (\(e :: SomeException) ->
                       putStrLn $ "setban: persist failed: " ++ show e)
@@ -12962,7 +12978,7 @@ handleListBanned server = do
 -- Reference: bitcoin-core/src/rpc/net.cpp clearbanned.
 handleClearBanned :: RpcServer -> IO RpcResponse
 handleClearBanned server = do
-  atomically $ writeTVar (pmBannedAddrs (rsPeerMgr server)) Map.empty
+  clearAllBans (rsPeerMgr server)
   saveBanList (rsPeerMgr server) (banlistPath server)
     `catch` (\(e :: SomeException) ->
       putStrLn $ "clearbanned: persist failed: " ++ show e)
@@ -14333,10 +14349,12 @@ getCommandHelp cmd = case T.toLower cmd of
 -- Reference: Bitcoin Core's @encryptwallet@ RPC (wallet/rpc/encrypt.cpp).
 -- The wallet must be currently unencrypted; otherwise we return
 -- 'rpcWalletWrongEncState' to mirror Core's @RPC_WALLET_WRONG_ENC_STATE@.
--- An empty passphrase is rejected with 'rpcInvalidParams'.  Once encrypted,
--- the wallet remains *unlocked* for the lifetime of this call (no automatic
--- lock) — callers should follow up with @walletlock@ to drop the in-memory
--- key, matching Core's documented behaviour.
+-- An empty passphrase is rejected with 'rpcInvalidParams'.  The encrypted
+-- key is written to the wallet file before this answers, and the wallet is
+-- left locked, as in Core.  The answer drops Core's "The keypool has been
+-- flushed and a new HD seed was generated": haskoin keeps the same HD seed
+-- (it only encrypts it), so saying otherwise would tell the user an old
+-- backup no longer holds the keys when it still does.
 handleEncryptWallet :: RpcServer -> Value -> IO RpcResponse
 handleEncryptWallet server params =
   case rsWalletMgr server of
@@ -14368,8 +14386,8 @@ handleEncryptWallet server params =
                             (toJSON $ RpcError rpcWalletEncryptionFailed
                               (T.pack ("Error: " ++ err))) Null
                     Right _ -> return $ RpcResponse
-                      (toJSON ("wallet encrypted; the keypool has been flushed and a \
-                               \new HD seed was generated. You need to make a new backup." :: Text))
+                      (toJSON ("wallet encrypted; You need to make a new backup \
+                               \with the backupwallet RPC." :: Text))
                       Null Null
 
 -- | Unlock the default wallet for @timeout@ seconds.
