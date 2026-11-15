@@ -6688,7 +6688,7 @@ addHeaderAt net hc header minPowChecked mNow = do
                         -- passes min_pow_checked=true outright when the headers
                         -- extend a chain already past nMinimumChainWork.
                         --
-                        -- haskoin has no PRESYNC machine.  The pre-fix code gated
+                        -- This gate is not that machine.  The pre-fix code gated
                         -- every header on its OWN cumulative work, which is
                         -- unsatisfiable during a from-genesis sync: header 1's
                         -- cumulative work is far below the mainnet threshold, so it
@@ -6703,8 +6703,10 @@ addHeaderAt net hc header minPowChecked mNow = do
                         -- already-high-work chain" case).  During from-genesis
                         -- bootstrap the gate is skipped; a low-work header flood is
                         -- still bounded by the checkpoint set (Gate 5), PoW (Gate 3)
-                        -- and diffbits (Gate 4).  A real PRESYNC machine is the
-                        -- principled follow-up.
+                        -- and diffbits (Gate 4).  Peer headers messages no longer
+                        -- rely on this gate: Haskoin.Sync.peerHeadersGate runs
+                        -- Core's PRESYNC/REDOWNLOAD anti-DoS check first and hands
+                        -- only headers that pass it here, with minPowChecked=True.
                         tipWork <- ceChainWork <$> readTVarIO (hcTip hc)
                         if not minPowChecked
                              && tipWork >= netMinimumChainWork net

@@ -57,7 +57,9 @@ import Haskoin.ChainLock (ChainLock, withChainLock, tryWithChainLock, chainLockH
 import Haskoin.Storage
 import Haskoin.HeaderReload (initHeaderChainFromDB, estimateUndoConnectedTip)
 import Haskoin.BlockNotFound (noteBlockNotFound, noteBlockRequestAnswered, readBlockNotFound)
-import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment)
+import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment,
+                     HeadersSyncPeers, PeerHeadersVerdict(..), peerHeadersGate,
+                     headersSyncActive)
 import Haskoin.Rpc
 import Haskoin.Mempool
 import qualified Haskoin.Mempool.Persist as MPP
@@ -1908,7 +1910,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       -- BUG-12 FIX: EraseForPeer — purge orphans from disconnected peer.
       -- Core: TxOrphanage::EraseForPeer (txorphanage.h:86) is called in
       -- net_processing.cpp FinalizeNode when a peer disconnects.
-      (\addr -> eraseOrphansForPeer addr orphanPoolRef
+      (\addr -> (atomically (modifyTVar' headersSyncPeersRef (Map.delete addr)) >>
+                 eraseOrphansForPeer addr orphanPoolRef)
           `catchSync` (\e ->
             putStrLn $ "eraseOrphansForPeer error: " ++ show e))
     writeIORef pmRef pm
@@ -2908,7 +2911,7 @@ staleTipWatcher pm hc db net inflightRef = do
               then do
                 putStrLn (formatStaleTipLog (now - lastUpdate'))
                 requestExtraOutbound pm True
-                peers <- getConnectedPeerList pm
+                peers <- getConnectedPeerList pm >>= withoutHeadersSync
                 locator <- buildBlockLocatorFromChain hc
                 let gh = GetHeaders
                       { ghVersion  = fromIntegral protocolVersion
@@ -2936,6 +2939,7 @@ outboundEvictionWatcher pm hc db inflightRef = forever $ do
   now <- (round <$> getPOSIXTime :: IO Int64)
   let env = OutboundEvictEnv
         { oeeTipWork = ceChainWork <$> getValidatedChainTip db hc
+        , oeeMaySendGetHeaders = fmap not . headersSyncInFlight
         , oeeInFlight = \a -> do
             m <- readIORef inflightRef
             return (length [ () | (k, _, _) <- Map.elems m, k == a ])
@@ -2964,9 +2968,11 @@ getheadersSender pm hc _net = do
   -- next backstop probe immediately.
   let headersResponseTime = 120 :: Int64   -- Core HEADERS_RESPONSE_TIME (2min)
       loop lastSentT lastPeerCount = do
-        connectedPeers <- getConnectedPeerList pm
+        allPeers <- getConnectedPeerList pm
+        -- A peer in a low-work headers sync gets that sync's getheaders only.
+        connectedPeers <- withoutHeadersSync allPeers
         now <- (round <$> getPOSIXTime :: IO Int64)
-        let peerCount = length connectedPeers
+        let peerCount = length allPeers
         -- Don't send while a getheaders is still "in flight" (< 2 min since
         -- our last one).  The MHeaders handler drives the active chain; this
         -- only re-probes after a stall, so a fixed 2-min backstop is enough
@@ -3570,6 +3576,25 @@ punishBlockSource pmRefP bh = do
 -- (secfix-haskoin-notfound-unsolicited): only notfound answers for blocks
 -- this node asked that peer for are kept.
 
+-- | Per-peer low-work headers sync (Core Peer::m_headers_sync), keyed by
+-- peer address and dropped on disconnect.
+{-# NOINLINE headersSyncPeersRef #-}
+headersSyncPeersRef :: HeadersSyncPeers
+headersSyncPeersRef = unsafePerformIO (newTVarIO Map.empty)
+
+-- | Is a low-work headers sync's getheaders to this peer in flight?
+-- (Core MaybeSendGetHeaders sends no second one.)
+headersSyncInFlight :: NS.SockAddr -> IO Bool
+headersSyncInFlight a = do
+  now <- (round <$> getPOSIXTime :: IO Int64)
+  headersSyncActive headersSyncPeersRef a now
+
+-- | Drop peers with a headers sync request in flight ('headersSyncInFlight').
+withoutHeadersSync :: [PeerConnection] -> IO [PeerConnection]
+withoutHeadersSync = filterM $ \pc -> do
+  a <- piAddress <$> readTVarIO (pcInfo pc)
+  not <$> headersSyncInFlight a
+
 -- | Which peers announced a block's header (small announcement batches
 -- only, not bulk IBD header sync).  Core FindNextBlocksToDownload asks a
 -- peer only for blocks on that peer's pindexBestKnownBlock chain; this is
@@ -3923,17 +3948,28 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     putStrLn $ "Received " ++ show (length hdrs) ++ " headers"
     when (length hdrs <= 16) $
       noteHeaderAnnouncer addr (map computeBlockHash hdrs)
-    -- Headers arrive from a peer so minPowChecked=False: the
-    -- too-little-chainwork gate (W97 G8) must fire for any batch
-    -- whose cumulative work is below netMinimumChainWork.  We do not
-    -- stand up the full PRESYNC/REDOWNLOAD state machine (that is
-    -- implemented in headerssync.cpp and is a separate hardening layer);
-    -- the chainwork gate provides equivalent protection against
-    -- low-work header floods without requiring the extra round-trips.
-    -- Track header rejection reasons so we can attribute misbehavior:
-    -- "Block header has no valid parent" -> NonContinuousHeaders
-    -- "Invalid proof of work" -> InvalidBlockHeader
+    -- Core ProcessHeadersMessage anti-DoS (headerssync.cpp PRESYNC /
+    -- REDOWNLOAD, GetAntiDoSWorkThreshold): a chain whose claimed work is
+    -- below the threshold is never indexed or stored.  'addHeader''s own
+    -- too-little-chainwork gate is off until our tip passes
+    -- nMinimumChainWork, so before this a fresh node stored every low-work
+    -- fork header a peer sent.  'peerHeadersGate' decides which headers of
+    -- this message may be processed; only those reach 'addHeader', with
+    -- min_pow_checked=True as in Core.
     pmRefVal <- readIORef pmRef
+    activeTip <- getValidatedChainTip db hc
+    nowGate <- (round <$> getPOSIXTime :: IO Int64)
+    gate <- peerHeadersGate net hc activeTip headersSyncPeersRef addr nowGate hdrs
+    forM_ (phvLog gate) $ \l -> putStrLn $ "Headers from " ++ show addr ++ ": " ++ l
+    forM_ (phvPunish gate) $ \why -> void $ misbehaving pmRefVal addr why
+    forM_ (phvGetHeaders gate) $ \loc -> do
+      pmS <- readIORef pmRef
+      let zeroH = BlockHash (Hash256 (BS.replicate 32 0))
+      requestFromPeer pmS addr (MGetHeaders GetHeaders
+        { ghVersion  = fromIntegral protocolVersion
+        , ghLocators = take 101 loc
+        , ghHashStop = zeroH })
+    let accepted = phvAccept gate
     -- Snapshot the active header-tip height BEFORE processing this batch so
     -- we can tell whether the batch actually EXTENDED our best header chain.
     -- 'addHeader' returns 'Right' both for genuinely new headers and for
@@ -3945,7 +3981,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     tipBefore <- readTVarIO (hcHeight hc)
     batchWorkRef <- newIORef (Nothing :: Maybe Integer)
     (added, badPow, badConn) <- foldM (\(count, pow, conn) hdr -> do
-        result <- addHeader net hc hdr False
+        result <- addHeader net hc hdr True
         case result of
             Right entry -> do
               modifyIORef' batchWorkRef (Just . maybe (ceChainWork entry) (max (ceChainWork entry)))
@@ -3976,7 +4012,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 || "not connected"  `infixOfStr` err
                   -> return (count, pow, conn + 1 :: Int)
               | otherwise -> return (count, pow, conn)
-        ) (0 :: Int, 0 :: Int, 0 :: Int) hdrs
+        ) (0 :: Int, 0 :: Int, 0 :: Int) accepted
     putStrLn $ "Added " ++ show added ++ " of " ++ show (length hdrs) ++ " headers"
     tipAfter <- readTVarIO (hcHeight hc)
     -- Did this batch extend our best header chain (Core's received_new_header)?
@@ -4048,7 +4084,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     --     ('buildBlockLocatorFromChain' == Core GetLocator(pindexLast), since
     --     addHeader has already advanced the tip to the last received header),
     --     so the peer always resumes exactly past our tip instead of resending.
-    when (length hdrs == 2000 && progressed) $ do
+    -- Core: never while a low-work headers sync with this peer runs
+    -- (!have_headers_sync); that sync sends its own getheaders above.
+    when (length hdrs == 2000 && progressed && not (phvSyncActive gate)) $ do
       -- Headers-first: mark bulk header sync as live so the block-gap
       -- kicker and the post-headers requestBlocks below stay deferred.
       nowFull <- (round <$> getPOSIXTime :: IO Int64)
@@ -4064,7 +4102,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
             , ghHashStop = zeroHash
             }
       pm <- readIORef pmRef
-      connPeers <- getConnectedPeerList pm
+      connPeers <- getConnectedPeerList pm >>= withoutHeadersSync
       case connPeers of
         [] -> putStrLn "No peers to request more headers from"
         _  -> do
@@ -4589,7 +4627,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   -- tip here) instead of the single hash so the peer resumes past
                   -- our tip rather than resending.
                   headerTipH <- readTVarIO (hcHeight hc)
-                  connPeers <- getConnectedPeerList pm
+                  connPeers <- getConnectedPeerList pm >>= withoutHeadersSync
                   unless (null connPeers || height < headerTipH) $ do
                     locator <- buildBlockLocatorFromChain hc
                     let finalLocator = if null locator then [bh] else locator
@@ -4742,8 +4780,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 , ghLocators = finalLocator
                 , ghHashStop = zeroHash
                 }
-          requestFromPeer pm addr (MGetHeaders getHdrs)
-            `catch` (\(_ :: SomeException) -> return ())
+          syncing <- headersSyncInFlight addr
+          unless syncing $
+            requestFromPeer pm addr (MGetHeaders getHdrs)
+              `catch` (\(_ :: SomeException) -> return ())
 
     -- BUG-14 FIX: reject tx invs from block-relay-only peers.
     -- Core: RejectIncomingTxs() returns true for block-relay-only connections;
@@ -4985,8 +5025,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                 , ghLocators = if null locator then [ceHash tip] else locator
                 , ghHashStop = BlockHash (Hash256 (BS.replicate 32 0))
                 }
-          requestFromPeer pm addr (MGetHeaders getHdrs)
-            `catch` (\(_ :: SomeException) -> return ())
+          syncing <- headersSyncInFlight addr
+          unless syncing $
+            requestFromPeer pm addr (MGetHeaders getHdrs)
+              `catch` (\(_ :: SomeException) -> return ())
         pure False
       CmpctHeaderIgnored why -> do
         putStrLn $ "Compact block " ++ show bh ++ " ignored: " ++ why

@@ -4263,6 +4263,9 @@ data OutboundEvictEnv = OutboundEvictEnv
     -- ^ chain work of our validated tip
   , oeeInFlight :: SockAddr -> IO Int
     -- ^ blocks currently requested from that peer
+  , oeeMaySendGetHeaders :: SockAddr -> IO Bool
+    -- ^ Core MaybeSendGetHeaders: False while another getheaders to that
+    --   peer is still in flight (a running low-work headers sync's).
   , oeeLocator  :: IO [BlockHash]
     -- ^ locator for the chain-sync probe. Core sends
     --   GetLocator(work_header->pprev): it must start BELOW our tip so a
@@ -4380,8 +4383,10 @@ runOutboundEviction pm env now = do
           let gh = GetHeaders { ghVersion = fromIntegral protocolVersion
                               , ghLocators = locator
                               , ghHashStop = BlockHash (Hash256 (BS.replicate 32 0)) }
-          _ <- forkIO $ sendMessage pc (MGetHeaders gh)
-                 `catch` (\(_ :: SomeException) -> return ())
+          maySend <- oeeMaySendGetHeaders env a
+          when maySend $
+            void $ forkIO $ sendMessage pc (MGetHeaders gh)
+                     `catch` (\(_ :: SomeException) -> return ())
           return Nothing
         ConsiderDisconnect -> do
           putStrLn $ "Outbound peer has old chain, best known work = "
