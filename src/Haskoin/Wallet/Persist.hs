@@ -50,10 +50,11 @@ module Haskoin.Wallet.Persist
   ( -- * Snapshot type
     WalletSnapshot(..)
   , SnapUtxo(..)
+  , SnapEncryption(..)
     -- * Codec (pure, exported for tests)
   , encodeWalletSnapshot
   , decodeWalletSnapshot
-  , walletSnapshotVersion
+  , walletSnapshotVersion   -- newest layout; unencrypted wallets are still written as version 1
     -- * IO: atomic durable save / fault-tolerant load
   , saveWalletSnapshot
   , loadWalletSnapshot
@@ -105,8 +106,17 @@ walletSnapshotMagic = "HSKWLT01"
 
 -- | On-disk format version. Bump on any layout change; 'decodeWalletSnapshot'
 -- refuses unknown versions (fault-tolerant load treats that as corrupt).
+--
+-- Version 2 = version 1 + a trailing passphrase-encryption record
+-- ('SnapEncryption'). Only an ENCRYPTED wallet is written as version 2;
+-- an unencrypted wallet is still written byte-for-byte as version 1, so a
+-- binary that predates version 2 still reads it.
 walletSnapshotVersion :: Word32
-walletSnapshotVersion = 1
+walletSnapshotVersion = 2
+
+-- | Layout without the encryption record (every unencrypted wallet).
+walletSnapshotVersionPlain :: Word32
+walletSnapshotVersionPlain = 1
 
 --------------------------------------------------------------------------------
 -- Snapshot data
@@ -120,6 +130,20 @@ data SnapUtxo = SnapUtxo
   , suTxOut       :: !TxOut
   , suBlockHeight :: !Word32
   , suIsCoinbase  :: !Bool
+  } deriving (Show, Eq)
+
+-- | The passphrase-encryption record of an encrypted wallet: the master
+-- private key AES-256-CBC-encrypted under a key derived from the user's
+-- passphrase, plus the KDF parameters needed to derive it again.  Core's
+-- @CMasterKey@ record (wallet/crypter.h: vchCryptedKey, vchSalt,
+-- nDerivationMethod, nDeriveIterations), written by
+-- @CWallet::EncryptWallet@ (wallet/wallet.cpp).  It is NOT sealed again
+-- under the at-rest key: without the passphrase it is unreadable anyway.
+data SnapEncryption = SnapEncryption
+  { seSalt       :: !ByteString   -- ^ PBKDF2 salt
+  , seIterations :: !Word32       -- ^ PBKDF2-HMAC-SHA512 iteration count
+  , seIV         :: !ByteString   -- ^ AES-CBC IV (16 bytes)
+  , seCiphertext :: !ByteString   -- ^ encrypted master private key (PKCS#7 padded)
   } deriving (Show, Eq)
 
 -- | A complete, restartable wallet snapshot. Everything needed to bring
@@ -136,6 +160,9 @@ data WalletSnapshot = WalletSnapshot
   , wsnAddrLabels     :: !(Map Address Text)
   , wsnTxLabels       :: !(Map TxId Text)
   , wsnLastSynced     :: !Word32               -- ^ chain height the UTXO ledger is reconciled to (rescan anchor)
+  , wsnEncryption     :: !(Maybe SnapEncryption)
+      -- ^ 'Just' once the wallet is passphrase-encrypted (encryptwallet);
+      --   a reload restores it LOCKED.  Format version 2 only.
   } deriving (Show, Eq)
 
 --------------------------------------------------------------------------------
@@ -149,7 +176,8 @@ data WalletSnapshot = WalletSnapshot
 encodeWalletSnapshot :: WalletSnapshot -> ByteString
 encodeWalletSnapshot WalletSnapshot{..} = runPut $ do
   putByteString walletSnapshotMagic
-  putWord32le walletSnapshotVersion
+  putWord32le (maybe walletSnapshotVersionPlain (const walletSnapshotVersion)
+                     wsnEncryption)
   putVarBytes' wsnMasterSecKey
   putVarBytes' wsnMasterChain
   putText wsnNetworkName
@@ -161,6 +189,7 @@ encodeWalletSnapshot WalletSnapshot{..} = runPut $ do
   putAddrTextMap wsnAddrLabels
   putTxIdTextMap wsnTxLabels
   putWord32le wsnLastSynced
+  mapM_ putSnapEncryption wsnEncryption
 
 -- | Parse a snapshot blob. 'Left' on magic / version / structural
 -- mismatch; the IO loader turns that into the move-aside recovery path.
@@ -170,7 +199,7 @@ decodeWalletSnapshot = runGet $ do
   when (magic /= walletSnapshotMagic) $
     fail "wallet snapshot: bad magic"
   ver <- getWord32le
-  when (ver /= walletSnapshotVersion) $
+  when (ver /= walletSnapshotVersionPlain && ver /= walletSnapshotVersion) $
     fail ("wallet snapshot: unsupported version " ++ show ver)
   sk      <- getVarBytes'
   cc      <- getVarBytes'
@@ -183,6 +212,9 @@ decodeWalletSnapshot = runGet $ do
   aLabels <- getAddrTextMap
   tLabels <- getTxIdTextMap
   synced  <- getWord32le
+  enc     <- if ver == walletSnapshotVersion
+               then Just <$> getSnapEncryption
+               else pure Nothing
   pure WalletSnapshot
     { wsnMasterSecKey = sk
     , wsnMasterChain  = cc
@@ -195,6 +227,7 @@ decodeWalletSnapshot = runGet $ do
     , wsnAddrLabels   = aLabels
     , wsnTxLabels     = tLabels
     , wsnLastSynced   = synced
+    , wsnEncryption   = enc
     }
 
 --------------------------------------------------------------------------------
@@ -288,6 +321,29 @@ getSnapUtxo = do
   h   <- getWord32le
   cb  <- getWord8
   pure (SnapUtxo op txo h (cb /= 0))
+
+putSnapEncryption :: SnapEncryption -> Put
+putSnapEncryption SnapEncryption{..} = do
+  putVarBytes' seSalt
+  putWord32le seIterations
+  putVarBytes' seIV
+  putVarBytes' seCiphertext
+
+-- | A malformed record fails the decode (and so the load) rather than
+-- loading the wallet unencrypted: dropping the record would silently
+-- remove the passphrase.
+getSnapEncryption :: Get SnapEncryption
+getSnapEncryption = do
+  salt <- getVarBytes'
+  iter <- getWord32le
+  iv   <- getVarBytes'
+  ct   <- getVarBytes'
+  when (BS.null salt) $ fail "wallet snapshot: empty encryption salt"
+  when (iter == 0) $ fail "wallet snapshot: zero KDF iterations"
+  when (BS.length iv /= aesBlockBytes) $ fail "wallet snapshot: bad encryption IV length"
+  when (BS.null ct || BS.length ct `mod` aesBlockBytes /= 0) $
+    fail "wallet snapshot: bad encrypted key length"
+  pure (SnapEncryption salt iter iv ct)
 
 --------------------------------------------------------------------------------
 -- Encryption at rest

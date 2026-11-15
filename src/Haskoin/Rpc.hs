@@ -14354,10 +14354,12 @@ getCommandHelp cmd = case T.toLower cmd of
 -- Reference: Bitcoin Core's @encryptwallet@ RPC (wallet/rpc/encrypt.cpp).
 -- The wallet must be currently unencrypted; otherwise we return
 -- 'rpcWalletWrongEncState' to mirror Core's @RPC_WALLET_WRONG_ENC_STATE@.
--- An empty passphrase is rejected with 'rpcInvalidParams'.  Once encrypted,
--- the wallet remains *unlocked* for the lifetime of this call (no automatic
--- lock) — callers should follow up with @walletlock@ to drop the in-memory
--- key, matching Core's documented behaviour.
+-- An empty passphrase is rejected with 'rpcInvalidParams'.  The encrypted
+-- key is written to the wallet file before this answers, and the wallet is
+-- left locked, as in Core.  The answer drops Core's "The keypool has been
+-- flushed and a new HD seed was generated": haskoin keeps the same HD seed
+-- (it only encrypts it), so saying otherwise would tell the user an old
+-- backup no longer holds the keys when it still does.
 handleEncryptWallet :: RpcServer -> Value -> IO RpcResponse
 handleEncryptWallet server params =
   case rsWalletMgr server of
@@ -14390,8 +14392,8 @@ handleEncryptWallet server params =
                             (toJSON $ RpcError rpcWalletEncryptionFailed
                               (T.pack ("Error: " ++ err))) Null
                     Right _ -> return $ RpcResponse
-                      (toJSON ("wallet encrypted; the keypool has been flushed and a \
-                               \new HD seed was generated. You need to make a new backup." :: Text))
+                      (toJSON ("wallet encrypted; You need to make a new backup \
+                               \with the backupwallet RPC." :: Text))
                       Null Null
 
 -- | Unlock the default wallet for @timeout@ seconds.

@@ -62,6 +62,23 @@ mkOutPoint :: Word -> OutPoint
 mkOutPoint n =
   OutPoint (TxId (Hash256 (BS.pack (replicate 31 0 ++ [fromIntegral n])))) 0
 
+-- | A minimal unencrypted snapshot for the codec tests.
+plainSnap :: WalletSnapshot
+plainSnap = WalletSnapshot
+  { wsnMasterSecKey = BS.replicate 32 0x11
+  , wsnMasterChain  = BS.replicate 32 0x22
+  , wsnNetworkName  = "regtest"
+  , wsnGapLimit     = 20
+  , wsnReceiveIndex = 0
+  , wsnChangeIndex  = 0
+  , wsnAddresses    = Map.empty
+  , wsnUtxos        = []
+  , wsnAddrLabels   = Map.empty
+  , wsnTxLabels     = Map.empty
+  , wsnLastSynced   = 0
+  , wsnEncryption   = Nothing
+  }
+
 -- P2WPKH-shaped 22-byte script (OP_0 PUSH20 <hash>) — content irrelevant
 -- to the codec, just needs to round-trip.
 sampleScript :: BS.ByteString
@@ -116,8 +133,33 @@ spec = describe "W166 durable wallet persistence (sweep wa0fq5wtk)" $ do
             , wsnAddrLabels   = Map.empty
             , wsnTxLabels     = Map.empty
             , wsnLastSynced   = 944183
+            , wsnEncryption   = Nothing
             }
       decodeWalletSnapshot (encodeWalletSnapshot snap) `shouldBe` Right snap
+
+    it "G1.3: an encrypted snapshot round-trips as format version 2" $ do
+      let enc = SnapEncryption
+            { seSalt = BS.replicate 8 0x33, seIterations = 25000
+            , seIV = BS.replicate 16 0x44, seCiphertext = BS.replicate 48 0x55 }
+          snap = plainSnap { wsnEncryption = Just enc }
+          blob = encodeWalletSnapshot snap
+      BS.take 4 (BS.drop 8 blob) `shouldBe` BS.pack [2, 0, 0, 0]
+      decodeWalletSnapshot blob `shouldBe` Right snap
+      -- Unencrypted snapshots keep the version-1 layout.
+      BS.take 4 (BS.drop 8 (encodeWalletSnapshot plainSnap))
+        `shouldBe` BS.pack [1, 0, 0, 0]
+
+    it "G1.4: a truncated encryption record fails the decode (never loads unencrypted)" $ do
+      let enc = SnapEncryption
+            { seSalt = BS.replicate 8 0x33, seIterations = 25000
+            , seIV = BS.replicate 16 0x44, seCiphertext = BS.replicate 48 0x55 }
+          blob = encodeWalletSnapshot plainSnap { wsnEncryption = Just enc }
+      decodeWalletSnapshot (BS.take (BS.length blob - 1) blob)
+        `shouldSatisfy` either (const True) (const False)
+      -- A record with a malformed IV is refused too.
+      decodeWalletSnapshot
+        (encodeWalletSnapshot plainSnap { wsnEncryption = Just enc { seIV = BS.replicate 3 0 } })
+        `shouldSatisfy` either (const True) (const False)
 
   ------------------------------------------------------------------------
   describe "G2 mutation survives a SIMULATED UNCLEAN restart" $ do
