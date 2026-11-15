@@ -34,11 +34,11 @@
 --    State is therefore NOT lost on SIGKILL the way a flush-only-on-clean-
 --    shutdown scheme would.
 --
--- 3. FAULT-TOLERANT LOAD ('loadWalletFile'): a missing file is "fresh
---    wallet, no error"; a corrupt / truncated / partially-written file is
---    moved aside to @wallet.dat.bad@, logged, and reported as @Left@ so
---    the caller can fall back to seed re-derivation instead of crashing
---    node startup.
+-- 3. FAULT-TOLERANT LOAD ('loadWalletSnapshot'): a missing file is
+--    @Right Nothing@; a corrupt / truncated / undecryptable file is logged
+--    and reported as @Left@ and LEFT IN PLACE.  The caller must fail the
+--    load (Core wallet.cpp LoadWallet: a database that cannot be read is
+--    an error); it must never replace the wallet with a fresh one.
 --
 -- 4. ENCRYPTION AT REST: the secret-bearing region (master private key +
 --    chain code) is sealed with AES-256-CBC under a key derived from a
@@ -46,6 +46,14 @@
 --    address/UTXO/history metadata needed for fast balance display is
 --    stored in the clear; only key material that could spend funds is
 --    encrypted, matching Core's "encrypt the keys, index the rest" split.
+--
+-- 5. SELF-CONTAINED BACKUPS ('encodeWalletBackup'): the at-rest key lives
+--    beside the wallets, not inside wallet.dat, so a copy of wallet.dat
+--    cannot be opened on another datadir.  A backup therefore re-seals the
+--    secrets under a fresh random key and carries that key in the file
+--    (@HSKWBK01@ magic).  It does NOT carry the datadir's @wallet.key@,
+--    which seals every other wallet in the datadir.  Like an unencrypted
+--    Core wallet backup, the file alone is enough to spend: keep it safe.
 module Haskoin.Wallet.Persist
   ( -- * Snapshot type
     WalletSnapshot(..)
@@ -59,16 +67,24 @@ module Haskoin.Wallet.Persist
   , saveWalletSnapshot
   , loadWalletSnapshot
   , atomicWriteFileSync
+  , atomicWritePrivateFileSync
+  , isRecognizedWalletFile
+    -- * Self-contained backups
+  , encodeWalletBackup
+  , decodeWalletBackup
+  , readWalletBackupFile
     -- * Encryption-at-rest key file
   , loadOrCreateAtRestKey
   ) where
 
-import Control.Exception (IOException, SomeException, bracketOnError, catch, try)
+import Control.Exception (IOException, SomeException, bracketOnError, catch,
+                          finally, onException, throwIO, try)
 import Control.Monad (when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.Serialize
 import Data.Serialize (Get, Put, Serialize (..), getBytes,
                        getWord32le, getWord8, putByteString,
                        putWord32le, putWord8, runGet, runPut)
@@ -77,8 +93,10 @@ import qualified Data.Text.Encoding as TE
 import Data.Word (Word32)
 import System.Directory (doesFileExist, renameFile)
 import System.FilePath (takeDirectory)
-import System.IO (IOMode (WriteMode), hClose, hFlush, hPutStrLn,
-                  openBinaryFile, stderr)
+import System.IO (IOMode (ReadMode, WriteMode), hClose, hFlush, hPutStrLn,
+                  openBinaryFile, stderr, withBinaryFile)
+import System.IO.Error (isAlreadyExistsError)
+import Numeric (showHex)
 import qualified System.Posix.Files as PosixFiles
 import qualified System.Posix.IO as PosixIO
 import qualified System.Posix.Unistd as PosixUnistd
@@ -410,18 +428,62 @@ unsealAtRest atRestPass blob
 -- file used to seal wallet secrets. Stored mode 0600. This lets the
 -- wallet re-open after an UNCLEAN restart with no interactive passphrase,
 -- while still keeping the spendable key material off disk in the clear.
+--
+-- Creation is exclusive: the key is written and fsynced to a temp file
+-- opened @O_CREAT|O_EXCL@ with mode 0600 (so it is never readable by
+-- others, not even briefly), then published with @link(2)@, which fails
+-- with EEXIST instead of replacing a key another caller published first.
+-- The loser reads the winner's key.  Before this, two first-use callers
+-- could each write a key and the second rename overwrote the first,
+-- leaving any wallet sealed under the first key unreadable.
 loadOrCreateAtRestKey :: FilePath -> IO ByteString
 loadOrCreateAtRestKey keyPath = do
   exists <- doesFileExist keyPath
   if exists
     then BS.readFile keyPath
     else do
-      k <- CryptoRandom.getRandomBytes 32 :: IO ByteString
-      -- Atomic + restrictive perms; created once, never overwritten.
-      atomicWriteFileSync keyPath k
-      (PosixFiles.setFileMode keyPath 0o600)
-        `catch` (\(_ :: IOException) -> pure ())
-      pure k
+      k   <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+      tmp <- writePrivateTemp keyPath k
+      linked <- try (PosixFiles.createLink tmp keyPath)
+      removeQuietly tmp
+      case linked of
+        Right () -> fsyncDir (takeDirectory keyPath) >> pure k
+        Left e
+          | isAlreadyExistsError e -> BS.readFile keyPath
+          | otherwise              -> throwIO e
+
+-- | Write @bytes@ to a new, uniquely named @path.new.<random>@ created
+-- @O_CREAT|O_EXCL@ with mode 0600, fsync it, and return its name.  The
+-- file is never readable by group or others, not even briefly.  On any
+-- failure the temp file is removed and the exception rethrown.
+writePrivateTemp :: FilePath -> ByteString -> IO FilePath
+writePrivateTemp path bytes = do
+  tag <- CryptoRandom.getRandomBytes 8 :: IO ByteString
+  let tmp    = path <> ".new." <> concatMap hex2 (BS.unpack tag)
+      hex2 b = let h = showHex b "" in if length h < 2 then '0' : h else h
+      flags  = PosixIO.defaultFileFlags { PosixIO.creat     = Just 0o600
+                                        , PosixIO.exclusive = True }
+  (do h <- PosixIO.openFd tmp PosixIO.WriteOnly flags >>= PosixIO.fdToHandle
+      (do BS.hPut h bytes
+          hFlush h
+          fd <- PosixIO.handleToFd h      -- consumes the handle
+          PosixUnistd.fileSynchronise fd `finally` PosixIO.closeFd fd)
+        `onException` (hClose h `catch` (\(_ :: IOException) -> pure ())))
+    `onException` removeQuietly tmp
+  pure tmp
+
+removeQuietly :: FilePath -> IO ()
+removeQuietly p = PosixFiles.removeLink p `catch` (\(_ :: IOException) -> pure ())
+
+-- | 'atomicWriteFileSync' for secrets: the file is created mode 0600
+-- under a unique temp name ('writePrivateTemp'), then renamed onto
+-- @path@.  Used for backups, which carry their own seal key and so are
+-- enough to spend (Core creates wallet files under umask 077).
+atomicWritePrivateFileSync :: FilePath -> ByteString -> IO ()
+atomicWritePrivateFileSync path bytes = do
+  tmp <- writePrivateTemp path bytes
+  renameFile tmp path `onException` removeQuietly tmp
+  fsyncDir (takeDirectory path)
 
 --------------------------------------------------------------------------------
 -- IO: atomic durable write
@@ -489,10 +551,10 @@ saveWalletSnapshot atRestKey path snap0 = do
 --   * @Right (Just s)@ — a valid snapshot with the master key/chain code
 --                        UNSEALED back to plaintext.
 --   * @Left err@       — file present but corrupt / undecodable / wrong
---                        key. The bad file is moved aside to @path.bad@
---                        (best-effort) and the error logged; the caller
---                        falls back to seed re-derivation and node
---                        startup proceeds. NEVER throws.
+--                        key. The error is logged and the file is LEFT
+--                        WHERE IT IS: the caller fails the load (Core
+--                        LoadWallet), so the user's file is never moved
+--                        aside and replaced by a fresh wallet. NEVER throws.
 loadWalletSnapshot :: ByteString -> FilePath -> IO (Either String (Maybe WalletSnapshot))
 loadWalletSnapshot atRestKey path = do
   exists <- doesFileExist path
@@ -513,9 +575,76 @@ loadWalletSnapshot atRestKey path = do
                                        , wsnMasterChain  = cc }))
   where
     recover reason = do
-      let bad = path <> ".bad"
       hPutStrLn stderr $
-        "[wallet] corrupt wallet file " ++ path ++ " (" ++ reason
-        ++ "); moving to " ++ bad ++ " and continuing with seed recovery"
-      (renameFile path bad) `catch` (\(_ :: IOException) -> pure ())
+        "[wallet] cannot read wallet file " ++ path ++ " (" ++ reason
+        ++ "); leaving it in place, load fails"
       pure (Left reason)
+
+--------------------------------------------------------------------------------
+-- Self-contained backups
+--------------------------------------------------------------------------------
+
+-- | Magic prefix of a 'encodeWalletBackup' file.
+walletBackupMagic :: ByteString
+walletBackupMagic = "HSKWBK01"
+
+-- | Serialise a PLAINTEXT snapshot as a self-contained backup:
+-- @HSKWBK01 ++ varbytes(backupKey) ++ encodeWalletSnapshot(sealed)@, with
+-- the secrets sealed under a fresh random @backupKey@.  Opening it needs
+-- nothing from the source datadir, and it does not reveal the datadir's
+-- @wallet.key@.
+encodeWalletBackup :: WalletSnapshot -> IO (Either String ByteString)
+encodeWalletBackup snap0 = do
+  bk <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  sealedSk <- sealAtRest bk (wsnMasterSecKey snap0)
+  sealedCc <- sealAtRest bk (wsnMasterChain snap0)
+  pure $ do
+    sk' <- sealedSk
+    cc' <- sealedCc
+    let snap = snap0 { wsnMasterSecKey = sk', wsnMasterChain = cc' }
+    pure (walletBackupMagic <> runPut (putVarBytes' bk)
+                            <> encodeWalletSnapshot snap)
+
+-- | Reverse 'encodeWalletBackup'; the result holds PLAINTEXT secrets.
+decodeWalletBackup :: ByteString -> Either String WalletSnapshot
+decodeWalletBackup blob
+  | not (walletBackupMagic `BS.isPrefixOf` blob) = Left "wallet backup: bad magic"
+  | otherwise = do
+      (bk, rest) <- runGet ((,) <$> getVarBytes' <*> (getBytes =<< remainingLen))
+                           (BS.drop (BS.length walletBackupMagic) blob)
+      snap <- decodeWalletSnapshot rest
+      sk <- unsealAtRest bk (wsnMasterSecKey snap)
+      cc <- unsealAtRest bk (wsnMasterChain snap)
+      pure snap { wsnMasterSecKey = sk, wsnMasterChain = cc }
+  where
+    remainingLen = Data.Serialize.remaining
+
+-- | Does the file start with a haskoin wallet or backup magic?  Tells a
+-- file that is not a wallet at all (Core's FAILED_BAD_FORMAT) from a
+-- wallet file that is damaged (Core's FAILED_LOAD, "Wallet corrupted").
+isRecognizedWalletFile :: FilePath -> IO Bool
+isRecognizedWalletFile path = do
+  r <- try (withBinaryFile path ReadMode (\h -> BS.hGet h 8))
+         :: IO (Either SomeException ByteString)
+  pure $ case r of
+    Right pfx -> pfx == walletSnapshotMagic || pfx == walletBackupMagic
+    Left _    -> False
+
+-- | Read a file given to restorewallet.  A self-contained backup opens on
+-- its own; a bare wallet.dat (what backupwallet wrote before backups were
+-- self-contained) opens only under this datadir's at-rest key.  'Left' on
+-- anything that does not open; the file is never moved or modified.
+readWalletBackupFile :: ByteString      -- ^ this datadir's at-rest key
+                     -> FilePath
+                     -> IO (Either String WalletSnapshot)
+readWalletBackupFile atRestKey path = do
+  eBlob <- try (BS.readFile path) :: IO (Either SomeException ByteString)
+  pure $ case eBlob of
+    Left e -> Left ("read error: " ++ show e)
+    Right blob
+      | walletBackupMagic `BS.isPrefixOf` blob -> decodeWalletBackup blob
+      | otherwise -> do
+          snap <- decodeWalletSnapshot blob
+          sk <- unsealAtRest atRestKey (wsnMasterSecKey snap)
+          cc <- unsealAtRest atRestKey (wsnMasterChain snap)
+          pure snap { wsnMasterSecKey = sk, wsnMasterChain = cc }

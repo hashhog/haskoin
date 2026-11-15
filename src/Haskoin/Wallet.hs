@@ -48,6 +48,8 @@ module Haskoin.Wallet
   , newWalletManager
   , createManagedWallet
   , loadManagedWallet
+  , backupManagedWallet
+  , restoreManagedWallet
   , unloadManagedWallet
   , getManagedWallet
   , getDefaultWallet
@@ -314,9 +316,10 @@ import Control.DeepSeq (NFData)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Char (isSpace, isDigit, isHexDigit, digitToInt, ord)
 import Data.Maybe (listToMaybe, mapMaybe, fromMaybe, isJust)
-import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory)
+import System.Directory (createDirectory, createDirectoryIfMissing, doesDirectoryExist,
+                         listDirectory, removeDirectoryRecursive)
 import System.FilePath ((</>), takeDirectory)
-import Control.Exception (SomeException, catch)
+import Control.Exception (SomeException, catch, try)
 
 import Haskoin.Types (Hash256(..), Hash160(..), TxId(..), BlockHash(..), OutPoint(..),
                        TxIn(..), TxOut(..), Tx(..), decodeLegacyTx,
@@ -6950,30 +6953,103 @@ loadManagedWallet wm name = do
         then return $ Left $ "Wallet not found: " <> name
         else do
           -- DURABILITY: load the persisted snapshot from disk and restore
-          -- the live wallet from it (sweep wa0fq5wtk).  A missing file =>
-          -- fresh wallet (newly-created dir before first save, or seed-only
-          -- recovery); a CORRUPT file is moved aside by 'loadWalletSnapshot'
-          -- and we recover to a fresh wallet rather than crashing.
+          -- the live wallet from it (sweep wa0fq5wtk).  Core wallet.cpp
+          -- LoadWallet: a wallet whose database is missing or cannot be
+          -- read FAILS to load.  It is never replaced by a fresh wallet
+          -- under the same name, and the file is left where it is (H11:
+          -- this used to move it to wallet.dat.bad and load a new keychain,
+          -- reporting success).
+          --
+          -- Messages follow Core: a directory with no wallet file, or a
+          -- file that is not a wallet, is MakeDatabase's FAILED_BAD_FORMAT
+          -- (RPC -18); a wallet file that is damaged is LoadExisting's
+          -- DBErrors::CORRUPT -> FAILED_LOAD (RPC -4).
           atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
           loaded    <- WP.loadWalletSnapshot atRestKey datPath
-          wallet <- case loaded of
-            Right (Just snap) ->
-              restoreWalletFromSnapshot (wmNetwork wm) datPath atRestKey snap
-            _ -> do
-              -- No snapshot (or corrupt -> moved aside): start fresh and
-              -- attach persistence so the next mutation lands on disk.
-              let config = WalletConfig (wmNetwork wm) 20 ""
-              (_mnemonic, w) <- createWallet config
-              attachWalletPersistence w datPath atRestKey
-              void (persistWallet w)
-              return w
-          walletState <- createWalletState wallet
-          atomically $ do
-            modifyTVar' (wmWallets wm) (Map.insert name walletState)
-            -- Set as default if first wallet
-            mDefault <- readTVar (wmDefaultName wm)
-            when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
-          return $ Right walletState
+          case loaded of
+            Right Nothing -> return $ Left (walletBadFormatMsg walletPath)
+            Left _ -> do
+              recognized <- WP.isRecognizedWalletFile datPath
+              return $ Left $ if recognized
+                then walletCorruptedMsg
+                else walletBadFormatMsg walletPath
+            Right (Just snap) -> do
+              wallet <- restoreWalletFromSnapshot (wmNetwork wm) datPath atRestKey snap
+              walletState <- createWalletState wallet
+              atomically $ do
+                modifyTVar' (wmWallets wm) (Map.insert name walletState)
+                -- Set as default if first wallet
+                mDefault <- readTVar (wmDefaultName wm)
+                when (mDefault == Nothing) $ writeTVar (wmDefaultName wm) (Just name)
+              return $ Right walletState
+
+-- | Core walletdb.cpp MakeDatabase, FAILED_BAD_FORMAT (RPC -18).
+walletBadFormatMsg :: FilePath -> Text
+walletBadFormatMsg walletPath =
+  "Wallet file verification failed. Failed to load database path '"
+  <> T.pack walletPath <> "'. Data is not in recognized format."
+
+-- | Core wallet.cpp LoadWalletInternal + DBErrors::CORRUPT, FAILED_LOAD (RPC -4).
+walletCorruptedMsg :: Text
+walletCorruptedMsg = "Wallet loading failed. Error loading wallet.dat: Wallet corrupted"
+
+-- | Write a self-contained backup of a live wallet to @dest@ (backupwallet).
+-- Core wallet/walletdb.cpp BackupWallet: the backup opens on its own.  The
+-- secrets are re-sealed under a key carried in the file
+-- ('WP.encodeWalletBackup'); a bare copy of wallet.dat would need this
+-- datadir's wallet.key, which is not in the backup.
+backupManagedWallet :: Wallet -> FilePath -> IO (Either String ())
+backupManagedWallet wallet dest = do
+  snap <- snapshotWallet wallet
+  enc  <- WP.encodeWalletBackup snap
+  case enc of
+    Left e -> pure (Left e)
+    Right blob ->
+      -- Mode 0600: the backup carries its own key, so it is enough to spend.
+      (Right <$> WP.atomicWritePrivateFileSync dest blob)
+        `catch` (\(e :: SomeException) -> pure (Left (show e)))
+
+-- | Restore a backup file into a new wallet @name@ and load it
+-- (restorewallet).  The caller has checked that the name is free and the
+-- file exists.  Core wallet.cpp RestoreWallet: if the backup does not
+-- load, the error is returned and the wallet directory it created is
+-- removed.  A backup is re-sealed under this datadir's wallet.key.
+--
+-- The wallet directory is created with a non-recursive mkdir, which
+-- fails if it already exists, so a concurrent create of the same name is
+-- never overwritten, and the cleanup only ever removes a directory this
+-- call made.
+restoreManagedWallet :: WalletManager -> Text -> FilePath -> IO (Either Text WalletState)
+restoreManagedWallet wm name backupPath = do
+  let walletPath = wmWalletDir wm </> T.unpack name
+      datPath    = walletPath </> "wallet.dat"
+  atRestKey <- WP.loadOrCreateAtRestKey (wmWalletDir wm </> "wallet.key")
+  decoded   <- WP.readWalletBackupFile atRestKey backupPath
+  case decoded of
+    Left _ -> do
+      recognized <- WP.isRecognizedWalletFile backupPath
+      return $ Left $ if recognized
+        then walletCorruptedMsg
+        else walletBadFormatMsg walletPath
+    Right snap -> do
+      made <- try (createDirectory walletPath) :: IO (Either SomeException ())
+      case made of
+        Left _ -> return $ Left $
+          "Failed to restore database path '" <> T.pack walletPath <> "'."
+        Right () -> do
+          result <- (do
+              saved <- WP.saveWalletSnapshot atRestKey datPath snap
+              case saved of
+                Left e  -> return (Left ("Wallet restore failed: " <> T.pack e))
+                Right () -> loadManagedWallet wm name)
+            `catch` (\(e :: SomeException) ->
+                       return (Left ("Wallet restore failed: " <> T.pack (show e))))
+          case result of
+            Right ws -> return (Right ws)
+            Left err -> do
+              removeDirectoryRecursive walletPath
+                `catch` (\(_ :: SomeException) -> pure ())
+              return (Left err)
 
 -- | Unload a wallet.
 -- Removes the wallet from the manager but does not delete wallet files.

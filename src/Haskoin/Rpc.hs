@@ -366,7 +366,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Data.Time.Clock (NominalDiffTime)
 import qualified Data.Time.Clock as TimeClock
 import qualified Crypto.Random as CryptoRandom
-import System.Directory (doesFileExist, removeFile, createDirectoryIfMissing, doesDirectoryExist, listDirectory, getFileSize, copyFile)
+import System.Directory (doesFileExist, removeFile, doesDirectoryExist, listDirectory, getFileSize)
 import System.FilePath ((</>), isRelative, takeDirectory)
 import System.Posix.Files (setFileMode)
 import System.Posix.Signals (raiseSignal, sigTERM)
@@ -562,6 +562,7 @@ import Haskoin.Wallet (Descriptor(..), KeyExpr(..), TapTree(..), ParseError(..),
                         -- SAME PSBT Signer engine the wallet path uses.
                         ExtendedKey(..), derivePubKeyFromPrivate,
                         newWalletManager, createManagedWallet, loadManagedWallet,
+                        backupManagedWallet, restoreManagedWallet,
                         unloadManagedWallet, getManagedWallet, getDefaultWallet,
                         listManagedWallets, getWalletInfo, getBalance,
                         getSpendableBalance, scanBlockForWallet, resignViaPsbt,
@@ -9176,8 +9177,10 @@ handleWalletProcessPsbt server params = withWalletMgr server $ \wm -> do
 
 -- | backupwallet "destination"
 -- Reference: bitcoin-core/src/wallet/rpc/backup.cpp backupwallet.
--- Copies wallet.dat to a file or into a directory. A destination whose
--- parent does not exist is RPC_WALLET_ERROR (-4). Success is JSON null.
+-- Writes a self-contained backup (secrets re-sealed under a key carried in
+-- the file, not this datadir's wallet.key) to a file or into a directory.
+-- A destination whose parent does not exist is RPC_WALLET_ERROR (-4).
+-- Success is JSON null.
 handleBackupWallet :: RpcServer -> Value -> IO RpcResponse
 handleBackupWallet server params = withWalletMgr server $ \wm ->
   case extractParamText params 0 of
@@ -9209,8 +9212,8 @@ handleBackupWallet server params = withWalletMgr server $ \wm ->
                 else do
                   let target | destIsDir = dest </> "wallet.dat"
                              | otherwise = dest
-                  copied <- try (copyFile src target) :: IO (Either SomeException ())
-                  case copied of
+                  written <- backupManagedWallet (wsWallet ws) target
+                  case written of
                     Left _ -> return $ rpcFail rpcWalletError "Error: Wallet backup failed!"
                     Right () -> return $ RpcResponse Null Null Null
 
@@ -9287,7 +9290,10 @@ handleCreateWallet server params = withWalletMgr server $ \wm ->
 -- | restorewallet "wallet_name" "backup_file" ( load_on_startup )
 --
 -- Reference: bitcoin-core/src/wallet/rpc/backup.cpp restorewallet.
--- Copies a backupwallet file into a new wallet directory and loads it.
+-- Re-seals a backupwallet file under this datadir's wallet.key into a new
+-- wallet directory and loads it. A file that is not a wallet is
+-- RPC_WALLET_NOT_FOUND (-18), a damaged one RPC_WALLET_ERROR (-4); either
+-- leaves no wallet directory behind.
 -- A missing backup is RPC_INVALID_PARAMETER (-8), checked BEFORE the
 -- name-exists test, which is RPC_WALLET_ALREADY_EXISTS (-36) — the only
 -- create path that still returns -36 (CreateWallet maps that status to -4).
@@ -9318,19 +9324,20 @@ handleRestoreWallet server params = withWalletMgr server $ \wm ->
               if not srcOk
                 then return $ rpcFail rpcInvalidParameter "Backup file does not exist"
                 else do
-                  createDirectoryIfMissing True walletPath
-                  let datPath = walletPath </> "wallet.dat"
-                  copied <- try (copyFile src datPath) :: IO (Either SomeException ())
-                  case copied of
-                    Left _ -> return $ rpcFail rpcWalletError "Wallet restore failed"
-                    Right () -> do
-                      result <- loadManagedWallet wm walletName
-                      case result of
-                        Left err -> return $ rpcFail rpcWalletError err
-                        Right _ -> return $ RpcResponse
-                          (object [ "name"    .= walletName
-                                  , "warning" .= ("" :: Text)
-                                  ]) Null Null
+                  result <- restoreManagedWallet wm walletName src
+                  -- Core HandleWalletError: FAILED_BAD_FORMAT -> -18,
+                  -- FAILED_ALREADY_EXISTS -> -36, FAILED_LOAD and the
+                  -- rest -> -4.
+                  let code err
+                        | "not in recognized format" `T.isInfixOf` err = rpcWalletNotFound
+                        | "Failed to restore database path" `T.isInfixOf` err = rpcWalletAlreadyExists
+                        | otherwise = rpcWalletError
+                  case result of
+                    Left err -> return $ rpcFail (code err) err
+                    Right _ -> return $ RpcResponse
+                      (object [ "name"    .= walletName
+                              , "warning" .= ("" :: Text)
+                              ]) Null Null
 
 -- | Load an existing wallet by name.
 -- Reference: bitcoin-core/src/wallet/rpc/wallet.cpp loadwallet
@@ -9353,7 +9360,11 @@ handleLoadWallet server params = withWalletMgr server $ \wm ->
         Left err ->
           -- Disambiguate "already loaded" vs "not found" by string match;
           -- 'loadManagedWallet' returns these two cases as 'Left _'.
+          -- A damaged wallet file is Core's DatabaseStatus::FAILED_LOAD,
+          -- which HandleWalletError maps to its default RPC_WALLET_ERROR
+          -- (-4). A file that is not a wallet (FAILED_BAD_FORMAT) is -18.
           let code | "already loaded" `T.isInfixOf` err = rpcWalletAlreadyLoaded
+                   | "Wallet corrupted" `T.isInfixOf` err = rpcWalletError
                    | otherwise                          = rpcWalletNotFound
           in return $ RpcResponse Null (toJSON $ RpcError code err) Null
         Right _ws ->

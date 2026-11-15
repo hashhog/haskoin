@@ -197,7 +197,7 @@ spec = describe "W166 durable wallet persistence (sweep wa0fq5wtk)" $ do
   ------------------------------------------------------------------------
   describe "G3 fault-tolerant load (must NOT crash startup)" $ do
 
-    it "G3.1: a truncated/partial wallet file does not crash; recovers + .bak" $
+    it "G3.1: a truncated/partial wallet file does not crash; left in place" $
       withTmpDir "g3a" $ \dir -> do
         let datPath = dir </> "wallet.dat"
         atRestKey <- loadOrCreateAtRestKey (dir </> "wallet.key")
@@ -208,17 +208,20 @@ spec = describe "W166 durable wallet persistence (sweep wa0fq5wtk)" $ do
         attachWalletPersistence w datPath atRestKey
         Right _ <- persistWallet w
         full <- BS.readFile datPath
-        BS.writeFile datPath (BS.take (BS.length full `div` 2) full)
+        let torn = BS.take (BS.length full `div` 2) full
+        BS.writeFile datPath torn
 
-        -- The load MUST NOT throw; it returns Left and moves the bad file.
+        -- The load MUST NOT throw; it returns Left and leaves the file
+        -- where it is (H11: moving it aside let the manager load a fresh
+        -- wallet in its place; Core LoadWallet fails instead).
         r <- try (loadWalletSnapshot atRestKey datPath)
                :: IO (Either SomeException (Either String (Maybe WalletSnapshot)))
         case r of
           Left e  -> expectationFailure $ "loader threw: " ++ show e
           Right (Left _)  -> pure ()   -- expected: graceful failure
           Right (Right _) -> expectationFailure "expected Left on corrupt file"
-        bakExists <- doesFileExist (datPath ++ ".bad")
-        bakExists `shouldBe` True
+        doesFileExist (datPath ++ ".bad") `shouldReturn` False
+        BS.readFile datPath `shouldReturn` torn
 
     it "G3.2: garbage bytes (bad magic) are rejected gracefully, not parsed" $
       withTmpDir "g3b" $ \dir -> do
