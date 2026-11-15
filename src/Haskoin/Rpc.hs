@@ -537,7 +537,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          -- "sequence contradicts replaceable" check.
                          signalsOptInRBF,
                          -- Package relay (BIP-331) — submitpackage RPC
-                         TxPackage(..), maxPackageCount, acceptPackage,
+                         TxPackage(..), PackageError(..), maxPackageCount, acceptPackage,
                          isWellFormedPackage, isChildWithParents,
                          isChildWithParentsTree,
                          mempoolChunkInfo, mempoolParents, mempoolChildren)
@@ -10285,9 +10285,9 @@ handleTestMempoolAccept server params
 -- Reference: Bitcoin Core's @submitpackage@ RPC (@src/rpc/mempool.cpp@,
 -- @ProcessNewPackage@). The package is parsed, validated as a child-with-
 -- parents bundle (last entry must be the child, prior entries are direct
--- parents), and submitted atomically to the mempool. On failure the mempool
--- is unchanged (best-effort: any tx that managed to land before the failure
--- is rolled back).
+-- parents), and submitted the way Core's AcceptPackage does it: each tx alone
+-- first, the fee-dependent remainder as a package (see 'submitPackageTxns').
+-- A tx that is admitted alone stays admitted when a later tx fails.
 --
 -- Parameters:
 --
@@ -10341,22 +10341,44 @@ handleSubmitPackage server params =
               (toJSON $ RpcError rpcDeserializationError (T.pack err)) Null
             Right txns -> submitPackageTxns server txns maxFeeRateSatPerVB
 
--- | Run package validation + atomic admission and build the JSON result.
+-- | One per-tx result of @submitpackage@, Core's
+-- @MempoolAcceptResult::ResultType@ as rendered by rpc/mempool.cpp.
+data SubmitPkgResult
+  = SprValid !MempoolEntry !Int64 ![TxId]
+    -- ^ VALID: admitted by this call; effective feerate (sat/kvB) and
+    --   effective-includes (the wtxids whose fees it was judged with)
+  | SprInPool !MempoolEntry
+    -- ^ MEMPOOL_ENTRY: the exact tx was already in the pool
+  | SprOtherWtxid !TxId
+    -- ^ DIFFERENT_WITNESS: same txid, other witness already in the pool
+  | SprInvalid !Text
+    -- ^ INVALID: Core's TxValidationState::ToString()
+
+-- | Run Core's package acceptance and build the submitpackage result.
 --
--- The single-tx case is folded into the same code path so callers can submit
--- a self-contained tx with no unconfirmed parents, matching Bitcoin Core.
+-- Core validation.cpp MemPoolAccept::AcceptPackage tries every tx that is not
+-- already in the pool ON ITS OWN first, in package order.  A tx that passes
+-- alone is admitted and stays admitted whatever happens to the rest.  A tx
+-- that fails alone for a reason other than its feerate (TX_RECONSIDERABLE) or
+-- missing inputs (TX_MISSING_INPUTS) ends package evaluation ("quit early",
+-- package_msg "transaction failed"), but the remaining txs are still tried
+-- alone.  Only the txs left over (fee-rejected parents and the child that
+-- needs them) are evaluated together, as one subpackage.  Each tx then gets
+-- its own result: the package result if it was evaluated as a package, its
+-- admitted / in-pool result, or else its own individual failure.
+-- rpc/mempool.cpp submitpackage renders package_msg from the package state
+-- (PCKG_TX "transaction failed", PCKG_POLICY e.g. "too-large-cluster") and
+-- each failure as m_state.ToString().
+--
+-- haskoin used to evaluate the whole package atomically, roll every tx back
+-- on any failure, and print the Haskell @show@ of the one package error into
+-- every tx's "error".
 submitPackageTxns :: RpcServer -> [Tx] -> Double -> IO RpcResponse
 submitPackageTxns server txns maxFeeRateSatPerVB = do
   let mp           = rsMempool server
-      pkgWtxids    = map computeWtxId txns
-
-      -- Build the per-wtxid skeleton.
-      skel         = [ (wtxid, computeTxId tx) | (tx, wtxid) <- zip txns pkgWtxids ]
-
-      -- "package-not-validated" sentinel for txs that never get individually
-      -- inspected when a top-level (package-wide) error short-circuits.
-      packageNotValidated :: Value
-      packageNotValidated = String "package-not-validated"
+      floorKvb     = getFeeRate (mpcMinFeeRate (mpConfig mp))
+      isSingle     = length txns == 1
+      skel         = [ (computeWtxId tx, computeTxId tx) | tx <- txns ]
 
       -- Build a tx-results JSON object keyed by wtxid hex (Core wire format).
       -- Core: tx_result_map (UniValue::VOBJ), keyed by wtxid_hex
@@ -10381,121 +10403,190 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
           ])
         Null Null
 
+      -- TxValidationState::ToString() for a haskoin rejection.  Core's
+      -- submitpackage does NOT apply testmempoolaccept's TX_MISSING_INPUTS ->
+      -- "missing-inputs" remap, so a missing input is the raw state reason.
+      stateText :: MempoolError -> Text
+      stateText (ErrMissingInput _) = "bad-txns-inputs-missingorspent"
+      stateText err                 = mempoolRejectToken floorKvb err
+
+      -- Core AcceptPackage retries a tx as part of the package only when it
+      -- failed alone with TX_RECONSIDERABLE (the feerate floors, RBF fee
+      -- rules, "mempool full") or TX_MISSING_INPUTS.
+      reconsiderable :: MempoolError -> Bool
+      reconsiderable err = case err of
+        ErrFeeBelowMinimum _ _            -> True
+        ErrRBFFeeTooLow _ _               -> True
+        ErrRBFInsufficientAbsoluteFee _ _ -> True
+        ErrRBFInsufficientFeeRate _ _     -> True
+        ErrRBFInsufficientRelayFee _ _    -> True
+        ErrMempoolFull                    -> True
+        ErrMissingInput _                 -> True
+        _                                 -> False
+
+      -- -maxfeerate (sat/vB; 0 disables, as Core's client_maxfeerate nullopt).
+      exceedsCap :: Int64 -> Int -> Bool
+      exceedsCap fee vsize =
+        maxFeeRateSatPerVB > 0 && vsize > 0
+          && fromIntegral fee / fromIntegral vsize > maxFeeRateSatPerVB
+
+      -- CFeeRate(fee, vsize).GetFeePerK(): integer sat/kvB.
+      feePerK :: Int64 -> Int -> Int64
+      feePerK fee vsize = (fee * 1000) `div` fromIntegral (max 1 vsize)
+
+      entryFee :: MempoolEntry -> Int64
+      entryFee = fromIntegral . meFee
+
+      removeIfPresent :: Tx -> IO ()
+      removeIfPresent tx = do
+        let txid = computeTxId tx
+        me <- getTransaction mp txid
+        when (isJust me) $ removeTransaction mp txid
+
+      -- One step of AcceptPackage's first loop.  State: (results_final,
+      -- individual_results_nonfinal, txns_package_eval, quit_early).
+      step (finals, nonfinal, evalTxs, quit) tx = do
+        let txid  = computeTxId tx
+            wtxid = computeWtxId tx
+        mExisting <- getTransaction mp txid
+        case mExisting of
+          Just e
+            | computeWtxId (meTransaction e) == wtxid ->
+                return (Map.insert wtxid (SprInPool e) finals, nonfinal, evalTxs, quit)
+            | otherwise ->
+                return ( Map.insert wtxid (SprOtherWtxid (computeWtxId (meTransaction e))) finals
+                       , nonfinal, evalTxs, quit )
+          Nothing -> do
+            r <- addTransaction mp tx
+            case r of
+              Right _ -> do
+                mEntry <- getTransaction mp txid
+                case mEntry of
+                  Just e
+                    | exceedsCap (entryFee e) (meSize e) -> do
+                        -- Core checks client_maxfeerate inside validation
+                        -- ("max feerate exceeded", TX_MEMPOOL_POLICY), so the
+                        -- tx is never admitted and evaluation quits early.
+                        removeTransaction mp txid
+                        return (finals, Map.insert wtxid "max feerate exceeded" nonfinal, evalTxs, True)
+                    | otherwise ->
+                        return ( Map.insert wtxid (SprValid e (feePerK (entryFee e) (meSize e)) [wtxid]) finals
+                               , nonfinal, evalTxs, quit )
+                  Nothing ->
+                    return (finals, Map.insert wtxid "mempool full" nonfinal, evalTxs, True)
+              Left err
+                | isSingle || not (reconsiderable err) ->
+                    return (finals, Map.insert wtxid (stateText err) nonfinal, evalTxs, True)
+                | otherwise ->
+                    return (finals, Map.insert wtxid (stateText err) nonfinal, evalTxs ++ [tx], quit)
+
+      -- AcceptSubPackage(txns_package_eval): (package-state reason if it
+      -- failed, per-tx results of the subpackage evaluation).
+      evalPackage :: [Tx] -> IO (Maybe Text, Map TxId SubmitPkgResult)
+      evalPackage evalTxs = do
+        res <- acceptPackage (TxPackage (init txns) (last txns)) mp
+        case res of
+          Right _ -> do
+            got <- forM evalTxs $ \tx -> (,) tx <$> getTransaction mp (computeTxId tx)
+            let admitted = [ (tx, e) | (tx, Just e) <- got ]
+                totFee   = sum (map (entryFee . snd) admitted)
+                totSize  = sum (map (meSize . snd) admitted)
+                rate     = feePerK totFee totSize
+                includes = map computeWtxId evalTxs
+                over     = [ tx | (tx, e) <- admitted, exceedsCap (entryFee e) (meSize e) ]
+            if length admitted /= length evalTxs
+              then do
+                mapM_ removeIfPresent evalTxs
+                return (Just "transaction failed", Map.empty)
+              else if not (null over)
+                then do
+                  -- Core: package feerate above client_maxfeerate ->
+                  -- PCKG_TX "transaction failed", "max feerate exceeded".
+                  mapM_ removeIfPresent evalTxs
+                  return ( Just "transaction failed"
+                         , Map.fromList [ (computeWtxId tx, SprInvalid "max feerate exceeded") | tx <- over ] )
+                else
+                  return ( Nothing
+                         , Map.fromList [ (computeWtxId tx, SprValid e rate includes) | (tx, e) <- admitted ] )
+          Left perr -> do
+            -- acceptPackage is meant to be atomic; remove anything of the
+            -- subpackage that landed anyway.  Txs admitted alone above stay.
+            mapM_ removeIfPresent evalTxs
+            return $ case perr of
+              -- Core AcceptMultipleTransactions: PCKG_POLICY with no per-tx
+              -- results, so each tx keeps its individual failure.
+              PkgTxError _ (ErrClusterLimitExceeded _ _) ->
+                (Just "too-large-cluster", Map.empty)
+              PkgTxError badTxid err ->
+                ( Just "transaction failed"
+                , Map.fromList [ (computeWtxId tx, SprInvalid (stateText err))
+                               | tx <- evalTxs, computeTxId tx == badTxid ] )
+              -- Core CheckFeeRate on the package feerate: PCKG_TX, result on
+              -- the last tx of the subpackage.
+              PkgInsufficientFee _ _ ->
+                ( Just "transaction failed"
+                , Map.singleton (computeWtxId (last evalTxs)) (SprInvalid "min relay fee not met") )
+              _ -> (Just "transaction failed", Map.empty)
+
   case txns of
     [] -> return $ RpcResponse Null
             (toJSON $ RpcError rpcInvalidParams "Empty package") Null
 
-    [singleTx] -> do
-      -- Single-tx package: just run normal addTransaction, then maxfeerate
-      -- check (mirrors sendrawtransaction). No package-topology check.
-      let txid = computeTxId singleTx
-      mExisting <- getTransaction mp txid
-      case mExisting of
-        Just existing ->
-          -- Already in mempool: report wtxid match, no error.
-          return $ buildSuccessResponse [(singleTx, txid, computeWtxId singleTx, Just existing)]
-        Nothing -> do
-          result <- addTransaction mp singleTx
-          case result of
-            Left err -> do
-              let reason = String (T.pack (show err))
-              return $ buildAbortResponse "transaction failed" reason
-            Right _txid -> do
-              mEntry <- getTransaction mp txid
-              case mEntry of
-                Nothing ->
-                  -- Shouldn't happen — fallback to bare success.
-                  return $ buildSuccessResponse [(singleTx, txid, computeWtxId singleTx, Nothing)]
-                Just entry -> do
-                  let vsize       = meSize entry
-                      fee         = meFee entry
-                      actualSatPerVB = if vsize > 0
-                                       then fromIntegral fee / fromIntegral vsize
-                                       else 0 :: Double
-                  if maxFeeRateSatPerVB > 0 && actualSatPerVB > maxFeeRateSatPerVB
-                    then do
-                      removeTransaction mp txid
-                      return $ buildAbortResponse "max-fee-exceeded"
-                        (String (T.pack ("Fee exceeds maximum (" ++ show actualSatPerVB
-                                          ++ " > " ++ show maxFeeRateSatPerVB ++ " sat/vB)")))
-                    else
-                      return $ buildSuccessResponse
-                        [(singleTx, txid, computeWtxId singleTx, Just entry)]
-
-    multi -> do
-      -- Multi-tx package: must be child-with-parents (last = child).
-      case isWellFormedPackage multi of
-        Left perr ->
+    _ | not isSingle, Left perr <- isWellFormedPackage txns ->
           return $ buildAbortResponse "package topology disallowed"
                                       (String (T.pack (show perr)))
-        Right () ->
-          if not (isChildWithParentsTree multi)
-            then return $ buildAbortResponse
-                            "package topology disallowed"
-                            (String "package topology disallowed. not child-with-parents or parents depend on each other.")
-            else do
-              -- Drive the existing acceptPackage engine (parents init, child last).
-              let parents = init multi
-                  child   = last multi
-                  pkg     = TxPackage parents child
-              acceptResult <- acceptPackage pkg mp
-              case acceptResult of
-                Left perr -> do
-                  -- Roll back any tx that may have landed already (defensive:
-                  -- acceptPackage is meant to be atomic, but if it added some
-                  -- parents then failed on the child we want a clean state).
-                  forM_ multi $ \tx -> do
-                    let txid = computeTxId tx
-                    mEntry <- getTransaction mp txid
-                    case mEntry of
-                      Just _  -> removeTransaction mp txid
-                      Nothing -> return ()
-                  return $ buildAbortResponse "package validation failed"
-                                              (String (T.pack (show perr)))
-                Right _txids -> do
-                  -- Per-tx maxfeerate check on each accepted tx.
-                  entries <- forM multi $ \tx -> do
-                    let txid = computeTxId tx
-                    me <- getTransaction mp txid
-                    return (tx, txid, computeWtxId tx, me)
-                  let exceedsCap (_, _, _, Nothing) = False
-                      exceedsCap (_, _, _, Just e) =
-                        let v   = meSize e
-                            f   = meFee e
-                            satPerVB = if v > 0
-                                        then fromIntegral f / fromIntegral v
-                                        else 0 :: Double
-                        in maxFeeRateSatPerVB > 0 && satPerVB > maxFeeRateSatPerVB
-                  if any exceedsCap entries
-                    then do
-                      forM_ entries $ \(_, txid, _, _) -> removeTransaction mp txid
-                      return $ buildAbortResponse "max-fee-exceeded"
-                        (String "One or more package txs exceed maxfeerate")
-                    else
-                      return $ buildSuccessResponse entries
+      | not isSingle, not (isChildWithParentsTree txns) ->
+          return $ buildAbortResponse
+                     "package topology disallowed"
+                     (String "package topology disallowed. not child-with-parents or parents depend on each other.")
+      | otherwise -> do
+          (finals, nonfinal, evalTxs, quit) <- foldM step (Map.empty, Map.empty, [], False) txns
+          (pkgState, evalResults) <-
+            if quit || null evalTxs
+              then return (if quit then Just "transaction failed" else Nothing, Map.empty)
+              else case evalTxs of
+                -- A one-tx subpackage is the same single-tx check it just
+                -- failed (AcceptSubPackage wraps it as PCKG_TX).
+                [_] -> return (Just "transaction failed", Map.empty)
+                _ | computeTxId (last evalTxs) /= computeTxId (last txns) ->
+                      return (Just "transaction failed", Map.empty)
+                  | otherwise -> evalPackage evalTxs
+          let resultFor tx =
+                let w = computeWtxId tx
+                in case Map.lookup w evalResults of
+                     Just r  -> Just r
+                     Nothing -> case Map.lookup w finals of
+                       Just r  -> Just r
+                       Nothing -> SprInvalid <$> Map.lookup w nonfinal
+          return $ buildResponse (fromMaybe "success" pkgState)
+                                 [ (tx, resultFor tx) | tx <- txns ]
   where
-    -- Build the success response from a list of (tx, txid, wtxid, maybe entry).
+    hexId :: TxId -> Text
+    hexId = showHash . BlockHash . getTxIdHash
+
     -- tx-results is a JSON object keyed by wtxid hex (Core wire format).
-    -- Reference: bitcoin-core/src/rpc/mempool.cpp:1459-1507
-    buildSuccessResponse :: [(Tx, TxId, TxId, Maybe MempoolEntry)] -> RpcResponse
-    buildSuccessResponse entries =
-      -- Build tx-results as a JSON object keyed by wtxid hex.
-      -- Each value is an object with txid, vsize?, fees? fields.
-      let perTxSeries =
-            foldl' (<>) mempty
-              [ pair (Key.fromText (showHash (BlockHash (getTxIdHash wtxid))))
-                     (pairs $
-                        pair "txid" (text (showHash (BlockHash (getTxIdHash txid)))) <>
-                        case mEntry of
-                          Nothing -> mempty
-                          Just e  ->
-                            pair "vsize" (AE.int (meSize e)) <>
-                            pair "fees"  (pairs (pair "base" (btcAmountEnc (fromIntegral (meFee e))))))
-              | (_tx, txid, wtxid, mEntry) <- entries
-              ]
+    -- Reference: bitcoin-core/src/rpc/mempool.cpp:1457-1511
+    buildResponse :: Text -> [(Tx, Maybe SubmitPkgResult)] -> RpcResponse
+    buildResponse pkgMsg rows =
+      let perTx (tx, mr) =
+            pair (Key.fromText (hexId (computeWtxId tx))) $ pairs $
+              pair "txid" (text (hexId (computeTxId tx))) <>
+              case mr of
+                Nothing -> pair "error" (text "package-not-validated")
+                Just (SprInvalid msg) -> pair "error" (text msg)
+                Just (SprOtherWtxid w) -> pair "other-wtxid" (text (hexId w))
+                Just (SprInPool e) ->
+                  pair "vsize" (AE.int (meSize e)) <>
+                  pair "fees" (pairs (pair "base" (btcAmountEnc (fromIntegral (meFee e)))))
+                Just (SprValid e rate includes) ->
+                  pair "vsize" (AE.int (meSize e)) <>
+                  pair "fees" (pairs (
+                    pair "base" (btcAmountEnc (fromIntegral (meFee e))) <>
+                    pair "effective-feerate" (btcAmountEnc rate) <>
+                    pair "effective-includes" (AE.list (text . hexId) includes)))
           enc = pairs $
-                  pair "package_msg"           (text "success")               <>
-                  pair "tx-results"            (pairs perTxSeries)            <>
+                  pair "package_msg"           (text pkgMsg)                         <>
+                  pair "tx-results"            (pairs (foldl' (<>) mempty (map perTx rows))) <>
                   pair "replaced-transactions" (AE.list text [])
       in RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
