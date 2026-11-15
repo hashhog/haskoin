@@ -6821,6 +6821,13 @@ data WalletManager = WalletManager
       -- ^ Network (mainnet/testnet/regtest)
   , wmDefaultName :: !(TVar (Maybe Text))
       -- ^ Default wallet name (first loaded, or explicitly set)
+  , wmRequestWallet :: !(Maybe Text)
+      -- ^ Wallet named by the current RPC request's @/wallet/<name>@ URI,
+      -- or 'Nothing' when the request came in on @/@.  Always 'Nothing'
+      -- on the shared manager; the RPC server sets it on a per-request
+      -- copy (the TVars above stay shared), so concurrent requests on
+      -- different URIs never see each other's selection.
+      -- Reference: Core wallet/rpc/util.cpp GetWalletNameFromJSONRPCRequest.
   }
 
 -- | Information about a wallet for getwalletinfo RPC.
@@ -6870,6 +6877,7 @@ newWalletManager walletDir net = do
     , wmWalletDir   = walletDir
     , wmNetwork     = net
     , wmDefaultName = defaultNameVar
+    , wmRequestWallet = Nothing
     }
 
 -- | Create a new managed wallet.

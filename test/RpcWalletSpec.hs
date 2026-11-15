@@ -58,7 +58,7 @@ import Haskoin.Network
 import Haskoin.TxOrphanage (emptyOrphanPool)
 import Haskoin.Payjoin (defaultPayjoinConfig, PayjoinConfig(..))
 import Haskoin.Wallet
-  ( WalletManager, WalletState(..), newWalletManager, createManagedWallet
+  ( WalletManager(..), WalletState(..), newWalletManager, createManagedWallet
   , getDefaultWallet
   , getNewAddress, getChangeAddress, AddressType(..), addressToTextW
   , recordSentTx )
@@ -391,6 +391,144 @@ spec = describe "encrypted wallet: key-exporting and signing RPCs require unlock
       e1 `shouldBe` A.Null
       txid1 `shouldNotBe` A.Null
       forM_ [txid0, txid1] $ \t -> t `shouldNotBe` A.Null
+
+  -- secfix-haskoin-wallet-uri-routing (H9).  Core wallet/rpc/util.cpp
+  -- GetWalletForJSONRPCRequest: a request on /wallet/<name> acts on that
+  -- wallet (-18 if it is not loaded); with no URI and several wallets
+  -- loaded the call is refused with RPC_WALLET_NOT_SPECIFIED (-19).
+  -- TEETH: on the base commit rpcApp never read the path, so every wallet
+  -- RPC acted on the first-loaded wallet ("w1") whatever URI it came in on,
+  -- and encryptwallet on /wallet/enc encrypted w1.
+  it "wallet_uri_selects_wallet" $ withWalletServer $ \server0 wm -> do
+    let server = server0 { rsCookiePassword = "pw" }
+    Right w1 <- createManagedWallet wm "w1" False False
+    Right ws <- createManagedWallet wm "enc" False False
+    addrW1  <- getNewAddress AddrP2WPKH (wsWallet w1)
+    addrEnc <- getNewAddress AddrP2WPKH (wsWallet ws)
+    let walletName v = case v of
+          A.Object o -> KM.lookup "walletname" o
+          _ -> Nothing
+    -- The URI picks the wallet.
+    (r1, e1) <- callAt server "/wallet/enc" "getwalletinfo" []
+    (walletName r1, e1) `shouldBe` (Just (str "enc"), A.Null)
+    (r2, e2) <- callAt server "/wallet/w1" "getwalletinfo" []
+    (walletName r2, e2) `shouldBe` (Just (str "w1"), A.Null)
+    -- No URI with two wallets loaded: refused, not answered by w1.
+    (r3, e3) <- callAt server "/" "getwalletinfo" []
+    (errCode e3, errMsg e3) `shouldBe`
+      ( Just (-19)
+      , Just "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path." )
+    r3 `shouldBe` A.Null
+    (_, e3b) <- callAt server "/" "getbalance" []
+    errCode e3b `shouldBe` Just (-19)
+    -- Handlers that also report or back up by name use the resolved wallet:
+    -- listdescriptors names it, backupwallet backs up its keys (w1 is the
+    -- default wallet, so the base code backed up w1 for /wallet/enc).
+    (rd, ed) <- callAt server "/wallet/enc" "listdescriptors" []
+    ed `shouldBe` A.Null
+    (case rd of
+       A.Object o -> KM.lookup "wallet_name" o
+       _ -> Nothing) `shouldBe` Just (str "enc")
+    let backup = wmWalletDir wm </> "backup-enc.dat"
+    (_, eb) <- callAt server "/wallet/enc" "backupwallet" [str (T.pack backup)]
+    eb `shouldBe` A.Null
+    -- The backup is sealed (backupManagedWallet), so its bytes match neither
+    -- wallet.dat.  Restore it and ask which wallet's keys it holds: enc's
+    -- address must export from the restored wallet and w1's must not.
+    (_, er) <- callAt server "/" "restorewallet" [str "restored-enc", str (T.pack backup)]
+    er `shouldBe` A.Null
+    (rk1, ek1) <- callAt server "/wallet/restored-enc" "dumpprivkey" [str (addrText addrEnc)]
+    (rk1 /= A.Null, ek1) `shouldBe` (True, A.Null)
+    (_, ek2) <- callAt server "/wallet/restored-enc" "dumpprivkey" [str (addrText addrW1)]
+    (errCode ek2, errMsg ek2) `shouldBe` (Just (-5), Just "Private key for address is not known")
+    (_, eu) <- callAt server "/wallet/restored-enc" "unloadwallet" []
+    eu `shouldBe` A.Null
+    -- A URI naming a wallet that is not loaded.
+    (_, e4) <- callAt server "/wallet/nope" "getwalletinfo" []
+    (errCode e4, errMsg e4) `shouldBe`
+      (Just (-18), Just "Requested wallet does not exist or is not loaded")
+    -- A wallet name that is not valid UTF-8 is just a wallet that is not
+    -- loaded (the path is bytes; decoding it must not throw).
+    (_, e4b) <- callAt server (BS.pack [0x2f, 0x77, 0x61, 0x6c, 0x6c, 0x65, 0x74, 0x2f, 0xff]) "getwalletinfo" []
+    errCode e4b `shouldBe` Just (-18)
+    -- A state change lands on the named wallet only.
+    (_, e5) <- callAt server "/wallet/enc" "encryptwallet" [str "correct horse"]
+    e5 `shouldBe` A.Null
+    (_, e6) <- callAt server "/wallet/enc" "walletlock" []
+    e6 `shouldBe` A.Null
+    callAt server "/wallet/enc" "dumpprivkey" [str (addrText addrEnc)] >>= shouldNeedUnlock
+    -- w1 was not encrypted: its key still exports.
+    (r8, e8) <- callAt server "/wallet/w1" "dumpprivkey" [str (addrText addrW1)]
+    e8 `shouldBe` A.Null
+    r8 `shouldNotBe` A.Null
+    -- A batch resolves every member against the URI it arrived on.
+    let dumpW1 = ("dumpprivkey", [str (addrText addrW1)])
+    bW1 <- batchAt server "/wallet/w1" [dumpW1, dumpW1]
+    map (\(r, e) -> (r /= A.Null, e)) bW1 `shouldBe` [(True, A.Null), (True, A.Null)]
+    bEnc <- batchAt server "/wallet/enc" [("dumpprivkey", [str (addrText addrEnc)])]
+    map (errCode . snd) bEnc `shouldBe` [Just (-13)]
+    bNone <- batchAt server "/" [dumpW1, dumpW1]
+    map (errCode . snd) bNone `shouldBe` [Just (-19), Just (-19)]
+    -- unloadwallet takes its target from the URI; a different
+    -- wallet_name param is refused (Core EnsureUniqueWalletName).
+    (_, e9) <- callAt server "/wallet/enc" "unloadwallet" [str "w1"]
+    errCode e9 `shouldBe` Just (-8)
+    (_, e10) <- callAt server "/wallet/w1" "unloadwallet" []
+    e10 `shouldBe` A.Null
+    -- CONTROL: with one wallet left, no URI answers that wallet.
+    (r11, e11) <- callAt server "/" "getwalletinfo" []
+    (walletName r11, e11) `shouldBe` (Just (str "enc"), A.Null)
+
+-- | One JSON-RPC call POSTed to @path@ through 'combinedApp' (the real HTTP
+-- entry, which is where the /wallet/<name> URI is read): (result, error).
+callAt :: RpcServer -> BS.ByteString -> T.Text -> [A.Value] -> IO (A.Value, A.Value)
+callAt server path method ps = do
+  (_, body) <- postRpc server path (A.encode (rpcObj method ps))
+  case A.decode body of
+    Just (A.Object o) -> return ( maybe A.Null id (KM.lookup "result" o)
+                                , maybe A.Null id (KM.lookup "error" o) )
+    other -> fail ("unexpected response: " ++ show other ++ " body " ++ show body)
+
+-- | A JSON-RPC batch POSTed to @path@: each member's (result, error).
+batchAt :: RpcServer -> BS.ByteString -> [(T.Text, [A.Value])] -> IO [(A.Value, A.Value)]
+batchAt server path calls = do
+  (_, body) <- postRpc server path (A.encode (map (uncurry rpcObj) calls))
+  case A.decode body of
+    Just (A.Array arr) -> return
+      [ ( maybe A.Null id (KM.lookup "result" o)
+        , maybe A.Null id (KM.lookup "error" o) )
+      | A.Object o <- V.toList arr ]
+    other -> fail ("unexpected batch response: " ++ show other)
+
+rpcObj :: T.Text -> [A.Value] -> A.Value
+rpcObj method ps = A.Object $ KM.fromList
+  [ ("jsonrpc", A.String "1.0"), ("id", A.Number 1)
+  , ("method", A.String method), ("params", A.Array (V.fromList ps)) ]
+
+-- | POST a JSON body to @path@ through 'combinedApp' with cookie auth
+-- (password "pw") from a loopback client.
+postRpc :: RpcServer -> BS.ByteString -> BL.ByteString -> IO (Int, BL.ByteString)
+postRpc server path body = do
+  bodyRef <- newIORef [BL.toStrict body]
+  let nextChunk = atomicModifyIORef' bodyRef $ \cs -> case cs of
+        []       -> ([], BS.empty)
+        (c:rest) -> (rest, c)
+      req = setRequestBodyChunks nextChunk defaultRequest
+              { requestMethod  = "POST"
+              , rawPathInfo    = path
+              , requestHeaders = [ ("Content-Type", "application/json")
+                                 , ("Authorization", "Basic X19jb29raWVfXzpwdw==") ]
+              , remoteHost     = SockAddrInet 0 (tupleToHostAddress (127, 0, 0, 1))
+              }
+  out <- newIORef (0, BL.empty)
+  _ <- combinedApp server req $ \resp -> do
+    let (_, _, withBody) = responseToStream resp
+    chunks <- newIORef mempty
+    withBody $ \stream -> stream (\b -> atomicModifyIORef' chunks (\acc -> (acc <> b, ()))) (return ())
+    b <- readIORef chunks
+    writeIORef out (statusCode (responseStatus resp), toLazyByteString b)
+    return undefined
+  readIORef out
 
 -- | POST @body@ to /payjoin through 'combinedApp' from a loopback client;
 -- return the status code and response body.
