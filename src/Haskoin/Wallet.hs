@@ -3449,16 +3449,31 @@ encryptWallet passphrase ws = do
               -- write fails the wallet stays unencrypted: reporting
               -- success would leave a passphrase that a restart drops.
               -- An unattached (in-memory) wallet has nothing to write.
+              -- The already-encrypted check is repeated in the same STM
+              -- transaction as the write, so two concurrent encryptwallet
+              -- calls cannot both succeed (the second passphrase winning).
               let wallet = wsWallet ws
-              atomically $ do
-                writeTVar (wsEncrypted ws) (Just encWallet)
-                writeTVar (walletDirty wallet) True
-              saved <- persistWallet wallet
-              case saved of
-                Right _ -> return $ Right ws
-                Left err -> do
-                  atomically $ writeTVar (wsEncrypted ws) Nothing
-                  return $ Left $ "Failed to write the encrypted wallet: " ++ err
+              claimed <- atomically $ do
+                cur <- readTVar (wsEncrypted ws)
+                case cur of
+                  Just _  -> return False
+                  Nothing -> do
+                    writeTVar (wsEncrypted ws) (Just encWallet)
+                    writeTVar (walletDirty wallet) True
+                    return True
+              if not claimed
+                then return $ Left "Wallet is already encrypted"
+                else do
+                  saved <- persistWallet wallet
+                  case saved of
+                    Right _ -> return $ Right ws
+                    Left err -> do
+                      -- Dirty again, so the flusher rewrites the file
+                      -- unencrypted even if it saved the record meanwhile.
+                      atomically $ do
+                        writeTVar (wsEncrypted ws) Nothing
+                        writeTVar (walletDirty wallet) True
+                      return $ Left $ "Failed to write the encrypted wallet: " ++ err
 
 -- | Decrypt a wallet with a passphrase.
 -- Returns the decrypted master key or an error.

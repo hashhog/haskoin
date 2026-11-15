@@ -54,7 +54,7 @@ module Haskoin.Wallet.Persist
     -- * Codec (pure, exported for tests)
   , encodeWalletSnapshot
   , decodeWalletSnapshot
-  , walletSnapshotVersion
+  , walletSnapshotVersion   -- newest layout; unencrypted wallets are still written as version 1
     -- * IO: atomic durable save / fault-tolerant load
   , saveWalletSnapshot
   , loadWalletSnapshot
