@@ -23,6 +23,7 @@ import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
 import Control.Monad (forM, forM_, unless, when, void, forever, filterM, foldM, join)
 import System.Posix.Signals (installHandler, sigINT, sigTERM, Handler(..))
 import qualified Haskoin.Daemon as Daemon
+import qualified Haskoin.Metrics as Metrics
 import Data.Maybe (mapMaybe, fromMaybe, isJust, isNothing, fromJust, catMaybes)
 import Control.Concurrent.STM
 import Control.Exception
@@ -55,6 +56,7 @@ import Haskoin.Consensus
 import Haskoin.ChainLock (ChainLock, withChainLock, tryWithChainLock, chainLockHeld)
 import Haskoin.Storage
 import Haskoin.HeaderReload (initHeaderChainFromDB, estimateUndoConnectedTip)
+import Haskoin.BlockNotFound (noteBlockNotFound, noteBlockRequestAnswered, readBlockNotFound)
 import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment,
                      HeadersSyncPeers, PeerHeadersVerdict(..), peerHeadersGate,
                      headersSyncActive)
@@ -124,6 +126,9 @@ data NodeOptions = NodeOptions
   , noListen     :: !Bool
   , noListenPort :: !Int
   , noMetricsPort :: !Int
+  , noMetricsBind :: !(Maybe String)
+    -- ^ @--metricsbind=\<addr\>@; Nothing = conf file, else 127.0.0.1
+    -- (see "Haskoin.Metrics").
   , noPeerBloomFilters :: !Bool
     -- Operational / supervisor flags (Bitcoin Core parity).
   , noDaemon     :: !Bool       -- ^ -daemon: detach to background
@@ -332,6 +337,9 @@ parseNodeOptions = NodeOptions
   <*> option auto (long "listen" <> value True <> help "Accept incoming connections (default: True)")
   <*> option auto (long "port" <> value 8333 <> help "Listen port")
   <*> option auto (long "metricsport" <> value 9332 <> help "Prometheus metrics port (0 to disable)")
+  <*> optional (strOption (long "metricsbind" <> metavar "ADDR"
+        <> help "Address the Prometheus metrics server binds \
+                \(default: 127.0.0.1; the endpoint is unauthenticated)"))
   <*> option auto (long "peerbloomfilters" <> value False
         <> help "Advertise NODE_BLOOM and serve BIP-37/BIP-35 (default: False, matches Core)")
   -- Operational flags
@@ -673,6 +681,9 @@ applyConfigOverlay cm n = n
   , noMetricsPort = if noMetricsPort n == 9332
                      then Daemon.configLookupInt "metricsport" 9332 cm
                      else noMetricsPort n
+  , noMetricsBind = case noMetricsBind n of
+                     Just _  -> noMetricsBind n
+                     Nothing -> Daemon.configLookup "metricsbind" cm
   , noPeerBloomFilters = if not (noPeerBloomFilters n)
                      then Daemon.configLookupBool "peerbloomfilters" False cm
                      else noPeerBloomFilters n
@@ -2667,7 +2678,13 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
 
     -- Start Prometheus metrics server
     when (noMetricsPort > 0) $ do
-      void $ forkIO $ Warp.run noMetricsPort $ \_ respond -> do
+      let metricsBind = fromMaybe Metrics.defaultMetricsBind noMetricsBind
+      metricsCfg <- Metrics.metricsSettings metricsBind noMetricsPort
+      let metricsStopped (e :: SomeException) =
+            hPutStrLn stderr $ "Prometheus metrics server on " ++ metricsBind
+              ++ ":" ++ show noMetricsPort ++ " stopped: " ++ show e
+      void $ forkIO $ flip catch metricsStopped $
+       Warp.runSettings metricsCfg $ \_ respond -> do
         nextB <- readIORef nextBlockRef
         let height = connectedHeight nextB
         peers <- Map.size <$> readTVarIO (pmPeers pm)
@@ -2690,7 +2707,8 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         respond $ Wai.responseLBS HTTP.status200
           [(HTTP.hContentType, "text/plain; version=0.0.4; charset=utf-8")]
           body
-      putStrLn $ "Prometheus metrics server listening on port " ++ show noMetricsPort
+      putStrLn $ "Prometheus metrics server listening on " ++ metricsBind
+              ++ ":" ++ show noMetricsPort
 
     -- Start P2P listener for inbound connections
     let listenPort = p2pListenPort  -- network-appropriate default (8333 sentinel)
@@ -3554,28 +3572,9 @@ punishBlockSource pmRefP bh = do
               ++ " for delivering invalid block " ++ hexHashS bh
       void (misbehaving pm a InvalidBlock)
 
--- | Peers that answered @notfound@ for a block we asked them for, with the
--- time.  The linear planner does not ask that peer for that hash again for
--- 'blockNotFoundTtl' seconds, and the kicker releases the in-flight entry so
--- the peer is not then disconnected as a staller for a block it never had.
--- Core never gets here: FindNextBlocksToDownload only asks a peer for blocks
--- on its pindexBestKnownBlock chain; haskoin's planner is header-blind, and
--- a peer that does not have a freshly announced block (the honest peer when
--- another peer announces a block only it holds) was disconnected after 2 s.
-{-# NOINLINE blockNotFoundRef #-}
-blockNotFoundRef :: IORef (Map.Map BlockHash (Map.Map NS.SockAddr Int64))
-blockNotFoundRef = unsafePerformIO (newIORef Map.empty)
-
-blockNotFoundTtl :: Int64
-blockNotFoundTtl = 120
-
-noteBlockNotFound :: NS.SockAddr -> [BlockHash] -> IO ()
-noteBlockNotFound addr hs = do
-  now <- round <$> getPOSIXTime :: IO Int64
-  atomicModifyIORef' blockNotFoundRef $ \m ->
-    let m' = Map.filter (not . Map.null)
-               (Map.map (Map.filter (\t -> now - t < blockNotFoundTtl)) m)
-    in (foldl (\acc h -> Map.insertWith Map.union h (Map.singleton addr now) acc) m' hs, ())
+-- 'blockNotFoundRef' / 'noteBlockNotFound' live in "Haskoin.BlockNotFound"
+-- (secfix-haskoin-notfound-unsolicited): only notfound answers for blocks
+-- this node asked that peer for are kept.
 
 -- | Per-peer low-work headers sync (Core Peer::m_headers_sync), keyed by
 -- peer address and dropped on disconnect.
@@ -3637,14 +3636,6 @@ dropNotFoundInflight m = do
   return $ if Map.null nf then m else
     Map.filterWithKey
       (\h (k, _, _) -> not (maybe False (Map.member k) (Map.lookup h nf))) m
-
--- | Live (unexpired) notfound answers.
-readBlockNotFound :: IO (Map.Map BlockHash (Map.Map NS.SockAddr Int64))
-readBlockNotFound = do
-  now <- round <$> getPOSIXTime :: IO Int64
-  m <- readIORef blockNotFoundRef
-  return $ Map.filter (not . Map.null)
-             (Map.map (Map.filter (\t -> now - t < blockNotFoundTtl)) m)
 
 {-# NOINLINE forkPointMemoRef #-}
 forkPointMemoRef :: IORef (Maybe ((BlockHash, BlockHash), BlockHash))
@@ -3812,13 +3803,21 @@ infixOfStr needle haystack =
 -- DeploymentActiveAfter(prev, SEGWIT)).  @Just (reason, height)@ = mutated.
 -- Cost: one txid pass (+ one wtxid pass under segwit) over the block.
 mutationOnReceipt :: Network -> HeaderChain -> Block -> IO (Maybe (String, Word32))
-mutationOnReceipt net hc block = do
+mutationOnReceipt net hc block = snd <$> mutationOnReceiptChecked net hc block
+
+-- | 'mutationOnReceipt' plus whether the check RAN (the parent was known),
+-- from the same 'hcEntries' snapshot.  @False@ = not checked: the MBlock
+-- arm re-runs the check once 'addHeader' has placed the block, because the
+-- parent may have arrived on another peer thread in between.
+mutationOnReceiptChecked :: Network -> HeaderChain -> Block
+                         -> IO (Bool, Maybe (String, Word32))
+mutationOnReceiptChecked net hc block = do
   entries <- readTVarIO (hcEntries hc)
   return $ case Map.lookup (bhPrevBlock (blockHeader block)) entries of
-    Nothing    -> Nothing
+    Nothing    -> (False, Nothing)
     Just prevE ->
       let ht = ceHeight prevE + 1
-      in fmap (\w -> (w, ht)) (blockMutation (ht >= netSegwitHeight net) block)
+      in (True, fmap (\w -> (w, ht)) (blockMutation (ht >= netSegwitHeight net) block))
 
 -- | A mutated block body (Core IsBlockMutated): the body says nothing about
 -- the block.  Core (net_processing.cpp): @Misbehaving(peer, "mutated
@@ -3927,9 +3926,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
  -- receipt, before ANY download state, header, storage or validation step,
  -- whenever the parent is known.  Computed here so the MBlock arm below can
  -- branch on it with a guard.
- receiptMutation <- case msg of
-   MBlock blk -> mutationOnReceipt net hc blk
-   _          -> return Nothing
+ (receiptChecked, receiptMutation) <- case msg of
+   MBlock blk -> mutationOnReceiptChecked net hc blk
+   _          -> return (True, Nothing)
  case msg of
   MBlock block | Just (why, mutHeight) <- receiptMutation ->
     rejectMutatedOnReceipt db pmRef receiptRefillRef blockReceipt addr
@@ -4140,6 +4139,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
   MBlock block -> do
     let bh = computeBlockHash (blockHeader block)
         hdr = blockHeader block
+    -- The getdata for it (if any) is answered ('Haskoin.BlockNotFound').
+    noteBlockRequestAnswered addr bh
     -- First, ensure the header is in our chain index.
     -- For unsolicited blocks (received via inv->getdata), the header may
     -- not yet be in the chain. addHeader is idempotent if already known.
@@ -4163,6 +4164,17 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
         -- BlockChecked — invalid blocks score 100.
         pm <- readIORef pmRef
         void $ misbehaving pm addr InvalidBlock
+      -- The receipt check above did not run (parent unknown then), but
+      -- addHeader accepted the header, so the parent is known now: it
+      -- arrived on another peer thread in between.  Run IsBlockMutated now,
+      -- before any download state, storage or validation step, exactly as
+      -- the receipt check would have.  Without this a junk body skipped the
+      -- check and a structural verdict marked the honest block failed.
+      Right entry
+        | not receiptChecked
+        , Just why <- blockMutation (ceHeight entry >= netSegwitHeight net) block ->
+            rejectMutatedOnReceipt db pmRef receiptRefillRef blockReceipt addr
+              bh (ceHeight entry) why
       Right entry -> do
        -- Arrived: no longer in flight (Core RemoveBlockRequest), and not
        -- re-requested while this thread validates it. 'finally' so a
@@ -4970,7 +4982,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     putStrLn $ "Peer says not found: " ++ show (length invs) ++ " items"
     -- Remember which block hashes this peer does not have so the linear
     -- planner asks someone else and the stall rule does not charge it
-    -- ('blockNotFoundRef').
+    -- ('blockNotFoundRef').  Only hashes we sent this peer a block getdata
+    -- for are kept; the rest of the message is ignored, as Core does.
     let blockHs = [ BlockHash (ivHash iv) | iv <- invs
                   , ivType iv == InvBlock || ivType iv == InvWitnessBlock ]
     unless (null blockHs) $ noteBlockNotFound addr blockHs
@@ -5049,8 +5062,10 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
           `catch` (\(_ :: SomeException) -> return ())
       else do
         entries <- readTVarIO (mpEntries mp)
-        let mempoolTxMap = Map.map meTransaction entries
-        case initPartialBlock cb mempoolTxMap of
+        -- Cached wtxids (meWtxid): matching a short id must not
+        -- re-serialize and SHA256d every mempool tx per cmpctblock.
+        let mempoolWtxids = [ (meWtxid e, meTransaction e) | e <- Map.elems entries ]
+        case initPartialBlockCached cb mempoolWtxids of
           Left err -> do
             putStrLn $ "Compact block " ++ show bh ++ " init failed: " ++ err
             pm <- readIORef pmRef

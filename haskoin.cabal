@@ -21,10 +21,12 @@ library
                  , Haskoin.Consensus
                  , Haskoin.Storage
                  , Haskoin.HeaderReload
+                 , Haskoin.BlockNotFound
                  , Haskoin.Network
                  , Haskoin.Sync
                  , Haskoin.Mempool
                  , Haskoin.Mempool.Persist
+                 , Haskoin.Metrics
                  , Haskoin.Policy.Standard
                  , Haskoin.FeeEstimator
                  , Haskoin.BlockTemplate
@@ -388,6 +390,29 @@ test-suite getdata-amplification
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- secfix-haskoin-ban-keyed-by-ip: own target so the spec needs no edit to
+-- the shared Spec.hs / haskoin-test other-modules list.
+test-suite ban-keyed-by-ip
+  type:          exitcode-stdio-1.0
+  main-is:       BanKeyedByIpMain.hs
+  other-modules: BanKeyedByIpSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , filepath
+               , network
+               , stm
+               , temporary
+               , text
+               , time
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded -rtsopts "-with-rtsopts=-N"
+
 -- cffix-haskoin-bip68-mtp-p2p-arm: own target so the spec needs no edit to
 -- the shared Spec.hs / haskoin-test other-modules list.
 test-suite bip68-mtp-p2p-arm
@@ -529,6 +554,26 @@ test-suite maxmempool-arg
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- secfix-haskoin-metrics-bind-all (audit H8): starts the real haskoin
+-- binary on regtest and probes its metrics port from outside, so it builds
+-- against master and fails there on the assertion.
+test-suite metrics-bind
+  type:          exitcode-stdio-1.0
+  main-is:       MetricsBindMain.hs
+  other-modules: MetricsBindSpec
+  hs-source-dirs: test
+  build-tool-depends: haskoin:haskoin
+  build-depends: base >= 4.14 && < 5
+               , hspec
+               , bytestring
+               , directory
+               , filepath
+               , network
+               , process
+               , temporary
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
@@ -749,6 +794,28 @@ test-suite decode-strict
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- secfix-haskoin-encryptwallet-persist: own target so the spec needs no edit
+-- to the shared Spec.hs / haskoin-test other-modules list.
+test-suite encryptwallet-persist
+  type:          exitcode-stdio-1.0
+  main-is:       WalletPersistMain.hs
+  other-modules: WalletPersistSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- secfix-haskoin-getblocktxn-index-wrap: own target so the spec needs no edit
 -- to the shared Spec.hs / haskoin-test other-modules list.
 test-suite getblocktxn-index-wrap
@@ -771,7 +838,7 @@ test-suite cmpctblock-pending
   main-is:       CmpctMain.hs
   other-modules: CmpctSpec
   hs-source-dirs: test
-  cpp-options:   -DHASKOIN_CMPCT_ADMISSION
+  cpp-options:   -DHASKOIN_CMPCT_ADMISSION -DHASKOIN_CMPCT_CACHED_WTXID
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
@@ -779,6 +846,24 @@ test-suite cmpctblock-pending
                , containers
                , network
                , stm
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- secfix-haskoin-notfound-unsolicited: own target so the spec needs no
+-- edit to the shared Spec.hs / haskoin-test other-modules list.
+test-suite notfound-unsolicited
+  type:          exitcode-stdio-1.0
+  main-is:       NotFoundUnsolicitedMain.hs
+  other-modules: NotFoundUnsolicitedSpec
+  hs-source-dirs: test
+  -- Haskoin.BlockNotFound exists from this commit on (see the spec header).
+  cpp-options:   -DHASKOIN_NOTFOUND_SOLICITED
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , containers
+               , network
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
@@ -833,6 +918,30 @@ test-suite restart-best-header
   main-is:       RestartBestHeaderMain.hs
   other-modules: RestartBestHeaderSpec
   hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- sm-restart-headeronly-status: the restart loader derives the status of
+-- the persisted headers above the connected tip from the stored body
+-- (header-only -> StatusHeaderValid, no candidate; body -> candidate).
+test-suite sm-restart-headeronly-status
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/sm-restart-headeronly-status
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
@@ -1049,6 +1158,28 @@ test-suite sm-reorg-immature-coinbase
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- A disconnected block's txs are re-added with Core's bypass_limits (no
+-- fee-rate floor), and a failed re-add removes its in-pool spenders
+-- (Core MaybeUpdateMempoolForReorg: AcceptToMemoryPool bypass_limits=true,
+-- removeRecursive(tx, REORG)).
+test-suite sm-reorg-readd-bypass-limits
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/sm-reorg-readd-bypass-limits
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- An outbound peer's netgroup stops counting towards outbound diversity the
 -- moment the peer leaves pmPeers, by any path (Core rebuilds the set from
 -- m_nodes on every ThreadOpenConnections pass).
@@ -1077,6 +1208,22 @@ test-suite reconcile-forward-test
                , bytestring
                , containers
                , directory
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- A payload trickled a few bytes per read must cost memory linear in its
+-- size, not payload^2 / chunk (secfix-haskoin-recvexact-quadratic).
+test-suite recvexact-linear-cost
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/recvexact-linear-cost
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , cereal
+               , network
+               , stm
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
@@ -1175,6 +1322,23 @@ test-suite mempool-trim-usage
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- secfix-haskoin-mutation-recheck-race: IsBlockMutated must survive the
+-- parent header arriving between the receipt check and addHeader.
+test-suite mutation-recheck-race
+  type:          exitcode-stdio-1.0
+  main-is:       Main.hs
+  hs-source-dirs: test/mutation-recheck-race
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , bytestring
+               , containers
+               , filepath
+               , stm
+               , temporary
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- policy-cause-04: own target so the spec needs no edit to the shared
 -- Spec.hs / haskoin-test other-modules list.
 test-suite unbroadcast-set
@@ -1195,6 +1359,30 @@ test-suite unbroadcast-set
                , stm
                , temporary
                , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
+-- secfix-haskoin-wallet-backup-seal-key: own target so the spec needs no
+-- edit to the shared Spec.hs / haskoin-test other-modules list.
+test-suite wallet-backup-seal-key
+  type:          exitcode-stdio-1.0
+  main-is:       WalletBackupSealKeyMain.hs
+  other-modules: WalletBackupSealKeySpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , async
+               , bytestring
+               , containers
+               , directory
+               , filepath
+               , stm
+               , temporary
+               , text
+               , unix
                , vector
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded

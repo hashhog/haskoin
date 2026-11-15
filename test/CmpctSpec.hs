@@ -23,13 +23,24 @@
 -- MCmpctBlock / MBlockTxn handlers in app/Main.hs call.  They need functions
 -- the fix adds, so they sit behind HASKOIN_CMPCT_ADMISSION, a cpp flag only the
 -- fix commit sets in this suite's stanza; without it every test fails by name.
+--
+-- secfix-haskoin-cmpctblock-mempool-rehash (finding H2): the handler then
+-- matched short ids by recomputing every mempool transaction's wtxid (full
+-- re-serialization + SHA256d per tx, per cmpctblock).  Core's
+-- PartiallyDownloadedBlock::InitData uses the wtxid the mempool cached.  The
+-- "mempool rehash (H2)" tests count how many mempool transactions the
+-- handler's call forces; on a commit without HASKOIN_CMPCT_CACHED_WTXID they
+-- drive the call master's handler makes ('initPartialBlock' on the txid map).
 module CmpctSpec (spec) where
 
 import Test.Hspec
 
 #ifdef HASKOIN_CMPCT_ADMISSION
 import Control.Concurrent.STM
+import Control.Exception (evaluate)
 import Control.Monad (forM)
+import Data.IORef
+import System.IO.Unsafe (unsafeInterleaveIO)
 import qualified Data.ByteString as BS
 import Data.Bits (shiftR, (.&.))
 import qualified Data.Map.Strict as Map
@@ -38,14 +49,19 @@ import Data.Word (Word8, Word32)
 import Network.Socket (SockAddr(..), tupleToHostAddress)
 
 import Haskoin.Types
+import qualified Haskoin.Crypto as Crypto
 import Haskoin.Crypto (computeBlockHash)
 import Haskoin.Consensus (regtest, initHeaderChain, getChainTip, HeaderChain(..),
                           ChainEntry(..), checkProofOfWork, Network(..))
-import Haskoin.Network (CmpctBlock(..), PrefilledTx(..), PartiallyDownloadedBlock,
+import Haskoin.Network (CmpctBlock(..), PrefilledTx(..), PartiallyDownloadedBlock(..),
+                        computeShortIdKey, computeShortId,
                         CmpctPendingAdmit(..), CmpctPendingMap,
                         admitPendingCompact, takePendingCompact,
                         maxCmpctPendingPerPeer, maxCmpctPendingPerBlock,
                         maxCmpctPendingGlobal, initPartialBlock,
+#ifdef HASKOIN_CMPCT_CACHED_WTXID
+                        initPartialBlockCached,
+#endif
                         MisbehaviorReason(..))
 import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment)
 
@@ -131,8 +147,75 @@ fresh = do
 pdbFor :: BlockHeader -> PartiallyDownloadedBlock
 pdbFor hdr = either error fst (initPartialBlock (mkCmpct hdr) Map.empty)
 
+-- | The call the MCmpctBlock handler (app/Main.hs) makes once the header is
+-- accepted, over a mempool of (cached wtxid, txid, tx).
+handlerInit :: CmpctBlock -> [(Wtxid, TxId, Tx)]
+            -> Either String (PartiallyDownloadedBlock, [Int])
+#ifdef HASKOIN_CMPCT_CACHED_WTXID
+handlerInit cb mp = initPartialBlockCached cb [ (w, tx) | (w, _, tx) <- mp ]
+#else
+handlerInit cb mp = initPartialBlock cb (Map.fromList [ (t, tx) | (_, t, tx) <- mp ])
+#endif
+
+-- | 32 bytes carrying @i@ and a salt, so ids are distinct by construction.
+idBytes :: Int -> Word8 -> BS.ByteString
+idBytes i salt = BS.pack ([salt] ++ [ fromIntegral (i `shiftR` (8 * k)) | k <- [0 .. 3] ]) <> BS.replicate 27 0
+
+-- | @n@ mempool transactions with (random) cached wtxids.  Each tx is a thunk
+-- that bumps @cnt@ when forced; only re-serializing it (to recompute its
+-- wtxid) forces it, so @cnt@ counts the SHA256d re-hashes.
+countedMempool :: IORef Int -> Int -> IO [(Wtxid, TxId, Tx)]
+countedMempool cnt n = forM [1 .. n] $ \i -> do
+  tx <- unsafeInterleaveIO $ do
+    atomicModifyIORef' cnt (\c -> (c + 1, ()))
+    pure (coinbase (fromIntegral i))
+  pure (Wtxid (Hash256 (idBytes i 0xa1)), TxId (Hash256 (idBytes i 0xb2)), tx)
+
+-- | A real mempool tx (with its real, cached wtxid) the cmpctblock refers to.
+realMempoolTx :: Tx
+realMempoolTx = coinbase 777777
+
+-- | A cmpctblock: coinbase prefilled, one short id = the real mempool tx.
+cmpctFor :: BlockHeader -> CmpctBlock
+cmpctFor hdr =
+  let nonce = fromIntegral (bhNonce hdr)
+      sid   = computeShortId (computeShortIdKey hdr nonce)
+                             (getHash256 (getWtxidHash (Crypto.computeWtxid realMempoolTx)))
+  in CmpctBlock { cbHeader = hdr, cbNonce = nonce, cbShortIds = [sid]
+                , cbPrefilled = [PrefilledTx 0 (coinbase (bhNonce hdr))] }
+
+mempoolSize :: Int
+mempoolSize = 10000
+
+-- | Run the handler path (header gate, then the partial block) over a
+-- counted mempool of 'mempoolSize' txs plus the real one.  Returns the
+-- verdict, the (missing count, mempool hits) if reached, and the re-hashes.
+handlerPath :: BlockHeader -> IO (CmpctHeaderVerdict, Maybe (Int, Int, Maybe Tx), Int)
+handlerPath hdr = do
+  hc <- initHeaderChain regtest
+  cnt <- newIORef 0
+  counted <- countedMempool cnt mempoolSize
+  let real = (Crypto.computeWtxid realMempoolTx, Crypto.computeTxId realMempoolTx, realMempoolTx)
+      mp = counted ++ [real]
+  v <- cmpctHeaderGate regtest hc hdr
+  r <- case v of
+    CmpctHeaderAccepted _ -> case handlerInit (cmpctFor hdr) mp of
+      Right (pdb, missing) -> do
+        -- force each component (a tuple in WHNF would leave the fold unrun
+        -- and the counter read before any re-hash could happen)
+        m <- evaluate (length missing)
+        h <- evaluate (pdbMempoolCount pdb)
+        slot <- evaluate (Map.findWithDefault Nothing 1 (pdbAvailable pdb))
+        pure (Just (m, h, slot))
+      Left err -> error ("initPartialBlock failed: " ++ err)
+    _ -> pure Nothing
+  n <- readIORef cnt
+  pure (v, r, n)
+
 spec :: Spec
-spec = describe "cmpctblock pending admission (C4)" $ do
+spec = do
+ rehashSpec
+ describe "cmpctblock pending admission (C4)" $ do
   it "cmpctblock_unknown_parent_not_stored" $ do
     (hc, pend, _) <- fresh
     n0 <- Map.size <$> readTVarIO (hcEntries hc)
@@ -205,13 +288,52 @@ spec = describe "cmpctblock pending admission (C4)" $ do
     own <- atomically $ takePendingCompact pend (peer 1) bh
     isJust own `shouldBe` True
     Map.size <$> readTVarIO pend `shouldReturn` 0
+rehashSpec :: Spec
+rehashSpec = describe "cmpctblock mempool rehash (H2)" $ do
+  it "cmpctblock_bad_header_no_mempool_hash" $ do
+    g <- initHeaderChain regtest >>= getChainTip
+    (v, r, n) <- handlerPath (badPowChild g 1)
+    isInvalid v `shouldBe` True
+    r `shouldBe` Nothing
+    n `shouldBe` 0
+
+  it "cmpctblock_valid_header_no_mempool_rehash" $ do
+    g <- initHeaderChain regtest >>= getChainTip
+    (v, r, n) <- handlerPath (validChild g 1)
+    cmpctHeaderPunishment v `shouldBe` Nothing
+    -- control: the real tx was found by its cached wtxid, so the match ran
+    r `shouldBe` Just (0, 1, Just realMempoolTx)
+    -- and none of the 10k other mempool txs was re-serialized / re-hashed
+    n `shouldBe` 0
+
+#ifdef HASKOIN_CMPCT_CACHED_WTXID
+  it "cached_wtxid_matching_equals_recomputed_matching" $ do
+    g <- initHeaderChain regtest >>= getChainTip
+    let hdr  = validChild g 2
+        txs  = [ coinbase i | i <- [900000 .. 900040] ] ++ [realMempoolTx]
+        byId = Map.fromList [ (Crypto.computeTxId t, t) | t <- txs ]
+        cached = [ (Crypto.computeWtxid t, t) | t <- Map.elems byId ]
+        strip = fmap (\(p, m) -> (pdbAvailable p, pdbMempoolCount p, m))
+    strip (initPartialBlockCached (cmpctFor hdr) cached)
+      `shouldBe` strip (initPartialBlock (cmpctFor hdr) byId)
+    fmap (\(p, _) -> pdbMempoolCount p) (initPartialBlockCached (cmpctFor hdr) cached)
+      `shouldBe` Right 1
+#else
+  it "cached_wtxid_matching_equals_recomputed_matching" $
+    expectationFailure "no initPartialBlockCached on this commit: the handler recomputes every mempool wtxid"
+#endif
 #else
 noGate :: Expectation
 noGate = expectationFailure
   "no cmpctblock header gate / pending caps on this commit: every cmpctblock is stored in cbsPending"
 
 spec :: Spec
-spec = describe "cmpctblock pending admission (C4)" $ do
+spec = do
+ describe "cmpctblock mempool rehash (H2)" $ do
+  it "cmpctblock_bad_header_no_mempool_hash" noGate
+  it "cmpctblock_valid_header_no_mempool_rehash" noGate
+  it "cached_wtxid_matching_equals_recomputed_matching" noGate
+ describe "cmpctblock pending admission (C4)" $ do
   it "cmpctblock_unknown_parent_not_stored" noGate
   it "cmpctblock_bad_pow_known_parent_punished_not_stored" noGate
   it "control: a valid-PoW header on a known parent is accepted and stored" noGate

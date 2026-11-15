@@ -93,6 +93,7 @@ module Haskoin.Network
   , computeWtxid
   , createCompactBlock
   , initPartialBlock
+  , initPartialBlockCached
   , fillPartialBlock
   , reconstructBlock
   , getMissingTxIndices
@@ -222,6 +223,7 @@ module Haskoin.Network
   , peerCanServeWitnesses
   , outboundHasDesirableServices
   , isBlockDataRequest
+  , blockGetDataHashes
   , blockRequestAllowed
   , userAgent
     -- * Inventory type helpers
@@ -306,6 +308,12 @@ module Haskoin.Network
   , getUnconnectingHeadersCount
   , isDiscouraged
   , isBanned
+  , banKey
+  , lookupBan
+  , maxDiscouragedEntries
+  , addManualBan
+  , removeManualBan
+  , clearAllBans
   , getBanList
   , clearExpiredBans
   , loadBanList
@@ -752,7 +760,7 @@ import Data.Bits ((.&.), (.|.), shiftR, shiftL, xor, complement, rotateL)
 import Control.Monad (replicateM, forM_, forM, when, forever, unless, void, filterM, join)
 import GHC.Generics (Generic)
 import Control.DeepSeq (NFData(..))
-import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr)
+import Foreign.Ptr (Ptr, FunPtr, nullPtr, castPtr, plusPtr)
 import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
 import Foreign.C.Types (CUInt(..), CSize(..), CInt(..), CChar, CUChar)
 import Foreign.Marshal.Alloc (mallocBytes, free, alloca, allocaBytes)
@@ -783,7 +791,7 @@ import Control.Concurrent (threadDelay)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Aeson as Aeson
-import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:))
+import Data.Aeson (ToJSON(..), FromJSON(..), (.=), (.:), (.:?), (.!=))
 import System.FilePath ((</>))
 import System.Directory (doesFileExist, renameFile, getFileSize)
 import System.IO (withFile, IOMode(..), hPutStr, hGetContents')
@@ -795,7 +803,7 @@ import Network.Socket (Socket, SockAddr(..), getAddrInfo,
                        bind, listen, accept, setSocketOption,
                        SocketOption(..), socketPair, defaultProtocol,
                        tupleToHostAddress, getSocketName,
-                       AddrInfoFlag(..))
+                       AddrInfoFlag(..), recvBuf)
 import qualified Network.Socket as NS (AddrInfo(..))
 import Network.Socket.ByteString (recv, send, sendAll)
 import System.IO.Unsafe (unsafePerformIO)
@@ -808,6 +816,7 @@ import qualified Crypto.Random as CryptoRandom
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import System.Timeout (timeout)
+import Haskoin.BlockNotFound (noteBlockRequested)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException, catch, mask, mask_, IOException, finally, throwIO)
 import Data.Hashable (Hashable(..))
@@ -1282,6 +1291,17 @@ isBlockDataRequest msg = case msg of
   where
     isBlockInv t = t `elem` [ InvBlock, InvWitnessBlock
                             , InvFilteredBlock, InvCompactBlock ]
+
+-- | Block hashes a getdata asks for (any block-type inventory).  Recorded
+-- by 'sendMessage' so a later @notfound@ is honoured only for hashes this
+-- node actually asked that peer for (secfix-haskoin-notfound-unsolicited).
+blockGetDataHashes :: Message -> [BlockHash]
+blockGetDataHashes msg = case msg of
+  MGetData (GetData ivs) ->
+    [ BlockHash (ivHash iv) | iv <- ivs
+    , ivType iv `elem` [ InvBlock, InvWitnessBlock
+                       , InvFilteredBlock, InvCompactBlock ] ]
+  _ -> []
 
 -- | Single chokepoint for every block request that goes through
 -- 'requestFromPeerChecked': refuse to ask a peer without NODE_WITNESS
@@ -4080,6 +4100,13 @@ disconnectPeer pc = do
 -- to the v1 framing path (network magic + 24-byte header + payload).
 sendMessage :: PeerConnection -> Message -> IO ()
 sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
+  -- Every block getdata leaves through here; note it before the bytes go
+  -- out so a fast notfound reply always finds the request.
+  case blockGetDataHashes msg of
+    [] -> return ()
+    hs -> do
+      addr <- piAddress <$> readTVarIO (pcInfo pc)
+      noteBlockRequested addr hs
   mV2 <- readIORef (pcV2Transport pc)
   case mV2 of
     -- Hold the per-connection send mutex across BOTH the cipher advance
@@ -4441,6 +4468,24 @@ markPeerSendFailed pc = do
 -- ("connection closed reading length") was then banned for 24 h.
 -- Handshake paths that must fail faster wrap 'performHandshake' in
 -- 'performHandshakeWithin' (inbound uses the 60 s watchdog).
+--
+-- Cost is linear in n however the peer slices its writes. Reads go
+-- into one scratch buffer (at most 'recvScratchMax' bytes, allocated
+-- once per call) at the next free offset; the scratch is copied out as
+-- one chunk only when it is full or n bytes are in, and the chunks are
+-- joined once at the end. A peer sending one byte per segment therefore
+-- leaves at most n / 64 KiB chunks live, not one per byte. Core appends
+-- arriving bytes into the message's vRecv the same way
+-- (V1Transport::ReceivedBytes, net.cpp). Asking 'recv' for the whole
+-- remaining length on every read (recv allocates that many bytes) and
+-- appending every chunk to the buffered prefix made a 4,000,000-byte
+-- payload trickled 100 bytes at a time allocate ~160 GB, before the
+-- handshake.
+--
+-- On timeout, close or a socket error the bytes received so far are put
+-- back in 'pcReadBuffer', as before. An asynchronous exception (the
+-- handshake watchdog, 'killThread') drops them; every caller disconnects
+-- on those paths.
 recvExact :: PeerConnection -> Int -> IO (Maybe ByteString)
 recvExact pc n = do
   buf <- readIORef (pcReadBuffer pc)
@@ -4450,19 +4495,43 @@ recvExact pc n = do
       writeIORef (pcReadBuffer pc) rest
       return (Just result)
     else do
-      -- Need more data. Timeout matches Core's inactivity window so a
-      -- quiet-but-alive peer is not declared dead between pings.
-      mResult <- timeout recvIdleTimeoutMicros $
-        (Just <$> recv (pcSocket pc) (max 4096 (n - BS.length buf)))
-          `catch` (\(_ :: IOException) -> return Nothing)
-      case mResult of
-        Nothing -> return Nothing  -- Timeout: peer unresponsive
-        Just Nothing -> return Nothing  -- Connection closed or error
-        Just (Just chunk)
-          | BS.null chunk -> return Nothing  -- Connection closed
-          | otherwise -> do
-              writeIORef (pcReadBuffer pc) (BS.append buf chunk)
-              recvExact pc n
+      let scratchLen = min recvScratchMax (max 4096 (n - BS.length buf))
+      allocaBytes scratchLen $ \scratch ->
+        go scratch scratchLen [buf] (BS.length buf) 0
+  where
+    -- acc: chunks already copied out of the scratch, newest first;
+    -- flushed: their total length; off: bytes waiting in the scratch.
+    go scratch scratchLen acc flushed off
+      | flushed >= n = do
+          let (result, rest) = BS.splitAt n (BS.concat (reverse acc))
+          -- Copy the (at most one scratch) over-read so it does not keep
+          -- the whole joined message alive until the next read.
+          writeIORef (pcReadBuffer pc) (BS.copy rest)
+          return (Just result)
+      | otherwise = do
+          -- Timeout matches Core's inactivity window so a quiet-but-alive
+          -- peer is not declared dead between pings.
+          mResult <- timeout recvIdleTimeoutMicros $
+            (Just <$> recvBuf (pcSocket pc) (scratch `plusPtr` off) (scratchLen - off))
+              `catch` (\(_ :: IOException) -> return Nothing)
+          case mResult of
+            Just (Just k) | k > 0 -> do
+              let off' = off + k
+              if off' == scratchLen || flushed + off' >= n
+                then do
+                  chunk <- BS.packCStringLen (castPtr scratch, off')
+                  go scratch scratchLen (chunk : acc) (flushed + off') 0
+                else go scratch scratchLen acc flushed off'
+            _ -> do
+              -- Timeout, error or close: keep what arrived buffered, as
+              -- before.
+              pending <- BS.packCStringLen (castPtr scratch, off)
+              writeIORef (pcReadBuffer pc) (BS.concat (reverse (pending : acc)))
+              return Nothing
+
+-- | Largest single read 'recvExact' issues (64 KiB).
+recvScratchMax :: Int
+recvScratchMax = 65536
 
 -- | Receive a complete message from a peer.
 --
@@ -5247,6 +5316,8 @@ data PeerManager = PeerManager
     --   backward-compat with callers that read this field directly.  The
     --   production connection loop now selects via 'pmAddrMan'.
   , pmBannedAddrs        :: !(TVar (Map SockAddr Int64))
+    -- ^ Ban / discouragement expiry by peer IP.  Keys are 'banKey'
+    --   addresses (port zeroed), so one entry covers every source port.
   , pmConfig             :: !PeerManagerConfig
   , pmNetwork            :: !Network
   , pmBestHeight         :: !(TVar Int32)
@@ -5337,6 +5408,11 @@ data PeerManager = PeerManager
   , pmOutboundTrack      :: !(TVar (Map SockAddr OutboundTrack))
     -- ^ Per-peer facts for 'runOutboundEviction' (Core CNodeState:
     --   m_last_block_announcement, pindexBestKnownBlock, m_chain_sync).
+  , pmManualBans         :: !(TVar (Set.Set SockAddr))
+    -- ^ Keys of 'pmBannedAddrs' that an operator added with @setban@ (or
+    --   that banlist.json marks manual).  Core keeps these in @m_banned@,
+    --   apart from the bounded @m_discouraged@ filter, so the discouragement
+    --   cap in 'banPeer' never evicts them.
   }
 
 -- | Per-peer self-announcement state.
@@ -5648,6 +5724,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTBQueueIO (fromIntegral backgroundSendQueueCap)  -- pmBackgroundSends
     <*> newTVarIO 0             -- pmBackgroundDropped
     <*> newTVarIO Map.empty     -- pmOutboundTrack
+    <*> newTVarIO Set.empty     -- pmManualBans
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -5718,6 +5795,9 @@ peerManagerLoop pm = forever $ do
   -- path (misbehaviour, timeouts, eviction).  Those already stopped counting
   -- (the groups are derived from the live map); this only bounds the registry.
   pruneOutboundDiversity (pmOutboundDiversity pm)
+  -- Drop expired bans every tick so the ban map holds live entries only
+  -- (Core's BanMan::SweepBanned runs on every IsBanned / dump).
+  void (clearExpiredBans pm)
 
   -- setnetworkactive gate (Core CConnman::fNetworkActive, net.cpp:2351/3022/
   -- 3219): when the operator has disabled networking, suppress ALL new
@@ -5769,7 +5849,7 @@ peerManagerLoop pm = forever $ do
         -- Pinned peers not already connected and not actively banned.
         toDial = [ a | a <- connectAddrs
                      , Set.notMember a connected
-                     , Map.notMember a activeBans ]
+                     , isNothing (lookupBan a activeBans) ]
     unless (null toDial) $
       putStrLn $ "peerManagerLoop: -connect mode — (re)dialing "
               ++ show (length toDial) ++ " pinned peer(s); "
@@ -5845,7 +5925,7 @@ peerManagerLoop pm = forever $ do
     let asmapD = pmAsmapData pm
     let filtered = filter (\a ->
           Set.notMember a connected &&
-          Map.notMember a activeBans &&
+          isNothing (lookupBan a activeBans) &&
           Set.notMember a failed) allCandidates
     -- Remove duplicates while preserving order.
     let unique = nub filtered
@@ -7009,12 +7089,110 @@ getConnectedPeers pm = do
     info <- readTVarIO (pcInfo pc)
     return (addr, info)
 
--- | Ban a peer for the configured duration
+-- | The ban-map key for an address: the IP with the port (and IPv6 flow
+-- info / scope id) zeroed, and an IPv4-mapped IPv6 address folded to IPv4.
+-- Core's BanMan keys both stores by 'CNetAddr', which has no port
+-- (banman.cpp Ban / Discourage / IsBanned / IsDiscouraged), so a ban covers
+-- every source port the peer can reconnect from.
+banKey :: SockAddr -> SockAddr
+banKey (SockAddrInet _ h) = SockAddrInet 0 h
+banKey (SockAddrInet6 _ _ (0, 0, 0xffff, w) _) =
+  -- ::ffff:a.b.c.d (HostAddress6 words are host order, a in the top byte).
+  let b1 = (w `shiftR` 24) .&. 0xff
+      b2 = (w `shiftR` 16) .&. 0xff
+      b3 = (w `shiftR` 8) .&. 0xff
+      b4 = w .&. 0xff
+  in SockAddrInet 0 (tupleToHostAddress ( fromIntegral b1, fromIntegral b2
+                                        , fromIntegral b3, fromIntegral b4 ))
+banKey (SockAddrInet6 _ _ h _) = SockAddrInet6 0 0 h 0
+banKey a = a
+
+-- | Look an address up in a ban map by its 'banKey'.  The exact address is
+-- tried as well so an entry inserted directly with a port still matches.
+lookupBan :: SockAddr -> Map SockAddr Int64 -> Maybe Int64
+lookupBan addr m = case Map.lookup (banKey addr) m of
+  Just e  -> Just e
+  Nothing -> Map.lookup addr m
+
+-- | Upper bound on the automatic (non-manual) entries of the ban map.
+-- Core holds discouraged addresses in @CRollingBloomFilter m_discouraged
+-- {50000, 0.000001}@ (banman.h), which forgets the oldest entries once
+-- 50000 have been added.  Manual bans ('pmManualBans', Core's @m_banned@)
+-- are not counted and never evicted.
+maxDiscouragedEntries :: Int
+maxDiscouragedEntries = 50000
+
+-- | Ban (discourage) a peer's IP for the configured duration.
+-- When the automatic entries are at 'maxDiscouragedEntries', expired entries
+-- are swept first and, if still full, the automatic entry nearest expiry is
+-- dropped, so the newest discouragement always lands and the map never holds
+-- more than the cap plus the operator's manual bans.  An IP that is already
+-- manually banned keeps its manual expiry.
 banPeer :: PeerManager -> SockAddr -> IO ()
 banPeer pm addr = do
   now <- round <$> getPOSIXTime
   let expiry = now + pmcBanDuration (pmConfig pm)
-  atomically $ modifyTVar' (pmBannedAddrs pm) (Map.insert addr expiry)
+      key    = banKey addr
+  atomically $ do
+    manual <- readTVar (pmManualBans pm)
+    unless (Set.member key manual) $ do
+      m0 <- readTVar (pmBannedAddrs pm)
+      let autoCount m = Map.size m - Set.size (Set.filter (`Map.member` m) manual)
+          full m = Map.notMember key m && autoCount m >= maxDiscouragedEntries
+          m1 = if full m0 then Map.filter (> now) m0 else m0
+          m2 = if full m1 then evictSoonest manual m1 else m1
+      writeTVar (pmBannedAddrs pm) (Map.insert key expiry m2)
+      when (Map.size m1 /= Map.size m0) $
+        writeTVar (pmManualBans pm) (Set.filter (`Map.member` m1) manual)
+  where
+    evictSoonest manual m =
+      case Map.foldrWithKey (pick manual) Nothing m of
+        Just (k, _) -> Map.delete k m
+        Nothing     -> m
+    pick manual k e acc
+      | Set.member k manual = acc
+      | otherwise = case acc of
+          Just (_, e') | e' <= e -> acc
+          _                      -> Just (k, e)
+
+-- | Operator ban (@setban add@): store @expiry@ under the IP's 'banKey' and
+-- mark it manual.  Returns 'False' without changing anything when the IP
+-- already holds a live manual ban (Core: "IP/Subnet already banned").  An
+-- automatic discouragement of the same IP is replaced by the manual entry.
+addManualBan :: PeerManager -> SockAddr -> Int64 -> IO Bool
+addManualBan pm addr expiry = do
+  now <- round <$> getPOSIXTime
+  let key = banKey addr
+  atomically $ do
+    manual <- readTVar (pmManualBans pm)
+    banned <- readTVar (pmBannedAddrs pm)
+    let live = Set.member key manual && maybe False (> now) (Map.lookup key banned)
+    if live
+      then return False
+      else do
+        writeTVar (pmBannedAddrs pm) (Map.insert key expiry banned)
+        writeTVar (pmManualBans pm) (Set.insert key manual)
+        return True
+
+-- | Operator unban (@setban remove@).  Only a manual ban can be removed, as
+-- Core's @BanMan::Unban@ only touches @m_banned@; returns 'False' otherwise.
+removeManualBan :: PeerManager -> SockAddr -> IO Bool
+removeManualBan pm addr = do
+  let key = banKey addr
+  atomically $ do
+    manual <- readTVar (pmManualBans pm)
+    if Set.member key manual
+      then do
+        modifyTVar' (pmBannedAddrs pm) (Map.delete key)
+        writeTVar (pmManualBans pm) (Set.delete key manual)
+        return True
+      else return False
+
+-- | Drop every ban, manual and automatic (@clearbanned@).
+clearAllBans :: PeerManager -> IO ()
+clearAllBans pm = atomically $ do
+  writeTVar (pmBannedAddrs pm) Map.empty
+  writeTVar (pmManualBans pm) Set.empty
 
 -- | Add to a peer's ban score for misbehavior
 -- Invalid messages typically add 10-100 points
@@ -7146,7 +7324,7 @@ isDiscouraged :: PeerManager -> SockAddr -> IO Bool
 isDiscouraged pm addr = do
   now <- round <$> getPOSIXTime
   banned <- readTVarIO (pmBannedAddrs pm)
-  case Map.lookup addr banned of
+  case lookupBan addr banned of
     Nothing -> return False
     Just expiry -> return (now < expiry)
 
@@ -7166,6 +7344,8 @@ clearExpiredBans pm = do
     banned <- readTVar (pmBannedAddrs pm)
     let (expired, active) = Map.partition (<= now) banned
     writeTVar (pmBannedAddrs pm) active
+    unless (Map.null expired) $
+      modifyTVar' (pmManualBans pm) (Set.filter (`Map.member` active))
     return (Map.size expired)
 
 -- | Insert a minimal peer entry directly into the peer map for testing.
@@ -7267,12 +7447,38 @@ banEntryToSockAddr be =
       | otherwise = let (h:t) = splitOn c xs in (x:h) : t
 
 -- | Save the ban list to a JSON file
+-- Each entry also records @"manual"@, so an operator ban stays out of the
+-- discouragement cap after a restart (see 'pmManualBans').
 saveBanList :: PeerManager -> FilePath -> IO ()
 saveBanList pm path = do
-  banned <- readTVarIO (pmBannedAddrs pm)
-  let entries = mapMaybe (uncurry sockAddrToBanEntry) (Map.toList banned)
+  (banned, manual) <- atomically $
+    (,) <$> readTVar (pmBannedAddrs pm) <*> readTVar (pmManualBans pm)
+  let entries =
+        [ SavedBan be (Set.member a manual)
+        | (a, e) <- Map.toList banned
+        , Just be <- [sockAddrToBanEntry a e]
+        ]
   withFile path WriteMode $ \h ->
     hPutStr h (C8.unpack $ LBS.toStrict $ Aeson.encode entries)
+
+-- | A banlist.json entry: the 'BanEntry' fields plus whether it is manual.
+-- A file without @"manual"@ (written before the flag existed) loads as
+-- automatic, so it stays inside the discouragement cap.
+data SavedBan = SavedBan !BanEntry !Bool
+
+instance ToJSON SavedBan where
+  toJSON (SavedBan be manual) = Aeson.object
+    [ "address" .= beAddress be
+    , "port"    .= bePort be
+    , "expiry"  .= beExpiry be
+    , "manual"  .= manual
+    ]
+
+instance FromJSON SavedBan where
+  parseJSON v = do
+    be <- parseJSON v
+    manual <- Aeson.withObject "SavedBan" (\o -> o .:? "manual" .!= False) v
+    return (SavedBan be manual)
 
 -- | Load the ban list from a JSON file
 loadBanList :: PeerManager -> FilePath -> IO (Either String Int)
@@ -7283,17 +7489,23 @@ loadBanList pm path = do
     Right contents ->
       case Aeson.decodeStrict (C8.pack contents) of
         Nothing -> return $ Left "Invalid JSON in ban list"
-        Just (entries :: [BanEntry]) -> do
+        Just (entries :: [SavedBan]) -> do
           now <- round <$> getPOSIXTime
-          let validEntries = filter (\e -> beExpiry e > now) entries
-              banMap = Map.fromList $ mapMaybe toBanPair validEntries
-          atomically $ modifyTVar' (pmBannedAddrs pm) (Map.union banMap)
+          let validEntries = [ e | e@(SavedBan be _) <- entries, beExpiry be > now ]
+              pairs  = mapMaybe toBanPair validEntries
+              banMap = Map.fromListWith max [ (k, x) | (k, x, _) <- pairs ]
+              manual = Set.fromList [ k | (k, _, True) <- pairs ]
+          atomically $ do
+            modifyTVar' (pmBannedAddrs pm) (Map.union banMap)
+            modifyTVar' (pmManualBans pm) (Set.union manual)
           return $ Right (Map.size banMap)
   where
-    toBanPair :: BanEntry -> Maybe (SockAddr, Int64)
-    toBanPair be = do
+    toBanPair :: SavedBan -> Maybe (SockAddr, Int64, Bool)
+    -- Entries saved before bans were keyed by IP carry the peer's port;
+    -- fold them to the IP key so they cover every port again.
+    toBanPair (SavedBan be manual) = do
       addr <- banEntryToSockAddr be
-      return (addr, beExpiry be)
+      return (banKey addr, beExpiry be, manual)
 
 --------------------------------------------------------------------------------
 -- Addr Message Handling
@@ -7423,7 +7635,7 @@ checkPreHandshake pm addr = do
   inboundCount <- countInboundPeers pm
 
   -- Check 1: Is the peer banned?
-  case Map.lookup addr banned of
+  case lookupBan addr banned of
     Just expiry | expiry > now -> return RejectBanned
     _ -> do
       -- Check 2: Is the peer discouraged and slots nearly full?
@@ -10431,10 +10643,28 @@ takePendingCompact var addr bh = do
 --   - short-ID collision detection (Core:115-116)
 --   - bucket-size-12 DoS check (Core:110-111)
 --   - duplicate-match clearing (Core:129-136)
+--
+-- This form recomputes every mempool transaction's wtxid (a full
+-- re-serialization and SHA256d per tx).  The network handler must use
+-- 'initPartialBlockCached' with the mempool's cached wtxids instead.
 initPartialBlock :: CmpctBlock
                  -> Map TxId Tx       -- ^ Mempool transactions (by txid; wtxid recomputed)
                  -> Either String (PartiallyDownloadedBlock, [Int])
-initPartialBlock cb mempoolTxs = do
+initPartialBlock cb mempoolTxs =
+  initPartialBlockCached cb [ (Wtxid (computeWtxid tx), tx) | tx <- Map.elems mempoolTxs ]
+
+-- | 'initPartialBlock' over mempool transactions paired with their cached
+-- wtxids (the mempool's 'meWtxid').  Matching a short id costs one SipHash
+-- per mempool tx and never re-serializes or re-hashes a transaction, as in
+-- Core's PartiallyDownloadedBlock::InitData, which reads the wtxid the
+-- mempool cached (txns_randomized) rather than recomputing it.
+--
+-- The list is folded in order, so a caller that passes the mempool in txid
+-- order gets exactly the result 'initPartialBlock' gives for the same map.
+initPartialBlockCached :: CmpctBlock
+                       -> [(Wtxid, Tx)]  -- ^ Mempool transactions with cached wtxids
+                       -> Either String (PartiallyDownloadedBlock, [Int])
+initPartialBlockCached cb mempoolTxs = do
   let shortIds  = cbShortIds cb
       prefilled = cbPrefilled cb
 
@@ -10518,22 +10748,21 @@ initPartialBlock cb mempoolTxs = do
 
     -- Try to fill slots from mempool transactions.
     -- Uses a 'have_txn' set to detect duplicate matches and clear them (Core:125-136).
-    fillFromMempool :: SipHashKey -> Map ShortTxId Int -> Map TxId Tx
+    fillFromMempool :: SipHashKey -> Map ShortTxId Int -> [(Wtxid, Tx)]
                     -> Map Int (Maybe Tx)
                     -> (Map Int (Maybe Tx), Int)
     fillFromMempool skey shortIdMap mempool available =
       -- have_txn tracks which slots are already tentatively filled
       let (avail', hits, _haveTxn) =
-            Map.foldlWithKey' (tryFill skey shortIdMap) (available, 0, Map.empty) mempool
+            foldl' (tryFill skey shortIdMap) (available, 0, Map.empty) mempool
       in (avail', hits)
 
     tryFill :: SipHashKey -> Map ShortTxId Int
             -> (Map Int (Maybe Tx), Int, Map Int ())
-            -> TxId -> Tx
+            -> (Wtxid, Tx)
             -> (Map Int (Maybe Tx), Int, Map Int ())
-    tryFill skey shortIdMap (avail, hits, haveTxn) _txid tx =
-      let wtxid   = computeWtxid tx
-          shortId = computeShortId skey (getHash256 wtxid)
+    tryFill skey shortIdMap (avail, hits, haveTxn) (Wtxid wtxid, tx) =
+      let shortId = computeShortId skey (getHash256 wtxid)
       in case Map.lookup shortId shortIdMap of
            Nothing  -> (avail, hits, haveTxn)
            Just idx ->
