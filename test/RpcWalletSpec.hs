@@ -421,9 +421,9 @@ spec = describe "encrypted wallet: key-exporting and signing RPCs require unlock
     r3 `shouldBe` A.Null
     (_, e3b) <- callAt server "/" "getbalance" []
     errCode e3b `shouldBe` Just (-19)
-    -- Handlers that also report or copy by name use the resolved wallet:
-    -- listdescriptors names it, backupwallet copies its file (w1 is the
-    -- default wallet, so the base code copied w1's file for /wallet/enc).
+    -- Handlers that also report or back up by name use the resolved wallet:
+    -- listdescriptors names it, backupwallet backs up its keys (w1 is the
+    -- default wallet, so the base code backed up w1 for /wallet/enc).
     (rd, ed) <- callAt server "/wallet/enc" "listdescriptors" []
     ed `shouldBe` A.Null
     (case rd of
@@ -432,10 +432,17 @@ spec = describe "encrypted wallet: key-exporting and signing RPCs require unlock
     let backup = wmWalletDir wm </> "backup-enc.dat"
     (_, eb) <- callAt server "/wallet/enc" "backupwallet" [str (T.pack backup)]
     eb `shouldBe` A.Null
-    copied <- BS.readFile backup
-    encFile <- BS.readFile (wmWalletDir wm </> "enc" </> "wallet.dat")
-    w1File  <- BS.readFile (wmWalletDir wm </> "w1" </> "wallet.dat")
-    (copied == encFile, copied == w1File) `shouldBe` (True, False)
+    -- The backup is sealed (backupManagedWallet), so its bytes match neither
+    -- wallet.dat.  Restore it and ask which wallet's keys it holds: enc's
+    -- address must export from the restored wallet and w1's must not.
+    (_, er) <- callAt server "/" "restorewallet" [str "restored-enc", str (T.pack backup)]
+    er `shouldBe` A.Null
+    (rk1, ek1) <- callAt server "/wallet/restored-enc" "dumpprivkey" [str (addrText addrEnc)]
+    (rk1 /= A.Null, ek1) `shouldBe` (True, A.Null)
+    (_, ek2) <- callAt server "/wallet/restored-enc" "dumpprivkey" [str (addrText addrW1)]
+    ek2 `shouldNotBe` A.Null
+    (_, eu) <- callAt server "/wallet/restored-enc" "unloadwallet" []
+    eu `shouldBe` A.Null
     -- A URI naming a wallet that is not loaded.
     (_, e4) <- callAt server "/wallet/nope" "getwalletinfo" []
     (errCode e4, errMsg e4) `shouldBe`
