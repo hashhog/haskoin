@@ -93,6 +93,7 @@ module Haskoin.Network
   , computeWtxid
   , createCompactBlock
   , initPartialBlock
+  , initPartialBlockCached
   , fillPartialBlock
   , reconstructBlock
   , getMissingTxIndices
@@ -10575,10 +10576,28 @@ takePendingCompact var addr bh = do
 --   - short-ID collision detection (Core:115-116)
 --   - bucket-size-12 DoS check (Core:110-111)
 --   - duplicate-match clearing (Core:129-136)
+--
+-- This form recomputes every mempool transaction's wtxid (a full
+-- re-serialization and SHA256d per tx).  The network handler must use
+-- 'initPartialBlockCached' with the mempool's cached wtxids instead.
 initPartialBlock :: CmpctBlock
                  -> Map TxId Tx       -- ^ Mempool transactions (by txid; wtxid recomputed)
                  -> Either String (PartiallyDownloadedBlock, [Int])
-initPartialBlock cb mempoolTxs = do
+initPartialBlock cb mempoolTxs =
+  initPartialBlockCached cb [ (Wtxid (computeWtxid tx), tx) | tx <- Map.elems mempoolTxs ]
+
+-- | 'initPartialBlock' over mempool transactions paired with their cached
+-- wtxids (the mempool's 'meWtxid').  Matching a short id costs one SipHash
+-- per mempool tx and never re-serializes or re-hashes a transaction, as in
+-- Core's PartiallyDownloadedBlock::InitData, which reads the wtxid the
+-- mempool cached (txns_randomized) rather than recomputing it.
+--
+-- The list is folded in order, so a caller that passes the mempool in txid
+-- order gets exactly the result 'initPartialBlock' gives for the same map.
+initPartialBlockCached :: CmpctBlock
+                       -> [(Wtxid, Tx)]  -- ^ Mempool transactions with cached wtxids
+                       -> Either String (PartiallyDownloadedBlock, [Int])
+initPartialBlockCached cb mempoolTxs = do
   let shortIds  = cbShortIds cb
       prefilled = cbPrefilled cb
 
@@ -10662,22 +10681,21 @@ initPartialBlock cb mempoolTxs = do
 
     -- Try to fill slots from mempool transactions.
     -- Uses a 'have_txn' set to detect duplicate matches and clear them (Core:125-136).
-    fillFromMempool :: SipHashKey -> Map ShortTxId Int -> Map TxId Tx
+    fillFromMempool :: SipHashKey -> Map ShortTxId Int -> [(Wtxid, Tx)]
                     -> Map Int (Maybe Tx)
                     -> (Map Int (Maybe Tx), Int)
     fillFromMempool skey shortIdMap mempool available =
       -- have_txn tracks which slots are already tentatively filled
       let (avail', hits, _haveTxn) =
-            Map.foldlWithKey' (tryFill skey shortIdMap) (available, 0, Map.empty) mempool
+            foldl' (tryFill skey shortIdMap) (available, 0, Map.empty) mempool
       in (avail', hits)
 
     tryFill :: SipHashKey -> Map ShortTxId Int
             -> (Map Int (Maybe Tx), Int, Map Int ())
-            -> TxId -> Tx
+            -> (Wtxid, Tx)
             -> (Map Int (Maybe Tx), Int, Map Int ())
-    tryFill skey shortIdMap (avail, hits, haveTxn) _txid tx =
-      let wtxid   = computeWtxid tx
-          shortId = computeShortId skey (getHash256 wtxid)
+    tryFill skey shortIdMap (avail, hits, haveTxn) (Wtxid wtxid, tx) =
+      let shortId = computeShortId skey (getHash256 wtxid)
       in case Map.lookup shortId shortIdMap of
            Nothing  -> (avail, hits, haveTxn)
            Just idx ->
