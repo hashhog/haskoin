@@ -55,6 +55,7 @@ import Haskoin.Consensus
 import Haskoin.ChainLock (ChainLock, withChainLock, tryWithChainLock, chainLockHeld)
 import Haskoin.Storage
 import Haskoin.HeaderReload (initHeaderChainFromDB, estimateUndoConnectedTip)
+import Haskoin.BlockNotFound (noteBlockNotFound, noteBlockRequestAnswered, readBlockNotFound)
 import Haskoin.Sync (CmpctHeaderVerdict(..), cmpctHeaderGate, cmpctHeaderPunishment)
 import Haskoin.Rpc
 import Haskoin.Mempool
@@ -3548,28 +3549,9 @@ punishBlockSource pmRefP bh = do
               ++ " for delivering invalid block " ++ hexHashS bh
       void (misbehaving pm a InvalidBlock)
 
--- | Peers that answered @notfound@ for a block we asked them for, with the
--- time.  The linear planner does not ask that peer for that hash again for
--- 'blockNotFoundTtl' seconds, and the kicker releases the in-flight entry so
--- the peer is not then disconnected as a staller for a block it never had.
--- Core never gets here: FindNextBlocksToDownload only asks a peer for blocks
--- on its pindexBestKnownBlock chain; haskoin's planner is header-blind, and
--- a peer that does not have a freshly announced block (the honest peer when
--- another peer announces a block only it holds) was disconnected after 2 s.
-{-# NOINLINE blockNotFoundRef #-}
-blockNotFoundRef :: IORef (Map.Map BlockHash (Map.Map NS.SockAddr Int64))
-blockNotFoundRef = unsafePerformIO (newIORef Map.empty)
-
-blockNotFoundTtl :: Int64
-blockNotFoundTtl = 120
-
-noteBlockNotFound :: NS.SockAddr -> [BlockHash] -> IO ()
-noteBlockNotFound addr hs = do
-  now <- round <$> getPOSIXTime :: IO Int64
-  atomicModifyIORef' blockNotFoundRef $ \m ->
-    let m' = Map.filter (not . Map.null)
-               (Map.map (Map.filter (\t -> now - t < blockNotFoundTtl)) m)
-    in (foldl (\acc h -> Map.insertWith Map.union h (Map.singleton addr now) acc) m' hs, ())
+-- 'blockNotFoundRef' / 'noteBlockNotFound' live in "Haskoin.BlockNotFound"
+-- (secfix-haskoin-notfound-unsolicited): only notfound answers for blocks
+-- this node asked that peer for are kept.
 
 -- | Which peers announced a block's header (small announcement batches
 -- only, not bulk IBD header sync).  Core FindNextBlocksToDownload asks a
@@ -3612,14 +3594,6 @@ dropNotFoundInflight m = do
   return $ if Map.null nf then m else
     Map.filterWithKey
       (\h (k, _, _) -> not (maybe False (Map.member k) (Map.lookup h nf))) m
-
--- | Live (unexpired) notfound answers.
-readBlockNotFound :: IO (Map.Map BlockHash (Map.Map NS.SockAddr Int64))
-readBlockNotFound = do
-  now <- round <$> getPOSIXTime :: IO Int64
-  m <- readIORef blockNotFoundRef
-  return $ Map.filter (not . Map.null)
-             (Map.map (Map.filter (\t -> now - t < blockNotFoundTtl)) m)
 
 {-# NOINLINE forkPointMemoRef #-}
 forkPointMemoRef :: IORef (Maybe ((BlockHash, BlockHash), BlockHash))
@@ -4110,6 +4084,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
   MBlock block -> do
     let bh = computeBlockHash (blockHeader block)
         hdr = blockHeader block
+    -- The getdata for it (if any) is answered ('Haskoin.BlockNotFound').
+    noteBlockRequestAnswered addr bh
     -- First, ensure the header is in our chain index.
     -- For unsolicited blocks (received via inv->getdata), the header may
     -- not yet be in the chain. addHeader is idempotent if already known.
@@ -4949,7 +4925,8 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     putStrLn $ "Peer says not found: " ++ show (length invs) ++ " items"
     -- Remember which block hashes this peer does not have so the linear
     -- planner asks someone else and the stall rule does not charge it
-    -- ('blockNotFoundRef').
+    -- ('blockNotFoundRef').  Only hashes we sent this peer a block getdata
+    -- for are kept; the rest of the message is ignored, as Core does.
     let blockHs = [ BlockHash (ivHash iv) | iv <- invs
                   , ivType iv == InvBlock || ivType iv == InvWitnessBlock ]
     unless (null blockHs) $ noteBlockNotFound addr blockHs

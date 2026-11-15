@@ -223,6 +223,7 @@ module Haskoin.Network
   , peerCanServeWitnesses
   , outboundHasDesirableServices
   , isBlockDataRequest
+  , blockGetDataHashes
   , blockRequestAllowed
   , userAgent
     -- * Inventory type helpers
@@ -815,6 +816,7 @@ import qualified Crypto.Random as CryptoRandom
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import System.Timeout (timeout)
+import Haskoin.BlockNotFound (noteBlockRequested)
 import Control.Concurrent.STM
 import Control.Exception (try, SomeException, catch, mask, mask_, IOException, finally, throwIO)
 import Data.Hashable (Hashable(..))
@@ -1289,6 +1291,17 @@ isBlockDataRequest msg = case msg of
   where
     isBlockInv t = t `elem` [ InvBlock, InvWitnessBlock
                             , InvFilteredBlock, InvCompactBlock ]
+
+-- | Block hashes a getdata asks for (any block-type inventory).  Recorded
+-- by 'sendMessage' so a later @notfound@ is honoured only for hashes this
+-- node actually asked that peer for (secfix-haskoin-notfound-unsolicited).
+blockGetDataHashes :: Message -> [BlockHash]
+blockGetDataHashes msg = case msg of
+  MGetData (GetData ivs) ->
+    [ BlockHash (ivHash iv) | iv <- ivs
+    , ivType iv `elem` [ InvBlock, InvWitnessBlock
+                       , InvFilteredBlock, InvCompactBlock ] ]
+  _ -> []
 
 -- | Single chokepoint for every block request that goes through
 -- 'requestFromPeerChecked': refuse to ask a peer without NODE_WITNESS
@@ -4087,6 +4100,13 @@ disconnectPeer pc = do
 -- to the v1 framing path (network magic + 24-byte header + payload).
 sendMessage :: PeerConnection -> Message -> IO ()
 sendMessage pc msg = withMVar (pcSendLock pc) $ \_ -> do
+  -- Every block getdata leaves through here; note it before the bytes go
+  -- out so a fast notfound reply always finds the request.
+  case blockGetDataHashes msg of
+    [] -> return ()
+    hs -> do
+      addr <- piAddress <$> readTVarIO (pcInfo pc)
+      noteBlockRequested addr hs
   mV2 <- readIORef (pcV2Transport pc)
   case mV2 of
     -- Hold the per-connection send mutex across BOTH the cipher advance
