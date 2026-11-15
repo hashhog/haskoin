@@ -440,7 +440,7 @@ spec = describe "encrypted wallet: key-exporting and signing RPCs require unlock
     (rk1, ek1) <- callAt server "/wallet/restored-enc" "dumpprivkey" [str (addrText addrEnc)]
     (rk1 /= A.Null, ek1) `shouldBe` (True, A.Null)
     (_, ek2) <- callAt server "/wallet/restored-enc" "dumpprivkey" [str (addrText addrW1)]
-    ek2 `shouldNotBe` A.Null
+    (errCode ek2, errMsg ek2) `shouldBe` (Just (-5), Just "Private key for address is not known")
     (_, eu) <- callAt server "/wallet/restored-enc" "unloadwallet" []
     eu `shouldBe` A.Null
     -- A URI naming a wallet that is not loaded.

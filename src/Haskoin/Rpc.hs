@@ -9204,9 +9204,9 @@ handleBackupWallet server params = withWalletMgr server $ \wm ->
           case eWallet of
             Left walletErr -> return walletErr
             Right (walletName, ws) -> do
-              -- Flush so the copy contains the live keychain, not the
-              -- create-time snapshot.  The file copied is the resolved
-              -- wallet's own, never the default wallet's.
+              -- Flush so the backup holds the live keychain, not the
+              -- create-time snapshot.  The wallet backed up is the resolved
+              -- one, never the default wallet.
               void (persistWallet (wsWallet ws))
               let src = wmWalletDir wm </> T.unpack walletName </> "wallet.dat"
                   dest = T.unpack destText
