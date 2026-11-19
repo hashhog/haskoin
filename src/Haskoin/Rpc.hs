@@ -540,7 +540,8 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          TxPackage(..), PackageError(..), maxPackageCount, acceptPackage,
                          isWellFormedPackage, isChildWithParents,
                          isChildWithParentsTree,
-                         mempoolChunkInfo, mempoolParents, mempoolChildren)
+                         mempoolChunkInfo, mempoolParents, mempoolChildren,
+                         getMempoolInfoUsage)
 import qualified Haskoin.Mempool.Persist as MPP
 import qualified Haskoin.Policy.Standard as PolicyStd
 import Haskoin.TxOrphanage (OrphanPool(..))
@@ -4625,11 +4626,13 @@ mempoolInfoJson server = do
   -- static relay floor).  Reads the REAL floor via getMempoolMinFeeRate.
   effFloorKvb <- fromIntegral <$> getMempoolMinFeeRate (rsMempool server) :: IO Int64
   unbroadcastN <- Set.size <$> getUnbroadcastSet (rsMempool server)
+  -- usage = Core's DynamicMemoryUsage(), not the vsize total in "bytes".
+  usage <- atomically (getMempoolInfoUsage (rsMempool server))
   let enc = pairs $
               pair "loaded"              (AE.bool True)                             <>
               pair "size"                (AE.int count)                             <>
               pair "bytes"               (AE.int size)                              <>
-              pair "usage"               (AE.int size)                              <>
+              pair "usage"               (AE.int usage)                             <>
               pair "total_fee"           (btcAmountEnc (fromIntegral totalFeeSat))  <>
               pair "maxmempool"          (toEncoding (mpcMaxSize mpCfg))            <>
               pair "mempoolminfee"       (btcAmountEnc effFloorKvb)                 <>

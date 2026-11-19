@@ -86,6 +86,7 @@ module Haskoin.Mempool
   , rollingFeeHalflife
   , txMemUsage
   , getMempoolDynamicUsage
+  , getMempoolInfoUsage
   , setMempoolMockTime
   , applyMaxMempoolMb
     -- * RBF (Replace-by-Fee)
@@ -3049,6 +3050,52 @@ getMempoolDynamicUsage mp = do
   used <- readTVar (mpUsage mp)
   cap  <- readTVar (mpRandCap mp)
   return (used + mallocUsage (cap * 40))
+
+-- | The @usage@ field of getmempoolinfo and REST @/rest/mempool/info.json@:
+-- Core fills it from @pool.DynamicMemoryUsage()@ (MempoolInfoToJSON,
+-- rpc/mempool.cpp), which includes @m_txgraph->GetMainMemoryUsage()@.
+-- 'getMempoolDynamicUsage' prices every tx as a TxGraph singleton; this
+-- adds 'clusterMemUsage' for the pool's multi-tx clusters.  Walking the
+-- clusters costs a pass over the pool, so the per-admission trim check
+-- keeps using 'getMempoolDynamicUsage'.
+getMempoolInfoUsage :: Mempool -> STM Int
+getMempoolInfoUsage mp = do
+  base       <- getMempoolDynamicUsage mp
+  entries    <- readTVar (mpEntries mp)
+  byOutpoint <- readTVar (mpByOutpoint mp)
+  return (base + clusterMemUsage entries byOutpoint)
+
+-- | What Core's TxGraph spends on multi-tx clusters beyond the singleton
+-- share already in 'txMemUsage' (txgraph.cpp GetMainMemoryUsage):
+--
+--   * a cluster of n >= 2 txs is one @GenericClusterImpl@
+--     (@TotalMemoryUsage@, txgraph.cpp:915): the allocation itself and its
+--     @m_clusters@ slot (136), @m_mapping@ and @m_linearization@ (n 4-byte
+--     indexes each) and the DepGraph's @entries@ (n 32-byte entries), in
+--     place of n @SingletonClusterImpl@s (72 each);
+--   * every chunk of the linearization is one @m_main_chunkindex@ node
+--     (64), so a chunk that merges k txs saves k - 1 nodes.
+--
+-- Measured on Core v31.1 regtest: chains of 2..6 equal-fee spends add
+-- 136, 96, 56, 48, 8 over the same txs unrelated; a CPFP chain (one chunk)
+-- subtracts a further 64 per merged tx; a two-parent fan-in whose child
+-- pays for both is 32 under the unrelated sum.  The capacities assume
+-- each vector holds exactly its txs, which is what those measurements show.
+clusterMemUsage :: Map TxId MempoolEntry -> Map OutPoint TxId -> Int
+clusterMemUsage entries byOutpoint = sum
+  [ genericCluster n - n * singletonCluster - chunkNode * (n - nChunks)
+  | txids <- findAllClusters entries byOutpoint
+  , let n = Set.size txids
+  , n >= 2
+  , let nChunks = length $ computeChunks
+          [ (t, meFee e, meAdjWeight e)
+          | t <- linearize txids entries
+          , Just e <- [Map.lookup t entries] ]
+  ]
+  where
+    singletonCluster = 72
+    chunkNode        = 64
+    genericCluster k = 136 + 2 * mallocUsage (4 * k) + mallocUsage (32 * k)
 
 -- | Set or clear (Nothing) the mempool's mock clock; @setmocktime@ calls it.
 setMempoolMockTime :: Mempool -> Maybe Int64 -> IO ()
