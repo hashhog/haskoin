@@ -2999,9 +2999,9 @@ scriptUsage s
 -- spend adds 1,208 bytes, each further input of the same shape 496, an
 -- extra 48-byte output 48; an 800-input spend with two 80-byte items and
 -- a 3-byte script per witness adds 397,512 bytes in Core and here.
--- Not modelled: TxGraph's per-cluster bookkeeping for multi-tx clusters (a
--- few hundred bytes per dependency) and the mapDeltas map that
--- prioritisetransaction fills.
+-- Not modelled here: TxGraph's bookkeeping for multi-tx clusters (see
+-- 'clusterMemUsage', which getmempoolinfo adds via 'getMempoolInfoUsage')
+-- and the mapDeltas map that prioritisetransaction fills.
 txMemUsage :: Tx -> Int
 txMemUsage tx =
     entryOverhead
