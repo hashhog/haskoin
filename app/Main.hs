@@ -4939,7 +4939,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     pm <- readIORef pmRef
     admitted <- admitInboundAddrs pmRef addr entries
     unless (null admitted) $ do
-      handleAddrMessage pm (Haskoin.Network.Addr admitted)
+      handleAddrMessage pm addr (Haskoin.Network.Addr admitted)
       relayAddrToRandomPeers pm addr (MAddr (Haskoin.Network.Addr admitted))
 
   MAddrV2 addrv2msg -> do
@@ -4964,7 +4964,7 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     -- If everything was filtered out, no relay happens either.
     unless (null filtered) $ do
       unless (null converted) $
-        handleAddrMessage pm (Haskoin.Network.Addr converted)
+        handleAddrMessage pm addr (Haskoin.Network.Addr converted)
       relayAddrToRandomPeers pm addr (MAddrV2 (AddrV2Msg filtered))
 
   MFeeFilter (FeeFilter fee) -> do
