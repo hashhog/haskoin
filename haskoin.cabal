@@ -335,6 +335,8 @@ test-suite addrman-index-bound
   main-is:       AddrmanIndexBoundMain.hs
   other-modules: AddrmanIndexBoundSpec
   hs-source-dirs: test
+  -- mergeKnownAddrs exists from this commit on (see the spec header).
+  cpp-options:   -DHASKOIN_KNOWNADDRS_CAP
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec

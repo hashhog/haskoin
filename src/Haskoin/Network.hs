@@ -379,6 +379,8 @@ module Haskoin.Network
   , AddrInfo(..)
   , newAddrMan
   , addAddress
+  , mergeKnownAddrs
+  , knownAddrsCap
   , selectAddress
   , selectForFeeler
   , markGood
@@ -5892,7 +5894,7 @@ peerManagerLoop pm = forever $ do
         addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 nowTs
       -- Also keep pmKnownAddrs in sync for callers that read it directly.
       atomically $ do
-        modifyTVar' (pmKnownAddrs pm) (Set.union (Set.fromList discovered))
+        modifyTVar' (pmKnownAddrs pm) (`mergeKnownAddrs` discovered)
         -- Clear failed set on DNS refresh so we retry previously-failed addresses
         writeTVar (pmFailedAddrs pm) Set.empty
         writeTVar (pmLastDNSRefresh pm) nowTs
@@ -7534,6 +7536,24 @@ clampAddrTimestamp now peerTs =
      then now - 5 * 24 * 60 * 60   -- Core: current_time - 5*24h
      else ts
 
+-- | Upper bound on 'pmKnownAddrs' (seed / addnode fallback addresses).
+knownAddrsCap :: Int
+knownAddrsCap = 1000
+
+-- | Merge a DNS-seed answer into 'pmKnownAddrs' without letting the set grow
+-- past 'knownAddrsCap' over the uptime.  The latest answer is always kept;
+-- older entries fill the remaining room.
+mergeKnownAddrs :: Set.Set SockAddr -> [SockAddr] -> Set.Set SockAddr
+mergeKnownAddrs known discovered
+  | Set.size merged <= knownAddrsCap = merged
+  | Set.size fresh >= knownAddrsCap  = Set.take knownAddrsCap fresh
+  | otherwise =
+      Set.union fresh
+        (Set.take (knownAddrsCap - Set.size fresh) (known `Set.difference` fresh))
+  where
+    fresh  = Set.fromList discovered
+    merged = Set.union fresh known
+
 -- | Handle an addr message by adding addresses to the known pool
 -- BUG-5 FIX: feed peer-advertised addresses into pmAddrMan (addAddress)
 -- instead of inserting directly into the flat pmKnownAddrs set.
@@ -7556,10 +7576,10 @@ handleAddrMessage pm (Addr entries) = do
   let pairs = mapMaybe (entryToPair now) entries
   forM_ pairs $ \(a, clampedTs) ->
     addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 clampedTs
-  -- Keep pmKnownAddrs in sync for callers that read it directly.
-  let addrs = map fst pairs
-  atomically $ modifyTVar' (pmKnownAddrs pm) $
-    Set.union (Set.fromList addrs)
+  -- Gossip lives in AddrMan only.  It used to be unioned into pmKnownAddrs
+  -- too, which nothing ever shrinks: the set grew with every address any
+  -- peer ever sent, and the connection loop dialled it as a fallback that
+  -- bypassed AddrMan's bucketing and IsTerrible filter.
   where
     -- Combine timestamp clamping + SockAddr conversion for one entry.
     -- 'now' is captured from the enclosing do-block so all entries in the
@@ -8979,16 +8999,37 @@ addAddress am asmapData addr source services now
           position = getBucketPosition (amKey am) True bucket addr
 
       atomically $ do
-        -- Add to new table
-        modifyTVar' (amNewTable am) $ \table ->
-          let existing_bucket = Map.findWithDefault [] bucket table
-              -- Check if bucket position is taken
-              newBucket = take addrmanBucketSize $ info : existing_bucket
-          in Map.insert bucket newBucket table
-        -- Add to index
-        modifyTVar' (amAddrIndex am) (Map.insert addr info)
-        modifyTVar' (amNewCount am) (+1)
-      return True
+        -- Re-check inside the transaction: a concurrent add of the same
+        -- address between the lookup above and here would otherwise file it
+        -- twice and count it twice.
+        present <- Map.member addr <$> readTVar (amAddrIndex am)
+        if present
+          then return False
+          else do
+            insertNewSTM am bucket info
+            return True
+
+-- | Insert an entry (not yet in any table) at the front of a new bucket,
+-- keeping the bucket at 'addrmanBucketSize'.  Entries pushed out of the
+-- bucket are no longer referenced by any table, so they leave the index and
+-- the count, as Core's ClearNew/Delete erase them from mapInfo/mapAddr.
+-- Without this the index grew with every address ever accepted instead of
+-- staying bounded by table capacity.
+-- Reference: bitcoin-core/src/addrman.cpp AddrManImpl::ClearNew, ::Delete.
+insertNewSTM :: AddrMan -> Int -> AddrInfo -> STM ()
+insertNewSTM am bucket info = do
+  table <- readTVar (amNewTable am)
+  let (kept, evicted) =
+        splitAt addrmanBucketSize (info : Map.findWithDefault [] bucket table)
+  writeTVar (amNewTable am) (Map.insert bucket kept table)
+  idx <- readTVar (amAddrIndex am)
+  let -- An entry flagged tried belongs to the tried table, not this bucket.
+      dropped = [ aiAddress e | e <- evicted
+                              , maybe True (not . aiInTried)
+                                  (Map.lookup (aiAddress e) idx) ]
+  writeTVar (amAddrIndex am) $
+    foldl' (flip Map.delete) (Map.insert (aiAddress info) info idx) dropped
+  modifyTVar' (amNewCount am) (\n -> n + 1 - length dropped)
 
 -- | Select a random address from the manager
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Select_
@@ -9138,13 +9179,22 @@ markGood am asmapData addr now = do
             -- Remove from new table
             modifyTVar' (amNewTable am) $ Map.map (filter ((/= addr) . aiAddress))
             modifyTVar' (amNewCount am) (subtract 1)
-            -- Add to tried table
-            modifyTVar' (amTriedTable am) $ \table ->
-              let existing = Map.findWithDefault [] bucket table
-              in Map.insert bucket (take addrmanBucketSize $ updated : existing) table
-            modifyTVar' (amTriedCount am) (+1)
+            -- Add to tried table, keeping the bucket at addrmanBucketSize.
+            triedT <- readTVar (amTriedTable am)
+            let (kept, evicted) =
+                  splitAt addrmanBucketSize
+                    (updated : Map.findWithDefault [] bucket triedT)
+            writeTVar (amTriedTable am) (Map.insert bucket kept triedT)
+            modifyTVar' (amTriedCount am) (\n -> n + 1 - length evicted)
             -- Update index
             modifyTVar' (amAddrIndex am) (Map.insert addr updated)
+            -- Core MakeTried: an entry displaced from the tried table goes
+            -- back to the new table rather than lingering in the index as a
+            -- tried entry no table holds (and in amTriedCount).
+            forM_ evicted $ \old ->
+              insertNewSTM am
+                (getNewBucket (amKey am) asmapData (aiAddress old) (aiSource old))
+                old { aiInTried = False, aiRefCount = 1 }
 
 -- | Mark an address as attempted (failed connection)
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Attempt_
