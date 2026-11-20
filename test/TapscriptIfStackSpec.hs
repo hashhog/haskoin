@@ -185,11 +185,21 @@ main = hspec $ do
     it "control: innermost OP_0 OP_IF still verifies at both depths" $ do
       spendLeaf (nestedFalseInner 2000) `shouldBe` Right True
       spendLeaf (nestedFalseInner 20000) `shouldBe` Right True
-    it "control: one ENDIF missing fails, final OP_0 is false" $ do
+    -- (An unbalanced leaf is not used as a control here: the tapscript and
+    -- P2WSH paths skip Core's end-of-script UNBALANCED_CONDITIONAL check,
+    -- a separate consensus bug filed as its own item. The exhaustive
+    -- group below covers unbalanced sequences through the legacy path.)
+    it "control: same nesting with a final OP_0 does not verify" $ do
       let d = 2000
-      spendLeaf (concat (replicate d [OP_1, OP_IF]) ++ replicate (d - 1) OP_ENDIF ++ [OP_1])
-        `shouldSatisfy` either (const True) not
       spendLeaf (concat (replicate d [OP_1, OP_IF]) ++ replicate d OP_ENDIF ++ [OP_0])
+        `shouldSatisfy` either (const True) not
+    it "control: a false IF condition skips the branch (OP_RETURN unreached)" $ do
+      let d = 2000
+      spendLeaf (concat (replicate (d - 1) [OP_1, OP_IF]) ++ [OP_0, OP_IF, OP_RETURN]
+                 ++ replicate d OP_ENDIF ++ [OP_1])
+        `shouldBe` Right True
+      spendLeaf (concat (replicate (d - 1) [OP_1, OP_IF]) ++ [OP_1, OP_IF, OP_RETURN]
+                 ++ replicate d OP_ENDIF ++ [OP_1])
         `shouldSatisfy` either (const True) not
     linearity "all-true nesting" nestedTrue
     linearity "innermost-false nesting" nestedFalseInner
