@@ -34,6 +34,7 @@ import Data.Bits ((.|.))
 import qualified Data.ByteString as BS
 import Data.Word (Word64)
 import System.CPUTime (getCPUTime)
+import System.Mem (performMajorGC)
 import Test.Hspec
 import Test.QuickCheck
 
@@ -87,13 +88,15 @@ nestedFalseInner d =
   concat (replicate (d - 1) [OP_1, OP_IF]) ++ [OP_0, OP_IF]
   ++ replicate d OP_ENDIF ++ [OP_1]
 
--- | Minimum CPU picoseconds over 3 runs of a verification.
+-- | Minimum CPU picoseconds over 5 runs of a verification. Each run starts
+-- after a major GC so the two depths are timed from the same heap state.
 cpuCost :: [ScriptOp] -> IO (Integer, Either String Bool)
 cpuCost leaf = do
-  runs <- forM [1 :: Int .. 3] $ \_ -> do
+  runs <- forM [1 :: Int .. 5] $ \_ -> do
     -- The op list is shared across runs, but the verification itself is
     -- re-run: 'spendLeaf' is applied afresh inside each timed region.
     _ <- evaluate (length leaf)
+    performMajorGC
     t0 <- getCPUTime
     r <- evaluate (spendLeaf leaf)
     _ <- evaluate (either length fromEnum r)
