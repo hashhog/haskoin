@@ -103,6 +103,28 @@ emittedPubKey side = do
   close ours
   return pub
 
+-- | Run the outbound handshake against the inbound one over a socket pair
+-- and return both results ('Right ()' = reached app-data state).  Guards
+-- the garbage change: our garbage now has a random length in [0, 4095]
+-- instead of a fixed 32 bytes, and both sides must still complete.
+handshakePair :: IO (Either String (), Either String ())
+handshakePair = do
+  (a, b) <- socketPair AF_UNIX Stream 0
+  pcA <- mkConn a
+  pcB <- mkConn b
+  inV <- newEmptyMVar
+  _ <- forkIO $ do
+    r <- try (v2InboundHandshake pcB regtest)
+    putMVar inV (case r of
+                   Left (e :: SomeException) -> Left (show e)
+                   Right x -> () <$ x)
+  outR <- timeout 10000000 (v2OutboundHandshake pcA regtest)
+  inR <- timeout 10000000 (takeMVar inV)
+  close a
+  close b
+  return ( maybe (Left "outbound timed out") (fmap (const ())) outR
+         , maybe (Left "inbound timed out") id inR )
+
 -- | Seed the global StdGen with 42, emit one public key, and report the key
 -- plus whether the global StdGen was left untouched.
 seededRun :: Side -> IO (BS.ByteString, Bool)
@@ -115,6 +137,9 @@ seededRun side = do
 main :: IO ()
 main = hspec $ describe "BIP-324 ephemeral key randomness (Core: GenerateRandomKey / GetRandHash)" $ do
   mapM_ sideSpec [Outbound, Inbound]
+  it "outbound and inbound handshakes still complete against each other (random garbage lengths, 32 runs)" $ do
+    results <- mapM (const handshakePair) [1 :: Int .. 32]
+    results `shouldBe` replicate 32 (Right (), Right ())
   where
     sideSpec side = do
       it (show side ++ " handshake emits a different ellswift pubkey after resetting the global StdGen to the same seed") $ do
