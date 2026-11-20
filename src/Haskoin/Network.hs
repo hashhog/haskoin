@@ -783,7 +783,7 @@ import qualified Data.ByteArray as BA
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Maybe (mapMaybe, listToMaybe, isNothing, fromMaybe, catMaybes)
-import Data.List (sortOn, sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
+import Data.List (find, sortOn, sortBy, groupBy, partition, foldl', nub, isPrefixOf, isInfixOf, minimumBy, maximumBy)
 import Text.Read (readMaybe)
 import Data.Ord (comparing, Down(..))
 import Data.Function (fix, on)
@@ -7544,18 +7544,20 @@ clampAddrTimestamp now peerTs =
 --
 -- 3G FIX: clamp peer-advertised timestamps before storing.
 -- Reference: bitcoin-core/src/net_processing.cpp:5678-5680 (ProcessAddrs).
-handleAddrMessage :: PeerManager -> Addr -> IO ()
-handleAddrMessage pm (Addr entries) = do
+--
+-- @source@ is the address of the peer that sent the message.  Every entry is
+-- filed under it, as Core does (@m_addrman.Add(vAddrOk, pfrom.addr)@): the new
+-- bucket is keyed on the source group, so one peer can reach at most
+-- 'addrmanNewBucketsPerSourceGroup' (64) of the 1024 new buckets.  Filing an
+-- entry under its own address instead let one peer spread over all of them.
+handleAddrMessage :: PeerManager -> SockAddr -> Addr -> IO ()
+handleAddrMessage pm source (Addr entries) = do
   now <- (round <$> getPOSIXTime :: IO Int64)
   -- Process each entry with its own peer-advertised timestamp, clamped per
   -- Core's rule before being stored in AddrMan (aiTime field).
-  -- Each entry's source is the sending peer; we use the address itself as
-  -- source here because the Addr type does not carry a per-entry source.
-  -- This matches the "source = pfrom.addr" semantics in Core when the peer
-  -- is untrusted (no whitelisting in this impl).
   let pairs = mapMaybe (entryToPair now) entries
   forM_ pairs $ \(a, clampedTs) ->
-    addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 clampedTs
+    addAddress (pmAddrMan pm) (pmAsmapData pm) a source 0x409 clampedTs
   -- Keep pmKnownAddrs in sync for callers that read it directly.
   let addrs = map fst pairs
   atomically $ modifyTVar' (pmKnownAddrs pm) $
@@ -8978,17 +8980,49 @@ addAddress am asmapData addr source services now
           bucket = getNewBucket (amKey am) asmapData addr source
           position = getBucketPosition (amKey am) True bucket addr
 
+      -- Core AddSingle: the newcomer owns slot (bucket, position).  If the slot
+      -- is held, the occupant is replaced only if it IsTerrible or is also
+      -- referenced from another new bucket (nRefCount > 1); otherwise the
+      -- newcomer is dropped.  A bucket therefore never needs truncating, and
+      -- a good entry is never pushed out by gossip.
+      -- Reference: bitcoin-core/src/addrman.cpp AddrManImpl::AddSingle.
+      -- IsTerrible is judged at the current time, as in Core; @now@ is the
+      -- entry's (peer-advertised, clamped) timestamp and must not decide it.
+      clock <- (round <$> getPOSIXTime :: IO Int64)
       atomically $ do
-        -- Add to new table
-        modifyTVar' (amNewTable am) $ \table ->
-          let existing_bucket = Map.findWithDefault [] bucket table
-              -- Check if bucket position is taken
-              newBucket = take addrmanBucketSize $ info : existing_bucket
-          in Map.insert bucket newBucket table
-        -- Add to index
-        modifyTVar' (amAddrIndex am) (Map.insert addr info)
-        modifyTVar' (amNewCount am) (+1)
-      return True
+        table <- readTVar (amNewTable am)
+        idx   <- readTVar (amAddrIndex am)
+        let existingBucket = Map.findWithDefault [] bucket table
+            slotOf o = getBucketPosition (amKey am) True bucket (aiAddress o)
+            -- The index holds the current attempt/success counters
+            -- (markAttempt updates only the index), so judge the occupant by
+            -- its index entry.
+            current o = Map.findWithDefault o (aiAddress o) idx
+            occupant = fmap current (find ((== position) . slotOf) existingBucket)
+            -- Insert the newcomer, dropping only the evicted occupant (if
+            -- any) from this bucket; every other entry, and its index and
+            -- count bookkeeping, is left alone.
+            place evicted = do
+              writeTVar (amNewTable am) $
+                Map.insert bucket
+                  (info : filter ((`notElem` evicted) . aiAddress) existingBucket) table
+              modifyTVar' (amAddrIndex am) (Map.insert addr info)
+              modifyTVar' (amNewCount am) (+1)
+              return True
+        case occupant of
+          Nothing -> place []
+          Just occ
+            | isTerribleAddress clock occ || aiRefCount occ > 1 -> do
+                -- Core ClearNew: drop this bucket's reference; delete the
+                -- entry once no bucket references it.
+                if aiRefCount occ > 1
+                  then modifyTVar' (amAddrIndex am)
+                         (Map.insert (aiAddress occ) occ { aiRefCount = aiRefCount occ - 1 })
+                  else do
+                    modifyTVar' (amAddrIndex am) (Map.delete (aiAddress occ))
+                    modifyTVar' (amNewCount am) (subtract 1)
+                place [aiAddress occ]
+            | otherwise -> return False
 
 -- | Select a random address from the manager
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Select_

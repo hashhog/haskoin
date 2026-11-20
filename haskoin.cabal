@@ -397,6 +397,9 @@ test-suite addrman-source
   main-is:       AddrmanSourceMain.hs
   other-modules: AddrmanSourceSpec
   hs-source-dirs: test
+  -- handleAddrMessage takes the sending peer from this commit on (see the
+  -- spec header).
+  cpp-options:   -DHASKOIN_ADDRMAN_SOURCE
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec
