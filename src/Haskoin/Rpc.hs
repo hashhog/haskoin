@@ -537,7 +537,7 @@ import Haskoin.Mempool (Mempool(..), MempoolEntry(..), MempoolConfig(..),
                          -- "sequence contradicts replaceable" check.
                          signalsOptInRBF,
                          -- Package relay (BIP-331) — submitpackage RPC
-                         TxPackage(..), PackageError(..), maxPackageCount, acceptPackage,
+                         TxPackage(..), PackageError(..), maxPackageCount, acceptPackageReplacing, readmitEvicted,
                          isWellFormedPackage, isChildWithParents,
                          isChildWithParentsTree,
                          mempoolChunkInfo, mempoolParents, mempoolChildren,
@@ -10480,11 +10480,11 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
 
       -- AcceptSubPackage(txns_package_eval): (package-state reason if it
       -- failed, per-tx results of the subpackage evaluation).
-      evalPackage :: [Tx] -> IO (Maybe Text, Map TxId SubmitPkgResult)
+      evalPackage :: [Tx] -> IO (Maybe Text, Map TxId SubmitPkgResult, [TxId])
       evalPackage evalTxs = do
-        res <- acceptPackage (TxPackage (init txns) (last txns)) mp
+        res <- acceptPackageReplacing maxFeeRateSatPerVB (TxPackage (init txns) (last txns)) mp
         case res of
-          Right _ -> do
+          Right (_, evicted) -> do
             got <- forM evalTxs $ \tx -> (,) tx <$> getTransaction mp (computeTxId tx)
             let admitted = [ (tx, e) | (tx, Just e) <- got ]
                 totFee   = sum (map (entryFee . snd) admitted)
@@ -10492,20 +10492,28 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
                 rate     = feePerK totFee totSize
                 includes = map computeWtxId evalTxs
                 over     = [ tx | (tx, e) <- admitted, exceedsCap (entryFee e) (meSize e) ]
+                -- Core's std::set<Txid> replaced_txids: TxId order.
+                replaced = Set.toList (Set.fromList (map meTxId evicted))
             if length admitted /= length evalTxs
               then do
                 mapM_ removeIfPresent evalTxs
-                return (Just "transaction failed", Map.empty)
+                readmitEvicted mp evicted
+                return (Just "transaction failed", Map.empty, [])
               else if not (null over)
                 then do
                   -- Core: package feerate above client_maxfeerate ->
                   -- PCKG_TX "transaction failed", "max feerate exceeded".
+                  -- A package RBF checks the cap before evicting, so
+                  -- 'evicted' is empty here unless that check missed.
                   mapM_ removeIfPresent evalTxs
+                  readmitEvicted mp evicted
                   return ( Just "transaction failed"
-                         , Map.fromList [ (computeWtxId tx, SprInvalid "max feerate exceeded") | tx <- over ] )
+                         , Map.fromList [ (computeWtxId tx, SprInvalid "max feerate exceeded") | tx <- over ]
+                         , [] )
                 else
                   return ( Nothing
-                         , Map.fromList [ (computeWtxId tx, SprValid e rate includes) | (tx, e) <- admitted ] )
+                         , Map.fromList [ (computeWtxId tx, SprValid e rate includes) | (tx, e) <- admitted ]
+                         , replaced )
           Left perr -> do
             -- acceptPackage is meant to be atomic; remove anything of the
             -- subpackage that landed anyway.  Txs admitted alone above stay.
@@ -10514,17 +10522,26 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
               -- Core AcceptMultipleTransactions: PCKG_POLICY with no per-tx
               -- results, so each tx keeps its individual failure.
               PkgTxError _ (ErrClusterLimitExceeded _ _) ->
-                (Just "too-large-cluster", Map.empty)
+                (Just "too-large-cluster", Map.empty, [])
+              -- Package RBF (PackageRBFChecks) failures are PCKG_POLICY too.
+              PkgPolicy msg -> (Just (T.pack msg), Map.empty, [])
+              PkgMaxFeeRate badTxid ->
+                ( Just "transaction failed"
+                , Map.fromList [ (computeWtxId tx, SprInvalid "max feerate exceeded")
+                               | tx <- evalTxs, computeTxId tx == badTxid ]
+                , [] )
               PkgTxError badTxid err ->
                 ( Just "transaction failed"
                 , Map.fromList [ (computeWtxId tx, SprInvalid (stateText err))
-                               | tx <- evalTxs, computeTxId tx == badTxid ] )
+                               | tx <- evalTxs, computeTxId tx == badTxid ]
+                , [] )
               -- Core CheckFeeRate on the package feerate: PCKG_TX, result on
               -- the last tx of the subpackage.
               PkgInsufficientFee _ _ ->
                 ( Just "transaction failed"
-                , Map.singleton (computeWtxId (last evalTxs)) (SprInvalid "min relay fee not met") )
-              _ -> (Just "transaction failed", Map.empty)
+                , Map.singleton (computeWtxId (last evalTxs)) (SprInvalid "min relay fee not met")
+                , [] )
+              _ -> (Just "transaction failed", Map.empty, [])
 
   case txns of
     [] -> return $ RpcResponse Null
@@ -10539,15 +10556,15 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
                      (String "package topology disallowed. not child-with-parents or parents depend on each other.")
       | otherwise -> do
           (finals, nonfinal, evalTxs, quit) <- foldM step (Map.empty, Map.empty, [], False) txns
-          (pkgState, evalResults) <-
+          (pkgState, evalResults, replacedTxids) <-
             if quit || null evalTxs
-              then return (if quit then Just "transaction failed" else Nothing, Map.empty)
+              then return (if quit then Just "transaction failed" else Nothing, Map.empty, [])
               else case evalTxs of
                 -- A one-tx subpackage is the same single-tx check it just
                 -- failed (AcceptSubPackage wraps it as PCKG_TX).
-                [_] -> return (Just "transaction failed", Map.empty)
+                [_] -> return (Just "transaction failed", Map.empty, [])
                 _ | computeTxId (last evalTxs) /= computeTxId (last txns) ->
-                      return (Just "transaction failed", Map.empty)
+                      return (Just "transaction failed", Map.empty, [])
                   | otherwise -> evalPackage evalTxs
           let resultFor tx =
                 let w = computeWtxId tx
@@ -10556,7 +10573,7 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
                      Nothing -> case Map.lookup w finals of
                        Just r  -> Just r
                        Nothing -> SprInvalid <$> Map.lookup w nonfinal
-          return $ buildResponse (fromMaybe "success" pkgState)
+          return $ buildResponse (fromMaybe "success" pkgState) replacedTxids
                                  [ (tx, resultFor tx) | tx <- txns ]
   where
     hexId :: TxId -> Text
@@ -10564,8 +10581,10 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
 
     -- tx-results is a JSON object keyed by wtxid hex (Core wire format).
     -- Reference: bitcoin-core/src/rpc/mempool.cpp:1457-1511
-    buildResponse :: Text -> [(Tx, Maybe SubmitPkgResult)] -> RpcResponse
-    buildResponse pkgMsg rows =
+    -- replaced-transactions: the txids a package RBF evicted, in TxId
+    -- (internal byte) order, as Core's std::set<Txid> replaced_txids.
+    buildResponse :: Text -> [TxId] -> [(Tx, Maybe SubmitPkgResult)] -> RpcResponse
+    buildResponse pkgMsg replacedTxids rows =
       let perTx (tx, mr) =
             pair (Key.fromText (hexId (computeWtxId tx))) $ pairs $
               pair "txid" (text (hexId (computeTxId tx))) <>
@@ -10585,7 +10604,7 @@ submitPackageTxns server txns maxFeeRateSatPerVB = do
           enc = pairs $
                   pair "package_msg"           (text pkgMsg)                         <>
                   pair "tx-results"            (pairs (foldl' (<>) mempty (map perTx rows))) <>
-                  pair "replaced-transactions" (AE.list text [])
+                  pair "replaced-transactions" (AE.list (text . hexId) replacedTxids)
       in RpcResponse (rawJsonResult (encodingToLazyByteString enc)) Null Null
 
 --------------------------------------------------------------------------------
