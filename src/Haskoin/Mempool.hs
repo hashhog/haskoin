@@ -1060,18 +1060,108 @@ addTransactionWithReplacementInner bypass mp tx txid conflictTxIds = do
           if not bypass && feeRate < minFee
             then return $ Left (ErrFeeBelowMinimum feeRate minFee)
             else do
-              -- Attempt replacement with RBF rules
-              replaceResult <- attemptReplacement mp tx txid conflictTxIds fee vsize feeRate
-              case replaceResult of
+              -- Core order (validation.cpp MemPoolAccept::
+              -- AcceptSingleTransactionInternal): ReplacementChecks, the
+              -- cluster-limit check, PolicyScriptChecks and
+              -- ConsensusScriptChecks all run BEFORE FinalizeSubpackage, the
+              -- step that removes the conflicts.  So the replacement's own
+              -- standardness, sigops, script, cluster and TRUC gates are run
+              -- here as a dry run against the pool minus the to-be-evicted
+              -- set, and only once they pass does 'attemptReplacement'
+              -- evict.  Evicting first (the old order) had no rollback: any
+              -- peer could evict any pool tx and its descendants for free by
+              -- relaying an unsigned high-fee conflicting spend.
+              rbfCheck <- evaluateReplacementRules mp tx conflictTxIds fee vsize feeRate
+              case rbfCheck of
                 Left err -> return $ Left err
                 Right () -> do
-                  -- Conflicts removed, now add the new transaction
-                  -- Re-resolve inputs now that conflicts are removed
-                  inputResults' <- resolveInputs mp tx
-                  case inputResults' of
+                  gates <- replacementGatesBeforeEviction bypass mp tx txid conflictTxIds inputPairs
+                  case gates of
                     Left err -> return $ Left err
-                    Right inputPairs' ->
-                      finalizeTransaction bypass mp tx txid inputPairs'
+                    Right () -> do
+                      -- Attempt replacement with RBF rules (re-evaluated under
+                      -- the same admission lock, so the verdict is unchanged)
+                      replaceResult <- attemptReplacement mp tx txid conflictTxIds fee vsize feeRate
+                      case replaceResult of
+                        Left err -> return $ Left err
+                        Right () -> do
+                          -- Conflicts removed, now add the new transaction
+                          -- Re-resolve inputs now that conflicts are removed
+                          inputResults' <- resolveInputs mp tx
+                          case inputResults' of
+                            Left err -> return $ Left err
+                            Right inputPairs' ->
+                              finalizeTransaction bypass mp tx txid inputPairs'
+
+-- | The replacement's own admission gates, evaluated WITHOUT touching the
+-- pool, before any conflict is evicted: every gate of 'finalizeTransaction'
+-- (fee floor, maxfeerate, input and witness standardness, dust, ephemeral,
+-- sigops, scripts), then the cluster limit and the TRUC rules judged against
+-- the pool with the eviction set (direct conflicts + descendants) removed —
+-- the view Core's changeset gives CheckMemPoolPolicyLimits and the TRUC
+-- checks.  'finalizeTransaction' still runs after the eviction as before;
+-- this only decides whether the eviction may happen at all.
+replacementGatesBeforeEviction :: Bool -> Mempool -> Tx -> TxId -> [TxId]
+                               -> [(OutPoint, TxOut)] -> IO (Either MempoolError ())
+replacementGatesBeforeEviction bypass mp tx txid conflictTxIds inputPairs = do
+  gates <- finalizeGatesDry bypass mp tx txid inputPairs
+  case gates of
+    Left err -> return (Left err)
+    Right (fee, vsize, txSigOpCost) -> do
+      evicted    <- Set.fromList . map meTxId <$> getConflictSet mp conflictTxIds
+      entries    <- readTVarIO (mpEntries mp)
+      byOutpoint <- readTVarIO (mpByOutpoint mp)
+      let entries'    = Map.withoutKeys entries evicted
+          byOutpoint' = Map.filter (`Set.notMember` evicted) byOutpoint
+      return $ case checkClusterLimit tx entries' byOutpoint'
+                      (calculateAdjustedWeight tx txSigOpCost) of
+        Left (ClusterLimitExceeded actual maxCount) ->
+          Left (ErrClusterLimitExceeded actual maxCount)
+        Left (ClusterSizeExceeded actualWu maxWu) ->
+          Left (ErrClusterLimitExceeded actualWu maxWu)
+        Right () -> trucChecksExcluding tx txid fee vsize entries' byOutpoint'
+
+-- | Pure TRUC (v3) admission verdict against a given view of the pool (the
+-- pool minus the replacement's eviction set).  Same gates and order as
+-- 'checkTrucPolicy' + 'checkV3WithParent', with the sibling-eviction outcome
+-- of 'attemptSiblingEviction' folded in: a remaining single sibling with no
+-- descendants is acceptable when the new tx pays the incremental relay fee.
+trucChecksExcluding :: Tx -> TxId -> Word64 -> Int
+                    -> Map TxId MempoolEntry -> Map OutPoint TxId
+                    -> Either MempoolError ()
+trucChecksExcluding tx txid fee vsize entries byOutpoint =
+  let parentIds = Set.fromList (map (outPointHash . txInPrevOutput) (txInputs tx))
+      parents   = mapMaybe (`Map.lookup` entries) (Set.toList parentIds)
+      bad       = Left . ErrTrucViolation
+  in case checkVersionInheritance tx txid parents of
+    Left e -> bad e
+    Right ()
+      | not (isV3 tx) -> Right ()
+      | fromIntegral vsize > trucMaxVsize ->
+          bad (TrucTooLarge (fromIntegral vsize) trucMaxVsize)
+      | length parents + 1 > trucAncestorLimit ->
+          bad (TrucTooManyAncestors (length parents + 1) trucAncestorLimit)
+      | otherwise -> case parents of
+          [p]
+            | meAncestorCount p + 1 > trucAncestorLimit ->
+                bad (TrucTooManyAncestors (meAncestorCount p + 1) trucAncestorLimit)
+            | fromIntegral vsize > trucChildMaxVsize ->
+                bad (TrucChildTooLarge (fromIntegral vsize) trucChildMaxVsize)
+            | otherwise ->
+                let pid  = meTxId p
+                    kids = Set.toList $ Set.fromList
+                      [ s | i <- [0 .. length (txOutputs (meTransaction p)) - 1]
+                          , Just s <- [Map.lookup (OutPoint pid (fromIntegral i)) byOutpoint] ]
+                    requiredFee = (incrementalRelayFeePerKvb * fromIntegral vsize + 999) `div` 1000
+                in case mapMaybe (`Map.lookup` entries) kids of
+                     [] -> Right ()
+                     [sib]
+                       | meAncestorCount sib /= 2 || meDescendantCount sib /= 1 ->
+                           bad (TrucTooManyDescendants (meDescendantCount sib + 2) trucDescendantLimit)
+                       | fee < requiredFee -> bad (TrucSiblingExists pid (meTxId sib))
+                       | otherwise -> Right ()
+                     many -> bad (TrucTooManyDescendants (length many + 2) trucDescendantLimit)
+          _ -> Right ()
 
 -- | Does a mempool rejection of a transaction RELAYED by a peer charge that
 -- peer a misbehavior score?  Never.
@@ -1426,6 +1516,24 @@ handleTrucDry mp tx txid fee vsize txSigOpCost ancestors = do
 -- | Dry-run finalizeTransaction: runs all gates but does NOT commit.
 finalizeTransactionDry :: Mempool -> Tx -> TxId -> [(OutPoint, TxOut)] -> IO (Either MempoolError MempoolEntry)
 finalizeTransactionDry mp tx txid inputPairs = do
+  gates <- finalizeGatesDry False mp tx txid inputPairs
+  case gates of
+    Left err -> return $ Left err
+    Right (fee, vsize, txSigOpCost) -> do
+      ancestorResult <- checkAncestorLimits mp tx
+                          (calculateAdjustedWeight tx txSigOpCost)
+      case ancestorResult of
+        Left err -> return $ Left err
+        Right ancestors ->
+          handleTrucDry mp tx txid fee vsize txSigOpCost ancestors
+
+-- | The per-transaction gates of 'finalizeTransaction' up to and including
+-- script verification, with no pool writes.  Returns (base fee, vsize,
+-- sigop cost) for the topology checks that follow.  The first argument is
+-- Core's bypass_limits (skips the fee-rate floor, as the commit path does).
+finalizeGatesDry :: Bool -> Mempool -> Tx -> TxId -> [(OutPoint, TxOut)]
+                 -> IO (Either MempoolError (Word64, Int, Int))
+finalizeGatesDry bypass mp tx txid inputPairs = do
   let inputMap = Map.fromList inputPairs
       totalIn  = sum $ map (txOutValue . snd) inputPairs
       totalOut = sum $ map txOutValue (txOutputs tx)
@@ -1448,7 +1556,7 @@ finalizeTransactionDry mp tx txid inputPairs = do
       -- floor = max(static relay min, decayed rolling min) so testmempoolaccept
       -- reports the same reject as the live admission path (W153 BUG-5).
       minFee <- effectiveMinFeeRate mp
-      if modifiedRate < minFee
+      if not bypass && modifiedRate < minFee
         then return $ Left (ErrFeeBelowMinimum modifiedRate minFee)
         else case mpcMaxFeeRate (mpConfig mp) of
           Just cap | modifiedRate > cap ->
@@ -1480,13 +1588,7 @@ finalizeTransactionDry mp tx txid inputPairs = do
                                 scriptResult <- verifyAllScripts mp tx inputMap
                                 case scriptResult of
                                   Left err -> return $ Left err
-                                  Right () -> do
-                                    ancestorResult <- checkAncestorLimits mp tx
-                                                        (calculateAdjustedWeight tx txSigOpCost)
-                                    case ancestorResult of
-                                      Left err -> return $ Left err
-                                      Right ancestors ->
-                                        handleTrucDry mp tx txid fee vsize txSigOpCost ancestors
+                                  Right () -> return $ Right (fee, vsize, txSigOpCost)
 
 -- | Test whether a transaction would be accepted by the mempool without
 -- modifying any mempool state.
