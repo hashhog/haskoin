@@ -23723,15 +23723,15 @@ main = hspec $ do
     it "G28 addr 1000-cap: maxAddrToSend constant correct (W99)" $ do
       maxAddrToSend `shouldBe` 1000
 
-    it "G29 BUG: pong nonce not verified in syncMessageHandler (W99 CORRECTNESS)" $ do
-      -- Core: pong handler checks nonce == last ping nonce; mismatch → Misbehaving.
-      -- haskoin syncMessageHandler: MPong _ -> return () with no nonce check.
-      -- The piLastPing field exists but is only updated by the ping sender
-      -- (Network.hs:2721), never read in the pong path.
+    it "G29 FIXED: pong nonce verified in syncMessageHandler via recordPong (W99 CORRECTNESS)" $ do
+      -- Core: the pong handler matches nonce == the outstanding ping nonce
+      -- and records the RTT; a mismatch is ignored (logged, not punished).
+      -- haskoin used to drop the pong (MPong _ -> return ()).  The MPong
+      -- arm now hands the nonce to recordPong (Network.hs), whose nonce
+      -- handling is pinned by the eviction-protection suite.
       contents <- readFile "app/Main.hs"
-      ("MPong _ -> return ()" `isInfixOf` contents) `shouldBe` True
-      -- No pong nonce verification in the main message handler:
-      ("piLastPing" `isInfixOf` contents) `shouldBe` False
+      ("MPong _ -> return ()" `isInfixOf` contents) `shouldBe` False
+      ("recordPong pm addr nonce" `isInfixOf` contents) `shouldBe` True
 
     it "G30 BUG: feefilter not gated on verack completion (W99 CORRECTNESS)" $ do
       -- Core: feefilter is only sent after handshake completes and only to
