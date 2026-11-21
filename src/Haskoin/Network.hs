@@ -379,6 +379,8 @@ module Haskoin.Network
   , AddrInfo(..)
   , newAddrMan
   , addAddress
+  , mergeKnownAddrs
+  , knownAddrsCap
   , selectAddress
   , selectForFeeler
   , markGood
@@ -5051,6 +5053,29 @@ writeEncryptedPacket pc transport aad contents ignore = do
       sendAll (pcSocket pc) encrypted
       return (Right ())
 
+-- | Fresh secret key, ElligatorSwift aux randomness and garbage for one
+-- BIP-324 handshake, all from the CSPRNG ('Crypto.Random.getRandomBytes',
+-- the OS entropy source).
+--
+-- Core: the V2Transport constructor (net.cpp) passes GenerateRandomKey()
+-- and GetRandHash() to BIP324Cipher, and GenerateRandomGarbage() picks a
+-- garbage length uniformly in [0, MAX_GARBAGE_LEN] and fills it with random
+-- bytes.  These used to come from 'randomRIO', the process-global SplitMix
+-- StdGen.  SplitMix is not a CSPRNG and the same generator hands full 64-bit
+-- outputs to peers (version / ping / cmpctblock nonces), so the secret key
+-- was predictable from state a peer can observe.
+v2HandshakeRandomness :: IO (ByteString, ByteString, ByteString)
+v2HandshakeRandomness = do
+  seckey <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  auxRnd <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  lenBytes <- CryptoRandom.getRandomBytes 2 :: IO ByteString
+  -- 65536 is a multiple of 4096, so the low 12 bits are uniform on
+  -- [0, 4095] = [0, v2MaxGarbageLen].
+  let garbageLen = (fromIntegral (BS.index lenBytes 0) * 256
+                    + fromIntegral (BS.index lenBytes 1)) `mod` (v2MaxGarbageLen + 1)
+  garbage <- CryptoRandom.getRandomBytes garbageLen :: IO ByteString
+  return (seckey, auxRnd, garbage)
+
 -- | Drive the BIP-324 v2 handshake on the responder (inbound) side.
 --
 -- Wire ordering (responder PoV):
@@ -5081,12 +5106,9 @@ v2InboundHandshake pc net = do
   case mTheirPub of
     Nothing -> return $ Left "v2: closed reading peer pubkey"
     Just theirPubBs -> do
-      -- Step 2: build our cipher + our garbage.  Use 32 bytes of garbage
-      -- by default (a small but non-zero amount, well within the 4095
-      -- cap) — the size is opaque to the protocol.
-      seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-      auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-      garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+      -- Step 2: build our cipher + our garbage (all from the CSPRNG, see
+      -- 'v2HandshakeRandomness').
+      (seckey, auxRnd, garbage) <- v2HandshakeRandomness
 
       transport <- newV2Transport seckey auxRnd (netMagicBytes net) False garbage
       respRes <- v2HandshakeResponder transport (EllSwiftPubKey theirPubBs)
@@ -5147,9 +5169,7 @@ v2OutboundHandshake
   -> Network
   -> IO (Either String V2Transport)
 v2OutboundHandshake pc net = do
-  seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-  auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-  garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+  (seckey, auxRnd, garbage) <- v2HandshakeRandomness
 
   transport <- newV2Transport seckey auxRnd (netMagicBytes net) True garbage
 
@@ -5892,7 +5912,7 @@ peerManagerLoop pm = forever $ do
         addAddress (pmAddrMan pm) (pmAsmapData pm) a a 0x409 nowTs
       -- Also keep pmKnownAddrs in sync for callers that read it directly.
       atomically $ do
-        modifyTVar' (pmKnownAddrs pm) (Set.union (Set.fromList discovered))
+        modifyTVar' (pmKnownAddrs pm) (`mergeKnownAddrs` discovered)
         -- Clear failed set on DNS refresh so we retry previously-failed addresses
         writeTVar (pmFailedAddrs pm) Set.empty
         writeTVar (pmLastDNSRefresh pm) nowTs
@@ -7534,6 +7554,26 @@ clampAddrTimestamp now peerTs =
      then now - 5 * 24 * 60 * 60   -- Core: current_time - 5*24h
      else ts
 
+-- | Upper bound on 'pmKnownAddrs' (seed / addnode fallback addresses).
+knownAddrsCap :: Int
+knownAddrsCap = 1000
+
+-- | Merge a DNS-seed answer into 'pmKnownAddrs' without letting the set grow
+-- past 'knownAddrsCap' over the uptime.  The latest answer is always kept;
+-- older entries fill the remaining room (lowest-ordered first).  The only
+-- other writer, the @-connect@ insert in app/Main.hs, runs in connect mode,
+-- where the DNS branch that calls this never runs.
+mergeKnownAddrs :: Set.Set SockAddr -> [SockAddr] -> Set.Set SockAddr
+mergeKnownAddrs known discovered
+  | Set.size merged <= knownAddrsCap = merged
+  | Set.size fresh >= knownAddrsCap  = Set.take knownAddrsCap fresh
+  | otherwise =
+      Set.union fresh
+        (Set.take (knownAddrsCap - Set.size fresh) (known `Set.difference` fresh))
+  where
+    fresh  = Set.fromList discovered
+    merged = Set.union fresh known
+
 -- | Handle an addr message by adding addresses to the known pool
 -- BUG-5 FIX: feed peer-advertised addresses into pmAddrMan (addAddress)
 -- instead of inserting directly into the flat pmKnownAddrs set.
@@ -7558,10 +7598,10 @@ handleAddrMessage pm source (Addr entries) = do
   let pairs = mapMaybe (entryToPair now) entries
   forM_ pairs $ \(a, clampedTs) ->
     addAddress (pmAddrMan pm) (pmAsmapData pm) a source 0x409 clampedTs
-  -- Keep pmKnownAddrs in sync for callers that read it directly.
-  let addrs = map fst pairs
-  atomically $ modifyTVar' (pmKnownAddrs pm) $
-    Set.union (Set.fromList addrs)
+  -- Gossip lives in AddrMan only.  It used to be unioned into pmKnownAddrs
+  -- too, which nothing ever shrinks: the set grew with every address any
+  -- peer ever sent, and the connection loop dialled it as a fallback that
+  -- bypassed AddrMan's bucketing and IsTerrible filter.
   where
     -- Combine timestamp clamping + SockAddr conversion for one entry.
     -- 'now' is captured from the enclosing do-block so all entries in the
@@ -8990,8 +9030,11 @@ addAddress am asmapData addr source services now
       -- entry's (peer-advertised, clamped) timestamp and must not decide it.
       clock <- (round <$> getPOSIXTime :: IO Int64)
       atomically $ do
-        table <- readTVar (amNewTable am)
+        -- Re-check inside the transaction: a concurrent add of the same
+        -- address between the lookup above and here would otherwise file it
+        -- twice and count it twice.
         idx   <- readTVar (amAddrIndex am)
+        table <- readTVar (amNewTable am)
         let existingBucket = Map.findWithDefault [] bucket table
             slotOf o = getBucketPosition (amKey am) True bucket (aiAddress o)
             -- The index holds the current attempt/success counters
@@ -9010,12 +9053,16 @@ addAddress am asmapData addr source services now
               modifyTVar' (amNewCount am) (+1)
               return True
         case occupant of
+          _ | Map.member addr idx -> return False
           Nothing -> place []
           Just occ
             | isTerribleAddress clock occ || aiRefCount occ > 1 -> do
                 -- Core ClearNew: drop this bucket's reference; delete the
                 -- entry once no bucket references it.
-                if aiRefCount occ > 1
+                -- An entry the index marks tried belongs to the tried table;
+                -- only this stale new-bucket reference goes.
+                if aiInTried occ then return ()
+                else if aiRefCount occ > 1
                   then modifyTVar' (amAddrIndex am)
                          (Map.insert (aiAddress occ) occ { aiRefCount = aiRefCount occ - 1 })
                   else do
@@ -9023,6 +9070,30 @@ addAddress am asmapData addr source services now
                     modifyTVar' (amNewCount am) (subtract 1)
                 place [aiAddress occ]
             | otherwise -> return False
+
+-- | Insert an entry (not yet in any table) at the front of a new bucket,
+-- keeping the bucket at 'addrmanBucketSize'.  Used by 'markGood' to re-file
+-- an entry displaced from the tried table; gossip goes through 'addAddress',
+-- which applies Core's slot rule instead.  Entries pushed out of the
+-- bucket are no longer referenced by any table, so they leave the index and
+-- the count, as Core's ClearNew/Delete erase them from mapInfo/mapAddr.
+-- Without this the index grew with every address ever accepted instead of
+-- staying bounded by table capacity.
+-- Reference: bitcoin-core/src/addrman.cpp AddrManImpl::ClearNew, ::Delete.
+insertNewSTM :: AddrMan -> Int -> AddrInfo -> STM ()
+insertNewSTM am bucket info = do
+  table <- readTVar (amNewTable am)
+  let (kept, evicted) =
+        splitAt addrmanBucketSize (info : Map.findWithDefault [] bucket table)
+  writeTVar (amNewTable am) (Map.insert bucket kept table)
+  idx <- readTVar (amAddrIndex am)
+  let -- An entry flagged tried belongs to the tried table, not this bucket.
+      dropped = [ aiAddress e | e <- evicted
+                              , maybe True (not . aiInTried)
+                                  (Map.lookup (aiAddress e) idx) ]
+  writeTVar (amAddrIndex am) $
+    foldl' (flip Map.delete) (Map.insert (aiAddress info) info idx) dropped
+  modifyTVar' (amNewCount am) (\n -> n + 1 - length dropped)
 
 -- | Select a random address from the manager
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Select_
@@ -9153,32 +9224,43 @@ buildGetAddrResponse am = do
 -- Moves address from new to tried table.
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Good_.
 markGood :: AddrMan -> ByteString -> SockAddr -> Int64 -> IO ()
-markGood am asmapData addr now = do
-  mInfo <- Map.lookup addr <$> readTVarIO (amAddrIndex am)
+markGood am asmapData addr now = atomically $ do
+  -- One transaction from lookup to placement: two concurrent markGood calls
+  -- on the same new address must not both move it into the tried table.
+  mInfo <- Map.lookup addr <$> readTVar (amAddrIndex am)
   case mInfo of
     Nothing -> return ()
     Just info
-      | aiInTried info -> do
+      | aiInTried info ->
           -- Already in tried, just update timestamp
-          let updated = info { aiLastSuccess = now }
-          atomically $ modifyTVar' (amAddrIndex am) (Map.insert addr updated)
+          modifyTVar' (amAddrIndex am) (Map.insert addr info { aiLastSuccess = now })
       | otherwise -> do
           -- Move from new to tried
           let bucket = getTriedBucket (amKey am) asmapData addr
-              position = getBucketPosition (amKey am) False bucket addr
               updated = info { aiInTried = True, aiLastSuccess = now }
-
-          atomically $ do
-            -- Remove from new table
-            modifyTVar' (amNewTable am) $ Map.map (filter ((/= addr) . aiAddress))
-            modifyTVar' (amNewCount am) (subtract 1)
-            -- Add to tried table
-            modifyTVar' (amTriedTable am) $ \table ->
-              let existing = Map.findWithDefault [] bucket table
-              in Map.insert bucket (take addrmanBucketSize $ updated : existing) table
-            modifyTVar' (amTriedCount am) (+1)
-            -- Update index
-            modifyTVar' (amAddrIndex am) (Map.insert addr updated)
+          -- Remove from new table
+          modifyTVar' (amNewTable am) $ Map.map (filter ((/= addr) . aiAddress))
+          modifyTVar' (amNewCount am) (subtract 1)
+          -- Add to tried table, keeping the bucket at addrmanBucketSize.
+          triedT <- readTVar (amTriedTable am)
+          let (kept, evicted) =
+                splitAt addrmanBucketSize
+                  (updated : Map.findWithDefault [] bucket triedT)
+          writeTVar (amTriedTable am) (Map.insert bucket kept triedT)
+          modifyTVar' (amTriedCount am) (\n -> n + 1 - length evicted)
+          -- Update index
+          idx <- readTVar (amAddrIndex am)
+          writeTVar (amAddrIndex am) (Map.insert addr updated idx)
+          -- Core MakeTried: an entry displaced from the tried table goes
+          -- back to the new table rather than lingering in the index as a
+          -- tried entry no table holds (and in amTriedCount).  Re-file the
+          -- index's record, which carries the attempt/success counters that
+          -- markAttempt and the already-tried branch above update.
+          forM_ evicted $ \old -> do
+            let rec_ = Map.findWithDefault old (aiAddress old) idx
+            insertNewSTM am
+              (getNewBucket (amKey am) asmapData (aiAddress rec_) (aiSource rec_))
+              rec_ { aiInTried = False, aiRefCount = 1 }
 
 -- | Mark an address as attempted (failed connection)
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Attempt_
