@@ -384,6 +384,9 @@ spec = describe "reorg old tip is the connected tip (Core m_chain.Tip())" $ do
           byH <- readTVarIO (hcByHeight hc)
           Map.lookup 6 byH `shouldBe` Just (ceHash a6)
           -- heights at or below the connected tip name the connected chain
+          -- (recalculateBestHeader rewrites only the heights above it, as
+          -- after activateDownloadedPrefix / invalidateBlock); A5 is reached
+          -- by the fork-aware fetch below, not by a height walk.
           Map.lookup 5 byH `shouldBe` Just (ceHash b5)
           -- downloadable: the fork-aware fetch (app/Main.hs detectP2PFork ->
           -- requestForkBlocks) walks from the fork of (connected, hcTip) up
@@ -411,6 +414,36 @@ spec = describe "reorg old tip is the connected tip (Core m_chain.Tip())" $ do
         r `shouldBe` Right ()
         shouldBeOnB db fx
         bestHeaderStaysA6 fx
+
+  -- Equal-work tie: connected A4, header-only A5 as the best header, rival
+  -- B5 with the same work as A5.  B5 out-works the connected A4, so the
+  -- chain reorgs onto it; the best header stays A5, because Core only
+  -- replaces m_best_header with a header of MORE work (AcceptBlockHeader,
+  -- RecalculateBestHeader), so the header it already had wins a tie.
+  describe "best header after a reorg, equal-work tie (connected A4, best header A5, rival B5)" $ do
+
+    let bestHeaderStaysA5 fx = do
+          let hc = fxHc fx
+              a5 = last (fxHdr fx)
+          (ceHash <$> readTVarIO (hcTip hc)) `shouldReturn` ceHash a5
+          readTVarIO (hcHeight hc) `shouldReturn` 5
+
+    it "activateBestChain keeps the equal-work best header A5" $
+      withTestDB "besthdr-tie-abc" $ \db -> do
+        fx <- setupFx db 4 5 1
+        cache <- newUTXOCache db 100000
+        activateBestChain regtest cache db (fxHc fx) Nothing
+        shouldBeOnB db fx
+        bestHeaderStaysA5 fx
+
+    it "preciousblock keeps the equal-work best header A5" $
+      withTestDB "besthdr-tie-precious" $ \db -> do
+        fx <- setupFx db 4 5 1
+        cache <- newUTXOCache db 100000
+        r <- preciousBlock regtest cache db (fxHc fx) Nothing (lastHash (fxB fx))
+        r `shouldBe` Right ()
+        shouldBeOnB db fx
+        bestHeaderStaysA5 fx
 
   -- Warden review point 2 (haskoin#82): the disconnect list is checked as a
   -- whole before the first commit.  A list whose second entry is not the
