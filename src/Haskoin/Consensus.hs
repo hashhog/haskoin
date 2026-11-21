@@ -171,6 +171,7 @@ module Haskoin.Consensus
   , UndoData(..)
     -- * Chain Reorganization
   , performReorg
+  , reorgAtomic
   , disconnectChain
   , connectChain
   , pairTxInputsWithUndo

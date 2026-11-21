@@ -40,7 +40,12 @@ import Haskoin.Consensus
   ( regtest, netGenesisBlock
   , connectBlockAt
   , performReorg
+  , reorgAtomic
   , activateBestChain
+  , invalidateBlock
+  , InvalidateError(..)
+  , findForkPoint
+  , heavierBranchHashes
   , preciousBlock
   , initHeaderChain
   , HeaderChain(..)
@@ -56,6 +61,7 @@ import qualified Haskoin.Storage as S
 import Haskoin.Storage
   ( defaultDBConfig, withDB
   , getBestBlockHash
+  , putBestBlockHash
   , getUTXO
   , putBlock
   , newUTXOCache
@@ -358,3 +364,184 @@ spec = describe "reorg old tip is the connected tip (Core m_chain.Tip())" $ do
           `shouldReturn` Right ()
         getBestBlockHash db `shouldReturn` Just (ceHash a2)
         getUTXO db (cbOut 3 tagA) `shouldReturn` Nothing
+
+  -- Warden review point 1 (haskoin#82): a successful reorg must not move the
+  -- best header.  Core's ActivateBestChain changes m_chain only;
+  -- m_best_header stays the most-work header (RecalculateBestHeader), so the
+  -- header-only A5, A6 are still fetched (FindNextBlocksToDownload walks
+  -- from the fork of the active chain and the best header).  The
+  -- disconnect/connect steps write hcTip/hcHeight unconditionally, so
+  -- without a recalculation the best header ends at the connected B5.
+  describe "best header after a reorg (connected A4, best header A6, rival B5)" $ do
+
+    let bestHeaderStaysA6 fx = do
+          let hc = fxHc fx
+              a6 = last (fxHdr fx)
+              b5 = last (fxB fx)
+          tip <- readTVarIO (hcTip hc)
+          ceHash tip `shouldBe` ceHash a6
+          readTVarIO (hcHeight hc) `shouldReturn` 6
+          byH <- readTVarIO (hcByHeight hc)
+          Map.lookup 6 byH `shouldBe` Just (ceHash a6)
+          -- heights at or below the connected tip name the connected chain
+          Map.lookup 5 byH `shouldBe` Just (ceHash b5)
+          -- downloadable: the fork-aware fetch (app/Main.hs detectP2PFork ->
+          -- requestForkBlocks) walks from the fork of (connected, hcTip) up
+          -- to hcTip; that walk must name every A block, A5 and A6 included.
+          entries <- readTVarIO (hcEntries hc)
+          mFork <- findForkPoint hc (ceHash b5) (ceHash a6)
+          let gHash = computeBlockHash (blockHeader (netGenesisBlock regtest))
+          fmap ceHash mFork `shouldBe` Just gHash
+          heavierBranchHashes entries gHash (ceHash a6)
+            `shouldBe` Just (map ceHash (fxA fx ++ fxHdr fx))
+
+    it "activateBestChain leaves the best header at A6" $
+      withTestDB "besthdr-abc" $ \db -> do
+        fx <- setupFx db 4 5 2
+        cache <- newUTXOCache db 100000
+        activateBestChain regtest cache db (fxHc fx) Nothing
+        shouldBeOnB db fx
+        bestHeaderStaysA6 fx
+
+    it "preciousblock leaves the best header at A6" $
+      withTestDB "besthdr-precious" $ \db -> do
+        fx <- setupFx db 4 5 2
+        cache <- newUTXOCache db 100000
+        r <- preciousBlock regtest cache db (fxHc fx) Nothing (lastHash (fxB fx))
+        r `shouldBe` Right ()
+        shouldBeOnB db fx
+        bestHeaderStaysA6 fx
+
+  -- Warden review point 2 (haskoin#82): the disconnect list is checked as a
+  -- whole before the first commit.  A list whose second entry is not the
+  -- parent of the first used to commit the first disconnect (moving
+  -- PrefixBestBlock and rewinding coins) and only then fail, and
+  -- activateBestChain drops that Left with no rollback.
+  describe "disconnect list check" $ do
+
+    it "refuses a disconnect list whose second entry is not the parent, before any commit" $
+      withTestDB "dislist-not-parent" $ \db -> do
+        fx <- setupFx db 3 0 0
+        let hc = fxHc fx
+            a1 = fxA fx !! 0
+            a3 = fxA fx !! 2
+        cache <- newUTXOCache db 100000
+        r <- reorgAtomic regtest cache db hc Nothing [a3, a1] []
+        -- nothing committed: still at A3 with A3's coin (state first, so a
+        -- half-committed disconnect is what a failure reports)
+        getBestBlockHash db `shouldReturn` Just (ceHash a3)
+        forM_ [1 .. 3] $ \h -> do
+          m <- getUTXO db (cbOut h tagA)
+          fmap txOutScript m `shouldBe` Just opTrue
+        (ceHash <$> readTVarIO (hcTip hc)) `shouldReturn` ceHash a3
+        r `shouldSatisfy` either ("is not the parent" `isInfixOf`) (const False)
+
+    it "refuses a disconnect list that does not start at the connected tip, before any commit" $
+      withTestDB "dislist-not-tip" $ \db -> do
+        fx <- setupFx db 3 0 0
+        let hc = fxHc fx
+            a1 = fxA fx !! 0
+            a2 = fxA fx !! 1
+            a3 = fxA fx !! 2
+        cache <- newUTXOCache db 100000
+        r <- reorgAtomic regtest cache db hc Nothing [a2, a1] []
+        r `shouldSatisfy` either ("is not the connected tip" `isInfixOf`) (const False)
+        getBestBlockHash db `shouldReturn` Just (ceHash a3)
+        forM_ [1 .. 3] $ \h -> do
+          m <- getUTXO db (cbOut h tagA)
+          fmap txOutScript m `shouldBe` Just opTrue
+
+    it "control: a parent-linked list from the connected tip disconnects" $
+      withTestDB "dislist-control" $ \db -> do
+        fx <- setupFx db 3 0 0
+        let hc = fxHc fx
+            a1 = fxA fx !! 0
+            a2 = fxA fx !! 1
+            a3 = fxA fx !! 2
+        cache <- newUTXOCache db 100000
+        reorgAtomic regtest cache db hc Nothing [a3, a2] [] `shouldReturn` Right ()
+        getBestBlockHash db `shouldReturn` Just (ceHash a1)
+        getUTXO db (cbOut 3 tagA) `shouldReturn` Nothing
+        getUTXO db (cbOut 2 tagA) `shouldReturn` Nothing
+        m <- getUTXO db (cbOut 1 tagA)
+        fmap txOutScript m `shouldBe` Just opTrue
+
+  -- Warden review point 3 (haskoin#82): invalidateblock under the tip check.
+  describe "invalidateblock" $ do
+
+    -- Connected A1..A5; invalidate A3: tip rewinds to A2 on disk and in
+    -- memory, A3 is FAILED_VALID, A4/A5 FAILED_CHILD, their coins gone.
+    it "invalidates a block on a connected multi-block chain" $
+      withTestDB "invalidate-connected" $ \db -> do
+        fx <- setupFx db 5 0 0
+        let hc = fxHc fx
+            a2 = fxA fx !! 1
+            a3 = fxA fx !! 2
+        cache <- newUTXOCache db 100000
+        r <- invalidateBlock regtest cache db hc Nothing (ceHash a3)
+        r `shouldBe` Right ()
+        getBestBlockHash db `shouldReturn` Just (ceHash a2)
+        (ceHash <$> readTVarIO (hcTip hc)) `shouldReturn` ceHash a2
+        readTVarIO (hcHeight hc) `shouldReturn` 2
+        entries <- readTVarIO (hcEntries hc)
+        let st ce = ceStatus <$> Map.lookup (ceHash ce) entries
+        st a3 `shouldBe` Just StatusFailedValid
+        forM_ (drop 3 (fxA fx)) $ \ce -> st ce `shouldBe` Just StatusFailedChild
+        forM_ [3 .. 5] $ \h -> getUTXO db (cbOut h tagA) `shouldReturn` Nothing
+        forM_ [1 .. 2] $ \h -> do
+          m <- getUTXO db (cbOut h tagA)
+          fmap txOutScript m `shouldBe` Just opTrue
+        inv <- readTVarIO (hcInvalidated hc)
+        Set.member (ceHash a3) inv `shouldBe` True
+
+    -- getValidatedChainTip falls back to hcTip when PrefixBestBlock is
+    -- missing from hcEntries.  A block on that chain cannot be disconnected
+    -- from a connected tip nobody can name: a clear error, nothing marked.
+    it "returns a clear error when the connected tip is not in the block index" $
+      withTestDB "invalidate-unknown-best" $ \db -> do
+        fx <- setupFx db 3 0 0
+        let hc = fxHc fx
+            a2 = fxA fx !! 1
+            unknown = BlockHash (Hash256 (BS.replicate 32 0x77))
+        putBestBlockHash db unknown
+        cache <- newUTXOCache db 100000
+        r <- invalidateBlock regtest cache db hc Nothing (ceHash a2)
+        r `shouldSatisfy` either isNoConnectedTip (const False)
+        noMark hc a2
+        getBestBlockHash db `shouldReturn` Just unknown
+
+    -- PrefixBestBlock unset (nothing connected), header chain A1..A3.
+    it "returns a clear error when there is no connected tip at all" $
+      withTestDB "invalidate-no-best" $ \db -> do
+        let net = regtest
+            gHash = computeBlockHash (blockHeader (netGenesisBlock net))
+            gWork = headerWork (blockHeader (netGenesisBlock net))
+        hc <- initHeaderChain net
+        let step (acc, prev, work) h = do
+              let blk = branchBlock tagA prev h
+                  work' = work + headerWork (blockHeader blk)
+                  ce = mkEntry blk h prev work' (fromIntegral h) StatusHeaderValid
+              atomically $ do
+                modifyTVar' (hcEntries hc)  (Map.insert (ceHash ce) ce)
+                modifyTVar' (hcByHeight hc) (Map.insert h (ceHash ce))
+                writeTVar (hcTip hc) ce
+                writeTVar (hcHeight hc) h
+              return (acc ++ [ce], ceHash ce, work')
+        (as, _, _) <- foldM step ([], gHash, gWork) [1 .. 3]
+        getBestBlockHash db `shouldReturn` Nothing
+        cache <- newUTXOCache db 100000
+        r <- invalidateBlock net cache db hc Nothing (ceHash (as !! 1))
+        r `shouldSatisfy` either isNoConnectedTip (const False)
+        noMark hc (as !! 1)
+
+  where
+    isNoConnectedTip e = case e of
+      InvalidateDisconnectFailed msg -> "no connected tip" `isInfixOf` msg
+      _ -> False
+    noMark hc ce = do
+      entries <- readTVarIO (hcEntries hc)
+      fmap (isFailedSt . ceStatus) (Map.lookup (ceHash ce) entries)
+        `shouldBe` Just False
+      inv <- readTVarIO (hcInvalidated hc)
+      Set.member (ceHash ce) inv `shouldBe` False
+    isFailedSt s = s `elem` [StatusFailedValid, StatusFailedChild, StatusInvalid]
