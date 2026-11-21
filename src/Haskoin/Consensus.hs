@@ -7702,7 +7702,16 @@ reorgDisconnectIncremental
   -> IO (Either String ())
 reorgDisconnectIncremental _     _  _  _       [] = return (Right ())
 reorgDisconnectIncremental cache db hc mIdxMgr (ce : rest) = do
-  blkR <- loadReorgBlock db ce
+  -- Core DisconnectTip takes pindexDelete = m_chain.Tip(): only the
+  -- connected tip is ever disconnected.  Applying another block's undo
+  -- rewinds coins the UTXO set does not hold and moves PrefixBestBlock
+  -- onto a chain that was never connected.
+  mBest <- getBestBlockHash db
+  blkR <- if mBest /= Just (ceHash ce)
+            then return $ Left $
+              "reorg disconnect: block " ++ show (ceHash ce)
+              ++ " is not the connected tip " ++ show mBest
+            else loadReorgBlock db ce
   case blkR of
     Left err -> return (Left err)
     Right blk -> do
@@ -9457,7 +9466,12 @@ activateBestChain net cache db hc mIdxMgr = do
   -- HK-3: the caller holds the chain lock (the RPC handlers take it; Core:
   -- ActivateBestChain :3323 under cs_main).  Taken there, not here, so the header-only
   -- early exits stay usable without a coins cache.
-  currentTip <- readTVarIO (hcTip hc)
+  --
+  -- Core works from m_chain.Tip(), the CONNECTED tip, never m_best_header.
+  -- 'hcTip' is the best header: it can be a header-only descendant or a
+  -- stale branch, and a reorg started there disconnects a block that is
+  -- not PrefixBestBlock.
+  currentTip <- getValidatedChainTip db hc
   best       <- findBestCandidate hc
   case best of
     Nothing     -> return ()
@@ -9780,7 +9794,8 @@ preciousBlock net cache db hc mIdxMgr blockHash = do
   case Map.lookup blockHash entries of
     Nothing -> return $ Left (PreciousBlockNotFound blockHash)
     Just entry -> do
-      tip <- readTVarIO (hcTip hc)
+      -- m_chain.Tip(): the connected tip, not the best header 'hcTip'.
+      tip <- getValidatedChainTip db hc
       -- Core: "if (pindex->nChainWork < m_chain.Tip()->nChainWork) return true"
       -- — a block below the tip's work can never be the tip; nothing to do.
       if ceChainWork entry < ceChainWork tip
@@ -9830,7 +9845,9 @@ preciousReactivate net cache db hc mIdxMgr blockHash = do
   entries     <- readTVarIO (hcEntries hc)
   invalidated <- readTVarIO (hcInvalidated hc)
   byHeight    <- readTVarIO (hcByHeight hc)
-  tip         <- readTVarIO (hcTip hc)
+  -- Core PreciousBlock -> ActivateBestChain works from m_chain.Tip(), the
+  -- connected tip; 'hcTip' is the best header and may not be connected.
+  tip         <- getValidatedChainTip db hc
   let onActiveChain ce = Map.lookup (ceHeight ce) byHeight == Just (ceHash ce)
   case Map.lookup blockHash entries of
     Nothing -> return ()
