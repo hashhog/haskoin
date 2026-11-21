@@ -846,6 +846,7 @@ test-suite eviction-protection
   type:          exitcode-stdio-1.0
   main-is:       EvictionProtectionMain.hs
   other-modules: EvictionProtectionSpec
+               , EvictionTrackingSpec
   hs-source-dirs: test
   build-depends: base >= 4.14 && < 5
                , haskoin

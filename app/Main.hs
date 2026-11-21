@@ -4655,6 +4655,9 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
     result <- addTransaction mp tx
     case result of
       Right _ -> do
+        -- Core ProcessMessage TX: pfrom.m_last_tx_time = GetTime() for a
+        -- tx accepted to the mempool (inbound-eviction tx protection).
+        readIORef pmRef >>= \pmTx -> noteTxAccepted pmTx addr
         -- BIP-339: relay accepted tx inv to all connected peers,
         -- selecting InvWtx (MSG_WTX=5) + wtxid for wtxid-relay peers
         -- and InvTx (type=1) + txid for legacy peers.
@@ -5210,7 +5213,12 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
              putStrLn $ "MBlockTxn: compact block " ++ show blockHash ++ " reconstructed via getblocktxn round-trip"
              syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requestedUpToRef ibdModeRef lastFullBatchAtRef recentlyRejectedRef blocksSinceFlushRef lastFlushEpochRef pruneCfg mBlockStore mIdxMgr orphanPoolRef compactBlockStateRef connectLock walletMgrRef receiptRefillRef bodyStoredRef storedDrainRef unconnectedCountRef blockReceipt addr (MBlock block)
 
-  MPong _ -> return ()
+  MPong (Pong nonce) -> do
+    -- Core ProcessMessage PONG: match the outstanding nonce, record the
+    -- round trip (min kept for the inbound-eviction ping protection).
+    pm <- readIORef pmRef
+    t <- realToFrac <$> getPOSIXTime
+    recordPong pm addr nonce t
   MVerAck -> return ()
   MSendHeaders -> do
     -- BIP-130: peer is requesting headers-first announcements.  Record
