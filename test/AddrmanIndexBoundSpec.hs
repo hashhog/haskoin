@@ -150,6 +150,28 @@ spec = describe "addrman: the index and pmKnownAddrs are bounded by table capaci
     length (Map.findWithDefault [] target triedT) `shouldSatisfy` (<= addrmanBucketSize)
     checkConsistent am
 
+  it "a tried entry displaced by markGood returns to the new table with its attempt history" $ do
+    am <- newAddrMan
+    now <- round <$> getPOSIXTime
+    let pool   = [ v4 50 61 c d | c <- [0 .. 255], d <- [1 .. 254] ]
+        target = getTriedBucket (amKey am) BS.empty (head pool)
+        same   = take 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
+        (first64, later16) = splitAt addrmanBucketSize same
+    forM_ same $ \a -> addAddress am BS.empty a a 0x409 now
+    forM_ first64 $ \a -> markGood am BS.empty a now
+    -- markAttempt updates only the index record of a tried entry.
+    forM_ first64 $ \a -> markAttempt am a now
+    forM_ later16 $ \a -> markGood am BS.empty a now
+    newT <- readTVarIO (amNewTable am)
+    idx  <- readTVarIO (amAddrIndex am)
+    let newSet    = Set.fromList (tableAddrs newT)
+        displaced = filter (`Set.member` newSet) first64
+    length displaced `shouldBe` length later16
+    [ (a, fmap aiAttempts (Map.lookup a idx), fmap aiInTried (Map.lookup a idx))
+      | a <- displaced ]
+      `shouldBe` [ (a, Just 1, Just False) | a <- displaced ]
+    checkConsistent am
+
   it "gossip through handleAddrMessage does not grow pmKnownAddrs" $
     withPm $ \pm -> do
       now <- round <$> getPOSIXTime
