@@ -25,7 +25,7 @@ module ReorgOldTipSpec (spec) where
 import Test.Hspec
 import Control.Concurrent.STM (atomically, modifyTVar', writeTVar, readTVarIO)
 import Control.Monad (foldM, forM_)
-import Data.Either (isLeft)
+import Data.List (isInfixOf)
 import Data.Word (Word8, Word32, Word64)
 import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
@@ -342,7 +342,9 @@ spec = describe "reorg old tip is the connected tip (Core m_chain.Tip())" $ do
         performReorg regtest cache db hc Nothing (ceHash a3) (lastHash (fxB fx))
           `shouldReturn` Right ()
         r <- performReorg regtest cache db hc Nothing (ceHash a3) (ceHash a2)
-        r `shouldSatisfy` isLeft
+        -- The tip check, not Phase A (A3's body and undo are on disk).
+        r `shouldSatisfy` either ("is not the connected tip" `isInfixOf`)
+                                 (const False)
         shouldBeOnB db fx
 
     it "control: disconnects the connected tip" $
