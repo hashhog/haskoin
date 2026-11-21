@@ -7542,7 +7542,9 @@ knownAddrsCap = 1000
 
 -- | Merge a DNS-seed answer into 'pmKnownAddrs' without letting the set grow
 -- past 'knownAddrsCap' over the uptime.  The latest answer is always kept;
--- older entries fill the remaining room.
+-- older entries fill the remaining room (lowest-ordered first).  The only
+-- other writer, the @-connect@ insert in app/Main.hs, runs in connect mode,
+-- where the DNS branch that calls this never runs.
 mergeKnownAddrs :: Set.Set SockAddr -> [SockAddr] -> Set.Set SockAddr
 mergeKnownAddrs known discovered
   | Set.size merged <= knownAddrsCap = merged
@@ -9160,41 +9162,43 @@ buildGetAddrResponse am = do
 -- Moves address from new to tried table.
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Good_.
 markGood :: AddrMan -> ByteString -> SockAddr -> Int64 -> IO ()
-markGood am asmapData addr now = do
-  mInfo <- Map.lookup addr <$> readTVarIO (amAddrIndex am)
+markGood am asmapData addr now = atomically $ do
+  -- One transaction from lookup to placement: two concurrent markGood calls
+  -- on the same new address must not both move it into the tried table.
+  mInfo <- Map.lookup addr <$> readTVar (amAddrIndex am)
   case mInfo of
     Nothing -> return ()
     Just info
-      | aiInTried info -> do
+      | aiInTried info ->
           -- Already in tried, just update timestamp
-          let updated = info { aiLastSuccess = now }
-          atomically $ modifyTVar' (amAddrIndex am) (Map.insert addr updated)
+          modifyTVar' (amAddrIndex am) (Map.insert addr info { aiLastSuccess = now })
       | otherwise -> do
           -- Move from new to tried
           let bucket = getTriedBucket (amKey am) asmapData addr
-              position = getBucketPosition (amKey am) False bucket addr
               updated = info { aiInTried = True, aiLastSuccess = now }
-
-          atomically $ do
-            -- Remove from new table
-            modifyTVar' (amNewTable am) $ Map.map (filter ((/= addr) . aiAddress))
-            modifyTVar' (amNewCount am) (subtract 1)
-            -- Add to tried table, keeping the bucket at addrmanBucketSize.
-            triedT <- readTVar (amTriedTable am)
-            let (kept, evicted) =
-                  splitAt addrmanBucketSize
-                    (updated : Map.findWithDefault [] bucket triedT)
-            writeTVar (amTriedTable am) (Map.insert bucket kept triedT)
-            modifyTVar' (amTriedCount am) (\n -> n + 1 - length evicted)
-            -- Update index
-            modifyTVar' (amAddrIndex am) (Map.insert addr updated)
-            -- Core MakeTried: an entry displaced from the tried table goes
-            -- back to the new table rather than lingering in the index as a
-            -- tried entry no table holds (and in amTriedCount).
-            forM_ evicted $ \old ->
-              insertNewSTM am
-                (getNewBucket (amKey am) asmapData (aiAddress old) (aiSource old))
-                old { aiInTried = False, aiRefCount = 1 }
+          -- Remove from new table
+          modifyTVar' (amNewTable am) $ Map.map (filter ((/= addr) . aiAddress))
+          modifyTVar' (amNewCount am) (subtract 1)
+          -- Add to tried table, keeping the bucket at addrmanBucketSize.
+          triedT <- readTVar (amTriedTable am)
+          let (kept, evicted) =
+                splitAt addrmanBucketSize
+                  (updated : Map.findWithDefault [] bucket triedT)
+          writeTVar (amTriedTable am) (Map.insert bucket kept triedT)
+          modifyTVar' (amTriedCount am) (\n -> n + 1 - length evicted)
+          -- Update index
+          idx <- readTVar (amAddrIndex am)
+          writeTVar (amAddrIndex am) (Map.insert addr updated idx)
+          -- Core MakeTried: an entry displaced from the tried table goes
+          -- back to the new table rather than lingering in the index as a
+          -- tried entry no table holds (and in amTriedCount).  Re-file the
+          -- index's record, which carries the attempt/success counters that
+          -- markAttempt and the already-tried branch above update.
+          forM_ evicted $ \old -> do
+            let rec_ = Map.findWithDefault old (aiAddress old) idx
+            insertNewSTM am
+              (getNewBucket (amKey am) asmapData (aiAddress rec_) (aiSource rec_))
+              rec_ { aiInTried = False, aiRefCount = 1 }
 
 -- | Mark an address as attempted (failed connection)
 -- Reference: Bitcoin Core addrman.cpp AddrManImpl::Attempt_
