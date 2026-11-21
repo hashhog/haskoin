@@ -110,6 +110,10 @@ withPm act =
       _ <- setNetworkActive pm False
       act pm
 
+-- | A distinct source /16 per index (first octet 101..126, 128..).
+sourceFor :: Int -> SockAddr
+sourceFor i = v4 (101 + i `div` 256) (i `mod` 256) 0 1
+
 chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
@@ -144,10 +148,18 @@ spec = describe "addrman: the index and pmKnownAddrs are bounded by table capaci
         target = getTriedBucket (amKey am) BS.empty (head pool)
         same   = take 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
     length same `shouldBe` 80
-    forM_ same $ \a -> addAddress am BS.empty a a 0x409 now
+    -- Each from its own source /16, so the 80 spread over new buckets and
+    -- all of them are still in the new table when markGood runs.
+    forM_ (zip [0 :: Int ..] same) $ \(i, a) ->
+      addAddress am BS.empty a (sourceFor i) 0x409 now
+    idx0 <- readTVarIO (amAddrIndex am)
+    length (filter (`Map.member` idx0) same) `shouldBe` 80
     forM_ same $ \a -> markGood am BS.empty a now
     triedT <- readTVarIO (amTriedTable am)
-    length (Map.findWithDefault [] target triedT) `shouldSatisfy` (<= addrmanBucketSize)
+    -- The bucket really overflowed: 64 held, 16 displaced back to new.
+    length (Map.findWithDefault [] target triedT) `shouldBe` addrmanBucketSize
+    newT <- readTVarIO (amNewTable am)
+    length (filter (`elem` tableAddrs newT) same) `shouldBe` 80 - addrmanBucketSize
     checkConsistent am
 
   it "a tried entry displaced by markGood returns to the new table with its attempt history" $ do
@@ -157,7 +169,8 @@ spec = describe "addrman: the index and pmKnownAddrs are bounded by table capaci
         target = getTriedBucket (amKey am) BS.empty (head pool)
         same   = take 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
         (first64, later16) = splitAt addrmanBucketSize same
-    forM_ same $ \a -> addAddress am BS.empty a a 0x409 now
+    forM_ (zip [0 :: Int ..] same) $ \(i, a) ->
+      addAddress am BS.empty a (sourceFor i) 0x409 now
     forM_ first64 $ \a -> markGood am BS.empty a now
     -- markAttempt updates only the index record of a tried entry.
     forM_ first64 $ \a -> markAttempt am a now
