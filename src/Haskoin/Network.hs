@@ -5051,6 +5051,29 @@ writeEncryptedPacket pc transport aad contents ignore = do
       sendAll (pcSocket pc) encrypted
       return (Right ())
 
+-- | Fresh secret key, ElligatorSwift aux randomness and garbage for one
+-- BIP-324 handshake, all from the CSPRNG ('Crypto.Random.getRandomBytes',
+-- the OS entropy source).
+--
+-- Core: the V2Transport constructor (net.cpp) passes GenerateRandomKey()
+-- and GetRandHash() to BIP324Cipher, and GenerateRandomGarbage() picks a
+-- garbage length uniformly in [0, MAX_GARBAGE_LEN] and fills it with random
+-- bytes.  These used to come from 'randomRIO', the process-global SplitMix
+-- StdGen.  SplitMix is not a CSPRNG and the same generator hands full 64-bit
+-- outputs to peers (version / ping / cmpctblock nonces), so the secret key
+-- was predictable from state a peer can observe.
+v2HandshakeRandomness :: IO (ByteString, ByteString, ByteString)
+v2HandshakeRandomness = do
+  seckey <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  auxRnd <- CryptoRandom.getRandomBytes 32 :: IO ByteString
+  lenBytes <- CryptoRandom.getRandomBytes 2 :: IO ByteString
+  -- 65536 is a multiple of 4096, so the low 12 bits are uniform on
+  -- [0, 4095] = [0, v2MaxGarbageLen].
+  let garbageLen = (fromIntegral (BS.index lenBytes 0) * 256
+                    + fromIntegral (BS.index lenBytes 1)) `mod` (v2MaxGarbageLen + 1)
+  garbage <- CryptoRandom.getRandomBytes garbageLen :: IO ByteString
+  return (seckey, auxRnd, garbage)
+
 -- | Drive the BIP-324 v2 handshake on the responder (inbound) side.
 --
 -- Wire ordering (responder PoV):
@@ -5081,12 +5104,9 @@ v2InboundHandshake pc net = do
   case mTheirPub of
     Nothing -> return $ Left "v2: closed reading peer pubkey"
     Just theirPubBs -> do
-      -- Step 2: build our cipher + our garbage.  Use 32 bytes of garbage
-      -- by default (a small but non-zero amount, well within the 4095
-      -- cap) — the size is opaque to the protocol.
-      seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-      auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-      garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+      -- Step 2: build our cipher + our garbage (all from the CSPRNG, see
+      -- 'v2HandshakeRandomness').
+      (seckey, auxRnd, garbage) <- v2HandshakeRandomness
 
       transport <- newV2Transport seckey auxRnd (netMagicBytes net) False garbage
       respRes <- v2HandshakeResponder transport (EllSwiftPubKey theirPubBs)
@@ -5147,9 +5167,7 @@ v2OutboundHandshake
   -> Network
   -> IO (Either String V2Transport)
 v2OutboundHandshake pc net = do
-  seckey  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-  auxRnd  <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
-  garbage <- BS.pack <$> mapM (const (randomRIO (0, 255 :: Int) >>= return . fromIntegral)) [1 :: Int .. 32]
+  (seckey, auxRnd, garbage) <- v2HandshakeRandomness
 
   transport <- newV2Transport seckey auxRnd (netMagicBytes net) True garbage
 
