@@ -7654,11 +7654,38 @@ reorgAtomic net cache db hc mIdxMgr disList conList =
           -- peak RSS is one block's WriteBatch, not the overlay of
           -- the whole reorg.
           flushCache cache
-          disR <- reorgDisconnectIncremental cache db hc mIdxMgr disList
-          case disR of
+          -- Check the WHOLE disconnect list before the first commit: the
+          -- head must be PrefixBestBlock and each entry the parent of the
+          -- one before (Core DisconnectTip only ever takes m_chain.Tip(),
+          -- so its steps are tip, tip->pprev, ...).  A bad later entry
+          -- found mid-loop would leave the earlier disconnects committed,
+          -- and 'activateBestChain' discards the Left with no rollback.
+          mBest <- getBestBlockHash db
+          case checkDisconnectList mBest disList of
             Left err -> return (Left err)
-            Right () ->
-              reorgConnectIncremental net cache db hc mIdxMgr conList
+            Right () -> do
+              disR <- reorgDisconnectIncremental cache db hc mIdxMgr disList
+              case disR of
+                Left err -> return (Left err)
+                Right () ->
+                  reorgConnectIncremental net cache db hc mIdxMgr conList
+
+-- | A disconnect list is the connected tip followed by its ancestors, each
+-- entry the parent of the one before.  The empty list (a pure connect) is
+-- trivially fine.
+checkDisconnectList :: Maybe BlockHash -> [ChainEntry] -> Either String ()
+checkDisconnectList _ [] = Right ()
+checkDisconnectList mBest disList@(first : _)
+  | mBest /= Just (ceHash first) = Left $
+      "reorg disconnect: block " ++ show (ceHash first)
+      ++ " is not the connected tip " ++ show mBest
+  | otherwise =
+      case [ (c, p) | (c, p) <- zip disList (drop 1 disList)
+                    , cePrev c /= Just (ceHash p) ] of
+        []         -> Right ()
+        ((c, p) : _) -> Left $
+          "reorg disconnect: block " ++ show (ceHash p)
+          ++ " is not the parent of " ++ show (ceHash c)
 
 -- | Load one reorg body.  Callers drop the Block after the step so
 -- peak RSS is O(block), not O(depth).
@@ -9113,6 +9140,13 @@ invalidateBlock net cache db hc mIdxMgr blockHash = do
           -- block "off-chain" and only mark it.  'getValidatedChainTip' falls
           -- back to hcTip when PrefixBestBlock is unset.
           tip <- getValidatedChainTip db hc
+          -- ... but a disconnect needs the REAL connected tip: when
+          -- PrefixBestBlock is unset or names a block missing from
+          -- hcEntries, the hcTip fallback is not a connected chain and the
+          -- disconnect list check refuses every step.  Say so up front
+          -- (nothing marked) rather than surface an undo / tip-check error.
+          mConnected <- getBestBlockHash db
+          let connectedKnown = maybe False (`Map.member` entries) mConnected
           -- Find all descendants (including this block)
           descendants <- findDescendants hc blockHash
 
@@ -9150,7 +9184,13 @@ invalidateBlock net cache db hc mIdxMgr blockHash = do
           -- Check if the block is on the active chain (ancestor of tip)
           let isOnActiveChain = isAncestor entries blockHash (ceHash tip)
 
-          result <- if isOnActiveChain
+          result <- if isOnActiveChain && not connectedKnown
+            then return $ Left $ InvalidateDisconnectFailed $
+              "no connected tip: PrefixBestBlock "
+              ++ maybe "is unset" (\h -> show h ++ " is not in the block index")
+                       mConnected
+              ++ "; cannot disconnect " ++ show blockHash
+            else if isOnActiveChain
             then do
               -- BUG-4 fix: disconnect FIRST, then mark each entry after its
               -- successful disconnect (mirrors Core's per-block marking order).
@@ -9487,8 +9527,15 @@ activateBestChain net cache db hc mIdxMgr = do
             atomically $
               modifyTVar' (hcCandidates hc)
                 (Set.delete (mkCandidateKey bestCe))
-          Just _fork ->
+          Just _fork -> do
             void $ performReorg net cache db hc mIdxMgr (ceHash currentTip) (ceHash bestCe)
+            -- The disconnect / connect steps write hcTip/hcHeight as they
+            -- go, so hcTip now names the CONNECTED tip.  Core's
+            -- ActivateBestChain moves m_chain only; m_best_header stays the
+            -- most-work header, so a header-only branch heavier than the
+            -- new tip keeps being fetched (getblockchaininfo.headers, the
+            -- fork-aware download and assumevalid all read hcTip).
+            recalculateBestHeader db hc
 
 -- | Pull the best valid tip candidate from the sorted set, applying
 -- Core's ancestor-walk @BLOCK_HAVE_DATA@ + invalidation gate
@@ -9867,6 +9914,9 @@ preciousReactivate net cache db hc mIdxMgr blockHash = do
             Nothing -> activateBestChain net cache db hc mIdxMgr
             Just _  -> do
               res <- performReorg net cache db hc mIdxMgr (ceHash tip) blockHash
+              -- As in 'activateBestChain': the reorg steps leave hcTip at the
+              -- connected tip; put the best header back (Core m_best_header).
+              recalculateBestHeader db hc
               case res of
                 Right () -> return ()
                 Left _   -> activateBestChain net cache db hc mIdxMgr
