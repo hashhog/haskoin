@@ -9423,6 +9423,27 @@ recalculateBestHeader db hc = do
           writeTVar (hcHeight hc) (ceHeight best)
           bumpTipGen hc
 
+-- | After a reorg: the disconnect / connect steps have set hcTip to the
+-- connected tip.  Put the pre-reorg best header back when it is still valid
+-- and has at least the new tip's work, then 'recalculateBestHeader'.  Core
+-- never moves m_best_header for a reorg and replaces it only with a header
+-- of MORE work, so restoring first keeps Core's tie rule: an equal-work
+-- best header seen before the reorg stays the best header.
+keepBestHeaderAfterReorg :: HaskoinDB -> HeaderChain -> ChainEntry -> IO ()
+keepBestHeaderAfterReorg db hc prevBest = do
+  atomically $ do
+    entries <- readTVar (hcEntries hc)
+    tipNow  <- readTVar (hcTip hc)
+    case Map.lookup (ceHash prevBest) entries of
+      Just p | not (isFailedStatus (ceStatus p))
+             , ceHash p /= ceHash tipNow
+             , ceChainWork p >= ceChainWork tipNow -> do
+          writeTVar (hcTip hc) p
+          writeTVar (hcHeight hc) (ceHeight p)
+          bumpTipGen hc
+      _ -> return ()
+  recalculateBestHeader db hc
+
 -- | 'performReorg' with Core's ActivateBestChain recovery.  On a connect
 -- step that fails with a VERDICT, 'reorgConnectIncremental' has already
 -- marked the block ('invalidBlockFound'); the chainstate (left at the last
@@ -9528,6 +9549,7 @@ activateBestChain net cache db hc mIdxMgr = do
               modifyTVar' (hcCandidates hc)
                 (Set.delete (mkCandidateKey bestCe))
           Just _fork -> do
+            prevBest <- readTVarIO (hcTip hc)
             void $ performReorg net cache db hc mIdxMgr (ceHash currentTip) (ceHash bestCe)
             -- The disconnect / connect steps write hcTip/hcHeight as they
             -- go, so hcTip now names the CONNECTED tip.  Core's
@@ -9535,7 +9557,7 @@ activateBestChain net cache db hc mIdxMgr = do
             -- most-work header, so a header-only branch heavier than the
             -- new tip keeps being fetched (getblockchaininfo.headers, the
             -- fork-aware download and assumevalid all read hcTip).
-            recalculateBestHeader db hc
+            keepBestHeaderAfterReorg db hc prevBest
 
 -- | Pull the best valid tip candidate from the sorted set, applying
 -- Core's ancestor-walk @BLOCK_HAVE_DATA@ + invalidation gate
@@ -9913,10 +9935,11 @@ preciousReactivate net cache db hc mIdxMgr blockHash = do
           case mFork of
             Nothing -> activateBestChain net cache db hc mIdxMgr
             Just _  -> do
+              prevBest <- readTVarIO (hcTip hc)
               res <- performReorg net cache db hc mIdxMgr (ceHash tip) blockHash
               -- As in 'activateBestChain': the reorg steps leave hcTip at the
               -- connected tip; put the best header back (Core m_best_header).
-              recalculateBestHeader db hc
+              keepBestHeaderAfterReorg db hc prevBest
               case res of
                 Right () -> return ()
                 Left _   -> activateBestChain net cache db hc mIdxMgr
