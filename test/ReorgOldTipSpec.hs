@@ -38,6 +38,7 @@ import Haskoin.Types
 import Haskoin.Crypto (computeBlockHash, computeTxId)
 import Haskoin.Consensus
   ( regtest, netGenesisBlock
+  , Network(..)
   , connectBlockAt
   , performReorg
   , reorgAtomic
@@ -444,6 +445,71 @@ spec = describe "reorg old tip is the connected tip (Core m_chain.Tip())" $ do
         r `shouldBe` Right ()
         shouldBeOnB db fx
         bestHeaderStaysA5 fx
+
+  -- Warden review 2, point 1 (haskoin#82): the checkpoint guard in
+  -- 'performReorg' must be keyed off the CONNECTED (old) tip's height, not
+  -- hcHeight (the best-header height).  Headers run ahead of bodies, so a
+  -- checkpoint strictly above the connected tip and at or below the best
+  -- header is routine during IBD (mainnet checkpoints run to 295000).
+  -- Pre-fix such a checkpoint rejected every reorg of the connected chain
+  -- whose fork lies below it, here even the reorg ONTO the checkpointed
+  -- branch.
+  --
+  -- Fixture: connected A4; rival B1..B5 with bodies; header-only B6, B7
+  -- make B7 the best header (hcHeight 7); a checkpoint at height 5 naming
+  -- B5.  The fork is genesis.
+  describe "checkpoint guard keyed off the connected tip" $ do
+
+    let withCheckpointFx tag cpOf act =
+          withTestDB tag $ \db -> do
+            fx <- setupFx db 4 5 0
+            let hc = fxHc fx
+                b5 = last (fxB fx)
+                mk prevCe h = do
+                  let blk = branchBlock tagB (ceHash prevCe) h
+                      ce  = mkEntry blk h (ceHash prevCe)
+                              (ceChainWork prevCe + headerWork (blockHeader blk))
+                              (40000 + fromIntegral h) StatusHeaderValid
+                  atomically $ do
+                    modifyTVar' (hcEntries hc)  (Map.insert (ceHash ce) ce)
+                    modifyTVar' (hcByHeight hc) (Map.insert h (ceHash ce))
+                    writeTVar (hcTip hc) ce
+                    writeTVar (hcHeight hc) h
+                  return ce
+            b6 <- mk b5 6
+            _b7 <- mk b6 7
+            readTVarIO (hcHeight hc) `shouldReturn` 7
+            let (cpH, cpHash) = cpOf fx
+                net = regtest { netCheckpoints = [(cpH, cpHash)] }
+            cache <- newUTXOCache db 100000
+            act net cache db fx
+
+    it "performReorg is not rejected by a checkpoint above the connected tip and at or below the best header" $
+      withCheckpointFx "cp-above-connected" (\fx -> (5, lastHash (fxB fx))) $
+        \net cache db fx -> do
+          r <- performReorg net cache db (fxHc fx) Nothing
+                 (lastHash (fxA fx)) (lastHash (fxB fx))
+          r `shouldBe` Right ()
+          shouldBeOnB db fx
+
+    it "activateBestChain is not rejected by a checkpoint above the connected tip and at or below the best header" $
+      withCheckpointFx "cp-above-connected-abc" (\fx -> (5, lastHash (fxB fx))) $
+        \net cache db fx -> do
+          activateBestChain net cache db (fxHc fx) Nothing
+          shouldBeOnB db fx
+
+    -- The guard still fires: a checkpoint at or below the connected tip and
+    -- above the fork rejects the reorg, with the connected chain untouched.
+    it "control: a checkpoint at or below the connected tip still rejects a reorg past it" $
+      withCheckpointFx "cp-below-connected" (\fx -> (3, ceHash (fxA fx !! 2))) $
+        \net cache db fx -> do
+          r <- performReorg net cache db (fxHc fx) Nothing
+                 (lastHash (fxA fx)) (lastHash (fxB fx))
+          r `shouldBe` Left "Reorg rejected: would go past checkpoint at height 3"
+          getBestBlockHash db `shouldReturn` Just (lastHash (fxA fx))
+          forM_ (fxA fx) $ \ce -> do
+            m <- getUTXO db (cbOut (ceHeight ce) tagA)
+            fmap txOutScript m `shouldBe` Just opTrue
 
   -- Warden review point 2 (haskoin#82): the disconnect list is checked as a
   -- whole before the first commit.  A list whose second entry is not the
