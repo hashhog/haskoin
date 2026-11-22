@@ -107,6 +107,8 @@ module Haskoin.Mempool
   , maxPackageCount
   , maxPackageWeight
   , acceptPackage
+  , acceptPackageReplacing
+  , readmitEvicted
   , isTopoSortedPackage
   , isConsistentPackage
   , isWellFormedPackage
@@ -3393,6 +3395,18 @@ data PackageError
   | PkgTxError !TxId !MempoolError        -- ^ Individual tx validation failed
   | PkgInsufficientFee !FeeRate !FeeRate  -- ^ (package_feerate, min_required)
   | PkgEphemeralError !EphemeralError     -- ^ Ephemeral anchor policy violation
+  | PkgPolicy !String
+    -- ^ Core PCKG_POLICY package state, rendered as Core's
+    -- PackageValidationState::ToString (reject reason, then ", " and the
+    -- debug message when there is one).  Used by package RBF
+    -- (validation.cpp PackageRBFChecks), whose failures carry no per-tx
+    -- result.
+  | PkgMaxFeeRate !TxId
+    -- ^ A package tx's own feerate is above the caller's maxfeerate (Core
+    -- client_maxfeerate, checked per tx in AcceptMultipleTransactions'
+    -- PreChecks loop: PCKG_TX "transaction failed", tx state
+    -- "max feerate exceeded").  Only raised on the package-RBF path, before
+    -- anything is evicted.
   deriving (Show, Eq, Generic)
 
 instance NFData PackageError
@@ -3540,7 +3554,19 @@ calculatePackageFeeRate txns utxoMap = do
 -- acceptPackageInner.  If every tx is already in the mempool the call
 -- succeeds and returns the empty list (nothing newly admitted).
 acceptPackage :: TxPackage -> Mempool -> IO (Either PackageError [TxId])
-acceptPackage pkg mp = withAdmissionLock mp $ do
+acceptPackage pkg mp = fmap fst <$> acceptPackageReplacing 0 pkg mp
+
+-- | 'acceptPackage', also returning the entries a package RBF evicted (the
+-- direct conflicts and their descendants; Core's m_replaced_transactions),
+-- parents first.  Empty when the package conflicted with nothing.
+--
+-- The 'Double' is the caller's maxfeerate in sat/vB (0 = none).  On the
+-- package-RBF path it is checked per tx before anything is evicted, as Core
+-- does; a caller that refuses the package for any other reason after a
+-- successful return must hand the evicted entries to 'readmitEvicted'.
+acceptPackageReplacing :: Double -> TxPackage -> Mempool
+                       -> IO (Either PackageError ([TxId], [MempoolEntry]))
+acceptPackageReplacing maxFeeRate pkg mp = withAdmissionLock mp $ do
   let allTxns = pkgParents pkg ++ [pkgChild pkg]
 
   -- 1. Context-free validation (applied to the full declared package).
@@ -3561,12 +3587,13 @@ acceptPackage pkg mp = withAdmissionLock mp $ do
           let newTxns = filter (\tx -> not (Map.member (computeTxId tx) entries)) allTxns
           if null newTxns
             -- Every tx is already in the mempool — nothing to do.
-            then return $ Right []
-            else acceptPackageInner pkg mp newTxns
+            then return $ Right ([], [])
+            else acceptPackageInner maxFeeRate pkg mp newTxns
 
 -- | Inner package acceptance after basic validation
-acceptPackageInner :: TxPackage -> Mempool -> [Tx] -> IO (Either PackageError [TxId])
-acceptPackageInner _pkg mp allTxns = do
+acceptPackageInner :: Double -> TxPackage -> Mempool -> [Tx]
+                   -> IO (Either PackageError ([TxId], [MempoolEntry]))
+acceptPackageInner maxFeeRate _pkg mp allTxns = do
   -- Resolve all inputs from UTXO and package itself
   utxoInputs <- resolvePackageInputs mp allTxns
   case utxoInputs of
@@ -3593,11 +3620,191 @@ acceptPackageInner _pkg mp allTxns = do
                   case checkEphemeralAnchors allTxns mempoolParents of
                     Left err -> return $ Left $ PkgEphemeralError err
                     Right () -> do
-                      -- Now add each transaction
-                      addedTxIds <- addPackageTransactions mp allTxns utxoMap pkgFeeRate
-                      case addedTxIds of
-                        Left err -> return $ Left err
-                        Right txids -> return $ Right txids
+                      -- Core MemPoolAccept::PreChecks collects GetConflictTx
+                      -- for every input of every package tx
+                      -- (validation.cpp:835-841); a package with conflicts
+                      -- is a package RBF (m_subpackage.m_rbf).  haskoin used
+                      -- to skip this, resolve the input from the chain UTXO
+                      -- set and admit a second spend of an in-pool coin.
+                      conflictLists <- mapM (getConflicts mp) allTxns
+                      let directConflicts = Set.fromList (concat conflictLists)
+                      if Set.null directConflicts
+                        then fmap (\ts -> (ts, [])) <$>
+                               addPackageTransactions False mp allTxns utxoMap pkgFeeRate
+                        else packageReplace maxFeeRate mp allTxns utxoMap pkgFeeRate directConflicts
+
+-- | Package RBF: Core validation.cpp PackageRBFChecks, then eviction of the
+-- conflicts and admission of the package.
+--
+-- Check order as Core: the per-tx gates (Core PreChecks / PolicyScriptChecks
+-- run before PackageRBFChecks on the whole subpackage; here a dry run of
+-- 'addPackageTransactions'), then 1-parent-1-child, no in-mempool ancestors,
+-- rule 5 (conflicting clusters), PaysForRBF over every evicted tx, package
+-- feerate above the parent's, the cluster limits of the new cluster, and the
+-- feerate diagram.  Nothing is evicted until all of them pass.  The caller's
+-- maxfeerate is checked first, per tx, as Core's PreChecks loop does.
+packageReplace :: Double -> Mempool -> [Tx] -> Map OutPoint TxOut -> FeeRate -> Set TxId
+               -> IO (Either PackageError ([TxId], [MempoolEntry]))
+packageReplace maxFeeRate mp allTxns utxoMap pkgFeeRate directConflicts = do
+      entries <- readTVarIO (mpEntries mp)
+      feeDeltas <- readTVarIO (mpFeeDeltas mp)
+      tipH <- mempoolTipHeight mp
+      let policy = return . Left . PkgPolicy . ("package RBF failed: " ++)
+          pkgTxids = Set.fromList (map computeTxId allTxns)
+          inPoolParent tx = any (\i -> let h = outPointHash (txInPrevOutput i)
+                                       in Map.member h entries && not (Set.member h pkgTxids))
+                                (txInputs tx)
+          sigopFlags = consensusFlagsAtHeight (mpNetwork mp) (tipH + 1)
+          -- Per tx: (modified fee, sigop-adjusted vsize, sigop-adjusted
+          -- weight), Core's ws.m_modified_fees / ws.m_vsize.
+          measure tx =
+            let txid = computeTxId tx
+                ins = [ (op, o) | i <- txInputs tx
+                                , let op = txInPrevOutput i
+                                , Just o <- [Map.lookup op utxoMap] ]
+                inV = sum (map (txOutValue . snd) ins)
+                outV = sum (map txOutValue (txOutputs tx))
+                fee = if inV > outV then inV - outV else 0
+                SigOpCost sc = getTransactionSigOpCost tx (Map.fromList ins) sigopFlags
+                modFee = applyFeeDelta fee (Map.findWithDefault 0 txid feeDeltas)
+            in (modFee, calculateAdjustedVSize tx sc, calculateAdjustedWeight tx sc)
+          modifiedFee e = applyFeeDelta (meFee e)
+                            (Map.findWithDefault 0 (meTxId e) feeDeltas)
+          overCap tx = let (f, v, _) = measure tx
+                       in maxFeeRate > 0 && v > 0
+                            && fromIntegral f / fromIntegral v > maxFeeRate
+      case (filter overCap allTxns, allTxns) of
+        (tx : _, _) -> return $ Left $ PkgMaxFeeRate (computeTxId tx)
+        ([], [parent, child])
+          | any inPoolParent allTxns ->
+              policy "new transaction cannot have mempool ancestors"
+          | otherwise -> do
+              let childTxid = computeTxId child
+                  directEntries = mapMaybe (`Map.lookup` entries) (Set.toList directConflicts)
+              nClusters <- countConflictClusters mp directEntries
+              if nClusters > maxReplacementEvictions
+                then policy $ "too many potential replacements, rejecting replacement "
+                       ++ txIdHex childTxid ++ "; too many conflicting clusters ("
+                       ++ show nClusters ++ " > " ++ show maxReplacementEvictions ++ ")"
+                else do
+                  allEvictions <- getConflictSet mp (Set.toList directConflicts)
+                  let (pFee, pVsize, pWeight) = measure parent
+                      (cFee, cVsize, cWeight) = measure child
+                      totalFee = pFee + cFee
+                      totalVsize = pVsize + cVsize
+                      conflictingFees = sum (map modifiedFee allEvictions)
+                      additional = totalFee - conflictingFees
+                      -- Core CFeeRate::GetFee rounds up (EvaluateFeeUp).
+                      relayFee = (incrementalRelayFeePerKvb * fromIntegral totalVsize + 999) `div` 1000
+                      perK fee vsz = (fee * 1000) `div` fromIntegral (max 1 vsz)
+                      parentRate = perK pFee pVsize
+                      packageRate = perK totalFee totalVsize
+                      -- Core compares CFeeRates as exact fractions
+                      -- (FeeRateCompare on FeePerVSize); sat/kvB is only
+                      -- for the message.
+                      packageNotAboveParent =
+                        toInteger totalFee * toInteger pVsize
+                          <= toInteger pFee * toInteger totalVsize
+                  if totalFee < conflictingFees
+                    then policy $ "insufficient anti-DoS fees, rejecting replacement "
+                           ++ txIdHex childTxid ++ ", less fees than conflicting txs; "
+                           ++ formatMoney totalFee ++ " < " ++ formatMoney conflictingFees
+                  else if additional < relayFee
+                    then policy $ "insufficient anti-DoS fees, rejecting replacement "
+                           ++ txIdHex childTxid ++ ", not enough additional fees to relay; "
+                           ++ formatMoney additional ++ " < " ++ formatMoney relayFee
+                  else if packageNotAboveParent
+                    then policy $ "package feerate is less than or equal to parent feerate, "
+                           ++ "package feerate " ++ formatFeeRateKvB packageRate
+                           ++ " <= parent feerate is " ++ formatFeeRateKvB parentRate
+                  -- The conflicts and their descendants are staged for
+                  -- removal and the package has no in-pool ancestors, so the
+                  -- new cluster is the two package txs alone
+                  -- (CheckMemPoolPolicyLimits on the changeset).
+                  else if pWeight + cWeight > maxClusterSizeWeight
+                    then return $ Left $ PkgPolicy "too-large-cluster"
+                  -- computeChunks linearizes in list order, so the evicted
+                  -- txs must come parents first; getConflictSet returns
+                  -- them in txid order, which can put a high-feerate
+                  -- descendant ahead of its parent and make a replacement
+                  -- that improves the diagram look worse.
+                  else case checkDiagramReplacement
+                              (sortBy (comparing meAncestorCount) allEvictions)
+                              totalFee totalVsize
+                              (calculateFeeRate totalFee totalVsize) of
+                    Left _ -> policy "insufficient feerate: does not improve feerate diagram"
+                    Right () -> do
+                      -- Every per-tx gate (standardness, locktime, scripts)
+                      -- must pass before anything is evicted: a dry run of
+                      -- the package admission that inserts nothing.  Core
+                      -- runs PolicyScriptChecks after PackageRBFChecks,
+                      -- likewise before the changeset is applied.
+                      dry <- addPackageTransactions True mp allTxns utxoMap pkgFeeRate
+                      either (return . Left)
+                             (const (commitPackageReplacement mp allTxns utxoMap pkgFeeRate
+                                       directConflicts allEvictions))
+                             dry
+        ([], _) -> policy "package must be 1-parent-1-child"
+
+-- | Evict the conflicts (and their descendants) of an accepted package RBF,
+-- then admit the package.  Returns the admitted txids and the evicted
+-- entries, parents first.
+commitPackageReplacement :: Mempool -> [Tx] -> Map OutPoint TxOut -> FeeRate
+                         -> Set TxId -> [MempoolEntry]
+                         -> IO (Either PackageError ([TxId], [MempoolEntry]))
+commitPackageReplacement mp allTxns utxoMap pkgFeeRate directConflicts allEvictions = do
+  let evicted = sortBy (comparing meAncestorCount) allEvictions
+  removeConflicts directConflicts mp
+  added <- addPackageTransactions False mp allTxns utxoMap pkgFeeRate
+  case added of
+    Right txids -> return (Right (txids, evicted))
+    Left err -> do
+      -- A gate only the real insert can see (TRUC against the now-pooled
+      -- parent, the per-insert cluster gate) refused it after eviction.
+      -- Core applies the changeset atomically, so put the pool back: drop
+      -- whatever of the package landed, re-admit the evicted txs parents
+      -- first.
+      forM_ (reverse (map computeTxId allTxns)) $ \t -> do
+        present <- Map.member t <$> readTVarIO (mpEntries mp)
+        when present $ removeTransaction mp t
+      readmitEvicted mp evicted
+      return (Left err)
+
+-- | Put back the entries a package RBF evicted, parents first, when the
+-- package that replaced them is being taken out again (its own package txs
+-- must already be gone).  Re-admitted without the feerate floor, as a reorg
+-- re-add: they were in the pool a moment ago.
+readmitEvicted :: Mempool -> [MempoolEntry] -> IO ()
+readmitEvicted mp evicted = withAdmissionLock mp $
+  forM_ (sortBy (comparing meAncestorCount) evicted) $ \e ->
+    void (addTransactionUnlatched True mp (meTransaction e))
+
+-- | Core FormatMoney: whole coins, a point, the satoshi digits with trailing
+-- zeros trimmed down to two decimals (util/moneystr.cpp).
+formatMoney :: Word64 -> String
+formatMoney sats =
+  let (q, r) = sats `divMod` 100000000
+      frac = let s = show r in replicate (8 - length s) '0' ++ s
+      trimmed = reverse (dropWhileMax 6 (== '0') (reverse frac))
+  in show q ++ "." ++ trimmed
+  where
+    dropWhileMax :: Int -> (Char -> Bool) -> String -> String
+    dropWhileMax 0 _ s = s
+    dropWhileMax n p (c:cs) | p c = dropWhileMax (n - 1) p cs
+    dropWhileMax _ _ s = s
+
+-- | Core CFeeRate::ToString (BTC_KVB): "%d.%08d BTC/kvB" of the sat/kvB rate.
+formatFeeRateKvB :: Word64 -> String
+formatFeeRateKvB perK =
+  let (q, r) = perK `divMod` 100000000
+      s = show r
+  in show q ++ "." ++ replicate (8 - length s) '0' ++ s ++ " BTC/kvB"
+
+-- | Display-order (byte-reversed) hex of a txid, as Core's Txid::ToString.
+txIdHex :: TxId -> String
+txIdHex (TxId (Hash256 bs)) = concatMap byte (reverse (BS.unpack bs))
+  where byte b = [hexDigit (b `div` 16), hexDigit (b `mod` 16)]
+        hexDigit n = "0123456789abcdef" !! fromIntegral n
 
 -- | Pre-check all transactions in package for ephemeral policy
 checkAllEphemeralPreChecks :: [Tx] -> Map OutPoint TxOut -> Either EphemeralError ()
@@ -3683,12 +3890,17 @@ resolvePackageInputs mp txns = do
         Nothing -> return $ Left (txid, ErrMissingInput op)
 
 -- | Add all transactions in a package to the mempool
-addPackageTransactions :: Mempool
+--
+-- With @dryRun@ every per-tx gate runs but nothing is inserted and the
+-- TRUC gate (which reads the in-pool parent) is left to the real run; package
+-- RBF uses it to prove the package admissible before evicting anything.
+addPackageTransactions :: Bool                -- ^ dry run: check, insert nothing
+                       -> Mempool
                        -> [Tx]
                        -> Map OutPoint TxOut
                        -> FeeRate             -- ^ Package fee rate (for CPFP)
                        -> IO (Either PackageError [TxId])
-addPackageTransactions mp txns utxoMap pkgFeeRate = do
+addPackageTransactions dryRun mp txns utxoMap pkgFeeRate = do
   -- Process transactions in order (parents first)
   go txns [] Map.empty
   where
@@ -3790,7 +4002,9 @@ addPackageTransactions mp txns utxoMap pkgFeeRate = do
                                   case scriptResult of
                                     Left err -> return $ Left $ PkgTxError txid
                                                             (ErrScriptVerificationFailed err)
-                                    Right () -> do
+                                    Right ()
+                                     | dryRun -> go rest (txid : acc) localOutputs
+                                     | otherwise -> do
                                       -- BUG-G17 fix (TP-1): enforce TRUC/v3 policy in the
                                       -- package path.  The single-tx path calls
                                       -- checkTrucPolicy via handleTruc (Mempool.hs:960).
@@ -3898,25 +4112,39 @@ addTransactionToMempool mp tx txid inputPairs fee _vsize = do
             , meRBFOptIn = rbfOptIn
             }
 
-      -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync)
-      atomically $ do
-        modifyTVar' (mpEntries mp) (Map.insert txid entry)
-        modifyTVar' (mpByWtxid mp) (Map.insert wtxid txid)
-        forM_ (txInputs tx) $ \inp ->
-          modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
-        modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
-        modifyTVar' (mpSize mp) (+ adjVsize)
-        accountEntryAdded mp tx
+      -- Insert atomically (BIP-339 dual index: txid + wtxid stay in sync).
+      -- The clash check runs inside the same STM transaction as the insert:
+      -- a coin another pool entry already spends is never overwritten in
+      -- mpByOutpoint, so the pool can never hold two spends of one coin
+      -- (the single-tx insert has the same guard).
+      clash <- atomically $ do
+        byOp <- readTVar (mpByOutpoint mp)
+        case [ s | inp <- txInputs tx
+                 , Just s <- [Map.lookup (txInPrevOutput inp) byOp]
+                 , s /= txid ] of
+          (s : _) -> return (Just s)
+          [] -> do
+            modifyTVar' (mpEntries mp) (Map.insert txid entry)
+            modifyTVar' (mpByWtxid mp) (Map.insert wtxid txid)
+            forM_ (txInputs tx) $ \inp ->
+              modifyTVar' (mpByOutpoint mp) (Map.insert (txInPrevOutput inp) txid)
+            modifyTVar' (mpByFeeRate mp) (Map.insert (feeRate, txid) ())
+            modifyTVar' (mpSize mp) (+ adjVsize)
+            accountEntryAdded mp tx
+            return Nothing
 
-      -- Update ancestor entries with new descendant
-      atomically $ forM_ ancestors $ \anc ->
-        modifyTVar' (mpEntries mp) $ Map.adjust
-          (\e -> e { meDescendantCount = meDescendantCount e + 1
-                   , meDescendantSize = meDescendantSize e + adjVsize
-                   , meDescendantFees = meDescendantFees e + fee
-                   }) (meTxId anc)
+      case clash of
+        Just s -> return $ Left (ErrInputSpentInMempool s)
+        Nothing -> do
+          -- Update ancestor entries with new descendant
+          atomically $ forM_ ancestors $ \anc ->
+            modifyTVar' (mpEntries mp) $ Map.adjust
+              (\e -> e { meDescendantCount = meDescendantCount e + 1
+                       , meDescendantSize = meDescendantSize e + adjVsize
+                       , meDescendantFees = meDescendantFees e + fee
+                       }) (meTxId anc)
 
-      return $ Right ()
+          return $ Right ()
 
 --------------------------------------------------------------------------------
 -- v3/TRUC Transaction Policy (BIP 431)
