@@ -1232,11 +1232,62 @@ isTrue bs
 -- Script Environment
 --------------------------------------------------------------------------------
 
+-- | The OP_IF / OP_NOTIF / OP_ELSE / OP_ENDIF condition stack, kept the
+-- way Core keeps it (@ConditionStack@, bitcoin-core/src/script/
+-- interpreter.cpp:273-318): only the stack's size and the position of its
+-- lowest @False@ entry are stored, so "is every entry True?" (asked before
+-- every opcode) is O(1).
+--
+-- Why: tapscript lifts the 201-opcode and 10,000-byte limits and nothing
+-- bounds the nesting depth, so with a @[Bool]@ and @all id@ a Core-valid
+-- leaf @(OP_1 OP_IF)*d (OP_ENDIF)*d OP_1@ cost ~1.5*d^2 steps (d ~ 130k in
+-- one standard input).
+--
+-- The values of entries above the lowest @False@ are not stored. They are
+-- unobservable: 'condAllTrue' is False while that @False@ is on the stack,
+-- and entries above it are popped before it is. Toggling the top therefore
+-- only matters when the top IS the lowest @False@ (it becomes True) or when
+-- there is no @False@ (the top becomes the lowest one).
+data CondStack = CondStack
+  { csSize       :: {-# UNPACK #-} !Int  -- ^ number of entries
+  , csFirstFalse :: {-# UNPACK #-} !Int  -- ^ index of the lowest False, or -1 if none
+  } deriving (Show, Eq)
+
+condEmpty :: CondStack
+condEmpty = CondStack 0 (-1)
+
+condNull :: CondStack -> Bool
+condNull cs = csSize cs == 0
+
+condAllTrue :: CondStack -> Bool
+condAllTrue cs = csFirstFalse cs < 0
+
+condPush :: Bool -> CondStack -> CondStack
+condPush f (CondStack n ff)
+  | ff < 0 && not f = CondStack (n + 1) n
+  | otherwise       = CondStack (n + 1) ff
+
+-- | OP_ENDIF. 'Nothing' on an empty stack.
+condPop :: CondStack -> Maybe CondStack
+condPop (CondStack n ff)
+  | n <= 0    = Nothing
+  | ff == n'  = Just (CondStack n' (-1))
+  | otherwise = Just (CondStack n' ff)
+  where n' = n - 1
+
+-- | OP_ELSE. 'Nothing' on an empty stack.
+condToggle :: CondStack -> Maybe CondStack
+condToggle (CondStack n ff)
+  | n <= 0      = Nothing
+  | ff < 0      = Just (CondStack n (n - 1))
+  | ff == n - 1 = Just (CondStack n (-1))
+  | otherwise   = Just (CondStack n ff)
+
 -- | Script execution environment
 data ScriptEnv = ScriptEnv
   { seStack        :: !ScriptStack     -- ^ Main stack
   , seAltStack     :: !ScriptStack     -- ^ Alt stack
-  , seIfStack      :: ![Bool]          -- ^ Execution condition stack
+  , seIfStack      :: !CondStack       -- ^ Execution condition stack (O(1), see 'CondStack')
   , seTx           :: !Tx              -- ^ Transaction being verified
   , seInputIdx     :: !Int             -- ^ Input index being verified
   , seAmount       :: !Word64          -- ^ Amount being spent (for SegWit sighash)
@@ -1277,7 +1328,7 @@ initScriptEnvWithFlags :: Tx -> Int -> Word64 -> ByteString -> ScriptFlags -> Sc
 initScriptEnvWithFlags tx idx amount scriptCode flags = ScriptEnv
   { seStack = []
   , seAltStack = []
-  , seIfStack = []
+  , seIfStack = condEmpty
   , seTx = tx
   , seInputIdx = idx
   , seAmount = amount
@@ -1309,7 +1360,7 @@ data ScriptResult
 
 -- | Check if we're in an executing branch
 isExecuting :: ScriptEnv -> Bool
-isExecuting env = all id (seIfStack env)
+isExecuting env = condAllTrue (seIfStack env)
 
 -- | Pop from stack
 popStack :: ScriptEnv -> Either String (ByteString, ScriptEnv)
@@ -1531,16 +1582,16 @@ execFlowControlOnly op env = do
   -- Count non-push opcodes even in non-executing branches
   env' <- if isCountedOp op then incOpCount env else Right env
   case op of
-    OP_IF -> Right env' { seIfStack = False : seIfStack env' }
-    OP_NOTIF -> Right env' { seIfStack = False : seIfStack env' }
+    OP_IF -> Right env' { seIfStack = condPush False (seIfStack env') }
+    OP_NOTIF -> Right env' { seIfStack = condPush False (seIfStack env') }
     OP_ELSE ->
-      case seIfStack env' of
-        [] -> Left "OP_ELSE without OP_IF"
-        (x:xs) -> Right env' { seIfStack = not x : xs }
+      case condToggle (seIfStack env') of
+        Nothing -> Left "OP_ELSE without OP_IF"
+        Just cs -> Right env' { seIfStack = cs }
     OP_ENDIF ->
-      case seIfStack env' of
-        [] -> Left "OP_ENDIF without OP_IF"
-        (_:xs) -> Right env' { seIfStack = xs }
+      case condPop (seIfStack env') of
+        Nothing -> Left "OP_ENDIF without OP_IF"
+        Just cs -> Right env' { seIfStack = cs }
     OP_VERIF -> Left "OP_VERIF is disabled"
     OP_VERNOTIF -> Left "OP_VERNOTIF is disabled"
     -- Disabled opcodes must fail even in unexecuted branches
@@ -1594,21 +1645,21 @@ execIf matchTrue env = do
        else Right ()
   let cond = isTrue top
       execute = if matchTrue then cond else not cond
-  Right env'' { seIfStack = execute : seIfStack env'' }
+  Right env'' { seIfStack = condPush execute (seIfStack env'') }
 
 execElse :: ScriptEnv -> Either String ScriptEnv
 execElse env = do
   env' <- incOpCount env
-  case seIfStack env' of
-    [] -> Left "OP_ELSE without OP_IF"
-    (x:xs) -> Right env' { seIfStack = not x : xs }
+  case condToggle (seIfStack env') of
+    Nothing -> Left "OP_ELSE without OP_IF"
+    Just cs -> Right env' { seIfStack = cs }
 
 execEndif :: ScriptEnv -> Either String ScriptEnv
 execEndif env = do
   env' <- incOpCount env
-  case seIfStack env' of
-    [] -> Left "OP_ENDIF without OP_IF"
-    (_:xs) -> Right env' { seIfStack = xs }
+  case condPop (seIfStack env') of
+    Nothing -> Left "OP_ENDIF without OP_IF"
+    Just cs -> Right env' { seIfStack = cs }
 
 execVerify :: ScriptEnv -> Either String ScriptEnv
 execVerify env = do
@@ -2708,13 +2759,13 @@ evalScriptWithFlags flags tx idx amount scriptSig scriptPubKey = do
 
   -- Clear altstack between scriptSig and scriptPubKey evaluation
   -- Reset for scriptPubKey evaluation
-  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = [], seAltStack = [] }
+  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = condEmpty, seAltStack = [] }
 
   -- Evaluate scriptPubKey
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
 
   -- Check if-stack is empty
-  unless (null $ seIfStack env3) $
+  unless (condNull $ seIfStack env3) $
     Left "Unbalanced IF/ENDIF"
 
   -- Check top stack element
@@ -2769,19 +2820,19 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
       savedStack = sigStack  -- Save for P2SH
 
   -- Check for unbalanced IF/ENDIF in scriptSig
-  unless (null $ seIfStack env1) $
+  unless (condNull $ seIfStack env1) $
     Left "Unbalanced IF/ENDIF"
 
   -- Clear altstack between scriptSig and scriptPubKey evaluation; restore the
   -- scriptCode to the scriptPubKey for the scriptPubKey-execution phase
   -- (and reset the codeseparator position, which is per-script).
-  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = []
+  let env2 = env1 { seStack = sigStack, seOpCount = 0, seIfStack = condEmpty
                   , seAltStack = []
                   , seScriptCode = prevScriptPubKey
                   , seCodeSepPos = 0xFFFFFFFF }
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
 
-  unless (null $ seIfStack env3) $
+  unless (condNull $ seIfStack env3) $
     Left "Unbalanced IF/ENDIF"
 
   case seStack env3 of
@@ -2869,11 +2920,11 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
                       redeemScript <- decodeScript redeemScriptBytes
                       let env4 = env3 { seStack = restStack
                                       , seOpCount = 0
-                                      , seIfStack = []
+                                      , seIfStack = condEmpty
                                       , seScriptCode = redeemScriptBytes
                                       }
                       env5 <- evalScriptWithStack restStack redeemScript env4
-                      unless (null $ seIfStack env5) $
+                      unless (condNull $ seIfStack env5) $
                         Left "Unbalanced IF/ENDIF"
                       case seStack env5 of
                         [] -> Right False

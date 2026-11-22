@@ -1422,6 +1422,20 @@ test-suite mutation-recheck-race
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- cffix-haskoin-tapscript-ifstack-quadratic: own target so the spec needs
+-- no edit to the shared Spec.hs / haskoin-test other-modules list.
+test-suite tapscript-ifstack
+  type:          exitcode-stdio-1.0
+  main-is:       TapscriptIfStackSpec.hs
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , QuickCheck
+               , bytestring
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1
+
 -- policy-cause-04: own target so the spec needs no edit to the shared
 -- Spec.hs / haskoin-test other-modules list.
 test-suite unbroadcast-set
