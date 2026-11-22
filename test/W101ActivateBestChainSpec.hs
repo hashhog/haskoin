@@ -192,8 +192,11 @@ spec = do
         -- activateBestChain will find orphanEntry as best candidate, call
         -- findForkPoint (returns Nothing), then silently return ().
         -- Tip must not be corrupted.
-        activateBestChain regtest (error "no cache") (error "no db") hc Nothing
-          `shouldReturn` ()
+        -- activateBestChain reads the connected tip (PrefixBestBlock), so it
+        -- needs a chainstate; an empty one falls back to the in-memory tip.
+        withChainDB $ \db ->
+          activateBestChain regtest (error "no cache") db hc Nothing
+            `shouldReturn` ()
         tip1 <- readTVarIO (hcTip hc)
         ceHash tip1 `shouldBe` ceHash tip0
 
@@ -768,8 +771,11 @@ spec = do
             h1 = mkBlockHash 60
             e1 = mkEntry h1 genesisHash 1 genesisWork StatusValid  -- equal work
         insertEntry hc e1
-        activateBestChain regtest (error "no cache") (error "no db") hc Nothing
-          `shouldReturn` ()
+        -- activateBestChain reads the connected tip (PrefixBestBlock), so it
+        -- needs a chainstate; an empty one falls back to the in-memory tip.
+        withChainDB $ \db ->
+          activateBestChain regtest (error "no cache") db hc Nothing
+            `shouldReturn` ()
         tip1 <- readTVarIO (hcTip hc)
         ceHash tip1 `shouldBe` ceHash tip0
 
