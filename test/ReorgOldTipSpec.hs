@@ -498,6 +498,26 @@ spec = describe "reorg old tip is the connected tip (Core m_chain.Tip())" $ do
           activateBestChain net cache db (fxHc fx) Nothing
           shouldBeOnB db fx
 
+    -- Consensus control for the other direction: with the guard no longer
+    -- firing above the connected tip, a rival that CONTRADICTS such a
+    -- checkpoint must still be refused, by the per-block checkpoint check
+    -- in block validation.  Checkpoint at 5 names A5 (the header-only best
+    -- chain), so B5 at height 5 contradicts it.
+    it "control: a rival contradicting a checkpoint above the connected tip is still refused" $
+      withTestDB "cp-contradicted" $ \db -> do
+        fx <- setupFx db 4 5 2
+        let a5 = head (fxHdr fx)
+            net = regtest { netCheckpoints = [(5, ceHash a5)] }
+        cache <- newUTXOCache db 100000
+        r <- performReorg net cache db (fxHc fx) Nothing
+               (lastHash (fxA fx)) (lastHash (fxB fx))
+        case r of
+          Right () -> expectationFailure "reorg onto a checkpoint-contradicting rival succeeded"
+          Left msg -> msg `shouldSatisfy` ("heckpoint" `isInfixOf`)
+        tip <- getBestBlockHash db
+        tip `shouldNotBe` Just (lastHash (fxB fx))
+        getUTXO db (cbOut 5 tagB) `shouldReturn` Nothing
+
     -- The guard still fires: a checkpoint at or below the connected tip and
     -- above the fork rejects the reorg, with the connected chain untouched.
     it "control: a checkpoint at or below the connected tip still rejects a reorg past it" $
