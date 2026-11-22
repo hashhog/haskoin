@@ -495,7 +495,7 @@ import Haskoin.Network (PeerManager(..), PeerInfo(..), PeerConnection(..),
                          PeerState(..), Version(..),
                          LocalAddress(..), getLocalAddresses, showIP16,
                          getPeerCount, getConnectedPeers, broadcastMessage,
-                         sendMessage, requestFromPeer,
+                         sendMessage, requestFromPeer, notePingSent,
                          Message(..), Inv(..), GetData(..),
                          InvVector(..), InvType(..),
                          protocolVersion, peerCommonVersion, p2pBip31Version,
@@ -12185,13 +12185,13 @@ handlePing server = do
   -- For each connected peer: stamp a fresh nonce in piLastPing (so the PONG
   -- handler can match it) and enqueue a P2P PING.  A per-peer send failure must
   -- not fail the RPC (Core loops over the map and returns regardless).
-  forM_ (Map.toList peers) $ \(_, pc) -> do
+  forM_ (Map.toList peers) $ \(addr, pc) -> do
     info <- readTVarIO (pcInfo pc)
     -- Nonce pings only above BIP0031_VERSION (Core net_processing.cpp:5431).
     when (piState info == PeerConnected
           && peerCommonVersion info > p2pBip31Version) $ do
       nonce <- SysRandom.randomIO
-      atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
+      notePingSent pm addr nonce . realToFrac =<< getPOSIXTime
       sendMessage pc (MPing (Ping nonce))
         `catch` (\(_ :: SomeException) -> return ())
   -- Core returns UniValue::VNULL -> JSON null.

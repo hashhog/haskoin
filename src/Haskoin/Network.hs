@@ -175,6 +175,10 @@ module Haskoin.Network
   , noteBlockAnnouncement
   , noteBlockAnnouncementAt
   , noteBlockReceived
+  , noteTxAccepted
+  , noteTxAcceptedAt
+  , notePingSent
+  , recordPong
   , noteBestKnownWork
   , runOutboundEviction
   , pickRandomN
@@ -335,6 +339,10 @@ module Haskoin.Network
   , EvictionCandidate(..)
   , evictConnection
   , selectEvictionCandidate
+  , selectEvictionCandidateKeyed
+  , protectByNetGroupKeyed
+  , keyedNetGroup
+  , buildEvictionCandidates
   , peerToEvictionCandidate
   , getNetworkGroup
     -- * Inv Trickling
@@ -4281,10 +4289,18 @@ data OutboundTrack = OutboundTrack
   , otBestWork     :: !(Maybe Integer)  -- ^ Core pindexBestKnownBlock->nChainWork
   , otTimer        :: !ChainSyncTimer   -- ^ Core m_chain_sync
   , otProtected    :: !Bool             -- ^ Core m_chain_sync.m_protect
+  , otLastTx       :: !Int64            -- ^ Core CNode::m_last_tx_time (inbound eviction)
+  , otPingSent     :: !(Maybe (Word64, Double))
+    -- ^ Outstanding ping: Core Peer::m_ping_nonce_sent and m_ping_start
+    --   (POSIX seconds).  Cleared by the matching pong ('recordPong').
   } deriving (Show)
 
+-- Despite the name, entries exist for inbound peers too: the inbound
+-- eviction protections ('buildEvictionCandidates') read otLastBlock,
+-- otLastTx and the ping state from here.  'runOutboundEviction' prunes the
+-- map to the live peer set.
 emptyTrack :: OutboundTrack
-emptyTrack = OutboundTrack 0 0 Nothing noChainSyncTimer False
+emptyTrack = OutboundTrack 0 0 Nothing noChainSyncTimer False 0 Nothing
 
 adjustTrack :: PeerManager -> SockAddr -> (OutboundTrack -> OutboundTrack) -> IO ()
 adjustTrack pm addr f = atomically $ modifyTVar' (pmOutboundTrack pm) $
@@ -4316,6 +4332,54 @@ noteBlockReceived pm addr = do
   -- records one; a block announced by inv records nothing, so a delivered
   -- block stands in for the announcement.
   adjustTrack pm addr $ \o -> o { otLastBlock = t, otLastAnnounce = t }
+
+-- | Core ProcessMessage TX: a transaction this peer sent was accepted into
+-- the mempool (@pfrom.m_last_tx_time = GetTime()@).  Read by the inbound
+-- eviction tx protection; an attacker cannot raise it without relaying
+-- transactions we did not already have.
+noteTxAccepted :: PeerManager -> SockAddr -> IO ()
+noteTxAccepted pm addr = round <$> getPOSIXTime >>= noteTxAcceptedAt pm addr
+
+noteTxAcceptedAt :: PeerManager -> SockAddr -> Int64 -> IO ()
+noteTxAcceptedAt pm addr t = adjustTrack pm addr $ \o -> o { otLastTx = t }
+
+-- | We sent this peer a ping with @nonce@ at POSIX time @t@ (Core SendPings:
+-- m_ping_nonce_sent, m_ping_start).  Also stamps 'piLastPing'.
+notePingSent :: PeerManager -> SockAddr -> Word64 -> Double -> IO ()
+notePingSent pm addr nonce t = do
+  peers <- readTVarIO (pmPeers pm)
+  atomically $ do
+    modifyTVar' (pmOutboundTrack pm) $
+      Map.alter (\m -> Just ((fromMaybe emptyTrack m) { otPingSent = Just (nonce, t) })) addr
+    forM_ (Map.lookup addr peers) $ \pc ->
+      modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
+
+-- | Core ProcessMessage PONG at POSIX time @now@.  A pong carrying the
+-- outstanding nonce ends the ping and records the round trip; 'piPingLatency'
+-- keeps the minimum over the connection (Core PingReceived:
+-- m_min_ping_time = min(m_min_ping_time, ping_time)), which is what the
+-- inbound-eviction ping protection reads.  A zero nonce cancels the ping
+-- without a sample; any other nonce, or a pong with no ping outstanding, is
+-- ignored.
+recordPong :: PeerManager -> SockAddr -> Word64 -> Double -> IO ()
+recordPong pm addr nonce now = do
+  peers <- readTVarIO (pmPeers pm)
+  forM_ (Map.lookup addr peers) $ \pc -> atomically $ do
+    tr <- readTVar (pmOutboundTrack pm)
+    case Map.lookup addr tr >>= otPingSent of
+      Just (sent, t0)
+        | nonce == sent || nonce == 0 -> do
+            modifyTVar' (pmOutboundTrack pm) $
+              Map.adjust (\o -> o { otPingSent = Nothing }) addr
+            let rtt = now - t0
+                sample = nonce == sent && rtt > 0
+            modifyTVar' (pcInfo pc) $ \i ->
+              i { piLastPing = Nothing
+                , piPingLatency =
+                    if sample
+                      then Just (maybe rtt (min rtt) (piPingLatency i))
+                      else piPingLatency i }
+      _ -> return ()
 
 -- | Core UpdateBlockAvailability: the peer is known to have a chain with
 -- this much work.
@@ -5433,6 +5497,11 @@ data PeerManager = PeerManager
     --   that banlist.json marks manual).  Core keeps these in @m_banned@,
     --   apart from the bounded @m_discouraged@ filter, so the discouragement
     --   cap in 'banPeer' never evicts them.
+  , pmNetGroupKey        :: !SipHashKey
+    -- ^ Per-node random key for the inbound-eviction netgroup protection
+    --   (Core CConnman nSeed0/nSeed1 -> CalculateKeyedNetGroup).  Drawn
+    --   once at startup so a remote peer cannot predict which netgroups
+    --   are protected.
   }
 
 -- | Per-peer self-announcement state.
@@ -5745,6 +5814,7 @@ startPeerManagerWith net config handler onDisconnect = do
     <*> newTVarIO 0             -- pmBackgroundDropped
     <*> newTVarIO Map.empty     -- pmOutboundTrack
     <*> newTVarIO Set.empty     -- pmManualBans
+    <*> newNetGroupKey          -- pmNetGroupKey
 
   -- Load anchor connections from previous session
   let anchorsPath = pmcDataDir config </> "anchors.json"
@@ -5999,7 +6069,7 @@ peerManagerLoop pm = forever $ do
       when (now - piLastSeen info > fromIntegral (pmcPingInterval (pmConfig pm))
             && peerCommonVersion info > p2pBip31Version) $ do
         nonce <- randomIO
-        atomically $ modifyTVar' (pcInfo pc) (\i -> i { piLastPing = Just nonce })
+        notePingSent pm addr nonce . realToFrac =<< getPOSIXTime
         -- Off this loop's thread: the loop is the reaper, the inactivity
         -- check and the outbound refill. A ping parked on one deaf peer's
         -- socket froze all three on mainnet 2026-10-04 (no feeler, no
@@ -7695,7 +7765,7 @@ checkPreHandshake pm addr = do
                 then do
                   -- Try to evict an existing connection
                   candidates <- buildEvictionCandidates pm
-                  case selectEvictionCandidate candidates of
+                  case selectEvictionCandidateKeyed (pmNetGroupKey pm) candidates of
                     Nothing -> return RejectMaxInbound
                     Just candidate -> return $ AcceptAfterEviction (ecAddress candidate)
                 else return AcceptConnection
@@ -7819,8 +7889,8 @@ peerToEvictionCandidate asmapData addr info = EvictionCandidate
   { ecAddress       = addr
   , ecConnectedAt   = piConnectedAt info
   , ecMinPingTime   = piPingLatency info
-  , ecLastBlockTime = 0  -- Would need to track this in PeerInfo
-  , ecLastTxTime    = 0  -- Would need to track this in PeerInfo
+  , ecLastBlockTime = 0  -- filled from pmOutboundTrack by 'buildEvictionCandidates'
+  , ecLastTxTime    = 0  -- filled from pmOutboundTrack by 'buildEvictionCandidates'
   , ecServices      = piServices info
   , ecRelaysTxs     = piRelay info
   , ecNetworkGroup  = computeNetworkGroupWithASMap asmapData addr
@@ -7851,24 +7921,38 @@ getNetworkGroup (SockAddrInet6 _ _ (h1, h2, _, _) _) =
 getNetworkGroup _ = 0  -- Unix sockets, etc.
 
 -- | Build list of eviction candidates from current peers
+-- The min ping comes from 'piPingLatency' (set by 'recordPong'); the last
+-- novel block and tx times come from 'pmOutboundTrack' ('noteBlockReceived',
+-- 'noteTxAccepted').
 buildEvictionCandidates :: PeerManager -> IO [EvictionCandidate]
 buildEvictionCandidates pm = do
   peers <- readTVarIO (pmPeers pm)
+  tr <- readTVarIO (pmOutboundTrack pm)
   let asmapData = pmAsmapData pm
   forM (Map.toList peers) $ \(addr, pc) -> do
     info <- readTVarIO (pcInfo pc)
-    return $ peerToEvictionCandidate asmapData addr info
+    let c = peerToEvictionCandidate asmapData addr info
+    return $ case Map.lookup addr tr of
+      Nothing -> c
+      Just o  -> c { ecLastBlockTime = otLastBlock o, ecLastTxTime = otLastTx o }
+
+-- | 'selectEvictionCandidateKeyed' with a fixed, public netgroup key.  The
+-- node never uses this: 'checkPreHandshake' and 'evictConnection' pass the
+-- random 'pmNetGroupKey'.  Kept for callers and tests that need a
+-- deterministic answer.
+selectEvictionCandidate :: [EvictionCandidate] -> Maybe EvictionCandidate
+selectEvictionCandidate = selectEvictionCandidateKeyed (SipHashKey 0 0)
 
 -- | Select a peer to evict using Bitcoin Core's eviction algorithm
 -- Returns Nothing if no suitable candidate exists
 -- Reference: Bitcoin Core node/eviction.cpp SelectNodeToEvict
-selectEvictionCandidate :: [EvictionCandidate] -> Maybe EvictionCandidate
-selectEvictionCandidate candidates =
+selectEvictionCandidateKeyed :: SipHashKey -> [EvictionCandidate] -> Maybe EvictionCandidate
+selectEvictionCandidateKeyed key candidates =
   let -- Step 1: Filter to only inbound, non-NoBan connections
       inboundCandidates = filter (\c -> ecInbound c && not (ecNoBan c)) candidates
 
       -- Step 2: Protect peers by various criteria
-      afterProtection = applyProtections inboundCandidates
+      afterProtection = applyProtections key inboundCandidates
 
   in case afterProtection of
        [] -> Nothing
@@ -7878,10 +7962,11 @@ selectEvictionCandidate candidates =
 
 -- | Apply Bitcoin Core's protection rules to filter eviction candidates
 -- Reference: Bitcoin Core node/eviction.cpp SelectNodeToEvict
-applyProtections :: [EvictionCandidate] -> [EvictionCandidate]
-applyProtections candidates =
-  let -- Protect 4 peers by deterministic network group selection
-      afterNetGroup = protectByNetGroup 4 candidates
+applyProtections :: SipHashKey -> [EvictionCandidate] -> [EvictionCandidate]
+applyProtections key candidates =
+  let -- Protect 4 peers by keyed network group (Core CompareNetGroupKeyed):
+      -- an attacker cannot predict which netgroups are protected.
+      afterNetGroup = protectByNetGroupKeyed key 4 candidates
 
       -- Protect 8 peers with lowest ping time
       afterPing = protectByPingTime 8 afterNetGroup
@@ -7897,22 +7982,33 @@ applyProtections candidates =
 
   in afterLongevity
 
--- | Protect N peers from distinct network groups (deterministic selection)
-protectByNetGroup :: Int -> [EvictionCandidate] -> [EvictionCandidate]
-protectByNetGroup n candidates =
-  let -- Group by network group and take one peer from each of the first N groups
-      grouped = groupBy ((==) `on` ecNetworkGroup) $
-                sortBy (comparing ecNetworkGroup) candidates
-      -- Take one peer from each of first N groups (protect them)
-      protectedGroups = take n grouped
-      protectedAddrs = Set.fromList $ map (ecAddress . head) protectedGroups
+-- | Core CalculateKeyedNetGroup: SipHash of the netgroup bytes under the
+-- node's secret key.
+keyedNetGroup :: SipHashKey -> NetworkGroup -> Word64
+keyedNetGroup key (NetworkGroup bs) = sipHash128 key bs
+
+-- | A fresh random netgroup key ('pmNetGroupKey').
+newNetGroupKey :: IO SipHashKey
+newNetGroupKey = do
+  bs <- CryptoRandom.getRandomBytes 16 :: IO BS.ByteString
+  let w64 = foldl' (\acc b -> (acc `shiftL` 8) .|. fromIntegral b) 0 . BS.unpack
+  return $ SipHashKey (w64 (BS.take 8 bs)) (w64 (BS.drop 8 bs))
+
+-- | Core @EraseLastKElements(CompareNetGroupKeyed, n)@: protect the @n@
+-- candidates with the highest keyed netgroup; returns the rest.
+protectByNetGroupKeyed :: SipHashKey -> Int -> [EvictionCandidate] -> [EvictionCandidate]
+protectByNetGroupKeyed key n candidates =
+  let sortedByKey = sortBy (comparing (Down . keyedNetGroup key . ecNetworkGroup)) candidates
+      protectedAddrs = Set.fromList $ map ecAddress (take n sortedByKey)
   in filter (\c -> not $ Set.member (ecAddress c) protectedAddrs) candidates
 
 -- | Protect N peers with lowest ping time
 protectByPingTime :: Int -> [EvictionCandidate] -> [EvictionCandidate]
 protectByPingTime n candidates =
-  let -- Sort by ping time (Nothing goes to end, lowest first)
-      sortedByPing = sortBy (comparing ecMinPingTime) candidates
+  let -- Core ReverseCompareNodeMinPingTime: lowest measured min ping first.
+      -- A peer never measured has m_min_ping_time = max, so it sorts last
+      -- (comparing the Maybe directly put Nothing FIRST and protected it).
+      sortedByPing = sortBy (comparing (fromMaybe (1 / 0) . ecMinPingTime)) candidates
       -- Protect the N with lowest ping
       protected = take n sortedByPing
       protectedAddrs = Set.fromList $ map ecAddress protected
@@ -7921,8 +8017,10 @@ protectByPingTime n candidates =
 -- | Protect N peers that most recently sent transactions
 protectByLastTxTime :: Int -> [EvictionCandidate] -> [EvictionCandidate]
 protectByLastTxTime n candidates =
-  let -- Sort by last tx time descending (most recent first)
-      sortedByTx = sortBy (comparing (Down . ecLastTxTime)) candidates
+  let -- Core CompareNodeTXTime: most recent tx first; ties go to peers
+      -- that relay txs, then to the longest-connected (not to the peer-map
+      -- order, which is the attacker-chosen SockAddr).
+      sortedByTx = sortBy (comparing (\c -> Down (ecLastTxTime c, ecRelaysTxs c, Down (ecConnectedAt c)))) candidates
       -- Protect the N most recent
       protected = take n sortedByTx
       protectedAddrs = Set.fromList $ map ecAddress protected
@@ -7931,8 +8029,14 @@ protectByLastTxTime n candidates =
 -- | Protect N peers that most recently sent blocks
 protectByLastBlockTime :: Int -> [EvictionCandidate] -> [EvictionCandidate]
 protectByLastBlockTime n candidates =
-  let -- Sort by last block time descending (most recent first)
-      sortedByBlock = sortBy (comparing (Down . ecLastBlockTime)) candidates
+  let -- Core CompareNodeBlockTime: most recent block first; ties go to
+      -- peers with the desirable services, then to the longest-connected.
+      sortedByBlock = sortBy (comparing (\c -> Down (ecLastBlockTime c, relevantServices c, Down (ecConnectedAt c)))) candidates
+      -- Core fRelevantServices = HasAllDesirableServiceFlags: NODE_WITNESS
+      -- plus NODE_NETWORK or NODE_NETWORK_LIMITED.
+      relevantServices c =
+        let s = ecServices c
+        in s .&. 0x8 /= 0 && (s .&. 0x1 /= 0 || s .&. 0x400 /= 0)
       -- Protect the N most recent
       protected = take n sortedByBlock
       protectedAddrs = Set.fromList $ map ecAddress protected
@@ -7976,7 +8080,7 @@ selectFromNetworkGroup candidates =
 evictConnection :: PeerManager -> IO (Maybe SockAddr)
 evictConnection pm = do
   candidates <- buildEvictionCandidates pm
-  case selectEvictionCandidate candidates of
+  case selectEvictionCandidateKeyed (pmNetGroupKey pm) candidates of
     Nothing -> return Nothing
     Just candidate -> do
       let addr = ecAddress candidate
