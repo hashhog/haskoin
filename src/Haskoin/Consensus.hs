@@ -7568,10 +7568,16 @@ performReorg net cache db hc mIdxMgr oldTip newTip =
   case mFork of
     Nothing -> return $ Left "Cannot find fork point"
     Just forkEntry -> do
-      -- Get current tip height
-      currentHeight <- readTVarIO (hcHeight hc)
+      -- The height the checkpoint guard looks below is the OLD tip's: the
+      -- connected chain that this reorg rewinds.  NOT hcHeight, which is the
+      -- best-header height; headers run ahead of bodies, so a checkpoint
+      -- above the connected tip and at or below the best header (routine on
+      -- mainnet during IBD) would otherwise reject every reorg of the
+      -- connected chain whose fork lies below it (haskoin#82 review 2).
+      entries0 <- readTVarIO (hcEntries hc)
       let checkpoints = buildCheckpoints net
           forkHeight = ceHeight forkEntry
+          currentHeight = maybe forkHeight ceHeight (Map.lookup oldTip entries0)
 
       -- Check if reorg would go past a checkpoint
       if isReorgPastCheckpoint checkpoints forkHeight currentHeight
