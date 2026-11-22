@@ -118,6 +118,21 @@ chunksOf :: Int -> [a] -> [[a]]
 chunksOf _ [] = []
 chunksOf n xs = let (h, t) = splitAt n xs in h : chunksOf n t
 
+-- | File candidates into the new table, each under its own source /16 (see
+-- 'sourceFor'), until @n@ have been admitted; return those @n@.  Core's
+-- AddSingle drops a newcomer whose (bucket, position) slot already holds a
+-- good entry, so with distinct sources a few candidates can collide and be
+-- refused; skipping them keeps the fixture at exactly @n@ new-table entries.
+admitN :: AddrMan -> Int64 -> Int -> [SockAddr] -> IO [SockAddr]
+admitN am now = go 0
+  where
+    go _ 0 _ = pure []
+    go _ _ [] = pure []
+    go i k (a : rest) = do
+      ok <- addAddress am BS.empty a (sourceFor i) 0x409 now
+      if ok then (a :) <$> go (i + 1) (k - 1) rest
+            else go (i + 1) k rest
+
 spec :: Spec
 spec = describe "addrman: the index and pmKnownAddrs are bounded by table capacity (Core AddrManImpl::Delete)" $ do
 
@@ -146,12 +161,10 @@ spec = describe "addrman: the index and pmKnownAddrs are bounded by table capaci
     -- than the 64 slots, so markGood has to displace tried entries.
     let pool   = [ v4 50 60 c d | c <- [0 .. 255], d <- [1 .. 254] ]
         target = getTriedBucket (amKey am) BS.empty (head pool)
-        same   = take 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
+    same <- admitN am now 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
     length same `shouldBe` 80
-    -- Each from its own source /16, so the 80 spread over new buckets and
-    -- all of them are still in the new table when markGood runs.
-    forM_ (zip [0 :: Int ..] same) $ \(i, a) ->
-      addAddress am BS.empty a (sourceFor i) 0x409 now
+    -- Each from its own source /16 (admitN), so the 80 spread over new
+    -- buckets and all of them are still in the new table when markGood runs.
     idx0 <- readTVarIO (amAddrIndex am)
     length (filter (`Map.member` idx0) same) `shouldBe` 80
     forM_ same $ \a -> markGood am BS.empty a now
@@ -167,10 +180,8 @@ spec = describe "addrman: the index and pmKnownAddrs are bounded by table capaci
     now <- round <$> getPOSIXTime
     let pool   = [ v4 50 61 c d | c <- [0 .. 255], d <- [1 .. 254] ]
         target = getTriedBucket (amKey am) BS.empty (head pool)
-        same   = take 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
-        (first64, later16) = splitAt addrmanBucketSize same
-    forM_ (zip [0 :: Int ..] same) $ \(i, a) ->
-      addAddress am BS.empty a (sourceFor i) 0x409 now
+    same <- admitN am now 80 (filter ((== target) . getTriedBucket (amKey am) BS.empty) pool)
+    let (first64, later16) = splitAt addrmanBucketSize same
     forM_ first64 $ \a -> markGood am BS.empty a now
     -- markAttempt updates only the index record of a tried entry.
     forM_ first64 $ \a -> markAttempt am a now
@@ -189,8 +200,10 @@ spec = describe "addrman: the index and pmKnownAddrs are bounded by table capaci
     withPm $ \pm -> do
       now <- round <$> getPOSIXTime
       before <- Set.size <$> readTVarIO (pmKnownAddrs pm)
+      -- handleAddrMessage files gossip under the sending peer.
+      let sender = SockAddrInet 8333 (tupleToHostAddress (9, 9, 9, 9))
       forM_ (chunksOf 1000 (distinctRoutable 5000)) $ \batch ->
-        handleAddrMessage pm (Addr (map (toEntry now) batch))
+        handleAddrMessage pm sender (Addr (map (toEntry now) batch))
       after <- Set.size <$> readTVarIO (pmKnownAddrs pm)
       -- The addresses are still learned, by the address manager.
       idx <- readTVarIO (amAddrIndex (pmAddrMan pm))
