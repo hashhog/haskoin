@@ -6585,7 +6585,10 @@ generateSingleBlockLocked server scriptPubKey specificTxs = do
   let mtp = medianTimePast entries prevHash
       blockTime = max (mtp + 1) now
 
-  let reward = blockReward height
+  -- The network's halving interval (regtest halves every 150 blocks, Core
+  -- consensus.nSubsidyHalvingInterval), not mainnet's 210,000: past height
+  -- 150 the mainnet subsidy fails validation (bad-cb-amount).
+  let reward = blockRewardForNet (rsNetwork server) height
 
   -- Get transactions from mempool if none specified.  Selected FIRST so we
   -- can build the coinbase's BIP-141 witness commitment over their wtxids.
