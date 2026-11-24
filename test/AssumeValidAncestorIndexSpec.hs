@@ -225,7 +225,7 @@ main = hspec $ do
              in conjoin (fst (foldl' step ([], Nothing) tips))
 
     it "shouldSkipScriptsCached equals shouldSkipScripts across random trees, assumevalid and best headers" $
-      property $ forAll genParents $ \parents ->
+      property $ withMaxSuccess 1000 $ forAll genParents $ \parents ->
         let (m, _) = buildTree parents
             n = length parents
         in forAll (choose (0, n)) $ \av ->
