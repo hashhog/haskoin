@@ -621,8 +621,16 @@ takeWhileNotFailed db = go []
 -- On an assumeUTXO-bootstrapped chainstate (@mSnapshotBaseHeight@ set) the
 -- snapshot import writes no undo records, so the search floor is the base
 -- height, not 1.
+--
+-- On a pruned chainstate ('getPrunedHeight' = P) prune deleted the undo
+-- records of heights 1..P; those blocks WERE connected, so the search
+-- floor is P + 1 (and P itself when nothing above it has undo).  Without
+-- this a pruned node came back from every restart believing its connected
+-- tip was 0 (block 1 has no undo record).
 estimateUndoConnectedTip :: HaskoinDB -> HeaderChain -> Maybe Word32 -> IO Word32
 estimateUndoConnectedTip db hc mSnapshotBaseHeight = do
+  mPruned <- getPrunedHeight db
+  let prunedFloor = maybe 1 (+ 1) mPruned   -- lowest height that keeps undo
   bestHeaderHeight <- readTVarIO (hcHeight hc)
   -- The search ceiling is max(best-header height, persisted best-block
   -- height).  'recalculateBestHeader' (run by the full reload above) picks
@@ -692,8 +700,11 @@ estimateUndoConnectedTip db hc mSnapshotBaseHeight = do
                   ++ "..header-tip."
           return baseHeight
         else do
-          aboveConnected <- blockIsConnected (baseHeight + 1)
-          if not aboveConnected
+          let floorH = max (baseHeight + 1) prunedFloor
+          aboveConnected <- blockIsConnected floorH
+          if not aboveConnected && floorH > baseHeight + 1
+            then return (floorH - 1)   -- everything up to the prune height
+          else if not aboveConnected
             then do
               putStrLn $ "Chainstate reconciliation: assumeUTXO "
                       ++ "snapshot base at height " ++ show baseHeight
@@ -702,15 +713,17 @@ estimateUndoConnectedTip db hc mSnapshotBaseHeight = do
                       ++ "design) — treating the base as the "
                       ++ "connected tip."
               return baseHeight
-            else findConnectedTip (baseHeight + 1) headerTipHeight
+            else findConnectedTip floorH headerTipHeight
     -- Normal (genesis-up) chainstate, no snapshot marker.
     Nothing ->
       if headerTipHeight == 0
         then return 0
         else do
-          -- If even block 1 has no undo record the UTXO set never
-          -- advanced past genesis; otherwise binary-search [1..tip].
-          oneConnected <- blockIsConnected 1
+          -- If even the lowest unpruned block (1 when nothing is pruned)
+          -- has no undo record, the UTXO set never advanced past it;
+          -- otherwise binary-search [floor..tip].  Pruned heights below
+          -- the floor were connected before prune deleted their undo.
+          oneConnected <- blockIsConnected prunedFloor
           if not oneConnected
-            then return 0
-            else findConnectedTip 1 headerTipHeight
+            then return (prunedFloor - 1)
+            else findConnectedTip prunedFloor headerTipHeight
