@@ -4315,10 +4315,14 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                   blockEntries <- readTVarIO (hcEntries hc)
                   getMtpBg     <- p2pBlockArmMtpResolver hc (bhPrevBlock hdr)
                   bestHdr      <- readTVarIO (hcTip hc)
-                  let blockTs     = bhTimestamp hdr
-                      parentHash  = bhPrevBlock hdr
+                  -- The two assumevalid ancestor checks are answered from
+                  -- the header chain's height indexes (O(1) per block), not
+                  -- a cePrev walk of (assumevalid height - h) + (best height
+                  -- - h) lookups per block; same answers, same decision.
+                  skipScripts  <- shouldSkipScriptsCached (hcAncestors hc) bh height
+                                    (bhTimestamp hdr) net blockEntries bestHdr
+                  let parentHash  = bhPrevBlock hdr
                       prevMTP     = medianTimePast blockEntries parentHash
-                      skipScripts = shouldSkipScripts bh height blockTs net blockEntries bestHdr
                       cs          = ChainState (height - 1) parentHash (ceChainWork entry) prevMTP
                                       (consensusFlagsAtHeight net height)
                   -- gate-6: the validation (a lazy Either: forcing it runs

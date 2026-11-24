@@ -461,6 +461,7 @@ initHeaderChainFromDB db net = do
               ioError (userError
                 ("header reload: chainstate rewind failed: " ++ err))
 
+  ancestorCache <- newAncestorCache
   hc <- pure HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
@@ -472,6 +473,7 @@ initHeaderChainFromDB db net = do
     , hcTipGen = tipGenVar
     , hcPreciousReverseSeq = preciousReverseSeqVar
     , hcLastPreciousWork = lastPreciousWorkVar
+    , hcAncestors = ancestorCache
     }
 
   -- Recompute the best header over the whole loaded index.  The walk above
