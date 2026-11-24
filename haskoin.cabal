@@ -1662,6 +1662,32 @@ test-suite package-conflict
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- fix-haskoin-prune-noop: -prune deletes the RocksDB block bodies and undo
+-- haskoin stores (not blk/rev files it never writes). Own suite so the shared
+-- Spec.hs / haskoin-test other-modules list is not touched.
+test-suite prune-blockdata
+  type:          exitcode-stdio-1.0
+  main-is:       PruneBlockDataMain.hs
+  other-modules: PruneBlockDataSpec
+  hs-source-dirs: test
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , aeson
+               , bytestring
+               , base16-bytestring
+               , cereal
+               , containers
+               , directory
+               , filepath
+               , rocksdb-haskell
+               , stm
+               , temporary
+               , text
+               , vector
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- secfix-haskoin-default-rpc-login: own suite so the shared Spec.hs /
 -- haskoin-test other-modules list is not touched.
 test-suite rpc-auth

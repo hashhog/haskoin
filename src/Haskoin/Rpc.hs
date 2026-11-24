@@ -476,6 +476,7 @@ import Haskoin.Storage (HaskoinDB, UTXOCache(..), getBlock, getBlockHeader,
                          lookupUTXO, rcClear, invalidateCoinCaches, UTXOEntry(..), TxLocation(..), getTxIndex,
                          BlockStore(..), BlockIndex(..), getBlockIndex,
                          isBlockPruned, pruneBlockchain, minBlocksToKeep,
+                         getPrunedHeight, storePruneAfterHeight,
                          PruneConfig(..), defaultPruneConfig,
                          pruneConfigEnabled, pruneConfigManual,
                          pruneConfigAutoTarget, pruneTargetManual,
@@ -1907,20 +1908,16 @@ handleGetBlockchainInfo server = do
       autoMode  = case pruneConfigAutoTarget pruneCfg of
                     Just _  -> True
                     Nothing -> False
-  sizeOnDisk <- case rsBlockStore server of
-    Just bs -> do
-      fileInfos <- readIORef (bsFileInfos bs)
-      return (calculateCurrentUsage fileInfos)
-    Nothing ->
-      -- No blk*.dat BlockStore is wired on this run: haskoin persists
-      -- block bodies + undo data + the coins view inside the RocksDB
-      -- chainstate store, so Core's CalculateCurrentUsage (which sums
-      -- blocks/ blk+rev file bytes, rpc/blockchain.cpp getblockchaininfo
-      -- -> BlockManager::CalculateCurrentUsage) has no blk-file analog.
-      -- Report the truthful on-disk footprint of that store instead of a
-      -- 0 stub, so size_on_disk is a real byte count of the node's
-      -- block/chain data on disk.
-      chainstateSizeOnDisk (rpcDataDir (rsConfig server) </> "chainstate")
+  -- haskoin persists block bodies + undo data + the coins view inside
+  -- the RocksDB chainstate store, pruned or not, so Core's
+  -- CalculateCurrentUsage (the blocks/ blk+rev file bytes) has no blk-file
+  -- analog.  Report the truthful on-disk footprint of that store; prune
+  -- deletes bodies + undo from it and compacts, so it shrinks after a
+  -- prune.  (It used to sum the never-written blk*.dat files when prune
+  -- was on: always 0.)
+  sizeOnDisk <- chainstateSizeOnDisk (rpcDataDir (rsConfig server) </> "chainstate")
+  -- Core: pruneheight = GetPruneHeight + 1, or 0 when nothing is pruned.
+  mPrunedHeight <- if pruneOn then getPrunedHeight (rsDB server) else return Nothing
   -- Build the response on the streaming path so difficulty uses
   -- Core-parity %.16g formatting (difficultyStr / FFI snprintf).
   let bits = bhBits (ceHeader tip)
@@ -1928,7 +1925,7 @@ handleGetBlockchainInfo server = do
         | not pruneOn = mempty
         | otherwise   =
             pair "automatic_pruning" (AE.bool autoMode)                              <>
-            pair "pruneheight"       (AE.word32 (0 :: Word32))                      <>
+            pair "pruneheight"       (AE.word32 (maybe 0 (+ 1) mPrunedHeight))      <>
             (case pruneConfigAutoTarget pruneCfg of
                Just t  -> pair "prune_target_size" (AE.int64 t)
                Nothing -> mempty)
@@ -3541,29 +3538,92 @@ handlePruneBlockchain server params =
     Nothing -> return $ RpcResponse Null
       (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
     Just (Number _) ->
-      case extractParam params 0 :: Maybe Word32 of
+      case extractParam params 0 :: Maybe Int of
         Nothing -> return $ RpcResponse Null
           (toJSON $ RpcError rpcInvalidParams "Missing height parameter") Null
-        Just targetHeight
+        Just heightParam
           | not (rsPruneEnabled server) ->
               return pruneblockchainNotEnabledResponse
           | otherwise ->
               case rsBlockStore server of
                 Nothing -> return $ RpcResponse Null
                   (toJSON $ RpcError rpcMiscError pruneblockchainNotEnabledMsg) Null
-                Just blockStore -> do
-                  tip <- readTVarIO (hcTip (rsHeaderChain server))
-                  let tipHeight = ceHeight tip
-                  result <- pruneBlockchain blockStore tipHeight targetHeight
-                  case result of
-                    Left err -> return $ RpcResponse Null
-                      (toJSON $ RpcError rpcMiscError (T.pack err)) Null
-                    Right _numPruned ->
-                      return $ RpcResponse (toJSON targetHeight) Null Null
+                Just blockStore ->
+                  withChainLock (ucChainLock (rsUTXOCache server)) $
+                    pruneBlockchainLocked server blockStore heightParam
     Just other -> return $ RpcResponse Null
       (toJSON $ RpcError rpcTypeError
         ("JSON value of type " <> jsonTypeName other
          <> " is not of expected type number")) Null
+
+-- | Core pruneblockchain (rpc/blockchain.cpp) after the prune-mode gate,
+-- under the chain lock (Core holds cs_main):
+--
+--   * negative -> -8 "Negative block height."
+--   * > 1,000,000,000 -> a UNIX time: the first active-chain block whose
+--     max-time-so-far is at least time - 2h (CChain::FindEarliestAtLeast
+--     with TIMESTAMP_WINDOW); none -> -8.
+--   * chain below PruneAfterHeight -> -1 "Blockchain is too short for
+--     pruning."
+--   * height above the tip -> -8 "Blockchain is shorter than the
+--     attempted prune height."
+--   * within MIN_BLOCKS_TO_KEEP of the tip -> clamped to tip - 288, no
+--     error.
+--
+-- Returns Core's GetPruneHeight (the last pruned height), or -1 when
+-- nothing has been pruned.  haskoin prunes per block (bodies live in
+-- RocksDB), Core per 128 MiB blk file, so a small chain that Core would
+-- keep whole in blk00000.dat is pruned here up to the clamped height.
+pruneBlockchainLocked :: RpcServer -> BlockStore -> Int -> IO RpcResponse
+pruneBlockchainLocked server blockStore heightParam
+  | heightParam < 0 = invalidParam "Negative block height."
+  | otherwise = do
+      tip <- getValidatedChainTip (rsDB server) (rsHeaderChain server)
+      let chainHeight = ceHeight tip
+      mHeight <- if heightParam > 1000000000
+        then earliestAtLeast (fromIntegral heightParam - 7200) chainHeight
+        else return (Just (fromIntegral heightParam))
+      case mHeight of
+        Nothing -> invalidParam
+          "Could not find block with at least the specified timestamp."
+        Just height
+          | chainHeight < storePruneAfterHeight blockStore ->
+              return $ RpcResponse Null
+                (toJSON $ RpcError rpcMiscError
+                   ("Blockchain is too short for pruning." :: Text)) Null
+          | height > chainHeight ->
+              invalidParam "Blockchain is shorter than the attempted prune height."
+          | otherwise -> do
+              let height' = min height (chainHeight - minBlocksToKeep)
+              result <- pruneBlockchain blockStore chainHeight height'
+              case result of
+                Left err -> return $ RpcResponse Null
+                  (toJSON $ RpcError rpcMiscError (T.pack err)) Null
+                Right _ -> do
+                  mPruned <- getPrunedHeight (rsDB server)
+                  return $ RpcResponse
+                    (toJSON (maybe (-1) fromIntegral mPruned :: Int)) Null Null
+  where
+    invalidParam :: Text -> IO RpcResponse
+    invalidParam msg = return $ RpcResponse Null
+      (toJSON $ RpcError rpcInvalidParameter msg) Null
+    -- CChain::FindEarliestAtLeast(t, 0): lowest active-chain height whose
+    -- GetBlockTimeMax (max header time over the block and its ancestors)
+    -- is >= t.
+    earliestAtLeast :: Integer -> Word32 -> IO (Maybe Word32)
+    earliestAtLeast t chainHeight = do
+      byHeight <- readTVarIO (hcByHeight (rsHeaderChain server))
+      entries  <- readTVarIO (hcEntries (rsHeaderChain server))
+      let timeAt h = Map.lookup h byHeight >>= \bh -> Map.lookup bh entries
+                       >>= \ce -> Just (toInteger (bhTimestamp (ceHeader ce)))
+          go h runMax
+            | h > chainHeight = Nothing
+            | otherwise = case timeAt h of
+                Nothing -> Nothing
+                Just ts ->
+                  let m = max runMax ts
+                  in if m >= t then Just h else go (h + 1) m
+      return (go 0 0)
 
 -- | Invalidate a block and all its descendants
 -- Reference: bitcoin/src/rpc/blockchain.cpp invalidateblock
@@ -6585,7 +6645,10 @@ generateSingleBlockLocked server scriptPubKey specificTxs = do
   let mtp = medianTimePast entries prevHash
       blockTime = max (mtp + 1) now
 
-  let reward = blockReward height
+  -- The network's halving interval (regtest halves every 150 blocks, Core
+  -- consensus.nSubsidyHalvingInterval), not mainnet's 210,000: past height
+  -- 150 the mainnet subsidy fails validation (bad-cb-amount).
+  let reward = blockRewardForNet (rsNetwork server) height
 
   -- Get transactions from mempool if none specified.  Selected FIRST so we
   -- can build the coinbase's BIP-141 witness commitment over their wtxids.

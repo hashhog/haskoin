@@ -1010,7 +1010,10 @@ hasService flags (ServiceFlag s) = flags .&. s == s
 localServicesFor :: PeerManagerConfig -> Bool -> Word64
 localServicesFor cfg v2adv = combineServices flags
   where
-    networkFlags = if pmcHistoryIncomplete cfg then [] else [nodeNetwork]
+    -- No NODE_NETWORK without full history: a snapshot-started node, or a
+    -- pruned one (Core sets NODE_NETWORK only in non-prune mode, init.cpp).
+    networkFlags = if pmcHistoryIncomplete cfg || pmcPruneMode cfg
+                     then [] else [nodeNetwork]
     baseFlags = networkFlags ++ [nodeWitness]
     bloomFlags = if pmcPeerBloomFilters cfg then nodeBloom : baseFlags else baseFlags
     -- BIP-159: NODE_NETWORK_LIMITED unconditionally — every node serves at
@@ -5522,7 +5525,7 @@ data PeerManagerConfig = PeerManagerConfig
   , pmcConnectTimeout   :: !Int        -- ^ Connection timeout in seconds (default 5)
   , pmcDataDir          :: !FilePath   -- ^ Data directory for persistent state (anchors, etc.)
   , pmcPeerBloomFilters :: !Bool       -- ^ Advertise NODE_BLOOM (BIP-37) and serve BIP-35 mempool (default False, matches Core's DEFAULT_PEERBLOOMFILTERS)
-  , pmcPruneMode        :: !Bool       -- ^ BIP-159: advertise NODE_NETWORK_LIMITED (1<<10) when prune mode is on (default False, mirrors Core's `IsPruneMode()` gate in init.cpp)
+  , pmcPruneMode        :: !Bool       -- ^ Prune mode is on (--prune): NODE_NETWORK is not advertised ('localServicesFor'), as Core sets it only in non-prune mode (init.cpp). NODE_NETWORK_LIMITED is advertised either way.
   , pmcHistoryIncomplete :: !Bool
     -- ^ The node lacks the block bodies at and below a UTXO-snapshot base
     --   (it was bootstrapped with @--load-snapshot@ and never downloads

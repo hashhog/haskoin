@@ -59,9 +59,13 @@ spec = describe "Advertised service flags (Core init.cpp:863 parity)" $ do
   it "NODE_P2P_V2 (0x800) is NOT set (v2 default-off for haskoin)" $
     (advertisedServices defaultPeerManagerConfig .&. nodeP2PV2Bit) `shouldBe` 0
 
-  it "stays 0x409 even when prune mode is on (un-gated from prune)" $
+  -- fix-haskoin-prune-noop: prune now really deletes block bodies, so a
+  -- pruned node must not claim NODE_NETWORK (Core sets it only in non-prune
+  -- mode, init.cpp "Setting NODE_NETWORK in non-prune mode").  This used to
+  -- assert 0x409, which was harmless only while prune deleted nothing.
+  it "prune mode drops NODE_NETWORK and keeps NODE_NETWORK_LIMITED (0x408)" $
     advertisedServices defaultPeerManagerConfig { pmcPruneMode = True }
-      `shouldBe` 0x409
+      `shouldBe` 0x408
 
   describe "snapshot-started node (history below the base missing)" $ do
     it "full-history node with v2 advertises 0xc09 (NETWORK kept)" $
