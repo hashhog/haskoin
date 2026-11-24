@@ -2703,7 +2703,19 @@ evalScriptWithStack stack (Script ops) env = do
   unless (seIsTapscript env) $ do
     let scriptBytes = encodeScriptOps ops
     when (BS.length scriptBytes > 10000) $ Left "Script size exceeds 10000 bytes"
-  evalWithPosition ops 0 0 (env { seStack = stack })
+  env' <- evalWithPosition ops 0 0 (env { seStack = stack })
+  -- Core ends EVERY EvalScript with
+  --   if (!vfExec.empty()) return set_error(serror, SCRIPT_ERR_UNBALANCED_CONDITIONAL);
+  -- (interpreter.cpp, end of EvalScript), so an OP_IF / OP_NOTIF left open
+  -- fails whichever script it is in: scriptSig, scriptPubKey, P2SH redeem
+  -- script, witness v0 witnessScript, tapscript leaf. haskoin used to make
+  -- this check at the call sites, and the P2WSH and tapscript call sites
+  -- had none, so a witness script ending inside an IF with one true item
+  -- verified (accepted in blocks and the mempool; Core rejects). Checking
+  -- here, where every script is evaluated, cannot miss a path.
+  unless (condNull (seIfStack env')) $
+    Left "Unbalanced IF/ENDIF"
+  Right env'
   where
     -- Evaluate ops while tracking byte position and opcode index
     -- opPos: 0-based opcode index (incremented for every opcode, including pushdata)
@@ -2763,10 +2775,7 @@ evalScriptWithFlags flags tx idx amount scriptSig scriptPubKey = do
 
   -- Evaluate scriptPubKey
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
-
-  -- Check if-stack is empty
-  unless (condNull $ seIfStack env3) $
-    Left "Unbalanced IF/ENDIF"
+  -- (an unbalanced IF/ENDIF has already failed inside evalScriptWithStack)
 
   -- Check top stack element
   case seStack env3 of
@@ -2818,10 +2827,8 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
   env1 <- evalScriptWithStack [] scriptSig (env { seScriptCode = scriptSigBytes })
   let sigStack = seStack env1
       savedStack = sigStack  -- Save for P2SH
-
-  -- Check for unbalanced IF/ENDIF in scriptSig
-  unless (condNull $ seIfStack env1) $
-    Left "Unbalanced IF/ENDIF"
+  -- (an unbalanced IF/ENDIF in the scriptSig has already failed inside
+  -- evalScriptWithStack, as Core's EvalScript of the scriptSig does)
 
   -- Clear altstack between scriptSig and scriptPubKey evaluation; restore the
   -- scriptCode to the scriptPubKey for the scriptPubKey-execution phase
@@ -2831,9 +2838,6 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
                   , seScriptCode = prevScriptPubKey
                   , seCodeSepPos = 0xFFFFFFFF }
   env3 <- evalScriptWithStack sigStack scriptPubKey env2
-
-  unless (condNull $ seIfStack env3) $
-    Left "Unbalanced IF/ENDIF"
 
   case seStack env3 of
     [] -> Right False
@@ -2924,8 +2928,6 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
                                       , seScriptCode = redeemScriptBytes
                                       }
                       env5 <- evalScriptWithStack restStack redeemScript env4
-                      unless (condNull $ seIfStack env5) $
-                        Left "Unbalanced IF/ENDIF"
                       case seStack env5 of
                         [] -> Right False
                         (t:_) ->
