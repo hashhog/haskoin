@@ -190,6 +190,11 @@ data NodeOptions = NodeOptions
     -- only answer from the mempool and errors @-1 "Mempool lacks a relevant
     -- spend, and txospenderindex is unavailable."@ for the confirmed path.
     -- Reference: bitcoin-core/src/index/txospenderindex.cpp.
+  , noTxIndex            :: !Bool
+    -- ^ @-txindex@ asked for explicitly.  An unpruned haskoin node always
+    -- keeps its txid -> block index, so the flag changes nothing there; with
+    -- @--prune@ the index is off and asking for it is Core's startup error
+    -- "Prune mode is incompatible with -txindex." (init.cpp).
   , noAsmapFile          :: !(Maybe FilePath)
     -- ^ @-asmap=\<file\>@: path to an ASMap bytecode file for
     -- ASN-based IP bucketing.  When set, haskoin loads the file at
@@ -410,6 +415,10 @@ parseNodeOptions = NodeOptions
                 \is the confirmed-spend data source for gettxspendingprevout. \
                 \On startup haskoin backfills any gap between the index tip \
                 \and the chain tip.")
+  <*> switch (long "txindex"
+        <> help "Ask for the txid -> block index (Bitcoin Core -txindex). \
+                \An unpruned node always keeps it; it is off under --prune, \
+                \and --txindex with --prune is a startup error, as in Core.")
   <*> optional (strOption (long "asmap" <> metavar "FILE"
         <> help "Path to an ASMap bytecode file for ASN-based IP \
                 \bucketing (Bitcoin Core -asmap=<file>). When set, \
@@ -733,6 +742,9 @@ applyConfigOverlay cm n = n
   , noTxoSpenderIndex = if not (noTxoSpenderIndex n)
                           then Daemon.configLookupBool "txospenderindex" False cm
                           else noTxoSpenderIndex n
+  , noTxIndex = if not (noTxIndex n)
+                  then Daemon.configLookupBool "txindex" False cm
+                  else noTxIndex n
   , noAsmapFile  = case noAsmapFile n of
                      Just _  -> noAsmapFile n
                      Nothing -> Daemon.configLookup "asmap" cm
@@ -785,6 +797,20 @@ applyConfigOverlay cm n = n
     wordsBy p s = case break p s of
       (h, [])      -> [h]
       (h, _ : rest) -> h : wordsBy p rest
+
+-- | Core init.cpp's -prune incompatibilities, in Core's order.  Arguments:
+-- prune on, -txindex, -txospenderindex, -reindex-chainstate, -reindex.
+prunePrecludes :: Bool -> Bool -> Bool -> Bool -> Bool -> Maybe String
+prunePrecludes pruneOn txIndex txoSpender reindexChainstate reindex
+  | not pruneOn = Nothing
+  | txIndex = Just "Prune mode is incompatible with -txindex."
+  | txoSpender = Just "Prune mode is incompatible with -txospenderindex."
+  | reindexChainstate = Just
+      "Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."
+  | reindex = Just
+      "Prune mode is incompatible with -reindex: haskoin's -reindex replays \
+      \the stored blocks (as -reindex-chainstate) and does not re-download them."
+  | otherwise = Nothing
 
 -- | Encode the network's @netMagic@ Word32 as the 4 little-endian
 -- bytes that @newBlockStore@ stores for blk-file framing.  This
@@ -908,6 +934,18 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
       return cfg
   let pruneOn = pruneConfigEnabled pruneCfg
 
+  -- Core init.cpp: with -prune, -txindex, -txospenderindex and
+  -- -reindex-chainstate are startup errors (the indexes need every block
+  -- body; a chainstate replay needs them too).  haskoin's -reindex is the
+  -- same stored-body replay as -reindex-chainstate (it does not re-download),
+  -- so it is refused as well.
+  case prunePrecludes pruneOn noTxIndex noTxoSpenderIndex
+                      noReindexChainstate noReindex of
+    Just err -> do
+      putStrLn $ "FATAL: " ++ err
+      exitWith (ExitFailure 1)
+    Nothing -> return ()
+
   -- Open database
   let dbConfig = (defaultDBConfig (dataDir </> "chainstate"))
         { dbBlockCacheSize = noDbCache * 1024 * 1024 }
@@ -963,6 +1001,17 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
         putBestBlockHash db genesisHash
       Just bestHash ->
         putStrLn $ "Resuming chainstate from best-block " ++ show bestHash
+
+    -- Core node/chainstate.cpp: a datadir that has pruned block data cannot
+    -- run unpruned; the deleted bodies are gone.
+    mPrunedAtStartup <- getPrunedHeight db
+    when (not pruneOn && mPrunedAtStartup /= Nothing) $ do
+      putStrLn $ "FATAL: You need to rebuild the database using -reindex to "
+              ++ "go back to unpruned mode.  This will redownload the entire "
+              ++ "blockchain (Core's wording; haskoin's --reindex replays stored "
+              ++ "blocks and cannot re-download them: delete this data "
+              ++ "directory and sync again)"
+      exitWith (ExitFailure 1)
 
     -- -reindex / -reindex-chainstate.
     --
@@ -1655,18 +1704,17 @@ runNodeBody net dataDir NodeOptions{..} effectiveLogFile pidFilePath = do
     -- the manager exists simply means "no wallet to scan yet".
     walletMgrRef <- newIORef (Nothing :: Maybe WalletManager)
 
-    -- Initialise BlockStore IFF pruning is enabled.  Most haskoin
-    -- block I/O still flows through RocksDB, so the BlockStore is
-    -- not on the hot path; we only create it when prune RPC /
-    -- auto-prune triggers need it.  newBlockStore is idempotent —
-    -- re-running on an existing blocks/ dir loads the persisted
-    -- file-info index from RocksDB.
+    -- Initialise the prune handle IFF pruning is enabled.  Block bodies
+    -- and undo data live in RocksDB (chainstate/); prune deletes them
+    -- there and compacts.  Creating the handle also turns the txindex off
+    -- (Core: no -txindex with -prune).  No blocks/ directory is used.
     let blocksDir = dataDir </> "blocks"
     mBlockStore <- if pruneOn
       then do
         bs <- newBlockStore blocksDir (netMagicBytesLE net) db
-        putStrLn $ "BlockStore initialised at " ++ blocksDir
-                ++ " (prune subsystem armed)"
+        putStrLn $ "Prune: block bodies + undo in chainstate/ are pruned; "
+                ++ "txindex off; last pruned height "
+                ++ maybe "none" show mPrunedAtStartup
         return (Just bs)
       else return Nothing
 
@@ -4572,23 +4620,29 @@ syncMessageHandler db hc hs cache mp fe net pmRef nextBlockRef reorgFailRef requ
                     writeIORef blocksSinceFlushRef 0
                     nowE <- round <$> getPOSIXTime
                     writeIORef lastFlushEpochRef nowE
-                    -- Auto-prune trigger.  Mirrors Bitcoin Core's
-                    -- @FlushStateToDisk -> PruneBlockFiles@ branch in
-                    -- bitcoin-core/src/validation.cpp: pruning fires only on a
-                    -- flush boundary (not every block), only when prune mode is
-                    -- on and the target is finite (not manual / disabled).
-                    -- Best-effort; pruning errors must never abort the block
-                    -- connection or the flush path.
-                    case mBlockStore of
-                      Just bs -> do
-                        n <- autoPruneIfNeeded bs height pruneCfg
-                               `catch` (\(e :: SomeException) -> do
-                                          putStrLn $ "auto-prune error: " ++ show e
-                                          return 0)
-                        when (n > 0) $
-                          putStrLn $ "auto-prune: pruned " ++ show n
-                                  ++ " block file(s) at height=" ++ show height
-                      Nothing -> return ()
+                  -- Auto-prune trigger (Core FlushStateToDisk ->
+                  -- FindFilesToPrune, validation.cpp), checked after every
+                  -- connected block: Core prunes whenever a new blk file is
+                  -- allocated, which at the tip is every ~128 MiB, far more
+                  -- often than the 1000-block flush above.  The check reads
+                  -- only blocks it has not sized yet; it deletes + compacts
+                  -- only when stored data reaches the target.  No-op unless
+                  -- the target is finite (not manual / disabled).
+                  -- Best-effort; pruning errors must never abort the block
+                  -- connection.
+                  case mBlockStore of
+                    Just bs -> do
+                      n <- autoPruneIfNeeded bs height pruneCfg
+                             `catch` (\(e :: SomeException) -> do
+                                        putStrLn $ "auto-prune error: " ++ show e
+                                        return 0)
+                      when (n > 0) $ do
+                        mP <- getPrunedHeight db
+                        putStrLn $ "auto-prune: deleted " ++ show n
+                                ++ " block bodies + undo at tip height="
+                                ++ show height ++ ", prune height now "
+                                ++ maybe "none" show mP
+                    Nothing -> return ()
                   -- Remove confirmed txs from mempool and clear rejection filter
                   blockConnected mp block
                   writeIORef recentlyRejectedRef Set.empty

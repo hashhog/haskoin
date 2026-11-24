@@ -30,7 +30,7 @@ flush) takes one re-entrant chain lock (`Haskoin.ChainLock`), the counterpart of
 | Script | `Script.hs` | Script parser and interpreter, all verification flags, P2SH, segwit v0, taproot and tapscript |
 | Consensus | `Consensus.hs` | Chain parameters for each network, header and block checks, contextual checks, difficulty, BIP-30/34/68/112/113/141/341 rules, connect/disconnect, reorgs, assumevalid, assumeutxo snapshots |
 | Faults | `Fatal.hs` | Keeps I/O and database errors from being recorded as "block invalid" |
-| Storage | `Storage.hs` | RocksDB schema (key prefixes) holding headers, blocks, undo data and the UTXO set; UTXO cache with dirty/fresh tracking; with pruning on, a block-file store in Core's `blk*.dat`/`rev*.dat` format |
+| Storage | `Storage.hs` | RocksDB schema (key prefixes) holding headers, blocks, undo data and the UTXO set; UTXO cache with dirty/fresh tracking; pruning, which deletes stored block bodies and undo data and compacts RocksDB |
 | Indexes | `Index.hs` | BIP-157/158 block filter index, coinstats index and txospender index, each behind its option |
 | P2P | `Network.hs` | Message codec, version handshake, BIP-324 v2 transport, addrman with ASMap (`ASMap.hs`), addrv2, compact blocks (BIP-152), eviction, misbehaviour, bans, SOCKS5/Tor/I2P, BIP-330 (Erlay) reconciliation code using minisketch |
 | Download | `Sync.hs`, `app/Main.hs` | Headers-first sync and the block download window |

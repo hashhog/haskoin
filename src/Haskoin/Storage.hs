@@ -194,6 +194,13 @@ module Haskoin.Storage
   , calculateCurrentUsage
   , isBlockPruned
   , pruneBlockchain
+  , getPrunedHeight
+  , autoPruneCutoff
+  , autoPruneCutoffWith
+  , pruneAfterHeightFor
+  , storePruneAfterHeight
+  , storedBlockBytes
+  , compactBlockData
   , revFilePath
     -- * AssumeUTXO Support
   , snapshotMagicBytes
@@ -263,7 +270,7 @@ import Data.Word (Word8, Word16, Word32, Word64)
 import Data.Int (Int64)
 import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Control.Exception (bracket, try, IOException, catch)
-import Control.Monad (when, void, unless, forM_, join)
+import Control.Monad (when, void, unless, forM, forM_, join)
 import System.Mem (performGC)
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.IO.Class (liftIO)
@@ -289,6 +296,12 @@ import qualified System.Posix.Unistd as PosixUnistd
 import qualified Control.Exception as Exc
 import Text.Printf (printf)
 import Control.Concurrent.STM
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import qualified Data.ByteString.Unsafe as BSU
+import Foreign.C.String (CString)
+import Foreign.C.Types (CSize(..))
+import qualified Database.RocksDB.Internal as RI
+import qualified Database.RocksDB.C as RC
 import qualified Crypto.Hash as Hash
 import qualified Data.ByteArray as BA
 
@@ -322,6 +335,14 @@ data HaskoinDB = HaskoinDB
   { dbHandle    :: !R.DB
   , dbReadOpts  :: !R.ReadOptions
   , dbWriteOpts :: !R.WriteOptions
+  , dbTxIndexOn :: !(IORef Bool)
+    -- ^ Whether the txid -> block index ('PrefixTxIndex') is maintained.
+    -- True on open.  'newBlockStore' (prune mode) turns it off: Core
+    -- refuses @-txindex@ with @-prune@ (init.cpp), and an index whose
+    -- entries point at deleted block bodies is dead weight.  While off,
+    -- 'writeBatch' drops PrefixTxIndex puts, 'putTxIndex' is a no-op and
+    -- 'getTxIndex' answers Nothing, so callers fall back to the same
+    -- "Use -txindex" answers as a Core node without the index.
   }
 
 -- | Database configuration
@@ -420,12 +441,14 @@ openDB DBConfig{..} = do
         , R.compression     = if dbCompression then R.SnappyCompression else R.NoCompression
         }
   db <- R.open dbPath opts
+  txIndexOn <- newIORef True
   let readOpts  = R.defaultReadOptions
       writeOpts = R.defaultWriteOptions { R.sync = False }
   return HaskoinDB
     { dbHandle    = db
     , dbReadOpts  = readOpts
     , dbWriteOpts = writeOpts
+    , dbTxIndexOn = txIndexOn
     }
 
 -- | Close the database
@@ -2045,17 +2068,24 @@ instance Serialize TxLocation where
   get = TxLocation <$> get <*> getWord32be
 
 -- | Store transaction location index
+-- No-op while the index is off ('dbTxIndexOn', prune mode).
 putTxIndex :: HaskoinDB -> TxId -> TxLocation -> IO ()
-putTxIndex db txid loc =
-  let key = makeKey PrefixTxIndex (encode txid)
-  in R.put (dbHandle db) (dbWriteOpts db) key (encode loc)
+putTxIndex db txid loc = do
+  on <- readIORef (dbTxIndexOn db)
+  when on $
+    let key = makeKey PrefixTxIndex (encode txid)
+    in R.put (dbHandle db) (dbWriteOpts db) key (encode loc)
 
--- | Retrieve transaction location
+-- | Retrieve transaction location.  Nothing while the index is off
+-- ('dbTxIndexOn', prune mode), including for rows written before the node
+-- was switched to prune mode: those point at bodies prune deletes.
 getTxIndex :: HaskoinDB -> TxId -> IO (Maybe TxLocation)
 getTxIndex db txid = do
-  let key = makeKey PrefixTxIndex (encode txid)
-  mval <- R.get (dbHandle db) (dbReadOpts db) key
-  return $ mval >>= either (const Nothing) Just . decode
+  on <- readIORef (dbTxIndexOn db)
+  if not on then return Nothing else do
+    let key = makeKey PrefixTxIndex (encode txid)
+    mval <- R.get (dbHandle db) (dbReadOpts db) key
+    return $ mval >>= either (const Nothing) Just . decode
 
 -- | Delete transaction index entry (used during reorg)
 deleteTxIndex :: HaskoinDB -> TxId -> IO ()
@@ -2168,13 +2198,23 @@ instance Semigroup WriteBatch where
 instance Monoid WriteBatch where
   mempty = WriteBatch []
 
--- | Execute a batch of operations atomically
+-- | Execute a batch of operations atomically.
+--
+-- While the txindex is off ('dbTxIndexOn', prune mode) every PrefixTxIndex
+-- put is dropped here, so the connect batches ('connectBlockAt',
+-- 'buildConnectBlockOps') need no flag of their own.
 writeBatch :: HaskoinDB -> WriteBatch -> IO ()
-writeBatch db (WriteBatch ops) =
-  R.write (dbHandle db) (dbWriteOpts db) $ map toRocksOp ops
+writeBatch db (WriteBatch ops) = do
+  txIndexOn <- readIORef (dbTxIndexOn db)
+  let ops' | txIndexOn = ops
+           | otherwise = filter (not . isTxIndexPut) ops
+  R.write (dbHandle db) (dbWriteOpts db) $ map toRocksOp ops'
   where
     toRocksOp (BatchPut k v)  = R.Put k v
     toRocksOp (BatchDelete k) = R.Del k
+    isTxIndexPut (BatchPut k _) =
+      not (BS.null k) && BS.head k == prefixByte PrefixTxIndex
+    isTxIndexPut _ = False
 
 -- | Create a batch operation to put a block header
 batchPutBlockHeader :: BlockHash -> BlockHeader -> BatchOp
@@ -2537,6 +2577,12 @@ data BlockStore = BlockStore
   , bsCurrentFile  :: !(IORef Int)           -- ^ Current file number
   , bsCurrentPos   :: !(IORef Int64)         -- ^ Current position in file
   , bsFileInfos    :: !(IORef (Map Int BlockFileInfo))  -- ^ Info per file
+  , bsSizeCache    :: !(IORef (Map Word32 (BlockHash, Int64)))
+    -- ^ Prune accounting: stored body + undo bytes of active-chain blocks
+    -- above the prune height, keyed by height and tagged with the hash the
+    -- size belongs to (a reorg replaces the hash, so the entry is re-read).
+  , bsPruneLock    :: !(MVar ())
+    -- ^ Serialises the auto-prune trigger and the pruneblockchain RPC.
   }
 
 -- | Key prefix for block index entries in RocksDB
@@ -2558,9 +2604,17 @@ blockFilePath blocksDir fileNum =
 
 -- | Create a new block store.
 -- Initializes the blocks directory and loads existing file info.
+--
+-- haskoin keeps block bodies (PrefixBlockData) and undo data (0x10) in
+-- RocksDB, not in blk/rev files, so the node only builds a 'BlockStore' as
+-- its PRUNE handle: Main creates one iff @--prune@ is on.  Creating it
+-- switches the txindex off ('dbTxIndexOn'): Core refuses @-txindex@ with
+-- @-prune@, and the index would point at bodies prune deletes.  No
+-- @blocks/@ directory is created; the flat-file writer below
+-- ('writeBlockToDisk') has no caller in the node.
 newBlockStore :: FilePath -> ByteString -> HaskoinDB -> IO BlockStore
 newBlockStore blocksDir magic db = do
-  createDirectoryIfMissing True blocksDir
+  writeIORef (dbTxIndexOn db) False
 
   -- Load or initialize state
   mLastFile <- getLastBlockFile db
@@ -2577,6 +2631,8 @@ newBlockStore blocksDir magic db = do
   currentFileRef <- newIORef lastFile
   currentPosRef <- newIORef currentPos
   fileInfosRef <- newIORef fileInfos
+  sizeCacheRef <- newIORef Map.empty
+  pruneLock <- newMVar ()
 
   return BlockStore
     { bsBlocksDir    = blocksDir
@@ -2585,6 +2641,8 @@ newBlockStore blocksDir magic db = do
     , bsCurrentFile  = currentFileRef
     , bsCurrentPos   = currentPosRef
     , bsFileInfos    = fileInfosRef
+    , bsSizeCache    = sizeCacheRef
+    , bsPruneLock    = pruneLock
     }
 
 -- | Load all file infos from database
@@ -2714,6 +2772,7 @@ writeBlockToDisk store block blockHash height = do
   let filePath = blockFilePath (bsBlocksDir store) (ffpFileNum pos)
 
   result <- try $ do
+    createDirectoryIfMissing True (bsBlocksDir store)
     -- Open or create the file
     h <- openBinaryFile filePath ReadWriteMode `catch` \(_ :: IOException) ->
            openBinaryFile filePath WriteMode
@@ -2946,25 +3005,193 @@ pruneConfigAutoTarget cfg = case pcPruneTarget cfg of
   Just t | t /= pruneTargetManual -> Just t
   _                               -> Nothing
 
--- | Post-block-connect auto-prune trigger.  Called from the IBD /
--- live-tip block handler; no-op unless 'PruneConfig' has a finite
--- (non-manual) target AND current on-disk usage exceeds it.  Mirrors
--- the @FlushStateToDisk@ branch in @bitcoin-core/src/validation.cpp@
--- that calls @PruneBlockFiles@ when @fPruneMode && !fReindex@.
+-- | Post-block-connect auto-prune trigger (Core @FlushStateToDisk ->
+-- FindFilesToPrune@, node/blockstorage.cpp).  No-op unless 'PruneConfig'
+-- has a finite (non-manual) target, the tip is above the network's
+-- @PruneAfterHeight@ (see 'pruneAfterHeightFor'), and the stored block data
+-- has reached the target.  Then it deletes the oldest stored bodies + undo
+-- until the rest fits, never touching the last 'minBlocksToKeep' blocks
+-- below the tip, and compacts so the space is returned to the filesystem.
 --
--- Returns the number of files actually pruned (zero on the disabled
--- and manual paths, and on the common "below target" fast path).
--- Errors are caught and reported to stderr; pruning is best-effort
--- and must never abort block connection.
+-- haskoin stores block data per block in RocksDB, so the unit is a block
+-- rather than Core's 128 MiB blk/rev file pair.  To keep Core's cadence
+-- (one prune per ~file of new data, not one per block) a prune frees
+-- 'pruneHysteresisBytes' more than the bare target requires.
+--
+-- Returns the number of active-chain blocks pruned.
 autoPruneIfNeeded :: BlockStore -> Word32 -> PruneConfig -> IO Int
 autoPruneIfNeeded store tipHeight cfg =
   case pruneConfigAutoTarget cfg of
     Nothing     -> return 0  -- disabled or manual
-    Just target -> do
-      fileInfos <- readIORef (bsFileInfos store)
-      let toPrune = findFilesToPrune tipHeight target fileInfos
-      forM_ toPrune (pruneOneBlockFile store)
-      return (length toPrune)
+    Just target -> withMVar (bsPruneLock store) $ \_ -> do
+      let db = bsDB store
+      if tipHeight <= storePruneAfterHeight store then return 0 else do
+        lastPruned <- getPrunedHeight db
+        let lo = maybe 1 (+ 1) lastPruned
+        sizes <- storedSizesFromTip store tipHeight lo target
+        case autoPruneCutoff tipHeight target lo sizes of
+          Nothing  -> return 0
+          Just end -> pruneStoredBlocksTo store lo end
+
+-- | Trigger slack: Core's @BLOCKFILE_CHUNK_SIZE + UNDOFILE_CHUNK_SIZE@
+-- (16 MiB + 1 MiB), the room FindFilesToPrune leaves for the next write.
+-- Capped at 1/32 of the target, which only binds below the 550 MiB
+-- minimum a node accepts (tests).
+pruneBufferBytes :: Int64 -> Int64
+pruneBufferBytes target = min (0x1000000 + 0x100000) (target `div` 32)
+
+-- | Extra space a prune frees beyond the target: one Core blk file
+-- (@MAX_BLOCKFILE_SIZE@, 128 MiB), the granularity Core prunes at.
+-- Capped at 1/4 of the target; at the 550 MiB minimum that is 137 MiB, so
+-- the cap only binds for test targets.
+pruneHysteresisBytes :: Int64 -> Int64
+pruneHysteresisBytes target = min 0x8000000 (target `div` 4)
+
+-- | Core's per-network @PruneAfterHeight@ (kernel/chainparams.cpp): no
+-- automatic pruning until the chain is longer than this.  100,000 on
+-- mainnet, 1,000 on testnet3/testnet4/regtest.
+pruneAfterHeightFor :: Bool -> Word32
+pruneAfterHeightFor isMainnet = if isMainnet then 100000 else 1000
+
+-- | 'pruneAfterHeightFor' for the network a 'BlockStore' serves, told by
+-- its wire magic (mainnet F9 BE B4 D9).
+storePruneAfterHeight :: BlockStore -> Word32
+storePruneAfterHeight store =
+  pruneAfterHeightFor (bsNetworkMagic store == BS.pack [0xf9, 0xbe, 0xb4, 0xd9])
+
+-- | Pure prune decision for 'autoPruneIfNeeded' (Core FindFilesToPrune at
+-- block granularity).  Arguments: tip height, target bytes, lowest stored
+-- height, and @(height, stored bytes)@ walking DOWN from the tip (the walk
+-- may stop once it has seen @target@ bytes).  Returns the new prune height
+-- (every stored block at or below it is deleted), or Nothing.
+autoPruneCutoff :: Word32 -> Int64 -> Word32 -> [(Word32, Int64)]
+                -> Maybe Word32
+autoPruneCutoff tipHeight target =
+  autoPruneCutoffWith (pruneBufferBytes target) (pruneHysteresisBytes target)
+                      tipHeight target
+
+-- | 'autoPruneCutoff' with explicit trigger buffer and hysteresis.
+autoPruneCutoffWith :: Int64 -> Int64 -> Word32 -> Int64 -> Word32
+                    -> [(Word32, Int64)] -> Maybe Word32
+autoPruneCutoffWith buffer hysteresis tipHeight target lo sizesDesc
+  | tipHeight < minBlocksToKeep        = Nothing
+  | lo > maxPrune                      = Nothing
+  | usage + buffer < target            = Nothing   -- below target
+  | end < lo                           = Nothing
+  | otherwise                          = Just end
+  where
+    maxPrune = tipHeight - minBlocksToKeep
+    usage = sum (map snd sizesDesc)
+    -- Keep the longest run below the tip that fits; everything older goes.
+    cut = keep 0 sizesDesc
+    keep _ [] = lo
+    keep acc ((h, sz) : rest)
+      | acc + sz + buffer + hysteresis < target = keep (acc + sz) rest
+      | otherwise = h + 1
+    end = min maxPrune (cut - 1)
+
+-- | Stored bytes of the active-chain blocks from the tip down to @lo@,
+-- stopping once @target@ bytes have been seen (the decision needs no more).
+-- Sizes come from 'bsSizeCache' when the cached hash still matches.
+storedSizesFromTip :: BlockStore -> Word32 -> Word32 -> Int64
+                   -> IO [(Word32, Int64)]
+storedSizesFromTip store tipHeight lo target = go tipHeight 0 []
+  where
+    db = bsDB store
+    go h acc out
+      | h < lo || acc >= target = finish out
+      | otherwise = do
+          mbh <- getBlockHeight db h
+          case mbh of
+            Nothing -> finish out
+            Just bh -> do
+              cache <- readIORef (bsSizeCache store)
+              sz <- case Map.lookup h cache of
+                Just (bh', n) | bh' == bh -> return n
+                _ -> do
+                  n <- storedBlockBytes db bh
+                  modifyIORef' (bsSizeCache store) (Map.insert h (bh, n))
+                  return n
+              let out' = (h, sz) : out
+              if h == 0 then finish out' else go (h - 1) (acc + sz) out'
+    finish out = do
+      -- Drop cache rows above the tip (a reorg to a shorter chain).
+      modifyIORef' (bsSizeCache store) (fst . Map.split (tipHeight + 1))
+      return (reverse out)
+
+-- | Bytes this node stores for one block: body + undo record.
+storedBlockBytes :: HaskoinDB -> BlockHash -> IO Int64
+storedBlockBytes db bh = do
+  mBody <- R.get (dbHandle db) (dbReadOpts db) (makeKey PrefixBlockData (encode bh))
+  mUndo <- R.get (dbHandle db) (dbReadOpts db) (BS.cons 0x10 (encode bh))
+  return $ fromIntegral (maybe 0 BS.length mBody + maybe 0 BS.length mUndo)
+
+-- | Key of Core's @GetPruneHeight@: the highest active-chain height whose
+-- body and undo this node deleted.  Absent = nothing pruned.  Outside every
+-- chainstate prefix, so 'wipeChainstate' keeps it.
+prunedHeightKey :: ByteString
+prunedHeightKey = BS.singleton 0x50  -- 'P'
+
+-- | Core @GetPruneHeight@ (rpc/blockchain.cpp): the last pruned height,
+-- Nothing when nothing was pruned.  Core's @m_have_pruned@ is @isJust@.
+getPrunedHeight :: HaskoinDB -> IO (Maybe Word32)
+getPrunedHeight db = do
+  mval <- R.get (dbHandle db) (dbReadOpts db) prunedHeightKey
+  return (mval >>= fromBE32)
+
+-- | Delete the stored body + undo of every active-chain block at heights
+-- @lo..end@ (genesis is never pruned: @lo >= 1@), record @end@ as the
+-- prune height, and compact the body and undo key ranges so the deleted
+-- bytes leave the disk.  The prune height is written FIRST, as Core marks
+-- the block index before unlinking files (PruneOneBlockFile then
+-- UnlinkPrunedFiles): a crash in between leaves extra bodies, never a
+-- missing body the node believes it has.  Returns the number of blocks.
+pruneStoredBlocksTo :: BlockStore -> Word32 -> Word32 -> IO Int
+pruneStoredBlocksTo store lo0 end
+  | end < lo = return 0
+  | otherwise = do
+      R.put (dbHandle db) (dbWriteOpts db) prunedHeightKey (toBE32 end)
+      let chunk a = do
+            let b = min end (a + 999)
+            hashes <- fmap concat $ forM [a .. b] $ \h ->
+              maybe [] (: []) <$> getBlockHeight db h
+            R.write (dbHandle db) (dbWriteOpts db)
+              (concat [ [ R.Del (makeKey PrefixBlockData (encode bh))
+                        , R.Del (BS.cons 0x10 (encode bh)) ]
+                      | bh <- hashes ])
+            n <- if b < end then chunk (b + 1) else return 0
+            return (length hashes + n)
+      n <- chunk lo
+      modifyIORef' (bsSizeCache store) (snd . Map.split end)
+      compactBlockData db
+      return n
+  where
+    db = bsDB store
+    lo = max 1 lo0
+
+-- | Compact the block-body (0x02) and undo (0x10) key ranges.  Deleting a
+-- RocksDB key only writes a tombstone; the bytes stay in the SST files
+-- until a compaction drops them.  Prune needs the space back now, as Core
+-- gets it from unlink().
+compactBlockData :: HaskoinDB -> IO ()
+compactBlockData db = do
+  compactKeyRange db (BS.singleton (prefixByte PrefixBlockData))
+                     (BS.singleton (prefixByte PrefixBlockData + 1))
+  compactKeyRange db (BS.singleton 0x10) (BS.singleton 0x11)
+
+-- | @rocksdb_compact_range@ over @[from, to)@.  rocksdb-haskell does not
+-- bind it; the symbol comes from the librocksdb the binding links.
+compactKeyRange :: HaskoinDB -> ByteString -> ByteString -> IO ()
+compactKeyRange db from to =
+  case dbHandle db of
+    RI.DB dbPtr _ ->
+      BSU.unsafeUseAsCStringLen from $ \(fp, fl) ->
+      BSU.unsafeUseAsCStringLen to $ \(tp, tl) ->
+        c_rocksdb_compact_range dbPtr fp (fromIntegral fl) tp (fromIntegral tl)
+
+foreign import ccall safe "rocksdb/c.h rocksdb_compact_range"
+  c_rocksdb_compact_range :: RC.RocksDBPtr -> CString -> CSize -> CString -> CSize
+                          -> IO ()
 
 -- | Format a rev (undo) file path: rev{nnnnn}.dat
 revFilePath :: FilePath -> Int -> FilePath
@@ -3041,60 +3268,36 @@ pruneOneBlockFile store fileNum = do
       emptyInfo = emptyBlockFileInfo
   putFileInfo db fileNum emptyInfo
 
--- | Check if a block has been pruned.
--- A block is pruned if it has a valid block index but the block file
--- position is invalid (set to Nothing/pruned marker).
+-- | Core @IsBlockPruned@: the node has pruned (a prune height is recorded)
+-- and this block's body is not stored.
 isBlockPruned :: BlockStore -> BlockHash -> IO Bool
 isBlockPruned store bh = do
-  mIdx <- getBlockIndex (bsDB store) bh
-  case mIdx of
-    Nothing -> return False  -- Block not in index at all
-    Just idx ->
-      -- Check if the file still exists
-      let filePath = blockFilePath (bsBlocksDir store) (biFileNumber idx)
-      in do
-        exists <- doesFileExist filePath
-        if not exists
-          then return True  -- File was pruned
-          else do
-            -- Also check if file info shows it as empty
-            fileInfos <- readIORef (bsFileInfos store)
-            case Map.lookup (biFileNumber idx) fileInfos of
-              Nothing -> return True  -- No info = pruned
-              Just info -> return (bfiSize info == 0)  -- Empty = pruned
+  let db = bsDB store
+  mPruned <- getPrunedHeight db
+  case mPruned of
+    Nothing -> return False
+    Just _  -> do
+      mBody <- R.get (dbHandle db) (dbReadOpts db) (makeKey PrefixBlockData (encode bh))
+      return (not (isJust mBody))
 
--- | Prune blockchain data up to a specified height.
--- Returns the number of files pruned and any error.
---
--- This is called manually via the pruneblockchain RPC.
--- Reference: bitcoin/src/node/blockstorage.cpp FindFilesToPruneManual
+-- | Manual prune (pruneblockchain RPC; Core PruneBlockFilesManual +
+-- FindFilesToPruneManual + Chainstate::GetPruneRange): delete the stored
+-- body + undo of every active-chain block at or below
+-- @min(pruneHeight, tip - MIN_BLOCKS_TO_KEEP)@.  The caller does Core's
+-- argument checks; this never deletes within 'minBlocksToKeep' of the tip.
+-- Returns the number of blocks deleted; read the resulting prune height
+-- with 'getPrunedHeight'.
 pruneBlockchain :: BlockStore
                 -> Word32      -- ^ Current tip height
                 -> Word32      -- ^ Prune up to this height
                 -> IO (Either String Int)
 pruneBlockchain store tipHeight pruneHeight
-  | tipHeight < minBlocksToKeep = return $ Left $
-      "Chain height " ++ show tipHeight ++
-      " is below minimum required for pruning (" ++ show minBlocksToKeep ++ ")"
-  | pruneHeight > tipHeight - minBlocksToKeep = return $ Left $
-      "Cannot prune blocks within " ++ show minBlocksToKeep ++
-      " blocks of the current tip (" ++ show tipHeight ++ ")"
-  | otherwise = do
-      fileInfos <- readIORef (bsFileInfos store)
-      let filesToPrune = findFilesToPruneManual pruneHeight fileInfos
-      -- Prune each file
-      forM_ filesToPrune $ \fileNum ->
-        pruneOneBlockFile store fileNum
-      return $ Right (length filesToPrune)
-  where
-    -- Find files where all blocks are at or below pruneHeight
-    findFilesToPruneManual :: Word32 -> Map Int BlockFileInfo -> [Int]
-    findFilesToPruneManual maxHeight infos =
-      [ fileNum
-      | (fileNum, info) <- Map.toAscList infos
-      , bfiSize info > 0  -- Not already empty
-      , bfiMaxHeight info <= maxHeight  -- All blocks at or below max
-      ]
+  | tipHeight < minBlocksToKeep = return (Right 0)
+  | otherwise = withMVar (bsPruneLock store) $ \_ -> do
+      lastPruned <- getPrunedHeight (bsDB store)
+      let lo  = maybe 1 (+ 1) lastPruned
+          end = min pruneHeight (tipHeight - minBlocksToKeep)
+      Right <$> pruneStoredBlocksTo store lo end
 
 --------------------------------------------------------------------------------
 -- AssumeUTXO Support
