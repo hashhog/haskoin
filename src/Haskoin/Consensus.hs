@@ -65,6 +65,16 @@ module Haskoin.Consensus
   , computeMerkleRootMutated
     -- * AssumeValid
   , shouldSkipScripts
+  , shouldSkipScriptsCached
+  , shouldSkipScriptsWith
+  , ChainIndex(..)
+  , ciTipHeight
+  , chainIndexLookup
+  , chainIndexSetTip
+  , ancestorViaIndex
+  , AncestorCache(..)
+  , newAncestorCache
+  , cachedAncestorAtHeight
     -- * Script-verification counter (process-wide; not persistable)
     --   Incremented only when input scripts actually run (skipScripts=False).
     --   Read by getchainstates / Prometheus so a range can prove scripts ran
@@ -377,7 +387,8 @@ import Control.Exception (try, catch, SomeException, bracket_, evaluate, mask, o
 import Haskoin.Fatal (internalErrorMarker, trySync, catchSync, internalReject, isInternalReject,
                      readFatalLatch, setFatalLatch, fatalLatchedReject)
 import GHC.Conc (getNumProcessors, getNumCapabilities, setNumCapabilities)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef')
+import Data.IORef (IORef, newIORef, readIORef, writeIORef, modifyIORef', atomicModifyIORef', atomicWriteIORef)
+import Data.Functor.Identity (Identity(..))
 import System.Mem.StableName (makeStableName, hashStableName)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.Time.Clock.POSIX (getPOSIXTime, POSIXTime)
@@ -846,33 +857,77 @@ shouldSkipScripts :: BlockHash      -- ^ Hash of block being connected
                   -> Map BlockHash ChainEntry  -- ^ In-memory block index
                   -> ChainEntry                -- ^ Best known header tip
                   -> Bool
-shouldSkipScripts _pHash pHeight pTimestamp net blockIndex bestHeader =
+shouldSkipScripts pHash pHeight pTimestamp net blockIndex bestHeader =
+  runIdentity $
+    shouldSkipScriptsWith (\s h -> Identity (ceHash <$> ancestorAtHeight blockIndex s h))
+                          pHash pHeight pTimestamp net blockIndex bestHeader
+
+-- | 'shouldSkipScripts' with the two ancestor checks answered from the
+-- height indexes in an 'AncestorCache' instead of a 'cePrev' walk.  This is
+-- the per-block call of the live MBlock arm (app/Main.hs).
+--
+-- 'shouldSkipScripts' walks one 'Map.lookup' per height from the
+-- assumevalid header and from the best header down to the block, so a sync
+-- from genesis paid O(height) per block, O(n^2) overall (about 1.9M lookups
+-- for each early mainnet block).  Core answers @GetAncestor@ in O(log n)
+-- through pskip.  Here each answer is one vector index; the vector of the
+-- best header's ancestry is rebuilt only when the best header changes, and
+-- then only above the fork point with the previous best header (as
+-- CChain::SetTip).  The answers equal the walk's ('chainIndexSetTip',
+-- 'ancestorViaIndex'); the decision logic is the same function.
+shouldSkipScriptsCached :: AncestorCache
+                        -> BlockHash      -- ^ Hash of block being connected
+                        -> Word32         -- ^ Height of block being connected
+                        -> Word32         -- ^ Timestamp of block being connected
+                        -> Network
+                        -> Map BlockHash ChainEntry  -- ^ In-memory block index
+                        -> ChainEntry                -- ^ Best known header tip
+                        -> IO Bool
+shouldSkipScriptsCached cache pHash pHeight pTimestamp net blockIndex bestHeader =
+  shouldSkipScriptsWith query pHash pHeight pTimestamp net blockIndex bestHeader
+  where
+    -- The first query starts at the assumevalid header, the second at the
+    -- best header; each has its own slot so neither evicts the other.
+    query start h =
+      let slot | Just start == netAssumedValid net = acAssumeValid cache
+               | otherwise                         = acBestHeader cache
+      in cachedAncestorAtHeight slot blockIndex start h
+
+-- | The six-condition decision, parameterised by how "the ancestor of
+-- @start@ at height @h@" is answered.  'shouldSkipScripts' passes the
+-- 'cePrev' walk, 'shouldSkipScriptsCached' the height index.
+shouldSkipScriptsWith :: Monad m
+                      => (BlockHash -> Word32 -> m (Maybe BlockHash))
+                         -- ^ Hash of the ancestor of the first argument at the given height
+                      -> BlockHash -> Word32 -> Word32 -> Network
+                      -> Map BlockHash ChainEntry -> ChainEntry -> m Bool
+shouldSkipScriptsWith ancestorOf _pHash pHeight pTimestamp net blockIndex bestHeader =
   case netAssumedValid net of
     -- Condition 1: assumevalid not configured — always verify scripts.
-    Nothing -> False
+    Nothing -> return False
     Just avHash ->
       -- Condition 2: assumed-valid hash must be in our block index.
       case Map.lookup avHash blockIndex of
-        Nothing -> False   -- Haven't received the assumevalid header yet
-        Just avEntry ->
+        Nothing -> return False   -- Haven't received the assumevalid header yet
+        Just avEntry -> do
           -- Condition 3: block being connected must be an ancestor of the
-          -- assumed-valid block.  We check this by walking from avEntry
-          -- down to pHeight and verifying the hash matches.
+          -- assumed-valid block.  We check this by finding avEntry's
+          -- ancestor at pHeight and verifying the hash matches.
           -- Equivalent to Bitcoin Core:
           --   it->second.GetAncestor(pindex->nHeight) == pindex
-          let ancestorOfAV = ancestorAtHeight blockIndex (ceHash avEntry) pHeight
-          in case ancestorOfAV of
-            Nothing      -> False   -- Couldn't walk back (height mismatch)
+          ancestorOfAV <- ancestorOf (ceHash avEntry) pHeight
+          case ancestorOfAV of
+            Nothing      -> return False   -- Couldn't walk back (height mismatch)
             Just ancestor ->
-              if ceHash ancestor /= _pHash
-                then False  -- Block is not on the assumevalid chain
-                else
+              if ancestor /= _pHash
+                then return False  -- Block is not on the assumevalid chain
+                else do
                   -- Condition 4: block must also be an ancestor of best header.
-                  let ancestorOfBest = ancestorAtHeight blockIndex (ceHash bestHeader) pHeight
-                  in case ancestorOfBest of
+                  ancestorOfBest <- ancestorOf (ceHash bestHeader) pHeight
+                  return $ case ancestorOfBest of
                     Nothing -> False
                     Just bestAnc ->
-                      if ceHash bestAnc /= _pHash
+                      if bestAnc /= _pHash
                         then False  -- Block not in best header chain
                         else
                           -- Condition 5: best header chainwork >= minimumChainWork.
@@ -897,6 +952,116 @@ ancestorAtHeight blockIndex startHash targetHeight =
       | ceHeight ce == targetHeight -> Just ce
       | ceHeight ce <  targetHeight -> Nothing  -- Target is higher than start
       | otherwise -> cePrev ce >>= \p -> ancestorAtHeight blockIndex p targetHeight
+
+--------------------------------------------------------------------------------
+-- Height-indexed ancestry (Core's CChain vector) for the assumevalid checks
+--------------------------------------------------------------------------------
+
+-- | The ancestry of one header, 'ciTip', indexed by height: the hash at
+-- height @h@ is @ciHashes V.! (h - ciBase)@.  Core keeps the active chain
+-- the same way (CChain::vChain) and reaches other ancestors with pskip.
+--
+-- The index is built by walking 'cePrev' from the tip, so for every height
+-- in @[ciBase, ciTipHeight]@ it holds exactly what 'ancestorAtHeight' finds.
+-- The walk stops at genesis, at a missing parent, or at a parent whose
+-- height is not one less (a malformed index); 'ciWalkBelow' records the last
+-- case, where heights below 'ciBase' fall back to the walk itself.
+--
+-- An index stays correct while the map only grows: a header's hash fixes its
+-- parent, and the header index never deletes entries.
+data ChainIndex = ChainIndex
+  { ciTip       :: !BlockHash
+  , ciBase      :: !Word32
+  , ciHashes    :: !(Vector BlockHash)
+  , ciWalkBelow :: !Bool
+  } deriving (Show, Eq)
+
+-- | Height of 'ciTip'.
+ciTipHeight :: ChainIndex -> Word32
+ciTipHeight ci = ciBase ci + fromIntegral (V.length (ciHashes ci)) - 1
+
+-- | The indexed hash at height @h@, if @h@ is in @[ciBase, ciTipHeight]@.
+chainIndexLookup :: ChainIndex -> Word32 -> Maybe BlockHash
+chainIndexLookup ci h
+  | h < ciBase ci = Nothing
+  | otherwise     = ciHashes ci V.!? fromIntegral (h - ciBase ci)
+
+-- | The index of @tipHash@'s ancestry, reusing the part it shares with
+-- @old@ (CChain::SetTip): the walk from the tip stops at the first height
+-- where @old@ already holds the same hash, so moving the tip forward by k
+-- headers or across a k-deep header reorg walks k entries.  'Nothing' when
+-- @tipHash@ is not in the map.
+chainIndexSetTip :: Map BlockHash ChainEntry -> BlockHash -> Maybe ChainIndex -> Maybe ChainIndex
+chainIndexSetTip entries tipHash old = do
+  tipEntry <- Map.lookup tipHash entries
+  let (base, prefix, walkBelow, suffix) = go tipEntry []
+  return $! ChainIndex
+    { ciTip       = tipHash
+    , ciBase      = base
+    , ciHashes    = prefix V.++ V.fromList suffix
+    , ciWalkBelow = walkBelow
+    }
+  where
+    -- Accumulates the walked hashes in ascending height order.
+    go :: ChainEntry -> [BlockHash] -> (Word32, Vector BlockHash, Bool, [BlockHash])
+    go e acc =
+      let !h  = ceHeight e
+          !hh = ceHash e
+      in case old of
+           Just o | chainIndexLookup o h == Just hh ->
+             (ciBase o, V.take (fromIntegral (h - ciBase o) + 1) (ciHashes o), ciWalkBelow o, acc)
+           _ ->
+             let acc' = hh : acc
+             in case cePrev e of
+                  Nothing -> (h, V.empty, False, acc')
+                  Just p -> case Map.lookup p entries of
+                    Nothing -> (h, V.empty, False, acc')
+                    Just pe
+                      | h > 0 && ceHeight pe == h - 1 -> go pe acc'
+                      | otherwise -> (h, V.empty, True, acc')
+
+-- | The ancestor of 'ciTip' at height @h@: the same answer as
+-- @ceHash <$> ancestorAtHeight entries (ciTip ci) h@, in O(1) for every
+-- height the index covers.
+ancestorViaIndex :: Map BlockHash ChainEntry -> ChainIndex -> Word32 -> Maybe BlockHash
+ancestorViaIndex entries ci h
+  | h > ciTipHeight ci = Nothing
+  | h >= ciBase ci     = chainIndexLookup ci h
+  | ciWalkBelow ci     = ceHash <$> ancestorAtHeight entries (ciTip ci) h
+  | otherwise          = Nothing   -- the walk ends at genesis or a missing parent
+
+-- | Per-header-chain cache of the two indexes the assumevalid checks need:
+-- the assumevalid header's ancestry (built once) and the best header's
+-- (moved with the best header).  Lives in 'HeaderChain' ('hcAncestors').
+data AncestorCache = AncestorCache
+  { acAssumeValid :: !(IORef (Maybe ChainIndex))
+  , acBestHeader  :: !(IORef (Maybe ChainIndex))
+  }
+
+newAncestorCache :: IO AncestorCache
+newAncestorCache = AncestorCache <$> newIORef Nothing <*> newIORef Nothing
+
+-- | @ceHash <$> ancestorAtHeight entries start h@, answered from the index
+-- in @slot@ (moved to @start@ first if it indexes another tip).  The first
+-- two cases are the walk's own first step, so a block above the start (every
+-- block above the assumevalid height) never builds an index.
+cachedAncestorAtHeight :: IORef (Maybe ChainIndex) -> Map BlockHash ChainEntry
+                       -> BlockHash -> Word32 -> IO (Maybe BlockHash)
+cachedAncestorAtHeight slot entries start h =
+  case Map.lookup start entries of
+    Nothing -> return Nothing
+    Just ce
+      | ceHeight ce == h -> return (Just (ceHash ce))
+      | ceHeight ce <  h -> return Nothing
+      | otherwise -> do
+          old <- readIORef slot
+          mci <- case old of
+            Just o | ciTip o == start -> return old
+            _ -> do
+              new <- evaluate (chainIndexSetTip entries start old)
+              atomicWriteIORef slot new
+              return new
+          return (mci >>= \ci -> ancestorViaIndex entries ci h)
 
 --------------------------------------------------------------------------------
 -- Consensus Constants
@@ -6312,6 +6477,11 @@ data HeaderChain = HeaderChain
     -- ^ Core's @nLastPreciousChainwork@.  The tip chainwork observed at the
     -- previous 'preciousBlock' call; a later call made after the tip work
     -- has grown resets 'hcPreciousReverseSeq'.
+  , hcAncestors          :: !AncestorCache
+    -- ^ Height indexes of the assumevalid header's and the best header's
+    -- ancestry, for the per-block assumevalid ancestor checks
+    -- ('shouldSkipScriptsCached').  Moved to the current best header on
+    -- use, so it needs no update when headers are added.
   }
 
 --------------------------------------------------------------------------------
@@ -6518,6 +6688,7 @@ initHeaderChain net = do
   tipGenVar <- newTVarIO 0
   preciousReverseSeqVar <- newTVarIO preciousReverseSeqInit
   lastPreciousWorkVar <- newTVarIO 0
+  ancestorCache <- newAncestorCache
   return HeaderChain
     { hcEntries = entriesVar
     , hcTip = tipVar
@@ -6529,6 +6700,7 @@ initHeaderChain net = do
     , hcTipGen = tipGenVar
     , hcPreciousReverseSeq = preciousReverseSeqVar
     , hcLastPreciousWork = lastPreciousWorkVar
+    , hcAncestors = ancestorCache
     }
 
 -- | Bump the tip-change generation counter inside a running STM transaction.
