@@ -51,6 +51,19 @@ module Haskoin.Crypto
   , sigHashTypeToWord32
   , txSigHash
   , txSigHashSegWit
+  , txSigHashSegWitTxData
+    -- * Per-transaction sighash midstate (Core PrecomputedTransactionData)
+  , PrecomputedTxData
+  , precomputeTxData
+  , ptdTx
+  , ptdSpentAmounts
+  , ptdSpentScripts
+  , ptdSpentReady
+  , ptdPrevoutsSingle
+  , ptdAmountsSingle
+  , ptdScriptsSingle
+  , ptdSequencesSingle
+  , ptdOutputsSingle
     -- * Legacy sighash helpers
   , findAndDelete
   , findAndDeleteCount
@@ -1259,24 +1272,43 @@ txSigHash tx inputIdx subScript hashTypeW32 shType =
 -- base (e.g. 0x04) to 0x01 (SIGHASH_ALL), producing a different sighash than
 -- the signer computed and causing a false-reject.  Core reference:
 -- interpreter.cpp:1702 (nHashType = vchSig.back()) + 1675 (ss << nHashType).
+--
+-- Builds a fresh 'PrecomputedTxData' for this one call, so it re-hashes the
+-- whole transaction every time. Script verification shares one record per
+-- transaction through 'txSigHashSegWitTxData' instead; this wrapper is kept
+-- for the wallet signers, the shims and the vector suites.
 txSigHashSegWit :: Tx -> Int -> ByteString -> Word64 -> Word32 -> SigHashType -> Hash256
-txSigHashSegWit tx inputIdx scriptCode amount rawHashType shType =
-  let -- Hash of all prevouts (unless ANYONECANPAY)
+txSigHashSegWit tx = txSigHashSegWitTxData (precomputeTxData tx [] [])
+
+-- | BIP-143 sighash using the transaction's shared 'PrecomputedTxData'
+-- (Core: @SignatureHash@ with a @PrecomputedTransactionData@ whose
+-- @m_bip143_segwit_ready@ is set). The transaction is the record's own
+-- ('ptdTx'), so a digest can never be paired with another transaction's
+-- midstate. Byte-identical to the per-call computation: each double hash is
+-- @SHA256(SHA256(serialization))@ and the record's single hash is the inner
+-- @SHA256(serialization)@ of the same serialization.
+txSigHashSegWitTxData :: PrecomputedTxData -> Int -> ByteString -> Word64 -> Word32
+                      -> SigHashType -> Hash256
+txSigHashSegWitTxData td inputIdx scriptCode amount rawHashType shType =
+  let tx = ptdTx td
+      -- Hash of all prevouts (unless ANYONECANPAY)
       hashPrevouts = if shAnyoneCanPay shType
         then Hash256 (BS.replicate 32 0)
-        else doubleSHA256 $ runPut $ mapM_ (putOutPoint . txInPrevOutput) (txInputs tx)
+        else ptdHashPrevouts td
       -- Hash of all sequences (unless ANYONECANPAY, SINGLE, or NONE)
       hashSequence = if shAnyoneCanPay shType || shSingle shType || shNone shType
         then Hash256 (BS.replicate 32 0)
-        else doubleSHA256 $ runPut $ mapM_ (putWord32le . txInSequence) (txInputs tx)
-      -- Hash of all outputs (with modifications for SINGLE/NONE)
+        else ptdHashSequence td
+      -- Hash of all outputs (with modifications for SINGLE/NONE). The
+      -- SINGLE case hashes only this input's output, so it is per call
+      -- (Core computes it per call too).
       hashOutputs
         | shSingle shType && inputIdx < length (txOutputs tx) =
             doubleSHA256 $ encode (txOutputs tx !! inputIdx)
         | shNone shType || shSingle shType =
             Hash256 (BS.replicate 32 0)
         | otherwise =
-            doubleSHA256 $ runPut $ mapM_ putTxOut (txOutputs tx)
+            ptdHashOutputs td
       inp = txInputs tx !! inputIdx
       preimage = runPut $ do
         putWord32le (fromIntegral $ txVersion tx)
@@ -1290,6 +1322,75 @@ txSigHashSegWit tx inputIdx scriptCode amount rawHashType shType =
         putWord32le (txLockTime tx)
         putWord32le rawHashType   -- raw byte from sig, NOT re-canonicalized (BIP-143 / Core:1675)
   in doubleSHA256 preimage
+
+-- | Per-transaction sighash midstate: Core's @PrecomputedTransactionData@
+-- (src/script/interpreter.cpp @PrecomputedTransactionData::Init@).
+--
+-- Build ONE per transaction with 'precomputeTxData' and hand the same value
+-- to every input's script check. Each digest field is a lazy thunk, so it
+-- is computed the first time any input needs it and then shared by every
+-- later check of the same transaction: a tx with no witness-v0 input never
+-- computes the BIP-143 doubles, a tx with no Taproot input never computes
+-- the BIP-341 amounts / scriptPubKeys digests (Core's @m_bip143_segwit_ready@
+-- / @m_bip341_taproot_ready@ laziness, by evaluation instead of flags).
+--
+-- The BIP-341 fields are single SHA-256 of the serialization; the BIP-143
+-- fields are SHA-256 of those, i.e. the double SHA-256 BIP-143 specifies
+-- (Core derives them the same way: @hashPrevouts = SHA256Uint256(m_prevouts_single_hash)@).
+-- The serializations are the ones the per-call code used: outpoint =
+-- txid || vout LE, sequence LE, amount LE, scriptPubKey and output script
+-- with a compact-size length prefix, output = value LE || script.
+data PrecomputedTxData = PrecomputedTxData
+  { ptdTx              :: !Tx
+    -- ^ The transaction these digests belong to.
+  , ptdSpentAmounts    :: [Word64]
+    -- ^ Spent output amounts, one per input (BIP-341 only).
+  , ptdSpentScripts    :: [ByteString]
+    -- ^ Spent output scriptPubKeys, one per input (BIP-341 only).
+  , ptdSpentReady      :: Bool
+    -- ^ Both spent lists have exactly one entry per input (Core
+    -- @m_spent_outputs_ready@). BIP-341 sighash fails closed without it.
+  , ptdPrevoutsSingle  :: ByteString   -- ^ SHA256(all outpoints)
+  , ptdSequencesSingle :: ByteString   -- ^ SHA256(all nSequence)
+  , ptdOutputsSingle   :: ByteString   -- ^ SHA256(all outputs)
+  , ptdAmountsSingle   :: ByteString   -- ^ SHA256(all spent amounts)
+  , ptdScriptsSingle   :: ByteString   -- ^ SHA256(all spent scriptPubKeys)
+  , ptdHashPrevouts    :: Hash256      -- ^ BIP-143 hashPrevouts
+  , ptdHashSequence    :: Hash256      -- ^ BIP-143 hashSequence
+  , ptdHashOutputs     :: Hash256      -- ^ BIP-143 hashOutputs (SIGHASH_ALL)
+  }
+
+-- | Never forces a digest (Show is only for 'ScriptEnv' debugging output).
+instance Show PrecomputedTxData where
+  show td = "PrecomputedTxData{inputs=" ++ show (length (txInputs (ptdTx td)))
+            ++ ",spentReady=" ++ show (ptdSpentReady td) ++ "}"
+
+-- | Build the per-transaction midstate. Nothing is hashed here; each digest
+-- is computed on first use and shared afterwards. @spentAmounts@ /
+-- @spentScripts@ are the outputs the inputs spend, in input order; pass
+-- empty lists when they are unknown (BIP-143 and legacy do not need them,
+-- BIP-341 then fails closed).
+precomputeTxData :: Tx -> [Word64] -> [ByteString] -> PrecomputedTxData
+precomputeTxData tx spentAmounts spentScripts =
+  let ins  = txInputs tx
+      nIns = length ins
+      prevoutsSingle  = sha256 $ runPut $ mapM_ (putOutPoint . txInPrevOutput) ins
+      sequencesSingle = sha256 $ runPut $ mapM_ (putWord32le . txInSequence) ins
+      outputsSingle   = sha256 $ runPut $ mapM_ putTxOut (txOutputs tx)
+  in PrecomputedTxData
+       { ptdTx              = tx
+       , ptdSpentAmounts    = spentAmounts
+       , ptdSpentScripts    = spentScripts
+       , ptdSpentReady      = length spentAmounts == nIns && length spentScripts == nIns
+       , ptdPrevoutsSingle  = prevoutsSingle
+       , ptdSequencesSingle = sequencesSingle
+       , ptdOutputsSingle   = outputsSingle
+       , ptdAmountsSingle   = sha256 $ runPut $ mapM_ putWord64le spentAmounts
+       , ptdScriptsSingle   = sha256 $ runPut $ mapM_ putVarBytes spentScripts
+       , ptdHashPrevouts    = Hash256 (sha256 prevoutsSingle)
+       , ptdHashSequence    = Hash256 (sha256 sequencesSingle)
+       , ptdHashOutputs     = Hash256 (sha256 outputsSingle)
+       }
 
 --------------------------------------------------------------------------------
 -- Transaction/Block Hash Computation

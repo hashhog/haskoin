@@ -406,10 +406,12 @@ import Haskoin.Types (Hash256(..), TxId(..), BlockHash(..),
                       OutPoint(..), TxIn(..), TxOut(..), Tx(..), BlockHeader(..),
                       Block(..), putVarInt, putVarBytes)
 import Haskoin.Crypto (doubleSHA256, sha256, computeTxId, computeBlockHash,
-                       initGlobalSigCache, lookupGlobalSigCache, insertGlobalSigCache)
+                       initGlobalSigCache, lookupGlobalSigCache, insertGlobalSigCache,
+                       PrecomputedTxData, precomputeTxData)
 import Haskoin.Script (decodeScript, countScriptSigops, countSigopsBytes,
                        ScriptVerifyFlag(..), ScriptFlags, flagSet,
-                       verifyScriptWithFlags, isPushOnly, classifyOutput,
+                       verifyScriptWithTxData,
+                       isPushOnly, classifyOutput,
                        isWitnessProgram, ScriptType(..), Script(..), ScriptOp(..))
 import Haskoin.Storage (HaskoinDB, WriteBatch(..), BatchOp(..), writeBatch,
                         makeKey, KeyPrefix(..), prefixByte, toBE32, TxLocation(..),
@@ -3971,6 +3973,11 @@ data ScriptCheckItem = ScriptCheckItem
   , sciPrevValue    :: !Word64       -- ^ prevout amount
   , sciSpentAmounts :: ![Word64]     -- ^ BIP-341 sha_amounts (this tx, in order)
   , sciSpentScripts :: ![ByteString] -- ^ BIP-341 sha_scriptpubkeys (this tx, in order)
+  , sciTxData       :: PrecomputedTxData
+    -- ^ The tx's sighash midstate, ONE value shared by every item of the
+    -- same tx (Core: @CScriptCheck@'s @txdata@ pointer), built from
+    -- 'sciTx' / 'sciSpentAmounts' / 'sciSpentScripts' by 'precomputeTxData'.
+    -- Lazy, so building an item hashes nothing.
   }
 
 -- | Verify a single 'ScriptCheckItem', returning @Nothing@ on success or
@@ -3978,8 +3985,8 @@ data ScriptCheckItem = ScriptCheckItem
 -- serial loop in 'validateSingleTx'.
 verifyScriptCheckItem :: ScriptFlags -> ScriptCheckItem -> Maybe String
 verifyScriptCheckItem scriptFlags ScriptCheckItem{..} =
-  case verifyScriptWithFlags scriptFlags sciTx sciInputIdx
-         sciPrevScript sciPrevValue sciSpentAmounts sciSpentScripts of
+  case verifyScriptWithTxData scriptFlags sciTxData sciInputIdx
+         sciPrevScript sciPrevValue of
     Left err    -> Just $ "script verify failed (input " ++ show sciInputIdx
                         ++ "): " ++ err
     Right False -> Just $ "script verify failed (input " ++ show sciInputIdx
@@ -4745,8 +4752,12 @@ validateSingleTxCollect flags utxoMap tx = do
   -- this-tx spentScripts).  The witness is read inside 'verifyScriptWithFlags'
   -- from @txWitness tx !! idx@, so no witness field is needed here (the old
   -- loop's @_witStack@ was already unused).
+  -- One sighash midstate per tx, shared by all of its items, so the
+  -- whole-tx digests are hashed once per tx and not once per signature
+  -- (Core: PrecomputedTransactionData, validation.cpp CheckInputScripts).
   let spentAmounts = inputValues
       spentScripts = map txOutScript prevOuts
+      txData = precomputeTxData tx spentAmounts spentScripts
       txChecks =
         [ ScriptCheckItem
             { sciTx           = tx
@@ -4755,6 +4766,7 @@ validateSingleTxCollect flags utxoMap tx = do
             , sciPrevValue    = txOutValue prevOut
             , sciSpentAmounts = spentAmounts
             , sciSpentScripts = spentScripts
+            , sciTxData       = txData
             }
         | (idx, prevOut) <- zip [0..] prevOuts
         ]

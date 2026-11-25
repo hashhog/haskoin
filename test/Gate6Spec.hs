@@ -45,7 +45,7 @@ import System.Timeout (timeout)
 import Test.Hspec
 
 import Haskoin.Types
-import Haskoin.Crypto (computeBlockHash, computeTxId)
+import Haskoin.Crypto (computeBlockHash, computeTxId, precomputeTxData)
 import Haskoin.Consensus
 import Haskoin.Script (emptyFlags)
 import Haskoin.Network (HardStallView (..), hardStallFires)
@@ -84,7 +84,8 @@ itemsOf spks =
              [TxOut 900 opTrue] (replicate n []) 7
   in [ ScriptCheckItem
          { sciTx = tx, sciInputIdx = i, sciPrevScript = spk, sciPrevValue = 100_000
-         , sciSpentAmounts = replicate n 100_000, sciSpentScripts = spks }
+         , sciSpentAmounts = replicate n 100_000, sciSpentScripts = spks
+         , sciTxData = precomputeTxData tx (replicate n 100_000) spks }
      | (i, spk) <- zip [0 ..] spks ]
 
 resetHooks :: IO ()
