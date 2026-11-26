@@ -1553,14 +1553,17 @@ execOp op env
       OP_NOP1 -> incOpCount env >>= checkDiscourageNop
       OP_CHECKLOCKTIMEVERIFY -> do
         env' <- incOpCount env
+        -- Not enabled: "treat as a NOP2" (Core EvalScript breaks out
+        -- without consulting DISCOURAGE_UPGRADABLE_NOPS).
         if hasFlag (seFlags env') VerifyCheckLockTimeVerify
           then execCheckLockTimeVerify env'
-          else checkDiscourageNop env'
+          else Right env'
       OP_CHECKSEQUENCEVERIFY -> do
         env' <- incOpCount env
+        -- Not enabled: "treat as a NOP3", as above.
         if hasFlag (seFlags env') VerifyCheckSequenceVerify
           then execCheckSequenceVerify env'
-          else checkDiscourageNop env'
+          else Right env'
       OP_NOP4 -> incOpCount env >>= checkDiscourageNop
       OP_NOP5 -> incOpCount env >>= checkDiscourageNop
       OP_NOP6 -> incOpCount env >>= checkDiscourageNop
@@ -2252,10 +2255,15 @@ execCheckSigAdd env = do
   success <- if BS.null sigBytes
     then
       -- Empty pubkey is still an error in tapscript even if sig is empty
-      -- (matches OP_CHECKSIG's TAPSCRIPT_EMPTY_PUBKEY rule).
+      -- (matches OP_CHECKSIG's TAPSCRIPT_EMPTY_PUBKEY rule), and so is an
+      -- unknown pubkey type under DISCOURAGE_UPGRADABLE_PUBKEYTYPE:
+      -- EvalChecksigTapscript tests the pubkey size whatever the signature.
       if BS.null pubkeyBytes
         then Left "TAPSCRIPT_EMPTY_PUBKEY"
-        else Right False
+        else if BS.length pubkeyBytes /= 32
+                && hasFlag (seFlags env3w) VerifyDiscourageUpgradablePubkeyType
+          then Left "Tapscript unknown pubkey type (DISCOURAGE_UPGRADABLE_PUBKEYTYPE)"
+          else Right False
     else
       -- Non-empty signature: verify per tapscript rules.
       if BS.null pubkeyBytes
@@ -2922,12 +2930,17 @@ verifyScriptWithTxData flags td idx prevScriptPubKey amount = do
                         else if progLen == 32
                           then verifyP2WSHTxData flags td idx (Hash256 prog) amount
                           else Left "Witness program wrong length"
-                    1 | BS.length prog == 32 && hasFlag flags VerifyTaproot && not isP2SHWrapped ->
+                    1 | BS.length prog == 32 && not isP2SHWrapped ->
                       -- BIP-341: Taproot witness v1, native only.
                       -- Core interpreter.cpp:1947 gates with !is_p2sh; a P2SH-wrapped
                       -- v1+32 program falls through to the unknown-version arm below
                       -- (forward-softfork anyone-can-spend), matching Core's else at :1992.
-                      verifyTaprootTxData flags td idx prog witness amount
+                      -- Without TAPROOT, Core returns success here, before the
+                      -- DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM test of that else arm:
+                      --   if (!(flags & SCRIPT_VERIFY_TAPROOT)) return set_success(serror);
+                      if hasFlag flags VerifyTaproot
+                        then verifyTaprootTxData flags td idx prog witness amount
+                        else Right True
                     _ -> do
                       -- Unknown witness version
                       when (hasFlag flags VerifyDiscourageUpgradableWitnessProgram) $
@@ -3009,6 +3022,16 @@ verifyP2WPKHTxData flags td idx expectedHash amount = do
 
   unless (length witness == 2) $
     Left "P2WPKH witness must have exactly 2 items"
+
+  -- ExecuteWitnessScript disallows any initial witness stack item over
+  -- MAX_SCRIPT_ELEMENT_SIZE for P2WPKH exactly as for P2WSH, before the
+  -- implicit P2PKH script runs (interpreter.cpp):
+  --   for (const valtype& elem : stack)
+  --     if (elem.size() > MAX_SCRIPT_ELEMENT_SIZE) -> SCRIPT_ERR_PUSH_SIZE
+  -- Without DERSIG a lax-DER signature padded past 520 bytes still
+  -- verifies, so the missing check let such a spend through.
+  when (any (\elem' -> BS.length elem' > tapMaxScriptElementSize) witness) $
+    Left "Witness stack item exceeds 520 bytes (PUSH_SIZE)"
 
   -- witness is [signature, pubkey]
   let pubkeyBytes = witness !! 1

@@ -814,35 +814,29 @@ isDefinedSigHashType b =
 
 -- | Check if a DER signature has low S value (BIP-62 LOW_S rule).
 -- The input is the full signature WITH the sighash type byte appended.
--- S must be <= order/2 where order is the secp256k1 curve order.
 -- This assumes the signature already passed isValidDERSignature.
+--
+-- Core's CPubKey::CheckLowS parses with ecdsa_signature_parse_der_lax,
+-- which replaces the whole signature by (0, 0) when R or S is >= the curve
+-- order n (the compact parse overflows), and then asks
+-- secp256k1_ecdsa_signature_normalize whether S > n/2.  So S must be
+-- <= n/2, OR either value must be >= n: such a signature is "low" (and
+-- then fails verification, which NULLFAIL turns into an error).
 isLowDERSignature :: ByteString -> Bool
 isLowDERSignature sig
   | BS.length sig < 9 = False
   | otherwise =
     let rLen = fromIntegral (BS.index sig 3) :: Int
+        rBytes = BS.take rLen (BS.drop 4 sig)
         sMarkerPos = 4 + rLen
         sLen = fromIntegral (BS.index sig (sMarkerPos + 1)) :: Int
         sBytes = BS.take sLen (BS.drop (sMarkerPos + 2) sig)
-        -- secp256k1 half-order (order / 2):
-        -- order = FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-        -- order/2 = 7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
-        halfOrder = BS.pack [0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                             0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
-                             0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0]
-    in compareBigEndian sBytes halfOrder /= GT
-  where
-    -- Compare two big-endian byte strings as unsigned integers
-    compareBigEndian :: ByteString -> ByteString -> Ordering
-    compareBigEndian a b =
-      let la = BS.length a
-          lb = BS.length b
-          -- Pad shorter value with leading zeros
-          (a', b') = if la > lb
-                     then (a, BS.replicate (la - lb) 0 <> b)
-                     else (BS.replicate (lb - la) 0 <> a, b)
-      in compare a' b'
+        toInteger' = BS.foldl' (\acc b -> acc * 256 + fromIntegral b) (0 :: Integer)
+        -- secp256k1 curve order n.
+        order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141 :: Integer
+        r = toInteger' rBytes
+        s = toInteger' sBytes
+    in r >= order || s >= order || s <= order `div` 2
 
 --------------------------------------------------------------------------------
 -- Recoverable / Message Signing (signmessage / verifymessage, BIP-137 era)
