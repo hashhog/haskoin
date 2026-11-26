@@ -5373,7 +5373,7 @@ main = hspec $ do
       genesisTip <- getChainTip hc
       let genesisHash = ceHash genesisTip
           gts = bhTimestamp (ceHeader genesisTip)
-          h1 = mineRegtestHeader (BlockHeader 1 genesisHash
+          h1 = mineRegtestHeader (BlockHeader 4 genesisHash
                  (Hash256 (BS.replicate 32 0xa1)) (gts + 600) 0x207fffff 0)
       r1 <- addHeaderAt regtest hc h1 True Nothing
       e1 <- case r1 of
@@ -5387,7 +5387,7 @@ main = hspec $ do
         writeTVar (hcTip hc) genesisTip
         writeTVar (hcHeight hc) 0
       -- h2 extends the FAILED h1 with more cumulative work than genesis.
-      let h2 = mineRegtestHeader (BlockHeader 1 (ceHash e1)
+      let h2 = mineRegtestHeader (BlockHeader 4 (ceHash e1)
                  (Hash256 (BS.replicate 32 0xa2)) (gts + 1200) 0x207fffff 0)
       r2 <- addHeaderAt regtest hc h2 True Nothing
       -- Rejected bad-prevblk, not stored, and the tip stays on genesis.
@@ -5411,7 +5411,7 @@ main = hspec $ do
       let genesisHash = ceHash genesisTip
           gts = bhTimestamp (ceHeader genesisTip)
           mineOn prevHash marker ts = mineRegtestHeader
-            (BlockHeader 1 prevHash (Hash256 (BS.replicate 32 marker)) ts 0x207fffff 0)
+            (BlockHeader 4 prevHash (Hash256 (BS.replicate 32 marker)) ts 0x207fffff 0)
           extend prev 0 _ = pure prev
           extend prev n marker = do
             r <- addHeaderAt regtest hc
@@ -5461,7 +5461,7 @@ main = hspec $ do
       let genesisHash = ceHash genesisTip
           gts = bhTimestamp (ceHeader genesisTip)
           mineOn prevHash marker ts = mineRegtestHeader
-            (BlockHeader 1 prevHash (Hash256 (BS.replicate 32 marker)) ts 0x207fffff 0)
+            (BlockHeader 4 prevHash (Hash256 (BS.replicate 32 marker)) ts 0x207fffff 0)
           extend prev 0 _ = pure prev
           extend prev n marker = do
             r <- addHeaderAt regtest hc
@@ -5520,7 +5520,7 @@ main = hspec $ do
             [ base { bhNonce = n } | n <- [0..] ]
 
           -- A1: extends genesis (active chain).
-          a1Base = BlockHeader 1 genesisHash
+          a1Base = BlockHeader 4 genesisHash
                                 (Hash256 (BS.replicate 32 0x11))
                                 1700000000 0x207fffff 0
           a1 = mineH a1Base
@@ -5535,7 +5535,7 @@ main = hspec $ do
       -- overwrite hcByHeight[1] = b1Hash, clobbering the active-chain
       -- pointer at height 1.  Post-fix, hcByHeight[1] stays = a1Hash
       -- because B1's work is not strictly greater than A1's (tie).
-      let b1Base = BlockHeader 1 genesisHash
+      let b1Base = BlockHeader 4 genesisHash
                                 (Hash256 (BS.replicate 32 0x22))
                                 1700000600 0x207fffff 0
           b1 = mineH b1Base
@@ -5562,7 +5562,7 @@ main = hspec $ do
             [ base { bhNonce = n } | n <- [0..] ]
 
           -- Active chain: A1 extends genesis.
-          a1Base = BlockHeader 1 genesisHash
+          a1Base = BlockHeader 4 genesisHash
                                 (Hash256 (BS.replicate 32 0x33))
                                 1700000000 0x207fffff 0
           a1 = mineH a1Base
@@ -5572,7 +5572,7 @@ main = hspec $ do
       -- B1 (side-branch sibling of A1) inserted via the side-branch
       -- helper.  Mirrors nimrod's putBlockIndexHashOnly: hash entry
       -- is stored, but hcByHeight is not touched.
-      let b1Base = BlockHeader 1 genesisHash
+      let b1Base = BlockHeader 4 genesisHash
                                 (Hash256 (BS.replicate 32 0x44))
                                 1700000600 0x207fffff 0
           b1 = mineH b1Base
@@ -5991,7 +5991,7 @@ main = hspec $ do
             -- Mine a child header with valid PoW (regtest 0x207fffff is easy)
             -- Try nonces until we find one whose hash satisfies PoW
             baseHdr = BlockHeader
-              { bhVersion = 1
+              { bhVersion = 4
               , bhPrevBlock = genesisHash
               , bhMerkleRoot = Hash256 (BS.replicate 32 0x11)
               , bhTimestamp = 1296689202  -- genesis + 600 seconds
@@ -11008,7 +11008,7 @@ main = hspec $ do
       now <- (round <$> getPOSIXTime) :: IO Word32
       let okAhead = now + 7200  -- exactly the boundary
           okHdr = mineRegtestHeader $
-            BlockHeader 1 genesisHash
+            BlockHeader 4 genesisHash
                         (Hash256 (BS.replicate 32 0x66))
                         okAhead 0x207fffff 0
       result <- addHeader regtest hc okHdr True
@@ -11134,7 +11134,7 @@ main = hspec $ do
           genesisHash = computeBlockHash genesisHdr
           genesisMtp  = bhTimestamp genesisHdr
           okHdr = mineRegtestHeader $
-            BlockHeader 1 genesisHash
+            BlockHeader 4 genesisHash
                         (Hash256 (BS.replicate 32 0x02))
                         (genesisMtp + 1)  -- timestamp = MTP + 1 => accepted
                         0x207fffff 0
@@ -11189,7 +11189,7 @@ main = hspec $ do
           genesisTs   = bhTimestamp genesisHdr
           -- Build block 1 with timestamp = genesisTs + 100.
           hdr1 = mineRegtestHeader $
-            BlockHeader 1 genesisHash
+            BlockHeader 4 genesisHash
                         (Hash256 (BS.replicate 32 0x10))
                         (genesisTs + 100) 0x207fffff 0
       result1 <- addHeader regtest hc hdr1 True
@@ -11266,7 +11266,7 @@ main = hspec $ do
       -- Add block 1 (height=1, not at retarget boundary).
       hc <- initHeaderChain bip94net
       let hdr1 = mineRegtestHeader $
-                   BlockHeader 1 genesisHash
+                   BlockHeader 4 genesisHash
                                (Hash256 (BS.replicate 32 0x20))
                                (genesisTs + 1000) 0x207fffff 0
       r1 <- addHeader bip94net hc hdr1 True
@@ -11339,7 +11339,7 @@ main = hspec $ do
       -- Build blocks 1..4 sequentially with modest timestamps.
       -- Block 4 has a very large ts (attacker inflates prev ts before retarget boundary).
       let mkH n parent ts = mineRegtestHeader $
-                BlockHeader 1 parent (Hash256 (BS.replicate 31 0x00 <> BS.singleton n))
+                BlockHeader 4 parent (Hash256 (BS.replicate 31 0x00 <> BS.singleton n))
                             ts 0x207fffff 0
           hdr1 = mkH 1 g2Hash (g2Ts + 100)
           hdr2 = mkH 2 (computeBlockHash hdr1) (g2Ts + 200)
@@ -11365,7 +11365,7 @@ main = hspec $ do
           -- Choose ts5 = g2Ts + 500 (satisfies MTP > 200 but violates timewarp < 9400).
           timewarpTs = g2Ts + 500  -- > MTP(block4)=g2Ts+200, but < prevTs-600=g2Ts+9400 => timewarp!
           badHdr5 = mineRegtestHeader $
-            BlockHeader 1 prevHash5
+            BlockHeader 4 prevHash5
                         (Hash256 (BS.replicate 32 0x22))
                         timewarpTs 0x207fffff 0
       result5 <- addHeader bip94net2 hc2 badHdr5 True
@@ -11387,7 +11387,7 @@ main = hspec $ do
           g3Ts   = bhTimestamp g3Hdr
       hc3 <- initHeaderChain bip94net3
       let mkH' n parent ts = mineRegtestHeader $
-                BlockHeader 1 parent (Hash256 (BS.replicate 31 0x00 <> BS.singleton n))
+                BlockHeader 4 parent (Hash256 (BS.replicate 31 0x00 <> BS.singleton n))
                             ts 0x207fffff 0
           hdr3_1 = mkH' 11 g3Hash (g3Ts + 100)
           hdr3_2 = mkH' 12 (computeBlockHash hdr3_1) (g3Ts + 200)
@@ -11406,7 +11406,7 @@ main = hspec $ do
           -- Use g3Ts + 9400 (exactly at boundary — must be >= to pass).
           okTs = g3Ts + 9400
           okHdr5 = mineRegtestHeader $
-            BlockHeader 1 prevHash3_5
+            BlockHeader 4 prevHash3_5
                         (Hash256 (BS.replicate 32 0x32))
                         okTs 0x207fffff 0
       result5 <- addHeader bip94net3 hc3 okHdr5 True
@@ -20621,7 +20621,9 @@ main = hspec $ do
                 cbTx = Tx 1
                   [ TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0))) 0xFFFFFFFF)
                           "" 0xFFFFFFFF ]
-                  [ TxOut 5_000_000_000 "cb"
+                  -- 12.5 BTC: the regtest subsidy at height 400 (halvings
+                  -- every 150 blocks, Core GetBlockSubsidy).
+                  [ TxOut 1_250_000_000 "cb"
                   , TxOut 0 coinbaseOpReturn ]
                   [] 0
                 hdr = BlockHeader 1 prev (Hash256 (BS.replicate 32 0))
@@ -22799,13 +22801,13 @@ main = hspec $ do
       hc <- initHeaderChain regtest
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
-          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          hdr1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 0x01))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
-          hdr2 = mineRegtestHeader $ BlockHeader 1 (computeBlockHash hdr1)
+          hdr2 = mineRegtestHeader $ BlockHeader 4 (computeBlockHash hdr1)
                    (Hash256 (BS.replicate 32 0x04))
                    (bhTimestamp genesisHdr + 1200) 0x207fffff 0
-          sibling1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          sibling1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 0x05))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       Right e1 <- addHeader regtest hc hdr1 True
@@ -22826,7 +22828,7 @@ main = hspec $ do
       hc <- initHeaderChain highWorkNet
       let genesisHdr = blockHeader (netGenesisBlock highWorkNet)
           genesisHsh = computeBlockHash genesisHdr
-          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          hdr1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 0x01))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       r <- addHeader highWorkNet hc hdr1 False
@@ -22843,7 +22845,7 @@ main = hspec $ do
       hc <- initHeaderChain highWorkNet
       let genesisHdr = blockHeader (netGenesisBlock highWorkNet)
           genesisHsh = computeBlockHash genesisHdr
-          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          hdr1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 0x02))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       r <- addHeader highWorkNet hc hdr1 True
@@ -22858,7 +22860,7 @@ main = hspec $ do
       hc <- initHeaderChain regtest
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
-          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          hdr1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 0x03))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       r <- addHeader regtest hc hdr1 False
@@ -22875,7 +22877,7 @@ main = hspec $ do
       hc <- initHeaderChain regtest
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
-          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          hdr1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 1))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       r <- addHeader regtest hc hdr1 True
@@ -22892,7 +22894,7 @@ main = hspec $ do
       hc <- initHeaderChain regtest
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
-          hdr1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          hdr1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                    (Hash256 (BS.replicate 32 2))
                    (bhTimestamp genesisHdr + 600) 0x207fffff 0
       r <- addHeader regtest hc hdr1 True
@@ -22959,15 +22961,15 @@ main = hspec $ do
         startHeaderSync regtest hc
       let genesisHdr = blockHeader (netGenesisBlock regtest)
           genesisHsh = computeBlockHash genesisHdr
-          h1 = mineRegtestHeader $ BlockHeader 1 genesisHsh
+          h1 = mineRegtestHeader $ BlockHeader 4 genesisHsh
                  (Hash256 (BS.replicate 32 3))
                  (bhTimestamp genesisHdr + 600) 0x207fffff 0
           h1hash = computeBlockHash h1
           -- broken middle header: bad bits on regtest.
-          h2 = BlockHeader 1 h1hash
+          h2 = BlockHeader 4 h1hash
                  (Hash256 (BS.replicate 32 4))
                  (bhTimestamp genesisHdr + 1200) 0x1d00ffff 0
-          h3 = mineRegtestHeader $ BlockHeader 1 h1hash
+          h3 = mineRegtestHeader $ BlockHeader 4 h1hash
                  (Hash256 (BS.replicate 32 5))
                  (bhTimestamp genesisHdr + 1800) 0x207fffff 0
       (succ_, _errs) <- handleHeaders hs [h1, h2, h3]

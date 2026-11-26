@@ -73,7 +73,7 @@ mkChain salt prev0 tStart n = go prev0 1
       let root = Hash256 (BS.pack ([fromIntegral salt, fromIntegral (salt `div` 256)]
                                    ++ replicate 26 0
                                    ++ le32 (fromIntegral i)))
-          base nonce = BlockHeader 1 prev root (tStart + fromIntegral i * 600) 0x207fffff nonce
+          base nonce = BlockHeader 4 prev root (tStart + fromIntegral i * 600) 0x207fffff nonce
           h = head [ base k | k <- [0 ..], checkProofOfWork (base k) (netPowLimit regtest) ]
       in h : go (computeBlockHash h) (i + 1)
     le32 :: Word32 -> [Word8]

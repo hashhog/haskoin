@@ -74,7 +74,7 @@ import qualified Data.Serialize as S
 
 import Haskoin.Types
 import Haskoin.Crypto (doubleSHA256, computeTxId, computeBlockHash)
-import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, blockReward,
+import Haskoin.Consensus (Network(..), validateFullBlock, validateFullBlockIO, blockRewardForNet,
                            validateBlockGuarded, validateFullBlockFresh,
                            maxBlockWeight, maxBlockSigops, maxBlockSigOpsCost,
                            witnessScaleFactor,
@@ -292,7 +292,9 @@ createBlockTemplate net hc mp cache coinbaseScript extraNonce = do
 
   -- Calculate total fees from selected transactions
   let totalFees = sum $ map meFee finalEntries
-      reward = blockReward height
+      -- GetBlockSubsidy halves on the network's nSubsidyHalvingInterval
+      -- (150 on regtest), not the mainnet 210000 constant.
+      reward = blockRewardForNet net height
       coinbaseValue = reward + totalFees
 
   -- Calculate witness commitment
@@ -1917,7 +1919,7 @@ applyBlockToCache cache net block height = do
     Right _ -> do
       -- W93 Gate G6: bad-cb-amount (Core 2611-2614).
       totalFees <- readIORef feesRef
-      let maxCoinbase = blockReward height + totalFees
+      let maxCoinbase = blockRewardForNet net height + totalFees
           cbValueOut  = sum (map txOutValue (txOutputs (head txns)))
       if cbValueOut > maxCoinbase
         then return $ Left $
