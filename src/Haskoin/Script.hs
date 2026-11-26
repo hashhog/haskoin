@@ -29,6 +29,7 @@ module Haskoin.Script
   , evalScriptWithFlags
   , verifyScript
   , verifyScriptWithFlags
+  , verifyScriptWithTxData
   , verifySegWitScript
   , verifySegWitScriptWithFlags
     -- * Standard Scripts
@@ -1317,7 +1318,21 @@ data ScriptEnv = ScriptEnv
     -- legacy / SegWit-v0 contexts where the budget is not initialized.
   , seValidationWeightLeft :: !Int
   , seValidationWeightInit :: !Bool
+    -- The transaction's shared sighash midstate (Core's
+    -- PrecomputedTransactionData), set by 'verifyScriptWithTxData' so every
+    -- input of one transaction hashes its prevouts / amounts / scripts /
+    -- sequences / outputs once. 'Nothing' (an env built directly, as the
+    -- opcode unit tests do) falls back to a per-signature record built from
+    -- 'seTx' / 'seSpentAmounts' / 'seSpentScripts': see 'envTxData'.
+  , seTxData :: !(Maybe PrecomputedTxData)
   } deriving (Show)
+
+-- | The sighash midstate for this env's transaction: the shared one when
+-- verification set it, otherwise a fresh one from the env's own fields.
+envTxData :: ScriptEnv -> PrecomputedTxData
+envTxData env = case seTxData env of
+  Just td -> td
+  Nothing -> precomputeTxData (seTx env) (seSpentAmounts env) (seSpentScripts env)
 
 -- | Initialize script environment
 initScriptEnv :: Tx -> Int -> Word64 -> ByteString -> ScriptEnv
@@ -1346,6 +1361,7 @@ initScriptEnvWithFlags tx idx amount scriptCode flags = ScriptEnv
   , seTaprootAnnex = Nothing
   , seValidationWeightLeft = 0
   , seValidationWeightInit = False
+  , seTxData = Nothing
   }
 
 -- | Result of script evaluation
@@ -2048,16 +2064,15 @@ verifyTapscriptSchnorr env sigBytesRaw pubkey32 = do
   tlh <- case seTapleafHash env of
     Just h -> Right h
     Nothing -> Left "Tapscript checksig: tapleaf_hash missing in env"
-  let prevouts = TS.TaprootPrevouts (seSpentAmounts env) (seSpentScripts env)
-  when (length (seSpentAmounts env) /= length (txInputs (seTx env)) ||
-        length (seSpentScripts env) /= length (txInputs (seTx env))) $
+  let td = envTxData env
+  unless (ptdSpentReady td) $
     Left "Tapscript checksig: per-input prevouts missing in env"
   let sp = TS.TapscriptContext
              { TS.tapleafHash = tlh
              , TS.codesepPos = seCodeSepOpPos env  -- BIP-341: commit opcode INDEX, not byte position
              }
-  sighash <- case TS.computeTaprootSighash (seTx env) (seInputIdx env)
-                    prevouts ht (seTaprootAnnex env) (Just sp) of
+  sighash <- case TS.computeTaprootSighashTxData td (seInputIdx env)
+                    ht (seTaprootAnnex env) (Just sp) of
     Right h -> Right h
     Left  e -> Left ("Tapscript sighash: " ++ show e)
   -- W159 BUG-17 / W160 BUG-16 FIX: use process-global SigCache keyed on
@@ -2153,7 +2168,7 @@ execCheckSigLegacy env'' pubkeyBytes sigBytes = do
       -- collapse e.g. byte 0x04 to 0x01 and produce the wrong hash.
       let sigHashW32 = fromIntegral sigHashByte :: Word32
           _sighash = if seIsWitness env''
-                    then txSigHashSegWit (seTx env'') (seInputIdx env'')
+                    then txSigHashSegWitTxData (envTxData env'') (seInputIdx env'')
                                          scriptCode (seAmount env'') sigHashW32 sigHashType
                     else txSigHash (seTx env'') (seInputIdx env'') scriptCode sigHashW32 sigHashType
 
@@ -2449,7 +2464,7 @@ execCheckMultiSig env = do
                              -- Pass raw sigHashW32 (not re-canonicalized shType) for the
                              -- BIP-143 preimage; mirrors Core interpreter.cpp:1675.
                              sighash = if seIsWitness env5
-                                       then txSigHashSegWit (seTx env5) (seInputIdx env5)
+                                       then txSigHashSegWitTxData (envTxData env5) (seInputIdx env5)
                                                              baseScriptCode (seAmount env5) sigHashW32 sigHashType
                                        else txSigHash (seTx env5) (seInputIdx env5) baseScriptCode sigHashW32 sigHashType
                          in case parsePubKey pk of
@@ -2794,15 +2809,33 @@ verifyScript tx idx prevScriptPubKey amount =
 -- whole transaction (one entry per 'txInputs' element). Required by
 -- BIP-341's @sha_amounts@ and @sha_scriptpubkeys@ for Taproot inputs;
 -- ignored for legacy / SegWit-v0. Empty lists fail Taproot inputs closed.
+--
+-- Builds a midstate for this one input. To verify several inputs of one
+-- transaction, build one 'precomputeTxData' and call
+-- 'verifyScriptWithTxData' for each, as block connect and the mempool do.
 verifyScriptWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> Word64
                       -> [Word64] -> [ByteString] -> Either String Bool
-verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScripts = do
-  let scriptSigBytes = txInScript (txInputs tx !! idx)
+verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScripts =
+  verifyScriptWithTxData flags (precomputeTxData tx spentAmounts spentScripts)
+    idx prevScriptPubKey amount
+
+-- | Verify input @idx@ of the midstate's transaction ('ptdTx'), sharing the
+-- transaction's sighash digests with every other input verified through
+-- the same 'PrecomputedTxData' (Core: @CScriptCheck@ holding a pointer to
+-- the tx's @PrecomputedTransactionData@). The spent amounts / scripts are
+-- the midstate's own. Same verdicts and error strings as
+-- 'verifyScriptWithFlags'.
+verifyScriptWithTxData :: ScriptFlags -> PrecomputedTxData -> Int -> ByteString -> Word64
+                       -> Either String Bool
+verifyScriptWithTxData flags td idx prevScriptPubKey amount = do
+  let tx = ptdTx td
+      scriptSigBytes = txInScript (txInputs tx !! idx)
 
   scriptSig <- decodeScript scriptSigBytes
   scriptPubKey <- decodeScript prevScriptPubKey
 
-  let env = initScriptEnvWithFlags tx idx amount prevScriptPubKey flags
+  let env = (initScriptEnvWithFlags tx idx amount prevScriptPubKey flags)
+              { seTxData = Just td }
 
   -- SIGPUSHONLY: When flag is set, scriptSig must be push-only
   when (hasFlag flags VerifySigPushOnly && not (isPushOnly scriptSig)) $
@@ -2885,16 +2918,16 @@ verifyScriptWithFlags flags tx idx prevScriptPubKey amount spentAmounts spentScr
                     0 -> do
                       let progLen = BS.length prog
                       if progLen == 20
-                        then verifyP2WPKHWithFlags flags tx idx (Hash160 prog) amount
+                        then verifyP2WPKHTxData flags td idx (Hash160 prog) amount
                         else if progLen == 32
-                          then verifyP2WSHWithFlags flags tx idx (Hash256 prog) amount
+                          then verifyP2WSHTxData flags td idx (Hash256 prog) amount
                           else Left "Witness program wrong length"
                     1 | BS.length prog == 32 && hasFlag flags VerifyTaproot && not isP2SHWrapped ->
                       -- BIP-341: Taproot witness v1, native only.
                       -- Core interpreter.cpp:1947 gates with !is_p2sh; a P2SH-wrapped
                       -- v1+32 program falls through to the unknown-version arm below
                       -- (forward-softfork anyone-can-spend), matching Core's else at :1992.
-                      verifyTaprootWithFlags flags tx idx prog witness amount spentAmounts spentScripts
+                      verifyTaprootTxData flags td idx prog witness amount
                     _ -> do
                       -- Unknown witness version
                       when (hasFlag flags VerifyDiscourageUpgradableWitnessProgram) $
@@ -2964,7 +2997,12 @@ verifyP2WPKH = verifyP2WPKHWithFlags emptyFlags
 
 -- | Verify P2WPKH witness with verification flags
 verifyP2WPKHWithFlags :: ScriptFlags -> Tx -> Int -> Hash160 -> Word64 -> Either String Bool
-verifyP2WPKHWithFlags flags tx idx expectedHash amount = do
+verifyP2WPKHWithFlags flags tx = verifyP2WPKHTxData flags (precomputeTxData tx [] [])
+
+-- | 'verifyP2WPKHWithFlags' over the transaction's shared midstate.
+verifyP2WPKHTxData :: ScriptFlags -> PrecomputedTxData -> Int -> Hash160 -> Word64 -> Either String Bool
+verifyP2WPKHTxData flags td idx expectedHash amount = do
+  let tx = ptdTx td
   let witness = if idx < length (txWitness tx)
                 then txWitness tx !! idx
                 else []
@@ -2991,6 +3029,7 @@ verifyP2WPKHWithFlags flags tx idx expectedHash amount = do
       env = (initScriptEnvWithFlags tx idx amount implicitScript flags)
             { seIsWitness = True
             , seScriptCode = implicitScript
+            , seTxData = Just td
             }
 
   -- KNOWN PITFALL: Reverse witness stack (wire order is bottom-to-top)
@@ -3016,7 +3055,12 @@ verifyP2WSH = verifyP2WSHWithFlags emptyFlags
 
 -- | Verify P2WSH witness with verification flags
 verifyP2WSHWithFlags :: ScriptFlags -> Tx -> Int -> Hash256 -> Word64 -> Either String Bool
-verifyP2WSHWithFlags flags tx idx expectedHash amount = do
+verifyP2WSHWithFlags flags tx = verifyP2WSHTxData flags (precomputeTxData tx [] [])
+
+-- | 'verifyP2WSHWithFlags' over the transaction's shared midstate.
+verifyP2WSHTxData :: ScriptFlags -> PrecomputedTxData -> Int -> Hash256 -> Word64 -> Either String Bool
+verifyP2WSHTxData flags td idx expectedHash amount = do
+  let tx = ptdTx td
   let witness = if idx < length (txWitness tx)
                 then txWitness tx !! idx
                 else []
@@ -3051,6 +3095,7 @@ verifyP2WSHWithFlags flags tx idx expectedHash amount = do
   let env = (initScriptEnvWithFlags tx idx amount witnessScriptBytes flags)
             { seIsWitness = True
             , seScriptCode = witnessScriptBytes
+            , seTxData = Just td
             }
 
   -- KNOWN PITFALL: Reverse witness stack (wire order is bottom-to-top)
@@ -3120,7 +3165,17 @@ tapMaxStackSize = 1000
 -- Handles both key-path (single witness element = Schnorr sig) and
 -- script-path (witness stack + script + control block).
 verifyTaprootWithFlags :: ScriptFlags -> Tx -> Int -> ByteString -> [ByteString] -> Word64 -> [Word64] -> [ByteString] -> Either String Bool
-verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts spentScripts = do
+verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts spentScripts =
+  verifyTaprootTxData flags (precomputeTxData tx spentAmounts spentScripts)
+    idx outputKeyBytes witness amount
+
+-- | 'verifyTaprootWithFlags' over the transaction's shared midstate (the
+-- spent amounts / scripts are the midstate's own).
+verifyTaprootTxData :: ScriptFlags -> PrecomputedTxData -> Int -> ByteString -> [ByteString] -> Word64 -> Either String Bool
+verifyTaprootTxData flags td idx outputKeyBytes witness amount = do
+  let tx = ptdTx td
+      spentAmounts = ptdSpentAmounts td
+      spentScripts = ptdSpentScripts td
   when (null witness) $
     Left "Taproot witness empty"
 
@@ -3157,12 +3212,10 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
       unless (TS.isValidTaprootHashType hashType) $
         Left "Taproot key-path: invalid hash_type byte (BIP-341)"
       -- Need full prevouts; if the caller didn't supply them, fail closed.
-      when (length spentAmounts /= length (txInputs tx) ||
-            length spentScripts /= length (txInputs tx)) $
+      unless (ptdSpentReady td) $
         Left "Taproot: caller did not supply per-input prevouts"
       let _ = amount  -- subsumed by spentAmounts !! idx for Taproot
-      let prevouts = TS.TaprootPrevouts spentAmounts spentScripts
-      sighash <- case TS.computeTaprootSighash tx idx prevouts hashType annex Nothing of
+      sighash <- case TS.computeTaprootSighashTxData td idx hashType annex Nothing of
         Right h -> Right h
         Left e  -> Left ("Taproot sighash: " ++ show e)
       when (BS.length outputKeyBytes /= 32) $
@@ -3225,8 +3278,7 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
 
       -- Need full prevouts before we exec the tapscript so OP_CHECKSIG
       -- inside it can compute ext_flag=1 sighash.
-      when (length spentAmounts /= length (txInputs tx) ||
-            length spentScripts /= length (txInputs tx)) $
+      unless (ptdSpentReady td) $
         Left "Taproot script-path: caller did not supply per-input prevouts"
 
       -- Check leaf version: TAPROOT_LEAF_TAPSCRIPT (0xc0) = tapscript (BIP-342).
@@ -3280,6 +3332,7 @@ verifyTaprootWithFlags flags tx idx outputKeyBytes witness amount spentAmounts s
                         , seScriptCode = tapscriptBytes
                         , seSpentAmounts = spentAmounts
                         , seSpentScripts = spentScripts
+                        , seTxData = Just td
                         , seTapleafHash  = Just tapleafHashBytes
                         , seTaprootAnnex = annex
                         , seValidationWeightLeft = validationWeightLeft

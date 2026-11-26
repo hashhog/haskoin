@@ -205,7 +205,7 @@ import Control.DeepSeq (NFData)
 import Data.Serialize (encode)
 
 import Haskoin.Types
-import Haskoin.Crypto (computeTxId, computeWtxid)
+import Haskoin.Crypto (computeTxId, computeWtxid, precomputeTxData)
 import Haskoin.Consensus (HeaderChain(..), ChainEntry(..), getValidatedChainTip,
                            medianTimePast)
 import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
@@ -1871,11 +1871,13 @@ verifyAllScripts mp tx inputMap = do
           scriptFlags = consensusFlagsToScriptFlags cflags
           spentAmounts = map txOutValue prevs
           spentScripts = map txOutScript prevs
+          -- one sighash midstate for every input of this tx (Core:
+          -- PrecomputedTransactionData), not one per signature check
+          txData = precomputeTxData tx spentAmounts spentScripts
           indexed = zip [0..] prevs
       results <- forM indexed $ \(idx, prevOut) ->
-        case Script.verifyScriptWithFlags scriptFlags tx idx
-               (txOutScript prevOut) (txOutValue prevOut)
-               spentAmounts spentScripts of
+        case Script.verifyScriptWithTxData scriptFlags txData idx
+               (txOutScript prevOut) (txOutValue prevOut) of
           Left err -> return $ Left (ErrScriptVerificationFailed err)
           Right False -> return $ Left (ErrScriptVerificationFailed "Script returned false")
           Right True -> return $ Right ()
@@ -4048,11 +4050,13 @@ verifyAllScripts' mp tx inputMap = do
           scriptFlags = consensusFlagsToScriptFlags cflags
           spentAmounts = map txOutValue prevs
           spentScripts = map txOutScript prevs
+          -- one sighash midstate for every input of this tx (Core:
+          -- PrecomputedTransactionData), not one per signature check
+          txData = precomputeTxData tx spentAmounts spentScripts
           indexed = zip [0..] prevs
       results <- forM indexed $ \(idx, prevOut) ->
-        case Script.verifyScriptWithFlags scriptFlags tx idx
-               (txOutScript prevOut) (txOutValue prevOut)
-               spentAmounts spentScripts of
+        case Script.verifyScriptWithTxData scriptFlags txData idx
+               (txOutScript prevOut) (txOutValue prevOut) of
           Left err -> return $ Left err
           Right False -> return $ Left "Script returned false"
           Right True -> return $ Right ()

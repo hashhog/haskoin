@@ -35,6 +35,7 @@ import System.IO (hPutStrLn, stderr)
 import Test.Hspec
 
 import Haskoin.Consensus
+import Haskoin.Crypto (precomputeTxData)
 import Haskoin.Script (emptyFlags)
 import Haskoin.Types
 
@@ -99,6 +100,7 @@ jobsOfSpks uid spks = do
         , sciPrevValue = 100_000
         , sciSpentAmounts = amounts
         , sciSpentScripts = spks
+        , sciTxData = precomputeTxData tx amounts spks
         }
     | (i, spk) <- zip [0 ..] spks
     ]

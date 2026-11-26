@@ -25,6 +25,9 @@ module Haskoin.TaprootSighash
     -- * Sighash entry points
   , computeTaprootSighash
   , buildSigMsg
+    -- * Sighash with the per-transaction midstate
+  , computeTaprootSighashTxData
+  , buildSigMsgTxData
     -- * BIP-342 tapscript primitives
   , tapscriptLeafVersion
   , defaultCodesepPos
@@ -43,7 +46,10 @@ import Data.Serialize (runPut, putWord8, putWord32le, putInt32le,
 import Data.Word (Word8, Word32, Word64)
 import Data.Int (Int64)
 
-import Haskoin.Crypto (sha256, taggedHash)
+import Haskoin.Crypto (sha256, taggedHash, PrecomputedTxData, precomputeTxData,
+                       ptdTx, ptdSpentAmounts, ptdSpentScripts, ptdSpentReady,
+                       ptdPrevoutsSingle, ptdAmountsSingle, ptdScriptsSingle,
+                       ptdSequencesSingle, ptdOutputsSingle)
 import Haskoin.Types (Tx(..), TxIn(..), TxOut(..), OutPoint(..),
                       Hash256(..), TxId(..), putVarInt)
 
@@ -99,6 +105,11 @@ computeTaprootSighash tx idx prevouts ht annex sp = do
 --
 -- Exposed separately so callers (e.g. the BIP-341 vector validation
 -- shim) can compare against the test-vector @intermediary.sigMsg@.
+--
+-- Builds a fresh 'PrecomputedTxData' for this one call, so it re-hashes
+-- the whole transaction every time. Script verification shares one record
+-- per transaction through 'buildSigMsgTxData' instead; this wrapper is kept
+-- for the wallet signers, the shim and the vector suites.
 buildSigMsg
   :: Tx
   -> Int
@@ -107,10 +118,38 @@ buildSigMsg
   -> Maybe ByteString
   -> Maybe TapscriptContext
   -> Either TaprootSighashError ByteString
-buildSigMsg tx idx (TaprootPrevouts amounts scripts) ht annex sp
+buildSigMsg tx idx (TaprootPrevouts amounts scripts) =
+  buildSigMsgTxData (precomputeTxData tx amounts scripts) idx
+
+-- | 'computeTaprootSighash' over the transaction's shared midstate.
+computeTaprootSighashTxData
+  :: PrecomputedTxData
+  -> Int                         -- ^ input_index
+  -> Word8                       -- ^ hash_type
+  -> Maybe ByteString            -- ^ optional annex (with leading 0x50)
+  -> Maybe TapscriptContext      -- ^ Just _ for tapscript script-path
+  -> Either TaprootSighashError ByteString
+computeTaprootSighashTxData td idx ht annex sp = do
+  msg <- buildSigMsgTxData td idx ht annex sp
+  pure (taggedHash "TapSighash" msg)
+
+-- | 'buildSigMsg' over the transaction's shared 'PrecomputedTxData' (Core:
+-- @SignatureHashSchnorr@ reading @m_prevouts_single_hash@,
+-- @m_spent_amounts_single_hash@, @m_spent_scripts_single_hash@,
+-- @m_sequences_single_hash@ and @m_outputs_single_hash@). The transaction
+-- and the spent outputs are the record's own. Same checks in the same
+-- order, and the same bytes, as the per-call construction: only the source
+-- of the five whole-transaction digests changed.
+buildSigMsgTxData
+  :: PrecomputedTxData
+  -> Int
+  -> Word8
+  -> Maybe ByteString
+  -> Maybe TapscriptContext
+  -> Either TaprootSighashError ByteString
+buildSigMsgTxData td idx ht annex sp
   | idx < 0 || idx >= length (txInputs tx) = Left InputIndexOutOfRange
-  | length amounts /= length (txInputs tx) || length scripts /= length (txInputs tx) =
-      Left PrevoutsLengthMismatch
+  | not (ptdSpentReady td) = Left PrevoutsLengthMismatch
   | not (isValidTaprootHashType ht) = Left InvalidHashType
   | maybe False (\s -> BS.length (tapleafHash s) /= 32) sp =
       Left InvalidTapleafHashLength
@@ -129,6 +168,8 @@ buildSigMsg tx idx (TaprootPrevouts amounts scripts) ht annex sp
 
       let inputs = txInputs tx
           outputs = txOutputs tx
+          amounts = ptdSpentAmounts td
+          scripts = ptdSpentScripts td
 
       let preimage = runPut $ do
             -- 1. Epoch
@@ -141,17 +182,18 @@ buildSigMsg tx idx (TaprootPrevouts amounts scripts) ht annex sp
             putWord32le (txLockTime tx)
 
             -- 5-8. sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences
+            -- (once per transaction, shared by every input)
             if not anyoneCanPay
               then do
-                putByteString (sha256 (concatBS (map serPrevout inputs)))
-                putByteString (sha256 (concatBS (map encWord64le amounts)))
-                putByteString (sha256 (concatBS (map serVarBytes scripts)))
-                putByteString (sha256 (concatBS (map (encWord32le . txInSequence) inputs)))
+                putByteString (ptdPrevoutsSingle td)
+                putByteString (ptdAmountsSingle td)
+                putByteString (ptdScriptsSingle td)
+                putByteString (ptdSequencesSingle td)
               else pure ()
 
             -- 9. sha_outputs (skipped for SIGHASH_NONE/SINGLE)
             if outputType /= sighashNone && outputType /= sighashSingle
-              then putByteString (sha256 (concatBS (map serTxOut outputs)))
+              then putByteString (ptdOutputsSingle td)
               else pure ()
 
             -- 10. spend_type
@@ -187,19 +229,15 @@ buildSigMsg tx idx (TaprootPrevouts amounts scripts) ht annex sp
               Nothing -> pure ()
 
       Right preimage
+  where
+    tx = ptdTx td
 
 ------------------------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------------------------
 
-concatBS :: [ByteString] -> ByteString
-concatBS = BS.concat
-
 encWord32le :: Word32 -> ByteString
 encWord32le w = runPut (putWord32le w)
-
-encWord64le :: Word64 -> ByteString
-encWord64le w = runPut (putWord64le w)
 
 serPrevout :: TxIn -> ByteString
 serPrevout TxIn{txInPrevOutput = OutPoint (TxId (Hash256 h)) i} =
