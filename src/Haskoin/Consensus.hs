@@ -3869,7 +3869,13 @@ checkBIP30 db net height block = do
     go [] = return (Right ())
     go (tx:txs) = do
       let txid = computeTxId tx
-          vouts = [0 .. fromIntegral (length (txOutputs tx) - 1)]
+          -- One outpoint per output, as Core's ConnectBlock BIP30 loop
+          -- (validation.cpp: for (o = 0; o < tx->vout.size(); o++)).  The
+          -- old [0 .. fromIntegral (length outs - 1)] at Word32 turned
+          -- -1 into 4294967295 for a zero-output tx: 2^32 RocksDB reads
+          -- under the chain lock before validateTransaction could reject
+          -- it as bad-txns-vout-empty.
+          vouts = zipWith const [0 :: Word32 ..] (txOutputs tx)
       result <- checkTxOutputs txid vouts
       case result of
         Left err -> return (Left err)
