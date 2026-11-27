@@ -903,7 +903,9 @@ shouldSkipScriptsWith :: Monad m
                          -- ^ Hash of the ancestor of the first argument at the given height
                       -> BlockHash -> Word32 -> Word32 -> Network
                       -> Map BlockHash ChainEntry -> ChainEntry -> m Bool
-shouldSkipScriptsWith ancestorOf _pHash pHeight pTimestamp net blockIndex bestHeader =
+-- The block's timestamp argument is no longer consulted (condition 6 is
+-- work-based, as Core); it is kept so the callers' signature is unchanged.
+shouldSkipScriptsWith ancestorOf _pHash pHeight _pTimestamp net blockIndex bestHeader =
   case netAssumedValid net of
     -- Condition 1: assumevalid not configured — always verify scripts.
     Nothing -> return False
@@ -936,13 +938,35 @@ shouldSkipScriptsWith ancestorOf _pHash pHeight pTimestamp net blockIndex bestHe
                           if ceChainWork bestHeader < netMinimumChainWork net
                             then False
                             else
-                              -- Condition 6: best header is at least 2 weeks of
-                              -- timestamps past the block being connected.
-                              -- We use timestamp difference as a proxy for
-                              -- GetBlockProofEquivalentTime.
-                              let twoWeeks = 60 * 60 * 24 * 7 * 2 :: Word32  -- 1209600 s
-                                  timeDiff = bhTimestamp (ceHeader bestHeader) - pTimestamp
-                              in timeDiff >= twoWeeks
+                              -- Condition 6: the best header is more than two
+                              -- weeks of WORK past the block being connected:
+                              --   GetBlockProofEquivalentTime(*m_best_header,
+                              --     *pindex, *m_best_header) > 60*60*24*7*2
+                              -- (validation.cpp ConnectBlock; Core verifies
+                              -- scripts when it is <=).  Timestamps are not
+                              -- consulted: they are not monotonic, and the old
+                              -- Word32 timestamp difference wrapped to ~4.29e9
+                              -- when the best header was older than the block.
+                              case Map.lookup _pHash blockIndex of
+                                Nothing -> False  -- no chainwork for the block: verify
+                                Just pEntry ->
+                                  let twoWeeks = 60 * 60 * 24 * 7 * 2 :: Integer  -- 1209600 s
+                                  in blockProofEquivalentTime net bestHeader pEntry bestHeader
+                                       > twoWeeks
+
+-- | Core's @GetBlockProofEquivalentTime(to, from, tip)@ (pow.cpp): the work
+-- between @from@ and @to@, expressed as seconds at @tip@'s difficulty, with
+-- the sign of @to - from@, saturated at int64.
+blockProofEquivalentTime :: Network -> ChainEntry -> ChainEntry -> ChainEntry -> Integer
+blockProofEquivalentTime net to from tip =
+  let (r0, sign) = if ceChainWork to > ceChainWork from
+                     then (ceChainWork to - ceChainWork from, 1)
+                     else (ceChainWork from - ceChainWork to, -1)
+      tipProof = headerWork (ceHeader tip)
+      r = if tipProof <= 0 then 0
+          else r0 * fromIntegral (netPowTargetSpacing net) `div` tipProof
+      int64Max = 9223372036854775807 :: Integer
+  in sign * (if r > int64Max then int64Max else r)
 
 -- | Walk the in-memory block index from 'startHash' back to 'targetHeight'.
 -- Returns Nothing if the entry is not found or height is unreachable.
@@ -1981,7 +2005,7 @@ testnet4GenesisBlock = Block
           }]
       , txOutputs  = [TxOut
           { txOutValue  = 5000000000  -- 50 BTC
-          , txOutScript = hexToBS "2100000000000000000000000000000000000000000000000000000000000000000000ac"
+          , txOutScript = hexToBS "21000000000000000000000000000000000000000000000000000000000000000000ac"
             -- 33 zero bytes (push 0x21) + OP_CHECKSIG (0xac)
           }]
       , txWitness  = [[]]
@@ -2004,7 +2028,7 @@ regtest = Network
   , netPowLimit          = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
   , netPowTargetSpacing  = 600
   , netPowTargetTimespan = 86400       -- 24 hours (matches Bitcoin Core)
-  , netRetargetInterval  = 150         -- Much shorter for testing
+  , netRetargetInterval  = 144         -- nPowTargetTimespan / nPowTargetSpacing = 86400 / 600 (Core DifficultyAdjustmentInterval)
   , netHalvingInterval   = 150         -- Much shorter for testing
   , netCoinbaseMaturity  = 100
   , netGenesisBlock      = regtestGenesisBlock
@@ -6850,7 +6874,9 @@ addHeaderAt net hc header minPowChecked mNow = do
 
                 if not difficultyOk
                   then return $ Left "bad-diffbits"
-                  else do
+                else case checkHeaderVersion net height header of
+                 Left err -> return (Left err)
+                 Right () -> do
                     -- Gate 5: Checkpoint verification
                     let checkpoints = buildCheckpoints net
                     case verifyCheckpoint checkpoints height hash of
@@ -7034,12 +7060,38 @@ contextualCheckBlockHeader net entries parent header now =
        then Left "time-too-new"
      else if bhBits header /= difficultyAdjustment net entries parent header
        then Left "bad-diffbits"
-     else case verifyCheckpoint (buildCheckpoints net) height hash of
+     else case checkHeaderVersion net height header of
+      Left err -> Left err
+      Right () -> case verifyCheckpoint (buildCheckpoints net) height hash of
             Left (ChainErrCheckpoint h expected actual) ->
               Left $ "Checkpoint mismatch at height " ++ show h ++
                      ": expected " ++ show expected ++ " got " ++ show actual
             Left err -> Left $ "Checkpoint error: " ++ show err
             Right () -> Right ()
+
+-- | ContextualCheckBlockHeader's outdated-version gate (validation.cpp):
+--
+-- > if ((block.nVersion < 2 && DeploymentActiveAfter(pindexPrev, ..., DEPLOYMENT_HEIGHTINCB)) ||
+-- >     (block.nVersion < 3 && DeploymentActiveAfter(pindexPrev, ..., DEPLOYMENT_DERSIG)) ||
+-- >     (block.nVersion < 4 && DeploymentActiveAfter(pindexPrev, ..., DEPLOYMENT_CLTV)))
+-- >     return state.Invalid(BLOCK_INVALID_HEADER, strprintf("bad-version(0x%08x)", block.nVersion), ...);
+--
+-- Core runs it for every header it accepts (P2P headers, submitheader,
+-- submitblock on any branch), so a header-only chain with an outdated
+-- version is never indexed.  haskoin used to check the version only for
+-- block bodies (in the body validation below), and accepted such headers.
+-- @height@ is the header's own height: DeploymentActiveAfter(pindexPrev)
+-- is @pindexPrev->nHeight + 1 >= activation height@.
+checkHeaderVersion :: Network -> Word32 -> BlockHeader -> Either String ()
+checkHeaderVersion net height header =
+  let ver = bhVersion header
+      outdated = (ver < 2 && height >= netBIP34Height net)
+              || (ver < 3 && height >= netBIP66Height net)
+              || (ver < 4 && height >= netBIP65Height net)
+      h = showHex (fromIntegral ver :: Word32) ""
+  in if outdated
+       then Left ("bad-version(0x" ++ replicate (8 - length h) '0' ++ h ++ ")")
+       else Right ()
 
 -- | Persist a side-branch header that has already been validated by the
 -- caller (typically 'submitBlock' which runs the full

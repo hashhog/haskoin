@@ -57,8 +57,11 @@ hashOf i = BlockHash (Hash256 (BS.pack (map byte [7, 6 .. 0] ++ replicate 24 0x5
 zeroHash :: BlockHash
 zeroHash = BlockHash (Hash256 (BS.replicate 32 0))
 
--- | Timestamps 100,000 s apart per height: two weeks is ~12 blocks, so the
--- 2-week guard (condition 6) is both met and missed inside small trees.
+-- | Timestamps 100,000 s apart per height, and 333 work units per height at
+-- the 0x207fffff difficulty (header work 2, so 333 * 600 / 2 = 99,900 s of
+-- work-equivalent time per block): two weeks is ~12 blocks either way, so the
+-- 2-week guard (condition 6, Core's GetBlockProofEquivalentTime) is both met
+-- and missed inside small trees.
 tsAt :: Word32 -> Word32
 tsAt h = 1000000 + h * 100000
 
@@ -68,7 +71,7 @@ entryFor h height prev = ChainEntry
                      (tsAt height) 0x207fffff 0
   , ceHash       = h
   , ceHeight     = height
-  , ceChainWork  = fromIntegral height + 1
+  , ceChainWork  = (fromIntegral height + 1) * 333
   , cePrev       = prev
   , ceStatus     = StatusHeaderValid
   , ceMedianTime = tsAt height
