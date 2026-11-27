@@ -18,18 +18,23 @@
 -- byte for byte.  R53's stored example is an unbalanced [IF 1], which master
 -- already refuses since haskoin#85 (UNBALANCED_CONDITIONAL is consensus), so
 -- the MINIMALIF rule is pinned with the balanced [IF 1 ENDIF] instead.  LOW_S,
--- NULLFAIL and WITNESS_PUBKEYTYPE had no night-1 verdict row; they are
--- hand-built with the generator's case builder.  The fourteenth flag,
--- DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, is passed too but has no mempool case
--- here: the only standard way to reach it is a P2SH-wrapped unknown witness
--- version, which haskoin's IsWitnessStandard refuses first
--- (bad-witness-nonstandard) where Core's lets it through to the script check.
--- That is a separate standardness gap, left for its own item.
+-- NULLFAIL, WITNESS_PUBKEYTYPE and DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM had
+-- no night-1 verdict row; they are hand-built with the generator's case
+-- builder.  The witness-program cases are P2SH-wrapped programs spent with no
+-- witness at all (P2SH-wrapped P2A, and v2): with a witness, haskoin's
+-- IsWitnessStandard refuses a P2SH-wrapped unknown version before the script
+-- check, where Core's lets it through (a separate standardness gap).
+--
+-- Pay-to-Anchor is the one witness program Core exempts from
+-- DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, and only when native
+-- (interpreter.cpp:1990): control_p2a_native, alone and as a package child,
+-- must stay accepted under the standard flags.
 --
 -- The controls are standard spends Core accepts; they must stay accepted, so
 -- a refusal for an unrelated reason (a broken fixture, a funding mistake) cannot
 -- pass as a fix.  The block-flag test pins that block validation is untouched:
--- every policy fixture still verifies under the block script flags.
+-- every fixture, policy and control (the native P2A anchor spend included),
+-- still verifies under the block script flags.
 module Main (main) where
 
 import Control.Concurrent.STM (atomically)
@@ -93,22 +98,24 @@ pkgScriptRefused _ = False
 opTrueSpk :: BS.ByteString
 opTrueSpk = BS.pack [0x00, 0x20] <> sha256 (BS.singleton 0x51)
 
--- | A parent spending a P2WSH(OP_TRUE) coin into one output locked by @spk@,
--- and the fixture's spend re-pointed at that output (no signature in the
--- fixtures used here, so the re-pointed spend is still well formed).
+-- | A parent spending a P2WSH(OP_TRUE) coin into an output locked by @spk@
+-- (plus a P2WSH(OP_TRUE) output, so a parent paying to the 4-byte P2A script
+-- is not under Core's 65-byte MIN_STANDARD_TX_NONWITNESS_SIZE), and the
+-- fixture's spend re-pointed at output 0 (no signature in the fixtures used
+-- here, so the re-pointed spend is still well formed).
 packageFor :: Fixture -> ((OutPoint, TxOut), TxPackage)
 packageFor f =
   let fundOp = OutPoint (TxId (Hash256 (BS.replicate 32 0x6b))) 0
       parent = Tx { txVersion = 2
                   , txInputs = [TxIn fundOp BS.empty 0xfffffffd]
-                  , txOutputs = [TxOut (fxValue f) (hex (fxSpk f))]
+                  , txOutputs = [TxOut (fxValue f) (hex (fxSpk f)), TxOut 1000 opTrueSpk]
                   , txWitness = [[BS.singleton 0x51]]
                   , txLockTime = 0 }
       child0 = txOf f
       repoint (i : rest) = i { txInPrevOutput = OutPoint (computeTxId parent) 0 } : rest
       repoint [] = []
       child = child0 { txInputs = repoint (txInputs child0) }
-  in ((fundOp, TxOut (fxValue f + 1000) opTrueSpk), TxPackage [parent] child)
+  in ((fundOp, TxOut (fxValue f + 2000) opTrueSpk), TxPackage [parent] child)
 
 policyFixtures :: [Fixture]
 policyFixtures =
@@ -210,6 +217,20 @@ policyFixtures =
       , fxValue = 100000
       , fxTx    = "020000000001015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0000000023220020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665dfeffffff01d07e0100000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc332600201020363516800000000"
       }
+  , Fixture
+      { fxName  = "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM_p2sh_p2a (p2sh script=[1 4e73], no witness)"
+      , fxCore  = "mempool-script-verify-flag-failed (Witness version reserved for soft-fork upgrades)"
+      , fxSpk   = "a9143b68dd0468ddab9d6b7d341e721ec1b386aa29b987"
+      , fxValue = 100000
+      , fxTx    = "02000000015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a00000000050451024e73feffffff01d07e0100000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326000000000"
+      }
+  , Fixture
+      { fxName  = "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM_p2sh_v2_nowit (p2sh script=[2 1111111111111111111111111111111111111111111111111111111111111111], no witness)"
+      , fxCore  = "mempool-script-verify-flag-failed (Witness version reserved for soft-fork upgrades)"
+      , fxSpk   = "a914bd36a36cbcbdf52ad0420a31112a7b10bd99a15087"
+      , fxValue = 100000
+      , fxTx    = "02000000015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a00000000232252201111111111111111111111111111111111111111111111111111111111111111feffffff01d07e0100000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326000000000"
+      }
   ]
 
 controlFixtures :: [Fixture]
@@ -256,6 +277,13 @@ controlFixtures =
       , fxValue = 100000
       , fxTx    = "020000000001015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0000000000feffffff01d07e0100000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc332600340941ee67bb0103312578e618eb6438d6a78f781ef1d54f9b8847163ca6ebfc16fea49d52afb09b29ccf28eb62f1c95373e0776b9eaedeca0dd0b84bdc4ee1edc9222079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac21c179be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179800000000"
       }
+  , Fixture
+      { fxName  = "control_p2a_native (bare script=[1 4e73])"
+      , fxCore  = ""
+      , fxSpk   = "51024e73"
+      , fxValue = 100000
+      , fxTx    = "02000000015a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a0000000000feffffff01d07e0100000000002200204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc3326000000000"
+      }
   ]
 
 -- | R60, the item's minimised case: p2sh script=[NOP10] sig=[1].
@@ -265,6 +293,10 @@ nopsFixture = head [ f | f <- policyFixtures, take 4 (fxName f) == "R60 " ]
 -- | control_p2sh_true: p2sh script=[1].
 p2shTrueFixture :: Fixture
 p2shTrueFixture = head [ f | f <- controlFixtures, take 17 (fxName f) == "control_p2sh_true" ]
+
+-- | control_p2a_native: bare script=[1 4e73], the Pay-to-Anchor output.
+p2aFixture :: Fixture
+p2aFixture = head [ f | f <- controlFixtures, take 18 (fxName f) == "control_p2a_native" ]
 
 main :: IO ()
 main = hspec $ do
@@ -291,14 +323,20 @@ main = hspec $ do
         r <- acceptPackage pkg mp
         r `shouldSatisfy` pkgScriptRefused
 
+    it "control via the package path: a parent + native P2A anchor-spend child is accepted" $ do
+      let (coin, pkg) = packageFor p2aFixture
+      withCoins [coin] $ \mp -> do
+        r <- acceptPackage pkg mp
+        fmap length r `shouldBe` Right 2
+
     it "control via the package path: a parent + standard p2sh [1] child is accepted" $ do
       let (coin, pkg) = packageFor p2shTrueFixture
       withCoins [coin] $ \mp -> do
         r <- acceptPackage pkg mp
         fmap length r `shouldBe` Right 2
 
-  describe "block validation is unchanged: every policy fixture is consensus-valid" $
-    forM_ policyFixtures $ \f ->
+  describe "block validation is unchanged: every fixture is consensus-valid" $
+    forM_ (policyFixtures ++ controlFixtures) $ \f ->
       it (fxName f ++ ": verifies under the block script flags at height 201") $ do
         let tx = txOf f
             (_, coin) = coinOf f

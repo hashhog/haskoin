@@ -552,15 +552,40 @@ spec = describe "W127 Taproot / Schnorr / Tapscript audit (haskoin)" $ do
       isPayToAnchor (Script [OP_1, OP_PUSHDATA (BS.replicate 32 0x00) OPCODE])
         `shouldBe` False
 
-    -- BUG-2 forward regression: the verifier doesn't short-circuit P2A
-    -- before the DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM check.
-    xit "BUG-2 (P1-CDIV): P2A spend under DISCOURAGE flag should succeed (Core parity)" $
-      pendingWith
-        "BUG-2: Core (interpreter.cpp:1990) short-circuits P2A to True before \
-        \DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM.  haskoin (Script.hs:2667-2675) \
-        \enters the upgradable-witness arm and errors under the discourage flag. \
-        \Fix: add `| ver == 1 && prog == p2aWitnessProgram -> Right True` before \
-        \the DISCOURAGE gate."
+    -- BUG-2: Core (interpreter.cpp:1990) returns success for a native P2A
+    -- program before the DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM test; a
+    -- P2SH-wrapped one falls through to it.  Fixed with Core's standard flags
+    -- reaching the mempool (r3fix-haskoin-mempool-standard-script-flags).
+    it "BUG-2 (P1-CDIV): P2A spend under DISCOURAGE flag should succeed (Core parity)" $ do
+      let amount   = 100000 :: Word64
+          p2aSpk   = BS.pack [0x51, 0x02, 0x4e, 0x73]
+          flags    = Set.fromList [VerifyP2SH, VerifyWitness, VerifyTaproot,
+                                   VerifyDiscourageUpgradableWitnessProgram]
+          spendTx  = Tx { txVersion  = 2
+                        , txInputs   = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x5a))) 0)
+                                             BS.empty 0xfffffffe]
+                        , txOutputs  = [TxOut 99000 (BS.pack (0x00 : 0x20 : replicate 32 0x11))]
+                        , txWitness  = [[]]
+                        , txLockTime = 0 }
+      verifyScriptWithFlags flags spendTx 0 p2aSpk amount [amount] [p2aSpk]
+        `shouldBe` Right True
+
+    it "BUG-2 control: a P2SH-wrapped P2A is still discouraged (Core: is_p2sh skips the exemption)" $ do
+      let amount   = 100000 :: Word64
+          redeem   = BS.pack [0x51, 0x02, 0x4e, 0x73]
+          Hash160 h = hash160 redeem
+          spk      = BS.pack [0xa9, 0x14] <> h <> BS.pack [0x87]
+          flags    = Set.fromList [VerifyP2SH, VerifyWitness, VerifyTaproot,
+                                   VerifyDiscourageUpgradableWitnessProgram]
+          spendTx  = Tx { txVersion  = 2
+                        , txInputs   = [TxIn (OutPoint (TxId (Hash256 (BS.replicate 32 0x5a))) 0)
+                                             (BS.pack [0x04] <> redeem) 0xfffffffe]
+                        , txOutputs  = [TxOut 99000 (BS.pack (0x00 : 0x20 : replicate 32 0x11))]
+                        , txWitness  = [[]]
+                        , txLockTime = 0 }
+      either (const True) (const False)
+        (verifyScriptWithFlags flags spendTx 0 spk amount [amount] [spk])
+        `shouldBe` True
 
   ------------------------------------------------------------------------------
   -- BUG-3: control-block codec is well-engineered but not wired in the
