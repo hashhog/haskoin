@@ -390,6 +390,26 @@ test-suite assumevalid-ancestor-index
   default-language: Haskell2010
   ghc-options:     -Wall -O1 -threaded
 
+-- perf-fix2-haskoin-fork-walk: own target so the spec needs no edit to the
+-- shared Spec.hs / haskoin-test other-modules list.
+test-suite fork-point-index
+  type:          exitcode-stdio-1.0
+  main-is:       ForkPointIndexSpec.hs
+  hs-source-dirs: test
+  -- findForkPointIndexed / forkPointWith exist from this commit on (see the
+  -- spec header).
+  cpp-options:   -DHASKOIN_FORK_POINT_INDEX
+  build-depends: base >= 4.14 && < 5
+               , haskoin
+               , hspec
+               , QuickCheck
+               , bytestring
+               , containers
+               , stm
+               , time
+  default-language: Haskell2010
+  ghc-options:     -Wall -O1 -threaded
+
 -- batch5-haskoin-node_error: own target so the spec needs no edit to the
 -- shared Spec.hs / haskoin-test other-modules list.
 test-suite rawtx-messages

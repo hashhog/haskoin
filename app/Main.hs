@@ -3393,8 +3393,11 @@ detectP2PFork db hc = do
   case mBest of
     Nothing -> return Nothing
     Just bestHash -> do
-      entries   <- readTVarIO (hcEntries hc)
-      headerTip <- readTVarIO (hcTip hc)
+      -- One snapshot of both: the fork point is answered from 'entries'
+      -- alone, so the header tip must be in it (a header batch landing
+      -- between two separate reads would leave it out).
+      (entries, headerTip) <- atomically $
+        (,) <$> readTVar (hcEntries hc) <*> readTVar (hcTip hc)
       case Map.lookup bestHash entries of
         Nothing -> return Nothing   -- connected tip not in header index (shouldn't happen)
         Just connectedTip
@@ -3402,7 +3405,13 @@ detectP2PFork db hc = do
           | ceChainWork headerTip <= ceChainWork connectedTip -> return Nothing
           | ceHash headerTip == ceHash connectedTip           -> return Nothing
           | otherwise -> do
-              mFork <- findForkPointMemo hc entries bestHash (ceHash headerTip)
+              -- The header tip's ancestry comes from its height index
+              -- (the best-header slot the assumevalid check keeps on the
+              -- same header), so plain IBD costs no walk: the old
+              -- findForkPoint walked header tip -> connected tip, one
+              -- Map.lookup per height of the header lead, on every
+              -- connected block and every 0.4 s kicker tick.
+              mFork <- findForkPointIndexed (hcAncestors hc) entries bestHash (ceHash headerTip)
               case mFork of
                 Nothing -> return Nothing
                 Just forkEntry
@@ -3577,17 +3586,6 @@ tryP2PReorg net db hc cache mIdxMgr nextBlockRef reorgFailRef connectLock pmRefR
 -- bodies are required by 'buildReorgConnectList' before the reorg can run.
 -- In that case the floor drops to FORK_POINT+1 so 'requestForkBlocks' fetches
 -- the whole heavier branch.
--- | 'findForkPoint' memoised on the (connected tip, header tip) pair.
--- The block-gap kicker calls 'detectP2PFork' every 0.4 s; during a
--- catch-up with the header tip ~56k blocks ahead each call walked all
--- ~56k cePrev links (a Map lookup each) to rediscover that the fork
--- point is the connected tip. The pair changes once per connected block
--- or header batch. A fork point is a function of the two hashes'
--- ancestries, which never change once the headers exist, so a hit is
--- exact; the entry is re-read from the CURRENT map (never a stale
--- ChainEntry), and only found fork points are cached. Core keeps this
--- O(1) via CChain / CBlockIndex::GetAncestor skip pointers
--- (chain.cpp LastCommonAncestor).
 -- | Display-order hex of a block hash, for log lines.
 hexHashS :: BlockHash -> String
 hexHashS (BlockHash (Hash256 bs)) = BL8.unpack (BL8.fromStrict (B16.encode (BS.reverse bs)))
@@ -3684,25 +3682,6 @@ dropNotFoundInflight m = do
   return $ if Map.null nf then m else
     Map.filterWithKey
       (\h (k, _, _) -> not (maybe False (Map.member k) (Map.lookup h nf))) m
-
-{-# NOINLINE forkPointMemoRef #-}
-forkPointMemoRef :: IORef (Maybe ((BlockHash, BlockHash), BlockHash))
-forkPointMemoRef = unsafePerformIO (newIORef Nothing)
-
-findForkPointMemo :: HeaderChain -> Map.Map BlockHash ChainEntry
-                  -> BlockHash -> BlockHash -> IO (Maybe ChainEntry)
-findForkPointMemo hc entries h1 h2 = do
-  memo <- readIORef forkPointMemoRef
-  case memo of
-    Just (k, forkHash) | k == (h1, h2)
-                       , Just ce <- Map.lookup forkHash entries ->
-      return (Just ce)
-    _ -> do
-      r <- findForkPoint hc h1 h2
-      case r of
-        Just ce -> writeIORef forkPointMemoRef (Just ((h1, h2), ceHash ce))
-        Nothing -> return ()
-      return r
 
 -- | Log text for a duplicate of an already-connected block
 -- ('isAlreadyConnected'). Core AcceptBlock: @if (fAlreadyHave) return
