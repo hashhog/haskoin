@@ -3393,8 +3393,11 @@ detectP2PFork db hc = do
   case mBest of
     Nothing -> return Nothing
     Just bestHash -> do
-      entries   <- readTVarIO (hcEntries hc)
-      headerTip <- readTVarIO (hcTip hc)
+      -- One snapshot of both: the fork point is answered from 'entries'
+      -- alone, so the header tip must be in it (a header batch landing
+      -- between two separate reads would leave it out).
+      (entries, headerTip) <- atomically $
+        (,) <$> readTVar (hcEntries hc) <*> readTVar (hcTip hc)
       case Map.lookup bestHash entries of
         Nothing -> return Nothing   -- connected tip not in header index (shouldn't happen)
         Just connectedTip
