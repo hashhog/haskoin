@@ -2941,6 +2941,13 @@ verifyScriptWithTxData flags td idx prevScriptPubKey amount = do
                       if hasFlag flags VerifyTaproot
                         then verifyTaprootTxData flags td idx prog witness amount
                         else Right True
+                    1 | prog == p2aWitnessProgram && not isP2SHWrapped ->
+                      -- Pay-to-Anchor (native OP_1 <4e73>): Core interpreter.cpp:1990
+                      -- returns success before the DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+                      -- test of the else arm, so the standard flags do not refuse an
+                      -- anchor spend.  Without that flag the arm below also succeeds,
+                      -- so block validation is unchanged.
+                      Right True
                     _ -> do
                       -- Unknown witness version
                       when (hasFlag flags VerifyDiscourageUpgradableWitnessProgram) $
