@@ -396,6 +396,9 @@ test-suite fork-point-index
   type:          exitcode-stdio-1.0
   main-is:       ForkPointIndexSpec.hs
   hs-source-dirs: test
+  -- findForkPointIndexed / forkPointWith exist from this commit on (see the
+  -- spec header).
+  cpp-options:   -DHASKOIN_FORK_POINT_INDEX
   build-depends: base >= 4.14 && < 5
                , haskoin
                , hspec

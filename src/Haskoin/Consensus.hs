@@ -222,6 +222,9 @@ module Haskoin.Consensus
   , getValidatedChainTip
   , getValidatedChainTipFromBest
   , findForkPoint
+  , forkWalkWith
+  , forkPointWith
+  , findForkPointIndexed
   , heavierBranchHashes
   , connectableForkTip
   , getAncestor
@@ -1056,14 +1059,22 @@ cachedAncestorAtHeight slot entries start h =
       | ceHeight ce == h -> return (Just (ceHash ce))
       | ceHeight ce <  h -> return Nothing
       | otherwise -> do
-          old <- readIORef slot
-          mci <- case old of
-            Just o | ciTip o == start -> return old
-            _ -> do
-              new <- evaluate (chainIndexSetTip entries start old)
-              atomicWriteIORef slot new
-              return new
+          mci <- chainIndexAt slot entries start
           return (mci >>= \ci -> ancestorViaIndex entries ci h)
+
+-- | The index of @start@'s ancestry held in @slot@, moved to @start@ first
+-- (CChain::SetTip, reusing the part shared with the previous tip) if the
+-- slot indexes another tip.
+chainIndexAt :: IORef (Maybe ChainIndex) -> Map BlockHash ChainEntry
+             -> BlockHash -> IO (Maybe ChainIndex)
+chainIndexAt slot entries start = do
+  old <- readIORef slot
+  case old of
+    Just o | ciTip o == start -> return old
+    _ -> do
+      new <- evaluate (chainIndexSetTip entries start old)
+      atomicWriteIORef slot new
+      return new
 
 --------------------------------------------------------------------------------
 -- Consensus Constants
@@ -7187,21 +7198,75 @@ findForkPoint hc h1 h2 = do
   let e1 = Map.lookup h1 entries
       e2 = Map.lookup h2 entries
   case (e1, e2) of
-    (Just a, Just b) -> return $ go entries a b
+    (Just a, Just b) -> return $ runIdentity (forkWalkWith (Identity . (`Map.lookup` entries)) a b)
     _ -> return Nothing
+
+-- | 'findForkPoint's walk, with the parent lookup passed in: step the
+-- higher of the two down one 'cePrev' at a time (both at equal heights)
+-- until they meet; 'Nothing' when a parent is missing or the walk passes
+-- genesis without meeting.  One lookup per height of the gap.
+forkWalkWith :: Monad m => (BlockHash -> m (Maybe ChainEntry))
+             -> ChainEntry -> ChainEntry -> m (Maybe ChainEntry)
+forkWalkWith look = go
   where
-    go :: Map BlockHash ChainEntry -> ChainEntry -> ChainEntry -> Maybe ChainEntry
-    go ents a b
-      | ceHash a == ceHash b = Just a
-      | ceHeight a > ceHeight b =
-          cePrev a >>= (`Map.lookup` ents) >>= \p -> go ents p b
-      | ceHeight a < ceHeight b =
-          cePrev b >>= (`Map.lookup` ents) >>= \p -> go ents a p
+    parent e = maybe (return Nothing) look (cePrev e)
+    go a b
+      | ceHash a == ceHash b = return (Just a)
+      | ceHeight a > ceHeight b = parent a >>= maybe (return Nothing) (\p -> go p b)
+      | ceHeight a < ceHeight b = parent b >>= maybe (return Nothing) (go a)
       | otherwise = do
           -- Same height, both need to step back
-          p1 <- cePrev a >>= (`Map.lookup` ents)
-          p2 <- cePrev b >>= (`Map.lookup` ents)
-          go ents p1 p2
+          mp1 <- parent a
+          case mp1 of
+            Nothing -> return Nothing
+            Just p1 -> parent b >>= maybe (return Nothing) (go p1)
+
+-- | The fork point of @a@ and @b@, with @b@'s ancestry read from @mci@ when
+-- that is @b@'s height index: only @a@ is walked, and only while it is off
+-- @b@'s chain (Core LastCommonAncestor / CChain::FindFork).  When @a@
+-- descends to @b@'s chain the answer costs no lookup at all; a stale branch
+-- under @a@ costs one lookup per block of that branch.
+--
+-- The answer equals 'forkWalkWith's for the same lookup.  The walk compares
+-- each @a@-side entry with @b@'s ancestor at the same height, which is what
+-- the index holds for every height in @[ciBase, ciTipHeight]@.  Anything the
+-- index cannot vouch for falls back to 'forkWalkWith' from the start: no
+-- index or an index of another tip, a height below 'ciBase', or a parent on
+-- the @a@ side whose height is not one less.
+forkPointWith :: Monad m => (BlockHash -> m (Maybe ChainEntry))
+              -> Maybe ChainIndex -> ChainEntry -> ChainEntry -> m (Maybe ChainEntry)
+forkPointWith look mci a b = case mci of
+  Just ci | ciTip ci == ceHash b, ciTipHeight ci == ceHeight b -> climb ci a
+  _ -> forkWalkWith look a b
+  where
+    climb ci x
+      | ceHeight x < ciBase ci = forkWalkWith look a b
+      | ceHeight x <= ciTipHeight ci
+      , chainIndexLookup ci (ceHeight x) == Just (ceHash x) = return (Just x)
+      | otherwise = case cePrev x of
+          Nothing -> return Nothing
+          Just p -> do
+            mpx <- look p
+            case mpx of
+              Nothing -> return Nothing
+              Just px
+                | ceHeight x > 0 && ceHeight px == ceHeight x - 1 -> climb ci px
+                | otherwise -> forkWalkWith look a b
+
+-- | 'findForkPoint' over the snapshot @entries@, with @h2@'s ancestry read
+-- from the best-header index slot of @cache@ (moved to @h2@ first if it
+-- indexes another tip).  This is the per-block call of the P2P download path
+-- (@detectP2PFork@ in app/Main.hs), whose @h2@ is the best header: the slot
+-- is the one the per-block assumevalid check keeps on the same header, so it
+-- moves only when the best header does.  Same answers as 'findForkPoint'.
+findForkPointIndexed :: AncestorCache -> Map BlockHash ChainEntry
+                     -> BlockHash -> BlockHash -> IO (Maybe ChainEntry)
+findForkPointIndexed cache entries h1 h2 =
+  case (Map.lookup h1 entries, Map.lookup h2 entries) of
+    (Just a, Just b) -> do
+      mci <- chainIndexAt (acBestHeader cache) entries h2
+      return $! runIdentity (forkPointWith (Identity . (`Map.lookup` entries)) mci a b)
+    _ -> return Nothing
 
 -- | Hashes of the competing branch from @forkHash@ (exclusive) to
 -- @tipHash@ (inclusive), in ascending height order.  'Nothing' if the
