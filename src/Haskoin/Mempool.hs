@@ -213,7 +213,6 @@ import Haskoin.Consensus (Network(..), validateTransaction, witnessScaleFactor,
                            isFinalTxCheck, calculateSequenceLocks,
                            checkSequenceLocks,
                            getTransactionSigOpCost, consensusFlagsAtHeight,
-                           consensusFlagsToScriptFlags,
                            SigOpCost(..), isCoinbase)
 import Haskoin.Storage (HaskoinDB, UTXOCache(..), UTXOEntry(..), lookupUTXO)
 import Haskoin.Fatal (readFatalLatch, fatalLatchedReject)
@@ -1848,6 +1847,41 @@ resolveInput mp op = do
                  else return $ Left (ErrMissingInput op)
             Nothing -> return $ Left (ErrMissingInput op)
 
+-- | Core's STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-131): the
+-- script flags every mempool candidate is checked with, in
+-- MemPoolAccept::PolicyScriptChecks (validation.cpp:1146), for
+-- testmempoolaccept, sendrawtransaction, relay and packages alike.  It is a
+-- constant, not a function of the next block's height: the mandatory part is
+-- MANDATORY_SCRIPT_VERIFY_FLAGS (policy.h:104-110), and the standard-only part
+-- is policy, never consensus.  Block validation keeps 'getBlockScriptFlags'.
+-- SIGPUSHONLY is not in Core's set (IsStandardTx refuses a non-push scriptSig
+-- before scripts run), so it is not here either.
+standardScriptVerifyFlags :: Script.ScriptFlags
+standardScriptVerifyFlags = Script.flagSet
+  [ -- MANDATORY_SCRIPT_VERIFY_FLAGS
+    Script.VerifyP2SH
+  , Script.VerifyDERSig
+  , Script.VerifyNullDummy
+  , Script.VerifyCheckLockTimeVerify
+  , Script.VerifyCheckSequenceVerify
+  , Script.VerifyWitness
+  , Script.VerifyTaproot
+    -- standard-only (STANDARD_NOT_MANDATORY_VERIFY_FLAGS), in policy.h's order
+  , Script.VerifyStrictEncoding
+  , Script.VerifyMinimalData
+  , Script.VerifyDiscourageUpgradableNops
+  , Script.VerifyCleanStack
+  , Script.VerifyMinimalIf
+  , Script.VerifyNullFail
+  , Script.VerifyLowS
+  , Script.VerifyDiscourageUpgradableWitnessProgram
+  , Script.VerifyWitnessPubkeyType
+  , Script.VerifyConstScriptcode
+  , Script.VerifyDiscourageUpgradableTaprootVersion
+  , Script.VerifyDiscourageOpSuccess
+  , Script.VerifyDiscourageUpgradablePubkeyType
+  ]
+
 -- | Verify all scripts for a transaction.
 --
 -- Pre-collects per-input prevouts (amounts + scriptPubKeys) before
@@ -1855,7 +1889,7 @@ resolveInput mp op = do
 -- @sha_scriptpubkeys@ commitments can be computed correctly. Falls
 -- back to script-only behaviour for legacy / SegWit-v0 inputs.
 verifyAllScripts :: Mempool -> Tx -> Map OutPoint TxOut -> IO (Either MempoolError ())
-verifyAllScripts mp tx inputMap = do
+verifyAllScripts _mp tx inputMap = do
   -- First pass: resolve every input's prevout, fail fast on missing.
   let resolveAll = traverse
         (\inp -> case Map.lookup (txInPrevOutput inp) inputMap of
@@ -1865,10 +1899,9 @@ verifyAllScripts mp tx inputMap = do
   case resolveAll of
     Left err -> return $ Left err
     Right prevs -> do
-      -- Use consensus flags for the next block height (mempool admission standard).
-      height <- mempoolTipHeight mp
-      let cflags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
-          scriptFlags = consensusFlagsToScriptFlags cflags
+      -- Core MemPoolAccept::PolicyScriptChecks (validation.cpp:1146) checks
+      -- with STANDARD_SCRIPT_VERIFY_FLAGS, not the next block's flags.
+      let scriptFlags = standardScriptVerifyFlags
           spentAmounts = map txOutValue prevs
           spentScripts = map txOutScript prevs
           -- one sighash midstate for every input of this tx (Core:
@@ -4033,9 +4066,9 @@ addPackageTransactions dryRun mp txns utxoMap pkgFeeRate = do
 -- | Verify all scripts for a transaction (variant returning String error).
 -- Same Taproot-aware refactor as 'verifyAllScripts': pre-collect prevouts
 -- and pass to 'verifyScriptWithFlags' so BIP-341 sighash works.
--- Uses consensus flags for the next block height (mempool admission standard).
+-- Uses 'standardScriptVerifyFlags', as 'verifyAllScripts' does.
 verifyAllScripts' :: Mempool -> Tx -> Map OutPoint TxOut -> IO (Either String ())
-verifyAllScripts' mp tx inputMap = do
+verifyAllScripts' _mp tx inputMap = do
   let resolveAll = traverse
         (\inp -> case Map.lookup (txInPrevOutput inp) inputMap of
             Nothing -> Left $ "Missing input: " ++ show (txInPrevOutput inp)
@@ -4044,10 +4077,9 @@ verifyAllScripts' mp tx inputMap = do
   case resolveAll of
     Left err -> return $ Left err
     Right prevs -> do
-      -- Use consensus flags for the next block height (mempool admission standard).
-      height <- mempoolTipHeight mp
-      let cflags = consensusFlagsAtHeight (mpNetwork mp) (height + 1)
-          scriptFlags = consensusFlagsToScriptFlags cflags
+      -- Core MemPoolAccept::PolicyScriptChecks (validation.cpp:1146) checks
+      -- with STANDARD_SCRIPT_VERIFY_FLAGS, not the next block's flags.
+      let scriptFlags = standardScriptVerifyFlags
           spentAmounts = map txOutValue prevs
           spentScripts = map txOutScript prevs
           -- one sighash midstate for every input of this tx (Core:
